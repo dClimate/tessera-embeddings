@@ -47,11 +47,13 @@ def test_inference_modules_import() -> None:
         dataset,
         diagnostics,
         inference,
+        lifecycle,
         profiling,
         progress,
         quantization,
         reference_grid,
         resource_monitor,
+        runner,
         sampling,
         scheduling,
     )

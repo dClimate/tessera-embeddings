@@ -140,6 +140,13 @@ class InferenceConfig:
     s1_orbit: Literal["ascending", "descending"] = "ascending"
     compute_std: bool = False
 
+    # Ray actor resource reservation. ``num_gpus=1`` is the production
+    # default (one A10G per actor); set to ``0`` for CPU-only runs (local
+    # smoke tests, the plain runner on a non-GPU host). Passed at
+    # ``InferenceActor.options(...).remote()`` time so a single actor
+    # class supports both.
+    num_gpus: float = 1.0
+
     # I/O. Callers must supply absolute URIs; storage paths come from
     # ``BucketPaths`` (config/paths.py, Phase 3) or equivalent caller-side
     # configuration. No environment-derived defaults.

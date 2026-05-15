@@ -114,12 +114,23 @@ def _log_vram_breakdown(model: MultimodalBTInferenceModel, torch_mod: types.Modu
     )
 
 
-@ray.remote(num_gpus=1)
+@ray.remote
 class InferenceActor:
-    """Ray actor that runs embedding inference on a single GPU.
+    """Ray actor that runs embedding inference on a single GPU or CPU.
 
     Loads the model checkpoint once at initialization, then processes
-    chunks on demand via process_chunk().
+    chunks on demand via :meth:`process_chunk`.
+
+    Resource reservations (``num_gpus``, ``num_cpus``, ...) are NOT set on
+    the decorator. Callers pass them via ``InferenceActor.options(...)``
+    at ``.remote()`` call time so the same class supports GPU and CPU
+    deployments without duplication. Typical patterns::
+
+        # GPU worker (production / CUDA host)
+        InferenceActor.options(num_gpus=1).remote(config, ckpt)
+
+        # CPU-only worker (local runner, smoke tests)
+        InferenceActor.options(num_gpus=0).remote(config, ckpt)
     """
 
     def __init__(self, config: InferenceConfig, checkpoint_path: str) -> None:
