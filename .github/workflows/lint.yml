@@ -1,0 +1,26 @@
+name: Lint
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      # NOTE: pin all third-party actions to commit SHAs (with version
+      # in a comment) before tagging the first release. See implementation
+      # plan §12.0. Tagged versions are placeholders here.
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "dev.lock"
+      - name: Install dev environment
+        run: uv sync --frozen --group dev
+      - name: ruff check
+        run: uv run ruff check src/ tests/
+      - name: ruff format check
+        run: uv run ruff format --check src/ tests/

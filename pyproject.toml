@@ -1,0 +1,119 @@
+[project]
+name = "tessera_embeddings"
+version = "0.1.0"
+description = "Distributed satellite data ingestion and Tessera embedding generation"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Tessera Embeddings contributors" },
+]
+keywords = ["satellite", "remote-sensing", "embeddings", "tessera", "sentinel"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+# Ingest-only essentials. Torch / Ray / Prefect / AWS are opt-in groups
+# (see [dependency-groups] below). `pip install tessera_embeddings` from
+# PyPI gives the minimal domain library; shipped lock files stack groups.
+dependencies = [
+    "xarray",
+    "dask",
+    "distributed",
+    "zarr",
+    "icechunk",
+    "fsspec",
+    "odc-stac",
+    "odc-geo",
+    "rasterio",
+    "rioxarray",
+    "pystac",
+    "pystac-client",
+    "stackstac",
+    "pyproj",
+    "shapely",
+    "pydantic",
+    "pydantic-settings",
+    "tenacity",
+    "numcodecs[pcodec]",
+    "cloudpickle",
+    "tqdm",
+    "pyyaml",
+    "python-dotenv",
+    "numpy",
+    "pandas",
+]
+
+[project.optional-dependencies]
+# Pure-stdlib package exposing the architecture-test runner so downstream
+# repos can enforce the same layer rules without pulling pytest.
+architecture-tests = []
+
+[dependency-groups]
+inference = [
+    "torch",
+    "ray[default]",
+    "scikit-learn",
+]
+prefect = [
+    "prefect>=3.0",
+    "prefect-dask",
+]
+# prefect-aws lives here, not in `prefect`, so a Prefect user on GCP
+# isn't forced to pull AWS-specific Prefect blocks. Groups compose.
+aws = [
+    "boto3",
+    "botocore",
+    "s3fs",
+    "dask-cloudprovider[aws]",
+    "prefect-aws",
+]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-xdist",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "moto[server]",
+    "hypothesis",
+    "vcrpy",
+    "pytest-recording",
+]
+
+[tool.uv.sources]
+# Default torch pin is CPU so laptop sync works without flags.
+# CUDA variants override with --extra-index-url at lock time.
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tessera_embeddings"]
+
+[tool.pytest.ini_options]
+# Default invocation excludes integration / parity / slow / gpu;
+# CI workflows target those explicitly.
+addopts = "-m 'not integration and not parity and not slow and not gpu'"
+markers = [
+    "integration: requires network/AWS/external services",
+    "parity: Prefect vs plain.py output equivalence (slow)",
+    "slow: >30s runtime (CPU inference, etc.)",
+    "gpu: requires CUDA",
+]
+testpaths = ["tests"]
