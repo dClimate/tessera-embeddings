@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-import botocore.session as botocore_session
 import dask.array as da
 import numpy as np
 import s3fs
@@ -87,29 +86,6 @@ class GridSpec:
 # ---------------------------------------------------------------------------
 
 
-def _iam_storage_options() -> dict[str, str]:
-    """Resolve IAM credentials as plain strings for ``da.from_zarr`` storage_options.
-
-    When ``set_s3_credentials`` has overridden ``AWS_*`` env vars with
-    ASF STS creds (scoped to the OPERA bucket), a plain ``da.from_zarr``
-    on an S3 Zarr store in *our* bucket would pick up those creds and get
-    AccessDenied.  This helper strips the ``env`` provider from the
-    botocore credential chain — the same pattern used by
-    ``zarr_store._get_iam_credentials`` — and returns frozen credential
-    strings that Dask can serialize into the task graph.
-    """
-    bc_session = botocore_session.get_session()
-    bc_session.get_component("credential_provider").remove("env")
-    creds = bc_session.get_credentials()
-    if creds is None:
-        raise RuntimeError("No AWS credentials found for ROI store (checked all providers except env vars)")
-    frozen = creds.get_frozen_credentials()
-    opts: dict[str, str] = {"key": frozen.access_key, "secret": frozen.secret_key}
-    if frozen.token:
-        opts["token"] = frozen.token
-    return opts
-
-
 def read_roi_metadata(roi_path: str) -> ROIMetadata:
     """Read spatial metadata from a Zarr ROI store.
 
@@ -143,18 +119,20 @@ def read_roi_metadata(roi_path: str) -> ROIMetadata:
 def read_roi_mask(
     roi_path: str,
     chunks: dict[str, int],
+    storage_options: dict | None = None,
 ) -> da.Array:
     """Read ROI mask from a Zarr store as a chunked dask array.
 
     Args:
-        roi_path: Path to the Zarr ROI store (local or s3://).
+        roi_path: Path to the Zarr ROI store (local or s3:// or any fsspec URI).
         chunks: Dict with ``"northing"`` and ``"easting"`` chunk sizes.
+        storage_options: fsspec storage options (e.g. explicit AWS credentials).
+            When ``None``, fsspec infers credentials from the environment.
 
     Returns:
         Chunked dask boolean array aligned to the target grid (True = inside ROI).
     """
-    storage_opts = _iam_storage_options() if roi_path.startswith("s3://") else None
-    return da.from_zarr(roi_path, chunks=(chunks["northing"], chunks["easting"]), storage_options=storage_opts)
+    return da.from_zarr(roi_path, chunks=(chunks["northing"], chunks["easting"]), storage_options=storage_options)
 
 
 # ---------------------------------------------------------------------------

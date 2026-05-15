@@ -14,11 +14,9 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import logging
-import shutil
 import subprocess
 import warnings
 from collections.abc import Callable
-from pathlib import Path
 
 import dask.array as da
 import fsspec
@@ -39,6 +37,20 @@ from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_stor
 warnings.filterwarnings("ignore", message="Numcodecs codecs are not in the Zarr version 3")
 
 logger = logging.getLogger(__name__)
+
+
+def _fs_for(uri: str, storage_options: dict | None = None) -> fsspec.AbstractFileSystem:
+    """Return an fsspec filesystem inferred from the URI scheme.
+
+    Args:
+        uri: Any fsspec-compatible URI (``s3://``, ``gs://``, ``file://``,
+            absolute local path, etc.).
+        storage_options: Extra kwargs forwarded to
+            :func:`fsspec.filesystem` (e.g. ``{"anon": False}``).
+    """
+    opts = storage_options or {}
+    protocol = fsspec.utils.get_protocol(uri)
+    return fsspec.filesystem(protocol, **opts)
 
 
 class IncompleteStageError(RuntimeError):
@@ -225,7 +237,7 @@ class ZarrWriter:
         distinguish a legitimate skip from a silently-failed chunk.
         """
         path = self._skip_marker_path(run_id, chunk)
-        fs = fsspec.filesystem("s3", anon=False) if path.startswith("s3://") else fsspec.filesystem("file")
+        fs = _fs_for(path)
         with fs.open(path, "wb") as f:
             f.write(b"")
         logger.info("Wrote skip marker for %s to %s", chunk.label, path)
@@ -434,7 +446,7 @@ class ZarrWriter:
 
     def _list_labels_by_suffix(self, run_id: str, suffix: str) -> list[str]:
         staging_dir = f"{self.staging_base}/{run_id}"
-        fs = fsspec.filesystem("s3", anon=False) if staging_dir.startswith("s3://") else fsspec.filesystem("file")
+        fs = _fs_for(staging_dir)
         try:
             # refresh=True forces a fresh S3 LIST instead of returning the
             # cached dir listing. Staged artifacts (zarrs + skip markers) are
@@ -1017,10 +1029,10 @@ class ZarrWriter:
         _log = log or logger
         target = f"{self.staging_base}/{run_id}"
 
-        if target.startswith("s3://"):
-            _log.info("Cleaning up S3 staging: %s", target)
-            _s5cmd_rm(target, _log)
-        else:
-            _log.info("Cleaning up local staging: %s", target)
-            if Path(target).exists():
-                shutil.rmtree(target)
+        _log.info("Cleaning up staging: %s", target)
+        try:
+            fs = _fs_for(target)
+            if fs.exists(target):
+                fs.rm(target, recursive=True)
+        except Exception:
+            _log.warning("Failed to clean up staging directory %s", target, exc_info=True)

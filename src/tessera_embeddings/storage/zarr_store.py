@@ -7,7 +7,6 @@ Uses Icechunk for transactional writes with atomic commit semantics.
 """
 
 import logging
-import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -15,14 +14,12 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-import boto3
-import botocore.session as botocore_session
 import dask.array as da
+import fsspec
 import icechunk
 import numpy as np
 import xarray as xr
 import zarr
-from icechunk import S3StaticCredentials
 from icechunk.xarray import to_icechunk
 
 from tessera_embeddings.errors import CorruptedStoreError
@@ -47,25 +44,14 @@ TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic
 
 def _delete_store(store_path: str) -> bool:
     """Delete a store at the given path. Returns True if deleted, False if not found."""
-    if store_path.startswith("s3://"):
-        try:
-            bucket, prefix = _parse_s3_url(store_path)
-            # Skip env vars so GDAL/rasterio overrides don't affect store ops
-            bc_session = botocore_session.get_session()
-            bc_session.get_component("credential_provider").remove("env")
-            session = boto3.Session(botocore_session=bc_session)
-            s3 = session.resource("s3")
-            bucket_obj = s3.Bucket(bucket)
-            bucket_obj.objects.filter(Prefix=prefix).delete()
+    try:
+        fs = fsspec.filesystem(fsspec.utils.get_protocol(store_path))
+        if fs.exists(store_path):
+            fs.rm(store_path, recursive=True)
             return True
-        except Exception as e:
-            logger.warning(f"Failed to delete S3 store {store_path}: {e}")
-            return False
-    else:
-        path = Path(store_path)
-        if path.exists():
-            shutil.rmtree(path)
-            return True
+        return False
+    except Exception as e:
+        logger.warning(f"Failed to delete store {store_path}: {e}")
         return False
 
 
@@ -105,51 +91,29 @@ def _parse_s3_url(url: str) -> tuple[str, str]:
 _S3_REGION = "us-west-2"
 
 
-def _get_iam_credentials() -> S3StaticCredentials:
-    """Resolve AWS credentials from the standard chain, skipping env vars.
+def _create_storage(
+    store_path: str,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+) -> icechunk.Storage:
+    """Create Icechunk storage for local or S3 paths.
 
-    Icechunk calls this callback whenever it needs S3 credentials for output
-    store reads/writes.  By removing the ``env`` provider from the botocore
-    credential chain, the callback always resolves to IAM role credentials
-    (instance-metadata on EC2, container credentials on ECS, or
-    ``~/.aws/credentials`` / SSO locally) — even when ``s3_direct_access``
-    has temporarily overridden the ``AWS_*`` env vars for GDAL reads.
-
-    Botocore refreshes instance-metadata credentials automatically, so this
-    never returns stale tokens.
+    Args:
+        store_path: Local path or S3 URI.
+        get_credentials: Optional credential callback for Icechunk's S3
+            client. When ``None`` on an S3 path, environment-default
+            credentials are used (suitable for local testing with moto or
+            for environments where the default credential chain resolves
+            correctly). The AWS provider supplies a botocore-backed callback
+            that skips env vars to avoid credential conflicts with GDAL.
     """
-    bc_session = botocore_session.get_session()
-    resolver = bc_session.get_component("credential_provider")
-    resolver.remove("env")  # skip env vars → falls through to IAM role
-
-    creds = bc_session.get_credentials()
-    if creds is None:
-        raise RuntimeError("No AWS credentials found for output store (checked all providers except env vars)")
-    frozen = creds.get_frozen_credentials()
-    return S3StaticCredentials(
-        access_key_id=frozen.access_key,
-        secret_access_key=frozen.secret_key,
-        session_token=frozen.token,
-    )
-
-
-def _create_storage(store_path: str) -> icechunk.Storage:
-    """Create Icechunk storage for local or S3 paths."""
     if store_path.startswith("s3://"):
         bucket, prefix = _parse_s3_url(store_path)
         if _s3_config_override:
             return _s3_config_override.make_storage(prefix_override=prefix)
-        # Icechunk's Rust S3 client doesn't follow PermanentRedirect,
-        # so we must supply the correct region explicitly.
-        # get_credentials callback resolves IAM role creds directly,
-        # bypassing env vars that may be temporarily overridden for
-        # GDAL/rasterio reads (e.g. s3_direct_access for ASF data).
-        return icechunk.s3_storage(
-            bucket=bucket,
-            prefix=prefix,
-            region=_S3_REGION,
-            get_credentials=_get_iam_credentials,
-        )
+        s3_kwargs: dict = {"bucket": bucket, "prefix": prefix, "region": _S3_REGION}
+        if get_credentials is not None:
+            s3_kwargs["get_credentials"] = get_credentials
+        return icechunk.s3_storage(**s3_kwargs)
     Path(store_path).parent.mkdir(parents=True, exist_ok=True)
     return icechunk.local_filesystem_storage(store_path)
 
@@ -173,16 +137,28 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     return config
 
 
-def _open_repo(store_path: str, max_concurrent_requests: int | None = None) -> icechunk.Repository:
+def _open_repo(
+    store_path: str,
+    max_concurrent_requests: int | None = None,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+) -> icechunk.Repository:
     """Open an existing Icechunk repository."""
-    return icechunk.Repository.open(_create_storage(store_path), config=_default_repo_config(max_concurrent_requests))
+    return icechunk.Repository.open(
+        _create_storage(store_path, get_credentials=get_credentials),
+        config=_default_repo_config(max_concurrent_requests),
+    )
 
 
-def _create_repo(store_path: str, max_concurrent_requests: int | None = None) -> icechunk.Repository:
+def _create_repo(
+    store_path: str,
+    max_concurrent_requests: int | None = None,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+) -> icechunk.Repository:
     """Create a new Icechunk repository."""
     try:
         return icechunk.Repository.create(
-            _create_storage(store_path), config=_default_repo_config(max_concurrent_requests)
+            _create_storage(store_path, get_credentials=get_credentials),
+            config=_default_repo_config(max_concurrent_requests),
         )
     except icechunk.IcechunkError as e:
         if "repositories can only be created in clean prefixes" in str(e):
@@ -193,17 +169,26 @@ def _create_repo(store_path: str, max_concurrent_requests: int | None = None) ->
 
 
 def open_or_create_repo(
-    store_path: str, max_concurrent_requests: int | None = None
+    store_path: str,
+    max_concurrent_requests: int | None = None,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
 ) -> tuple[icechunk.Repository, bool]:
     """Open existing or create new Icechunk repository.
 
+    Args:
+        store_path: Local path or S3 URI.
+        max_concurrent_requests: Optional cap on concurrent S3 requests per repo.
+        get_credentials: Optional credential callback for Icechunk's S3 client.
+            See :func:`_create_storage` for details.
+
     Returns:
-        Tuple of (repository, is_new). is_new is True if the repo was just created.
+        Tuple of ``(repository, is_new)``. ``is_new`` is True if the repo was
+        just created.
     """
     try:
-        return _open_repo(store_path, max_concurrent_requests), False
+        return _open_repo(store_path, max_concurrent_requests, get_credentials=get_credentials), False
     except (FileNotFoundError, icechunk.IcechunkError):
-        return _create_repo(store_path, max_concurrent_requests), True
+        return _create_repo(store_path, max_concurrent_requests, get_credentials=get_credentials), True
 
 
 # =============================================================================

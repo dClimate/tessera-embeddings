@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import boto3
+import fsspec
 import ray
 import requests
 
@@ -298,7 +298,6 @@ def download_checkpoint(s3_path: str, local_dir: str = "/opt/dlami/nvme/tessera-
         Local file path.
     """
     filename = s3_path.rsplit("/", 1)[-1]
-    bucket, key = s3_path[5:].split("/", 1)
 
     local = Path(local_dir)
     local.mkdir(parents=True, exist_ok=True)
@@ -309,8 +308,9 @@ def download_checkpoint(s3_path: str, local_dir: str = "/opt/dlami/nvme/tessera-
         return str(local_path)
 
     logger.info("Downloading checkpoint: %s → %s", s3_path, local_path)
-    boto3.client("s3").download_file(bucket, key, str(local_path))
-    s3_downloaded_size = local_path.stat().st_size
-    logger.info("Download complete: %s (%.1f MB)", local_path, s3_downloaded_size / 1024 / 1024)
+    with fsspec.open(s3_path, "rb") as remote, local_path.open("wb") as dest:
+        dest.write(remote.read())
+    downloaded_size = local_path.stat().st_size
+    logger.info("Download complete: %s (%.1f MB)", local_path, downloaded_size / 1024 / 1024)
 
     return str(local_path)
