@@ -169,6 +169,8 @@ fsspec==2026.4.0
     #   prefect
     #   s3fs
     #   torch
+gdal==3.13.0
+    # via tessera-embeddings (pyproject.toml)
 google-api-core==2.30.3
     # via opencensus
 google-auth==2.52.0
@@ -264,6 +266,8 @@ markupsafe==3.0.3
     #   mako
 mdurl==0.1.2
     # via markdown-it-py
+mgrs==1.5.4
+    # via tessera-embeddings (pyproject.toml)
 mpmath==1.3.0
     # via sympy
 msgpack==1.1.2

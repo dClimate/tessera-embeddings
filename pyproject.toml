@@ -31,6 +31,9 @@ dependencies = [
     "zarr",
     "icechunk",
     "fsspec",
+    # gdal Python bindings must match the libgdal installed on the system.
+    # Bump in lockstep with the system library.
+    "gdal==3.13.0",
     "odc-stac",
     "odc-geo",
     "rasterio",
@@ -38,6 +41,7 @@ dependencies = [
     "pystac",
     "pystac-client",
     "stackstac",
+    "mgrs",
     "pyproj",
     "shapely",
     "pydantic",
