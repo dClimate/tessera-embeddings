@@ -16,6 +16,7 @@ def test_top_level_packages_import() -> None:
 def test_config_modules_import() -> None:
     """Every config submodule imports."""
     from tessera_embeddings.config import (  # noqa: F401
+        dask,
         environment,
         inference,
         providers,
@@ -71,6 +72,13 @@ def test_storage_modules_import() -> None:
 
 def test_provider_modules_import() -> None:
     """Provider submodules import."""
+    from tessera_embeddings.providers.aws import dask as aws_dask  # noqa: F401
     from tessera_embeddings.providers.aws import diagnostics  # noqa: F401
     from tessera_embeddings.providers.aws import ray as aws_ray  # noqa: F401
+    from tessera_embeddings.providers.local import dask as local_dask  # noqa: F401
     from tessera_embeddings.providers.local import ray as local_ray  # noqa: F401
+
+
+def test_orchestration_modules_import() -> None:
+    """Orchestration helpers import (no Prefect required)."""
+    from tessera_embeddings.orchestration import concurrency  # noqa: F401
