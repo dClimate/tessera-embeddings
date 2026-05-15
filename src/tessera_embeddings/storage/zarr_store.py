@@ -88,31 +88,58 @@ def _parse_s3_url(url: str) -> tuple[str, str]:
     return parts[0], parts[1] if len(parts) > 1 else ""
 
 
-_S3_REGION = "us-west-2"
+# NOTE: Hardcoding a default region is normally an anti-pattern in this
+# package — paths and credentials are caller-supplied so the code works for
+# any deployment. We make a deliberate exception here: the Sentinel-1 OPERA
+# RTC archive lives in us-west-2 and authentication to it only succeeds
+# from in-region clients (cross-region requests are rejected, not just
+# charged for). Any pipeline running this code against OPERA must therefore
+# be in us-west-2, so defaulting the region here keeps that path zero-config
+# while still letting callers override via the ``region`` argument.
+_DEFAULT_S3_REGION = "us-west-2"
 
 
 def _create_storage(
     store_path: str,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    region: str | None = None,
+    scatter_initial_credentials: bool = False,
 ) -> icechunk.Storage:
     """Create Icechunk storage for local or S3 paths.
 
     Args:
         store_path: Local path or S3 URI.
         get_credentials: Optional credential callback for Icechunk's S3
-            client. When ``None`` on an S3 path, environment-default
-            credentials are used (suitable for local testing with moto or
-            for environments where the default credential chain resolves
-            correctly). The AWS provider supplies a botocore-backed callback
-            that skips env vars to avoid credential conflicts with GDAL.
+            client. The callable returns a fresh
+            :class:`icechunk.S3StaticCredentials` on each invocation; setting
+            ``expires_after`` on the returned object tells Icechunk when to
+            call back for refresh. When ``None`` on an S3 path, Icechunk
+            falls back to the default AWS credential chain (env, instance
+            profile, etc.), which is suitable for local testing with moto.
+            The AWS provider in the closed-source repo supplies a
+            botocore-backed callback that adapts boto's
+            ``RefreshableCredentials`` into ``S3StaticCredentials``.
+        region: Optional S3 region. Defaults to ``us-west-2`` because the
+            Sentinel-1 OPERA RTC archive only authenticates in-region.
+            Override for stores outside us-west-2.
+        scatter_initial_credentials: When True, Icechunk eagerly calls
+            ``get_credentials`` once and caches the result so that pickled
+            copies of the storage (e.g. shipped to Ray actors or Dask workers
+            during ``to_icechunk``) don't all stampede the credential
+            provider on deserialisation. Set True for distributed assembly.
     """
     if store_path.startswith("s3://"):
         bucket, prefix = _parse_s3_url(store_path)
         if _s3_config_override:
             return _s3_config_override.make_storage(prefix_override=prefix)
-        s3_kwargs: dict = {"bucket": bucket, "prefix": prefix, "region": _S3_REGION}
+        s3_kwargs: dict = {
+            "bucket": bucket,
+            "prefix": prefix,
+            "region": region if region is not None else _DEFAULT_S3_REGION,
+        }
         if get_credentials is not None:
             s3_kwargs["get_credentials"] = get_credentials
+            s3_kwargs["scatter_initial_credentials"] = scatter_initial_credentials
         return icechunk.s3_storage(**s3_kwargs)
     Path(store_path).parent.mkdir(parents=True, exist_ok=True)
     return icechunk.local_filesystem_storage(store_path)
@@ -141,10 +168,17 @@ def _open_repo(
     store_path: str,
     max_concurrent_requests: int | None = None,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    region: str | None = None,
+    scatter_initial_credentials: bool = False,
 ) -> icechunk.Repository:
     """Open an existing Icechunk repository."""
     return icechunk.Repository.open(
-        _create_storage(store_path, get_credentials=get_credentials),
+        _create_storage(
+            store_path,
+            get_credentials=get_credentials,
+            region=region,
+            scatter_initial_credentials=scatter_initial_credentials,
+        ),
         config=_default_repo_config(max_concurrent_requests),
     )
 
@@ -153,11 +187,18 @@ def _create_repo(
     store_path: str,
     max_concurrent_requests: int | None = None,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    region: str | None = None,
+    scatter_initial_credentials: bool = False,
 ) -> icechunk.Repository:
     """Create a new Icechunk repository."""
     try:
         return icechunk.Repository.create(
-            _create_storage(store_path, get_credentials=get_credentials),
+            _create_storage(
+                store_path,
+                get_credentials=get_credentials,
+                region=region,
+                scatter_initial_credentials=scatter_initial_credentials,
+            ),
             config=_default_repo_config(max_concurrent_requests),
         )
     except icechunk.IcechunkError as e:
@@ -172,6 +213,8 @@ def open_or_create_repo(
     store_path: str,
     max_concurrent_requests: int | None = None,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    region: str | None = None,
+    scatter_initial_credentials: bool = False,
 ) -> tuple[icechunk.Repository, bool]:
     """Open existing or create new Icechunk repository.
 
@@ -180,15 +223,31 @@ def open_or_create_repo(
         max_concurrent_requests: Optional cap on concurrent S3 requests per repo.
         get_credentials: Optional credential callback for Icechunk's S3 client.
             See :func:`_create_storage` for details.
+        region: Optional S3 region override.
+        scatter_initial_credentials: When True with a distributed writer,
+            cache the initial credentials so pickled storage copies don't
+            re-invoke the callback on each worker. See :func:`_create_storage`.
 
     Returns:
         Tuple of ``(repository, is_new)``. ``is_new`` is True if the repo was
         just created.
     """
     try:
-        return _open_repo(store_path, max_concurrent_requests, get_credentials=get_credentials), False
+        return _open_repo(
+            store_path,
+            max_concurrent_requests,
+            get_credentials=get_credentials,
+            region=region,
+            scatter_initial_credentials=scatter_initial_credentials,
+        ), False
     except (FileNotFoundError, icechunk.IcechunkError):
-        return _create_repo(store_path, max_concurrent_requests, get_credentials=get_credentials), True
+        return _create_repo(
+            store_path,
+            max_concurrent_requests,
+            get_credentials=get_credentials,
+            region=region,
+            scatter_initial_credentials=scatter_initial_credentials,
+        ), True
 
 
 # =============================================================================

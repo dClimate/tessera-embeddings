@@ -20,6 +20,7 @@ from collections.abc import Callable
 
 import dask.array as da
 import fsspec
+import icechunk
 import numpy as np
 import xarray as xr
 import zarr
@@ -810,6 +811,8 @@ class ZarrWriter:
         model_version: str | None = None,
         manifest: EmbeddingManifest | None = None,
         n_workers: int,
+        get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+        s3_region: str | None = None,
     ) -> str:
         """Assemble staged chunk Zarrs into the output Icechunk store.
 
@@ -852,6 +855,11 @@ class ZarrWriter:
             n_workers: Max Dask worker count for this assembly. Used to divide
                 ``TARGET_AGGREGATE_S3_CONCURRENCY`` across workers so the
                 fleet-wide PUT rate stays under S3's per-prefix ceiling.
+            get_credentials: Optional credential callback forwarded to
+                Icechunk for the output store. See
+                :func:`tessera_embeddings.storage.zarr_store._create_storage`.
+            s3_region: Optional S3 region override for the output store.
+                Defaults to us-west-2 (see ``zarr_store._DEFAULT_S3_REGION``).
 
         Returns:
             Path to the assembled output store.
@@ -910,7 +918,17 @@ class ZarrWriter:
         # pre-divide by n_workers to keep aggregate under S3's per-prefix
         # ceiling. See TARGET_AGGREGATE_S3_CONCURRENCY for the rationale.
         per_worker_cap = max(4, TARGET_AGGREGATE_S3_CONCURRENCY // n_workers)
-        repo, is_new = open_or_create_repo(output_path, max_concurrent_requests=per_worker_cap)
+        # scatter_initial_credentials: to_icechunk pickles the session out to
+        # every Dask worker. With a credential callback, eager scatter
+        # caches one credential set on the driver so workers don't all stampede
+        # the credential provider on deserialisation.
+        repo, is_new = open_or_create_repo(
+            output_path,
+            max_concurrent_requests=per_worker_cap,
+            get_credentials=get_credentials,
+            region=s3_region,
+            scatter_initial_credentials=get_credentials is not None,
+        )
         # Persist the cap into the repo's config blob. to_icechunk ships the
         # session out and each worker re-opens the Repository — without
         # save_config, those workers read the persisted config (defaults) and
