@@ -299,9 +299,11 @@ break in CI before it hits a 1hr cloud run.
 
 OPERA asset STS credentials are intentionally **never cleaned up** from env vars. This avoids
 a race condition where one Dask task's cleanup could remove credentials another task still
-needs. Icechunk/Zarr write operations on the project's own S3 bucket are immune: they
-explicitly strip the `env` provider from botocore's credential chain so they always use the
-IAM role regardless of what `AWS_*` env vars are set.
+needs. Icechunk/Zarr write operations on the project's own S3 bucket stay isolated by being
+configured with an explicit credential callback (see ``storage.zarr_store._create_storage``
+``get_credentials``); the AWS-provider implementation passes a callback that resolves
+deployment credentials directly from the IAM role, so it is unaffected by whatever
+``AWS_*`` env vars OPERA's STS session has set.
 
 ### URL Rewriting
 

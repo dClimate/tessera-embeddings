@@ -23,12 +23,11 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import cast
 
 import dask.array as da
+import fsspec
 import numpy as np
-import s3fs
 import zarr
 from affine import Affine
 from odc.geo.geobox import GeoBox
@@ -148,18 +147,14 @@ def load_geometries_from_geojson(input_path: str) -> tuple[list, CRS]:
     that CRS is returned; otherwise WGS84 is assumed.
 
     Args:
-        input_path: Path to the GeoJSON file (local path or ``s3://`` URI).
+        input_path: Path to the GeoJSON file. Any fsspec-compatible URI
+            (``s3://``, ``gs://``, ``file://``, absolute local path).
 
     Returns:
         Tuple of (list of Shapely geometries, detected CRS).
     """
-    if input_path.startswith("s3://"):
-        fs = s3fs.S3FileSystem()
-        with fs.open(input_path, "r") as f:
-            geojson = json.load(f)
-    else:
-        with Path(input_path).open() as f:
-            geojson = json.load(f)
+    with fsspec.open(input_path, "r") as f:
+        geojson = json.load(f)
 
     if geojson.get("type") == "FeatureCollection":
         geometries = [shape(feat["geometry"]) for feat in geojson["features"]]
@@ -194,8 +189,8 @@ def load_s2_tile_geometry(tile_names: str, roi_bucket: str) -> list:
     Args:
         tile_names: One or more MGRS tile identifiers, comma-separated
             (e.g. ``"14TPK"`` or ``"14TPK,14TQK,15TPK"``).
-        roi_bucket: S3 base path for ROI storage (e.g.
-            ``s3://cl-tessera-inputs/rois``)
+        roi_bucket: Base URI for ROI storage (e.g. ``s3://my-bucket/rois``
+            or ``/local/path/rois``). Any fsspec-compatible URI is accepted.
 
     Returns:
         List of Shapely geometries for the requested tiles.
@@ -206,9 +201,8 @@ def load_s2_tile_geometry(tile_names: str, roi_bucket: str) -> list:
 
     tiles_uri = f"{roi_bucket.rstrip('/')}/{_S2_TILES_FILENAME}"
 
-    fs = s3fs.S3FileSystem()
     logger.info("Fetching tile(s) %s from %s", names, tiles_uri)
-    with fs.open(tiles_uri, "r") as f:
+    with fsspec.open(tiles_uri, "r") as f:
         geojson = json.load(f)
 
     name_set = set(names)
@@ -350,15 +344,13 @@ def check_output_exists(output_path: str) -> bool:
     """Check whether a Zarr store already exists at the given path.
 
     Args:
-        output_path: Local path or ``s3://`` URI.
+        output_path: Any fsspec-compatible URI.
 
     Returns:
         True if the path exists.
     """
-    if output_path.startswith("s3://"):
-        fs = s3fs.S3FileSystem()
-        return fs.exists(output_path)
-    return Path(output_path).exists()
+    fs = fsspec.filesystem(fsspec.utils.get_protocol(output_path))
+    return fs.exists(output_path)
 
 
 def rasterize_roi_zarr(
