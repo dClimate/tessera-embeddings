@@ -67,3 +67,10 @@ def test_inference_models_import() -> None:
 def test_storage_modules_import() -> None:
     """Storage submodules import."""
     from tessera_embeddings.storage import manifest, zarr_store  # noqa: F401
+
+
+def test_provider_modules_import() -> None:
+    """Provider submodules import."""
+    from tessera_embeddings.providers.aws import diagnostics  # noqa: F401
+    from tessera_embeddings.providers.aws import ray as aws_ray  # noqa: F401
+    from tessera_embeddings.providers.local import ray as local_ray  # noqa: F401
