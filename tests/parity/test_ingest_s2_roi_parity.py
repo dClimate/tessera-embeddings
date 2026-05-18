@@ -1,37 +1,103 @@
-"""Parity skeleton: S2 reflectance ingestion.
+"""Parity: S2 reflectance ingestion (Prefect flow vs domain function).
 
-This test will run the Prefect S2 flow (with ``use_local=True``) and
-the domain function :func:`ingest_s2_roi_reflectance` against a
-LocalCluster, against the same VCR-cassette-backed STAC responses,
-and assert the two output Zarr stores match via
-:func:`assert_zarr_equivalent`.
+Both call sites share a session-scoped LocalCluster; STAC HTTP
+responses are intercepted by ``pytest-recording`` against the
+cassette ``tests/fixtures/stac_cassettes/s2_l2a_story_county_jul2024.yaml``.
 
-Status: **xfail until cassettes land** (see
-``tests/fixtures/stac_cassettes/README.md``). The skeleton documents
-the expected shape; remove the xfail once the cassette is recorded.
+The actual COG pixel reads (``odc.stac.load`` → rasterio → GDAL curl)
+are NOT mocked — VCR sits at the Python HTTP layer; GDAL bypasses
+it. Earth Search COGs are public and unauthenticated, so the reads
+work without credentials. Tests fail if Earth Search is unreachable;
+that's tolerated because S2 ingest fundamentally depends on tile
+pixel access.
+
+The cassette only captures the STAC search response (item discovery);
+the ~50 KB JSON is what makes this fast and deterministic.
 """
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 import pytest
+from dask.distributed import Client
+
+from tessera_embeddings.ingest.roi import rasterize_roi_zarr
+from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
+from tessera_embeddings.orchestration.prefect.flows import ingest_s2_roi_reflectance as flow_module
+from tests.parity.helpers import assert_zarr_equivalent
+
+CASSETTE_NAME = "s2_l2a_story_county_jul2024"
+
+# Story County, IA. The fixture covers July 2024 — non-trivial S2
+# cloud coverage that exercises the painter's-algorithm sort.
+STORY_COUNTY_DATES = ("2024-07-01", "2024-07-31")
+FORCE_CRS = "EPSG:32615"  # UTM zone 15N covers Story County
+
+
+def _stage_quickstart_roi(tmp_path: Path, roi_geojson: Path) -> Path:
+    """Rasterise the quickstart GeoJSON to a Zarr ROI under ``tmp_path``."""
+    roi_zarr = tmp_path / "roi.zarr"
+    rasterize_roi_zarr(
+        output_path=str(roi_zarr),
+        resolution=10.0,
+        chunk_size=2000,
+        force_crs=FORCE_CRS,
+        input_path=str(roi_geojson),
+    )
+    return roi_zarr
 
 
 @pytest.mark.parity
 @pytest.mark.integration
-@pytest.mark.xfail(reason="Awaiting S2 STAC cassette recording (Phase 10.4 follow-up)", strict=True)
-def test_s2_roi_parity() -> None:
-    """Domain function and Prefect flow produce identical S2 reflectance Zarrs.
+@pytest.mark.vcr(CASSETTE_NAME)
+def test_s2_roi_parity(
+    tmp_path: Path,
+    fixture_quickstart_roi: Path,
+    parity_cluster: Client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Domain function and Prefect flow produce identical S2 reflectance Zarrs."""
+    monkeypatch.setattr(flow_module, "get_run_logger", lambda: logging.getLogger("parity-s2"))
 
-    See ``test_generate_roi_parity.py`` for the canonical shape; the
-    only differences for S2 are:
+    roi_zarr = _stage_quickstart_roi(tmp_path, fixture_quickstart_roi)
 
-    * Both calls receive a ``client`` from the shared LocalCluster
-      fixture (or the flow gets ``use_local=True`` which sets up its
-      own).
-    * STAC HTTP responses are intercepted by ``pytest-recording``;
-      the cassette path is
-      ``tests/fixtures/stac_cassettes/s2_l2a_story_county_jul2024.yaml``.
-    * The output store name is ``reflectance.zarr`` so
-      :func:`assert_zarr_equivalent` walks the group's data variables.
-    """
-    raise NotImplementedError("Implement once the S2 STAC cassette is recorded.")
+    domain_store = tmp_path / "domain"
+    flow_store = tmp_path / "flow"
+
+    # Domain path
+    ingest_s2_roi_reflectance(
+        roi_zarr_path=str(roi_zarr),
+        start_date=STORY_COUNTY_DATES[0],
+        end_date=STORY_COUNTY_DATES[1],
+        store_path=str(domain_store),
+        client=parity_cluster,
+        log=logging.getLogger("parity-s2-domain"),
+    )
+
+    # Flow path. We bypass the @flow wrapper via .fn so tests don't
+    # need a running Prefect server; the wrapper around our domain
+    # function is one concrete provider-selection branch (use_local)
+    # plus a dispatch to .with_options(task_runner=...). Both paths
+    # eventually land in ingest_s2_roi_reflectance, so .fn-bypass is
+    # faithful to the production code path.
+    flow_module.ingest_s2_roi_reflectance.fn(  # type: ignore[attr-defined]
+        roi_zarr_path=str(roi_zarr),
+        start_date=STORY_COUNTY_DATES[0],
+        end_date=STORY_COUNTY_DATES[1],
+        store_path=str(flow_store),
+        use_local=True,
+    )
+
+    # Both stores must materialise
+    domain_zarr = domain_store / "reflectance.zarr"
+    flow_zarr = flow_store / "reflectance.zarr"
+    assert domain_zarr.exists(), f"Domain output missing: {domain_zarr}"
+    assert flow_zarr.exists(), f"Flow output missing: {flow_zarr}"
+
+    # Compare with float32-ULP tolerance — odc.stac.load can produce
+    # bit-different floats across runs due to threading-order effects
+    # in baseline corrections. Strict equality is too tight for a
+    # parity check; correctness is what we're after.
+    assert_zarr_equivalent(domain_zarr, flow_zarr, rtol=1e-6, atol=1e-6)
