@@ -32,7 +32,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Literal
+from typing import Literal, final
 
 import dask.distributed
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
@@ -52,6 +52,7 @@ DEFAULT_CRED_REFRESH_INTERVAL_SEC = 30 * 60
 S1Orbit = Literal["ascending", "descending"]
 
 
+@final
 @dataclass(frozen=True)
 class SarIngestResult:
     """Return value from :func:`ingest_s1_roi_sar`.

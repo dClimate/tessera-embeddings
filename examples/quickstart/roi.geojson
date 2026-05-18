@@ -1,0 +1,26 @@
+{
+  "type": "FeatureCollection",
+  "name": "quickstart",
+  "crs": {
+    "type": "name",
+    "properties": {
+      "name": "urn:ogc:def:crs:OGC:1.3:CRS84"
+    }
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"Name": "quickstart"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-93.30, 44.95],
+          [-93.29, 44.95],
+          [-93.29, 44.96],
+          [-93.30, 44.96],
+          [-93.30, 44.95]
+        ]]
+      }
+    }
+  ]
+}

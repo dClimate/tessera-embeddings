@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, final
 
 from tessera_embeddings.config.time_windows import TimeWindow
 
@@ -71,6 +71,7 @@ DEFAULT_CHUNK_SIZE = 2000
 TESSERA_CHUNKS = {"time": 1, "northing": DEFAULT_CHUNK_SIZE, "easting": DEFAULT_CHUNK_SIZE}
 
 
+@final
 @dataclass
 class InferenceConfig:
     """Configuration for the full inference pipeline.

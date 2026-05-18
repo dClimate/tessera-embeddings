@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import cast
+from typing import cast, final
 
 import dask.array as da
 import dask.distributed
@@ -52,6 +52,7 @@ from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset
 
 
+@final
 @dataclass(frozen=True)
 class IngestResult:
     """Return value from :func:`ingest_s2_roi_reflectance`.

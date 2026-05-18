@@ -1,0 +1,46 @@
+# Quickstart config for the orchestrator-free plain runner.
+#
+# Run with:
+#     python -m tessera_embeddings.orchestration.runners.plain \
+#         examples/quickstart/config.yaml --skip-inference
+#
+# Drop --skip-inference to run the full pipeline (CPU inference).
+# Expect ~30+ minutes end-to-end on a developer laptop.
+#
+# All paths use file:// for portability. Replace with s3:// (or any
+# fsspec-supported scheme) for cloud deployments.
+
+paths:
+  inputs: file:///tmp/tessera/inputs
+  outputs: file:///tmp/tessera/outputs
+  preprocessed: file:///tmp/tessera/preprocessed
+
+roi:
+  name: quickstart
+  geojson: examples/quickstart/roi.geojson
+  resolution: 10.0
+  chunk_size: 2000
+  force_crs: null
+
+# Ingest date range. Keep narrow for quickstart speed; widen for
+# realistic comparison against production.
+time_range:
+  start: "2024-07-01"
+  end: "2024-08-01"
+
+# Inference time window — must match a 12-month rolling window's end.
+# (Plain runner derives this from the same string Prefect flows accept.)
+time_window_end: "July 2025"
+
+# Single-orbit ingest is enough for the quickstart.
+s1_orbit: ascending
+
+# Local Dask cluster size on the runner host.
+n_workers: 2
+
+# Quantized checkpoint loads faster on CPU.
+quantized_checkpoint: true
+
+# fsspec storage options. null lets fsspec auto-detect; for s3:// you
+# might pass {anon: false} or a dict with key/secret.
+storage_options: null

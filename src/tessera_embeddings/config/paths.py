@@ -15,6 +15,7 @@ URIs may use any fsspec-supported protocol: ``s3://``, ``gs://``,
 from __future__ import annotations
 
 import posixpath
+from typing import final
 
 from pydantic import BaseModel, Field
 
@@ -24,6 +25,7 @@ _PREPROCESSED_KINDS: frozenset[str] = frozenset({"staging"})
 _ALL_KINDS: frozenset[str] = _INPUT_KINDS | _OUTPUT_KINDS | _PREPROCESSED_KINDS
 
 
+@final
 class BucketPaths(BaseModel):
     """Base storage URIs for each pipeline stage.
 
