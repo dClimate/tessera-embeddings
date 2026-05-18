@@ -1,7 +1,8 @@
 # Quickstart
 
 This example runs the full `tessera_embeddings` pipeline locally,
-without Prefect, against a tiny ~1 km² ROI in southern Minnesota.
+without Prefect, against a small AOI over Story County, Iowa — the
+densest corn-producing county in the US (USDA NASS).
 
 It exists to prove that:
 
@@ -10,9 +11,18 @@ It exists to prove that:
 * The same code path the Prefect flows use is reachable without a
   Prefect runtime.
 
-The input AOI (`roi.geojson`) is a 0.01° × 0.01° box near Minneapolis;
-at 10 m resolution that's roughly one 2000×2000 chunk. Choose a real
-AOI for production runs.
+The input AOI (`roi.geojson`) is a 0.10° × 0.10° box (~10 km on a side,
+roughly five 2000×2000 chunks at 10 m resolution) centred near Ames,
+Iowa. The AOI was chosen for dense data coverage:
+
+* **Sentinel-2 L2A** (Earth Search): ~12 acquisitions / month over the
+  growing season.
+* **OPERA RTC-S1** (CMR-STAC ASF): ~6 ascending acquisitions / month.
+
+If you adapt this example to a different AOI, verify both providers
+return non-zero results before committing — geographic coverage of
+OPERA in particular is uneven (it's a NASA processing program, not a
+sensor; some regions have not yet been processed).
 
 ## Prerequisites
 

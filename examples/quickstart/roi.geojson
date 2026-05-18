@@ -10,15 +10,18 @@
   "features": [
     {
       "type": "Feature",
-      "properties": {"Name": "quickstart"},
+      "properties": {
+        "Name": "quickstart",
+        "Note": "10 km box over Story County, IA (Ames). Story County is the densest corn-producing county in the US (USDA NASS) and is well-covered by OPERA RTC-S1 (~6 ascending acquisitions per month) and Sentinel-2 (~12 acquisitions per month). Chosen to exercise both ingest paths in a realistic agricultural setting."
+      },
       "geometry": {
         "type": "Polygon",
         "coordinates": [[
-          [-93.30, 44.95],
-          [-93.29, 44.95],
-          [-93.29, 44.96],
-          [-93.30, 44.96],
-          [-93.30, 44.95]
+          [-93.65, 42.00],
+          [-93.55, 42.00],
+          [-93.55, 42.10],
+          [-93.65, 42.10],
+          [-93.65, 42.00]
         ]]
       }
     }

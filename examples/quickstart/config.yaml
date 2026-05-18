@@ -16,7 +16,9 @@ paths:
   preprocessed: file:///tmp/tessera/preprocessed
 
 roi:
-  name: quickstart
+  # 10 km box over Story County, IA (Ames) — top corn-producing county.
+  # See examples/quickstart/README.md for why this AOI was chosen.
+  name: quickstart_story_county_ia
   geojson: examples/quickstart/roi.geojson
   resolution: 10.0
   chunk_size: 2000
