@@ -1,0 +1,218 @@
+"""Master orchestration flow: ROI generation → S1/S2 ingestion → Tessera embeddings.
+
+Chains the three pipeline stages and dispatches each to its registered
+Prefect deployment via ``arun_deployment``. The two ingestion stages
+run concurrently. Cancelling this flow in the Prefect UI propagates
+cancellation to all running child deployments.
+
+Differences from the reference repo:
+
+* The coarsening stage is **not included** — the coarsen flow is out
+  of OSS scope (plan §17). Downstream consumers can chain a coarsen
+  step themselves.
+* The deployment names are caller-supplied via :class:`PipelineDeployments`
+  rather than module-level constants pinned to a private deployment
+  layout.
+* The ``BucketPaths`` parameter replaces ``resolve_buckets(dev)``; CRS
+  suffix logic is preserved via :func:`tessera_embeddings.orchestration.prefect.flows.generate_roi._crs_suffix`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import zarr
+from prefect import flow, get_run_logger
+from prefect.deployments import arun_deployment
+from prefect.states import StateType
+from pydantic import BaseModel
+
+from tessera_embeddings.config.dask import compute_pipeline_cluster_sizing
+from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.config.time_windows import parse_time_window
+from tessera_embeddings.orchestration.prefect.flows.generate_roi import _crs_suffix
+
+
+class PipelineDeployments(BaseModel):
+    """Deployment refs (``flow_name/deployment_name``) for the master pipeline.
+
+    The reference repo hardcodes deployment names as module constants;
+    making them caller-configurable lets the same pipeline flow drive
+    multiple environments (prod, dev, staging) without code changes.
+    """
+
+    generate_roi: str = "generate-roi/generate-roi"
+    ingest_s1_roi_sar: str = "ingest_s1_roi_sar/ingest-s1-roi-sar"
+    ingest_s2_roi_reflectance: str = "ingest_s2_roi_reflectance/ingest-s2-roi-reflectance"
+    tessera_embeddings: str = "tessera_embeddings/tessera-embeddings"
+
+
+def _count_roi_chunks(roi_zarr_path: str) -> int:
+    """Count total spatial chunks in the ROI zarr."""
+    import math
+
+    z = zarr.open_array(roi_zarr_path, mode="r")
+    height, width = z.shape
+    chunk_h, chunk_w = z.chunks
+    return math.ceil(height / chunk_h) * math.ceil(width / chunk_w)
+
+
+def _check_completed(flow_run: object, stage: str) -> None:
+    """Raise if a child flow run did not complete successfully."""
+    state = getattr(flow_run, "state", None)
+    if state is None or state.type != StateType.COMPLETED:
+        state_name = state.name if state else "UNKNOWN"
+        raise RuntimeError(f"{stage} did not complete successfully (state={state_name})")
+
+
+@flow(name="tessera-full-pipeline", log_prints=True)
+async def tessera_full_pipeline(
+    *,
+    paths: BucketPaths,
+    time_window_end: str,
+    deployments: PipelineDeployments = PipelineDeployments(),  # noqa: B008
+    # ROI inputs
+    roi_name: str | None = None,
+    tile_names: str | None = None,
+    roi_override_name: str | None = None,
+    resolution: float = 10.0,
+    force_crs: str | None = None,
+    # Cluster sizing (None = auto-size from ROI chunk count)
+    ingest_min_workers: int | None = None,
+    ingest_max_workers: int | None = None,
+    num_actors: int | None = None,
+    # Behaviour
+    s1_orbit: str = "ascending",
+    skip_coverage_check: bool = False,
+    ami_ssm_name: str = "/tessera/ray/ami-id",
+) -> dict:
+    """End-to-end pipeline: ROI → S1+S2 ingestion → Tessera embeddings.
+
+    Args:
+        paths: Deployment-supplied storage URIs (see :class:`BucketPaths`).
+        time_window_end: End month of the 12-month window as
+            ``"Month Year"`` (e.g. ``"June 2025"``).
+        deployments: Deployment refs to dispatch to.
+        roi_name: GeoJSON-mode ROI name. Mutually exclusive with
+            ``tile_names``.
+        tile_names: Comma-separated MGRS tile IDs. Mutually exclusive
+            with ``roi_name``.
+        roi_override_name: Human-readable nickname in tile mode.
+        resolution: ROI rasterisation pixel size (metres).
+        force_crs: Optional CRS override for ROI generation.
+        ingest_min_workers: Override for ingest Dask min_workers (None
+            = auto-size from chunk count).
+        ingest_max_workers: Override for ingest Dask max_workers.
+        num_actors: Override for Ray GPU actor count.
+        s1_orbit: SAR orbit direction.
+        skip_coverage_check: Skip the time-window coverage validation
+            on the embeddings stage.
+        ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
+
+    Returns:
+        Dict with the run IDs of every child flow.
+    """
+    log = get_run_logger()
+
+    if s1_orbit not in {"ascending", "descending"}:
+        raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending' or 'descending'.")
+
+    inputs_bucket = paths.inputs
+
+    time_window = parse_time_window(time_window_end)
+    start_date, end_date = time_window.to_date_range()
+    log.info("Time window: %s → %s (end month: %s)", start_date, end_date, time_window_end)
+
+    roi_name = roi_name.strip() if roi_name else None
+    tile_names = tile_names.strip() if tile_names else None
+    if (roi_name and tile_names) or not (roi_name or tile_names):
+        raise ValueError("Exactly one of roi_name or tile_names is required")
+
+    if roi_name:
+        canonical_name = roi_name
+    else:
+        parts = [t.strip() for t in tile_names.split(",") if t.strip()]  # type: ignore[union-attr]
+        if not parts:
+            raise ValueError("tile_names must contain at least one non-empty tile ID")
+        canonical_name = roi_override_name or "_".join(parts)
+
+    # Stage 1: Generate ROI
+    log.info("Stage 1: Generating ROI mask")
+    roi_run = await arun_deployment(
+        deployments.generate_roi,
+        parameters={
+            "roi_bucket": f"{inputs_bucket.rstrip('/')}/rois",
+            "roi_name": roi_name,
+            "tile_names": tile_names,
+            "output_name": roi_override_name,
+            "resolution": resolution,
+            "force_crs": force_crs,
+        },
+    )
+    _check_completed(roi_run, "generate_roi")
+
+    roi_zarr_path = f"{inputs_bucket.rstrip('/')}/rois/zarrs/{canonical_name}{_crs_suffix(force_crs)}.zarr"
+    store_path = f"{inputs_bucket.rstrip('/')}/mosaics/{canonical_name}"
+    log.info("ROI generated: %s (run_id=%s)", roi_zarr_path, roi_run.id)
+
+    # Auto-size cluster from ROI chunk count
+    n_chunks = _count_roi_chunks(roi_zarr_path)
+    ingest_min_workers, ingest_max_workers, num_actors = compute_pipeline_cluster_sizing(
+        n_chunks,
+        ingest_min_workers=ingest_min_workers,
+        ingest_max_workers=ingest_max_workers,
+        num_actors=num_actors,
+    )
+    log.info(
+        "ROI has %d chunks → ingest workers %d/%d, actors %d",
+        n_chunks,
+        ingest_min_workers,
+        ingest_max_workers,
+        num_actors,
+    )
+
+    # Stage 2: Concurrent S1 + S2 ingestion
+    log.info("Stage 2: Ingesting S1 SAR + S2 reflectance concurrently")
+    ingest_params_common = {
+        "roi_zarr_path": roi_zarr_path,
+        "start_date": start_date,
+        "end_date": end_date,
+        "store_path": store_path,
+        "min_workers": ingest_min_workers,
+        "max_workers": ingest_max_workers,
+    }
+    s1_run, s2_run = await asyncio.gather(
+        arun_deployment(
+            deployments.ingest_s1_roi_sar,
+            parameters={**ingest_params_common, "orbit": s1_orbit},
+        ),
+        arun_deployment(deployments.ingest_s2_roi_reflectance, parameters=ingest_params_common),
+    )
+    _check_completed(s1_run, "ingest_s1_roi_sar")
+    _check_completed(s2_run, "ingest_s2_roi_reflectance")
+    log.info("S1 ingestion complete (run_id=%s)", s1_run.id)
+    log.info("S2 ingestion complete (run_id=%s)", s2_run.id)
+
+    # Stage 3: Tessera embeddings
+    log.info("Stage 3: Running Tessera embedding inference")
+    embeddings_run = await arun_deployment(
+        deployments.tessera_embeddings,
+        parameters={
+            "roi_name": canonical_name,
+            "time_window_end": time_window_end,
+            "paths": paths.model_dump(),
+            "ami_ssm_name": ami_ssm_name,
+            "num_actors": num_actors,
+            "s1_orbit": s1_orbit,
+            "dev_params": {"skip_coverage_check": skip_coverage_check},
+        },
+    )
+    _check_completed(embeddings_run, "tessera_embeddings")
+    log.info("Embeddings complete (run_id=%s)", embeddings_run.id)
+
+    return {
+        "roi_run_id": str(roi_run.id),
+        "s1_run_id": str(s1_run.id),
+        "s2_run_id": str(s2_run.id),
+        "embeddings_run_id": str(embeddings_run.id),
+    }
