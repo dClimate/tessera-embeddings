@@ -66,14 +66,24 @@ def test_s2_roi_parity(
     domain_store = tmp_path / "domain"
     flow_store = tmp_path / "flow"
 
-    # Domain path
-    ingest_s2_roi_reflectance(
+    # Domain path. Capture the result so a "skipped" status (zero
+    # dates passing the SCL coverage check, etc.) surfaces in the
+    # test output instead of silently producing no Zarr store.
+    domain_log = logging.getLogger("parity-s2-domain")
+    domain_log.setLevel(logging.INFO)
+    domain_log.addHandler(logging.StreamHandler())
+    domain_result = ingest_s2_roi_reflectance(
         roi_zarr_path=str(roi_zarr),
         start_date=STORY_COUNTY_DATES[0],
         end_date=STORY_COUNTY_DATES[1],
         store_path=str(domain_store),
         client=parity_cluster,
-        log=logging.getLogger("parity-s2-domain"),
+        log=domain_log,
+    )
+    assert domain_result.status == "success", (
+        f"Domain ingest produced no output (result={domain_result}). "
+        f"This usually means every date got rejected by the SCL coverage "
+        f"check, or the domain call hit an exception that was swallowed."
     )
 
     # Flow path. We bypass the @flow wrapper via .fn so tests don't

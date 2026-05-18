@@ -55,29 +55,28 @@ def _stage_quickstart_roi(tmp_path: Path, roi_geojson: Path) -> Path:
 
 
 def _bearer_session_factory(token: str) -> requests.Session:
-    """Build an EDL-redirect-safe session that uses Bearer auth.
+    """Build a Bearer-auth requests session for cassette-recording use.
 
-    Subclasses :class:`auth_module._EDLSession` so the cross-domain
-    redirect handling stays identical, then sets the Authorization
-    header directly instead of using ``session.auth = (user, pass)``.
+    Sets the ``Authorization`` header at the **session** level so it's
+    applied to every request the session sends — including across
+    redirects. ``requests`` does not strip session-level headers the
+    way it strips per-request ``prepared_request.headers`` on
+    cross-domain redirects.
+
+    Verified working against the full ASF redirect chain by
+    ``scripts/probe_edl_bearer.py``: a single GET reaches
+    ``cloudfront.net`` with HTTP 200 across 5 redirect hops
+    (datapool → cumulus → URS → cumulus/login → cumulus/RTC → cloudfront).
+
+    We intentionally do NOT subclass ``auth_module._EDLSession``: that
+    class overrides ``rebuild_auth`` to re-inject ``session.auth`` on
+    URS hops (the basic-auth path). For bearer, the base
+    ``requests.Session.rebuild_auth`` is correct — it strips
+    *prepared-request* auth on cross-domain hops but leaves
+    *session-level* headers alone, which is exactly what we want.
     """
-    session = auth_module._EDLSession()
+    session = requests.Session()
     session.headers["Authorization"] = f"Bearer {token}"
-
-    # The base class re-injects session.auth on URS-bound redirects.
-    # With Bearer auth there's nothing to re-inject — but we need to
-    # make sure the Authorization header isn't stripped on the same
-    # cross-domain hop the basic-auth case worries about.
-    original_rebuild_auth = session.rebuild_auth
-
-    def _rebuild_auth_keep_bearer(prepared_request, response) -> None:  # type: ignore[no-untyped-def]
-        original_rebuild_auth(prepared_request, response)
-        # Re-add bearer on URS hops, since the base class only re-adds
-        # session.auth (Basic), not arbitrary headers.
-        if auth_module._AUTH_HOST in (prepared_request.url or ""):
-            prepared_request.headers["Authorization"] = f"Bearer {token}"
-
-    session.rebuild_auth = _rebuild_auth_keep_bearer  # type: ignore[method-assign]
     return session
 
 
