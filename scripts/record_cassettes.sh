@@ -39,6 +39,64 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 1
 fi
 
+# Check that the EDL credentials actually authorize against the ASF
+# datapool. A common failure mode is having the env vars set but
+# never having clicked "Approve" on the "Alaska Satellite Facility
+# Data Access" application in the EDL profile UI; the cassette
+# recording then dies mid-test with a confusing 401.
+#
+# We probe with a HEAD against a known-good OPERA tile via the
+# CloudFront-signed redirect chain. 200 means EDL + app authorization
+# are both good. 401 is the app-authorization case (or wrong creds).
+# Anything else (network blip, ASF outage) we surface as an error
+# the user can recognise.
+echo "Verifying EDL credentials against ASF..."
+EDL_PROBE_URL="https://datapool.asf.alaska.edu/RTC/OPERA-S1/OPERA_L2_RTC-S1_T063-133417-IW3_20240701T001410Z_20240701T044329Z_S1A_30_v1.0_VV.tif"
+EDL_HTTP_CODE=$(
+    curl --silent --output /dev/null --location-trusted \
+        --user "$EARTHDATA_USERNAME:$EARTHDATA_PASSWORD" \
+        --request HEAD \
+        --max-time 30 \
+        --write-out '%{http_code}' \
+        "$EDL_PROBE_URL" \
+    || echo "curl_failed"
+)
+
+case "$EDL_HTTP_CODE" in
+    200)
+        echo "  EDL credentials OK."
+        ;;
+    401)
+        cat >&2 <<EOF
+ERROR: EDL returned HTTP 401 for the ASF datapool. Most common cause:
+       you have not approved the "Alaska Satellite Facility Data
+       Access" application in your EDL profile.
+
+Fix:
+  1. Visit https://urs.earthdata.nasa.gov/profile
+  2. "Applications" → "Approved Applications"
+  3. If "Alaska Satellite Facility Data Access" is missing, click
+     "Authorize Applications" and add it.
+  4. (For OPERA-specific access you may also need to authorize
+     additional apps listed at https://search.asf.alaska.edu/.)
+
+If the app is already approved, double-check that
+EARTHDATA_USERNAME / EARTHDATA_PASSWORD match a working login at
+https://urs.earthdata.nasa.gov/.
+EOF
+        exit 1
+        ;;
+    curl_failed)
+        echo "ERROR: Could not reach $EDL_PROBE_URL (network or DNS issue)." >&2
+        exit 1
+        ;;
+    *)
+        echo "ERROR: EDL probe returned HTTP $EDL_HTTP_CODE — expected 200." >&2
+        echo "       Check ASF status (https://asf.alaska.edu/) and retry." >&2
+        exit 1
+        ;;
+esac
+
 # ── Activate env ──────────────────────────────────────────────────
 # We sync all four groups (dev + inference + prefect + aws) because
 # pytest collection imports modules transitively across the package:

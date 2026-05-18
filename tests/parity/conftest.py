@@ -1,8 +1,8 @@
 """Parity-test shared fixtures.
 
-Fixtures here are session-scoped where possible (LocalCluster is
-expensive to set up). Each parity test gets isolation via
-per-function ``tmp_path``.
+Fixtures here are session-scoped where possible (LocalCluster +
+prefect_test_harness are expensive to set up). Each parity test
+gets isolation via per-function ``tmp_path``.
 """
 
 from __future__ import annotations
@@ -12,9 +12,27 @@ from pathlib import Path
 
 import pytest
 from dask.distributed import Client, LocalCluster
+from prefect.testing.utilities import prefect_test_harness
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CASSETTE_DIR = REPO_ROOT / "tests" / "fixtures" / "stac_cassettes"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolated_prefect_runtime() -> Iterator[None]:
+    """Run every parity-test flow against an in-memory Prefect server.
+
+    Without this, Prefect uses the contributor's shell-configured
+    ``PREFECT_API_URL`` (Cloud, staging, prod, …) — leaking external
+    infrastructure into a test that's supposed to be hermetic.
+
+    ``prefect_test_harness`` overrides settings with a temp SQLite
+    database for the lifetime of the context manager. ``autouse=True``
+    + session scope means every parity test inherits it without
+    extra fixture wiring.
+    """
+    with prefect_test_harness():
+        yield
 
 
 @pytest.fixture(scope="session")
