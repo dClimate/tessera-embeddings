@@ -32,6 +32,8 @@ def test_ingest_modules_import() -> None:
         opera_query,
         roi,
         roi_processing,
+        s1_roi,
+        s2_roi,
         stac,
         transforms,
     )
