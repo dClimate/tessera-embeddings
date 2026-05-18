@@ -15,7 +15,24 @@ To record (do this once, then commit the cassette)::
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CASSETTE_DIR = REPO_ROOT / "tests" / "fixtures" / "stac_cassettes"
+
+
+@pytest.fixture(scope="module")
+def vcr_cassette_dir() -> str:
+    """Centralise this test's cassette under tests/fixtures/stac_cassettes/.
+
+    By default pytest-recording writes alongside the test file under
+    ``cassettes/<test_module>/``; we override so the safety guard
+    (``test_cassette_safety.py``) and the parity tests share one
+    inspection point.
+    """
+    return str(CASSETTE_DIR)
 
 
 @pytest.fixture(scope="module")
