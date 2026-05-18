@@ -39,9 +39,13 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 1
 fi
 
-# ── Activate dev env ──────────────────────────────────────────────
+# ── Activate env ──────────────────────────────────────────────────
+# Need dev (pytest, pytest-recording) AND inference (ray, torch).
+# tessera_embeddings/__init__.py re-exports run_inference, which
+# imports ray at module load — collection crashes without it even
+# though the parity tests don't actually invoke Ray.
 
-uv sync --frozen --group dev
+uv sync --frozen --group dev --group inference
 
 # ── Record ────────────────────────────────────────────────────────
 
@@ -59,6 +63,7 @@ echo
 # tests that have been written to use pytest-recording. --record-mode=once
 # means: only record what's missing; never re-record an existing cassette
 # (use --record-mode=rewrite to refresh).
+RECORDING_EXIT=0
 uv run pytest \
     tests/integration/test_stac_query_cassette.py \
     tests/parity/test_ingest_s2_roi_parity.py \
@@ -69,6 +74,29 @@ uv run pytest \
     || RECORDING_EXIT=$?
 
 # ── Inspection checklist ──────────────────────────────────────────
+
+if (( RECORDING_EXIT != 0 )); then
+    cat >&2 <<EOF
+
+────────────────────────────────────────────────────────────────────
+Recording exited with status $RECORDING_EXIT before all cassettes
+were captured.
+
+Common causes:
+- Collection error (ImportError): a dep is missing from the env. Run
+  'uv sync --frozen --group dev --group inference' and try again.
+- Network error reaching STAC: retry; if it persists, check whether
+  Earth Search or CMR is degraded.
+- Test failure after cassette write: VCR may have written a partial
+  cassette — DO NOT COMMIT IT. Delete tests/fixtures/stac_cassettes/*.yaml
+  and re-run.
+
+Skipping the inspection checklist. Fix the failure and re-run this
+script before committing anything.
+────────────────────────────────────────────────────────────────────
+EOF
+    exit "$RECORDING_EXIT"
+fi
 
 cat <<EOF
 
