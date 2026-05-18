@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # Auto-bump GitHub Actions when new versions are published. Dependabot
+  # rewrites the SHA pin and updates the `# v...` comment in one PR.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+      include: "scope"

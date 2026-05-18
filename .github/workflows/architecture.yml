@@ -1,0 +1,31 @@
+name: Architecture
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Architecture tests are AST-walk-based layer-rule checks. They don't need
+# the application's runtime deps, only pytest itself. Runs in seconds; no
+# Python-version matrix (rules don't vary by interpreter).
+jobs:
+  architecture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "dev.lock"
+      - name: Install minimal env
+        # We need the package itself (so the architecture_tests module
+        # is importable) plus pytest. The `dev` group brings pytest in.
+        run: uv sync --frozen --group dev
+      - name: Run architecture tests
+        run: uv run pytest tests/architecture -v
+      - name: Run architecture-tests CLI directly
+        # Sanity check: the bundled CLI also returns 0. Catches cases
+        # where the pytest wrapper passes but the standalone tool would
+        # fail (e.g. allowlist parsing regression).
+        run: uv run python -m tessera_embeddings.architecture_tests --source src/tessera_embeddings/

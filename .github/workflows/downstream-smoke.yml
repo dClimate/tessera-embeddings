@@ -1,0 +1,52 @@
+name: Downstream smoke test (yield_modeling)
+
+# INITIALLY DISABLED — the downstream consumer (yield_modeling) is a
+# private repo that does not yet have a stable v0.1.0 of its own. To
+# activate post yield_modeling first release:
+#
+#   1. Uncomment the `pull_request` trigger below.
+#   2. Add a repo secret `YIELD_MODELING_READ_TOKEN` (read-only PAT
+#      scoped to the closed repo).
+#   3. Verify yield_modeling/main has a stable green
+#      `pytest tests/unit tests/architecture` run.
+#
+# This workflow MUST NEVER be a required status check. The whole point
+# is that a private downstream cannot veto an OSS release. The
+# `continue-on-error: true` step below makes failure surface as a PR
+# warning, not a block.
+on:
+  # pull_request:
+  #   branches: [main]
+  workflow_dispatch: {}  # manual-only trigger while disabled
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true  # informational only
+    steps:
+      - name: Check out yield_modeling at known-good ref
+        uses: actions/checkout@v4
+        with:
+          repository: arbol/yield_modeling
+          ref: main
+          token: ${{ secrets.YIELD_MODELING_READ_TOKEN }}
+          path: yield_modeling
+      - name: Check out this OSS PR
+        uses: actions/checkout@v4
+        with:
+          path: tessera_embeddings
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "yield_modeling/dev.lock"
+      - name: Install yield_modeling against this PR's tessera_embeddings
+        run: |
+          cd yield_modeling
+          # Replace the pinned tessera_embeddings with the PR checkout.
+          uv pip install ../tessera_embeddings
+          uv pip install -r dev.lock
+      - name: Run yield_modeling fast suite
+        run: |
+          cd yield_modeling
+          uv run pytest tests/unit tests/architecture -n auto --tb=short

@@ -1,0 +1,52 @@
+name: Integration + Parity
+
+on:
+  pull_request:
+    branches: [main]
+    # Path-gated: only run when the PR touches code that integration /
+    # parity tests cover. Saves CI minutes on doc-only or unrelated PRs.
+    paths:
+      - 'src/tessera_embeddings/ingest/**'
+      - 'src/tessera_embeddings/inference/**'
+      - 'src/tessera_embeddings/orchestration/**'
+      - 'src/tessera_embeddings/providers/**'
+      - 'src/tessera_embeddings/storage/**'
+      - 'tests/integration/**'
+      - 'tests/parity/**'
+      - 'tests/fixtures/**'
+      - 'pyproject.toml'
+      - 'dev.lock'
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "dev.lock"
+      - run: uv sync --frozen --group dev
+      - name: Run integration tests
+        # `-n auto` is safe here — integration tests touch external surfaces
+        # (moto, fsspec) but each is independently set up. See implementation
+        # plan §12.8 for xdist conventions.
+        run: uv run pytest tests/integration -m integration -n auto -v --tb=short
+
+  parity-fast:
+    # Fast parity tests (per-flow). Full-pipeline parity is in nightly.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "dev.lock"
+      - run: uv sync --frozen --group dev
+      - name: Run parity tests (excluding slow)
+        # NO `-n auto` here: each parity test runs BOTH a Prefect flow AND
+        # the plain runner — already two heavyweight pipelines per test.
+        # Parallelising thrashes CPU instead of speeding up wall-clock.
+        run: uv run pytest tests/parity -m "parity and not slow" -v --tb=short

@@ -1,0 +1,52 @@
+name: Unit tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Pin third-party actions to commit SHAs before the first release —
+# see implementation plan §12.0.
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      # Don't cancel sibling matrix legs on failure — a 3.14 regression
+      # shouldn't hide whether 3.12 still passes, and vice versa.
+      fail-fast: false
+      matrix:
+        # 3.12: declared floor in pyproject.toml (requires-python).
+        # 3.13: current stable (the package is developed against this).
+        # 3.14: newest stable — catch forward-compat breaks early
+        #       (e.g. deprecated stdlib APIs, dep wheel availability).
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "dev.lock"
+          # uv downloads + manages the Python interpreter itself; no
+          # actions/setup-python step needed.
+          python-version: ${{ matrix.python-version }}
+      - name: Install dev environment
+        run: uv sync --frozen --group dev
+      - name: Run unit tests with coverage
+        # `-n auto` parallelises across CPUs via pytest-xdist (in dev group).
+        # Unit tests are function-level and independent — near-linear speedup.
+        # See implementation plan §12.8 for xdist conventions.
+        run: |
+          uv run pytest tests/unit \
+            -n auto \
+            --cov=src/tessera_embeddings \
+            --cov-report=xml \
+            --tb=short
+      - name: Upload coverage
+        # Upload once per PR (from the floor version) to avoid duplicate reports.
+        # 3.12 output is the canonical baseline.
+        if: matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false

@@ -1,0 +1,36 @@
+name: Lock file check
+
+on:
+  pull_request:
+    branches: [main]
+    # Only run when pyproject.toml or one of the lock files changes —
+    # those are the only edits that can drift the locks.
+    paths:
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'inference-cpu.lock'
+      - 'inference-cu121.lock'
+      - 'dev.lock'
+      - 'scripts/lock.sh'
+
+# Catches the "edited pyproject.toml without regenerating locks" mistake.
+# Keep this workflow cheap — it's a defensive check; if it gets slow,
+# people start ignoring it.
+jobs:
+  verify-locks-regenerated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "dev.lock"
+      - name: Re-run lock.sh and verify no diff
+        run: |
+          bash scripts/lock.sh
+          if ! git diff --exit-code uv.lock inference-cpu.lock inference-cu121.lock dev.lock; then
+            echo "::error::pyproject.toml changed but lock files were not regenerated."
+            echo "::error::Run scripts/lock.sh and commit the result."
+            exit 1
+          fi
