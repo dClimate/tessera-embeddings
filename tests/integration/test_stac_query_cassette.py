@@ -1,9 +1,7 @@
 """Integration test: STAC query against a recorded cassette.
 
-This exercises the cassette infrastructure end-to-end. It is xfailed
-until a cassette is actually recorded and committed (Phase 10.4
-follow-up). The shape is the canonical example for any future
-cassette-backed ingest test.
+This exercises the cassette infrastructure end-to-end and is the
+canonical example for any future cassette-backed ingest test.
 
 Run with::
 
@@ -31,8 +29,7 @@ def vcr_config() -> dict:
 
 
 @pytest.mark.integration
-@pytest.mark.vcr  # cassette: tests/fixtures/stac_cassettes/s2_l2a_story_county_jul2024.yaml
-@pytest.mark.xfail(reason="Cassette not yet recorded — Phase 10.4 follow-up", strict=True)
+@pytest.mark.vcr  # cassette: tests/fixtures/stac_cassettes/test_s2_stac_search_against_story_county.yaml
 def test_s2_stac_search_against_story_county() -> None:
     """A pystac-client search against Earth Search returns ~12 items.
 

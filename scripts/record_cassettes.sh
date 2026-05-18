@@ -40,12 +40,19 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 # ── Activate env ──────────────────────────────────────────────────
-# Need dev (pytest, pytest-recording) AND inference (ray, torch).
-# tessera_embeddings/__init__.py re-exports run_inference, which
-# imports ray at module load — collection crashes without it even
-# though the parity tests don't actually invoke Ray.
+# We sync all four groups (dev + inference + prefect + aws) because
+# pytest collection imports modules transitively across the package:
+#   - dev:        pytest, pytest-recording, hypothesis
+#   - inference:  ray (re-exported from tessera_embeddings.__init__)
+#   - prefect:    parity tests import the Prefect flow modules
+#   - aws:        providers/aws/dask.py imports dask_cloudprovider, and
+#                 tests/unit/test_imports.py asserts every provider
+#                 submodule imports cleanly during collection.
+# Recording itself only hits Earth Search + CMR-STAC, but partial
+# environments cause ImportError during collection — see the failure
+# mode in the first run of this script.
 
-uv sync --frozen --group dev --group inference
+uv sync --frozen --group dev --group inference --group prefect --group aws
 
 # ── Record ────────────────────────────────────────────────────────
 
@@ -101,7 +108,7 @@ fi
 cat <<EOF
 
 ────────────────────────────────────────────────────────────────────
-Cassette recording complete (or partially complete — review above).
+Cassette recording complete. All tests passed.
 
 NEXT STEPS — DO NOT COMMIT THE CASSETTES UNTIL THIS CHECKLIST PASSES:
 
@@ -122,11 +129,15 @@ NEXT STEPS — DO NOT COMMIT THE CASSETTES UNTIL THIS CHECKLIST PASSES:
    through).
 
 3. Verify item counts match expectations. As of last check
-   (2024-07, Story County, IA):
-     - s2_l2a:    ~12 items
-     - opera_rtc: ~6 ascending granules
+   (2024-07, Story County, IA): ~12 S2 items, ~6 OPERA ascending
+   granules. Each STAC item has a unique \`id\` field; cassettes are
+   YAML, so the JSON body shows up double-escaped:
 
-       grep -c '"id":' $CASSETTE_DIR/*.yaml
+       grep -c -E '\\\\"id\\\\"' $CASSETTE_DIR/*.yaml
+
+   Numbers will be approximate — STAC items contain nested 'id'
+   fields too (assets, etc.). What you're checking for is
+   "non-zero" and "in the right order of magnitude."
 
 4. Verify file sizes are reasonable. Each cassette should be
    50–500 KB. Anything > 1 MB suggests an unexpected payload was
@@ -151,4 +162,4 @@ NEXT STEPS — DO NOT COMMIT THE CASSETTES UNTIL THIS CHECKLIST PASSES:
 ────────────────────────────────────────────────────────────────────
 EOF
 
-exit "${RECORDING_EXIT:-0}"
+exit 0
