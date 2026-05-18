@@ -15,8 +15,8 @@ jobs:
     permissions:
       id-token: write  # required for PyPI trusted publishing
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           enable-cache: true
           cache-dependency-glob: "dev.lock"
@@ -25,4 +25,4 @@ jobs:
       - name: Publish to PyPI
         # No API token needed — trusted publishing reads the OIDC claim
         # and matches it against the PyPI project's allowed publishers.
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d # v1.14.0
