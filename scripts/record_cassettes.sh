@@ -20,18 +20,69 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # ── Pre-flight checks ─────────────────────────────────────────────
+#
+# Local cassette recording is allowed to deviate from production auth
+# in two ways. These deviations live ONLY in this script:
+#
+#   1. EARTHDATA_TOKEN (Bearer) is preferred over EARTHDATA_USERNAME +
+#      EARTHDATA_PASSWORD for the preflight. Some local EDL accounts
+#      can't basic-auth against ASF (SAML/Launchpad-linked, MFA, etc.)
+#      even when the same credentials work in production. Bearer
+#      tokens from urs.earthdata.nasa.gov/profile sidestep this.
+#
+#   2. AWS_PROFILE may need to point at a us-west-2 SSO profile (e.g.
+#      "cyclops") so the test phase's COG reads route through an
+#      in-region identity. Production runs in us-west-2 natively.
+#      Local runs from a laptop may need this hint.
+#
+# Production paths are unchanged: the package's auth.py uses basic
+# auth via EARTHDATA_USERNAME / EARTHDATA_PASSWORD, period. Both
+# deviations are recording-time conveniences only.
 
-if [[ -z "${EARTHDATA_USERNAME:-}" || -z "${EARTHDATA_PASSWORD:-}" ]]; then
+# 1. EDL credentials: token preferred, basic auth as fallback.
+if [[ -n "${EARTHDATA_TOKEN:-}" ]]; then
+    AUTH_MODE="bearer"
+elif [[ -n "${EARTHDATA_USERNAME:-}" && -n "${EARTHDATA_PASSWORD:-}" ]]; then
+    AUTH_MODE="basic"
+else
     cat >&2 <<EOF
-ERROR: Earthdata Login credentials are required to record OPERA
-       cassettes. Export both env vars before running this script:
+ERROR: EDL credentials required to record OPERA cassettes.
 
-           export EARTHDATA_USERNAME=<your-edl-username>
-           export EARTHDATA_PASSWORD=<your-edl-password>
+Set ONE of:
 
-       Get an EDL account at https://urs.earthdata.nasa.gov/.
+  EARTHDATA_TOKEN          (preferred — works around local basic-auth
+                            quirks on SAML/MFA-linked accounts)
+
+  EARTHDATA_USERNAME +
+  EARTHDATA_PASSWORD       (legacy basic auth — same form production uses)
+
+Get a token at: https://urs.earthdata.nasa.gov/profile → "Generate Token"
+Get an EDL account at: https://urs.earthdata.nasa.gov/
 EOF
     exit 1
+fi
+echo "Using EDL auth mode: $AUTH_MODE"
+
+# 2. AWS profile hint. Some ASF endpoints behave differently for
+#    requests originating outside us-west-2; if the user has a local
+#    SSO profile that lands them in us-west-2, exporting AWS_PROFILE
+#    before running this script may unblock the test phase. The
+#    user-specified profile name lives in the AWS_PROFILE env var
+#    (which we don't override here — just a reminder).
+if [[ -z "${AWS_PROFILE:-}" ]]; then
+    cat >&2 <<EOF
+NOTE: AWS_PROFILE is not set. If the test phase fails on COG reads
+      with HTTP 401/403 from ASF, try exporting an SSO profile that
+      authenticates from us-west-2:
+
+          export AWS_PROFILE=<your-us-west-2-profile>
+
+      For dClimate users, that's typically:
+
+          export AWS_PROFILE=cyclops
+
+      Recording-time only — production paths don't need it.
+EOF
 fi
 
 if ! command -v uv >/dev/null 2>&1; then
@@ -39,50 +90,52 @@ if ! command -v uv >/dev/null 2>&1; then
     exit 1
 fi
 
-# Check that the EDL credentials actually authorize against the ASF
-# datapool. A common failure mode is having the env vars set but
-# never having clicked "Approve" on the "Alaska Satellite Facility
-# Data Access" application in the EDL profile UI; the cassette
-# recording then dies mid-test with a confusing 401.
-#
-# We probe with a HEAD against a known-good OPERA tile via the
-# CloudFront-signed redirect chain. 200 means EDL + app authorization
-# are both good. 401 is the app-authorization case (or wrong creds).
-# Anything else (network blip, ASF outage) we surface as an error
-# the user can recognise.
+# Probe ASF with whichever credential mode the user gave us. A small
+# ranged GET (instead of HEAD) avoids a CloudFront-signed-URL bug
+# where HEAD against a signed URL returns 403 IncompleteSignatureException
+# even when credentials are fine.
 echo "Verifying EDL credentials against ASF..."
 EDL_PROBE_URL="https://datapool.asf.alaska.edu/RTC/OPERA-S1/OPERA_L2_RTC-S1_T063-133417-IW3_20240701T001410Z_20240701T044329Z_S1A_30_v1.0_VV.tif"
-EDL_HTTP_CODE=$(
-    curl --silent --output /dev/null --location-trusted \
-        --user "$EARTHDATA_USERNAME:$EARTHDATA_PASSWORD" \
-        --request HEAD \
-        --max-time 30 \
-        --write-out '%{http_code}' \
-        "$EDL_PROBE_URL" \
-    || echo "curl_failed"
-)
+if [[ "$AUTH_MODE" == "bearer" ]]; then
+    EDL_HTTP_CODE=$(
+        curl --silent --output /dev/null --location-trusted \
+            --header "Authorization: Bearer $EARTHDATA_TOKEN" \
+            --range 0-1023 \
+            --max-time 30 \
+            --write-out '%{http_code}' \
+            "$EDL_PROBE_URL" \
+        || echo "curl_failed"
+    )
+else
+    EDL_HTTP_CODE=$(
+        curl --silent --output /dev/null --location-trusted \
+            --user "$EARTHDATA_USERNAME:$EARTHDATA_PASSWORD" \
+            --range 0-1023 \
+            --max-time 30 \
+            --write-out '%{http_code}' \
+            "$EDL_PROBE_URL" \
+        || echo "curl_failed"
+    )
+fi
 
 case "$EDL_HTTP_CODE" in
-    200)
+    200|206)
         echo "  EDL credentials OK."
         ;;
     401)
         cat >&2 <<EOF
-ERROR: EDL returned HTTP 401 for the ASF datapool. Most common cause:
-       you have not approved the "Alaska Satellite Facility Data
-       Access" application in your EDL profile.
+ERROR: EDL returned HTTP 401 for the ASF datapool.
 
-Fix:
-  1. Visit https://urs.earthdata.nasa.gov/profile
-  2. "Applications" → "Approved Applications"
-  3. If "Alaska Satellite Facility Data Access" is missing, click
-     "Authorize Applications" and add it.
-  4. (For OPERA-specific access you may also need to authorize
-     additional apps listed at https://search.asf.alaska.edu/.)
-
-If the app is already approved, double-check that
-EARTHDATA_USERNAME / EARTHDATA_PASSWORD match a working login at
-https://urs.earthdata.nasa.gov/.
+Most common causes:
+  1. You have not approved the "Alaska Satellite Facility Data
+     Access" application in your EDL profile. Visit
+     https://urs.earthdata.nasa.gov/profile → "Authorized Apps"
+     and approve it.
+  2. (basic-auth mode only) Your account uses SAML / Launchpad
+     SSO / MFA and basic auth against ASF doesn't work even with
+     the app approved. Switch to a Bearer token:
+         export EARTHDATA_TOKEN=<token from urs.earthdata.nasa.gov/profile>
+     and re-run this script.
 EOF
         exit 1
         ;;
@@ -91,7 +144,7 @@ EOF
         exit 1
         ;;
     *)
-        echo "ERROR: EDL probe returned HTTP $EDL_HTTP_CODE — expected 200." >&2
+        echo "ERROR: EDL probe returned HTTP $EDL_HTTP_CODE — expected 200 or 206." >&2
         echo "       Check ASF status (https://asf.alaska.edu/) and retry." >&2
         exit 1
         ;;

@@ -6,17 +6,14 @@ concerns specific to OPERA:
 * OPERA orbit filtering hits the CMR Granule Search API in addition
   to STAC. ``pytest-recording`` captures both endpoints into the
   single cassette ``opera_rtc_story_county_jul2024.yaml``.
-* EDL credentials are required for OPERA S3 direct access. We pass
-  ``use_s3_direct=False`` so the test routes through CloudFront-signed
-  HTTPS URLs (no STS). EDL credentials still appear in the
-  Authorization header on the redirect chain — pytest-recording's
-  ``filter_headers`` config (in conftest.py) strips them, and the
-  ``test_cassette_safety.py`` guard backs that up.
-
-The COG pixel reads (rasterio → GDAL curl) are not VCR-mockable; we
-need EDL credentials in the test environment for them to succeed.
-``EARTHDATA_USERNAME`` / ``EARTHDATA_PASSWORD`` env vars are
-required.
+* EDL credentials are required for COG reads (rasterio → GDAL curl
+  bypasses VCR). On us-west-2 production the package's auth.py uses
+  basic auth via EARTHDATA_USERNAME / EARTHDATA_PASSWORD. Many
+  contributor laptops can't basic-auth against EDL (SAML / Launchpad
+  / MFA-linked accounts), so this test accepts an EARTHDATA_TOKEN
+  and monkey-patches the auth session to use Bearer for the test
+  duration. The patch is local — auth.py and production behaviour
+  are unchanged.
 """
 
 from __future__ import annotations
@@ -26,8 +23,10 @@ import os
 from pathlib import Path
 
 import pytest
+import requests
 from dask.distributed import Client
 
+from tessera_embeddings.ingest import auth as auth_module
 from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.ingest.s1_roi import ingest_s1_roi_sar
 from tessera_embeddings.orchestration.prefect.flows import ingest_s1_roi_sar as flow_module
@@ -54,12 +53,43 @@ def _stage_quickstart_roi(tmp_path: Path, roi_geojson: Path) -> Path:
     return roi_zarr
 
 
+def _bearer_session_factory(token: str) -> requests.Session:
+    """Build an EDL-redirect-safe session that uses Bearer auth.
+
+    Subclasses :class:`auth_module._EDLSession` so the cross-domain
+    redirect handling stays identical, then sets the Authorization
+    header directly instead of using ``session.auth = (user, pass)``.
+    """
+    session = auth_module._EDLSession()
+    session.headers["Authorization"] = f"Bearer {token}"
+
+    # The base class re-injects session.auth on URS-bound redirects.
+    # With Bearer auth there's nothing to re-inject — but we need to
+    # make sure the Authorization header isn't stripped on the same
+    # cross-domain hop the basic-auth case worries about.
+    original_rebuild_auth = session.rebuild_auth
+
+    def _rebuild_auth_keep_bearer(prepared_request, response) -> None:  # type: ignore[no-untyped-def]
+        original_rebuild_auth(prepared_request, response)
+        # Re-add bearer on URS hops, since the base class only re-adds
+        # session.auth (Basic), not arbitrary headers.
+        if auth_module._AUTH_HOST in (prepared_request.url or ""):
+            prepared_request.headers["Authorization"] = f"Bearer {token}"
+
+    session.rebuild_auth = _rebuild_auth_keep_bearer  # type: ignore[method-assign]
+    return session
+
+
 @pytest.mark.parity
 @pytest.mark.integration
 @pytest.mark.vcr(CASSETTE_NAME)
 @pytest.mark.skipif(
-    not os.environ.get("EARTHDATA_USERNAME") or not os.environ.get("EARTHDATA_PASSWORD"),
-    reason="EARTHDATA_USERNAME and EARTHDATA_PASSWORD required for COG reads",
+    not (
+        os.environ.get("EARTHDATA_TOKEN")
+        or (os.environ.get("EARTHDATA_USERNAME") and os.environ.get("EARTHDATA_PASSWORD"))
+    ),
+    reason="EDL credentials required: set EARTHDATA_TOKEN (preferred) or "
+    "EARTHDATA_USERNAME + EARTHDATA_PASSWORD",
 )
 def test_s1_roi_parity(
     tmp_path: Path,
@@ -69,6 +99,12 @@ def test_s1_roi_parity(
 ) -> None:
     """Domain function and Prefect flow produce identical S1 SAR Zarrs."""
     monkeypatch.setattr(flow_module, "get_run_logger", lambda: logging.getLogger("parity-s1"))
+
+    # Bearer-token override: when EARTHDATA_TOKEN is set, swap the
+    # auth.py session factory for one that uses Bearer auth for the
+    # duration of the test only. auth.py itself is unchanged.
+    if token := os.environ.get("EARTHDATA_TOKEN"):
+        monkeypatch.setattr(auth_module, "get_edl_session", lambda: _bearer_session_factory(token))
 
     roi_zarr = _stage_quickstart_roi(tmp_path, fixture_quickstart_roi)
 

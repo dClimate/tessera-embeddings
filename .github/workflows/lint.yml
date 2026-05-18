@@ -10,11 +10,12 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      # NOTE: pin all third-party actions to commit SHAs (with version
-      # in a comment) before tagging the first release. See implementation
-      # plan §12.0. Tagged versions are placeholders here.
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
+      # Third-party actions are pinned to commit SHAs. Dependabot
+      # (.github/dependabot.yml) bumps them weekly. Each comment notes
+      # the human-readable version that the SHA corresponds to so PR
+      # reviewers can sanity-check the bump without re-resolving SHAs.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           enable-cache: true
           cache-dependency-glob: "dev.lock"

@@ -87,6 +87,24 @@ def vcr_config() -> dict:
 
     Belt-and-braces with the safety guard: even if a leak slips
     through here, the architecture test catches it before merge.
+
+    ``ignore_hosts`` excludes hosts from cassette capture entirely.
+    Two reasons we do this:
+
+    * **Prefect API** — :func:`prefect_test_harness` spins up an
+      ephemeral Prefect server on ``127.0.0.1:<random>``. Without
+      ``ignore_localhost`` + ``ignore_hosts``, every Prefect API
+      call (admin/version checks, flow-run state writes, etc.) would
+      get baked into the cassette. Then on replay the random port
+      doesn't match and the cassette rejects the request.
+    * **Contributors with PREFECT_API_URL set** — recordings made
+      with a shell-configured Prefect URL would bake that URL into
+      the cassette. ``ignore_hosts`` keeps it out regardless of
+      whether the harness or the env var is in effect.
+
+    The cassette captures only the STAC HTTP we care about
+    (Earth Search, CMR-STAC, CMR Granule Search). Everything else
+    flows through normally.
     """
     return {
         "filter_headers": [
@@ -101,4 +119,12 @@ def vcr_config() -> dict:
             "X-Amz-Credential",
         ],
         "decode_compressed_response": True,
+        "ignore_localhost": True,  # never capture 127.0.0.1 (Prefect harness, Dask)
+        "ignore_hosts": [
+            # Catch Prefect deployments that shell-set PREFECT_API_URL to
+            # an external host so cassettes stay portable across contributors.
+            "cyclops-prefect-staging.up.railway.app",
+            "cyclops-prefect.up.railway.app",
+            "api.prefect.cloud",
+        ],
     }
