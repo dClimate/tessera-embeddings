@@ -36,7 +36,8 @@ to check for new data before spinning up a Dask cluster (see `has_new_stac_dates
 
 ### STAC Providers and Collections
 
-Provider configs live in `src/config/providers.py` (`PROVIDERS`, `CollectionConfig`). Supported:
+Provider configs live in
+[`config/providers.py`](../config/providers.py) (`PROVIDERS`, `CollectionConfig`). Supported:
 
 | Provider | Collections |
 |---|---|
@@ -228,9 +229,9 @@ per-file HTTPS redirects. At batch scale this is the dominant latency reduction.
 
 ### GDAL network tuning
 
-`configure_gdal_environment()` (`src/config/environment.py`) must be called before importing
-`rasterio` or `odc.stac`. It sets GDAL config options for network resilience (retry counts,
-timeouts, connection pooling) that affect all subsequent COG reads.
+`configure_gdal_environment()` (in [`config/environment.py`](../config/environment.py)) must be
+called before importing `rasterio` or `odc.stac`. It sets GDAL config options for network
+resilience (retry counts, timeouts, connection pooling) that affect all subsequent COG reads.
 
 ### Chunk alignment
 

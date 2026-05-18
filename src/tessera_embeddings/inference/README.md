@@ -1,9 +1,14 @@
 # Tessera Inference Pipeline
 
 Distributed GPU inference that generates **128-dimensional per-pixel embeddings** from mosaicked
-Sentinel-2 reflectance + Sentinel-1 SAR data. The Prefect flow (`src/flows/tessera_embeddings.py`)
+Sentinel-2 reflectance + Sentinel-1 SAR data. The Prefect flow at
+[`orchestration/prefect/flows/tessera_embeddings.py`](../orchestration/prefect/flows/tessera_embeddings.py)
 orchestrates the full process: spinning up a Ray cluster on EC2 GPU instances, running inference
 in parallel across spatial chunks, and assembling the output into a final Icechunk/Zarr store.
+
+The orchestrator-free equivalent is
+[`orchestration/runners/plain.py`](../orchestration/runners/plain.py), which calls the same
+domain functions on `ray_cluster(num_gpus=0)` for laptop/CI runs.
 
 ---
 
