@@ -27,6 +27,7 @@ import requests
 from dask.distributed import Client
 
 from tessera_embeddings.ingest import auth as auth_module
+from tessera_embeddings.ingest import opera_query as opera_query_module
 from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.ingest.s1_roi import ingest_s1_roi_sar
 from tessera_embeddings.orchestration.prefect.flows import ingest_s1_roi_sar as flow_module
@@ -103,8 +104,17 @@ def test_s1_roi_parity(
     # Bearer-token override: when EARTHDATA_TOKEN is set, swap the
     # auth.py session factory for one that uses Bearer auth for the
     # duration of the test only. auth.py itself is unchanged.
+    #
+    # We patch BOTH auth_module.get_edl_session AND opera_query_module.get_edl_session
+    # because opera_query.py uses `from tessera_embeddings.ingest.auth import
+    # get_edl_session` (a from-import that binds the symbol into opera_query's
+    # namespace at import time). Patching only auth_module wouldn't reach
+    # opera_query's already-bound reference. If a future module also
+    # from-imports get_edl_session, add it here.
     if token := os.environ.get("EARTHDATA_TOKEN"):
-        monkeypatch.setattr(auth_module, "get_edl_session", lambda: _bearer_session_factory(token))
+        bearer_factory = lambda: _bearer_session_factory(token)  # noqa: E731
+        monkeypatch.setattr(auth_module, "get_edl_session", bearer_factory)
+        monkeypatch.setattr(opera_query_module, "get_edl_session", bearer_factory)
 
     roi_zarr = _stage_quickstart_roi(tmp_path, fixture_quickstart_roi)
 
