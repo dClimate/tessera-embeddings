@@ -44,6 +44,7 @@ from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.providers.local.ray import ray_cluster
+from tessera_embeddings.inference.data_loading import resolve_s1_orbit
 from tessera_embeddings.storage.manifest import EmbeddingManifest
 
 
@@ -65,6 +66,7 @@ def _run_ingest(
     n_workers: int,
     log: logging.Logger,
     storage_options: dict | None,
+    s1_use_s3_direct: bool,
 ) -> None:
     """Run S2 + S1 ingestion sequentially against a local Dask cluster.
 
@@ -89,7 +91,7 @@ def _run_ingest(
         )
         log.info("S2 ingestion: %s", s2_result)
 
-        log.info("Ingesting S1 SAR (orbit=%s)", s1_orbit)
+        log.info("Ingesting S1 SAR (orbit=%s, use_s3_direct=%s)", s1_orbit, s1_use_s3_direct)
         s1_result = ingest_s1_roi_sar(
             roi_zarr_path=roi_path,
             start_date=start_date,
@@ -97,6 +99,7 @@ def _run_ingest(
             store_path=mosaic_base,
             client=client,
             orbit=s1_orbit,
+            use_s3_direct=s1_use_s3_direct,
             log=log,
             storage_options=storage_options,
         )
@@ -110,7 +113,6 @@ def _run_inference_and_assemble(
     paths: BucketPaths,
     time_window_end: str,
     s1_orbit: S1Orbit,
-    quantized_checkpoint: bool,
     log: logging.Logger,
 ) -> dict[str, Any]:
     """Run CPU inference under local Ray, then assemble under local Dask."""
@@ -118,11 +120,10 @@ def _run_inference_and_assemble(
     output_bucket = paths.outputs
 
     time_window = parse_time_window(time_window_end)
-    checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename(quantized=quantized_checkpoint)}"
+    checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename()}"
 
     config = build_inference_config(
         s1_orbit=s1_orbit,
-        compute_std=False,
         time_window=time_window,
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
@@ -132,6 +133,19 @@ def _run_inference_and_assemble(
 
     mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
     staging_base = f"{output_bucket.rstrip('/')}/staging"
+
+    # Probe for available SAR stores before dispatching inference; if s1_orbit="both"
+    # is requested but only one orbit was ingested, fall back gracefully.
+    effective_orbit = resolve_s1_orbit(mosaic_base, config.s1_orbit)
+    if effective_orbit != config.s1_orbit:
+        config = build_inference_config(
+            s1_orbit=effective_orbit,
+            time_window=time_window,
+            checkpoint_path=checkpoint_path,
+            inputs_bucket=inputs_bucket,
+            output_bucket=output_bucket,
+            num_gpus=0,
+        )
 
     chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, config.chunk_size or DEFAULT_CHUNK_SIZE, log)
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_path)
@@ -172,8 +186,7 @@ def _run_inference_and_assemble(
     upstream_manifests = read_upstream_manifests(mosaic_base, config.s1_orbit)
     manifest = EmbeddingManifest.from_upstream_stores(
         model_checkpoint=model_version,
-        repeat_times=config.repeat_times,
-        sample_size_s2=config.sample_size_s2,
+        num_obs_checkpoints=config.num_obs_checkpoints,
         upstream_manifests=upstream_manifests,
     )
 
@@ -225,7 +238,6 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
               end: "2025-07-01"
             s1_orbit: ascending
             n_workers: 2
-            quantized_checkpoint: true
             storage_options: null
 
         skip_inference: When True, stop after ingestion. Useful for
@@ -278,6 +290,10 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         n_workers=cfg.get("n_workers", 2),
         log=log,
         storage_options=cfg.get("storage_options"),
+        # The default in the domain layer is True (S3 direct from us-west-2).
+        # On a laptop outside us-west-2, default to CloudFront-signed HTTPS so
+        # the quickstart works without ASF S3 STS credentials.
+        s1_use_s3_direct=cfg.get("s1_use_s3_direct", False),
     )
 
     # ``--skip-inference`` ends here, with ingest output verified.
@@ -292,7 +308,6 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         paths=paths,
         time_window_end=cfg["time_window_end"],
         s1_orbit=cfg.get("s1_orbit", "ascending"),
-        quantized_checkpoint=cfg.get("quantized_checkpoint", True),
         log=log,
     )
     log.info("Pipeline complete: %s", summary)

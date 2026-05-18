@@ -30,6 +30,18 @@ from tessera_embeddings.errors import ConfigMismatchError
 logger = logging.getLogger(__name__)
 
 
+def _normalize(v: Any) -> Any:  # noqa: ANN401
+    """Normalize a value for JSON/zarr-attr round-trip equality.
+
+    Zarr attrs round-trip through JSON, which turns tuples into lists. To keep
+    stored and in-memory manifests comparable, coerce tuples (recursively) to
+    lists at serialization time.
+    """
+    if isinstance(v, tuple | list):
+        return [_normalize(x) for x in v]
+    return v
+
+
 def extract_manifest(attrs: Mapping[str, Any]) -> dict[str, Any] | None:
     """Extract the ``_manifest`` dict from zarr/xarray root attrs.
 
@@ -59,8 +71,12 @@ class StoreManifest:
     """
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize to a dict suitable for writing to zarr attrs."""
-        d = {k: v for k, v in asdict(self).items() if v is not None}
+        """Serialize to a dict suitable for writing to zarr attrs.
+
+        Tuples are normalized to lists so that round-tripping through JSON
+        (zarr attrs) doesn't cause equality mismatches during validation.
+        """
+        d = {k: _normalize(v) for k, v in asdict(self).items() if v is not None}
         d["manifest_type"] = type(self).__name__
         return d
 
@@ -169,28 +185,39 @@ class IngestManifest(StoreManifest):
 
 @dataclass(frozen=True)
 class EmbeddingManifest(StoreManifest):
-    """Manifest for embedding stores: model + inference config + upstream ingestion identity."""
+    """Manifest for embedding stores: model + inference config + upstream ingestion identity.
+
+    Under Tessera v1.1, sampling is deterministic (no random repeats) and every
+    valid observation is used with bucketed sequence lengths. ``num_obs_checkpoints``
+    replaces v1.0's ``repeat_times``/``sample_size_s2`` as the structural param.
+    """
 
     model_checkpoint: str
-    repeat_times: int
-    sample_size_s2: int
+    num_obs_checkpoints: tuple[int, ...]
     reflectance_manifest_hash: str | None = None
     sar_manifest_hash: str | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "EmbeddingManifest":
+        """Deserialize, coercing ``num_obs_checkpoints`` list → tuple."""
+        field_names = {f.name for f in fields(cls)}
+        kwargs = {k: v for k, v in d.items() if k in field_names}
+        if "num_obs_checkpoints" in kwargs:
+            kwargs["num_obs_checkpoints"] = tuple(int(v) for v in kwargs["num_obs_checkpoints"])
+        return cls(**kwargs)
 
     @classmethod
     def from_upstream_stores(
         cls,
         model_checkpoint: str,
-        repeat_times: int,
-        sample_size_s2: int,
+        num_obs_checkpoints: tuple[int, ...],
         upstream_manifests: dict[str, dict[str, Any] | None],
     ) -> EmbeddingManifest:
         """Build from upstream ingest store manifests.
 
         Args:
             model_checkpoint: Model version string.
-            repeat_times: Number of temporal repeats.
-            sample_size_s2: S2 sample size.
+            num_obs_checkpoints: Bucketed sequence-length checkpoints used by the sampler.
             upstream_manifests: Map of store name to manifest dict (or None).
                 Expected keys: ``"reflectance"``, optionally ``"sar_ascending"``
                 and/or ``"sar_descending"``.
@@ -198,7 +225,6 @@ class EmbeddingManifest(StoreManifest):
         ref_dict = upstream_manifests.get("reflectance")
         ref_hash = IngestManifest.from_dict(ref_dict).hash() if ref_dict else None
 
-        # Combine SAR orbit hashes (order is stable: ascending before descending)
         sar_hashes: list[str] = []
         for name in ("sar_ascending", "sar_descending"):
             d = upstream_manifests.get(name)
@@ -211,8 +237,7 @@ class EmbeddingManifest(StoreManifest):
 
         return cls(
             model_checkpoint=model_checkpoint,
-            repeat_times=repeat_times,
-            sample_size_s2=sample_size_s2,
+            num_obs_checkpoints=tuple(int(v) for v in num_obs_checkpoints),
             reflectance_manifest_hash=ref_hash,
             sar_manifest_hash=sar_hash,
         )

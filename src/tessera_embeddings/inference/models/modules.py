@@ -100,26 +100,6 @@ class CustomGRU(nn.Module):
         return outputs, h_t.unsqueeze(0)
 
 
-class AttentionPooling(nn.Module):
-    """Attention-weighted pooling over the sequence dimension."""
-
-    def __init__(self, input_dim: int) -> None:
-        super().__init__()
-        self.query = nn.Linear(input_dim, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Pool sequence via learned attention weights.
-
-        Args:
-            x: Input tensor of shape (B, seq_len, dim).
-
-        Returns:
-            Pooled tensor of shape (B, dim).
-        """
-        w = torch.softmax(self.query(x), dim=1)  # (B, seq_len, 1)
-        return (w * x).sum(dim=1)
-
-
 class TemporalAwarePooling(nn.Module):
     """Temporal-aware pooling: custom GRU for temporal context, LayerNorm, then attention pooling.
 
@@ -370,40 +350,3 @@ class TransformerEncoder(nn.Module):
         return result
 
 
-class ProjectionHead(nn.Module):
-    """BarlowTwins projection head (5 hidden layers with BatchNorm + ReLU).
-
-    Used during training only; stripped for inference via MultimodalBTInferenceModel.
-    """
-
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=False),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=False),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=False),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=False),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=False),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through projection layers.
-
-        Args:
-            x: Input of shape (B, input_dim).
-
-        Returns:
-            Projected output of shape (B, output_dim).
-        """
-        return self.net(x)

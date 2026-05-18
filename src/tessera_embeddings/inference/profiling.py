@@ -160,7 +160,6 @@ def log_profiled_batch_summary(
 def log_effective_tflops(
     forward_ms: float,
     batch_size: int,
-    repeat_times: int,
     seq_len: int = 20,
     d_model: int = 512,
     dim_feedforward: int = 4096,
@@ -181,7 +180,7 @@ def log_effective_tflops(
     if forward_ms <= 0:
         return
 
-    effective_batch = batch_size * repeat_times
+    effective_batch = batch_size
 
     # Per-layer FLOPs (standard transformer accounting -- each matmul (M,K)x(K,N) = 2MKN FLOPs):
     # Self-attention: 8*B*S*D^2 (4 projections, 2 FLOPs each) + 4*B*S^2*D (scores + context)

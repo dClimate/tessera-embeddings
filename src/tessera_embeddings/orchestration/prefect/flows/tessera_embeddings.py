@@ -69,7 +69,6 @@ class EmbeddingsDevParams(BaseModel):
     Cloud UI parameter form.
     """
 
-    compute_std: bool = False
     assembly_only: bool = False
     inference_only: bool = False
     previous_run_id: str | None = None
@@ -111,7 +110,6 @@ def tessera_embeddings(
     ami_ssm_name: str,
     num_actors: int = 20,
     s1_orbit: str = "ascending",
-    quantized_checkpoint: bool = True,
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
 ) -> dict[str, Any]:
     """Generate Tessera embeddings for a mosaicked ROI.
@@ -126,9 +124,7 @@ def tessera_embeddings(
             ``dev: bool`` toggle.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
         num_actors: Number of GPU actors to create.
-        s1_orbit: ``"ascending"`` or ``"descending"``.
-        quantized_checkpoint: Use the QAT checkpoint (default) versus
-            the full-precision one.
+        s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
         dev_params: See :class:`EmbeddingsDevParams`.
 
     Returns:
@@ -159,14 +155,10 @@ def tessera_embeddings(
         time_window.window_end_label,
     )
 
-    # The checkpoint path is assembled from the configured inputs bucket
-    # and the canonical filename. Substitute a different filename via
-    # quantized_checkpoint.
-    checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename(quantized=quantized_checkpoint)}"
+    checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename()}"
 
     config = build_inference_config(
         s1_orbit=s1_orbit,
-        compute_std=dev_params.compute_std,
         time_window=time_window,
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,

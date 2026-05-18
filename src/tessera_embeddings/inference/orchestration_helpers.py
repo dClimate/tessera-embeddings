@@ -98,7 +98,6 @@ def enumerate_mosaic_chunks(
 def build_inference_config(
     *,
     s1_orbit: str,
-    compute_std: bool,
     time_window: TimeWindow,
     checkpoint_path: str,
     inputs_bucket: str,
@@ -115,7 +114,6 @@ def build_inference_config(
     return InferenceConfig(
         time_window=time_window,
         s1_orbit=s1_orbit,  # type: ignore[arg-type]
-        compute_std=compute_std,
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,

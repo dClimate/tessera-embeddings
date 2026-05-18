@@ -1,16 +1,12 @@
-"""Core inference loop for generating per-pixel embeddings.
+"""Core inference loop for Tessera v1.1 embeddings.
 
-Decoupled from I/O: takes a model, dataset, and config; returns the embedding array.
-Ported from tessera's process_tile with repeated random sampling and averaging.
+Iterates buckets (pixels sharing a ``(s2_target, s1_target)`` key), then
+sub-batches each bucket by ``config.batch_size``. Each sub-batch goes through
+a single forward pass; the 192-D output is sliced to the canonical 128-D
+downstream representation and written into a flat per-pixel output array.
 
-CHANGED from original: Major performance rewrite (see inline annotations):
-  a) DataLoader replaced with direct get_batch() iteration on pre-extracted arrays
-  b) repeat_times loop folded into batch dimension (1 forward pass instead of 10)
-  c) model.half() for full FP16 + torch.compile for kernel fusion
-  d) cuda.synchronize() removed (implicit sync via .cpu())
-  e) torch.from_numpy + non_blocking transfer (zero-copy, 1 transfer instead of 10)
-
-Expected speedup: 50-200x (from ~100 px/sec to ~5,000-20,000 px/sec).
+Sampling is deterministic under v1.1 (no random repeats), so ``compute_std``
+from v1.0 is now a no-op and the ``embeddings_std`` field is always ``None``.
 """
 
 from __future__ import annotations
@@ -18,12 +14,13 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 
-from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.inference import EMBEDDING_DIM, InferenceConfig
 from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 from tessera_embeddings.inference.models.ssl_model import MultimodalBTInferenceModel
 from tessera_embeddings.inference.profiling import (
@@ -35,7 +32,6 @@ from tessera_embeddings.inference.profiling import (
     log_profiled_batch_summary,
 )
 from tessera_embeddings.inference.quantization import quantize_embeddings
-from tessera_embeddings.inference.sampling import sample_s1_batch, sample_s2_batch
 
 logger = logging.getLogger(__name__)
 
@@ -44,38 +40,22 @@ PROFILE_BATCH_IDX = 10
 
 
 @dataclass
-class _BandStats:
-    """Pre-computed band statistics for standardization."""
-
-    s2_mean: np.ndarray  # (10,) float32
-    s2_std: np.ndarray  # (10,) float32
-    s1_mean: np.ndarray  # (2,) float32
-    s1_std: np.ndarray  # (2,) float32
-
-
-@dataclass
 class _BatchTimings:
-    """Per-phase wall-clock times (seconds) for one batch."""
+    """Per-phase wall-clock times (seconds) for one sub-batch."""
 
     get_batch: float
-    sample_s2: float
-    sample_s1: float
     transfer: float
     forward: float
     postprocess: float
 
     @property
     def total(self) -> float:
-        """Sum of all phase times."""
-        return self.get_batch + self.sample_s2 + self.sample_s1 + self.transfer + self.forward + self.postprocess
+        return self.get_batch + self.transfer + self.forward + self.postprocess
 
     def avg_ms(self, n: int) -> _BatchTimings:
-        """Return a new instance with values converted to average milliseconds per batch."""
         scale = 1000.0 / n
         return _BatchTimings(
             get_batch=self.get_batch * scale,
-            sample_s2=self.sample_s2 * scale,
-            sample_s1=self.sample_s1 * scale,
             transfer=self.transfer * scale,
             forward=self.forward * scale,
             postprocess=self.postprocess * scale,
@@ -83,8 +63,6 @@ class _BatchTimings:
 
     def __iadd__(self, other: _BatchTimings) -> _BatchTimings:
         self.get_batch += other.get_batch
-        self.sample_s2 += other.sample_s2
-        self.sample_s1 += other.sample_s1
         self.transfer += other.transfer
         self.forward += other.forward
         self.postprocess += other.postprocess
@@ -96,8 +74,8 @@ class InferenceResult:
     """Output of :func:`run_inference`.
 
     Attributes:
-        embeddings: ``(H, W, D)`` int8 quantized array.
-        embeddings_std: Optional ``(H, W, D)`` float32 std array (None unless ``compute_std``).
+        embeddings: ``(H, W, 128)`` int8 quantized array.
+        embeddings_std: Always ``None`` under v1.1 (deterministic sampling).
         scales: ``(H, W)`` float32 per-pixel scale factors for dequantization.
     """
 
@@ -109,139 +87,79 @@ class InferenceResult:
 def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> bool:
     """Configure model and GPU for inference.
 
-    Runs one-time diagnostics, converts model to FP16 on CUDA, enables cuDNN
-    benchmark mode, and probes autocast dtypes.
-
-    Args:
-        model: Inference model — mutated in-place (half-precision) on CUDA.
-        device: Torch device.
+    On CUDA: converts to FP16, enables cuDNN benchmark mode, probes autocast dtypes.
 
     Returns:
         Whether to use FP16 (True when device is CUDA).
     """
     log_cuda_diagnostics(device)
 
-    # Full FP16 via model.half() — replaces previous autocast mixed-precision.
-    # autocast was not effectively engaging tensor cores for our small matmul geometry
-    # (seq=20, d=512). model.half() guarantees all params and ops run in FP16, which:
-    #   - Halves memory bandwidth (T4 has 320 GB/s — this was the bottleneck)
-    #   - Guarantees FP16 matmuls hit tensor cores (no autocast dispatch overhead)
-    #   - Halves activation memory → enables larger batch_size (3584 vs 768)
-    # Safe for inference: 10-repeat averaging smooths any FP16 noise.
-    # QA: compare embedding vectors vs FP32 baseline — should be within 1e-3.
     if device.type == "cuda":
         model.half()
         logger.info("Model converted to FP16")
-
-    # DISABLED: torch.compile was eating ~11.6 GB VRAM for CUDA graphs on a 15.4 GB GPU,
-    # and avg forward pass was 3,770ms vs 1,944ms without — compile overhead + GRU graph
-    # breaks likely causing repeated recompilation. Revisit on a GPU with more VRAM.
-
-    # Enable cuDNN benchmark mode — lets cuDNN profile and select the fastest
-    # algorithm for GRU and conv ops. Slight overhead on first call, then faster.
-    if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         logger.debug("cuDNN benchmark mode enabled")
 
     log_autocast_dtype_probe(device)
-
     return device.type == "cuda"
 
 
-def _process_batch(
-    model: MultimodalBTInferenceModel,
+def _prepare_batch(
     dataset: MosaicChunkInferenceDataset,
-    start: int,
-    end: int,
-    config: InferenceConfig,
-    band_stats: _BandStats,
+    bucket_key: tuple[int, int],
+    pixel_start: int,
+    pixel_end: int,
+) -> tuple[dict[str, np.ndarray], float]:
+    """Run CPU-side batch preparation. Returns (batch, elapsed_seconds)."""
+    t0 = time.monotonic()
+    batch = dataset.get_bucket_batch(bucket_key, pixel_start, pixel_end)
+    return batch, time.monotonic() - t0
+
+
+def _run_gpu_sub_batch(
+    model: MultimodalBTInferenceModel,
+    batch: dict[str, np.ndarray],
+    bucket_key: tuple[int, int],
     device: torch.device,
     use_fp16: bool,
     flat_out: np.ndarray,
-    flat_out_std: np.ndarray | None,
+    get_batch_secs: float,
     *,
     profile: bool = False,
+    config: InferenceConfig | None = None,
+    save_dim: int = EMBEDDING_DIM,
 ) -> _BatchTimings:
-    """Execute one batch of inference: load, sample, transfer, forward, postprocess.
+    """Transfer → forward → slice → write for a pre-prepared batch.
 
-    Must be called inside a ``torch.no_grad()`` context (the caller owns it).
-    Writes results directly into *flat_out* (and *flat_out_std* if not None).
-
-    Args:
-        model: Inference model (already on *device*).
-        dataset: Pixel dataset for one spatial chunk.
-        start: Start index into the valid-pixel array.
-        end: End index (exclusive).
-        config: Inference configuration.
-        band_stats: Pre-computed band means/stds for standardization.
-        device: Torch device.
-        use_fp16: Whether to convert inputs to FP16 before forward pass.
-        flat_out: (H*W, latent_dim) output array — written in-place.
-        flat_out_std: Optional (H*W, latent_dim) std output — written in-place.
-        profile: If True, enable per-layer profiling for this batch.
-
-    Returns:
-        Per-phase wall-clock timings for this batch.
+    Must be called inside a ``torch.no_grad()`` context.
+    Writes into ``flat_out[global_idxs]`` in place.
     """
-    actual_batch = end - start
-    repeat_times = config.repeat_times
-    latent_dim = config.latent_dim
-
-    # --- Phase: get_batch ---
-    tb0 = time.monotonic()
-    batch = dataset.get_batch(start, end)
     tb1 = time.monotonic()
 
     global_idxs = batch["global_idxs"]
+    s2_np = batch["s2"]
+    s1_np = batch["s1"]
 
-    # --- Phase: sample_s2 ---
-    s2_input_np = sample_s2_batch(
-        batch["s2_bands"],
-        batch["s2_masks"],
-        batch["s2_doys"],
-        band_mean=band_stats.s2_mean,
-        band_std=band_stats.s2_std,
-        sample_size_s2=config.sample_size_s2,
-        repeat_times=repeat_times,
-    )
-    tb2 = time.monotonic()
-
-    # --- Phase: sample_s1 ---
-    s1_input_np = sample_s1_batch(
-        batch["s1_asc_bands"],
-        batch["s1_asc_doys"],
-        batch["s1_desc_bands"],
-        batch["s1_desc_doys"],
-        band_mean=band_stats.s1_mean,
-        band_std=band_stats.s1_std,
-        sample_size_s1=config.sample_size_s1,
-        repeat_times=repeat_times,
-    )
-    tb3 = time.monotonic()
-
-    # --- Phase: transfer ---
-    s2_input = torch.from_numpy(s2_input_np).to(device, non_blocking=True)
-    s1_input = torch.from_numpy(s1_input_np).to(device, non_blocking=True)
+    s2_input = torch.from_numpy(s2_np).to(device, non_blocking=True)
+    s1_input = torch.from_numpy(s1_np).to(device, non_blocking=True)
     if use_fp16:
         s2_input = s2_input.half()
         s1_input = s1_input.half()
     if device.type == "cuda":
         torch.cuda.synchronize()
-    tb4 = time.monotonic()
+    tb2 = time.monotonic()
 
-    # --- Phase: forward ---
     if profile:
         enable_model_profiling(model)
 
-    # Direct FP16 forward — no autocast wrapper needed. See _prepare_gpu comments.
-    z = model(s2_input, s1_input)
+    z = model(s2_input, s1_input)  # (B, representation_dim) — 192 for v1.1
     if device.type == "cuda":
         torch.cuda.synchronize()
-    tb5 = time.monotonic()
+    tb3 = time.monotonic()
 
     if profile:
         disable_model_profiling(model)
-        fwd_ms = (tb5 - tb4) * 1000
+        fwd_ms = (tb3 - tb2) * 1000
         log_profiled_batch_summary(
             PROFILE_BATCH_IDX,
             s2_input,
@@ -251,30 +169,27 @@ def _process_batch(
             forward_ms=fwd_ms,
             device=device,
         )
-        log_effective_tflops(
-            forward_ms=fwd_ms,
-            batch_size=actual_batch,
-            repeat_times=repeat_times,
-            dim_feedforward=config.dim_feedforward,
-            num_layers=config.num_encoder_layers,
-        )
+        if config is not None:
+            s2_target, _s1_target = bucket_key
+            log_effective_tflops(
+                forward_ms=fwd_ms,
+                batch_size=len(global_idxs),
+                seq_len=s2_target,
+                d_model=config.latent_dim * 4,
+                dim_feedforward=config.dim_feedforward,
+                num_layers=config.num_encoder_layers,
+            )
 
-    # --- Phase: postprocess ---
-    z = z.float()
-    z_repeats = z.reshape(actual_batch, repeat_times, latent_dim)
-    avg_repr = z_repeats.mean(dim=1)
-    flat_out[global_idxs] = avg_repr.cpu().numpy()
-    if flat_out_std is not None:
-        flat_out_std[global_idxs] = z_repeats.std(dim=1).cpu().numpy()
-    tb6 = time.monotonic()
+    # Slice 192-D rep to canonical save_dim, then to CPU.
+    z = z[:, :save_dim].float()
+    flat_out[global_idxs] = z.cpu().numpy()
+    tb4 = time.monotonic()
 
     return _BatchTimings(
-        get_batch=tb1 - tb0,
-        sample_s2=tb2 - tb1,
-        sample_s1=tb3 - tb2,
-        transfer=tb4 - tb3,
-        forward=tb5 - tb4,
-        postprocess=tb6 - tb5,
+        get_batch=get_batch_secs,
+        transfer=tb2 - tb1,
+        forward=tb3 - tb2,
+        postprocess=tb4 - tb3,
     )
 
 
@@ -285,112 +200,130 @@ def run_inference(
     device: torch.device,
     on_batch: Callable[[int, int], None] | None = None,
 ) -> InferenceResult:
-    """Run inference on all valid pixels in a dataset.
-
-    CHANGED from original: The inner repeat_times loop is folded into the batch
-    dimension. Instead of R sequential forward passes of shape (B, seq, features),
-    we do a single forward pass of shape (B*R, seq, features) and reshape+mean on GPU.
+    """Run v1.1 inference on all valid pixels in a dataset.
 
     Args:
-        model: Frozen inference model in eval mode.
-        dataset: Dataset of valid pixels for one spatial chunk.
+        model: Frozen v1.1 inference model in eval mode.
+        dataset: Bucketed pixel dataset for one spatial chunk.
         config: Inference configuration.
         device: Torch device (cpu or cuda).
-        on_batch: Optional callback invoked every 50 batches with (batch_idx, total_batches).
-            Used for progress reporting without coupling inference.py to Ray.
+        on_batch: Optional callback invoked periodically with
+            (sub_batch_idx, total_sub_batches). Used for stall detection in
+            distributed actors.
 
     Returns:
         InferenceResult with:
-        - embeddings: (H, W, 128) int8 quantized. Zeros for invalid pixels.
-        - embeddings_std: (H, W, 128) float32 if compute_std, else None.
-        - scales: (H, W) float32 per-pixel scale factors.
+          - embeddings: (H, W, 128) int8 quantized. Zeros for invalid pixels.
+          - embeddings_std: Always None under v1.1.
+          - scales: (H, W) float32 per-pixel scale factors.
     """
     if config.batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {config.batch_size}")
-    if config.repeat_times < 1:
-        raise ValueError(f"repeat_times must be >= 1, got {config.repeat_times}")
+
     n_valid = len(dataset)
     batch_size = config.batch_size
-    total_batches = (n_valid + batch_size - 1) // batch_size
 
-    band_stats = _BandStats(
-        s2_mean=np.array(config.s2_band_mean, dtype=np.float32),
-        s2_std=np.array(config.s2_band_std, dtype=np.float32),
-        s1_mean=np.array(config.s1_band_mean, dtype=np.float32),
-        s1_std=np.array(config.s1_band_std, dtype=np.float32),
-    )
+    bucket_sizes = dataset.bucket_sizes()
+    total_sub_batches = sum((n + batch_size - 1) // batch_size for n in bucket_sizes.values())
+
+    # Save the canonical 128-D slice of the model's 192-D representation.
+    # If the model is configured smaller (e.g. tiny test model), save the full width.
+    save_dim = min(EMBEDDING_DIM, config.representation_dim)
 
     h, w = dataset.H, dataset.W
-    latent_dim = config.latent_dim
-    flat_out = np.zeros((h * w, latent_dim), dtype=np.float32)
-    flat_out_std = np.zeros((h * w, latent_dim), dtype=np.float32) if config.compute_std else None
+    flat_out = np.zeros((h * w, save_dim), dtype=np.float32)
 
-    logger.info("Starting inference: %d batches, %d valid pixels, batch_size=%d", total_batches, n_valid, batch_size)
+    logger.info(
+        "Starting v1.1 inference: %d buckets, %d sub-batches, %d valid pixels, batch_size=%d",
+        len(bucket_sizes),
+        total_sub_batches,
+        n_valid,
+        batch_size,
+    )
     use_fp16 = _prepare_gpu(model, device)
 
-    # Timing accumulators
-    t_total = _BatchTimings(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    t_total = _BatchTimings(0.0, 0.0, 0.0, 0.0)
     pixels_processed = 0
+    sub_batch_idx = 0
     t0 = time.monotonic()
 
-    with torch.no_grad():
-        for batch_idx in range(total_batches):
-            start = batch_idx * batch_size
-            end = min(start + batch_size, n_valid)
+    # Flatten (bucket_key, start, end) triples so the prefetch thread can
+    # pipeline CPU batch prep across bucket boundaries.
+    sub_batches: list[tuple[tuple[int, int], int, int]] = []
+    for bucket_key, pixel_indices in dataset.iter_buckets(largest_first=True):
+        n_in_bucket = int(pixel_indices.size)
+        logger.debug(
+            "Bucket %s: %d pixels in %d sub-batches",
+            bucket_key,
+            n_in_bucket,
+            (n_in_bucket + batch_size - 1) // batch_size,
+        )
+        for start in range(0, n_in_bucket, batch_size):
+            end = min(start + batch_size, n_in_bucket)
+            sub_batches.append((bucket_key, start, end))
 
-            bt = _process_batch(
+    # One prefetch worker pipelines CPU batch prep while GPU runs forward pass.
+    # CPU prep (~165ms) < forward (~250ms), so the GPU consumes faster than the
+    # prefetcher produces and a deeper queue would just sit full.
+    with torch.no_grad(), ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch") as pool:
+        next_future = (
+            pool.submit(_prepare_batch, dataset, *sub_batches[0]) if sub_batches else None
+        )
+
+        for i, (bucket_key, start, end) in enumerate(sub_batches):
+            assert next_future is not None
+            batch, get_batch_secs = next_future.result()
+
+            # Kick off prefetch of i+1 before the GPU work on i starts.
+            next_future = (
+                pool.submit(_prepare_batch, dataset, *sub_batches[i + 1])
+                if i + 1 < len(sub_batches)
+                else None
+            )
+
+            bt = _run_gpu_sub_batch(
                 model,
-                dataset,
-                start,
-                end,
-                config,
-                band_stats,
+                batch,
+                bucket_key,
                 device,
                 use_fp16,
                 flat_out,
-                flat_out_std,
-                profile=(batch_idx == PROFILE_BATCH_IDX),
+                get_batch_secs,
+                profile=(sub_batch_idx == PROFILE_BATCH_IDX),
+                config=config,
+                save_dim=save_dim,
             )
-
-            # add accumulations to timings (for logging)
             t_total += bt
-
             pixels_processed += end - start
+            sub_batch_idx += 1
 
-            # Report to tracker every 50 batches (stall detection), log every 200 (noise reduction)
-            if on_batch and ((batch_idx + 1) % 50 == 0 or batch_idx == total_batches - 1):
-                on_batch(batch_idx + 1, total_batches)
+            if on_batch and (sub_batch_idx % 50 == 0 or sub_batch_idx == total_sub_batches):
+                on_batch(sub_batch_idx, total_sub_batches)
 
-            if (batch_idx + 1) % 200 == 0 or batch_idx == total_batches - 1:
+            if sub_batch_idx % 200 == 0 or sub_batch_idx == total_sub_batches:
                 elapsed = time.monotonic() - t0
                 rate = pixels_processed / elapsed if elapsed > 0 else 0
-                n = batch_idx + 1
                 logger.info(
-                    "Batch %d/%d — %d px — %.0f px/sec — %.1fs elapsed",
-                    n,
-                    total_batches,
+                    "Sub-batch %d/%d — %d px — %.0f px/sec — %.1fs elapsed",
+                    sub_batch_idx,
+                    total_sub_batches,
                     pixels_processed,
                     rate,
                     elapsed,
                 )
-                avg = t_total.avg_ms(n)
+                avg = t_total.avg_ms(sub_batch_idx)
                 logger.debug(
-                    "  TIMING avg ms/batch (n=%d): "
-                    "get_batch=%.1f  sample_s2=%.1f  sample_s1=%.1f  "
-                    "transfer=%.1f  forward=%.1f  postprocess=%.1f  total=%.1f",
-                    n,
+                    "  TIMING avg ms/sub-batch (n=%d): "
+                    "get_batch=%.1f  transfer=%.1f  forward=%.1f  postprocess=%.1f  total=%.1f",
+                    sub_batch_idx,
                     avg.get_batch,
-                    avg.sample_s2,
-                    avg.sample_s1,
                     avg.transfer,
                     avg.forward,
                     avg.postprocess,
                     avg.total,
                 )
 
-    out = flat_out.reshape(h, w, latent_dim)
-    out_std = flat_out_std.reshape(h, w, latent_dim) if flat_out_std is not None else None
-
+    out = flat_out.reshape(h, w, save_dim)
     out, scales = quantize_embeddings(out)
     logger.info("Quantized embeddings to int8 (scales shape %s)", scales.shape)
 
@@ -404,4 +337,4 @@ def run_inference(
         pixels_processed / elapsed if elapsed > 0 else 0,
     )
 
-    return InferenceResult(embeddings=out, embeddings_std=out_std, scales=scales)
+    return InferenceResult(embeddings=out, embeddings_std=None, scales=scales)

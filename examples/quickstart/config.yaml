@@ -22,7 +22,9 @@ roi:
   geojson: examples/quickstart/roi.geojson
   resolution: 10.0
   chunk_size: 2000
-  force_crs: null
+  # Story County, IA falls in UTM zone 15N. Rasterisation requires a
+  # projected CRS (metres, not degrees); the GeoJSON itself is CRS84.
+  force_crs: "EPSG:32615"
 
 # Ingest date range. Keep narrow for quickstart speed; widen for
 # realistic comparison against production.
@@ -39,9 +41,6 @@ s1_orbit: ascending
 
 # Local Dask cluster size on the runner host.
 n_workers: 2
-
-# Quantized checkpoint loads faster on CPU.
-quantized_checkpoint: true
 
 # fsspec storage options. null lets fsspec auto-detect; for s3:// you
 # might pass {anon: false} or a dict with key/secret.

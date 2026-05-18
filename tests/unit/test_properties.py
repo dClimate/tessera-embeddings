@@ -145,27 +145,31 @@ def test_roi_manifest_round_trip(resolution: float, chunk_size: int, crs: str | 
 
 @given(
     model_checkpoint=st.text(min_size=1, max_size=80),
-    repeat_times=st.integers(min_value=1, max_value=10),
-    sample_size_s2=st.integers(min_value=1, max_value=200),
+    num_obs_checkpoints=st.lists(
+        st.integers(min_value=1, max_value=256), min_size=1, max_size=32
+    ).map(lambda xs: tuple(sorted(set(xs)))),
     reflectance_manifest_hash=st.one_of(st.none(), st.text(min_size=1, max_size=64)),
     sar_manifest_hash=st.one_of(st.none(), st.text(min_size=1, max_size=64)),
 )
 def test_embedding_manifest_round_trip(
     model_checkpoint: str,
-    repeat_times: int,
-    sample_size_s2: int,
+    num_obs_checkpoints: tuple[int, ...],
     reflectance_manifest_hash: str | None,
     sar_manifest_hash: str | None,
 ) -> None:
-    """Embedding manifest fields survive a to_dict / from_dict cycle."""
+    """Embedding manifest fields survive a to_dict / from_dict cycle.
+
+    Verifies that the tuple→list→tuple coercion through JSON zarr-attrs
+    preserves field equality and hash stability.
+    """
     original = EmbeddingManifest(
         model_checkpoint=model_checkpoint,
-        repeat_times=repeat_times,
-        sample_size_s2=sample_size_s2,
+        num_obs_checkpoints=num_obs_checkpoints,
         reflectance_manifest_hash=reflectance_manifest_hash,
         sar_manifest_hash=sar_manifest_hash,
     )
     restored = EmbeddingManifest.from_dict(original.to_dict())
+    # from_dict re-coerces lists back to tuples via the dataclass field type
     assert restored == original
     assert restored.hash() == original.hash()
 

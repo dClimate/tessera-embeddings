@@ -1,8 +1,28 @@
-"""Multimodal BarlowTwins SSL model and inference variant.
+"""Multimodal Tessera v1.1 inference model (merged S1 backbone).
 
-Ported from tessera_infer/src/models/ssl_model.py with type hints and ruff compliance.
-Logic is unchanged from the original implementation.
+Architecture::
+
+    S2 stream ──► TransformerEncoder (latent_dim=192) ─┐
+                                                       ├─ concat ─► dim_reducer ──► (B, 192)
+    S1 merged ──► TransformerEncoder (latent_dim=192) ─┘
+
+The S1 "merged" stream is ascending + descending concatenated time-wise, each
+pre-normalised with its own per-modality mean/std (done at the dataset level).
+
+``dim_reducer`` matches v1.1 training exactly::
+
+    Linear(in, in*2) → LayerNorm(in*2) → ReLU → Dropout(0.2) → Linear(in*2, 192)
+
+where ``in = latent_dim * 4 * 2 = 1536`` for concat fusion.
+
+The projector and segmented-matryoshka-projector from pretraining are stripped
+at checkpoint load time — they are not part of the inference graph.
+
+Ported from ``ucam-eo/tessera`` tag ``v1.1``
+(``tessera_infer_QAT/src/models/ssl_model_v1_1.py``).
 """
+
+from __future__ import annotations
 
 import logging
 import time
@@ -10,121 +30,51 @@ import time
 import torch
 import torch.nn as nn
 
-from .modules import ProjectionHead, TransformerEncoder
+from .modules import TransformerEncoder
 
 logger = logging.getLogger(__name__)
 
 
-class MultimodalBTModel(nn.Module):
-    """Full multimodal BarlowTwins model (training + inference).
-
-    Contains S2 and S1 backbones, fusion, dimension reducer, and projection head.
-    Used to load the full checkpoint; the projection head is then stripped for inference.
-    """
-
-    def __init__(
-        self,
-        s2_backbone: TransformerEncoder,
-        s1_backbone: TransformerEncoder,
-        projector: ProjectionHead,
-        fusion_method: str = "concat",
-        return_repr: bool = False,
-        latent_dim: int = 128,
-    ) -> None:
-        super().__init__()
-        self.s2_backbone = s2_backbone
-        self.s1_backbone = s1_backbone
-        self.projector = projector
-        self.fusion_method = fusion_method
-        self.return_repr = return_repr
-
-        if fusion_method == "concat":
-            in_dim = 8 * latent_dim
-        elif fusion_method == "sum":
-            in_dim = 4 * latent_dim
-        else:
-            msg = f"Unknown fusion method: {fusion_method}"
-            raise ValueError(msg)
-
-        self.dim_reducer = nn.Sequential(nn.Linear(in_dim, latent_dim))
-
-    def forward(self, s2_x: torch.Tensor, s1_x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through both backbones, fusion, and projection.
-
-        Args:
-            s2_x: S2 input of shape (B, seq_len, 11) — 10 bands + DOY.
-            s1_x: S1 input of shape (B, seq_len, 3) — 2 bands + DOY.
-
-        Returns:
-            If return_repr is True: (projected_features, fused_representation).
-            Otherwise: projected_features only.
-        """
-        s2_repr = self.s2_backbone(s2_x)
-        s1_repr = self.s1_backbone(s1_x)
-
-        if self.fusion_method == "concat":
-            fused = torch.cat([s2_repr, s1_repr], dim=-1)
-        else:
-            fused = s2_repr + s1_repr
-
-        fused = self.dim_reducer(fused)
-        feats = self.projector(fused)
-
-        if self.return_repr:
-            return feats, fused
-        return feats
-
-
 class MultimodalBTInferenceModel(nn.Module):
-    """Inference-only model: backbones + fusion + dim_reducer, no projection head.
+    """Two-backbone Tessera v1.1 inference model (concat fusion).
 
-    Output is the 128-dim fused representation (the embedding).
+    Output is the 192-dim representation. Callers that want the canonical 128-d
+    downstream save should slice ``out[:, :128]`` — this is done in the inference
+    loop, not the model, so the forward stays aligned with the tessera v1.1
+    reference implementation.
     """
 
     def __init__(
         self,
         s2_backbone: TransformerEncoder,
         s1_backbone: TransformerEncoder,
-        fusion_method: str,
         dim_reducer: nn.Module,
+        fusion_method: str = "concat",
     ) -> None:
         super().__init__()
         self.s2_backbone = s2_backbone
         self.s1_backbone = s1_backbone
-        self.fusion_method = fusion_method
         self.dim_reducer = dim_reducer
+        self.fusion_method = fusion_method
 
-        # ADDED: Pre-create CUDA streams for parallel backbone execution.
-        # Streams are lightweight handles — creating them once avoids per-call overhead.
-        # On CPU these are unused (forward falls back to sequential execution).
+        # Pre-create CUDA streams for parallel backbone execution.
         self._s2_stream: torch.cuda.Stream | None = None
         self._s1_stream: torch.cuda.Stream | None = None
 
     def _ensure_streams(self, device: torch.device) -> None:
-        """Lazily initialize CUDA streams on first forward pass.
-
-        Deferred to forward() because the model may be built before .to(device),
-        and stream creation requires knowing the CUDA device.
-        """
         if device.type == "cuda" and self._s2_stream is None:
             self._s2_stream = torch.cuda.Stream(device=device)
             self._s1_stream = torch.cuda.Stream(device=device)
 
     def forward(self, s2_x: torch.Tensor, s1_x: torch.Tensor) -> torch.Tensor:
-        """Forward pass producing 128-dim embeddings.
-
-        CHANGED from original: S2 and S1 backbones run on separate CUDA streams
-        so their kernels can overlap on the GPU. The two backbones are completely
-        independent (no shared parameters or state) until the fusion step, so
-        this is safe and produces bit-identical results. On CPU, falls back to
-        sequential execution.
+        """Forward pass producing 192-dim representations.
 
         Args:
-            s2_x: S2 input of shape (B, seq_len, 11) — 10 bands + DOY.
-            s1_x: S1 input of shape (B, seq_len, 3) — 2 bands + DOY.
+            s2_x: S2 input, shape ``(B, T_s2, 11)`` — 10 bands + DOY.
+            s1_x: Merged S1 input, shape ``(B, T_s1, 3)`` — 2 bands + DOY.
 
         Returns:
-            Embedding tensor of shape (B, 128).
+            Representation tensor of shape ``(B, 192)``.
         """
         self._ensure_streams(s2_x.device)
         profile = getattr(self, "_profile", False)
@@ -133,10 +83,8 @@ class MultimodalBTInferenceModel(nn.Module):
             torch.cuda.synchronize()
             tf0 = time.monotonic()
 
-        # CHANGED from original: run backbones on parallel CUDA streams.
-        # During the profiled batch, run sequentially so per-backbone timing is accurate.
+        # On the profiled batch run backbones sequentially for accurate per-backbone timing.
         if profile and s2_x.is_cuda:
-            # Sequential execution for accurate per-backbone timing
             torch.cuda.synchronize()
             ts2_start = time.monotonic()
             s2_repr = self.s2_backbone(s2_x)
@@ -159,10 +107,10 @@ class MultimodalBTInferenceModel(nn.Module):
         if profile and s2_x.is_cuda:
             tf1 = time.monotonic()
 
-        if self.fusion_method == "sum":
-            fused = s2_repr + s1_repr
-        elif self.fusion_method == "concat":
+        if self.fusion_method == "concat":
             fused = torch.cat([s2_repr, s1_repr], dim=-1)
+        elif self.fusion_method == "sum":
+            fused = s2_repr + s1_repr
         else:
             msg = f"Unknown fusion method: {self.fusion_method}"
             raise ValueError(msg)
@@ -191,3 +139,21 @@ class MultimodalBTInferenceModel(nn.Module):
             )
 
         return result
+
+
+def build_dim_reducer(latent_dim: int, active_backbones: int, repr_dim: int) -> nn.Sequential:
+    """Build the v1.1 MLP dim_reducer.
+
+    The shapes match the v1.1 training-time reducer exactly::
+
+        in_features = latent_dim * 4 * active_backbones
+        Linear(in, in*2) → LayerNorm(in*2) → ReLU → Dropout(0.2) → Linear(in*2, repr_dim)
+    """
+    in_features = latent_dim * 4 * active_backbones
+    return nn.Sequential(
+        nn.Linear(in_features, in_features * 2),
+        nn.LayerNorm(in_features * 2),
+        nn.ReLU(inplace=False),
+        nn.Dropout(0.2),
+        nn.Linear(in_features * 2, repr_dim),
+    )

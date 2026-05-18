@@ -211,15 +211,15 @@ class InferenceActor:
             chunk_data = load_chunk(
                 chunk,
                 mosaic_base,
-                sample_size_s2=self.config.sample_size_s2,
-                repeat_times=self.config.repeat_times,
-                s1_orbit=self.config.s1_orbit,
                 time_window=self.config.time_window,
+                s1_orbit=self.config.s1_orbit,
             )
 
             # Build dataset
             dataset = MosaicChunkInferenceDataset(
-                chunk_data, self.config.min_valid_timesteps, s1_orbit=self.config.s1_orbit
+                chunk_data,
+                num_obs_checkpoints=self.config.num_obs_checkpoints,
+                s1_orbit=self.config.s1_orbit,
             )
 
             writer = ZarrWriter(staging_base)

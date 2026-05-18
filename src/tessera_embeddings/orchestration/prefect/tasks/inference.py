@@ -137,8 +137,7 @@ def assemble_embeddings_task(
     upstream_manifests = read_upstream_manifests(mosaic_base, config.s1_orbit) if mosaic_base else {}
     embedding_manifest = EmbeddingManifest.from_upstream_stores(
         model_checkpoint=model_version,
-        repeat_times=config.repeat_times,
-        sample_size_s2=config.sample_size_s2,
+        num_obs_checkpoints=config.num_obs_checkpoints,
         upstream_manifests=upstream_manifests,
     )
 
@@ -149,7 +148,6 @@ def assemble_embeddings_task(
         run_id,
         output_path,
         roi_zarr_path=roi_zarr_path,
-        compute_std=config.compute_std,
         run_started_at=run_started_at,
         mosaic_base=mosaic_base,
         log=log,
