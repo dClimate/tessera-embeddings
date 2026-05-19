@@ -25,12 +25,14 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache venv
+      - name: Cache venv + uv Python
         id: cache-venv
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: .venv
-          key: v3-venv-gdal3.13.0-py3.13-${{ hashFiles('dev.lock') }}
+          path: |
+            .venv
+            ~/.local/share/uv/python
+          key: v4-venv-gdal3.13.0-py3.13-${{ hashFiles('dev.lock') }}
 
       - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'

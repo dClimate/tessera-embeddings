@@ -13,8 +13,10 @@ on:
 #   1. Install everything in dev.lock *except* gdal
 #   2. Install gdal pinned to the container library version
 # keeps the Python binding and libgdal in lockstep.
-# The full .venv (including the compiled extension) is cached keyed on
-# the container tag (encodes GDAL + OS) + Python version + dev.lock hash.
+#
+# Cache includes both .venv and the uv-managed Python install
+# (~/.local/share/uv/python) so that venv symlinks remain valid after
+# a cache restore inside the container.
 jobs:
   unit:
     runs-on: ubuntu-latest
@@ -36,12 +38,14 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Cache venv
+      - name: Cache venv + uv Python
         id: cache-venv
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: .venv
-          key: v3-venv-gdal3.13.0-py${{ matrix.python-version }}-${{ hashFiles('dev.lock') }}
+          path: |
+            .venv
+            ~/.local/share/uv/python
+          key: v4-venv-gdal3.13.0-py${{ matrix.python-version }}-${{ hashFiles('dev.lock') }}
 
       - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'
