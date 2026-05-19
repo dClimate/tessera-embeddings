@@ -4364,7 +4364,7 @@ requires-dist = [
     { name = "dask-cloudprovider", extras = ["aws"], marker = "extra == 'aws'" },
     { name = "distributed" },
     { name = "fsspec" },
-    { name = "gdal", specifier = "==3.13.0" },
+    { name = "gdal" },
     { name = "icechunk" },
     { name = "mgrs" },
     { name = "numcodecs", extras = ["pcodec"] },
