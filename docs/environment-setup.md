@@ -33,21 +33,17 @@ Or with pip-compile lock files for a specific environment:
 
 ```bash
 # CPU (laptop, CI, plain runner)
-grep -v '^gdal==' lock/inference-cpu.lock | pip install -r /dev/stdin
+pip install -r lock/inference-cpu.lock
 pip install --no-deps -e .
 
 # GPU — Linux x86_64, CUDA 12.1
-grep -v '^gdal==' lock/inference-cu121.lock | pip install -r /dev/stdin
+pip install -r lock/inference-cu121.lock
 pip install --no-deps -e .
 
 # Development (adds pytest, ruff, mypy)
-grep -v '^gdal==' lock/dev.lock | pip install -r /dev/stdin
+pip install -r lock/dev.lock
 pip install --no-deps -e .
 ```
-
-> **GDAL note:** `gdal==3.13.0` in the lock files requires a matching
-> system `libgdal` (see [GDAL](#gdal) below). The `grep -v '^gdal=='`
-> strip is intentional — install GDAL separately to match your system.
 
 ## Why multiple lock files?
 
@@ -118,23 +114,11 @@ supported laptop path.
 
 ## GDAL
 
-`gdal` is a C extension that must be compiled against matching system headers.
-
-**macOS:**
-```bash
-brew install gdal
-pip install gdal==$(gdal-config --version)
-```
-
-**Ubuntu/Debian:**
-```bash
-sudo apt-get install libgdal-dev
-pip install gdal==$(gdal-config --version)
-```
-
-The lock files exclude `gdal` via `grep -v '^gdal=='` — install it
-separately after ensuring `gdal-config --version` matches the version
-in `pyproject.toml`.
+`gdal` is declared as an unpinned dependency. `pip install tessera_embeddings`
+will pull a binary wheel from PyPI that bundles its own libgdal — no system
+library required for most platforms. If you are on a platform without a
+pre-built wheel (uncommon), you will need system `libgdal` headers and
+`gdal-config` available before `pip install`.
 
 ## Platform notes
 

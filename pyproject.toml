@@ -32,9 +32,9 @@ dependencies = [
     "zarr",
     "icechunk",
     "fsspec",
-    # gdal Python bindings must match the libgdal installed on the system.
-    # Bump in lockstep with the system library.
-    "gdal==3.13.0",
+    # gdal Python bindings: unpinned so rasterio's bundled libgdal satisfies
+    # the osgeo import without requiring a matching system library.
+    "gdal",
     "odc-stac",
     "odc-geo",
     "rasterio",

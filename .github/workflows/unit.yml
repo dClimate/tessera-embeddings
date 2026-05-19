@@ -6,14 +6,6 @@ on:
   push:
     branches: [main]
 
-# gdal is a C extension that must be built against matching headers.
-# We run inside the osgeo/gdal container so the system GDAL version
-# is fixed (3.13.0) and gdal-config is always present. The install
-# two-step:
-#   1. Install everything in lock/dev.lock *except* gdal
-#   2. Install gdal pinned to the container library version
-# keeps the Python binding and libgdal in lockstep.
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -44,14 +36,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          GDAL_VERSION=$(gdal-config --version)
           uv venv --python ${{ matrix.python-version }} --clear .venv
-          grep -v '^gdal==' lock/dev.lock | uv pip install --python .venv/bin/python \
+          uv pip install --python .venv/bin/python \
             --extra-index-url https://download.pytorch.org/whl/cpu \
             --index-strategy unsafe-best-match \
-            -r /dev/stdin
-          uv pip install --python .venv/bin/python "gdal==${GDAL_VERSION}"
-          uv pip install --python .venv/bin/python -e .
+            -r lock/dev.lock
+          uv pip install --python .venv/bin/python --no-deps -e .
 
       - name: Run unit tests with coverage
         run: |
