@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
@@ -96,8 +95,8 @@ def test_get_bucket_batch_shapes() -> None:
     for (s2_bin, s1_bin), idxs in ds.iter_buckets():
         batch = ds.get_bucket_batch((s2_bin, s1_bin), 0, min(4, len(idxs)))
         b = batch["s2"].shape[0]
-        assert batch["s2"].shape == (b, s2_bin, 11)   # 10 bands + DOY
-        assert batch["s1"].shape == (b, s1_bin, 3)    # 2 bands + DOY
+        assert batch["s2"].shape == (b, s2_bin, 11)  # 10 bands + DOY
+        assert batch["s1"].shape == (b, s1_bin, 3)  # 2 bands + DOY
         assert batch["global_idxs"].shape == (b,)
         break  # one bucket is enough for shape checks
 

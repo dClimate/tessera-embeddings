@@ -246,9 +246,7 @@ def tessera_embeddings(
     succeeded = [r for r in results if r["status"] == "success"]
     skipped = [r for r in results if r["status"] == "skipped"]
     failed = [r for r in results if r["status"] == "failed"]
-    log.info(
-        "Chunk results: %d succeeded, %d skipped, %d failed", len(succeeded), len(skipped), len(failed)
-    )
+    log.info("Chunk results: %d succeeded, %d skipped, %d failed", len(succeeded), len(skipped), len(failed))
     if failed:
         for failure in failed:
             log.error(

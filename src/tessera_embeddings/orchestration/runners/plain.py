@@ -30,6 +30,7 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
+from tessera_embeddings.inference.data_loading import resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
     checkpoint_to_version,
@@ -44,7 +45,6 @@ from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.providers.local.ray import ray_cluster
-from tessera_embeddings.inference.data_loading import resolve_s1_orbit
 from tessera_embeddings.storage.manifest import EmbeddingManifest
 
 

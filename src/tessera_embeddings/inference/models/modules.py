@@ -348,5 +348,3 @@ class TransformerEncoder(nn.Module):
             )
 
         return result
-
-

@@ -93,9 +93,15 @@ class MosaicChunkInferenceDataset:
         for t in range(s2_bands.shape[0]):
             s2_nonzero |= np.any(s2_bands[t] != 0, axis=-1)
 
-        s1_asc_valid = chunk_data.s1_asc_obs_count.astype(np.int32) if chunk_data.s1_asc_obs_count is not None else np.any(s1_asc != 0, axis=-1).sum(axis=0).astype(np.int32)
-        s1_desc_valid = chunk_data.s1_desc_obs_count.astype(np.int32) if chunk_data.s1_desc_obs_count is not None else np.any(s1_desc != 0, axis=-1).sum(axis=0).astype(np.int32)
-        s1_total_valid = (s1_asc_valid + s1_desc_valid)
+        if chunk_data.s1_asc_obs_count is not None:
+            s1_asc_valid = chunk_data.s1_asc_obs_count.astype(np.int32)
+        else:
+            s1_asc_valid = np.any(s1_asc != 0, axis=-1).sum(axis=0).astype(np.int32)
+        if chunk_data.s1_desc_obs_count is not None:
+            s1_desc_valid = chunk_data.s1_desc_obs_count.astype(np.int32)
+        else:
+            s1_desc_valid = np.any(s1_desc != 0, axis=-1).sum(axis=0).astype(np.int32)
+        s1_total_valid = s1_asc_valid + s1_desc_valid
 
         valid_mask = s2_nonzero & (s2_valid_count > 0) & (s1_total_valid > 0)
         rows, cols = np.where(valid_mask)
@@ -197,13 +203,13 @@ class MosaicChunkInferenceDataset:
         s2_doys = np.broadcast_to(self._s2_doys[None, :], (b, len(self._s2_doys))).astype(np.int32, copy=False)
 
         s1_asc_bands = self._s1_asc_bands[:, rows, cols, :].transpose(1, 0, 2)
-        s1_asc_doys = np.broadcast_to(
-            self._s1_asc_doys[None, :], (b, len(self._s1_asc_doys))
-        ).astype(np.int32, copy=False)
+        s1_asc_doys = np.broadcast_to(self._s1_asc_doys[None, :], (b, len(self._s1_asc_doys))).astype(
+            np.int32, copy=False
+        )
         s1_desc_bands = self._s1_desc_bands[:, rows, cols, :].transpose(1, 0, 2)
-        s1_desc_doys = np.broadcast_to(
-            self._s1_desc_doys[None, :], (b, len(self._s1_desc_doys))
-        ).astype(np.int32, copy=False)
+        s1_desc_doys = np.broadcast_to(self._s1_desc_doys[None, :], (b, len(self._s1_desc_doys))).astype(
+            np.int32, copy=False
+        )
 
         s2 = resample_s2_bucket(
             s2_bands,

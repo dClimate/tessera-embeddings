@@ -46,9 +46,7 @@ def load_allowlist(path: Path) -> dict[str, tuple[str, ...]]:
     out: dict[str, tuple[str, ...]] = {}
     for rule_name, entry in section.items():
         if not isinstance(entry, dict):
-            raise ValueError(
-                f"Expected [allowed_imports.{rule_name}] to be a table, got {type(entry).__name__}"
-            )
+            raise ValueError(f"Expected [allowed_imports.{rule_name}] to be a table, got {type(entry).__name__}")
         paths = entry.get("paths", [])
         if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
             raise ValueError(f"[allowed_imports.{rule_name}].paths must be a list of strings")

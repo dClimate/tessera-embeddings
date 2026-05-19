@@ -6,38 +6,42 @@ on:
   push:
     branches: [main]
 
-# mypy typechecks auth.py which imports osgeo.gdal — the import will
-# fail at collection time without the GDAL C extension installed, so
-# this job runs in the same osgeo/gdal container as unit.yml.
 jobs:
   lint:
     runs-on: ubuntu-latest
-    container:
-      # ubuntu-small includes libgdal + gdal-config; no X11/GUI extras.
-      # Version must match `gdal==X.Y.Z` in dev.lock.
-      image: ghcr.io/osgeo/gdal:ubuntu-small-3.13.0
     steps:
-      # Third-party actions are pinned to commit SHAs. Dependabot
-      # (.github/dependabot.yml) bumps them weekly. Each comment notes
-      # the human-readable version that the SHA corresponds to so PR
-      # reviewers can sanity-check the bump without re-resolving SHAs.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install system GDAL
+        id: gdal-version
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential libgdal-dev
+          echo "version=$(gdal-config --version)" >> "$GITHUB_OUTPUT"
+
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
       - name: Cache venv
         id: cache-venv
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: .venv
-          key: venv-gdal3.13.0-py3.13-${{ hashFiles('dev.lock') }}
-      - name: Install C build tools
+          key: venv-gdal${{ steps.gdal-version.outputs.version }}-py3.13-${{ hashFiles('dev.lock') }}
+
+      - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: apt-get update -qq && apt-get install -y -qq build-essential python3-dev
-      - name: Install dev environment
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: uv sync --frozen --group dev
+        run: |
+          GDAL_VERSION=$(gdal-config --version)
+          uv venv .venv
+          grep -v '^gdal==' dev.lock | uv pip install --python .venv/bin/python \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            --index-strategy unsafe-best-match \
+            -r /dev/stdin
+          uv pip install --python .venv/bin/python "gdal==${GDAL_VERSION}"
+
       - name: ruff check
-        run: uv run ruff check src/ tests/
+        run: .venv/bin/ruff check src/ tests/
       - name: ruff format check
-        run: uv run ruff format --check src/ tests/
+        run: .venv/bin/ruff format --check src/ tests/
       - name: mypy
-        run: uv run mypy src/tessera_embeddings/
+        run: .venv/bin/mypy src/tessera_embeddings/

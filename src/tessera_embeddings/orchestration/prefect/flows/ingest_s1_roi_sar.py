@@ -129,6 +129,7 @@ def ingest_s1_roi_sar(
     # and pass them as explicit storage_options so the ROI reads are immune.
     if use_s3_direct and roi_zarr_path.startswith("s3://") and storage_options is None:
         from tessera_embeddings.providers.aws.credentials import iam_s3_storage_options
+
         storage_options = iam_s3_storage_options()
         log.debug("Resolved IAM storage options for ROI mask reads (bypass OPERA STS env vars)")
 

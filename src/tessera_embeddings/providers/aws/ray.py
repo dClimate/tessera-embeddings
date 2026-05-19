@@ -261,9 +261,7 @@ def _resolve_ray_config(
     # Inject the CloudWatch agent setup command (replaces any heredoc-style
     # cloudwatch entry in the template, which would break over SSH).
     cw_cmd = _build_cloudwatch_setup_command(cloudwatch_template, cloudwatch_log_group)
-    config["setup_commands"] = [
-        cmd for cmd in config.get("setup_commands", []) if "cloudwatch" not in str(cmd).lower()
-    ]
+    config["setup_commands"] = [cmd for cmd in config.get("setup_commands", []) if "cloudwatch" not in str(cmd).lower()]
     config["setup_commands"].append(cw_cmd)
 
     # Substitute {CODE_BUCKET} and {CODE_SUFFIX} in setup_commands.
