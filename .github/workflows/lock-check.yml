@@ -14,8 +14,10 @@ on:
       - 'lock/lock.sh'
 
 # Catches the "edited pyproject.toml without regenerating locks" mistake.
-# Keep this workflow cheap — it's a defensive check; if it gets slow,
-# people start ignoring it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify-locks-regenerated:
     runs-on: ubuntu-latest
@@ -24,16 +26,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
-          enable-cache: true
           cache-dependency-glob: "lock/dev.lock"
       - name: Check uv.lock is up to date
+        # pip-compile files in lock/ are derivative exports — regenerate locally with lock/lock.sh.
         run: uv lock --check
-
-      # uv pip compile has no --check mode and always re-resolves from the
-      # network, so the output depends on what upstream has released at the
-      # moment CI runs — not just on pyproject.toml. Diffing re-generated
-      # pip-compile output in CI produces false failures on every upstream
-      # release. uv lock --check above is the authoritative consistency
-      # gate; if uv.lock is clean, pyproject.toml is consistent. The
-      # pip-compile files are derivative exports — regenerate them locally
-      # whenever uv.lock changes by running lock/lock.sh.
