@@ -11,7 +11,7 @@ on:
       - 'lock/inference-cpu.lock'
       - 'lock/inference-cu121.lock'
       - 'lock/dev.lock'
-      - 'scripts/lock.sh'
+      - 'lock/lock.sh'
 
 # Catches the "edited pyproject.toml without regenerating locks" mistake.
 # Keep this workflow cheap — it's a defensive check; if it gets slow,
@@ -54,6 +54,6 @@ jobs:
           diff lock/inference-cu121.lock /tmp/inference-cu121.lock || changed=1
           diff lock/dev.lock /tmp/dev.lock || changed=1
           if [ "$changed" -ne 0 ]; then
-            echo "::error::Lock files are out of date. Run scripts/lock.sh and commit."
+            echo "::error::Lock files are out of date. Run lock/lock.sh and commit."
             exit 1
           fi

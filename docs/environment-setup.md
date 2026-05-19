@@ -166,13 +166,13 @@ Triggered by any change to `pyproject.toml`. CI's `lock-check.yml` catches
 drift. To regenerate locally:
 
 ```bash
-bash scripts/lock.sh
+bash lock/lock.sh
 ```
 
 What it does:
 
 ```
-scripts/lock.sh
+lock/lock.sh
 ├── uv lock                                           → uv.lock (universal)
 ├── uv pip compile pyproject.toml \
 │       --extra inference --extra prefect --extra aws \
