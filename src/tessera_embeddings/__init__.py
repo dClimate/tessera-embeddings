@@ -47,6 +47,7 @@ from tessera_embeddings.ingest.s2_roi import (
 def __getattr__(name: str) -> object:
     if name == "run_inference":
         from tessera_embeddings.inference.runner import run_inference
+
         return run_inference
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
