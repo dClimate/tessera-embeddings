@@ -13,7 +13,7 @@ on:
       - 'tests/parity/**'
       - 'tests/fixtures/**'
       - 'pyproject.toml'
-      - 'dev.lock'
+      - 'lock/dev.lock'
 
 jobs:
   integration:
@@ -33,7 +33,7 @@ jobs:
           path: |
             .venv
             ~/.local/share/uv/python
-          key: v4-venv-gdal3.13.0-py3.13-${{ hashFiles('dev.lock') }}
+          key: v4-venv-gdal3.13.0-py3.13-${{ hashFiles('lock/dev.lock') }}
 
       - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -42,7 +42,7 @@ jobs:
           apt-get install -y -qq build-essential
           GDAL_VERSION=$(gdal-config --version)
           uv venv --python 3.13 .venv
-          grep -v '^gdal==' dev.lock | uv pip install --python .venv/bin/python \
+          grep -v '^gdal==' lock/dev.lock | uv pip install --python .venv/bin/python \
             --extra-index-url https://download.pytorch.org/whl/cpu \
             --index-strategy unsafe-best-match \
             -r /dev/stdin
@@ -69,7 +69,7 @@ jobs:
           path: |
             .venv
             ~/.local/share/uv/python
-          key: v4-venv-gdal3.13.0-py3.13-${{ hashFiles('dev.lock') }}
+          key: v4-venv-gdal3.13.0-py3.13-${{ hashFiles('lock/dev.lock') }}
 
       - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -78,7 +78,7 @@ jobs:
           apt-get install -y -qq build-essential
           GDAL_VERSION=$(gdal-config --version)
           uv venv --python 3.13 .venv
-          grep -v '^gdal==' dev.lock | uv pip install --python .venv/bin/python \
+          grep -v '^gdal==' lock/dev.lock | uv pip install --python .venv/bin/python \
             --extra-index-url https://download.pytorch.org/whl/cpu \
             --index-strategy unsafe-best-match \
             -r /dev/stdin

@@ -27,7 +27,7 @@ sensor; some regions have not yet been processed).
 
 * `tessera_embeddings` installed with the inference group::
 
-      uv sync --group inference
+      uv sync --extra inference
 
 * Earthdata Login credentials in your environment for OPERA RTC-S1
   ingestion. Two paths:

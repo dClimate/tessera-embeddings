@@ -21,9 +21,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 
-# Ingest-only essentials. Torch / Ray / Prefect / AWS are opt-in groups
-# (see [dependency-groups] below). `pip install tessera_embeddings` from
-# PyPI gives the minimal domain library; shipped lock files stack groups.
+# Base install: the ingestion pipeline (Sentinel-2/S1 ingest, Zarr store
+# management). No torch, no Ray. Add [inference] to unlock Tessera embedding
+# generation — that is what this library is for. The split is practical:
+# torch is large and CUDA variants are platform-specific.
 dependencies = [
     "xarray",
     "dask",
@@ -57,11 +58,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Pure-stdlib package exposing the architecture-test runner so downstream
-# repos can enforce the same layer rules without pulling pytest.
-architecture-tests = []
-
-[dependency-groups]
 inference = [
     "torch",
     "ray[default]",
@@ -72,7 +68,7 @@ prefect = [
     "prefect-dask",
 ]
 # prefect-aws lives here, not in `prefect`, so a Prefect user on GCP
-# isn't forced to pull AWS-specific Prefect blocks. Groups compose.
+# isn't forced to pull AWS-specific Prefect blocks.
 aws = [
     "boto3",
     "botocore",
@@ -80,6 +76,14 @@ aws = [
     "dask-cloudprovider[aws]",
     "prefect-aws",
 ]
+all = [
+    "tessera_embeddings[inference,prefect,aws]",
+]
+# Pure-stdlib package exposing the architecture-test runner so downstream
+# repos can enforce the same layer rules without pulling pytest.
+architecture-tests = []
+
+[dependency-groups]
 dev = [
     "pytest",
     "pytest-asyncio",

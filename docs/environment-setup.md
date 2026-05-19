@@ -1,120 +1,169 @@
 # Environment setup
 
-We ship multiple lock files so different deployments get the right
-binary wheels without surprises. Pick the one that matches your
-target.
+`tessera_embeddings` is an inference library. The goal is generating Tessera
+per-pixel satellite embeddings. Ingestion is the prerequisite — the base
+install covers it. Add `[inference]` to unlock the model and distributed
+execution that is the actual point of the library.
 
-## TL;DR
+## Install tiers
+
+| Tier | Command | Who needs it |
+|------|---------|--------------|
+| Inference (typical) | `pip install tessera_embeddings[inference]` | most users |
+| + Prefect orchestration | `pip install tessera_embeddings[inference,prefect]` | Prefect deployments |
+| + AWS | `pip install tessera_embeddings[inference,prefect,aws]` | AWS production |
+| Base only | `pip install tessera_embeddings` | contributors, CI, library integrations |
+
+uv is recommended for reproducible installs but not required — all `pip`
+commands above work identically with `uv pip`:
 
 ```bash
-uv sync                                    # laptop CPU (universal)
-uv sync --frozen -r inference-cu121.lock   # production GPU (Linux x86_64, CUDA 12.1)
-uv sync --frozen --group dev --group inference --group prefect --group aws
-                                            # full dev environment
+uv pip install tessera_embeddings[inference]
 ```
+
+## TL;DR for contributors
+
+```bash
+git clone https://github.com/dClimate/tessera-embeddings
+cd tessera-embeddings
+uv sync                                   # uv.lock — CPU torch, all extras, dev tools
+```
+
+Or with pip-compile lock files for a specific environment:
+
+```bash
+# CPU (laptop, CI, plain runner)
+grep -v '^gdal==' lock/inference-cpu.lock | pip install -r /dev/stdin
+pip install -e .
+
+# GPU — Linux x86_64, CUDA 12.1
+grep -v '^gdal==' lock/inference-cu121.lock | pip install -r /dev/stdin
+pip install -e .
+
+# Development (adds pytest, ruff, mypy)
+grep -v '^gdal==' lock/dev.lock | pip install -r /dev/stdin
+pip install -e .
+```
+
+> **GDAL note:** `gdal==3.13.0` in the lock files requires a matching
+> system `libgdal` (see [GDAL](#gdal) below). The `grep -v '^gdal=='`
+> strip is intentional — install GDAL separately to match your system.
 
 ## Why multiple lock files?
 
 CUDA torch wheels are platform-specific. A single universal lock
 file can't satisfy both "macOS arm64 contributor laptop" and
 "Linux x86_64 GPU AMI." Forcing one would either break locally or
-ship the CPU wheel to production, silently halving inference
-throughput.
+ship the CPU wheel to production, silently halving inference throughput.
 
 ```
                   ┌────────────────────────┐
                   │   pyproject.toml       │
-                  │  (deps + groups)       │
+                  │ (deps + extras)        │
                   └────────────┬───────────┘
                                │
               ┌────────────────┼────────────────┬─────────────────┐
               │                │                │                 │
               ▼                ▼                ▼                 ▼
-       inference-cpu.lock  inference-cu121.lock  dev.lock      uv.lock
-       (universal)         (Linux x86_64 only)  (superset of   (alias of CPU
-                                                 cpu + tools)   for `uv sync`)
+  lock/inference-cpu.lock  lock/inference-cu121.lock  lock/dev.lock  uv.lock
+  (universal)              (Linux x86_64 only)        (superset of   (alias of CPU
+                                                       cpu + tools)   for `uv sync`)
 ```
 
-## The four lock files
+## The lock files
 
 | File | Platforms | Torch | Purpose |
-|---|---|---|---|
-| `uv.lock` | universal | CPU | What `uv sync` reads by default. Aliases `inference-cpu.lock`. |
-| `inference-cpu.lock` | Linux x86_64, macOS arm64/x86_64, Linux arm64 | CPU | Laptop dev, CI, CPU inference, the plain runner. |
-| `inference-cu121.lock` | Linux x86_64 only | CUDA 12.1 | Production GPU AMI (Tessera was trained against this stack). |
-| `dev.lock` | universal | CPU | `inference-cpu.lock` + pytest, ruff, mypy, hypothesis. CI uses this. |
+|------|-----------|-------|---------|
+| `uv.lock` | universal | CPU | What `uv sync` reads by default. |
+| `lock/inference-cpu.lock` | Linux x86_64, macOS arm64/x86_64, Linux arm64 | CPU | Laptop dev, CI, CPU inference, the plain runner. |
+| `lock/inference-cu121.lock` | Linux x86_64 only | CUDA 12.1 | Production GPU AMI (Tessera was trained against this stack). |
+| `lock/dev.lock` | universal | CPU | `inference-cpu.lock` + pytest, ruff, mypy, hypothesis. CI uses this. |
 
 ## Picking a lock file
 
 ```
 What are you running?
 │
-├── ingestion only (no torch) ──────────────────► uv sync (uv.lock)
-│
 ├── CPU inference (laptop, CI, plain runner) ───► uv sync (uv.lock)
 │
-├── GPU inference (production, Linux x86_64) ───► uv sync --frozen -r inference-cu121.lock
+├── GPU inference (production, Linux x86_64) ───► lock/inference-cu121.lock
 │
 ├── Apple Silicon GPU (MPS) ────────────────────► uv sync (uv.lock); see "MPS status" below
 │
-├── Local development (tests, lint, types) ─────► uv sync --frozen -r dev.lock
-│
-└── Building docs only ─────────────────────────► uv sync --group dev
+└── Local development (tests, lint, types) ─────► uv sync (uv.lock) or lock/dev.lock
 ```
 
-## Optional dependency groups
+## CUDA
 
-`pyproject.toml` declares four groups; pick the ones you need
-alongside the lock file:
+`[inference]` defaults to CPU torch (the `[tool.uv.sources]` entry in
+`pyproject.toml` pins the CPU index so `uv sync` never accidentally
+pulls CUDA wheels on a laptop).
 
-| Group | Adds |
-|---|---|
-| `inference` | torch, ray |
-| `prefect` | prefect, prefect-dask, prefect-aws |
-| `aws` | boto3, botocore, s3fs, dask-cloudprovider, prefect-aws |
-| `dev` | pytest, pytest-recording, hypothesis, ruff, mypy |
+For GPU production:
 
 ```bash
-uv sync --group inference --group prefect       # only what you need
-uv sync --group dev --group inference --group prefect --group aws  # everything
+# Use the pre-solved CUDA lock file (recommended):
+grep -v '^gdal==' lock/inference-cu121.lock | pip install -r /dev/stdin
+
+# Or override the torch index at install time:
+pip install tessera_embeddings[inference] \
+    --extra-index-url https://download.pytorch.org/whl/cu121
 ```
+
+### MPS (Apple Silicon GPU)
+
+Untested. Anecdotally torch's MPS backend works for forward passes but
+specific ops in the Tessera model haven't been verified. CPU is the
+supported laptop path.
+
+## GDAL
+
+`gdal` is a C extension that must be compiled against matching system headers.
+
+**macOS:**
+```bash
+brew install gdal
+pip install gdal==$(gdal-config --version)
+```
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install libgdal-dev
+pip install gdal==$(gdal-config --version)
+```
+
+The lock files exclude `gdal` via `grep -v '^gdal=='` — install it
+separately after ensuring `gdal-config --version` matches the version
+in `pyproject.toml`.
 
 ## Platform notes
 
 ### Linux x86_64
 
-The blessed deployment platform. Both `inference-cpu.lock` and
-`inference-cu121.lock` resolve. Production AMIs use the CU121 lock
-to match the GPU build of torch.
+The blessed deployment platform. Both CPU and CUDA 12.1 lock files resolve.
+Production AMIs use `lock/inference-cu121.lock`.
 
 ### macOS arm64 (Apple Silicon)
 
-`inference-cpu.lock` resolves. Inference runs on CPU; **MPS is
-untested**. Anecdotally torch's MPS backend works for forward passes
-but specific ops in the Tessera model haven't been verified. Treat
-MPS as "maybe — file an issue if you try it." For laptop demos, CPU
-is the supported path.
+`lock/inference-cpu.lock` resolves. CPU inference is the supported path.
 
 ### macOS x86_64 (Intel)
 
-`inference-cpu.lock` resolves. Same caveats as Apple Silicon, minus
-MPS.
+`lock/inference-cpu.lock` resolves. Same caveats as Apple Silicon, minus MPS.
 
 ### Linux arm64 (Graviton)
 
-`inference-cpu.lock` resolves. Useful for cheap CI runners. **Not
-tested** on real workloads.
+`lock/inference-cpu.lock` resolves. Useful for cheap CI runners; not tested
+on real workloads.
 
 ### Windows
 
-Use WSL2. We don't ship Windows-native wheels; the surface area of
-testing native Windows isn't worth it given WSL2 is one command
-away.
+Use WSL2. We don't ship Windows-native wheels.
 
 ## Regenerating lock files
 
-Triggered by any change to `pyproject.toml`. CI's `lock-check.yml`
-catches drift. To regenerate locally:
+Triggered by any change to `pyproject.toml`. CI's `lock-check.yml` catches
+drift. To regenerate locally:
 
 ```bash
 bash scripts/lock.sh
@@ -124,40 +173,34 @@ What it does:
 
 ```
 scripts/lock.sh
-├── uv lock                                          → uv.lock (universal)
+├── uv lock                                           → uv.lock (universal)
 ├── uv pip compile pyproject.toml \
-│       --group inference --group prefect --group aws \
+│       --extra inference --extra prefect --extra aws \
 │       --universal --no-strip-extras \
-│       -o inference-cpu.lock
+│       -o lock/inference-cpu.lock
 ├── uv pip compile pyproject.toml \
-│       --group inference --group prefect --group aws \
+│       --extra inference --extra prefect --extra aws \
 │       --python-platform linux \
 │       --extra-index-url https://download.pytorch.org/whl/cu121 \
 │       --index-strategy unsafe-best-match \
-│       -o inference-cu121.lock
+│       -o lock/inference-cu121.lock
 └── uv pip compile pyproject.toml \
-        --group inference --group prefect --group aws --group dev \
-        --universal -o dev.lock
+        --extra inference --extra prefect --extra aws --group dev \
+        --universal -o lock/dev.lock
 ```
 
-Commit all four locks together — partial regeneration is a common
+Commit all four lock files together — partial regeneration is a common
 source of "works on my machine" bugs.
 
 ## Python versions
 
-`pyproject.toml` declares `requires-python = ">=3.12"`. CI tests
-3.12, 3.13, and 3.14. Earlier versions are not supported (we use
-`@final`, PEP-695 type-parameter syntax, and `tomllib` from the
-stdlib).
-
-If a transitive dep doesn't have a wheel for 3.14 yet, the matrix
-leg gracefully skips affected tests via `pytest.importorskip`.
-We don't drop Python versions to chase wheel availability.
+`pyproject.toml` declares `requires-python = ">=3.12"`. CI tests 3.12 and
+3.13. Earlier versions are not supported.
 
 ## Verifying the install
 
 ```bash
-uv run python scripts/check_env.py
+python scripts/check_env.py
 ```
 
 Prints:

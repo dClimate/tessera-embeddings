@@ -79,7 +79,7 @@ worked and your EDL credentials are fine.
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --group inference --group prefect
+uv sync --extra inference --extra prefect
 source .venv/bin/activate
 
 # Pick ONE of:
@@ -178,7 +178,7 @@ Story County, IA (roughly 84×101 pixels at 10 m resolution, one inference chunk
   and export `EARTHDATA_TOKEN` instead. Bearer takes precedence
   over `EARTHDATA_USERNAME` + `EARTHDATA_PASSWORD` when both are set.
 - **`ModuleNotFoundError: ray`** during the inference step → re-run
-  `uv sync --group dev --group inference --group prefect`.
+  `uv sync --extra inference --extra prefect` (dev tools included by default via uv.lock).
 - **The runner hangs on "Building Dask graph…"** → check chunk size
   in your config. See [`README.md`](../README.md) §"Why chunk size
   dominates everything".
