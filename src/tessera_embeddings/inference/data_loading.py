@@ -26,7 +26,7 @@ from tessera_embeddings.config.inference import S2_BAND_ORDER, SCL_VALID_CLASSES
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.storage.zarr_store import _compute_doy, open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import compute_doy, open_store_as_zarr_group
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +153,7 @@ def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.nd
     if len(indices) == 0:
         msg = f"No observations found within time window {window.months[0]}-{window.months[-1]}"
         raise RuntimeError(msg)
-    return indices, _compute_doy(times[indices])
+    return indices, compute_doy(times[indices])
 
 
 def _active_orbits(s1_orbit: str) -> tuple[str, ...]:

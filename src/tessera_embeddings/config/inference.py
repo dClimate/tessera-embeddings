@@ -193,25 +193,3 @@ class InferenceConfig:
         # v1.1 sampling is deterministic — no repeat variance to measure.
         self.compute_std = False
 
-        # Populate band stats from norm_source if not explicitly provided.
-        stats = _NORM_STATS[self.norm_source]
-        if not self.s2_band_mean:
-            self.s2_band_mean = list(stats["s2_mean"])
-        if not self.s2_band_std:
-            self.s2_band_std = list(stats["s2_std"])
-        if not self.s1_asc_band_mean:
-            self.s1_asc_band_mean = list(stats["s1_asc_mean"])
-        if not self.s1_asc_band_std:
-            self.s1_asc_band_std = list(stats["s1_asc_std"])
-        if not self.s1_desc_band_mean:
-            self.s1_desc_band_mean = list(stats["s1_desc_mean"])
-        if not self.s1_desc_band_std:
-            self.s1_desc_band_std = list(stats["s1_desc_std"])
-
-    # Band statistics — populated from norm_source in __post_init__ if empty.
-    s2_band_mean: list[float] = field(default_factory=list)
-    s2_band_std: list[float] = field(default_factory=list)
-    s1_asc_band_mean: list[float] = field(default_factory=list)
-    s1_asc_band_std: list[float] = field(default_factory=list)
-    s1_desc_band_mean: list[float] = field(default_factory=list)
-    s1_desc_band_std: list[float] = field(default_factory=list)

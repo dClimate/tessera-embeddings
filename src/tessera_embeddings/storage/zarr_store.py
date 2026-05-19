@@ -347,7 +347,7 @@ def get_existing_dates(store_path: str) -> set[str]:
         return set()
 
 
-def _compute_doy(timestamps: np.ndarray) -> np.ndarray:
+def compute_doy(timestamps: np.ndarray) -> np.ndarray:
     """Compute day-of-year from datetime64 timestamps.
 
     Returns (N,) array of int32 DOY values (1-366).
@@ -376,7 +376,7 @@ def _write_dataset_impl(
         data = data.assign_coords(time=data.time.values.astype("datetime64[ns]"))
 
     # Compute DOY coordinate
-    doy = _compute_doy(data.time.values)
+    doy = compute_doy(data.time.values)
 
     if existing_dates:
         # Single store open: read manifest + baseline attrs together
