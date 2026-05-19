@@ -122,6 +122,16 @@ def ingest_s1_roi_sar(
     log = get_run_logger()
     log.info("Starting ingest_s1_roi_sar for %s (orbit=%s)", roi_zarr_path, orbit)
 
+    # When S3 direct access is enabled, set_s3_credentials will overwrite
+    # AWS_* env vars with OPERA-scoped STS tokens.  Any da.from_zarr on our
+    # own ROI store that runs after the first cred refresh would pick up those
+    # tokens and get AccessDenied.  Resolve IAM creds now (before STS injection)
+    # and pass them as explicit storage_options so the ROI reads are immune.
+    if use_s3_direct and roi_zarr_path.startswith("s3://") and storage_options is None:
+        from tessera_embeddings.providers.aws.credentials import iam_s3_storage_options
+        storage_options = iam_s3_storage_options()
+        log.debug("Resolved IAM storage options for ROI mask reads (bypass OPERA STS env vars)")
+
     if use_local:
         from tessera_embeddings.providers.local.dask import local_cluster
 
