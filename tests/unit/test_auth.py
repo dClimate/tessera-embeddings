@@ -7,9 +7,7 @@ are either not invoked or patched; no network access is required.
 
 from __future__ import annotations
 
-import os
 import pytest
-
 
 # ---------------------------------------------------------------------------
 # get_edl_session
@@ -72,7 +70,7 @@ def test_get_edl_session_partial_basic_auth_raises(monkeypatch: pytest.MonkeyPat
 
 
 def test_datapool_url_to_s3_earthdatacloud() -> None:
-    """earthdatacloud URLs get a simple prefix swap."""
+    """Earthdatacloud URLs get a simple prefix swap."""
     from tessera_embeddings.ingest.auth import _datapool_url_to_s3
 
     url = "https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/OPERA_L2_RTC-S1/gran_dir/file_VV.tif"

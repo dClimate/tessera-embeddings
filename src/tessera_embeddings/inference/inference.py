@@ -266,9 +266,7 @@ def run_inference(
     # CPU prep (~165ms) < forward (~250ms), so the GPU consumes faster than the
     # prefetcher produces and a deeper queue would just sit full.
     with torch.no_grad(), ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch") as pool:
-        next_future = (
-            pool.submit(_prepare_batch, dataset, *sub_batches[0]) if sub_batches else None
-        )
+        next_future = pool.submit(_prepare_batch, dataset, *sub_batches[0]) if sub_batches else None
 
         for i, (bucket_key, start, end) in enumerate(sub_batches):
             assert next_future is not None
@@ -276,9 +274,7 @@ def run_inference(
 
             # Kick off prefetch of i+1 before the GPU work on i starts.
             next_future = (
-                pool.submit(_prepare_batch, dataset, *sub_batches[i + 1])
-                if i + 1 < len(sub_batches)
-                else None
+                pool.submit(_prepare_batch, dataset, *sub_batches[i + 1]) if i + 1 < len(sub_batches) else None
             )
 
             bt = _run_gpu_sub_batch(
