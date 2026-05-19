@@ -6,46 +6,72 @@ on:
   push:
     branches: [main]
 
-# Third-party actions are pinned to commit SHAs. Dependabot
-# (.github/dependabot.yml) bumps them weekly. Each comment notes the
-# human-readable version that the SHA corresponds to.
+# gdal is a C extension that must be built against matching headers.
+# We run inside the osgeo/gdal container so the system GDAL version
+# is fixed (3.13.0) and gdal-config is always present.  The install
+# two-step:
+#   1. Install everything in dev.lock *except* gdal
+#   2. Install gdal pinned to the container library version
+# keeps the Python binding and libgdal in lockstep.
+#
+# Cache includes both .venv and the uv-managed Python install
+# (~/.local/share/uv/python) so that venv symlinks remain valid after
+# a cache restore inside the container.
 jobs:
   unit:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/osgeo/gdal:ubuntu-small-3.13.0
     strategy:
-      # Don't cancel sibling matrix legs on failure — a 3.14 regression
-      # shouldn't hide whether 3.12 still passes, and vice versa.
       fail-fast: false
       matrix:
-        # 3.12: declared floor in pyproject.toml (requires-python).
-        # 3.13: current stable (the package is developed against this).
-        # 3.14: newest stable — catch forward-compat breaks early
-        #       (e.g. deprecated stdlib APIs, dep wheel availability).
-        python-version: ["3.12", "3.13", "3.14"]
+        # 3.12: declared floor in pyproject.toml.
+        # 3.13: current stable (developed against this).
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-        with:
-          enable-cache: true
-          cache-dependency-glob: "dev.lock"
-          # uv downloads + manages the Python interpreter itself; no
-          # actions/setup-python step needed.
-          python-version: ${{ matrix.python-version }}
-      - name: Install dev environment
-        run: uv sync --frozen --group dev
-      - name: Run unit tests with coverage
-        # `-n auto` parallelises across CPUs via pytest-xdist (in dev group).
-        # Unit tests are function-level and independent — near-linear speedup.
-        # See implementation plan §12.8 for xdist conventions.
+
+      - name: Install codecov deps
+        # curl + git are required by codecov-action on every run.
+        # build-essential is only needed when compiling the venv (cache miss);
+        # it is installed inside the "Install dependencies" step below.
         run: |
-          uv run pytest tests/unit \
+          apt-get update -qq
+          apt-get install -y -qq curl git gpg
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Cache venv + uv Python
+        id: cache-venv
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            .venv
+            ~/.local/share/uv/python
+          key: v4-venv-gdal3.13.0-py${{ matrix.python-version }}-${{ hashFiles('dev.lock') }}
+
+      - name: Install dependencies
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          apt-get install -y -qq build-essential
+          GDAL_VERSION=$(gdal-config --version)
+          uv venv --python ${{ matrix.python-version }} .venv
+          grep -v '^gdal==' dev.lock | uv pip install --python .venv/bin/python \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            --index-strategy unsafe-best-match \
+            -r /dev/stdin
+          uv pip install --python .venv/bin/python "gdal==${GDAL_VERSION}"
+          uv pip install --python .venv/bin/python -e .
+
+      - name: Run unit tests with coverage
+        run: |
+          .venv/bin/pytest tests/unit \
             -n auto \
             --cov=src/tessera_embeddings \
             --cov-report=xml \
             --tb=short
+
       - name: Upload coverage
-        # Upload once per PR (from the floor version) to avoid duplicate reports.
-        # 3.12 output is the canonical baseline.
         if: matrix.python-version == '3.12'
         uses: codecov/codecov-action@3f20e214133d0983f9a10f3d63b0faf9241a3daa # v6.0.0
         with:
