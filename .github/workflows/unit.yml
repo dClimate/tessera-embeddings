@@ -6,46 +6,42 @@ on:
   push:
     branches: [main]
 
-# gdal is a C extension that requires the system GDAL library + headers.
-# We install libgdal-dev from apt, then do the yield-modeling two-step:
-#   1. Install everything in dev.lock *except* gdal (grep -v '^gdal==')
-#   2. Install gdal pinned to the apt library version (gdal-config --version)
-# This avoids any version mismatch between the Python binding and libgdal.
-# The full .venv (including the compiled extension) is cached keyed on the
-# gdal apt version + Python version + dev.lock hash — rebuilt only when
-# any of those change.
+# gdal is a C extension that must be built against matching headers.
+# We run inside the osgeo/gdal container so the system GDAL version
+# is fixed (3.13.0) and gdal-config is always present.  The install
+# two-step:
+#   1. Install everything in dev.lock *except* gdal
+#   2. Install gdal pinned to the container library version
+# keeps the Python binding and libgdal in lockstep.
+# The full .venv (including the compiled extension) is cached keyed on
+# the container tag (encodes GDAL + OS) + Python version + dev.lock hash.
 jobs:
   unit:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/osgeo/gdal:ubuntu-small-3.13.0
     strategy:
       fail-fast: false
       matrix:
         # 3.12: declared floor in pyproject.toml.
         # 3.13: current stable (developed against this).
-        # 3.14 excluded: gdal C extension not reliably buildable on 3.14 yet.
         python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install system GDAL
-        # libgdal-dev supplies gdal-config + headers needed at build time.
-        # The output version is used as part of the cache key below.
-        id: gdal-version
+      - name: Install uv
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential libgdal-dev
-          echo "version=$(gdal-config --version)" >> "$GITHUB_OUTPUT"
-
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-        with:
-          python-version: ${{ matrix.python-version }}
+          apt-get update -qq
+          apt-get install -y -qq curl
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache venv
         id: cache-venv
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: .venv
-          key: venv-gdal${{ steps.gdal-version.outputs.version }}-py${{ matrix.python-version }}-${{ hashFiles('dev.lock') }}
+          key: venv-gdal3.13.0-py${{ matrix.python-version }}-${{ hashFiles('dev.lock') }}
 
       - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -57,6 +53,7 @@ jobs:
             --index-strategy unsafe-best-match \
             -r /dev/stdin
           uv pip install --python .venv/bin/python "gdal==${GDAL_VERSION}"
+          uv pip install --python .venv/bin/python -e .
 
       - name: Run unit tests with coverage
         run: |
