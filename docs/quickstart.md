@@ -93,10 +93,12 @@ python -m tessera_embeddings.orchestration.runners.plain \
     --skip-inference
 ```
 
-> **macOS note:** use `python -m` after activating the venv, not `uv run python -m`.
-> On macOS, `uv run` wraps Python in a subprocess; macOS security callbacks kill the
-> Ray GCS C++ process before it finishes starting (Ray issue #54047). Activating the
-> venv and calling `python` directly avoids the subprocess wrapper.
+> **Important:** always run via `python -m` after activating the venv — do **not** use
+> `uv run python -m`. `uv run` spawns Python in a child subprocess; on macOS the OS
+> security layer kills the Ray GCS C++ process before it finishes starting
+> (Ray issue #54047), and on Linux the subprocess wrapper can interfere with Ray's
+> signal handling. `source .venv/bin/activate` followed by plain `python` avoids
+> both problems.
 
 What happens:
 
