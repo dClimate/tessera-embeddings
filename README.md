@@ -79,34 +79,24 @@ uv pip install tessera_embeddings[inference]
 pip install tessera_embeddings[inference,prefect,aws]
 ```
 
-For contributors, fresh-clone convenience:
+For contributors:
 
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --all-extras                       # reads uv.lock (universal CPU, all extras + dev)
+uv sync --all-extras    # resolves uv.lock; installs all extras + dev tools
 ```
 
-Pre-solved lock files for specific environments live in `lock/`:
-
-```
-lock/inference-cpu.lock    cross-platform CPU torch + extras (laptop, CI, plain runner)
-lock/inference-cu121.lock  Linux x86_64, CUDA 12.1 (production GPU AMI)
-lock/dev.lock              inference-cpu + pytest/ruff/mypy (CI)
-```
-
-`lock/inference-cpu.lock` is `--universal` (Linux x86_64, macOS arm64/x86_64,
-Linux arm64). `lock/inference-cu121.lock` is Linux x86_64 only. See
-[`docs/environment-setup.md`](docs/environment-setup.md) for the full
-matrix, MPS/Apple Silicon status, Windows guidance (use WSL2), GDAL setup,
-and the rationale for the multi-lock-file setup.
+`uv.lock` at repo root is the single lock file. See
+[`docs/environment-setup.md`](docs/environment-setup.md) for CUDA GPU
+installs, GDAL notes, and platform guidance.
 
 ## Quickstart
 
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --all-extras                       # uv.lock covers all extras
+uv sync --all-extras    # resolves uv.lock; installs all extras + dev tools
 
 # End-to-end pipeline on the bundled Story-County, IA quickstart ROI.
 # Ingest → cloud mask → CPU inference → assemble. Expect ~30+ minutes;
