@@ -37,7 +37,7 @@ jobs:
         # it is installed inside the "Install dependencies" step below.
         run: |
           apt-get update -qq
-          apt-get install -y -qq curl git
+          apt-get install -y -qq curl git gpg
 
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
