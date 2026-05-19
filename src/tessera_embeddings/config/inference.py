@@ -27,8 +27,21 @@ def checkpoint_filename(norm_source: str = "aws") -> str:
         norm_source: Which checkpoint to use — ``"aws"`` (default) or ``"mpc"``.
     """
     if norm_source not in _CHECKPOINT_NAMES:
-        raise ValueError(f"Unknown norm_source: {norm_source!r}. Must be 'aws' or 'mpc'.")
+        valid = ", ".join(repr(k) for k in _CHECKPOINT_NAMES)
+        raise ValueError(f"Unknown norm_source: {norm_source!r}. Must be one of {valid}.")
     return _CHECKPOINT_NAMES[norm_source]
+
+
+def _normalize_obs_checkpoints(checkpoints: tuple[int, ...]) -> tuple[int, ...]:
+    """Coerce and validate a num_obs_checkpoints value.
+
+    Deduplicates, sorts, and filters out non-positive values. Safe to call on
+    values arriving as lists from YAML deserialization.
+    """
+    result = tuple(sorted({int(v) for v in checkpoints if int(v) > 0}))
+    if not result:
+        raise ValueError("num_obs_checkpoints must contain at least one positive integer")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -169,15 +182,13 @@ class InferenceConfig:
     def __post_init__(self) -> None:
         """Validate and normalise config fields."""
         if self.norm_source not in _NORM_STATS:
-            raise ValueError(f"Invalid norm_source: {self.norm_source!r}. Must be 'aws' or 'mpc'.")
+            valid = ", ".join(repr(k) for k in _NORM_STATS)
+            raise ValueError(f"Invalid norm_source: {self.norm_source!r}. Must be one of {valid}.")
         if self.s1_orbit not in {"ascending", "descending", "both"}:
             raise ValueError(
                 f"Invalid s1_orbit: {self.s1_orbit!r}. Must be 'ascending', 'descending', or 'both'."
             )
-        if not self.num_obs_checkpoints:
-            raise ValueError("num_obs_checkpoints must contain at least one positive integer")
-        # Coerce to sorted tuple (may arrive as list via YAML/dict overrides).
-        self.num_obs_checkpoints = tuple(sorted({int(v) for v in self.num_obs_checkpoints if int(v) > 0}))
+        self.num_obs_checkpoints = _normalize_obs_checkpoints(self.num_obs_checkpoints)
 
         # v1.1 sampling is deterministic — no repeat variance to measure.
         self.compute_std = False
