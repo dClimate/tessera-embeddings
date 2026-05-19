@@ -22,7 +22,8 @@ commands above work identically with `uv pip`.
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --all-extras    # resolves uv.lock; installs all extras + dev tools
+uv sync --all-extras                          # resolves uv.lock; all extras + dev tools
+uv pip install gdal==$(gdal-config --version) # must match system libgdal
 ```
 
 `uv.lock` at repo root is the single lock file. It covers every extra
@@ -36,16 +37,33 @@ uv sync --all-extras    # resolves uv.lock; installs all extras + dev tools
 `pyproject.toml` pins the CPU index so `uv sync` never accidentally pulls
 CUDA wheels on a laptop.
 
-For GPU production, override the torch index at install time:
+For GPU production, install torch with the CUDA wheel explicitly first,
+then install the package. `--extra-index-url` alone is not sufficient
+because PyPI's CPU wheel stays in the candidate pool and can win:
 
 ```bash
-pip install tessera_embeddings[inference] \
-    --extra-index-url https://download.pytorch.org/whl/cu121
+# 1. Install CUDA torch from the pytorch index
+pip install "torch==2.6.0+cu121" --index-url https://download.pytorch.org/whl/cu121
+
+# 2. Install the package — pip sees torch already satisfied, keeps the CUDA wheel
+pip install "tessera_embeddings[inference]"
 ```
 
-GPU deployment lock files (pinning a specific CUDA version and platform)
-are an ops concern for downstream consumers. They belong in your deployment
-repo alongside your Dockerfiles and AMI bake scripts, not here.
+For fully reproducible GPU deploys, generate a pinned constraints file in
+your deployment repo:
+
+```bash
+uv pip compile pyproject.toml \
+    --extra inference --extra prefect --extra aws \
+    --python-platform linux --python-version 3.12 \
+    --extra-index-url https://download.pytorch.org/whl/cu121 \
+    --index-strategy unsafe-best-match \
+    --no-sources \
+    -o constraints-cu121.txt
+```
+
+That file belongs in your deployment repo alongside your Dockerfiles, not
+in this OSS library.
 
 ### MPS (Apple Silicon GPU)
 
@@ -53,28 +71,26 @@ Untested. CPU is the supported laptop path.
 
 ## GDAL
 
-`gdal` is declared as an unpinned dependency and is source-only on PyPI —
-it builds against the system `libgdal`. You need a matching system library
-before installing:
+`gdal` is not declared as a package dependency — it is a system library
+binding that must match the `libgdal` installed on the host. Install the
+system library first, then install the matching Python binding separately:
 
 **macOS:**
 ```bash
 brew install gdal
+pip install gdal==$(gdal-config --version)
 ```
 
 **Ubuntu/Debian:**
 ```bash
 sudo apt-get install libgdal-dev
-```
-
-The Python binding version must match your installed libgdal. Check with
-`gdal-config --version` and install the matching binding:
-```bash
 pip install gdal==$(gdal-config --version)
 ```
 
-CI runs inside the `ghcr.io/osgeo/gdal:ubuntu-small-3.13.0` container,
-which pins both to 3.13.0.
+Attempting `pip install tessera_embeddings` without gdal pre-installed will
+produce an `ImportError` at runtime. CI runs inside the
+`ghcr.io/osgeo/gdal:ubuntu-small-3.13.0` container and installs the binding
+explicitly after `uv sync`.
 
 ## Platform notes
 

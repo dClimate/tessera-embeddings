@@ -68,15 +68,25 @@ no torch, no Ray). Add `[inference]` for the Tessera embedding model and
 distributed execution — that is what this library is for. The split is
 practical: torch is large and CUDA variants are platform-specific.
 
+**Prerequisite:** `gdal` is a system library binding — install it before
+installing this package (see [GDAL setup](docs/environment-setup.md#gdal)):
+```bash
+# macOS
+brew install gdal && pip install gdal==$(gdal-config --version)
+# Ubuntu/Debian
+sudo apt-get install libgdal-dev && pip install gdal==$(gdal-config --version)
+```
+
 ```bash
 # Typical install — ingestion pipeline + Tessera inference
 pip install tessera_embeddings[inference]
 
-# With uv (recommended for reproducible environments):
-uv pip install tessera_embeddings[inference]
-
 # Full production stack — inference + Prefect orchestration + AWS:
 pip install tessera_embeddings[inference,prefect,aws]
+
+# GPU (CUDA 12.1) — install torch first so pip keeps the CUDA wheel:
+pip install "torch==2.6.0+cu121" --index-url https://download.pytorch.org/whl/cu121
+pip install "tessera_embeddings[inference]"
 ```
 
 For contributors:
@@ -84,7 +94,8 @@ For contributors:
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --all-extras    # resolves uv.lock; installs all extras + dev tools
+uv sync --all-extras                          # resolves uv.lock; all extras + dev tools
+uv pip install gdal==$(gdal-config --version) # must match system libgdal
 ```
 
 `uv.lock` at repo root is the single lock file. See
@@ -96,7 +107,8 @@ installs, GDAL notes, and platform guidance.
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --all-extras    # resolves uv.lock; installs all extras + dev tools
+uv sync --all-extras                          # resolves uv.lock; all extras + dev tools
+uv pip install gdal==$(gdal-config --version) # must match system libgdal
 
 # End-to-end pipeline on the bundled Story-County, IA quickstart ROI.
 # Ingest → cloud mask → CPU inference → assemble. Expect ~30+ minutes;

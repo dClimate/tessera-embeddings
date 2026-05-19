@@ -1155,12 +1155,6 @@ wheels = [
 ]
 
 [[package]]
-name = "gdal"
-version = "3.13.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/28/58/c1d628c5b5a38d31e93e825199fd4dfd39b658104a52dfce3228d1067042/gdal-3.13.0.tar.gz", hash = "sha256:b440bcecbcdb96690a74da223142f2d51c6a540ee78674e10f9dca933d0e9006", size = 940507, upload-time = "2026-05-08T10:33:19.112Z" }
-
-[[package]]
 name = "google-api-core"
 version = "2.30.3"
 source = { registry = "https://pypi.org/simple" }
@@ -4284,7 +4278,6 @@ dependencies = [
     { name = "dask" },
     { name = "distributed" },
     { name = "fsspec" },
-    { name = "gdal" },
     { name = "icechunk" },
     { name = "mgrs" },
     { name = "numcodecs", extra = ["pcodec"] },
@@ -4364,7 +4357,6 @@ requires-dist = [
     { name = "dask-cloudprovider", extras = ["aws"], marker = "extra == 'aws'" },
     { name = "distributed" },
     { name = "fsspec" },
-    { name = "gdal" },
     { name = "icechunk" },
     { name = "mgrs" },
     { name = "numcodecs", extras = ["pcodec"] },
