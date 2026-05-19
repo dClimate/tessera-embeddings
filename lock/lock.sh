@@ -37,12 +37,14 @@ uv pip compile pyproject.toml \
     -o lock/inference-cpu.lock
 
 echo "==> lock/inference-cu121.lock (Linux x86_64, CUDA 12.1, inference+prefect+aws)..."
+# --no-sources bypasses [tool.uv.sources] CPU pin so the CUDA index wins for torch.
 uv pip compile pyproject.toml \
     --extra inference --extra prefect --extra aws \
     --python-platform linux \
     --python-version 3.12 \
     --extra-index-url https://download.pytorch.org/whl/cu121 \
     --index-strategy unsafe-best-match \
+    --no-sources \
     --no-strip-extras \
     -o lock/inference-cu121.lock
 

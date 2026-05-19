@@ -79,12 +79,12 @@ uv pip install tessera_embeddings[inference]
 pip install tessera_embeddings[inference,prefect,aws]
 ```
 
-For contributors, fresh-clone convenience: `uv sync` does the right thing.
+For contributors, fresh-clone convenience:
 
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync                                    # reads uv.lock (universal CPU, all extras + dev)
+uv sync --all-extras                       # reads uv.lock (universal CPU, all extras + dev)
 ```
 
 Pre-solved lock files for specific environments live in `lock/`:
@@ -106,7 +106,7 @@ and the rationale for the multi-lock-file setup.
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync                                    # uv.lock covers all extras
+uv sync --all-extras                       # uv.lock covers all extras
 
 # End-to-end pipeline on the bundled Story-County, IA quickstart ROI.
 # Ingest → cloud mask → CPU inference → assemble. Expect ~30+ minutes;

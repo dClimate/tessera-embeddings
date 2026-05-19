@@ -26,7 +26,7 @@ uv pip install tessera_embeddings[inference]
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync                                   # uv.lock — CPU torch, all extras, dev tools
+uv sync --all-extras                      # uv.lock — CPU torch, all extras, dev tools
 ```
 
 Or with pip-compile lock files for a specific environment:
@@ -34,15 +34,15 @@ Or with pip-compile lock files for a specific environment:
 ```bash
 # CPU (laptop, CI, plain runner)
 grep -v '^gdal==' lock/inference-cpu.lock | pip install -r /dev/stdin
-pip install -e .
+pip install --no-deps -e .
 
 # GPU — Linux x86_64, CUDA 12.1
 grep -v '^gdal==' lock/inference-cu121.lock | pip install -r /dev/stdin
-pip install -e .
+pip install --no-deps -e .
 
 # Development (adds pytest, ruff, mypy)
 grep -v '^gdal==' lock/dev.lock | pip install -r /dev/stdin
-pip install -e .
+pip install --no-deps -e .
 ```
 
 > **GDAL note:** `gdal==3.13.0` in the lock files requires a matching
@@ -183,6 +183,7 @@ lock/lock.sh
 │       --python-platform linux \
 │       --extra-index-url https://download.pytorch.org/whl/cu121 \
 │       --index-strategy unsafe-best-match \
+│       --no-sources \
 │       -o lock/inference-cu121.lock
 └── uv pip compile pyproject.toml \
         --extra inference --extra prefect --extra aws --group dev \
@@ -200,7 +201,7 @@ source of "works on my machine" bugs.
 ## Verifying the install
 
 ```bash
-python scripts/check_env.py
+uv run python scripts/check_env.py
 ```
 
 Prints:
