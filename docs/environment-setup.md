@@ -53,11 +53,21 @@ Untested. CPU is the supported laptop path.
 
 ## GDAL
 
-`gdal` is declared as an unpinned dependency. `pip install tessera_embeddings`
-pulls a binary wheel from PyPI that bundles its own libgdal — no system
-library required for most platforms. If you are on a platform without a
-pre-built wheel (uncommon), you will need system `libgdal` headers and
-`gdal-config` available before `pip install`.
+`gdal` is declared as an unpinned dependency and is source-only on PyPI —
+it builds against the system `libgdal`. Install the system library first:
+
+**macOS:**
+```bash
+brew install gdal
+```
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install libgdal-dev
+```
+
+Then `pip install tessera_embeddings` (or `uv sync`) will compile the
+Python bindings against your installed version.
 
 ## Platform notes
 
