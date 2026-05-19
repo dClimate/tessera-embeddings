@@ -6,9 +6,16 @@ on:
   push:
     branches: [main]
 
+# mypy typechecks auth.py which imports osgeo.gdal — the import will
+# fail at collection time without the GDAL C extension installed, so
+# this job runs in the same osgeo/gdal container as unit.yml.
 jobs:
   lint:
     runs-on: ubuntu-latest
+    container:
+      # ubuntu-small includes libgdal + gdal-config; no X11/GUI extras.
+      # Version must match `gdal==X.Y.Z` in dev.lock.
+      image: ghcr.io/osgeo/gdal:ubuntu-small-3.13.0
     steps:
       # Third-party actions are pinned to commit SHAs. Dependabot
       # (.github/dependabot.yml) bumps them weekly. Each comment notes
@@ -16,10 +23,17 @@ jobs:
       # reviewers can sanity-check the bump without re-resolving SHAs.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - name: Cache venv
+        id: cache-venv
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          enable-cache: true
-          cache-dependency-glob: "dev.lock"
+          path: .venv
+          key: venv-gdal3.13.0-py3.13-${{ hashFiles('dev.lock') }}
+      - name: Install C build tools
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: apt-get update -qq && apt-get install -y -qq build-essential python3-dev
       - name: Install dev environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
         run: uv sync --frozen --group dev
       - name: ruff check
         run: uv run ruff check src/ tests/

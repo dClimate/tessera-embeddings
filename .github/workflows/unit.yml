@@ -9,34 +9,56 @@ on:
 # Third-party actions are pinned to commit SHAs. Dependabot
 # (.github/dependabot.yml) bumps them weekly. Each comment notes the
 # human-readable version that the SHA corresponds to.
+#
+# All jobs run inside the osgeo/gdal container so `gdal-config` is
+# present at `uv sync` time. The gdal Python wheel is a C extension
+# that builds from source — without the system GDAL headers the build
+# fails with "Could not find gdal-config". The container version must
+# match the `gdal==X.Y.Z` pin in dev.lock.
+#
+# The fully-installed .venv is cached keyed on dev.lock + Python version.
+# On a cache hit the apt-get + uv sync steps are skipped entirely,
+# so the expensive gdal C compilation only runs when the lockfile changes.
 jobs:
   unit:
     runs-on: ubuntu-latest
+    container:
+      # ubuntu-small includes libgdal + gdal-config; no X11/GUI extras.
+      # Version must match `gdal==X.Y.Z` in dev.lock.
+      image: ghcr.io/osgeo/gdal:ubuntu-small-3.13.0
     strategy:
-      # Don't cancel sibling matrix legs on failure — a 3.14 regression
+      # Don't cancel sibling matrix legs on failure — a 3.13 regression
       # shouldn't hide whether 3.12 still passes, and vice versa.
       fail-fast: false
       matrix:
         # 3.12: declared floor in pyproject.toml (requires-python).
         # 3.13: current stable (the package is developed against this).
-        # 3.14: newest stable — catch forward-compat breaks early
-        #       (e.g. deprecated stdlib APIs, dep wheel availability).
-        python-version: ["3.12", "3.13", "3.14"]
+        # Note: 3.14 is excluded — the gdal C extension requires a
+        # Cython/setuptools version that does not yet support 3.14 reliably.
+        # Add it back once upstream wheels or build scripts stabilise.
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
-          enable-cache: true
-          cache-dependency-glob: "dev.lock"
-          # uv downloads + manages the Python interpreter itself; no
-          # actions/setup-python step needed.
           python-version: ${{ matrix.python-version }}
+      - name: Cache venv
+        id: cache-venv
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: .venv
+          key: venv-gdal3.13.0-py${{ matrix.python-version }}-${{ hashFiles('dev.lock') }}
+      - name: Install C build tools
+        # The osgeo/gdal image ships the GDAL shared library + headers but
+        # not the Python build toolchain. Needed to compile the gdal extension.
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: apt-get update -qq && apt-get install -y -qq build-essential python3-dev
       - name: Install dev environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
         run: uv sync --frozen --group dev
       - name: Run unit tests with coverage
         # `-n auto` parallelises across CPUs via pytest-xdist (in dev group).
         # Unit tests are function-level and independent — near-linear speedup.
-        # See implementation plan §12.8 for xdist conventions.
         run: |
           uv run pytest tests/unit \
             -n auto \

@@ -20,33 +20,51 @@ on:
 jobs:
   integration:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/osgeo/gdal:ubuntu-small-3.13.0
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - name: Cache venv
+        id: cache-venv
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          enable-cache: true
-          cache-dependency-glob: "dev.lock"
-      - run: uv sync --frozen --group dev
+          path: .venv
+          key: venv-gdal3.13.0-py3.13-${{ hashFiles('dev.lock') }}
+      - name: Install C build tools
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: apt-get update -qq && apt-get install -y -qq build-essential python3-dev
+      - name: Install dev environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: uv sync --frozen --group dev
       - name: Run integration tests
         # `-n auto` is safe here — integration tests touch external surfaces
-        # (moto, fsspec) but each is independently set up. See implementation
-        # plan §12.8 for xdist conventions.
+        # (moto, fsspec) but each is independently set up.
         run: uv run pytest tests/integration -m integration -n auto -v --tb=short
 
   parity-fast:
     # Fast parity tests (per-flow). Full-pipeline parity is in nightly.
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/osgeo/gdal:ubuntu-small-3.13.0
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - name: Cache venv
+        id: cache-venv
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          enable-cache: true
-          cache-dependency-glob: "dev.lock"
-      - run: uv sync --frozen --group dev
+          path: .venv
+          key: venv-gdal3.13.0-py3.13-${{ hashFiles('dev.lock') }}
+      - name: Install C build tools
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: apt-get update -qq && apt-get install -y -qq build-essential python3-dev
+      - name: Install dev environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: uv sync --frozen --group dev
       - name: Run parity tests (excluding slow)
         # NO `-n auto` here: each parity test runs BOTH a Prefect flow AND
         # the plain runner — already two heavyweight pipelines per test.
-        # Parallelising thrashes CPU instead of speeding up wall-clock.
         run: uv run pytest tests/parity -m "parity and not slow" -v --tb=short
