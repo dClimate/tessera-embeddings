@@ -191,9 +191,11 @@ target is reached. Over-sampled pixels are uniformly sub-sampled.
   smallest; the largest bucket sets the "hot" GPU allocation so smaller buckets reuse it.
 - **Prefetch thread** — a `ThreadPoolExecutor(max_workers=1)` pipelines CPU batch
   preparation (data loading + normalization) while the GPU runs the previous forward pass.
-- **FP16** — `model.half()` halves memory bandwidth; bucket-level aggregation (instead of
-  repeat averaging) absorbs FP16 noise.
-- **`torch.compile` is disabled** — GRU recompilation per unique seq_len makes it slower.
+- **FP16** — `model.half()` halves memory bandwidth; bucket-level aggregation absorbs FP16
+  noise without repeat-averaging.
+- **`torch.compile` is disabled** — on g5.2xlarge (15.4 GB VRAM), CUDA graph capture
+  consumed 11.6 GB and slowed forward passes (3,770 ms vs. 1,944 ms) due to GRU
+  recompilation per unique sequence length.
 - **cuDNN benchmark mode** — fastest algorithm for GRU/conv ops.
 - **Throughput:** ~1,300 px/sec per A10G; 100 actors ≈ 130,000 px/sec.
 
@@ -354,7 +356,7 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `batch_size` | 3584 | GPU pixels per forward pass |
+| `batch_size` | 3584 | GPU pixels per forward pass within a bucket |
 | `num_obs_checkpoints` | `range(8, 257, 8)` | Bucketed sequence-length schedule; pixels binned to nearest checkpoint |
 | `s1_orbit` | `"ascending"` | `"ascending"`, `"descending"`, or `"both"` |
 | `norm_source` | `"mpc"` | Band stats origin; `"aws"` for the AWS-normalised encoder checkpoint |

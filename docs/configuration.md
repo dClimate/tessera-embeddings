@@ -15,7 +15,8 @@ config/
 │                           TimeWindow      ── 12-month rolling window
 │                           DEFAULT_CHUNK_SIZE = 2000
 │                           EMBEDDING_DIM = 128
-│                           checkpoint_filename(quantized=True)
+│                           DEFAULT_NUM_OBS_CHECKPOINTS = tuple(range(8, 257, 8))
+│                           checkpoint_filename(norm_source="mpc"|"aws") → str
 ├── time_windows.py         parse_time_window(s)  ── "Month YYYY" → TimeWindow
 ├── dask.py                 AssemblyConfig   ── frozen: chunks_per_worker scaling
 │                           compute_pipeline_cluster_sizing
@@ -83,20 +84,21 @@ from tessera_embeddings import (
 
 config = InferenceConfig(
     time_window=parse_time_window("June 2025"),
-    s1_orbit="ascending",
-    checkpoint_path=f"{paths.inputs}/models/{checkpoint_filename(quantized=True)}",
+    s1_orbit="ascending",          # or "descending" or "both"
+    checkpoint_path=f"{paths.inputs}/models/{checkpoint_filename()}",
     inputs_bucket=paths.inputs,
     output_bucket=paths.outputs,
-    num_gpus=1,                # 0 for CPU runs
-    repeat_times=3,
-    sample_size_s2=40,
-    sample_size_s1=40,
+    num_gpus=1,                    # 0 for CPU runs
+    # v1.1 sampling — bucketed deterministic resampling:
+    num_obs_checkpoints=tuple(range(8, 257, 8)),  # default; multiples of 8 up to 256
+    norm_source="mpc",             # "aws" for the AWS-normalised encoder checkpoint
 )
 ```
 
-The model-architecture fields (`latent_dim`, `nhead`,
-`num_encoder_layers`, etc.) default to the production checkpoint's
-shape. Only override if you're loading a different checkpoint.
+Key architecture fields default to the v1.1 production checkpoint shape:
+`latent_dim=192`, `dim_feedforward=2048`, `representation_dim=192`.
+Only override if loading a different checkpoint. `batch_size=3584` controls
+per-GPU pixels per forward pass within a bucket.
 
 ## Secrets enter at the flow boundary
 
