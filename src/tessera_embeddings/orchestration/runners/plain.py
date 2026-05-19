@@ -113,6 +113,7 @@ def _run_inference_and_assemble(
     paths: BucketPaths,
     time_window_end: str,
     s1_orbit: S1Orbit,
+    checkpoint_dir: str | None,
     log: logging.Logger,
 ) -> dict[str, Any]:
     """Run CPU inference under local Ray, then assemble under local Dask."""
@@ -120,7 +121,8 @@ def _run_inference_and_assemble(
     output_bucket = paths.outputs
 
     time_window = parse_time_window(time_window_end)
-    checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename()}"
+    model_dir = checkpoint_dir or f"{inputs_bucket.rstrip('/')}/models"
+    checkpoint_path = f"{model_dir.rstrip('/')}/{checkpoint_filename()}"
 
     config = build_inference_config(
         s1_orbit=s1_orbit,
@@ -131,7 +133,7 @@ def _run_inference_and_assemble(
         num_gpus=0,  # CPU inference for the plain runner
     )
 
-    mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
+    mosaic_base = paths.store_for(roi_name, "reflectance").rsplit("/", 1)[0]
     staging_base = f"{output_bucket.rstrip('/')}/staging"
 
     # Probe for available SAR stores before dispatching inference; if s1_orbit="both"
@@ -238,6 +240,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
               end: "2025-07-01"
             s1_orbit: ascending
             n_workers: 2
+            checkpoint_dir: null    # override model directory; null → {inputs}/models/
             storage_options: null
 
         skip_inference: When True, stop after ingestion. Useful for
@@ -308,6 +311,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         paths=paths,
         time_window_end=cfg["time_window_end"],
         s1_orbit=cfg.get("s1_orbit", "ascending"),
+        checkpoint_dir=cfg.get("checkpoint_dir"),
         log=log,
     )
     log.info("Pipeline complete: %s", summary)

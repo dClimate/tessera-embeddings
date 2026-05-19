@@ -99,20 +99,54 @@ def get_edl_session() -> _EDLSession:
     Returns a session that preserves auth headers across NASA's
     cross-domain OAuth redirect chain (ASF → URS → CloudFront).
 
+    Authentication modes:
+
+    * **Basic auth** via ``EARTHDATA_USERNAME`` + ``EARTHDATA_PASSWORD``
+      is the production path. Production deployments set only these
+      two env vars and the contract our deployed pipelines rely on is
+      basic auth.
+    * **Bearer token** via ``EARTHDATA_TOKEN`` is a LOCAL DEVELOPMENT
+      FALLBACK ONLY. NASA EDL accounts that authenticate through
+      SAML / Launchpad cannot complete a basic-auth handshake against
+      datapool — the redirect chain returns 401 even when the user has
+      approved the ASF Data Access app. A user-generated bearer token
+      (from urs.earthdata.nasa.gov/profile) survives the redirect
+      chain when set as a session-level header.
+
+      Production deployments MUST NOT set ``EARTHDATA_TOKEN``: tokens
+      have a finite TTL and are not suitable for unattended workloads.
+      Bearer takes precedence when both are set, on the assumption
+      that a developer who has explicitly exported a token does so to
+      override basic auth that doesn't work for their account.
+
     Returns:
         Authenticated session with redirect-safe auth handling
 
     Raises:
-        RuntimeError: If credentials are not set in environment
+        RuntimeError: If neither credential set is available.
     """
     username = os.environ.get("EARTHDATA_USERNAME")
     password = os.environ.get("EARTHDATA_PASSWORD")
-    if not (username and password):
-        raise RuntimeError("EDL authentication requires EARTHDATA_USERNAME + EARTHDATA_PASSWORD")
+    token = os.environ.get("EARTHDATA_TOKEN")
 
-    session = _EDLSession()
-    session.auth = (username, password)
-    return session
+    if token:
+        # LOCAL-ONLY FALLBACK: bearer must be set at session level (not
+        # per-request) so it survives ASF's cross-domain redirects —
+        # requests strips per-request Authorization on cross-domain
+        # hops but leaves session.headers alone.
+        session = _EDLSession()
+        session.headers["Authorization"] = f"Bearer {token}"
+        return session
+
+    if username and password:
+        session = _EDLSession()
+        session.auth = (username, password)
+        return session
+
+    raise RuntimeError(
+        "EDL authentication requires EARTHDATA_USERNAME + EARTHDATA_PASSWORD "
+        "(production) or EARTHDATA_TOKEN (local-only fallback for SAML accounts)."
+    )
 
 
 def resolve_signed_url(session: requests.Session, url: str) -> str:

@@ -1,27 +1,74 @@
 # Quickstart
 
 A laptop demo that exercises the full pipeline against a small,
-real-world AOI: 10 km × 10 km over Story County, Iowa (the densest
+real-world AOI: ~1 km² over Story County, Iowa (the densest
 corn-producing county in the United States, picked because both
 Sentinel-2 and OPERA RTC-S1 give dense coverage there).
 
-Read time: 5 minutes. Run time: ~5 min for ingest only, ~30+ min for
+Read time: 5 minutes. Run time: ~5 min for ingest only, ~15 min for
 full end-to-end CPU inference.
 
 ## Prerequisites
 
 - **`uv`** — install from <https://docs.astral.sh/uv/>.
-- **An EDL (Earthdata Login) account** to ingest OPERA RTC-S1.
-  Register at <https://urs.earthdata.nasa.gov/> and approve the
-  "Alaska Satellite Facility Data Access" application in your
-  profile (one-time UI step). Without this you'll get an HTTP 401
-  during S1 ingest.
+- **An EDL (Earthdata Login) account** to ingest OPERA RTC-S1. See
+  the next section for setup — there are two cases, depending on
+  whether your EDL account is a standard account or a SAML /
+  Launchpad account.
 - **~5 GB of free disk** at the paths in `examples/quickstart/config.yaml`
   (default `/tmp/tessera/...`).
 - **A Tessera model checkpoint**, only for the full-pipeline run.
-  Download from the public release; the path goes under
-  `${paths.inputs}/models/<filename>`. The expected filename comes
-  from `tessera_embeddings.checkpoint_filename(quantized=True)`.
+  Download from the public release; set `checkpoint_dir` in
+  `examples/quickstart/config.yaml` to its parent directory. The
+  expected filename comes from
+  `tessera_embeddings.checkpoint_filename()` (or
+  `checkpoint_filename(norm_source="aws")` for the AWS-normalised
+  encoder).
+
+### Earthdata Login (EDL) setup
+
+Two one-time steps:
+
+1. **Register and approve the ASF Data Access app.**
+   Sign up at <https://urs.earthdata.nasa.gov/>. Once logged in, go
+   to **Applications → Authorized Apps** and approve **"Alaska
+   Satellite Facility Data Access"**. Without this, S1 ingest fails
+   with HTTP 401 on every granule.
+
+2. **Pick the auth mode that fits your account.**
+
+   The pipeline reads two env-var triples in this order:
+
+   | Mode | Env vars | Used by |
+   | --- | --- | --- |
+   | Bearer token | `EARTHDATA_TOKEN` | local quickstart, esp. SAML / Launchpad accounts |
+   | Basic auth | `EARTHDATA_USERNAME` + `EARTHDATA_PASSWORD` | production pipelines |
+
+   **Standard (password-login) account:** export
+   `EARTHDATA_USERNAME` and `EARTHDATA_PASSWORD` and you're done.
+
+   **SAML / Launchpad account (single-sign-on, no password):** the
+   ASF datapool redirect chain returns 401 for these accounts on
+   basic auth even with the app approved. Use a bearer token
+   instead:
+
+   ```
+   1. Log into https://urs.earthdata.nasa.gov/
+   2. Profile menu → "Generate Token" (or visit
+      https://urs.earthdata.nasa.gov/profile and look for the
+      "Generate Token" button under your account).
+   3. Copy the long JWT string.
+   4. export EARTHDATA_TOKEN=<paste>
+   ```
+
+   Bearer tokens have a TTL (typically ~60 days). When yours
+   expires, regenerate. **Do not check tokens into git.**
+
+   `EARTHDATA_TOKEN` is a local-development fallback only —
+   production deployments must use basic auth (token rotation is
+   incompatible with unattended workloads). See
+   `src/tessera_embeddings/ingest/auth.py::get_edl_session` for
+   the precedence rules.
 
 ## Ingest only (5 minutes)
 
@@ -32,15 +79,24 @@ worked and your EDL credentials are fine.
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --frozen -r inference-cpu.lock
+uv sync --group inference --group prefect
+source .venv/bin/activate
 
+# Pick ONE of:
 export EARTHDATA_USERNAME=<your-edl-username>
 export EARTHDATA_PASSWORD=<your-edl-password>
+# - or, for SAML / Launchpad accounts:
+export EARTHDATA_TOKEN=<token-from-urs.earthdata.nasa.gov/profile>
 
-uv run python -m tessera_embeddings.orchestration.runners.plain \
+python -m tessera_embeddings.orchestration.runners.plain \
     examples/quickstart/config.yaml \
     --skip-inference
 ```
+
+> **macOS note:** use `python -m` after activating the venv, not `uv run python -m`.
+> On macOS, `uv run` wraps Python in a subprocess; macOS security callbacks kill the
+> Ray GCS C++ process before it finishes starting (Ray issue #54047). Activating the
+> venv and calling `python` directly avoids the subprocess wrapper.
 
 What happens:
 
@@ -59,7 +115,8 @@ Output: `${paths.preprocessed}/quickstart_story_county_ia/{reflectance.zarr, sar
 Same command without `--skip-inference`:
 
 ```bash
-uv run python -m tessera_embeddings.orchestration.runners.plain \
+source .venv/bin/activate
+python -m tessera_embeddings.orchestration.runners.plain \
     examples/quickstart/config.yaml
 ```
 
@@ -67,7 +124,7 @@ Now the runner adds two steps:
 
 ```
 6. Local Ray cluster, num_gpus=0       (1 actor, model loads on CPU)
-7. Inference: 1 chunk of ROI           (~25 min on a laptop)
+7. Inference: 1 chunk of ROI           (~15-30 min on a laptop)
 8. Local Dask cluster, assemble        (~2 min)
 ```
 
@@ -90,8 +147,8 @@ For real workloads, run the Prefect flow against
 
 ## Adapting to a different AOI
 
-The bundled `examples/quickstart/roi.geojson` is a 0.10° square over
-Story County, IA. To use your own AOI:
+The bundled `examples/quickstart/roi.geojson` is a ~1 km² box over
+Story County, IA (roughly 84×101 pixels at 10 m resolution, one inference chunk). To use your own AOI:
 
 1. Edit `examples/quickstart/roi.geojson` (any single-feature
    GeoJSON polygon works).
@@ -114,11 +171,14 @@ Story County, IA. To use your own AOI:
 
 ## Troubleshooting
 
-- **HTTP 401 on `datapool.asf.alaska.edu`** → you haven't approved
-  the ASF Data Access app in your EDL profile. See Prerequisites.
-- **`ModuleNotFoundError: ray`** during the inference step → you
-  installed the CPU lock but Ray didn't come along. Re-run
-  `uv sync --frozen --group dev --group inference --group prefect`.
+- **HTTP 401 on `datapool.asf.alaska.edu`** → either
+  (a) you haven't approved the ASF Data Access app in your EDL
+  profile (see Prerequisites), or (b) your account is SAML /
+  Launchpad and basic auth doesn't work — generate a bearer token
+  and export `EARTHDATA_TOKEN` instead. Bearer takes precedence
+  over `EARTHDATA_USERNAME` + `EARTHDATA_PASSWORD` when both are set.
+- **`ModuleNotFoundError: ray`** during the inference step → re-run
+  `uv sync --group dev --group inference --group prefect`.
 - **The runner hangs on "Building Dask graph…"** → check chunk size
   in your config. See [`README.md`](../README.md) §"Why chunk size
   dominates everything".

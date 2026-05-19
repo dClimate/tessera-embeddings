@@ -34,13 +34,19 @@ time_range:
 
 # Inference time window — must match a 12-month rolling window's end.
 # (Plain runner derives this from the same string Prefect flows accept.)
-time_window_end: "July 2025"
+time_window_end: "August 2024"
 
 # Single-orbit ingest is enough for the quickstart.
 s1_orbit: ascending
 
 # Local Dask cluster size on the runner host.
 n_workers: 2
+
+# Optional override for the directory containing the model checkpoint.
+# null means the runner looks under {inputs}/models/. Set this to keep
+# checkpoints outside the inputs tree so they survive a data wipe.
+# Example: checkpoint_dir: /tmp/tessera-models
+checkpoint_dir: /tmp/tessera-models
 
 # fsspec storage options. null lets fsspec auto-detect; for s3:// you
 # might pass {anon: false} or a dict with key/secret.

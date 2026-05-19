@@ -107,105 +107,99 @@ Each chunk goes through four sub-steps:
 
 #### 4a. Data Loading (`data_loading.py`)
 
-Three-phase selective loading to keep peak RAM ~2 GB rather than ~15 GB:
+Two-phase loading keeps peak worker RAM ~2 GB rather than ~15 GB:
 
-1. **Load SCL only** — Read the uint8 Scene Classification Layer for all timesteps (~200 MB)
-   and derive a per-pixel binary validity mask. Timesteps where no pixel in the chunk has
-   any SCL-valid class are dropped immediately, before pre-sampling or band loading. For
-   large ROIs where the per-ROI time axis covers the full year but each chunk only
-   intersects a fraction of acquisitions, this typically halves `T` before Phase 2 runs.
-2. **Pre-sample timestep indices** — Simulate all `repeat_times` samplings across 10,000 random
-   pixels to find the union of timesteps actually needed (~20-40 out of the surviving ~100).
-3. **Load only those timesteps** — Fetch reflectance bands only for the needed timestep subset.
+```text
+All timesteps in the ROI time axis
+T ≈ 126 dates  (full year, all S2 acquisitions for this ROI)
+      │
+      │  Phase 1: Load SCL only (~200 MB)
+      │  Drop dates with no SCL-valid pixels in this spatial chunk.
+      │  (Most chunks intersect only a fraction of the ROI's date range.)
+      ▼
+T_valid ≈ 63 dates  (roughly halved for large ROIs)
+      │
+      │  Phase 2: Load full reflectance bands for all T_valid dates.
+      │  v1.1 uses all valid observations (bucketed sampling, not pre-sampled).
+      ▼
+Peak RAM: ~2 GB   (vs. ~15 GB if loaded without SCL pre-filter)
+```
 
-All three phases read directly from the raw zarr group via `open_store_as_zarr_group` / `zarr.Array.oindex`,
-bypassing xarray and dask entirely. A single icechunk session is opened per store; time-window
-filtering and DOY extraction decode the `int64` time coordinate directly from `root["time"]`.
-This eliminates the dask task-graph overhead that previously caused Phase 1 (SCL) to take ~3
-minutes and Phase 3 (bands) to spike ~3× above output size.
+All phases read directly from the raw zarr group via `open_store_as_zarr_group` /
+`zarr.Array.oindex`, bypassing xarray and dask entirely. A single icechunk session is opened
+per store; time-window filtering and DOY extraction decode the `int64` time coordinate
+directly from `root["time"]`. `data_loading.py` imports neither `xarray` nor `dask`.
 
-S1 SAR follows the same pattern: VV is read first to identify non-empty timesteps, then VH is
-loaded only for the survivors. `data_loading.py` imports neither `xarray` nor `dask`.
+S1 SAR: VV is read first to identify non-empty timesteps, then VH is loaded for survivors.
+Both ascending and descending stores are loaded when `s1_orbit="both"`;
+`resolve_s1_orbit(mosaic_base, s1_orbit)` probes for available stores and falls back
+gracefully when only one orbit was ingested.
 
-Output: `ChunkData` — numpy arrays for S2 bands/masks/DOYs, S1 ascending/descending bands/DOYs,
-and per-pixel observation counts (`s2_obs_count`, `s1_asc_obs_count`, `s1_desc_obs_count`) as
-uint16 arrays of shape (H, W). S2 obs count is the number of SCL-valid timesteps from the full
-(pre-pruning) mask. S1 obs counts are the number of timesteps where either VV or VH is non-zero.
+Output: `ChunkData` — numpy arrays for S2 bands/masks/DOYs, S1 ascending/descending
+bands/DOYs, and per-pixel observation counts (`s2_obs_count`, `s1_asc_obs_count`,
+`s1_desc_obs_count`) as uint16 arrays of shape (H, W).
 
-#### 4b. Valid Pixel Filtering (`dataset.py`)
+#### 4b. Valid Pixel Filtering + Bucketing (`dataset.py`)
 
-`MosaicChunkInferenceDataset` identifies the subset of pixels eligible for inference:
-- At least one non-zero S2 observation
-- `≥ min_valid_timesteps` valid S2 frames (from the full, un-pruned SCL mask)
-- `≥ max(min_valid_timesteps/2, 1)` valid S1 frames — see below
+`MosaicChunkInferenceDataset` identifies pixels eligible for inference and groups them
+into `(s2_bin, s1_bin)` buckets for batched processing:
 
-#### S1 non-zero floor (divergence from upstream)
+1. **Valid pixel mask** — at least one non-zero S2 observation AND at least one non-zero
+   S1 observation. S1 floor of 1 prevents the sampler from crashing on all-zero SAR tiles
+   at orbit coverage edges (pixels with zero valid S1 would be OOD for the model anyway).
 
-Cambridge's `tessera_infer` overrides `min_valid_timesteps=0` at inference time
-(see `configs/multi_tile_infer_config.py`), and its S1 check is literally
-`s1_total_valid >= 0` — always true. Their `.npy` tiles are curated so every
-pixel has some S1 observation, so this never bites.
+2. **Bin key assignment** — for each valid pixel, `compute_bin_keys` maps observation
+   counts `(s2_obs_count, s1_obs_count)` to the nearest entry in `num_obs_checkpoints`
+   (the bucketed sequence-length schedule). Pixels with the same `(s2_bin, s1_bin)` key
+   form a bucket — the transformer receives a rectangular `(B, seq_len, bands+1)` tensor
+   for each bucket. No padding, no masking, no variable-length overhead.
 
-Our Icechunk SAR stores sometimes have chunks where a 2000×2000 spatial extent
-is entirely zero-padded for all but a handful of timesteps (e.g. edge of the
-ascending-orbit coverage). Pixels in those chunks would pass the original
-filter with zero valid S1 observations, then crash the sampler with
-`IndexError: index -1 is out of bounds for axis 1 with size 0` when the
-latest-timestep force (`indices[:, :, -1] = n_t - 1`) hits an empty time axis.
-
-We diverge from upstream by flooring the S1 threshold at 1 — `s1_total_valid
->= max(s1_threshold, 1)`. This mirrors the implicit `s2_nonzero` floor that
-already exists for S2, is a strict superset of upstream's filter (any pixel
-accepted by upstream is still accepted), and only excludes pixels whose
-embeddings would have been produced from all-zero S1 input anyway — OOD for
-the model and not trustworthy.
+3. **Deferred extraction** — pixel coordinates for each bucket are stored at init time;
+   actual band data is loaded per-batch via fancy indexing. Previously, pre-extracting all
+   valid pixels doubled peak RAM (source arrays 14 GB + extracted copy 17 GB = OOM).
+   Per-batch indexing adds ~7 ms per batch and avoids the spike entirely.
 
 #### Skip path and skip markers
 
-When every pixel in a live (ROI-intersecting) chunk fails the validity
-filter, the chunk takes the `"skipped"` path. This fires in two situations:
-(1) the chunk has no usable S1 coverage (the new S1 floor, above) and (2) the
-chunk intersects the ROI polygon but its footprint is entirely empty in the
-source stores — no non-zero S2 observations anywhere. Case (2) happens for
-chunks that clip the ROI along data-coverage edges, where the ROI mask says
-"process this" but the underlying imagery is nodata.
-
-In both cases the actor writes a zero-byte `{chunk.label}.skipped` marker to
-the staging directory and returns. Assembly fills the chunk's footprint with
-constant-zero/NaN tasks in the dask graph — same handling as a chunk rejected
-by the ROI pre-filter. The marker distinguishes a legitimate skip from a
-silently-failed chunk (Ray actor crash that wasn't re-queued, an exception
-path that didn't write the marker, etc.). `verify_staged_completeness`
-requires every live chunk to have either a staged zarr or a skip marker and
-raises otherwise; it runs after inference in the normal path and at the start
-of `assembly_only` runs.
-
-Critically, **pixel extraction is deferred to batch time** (`get_batch(start, end)` uses fancy
-indexing). Previously, pre-extracting all valid pixels doubled peak RAM (source arrays 14 GB
-+ extracted copy 17 GB = OOM). Per-batch fancy indexing adds ~7 ms per batch and avoids the
-spike entirely.
+When every pixel in a live (ROI-intersecting) chunk fails the validity filter, the chunk
+takes the `"skipped"` path. The actor writes a zero-byte `{chunk.label}.skipped` marker
+and returns. Assembly fills the footprint with constant-zero/NaN fill tasks. The marker
+distinguishes a legitimate skip from a silently-failed chunk; `verify_staged_completeness`
+requires every live chunk to have either a staged zarr or a skip marker.
 
 #### 4c. Temporal Sampling (`sampling.py`)
 
-For each pixel and each of `repeat_times` repeats, `sample_size` timesteps are drawn from a
-validity-weighted distribution. The implementation is vectorized via cumsum + searchsorted
-(~50–100× faster than a per-pixel Python loop).
+For each bucket `(s2_bin, s1_bin)`:
 
-Repeats are **folded into the batch dimension**: for batch size B and repeat_times R, the
-GPU receives a (B×R, sample_size, bands+1) tensor and processes all repeats in one forward pass.
-Embeddings are reshaped to (B, R, 128) and averaged on-GPU before CPU transfer.
+- **`resample_s2_bucket`** — for each pixel, selects `s2_bin` timesteps from the valid
+  S2 observations (deterministic, no random repeats). Returns `(B, s2_bin, 12)` including
+  normalised bands + DOY feature.
+- **`resample_s1_bucket`** — loads ascending + descending observations and concatenates
+  per-modality-normalised VV/VH pairs + DOY. Returns `(B, s1_bin, 3)`.
+
+Each modality uses its own `(mean, std)` from `S1_ASC_BAND_MEAN/STD` and
+`S1_DESC_BAND_MEAN/STD` in `config/inference.py`. Ascending and descending are normalised
+separately before concatenation so that the model sees per-orbit statistics, not blended ones.
+
+`build_resample_indices` handles under-sampled pixels (fewer valid timesteps than the
+bucket target) via deterministic repeat-padding — last valid timestep is duplicated until
+target is reached. Over-sampled pixels are uniformly sub-sampled.
 
 #### 4d. GPU Forward Pass (`inference.py`)
 
-- **FP16 (`model.half()`)** — halves memory bandwidth and activation memory, enabling
-  batch_size=3584; 3-repeat averaging absorbs FP16 noise.
-- **`torch.compile` is disabled** — on g5.2xlarge (15.4 GB VRAM), CUDA graph capture consumed
-  11.6 GB and made forward passes slower due to GRU recompilation (3,770 ms vs. 1,944 ms).
-- **cuDNN benchmark mode** — lets cuDNN select the fastest algorithm for GRU/conv ops.
+- **Bucket loop** — `iter_buckets(largest_first=True)` yields buckets from largest to
+  smallest; the largest bucket sets the "hot" GPU allocation so smaller buckets reuse it.
+- **Prefetch thread** — a `ThreadPoolExecutor(max_workers=1)` pipelines CPU batch
+  preparation (data loading + normalization) while the GPU runs the previous forward pass.
+- **FP16** — `model.half()` halves memory bandwidth; bucket-level aggregation (instead of
+  repeat averaging) absorbs FP16 noise.
+- **`torch.compile` is disabled** — GRU recompilation per unique seq_len makes it slower.
+- **cuDNN benchmark mode** — fastest algorithm for GRU/conv ops.
 - **Throughput:** ~1,300 px/sec per A10G; 100 actors ≈ 130,000 px/sec.
 
 Output per chunk: `embeddings` array (H, W, 128) int8 with zeros for invalid pixels,
-plus a per-pixel float32 `scale` factor for dequantization.
+plus a per-pixel float32 `scale` factor for dequantization. The model produces 192-D
+representations; only the first 128 dimensions are saved (`save_dim = min(128, repr_dim)`).
 
 ### 4e. Quantization (`quantization.py`)
 
@@ -248,11 +242,71 @@ final store as 2D spatial variables (dims: `time, northing, easting`).
 
 ### 6. Dask Assembly
 
-After all live chunks complete, a Dask cluster (20-500 Fargate workers × 4 GB RAM) reads staged
-chunks and assembles them into the final Icechunk store:
+After all live chunks complete, a Dask cluster (20-500 workers × 4 GB RAM) reads staged
+chunks and assembles them into the final Icechunk store.
 
-1. Re-run `filter_chunks_by_roi_mask` to recover the set of live chunk labels (the list isn't
-   marshaled through Prefect; the ROI zarr path is the source of truth).
+#### Three-layer chunk anatomy
+
+The assembly design deliberately uses three different chunk granularities for three
+independent concerns. Understanding this is key to understanding why the code is shaped
+as it is:
+
+```text
+Layer                   Size              Controls
+──────────────────────────────────────────────────────────────────────
+Dask logical block      2000×2000 px      Scheduler task count (RAM)
+Staged zarr sub-chunk     500×500 px      Per-task read + decode RAM
+Final store sub-chunk     500×500×4       Downstream partial-read cost
+
+                         ┌──────────────────────────┐
+  One Dask task ──────►  │  ChunkSpec  2000×2000 px  │
+  (one entry in the      │  ┌────┬────┬────┬────┐   │
+   scheduler's task      │  │500 │500 │500 │500 │   │
+   graph)                │  ├────┼────┼────┼────┤   │
+                         │  │    │    │    │    │   │
+                         │  ├────┼────┼────┼────┤   │
+                         │  │    │    │    │    │   │
+                         │  ├────┼────┼────┼────┤   │
+                         │  │    │    │    │    │   │
+                         │  └────┴────┴────┴────┘   │
+                         │  16 on-disk sub-chunks    │
+                         └──────────────────────────┘
+                           to_icechunk handles the
+                           fan-out via align_chunks=True
+```
+
+At sub-chunk granularity (millions of tasks), the scheduler's per-task `TaskState` overhead
+(~1.5 KB each — see [`ingest/README.md`](../ingest/README.md#background-how-dask-task-graphs-consume-scheduler-ram))
+exhausted the scheduler's 8 GB RAM during graph expansion before any worker started. At
+ChunkSpec granularity (a few thousand tasks at cornbelt scale), graph planning takes
+seconds.
+
+The mechanism that makes this possible is `align_chunks=True` in the `to_icechunk` call.
+Without it, on-disk sub-chunk size and Dask block size would be forced to match:
+
+```text
+Without align_chunks=True (forced coupling):
+  To write 500×500 on-disk chunks, Dask blocks must also be 500×500.
+  A 2000×2000 ChunkSpec becomes 16 Dask blocks → 16 TaskStates.
+
+  At cornbelt scale: 5,000 ChunkSpecs × 16 sub-chunks × 2 layers
+                   = 160,000 TaskStates — manageable, but grows fast.
+  Add more variables, time steps, or larger ROIs and this explodes.
+
+With align_chunks=True:
+  Dask block = 2000×2000 ChunkSpec → 1 TaskState per variable per ChunkSpec.
+  Worker reads the full 2000×2000 array and writes it in one call.
+  zarr/icechunk splits the write into 500×500 on-disk sub-chunks internally.
+
+  Scheduler graph:  1 TaskState per ChunkSpec  (graph stays small)
+  On-disk layout:  16 sub-chunks per ChunkSpec (reads stay fast)
+  These two numbers are now independent — each can be tuned separately.
+```
+
+#### Assembly steps
+
+1. Re-run `filter_chunks_by_roi_mask` to recover the set of live chunk labels (the list
+   isn't marshaled through Prefect; the ROI zarr path is the source of truth).
 2. Build a lazy Dask mosaic as two unmaterialized `Blockwise` layers, at **ChunkSpec
    granularity** — one dask block per ChunkSpec (full spatial extent × full band axis):
     - a `da.full` template of the right shape filled with the fill value (0 for int8
@@ -260,12 +314,6 @@ chunks and assembles them into the final Icechunk store:
     - a `map_blocks(_assemble_var_block, live_lookup=…)` on top that, per block, consults
       a `(row, col) -> staged_path` dict and either reads the entire staged chunk or
       returns the fill template unchanged.
-
-   Dask block size is deliberately **decoupled from on-disk sub-chunk size**: task count
-   = `n_chunks` (a few thousand at cornbelt scale), not `n_chunks * sub_chunks_per_chunk`
-   (millions). The coarser granularity is what keeps the Dask scheduler alive — at the
-   sub-chunk granularity, the scheduler's per-task `TaskState` overhead (~1.5 KB) blew
-   through 8 GB of RAM during graph expansion before any worker started.
 3. Output zarr sub-chunking (500×500×4) is set via `to_icechunk(..., encoding=...)` and
    read from the staged files' on-disk chunk shape. `align_chunks=True` lets
    `to_icechunk` fan a single dask block out into 512 small on-disk zarr chunks — dask
@@ -307,13 +355,12 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | Parameter | Default | Notes |
 |---|---|---|
 | `batch_size` | 3584 | GPU pixels per forward pass |
-| `repeat_times` | 3 | Independent samplings per pixel; averaged for final embedding |
-| `sample_size_s2` | 40 | S2 timesteps per repeat |
-| `sample_size_s1` | 40 | S1 timesteps per repeat |
-| `min_valid_timesteps` | 0 | Include all pixels with any valid S2 observation |
-| `s1_orbit` | `"ascending"` | `"ascending"`, `"descending"` |
-| `compute_std` | `False` | Also write per-pixel embedding std across repeats |
-| `latent_dim` | 128 | Embedding dimension (must match checkpoint) |
+| `num_obs_checkpoints` | `range(8, 257, 8)` | Bucketed sequence-length schedule; pixels binned to nearest checkpoint |
+| `s1_orbit` | `"ascending"` | `"ascending"`, `"descending"`, or `"both"` |
+| `norm_source` | `"mpc"` | Band stats origin; `"aws"` for the AWS-normalised encoder checkpoint |
+| `latent_dim` | 192 | Transformer hidden dim (must match checkpoint) |
+| `representation_dim` | 192 | Model output dim; first 128 dims are saved to the store |
+| `dim_feedforward` | 2048 | Transformer FFN width |
 | `gpu_instance_type` | `g5.2xlarge` | Worker EC2 type |
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
@@ -337,9 +384,9 @@ Several modules are ported from the original `tessera_infer` repository:
 
 | File | Ported from | Changes |
 |---|---|---|
-| `sampling.py` | `tessera_infer/src/multi_tile_infer.py` | Type hints, ruff formatting. Sampling logic unchanged. |
-| `inference.py` | `tessera_infer` process_tile logic | Restructured into `run_inference()`. Same repeated random sampling + averaging. |
-| `models/` | `tessera_infer/src/models/` | See `models/README.md`. |
+| `sampling.py` | `tessera_infer/src/multi_tile_infer.py` | v1.1 bucketed deterministic sampling (replaces random repeat-averaging). |
+| `inference.py` | `tessera_infer` process_tile logic | v1.1 bucket loop with prefetch thread; removes repeat/averaging path. |
+| `models/` | `tessera_infer/src/models/` | See `models/README.md`. MLP `dim_reducer`, encoder-only checkpoint loading. |
 
 New code (not ported):
 

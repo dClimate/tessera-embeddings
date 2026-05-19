@@ -2,7 +2,7 @@
 
 Modules for querying, authenticating, and loading satellite data from STAC catalogs and CMR
 into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_sar`,
-`ingest_s2_roi_reflectance`) and the BarlowTwins tile-based ingestion flows.
+`ingest_s2_roi_reflectance`).
 
 ---
 
@@ -59,9 +59,15 @@ S2 and Landsat are queried by tile ID property (e.g., `grid:code = T33UUP`), whi
 only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equivalent
 property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbox()`.
 
-`_query_stac_items` is wrapped with `tenacity` retry logic: up to 4 attempts with
-exponential back-off (max 120 s) on `APIError`, which handles transient catalog outages
-without failing the whole flow.
+`_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry`
+passed into `StacApiIO` (`max_retries=Retry(total=8, backoff_factor=2,
+status_forcelist=(429, 500, 502, 503, 504))`). Because `search.items()` paginates
+lazily, each page fetch is a separate HTTP call — configuring retries on the underlying
+`HTTPAdapter` means a transient 5xx on page N is retried in place, instead of throwing
+away prior pages and restarting the whole query. This matters most for CMR-STAC, which
+returns 502/503 under load on large date-range queries. Note that `StacApiIO`'s default
+`max_retries=5` passes a bare int to urllib3, which has an empty `status_forcelist` and
+therefore does **not** retry 5xx responses — the explicit `Retry` object is required.
 
 Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
 cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
@@ -153,7 +159,7 @@ These happen before `odc.stac.load` is called:
   rendered in order and later items overwrite earlier ones where they overlap. Items are
   sorted cloudiest-first so the clearest tile paints last and wins. This is the standard
   approach for multi-tile STAC mosaicking and is required for ROI queries that cross tile
-  boundaries; not needed for single-tile BarlowTwins ingestion.
+  boundaries.
 - **Dimension rename** — `normalize_odc_dims` maps `odc.stac.load`'s `y`/`x` output
   dimensions to the project-wide `northing`/`easting` convention and drops `spatial_ref`.
 
@@ -199,6 +205,123 @@ This is a fully lazy Dask operation — no data is materialised until the Zarr w
 ---
 
 ## Performance Optimizations
+
+### Background: how Dask task graphs consume scheduler RAM
+
+"Dask is lazy" means workers don't read data until `.compute()` is called. It does *not*
+mean the scheduler avoids work. Before the first worker task executes, `dask.distributed`
+must expand the full `HighLevelGraph` (HLG) — the compact Python-side description of the
+computation — into a flat dictionary of `TaskState` objects in the scheduler process. Each
+`TaskState` holds the function, arguments, and dependency set for one task. The cost:
+
+```text
+    scheduler RAM used ≈ n_tasks × 1.5 KB
+```
+
+This is fully predictable and independent of data size. A graph with 1 million tasks
+consumes ~1.5 GB of scheduler RAM before any worker reads a single byte.
+
+The HLG itself is compact — it stores *layer dicts* rather than expanded objects. The
+expansion to TaskStates happens only when the graph is submitted to the scheduler:
+
+```text
+  Python process (builds the HLG)          Dask distributed scheduler process
+  ─────────────────────────────────         ─────────────────────────────────────
+  Layer "zarr_read"                         TaskState("zarr_read",(t=0,y= 0,x= 0))
+    { (t=0,y=0,x=0): read_fn, ... }         TaskState("zarr_read",(t=0,y= 0,x= 1))
+  Layer "baseline_corr"                     TaskState("zarr_read",(t=0,y= 0,x= 2))
+    { (t=0,y=0,x=0): corr_fn, ... }         ...
+  Layer "roi_mask"                          TaskState("baseline_corr",(t=0,y=0,x=0))
+    { (t=0,y=0,x=0): mask_fn, ... }         ...
+  Layer "zarr_write"
+    { (t=0,y=0,x=0): write_fn, ... }       one TaskState object per task,
+                                            all held in scheduler RAM simultaneously
+  4 compact Python dicts ≈ tens of MB      n_tasks × 1.5 KB of scheduler RAM
+```
+
+#### How task count multiplies: operations × chunk dimensions
+
+Each Dask operation (read, transform, write) adds a new layer. Each layer has one task per
+combination of *chunk coordinates* across all chunked dimensions. For S2 ingestion over a
+large ROI (e.g. cornbelt scale: ~75×50 grid of 2000×2000 px spatial chunks), the S2 flow
+processes one date at a time, so the time dimension is always 1:
+
+```text
+  Dimensions per single S2 date (ingest_s2_roi_reflectance):
+    spatial chunks:   ~3,750  (75×50 grid)
+    dates:                 1  (one date per loop iteration)
+    band variables:       10  (each S2 band is a separate xarray variable)
+
+  Operation            tasks per layer                          notes
+  ────────────────────────────────────────────────────────────────────────
+  odc.stac read     3,750 × 1 × 10 =  37,500   one task per (chunk, band var)
+  baseline corr.    3,750 × 1 × 10 =  37,500
+  ROI mask          3,750 × 1 × 10 =  37,500
+  zarr write        3,750 × 1 × 10 =  37,500
+                                    ─────────
+        per-date total:               150,000 tasks ≈ 0.2 GB scheduler RAM   ✓
+
+  Full year (all ~100 S2 dates in one graph, hypothetically):
+  3,750 × 100 × 10 × 4 = 15,000,000 tasks ≈ 22 GB scheduler RAM             ✗ OOM
+```
+
+The two flows keep task count bounded via different mechanisms — per-date iteration for S2,
+time-windowed batching for S1 — described in the sections below. The same scheduler-RAM
+discipline reappears in inference assembly; see
+[`inference/README.md`](../inference/README.md#three-layer-chunk-anatomy) for the
+ChunkSpec-vs-sub-chunk decoupling that makes assembly survive on the same budget.
+
+### S2: per-date iteration (task graph management)
+
+`ingest_s2_roi_reflectance` queries STAC for the full date range upfront, groups items by
+calendar day via `group_items_by_date`, then processes one day at a time in a Python loop.
+Each iteration builds a single-date Dask graph, calls `odc.stac.load` for that day, filters
+coverage, and writes before moving to the next date:
+
+```text
+Full year (don't build at once):
+┌──────────────────────────── 365 days ────────────────────────────────┐
+│ tiles × dates × bands = O(millions of tasks) → scheduler OOM         │
+└──────────────────────────────────────────────────────────────────────┘
+
+Per-date iteration (what ingest_s2_roi_reflectance actually does):
+ 2024-03-01    2024-03-06    2024-03-11    ...
+┌────────────┐ ┌────────────┐ ┌────────────┐
+│ build      │ │ build      │ │ build      │
+│ SCL check  │ │ SCL check  │ │ SCL check  │
+│ compute    │ │ compute    │ │ compute    │
+│ write      │ │ write      │ │ write      │
+│ discard ◄──┼─┼── graph freed after each date
+└────────────┘ └────────────┘ └────────────┘
+```
+
+Each single-date graph is small: `spatial_chunks × bands` tasks, with no date dimension to
+multiply through. The per-date overhead (one Python loop iteration, one Zarr append) is
+negligible compared to the Dask compute time for a large spatial ROI.
+
+### S1: time-windowed batching (task graph management)
+
+`ingest_s1_roi_sar` uses a different approach: it splits the full date range into
+`batch_days`-wide windows (default 30) and runs one `build → compute → write → discard`
+cycle per window. The reason is that the STS credentials obtained for S3 direct access to
+OPERA data expire after 1 hour, so batches also serve as natural credential-refresh
+checkpoints:
+
+```text
+Batched approach (batch_days=30, ingest_s1_roi_sar only):
+ Jan 1–30        Feb 1–28        Mar 1–30       ...
+┌────────────┐  ┌────────────┐  ┌────────────┐
+│ build      │  │ build      │  │ build      │
+│ compute    │  │ compute    │  │ compute    │
+│ write      │  │ write      │  │ write      │
+│ discard ◄──┼──┼── graph freed; S3 creds refreshed
+└────────────┘  └────────────┘  └────────────┘
+```
+
+`batch_days` is a parameter on `ingest_s1_roi_sar`. It is not present on the S2 flow. The
+formula in the background section above applies to estimating how many tasks a given
+window width will produce; the 30-day default keeps each batch well within the scheduler's
+RAM budget at cornbelt scale.
 
 ### Lazy evaluation throughout
 

@@ -141,8 +141,11 @@ def _create_storage(
             s3_kwargs["get_credentials"] = get_credentials
             s3_kwargs["scatter_initial_credentials"] = scatter_initial_credentials
         return icechunk.s3_storage(**s3_kwargs)
-    Path(store_path).parent.mkdir(parents=True, exist_ok=True)
-    return icechunk.local_filesystem_storage(store_path)
+    # icechunk.local_filesystem_storage takes a plain path, not a URI.
+    # Strip the file:// scheme that fsspec-style configs commonly use.
+    local_path = store_path[7:] if store_path.startswith("file://") else store_path
+    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+    return icechunk.local_filesystem_storage(local_path)
 
 
 def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk.RepositoryConfig | None:

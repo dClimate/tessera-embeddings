@@ -46,6 +46,15 @@ override.
 | `tessera_embeddings.py` | Distributed GPU inference: spin up Ray cluster, work-stealing dispatch across actors, Dask-based assembly. On-cancellation hook tears down EC2 instances. |
 | `tessera_full_pipeline.py` | Async master flow chaining the four above via `arun_deployment`. |
 
+> **Why so many flow files?** The two-flow pattern below explains the inner/outer
+> split per file. The flows themselves are kept thin — task-graph discipline
+> (per-date iteration for S2, batched windows for S1, ChunkSpec-granularity
+> assembly) lives in the domain modules. See
+> [`ingest/README.md`](../../ingest/README.md#background-how-dask-task-graphs-consume-scheduler-ram)
+> for the scheduler-RAM cost model that drives those choices, and
+> [`inference/README.md`](../../inference/README.md#three-layer-chunk-anatomy)
+> for the assembly-side equivalent.
+
 ## The two-flow pattern
 
 You'll notice each flow file has an outer `@flow` and an inner

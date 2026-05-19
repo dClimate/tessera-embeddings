@@ -9,6 +9,9 @@ unchanged on a developer laptop or in CI.
 from __future__ import annotations
 
 import contextlib
+import shutil
+import subprocess
+import tempfile
 from collections.abc import Iterator
 
 import ray
@@ -46,13 +49,19 @@ def ray_cluster(
     Yields:
         :data:`LOCAL_ADDRESS_SENTINEL` (the string ``"local"``).
     """
+    # Use a fresh temp dir each time so stale session files from prior
+    # runs (or from the Dask cluster that precedes us) never block GCS startup.
+    subprocess.run(["ray", "stop", "--force"], capture_output=True)
+    ray_tmpdir = tempfile.mkdtemp(prefix="ray_t_", dir="/tmp")
     ray.init(
         num_cpus=num_cpus,
         num_gpus=num_gpus,
         include_dashboard=include_dashboard,
         ignore_reinit_error=True,
+        _temp_dir=ray_tmpdir,
     )
     try:
         yield LOCAL_ADDRESS_SENTINEL
     finally:
         ray.shutdown()
+        shutil.rmtree(ray_tmpdir, ignore_errors=True)
