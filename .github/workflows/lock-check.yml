@@ -26,11 +26,34 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: "lock/dev.lock"
-      - name: Re-run lock.sh and verify no diff
+      - name: Check uv.lock is up to date
+        run: uv lock --check
+
+      - name: Check pip-compile lock files are up to date
+        # Regenerate into tmp files and diff; exits nonzero if any file
+        # would change. uv lock --check handles uv.lock above.
         run: |
-          bash scripts/lock.sh
-          if ! git diff --exit-code uv.lock lock/inference-cpu.lock lock/inference-cu121.lock lock/dev.lock; then
-            echo "::error::pyproject.toml changed but lock files were not regenerated."
-            echo "::error::Run scripts/lock.sh and commit the result."
+          uv pip compile pyproject.toml \
+              --extra inference --extra prefect --extra aws \
+              --universal --no-strip-extras \
+              -o /tmp/inference-cpu.lock
+          uv pip compile pyproject.toml \
+              --extra inference --extra prefect --extra aws \
+              --python-platform linux \
+              --python-version 3.12 \
+              --extra-index-url https://download.pytorch.org/whl/cu121 \
+              --index-strategy unsafe-best-match \
+              --no-strip-extras \
+              -o /tmp/inference-cu121.lock
+          uv pip compile pyproject.toml \
+              --extra inference --extra prefect --extra aws --group dev \
+              --universal --no-strip-extras \
+              -o /tmp/dev.lock
+          changed=0
+          diff lock/inference-cpu.lock /tmp/inference-cpu.lock || changed=1
+          diff lock/inference-cu121.lock /tmp/inference-cu121.lock || changed=1
+          diff lock/dev.lock /tmp/dev.lock || changed=1
+          if [ "$changed" -ne 0 ]; then
+            echo "::error::Lock files are out of date. Run scripts/lock.sh and commit."
             exit 1
           fi
