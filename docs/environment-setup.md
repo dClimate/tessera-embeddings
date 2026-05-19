@@ -54,7 +54,8 @@ Untested. CPU is the supported laptop path.
 ## GDAL
 
 `gdal` is declared as an unpinned dependency and is source-only on PyPI —
-it builds against the system `libgdal`. Install the system library first:
+it builds against the system `libgdal`. You need a matching system library
+before installing:
 
 **macOS:**
 ```bash
@@ -66,8 +67,14 @@ brew install gdal
 sudo apt-get install libgdal-dev
 ```
 
-Then `pip install tessera_embeddings` (or `uv sync`) will compile the
-Python bindings against your installed version.
+The Python binding version must match your installed libgdal. Check with
+`gdal-config --version` and install the matching binding:
+```bash
+pip install gdal==$(gdal-config --version)
+```
+
+CI runs inside the `ghcr.io/osgeo/gdal:ubuntu-small-3.13.0` container,
+which pins both to 3.13.0.
 
 ## Platform notes
 
