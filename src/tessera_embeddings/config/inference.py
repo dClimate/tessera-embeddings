@@ -53,24 +53,64 @@ def _normalize_obs_checkpoints(checkpoints: tuple[int, ...]) -> tuple[int, ...]:
 
 _NORM_STATS: dict[str, dict[str, list[float]]] = {
     "mpc": {
-        "s2_mean": [2683.4553, 2223.3630, 2432.0950, 3633.1970, 3602.1755,
-                    3006.4324, 3400.2710, 3515.6392, 2456.9163, 1983.8783],
-        "s2_std":  [2739.5217, 2846.2993, 2690.8250, 2290.0439, 2088.8970,
-                    2673.1106, 2381.4521, 2229.5225, 1601.0942, 1495.3545],
+        "s2_mean": [
+            2683.4553,
+            2223.3630,
+            2432.0950,
+            3633.1970,
+            3602.1755,
+            3006.4324,
+            3400.2710,
+            3515.6392,
+            2456.9163,
+            1983.8783,
+        ],
+        "s2_std": [
+            2739.5217,
+            2846.2993,
+            2690.8250,
+            2290.0439,
+            2088.8970,
+            2673.1106,
+            2381.4521,
+            2229.5225,
+            1601.0942,
+            1495.3545,
+        ],
         "s1_asc_mean": [5588.3291, 3025.6270],
-        "s1_asc_std":  [1713.4646, 1693.0471],
+        "s1_asc_std": [1713.4646, 1693.0471],
         "s1_desc_mean": [5552.9683, 2955.0520],
-        "s1_desc_std":  [1685.5857, 1677.6414],
+        "s1_desc_std": [1685.5857, 1677.6414],
     },
     "aws": {
-        "s2_mean": [2793.6589, 2356.7776, 2551.0496, 3741.9229, 3713.7844,
-                    3120.1997, 3516.3342, 3637.0342, 2501.0283, 2038.1504],
-        "s2_std":  [2810.0093, 2933.8835, 2755.6360, 2344.5027, 2145.7986,
-                    2743.9019, 2438.8601, 2286.5977, 1680.7367, 1585.5529],
+        "s2_mean": [
+            2793.6589,
+            2356.7776,
+            2551.0496,
+            3741.9229,
+            3713.7844,
+            3120.1997,
+            3516.3342,
+            3637.0342,
+            2501.0283,
+            2038.1504,
+        ],
+        "s2_std": [
+            2810.0093,
+            2933.8835,
+            2755.6360,
+            2344.5027,
+            2145.7986,
+            2743.9019,
+            2438.8601,
+            2286.5977,
+            1680.7367,
+            1585.5529,
+        ],
         "s1_asc_mean": [5664.5439, 2802.9736],
-        "s1_asc_std":  [1678.7821, 1786.0414],
+        "s1_asc_std": [1678.7821, 1786.0414],
         "s1_desc_mean": [5710.6992, 2830.1045],
-        "s1_desc_std":  [1616.1969, 1761.8499],
+        "s1_desc_std": [1616.1969, 1761.8499],
     },
 }
 
@@ -185,11 +225,8 @@ class InferenceConfig:
             valid = ", ".join(repr(k) for k in _NORM_STATS)
             raise ValueError(f"Invalid norm_source: {self.norm_source!r}. Must be one of {valid}.")
         if self.s1_orbit not in {"ascending", "descending", "both"}:
-            raise ValueError(
-                f"Invalid s1_orbit: {self.s1_orbit!r}. Must be 'ascending', 'descending', or 'both'."
-            )
+            raise ValueError(f"Invalid s1_orbit: {self.s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
         self.num_obs_checkpoints = _normalize_obs_checkpoints(self.num_obs_checkpoints)
 
         # v1.1 sampling is deterministic — no repeat variance to measure.
         self.compute_std = False
-

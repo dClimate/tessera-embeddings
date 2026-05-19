@@ -36,12 +36,8 @@ def _seed_ssm_and_vpc() -> tuple[str, list[str], str]:
 
     # VPC + 2 subnets (so _pick_least_loaded_subnet has something to choose between)
     vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]
-    subnet_a = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.1.0/24", AvailabilityZone=f"{REGION}a")[
-        "Subnet"
-    ]
-    subnet_b = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.2.0/24", AvailabilityZone=f"{REGION}b")[
-        "Subnet"
-    ]
+    subnet_a = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.1.0/24", AvailabilityZone=f"{REGION}a")["Subnet"]
+    subnet_b = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.2.0/24", AvailabilityZone=f"{REGION}b")["Subnet"]
     subnet_ids = [subnet_a["SubnetId"], subnet_b["SubnetId"]]
 
     key_pair = ec2.create_key_pair(KeyName="test-key")
@@ -130,12 +126,8 @@ def test_pick_least_loaded_subnet_returns_least_loaded() -> None:
     """Subnet with the fewest tagged Ray instances wins."""
     ec2 = boto3.client("ec2", region_name=REGION)
     vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]
-    subnet_a = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.1.0/24", AvailabilityZone=f"{REGION}a")[
-        "Subnet"
-    ]
-    subnet_b = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.2.0/24", AvailabilityZone=f"{REGION}b")[
-        "Subnet"
-    ]
+    subnet_a = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.1.0/24", AvailabilityZone=f"{REGION}a")["Subnet"]
+    subnet_b = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.2.0/24", AvailabilityZone=f"{REGION}b")["Subnet"]
     # Run 2 instances in subnet_a tagged for our cluster — subnet_b should win
     ec2.run_instances(
         ImageId="ami-x",

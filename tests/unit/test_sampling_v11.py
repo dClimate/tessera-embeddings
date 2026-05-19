@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from tessera_embeddings.inference.sampling import (
     bucket_for_count,
@@ -131,10 +130,15 @@ def test_resample_s1_bucket_both_orbits_output_shape() -> None:
     std2 = np.ones(2, dtype=np.float32)
 
     out = resample_s1_bucket(
-        asc_bands, asc_doys, desc_bands, desc_doys,
+        asc_bands,
+        asc_doys,
+        desc_bands,
+        desc_doys,
         target=8,
-        s1a_mean=mean2, s1a_std=std2,
-        s1d_mean=mean2, s1d_std=std2,
+        s1a_mean=mean2,
+        s1a_std=std2,
+        s1d_mean=mean2,
+        s1d_std=std2,
     )
     # 2 asc bands + 1 DOY = 3 features
     assert out.shape == (b, 8, 3)
@@ -152,9 +156,14 @@ def test_resample_s1_bucket_single_orbit_empty_desc() -> None:
     std2 = np.ones(2, dtype=np.float32)
 
     out = resample_s1_bucket(
-        asc_bands, asc_doys, empty_bands, empty_doys,
+        asc_bands,
+        asc_doys,
+        empty_bands,
+        empty_doys,
         target=8,
-        s1a_mean=mean2, s1a_std=std2,
-        s1d_mean=mean2, s1d_std=std2,
+        s1a_mean=mean2,
+        s1a_std=std2,
+        s1d_mean=mean2,
+        s1d_std=std2,
     )
     assert out.shape == (b, 8, 3)

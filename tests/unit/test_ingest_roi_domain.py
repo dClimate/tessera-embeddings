@@ -86,13 +86,9 @@ def test_no_prefect_or_get_client_in_domain_modules() -> None:
             # Reject: import prefect, from prefect import …
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    assert not alias.name.startswith("prefect"), (
-                        f"{path} imports {alias.name!r}"
-                    )
+                    assert not alias.name.startswith("prefect"), f"{path} imports {alias.name!r}"
             elif isinstance(node, ast.ImportFrom) and node.module:
-                assert not node.module.startswith("prefect"), (
-                    f"{path} imports from {node.module!r}"
-                )
+                assert not node.module.startswith("prefect"), f"{path} imports from {node.module!r}"
             # Reject: get_run_logger() / get_client() call sites
             elif isinstance(node, ast.Call):
                 fn = node.func

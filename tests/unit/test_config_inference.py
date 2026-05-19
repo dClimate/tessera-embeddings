@@ -11,7 +11,6 @@ from tessera_embeddings.config.inference import (
 )
 from tessera_embeddings.config.time_windows import parse_time_window
 
-
 # ---------------------------------------------------------------------------
 # checkpoint_filename
 # ---------------------------------------------------------------------------

@@ -88,8 +88,7 @@ def _bearer_session_factory(token: str) -> requests.Session:
         os.environ.get("EARTHDATA_TOKEN")
         or (os.environ.get("EARTHDATA_USERNAME") and os.environ.get("EARTHDATA_PASSWORD"))
     ),
-    reason="EDL credentials required: set EARTHDATA_TOKEN (preferred) or "
-    "EARTHDATA_USERNAME + EARTHDATA_PASSWORD",
+    reason="EDL credentials required: set EARTHDATA_TOKEN (preferred) or EARTHDATA_USERNAME + EARTHDATA_PASSWORD",
 )
 def test_s1_roi_parity(
     tmp_path: Path,

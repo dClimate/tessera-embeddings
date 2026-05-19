@@ -68,6 +68,7 @@ def test_respects_max_concurrent_invariant() -> None:
 
 def test_propagates_exceptions_via_result() -> None:
     """Failed jobs are returned with a future whose ``.result()`` raises."""
+
     def boom(should_fail: bool) -> str:
         if should_fail:
             raise RuntimeError("kapow")
