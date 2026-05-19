@@ -33,7 +33,7 @@ jobs:
           path: |
             .venv
             ~/.local/share/uv/python
-          key: v4-venv-gdal3.13.0-py3.13-${{ hashFiles('lock/dev.lock') }}
+          key: v5-venv-gdal3.13.0-py3.13-${{ hashFiles('lock/dev.lock') }}
 
       - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -41,7 +41,7 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq build-essential
           GDAL_VERSION=$(gdal-config --version)
-          uv venv --python 3.13 .venv
+          uv venv --python 3.13 --clear .venv
           grep -v '^gdal==' lock/dev.lock | uv pip install --python .venv/bin/python \
             --extra-index-url https://download.pytorch.org/whl/cpu \
             --index-strategy unsafe-best-match \
@@ -69,7 +69,7 @@ jobs:
           path: |
             .venv
             ~/.local/share/uv/python
-          key: v4-venv-gdal3.13.0-py3.13-${{ hashFiles('lock/dev.lock') }}
+          key: v5-venv-gdal3.13.0-py3.13-${{ hashFiles('lock/dev.lock') }}
 
       - name: Install dependencies
         if: steps.cache-venv.outputs.cache-hit != 'true'
@@ -77,7 +77,7 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq build-essential
           GDAL_VERSION=$(gdal-config --version)
-          uv venv --python 3.13 .venv
+          uv venv --python 3.13 --clear .venv
           grep -v '^gdal==' lock/dev.lock | uv pip install --python .venv/bin/python \
             --extra-index-url https://download.pytorch.org/whl/cpu \
             --index-strategy unsafe-best-match \
