@@ -29,31 +29,11 @@ jobs:
       - name: Check uv.lock is up to date
         run: uv lock --check
 
-      - name: Check pip-compile lock files are up to date
-        # Regenerate into tmp files and diff; exits nonzero if any file
-        # would change. uv lock --check handles uv.lock above.
-        run: |
-          uv pip compile pyproject.toml \
-              --extra inference --extra prefect --extra aws \
-              --universal --no-strip-extras \
-              -o /tmp/inference-cpu.lock
-          uv pip compile pyproject.toml \
-              --extra inference --extra prefect --extra aws \
-              --python-platform linux \
-              --python-version 3.12 \
-              --extra-index-url https://download.pytorch.org/whl/cu121 \
-              --index-strategy unsafe-best-match \
-              --no-strip-extras \
-              -o /tmp/inference-cu121.lock
-          uv pip compile pyproject.toml \
-              --extra inference --extra prefect --extra aws --group dev \
-              --universal --no-strip-extras \
-              -o /tmp/dev.lock
-          changed=0
-          diff lock/inference-cpu.lock /tmp/inference-cpu.lock || changed=1
-          diff lock/inference-cu121.lock /tmp/inference-cu121.lock || changed=1
-          diff lock/dev.lock /tmp/dev.lock || changed=1
-          if [ "$changed" -ne 0 ]; then
-            echo "::error::Lock files are out of date. Run lock/lock.sh and commit."
-            exit 1
-          fi
+      # uv pip compile has no --check mode and always re-resolves from the
+      # network, so the output depends on what upstream has released at the
+      # moment CI runs — not just on pyproject.toml. Diffing re-generated
+      # pip-compile output in CI produces false failures on every upstream
+      # release. uv lock --check above is the authoritative consistency
+      # gate; if uv.lock is clean, pyproject.toml is consistent. The
+      # pip-compile files are derivative exports — regenerate them locally
+      # whenever uv.lock changes by running lock/lock.sh.
