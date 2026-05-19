@@ -6,6 +6,8 @@ test cost. Update this file whenever a new public module is added.
 
 from __future__ import annotations
 
+import pytest
+
 
 def test_top_level_packages_import() -> None:
     """Every top-level domain package imports."""
@@ -74,12 +76,17 @@ def test_storage_modules_import() -> None:
 
 
 def test_provider_modules_import() -> None:
-    """Provider submodules import."""
+    """Local provider submodules import (no optional AWS deps required)."""
+    from tessera_embeddings.providers.local import dask as local_dask  # noqa: F401
+    from tessera_embeddings.providers.local import ray as local_ray  # noqa: F401
+
+
+def test_aws_provider_modules_import() -> None:
+    """AWS provider submodules import (requires dask-cloudprovider)."""
+    pytest.importorskip("dask_cloudprovider", reason="dask-cloudprovider not installed (AWS extras)")
     from tessera_embeddings.providers.aws import dask as aws_dask  # noqa: F401
     from tessera_embeddings.providers.aws import diagnostics  # noqa: F401
     from tessera_embeddings.providers.aws import ray as aws_ray  # noqa: F401
-    from tessera_embeddings.providers.local import dask as local_dask  # noqa: F401
-    from tessera_embeddings.providers.local import ray as local_ray  # noqa: F401
 
 
 def test_orchestration_modules_import() -> None:
