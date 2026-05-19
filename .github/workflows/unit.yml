@@ -34,7 +34,7 @@ jobs:
       - name: Install build tools
         run: |
           apt-get update -qq
-          apt-get install -y -qq build-essential git
+          apt-get install -y -qq build-essential curl git
 
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
