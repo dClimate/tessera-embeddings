@@ -37,7 +37,7 @@ def _isolated_prefect_runtime() -> Iterator[None]:
 
 @pytest.fixture(scope="session")
 def fixture_quickstart_roi() -> Path:
-    """The bundled Story-County-IA quickstart GeoJSON."""
+    """Denver, CO GeoJSON used by the parity-test cassettes."""
     path = REPO_ROOT / "examples" / "quickstart" / "roi.geojson"
     assert path.exists(), f"Missing quickstart fixture at {path}"
     return path
