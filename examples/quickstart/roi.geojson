@@ -12,16 +12,16 @@
       "type": "Feature",
       "properties": {
         "Name": "quickstart",
-        "Note": "10 km box over Story County, IA (Ames). Story County is the densest corn-producing county in the US (USDA NASS) and is well-covered by OPERA RTC-S1 (~6 ascending acquisitions per month) and Sentinel-2 (~12 acquisitions per month). Chosen to exercise both ingest paths in a realistic agricultural setting."
+        "Note": "~1 km box in Denver, CO (UTM 13N). Covered by both OPERA RTC-S1 ascending and descending tracks — chosen to exercise s1_orbit=both in the quickstart without excessive data volume."
       },
       "geometry": {
         "type": "Polygon",
         "coordinates": [[
-          [-93.620, 42.045],
-          [-93.610, 42.045],
-          [-93.610, 42.054],
-          [-93.620, 42.054],
-          [-93.620, 42.045]
+          [-105.020, 39.740],
+          [-105.010, 39.740],
+          [-105.010, 39.750],
+          [-105.020, 39.750],
+          [-105.020, 39.740]
         ]]
       }
     }
