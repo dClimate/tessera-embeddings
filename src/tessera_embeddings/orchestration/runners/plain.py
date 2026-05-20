@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import yaml
 from dask.distributed import Client
@@ -30,7 +30,7 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
-from tessera_embeddings.inference.data_loading import resolve_s1_orbit
+from tessera_embeddings.inference.data_loading import _active_orbits, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
     checkpoint_to_version,
@@ -41,7 +41,7 @@ from tessera_embeddings.inference.orchestration_helpers import (
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
-from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
+from tessera_embeddings.ingest.s1_roi import ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.providers.local.ray import ray_cluster
@@ -91,8 +91,7 @@ def _run_ingest(
         )
         log.info("S2 ingestion: %s", s2_result)
 
-        orbits_to_ingest: tuple[str, ...] = ("ascending", "descending") if s1_orbit == "both" else (s1_orbit,)
-        for orbit in orbits_to_ingest:
+        for orbit in _active_orbits(s1_orbit):
             log.info("Ingesting S1 SAR (orbit=%s, use_s3_direct=%s)", orbit, s1_use_s3_direct)
             s1_result = ingest_s1_roi_sar(
                 roi_zarr_path=roi_path,
@@ -100,7 +99,7 @@ def _run_ingest(
                 end_date=end_date,
                 store_path=mosaic_base,
                 client=client,
-                orbit=cast(S1Orbit, orbit),
+                orbit=orbit,  # type: ignore[arg-type]
                 use_s3_direct=s1_use_s3_direct,
                 log=log,
                 storage_options=storage_options,
@@ -126,30 +125,21 @@ def _run_inference_and_assemble(
     model_dir = checkpoint_dir or f"{inputs_bucket.rstrip('/')}/models"
     checkpoint_path = f"{model_dir.rstrip('/')}/{checkpoint_filename()}"
 
+    mosaic_base = paths.store_for(roi_name, "reflectance").rsplit("/", 1)[0]
+    staging_base = f"{output_bucket.rstrip('/')}/staging"
+
+    effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
+    if effective_orbit != s1_orbit:
+        log.info("s1_orbit resolved: %s → %s", s1_orbit, effective_orbit)
+
     config = build_inference_config(
-        s1_orbit=s1_orbit,
+        s1_orbit=effective_orbit,
         time_window=time_window,
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
-        num_gpus=0,  # CPU inference for the plain runner
+        num_gpus=0,
     )
-
-    mosaic_base = paths.store_for(roi_name, "reflectance").rsplit("/", 1)[0]
-    staging_base = f"{output_bucket.rstrip('/')}/staging"
-
-    # Probe for available SAR stores before dispatching inference; if s1_orbit="both"
-    # is requested but only one orbit was ingested, fall back gracefully.
-    effective_orbit = resolve_s1_orbit(mosaic_base, config.s1_orbit)
-    if effective_orbit != config.s1_orbit:
-        config = build_inference_config(
-            s1_orbit=effective_orbit,
-            time_window=time_window,
-            checkpoint_path=checkpoint_path,
-            inputs_bucket=inputs_bucket,
-            output_bucket=output_bucket,
-            num_gpus=0,
-        )
 
     chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, config.chunk_size or DEFAULT_CHUNK_SIZE, log)
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_path)

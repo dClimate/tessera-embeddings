@@ -29,7 +29,6 @@ def _mock_stores():
         yield {"extract": mock_extract, "ds": mock_ds}
 
 
-@pytest.mark.usefixtures("_mock_stores")
 class TestReadUpstreamManifests:
     """Verify read_upstream_manifests handles all orbit values."""
 

@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from tessera_embeddings.config.dask import compute_pipeline_cluster_sizing
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
+from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.orchestration.prefect.flows.generate_roi import _crs_suffix
 
 
@@ -115,8 +116,7 @@ async def tessera_full_pipeline(
     """
     log = get_run_logger()
 
-    if s1_orbit not in {"ascending", "descending", "both"}:
-        raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
+    _active_orbits(s1_orbit)  # validates
 
     inputs_bucket = paths.inputs
 
@@ -182,7 +182,7 @@ async def tessera_full_pipeline(
         "min_workers": ingest_min_workers,
         "max_workers": ingest_max_workers,
     }
-    s1_orbits_to_ingest = ("ascending", "descending") if s1_orbit == "both" else (s1_orbit,)
+    s1_orbits_to_ingest = _active_orbits(s1_orbit)
     s1_coros = [
         arun_deployment(
             deployments.ingest_s1_roi_sar,
@@ -218,7 +218,7 @@ async def tessera_full_pipeline(
 
     return {
         "roi_run_id": str(roi_run.id),
-        "s1_run_id": str(s1_run.id),
+        "s1_run_ids": [str(r.id) for r in s1_runs],
         "s2_run_id": str(s2_run.id),
         "embeddings_run_id": str(embeddings_run.id),
     }

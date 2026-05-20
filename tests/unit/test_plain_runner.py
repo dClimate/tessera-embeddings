@@ -44,7 +44,6 @@ def _common_kwargs() -> dict:
     )
 
 
-@pytest.mark.usefixtures("_mock_ingest_deps")
 class TestRunIngestOrbitDecomposition:
     """Verify _run_ingest decomposes s1_orbit='both' into two ingest calls."""
 
