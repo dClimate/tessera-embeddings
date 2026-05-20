@@ -22,7 +22,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from dask.distributed import Client
@@ -33,7 +33,7 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
-from tessera_embeddings.inference.data_loading import resolve_s1_orbit
+from tessera_embeddings.inference.data_loading import _active_orbits, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
     checkpoint_to_version,
@@ -45,7 +45,7 @@ from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.ingest.auth import get_s3_credentials, set_s3_credentials
 from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
-from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
+from tessera_embeddings.ingest.s1_roi import ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.providers.local.ray import ray_cluster
@@ -92,7 +92,7 @@ def _run_ingest(
     roi_name: str,
     start_date: str,
     end_date: str,
-    s1_orbit: S1Orbit,
+    s1_orbit: Literal["ascending", "descending", "both"],
     n_workers: int,
     log: logging.Logger,
     storage_options: dict | None,
@@ -121,25 +121,26 @@ def _run_ingest(
         )
         log.info("S2 ingestion: %s", s2_result)
 
-        log.info("Ingesting S1 SAR (orbit=%s, use_s3_direct=%s)", s1_orbit, s1_use_s3_direct)
-        # When S3 direct is on, the domain function expects callables that fetch
-        # ASF STS credentials and broadcast them to the cluster. The Prefect
-        # flow wires these the same way; without them GDAL hits /vsis3/ with no
-        # AWS env vars and ASF rejects the request.
-        s1_result = ingest_s1_roi_sar(
-            roi_zarr_path=roi_path,
-            start_date=start_date,
-            end_date=end_date,
-            store_path=mosaic_base,
-            client=client,
-            orbit=s1_orbit,
-            use_s3_direct=s1_use_s3_direct,
-            edl_credentials_fn=get_s3_credentials if s1_use_s3_direct else None,
-            apply_credentials_fn=set_s3_credentials if s1_use_s3_direct else None,
-            log=log,
-            storage_options=storage_options,
-        )
-        log.info("S1 ingestion: %s", s1_result)
+        for orbit in _active_orbits(s1_orbit):
+            log.info("Ingesting S1 SAR (orbit=%s, use_s3_direct=%s)", orbit, s1_use_s3_direct)
+            # When S3 direct is on, the domain function expects callables that fetch
+            # ASF STS credentials and broadcast them to the cluster. The Prefect
+            # flow wires these the same way; without them GDAL hits /vsis3/ with no
+            # AWS env vars and ASF rejects the request.
+            s1_result = ingest_s1_roi_sar(
+                roi_zarr_path=roi_path,
+                start_date=start_date,
+                end_date=end_date,
+                store_path=mosaic_base,
+                client=client,
+                orbit=orbit,  # type: ignore[arg-type]
+                use_s3_direct=s1_use_s3_direct,
+                edl_credentials_fn=get_s3_credentials if s1_use_s3_direct else None,
+                apply_credentials_fn=set_s3_credentials if s1_use_s3_direct else None,
+                log=log,
+                storage_options=storage_options,
+            )
+            log.info("S1 ingestion (%s): %s", orbit, s1_result)
 
 
 def _run_inference_and_assemble(
@@ -148,7 +149,7 @@ def _run_inference_and_assemble(
     roi_name: str,
     paths: BucketPaths,
     time_window_end: str,
-    s1_orbit: S1Orbit,
+    s1_orbit: Literal["ascending", "descending", "both"],
     checkpoint_dir: str | None,
     num_gpus: int,
     log: logging.Logger,
@@ -161,22 +162,13 @@ def _run_inference_and_assemble(
     model_dir = checkpoint_dir or f"{inputs_bucket.rstrip('/')}/models"
     checkpoint_path = f"{model_dir.rstrip('/')}/{checkpoint_filename()}"
 
-    config = build_inference_config(
-        s1_orbit=s1_orbit,
-        time_window=time_window,
-        checkpoint_path=checkpoint_path,
-        inputs_bucket=inputs_bucket,
-        output_bucket=output_bucket,
-        num_gpus=num_gpus,
-    )
-
     mosaic_base = paths.store_for(roi_name, "reflectance").rsplit("/", 1)[0]
     staging_base = f"{output_bucket.rstrip('/')}/staging"
 
     # Probe for available SAR stores before dispatching inference; if s1_orbit="both"
     # is requested but only one orbit was ingested, fall back gracefully.
-    effective_orbit = resolve_s1_orbit(mosaic_base, config.s1_orbit)
-    if effective_orbit != config.s1_orbit:
+    effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
+    if effective_orbit != s1_orbit:
         config = build_inference_config(
             s1_orbit=effective_orbit,
             time_window=time_window,
@@ -278,7 +270,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
             time_range:
               start: "2024-07-01"
               end: "2025-07-01"
-            s1_orbit: ascending
+            s1_orbit: ascending    # or "descending" or "both"
             n_workers: 2
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
             device: auto            # "auto" | "cpu" | "cuda"

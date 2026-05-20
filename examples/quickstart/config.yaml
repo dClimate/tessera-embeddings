@@ -16,15 +16,16 @@ paths:
   preprocessed: file:///tmp/tessera/preprocessed
 
 roi:
-  # 10 km box over Story County, IA (Ames) — top corn-producing county.
+  # ~1 km box in Denver, CO — covered by both ascending and descending
+  # OPERA RTC-S1 tracks, making it a good quickstart AOI for s1_orbit=both.
   # See examples/quickstart/README.md for why this AOI was chosen.
-  name: quickstart_story_county_ia
+  name: quickstart_denver_co
   geojson: examples/quickstart/roi.geojson
   resolution: 10.0
   chunk_size: 2000
-  # Story County, IA falls in UTM zone 15N. Rasterisation requires a
+  # Denver, CO falls in UTM zone 13N. Rasterisation requires a
   # projected CRS (metres, not degrees); the GeoJSON itself is CRS84.
-  force_crs: "EPSG:32615"
+  force_crs: "EPSG:32613"
 
 # Ingest date range. Keep narrow for quickstart speed; widen for
 # realistic comparison against production.
@@ -37,7 +38,7 @@ time_range:
 time_window_end: "August 2024"
 
 # Single-orbit ingest is enough for the quickstart.
-s1_orbit: ascending
+s1_orbit: both
 
 # Local Dask cluster size on the runner host.
 n_workers: 2

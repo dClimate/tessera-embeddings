@@ -33,7 +33,7 @@ def test_your_adapter_parity(tmp_path: Path, fixture_quickstart_roi: Path) -> No
         output_path=str(out_a),
         resolution=10.0,
         chunk_size=2000,
-        force_crs="EPSG:32615",
+        force_crs="EPSG:32613",
         input_path=str(fixture_quickstart_roi),
     )
 
@@ -43,7 +43,7 @@ def test_your_adapter_parity(tmp_path: Path, fixture_quickstart_roi: Path) -> No
     #     output_path=str(out_b),
     #     resolution=10.0,
     #     chunk_size=2000,
-    #     force_crs="EPSG:32615",
+    #     force_crs="EPSG:32613",
     # )
 
     assert_zarr_equivalent(out_a, out_b)

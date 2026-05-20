@@ -2,7 +2,7 @@
 
 Both call sites share a session-scoped LocalCluster; STAC HTTP
 responses are intercepted by ``pytest-recording`` against the
-cassette ``tests/fixtures/stac_cassettes/s2_l2a_story_county_jul2024.yaml``.
+cassette ``tests/fixtures/stac_cassettes/test_s2_roi_parity.yaml``.
 
 The actual COG pixel reads (``odc.stac.load`` → rasterio → GDAL curl)
 are NOT mocked — VCR sits at the Python HTTP layer; GDAL bypasses
@@ -28,12 +28,12 @@ from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.orchestration.prefect.flows import ingest_s2_roi_reflectance as flow_module
 from tests.parity.helpers import assert_zarr_equivalent
 
-CASSETTE_NAME = "s2_l2a_story_county_jul2024"
+CASSETTE_NAME = "test_s2_roi_parity"
 
-# Story County, IA. The fixture covers July 2024 — non-trivial S2
+# Denver, CO. The fixture covers July 2024 — non-trivial S2
 # cloud coverage that exercises the painter's-algorithm sort.
-STORY_COUNTY_DATES = ("2024-07-01", "2024-07-31")
-FORCE_CRS = "EPSG:32615"  # UTM zone 15N covers Story County
+DENVER_DATES = ("2024-07-01", "2024-07-31")
+FORCE_CRS = "EPSG:32613"  # UTM zone 13N covers Denver
 
 
 def _stage_quickstart_roi(tmp_path: Path, roi_geojson: Path) -> Path:
@@ -74,8 +74,8 @@ def test_s2_roi_parity(
     domain_log.addHandler(logging.StreamHandler())
     domain_result = ingest_s2_roi_reflectance(
         roi_zarr_path=str(roi_zarr),
-        start_date=STORY_COUNTY_DATES[0],
-        end_date=STORY_COUNTY_DATES[1],
+        start_date=DENVER_DATES[0],
+        end_date=DENVER_DATES[1],
         store_path=str(domain_store),
         client=parity_cluster,
         log=domain_log,
@@ -94,8 +94,8 @@ def test_s2_roi_parity(
     # faithful to the production code path.
     flow_module.ingest_s2_roi_reflectance.fn(  # type: ignore[attr-defined]
         roi_zarr_path=str(roi_zarr),
-        start_date=STORY_COUNTY_DATES[0],
-        end_date=STORY_COUNTY_DATES[1],
+        start_date=DENVER_DATES[0],
+        end_date=DENVER_DATES[1],
         store_path=str(flow_store),
         use_local=True,
     )
