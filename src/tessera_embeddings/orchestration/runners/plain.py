@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import yaml
 from dask.distributed import Client
@@ -62,7 +62,7 @@ def _run_ingest(
     roi_name: str,
     start_date: str,
     end_date: str,
-    s1_orbit: S1Orbit,
+    s1_orbit: Literal["ascending", "descending", "both"],
     n_workers: int,
     log: logging.Logger,
     storage_options: dict | None,
@@ -91,19 +91,21 @@ def _run_ingest(
         )
         log.info("S2 ingestion: %s", s2_result)
 
-        log.info("Ingesting S1 SAR (orbit=%s, use_s3_direct=%s)", s1_orbit, s1_use_s3_direct)
-        s1_result = ingest_s1_roi_sar(
-            roi_zarr_path=roi_path,
-            start_date=start_date,
-            end_date=end_date,
-            store_path=mosaic_base,
-            client=client,
-            orbit=s1_orbit,
-            use_s3_direct=s1_use_s3_direct,
-            log=log,
-            storage_options=storage_options,
-        )
-        log.info("S1 ingestion: %s", s1_result)
+        orbits_to_ingest: tuple[str, ...] = ("ascending", "descending") if s1_orbit == "both" else (s1_orbit,)
+        for orbit in orbits_to_ingest:
+            log.info("Ingesting S1 SAR (orbit=%s, use_s3_direct=%s)", orbit, s1_use_s3_direct)
+            s1_result = ingest_s1_roi_sar(
+                roi_zarr_path=roi_path,
+                start_date=start_date,
+                end_date=end_date,
+                store_path=mosaic_base,
+                client=client,
+                orbit=cast(S1Orbit, orbit),
+                use_s3_direct=s1_use_s3_direct,
+                log=log,
+                storage_options=storage_options,
+            )
+            log.info("S1 ingestion (%s): %s", orbit, s1_result)
 
 
 def _run_inference_and_assemble(
@@ -112,7 +114,7 @@ def _run_inference_and_assemble(
     roi_name: str,
     paths: BucketPaths,
     time_window_end: str,
-    s1_orbit: S1Orbit,
+    s1_orbit: Literal["ascending", "descending", "both"],
     checkpoint_dir: str | None,
     log: logging.Logger,
 ) -> dict[str, Any]:
@@ -238,7 +240,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
             time_range:
               start: "2024-07-01"
               end: "2025-07-01"
-            s1_orbit: ascending
+            s1_orbit: ascending    # or "descending" or "both"
             n_workers: 2
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
             storage_options: null
