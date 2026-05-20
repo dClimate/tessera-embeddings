@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 
 import pytest
+import requests
 
 # ---------------------------------------------------------------------------
 # get_edl_session
@@ -64,6 +65,91 @@ def test_get_edl_session_partial_basic_auth_raises(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(RuntimeError):
         get_edl_session()
+
+
+# ---------------------------------------------------------------------------
+# _EDLSession.rebuild_auth — redirect handling for both auth modes
+#
+# Regression tests for the bearer-token redirect bug: requests strips the
+# Authorization header (whether session-level or per-request) on every
+# cross-domain hop, so rebuild_auth must actively re-inject creds for both
+# basic-auth (self.auth) and bearer (self.headers['Authorization']) modes
+# whenever the redirect target is in the trusted EDL/ASF host set.
+# ---------------------------------------------------------------------------
+
+
+def _prepared(url: str) -> requests.PreparedRequest:
+    return requests.Request("GET", url).prepare()
+
+
+def _fake_response(original_url: str = "https://datapool.asf.alaska.edu/RTC/OPERA-S1/x.tif") -> requests.Response:
+    """Build a Response carrying an original request — requests' default
+    rebuild_auth dereferences response.request.url, so this must be set.
+    """
+    resp = requests.Response()
+    resp.request = requests.Request("GET", original_url).prepare()
+    return resp
+
+
+def test_rebuild_auth_basic_auth_reinjected_on_urs_redirect() -> None:
+    """Basic-auth creds are re-applied when redirected to URS."""
+    from tessera_embeddings.ingest.auth import _EDLSession
+
+    session = _EDLSession()
+    session.auth = ("user", "pass")
+    req = _prepared("https://urs.earthdata.nasa.gov/oauth/authorize")
+
+    session.rebuild_auth(req, _fake_response())
+
+    assert req.headers.get("Authorization", "").startswith("Basic ")
+
+
+def test_rebuild_auth_bearer_reinjected_on_cross_domain_redirect() -> None:
+    """Session-level bearer header survives datapool → cumulus redirect.
+
+    This is the bug the test user hit: the previous implementation only
+    re-applied self.auth, so SAML accounts using EARTHDATA_TOKEN got 401
+    when the bearer header was stripped on the datapool → cumulus hop.
+    """
+    from tessera_embeddings.ingest.auth import _EDLSession
+
+    session = _EDLSession()
+    session.headers["Authorization"] = "Bearer tok123"
+    req = _prepared("https://cumulus.asf.alaska.edu/some/path")
+    # Simulate requests' default strip before rebuild_auth runs.
+    req.headers.pop("Authorization", None)
+
+    session.rebuild_auth(req, _fake_response())
+
+    assert req.headers.get("Authorization") == "Bearer tok123"
+
+
+def test_rebuild_auth_bearer_reinjected_on_earthdatacloud_redirect() -> None:
+    """Bearer is also restored on redirects to earthdatacloud.nasa.gov."""
+    from tessera_embeddings.ingest.auth import _EDLSession
+
+    session = _EDLSession()
+    session.headers["Authorization"] = "Bearer tok123"
+    req = _prepared("https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/x.tif")
+    req.headers.pop("Authorization", None)
+
+    session.rebuild_auth(req, _fake_response())
+
+    assert req.headers.get("Authorization") == "Bearer tok123"
+
+
+def test_rebuild_auth_drops_auth_on_untrusted_redirect() -> None:
+    """Untrusted redirect targets must not receive EDL credentials."""
+    from tessera_embeddings.ingest.auth import _EDLSession
+
+    session = _EDLSession()
+    session.headers["Authorization"] = "Bearer tok123"
+    req = _prepared("https://evil.example.com/steal")
+    req.headers.pop("Authorization", None)
+
+    session.rebuild_auth(req, _fake_response())
+
+    assert "Authorization" not in req.headers
 
 
 # ---------------------------------------------------------------------------

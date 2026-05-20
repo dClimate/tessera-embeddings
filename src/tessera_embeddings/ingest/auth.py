@@ -20,6 +20,7 @@ import logging
 import os
 import re
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 import requests
 from dask.distributed import WorkerPlugin, get_client
@@ -38,6 +39,16 @@ _AUTH_HOST = "urs.earthdata.nasa.gov"
 _EDL_TOKEN_URL = f"https://{_AUTH_HOST}/api/users/token"
 _S3_CREDENTIALS_URL = "https://cumulus.asf.alaska.edu/s3credentials"
 _OPERA_S3_BUCKET = "asf-cumulus-prod-opera-products"
+
+# Hosts that are trusted to receive EDL credentials across redirects. The
+# datapool → URS → cumulus → CloudFront chain stays within asf.alaska.edu,
+# earthdatacloud.nasa.gov, and urs.earthdata.nasa.gov; any redirect to a
+# host outside this set must drop the Authorization header.
+_TRUSTED_AUTH_SUFFIXES = (
+    "urs.earthdata.nasa.gov",
+    "asf.alaska.edu",
+    "earthdatacloud.nasa.gov",
+)
 
 # Two HTTPS URL patterns for OPERA RTC-S1 assets:
 #   1. datapool (flat):      https://datapool.asf.alaska.edu/RTC/OPERA-S1/{filename}
@@ -73,22 +84,36 @@ class _EDLSession(requests.Session):
         self.mount("http://", adapter)
 
     def rebuild_auth(self, prepared_request: requests.PreparedRequest, response: requests.Response) -> None:
-        """Re-inject auth header for redirects targeting the URS host.
+        """Re-inject auth on redirects within the trusted EDL/ASF host set.
 
-        The default ``requests`` behavior strips Authorization on cross-domain
-        redirects.  By the time a redirect reaches URS, the header is already
-        gone from an earlier hop (e.g. datapool → cumulus stripped it).  So we
-        must actively re-apply ``self.auth`` rather than just skipping the
-        strip — a plain ``return`` would preserve "already missing".
+        ``requests`` strips Authorization on every cross-domain redirect, and
+        by the time a redirect reaches URS the header is already gone from an
+        earlier hop (datapool → cumulus stripped it).  We must actively
+        re-apply credentials, not just skip the strip — a plain ``return``
+        would preserve "already missing".
+
+        Two auth modes have to be handled because they live in different
+        attributes:
+
+        * Basic auth via ``self.auth`` (production path).
+        * Bearer token via ``self.headers['Authorization']`` (local SAML
+          fallback). Session headers are merged into the prepared request
+          before ``rebuild_auth`` runs, so requests' default behaviour also
+          strips this on cross-domain hops — restoring it here is required.
         """
-        redirect_url = prepared_request.url or ""
+        redirect_host = (urlparse(prepared_request.url or "").hostname or "").lower()
+        is_trusted = any(redirect_host == h or redirect_host.endswith("." + h) for h in _TRUSTED_AUTH_SUFFIXES)
 
-        if _AUTH_HOST in redirect_url and self.auth:
-            # Heading to URS — re-inject credentials that earlier hops stripped
-            prepared_request.prepare_auth(self.auth, redirect_url)
-            return
+        if is_trusted:
+            if self.auth:
+                prepared_request.prepare_auth(self.auth, prepared_request.url)
+                return
+            session_auth = self.headers.get("Authorization")
+            if session_auth:
+                prepared_request.headers["Authorization"] = session_auth
+                return
 
-        # All other redirects: default behaviour (strip cross-domain auth)
+        # Untrusted redirect target: default behaviour (strip cross-domain auth)
         super().rebuild_auth(prepared_request, response)
 
 
@@ -129,10 +154,9 @@ def get_edl_session() -> _EDLSession:
     token = os.environ.get("EARTHDATA_TOKEN")
 
     if token:
-        # LOCAL-ONLY FALLBACK: bearer must be set at session level (not
-        # per-request) so it survives ASF's cross-domain redirects —
-        # requests strips per-request Authorization on cross-domain
-        # hops but leaves session.headers alone.
+        # LOCAL-ONLY FALLBACK: set bearer at session level so _EDLSession's
+        # rebuild_auth can re-inject it on each hop of the cross-domain
+        # redirect chain (datapool → URS → cumulus → CloudFront).
         session = _EDLSession()
         session.headers["Authorization"] = f"Bearer {token}"
         return session
