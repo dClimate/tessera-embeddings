@@ -330,19 +330,6 @@ def _build_aws_env(creds: dict[str, str]) -> dict[str, str]:
     }
 
 
-def _apply_gdal_config(env: dict[str, str]) -> None:
-    """Set GDAL config options so /vsis3/ bypasses its credential cache."""
-    # Imported here rather than at module level so that importing auth.py
-    # does not require the gdal package to be installed. gdal is a system
-    # library prerequisite, not a pip dependency — eager import would break
-    # collection-time imports (mypy, pytest, architecture-tests) on hosts
-    # without libgdal installed.
-    from osgeo import gdal
-
-    for key, val in env.items():
-        gdal.SetConfigOption(key, val)
-
-
 def _patch_odc_thread_session_for_env_drift() -> None:
     """Make odc.loader's per-thread AWSSession cache self-invalidate on env drift.
 
@@ -400,21 +387,12 @@ class _S3CredentialPlugin(WorkerPlugin):
 
     def setup(self, worker: object) -> None:  # noqa: ARG002
         os.environ.update(self.env)
-        # GDAL's /vsis3/ handler caches credentials resolved from env vars
-        # in a static member (VSIS3HandleHelper).  VSICurlClearCache only
-        # clears curl handles and file-property caches — NOT the credential
-        # cache.  SetConfigOption bypasses that cache entirely: GDAL checks
-        # config options before env vars and re-reads them on every file open.
-        _apply_gdal_config(self.env)
-        # VSICurlClearCache clears curl handles and file-property caches.
-        # SetConfigOption (called above) is the actual credential cache fix —
-        # this is belt-and-suspenders. Same lazy import rationale as
-        # _apply_gdal_config.
-        from osgeo import gdal
-
-        gdal.VSICurlClearCache()
         # Reset the main-thread AWSSession cache. Task pool threads handle
-        # their own reset via the module-level env-drift patch.
+        # their own reset via the module-level env-drift patch, which detects
+        # the env mismatch on the next session() call and rebuilds. Together
+        # they ensure rasterio.env.Env (used by odc.loader on every /vsis3/
+        # open) signs with the new key — making gdal.SetConfigOption and
+        # gdal.VSICurlClearCache redundant for credential refresh.
         _odc_thread_session.reset()
 
 
@@ -451,11 +429,13 @@ def set_s3_credentials(creds: dict[str, str]) -> None:
     except ValueError as e:
         raise RuntimeError("No Dask client found — S3 credentials cannot be broadcast to workers") from e
 
-    # Set on orchestrator too — both env vars (for boto3/rasterio session
-    # creation) and GDAL config options (bypasses GDAL's credential cache).
+    # Set on orchestrator too. odc.loader's rio_env() wraps rasterio.env.Env
+    # around _local.session() on every /vsis3/ open, and rasterio.env.Env
+    # passes the AWSSession's frozen credentials into GDAL on entry — so
+    # updating os.environ is sufficient for GDAL to sign with the new key.
     env = _build_aws_env(creds)
     os.environ.update(env)
-    _apply_gdal_config(env)
+    _odc_thread_session.reset()
 
 
 def rewrite_assets_to_s3(item: pystac.Item, band_keys: list[str]) -> None:

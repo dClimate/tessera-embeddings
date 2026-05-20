@@ -7,6 +7,8 @@ are either not invoked or patched; no network access is required.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -131,3 +133,119 @@ def test_build_aws_env_maps_keys() -> None:
     assert env["AWS_SESSION_TOKEN"] == "TOKEN"
     assert env["AWS_NO_SIGN_REQUEST"] == "NO"
     assert env["AWS_DEFAULT_REGION"] == "us-west-2"
+
+
+# ---------------------------------------------------------------------------
+# odc ThreadSession env-drift patch
+#
+# Regression test for the simplification that drops gdal.SetConfigOption and
+# gdal.VSICurlClearCache from set_s3_credentials. The simplification is safe
+# only if the patched ThreadSession.session() returns an AWSSession whose
+# frozen access key tracks os.environ, because rio_env() wraps
+# rasterio.env.Env around that session on every /vsis3/ open and passes its
+# frozen credentials into GDAL — so GDAL signs with whatever key the cached
+# session holds at that moment.
+# ---------------------------------------------------------------------------
+
+
+def _frozen_access_key(session: object) -> str:
+    """Return the access-key id baked into a boto3 AWSSession's frozen creds."""
+    boto = session._session  # type: ignore[attr-defined]
+    return boto.get_credentials().get_frozen_credentials().access_key
+
+
+def test_odc_thread_session_tracks_env_after_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cached AWSSession self-invalidates when AWS_ACCESS_KEY_ID changes.
+
+    This is the load-bearing claim that lets set_s3_credentials skip
+    gdal.SetConfigOption / gdal.VSICurlClearCache: as long as
+    _local.session().get_frozen_credentials().access_key tracks
+    os.environ['AWS_ACCESS_KEY_ID'], rasterio.env.Env will hand GDAL the
+    refreshed key on every rio_env() entry.
+    """
+    pytest.importorskip("odc.loader._rio")
+    from odc.loader._rio import _local
+
+    # Importing auth.py installs the env-drift patch at module import.
+    from tessera_embeddings.ingest import auth  # noqa: F401
+
+    def run_in_fresh_thread(env_initial: dict[str, str], env_refreshed: dict[str, str]) -> dict[str, str]:
+        """Prime _local with one set of creds, mutate env, return what session() yields."""
+        import threading
+
+        out: dict[str, str] = {}
+
+        def body() -> None:
+            for k, v in env_initial.items():
+                os.environ[k] = v
+            out["initial"] = _frozen_access_key(_local.session())
+            for k, v in env_refreshed.items():
+                os.environ[k] = v
+            # Patched session() must observe the env mismatch and rebuild.
+            out["after_env_update"] = _frozen_access_key(_local.session())
+
+        # Run on a fresh thread so threading.local state is isolated.
+        t = threading.Thread(target=body)
+        t.start()
+        t.join()
+        return out
+
+    # Track keys we've stomped on so we can restore them.
+    for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+        monkeypatch.setenv(k, os.environ.get(k, ""))
+
+    initial = {
+        "AWS_ACCESS_KEY_ID": "INITIAL_KEY_AAAAAA",
+        "AWS_SECRET_ACCESS_KEY": "INITIAL_SECRET",
+        "AWS_SESSION_TOKEN": "INITIAL_TOKEN",
+    }
+    refreshed = {
+        "AWS_ACCESS_KEY_ID": "REFRESHED_KEY_BBBBBB",
+        "AWS_SECRET_ACCESS_KEY": "REFRESHED_SECRET",
+        "AWS_SESSION_TOKEN": "REFRESHED_TOKEN",
+    }
+    keys = run_in_fresh_thread(initial, refreshed)
+
+    assert keys["initial"] == "INITIAL_KEY_AAAAAA"
+    # Without the patch this would be "INITIAL_KEY_AAAAAA" (cached) — the
+    # patch detects the env mismatch and rebuilds from current env vars.
+    assert keys["after_env_update"] == "REFRESHED_KEY_BBBBBB"
+
+
+def test_odc_thread_session_explicit_reset_picks_up_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_local.reset() rebuilds the cached AWSSession from current os.environ.
+
+    Mirrors what _S3CredentialPlugin.setup() does on each worker: after
+    updating os.environ it calls _local.reset(), and the next session() call
+    must return an AWSSession bound to the new access key.
+    """
+    pytest.importorskip("odc.loader._rio")
+    from odc.loader._rio import _local
+
+    from tessera_embeddings.ingest import auth  # noqa: F401
+
+    for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+        monkeypatch.setenv(k, os.environ.get(k, ""))
+
+    import threading
+
+    out: dict[str, str] = {}
+
+    def body() -> None:
+        os.environ["AWS_ACCESS_KEY_ID"] = "INITIAL_KEY_AAAAAA"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "INITIAL_SECRET"
+        os.environ["AWS_SESSION_TOKEN"] = "INITIAL_TOKEN"
+        out["initial"] = _frozen_access_key(_local.session())
+
+        os.environ["AWS_ACCESS_KEY_ID"] = "REFRESHED_KEY_BBBBBB"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "REFRESHED_SECRET"
+        os.environ["AWS_SESSION_TOKEN"] = "REFRESHED_TOKEN"
+        _local.reset()
+        out["after_reset"] = _frozen_access_key(_local.session())
+
+    t = threading.Thread(target=body)
+    t.start()
+    t.join()
+
+    assert out["initial"] == "INITIAL_KEY_AAAAAA"
+    assert out["after_reset"] == "REFRESHED_KEY_BBBBBB"

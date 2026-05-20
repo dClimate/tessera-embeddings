@@ -68,15 +68,6 @@ no torch, no Ray). Add `[inference]` for the Tessera embedding model and
 distributed execution — that is what this library is for. The split is
 practical: torch is large and CUDA variants are platform-specific.
 
-**Prerequisite:** `gdal` is a system library binding — install it before
-installing this package (see [GDAL setup](docs/environment-setup.md#gdal)):
-```bash
-# macOS
-brew install gdal && pip install gdal==$(gdal-config --version)
-# Ubuntu/Debian
-sudo apt-get install libgdal-dev && pip install gdal==$(gdal-config --version)
-```
-
 ```bash
 # Typical install — ingestion pipeline + Tessera inference
 pip install tessera_embeddings[inference]
@@ -94,21 +85,19 @@ For contributors:
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --all-extras                          # resolves uv.lock; all extras + dev tools
-uv pip install gdal==$(gdal-config --version) # must match system libgdal
+uv sync --all-extras   # resolves uv.lock; all extras + dev tools
 ```
 
 `uv.lock` at repo root is the single lock file. See
 [`docs/environment-setup.md`](docs/environment-setup.md) for CUDA GPU
-installs, GDAL notes, and platform guidance.
+installs and platform guidance.
 
 ## Quickstart
 
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --all-extras                          # resolves uv.lock; all extras + dev tools
-uv pip install gdal==$(gdal-config --version) # must match system libgdal
+uv sync --all-extras   # resolves uv.lock; all extras + dev tools
 
 # End-to-end pipeline on the bundled Story-County, IA quickstart ROI.
 # Ingest → cloud mask → CPU inference → assemble. Expect ~30+ minutes;
