@@ -114,7 +114,7 @@ class _EDLSession(requests.Session):
         if self.auth:
             # Basic-auth path: only URS may receive the user's password.
             if redirect_host == _AUTH_HOST or redirect_host.endswith("." + _AUTH_HOST):
-                prepared_request.prepare_auth(self.auth, prepared_request.url)
+                prepared_request.prepare_auth(self.auth, prepared_request.url or "")
                 return
         else:
             session_auth = self.headers.get("Authorization")

@@ -72,8 +72,9 @@ Untested. CPU is the supported laptop path.
 
 ### Linux x86_64
 
-The blessed deployment platform. For GPU production, use
-`--extra-index-url https://download.pytorch.org/whl/cu121` at install time.
+The blessed deployment platform. For GPU production, follow the explicit
+two-step install in the [CUDA section above](#cuda): install
+`torch==...+cu121` with `--index-url` first, then install the package.
 
 ### macOS arm64 (Apple Silicon)
 
