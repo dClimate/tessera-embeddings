@@ -1,10 +1,13 @@
 """Orchestrator-free pipeline runner.
 
-Default: runs ROI generation → S2 + S1 ingestion → CPU inference →
-assembly end-to-end on a small example ROI using local Ray + local
-Dask. Slow (~30+ min on a developer laptop) but proves the layer
-separation is real — every step calls the same domain function the
-Prefect flows do.
+Runs ROI generation → S2 + S1 ingestion → inference → assembly
+end-to-end using local Ray + local Dask. Proves layer separation
+is real — every step calls the same domain function the Prefect
+flows do.
+
+Device is controlled by the ``device`` key in the YAML config
+(``"auto"`` | ``"cpu"`` | ``"cuda"``; default ``"auto"`` uses
+a GPU when one is available).
 
 ``--skip-inference`` short-circuits after ingestion for fast contributor
 iteration on the ingest path.
@@ -47,6 +50,32 @@ from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.providers.local.ray import ray_cluster
 from tessera_embeddings.storage.manifest import EmbeddingManifest
+
+
+def _resolve_num_gpus(device: str) -> int:
+    """Map the config ``device`` field to a Ray num_gpus count.
+
+    ``"auto"`` probes :func:`torch.cuda.is_available` at runtime so the
+    same config works on a CPU-only laptop and a single-GPU dev box.
+    Falls back to 0 if torch is not installed.
+
+    Raises:
+        ValueError: if ``device`` is not one of ``"cpu"``, ``"cuda"``, ``"auto"``.
+        RuntimeError: if ``device="cuda"`` but CUDA is not available.
+    """
+    if device not in {"cpu", "cuda", "auto"}:
+        raise ValueError(f"device must be 'auto', 'cpu', or 'cuda'; got {device!r}")
+    if device == "cpu":
+        return 0
+    try:
+        import torch
+
+        available = torch.cuda.is_available()
+    except ImportError:
+        available = False
+    if device == "cuda" and not available:
+        raise RuntimeError("device='cuda' requested but no CUDA device is visible on this host")
+    return 1 if available else 0
 
 
 @contextmanager
@@ -122,9 +151,10 @@ def _run_inference_and_assemble(
     time_window_end: str,
     s1_orbit: Literal["ascending", "descending", "both"],
     checkpoint_dir: str | None,
+    num_gpus: int,
     log: logging.Logger,
 ) -> dict[str, Any]:
-    """Run CPU inference under local Ray, then assemble under local Dask."""
+    """Run inference under local Ray, then assemble under local Dask."""
     inputs_bucket = paths.inputs
     output_bucket = paths.outputs
 
@@ -135,18 +165,18 @@ def _run_inference_and_assemble(
     mosaic_base = paths.store_for(roi_name, "reflectance").rsplit("/", 1)[0]
     staging_base = f"{output_bucket.rstrip('/')}/staging"
 
-    effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
+    # Probe for available SAR stores before dispatching inference; if s1_orbit="both"
+    # is requested but only one orbit was ingested, fall back gracefully.
+    effective_orbit = resolve_s1_orbit(mosaic_base, config.s1_orbit)
     if effective_orbit != s1_orbit:
-        log.info("s1_orbit resolved: %s → %s", s1_orbit, effective_orbit)
-
-    config = build_inference_config(
-        s1_orbit=effective_orbit,
-        time_window=time_window,
-        checkpoint_path=checkpoint_path,
-        inputs_bucket=inputs_bucket,
-        output_bucket=output_bucket,
-        num_gpus=0,
-    )
+        config = build_inference_config(
+            s1_orbit=effective_orbit,
+            time_window=time_window,
+            checkpoint_path=checkpoint_path,
+            inputs_bucket=inputs_bucket,
+            output_bucket=output_bucket,
+            num_gpus=num_gpus,
+        )
 
     chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, config.chunk_size or DEFAULT_CHUNK_SIZE, log)
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_path)
@@ -155,13 +185,16 @@ def _run_inference_and_assemble(
     run_id = uuid.uuid4().hex[:12]
     t0 = time.monotonic()
 
-    log.warning(
-        "Running CPU inference on %d chunks. Expect this to take a while; "
-        "use --skip-inference for ingest-only sanity checks.",
-        len(live_chunks),
-    )
+    if num_gpus == 0:
+        log.warning(
+            "Running CPU inference on %d chunks. Expect this to take a while; "
+            "use --skip-inference for ingest-only sanity checks.",
+            len(live_chunks),
+        )
+    else:
+        log.info("Running GPU inference on %d chunks (num_gpus=%d).", len(live_chunks), num_gpus)
 
-    with ray_cluster(num_gpus=0):
+    with ray_cluster(num_gpus=num_gpus):
         results = run_inference(
             num_actors=1,
             config=config,
@@ -240,6 +273,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
             s1_orbit: ascending    # or "descending" or "both"
             n_workers: 2
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
+            device: auto            # "auto" | "cpu" | "cuda"
             storage_options: null
 
         skip_inference: When True, stop after ingestion. Useful for
@@ -303,7 +337,8 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         log.info("Skipping inference + assembly (--skip-inference)")
         return None
 
-    # Stages 3 + 4: CPU inference + assembly
+    # Stages 3 + 4: inference + assembly
+    num_gpus = _resolve_num_gpus(cfg.get("device", "auto"))
     summary = _run_inference_and_assemble(
         roi_path=roi_path,
         roi_name=roi_name,
@@ -311,6 +346,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         time_window_end=cfg["time_window_end"],
         s1_orbit=cfg.get("s1_orbit", "ascending"),
         checkpoint_dir=cfg.get("checkpoint_dir"),
+        num_gpus=num_gpus,
         log=log,
     )
     log.info("Pipeline complete: %s", summary)
