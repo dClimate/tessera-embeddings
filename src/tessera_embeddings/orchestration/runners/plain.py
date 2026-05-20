@@ -167,7 +167,7 @@ def _run_inference_and_assemble(
 
     # Probe for available SAR stores before dispatching inference; if s1_orbit="both"
     # is requested but only one orbit was ingested, fall back gracefully.
-    effective_orbit = resolve_s1_orbit(mosaic_base, config.s1_orbit)
+    effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
     if effective_orbit != s1_orbit:
         config = build_inference_config(
             s1_orbit=effective_orbit,
