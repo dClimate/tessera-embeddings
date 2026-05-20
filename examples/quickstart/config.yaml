@@ -48,6 +48,10 @@ n_workers: 2
 # Example: checkpoint_dir: /tmp/tessera-models
 checkpoint_dir: /tmp/tessera-models
 
+# Device for inference. "auto" uses a GPU if torch.cuda.is_available(),
+# otherwise falls back to CPU. Set to "cpu" or "cuda" to override.
+device: auto
+
 # fsspec storage options. null lets fsspec auto-detect; for s3:// you
 # might pass {anon: false} or a dict with key/secret.
 storage_options: null
