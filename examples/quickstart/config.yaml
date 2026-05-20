@@ -37,7 +37,7 @@ time_range:
 time_window_end: "August 2024"
 
 # Single-orbit ingest is enough for the quickstart.
-s1_orbit: both
+s1_orbit: ascending
 
 # Local Dask cluster size on the runner host.
 n_workers: 2
