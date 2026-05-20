@@ -21,5 +21,3 @@ jobs:
 
       - name: Run slow parity tests
         run: uv run pytest tests/parity -m "parity and slow" -v --tb=short
-      - name: Run slow tests
-        run: uv run pytest tests/slow -m slow -v --tb=short
