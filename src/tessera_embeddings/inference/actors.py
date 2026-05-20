@@ -148,7 +148,7 @@ class InferenceActor:
 
         self.config = config
         self.instance_id = _fetch_ec2_instance_id()
-        self.device = _select_device(_torch, self.instance_id)
+        self.device = _torch.device("cpu") if self.config.num_gpus == 0 else _select_device(_torch, self.instance_id)
 
         local_ckpt = download_checkpoint(checkpoint_path) if checkpoint_path.startswith("s3://") else checkpoint_path
         self.model: MultimodalBTInferenceModel = build_inference_model(

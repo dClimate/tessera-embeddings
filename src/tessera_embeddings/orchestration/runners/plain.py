@@ -22,7 +22,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import yaml
 from dask.distributed import Client
@@ -52,24 +52,30 @@ from tessera_embeddings.providers.local.ray import ray_cluster
 from tessera_embeddings.storage.manifest import EmbeddingManifest
 
 
-def _resolve_num_gpus(device: Literal["cpu", "cuda", "auto"]) -> int:
+def _resolve_num_gpus(device: str) -> int:
     """Map the config ``device`` field to a Ray num_gpus count.
 
     ``"auto"`` probes :func:`torch.cuda.is_available` at runtime so the
     same config works on a CPU-only laptop and a single-GPU dev box.
     Falls back to 0 if torch is not installed.
+
+    Raises:
+        ValueError: if ``device`` is not one of ``"cpu"``, ``"cuda"``, ``"auto"``.
+        RuntimeError: if ``device="cuda"`` but CUDA is not available.
     """
+    if device not in {"cpu", "cuda", "auto"}:
+        raise ValueError(f"device must be 'auto', 'cpu', or 'cuda'; got {device!r}")
     if device == "cpu":
         return 0
-    if device == "cuda":
-        return 1
-    # auto — detect at runtime
     try:
-        import torch  # noqa: PLC0415
+        import torch
 
-        return 1 if torch.cuda.is_available() else 0
+        available = torch.cuda.is_available()
     except ImportError:
-        return 0
+        available = False
+    if device == "cuda" and not available:
+        raise RuntimeError("device='cuda' requested but no CUDA device is visible on this host")
+    return 1 if available else 0
 
 
 @contextmanager
