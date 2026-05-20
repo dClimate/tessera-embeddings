@@ -14,12 +14,12 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as np
-import tenacity
 import xarray as xr
 from odc.geo.geobox import GeoBox
 from pystac import Item
 from pystac_client import Client
-from pystac_client.exceptions import APIError
+from pystac_client.stac_api_io import StacApiIO
+from urllib3.util.retry import Retry
 
 from tessera_embeddings.config import (
     PROVIDERS,
@@ -57,6 +57,17 @@ def chunks_to_odc(chunks: dict[str, int]) -> dict[str, int]:
 
 
 logger = logging.getLogger(__name__)
+
+_STAC_RETRY = Retry(
+    total=8,
+    backoff_factor=2,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "POST"]),
+    respect_retry_after_header=True,
+)
+# (connect_timeout, read_timeout) in seconds. Without an explicit timeout,
+# a stalled TCP connection blocks indefinitely and the retry logic never fires.
+_STAC_TIMEOUT = (10, 60)
 
 
 def _get_provider_config(provider_name: str) -> STACProvider:
@@ -430,13 +441,6 @@ def _apply_baseline_corrections_by_date(
 # =============================================================================
 
 
-@tenacity.retry(
-    retry=tenacity.retry_if_exception_type(APIError),
-    wait=tenacity.wait_exponential(multiplier=10, max=120),
-    stop=tenacity.stop_after_attempt(4),
-    before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
-    reraise=True,
-)
 def _query_stac_items(
     provider: STACProvider,
     collection_config: CollectionConfig,
@@ -464,7 +468,8 @@ def _query_stac_items(
 
     t0 = time.monotonic()
     logger.debug(f"Opening STAC catalog: {provider.catalog_url}")
-    client = Client.open(provider.catalog_url)
+    stac_io = StacApiIO(max_retries=_STAC_RETRY, timeout=_STAC_TIMEOUT)
+    client = Client.open(provider.catalog_url, stac_io=stac_io)
     logger.debug(f"STAC catalog opened in {time.monotonic() - t0:.1f}s, executing search")
     search = client.search(**query_params, limit=250, max_items=None)
     items = list(search.items())

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from tessera_embeddings.ingest.s1_roi import S1Orbit, SarIngestResult, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import IngestResult, ingest_s2_roi_reflectance
@@ -96,3 +97,21 @@ def test_no_prefect_or_get_client_in_domain_modules() -> None:
                     raise AssertionError(f"{path} calls {fn.id}()")
                 if isinstance(fn, ast.Attribute) and fn.attr in forbidden_calls:
                     raise AssertionError(f"{path} calls {fn.attr}()")
+
+
+@patch("tessera_embeddings.ingest.stac.Client")
+@patch("tessera_embeddings.ingest.stac.StacApiIO")
+@patch("tessera_embeddings.ingest.stac._build_stac_query", return_value={})
+def test_query_stac_items_passes_stac_io_to_client(mock_build, mock_stac_io_cls, mock_client_cls):
+    """Retry config reaches Client.open — dropping stac_io= would silently skip retries."""
+    from tessera_embeddings.ingest.stac import _query_stac_items
+
+    mock_stac_io = MagicMock()
+    mock_stac_io_cls.return_value = mock_stac_io
+    mock_client_cls.open.return_value.search.return_value.items.return_value = iter([])
+
+    provider = MagicMock()
+    _query_stac_items(provider, MagicMock(), "T15TYH", "2024-01-01", "2024-01-31")
+
+    _, kwargs = mock_client_cls.open.call_args
+    assert kwargs.get("stac_io") is mock_stac_io
