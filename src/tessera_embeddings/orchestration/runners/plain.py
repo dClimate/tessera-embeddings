@@ -39,6 +39,7 @@ from tessera_embeddings.inference.orchestration_helpers import (
     read_upstream_manifests,
 )
 from tessera_embeddings.inference.runner import run_inference
+from tessera_embeddings.ingest.auth import get_s3_credentials, set_s3_credentials
 from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
@@ -92,6 +93,10 @@ def _run_ingest(
         log.info("S2 ingestion: %s", s2_result)
 
         log.info("Ingesting S1 SAR (orbit=%s, use_s3_direct=%s)", s1_orbit, s1_use_s3_direct)
+        # When S3 direct is on, the domain function expects callables that fetch
+        # ASF STS credentials and broadcast them to the cluster. The Prefect
+        # flow wires these the same way; without them GDAL hits /vsis3/ with no
+        # AWS env vars and ASF rejects the request.
         s1_result = ingest_s1_roi_sar(
             roi_zarr_path=roi_path,
             start_date=start_date,
@@ -100,6 +105,8 @@ def _run_ingest(
             client=client,
             orbit=s1_orbit,
             use_s3_direct=s1_use_s3_direct,
+            edl_credentials_fn=get_s3_credentials if s1_use_s3_direct else None,
+            apply_credentials_fn=set_s3_credentials if s1_use_s3_direct else None,
             log=log,
             storage_options=storage_options,
         )

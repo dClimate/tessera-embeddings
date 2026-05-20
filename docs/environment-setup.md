@@ -22,8 +22,7 @@ commands above work identically with `uv pip`.
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --all-extras                          # resolves uv.lock; all extras + dev tools
-uv pip install gdal==$(gdal-config --version) # must match system libgdal
+uv sync --all-extras   # resolves uv.lock; all extras + dev tools
 ```
 
 `uv.lock` at repo root is the single lock file. It covers every extra
@@ -68,29 +67,6 @@ in this OSS library.
 ### MPS (Apple Silicon GPU)
 
 Untested. CPU is the supported laptop path.
-
-## GDAL
-
-`gdal` is not declared as a package dependency — it is a system library
-binding that must match the `libgdal` installed on the host. Install the
-system library first, then install the matching Python binding separately:
-
-**macOS:**
-```bash
-brew install gdal
-pip install gdal==$(gdal-config --version)
-```
-
-**Ubuntu/Debian:**
-```bash
-sudo apt-get install libgdal-dev
-pip install gdal==$(gdal-config --version)
-```
-
-Attempting `pip install tessera_embeddings` without gdal pre-installed will
-produce an `ImportError` at runtime. CI runs inside the
-`ghcr.io/osgeo/gdal:ubuntu-small-3.13.0` container and installs the binding
-explicitly after `uv sync`.
 
 ## Platform notes
 

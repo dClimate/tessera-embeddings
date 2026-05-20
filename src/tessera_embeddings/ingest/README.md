@@ -401,25 +401,27 @@ You must also approve the **ASF Cumulus** application at
    `asf-cumulus-prod-opera-products` bucket in `us-west-2`.
 
 `set_s3_credentials` then injects these onto both the orchestrator process and all current and
-future Dask workers via a `WorkerPlugin`. It sets both environment variables (for boto3/rasterio
-session creation) and GDAL config options (which bypass GDAL's internal credential cache that
-can hold stale values).
-
-**Why GDAL config options are needed in addition to env vars**: GDAL's `/vsis3/` handler caches
-credentials resolved from env vars in a static C++ member. `VSICurlClearCache()` flushes curl
-handles and file-property caches but does **not** flush the credential cache.
-`gdal.SetConfigOption` bypasses the cache entirely because GDAL checks config options before
-env vars and re-reads them on every file open.
+future Dask workers via a `WorkerPlugin`. It sets `AWS_*` environment variables (consumed by
+boto3 when `odc.loader` builds an `AWSSession`) and resets the cached per-thread session so the
+next `/vsis3/` open picks up the new credentials.
 
 **Per-thread AWSSession cache**: `odc.loader` caches a boto3 `AWSSession` per thread in
 `threading.local` on first use and ignores subsequent env var updates for that thread's
 lifetime. Dask task pool threads are long-lived, so the initial 1hr STS token was getting
 pinned across refreshes and expiring mid-read. `auth.py` patches `odc.loader._rio.ThreadSession`
 at module import time so each thread self-detects `AWS_ACCESS_KEY_ID` drift and rebuilds its
-cached session. This reaches into private `odc.loader` internals (`_OdcThreadSession`, `_local`)
-and is a version-sensitive hook — if odc renames those symbols, the import fails loudly and the
-test in `tests/unit/ingestion/test_edl_auth.py::TestOdcThreadSessionEnvDriftPatch` catches the
-break in CI before it hits a 1hr cloud run.
+cached session from current env vars. `rasterio.env.Env` (entered by `odc.loader.rio_env()` on
+every `/vsis3/` open) then hands the refreshed `AWSSession`'s frozen credentials to GDAL — so
+no `gdal.SetConfigOption` or `VSICurlClearCache` is needed. This reaches into private
+`odc.loader` internals (`_OdcThreadSession`, `_local`) and is a version-sensitive hook — if odc
+renames those symbols, the import fails loudly and the regression tests in
+`tests/unit/test_auth.py` catch the break in CI before it hits a 1hr cloud run.
+
+This was empirically verified on a us-west-2 EC2 box (2026-05-20): a four-month S1 ingest
+run at `cred_refresh_interval_sec=60` over a persistent local Dask cluster forced multiple
+mid-run STS refreshes; every batch's `/vsis3/` reads succeeded, confirming the env-drift
+patch plus orchestrator-side `_local.reset()` are sufficient without explicit GDAL
+credential-cache calls.
 
 OPERA asset STS credentials are intentionally **never cleaned up** from env vars. This avoids
 a race condition where one Dask task's cleanup could remove credentials another task still

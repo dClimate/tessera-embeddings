@@ -163,11 +163,7 @@ esac
 # environments cause ImportError during collection — see the failure
 # mode in the first run of this script.
 
-# --inexact preserves packages not in uv.lock (notably the gdal binding
-# installed separately to match the system libgdal — see docs/environment-setup.md#gdal).
-# Exact sync would evict it, causing ModuleNotFoundError: osgeo during collection.
-uv sync --frozen --inexact --extra inference --extra prefect --extra aws
-uv pip install "gdal==$(gdal-config --version)"
+uv sync --frozen --extra inference --extra prefect --extra aws
 
 # ── Record ────────────────────────────────────────────────────────
 

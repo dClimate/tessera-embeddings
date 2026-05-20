@@ -80,7 +80,6 @@ worked and your EDL credentials are fine.
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
 uv sync --all-extras
-uv pip install gdal==$(gdal-config --version)
 source .venv/bin/activate
 
 # Pick ONE of:

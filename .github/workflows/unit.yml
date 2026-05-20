@@ -13,8 +13,6 @@ concurrency:
 jobs:
   unit:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/osgeo/gdal:ubuntu-small-3.13.0
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -25,19 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Install system deps
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq build-essential curl git gpg
-
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
           cache-dependency-glob: "uv.lock"
 
       - name: Install dependencies
-        run: |
-          uv sync --python ${{ matrix.python-version }} --all-extras
-          uv pip install "gdal==$(gdal-config --version)"
+        run: uv sync --python ${{ matrix.python-version }} --all-extras
 
       - name: Run unit tests with coverage
         run: |
