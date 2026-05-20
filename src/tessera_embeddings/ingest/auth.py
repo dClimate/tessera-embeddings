@@ -25,7 +25,6 @@ import requests
 from dask.distributed import WorkerPlugin, get_client
 from odc.loader._rio import ThreadSession as _OdcThreadSession  # type: ignore[attr-defined]
 from odc.loader._rio import _local as _odc_thread_session  # type: ignore[attr-defined]
-from osgeo import gdal
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -333,6 +332,13 @@ def _build_aws_env(creds: dict[str, str]) -> dict[str, str]:
 
 def _apply_gdal_config(env: dict[str, str]) -> None:
     """Set GDAL config options so /vsis3/ bypasses its credential cache."""
+    # Imported here rather than at module level so that importing auth.py
+    # does not require the gdal package to be installed. gdal is a system
+    # library prerequisite, not a pip dependency — eager import would break
+    # collection-time imports (mypy, pytest, architecture-tests) on hosts
+    # without libgdal installed.
+    from osgeo import gdal
+
     for key, val in env.items():
         gdal.SetConfigOption(key, val)
 
@@ -400,6 +406,12 @@ class _S3CredentialPlugin(WorkerPlugin):
         # cache.  SetConfigOption bypasses that cache entirely: GDAL checks
         # config options before env vars and re-reads them on every file open.
         _apply_gdal_config(self.env)
+        # VSICurlClearCache clears curl handles and file-property caches.
+        # SetConfigOption (called above) is the actual credential cache fix —
+        # this is belt-and-suspenders. Same lazy import rationale as
+        # _apply_gdal_config.
+        from osgeo import gdal
+
         gdal.VSICurlClearCache()
         # Reset the main-thread AWSSession cache. Task pool threads handle
         # their own reset via the module-level env-drift patch.
