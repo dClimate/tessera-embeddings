@@ -44,10 +44,10 @@ def read_upstream_manifests(
 ) -> dict[str, dict[str, Any] | None]:
     """Read ``_manifest`` attrs from all active ingest stores under ``mosaic_base``."""
     store_names = ["reflectance"]
-    if s1_orbit == "both":
-        store_names += ["sar_ascending", "sar_descending"]
-    elif s1_orbit in {"ascending", "descending"}:
-        store_names.append(f"sar_{s1_orbit}")
+    if s1_orbit in {"ascending", "both"}:
+        store_names.append("sar_ascending")
+    if s1_orbit in {"descending", "both"}:
+        store_names.append("sar_descending")
 
     manifests: dict[str, dict[str, Any] | None] = {}
     for name in store_names:

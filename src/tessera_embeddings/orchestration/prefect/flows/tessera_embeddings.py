@@ -40,7 +40,7 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
-from tessera_embeddings.inference.data_loading import check_time_window_coverage
+from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
     compute_assembly_worker_counts,
@@ -157,16 +157,20 @@ def tessera_embeddings(
 
     checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename()}"
 
+    mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
+    log.info("Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s", roi_name, mosaic_base, run_id)
+
+    resolved_s1_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
+    if resolved_s1_orbit != s1_orbit:
+        log.info("s1_orbit resolved: %s → %s", s1_orbit, resolved_s1_orbit)
+
     config = build_inference_config(
-        s1_orbit=s1_orbit,
+        s1_orbit=resolved_s1_orbit,
         time_window=time_window,
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
     )
-
-    mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
-    log.info("Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s", roi_name, mosaic_base, run_id)
 
     staging_base = f"{output_bucket.rstrip('/')}/staging"
 

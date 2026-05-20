@@ -104,7 +104,8 @@ async def tessera_full_pipeline(
             = auto-size from chunk count).
         ingest_max_workers: Override for ingest Dask max_workers.
         num_actors: Override for Ray GPU actor count.
-        s1_orbit: SAR orbit direction.
+        s1_orbit: SAR orbit direction — ``"ascending"``, ``"descending"``,
+            or ``"both"``. ``"both"`` ingests both orbits concurrently.
         skip_coverage_check: Skip the time-window coverage validation
             on the embeddings stage.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
@@ -114,8 +115,8 @@ async def tessera_full_pipeline(
     """
     log = get_run_logger()
 
-    if s1_orbit not in {"ascending", "descending"}:
-        raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending' or 'descending'.")
+    if s1_orbit not in {"ascending", "descending", "both"}:
+        raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
 
     inputs_bucket = paths.inputs
 
@@ -181,16 +182,21 @@ async def tessera_full_pipeline(
         "min_workers": ingest_min_workers,
         "max_workers": ingest_max_workers,
     }
-    s1_run, s2_run = await asyncio.gather(
+    s1_orbits_to_ingest = ("ascending", "descending") if s1_orbit == "both" else (s1_orbit,)
+    s1_coros = [
         arun_deployment(
             deployments.ingest_s1_roi_sar,
-            parameters={**ingest_params_common, "orbit": s1_orbit},
-        ),
-        arun_deployment(deployments.ingest_s2_roi_reflectance, parameters=ingest_params_common),
-    )
-    _check_completed(s1_run, "ingest_s1_roi_sar")
+            parameters={**ingest_params_common, "orbit": orbit},
+        )
+        for orbit in s1_orbits_to_ingest
+    ]
+    s2_coro = arun_deployment(deployments.ingest_s2_roi_reflectance, parameters=ingest_params_common)
+    results = await asyncio.gather(*s1_coros, s2_coro)
+    *s1_runs, s2_run = results
+    for orbit, s1_run in zip(s1_orbits_to_ingest, s1_runs, strict=True):
+        _check_completed(s1_run, f"ingest_s1_roi_sar ({orbit})")
+        log.info("S1 %s ingestion complete (run_id=%s)", orbit, s1_run.id)
     _check_completed(s2_run, "ingest_s2_roi_reflectance")
-    log.info("S1 ingestion complete (run_id=%s)", s1_run.id)
     log.info("S2 ingestion complete (run_id=%s)", s2_run.id)
 
     # Stage 3: Tessera embeddings
