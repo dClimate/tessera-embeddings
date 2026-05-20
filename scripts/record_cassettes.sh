@@ -163,7 +163,7 @@ esac
 # environments cause ImportError during collection — see the failure
 # mode in the first run of this script.
 
-uv sync --frozen --group dev --group inference --group prefect --group aws
+uv sync --frozen --extra inference --extra prefect --extra aws
 
 # ── Record ────────────────────────────────────────────────────────
 
@@ -202,7 +202,7 @@ were captured.
 
 Common causes:
 - Collection error (ImportError): a dep is missing from the env. Run
-  'uv sync --frozen --group dev --group inference' and try again.
+  'uv sync --frozen --extra inference' and try again.
 - Network error reaching STAC: retry; if it persists, check whether
   Earth Search or CMR is degraded.
 - Test failure after cassette write: VCR may have written a partial

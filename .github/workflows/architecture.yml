@@ -6,44 +6,25 @@ on:
   push:
     branches: [main]
 
-# Architecture tests are AST-walk-based layer-rule checks. They run inside
-# the osgeo/gdal container so the GDAL C extension can be compiled — the
-# package __init__ eagerly imports run_inference (which transitively needs
-# all runtime deps), so a minimal install is not viable.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   architecture:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/osgeo/gdal:ubuntu-small-3.13.0
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-
-      - name: Cache venv + uv Python
-        id: cache-venv
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: |
-            .venv
-            ~/.local/share/uv/python
-          key: v4-venv-gdal3.13.0-py3.13-${{ hashFiles('dev.lock') }}
+          cache-dependency-glob: "uv.lock"
 
       - name: Install dependencies
-        if: steps.cache-venv.outputs.cache-hit != 'true'
-        run: |
-          apt-get update -qq
-          apt-get install -y -qq build-essential
-          GDAL_VERSION=$(gdal-config --version)
-          uv venv --python 3.13 .venv
-          grep -v '^gdal==' dev.lock | uv pip install --python .venv/bin/python \
-            --extra-index-url https://download.pytorch.org/whl/cpu \
-            --index-strategy unsafe-best-match \
-            -r /dev/stdin
-          uv pip install --python .venv/bin/python "gdal==${GDAL_VERSION}"
-          uv pip install --python .venv/bin/python -e .
+        run: uv sync --python 3.13 --all-extras
 
       - name: Run architecture tests
-        run: .venv/bin/pytest tests/architecture -v
+        run: uv run pytest tests/architecture -v
       - name: Run architecture-tests CLI directly
-        run: .venv/bin/python -m tessera_embeddings.architecture_tests --source src/tessera_embeddings/
+        run: uv run python -m tessera_embeddings.architecture_tests --source src/tessera_embeddings/
