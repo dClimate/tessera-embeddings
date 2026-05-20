@@ -38,7 +38,6 @@ jobs:
           path: tessera_embeddings
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
-          enable-cache: true
           cache-dependency-glob: "yield_modeling/dev.lock"
       - name: Install yield_modeling against this PR's tessera_embeddings
         run: |

@@ -33,7 +33,6 @@ from tessera_embeddings.errors import (
     CorruptedStoreError,
     InsufficientCoverageError,
 )
-from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.ingest.s1_roi import (
     S1Orbit,
     SarIngestResult,
@@ -43,6 +42,15 @@ from tessera_embeddings.ingest.s2_roi import (
     IngestResult,
     ingest_s2_roi_reflectance,
 )
+
+
+def __getattr__(name: str) -> object:
+    if name == "run_inference":
+        from tessera_embeddings.inference.runner import run_inference
+
+        return run_inference
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "DEFAULT_CHUNK_SIZE",

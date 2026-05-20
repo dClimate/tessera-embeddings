@@ -1155,12 +1155,6 @@ wheels = [
 ]
 
 [[package]]
-name = "gdal"
-version = "3.13.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/28/58/c1d628c5b5a38d31e93e825199fd4dfd39b658104a52dfce3228d1067042/gdal-3.13.0.tar.gz", hash = "sha256:b440bcecbcdb96690a74da223142f2d51c6a540ee78674e10f9dca933d0e9006", size = 940507, upload-time = "2026-05-08T10:33:19.112Z" }
-
-[[package]]
 name = "google-api-core"
 version = "2.30.3"
 source = { registry = "https://pypi.org/simple" }
@@ -4284,7 +4278,6 @@ dependencies = [
     { name = "dask" },
     { name = "distributed" },
     { name = "fsspec" },
-    { name = "gdal" },
     { name = "icechunk" },
     { name = "mgrs" },
     { name = "numcodecs", extra = ["pcodec"] },
@@ -4309,25 +4302,26 @@ dependencies = [
     { name = "zarr" },
 ]
 
-[package.dev-dependencies]
+[package.optional-dependencies]
+all = [
+    { name = "boto3" },
+    { name = "botocore" },
+    { name = "dask-cloudprovider", extra = ["aws"] },
+    { name = "prefect" },
+    { name = "prefect-aws" },
+    { name = "prefect-dask" },
+    { name = "ray", extra = ["default"] },
+    { name = "s3fs" },
+    { name = "scikit-learn" },
+    { name = "torch", version = "2.12.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version < '3.15' and sys_platform == 'darwin'" },
+    { name = "torch", version = "2.12.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version >= '3.15' or sys_platform != 'darwin'" },
+]
 aws = [
     { name = "boto3" },
     { name = "botocore" },
     { name = "dask-cloudprovider", extra = ["aws"] },
     { name = "prefect-aws" },
     { name = "s3fs" },
-]
-dev = [
-    { name = "hypothesis" },
-    { name = "moto", extra = ["server"] },
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "pytest-cov" },
-    { name = "pytest-recording" },
-    { name = "pytest-xdist" },
-    { name = "ruff" },
-    { name = "vcrpy" },
 ]
 inference = [
     { name = "ray", extra = ["default"] },
@@ -4340,13 +4334,29 @@ prefect = [
     { name = "prefect-dask" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "hypothesis" },
+    { name = "moto", extra = ["server"] },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-cov" },
+    { name = "pytest-recording" },
+    { name = "pytest-xdist" },
+    { name = "ruff" },
+    { name = "vcrpy" },
+]
+
 [package.metadata]
 requires-dist = [
+    { name = "boto3", marker = "extra == 'aws'" },
+    { name = "botocore", marker = "extra == 'aws'" },
     { name = "cloudpickle" },
     { name = "dask" },
+    { name = "dask-cloudprovider", extras = ["aws"], marker = "extra == 'aws'" },
     { name = "distributed" },
     { name = "fsspec" },
-    { name = "gdal", specifier = "==3.13.0" },
     { name = "icechunk" },
     { name = "mgrs" },
     { name = "numcodecs", extras = ["pcodec"] },
@@ -4354,6 +4364,9 @@ requires-dist = [
     { name = "odc-geo" },
     { name = "odc-stac" },
     { name = "pandas" },
+    { name = "prefect", marker = "extra == 'prefect'", specifier = ">=3.0" },
+    { name = "prefect-aws", marker = "extra == 'aws'" },
+    { name = "prefect-dask", marker = "extra == 'prefect'" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyproj" },
@@ -4362,24 +4375,22 @@ requires-dist = [
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "rasterio" },
+    { name = "ray", extras = ["default"], marker = "extra == 'inference'" },
     { name = "rioxarray" },
+    { name = "s3fs", marker = "extra == 'aws'" },
+    { name = "scikit-learn", marker = "extra == 'inference'" },
     { name = "shapely" },
     { name = "stackstac" },
     { name = "tenacity" },
+    { name = "tessera-embeddings", extras = ["inference", "prefect", "aws"], marker = "extra == 'all'" },
+    { name = "torch", marker = "extra == 'inference'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "tqdm" },
     { name = "xarray" },
     { name = "zarr" },
 ]
-provides-extras = ["architecture-tests"]
+provides-extras = ["inference", "prefect", "aws", "all", "architecture-tests"]
 
 [package.metadata.requires-dev]
-aws = [
-    { name = "boto3" },
-    { name = "botocore" },
-    { name = "dask-cloudprovider", extras = ["aws"] },
-    { name = "prefect-aws" },
-    { name = "s3fs" },
-]
 dev = [
     { name = "hypothesis" },
     { name = "moto", extras = ["server"] },
@@ -4391,15 +4402,6 @@ dev = [
     { name = "pytest-xdist" },
     { name = "ruff" },
     { name = "vcrpy" },
-]
-inference = [
-    { name = "ray", extras = ["default"] },
-    { name = "scikit-learn" },
-    { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
-]
-prefect = [
-    { name = "prefect", specifier = ">=3.0" },
-    { name = "prefect-dask" },
 ]
 
 [[package]]
