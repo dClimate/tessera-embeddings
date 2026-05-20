@@ -417,6 +417,12 @@ no `gdal.SetConfigOption` or `VSICurlClearCache` is needed. This reaches into pr
 renames those symbols, the import fails loudly and the regression tests in
 `tests/unit/test_auth.py` catch the break in CI before it hits a 1hr cloud run.
 
+This was empirically verified on a us-west-2 EC2 box (2026-05-20): a four-month S1 ingest
+run at `cred_refresh_interval_sec=60` over a persistent local Dask cluster forced multiple
+mid-run STS refreshes; every batch's `/vsis3/` reads succeeded, confirming the env-drift
+patch plus orchestrator-side `_local.reset()` are sufficient without explicit GDAL
+credential-cache calls.
+
 OPERA asset STS credentials are intentionally **never cleaned up** from env vars. This avoids
 a race condition where one Dask task's cleanup could remove credentials another task still
 needs. Icechunk/Zarr write operations on the project's own S3 bucket stay isolated by being
