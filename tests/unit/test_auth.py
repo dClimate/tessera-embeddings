@@ -12,6 +12,8 @@ import os
 import pytest
 import requests
 
+from tessera_embeddings.ingest.auth import _EDLSession
+
 # ---------------------------------------------------------------------------
 # get_edl_session
 # ---------------------------------------------------------------------------
@@ -93,8 +95,6 @@ def _fake_response(original_url: str = "https://datapool.asf.alaska.edu/RTC/OPER
 
 def test_rebuild_auth_basic_auth_reinjected_on_urs_redirect() -> None:
     """Basic-auth creds are re-applied when redirected to URS."""
-    from tessera_embeddings.ingest.auth import _EDLSession
-
     session = _EDLSession()
     session.auth = ("user", "pass")
     req = _prepared("https://urs.earthdata.nasa.gov/oauth/authorize")
@@ -111,8 +111,6 @@ def test_rebuild_auth_bearer_reinjected_on_cross_domain_redirect() -> None:
     re-applied self.auth, so SAML accounts using EARTHDATA_TOKEN got 401
     when the bearer header was stripped on the datapool → cumulus hop.
     """
-    from tessera_embeddings.ingest.auth import _EDLSession
-
     session = _EDLSession()
     session.headers["Authorization"] = "Bearer tok123"
     req = _prepared("https://cumulus.asf.alaska.edu/some/path")
@@ -126,8 +124,6 @@ def test_rebuild_auth_bearer_reinjected_on_cross_domain_redirect() -> None:
 
 def test_rebuild_auth_bearer_reinjected_on_earthdatacloud_redirect() -> None:
     """Bearer is also restored on redirects to earthdatacloud.nasa.gov."""
-    from tessera_embeddings.ingest.auth import _EDLSession
-
     session = _EDLSession()
     session.headers["Authorization"] = "Bearer tok123"
     req = _prepared("https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/x.tif")
@@ -138,10 +134,26 @@ def test_rebuild_auth_bearer_reinjected_on_earthdatacloud_redirect() -> None:
     assert req.headers.get("Authorization") == "Bearer tok123"
 
 
+def test_rebuild_auth_basic_auth_dropped_on_non_urs_asf_redirect() -> None:
+    """Basic-auth credentials must NOT be sent to non-URS ASF hosts.
+
+    self.auth carries the user's permanent EDL password — only URS, the
+    OAuth handshake target, should ever receive it. A datapool → cumulus
+    redirect must drop the password (URS itself will set a cookie / issue
+    a token before redirecting onward).
+    """
+    session = _EDLSession()
+    session.auth = ("user", "pass")
+    req = _prepared("https://cumulus.asf.alaska.edu/some/path")
+    req.headers.pop("Authorization", None)
+
+    session.rebuild_auth(req, _fake_response())
+
+    assert "Authorization" not in req.headers
+
+
 def test_rebuild_auth_drops_auth_on_untrusted_redirect() -> None:
     """Untrusted redirect targets must not receive EDL credentials."""
-    from tessera_embeddings.ingest.auth import _EDLSession
-
     session = _EDLSession()
     session.headers["Authorization"] = "Bearer tok123"
     req = _prepared("https://evil.example.com/steal")

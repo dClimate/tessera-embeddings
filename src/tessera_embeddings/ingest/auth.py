@@ -84,7 +84,7 @@ class _EDLSession(requests.Session):
         self.mount("http://", adapter)
 
     def rebuild_auth(self, prepared_request: requests.PreparedRequest, response: requests.Response) -> None:
-        """Re-inject auth on redirects within the trusted EDL/ASF host set.
+        """Re-inject auth on cross-domain redirects within the EDL/ASF chain.
 
         ``requests`` strips Authorization on every cross-domain redirect, and
         by the time a redirect reaches URS the header is already gone from an
@@ -92,28 +92,39 @@ class _EDLSession(requests.Session):
         re-apply credentials, not just skip the strip — a plain ``return``
         would preserve "already missing".
 
-        Two auth modes have to be handled because they live in different
-        attributes:
+        The two auth modes are scoped differently because they carry very
+        different blast radii:
 
-        * Basic auth via ``self.auth`` (production path).
-        * Bearer token via ``self.headers['Authorization']`` (local SAML
-          fallback). Session headers are merged into the prepared request
-          before ``rebuild_auth`` runs, so requests' default behaviour also
-          strips this on cross-domain hops — restoring it here is required.
+        * **Basic auth** via ``self.auth`` is the user's permanent EDL
+          password.  It is only re-injected on redirects to URS
+          (``urs.earthdata.nasa.gov``), the OAuth handshake target.  Other
+          ASF / Earthdata Cloud hosts in the chain don't need it — URS issues
+          a token / sets cookies and redirects onward — and sending the
+          password to non-URS hosts would leak the user's credentials.
+
+        * **Bearer token** via ``self.headers['Authorization']`` (the local
+          SAML fallback) is scoped and time-limited.  Session headers get
+          merged into the prepared request before ``rebuild_auth`` runs, so
+          requests' default behaviour strips it on every cross-domain hop —
+          we must restore it across the whole trusted chain (datapool → URS
+          → cumulus → CloudFront) for the bearer path to work at all.
         """
         redirect_host = (urlparse(prepared_request.url or "").hostname or "").lower()
-        is_trusted = any(redirect_host == h or redirect_host.endswith("." + h) for h in _TRUSTED_AUTH_SUFFIXES)
 
-        if is_trusted:
-            if self.auth:
+        if self.auth:
+            # Basic-auth path: only URS may receive the user's password.
+            if redirect_host == _AUTH_HOST or redirect_host.endswith("." + _AUTH_HOST):
                 prepared_request.prepare_auth(self.auth, prepared_request.url)
                 return
+        else:
             session_auth = self.headers.get("Authorization")
-            if session_auth:
+            if session_auth and any(
+                redirect_host == h or redirect_host.endswith("." + h) for h in _TRUSTED_AUTH_SUFFIXES
+            ):
                 prepared_request.headers["Authorization"] = session_auth
                 return
 
-        # Untrusted redirect target: default behaviour (strip cross-domain auth)
+        # Untrusted target (or no creds to re-inject): default strip behaviour.
         super().rebuild_auth(prepared_request, response)
 
 
