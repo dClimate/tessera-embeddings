@@ -193,7 +193,7 @@ def build_inference_model(
     if unexpected:
         logger.warning("Checkpoint has %d unexpected params (first few): %s", len(unexpected), list(unexpected)[:5])
 
-    # Must run on CPU before .to(device)/.half() so the fused nn.GRU inherits correct weights.
+    # Must run on CPU before .to(device)/.bfloat16() so the fused nn.GRU inherits correct weights.
     _fuse_custom_gru(model)
 
     for param in model.parameters():

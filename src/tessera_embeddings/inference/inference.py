@@ -87,16 +87,16 @@ class InferenceResult:
 def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> bool:
     """Configure model and GPU for inference.
 
-    On CUDA: converts to FP16, enables cuDNN benchmark mode, probes autocast dtypes.
+    On CUDA: converts to BF16, enables cuDNN benchmark mode, probes autocast dtypes.
 
     Returns:
-        Whether to use FP16 (True when device is CUDA).
+        Whether to use reduced precision (True when device is CUDA).
     """
     log_cuda_diagnostics(device)
 
     if device.type == "cuda":
-        model.half()
-        logger.info("Model converted to FP16")
+        model.bfloat16()
+        logger.info("Model converted to BF16")
         torch.backends.cudnn.benchmark = True
         logger.debug("cuDNN benchmark mode enabled")
 
@@ -121,7 +121,7 @@ def _run_gpu_sub_batch(
     batch: dict[str, np.ndarray],
     bucket_key: tuple[int, int],
     device: torch.device,
-    use_fp16: bool,
+    use_reduced_precision: bool,
     flat_out: np.ndarray,
     get_batch_secs: float,
     *,
@@ -142,9 +142,9 @@ def _run_gpu_sub_batch(
 
     s2_input = torch.from_numpy(s2_np).to(device, non_blocking=True)
     s1_input = torch.from_numpy(s1_np).to(device, non_blocking=True)
-    if use_fp16:
-        s2_input = s2_input.half()
-        s1_input = s1_input.half()
+    if use_reduced_precision:
+        s2_input = s2_input.to(torch.bfloat16)
+        s1_input = s1_input.to(torch.bfloat16)
     if device.type == "cuda":
         torch.cuda.synchronize()
     tb2 = time.monotonic()
@@ -240,7 +240,7 @@ def run_inference(
         n_valid,
         batch_size,
     )
-    use_fp16 = _prepare_gpu(model, device)
+    use_reduced_precision = _prepare_gpu(model, device)
 
     t_total = _BatchTimings(0.0, 0.0, 0.0, 0.0)
     pixels_processed = 0
@@ -282,7 +282,7 @@ def run_inference(
                 batch,
                 bucket_key,
                 device,
-                use_fp16,
+                use_reduced_precision,
                 flat_out,
                 get_batch_secs,
                 profile=(sub_batch_idx == PROFILE_BATCH_IDX),
