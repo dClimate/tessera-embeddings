@@ -84,24 +84,39 @@ class InferenceResult:
     scales: np.ndarray
 
 
-def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> bool:
+def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> torch.dtype | None:
     """Configure model and GPU for inference.
 
-    On CUDA: converts to BF16, enables cuDNN benchmark mode, probes autocast dtypes.
+    On CUDA: converts to BF16 (preferred) and enables cuDNN benchmark mode.
+    Falls back to FP16 on GPUs that don't support BF16 (e.g. T4, compute
+    capability < 8.0). BF16 is strongly preferred — it has the same exponent
+    range as FP32 and avoids overflow on large intermediate activations. The
+    FP16 fallback is functional but carries a risk of inf/NaN from saturation
+    at 65504; treat it as a best-effort path, not a validated production config.
 
     Returns:
-        Whether to use reduced precision (True when device is CUDA).
+        The reduced-precision dtype to use for inputs (bfloat16 or float16), or None
+        on CPU (inputs stay float32).
     """
     log_cuda_diagnostics(device)
 
-    if device.type == "cuda":
-        model.bfloat16()
-        logger.info("Model converted to BF16")
-        torch.backends.cudnn.benchmark = True
-        logger.debug("cuDNN benchmark mode enabled")
+    if device.type != "cuda":
+        log_autocast_dtype_probe(device, dtype=None)
+        return None
 
-    log_autocast_dtype_probe(device)
-    return device.type == "cuda"
+    if torch.cuda.is_bf16_supported():
+        model.bfloat16()
+        dtype = torch.bfloat16
+        logger.info("Model converted to BF16")
+    else:
+        model.half()
+        dtype = torch.float16
+        logger.warning("BF16 not supported on this GPU; falling back to FP16")
+
+    torch.backends.cudnn.benchmark = True
+    logger.debug("cuDNN benchmark mode enabled")
+    log_autocast_dtype_probe(device, dtype=dtype)
+    return dtype
 
 
 def _prepare_batch(
@@ -121,7 +136,7 @@ def _run_gpu_sub_batch(
     batch: dict[str, np.ndarray],
     bucket_key: tuple[int, int],
     device: torch.device,
-    use_reduced_precision: bool,
+    reduced_precision_dtype: torch.dtype | None,
     flat_out: np.ndarray,
     get_batch_secs: float,
     *,
@@ -142,9 +157,9 @@ def _run_gpu_sub_batch(
 
     s2_input = torch.from_numpy(s2_np).to(device, non_blocking=True)
     s1_input = torch.from_numpy(s1_np).to(device, non_blocking=True)
-    if use_reduced_precision:
-        s2_input = s2_input.to(torch.bfloat16)
-        s1_input = s1_input.to(torch.bfloat16)
+    if reduced_precision_dtype is not None:
+        s2_input = s2_input.to(reduced_precision_dtype)
+        s1_input = s1_input.to(reduced_precision_dtype)
     if device.type == "cuda":
         torch.cuda.synchronize()
     tb2 = time.monotonic()
@@ -240,7 +255,7 @@ def run_inference(
         n_valid,
         batch_size,
     )
-    use_reduced_precision = _prepare_gpu(model, device)
+    reduced_precision_dtype = _prepare_gpu(model, device)
 
     t_total = _BatchTimings(0.0, 0.0, 0.0, 0.0)
     pixels_processed = 0
@@ -282,7 +297,7 @@ def run_inference(
                 batch,
                 bucket_key,
                 device,
-                use_reduced_precision,
+                reduced_precision_dtype,
                 flat_out,
                 get_batch_secs,
                 profile=(sub_batch_idx == PROFILE_BATCH_IDX),
