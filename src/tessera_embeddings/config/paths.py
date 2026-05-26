@@ -21,8 +21,7 @@ from pydantic import BaseModel, Field
 
 _INPUT_KINDS: frozenset[str] = frozenset({"reflectance", "sar_ascending", "sar_descending", "roi"})
 _OUTPUT_KINDS: frozenset[str] = frozenset({"embeddings"})
-_PREPROCESSED_KINDS: frozenset[str] = frozenset({"staging"})
-_ALL_KINDS: frozenset[str] = _INPUT_KINDS | _OUTPUT_KINDS | _PREPROCESSED_KINDS
+_ALL_KINDS: frozenset[str] = _INPUT_KINDS | _OUTPUT_KINDS
 
 
 @final
@@ -35,7 +34,6 @@ class BucketPaths(BaseModel):
 
     inputs: str = Field(..., description="Base URI for ROI masks and intermediate ingest stores.")
     outputs: str = Field(..., description="Base URI for final embedding outputs.")
-    preprocessed: str = Field(..., description="Base URI for mosaicked store outputs.")
 
     def store_for(self, roi_name: str, kind: str) -> str:
         """Return the canonical store URI for ``(roi_name, kind)``.
@@ -59,7 +57,5 @@ class BucketPaths(BaseModel):
             base = self.inputs
         elif kind in _OUTPUT_KINDS:
             base = self.outputs
-        else:
-            base = self.preprocessed
 
         return posixpath.join(base, roi_name, kind)

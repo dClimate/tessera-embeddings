@@ -127,7 +127,7 @@ The flow runner's task role needs:
 - ecs:RunTask, ecs:DescribeTasks, ecs:ListTasks,
   ecs:RegisterTaskDefinition, ecs:DescribeTaskDefinition → for dask-cloudprovider
 - iam:PassRole (for the Dask task + execution roles)  → for ECS RunTask
-- s3:* on your input/output/preprocessed buckets       → for fsspec operations
+- s3:* on your input/output buckets       → for fsspec operations
 - logs:CreateLogStream, logs:PutLogEvents              → for CloudWatch
 - logs:FilterLogEvents                                 → for the diagnostics fetcher
 ```

@@ -37,7 +37,6 @@ from tessera_embeddings import BucketPaths
 paths = BucketPaths(
     inputs="s3://my-org-tessera-inputs",
     outputs="s3://my-org-tessera-outputs",
-    preprocessed="s3://my-org-tessera-mosaics",
 )
 ```
 
@@ -51,7 +50,7 @@ this.
 caller / config  │  BucketPaths                │
 ─────────────────┤    inputs: <uri>            │ pydantic: validates at boundary
                  │    outputs: <uri>           │
-                 │    preprocessed: <uri>      │
+                 │                             │
                  └────────────┬────────────────┘
                               │
                               ▼

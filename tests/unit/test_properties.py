@@ -98,7 +98,6 @@ def _bucket_paths(draw: st.DrawFn) -> BucketPaths:
     return BucketPaths(
         inputs=f"{schemes}/inputs",
         outputs=f"{schemes}/outputs",
-        preprocessed=f"{schemes}/preprocessed",
     )
 
 
