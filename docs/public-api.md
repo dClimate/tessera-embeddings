@@ -8,9 +8,8 @@ CI verifies that the names listed here match `tessera_embeddings.__all__`.
 
 ## Configuration
 
-- `BucketPaths` — pydantic model for storage URIs (inputs / outputs /
-  preprocessed). Pass to flows / runners; never read from env inside
-  the package.
+- `BucketPaths` — pydantic model for storage URIs (inputs / outputs).
+  Pass to flows / runners; never read from env inside the package.
 - `InferenceConfig` — frozen-ish dataclass with model, sampling, and
   Ray-actor parameters.
 - `AssemblyConfig` — Dask cluster recipe for the embedding-assembly

@@ -89,7 +89,7 @@ def test_sliding_window_respects_concurrency_cap(n_jobs: int, max_concurrent: in
 # ---------------------------------------------------------------------------
 
 
-_KINDS = ["reflectance", "sar_ascending", "sar_descending", "embeddings", "staging", "roi"]
+_KINDS = ["reflectance", "sar_ascending", "sar_descending", "embeddings", "roi"]
 
 
 @st.composite
@@ -98,7 +98,6 @@ def _bucket_paths(draw: st.DrawFn) -> BucketPaths:
     return BucketPaths(
         inputs=f"{schemes}/inputs",
         outputs=f"{schemes}/outputs",
-        preprocessed=f"{schemes}/preprocessed",
     )
 
 

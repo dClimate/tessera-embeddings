@@ -113,7 +113,7 @@ the names of the four child deployments via the
 
 ```python
 prefect deployment run 'tessera-full-pipeline/master' \
-    --param paths='{"inputs": "s3://...", "outputs": "s3://...", "preprocessed": "s3://..."}' \
+    --param paths='{"inputs": "s3://...", "outputs": "s3://..."}' \
     --param time_window_end='June 2025' \
     --param tile_names='14TPK' \
     --param ami_ssm_name='/tessera/ray/ami-id'

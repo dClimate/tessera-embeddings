@@ -13,7 +13,6 @@
 paths:
   inputs: file:///tmp/tessera/inputs
   outputs: file:///tmp/tessera/outputs
-  preprocessed: file:///tmp/tessera/preprocessed
 
 roi:
   # ~1 km box in Denver, CO — covered by both ascending and descending

@@ -259,7 +259,6 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
             paths:
               inputs: file:///tmp/tessera/inputs
               outputs: file:///tmp/tessera/outputs
-              preprocessed: file:///tmp/tessera/preprocessed
             roi:
               name: my-roi
               geojson: examples/quickstart/roi.geojson    # optional
