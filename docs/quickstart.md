@@ -110,7 +110,7 @@ What happens:
 5. Stop. No inference. No assembly.
 ```
 
-Output: `${paths.outputs}/quickstart_denver/{reflectance.zarr, sar_ascending.zarr}`.
+Output: `${paths.inputs}/quickstart_denver_co/{reflectance.zarr, sar_ascending.zarr}`.
 
 ## Full pipeline (30+ minutes on CPU, much faster on GPU)
 
