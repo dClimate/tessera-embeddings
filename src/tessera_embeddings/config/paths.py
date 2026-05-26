@@ -41,8 +41,7 @@ class BucketPaths(BaseModel):
         Args:
             roi_name: Identifier for the region of interest (e.g. ``"33UWP"``).
             kind: One of ``"reflectance"``, ``"sar_ascending"``,
-                ``"sar_descending"``, ``"embeddings"``, ``"staging"``,
-                or ``"roi"``.
+                ``"sar_descending"``, ``"embeddings"``, or ``"roi"``.
 
         Returns:
             Full URI to the Zarr/Icechunk store.
