@@ -309,6 +309,10 @@ def _load_s2(
         logger.info("Pruned %d/%d empty S2 timesteps", t_full - n_kept, t_full)
     abs_kept = abs_indices[kept]
     s2_masks = s2_masks_full[kept]
+
+    # Free T_full-sized mask before allocating T_kept-sized bands (saves memory on large ROIs).
+    del s2_masks_full
+
     s2_doys = s2_doys_full[kept]
 
     s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice)
