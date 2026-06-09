@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.orchestration.prefect.flows import generate_roi as flow_module
 from tests.parity.helpers import assert_zarr_equivalent
@@ -61,7 +62,7 @@ def test_generate_roi_parity(tmp_path: Path, fixture_quickstart_roi: Path, monke
     rasterize_roi_zarr(
         output_path=str(out_a),
         resolution=10.0,
-        chunk_size=2000,
+        chunk_size=INGEST_CHUNK_SIZE,
         force_crs=force_crs,
         input_path=str(fixture_quickstart_roi),
     )
@@ -73,7 +74,7 @@ def test_generate_roi_parity(tmp_path: Path, fixture_quickstart_roi: Path, monke
         roi_bucket=str(bucket_b),
         roi_name="test",
         resolution=10.0,
-        chunk_size=2000,
+        chunk_size=INGEST_CHUNK_SIZE,
         force_crs=force_crs,
     )
 

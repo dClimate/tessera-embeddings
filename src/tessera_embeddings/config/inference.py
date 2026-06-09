@@ -139,11 +139,10 @@ REPRESENTATION_DIM = 192
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.
 DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
-# Spatial chunk size for storage and inference. 2000x2000 keeps peak RAM ~9.8 GB on
-# g5.2xlarge (31 GB), providing comfortable headroom.
+# Spatial read-tile size for inference. 2000x2000 keeps peak RAM ~9.8 GB on
+# g5.2xlarge (31 GB), providing comfortable headroom. Independent of the storage
+# chunk size written at ingest (config.ingest.INGEST_CHUNK_SIZE).
 DEFAULT_CHUNK_SIZE = 2000
-
-TESSERA_CHUNKS = {"time": 1, "northing": DEFAULT_CHUNK_SIZE, "easting": DEFAULT_CHUNK_SIZE}
 
 
 @final

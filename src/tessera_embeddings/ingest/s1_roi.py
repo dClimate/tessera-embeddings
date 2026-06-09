@@ -37,7 +37,7 @@ from typing import Literal, final
 import dask.distributed
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
-from tessera_embeddings.config.inference import TESSERA_CHUNKS
+from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest.opera_query import make_s1_item_rewriter
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import apply_roi_mask
@@ -142,9 +142,9 @@ def ingest_s1_roi_sar(
 
     ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path)
 
-    # Load chunks: spatial multiples of TESSERA_CHUNKS so rechunk at
+    # Load chunks: spatial multiples of INGEST_CHUNKS so rechunk at
     # write time is a pure split with no cross-chunk shuffling.
-    spatial_chunks = {"northing": TESSERA_CHUNKS["northing"], "easting": TESSERA_CHUNKS["easting"]}
+    spatial_chunks = {"northing": INGEST_CHUNKS["northing"], "easting": INGEST_CHUNKS["easting"]}
 
     last_cred_refresh: float = float("-inf")
 
@@ -188,7 +188,7 @@ def ingest_s1_roi_sar(
             end_date=batch_end_str,
             existing_dates=existing_dates,
             bbox=roi.bbox_wgs84,
-            chunks=TESSERA_CHUNKS,
+            chunks=INGEST_CHUNKS,
             resampling="bilinear",
             groupby="solar_day",
             item_filter_fn=make_s1_item_rewriter(
@@ -216,7 +216,7 @@ def ingest_s1_roi_sar(
                         data,
                         tile_id=roi_zarr_path,
                         baselines=baselines,
-                        chunks=TESSERA_CHUNKS,
+                        chunks=INGEST_CHUNKS,
                         manifest=ingest_manifest,
                         crs=roi.native_crs,
                     )

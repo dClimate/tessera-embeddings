@@ -29,6 +29,7 @@ from dask.distributed import Client
 
 from tessera_embeddings.config.dask import AssemblyConfig
 from tessera_embeddings.config.inference import DEFAULT_CHUNK_SIZE, checkpoint_filename
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import ZarrWriter
@@ -306,7 +307,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         rasterize_roi_zarr(
             output_path=roi_path,
             resolution=roi_cfg.get("resolution", 10.0),
-            chunk_size=roi_cfg.get("chunk_size", DEFAULT_CHUNK_SIZE),
+            chunk_size=roi_cfg.get("chunk_size", INGEST_CHUNK_SIZE),
             force_crs=roi_cfg.get("force_crs"),
             input_path=roi_cfg["geojson"],
         )

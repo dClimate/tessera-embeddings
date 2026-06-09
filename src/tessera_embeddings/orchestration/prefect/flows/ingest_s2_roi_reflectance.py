@@ -69,7 +69,7 @@ def ingest_s2_roi_reflectance(
     Reads the Zarr ROI store to extract a WGS84 bounding box, queries
     STAC for all intersecting tiles, and writes a mosaicked
     ``reflectance.zarr`` store under ``store_path`` with the
-    inference pipeline's TESSERA_CHUNKS (2000x2000).
+    ingestion pipeline's INGEST_CHUNKS (4000x4000).
 
     Args:
         roi_zarr_path: Any fsspec-compatible URI to the Zarr ROI store.
