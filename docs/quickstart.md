@@ -17,10 +17,13 @@ full end-to-end CPU inference.
   Launchpad account.
 - **~5 GB of free disk** at the paths in `examples/quickstart/config.yaml`
   (default `/tmp/tessera/...`).
-- **A Tessera model checkpoint**, only for the full-pipeline run.
-  Download from the public release; set `checkpoint_dir` in
-  `examples/quickstart/config.yaml` to its parent directory. The
-  expected filename comes from
+- **A Tessera model checkpoint** — no manual download needed. The
+  bundled `examples/quickstart/config.yaml` sets `checkpoint_url` to
+  the public v1.1 AWS encoder on HuggingFace; the runner fetches and
+  caches it locally on first use (under the system temp dir, or NVMe
+  on an AWS DLAMI host). To use a checkpoint you already have on disk,
+  set `checkpoint_url: null` and point `checkpoint_dir` at its parent
+  directory instead — the expected filename comes from
   `tessera_embeddings.checkpoint_filename()` (or
   `checkpoint_filename(norm_source="aws")` for the AWS-normalised
   encoder).

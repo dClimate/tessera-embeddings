@@ -114,7 +114,8 @@ coupled, so end-to-end is the primary demo. `--skip-inference` is the
 fast path for contributors iterating on ingest changes without waiting
 for CPU torch. Production inference always runs on GPU. See
 [`docs/quickstart.md`](docs/quickstart.md) for prerequisites
-(Earthdata Login credentials for OPERA, model checkpoint download).
+(Earthdata Login credentials for OPERA; the model checkpoint is
+pulled from HuggingFace automatically).
 
 ## Running at scale
 

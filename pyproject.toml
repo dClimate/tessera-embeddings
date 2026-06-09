@@ -60,6 +60,10 @@ inference = [
     "torch",
     "ray[default]",
     "scikit-learn",
+    # fsspec's HTTP backend (used to pull model checkpoints from URLs such as
+    # HuggingFace `resolve/main` links) requires aiohttp; it isn't pulled in by
+    # fsspec itself. Already resolved in uv.lock.
+    "aiohttp",
 ]
 prefect = [
     "prefect>=3.0",
