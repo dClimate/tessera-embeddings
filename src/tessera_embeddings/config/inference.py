@@ -142,7 +142,7 @@ DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 # Spatial read-tile size for inference. 2000x2000 keeps peak RAM ~9.8 GB on
 # g5.2xlarge (31 GB), providing comfortable headroom. Independent of the storage
 # chunk size written at ingest (config.ingest.INGEST_CHUNK_SIZE).
-DEFAULT_CHUNK_SIZE = 2000
+INFERENCE_CHUNK_SIZE = 2000
 
 
 @final
@@ -210,7 +210,7 @@ class InferenceConfig:
     checkpoint_path: str = ""
     inputs_bucket: str = ""
     output_bucket: str = ""
-    chunk_size: int = DEFAULT_CHUNK_SIZE
+    chunk_size: int = INFERENCE_CHUNK_SIZE
 
     # Ray cluster
     ray_address: str | None = None

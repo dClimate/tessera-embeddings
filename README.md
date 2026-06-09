@@ -207,7 +207,7 @@ overhead:       95% of wall-clock       overhead:      <5%
 Storage and read granularity are tuned separately. Ingest writes
 `INGEST_CHUNK_SIZE = 4000` storage chunks to keep the satellite-ingest
 Dask graph small (¼ the spatial tasks), while inference reads
-`DEFAULT_CHUNK_SIZE = 2000` sub-tiles out of them — small enough to keep
+`INFERENCE_CHUNK_SIZE = 2000` sub-tiles out of them — small enough to keep
 peak GPU-node RAM in check. Zarr's `oindex` reads the 2000 sub-tile out
 of a 4000 chunk without any alignment requirement. Go smaller on the
 read size and the Dask scheduler hangs on graph construction; larger and

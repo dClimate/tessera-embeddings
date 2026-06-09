@@ -13,7 +13,7 @@ config/
 ├── paths.py                BucketPaths   ─── pydantic, deployment-supplied storage URIs
 ├── inference.py            InferenceConfig ── frozen dataclass: model, sampling, Ray-actor
 │                           TimeWindow      ── 12-month rolling window
-│                           DEFAULT_CHUNK_SIZE = 2000
+│                           INFERENCE_CHUNK_SIZE = 2000
 │                           EMBEDDING_DIM = 128
 │                           DEFAULT_NUM_OBS_CHECKPOINTS = tuple(range(8, 257, 8))
 │                           checkpoint_filename(norm_source="mpc"|"aws") → str
