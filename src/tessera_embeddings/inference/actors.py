@@ -334,6 +334,13 @@ def download_checkpoint(remote_path: str, local_dir: str | None = None) -> str:
 
     Returns:
         Local file path.
+
+    Concurrency: many actors on the same host may call this with the same
+    ``remote_path`` and shared cache dir at once (cold cache, 100s of actors).
+    The download writes to a unique temp file and is published to the final
+    path with an atomic rename, so a concurrent reader never observes a
+    partially-written checkpoint and concurrent writers can't corrupt each
+    other's output — the last rename wins, and every byte is identical.
     """
     filename = remote_path.rsplit("/", 1)[-1]
 
@@ -346,8 +353,17 @@ def download_checkpoint(remote_path: str, local_dir: str | None = None) -> str:
         return str(local_path)
 
     logger.info("Downloading checkpoint: %s → %s", remote_path, local_path)
-    with fsspec.open(remote_path, "rb") as remote, local_path.open("wb") as dest:
-        dest.write(remote.read())
+    # Checkpoints are ~200 MB, so reading the whole file into memory is fine.
+    with fsspec.open(remote_path, "rb") as remote:
+        data = remote.read()
+    # Stage into a unique temp file in the same dir (so the rename stays on one
+    # filesystem and is atomic), then atomically publish — concurrent actors
+    # publishing the same checkpoint can't observe a half-written file.
+    with tempfile.NamedTemporaryFile(dir=local, prefix=f"{filename}.", suffix=".part", delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(local_path)
+
     downloaded_size = local_path.stat().st_size
     logger.info("Download complete: %s (%.1f MB)", local_path, downloaded_size / 1024 / 1024)
 

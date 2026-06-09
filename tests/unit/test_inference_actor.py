@@ -8,9 +8,12 @@ construction is covered in integration tests where Ray is available.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
 import ray
 
-from tessera_embeddings.inference.actors import InferenceActor
+from tessera_embeddings.inference.actors import InferenceActor, download_checkpoint
 
 
 def test_actor_class_has_no_static_gpu_reservation() -> None:
@@ -46,3 +49,71 @@ def test_actor_options_accepts_cpu_and_gpu() -> None:
 def test_actor_is_a_ray_remote_class() -> None:
     """InferenceActor is a Ray remote class (not a plain Python class)."""
     assert isinstance(InferenceActor, ray.actor.ActorClass)
+
+
+# --- download_checkpoint: real filesystem, no mocking ---
+#
+# fsspec.open() handles bare local paths, so the "remote" source is just a
+# real file on disk and the cache dir is a tmp_path. This exercises the actual
+# download → stage-to-temp → atomic-rename path; the only injected seam is the
+# existing ``local_dir`` argument.
+
+
+def _write_source(tmp_path: Path, payload: bytes = b"model-weights") -> Path:
+    src = tmp_path / "remote" / "tessera_v1_1_aws_encoder.pt"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(payload)
+    return src
+
+
+def test_download_checkpoint_copies_to_cache(tmp_path: Path) -> None:
+    """A cold cache stages the file under local_dir and returns its path."""
+    src = _write_source(tmp_path)
+    cache = tmp_path / "cache"
+
+    local = download_checkpoint(str(src), local_dir=str(cache))
+
+    assert Path(local) == cache / src.name
+    assert Path(local).read_bytes() == b"model-weights"
+
+
+def test_download_checkpoint_reuses_existing_file(tmp_path: Path) -> None:
+    """A warm cache returns the cached file without re-reading the source."""
+    src = _write_source(tmp_path)
+    cache = tmp_path / "cache"
+
+    first = download_checkpoint(str(src), local_dir=str(cache))
+    # Delete the source: a second call must hit the cache, not the source.
+    src.unlink()
+    second = download_checkpoint(str(src), local_dir=str(cache))
+
+    assert first == second
+    assert Path(second).read_bytes() == b"model-weights"
+
+
+def test_download_checkpoint_leaves_no_partial_files(tmp_path: Path) -> None:
+    """Only the published file remains — no leftover .part staging files."""
+    src = _write_source(tmp_path)
+    cache = tmp_path / "cache"
+
+    download_checkpoint(str(src), local_dir=str(cache))
+
+    assert sorted(p.name for p in cache.iterdir()) == [src.name]
+
+
+def test_download_checkpoint_concurrent_callers_get_intact_file(tmp_path: Path) -> None:
+    """Many actors racing on a cold cache never publish a half-written file.
+
+    Each thread runs the full download/stage/rename. Atomic rename means
+    last-writer-wins, so every returned path holds the complete payload and
+    no truncated ``.part`` file is left behind.
+    """
+    payload = b"x" * (4 * 1024 * 1024)  # 4 MB, big enough to interleave writes
+    src = _write_source(tmp_path, payload)
+    cache = tmp_path / "cache"
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda _: download_checkpoint(str(src), local_dir=str(cache)), range(32)))
+
+    assert all(Path(r).read_bytes() == payload for r in results)
+    assert sorted(p.name for p in cache.iterdir()) == [src.name]
