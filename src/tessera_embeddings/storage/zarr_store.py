@@ -14,7 +14,6 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-import dask.array as da
 import fsspec
 import icechunk
 import numpy as np
@@ -27,11 +26,6 @@ from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
 from tessera_embeddings.utils import utcnow_iso
 
 logger = logging.getLogger(__name__)
-
-# Default chunking for Zarr storage arrays.
-# time=1 keeps each date separate for efficient single-date reads and appends.
-# Full spatial chunks reasonable with icechunk and simplifies task graph
-DEFAULT_CHUNKS = {"time": 1, "northing": 10980, "easting": 10980}
 
 # Standard time encoding for all stores
 TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"}
@@ -356,17 +350,29 @@ def compute_doy(timestamps: np.ndarray) -> np.ndarray:
     return ((timestamps.astype("datetime64[D]") - years).astype(int) + 1).astype(np.int32)
 
 
-def _write_dataset_impl(
+def write_dataset(
     store_path: str,
     data: xr.Dataset,
     tile_id: str,
     baselines: dict[str, int],
-    chunks: dict[str, int] | None = None,
+    chunks: dict[str, int],
     manifest: IngestManifest | None = None,
-    crs: str | None = None,
+    *,
+    crs: str,
 ) -> None:
-    """Shared implementation for write_dataset and write_reflectance."""
-    effective_chunks = chunks if chunks is not None else DEFAULT_CHUNKS
+    """Write dataset to Icechunk Zarr store, creating or appending as needed.
+
+    Args:
+        store_path: Path to the Zarr store (local or s3://).
+        data: xarray Dataset with (time, northing, easting) dimensions.
+        tile_id: Tile identifier for store metadata.
+        baselines: Dict mapping date strings to baseline integers.
+        chunks: Chunk sizes dict with ``time``, ``northing``, and ``easting`` keys.
+        manifest: Typed manifest for append-safety validation.
+            Written on create, validated on append.
+        crs: CRS authority code (e.g. ``"EPSG:32615"``). Stored in root
+            attrs so downstream consumers can determine the projection.
+    """
     existing_dates = get_existing_dates(store_path)
 
     # Normalize time to nanosecond resolution to match TIME_ENCODING.
@@ -375,7 +381,6 @@ def _write_dataset_impl(
     if data.time.dtype != np.dtype("datetime64[ns]"):
         data = data.assign_coords(time=data.time.values.astype("datetime64[ns]"))
 
-    # Compute DOY coordinate
     doy = compute_doy(data.time.values)
 
     if existing_dates:
@@ -399,11 +404,10 @@ def _write_dataset_impl(
             },
         )
     else:
-        # Create new store with encoding
         chunk_sizes = (
-            effective_chunks["time"],
-            min(effective_chunks["northing"], data.sizes["northing"]),
-            min(effective_chunks["easting"], data.sizes["easting"]),
+            chunks["time"],
+            min(chunks["northing"], data.sizes["northing"]),
+            min(chunks["easting"], data.sizes["easting"]),
         )
         encoding: dict[str, Any] = {str(var): {"chunks": chunk_sizes} for var in data.data_vars}
         encoding["time"] = TIME_ENCODING
@@ -414,118 +418,14 @@ def _write_dataset_impl(
             "doy": doy.tolist(),
             "created_at": utcnow_iso(),
             "last_appended": utcnow_iso(),
+            "crs": crs,
         }
-        if crs:
-            store_attrs["crs"] = crs
         if manifest:
             store_attrs["_manifest"] = manifest.to_dict()
             logger.info("Writing _manifest to %s", store_path)
 
         data.attrs.update(store_attrs)
         _write_new(store_path, data, encoding, f"Create with {data.sizes['time']} dates")
-
-
-def write_dataset(
-    store_path: str,
-    data: xr.Dataset,
-    tile_id: str,
-    baselines: dict[str, int],
-    chunks: dict[str, int] | None = None,
-    manifest: IngestManifest | None = None,
-    *,
-    crs: str,
-) -> None:
-    """Write dataset to Icechunk Zarr store, creating or appending as needed.
-
-    Args:
-        store_path: Path to the Zarr store (local or s3://).
-        data: xarray Dataset with (time, northing, easting) dimensions.
-        tile_id: Tile identifier for store metadata.
-        baselines: Dict mapping date strings to baseline integers.
-        chunks: Optional chunk sizes dict. Defaults to DEFAULT_CHUNKS.
-        manifest: Typed manifest for append-safety validation.
-            Written on create, validated on append.
-        crs: CRS authority code (e.g. ``"EPSG:32615"``). Stored in root
-            attrs so downstream consumers can determine the projection.
-    """
-    _write_dataset_impl(store_path, data, tile_id, baselines, chunks, manifest, crs=crs)
-
-
-def write_reflectance(
-    store_path: str,
-    data: xr.Dataset,
-    tile_id: str,
-    baselines: dict[str, int],
-    chunks: dict[str, int] | None = None,
-    manifest: IngestManifest | None = None,
-    *,
-    crs: str | None = None,
-) -> None:
-    """Backward-compatible wrapper: writes reflectance without requiring CRS.
-
-    Prefer ``write_dataset`` for new code — it enforces CRS.
-    """
-    _write_dataset_impl(store_path, data, tile_id, baselines, chunks, manifest, crs=crs)
-
-
-def write_cloudmask(
-    store_path: str,
-    mask: np.ndarray | da.Array,
-    timestamps: list[np.datetime64],
-    tile_id: str | None = None,
-    model_version: str | None = None,
-    chunks: dict[str, int] | None = None,
-    *,
-    northing: np.ndarray,
-    easting: np.ndarray,
-) -> None:
-    """Write cloud mask data, creating store if needed or appending if exists.
-
-    Args:
-        store_path: Path to the Zarr store.
-        mask: Cloud mask array with shape (time, northing, easting).
-        timestamps: Full timestamps for each time slice. Using full timestamps
-            (not just dates) preserves distinct acquisitions on the same day.
-        tile_id: Tile ID for new stores (required for creation).
-        model_version: Model version for new stores (required for creation).
-        chunks: Optional chunk sizes dict. Defaults to DEFAULT_CHUNKS.
-        northing: 1-D UTM northing coordinate array (metres). Required — a
-            store without spatial coordinates does not satisfy the GeoZarr contract.
-        easting: 1-D UTM easting coordinate array (metres, paired with ``northing``).
-    """
-    effective_chunks = chunks if chunks is not None else DEFAULT_CHUNKS
-
-    if mask.ndim != 3 or mask.shape[0] != len(timestamps):
-        raise ValueError(f"mask shape {mask.shape} doesn't match {len(timestamps)} timestamps")
-
-    # Build dataset with full timestamps to handle multiple acquisitions per day
-    mask_ds = xr.DataArray(
-        mask,
-        dims=["time", "northing", "easting"],
-        coords={"time": timestamps, "northing": northing, "easting": easting},
-        name="mask",
-    ).to_dataset()
-
-    chunk_sizes = {
-        "time": 1,
-        "northing": min(effective_chunks["northing"], mask.shape[1]),
-        "easting": min(effective_chunks["easting"], mask.shape[2]),
-    }
-    mask_ds = mask_ds.chunk(chunk_sizes)
-
-    if get_existing_dates(store_path):
-        _write_append(store_path, mask_ds, f"Append {len(timestamps)} cloudmask timestamps")
-    else:
-        if not tile_id or not model_version:
-            raise ValueError("tile_id and model_version required for new cloudmask store")
-        mask_ds.attrs.update(
-            {
-                "tile_id": tile_id,
-                "model_version": model_version,
-                "created_at": utcnow_iso(),
-            }
-        )
-        _write_new(store_path, mask_ds, {"time": TIME_ENCODING}, f"Create with {len(timestamps)} timestamps")
 
 
 # =============================================================================
