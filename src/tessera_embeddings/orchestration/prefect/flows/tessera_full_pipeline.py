@@ -88,6 +88,9 @@ async def tessera_full_pipeline(
     ami_ssm_name: str = "/tessera/ray/ami-id",
     ssm_prefix: str = "/tessera/ray/",
     cloudwatch_log_group: str = "/ec2/tessera/ray",
+    code_bucket: str | None = None,
+    code_suffix: str = "",
+    sync_source_path: str | None = None,
 ) -> dict:
     """End-to-end pipeline: ROI → S1+S2 ingestion → Tessera embeddings.
 
@@ -119,6 +122,17 @@ async def tessera_full_pipeline(
         cloudwatch_log_group: CloudWatch log group the Ray workers write
             agent logs to. Forwarded to the embeddings stage; must match
             the group the deployment's infra creates and grants access to.
+        code_bucket: S3 bucket (no ``s3://`` prefix) workers pull the
+            source tarball from. Setting it only points workers at an
+            existing tarball (expected to be uploaded by CI — the general
+            production path); it does not upload one. Forwarded to the
+            embeddings stage; leave ``None`` for AMI-baked source.
+        code_suffix: Source tarball filename suffix. Forwarded to the
+            embeddings stage.
+        sync_source_path: Dev-iteration only. Local source dir to tar and
+            upload before ``ray up`` (requires ``code_bucket``), so
+            workers run your working-tree code without a CI round-trip.
+            Forwarded into the embeddings stage's ``dev_params``.
 
     Returns:
         Dict with the run IDs of every child flow.
@@ -219,9 +233,14 @@ async def tessera_full_pipeline(
             "ami_ssm_name": ami_ssm_name,
             "ssm_prefix": ssm_prefix,
             "cloudwatch_log_group": cloudwatch_log_group,
+            "code_bucket": code_bucket,
+            "code_suffix": code_suffix,
             "num_actors": num_actors,
             "s1_orbit": s1_orbit,
-            "dev_params": {"skip_coverage_check": skip_coverage_check},
+            "dev_params": {
+                "skip_coverage_check": skip_coverage_check,
+                "sync_source_path": sync_source_path,
+            },
         },
     )
     _check_completed(embeddings_run, "tessera_embeddings")

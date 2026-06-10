@@ -75,6 +75,12 @@ class EmbeddingsDevParams(BaseModel):
     skip_coverage_check: bool = False
     cleanup_staging: bool = True
     output_name_suffix: str = ""
+    # Dev-iteration escape hatch. When set (requires code_bucket), the provider
+    # tars this local dir and uploads it to s3://{code_bucket}/code/... *before*
+    # ``ray up``, so workers run your working-tree code without a CI round-trip.
+    # None (default) = no upload: workers use AMI-baked source, or a tarball a
+    # CI workflow already put in code_bucket. See providers/aws/gotchas.md.
+    sync_source_path: str | None = None
 
 
 def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
@@ -110,6 +116,8 @@ def tessera_embeddings(
     ami_ssm_name: str,
     ssm_prefix: str = "/tessera/ray/",
     cloudwatch_log_group: str = "/ec2/tessera/ray",
+    code_bucket: str | None = None,
+    code_suffix: str = "",
     num_actors: int = 20,
     s1_orbit: str = "ascending",
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
@@ -133,6 +141,18 @@ def tessera_embeddings(
         cloudwatch_log_group: CloudWatch log group the Ray workers write
             agent logs to. Must match the group the deployment's infra
             creates and grants the worker role access to.
+        code_bucket: S3 bucket (no ``s3://`` prefix) workers pull the
+            source tarball from, at
+            ``s3://{code_bucket}/code/src{code_suffix}.tar.gz``. Setting
+            this only *points* workers at the tarball — it does not
+            upload one; an external/CI workflow is expected to have put
+            it there (the general production path when source ships as an
+            S3 artifact). Leave ``None`` for AMI-baked source. See
+            ``dev_params.sync_source_path`` to also upload from the local
+            tree. See ``providers/aws/gotchas.md`` for the three modes.
+        code_suffix: Filename suffix for the source tarball (e.g.
+            ``"-mybranch"``, letting branches coexist in one bucket).
+            Empty for production tarballs.
         num_actors: Number of GPU actors to create.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
         dev_params: See :class:`EmbeddingsDevParams`.
@@ -244,6 +264,9 @@ def tessera_embeddings(
         ami_ssm_name=ami_ssm_name,
         ssm_prefix=ssm_prefix,
         cloudwatch_log_group=cloudwatch_log_group,
+        code_bucket=code_bucket,
+        code_suffix=code_suffix,
+        sync_source_path=Path(dev_params.sync_source_path) if dev_params.sync_source_path else None,
     ) as resolved_yaml:
         _active_resolved_yaml = resolved_yaml
         if resolved_yaml and Path(resolved_yaml).exists():
