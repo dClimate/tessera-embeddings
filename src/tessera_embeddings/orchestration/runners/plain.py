@@ -152,6 +152,7 @@ def _run_inference_and_assemble(
     time_window_end: str,
     s1_orbit: Literal["ascending", "descending", "both"],
     checkpoint_dir: str | None,
+    checkpoint_url: str | None,
     num_gpus: int,
     log: logging.Logger,
 ) -> dict[str, Any]:
@@ -160,8 +161,14 @@ def _run_inference_and_assemble(
     output_bucket = paths.outputs
 
     time_window = parse_time_window(time_window_end)
-    model_dir = checkpoint_dir or f"{inputs_bucket.rstrip('/')}/models"
-    checkpoint_path = f"{model_dir.rstrip('/')}/{checkpoint_filename()}"
+    # A full checkpoint URL/path (e.g. a HuggingFace `resolve/main` link) wins;
+    # otherwise derive `{checkpoint_dir or {inputs}/models}/{canonical filename}`.
+    # Remote URIs (s3://, https://, …) are downloaded and cached by the actor.
+    if checkpoint_url:
+        checkpoint_path = checkpoint_url
+    else:
+        model_dir = checkpoint_dir or f"{inputs_bucket.rstrip('/')}/models"
+        checkpoint_path = f"{model_dir.rstrip('/')}/{checkpoint_filename()}"
 
     mosaic_base = paths.store_for(roi_name, "reflectance").rsplit("/", 1)[0]
     staging_base = f"{output_bucket.rstrip('/')}/staging"
@@ -169,15 +176,14 @@ def _run_inference_and_assemble(
     # Probe for available SAR stores before dispatching inference; if s1_orbit="both"
     # is requested but only one orbit was ingested, fall back gracefully.
     effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
-    if effective_orbit != s1_orbit:
-        config = build_inference_config(
-            s1_orbit=effective_orbit,
-            time_window=time_window,
-            checkpoint_path=checkpoint_path,
-            inputs_bucket=inputs_bucket,
-            output_bucket=output_bucket,
-            num_gpus=num_gpus,
-        )
+    config = build_inference_config(
+        s1_orbit=effective_orbit,
+        time_window=time_window,
+        checkpoint_path=checkpoint_path,
+        inputs_bucket=inputs_bucket,
+        output_bucket=output_bucket,
+        num_gpus=num_gpus,
+    )
 
     chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, config.chunk_size or INFERENCE_CHUNK_SIZE, log)
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_path)
@@ -273,6 +279,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
             s1_orbit: ascending    # or "descending" or "both"
             n_workers: 2
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
+            checkpoint_url: null    # full checkpoint URI (s3://, https://, …); overrides checkpoint_dir
             device: auto            # "auto" | "cpu" | "cuda"
             storage_options: null
 
@@ -346,6 +353,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         time_window_end=cfg["time_window_end"],
         s1_orbit=cfg.get("s1_orbit", "ascending"),
         checkpoint_dir=cfg.get("checkpoint_dir"),
+        checkpoint_url=cfg.get("checkpoint_url"),
         num_gpus=num_gpus,
         log=log,
     )

@@ -12,6 +12,7 @@ torch is only needed on GPU workers at runtime.
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -150,7 +151,7 @@ class InferenceActor:
         self.instance_id = _fetch_ec2_instance_id()
         self.device = _torch.device("cpu") if self.config.num_gpus == 0 else _select_device(_torch, self.instance_id)
 
-        local_ckpt = download_checkpoint(checkpoint_path) if checkpoint_path.startswith("s3://") else checkpoint_path
+        local_ckpt = download_checkpoint(checkpoint_path) if _is_remote_uri(checkpoint_path) else checkpoint_path
         self.model: MultimodalBTInferenceModel = build_inference_model(
             config,
             self.device,
@@ -294,23 +295,56 @@ class InferenceActor:
             }
 
 
-def download_checkpoint(s3_path: str, local_dir: str = "/opt/dlami/nvme/tessera-checkpoints") -> str:
-    """Download a model checkpoint from S3 to local NVMe storage.
+# Schemes that mean "fetch this from somewhere else first". A local filesystem
+# path (or an explicit file:// URI) is loaded in place by torch.
+_REMOTE_CKPT_SCHEMES = ("s3://", "http://", "https://", "gs://", "az://", "abfs://")
 
-    Downloads to the NVMe instance store for fast torch.load. The root
-    EBS volume (~42 MB/s) is too slow for large checkpoints — torch.load
-    with mmap hangs indefinitely. The NVMe SSD (~1.5 GB/s) avoids this.
+
+def _is_remote_uri(path: str) -> bool:
+    """True if ``path`` must be downloaded before torch.load can open it."""
+    return path.startswith(_REMOTE_CKPT_SCHEMES)
+
+
+def _default_checkpoint_cache() -> str:
+    """Pick a download cache dir that exists on the running host.
+
+    On AWS DLAMI GPU boxes the NVMe instance store (~1.5 GB/s) is the right
+    target — the root EBS volume (~42 MB/s) is too slow and torch.load with
+    mmap hangs on it. Off that path (laptops, CI, non-AWS GPUs) the NVMe mount
+    doesn't exist, so fall back to a temp dir under the system tmp.
+    """
+    nvme = Path("/opt/dlami/nvme")
+    if nvme.is_dir():
+        return str(nvme / "tessera-checkpoints")
+    return str(Path(tempfile.gettempdir()) / "tessera-checkpoints")
+
+
+def download_checkpoint(remote_path: str, local_dir: str | None = None) -> str:
+    """Download a model checkpoint from a remote URI to local storage.
+
+    Handles any fsspec-supported remote scheme — ``s3://``, ``https://``
+    (e.g. a HuggingFace ``resolve/main`` URL), ``gs://``, etc. The file is
+    staged locally because torch.load wants a real path and reads it twice.
 
     Args:
-        s3_path: S3 URI (e.g., "s3://bucket/path/model.pt").
-        local_dir: Local directory for downloads. Defaults to NVMe instance store.
+        remote_path: Remote URI (e.g. ``"s3://bucket/path/model.pt"`` or
+            ``"https://huggingface.co/.../tessera_v1_1_aws_encoder.pt"``).
+        local_dir: Local directory for downloads. Defaults to the NVMe
+            instance store on AWS DLAMI hosts, else a system temp dir.
 
     Returns:
         Local file path.
-    """
-    filename = s3_path.rsplit("/", 1)[-1]
 
-    local = Path(local_dir)
+    Concurrency: many actors on the same host may call this with the same
+    ``remote_path`` and shared cache dir at once (cold cache, 100s of actors).
+    The download writes to a unique temp file and is published to the final
+    path with an atomic rename, so a concurrent reader never observes a
+    partially-written checkpoint and concurrent writers can't corrupt each
+    other's output — the last rename wins, and every byte is identical.
+    """
+    filename = remote_path.rsplit("/", 1)[-1]
+
+    local = Path(local_dir or _default_checkpoint_cache())
     local.mkdir(parents=True, exist_ok=True)
     local_path = local / filename
 
@@ -318,9 +352,18 @@ def download_checkpoint(s3_path: str, local_dir: str = "/opt/dlami/nvme/tessera-
         logger.info("Checkpoint already cached: %s", local_path)
         return str(local_path)
 
-    logger.info("Downloading checkpoint: %s → %s", s3_path, local_path)
-    with fsspec.open(s3_path, "rb") as remote, local_path.open("wb") as dest:
-        dest.write(remote.read())
+    logger.info("Downloading checkpoint: %s → %s", remote_path, local_path)
+    # Checkpoints are ~200 MB, so reading the whole file into memory is fine.
+    with fsspec.open(remote_path, "rb") as remote:
+        data = remote.read()
+    # Stage into a unique temp file in the same dir (so the rename stays on one
+    # filesystem and is atomic), then atomically publish — concurrent actors
+    # publishing the same checkpoint can't observe a half-written file.
+    with tempfile.NamedTemporaryFile(dir=local, prefix=f"{filename}.", suffix=".part", delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(local_path)
+
     downloaded_size = local_path.stat().st_size
     logger.info("Download complete: %s (%.1f MB)", local_path, downloaded_size / 1024 / 1024)
 
