@@ -125,16 +125,10 @@ def ingest_s1_roi_sar(
     edl_credentials_fn = get_s3_credentials if use_s3_direct else None
     apply_credentials_fn = set_s3_credentials if use_s3_direct else None
 
-    # When S3 direct access is enabled, set_s3_credentials will overwrite
-    # AWS_* env vars with OPERA-scoped STS tokens.  Any da.from_zarr on our
-    # own ROI store that runs after the first cred refresh would pick up those
-    # tokens and get AccessDenied.  Resolve IAM creds now (before STS injection)
-    # and pass them as explicit storage_options so the ROI reads are immune.
-    if use_s3_direct and roi_zarr_path.startswith("s3://") and storage_options is None:
-        from tessera_embeddings.providers.aws.credentials import iam_s3_storage_options
-
-        storage_options = iam_s3_storage_options()
-        log.debug("Resolved IAM storage options for ROI mask reads (bypass OPERA STS env vars)")
+    # IAM storage_options for the ROI-mask reads are resolved on the worker in
+    # process_roi_sar, not here: they carry a live access key / secret / STS
+    # token, and a flow parameter would be persisted in Prefect's DB and shown
+    # in the UI as a plaintext credential.
 
     if use_local:
         from tessera_embeddings.providers.local.dask import local_cluster

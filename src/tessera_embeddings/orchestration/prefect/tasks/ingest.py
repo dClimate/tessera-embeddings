@@ -84,23 +84,35 @@ def process_roi_sar(
     closures over Prefect Blocks / env vars; this task shell never
     reads credentials directly.
 
-    When ``use_s3_direct`` is set, register an IAM-resolving icechunk
-    credential provider here — in the Dask **worker** process where the
-    domain function's store writes actually run. ``set_s3_credentials``
-    will overwrite the ``AWS_*`` env vars with OPERA-scoped STS tokens for
-    GDAL reads; without this, icechunk's default AWS chain would pick those
-    up and fail with AccessDenied writing our own store. Registering in the
-    flow body would not help — that runs in a different process. Confining
-    the botocore-backed callback to providers/aws/ (imported lazily) keeps
-    the storage layer cloud-agnostic per the architecture rules.
+    When ``use_s3_direct`` is set, this task resolves IAM credentials in the
+    Dask **worker** process where the domain function's store writes and ROI
+    reads actually run — the worker holds the IAM role, and the credentials
+    (live access key / secret / STS token) stay off the orchestration
+    boundary rather than crossing it as serialized parameters (Hard rule #5):
+
+    1. Registers an IAM-resolving icechunk credential provider, so store
+       writes keep using IAM-role creds after ``set_s3_credentials``
+       overwrites the ``AWS_*`` env vars with OPERA-scoped STS tokens.
+    2. Resolves IAM ``storage_options`` for the ROI-mask reads, so those
+       reads survive the same env-var overwrite.
+
+    Confining the botocore-backed helpers to providers/aws/ (imported
+    lazily) keeps the storage layer cloud-agnostic per the architecture
+    rules.
     """
     if use_s3_direct:
         # Lazy import: providers.aws.credentials pulls in botocore, which lives
         # only in the optional `aws` extra. A prefect-only install (e.g. Prefect
         # on GCP) must be able to import this task module without it.
-        from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+        from tessera_embeddings.providers.aws.credentials import (
+            iam_icechunk_credentials,
+            iam_s3_storage_options,
+        )
 
         set_credentials_provider(iam_icechunk_credentials)
+
+        if storage_options is None and roi_zarr_path.startswith("s3://"):
+            storage_options = iam_s3_storage_options()
 
     result = ingest_s1_roi_sar(
         roi_zarr_path=roi_zarr_path,
