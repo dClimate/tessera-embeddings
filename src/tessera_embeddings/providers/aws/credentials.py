@@ -17,6 +17,7 @@ Usage in the S1 ingest flow::
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import icechunk
@@ -24,6 +25,13 @@ from botocore import session as botocore_session
 
 if TYPE_CHECKING:
     from botocore.credentials import Credentials
+
+# How long icechunk may reuse a returned credential before re-invoking the
+# provider. Kept well under any IAM/STS token TTL (instance-metadata ~1h,
+# ECS task role ~6h) so each re-invocation lands inside botocore's own
+# refresh window — botocore auto-refreshes the underlying token on the next
+# get_frozen_credentials() call, so we never serve a stale one.
+_ICECHUNK_CRED_TTL = timedelta(minutes=15)
 
 
 def _resolve_iam_credentials() -> Credentials:
@@ -85,20 +93,20 @@ def iam_icechunk_credentials() -> icechunk.S3StaticCredentials:
     store keep using IAM-role creds even after ``set_s3_credentials`` has
     overwritten the ``AWS_*`` env vars with OPERA-scoped STS tokens.
 
-    icechunk re-invokes the callback after ``expires_after``, so IAM-role
-    tokens (instance-metadata, ~1hr TTL) never go stale. We forward the
-    botocore credential expiry into ``expires_after`` — without it icechunk
-    treats the static creds as valid indefinitely and would keep reusing the
-    first token until S3 starts returning ``ExpiredToken`` mid-write.
+    Without ``expires_after`` icechunk treats the static creds as valid
+    indefinitely and reuses the first token until S3 returns ``ExpiredToken``
+    mid-write. We set a fixed, conservative ``expires_after`` so icechunk
+    re-invokes this callback every :data:`_ICECHUNK_CRED_TTL`; each
+    re-invocation calls ``get_frozen_credentials()``, which lets botocore
+    auto-refresh the underlying IAM/STS token. The window is well under any
+    token TTL, so we never serve a stale credential — and we avoid reaching
+    into botocore's private ``_expiry_time``.
 
     Raises:
         RuntimeError: If no AWS credentials are found outside env vars.
     """
-    creds = _resolve_iam_credentials()
-    # RefreshableCredentials (instance-metadata / ECS task role / STS) carry a
-    # tz-aware UTC expiry on ``_expiry_time``; plain static Credentials do not.
-    expires_after = getattr(creds, "_expiry_time", None)
-    frozen = creds.get_frozen_credentials()
+    frozen = _resolve_iam_credentials().get_frozen_credentials()
+    expires_after = datetime.now(UTC) + _ICECHUNK_CRED_TTL
     return icechunk.S3StaticCredentials(
         access_key_id=frozen.access_key,
         secret_access_key=frozen.secret_key,
