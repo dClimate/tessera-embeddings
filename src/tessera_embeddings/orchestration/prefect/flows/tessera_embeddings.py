@@ -52,6 +52,8 @@ from tessera_embeddings.orchestration.prefect.tasks.inference import (
     run_inference_task,
 )
 from tessera_embeddings.providers.aws.ray import (
+    DEFAULT_CLOUDWATCH_LOG_GROUP,
+    DEFAULT_SSM_PREFIX,
     cleanup_ray_tempfiles,
     terminate_ray_instances_by_tag,
 )
@@ -108,6 +110,8 @@ def tessera_embeddings(
     time_window_end: str,
     paths: BucketPaths,
     ami_ssm_name: str,
+    ssm_prefix: str = DEFAULT_SSM_PREFIX,
+    cloudwatch_log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,
     num_actors: int = 20,
     s1_orbit: str = "ascending",
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
@@ -123,6 +127,14 @@ def tessera_embeddings(
             :class:`BucketPaths`). Replaces the reference repo's
             ``dev: bool`` toggle.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
+        ssm_prefix: SSM Parameter Store prefix under which the Ray
+            cluster resource IDs (security group, instance profile,
+            subnets, key pair) are published by the deployment's infra.
+            Defaults to the OSS ``/tessera/ray/``; deployments that
+            publish under a different prefix must override this.
+        cloudwatch_log_group: CloudWatch log group the Ray workers write
+            agent logs to. Must match the group the deployment's infra
+            creates and grants the worker role access to.
         num_actors: Number of GPU actors to create.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
         dev_params: See :class:`EmbeddingsDevParams`.
@@ -229,7 +241,12 @@ def tessera_embeddings(
         return _run_assembly(log=log, chunks=chunks, results=None, **assemble_kwargs)
 
     global _active_resolved_yaml, _active_cluster_name
-    with ray_cluster(log, ami_ssm_name=ami_ssm_name) as resolved_yaml:
+    with ray_cluster(
+        log,
+        ami_ssm_name=ami_ssm_name,
+        ssm_prefix=ssm_prefix,
+        cloudwatch_log_group=cloudwatch_log_group,
+    ) as resolved_yaml:
         _active_resolved_yaml = resolved_yaml
         if resolved_yaml and Path(resolved_yaml).exists():
             with Path(resolved_yaml).open() as _f:
