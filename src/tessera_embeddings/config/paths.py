@@ -44,7 +44,10 @@ class BucketPaths(BaseModel):
                 ``"sar_descending"``, ``"embeddings"``, or ``"roi"``.
 
         Returns:
-            Full URI to the Zarr/Icechunk store.
+            Full URI to the Zarr store. Path structure varies by kind:
+            ``roi`` → ``{inputs}/rois/zarrs/{roi_name}.zarr``,
+            mosaic kinds → ``{inputs}/mosaics/{roi_name}/{kind}.zarr``,
+            ``embeddings`` → ``{outputs}/embeddings/{roi_name}.zarr``.
 
         Raises:
             ValueError: If ``kind`` is not one of the recognised values.
@@ -52,9 +55,9 @@ class BucketPaths(BaseModel):
         if kind not in _ALL_KINDS:
             raise ValueError(f"Unknown store kind {kind!r}. Expected one of: {sorted(_ALL_KINDS)}")
 
-        if kind in _INPUT_KINDS:
-            base = self.inputs
-        elif kind in _OUTPUT_KINDS:
-            base = self.outputs
-
-        return posixpath.join(base, roi_name, kind)
+        if kind == "roi":
+            return posixpath.join(self.inputs, "rois", "zarrs", f"{roi_name}.zarr")
+        elif kind in {"reflectance", "sar_ascending", "sar_descending"}:
+            return posixpath.join(self.inputs, "mosaics", roi_name, f"{kind}.zarr")
+        else:  # embeddings
+            return posixpath.join(self.outputs, "embeddings", f"{roi_name}.zarr")
