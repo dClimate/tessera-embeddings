@@ -86,6 +86,8 @@ async def tessera_full_pipeline(
     s1_orbit: str = "ascending",
     skip_coverage_check: bool = False,
     ami_ssm_name: str = "/tessera/ray/ami-id",
+    ssm_prefix: str = "/tessera/ray/",
+    cloudwatch_log_group: str = "/ec2/tessera/ray",
 ) -> dict:
     """End-to-end pipeline: ROI → S1+S2 ingestion → Tessera embeddings.
 
@@ -110,6 +112,13 @@ async def tessera_full_pipeline(
         skip_coverage_check: Skip the time-window coverage validation
             on the embeddings stage.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
+        ssm_prefix: SSM Parameter Store prefix under which the Ray
+            cluster resource IDs are published by the deployment's infra.
+            Forwarded to the embeddings stage; deployments that publish
+            under a different prefix must override the OSS ``/tessera/ray/``.
+        cloudwatch_log_group: CloudWatch log group the Ray workers write
+            agent logs to. Forwarded to the embeddings stage; must match
+            the group the deployment's infra creates and grants access to.
 
     Returns:
         Dict with the run IDs of every child flow.
@@ -208,6 +217,8 @@ async def tessera_full_pipeline(
             "time_window_end": time_window_end,
             "paths": paths.model_dump(),
             "ami_ssm_name": ami_ssm_name,
+            "ssm_prefix": ssm_prefix,
+            "cloudwatch_log_group": cloudwatch_log_group,
             "num_actors": num_actors,
             "s1_orbit": s1_orbit,
             "dev_params": {"skip_coverage_check": skip_coverage_check},

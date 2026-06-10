@@ -52,8 +52,6 @@ from tessera_embeddings.orchestration.prefect.tasks.inference import (
     run_inference_task,
 )
 from tessera_embeddings.providers.aws.ray import (
-    DEFAULT_CLOUDWATCH_LOG_GROUP,
-    DEFAULT_SSM_PREFIX,
     cleanup_ray_tempfiles,
     terminate_ray_instances_by_tag,
 )
@@ -110,8 +108,8 @@ def tessera_embeddings(
     time_window_end: str,
     paths: BucketPaths,
     ami_ssm_name: str,
-    ssm_prefix: str = DEFAULT_SSM_PREFIX,
-    cloudwatch_log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,
+    ssm_prefix: str = "/tessera/ray/",
+    cloudwatch_log_group: str = "/ec2/tessera/ray",
     num_actors: int = 20,
     s1_orbit: str = "ascending",
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
