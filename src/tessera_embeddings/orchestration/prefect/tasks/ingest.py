@@ -20,6 +20,8 @@ from prefect import get_run_logger, task
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
+from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+from tessera_embeddings.storage.zarr_store import set_credentials_provider
 
 
 @task(name="process-roi-reflectance")
@@ -82,7 +84,20 @@ def process_roi_sar(
     (secrets enter at flow entry only) means the *flow* constructs the
     closures over Prefect Blocks / env vars; this task shell never
     reads credentials directly.
+
+    When ``use_s3_direct`` is set, register an IAM-resolving icechunk
+    credential provider here — in the Dask **worker** process where the
+    domain function's store writes actually run. ``set_s3_credentials``
+    will overwrite the ``AWS_*`` env vars with OPERA-scoped STS tokens for
+    GDAL reads; without this, icechunk's default AWS chain would pick those
+    up and fail with AccessDenied writing our own store. Registering in the
+    flow body would not help — that runs in a different process. Confining
+    the botocore-backed callback to providers/aws/ (imported lazily) keeps
+    the storage layer cloud-agnostic per the architecture rules.
     """
+    if use_s3_direct:
+        set_credentials_provider(iam_icechunk_credentials)
+
     result = ingest_s1_roi_sar(
         roi_zarr_path=roi_zarr_path,
         start_date=start_date,

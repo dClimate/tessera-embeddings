@@ -99,6 +99,28 @@ def _parse_s3_url(url: str) -> tuple[str, str]:
 _DEFAULT_S3_REGION = "us-west-2"
 
 
+# Process-wide fallback credential provider for icechunk S3 storage. When set,
+# _create_storage uses it for any S3 open that didn't receive an explicit
+# get_credentials. The S1 ingest path registers an IAM-resolving callback here
+# (via the AWS provider) so icechunk writes keep using IAM-role creds even
+# after set_s3_credentials overwrites the AWS_* env vars with OPERA-scoped STS
+# tokens. Stays None in the open-source layer, keeping it cloud-agnostic.
+_default_credentials_provider: "Callable[[], icechunk.S3StaticCredentials] | None" = None
+
+
+def set_credentials_provider(
+    provider: "Callable[[], icechunk.S3StaticCredentials] | None",
+) -> None:
+    """Register a process-wide fallback credential provider for icechunk S3 opens.
+
+    Used by :func:`_create_storage` whenever an S3 open has no explicit
+    ``get_credentials``. Pass ``None`` to clear. See the module-level
+    ``_default_credentials_provider`` note for why the S1 ingest path needs this.
+    """
+    global _default_credentials_provider
+    _default_credentials_provider = provider
+
+
 def _create_storage(
     store_path: str,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
@@ -132,6 +154,16 @@ def _create_storage(
         bucket, prefix = _parse_s3_url(store_path)
         if _s3_config_override:
             return _s3_config_override.make_storage(prefix_override=prefix)
+        # Fall back to a globally-registered credential provider when the
+        # caller didn't pass one explicitly. This is how the S1 ingest path
+        # keeps icechunk on IAM-role creds: set_s3_credentials overwrites the
+        # AWS_* env vars with OPERA-scoped STS tokens for GDAL reads, and
+        # icechunk's default AWS chain would otherwise pick those up and get
+        # AccessDenied writing our own store. The AWS provider registers an
+        # IAM-resolving callback via set_credentials_provider(). See
+        # tessera_embeddings.providers.aws.credentials.
+        if get_credentials is None:
+            get_credentials = _default_credentials_provider
         s3_kwargs: dict = {
             "bucket": bucket,
             "prefix": prefix,

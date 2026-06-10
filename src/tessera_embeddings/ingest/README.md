@@ -425,11 +425,28 @@ credential-cache calls.
 
 OPERA asset STS credentials are intentionally **never cleaned up** from env vars. This avoids
 a race condition where one Dask task's cleanup could remove credentials another task still
-needs. Icechunk/Zarr write operations on the project's own S3 bucket stay isolated by being
-configured with an explicit credential callback (see ``storage.zarr_store._create_storage``
-``get_credentials``); the AWS-provider implementation passes a callback that resolves
-deployment credentials directly from the IAM role, so it is unaffected by whatever
-``AWS_*`` env vars OPERA's STS session has set.
+needs. The consequence is subtle: once `set_s3_credentials` runs, the `AWS_*` env vars hold
+OPERA-scoped STS tokens that grant access **only** to `asf-cumulus-prod-opera-products`. Any
+S3 access to the project's *own* bucket that resolves credentials from those env vars — every
+icechunk `Repository.open`/`create` in the S1 write path, not just the initial create — then
+fails with `AccessDenied`.
+
+Icechunk/Zarr operations on the project's own bucket therefore must resolve **IAM-role**
+credentials, bypassing the env vars. The mechanism:
+
+- `providers/aws/credentials.py::iam_icechunk_credentials` resolves credentials from the
+  botocore chain with the `env` provider **removed**, so it always lands on the deployment's
+  IAM role (instance-metadata / ECS task role / local SSO) regardless of what STS tokens the
+  env vars hold. It returns `icechunk.S3StaticCredentials`.
+- `storage.zarr_store` exposes a process-wide `set_credentials_provider()` hook.
+  `_create_storage` uses the registered provider as the `get_credentials` callback for any S3
+  open lacking an explicit one. The storage layer ships this as `None` and never imports
+  botocore (it must stay cloud-agnostic, per the `no-botocore-outside-aws-provider`
+  architecture rule); only the AWS provider supplies the concrete callback.
+- The `process_roi_sar` Prefect task registers `iam_icechunk_credentials` via that hook when
+  `use_s3_direct=True`. **This must happen in the task shell, not the flow body** — with the
+  Dask task runner the domain function (and its store writes) execute in a *worker* process,
+  so a provider registered in the flow-runner process would never reach them.
 
 ### URL Rewriting
 
