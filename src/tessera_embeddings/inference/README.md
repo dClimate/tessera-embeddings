@@ -63,7 +63,9 @@ Input stores (Icechunk/Zarr on S3):
 
 The input mosaic is divided into a grid of 2000×2000 pixel `ChunkSpec` objects (edge chunks may
 be smaller). 2000 px balances peak RAM during inference (~10 GB vs. ~37 GB at 3000 px) against
-scheduling overhead.
+scheduling overhead. This read-tile size is independent of the store's on-disk chunk size: the
+mosaic is written with larger 4000×4000 chunks at ingest (`INGEST_CHUNK_SIZE`), and `load_chunk`
+reads the 2000×2000 sub-tile out of them via `zarr.Array.oindex` with no alignment requirement.
 
 `filter_chunks_by_roi_mask` then drops any chunk whose footprint does not intersect the ROI
 zarr mask produced by `generate_roi`. Only the surviving **live chunks** are dispatched to

@@ -29,7 +29,7 @@ from tessera_embeddings.config import (
     STACProvider,
 )
 from tessera_embeddings.config.environment import configure_gdal_environment
-from tessera_embeddings.config.inference import TESSERA_CHUNKS
+from tessera_embeddings.config.ingest import INGEST_CHUNKS
 
 # =============================================================================
 # GDAL/Rasterio Configuration
@@ -275,7 +275,7 @@ def _load_from_stac(
         collection_config: Collection configuration with bands and resolution
         bbox: Optional bounding box (minx, miny, maxx, maxy) in EPSG:4326
               to spatially subset the load. Ignored when geobox is provided.
-        chunks: Optional chunk sizes for dask. Defaults to TESSERA_CHUNKS.
+        chunks: Optional chunk sizes for dask. Defaults to INGEST_CHUNKS.
               Accepts both project convention (northing/easting) and odc
               convention (y/x) — translated automatically.
         extra_bands: Additional bands to load alongside the collection's primary
@@ -306,7 +306,7 @@ def _load_from_stac(
     if not items:
         raise ValueError("No items to load")
 
-    load_chunks = chunks_to_odc(chunks if chunks is not None else TESSERA_CHUNKS)
+    load_chunks = chunks_to_odc(chunks if chunks is not None else INGEST_CHUNKS)
 
     # Merge extra bands with primary bands
     all_bands = list(collection_config.bands)
@@ -737,7 +737,7 @@ def ingest_tile(
               Also used as STAC query fallback when tile_id is None or
               tile_id_property is None.
         chunks: Optional chunk sizes for odc.stac.load. Defaults to
-              TESSERA_CHUNKS. Accepts northing/easting or y/x keys —
+              INGEST_CHUNKS. Accepts northing/easting or y/x keys —
               translated automatically before passing to odc.stac.load.
         extra_bands: Additional bands to load (e.g., ["scl"]).
         resampling: Resampling method for primary bands (default "bilinear").

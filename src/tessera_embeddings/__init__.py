@@ -21,8 +21,8 @@ orchestrator.
 
 from tessera_embeddings.config.dask import AssemblyConfig
 from tessera_embeddings.config.inference import (
-    DEFAULT_CHUNK_SIZE,
     EMBEDDING_DIM,
+    INFERENCE_CHUNK_SIZE,
     InferenceConfig,
     checkpoint_filename,
 )
@@ -53,8 +53,8 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
-    "DEFAULT_CHUNK_SIZE",
     "EMBEDDING_DIM",
+    "INFERENCE_CHUNK_SIZE",
     "AssemblyConfig",
     "BucketPaths",
     "ConfigMismatchError",

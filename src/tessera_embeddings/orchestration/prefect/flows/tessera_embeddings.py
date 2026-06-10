@@ -35,7 +35,7 @@ from prefect import flow, get_run_logger
 from pydantic import BaseModel
 
 from tessera_embeddings.config.dask import AssemblyConfig
-from tessera_embeddings.config.inference import DEFAULT_CHUNK_SIZE, checkpoint_filename
+from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import ZarrWriter
@@ -185,7 +185,7 @@ def tessera_embeddings(
             )
             chunk_size = detected
 
-    chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, chunk_size or DEFAULT_CHUNK_SIZE, log)
+    chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, chunk_size or INFERENCE_CHUNK_SIZE, log)
 
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_zarr_path)
     log.info(

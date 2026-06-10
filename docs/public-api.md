@@ -19,7 +19,7 @@ CI verifies that the names listed here match `tessera_embeddings.__all__`.
   `"Month YYYY"` strings.
 - `checkpoint_filename(quantized: bool = True) -> str` — canonical
   filename for the bundled model checkpoints.
-- `DEFAULT_CHUNK_SIZE` — pixel size of one spatial chunk (2000).
+- `INFERENCE_CHUNK_SIZE` — pixel size of one spatial chunk (2000).
 - `EMBEDDING_DIM` — output dimension of one Tessera embedding (128).
 
 ## Errors

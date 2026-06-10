@@ -168,7 +168,7 @@ while "Building Dask graph"; eventually fails.
 
 Cause: chunk size too small → graph too big. See
 [`README.md`](../README.md) §"Why chunk size dominates everything".
-The package defaults to `DEFAULT_CHUNK_SIZE = 2000` — change with
+The package defaults to `INFERENCE_CHUNK_SIZE = 2000` — change with
 care.
 
 ### ECS task definition diff between dev branches

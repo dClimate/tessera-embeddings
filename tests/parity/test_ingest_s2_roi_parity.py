@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 from dask.distributed import Client
 
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.orchestration.prefect.flows import ingest_s2_roi_reflectance as flow_module
@@ -42,7 +43,7 @@ def _stage_quickstart_roi(tmp_path: Path, roi_geojson: Path) -> Path:
     rasterize_roi_zarr(
         output_path=str(roi_zarr),
         resolution=10.0,
-        chunk_size=2000,
+        chunk_size=INGEST_CHUNK_SIZE,
         force_crs=FORCE_CRS,
         input_path=str(roi_geojson),
     )

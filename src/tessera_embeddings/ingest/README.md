@@ -242,28 +242,34 @@ expansion to TaskStates happens only when the graph is submitted to the schedule
 #### How task count multiplies: operations × chunk dimensions
 
 Each Dask operation (read, transform, write) adds a new layer. Each layer has one task per
-combination of *chunk coordinates* across all chunked dimensions. For S2 ingestion over a
-large ROI (e.g. cornbelt scale: ~75×50 grid of 2000×2000 px spatial chunks), the S2 flow
-processes one date at a time, so the time dimension is always 1:
+combination of *chunk coordinates* across all chunked dimensions. Ingest writes 4000×4000 px
+storage chunks (`INGEST_CHUNK_SIZE`), deliberately larger than the 2000×2000 inference
+read-tile size, precisely to keep this task count down. For S2 ingestion over a large ROI
+(e.g. cornbelt scale: ~38×25 grid of 4000×4000 px spatial chunks), the S2 flow processes one
+date at a time, so the time dimension is always 1:
 
 ```text
   Dimensions per single S2 date (ingest_s2_roi_reflectance):
-    spatial chunks:   ~3,750  (75×50 grid)
+    spatial chunks:     ~950  (38×25 grid of 4000×4000 px)
     dates:                 1  (one date per loop iteration)
     band variables:       10  (each S2 band is a separate xarray variable)
 
   Operation            tasks per layer                          notes
   ────────────────────────────────────────────────────────────────────────
-  odc.stac read     3,750 × 1 × 10 =  37,500   one task per (chunk, band var)
-  baseline corr.    3,750 × 1 × 10 =  37,500
-  ROI mask          3,750 × 1 × 10 =  37,500
-  zarr write        3,750 × 1 × 10 =  37,500
+  odc.stac read       950 × 1 × 10 =   9,500   one task per (chunk, band var)
+  baseline corr.      950 × 1 × 10 =   9,500
+  ROI mask            950 × 1 × 10 =   9,500
+  zarr write          950 × 1 × 10 =   9,500
                                     ─────────
-        per-date total:               150,000 tasks ≈ 0.2 GB scheduler RAM   ✓
+        per-date total:                38,000 tasks ≈ 0.06 GB scheduler RAM   ✓
 
   Full year (all ~100 S2 dates in one graph, hypothetically):
-  3,750 × 100 × 10 × 4 = 15,000,000 tasks ≈ 22 GB scheduler RAM             ✗ OOM
+  950 × 100 × 10 × 4 = 3,800,000 tasks ≈ 5.6 GB scheduler RAM                ✗ OOM
 ```
+
+Had ingest reused the 2000×2000 inference tile size, every count above would be 4× higher —
+that 4× on the satellite-ingest graph is the reason storage and inference chunk sizes are
+decoupled.
 
 The two flows keep task count bounded via different mechanisms — per-date iteration for S2,
 time-windowed batching for S1 — described in the sections below. The same scheduler-RAM
@@ -358,11 +364,13 @@ resilience (retry counts, timeouts, connection pooling) that affect all subseque
 
 ### Chunk alignment
 
-The ROI Zarr mask is generated with `chunk_size` matching `TESSERA_CHUNKS` so that
+The ROI Zarr mask is generated with `chunk_size` matching `INGEST_CHUNKS` so that
 `da.from_zarr` reads are zero-copy — each Dask partition maps to exactly one Zarr chunk.
 The same chunk sizes are passed to `odc.stac.load` (after translating `northing`/`easting`
 to `y`/`x`) so band arrays and the mask share the same partition boundaries for aligned
-Dask operations.
+Dask operations. (Inference reads 2000×2000 sub-tiles out of these 4000×4000 chunks via
+`zarr.Array.oindex`, which needs no such alignment — see
+[`inference/README.md`](../inference/README.md).)
 
 ### has_new_stac_dates pre-check
 
