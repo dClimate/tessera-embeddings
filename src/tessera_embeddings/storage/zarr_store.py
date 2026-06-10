@@ -8,7 +8,8 @@ Uses Icechunk for transactional writes with atomic commit semantics.
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
@@ -108,17 +109,27 @@ _DEFAULT_S3_REGION = "us-west-2"
 _default_credentials_provider: "Callable[[], icechunk.S3StaticCredentials] | None" = None
 
 
-def set_credentials_provider(
+@contextmanager
+def credentials_provider(
     provider: "Callable[[], icechunk.S3StaticCredentials] | None",
-) -> None:
-    """Register a process-wide fallback credential provider for icechunk S3 opens.
+) -> "Iterator[None]":
+    """Temporarily register a fallback credential provider for icechunk S3 opens.
 
-    Used by :func:`_create_storage` whenever an S3 open has no explicit
-    ``get_credentials``. Pass ``None`` to clear. See the module-level
-    ``_default_credentials_provider`` note for why the S1 ingest path needs this.
+    Used by :func:`_create_storage` whenever an S3 open inside the ``with``
+    block has no explicit ``get_credentials``. Scoped to the block so a
+    reused process (e.g. a Dask worker) is not left pinned to ``provider``
+    for later, unrelated icechunk opens. The previous provider is restored
+    even if the body raises. See the module-level
+    ``_default_credentials_provider`` note for why the S1 ingest path needs
+    this.
     """
     global _default_credentials_provider
+    previous = _default_credentials_provider
     _default_credentials_provider = provider
+    try:
+        yield
+    finally:
+        _default_credentials_provider = previous
 
 
 def _create_storage(
@@ -159,8 +170,8 @@ def _create_storage(
         # keeps icechunk on IAM-role creds: set_s3_credentials overwrites the
         # AWS_* env vars with OPERA-scoped STS tokens for GDAL reads, and
         # icechunk's default AWS chain would otherwise pick those up and get
-        # AccessDenied writing our own store. The AWS provider registers an
-        # IAM-resolving callback via set_credentials_provider(). See
+        # AccessDenied writing our own store. The S1 ingest task registers an
+        # IAM-resolving callback via credentials_provider(). See
         # tessera_embeddings.providers.aws.credentials.
         if get_credentials is None:
             get_credentials = _default_credentials_provider

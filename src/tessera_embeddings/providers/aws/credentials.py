@@ -88,8 +88,8 @@ def iam_icechunk_credentials() -> icechunk.S3StaticCredentials:
 
     The icechunk counterpart to :func:`iam_s3_storage_options`: same
     env-provider-stripping logic, but returns the type icechunk's
-    ``get_credentials`` callback expects. Registered process-wide via
-    ``zarr_store.set_credentials_provider`` so icechunk writes to our own
+    ``get_credentials`` callback expects. Registered via
+    ``zarr_store.credentials_provider`` so icechunk writes to our own
     store keep using IAM-role creds even after ``set_s3_credentials`` has
     overwritten the ``AWS_*`` env vars with OPERA-scoped STS tokens.
 
