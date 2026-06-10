@@ -23,10 +23,10 @@ import icechunk
 from botocore import session as botocore_session
 
 if TYPE_CHECKING:
-    from botocore.credentials import ReadOnlyCredentials
+    from botocore.credentials import Credentials
 
 
-def _resolve_iam_credentials() -> ReadOnlyCredentials:
+def _resolve_iam_credentials() -> Credentials:
     """Resolve IAM credentials, skipping the botocore ``env`` provider.
 
     Removing the ``env`` provider from the credential chain forces resolution
@@ -34,6 +34,10 @@ def _resolve_iam_credentials() -> ReadOnlyCredentials:
     ``~/.aws/credentials`` / SSO locally) — even when ``set_s3_credentials``
     has overridden the ``AWS_*`` env vars with OPERA-scoped STS tokens for
     GDAL reads.
+
+    Returns the live botocore credentials object (not a frozen snapshot) so
+    callers can read the credential expiry off refreshable creds. Call
+    ``get_frozen_credentials()`` on the result for a serializable snapshot.
 
     Raises:
         RuntimeError: If no AWS credentials are found outside env vars.
@@ -46,7 +50,7 @@ def _resolve_iam_credentials() -> ReadOnlyCredentials:
             "No AWS credentials found (checked all providers except env vars). "
             "Ensure an IAM role, instance profile, or ~/.aws/credentials is configured."
         )
-    return creds.get_frozen_credentials()
+    return creds
 
 
 def iam_s3_storage_options() -> dict[str, str]:
@@ -64,7 +68,7 @@ def iam_s3_storage_options() -> dict[str, str]:
     Raises:
         RuntimeError: If no AWS credentials are found outside env vars.
     """
-    frozen = _resolve_iam_credentials()
+    frozen = _resolve_iam_credentials().get_frozen_credentials()
     opts: dict[str, str] = {"key": frozen.access_key, "secret": frozen.secret_key}
     if frozen.token:
         opts["token"] = frozen.token
@@ -81,15 +85,23 @@ def iam_icechunk_credentials() -> icechunk.S3StaticCredentials:
     store keep using IAM-role creds even after ``set_s3_credentials`` has
     overwritten the ``AWS_*`` env vars with OPERA-scoped STS tokens.
 
-    icechunk re-invokes the callback on each refresh, so IAM-role tokens
-    (instance-metadata, ~1hr TTL) never go stale.
+    icechunk re-invokes the callback after ``expires_after``, so IAM-role
+    tokens (instance-metadata, ~1hr TTL) never go stale. We forward the
+    botocore credential expiry into ``expires_after`` — without it icechunk
+    treats the static creds as valid indefinitely and would keep reusing the
+    first token until S3 starts returning ``ExpiredToken`` mid-write.
 
     Raises:
         RuntimeError: If no AWS credentials are found outside env vars.
     """
-    frozen = _resolve_iam_credentials()
+    creds = _resolve_iam_credentials()
+    # RefreshableCredentials (instance-metadata / ECS task role / STS) carry a
+    # tz-aware UTC expiry on ``_expiry_time``; plain static Credentials do not.
+    expires_after = getattr(creds, "_expiry_time", None)
+    frozen = creds.get_frozen_credentials()
     return icechunk.S3StaticCredentials(
         access_key_id=frozen.access_key,
         secret_access_key=frozen.secret_key,
         session_token=frozen.token,
+        expires_after=expires_after,
     )

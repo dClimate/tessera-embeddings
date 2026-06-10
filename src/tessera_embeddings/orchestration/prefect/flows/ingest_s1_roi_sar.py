@@ -56,11 +56,13 @@ def _ingest_s1_roi_impl(
 def _default_edl_env() -> dict[str, str]:
     """Read EDL credentials from environment variables.
 
-    The default credential source for production deployments is the
-    Prefect work-pool job template, which injects
-    ``EARTHDATA_USERNAME`` / ``EARTHDATA_PASSWORD`` as env vars on the
-    flow runner. Override at flow-call time by passing an alternative
-    ``edl_env_fn`` (e.g. closing over a Prefect ``Secret`` block).
+    The credential source for production deployments is the Prefect
+    work-pool job template, which injects ``EARTHDATA_USERNAME`` /
+    ``EARTHDATA_PASSWORD`` as env vars on the flow runner. To source
+    these from a Prefect ``Secret`` block instead, read the block here
+    in the flow body (Hard rule #5: secrets enter at the flow boundary,
+    not via injected callables — which cannot cross the deployment's
+    JSON parameter boundary anyway).
     """
     return {
         "EARTHDATA_USERNAME": os.environ["EARTHDATA_USERNAME"],
@@ -81,9 +83,6 @@ def ingest_s1_roi_sar(
     orbit: S1Orbit = "ascending",
     use_s3_direct: bool = True,
     use_local: bool = False,
-    edl_env_fn: Callable[[], dict[str, str]] = _default_edl_env,
-    edl_credentials_fn: Callable[[], dict[str, str]] | None = None,
-    apply_credentials_fn: Callable[[dict[str, str]], None] | None = None,
     storage_options: dict | None = None,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
@@ -100,24 +99,13 @@ def ingest_s1_roi_sar(
         orbit: Orbit direction. Multi-orbit ingestion is a flow-level
             concern (call this flow twice).
         use_s3_direct: Use ASF in-region S3 endpoints (requires
-            us-west-2 reachability and STS creds).
+            us-west-2 reachability and STS creds). When ``True``, the
+            flow wires ``get_s3_credentials`` / ``set_s3_credentials`` as
+            the STS refresh + broadcast callbacks for the domain function
+            (workers receive EDL env vars via ``extra_worker_env`` but
+            need STS tokens for the OPERA bucket; ``extra_worker_env``
+            alone is not sufficient).
         use_local: Use the local Dask provider for testing.
-        edl_env_fn: Callable returning EDL env vars to inject into
-            workers via ``extra_worker_env``. Defaults to reading
-            ``EARTHDATA_USERNAME`` / ``EARTHDATA_PASSWORD`` from the
-            flow-runner environment. Override to close over a Prefect
-            ``Secret`` block.
-        edl_credentials_fn: STS credential refresh callback forwarded to
-            the domain function. Defaults to ``get_s3_credentials`` when
-            ``use_s3_direct=True`` — workers receive EDL env vars via
-            ``extra_worker_env`` but need STS tokens for the OPERA bucket;
-            ``extra_worker_env`` alone is not sufficient. Override to close
-            over a Prefect ``Secret`` block or pass ``None`` only when the
-            calling environment already injects STS tokens out-of-band.
-        apply_credentials_fn: Companion to ``edl_credentials_fn`` that
-            applies the returned creds to the orchestrator env and running
-            cluster workers. Defaults to ``set_s3_credentials`` when
-            ``use_s3_direct=True``.
         storage_options: fsspec storage options forwarded to the
             domain function.
 
@@ -127,16 +115,15 @@ def ingest_s1_roi_sar(
     log = get_run_logger()
     log.info("Starting ingest_s1_roi_sar for %s (orbit=%s)", roi_zarr_path, orbit)
 
-    # Default STS credential callbacks when use_s3_direct=True.
-    # Workers receive EARTHDATA_USERNAME/PASSWORD via extra_worker_env but
-    # cannot access s3://asf-cumulus-prod-opera-products with IAM task-role
-    # credentials — they need short-lived STS tokens from ASF's cumulus
-    # endpoint. The plain runner wires these explicitly; the Prefect flow
-    # must too, or every batch fails with AccessDenied on the first S3 read.
-    if use_s3_direct and edl_credentials_fn is None:
-        edl_credentials_fn = get_s3_credentials
-        apply_credentials_fn = set_s3_credentials
-        log.debug("Defaulting edl_credentials_fn=get_s3_credentials, apply_credentials_fn=set_s3_credentials")
+    # STS credential callbacks for the domain function, gated on
+    # use_s3_direct. Workers receive EARTHDATA_USERNAME/PASSWORD via
+    # extra_worker_env but cannot access s3://asf-cumulus-prod-opera-products
+    # with IAM task-role credentials — they need short-lived STS tokens from
+    # ASF's cumulus endpoint. The plain runner wires these the same way; the
+    # Prefect flow must too, or every batch fails with AccessDenied on the
+    # first S3 read.
+    edl_credentials_fn = get_s3_credentials if use_s3_direct else None
+    apply_credentials_fn = set_s3_credentials if use_s3_direct else None
 
     # When S3 direct access is enabled, set_s3_credentials will overwrite
     # AWS_* env vars with OPERA-scoped STS tokens.  Any da.from_zarr on our
@@ -170,7 +157,7 @@ def ingest_s1_roi_sar(
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster
 
-    edl_env = edl_env_fn()
+    edl_env = _default_edl_env()
 
     with ecs_cluster(
         log,

@@ -20,7 +20,6 @@ from prefect import get_run_logger, task
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
-from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 from tessera_embeddings.storage.zarr_store import set_credentials_provider
 
 
@@ -96,6 +95,11 @@ def process_roi_sar(
     the storage layer cloud-agnostic per the architecture rules.
     """
     if use_s3_direct:
+        # Lazy import: providers.aws.credentials pulls in botocore, which lives
+        # only in the optional `aws` extra. A prefect-only install (e.g. Prefect
+        # on GCP) must be able to import this task module without it.
+        from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+
         set_credentials_provider(iam_icechunk_credentials)
 
     result = ingest_s1_roi_sar(
