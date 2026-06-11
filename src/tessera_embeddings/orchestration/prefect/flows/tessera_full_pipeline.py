@@ -175,8 +175,16 @@ async def tessera_full_pipeline(
     )
     _check_completed(roi_run, "generate_roi")
 
-    roi_zarr_path = f"{inputs_bucket.rstrip('/')}/rois/zarrs/{canonical_name}{_crs_suffix(force_crs)}.zarr"
-    store_path = f"{inputs_bucket.rstrip('/')}/mosaics/{canonical_name}"
+    # The CRS suffix is part of the ROI's canonical identity, not just the
+    # ROI-zarr filename: it must thread through the mosaic dir and the
+    # downstream embeddings roi_name too, or `store_for(roi_name, "roi")` in
+    # the embeddings flow rebuilds an unsuffixed path that doesn't exist (and
+    # CRS variants would collide on the mosaic/embeddings paths). generate_roi
+    # stays the sole place that *derives* the suffix; everything after it uses
+    # this suffixed id uniformly. force_crs=None → roi_id == canonical_name.
+    roi_id = f"{canonical_name}{_crs_suffix(force_crs)}"
+    roi_zarr_path = f"{inputs_bucket.rstrip('/')}/rois/zarrs/{roi_id}.zarr"
+    store_path = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_id}"
     log.info("ROI generated: %s (run_id=%s)", roi_zarr_path, roi_run.id)
 
     # Auto-size cluster from ROI chunk count
@@ -227,7 +235,7 @@ async def tessera_full_pipeline(
     embeddings_run = await arun_deployment(
         deployments.tessera_embeddings,
         parameters={
-            "roi_name": canonical_name,
+            "roi_name": roi_id,
             "time_window_end": time_window_end,
             "paths": paths.model_dump(),
             "ami_ssm_name": ami_ssm_name,
