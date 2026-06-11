@@ -98,7 +98,7 @@ def _build_cloudwatch_setup_command(
         " && sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl"
         " -a fetch-config -m ec2 -s"
         " -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json"
-        ' 2>/dev/null || echo "CloudWatch agent not available (non-fatal)"'
+        ' || echo "WARNING: CloudWatch agent not available — logs will not ship to CloudWatch" >&2'
     )
 
 
