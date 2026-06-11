@@ -97,8 +97,12 @@ def test_resolve_ray_config_writes_a_complete_yaml(tmp_path: Path) -> None:
             assert nc["SubnetIds"][0] in subnet_ids
             assert nc["TagSpecifications"][0]["Tags"] == [{"Key": "Project", "Value": "tessera-test"}]
 
-        # CloudWatch setup command was injected
-        assert any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["setup_commands"])
+        # CloudWatch agent command was injected into the start_ray commands
+        # (after `ray start`, so the Ray session/logs exist when the agent
+        # resolves file paths) — not setup_commands, which run too early.
+        assert any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["head_start_ray_commands"])
+        assert any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["worker_start_ray_commands"])
+        assert not any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["setup_commands"])
     finally:
         cleanup_ray_tempfiles(resolved)
 
