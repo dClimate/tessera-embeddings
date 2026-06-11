@@ -388,6 +388,58 @@ def _start_ray_cluster(
     return resolved_yaml, head_ip
 
 
+def _log_ray_dashboard_ssm_command(
+    cluster_name: str,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    *,
+    region: str,
+) -> None:
+    """Log a copy-pasteable SSM command to port-forward the Ray dashboard.
+
+    Finds the head node by its ``ray-cluster-name`` + ``ray-node-type=head``
+    tags and emits an ``aws ssm start-session`` block that forwards the
+    dashboard (port 8265) to ``localhost``. The head listens on 8265 with
+    ``--dashboard-host=0.0.0.0`` and the EC2 role carries
+    ``AmazonSSMManagedInstanceCore``, so the port-forward works against the
+    instance ID.
+
+    Best-effort: warns and returns on any failure, never raises. No
+    ``--profile`` is printed — credentials come from the operator's
+    environment (``AWS_PROFILE`` or their default).
+
+    Args:
+        cluster_name: Resolved, unique ``ray-cluster-name`` tag value (with
+            the uuid8 suffix) that Ray actually tagged instances with.
+        log: Logger.
+        region: AWS region.
+    """
+    try:
+        ec2 = boto3.client("ec2", region_name=region)
+        resp = ec2.describe_instances(
+            Filters=[
+                {"Name": "tag:ray-cluster-name", "Values": [cluster_name]},
+                {"Name": "tag:ray-node-type", "Values": ["head"]},
+                {"Name": "instance-state-name", "Values": ["running"]},
+            ],
+        )
+        reservations = resp.get("Reservations", [])
+        instances = reservations[0].get("Instances", []) if reservations else []
+        if not instances:
+            log.warning("Could not find Ray head node for dashboard command")
+            return
+        instance_id = instances[0]["InstanceId"]
+        log.info(
+            "To view the Ray dashboard, run:\n\n"
+            "aws ssm start-session \\\n"
+            f"  --target {instance_id} \\\n"
+            "  --document-name AWS-StartPortForwardingSessionToRemoteHost \\\n"
+            '  --parameters \'{"host":["localhost"],"portNumber":["8265"],"localPortNumber":["8265"]}\'\n\n'
+            "Then open http://localhost:8265"
+        )
+    except Exception:
+        log.warning("Could not generate Ray dashboard command", exc_info=True)
+
+
 def make_instance_terminator(
     region: str = "us-west-2",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
@@ -571,6 +623,8 @@ def ray_cluster(
             head_address = f"ray://{head_ip}:10001"
             log.info("Connecting to Ray at %s", head_address)
             ray.init(address=head_address, ignore_reinit_error=True)
+
+            _log_ray_dashboard_ssm_command(cluster_name, log, region=region)
 
         yield resolved_yaml
     finally:
