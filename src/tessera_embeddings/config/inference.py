@@ -139,9 +139,9 @@ REPRESENTATION_DIM = 192
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.
 DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
-# Spatial read-tile size for inference. 2000x2000 keeps peak RAM ~9.8 GB on
-# g5.2xlarge (31 GB), providing comfortable headroom. Independent of the storage
-# chunk size written at ingest (config.ingest.INGEST_CHUNK_SIZE).
+# Spatial read-tile size for inference. 2000x2000 peaks at ~44% of host RAM on
+# g5.xlarge (16 GB), leaving headroom for denser-observation ROIs. Independent of
+# the storage chunk size written at ingest (config.ingest.INGEST_CHUNK_SIZE).
 INFERENCE_CHUNK_SIZE = 2000
 
 
@@ -176,7 +176,6 @@ class InferenceConfig:
 
         Ray cluster:
             ray_address: Ray cluster address (None for local mode).
-            gpu_instance_type: EC2 instance type for GPU workers.
             use_spot: Whether to use spot instances.
             max_gpu_workers: Maximum number of GPU workers.
     """
@@ -214,7 +213,6 @@ class InferenceConfig:
 
     # Ray cluster
     ray_address: str | None = None
-    gpu_instance_type: str = "g5.2xlarge"
     use_spot: bool = False
     max_gpu_workers: int = 500
 

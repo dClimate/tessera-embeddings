@@ -26,7 +26,7 @@ Input stores (Icechunk/Zarr on S3):
             │
             ▼
   ┌─────────────────────────────────────────────┐
-  │  Ray Cluster  (EC2, g5.2xlarge × N)         │
+  │  Ray Cluster  (EC2, g5.xlarge × N)          │
   │  ┌─────────────────────────────────────┐    │
   │  │ InferenceActor (1 GPU each)         │    │
   │  │  1. load_chunk()        ← selective  │    │
@@ -90,7 +90,7 @@ The cluster is managed in a context manager so it automatically tears down after
 
 **Cluster topology:**
 - Head: m5.2xlarge — GCS + autoscaler, no inference work
-- Workers: g5.2xlarge (1× A10G 24 GB VRAM, 32 GB RAM) — on-demand, single AZ
+- Workers: g5.xlarge (1× A10G 24 GB VRAM, 16 GB RAM) — on-demand, single AZ
 - Workers use a Packer-built AMI with all dependencies pre-installed; boot ready in ~1 minute
 
 ### 3. Inference Actors
@@ -195,7 +195,7 @@ target is reached. Over-sampled pixels are uniformly sub-sampled.
   preparation (data loading + normalization) while the GPU runs the previous forward pass.
 - **FP16** — `model.half()` halves memory bandwidth; bucket-level aggregation absorbs FP16
   noise without repeat-averaging.
-- **`torch.compile` is disabled** — on g5.2xlarge (15.4 GB VRAM), CUDA graph capture
+- **`torch.compile` is disabled** — on g5.xlarge (15.4 GB VRAM), CUDA graph capture
   consumed 11.6 GB and slowed forward passes (3,770 ms vs. 1,944 ms) due to GRU
   recompilation per unique sequence length.
 - **cuDNN benchmark mode** — fastest algorithm for GRU/conv ops.
@@ -375,7 +375,6 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | `latent_dim` | 192 | Transformer hidden dim (must match checkpoint) |
 | `representation_dim` | 192 | Model output dim; first 128 dims are saved to the store |
 | `dim_feedforward` | 2048 | Transformer FFN width |
-| `gpu_instance_type` | `g5.2xlarge` | Worker EC2 type |
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
 **Architecture params** (`nhead`, `num_encoder_layers`, `dim_feedforward`, etc.) **must match
