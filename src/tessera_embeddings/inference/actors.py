@@ -115,7 +115,35 @@ def _log_vram_breakdown(model: MultimodalBTInferenceModel, torch_mod: types.Modu
     )
 
 
-@ray.remote
+# Host-RAM env vars, all set via runtime_env (not the decorator process) so Ray
+# exports them into the worker environment BEFORE this module imports torch /
+# instantiates the C allocator — each is read once at init and ignored if set
+# later. On the decorator so they cover every creation site: the initial pool,
+# the ActorPool replacement path (scheduling.py), and the local CPU runner.
+#
+# CUBLAS_WORKSPACE_CONFIG caps the cuBLAS host-side workspace. The model runs
+# two CUDA streams (one per backbone), so the default workspace is reserved
+# twice and inflates the per-chunk host-RAM plateau. Pinning it small claws that
+# back. cuBLAS reads the var only when the first CUDA handle is created.
+#
+# MALLOC_ARENA_MAX=2 / MALLOC_TRIM_THRESHOLD_=0 attack glibc heap retention. The
+# per-sub-batch prefetch thread churns numpy/torch CPU buffers every ~250ms;
+# across multiple glibc arenas the freed regions are held on per-arena free
+# lists at the high-water mark instead of returned to the OS, which an smaps
+# rollup shows as dirty-anon RSS (much of it THP-backed). Capping arenas to 2
+# (main + prefetch) and forcing trim-on-free returns that churn to the OS.
+# These are A/B probes: if peak RSS drops, the plateau was retained churn, not
+# live working set; if it barely moves, the working set is genuinely resident
+# and chunking is the only remaining lever.
+@ray.remote(
+    runtime_env={
+        "env_vars": {
+            "CUBLAS_WORKSPACE_CONFIG": ":16:8",
+            "MALLOC_ARENA_MAX": "2",
+            "MALLOC_TRIM_THRESHOLD_": "0",
+        }
+    }
+)
 class InferenceActor:
     """Ray actor that runs embedding inference on a single GPU or CPU.
 
