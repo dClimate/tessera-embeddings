@@ -26,7 +26,7 @@ def _make_chunk_data(
         rng = np.random.default_rng(42)
 
     s2_bands = rng.integers(100, 3000, (n_s2, H, W, 10), dtype=np.uint16)
-    s2_masks = rng.integers(0, 2, (n_s2, H, W), dtype=np.int32)
+    s2_masks = rng.integers(0, 2, (n_s2, H, W)).astype(bool)
     s2_doys = np.arange(n_s2, dtype=np.int32) * 16
 
     if n_s1a > 0:
@@ -106,7 +106,7 @@ def test_no_valid_pixels_empty_dataset() -> None:
     H, W = 4, 4
     chunk_data = ChunkData(
         s2_bands=np.zeros((10, H, W, 10), dtype=np.uint16),
-        s2_masks=np.zeros((10, H, W), dtype=np.int32),
+        s2_masks=np.zeros((10, H, W), dtype=bool),
         s2_doys=np.arange(10, dtype=np.int32),
         s1_asc_bands=np.zeros((6, H, W, 2), dtype=np.float32),
         s1_asc_doys=np.arange(6, dtype=np.int32),

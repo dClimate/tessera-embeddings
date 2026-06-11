@@ -113,8 +113,13 @@ def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> tor
         dtype = torch.float16
         logger.warning("BF16 not supported on this GPU; falling back to FP16")
 
-    torch.backends.cudnn.benchmark = True
-    logger.debug("cuDNN benchmark mode enabled")
+    # benchmark=False: with variable bucket shapes (per-bucket seq lengths +
+    # partial final sub-batches) the autotuner re-searches constantly for little
+    # gain, and inflates the host-side cuDNN footprint by trial-loading multiple
+    # algorithms and holding the largest workspace it tried. Disabling it lowers
+    # the first-batch host-RAM plateau. See inference RAM investigation.
+    torch.backends.cudnn.benchmark = False
+    logger.debug("cuDNN benchmark mode disabled (variable input shapes)")
     log_autocast_dtype_probe(device, dtype=dtype)
     return dtype
 
