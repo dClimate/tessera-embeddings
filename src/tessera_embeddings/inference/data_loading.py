@@ -40,7 +40,7 @@ class ChunkData:
 
     Attributes:
         s2_bands: S2 reflectance bands, shape (T_s2, H, W, 10), uint16.
-        s2_masks: Binary valid-pixel mask from SCL, shape (T_s2, H, W), int32.
+        s2_masks: Binary valid-pixel mask from SCL, shape (T_s2, H, W), bool.
         s2_doys: Day-of-year for each S2 timestep, shape (T_s2,), int32.
         s1_asc_bands: S1 ascending VV+VH, shape (T_s1a, H, W, 2), native store dtype.
         s1_asc_doys: DOY for ascending, shape (T_s1a,), int32.
@@ -282,7 +282,7 @@ def _load_s2(
     Returns:
         Tuple of (s2_bands, s2_masks, s2_doys, s2_obs_count):
           - s2_bands: (T_kept, H, W, 10) uint16
-          - s2_masks: (T_kept, H, W) int32 — binary SCL validity
+          - s2_masks: (T_kept, H, W) bool — binary SCL validity
           - s2_doys: (T_kept,) int32
           - s2_obs_count: (H, W) uint16 — per-pixel valid-timestep count from full mask
     """
@@ -318,7 +318,10 @@ def _load_s2(
     s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice)
     logger.info("Loaded S2 bands shape %s", s2_bands.shape)
 
-    return s2_bands, s2_masks.astype(np.int32), s2_doys, s2_obs_count
+    # Keep the mask bool (1 byte/elem) rather than widening to int32 — it stays
+    # resident in ChunkData for the whole chunk, and the only consumers
+    # (np.nonzero in resampling, .sum for obs_count) handle bool directly.
+    return s2_bands, s2_masks, s2_doys, s2_obs_count
 
 
 def _load_sar_orbit(

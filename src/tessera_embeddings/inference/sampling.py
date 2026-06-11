@@ -90,7 +90,7 @@ def resample_s2_bucket(
 
     Args:
         s2_bands: ``(B, T, 10)`` uint16 bands.
-        s2_masks: ``(B, T)`` int32 binary validity mask from SCL.
+        s2_masks: ``(B, T)`` bool binary validity mask from SCL.
         s2_doys: ``(B, T)`` int32 day-of-year, broadcast across pixels.
         target: Target sequence length (bucket size).
         s2_mean: ``(10,)`` per-band mean.

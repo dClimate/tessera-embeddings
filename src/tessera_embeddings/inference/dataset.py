@@ -199,7 +199,7 @@ class MosaicChunkInferenceDataset:
 
         # S2: (T_s2, H, W, 10) → (T_s2, B, 10) → (B, T_s2, 10)
         s2_bands = self._s2_bands[:, rows, cols, :].transpose(1, 0, 2)
-        s2_masks = self._s2_masks[:, rows, cols].T.astype(np.int32, copy=False)
+        s2_masks = self._s2_masks[:, rows, cols].T
         s2_doys = np.broadcast_to(self._s2_doys[None, :], (b, len(self._s2_doys))).astype(np.int32, copy=False)
 
         s1_asc_bands = self._s1_asc_bands[:, rows, cols, :].transpose(1, 0, 2)
