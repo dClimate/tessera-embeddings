@@ -31,7 +31,7 @@ from tessera_embeddings.inference.profiling import (
     log_effective_tflops,
     log_profiled_batch_summary,
 )
-from tessera_embeddings.inference.quantization import quantize_embeddings
+from tessera_embeddings.inference.quantization import quantize_rows
 
 logger = logging.getLogger(__name__)
 
@@ -142,17 +142,21 @@ def _run_gpu_sub_batch(
     bucket_key: tuple[int, int],
     device: torch.device,
     reduced_precision_dtype: torch.dtype | None,
-    flat_out: np.ndarray,
+    flat_q: np.ndarray,
+    flat_scales: np.ndarray,
     get_batch_secs: float,
     *,
     profile: bool = False,
     config: InferenceConfig | None = None,
     save_dim: int = EMBEDDING_DIM,
 ) -> _BatchTimings:
-    """Transfer → forward → slice → write for a pre-prepared batch.
+    """Transfer → forward → slice → quantize → write for a pre-prepared batch.
 
     Must be called inside a ``torch.no_grad()`` context.
-    Writes into ``flat_out[global_idxs]`` in place.
+    Quantizes the batch's rows on arrival and writes int8 values into
+    ``flat_q[global_idxs]`` and their scales into ``flat_scales[global_idxs]``
+    in place. Per-row quantization is numerically identical to quantizing the
+    whole chunk at the end (see :func:`quantize_rows`).
     """
     tb1 = time.monotonic()
 
@@ -200,9 +204,12 @@ def _run_gpu_sub_batch(
                 num_layers=config.num_encoder_layers,
             )
 
-    # Slice 192-D rep to canonical save_dim, then to CPU.
+    # Slice 192-D rep to canonical save_dim, to CPU, then quantize this bucket's
+    # rows immediately so we never buffer the whole chunk in float32.
     z = z[:, :save_dim].float()
-    flat_out[global_idxs] = z.cpu().numpy()
+    q, s = quantize_rows(z.cpu().numpy())
+    flat_q[global_idxs] = q
+    flat_scales[global_idxs] = s
     tb4 = time.monotonic()
 
     return _BatchTimings(
@@ -251,7 +258,12 @@ def run_inference(
     save_dim = min(EMBEDDING_DIM, config.representation_dim)
 
     h, w = dataset.H, dataset.W
-    flat_out = np.zeros((h * w, save_dim), dtype=np.float32)
+    # Quantize per bucket into skinny int8 + scale buffers instead of accumulating
+    # the whole chunk in float32 (4x smaller resident accumulator). flat_scales is
+    # initialized to 1e-8 — the scale invalid/never-written pixels get under
+    # whole-array quantization (abs_max=0 -> max(0, 1e-8)).
+    flat_q = np.zeros((h * w, save_dim), dtype=np.int8)
+    flat_scales = np.full(h * w, 1e-8, dtype=np.float32)
 
     logger.info(
         "Starting v1.1 inference: %d buckets, %d sub-batches, %d valid pixels, batch_size=%d",
@@ -303,7 +315,8 @@ def run_inference(
                 bucket_key,
                 device,
                 reduced_precision_dtype,
-                flat_out,
+                flat_q,
+                flat_scales,
                 get_batch_secs,
                 profile=(sub_batch_idx == PROFILE_BATCH_IDX),
                 config=config,
@@ -339,8 +352,9 @@ def run_inference(
                     avg.total,
                 )
 
-    out = flat_out.reshape(h, w, save_dim)
-    out, scales = quantize_embeddings(out)
+    # Rows were already quantized per bucket on arrival; just reshape to (H,W,*).
+    out = flat_q.reshape(h, w, save_dim)
+    scales = flat_scales.reshape(h, w)
     logger.info("Quantized embeddings to int8 (scales shape %s)", scales.shape)
 
     elapsed = time.monotonic() - t0

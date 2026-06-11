@@ -215,6 +215,16 @@ is computed. Embeddings are scaled so that the max maps to ±127 (the int8 range
 rounded and clipped. The per-pixel scale factor (float32) is stored alongside the
 quantized embeddings so the original values can be reconstructed:
 
+**Per-bucket, not whole-chunk.** Quantization is per-pixel independent (each pixel's scale
+comes only from its own 128 channels), so `run_inference` quantizes each bucket's rows via
+`quantize_rows` the moment they come off the GPU, accumulating directly into skinny int8 +
+scale buffers. It never materializes the full `(H, W, 128)` chunk in float32. This is
+numerically identical to quantizing the whole array at the end, but shrinks the resident
+accumulator ~4× (~2 GB → ~0.5 GB at `chunk_size=2000`) and removes the end-of-chunk
+whole-array quantize and its multi-GB float32 temporaries — lowering the per-chunk host-RAM
+plateau. `quantize_embeddings` remains as the `(H, W, D)` entry point and delegates to
+`quantize_rows`.
+
 ```
 reconstructed = quantized.astype(float32) * scale[..., np.newaxis]
 ```
