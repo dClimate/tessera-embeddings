@@ -260,9 +260,19 @@ def _resolve_ray_config(
 
     # Inject the CloudWatch agent setup command (replaces any heredoc-style
     # cloudwatch entry in the template, which would break over SSH).
+    #
+    # Append it to the *_start_ray_commands, NOT setup_commands: setup_commands
+    # run before `ray start`, so the agent would resolve its file paths while
+    # /tmp/ray/session_latest is empty or stale, then `ray start` repoints the
+    # session_latest symlink out from under it and no logs ship. Starting the
+    # agent after `ray start` guarantees the session and its log files already
+    # exist when fetch-config discovers them. Strip any pre-existing cloudwatch
+    # entries from every command list so we don't double-start.
     cw_cmd = _build_cloudwatch_setup_command(cloudwatch_template, cloudwatch_log_group)
-    config["setup_commands"] = [cmd for cmd in config.get("setup_commands", []) if "cloudwatch" not in str(cmd).lower()]
-    config["setup_commands"].append(cw_cmd)
+    for key in ("setup_commands", "head_start_ray_commands", "worker_start_ray_commands"):
+        config[key] = [cmd for cmd in config.get(key, []) if "cloudwatch" not in str(cmd).lower()]
+    config["head_start_ray_commands"].append(cw_cmd)
+    config["worker_start_ray_commands"].append(cw_cmd)
 
     # Substitute {CODE_BUCKET} and {CODE_SUFFIX} in setup_commands.
     if code_bucket is not None:
