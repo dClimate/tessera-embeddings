@@ -62,6 +62,17 @@ you've stored the EC2 resource IDs your Ray nodes need.
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/ec2/tessera/ray"
 """Default CloudWatch log group for Ray agent logs."""
 
+PROJECT_TAG_VALUE = "tessera-embeddings"
+"""Value of the ``Project`` EC2 tag stamped on every Ray node.
+
+The deployment's runner IAM role conditions ``ec2:TerminateInstances`` on
+``aws:ResourceTag/Project`` equal to this value, so that ``ray down`` (which
+terminates nodes using the driver's credentials) and the
+:func:`terminate_ray_instances_by_tag` fallback are both authorised. Without
+this tag every teardown terminate is IAM-denied and the instances leak. Keep
+this in lockstep with the deployment's IAM condition (yield CDK:
+``ray_inference.py`` ``RayEc2Terminate``)."""
+
 _REQUIRED_SSM_KEYS = frozenset(
     {"security-group-id", "instance-profile-arn", "private-subnet-ids", "key-pair-name", "key-pair-id"}
 )
@@ -165,9 +176,11 @@ def _resolve_ray_config(
             ``private-subnet-ids``, ``key-pair-name``, ``key-pair-id``.
         cluster_name: Override the template's ``cluster_name``. Required
             for running multiple clusters concurrently.
-        instance_tags: EC2 tags to apply to every node. List of
-            ``{"Key": str, "Value": str}`` dicts. ``None`` means no tags
-            beyond Ray's own ``ray-cluster-name`` tag.
+        instance_tags: Extra EC2 tags to apply to every node, on top of
+            the always-present ``Project`` tag (see :data:`PROJECT_TAG_VALUE`)
+            and Ray's own ``ray-cluster-name`` tag. List of
+            ``{"Key": str, "Value": str}`` dicts; a ``Project`` key here
+            overrides the default. ``None`` means only the defaults.
         code_bucket: S3 bucket name (without ``s3://``) substituted for
             ``{CODE_BUCKET}`` in setup_commands. ``None`` leaves the
             placeholder; pair with ``sync_source_path=None`` to disable
@@ -211,9 +224,14 @@ def _resolve_ray_config(
     all_subnet_ids = [s.strip() for s in params["private-subnet-ids"].split(",")]
     iam_profile = {"Arn": params["instance-profile-arn"]}
     key_name = params["key-pair-name"]
-    tag_specs: list[dict[str, Any]] = []
-    if instance_tags:
-        tag_specs.append({"ResourceType": "instance", "Tags": instance_tags})
+    # Always stamp the Project tag so teardown terminates are IAM-authorised
+    # (see PROJECT_TAG_VALUE). Caller-supplied tags win on key collision.
+    merged_tags = [{"Key": "Project", "Value": PROJECT_TAG_VALUE}]
+    caller_keys = {t["Key"] for t in (instance_tags or [])}
+    if "Project" in caller_keys:
+        merged_tags = []
+    merged_tags.extend(instance_tags or [])
+    tag_specs: list[dict[str, Any]] = [{"ResourceType": "instance", "Tags": merged_tags}]
 
     # Pin all nodes to a single AZ to avoid cross-AZ data transfer costs.
     # Pick the subnet with the fewest running Ray instances to spread
