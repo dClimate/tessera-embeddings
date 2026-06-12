@@ -25,7 +25,7 @@ from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.inference.actors import InferenceActor
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.inference.lifecycle import MIN_ACTOR_FRACTION, wait_for_actors
+from tessera_embeddings.inference.lifecycle import MAX_ACTORS_TO_WAIT_FOR, MIN_ACTOR_FRACTION, wait_for_actors
 from tessera_embeddings.inference.progress import ProgressTracker
 from tessera_embeddings.inference.scheduling import _process_chunks_work_stealing
 
@@ -115,9 +115,11 @@ def run_inference(
     actors = [actor_cls.remote(config, config.checkpoint_path) for _ in range(num_actors)]
     progress_tracker: ray.actor.ActorHandle | None = None
     try:
-        min_required = max(1, int(num_actors * MIN_ACTOR_FRACTION))
+        min_required = min(max(1, int(num_actors * MIN_ACTOR_FRACTION)), MAX_ACTORS_TO_WAIT_FOR)
         log.info("Waiting for actors to initialize (need at least %d / %d)...", min_required, num_actors)
-        actors, actor_instance_ids, still_initializing = wait_for_actors(actors, num_actors, t_actors, log)
+        actors, actor_instance_ids, still_initializing = wait_for_actors(
+            actors, num_actors, min_required, t_actors, log
+        )
 
         # --- Process chunks with work-stealing ---
         log.info("Processing %d chunks across %d actors (work-stealing)", len(chunks), len(actors))
