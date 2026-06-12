@@ -38,7 +38,10 @@ class TestComputeStripHeight:
         assert h == 2000
 
     def test_dense_chunk_splits(self):
-        # T=120, W=2000, 4 GiB budget -> ~890 rows -> 3 strips of a 2000-row chunk.
+        # T=120, W=2000, 4 GiB budget. Whole-chunk footprint (~9.6 GiB) exceeds
+        # the budget so striping kicks in; strips are sized against half the
+        # budget (the 1-deep prefetch keeps two resident), -> ~445 rows -> 5
+        # strips of a 2000-row chunk.
         budget = 4 * 1024**3
         h = _compute_strip_height(height=2000, width=2000, t_estimate=120, strip_budget_bytes=budget)
         assert h < 2000

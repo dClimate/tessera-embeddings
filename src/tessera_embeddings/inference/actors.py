@@ -26,7 +26,7 @@ import requests
 from tessera_embeddings.config.inference import EMBEDDING_DIM, S2_BAND_ORDER, InferenceConfig
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.inference.data_loading import count_s2_window_timesteps, load_chunk
+from tessera_embeddings.inference.data_loading import count_s2_window_timesteps, load_chunk, make_store_opener
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 
 if TYPE_CHECKING:
@@ -55,21 +55,33 @@ _S2_BYTES_PER_ROW_TIMESTEP = len(S2_BAND_ORDER) * np.dtype(np.uint16).itemsize
 
 
 def _compute_strip_height(*, height: int, width: int, t_estimate: int, strip_budget_bytes: int) -> int:
-    """Derive the northing strip height that keeps one resident strip under budget.
+    """Derive the northing strip height that keeps resident input under budget.
 
     The resident input is dominated by the S2 band array, ``T * W * 10 * 2``
-    bytes, which scales linearly in the northing extent. We solve for the
-    largest strip height whose S2 band footprint fits ``strip_budget_bytes``,
-    clamp it to ``[_MIN_STRIP_H, height]``, and return it. When the result is
-    ``>= height`` the chunk loads as a single strip — byte-for-byte the
-    unstriped path. ``t_estimate`` of 0 (no timesteps) returns the full height.
+    bytes, which scales linearly in the northing extent. The strip loop in
+    ``process_chunk`` runs a 1-deep prefetch, so when a chunk splits the next
+    strip loads while the current one is still live — *two* strips coexist. We
+    therefore size against half the budget once striping kicks in, so that pair
+    stays under ``strip_budget_bytes`` rather than peaking at ~2x it.
+
+    A chunk whose whole-height footprint already fits the budget loads as a
+    single strip (no prefetched neighbour to coexist with) — byte-for-byte the
+    unstriped path, sized against the full budget. Otherwise we solve for the
+    largest strip height whose S2 band footprint fits ``strip_budget_bytes / 2``
+    and clamp it to ``[_MIN_STRIP_H, height]``. ``t_estimate`` of 0 (no
+    timesteps) returns the full height.
     """
     if t_estimate <= 0:
         return height
     bytes_per_row = width * t_estimate * _S2_BYTES_PER_ROW_TIMESTEP
     if bytes_per_row <= 0:
         return height
-    strip_h = strip_budget_bytes // bytes_per_row
+    # Single strip if the whole chunk fits — no prefetched neighbour to bound.
+    if height * bytes_per_row <= strip_budget_bytes:
+        return height
+    # Striping is active: two strips are resident under the prefetch, so each
+    # must fit half the budget for the pair to stay within it.
+    strip_h = (strip_budget_bytes // 2) // bytes_per_row
     strip_h = max(_MIN_STRIP_H, min(int(strip_h), height))
     return strip_h
 
@@ -282,12 +294,18 @@ class InferenceActor:
             tracker.report.remote(chunk.label, 0, 0, "loading")  # type: ignore[union-attr]
 
         try:
+            # Share one set of repo handles across the probe and every strip so
+            # the 512 MB icechunk chunk cache persists for the whole chunk:
+            # overlapping strips re-touch the same store chunks, so a warm cache
+            # turns those re-reads into hits instead of cold S3 fetches.
+            store_opener = make_store_opener()
+
             # Size northing strips from the byte budget so a dense chunk's
             # resident *input* stays bounded. Probe the window timestep count
             # from the 1-D time coord (cheap, no spatial read) to estimate T
             # before the first full load. A normal-density chunk resolves to a
             # single full-height strip — byte-for-byte the unstriped path.
-            t_estimate = count_s2_window_timesteps(mosaic_base, self.config.time_window)
+            t_estimate = count_s2_window_timesteps(mosaic_base, self.config.time_window, store_opener=store_opener)
             strip_h = _compute_strip_height(
                 height=chunk.height,
                 width=chunk.width,
@@ -320,6 +338,7 @@ class InferenceActor:
                     time_window=self.config.time_window,
                     s1_orbit=self.config.s1_orbit,
                     y_sub=y_sub,
+                    store_opener=store_opener,
                 )
 
             on_batch = (
@@ -342,6 +361,12 @@ class InferenceActor:
 
                 for i, strip in enumerate(strips):
                     assert next_future is not None
+                    # The previous strip reported "inference"; flip back to
+                    # "loading" before blocking on this strip's read so a slow
+                    # multi-strip load isn't misclassified as an inference stall
+                    # by _poll_tracker. (Strip 0's "loading" was reported above.)
+                    if tracker and i > 0:
+                        tracker.report.remote(chunk.label, 0, 0, "loading")  # type: ignore[union-attr]
                     chunk_data = next_future.result()
 
                     # Kick off the next strip's load before running inference on this one.

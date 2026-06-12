@@ -15,6 +15,7 @@ loaded eagerly.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -29,6 +30,34 @@ from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.storage.zarr_store import compute_doy, open_store_as_zarr_group
 
 logger = logging.getLogger(__name__)
+
+# A function that maps a store path to an open zarr group. The default is
+# ``open_store_as_zarr_group`` (a fresh repo open per call). The strip loop
+# passes a memoizing opener (see ``make_store_opener``) so every strip of a
+# chunk shares one repo handle — and thus one persistent 512 MB chunk cache —
+# rather than reopening cold and discarding the cache between strips.
+StoreOpener = Callable[[str], zarr.Group]
+
+
+def make_store_opener() -> StoreOpener:
+    """Return a store opener that opens each distinct path once and reuses it.
+
+    Holding the opened zarr groups alive keeps their icechunk chunk cache warm
+    across calls. Intended to live for the duration of one chunk's strip loop:
+    overlapping northing strips re-touch the same ``(time=1, 4000, 4000)`` store
+    chunks, so a shared cache turns the per-strip re-reads into cache hits
+    instead of repeated S3 fetches.
+    """
+    cache: dict[str, zarr.Group] = {}
+
+    def _open(store_path: str) -> zarr.Group:
+        group = cache.get(store_path)
+        if group is None:
+            group = open_store_as_zarr_group(store_path)
+            cache[store_path] = group
+        return group
+
+    return _open
 
 
 @dataclass
@@ -156,7 +185,9 @@ def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.nd
     return indices, compute_doy(times[indices])
 
 
-def count_s2_window_timesteps(mosaic_base: str, time_window: TimeWindow) -> int:
+def count_s2_window_timesteps(
+    mosaic_base: str, time_window: TimeWindow, store_opener: StoreOpener | None = None
+) -> int:
     """Return how many S2 timesteps fall inside ``time_window`` for this mosaic.
 
     Reads only the reflectance store's 1-D ``time`` coordinate (no spatial
@@ -165,8 +196,14 @@ def count_s2_window_timesteps(mosaic_base: str, time_window: TimeWindow) -> int:
     size northing strips ahead of the first full read. The true post-pruning
     ``T_kept`` is <= this value, so sizing on it is conservative (strips end up
     no wider than the budget allows).
+
+    ``store_opener`` defaults to a fresh repo open; pass a shared opener (see
+    ``make_store_opener``) to reuse the reflectance handle the strip loads use,
+    so the probe primes the chunk cache instead of opening a throwaway repo.
     """
-    root = open_store_as_zarr_group(f"{mosaic_base}/reflectance.zarr")
+    if store_opener is None:
+        store_opener = open_store_as_zarr_group
+    root = store_opener(f"{mosaic_base}/reflectance.zarr")
     window_indices, _ = _filter_times_from_zarr(root, time_window)
     return len(window_indices)
 
@@ -304,6 +341,7 @@ def _load_s2(
     chunk: ChunkSpec,
     time_window: TimeWindow,
     y_sub: slice | None = None,
+    store_opener: StoreOpener | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load all S2 timesteps in the window that have any valid pixel in the (sub-)chunk.
 
@@ -319,8 +357,10 @@ def _load_s2(
           - s2_doys: (T_kept,) int32
           - s2_obs_count: (H, W) uint16 — per-pixel valid-timestep count from full mask
     """
+    if store_opener is None:
+        store_opener = open_store_as_zarr_group
     store_path = f"{mosaic_base}/reflectance.zarr"
-    root = open_store_as_zarr_group(store_path)
+    root = store_opener(store_path)
     window_indices, s2_doys_full = _filter_times_from_zarr(root, time_window)
     y_slice = _resolve_y_slice(chunk, y_sub)
     x_slice = slice(chunk.x_start, chunk.x_stop)
@@ -363,6 +403,7 @@ def _load_sar_orbit(
     orbit: str,
     time_window: TimeWindow,
     y_sub: slice | None = None,
+    store_opener: StoreOpener | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Load SAR bands and DOYs for a single orbit direction.
 
@@ -372,7 +413,9 @@ def _load_sar_orbit(
     Returns:
         Tuple of (bands, doys) with shapes (T, H, W, 2) uint16 and (T,) int32.
     """
-    root = open_store_as_zarr_group(f"{mosaic_base}/sar_{orbit}.zarr")
+    if store_opener is None:
+        store_opener = open_store_as_zarr_group
+    root = store_opener(f"{mosaic_base}/sar_{orbit}.zarr")
     window_indices, doys_full = _filter_times_from_zarr(root, time_window)
     y_slice = _resolve_y_slice(chunk, y_sub)
     x_slice = slice(chunk.x_start, chunk.x_stop)
@@ -386,6 +429,7 @@ def load_chunk(
     time_window: TimeWindow,
     s1_orbit: Literal["ascending", "descending", "both"] = "ascending",
     y_sub: slice | None = None,
+    store_opener: StoreOpener | None = None,
 ) -> ChunkData:
     """Load all data for one spatial chunk (or a northing strip of it) for v1.1 inference.
 
@@ -395,6 +439,10 @@ def load_chunk(
         time_window: 12-month time window for temporal filtering.
         s1_orbit: Which S1 orbit direction(s) to load — ``"ascending"``,
             ``"descending"``, or ``"both"``.
+        store_opener: Maps a store path to an open zarr group. Defaults to a
+            fresh repo open per call; the strip loop passes one shared opener
+            (see ``make_store_opener``) for all strips of a chunk so the 512 MB
+            chunk cache persists across strips instead of starting cold on each.
         y_sub: Optional chunk-relative northing slice bounding the resident
             input working set. When given, only that horizontal strip of the
             chunk is read (full easting width) and the returned ``ChunkData``
@@ -420,15 +468,21 @@ def load_chunk(
         y_sub,
     )
 
-    s2_bands, s2_masks, s2_doys, s2_obs_count = _load_s2(mosaic_base, chunk, time_window, y_sub=y_sub)
+    s2_bands, s2_masks, s2_doys, s2_obs_count = _load_s2(
+        mosaic_base, chunk, time_window, y_sub=y_sub, store_opener=store_opener
+    )
 
     s1_asc_bands, s1_asc_doys = (
-        _load_sar_orbit(mosaic_base, chunk, "ascending", time_window=time_window, y_sub=y_sub)
+        _load_sar_orbit(
+            mosaic_base, chunk, "ascending", time_window=time_window, y_sub=y_sub, store_opener=store_opener
+        )
         if "ascending" in active
         else _empty_sar_arrays(height, width)
     )
     s1_desc_bands, s1_desc_doys = (
-        _load_sar_orbit(mosaic_base, chunk, "descending", time_window=time_window, y_sub=y_sub)
+        _load_sar_orbit(
+            mosaic_base, chunk, "descending", time_window=time_window, y_sub=y_sub, store_opener=store_opener
+        )
         if "descending" in active
         else _empty_sar_arrays(height, width)
     )

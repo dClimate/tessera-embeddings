@@ -163,10 +163,19 @@ are loaded through a 1-deep prefetch pipeline (strip *i+1* loads while strip *i*
 GPU), the same pattern as the sub-batch prefetcher in `inference.py`.
 
 ```text
-strip_h = strip_budget_bytes / (T_estimate × W × 10 × 2)   clamped to [256, H]
-  T_estimate ≈ 40  → strip_h ≥ H  → 1 strip  → byte-for-byte the unstriped path
-  T_estimate ≈ 120 → strip_h ≈ 670 → 3 strips → peak input ~⅓ of the whole chunk
+whole-chunk footprint = T_estimate × H × W × 10 × 2
+  ≤ strip_budget_bytes               → 1 strip → byte-for-byte the unstriped path
+  >  strip_budget_bytes (striping on) → strip_h = (strip_budget_bytes / 2) / (T_estimate × W × 10 × 2)
+                                        clamped to [256, H]
+  T_estimate ≈ 40  → fits → 1 strip
+  T_estimate ≈ 120 → strip_h ≈ 445 → 5 strips → two resident strips stay under budget
 ```
+
+The strip loop runs a 1-deep prefetch (strip *i+1* loads while strip *i* runs the GPU), so
+once a chunk splits **two strips are resident at once**. Strips are therefore sized against
+*half* the budget when striping is active, so the prefetched pair peaks under
+`strip_budget_bytes` rather than ~2× it; a chunk whose whole-height footprint already fits the
+budget loads as a single strip (no prefetched neighbour) sized against the full budget.
 
 `T_estimate` comes from `count_s2_window_timesteps`, which reads only the 1-D `time`
 coordinate (no spatial read) — an upper bound on `T_valid`, so strip sizing is conservative.
@@ -177,10 +186,13 @@ of observation density** — every other lever lowers the plateau by a fixed amo
 
 Read cost: strips overlap shared `(time=1, 4000, 4000)` store chunks, so a split chunk
 re-touches the same on-disk chunks once per strip. The icechunk repo is opened with a 512 MB
-chunk cache (`zarr_store.py::_default_repo_config`) so those re-reads hit cache rather than
-re-fetching S3 — measured strip read penalty ~1.35× (vs 2.37× uncached) on a dense chunk,
-which stays under the per-chunk compute time and is hidden by the prefetch pipeline. Normal
-single-strip chunks pay nothing.
+chunk cache (`zarr_store.py::_default_repo_config`), but that cache lives on the repo handle —
+so the strip loop opens each store **once per chunk** (`data_loading.make_store_opener`) and
+reuses the handle (and its warm cache) across every strip, rather than reopening cold per
+strip and discarding the cache. Those re-reads then hit cache rather than re-fetching S3 —
+measured strip read penalty ~1.35× (vs 2.37× uncached) on a dense chunk, which stays under the
+per-chunk compute time and is hidden by the prefetch pipeline. Normal single-strip chunks pay
+nothing.
 
 #### 4b. Valid Pixel Filtering + Bucketing (`dataset.py`)
 

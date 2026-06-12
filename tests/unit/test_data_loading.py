@@ -18,6 +18,7 @@ from tessera_embeddings.inference.data_loading import (
     _load_sar_orbit,
     _load_scl_mask,
     load_chunk,
+    make_store_opener,
     resolve_s1_orbit,
 )
 from tessera_embeddings.storage.zarr_store import compute_doy
@@ -384,3 +385,68 @@ class TestResolveS1Orbit:
             pytest.raises(InsufficientCoverageError, match="no SAR stores found"),
         ):
             resolve_s1_orbit("s3://b/m", "both")
+
+
+class TestSharedStoreOpener:
+    """A shared opener reuses one repo handle per store path across strip loads.
+
+    Reopening per strip would discard the icechunk chunk cache between strips;
+    the strip loop builds one ``make_store_opener`` per chunk so overlapping
+    strips re-touch the same store handle (and warm cache) instead.
+    """
+
+    _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
+
+    def _side_effect(self):
+        h, w = self._CHUNK.height, self._CHUNK.width
+        s2_root = _make_s2_zarr_group(10, h, w, seed=10)
+        sar_asc = _make_sar_zarr_group(5, h, w, seed=20)
+        sar_desc = _make_sar_zarr_group(5, h, w, seed=30)
+
+        def _open_store(path):
+            if "reflectance" in path:
+                return s2_root
+            if "ascending" in path:
+                return sar_asc
+            if "descending" in path:
+                return sar_desc
+            raise ValueError(f"Unexpected store path: {path}")
+
+        return _open_store
+
+    def test_opener_caches_each_path(self):
+        """make_store_opener opens each distinct path once and returns the same group."""
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()) as mock_open:
+            opener = make_store_opener()
+            first = opener("s3://b/m/reflectance.zarr")
+            second = opener("s3://b/m/reflectance.zarr")
+            other = opener("s3://b/m/sar_ascending.zarr")
+
+        assert first is second  # same handle reused
+        assert other is not first
+        # reflectance opened once despite two requests; sar once.
+        assert mock_open.call_count == 2
+
+    def test_strips_share_one_open_per_store(self):
+        """Probing T then loading three strips opens each store exactly once."""
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()) as mock_open:
+            opener = make_store_opener()
+            _dl_mod.count_s2_window_timesteps("s3://b/m", _TIME_WINDOW, store_opener=opener)
+            for y_sub in (slice(0, 4), slice(4, 8), slice(8, 12)):
+                load_chunk(
+                    self._CHUNK,
+                    "s3://b/m",
+                    time_window=_TIME_WINDOW,
+                    s1_orbit="both",
+                    y_sub=y_sub,
+                    store_opener=opener,
+                )
+
+        opened_paths = [call.args[0] for call in mock_open.call_args_list]
+        # reflectance + sar_ascending + sar_descending, each opened once total
+        # across the probe and all three strips.
+        assert sorted(opened_paths) == [
+            "s3://b/m/reflectance.zarr",
+            "s3://b/m/sar_ascending.zarr",
+            "s3://b/m/sar_descending.zarr",
+        ]
