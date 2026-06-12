@@ -94,6 +94,11 @@ def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> tor
     FP16 fallback is functional but carries a risk of inf/NaN from saturation
     at 65504; treat it as a best-effort path, not a validated production config.
 
+    The dtype conversion is idempotent: actors reuse one persistent model
+    across every strip and chunk, so once converted the model already carries
+    the target dtype and we skip the (non-trivial) re-cast. This hoists the
+    one-time conversion cost to the first strip instead of paying it per strip.
+
     Returns:
         The reduced-precision dtype to use for inputs (bfloat16 or float16), or None
         on CPU (inputs stay float32).
@@ -104,13 +109,15 @@ def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> tor
         log_autocast_dtype_probe(device, dtype=None)
         return None
 
-    if torch.cuda.is_bf16_supported():
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    current_dtype = next(model.parameters()).dtype
+    if current_dtype == dtype:
+        logger.debug("Model already in %s; skipping conversion", dtype)
+    elif dtype == torch.bfloat16:
         model.bfloat16()
-        dtype = torch.bfloat16
         logger.info("Model converted to BF16")
     else:
         model.half()
-        dtype = torch.float16
         logger.warning("BF16 not supported on this GPU; falling back to FP16")
 
     # benchmark=False: with variable bucket shapes (per-bucket seq lengths +
