@@ -37,7 +37,12 @@ class TestRunInference:
         assert result.embeddings_std is None
 
     def test_invalid_pixels_are_zero(self, inference_config, test_model):
-        """All-zero inputs produce zero embeddings (no valid pixels)."""
+        """Pixels that can't be generated get 0 in every band and a NaN scale.
+
+        All-zero inputs mean no valid pixels — this is the same shape as a pixel
+        outside the ROI but inside the bbox, which ingest zeroes across all bands
+        so it fails the nonzero validity check here.
+        """
         h, w, t = 4, 4, 10
         chunk = ChunkData(
             s2_bands=np.zeros((t, h, w, 10), dtype=np.uint16),
@@ -56,6 +61,28 @@ class TestRunInference:
         result = run_inference(test_model, dataset, inference_config, torch.device("cpu"))
 
         np.testing.assert_array_equal(result.embeddings, 0)
+        assert np.isnan(result.scales).all()
+
+    def test_partial_validity_marks_only_invalid_pixels(self, sample_chunk_data, inference_config, test_model):
+        """A chunk mixing valid and can't-generate pixels marks exactly the latter.
+
+        Valid pixels get a finite scale and (with random model weights) nonzero
+        embeddings; the zeroed-out pixels keep 0 embeddings and a NaN scale.
+        """
+        h, w = 4, 4
+        chunk = sample_chunk_data(height=h, width=w, t_s2=10, t_s1a=5, t_s1d=5)
+        # Zero out the bottom-right pixel across every S2 band/time so it fails
+        # the nonzero validity check — the in-bbox-outside-ROI case.
+        chunk.s2_bands[:, h - 1, w - 1, :] = 0
+        dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
+
+        result = run_inference(test_model, dataset, inference_config, torch.device("cpu"))
+
+        invalid = np.isnan(result.scales)
+        assert invalid[h - 1, w - 1]
+        # Invalid pixels are zero in every band; valid pixels have finite scales.
+        np.testing.assert_array_equal(result.embeddings[invalid], 0)
+        assert np.isfinite(result.scales[~invalid]).all()
 
     def test_nonzero_embeddings_for_valid_pixels(self, sample_chunk_data, inference_config, test_model):
         """Valid pixels produce non-zero embeddings (random model weights)."""
@@ -110,7 +137,7 @@ class TestProcessSubBatch:
         h, w = dataset.H, dataset.W
         save_dim = inference_config.representation_dim
         flat_q = np.zeros((h * w, save_dim), dtype=np.int8)
-        flat_scales = np.full(h * w, 1e-8, dtype=np.float32)
+        flat_scales = np.full(h * w, np.nan, dtype=np.float32)
 
         bucket_key, pixel_indices = next(iter(dataset.iter_buckets()))
         end = min(inference_config.batch_size, int(pixel_indices.size))
@@ -144,7 +171,7 @@ class TestProcessSubBatch:
         h, w = dataset.H, dataset.W
         save_dim = inference_config.representation_dim
         flat_q = np.zeros((h * w, save_dim), dtype=np.int8)
-        flat_scales = np.full(h * w, 1e-8, dtype=np.float32)
+        flat_scales = np.full(h * w, np.nan, dtype=np.float32)
 
         bucket_key, pixel_indices = next(iter(dataset.iter_buckets()))
         end = min(inference_config.batch_size, int(pixel_indices.size))

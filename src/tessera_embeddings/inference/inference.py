@@ -240,9 +240,12 @@ def run_inference(
 
     Returns:
         InferenceResult with:
-          - embeddings: (H, W, 128) int8 quantized. Zeros for invalid pixels.
+          - embeddings: (H, W, 128) int8 quantized. Zeros for pixels whose
+            embeddings can't be generated (failed validity, or outside the ROI
+            but inside the bbox).
           - embeddings_std: Always None under v1.1.
-          - scales: (H, W) float32 per-pixel scale factors.
+          - scales: (H, W) float32 per-pixel scale factors. NaN for those same
+            can't-generate pixels.
     """
     if config.batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {config.batch_size}")
@@ -259,11 +262,15 @@ def run_inference(
 
     h, w = dataset.H, dataset.W
     # Quantize per bucket into skinny int8 + scale buffers instead of accumulating
-    # the whole chunk in float32 (4x smaller resident accumulator). flat_scales is
-    # initialized to 1e-8 — the scale invalid/never-written pixels get under
-    # whole-array quantization (abs_max=0 -> max(0, 1e-8)).
+    # the whole chunk in float32 (4x smaller resident accumulator). Pixels whose
+    # embeddings can't be generated — failed validity, or outside the ROI but
+    # inside the bbox (zeroed during ingest, so they fail the nonzero check and
+    # never enter a bucket) — keep their initial values: embeddings 0 in every
+    # band, scale NaN. Only pixels run through the model overwrite their slot via
+    # flat_scales[global_idxs] = s. This matches the NaN-scale / 0-embedding fill
+    # assembly applies to skipped and non-intersecting chunks.
     flat_q = np.zeros((h * w, save_dim), dtype=np.int8)
-    flat_scales = np.full(h * w, 1e-8, dtype=np.float32)
+    flat_scales = np.full(h * w, np.nan, dtype=np.float32)
 
     logger.info(
         "Starting v1.1 inference: %d buckets, %d sub-batches, %d valid pixels, batch_size=%d",
