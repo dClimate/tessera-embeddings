@@ -117,7 +117,9 @@ def run_inference(
     try:
         min_required = min(max(1, int(num_actors * MIN_ACTOR_FRACTION)), MAX_ACTORS_TO_WAIT_FOR)
         log.info("Waiting for actors to initialize (need at least %d / %d)...", min_required, num_actors)
-        actors, actor_instance_ids, still_initializing = wait_for_actors(actors, num_actors, t_actors, log)
+        actors, actor_instance_ids, still_initializing = wait_for_actors(
+            actors, num_actors, min_required, t_actors, log
+        )
 
         # --- Process chunks with work-stealing ---
         log.info("Processing %d chunks across %d actors (work-stealing)", len(chunks), len(actors))
