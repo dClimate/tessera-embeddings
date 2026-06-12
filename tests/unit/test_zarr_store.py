@@ -50,15 +50,13 @@ DEFAULT_CHUNKS = {"time": 1, "northing": 10980, "easting": 10980}
 SPLIT_CHUNKS = {"time": 1, "northing": 500, "easting": 500}
 
 
-def _write_reflectance(store_path, data, tile_id, baselines, chunks=DEFAULT_CHUNKS,
-                       crs="EPSG:32633"):
+def _write_reflectance(store_path, data, tile_id, baselines, chunks=DEFAULT_CHUNKS, crs="EPSG:32633"):
     """Local helper mirroring the reference's removed ``write_reflectance``.
 
     Delegates to ``write_dataset`` with explicit chunks + crs so the ported
     tests read like the originals.
     """
-    write_dataset(store_path, data, tile_id=tile_id, baselines=baselines,
-                  chunks=chunks, crs=crs)
+    write_dataset(store_path, data, tile_id=tile_id, baselines=baselines, chunks=chunks, crs=crs)
 
 
 class TestReflectanceStore:
@@ -77,17 +75,13 @@ class TestReflectanceStore:
         assert str(ds.time.values[0])[:10] == "2024-06-15"
         assert str(ds.time.values[1])[:10] == "2024-06-20"
 
-    def test_create_store_initializes_with_correct_metadata(
-        self, local_zarr_path, sample_reflectance_data
-    ):
+    def test_create_store_initializes_with_correct_metadata(self, local_zarr_path, sample_reflectance_data):
         """Verify store created with correct attributes."""
         dates = ["2024-01-01", "2024-01-06"]
         data = sample_reflectance_data(dates, height=256, width=256)
         store_path = str(local_zarr_path / "test_tile" / "reflectance.zarr")
 
-        _write_reflectance(
-            store_path, data, tile_id="33UUP", baselines={"2024-01-01": 400, "2024-01-06": 400}
-        )
+        _write_reflectance(store_path, data, tile_id="33UUP", baselines={"2024-01-01": 400, "2024-01-06": 400})
 
         ds = open_store(store_path)
         assert ds.attrs["tile_id"] == "33UUP"
@@ -102,15 +96,12 @@ class TestReflectanceStore:
         data = sample_reflectance_data(dates, height=64, width=64)
         store_path = str(local_zarr_path / "crs_tile" / "reflectance.zarr")
 
-        _write_reflectance(store_path, data, tile_id="33UUP",
-                           baselines=dict.fromkeys(dates, 400), crs="EPSG:32615")
+        _write_reflectance(store_path, data, tile_id="33UUP", baselines=dict.fromkeys(dates, 400), crs="EPSG:32615")
 
         ds = open_store(store_path)
         assert ds.attrs["crs"] == "EPSG:32615"
 
-    def test_create_store_uses_expected_chunk_sizes(
-        self, local_zarr_path, sample_reflectance_data
-    ):
+    def test_create_store_uses_expected_chunk_sizes(self, local_zarr_path, sample_reflectance_data):
         """Verify store is created with correct chunking for efficient access."""
         dates = ["2024-01-01", "2024-01-06"]
         data = sample_reflectance_data(dates, height=256, width=256)
@@ -130,9 +121,7 @@ class TestReflectanceStore:
         # Create initial store
         initial_dates = ["2024-01-01", "2024-01-06"]
         initial_data = sample_reflectance_data(initial_dates, height=256, width=256, seed=42)
-        _write_reflectance(
-            store_path, initial_data, tile_id="33UUP", baselines=dict.fromkeys(initial_dates, 400)
-        )
+        _write_reflectance(store_path, initial_data, tile_id="33UUP", baselines=dict.fromkeys(initial_dates, 400))
 
         original_blue = open_store(store_path)["blue"].values.copy()
 
@@ -149,12 +138,10 @@ class TestReflectanceStore:
         store_path = str(local_zarr_path / "crs_append" / "reflectance.zarr")
 
         initial = sample_reflectance_data(["2024-01-01"], height=64, width=64)
-        _write_reflectance(store_path, initial, tile_id="33UUP",
-                           baselines={"2024-01-01": 400}, crs="EPSG:32615")
+        _write_reflectance(store_path, initial, tile_id="33UUP", baselines={"2024-01-01": 400}, crs="EPSG:32615")
 
         new_data = sample_reflectance_data(["2024-01-06"], height=64, width=64, seed=99)
-        _write_reflectance(store_path, new_data, tile_id="33UUP",
-                           baselines={"2024-01-06": 400}, crs="EPSG:32615")
+        _write_reflectance(store_path, new_data, tile_id="33UUP", baselines={"2024-01-06": 400}, crs="EPSG:32615")
 
         ds = open_store(store_path)
         assert ds.sizes["time"] == 2
@@ -164,9 +151,7 @@ class TestReflectanceStore:
         """Query non-existent store path returns empty set."""
         assert get_existing_dates(str(local_zarr_path / "nonexistent.zarr")) == set()
 
-    def test_get_existing_dates_returns_correct_dates(
-        self, local_zarr_path, sample_reflectance_data
-    ):
+    def test_get_existing_dates_returns_correct_dates(self, local_zarr_path, sample_reflectance_data):
         """Verify returned set matches stored dates exactly."""
         dates = ["2024-01-01", "2024-01-06", "2024-01-11"]
         data = sample_reflectance_data(dates, height=64, width=64)
@@ -192,7 +177,9 @@ class TestIcechunkTransactions:
         new_data = sample_reflectance_data(["2024-01-06"], height=64, width=64, seed=99)
         to_icechunk(
             new_data.chunk({"time": 1, "northing": 64, "easting": 64}),
-            session, mode="a", append_dim="time",
+            session,
+            mode="a",
+            append_dim="time",
         )
         # DO NOT commit
 
@@ -210,7 +197,9 @@ class TestIcechunkTransactions:
         new_data = sample_reflectance_data(["2024-01-06"], height=64, width=64, seed=99)
         to_icechunk(
             new_data.chunk({"time": 1, "northing": 64, "easting": 64}),
-            session, mode="a", append_dim="time",
+            session,
+            mode="a",
+            append_dim="time",
         )
         session.commit("Add new date")
 
@@ -245,10 +234,7 @@ class TestParallelAccess:
 
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = [
-                executor.submit(
-                    lambda d: open_store(store_path).sel(time=d)["blue"].values.shape[0], d
-                )
-                for d in dates
+                executor.submit(lambda d: open_store(store_path).sel(time=d)["blue"].values.shape[0], d) for d in dates
             ]
             results = [f.result() for f in as_completed(futures)]
 
@@ -294,9 +280,7 @@ class TestParallelAccess:
 
         assert results == set(tiles)
 
-    def test_uncommitted_writes_isolated_from_concurrent_reads(
-        self, moto_s3_config, sample_reflectance_data
-    ):
+    def test_uncommitted_writes_isolated_from_concurrent_reads(self, moto_s3_config, sample_reflectance_data):
         """Uncommitted writes aren't visible to concurrent readers."""
         bucket = moto_s3_config
         store_path = f"s3://{bucket}/test_tile/reflectance.zarr"
@@ -313,7 +297,9 @@ class TestParallelAccess:
         new_data = sample_reflectance_data(["2024-01-06"], height=64, width=64, seed=99)
         to_icechunk(
             new_data.chunk({"time": 1, "northing": 64, "easting": 64}),
-            session, mode="a", append_dim="time",
+            session,
+            mode="a",
+            append_dim="time",
         )
 
         # Concurrent reads see only committed data
@@ -331,9 +317,7 @@ class TestParallelAccess:
 class TestCleanupOnFailure:
     """Tests for the cleanup_on_failure decorator."""
 
-    def test_failed_write_cleans_up_partial_store(
-        self, local_zarr_path, sample_reflectance_data, monkeypatch
-    ):
+    def test_failed_write_cleans_up_partial_store(self, local_zarr_path, sample_reflectance_data, monkeypatch):
         """Store path should be deleted if write fails after repo creation."""
         store_path = str(local_zarr_path / "fail_test" / "reflectance.zarr")
         data = sample_reflectance_data(["2024-01-01"], height=64, width=64)
@@ -343,9 +327,7 @@ class TestCleanupOnFailure:
         def failing_to_icechunk(*args, **kwargs):
             raise RuntimeError("Simulated write failure")
 
-        monkeypatch.setattr(
-            "tessera_embeddings.storage.zarr_store.to_icechunk", failing_to_icechunk
-        )
+        monkeypatch.setattr("tessera_embeddings.storage.zarr_store.to_icechunk", failing_to_icechunk)
 
         with pytest.raises(RuntimeError, match="Simulated write failure"):
             _write_new(store_path, data, None, "test")
@@ -368,13 +350,18 @@ class TestComputeDoy:
 
     def test_computes_correct_doy_for_known_dates(self):
         """Known dates should produce correct DOY values."""
-        timestamps = np.array([
-            "2024-01-01", "2024-06-15", "2024-12-31",
-        ], dtype="datetime64[ns]")
+        timestamps = np.array(
+            [
+                "2024-01-01",
+                "2024-06-15",
+                "2024-12-31",
+            ],
+            dtype="datetime64[ns]",
+        )
 
         doy = compute_doy(timestamps)
 
-        assert doy[0] == 1    # Jan 1
+        assert doy[0] == 1  # Jan 1
         assert doy[1] == 167  # June 15 (2024 is leap year)
         assert doy[2] == 366  # Dec 31 (leap year)
 
@@ -394,18 +381,21 @@ class TestComputeDoy:
 class TestWriteDataset:
     """Tests for the generalized write_dataset function."""
 
-    def test_write_dataset_splits_chunks_smaller_than_extent(
-        self, local_zarr_path, sample_reflectance_data
-    ):
+    def test_write_dataset_splits_chunks_smaller_than_extent(self, local_zarr_path, sample_reflectance_data):
         """A chunk size smaller than the data extent produces multiple spatial chunks."""
         dates = ["2024-01-01"]
         # 1000x1000 data with 500x500 chunks → 2 chunks per spatial dim.
         data = sample_reflectance_data(dates, height=1000, width=1000)
         store_path = str(local_zarr_path / "split_chunks" / "reflectance.zarr")
 
-        write_dataset(store_path, data, tile_id="33UUP",
-                      baselines=dict.fromkeys(dates, 400), chunks=SPLIT_CHUNKS,
-                      crs="EPSG:32633")
+        write_dataset(
+            store_path,
+            data,
+            tile_id="33UUP",
+            baselines=dict.fromkeys(dates, 400),
+            chunks=SPLIT_CHUNKS,
+            crs="EPSG:32633",
+        )
 
         ds = open_store(store_path)
 
@@ -414,21 +404,22 @@ class TestWriteDataset:
         assert ds["blue"].chunks[1] == (500, 500)
         assert ds["blue"].chunks[2] == (500, 500)
         # Data still round-trips intact across the chunk boundaries.
-        np.testing.assert_array_equal(
-            ds["blue"].values, data["blue"].values
-        )
+        np.testing.assert_array_equal(ds["blue"].values, data["blue"].values)
 
-    def test_write_dataset_clamps_chunks_to_extent(
-        self, local_zarr_path, sample_reflectance_data
-    ):
+    def test_write_dataset_clamps_chunks_to_extent(self, local_zarr_path, sample_reflectance_data):
         """write_dataset clamps spatial chunks to data extent when smaller than chunk size."""
         dates = ["2024-01-01"]
         data = sample_reflectance_data(dates, height=256, width=256)
         store_path = str(local_zarr_path / "default_chunks" / "reflectance.zarr")
 
-        write_dataset(store_path, data, tile_id="33UUP",
-                      baselines=dict.fromkeys(dates, 400), chunks=DEFAULT_CHUNKS,
-                      crs="EPSG:32633")
+        write_dataset(
+            store_path,
+            data,
+            tile_id="33UUP",
+            baselines=dict.fromkeys(dates, 400),
+            chunks=DEFAULT_CHUNKS,
+            crs="EPSG:32633",
+        )
 
         ds = open_store(store_path)
         # Full spatial extent since 256 < chunk size (10980)
@@ -441,13 +432,18 @@ class TestWriteDataset:
         data = sample_reflectance_data(dates, height=64, width=64)
         store_path = str(local_zarr_path / "doy_test" / "reflectance.zarr")
 
-        write_dataset(store_path, data, tile_id="33UUP",
-                      baselines=dict.fromkeys(dates, 400), chunks=DEFAULT_CHUNKS,
-                      crs="EPSG:32633")
+        write_dataset(
+            store_path,
+            data,
+            tile_id="33UUP",
+            baselines=dict.fromkeys(dates, 400),
+            chunks=DEFAULT_CHUNKS,
+            crs="EPSG:32633",
+        )
 
         ds = open_store(store_path)
         doy = ds.attrs["doy"]
-        assert doy[0] == 1    # Jan 1
+        assert doy[0] == 1  # Jan 1
         assert doy[1] == 167  # June 15 (2024 is leap year)
 
     def test_write_dataset_append_merges_doy(self, local_zarr_path, sample_reflectance_data):
@@ -456,18 +452,18 @@ class TestWriteDataset:
 
         # Create initial store
         data1 = sample_reflectance_data(["2024-01-01"], height=64, width=64)
-        write_dataset(store_path, data1, tile_id="33UUP",
-                      baselines={"2024-01-01": 400}, chunks=DEFAULT_CHUNKS,
-                      crs="EPSG:32633")
+        write_dataset(
+            store_path, data1, tile_id="33UUP", baselines={"2024-01-01": 400}, chunks=DEFAULT_CHUNKS, crs="EPSG:32633"
+        )
 
         # Append
         data2 = sample_reflectance_data(["2024-06-15"], height=64, width=64, seed=99)
-        write_dataset(store_path, data2, tile_id="33UUP",
-                      baselines={"2024-06-15": 400}, chunks=DEFAULT_CHUNKS,
-                      crs="EPSG:32633")
+        write_dataset(
+            store_path, data2, tile_id="33UUP", baselines={"2024-06-15": 400}, chunks=DEFAULT_CHUNKS, crs="EPSG:32633"
+        )
 
         ds = open_store(store_path)
         doy = ds.attrs["doy"]
         assert len(doy) == 2
-        assert doy[0] == 1    # Jan 1
+        assert doy[0] == 1  # Jan 1
         assert doy[1] == 167  # June 15

@@ -46,10 +46,10 @@ class TestAmplitudeToDb:
     @pytest.mark.parametrize(
         "amplitude, expected",
         [
-            (1.0, 10000),    # dB=0, shifted=50, scaled=10000
-            (0.1, 6000),     # dB=-20, shifted=30, scaled=6000
-            (1e10, 32767),   # clipped to int16 max
-            (1e-30, 0),      # clipped to 0
+            (1.0, 10000),  # dB=0, shifted=50, scaled=10000
+            (0.1, 6000),  # dB=-20, shifted=30, scaled=6000
+            (1e10, 32767),  # clipped to int16 max
+            (1e-30, 0),  # clipped to 0
         ],
         ids=["amp-1.0", "amp-0.1", "clip-max", "clip-min"],
     )

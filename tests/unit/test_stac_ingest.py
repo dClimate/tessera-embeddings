@@ -33,9 +33,7 @@ class TestBaselineCorrection:
             "northing": np.arange(bands_data[next(iter(bands_data))].shape[-2]),
             "easting": np.arange(bands_data[next(iter(bands_data))].shape[-1]),
         }
-        data_vars = {
-            band: (["time", "northing", "easting"], arr) for band, arr in bands_data.items()
-        }
+        data_vars = {band: (["time", "northing", "easting"], arr) for band, arr in bands_data.items()}
         return xr.Dataset(data_vars, coords=coords)
 
     def test_subtracts_offset_when_baseline_gte_400(self):
@@ -46,9 +44,7 @@ class TestBaselineCorrection:
             ["2024-01-01"],
         )
 
-        result = _apply_baseline_corrections_by_date(
-            data, baselines={"2024-01-01": 400}
-        )
+        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400})
 
         expected = np.array([[[500, 1000], [2000, 3000]]], dtype=np.int16)
         np.testing.assert_array_equal(result["B02"].values, expected)
@@ -59,9 +55,7 @@ class TestBaselineCorrection:
         values = np.array([[[500, 800], [1000, 1500]]], dtype=np.uint16)
         data = self._make_dataset({"B02": values}, ["2024-01-01"])
 
-        result = _apply_baseline_corrections_by_date(
-            data, baselines={"2024-01-01": 400}
-        )
+        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400})
 
         # 500-1000=-500, 800-1000=-200, 1000-1000=0, 1500-1000=500
         np.testing.assert_array_equal(
@@ -74,9 +68,7 @@ class TestBaselineCorrection:
         original = np.array([[[1500, 2000], [3000, 4000]]], dtype=np.uint16)
         data = self._make_dataset({"B02": original.copy()}, ["2024-01-01"])
 
-        result = _apply_baseline_corrections_by_date(
-            data, baselines={"2024-01-01": 399}
-        )
+        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 399})
 
         # Values should be unchanged (cast to int16 but same magnitude)
         np.testing.assert_array_equal(
@@ -92,9 +84,7 @@ class TestBaselineCorrection:
             ["2024-01-01"],
         )
 
-        result = _apply_baseline_corrections_by_date(
-            data, baselines={"2024-01-01": 400}, bands=["B02"]
-        )
+        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400}, bands=["B02"])
 
         assert result["B02"].values[0, 0, 0] == 1000
         assert result["B03"].values[0, 0, 0] == 2000
@@ -124,9 +114,7 @@ class TestBaselineCorrection:
 class TestDateFiltering:
     """Tests for filtering STAC items by existing dates."""
 
-    def test_filter_existing_dates_removes_already_processed_items(
-        self, mock_stac_item
-    ):
+    def test_filter_existing_dates_removes_already_processed_items(self, mock_stac_item):
         """Items with dates in existing_dates should be filtered out."""
         items = [
             mock_stac_item("2024-01-01"),
@@ -179,9 +167,7 @@ class TestBaselineExtraction:
         del item.properties["s2:processing_baseline"]
         assert _extract_baseline(item) == 0
 
-    def test_extract_baselines_returns_dict_mapping_dates_to_baselines(
-        self, mock_stac_item
-    ):
+    def test_extract_baselines_returns_dict_mapping_dates_to_baselines(self, mock_stac_item):
         """extract_baselines should return dict of date -> baseline."""
         items = [
             mock_stac_item("2024-01-01", baseline="04.00"),
@@ -203,9 +189,7 @@ class TestProviderConfiguration:
             ("planetary-computer", "https://planetarycomputer.microsoft.com/api/stac/v1"),
         ],
     )
-    def test_get_provider_config_returns_expected_provider(
-        self, provider_name, expected_catalog_url
-    ):
+    def test_get_provider_config_returns_expected_provider(self, provider_name, expected_catalog_url):
         """Known providers resolve to the correct STACProvider catalog + collections."""
         provider = _get_provider_config(provider_name)
 
@@ -227,9 +211,7 @@ class TestProviderConfiguration:
             ("planetary-computer", "sentinel-2-l2a", S2_L2A_BANDS),
         ],
     )
-    def test_get_collection_config_returns_correct_bands(
-        self, provider_name, collection_alias, expected_bands
-    ):
+    def test_get_collection_config_returns_correct_bands(self, provider_name, collection_alias, expected_bands):
         """Collection configs should return appropriate bands for each dataset."""
         config = _get_collection_config(provider_name, collection_alias)
 
@@ -249,9 +231,7 @@ class TestProviderConfiguration:
             ("planetary-computer", "landsat-c2-l2", False),
         ],
     )
-    def test_baseline_correction_flag_set_correctly(
-        self, provider_name, collection_alias, expected_correction
-    ):
+    def test_baseline_correction_flag_set_correctly(self, provider_name, collection_alias, expected_correction):
         """requires_baseline_correction reflects whether baseline_threshold is set."""
         config = _get_collection_config(provider_name, collection_alias)
 
@@ -290,9 +270,7 @@ class TestSTACQueryBuilder:
 class TestIngestTile:
     """Tests for the high-level ingest_tile function."""
 
-    def test_ingest_tile_returns_none_when_all_dates_exist(
-        self, mock_stac_item, sample_reflectance_data, monkeypatch
-    ):
+    def test_ingest_tile_returns_none_when_all_dates_exist(self, mock_stac_item, sample_reflectance_data, monkeypatch):
         """When all queried dates already exist, returns (None, baselines)."""
         # Mock the STAC query to return items we control
         items = [
@@ -320,9 +298,7 @@ class TestIngestTile:
         assert result_data is None
         assert result_baselines == {"2024-01-01": 400, "2024-01-06": 400}
 
-    def test_ingest_tile_applies_baseline_correction(
-        self, mock_stac_item, sample_reflectance_data, monkeypatch
-    ):
+    def test_ingest_tile_applies_baseline_correction(self, mock_stac_item, sample_reflectance_data, monkeypatch):
         """Data from baseline >= 400 should have correction applied."""
         # Mock STAC query
         items = [mock_stac_item("2024-01-01", baseline="04.00")]
@@ -357,9 +333,7 @@ class TestIngestTile:
         assert result_data["blue"].values[0, 0, 0] == 2000
         assert result_baselines == {"2024-01-01": 400}
 
-    def test_ingest_tile_does_not_correct_extra_bands(
-        self, mock_stac_item, sample_reflectance_data, monkeypatch
-    ):
+    def test_ingest_tile_does_not_correct_extra_bands(self, mock_stac_item, sample_reflectance_data, monkeypatch):
         """Extra bands (like SCL) should NOT have baseline correction applied."""
         items = [mock_stac_item("2024-01-01", baseline="04.00")]
 
@@ -395,13 +369,9 @@ class TestIngestTile:
         # scl should NOT be corrected (still 4)
         assert result_data["scl"].values[0, 0, 0] == 4
 
-    def test_ingest_tile_applies_post_load_fn(
-        self, mock_stac_item, sample_reflectance_data, monkeypatch
-    ):
+    def test_ingest_tile_applies_post_load_fn(self, mock_stac_item, sample_reflectance_data, monkeypatch):
         """post_load_fn should be applied after loading and baseline correction."""
-        items = [
-            mock_stac_item("2024-01-01", baseline="02.00")
-        ]  # No baseline correction
+        items = [mock_stac_item("2024-01-01", baseline="02.00")]  # No baseline correction
 
         def mock_query(*args, **kwargs):
             return items
@@ -433,9 +403,7 @@ class TestIngestTile:
         assert result_data is not None
         assert result_data["blue"].values[0, 0, 0] == 200
 
-    def test_ingest_tile_applies_item_filter_fn(
-        self, mock_stac_item, sample_reflectance_data, monkeypatch
-    ):
+    def test_ingest_tile_applies_item_filter_fn(self, mock_stac_item, sample_reflectance_data, monkeypatch):
         """item_filter_fn should filter items before date filtering and loading."""
         items = [
             mock_stac_item("2024-01-01", baseline="04.00"),
@@ -474,9 +442,7 @@ class TestIngestTile:
         # (baselines are extracted AFTER item_filter_fn)
         assert "2024-01-01" in result_baselines
 
-    def test_ingest_tile_item_filter_fn_returns_none_when_empty(
-        self, mock_stac_item, monkeypatch
-    ):
+    def test_ingest_tile_item_filter_fn_returns_none_when_empty(self, mock_stac_item, monkeypatch):
         """When item_filter_fn removes all items, returns (None, {})."""
         items = [mock_stac_item("2024-01-01", baseline="04.00")]
 
@@ -519,9 +485,7 @@ class TestBuildStacQueryBboxFallback:
             tile_id_property=None,
         )
         bbox = (11.0, 48.0, 12.0, 49.0)
-        query = _build_stac_query(
-            config, "33UUP", "2024-01-01", "2024-01-31", bbox=bbox
-        )
+        query = _build_stac_query(config, "33UUP", "2024-01-01", "2024-01-31", bbox=bbox)
 
         assert "bbox" in query
         assert query["bbox"] == bbox

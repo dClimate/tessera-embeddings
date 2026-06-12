@@ -173,12 +173,15 @@ class TestLoadCheckpoint:
         """`_orig_mod.` (torch.compile) prefixes are removed from param keys."""
         from tessera_embeddings.inference.models.builder import load_checkpoint
 
-        path = self._save(tmp_path, {
-            "model_state": {
-                "_orig_mod.s2_backbone.weight": torch.ones(2),
-                "s1_backbone.bias": torch.zeros(3),
-            }
-        })
+        path = self._save(
+            tmp_path,
+            {
+                "model_state": {
+                    "_orig_mod.s2_backbone.weight": torch.ones(2),
+                    "s1_backbone.bias": torch.zeros(3),
+                }
+            },
+        )
         cleaned = load_checkpoint(path, torch.device("cpu"))
         assert "s2_backbone.weight" in cleaned
         assert "_orig_mod.s2_backbone.weight" not in cleaned
@@ -188,13 +191,16 @@ class TestLoadCheckpoint:
         """projector.* and segmented_matryoshka_projector.* params are dropped."""
         from tessera_embeddings.inference.models.builder import load_checkpoint
 
-        path = self._save(tmp_path, {
-            "model_state": {
-                "s2_backbone.weight": torch.ones(2),
-                "projector.0.weight": torch.ones(4),
-                "segmented_matryoshka_projector.fc.bias": torch.ones(8),
-            }
-        })
+        path = self._save(
+            tmp_path,
+            {
+                "model_state": {
+                    "s2_backbone.weight": torch.ones(2),
+                    "projector.0.weight": torch.ones(4),
+                    "segmented_matryoshka_projector.fc.bias": torch.ones(8),
+                }
+            },
+        )
         cleaned = load_checkpoint(path, torch.device("cpu"))
         assert set(cleaned) == {"s2_backbone.weight"}
 
@@ -202,9 +208,12 @@ class TestLoadCheckpoint:
         """When 'model_state' is absent, 'model_state_dict' is used."""
         from tessera_embeddings.inference.models.builder import load_checkpoint
 
-        path = self._save(tmp_path, {
-            "model_state_dict": {"s2_backbone.weight": torch.ones(2)},
-        })
+        path = self._save(
+            tmp_path,
+            {
+                "model_state_dict": {"s2_backbone.weight": torch.ones(2)},
+            },
+        )
         cleaned = load_checkpoint(path, torch.device("cpu"))
         assert "s2_backbone.weight" in cleaned
 
@@ -212,10 +221,13 @@ class TestLoadCheckpoint:
         """When both keys exist, 'model_state' wins."""
         from tessera_embeddings.inference.models.builder import load_checkpoint
 
-        path = self._save(tmp_path, {
-            "model_state": {"from_model_state": torch.ones(1)},
-            "model_state_dict": {"from_model_state_dict": torch.ones(1)},
-        })
+        path = self._save(
+            tmp_path,
+            {
+                "model_state": {"from_model_state": torch.ones(1)},
+                "model_state_dict": {"from_model_state_dict": torch.ones(1)},
+            },
+        )
         cleaned = load_checkpoint(path, torch.device("cpu"))
         assert "from_model_state" in cleaned
         assert "from_model_state_dict" not in cleaned

@@ -124,9 +124,7 @@ class TestValidateAgainst:
     def test_error_message_includes_old_and_new_values(self):
         existing = {"resolution": 10.0, "chunk_size": 2000, "crs": "EPSG:32615"}
         current = RoiManifest(resolution=20.0, chunk_size=2000, crs="EPSG:32615")
-        with pytest.raises(
-            ConfigMismatchError, match=r"store has 10\.0.*current config has 20\.0"
-        ):
+        with pytest.raises(ConfigMismatchError, match=r"store has 10\.0.*current config has 20\.0"):
             current.validate_against(existing, "test.zarr")
 
 
@@ -162,7 +160,8 @@ class TestValidateAgainstEdgeCases:
 
     def test_store_has_field_current_dropped_raises(self):
         """Store has a concrete roi_manifest_hash but current is None (dropped by
-        to_dict) — the `key in existing but not in current` branch must flag it."""
+        to_dict) — the `key in existing but not in current` branch must flag it.
+        """
         existing = {"roi_manifest_hash": "abc123", "manifest_type": "IngestManifest"}
         current = IngestManifest(roi_manifest_hash=None)
         with pytest.raises(ConfigMismatchError, match="roi_manifest_hash"):
@@ -335,30 +334,22 @@ class TestEmbeddingManifestFromUpstreamStores:
         """The combined SAR hash depends on ascending|descending order, not dict order."""
         asc = self._ingest_dict("roi_asc")
         desc = self._ingest_dict("roi_desc")
-        m1 = EmbeddingManifest.from_upstream_stores(
-            "ckpt", (8,), {"sar_ascending": asc, "sar_descending": desc}
-        )
-        m2 = EmbeddingManifest.from_upstream_stores(
-            "ckpt", (8,), {"sar_descending": desc, "sar_ascending": asc}
-        )
+        m1 = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {"sar_ascending": asc, "sar_descending": desc})
+        m2 = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {"sar_descending": desc, "sar_ascending": asc})
         assert m1.sar_manifest_hash == m2.sar_manifest_hash
 
     def test_single_sar_orbit_differs_from_both(self):
         """One orbit present must not collide with both orbits present."""
         asc = self._ingest_dict("roi_asc")
         desc = self._ingest_dict("roi_desc")
-        only_asc = EmbeddingManifest.from_upstream_stores(
-            "ckpt", (8,), {"sar_ascending": asc}
-        ).sar_manifest_hash
+        only_asc = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {"sar_ascending": asc}).sar_manifest_hash
         both = EmbeddingManifest.from_upstream_stores(
             "ckpt", (8,), {"sar_ascending": asc, "sar_descending": desc}
         ).sar_manifest_hash
         assert only_asc != both
 
     def test_no_upstream_yields_none_hashes(self):
-        m = EmbeddingManifest.from_upstream_stores(
-            "ckpt", (8, 16), upstream_manifests={}
-        )
+        m = EmbeddingManifest.from_upstream_stores("ckpt", (8, 16), upstream_manifests={})
         assert m.reflectance_manifest_hash is None
         assert m.sar_manifest_hash is None
         assert m.num_obs_checkpoints == (8, 16)

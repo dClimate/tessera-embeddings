@@ -242,9 +242,7 @@ class TestCheckTimeWindowCoverage:
         _mock_open_store("2024-10-01", "2024-12-31")
         tw = parse_time_window("July 2025")
         # Should NOT raise because the range check is skipped.
-        check_time_window_coverage(
-            "s3://fake/mosaic", tw, s1_orbit="ascending", skip_coverage_check=True
-        )
+        check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending", skip_coverage_check=True)
 
     def test_skip_coverage_check_still_rejects_empty_store(self, monkeypatch):
         """skip_coverage_check does not bypass the empty-store guard (it runs first)."""
@@ -259,6 +257,4 @@ class TestCheckTimeWindowCoverage:
         monkeypatch.setattr(dl, "open_store_as_zarr_group", _open_store)
         tw = parse_time_window("July 2025")
         with pytest.raises(InsufficientCoverageError, match="no time entries"):
-            check_time_window_coverage(
-                "s3://fake/mosaic", tw, s1_orbit="ascending", skip_coverage_check=True
-            )
+            check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending", skip_coverage_check=True)

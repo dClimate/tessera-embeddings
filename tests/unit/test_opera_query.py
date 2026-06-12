@@ -164,9 +164,7 @@ class TestQueryCmrOrbitIds:
         }
 
     def test_passes_attribute_filter(self):
-        with patch(
-            "tessera_embeddings.ingest.opera_query.requests.get", return_value=_cmr_response([])
-        ) as mock_get:
+        with patch("tessera_embeddings.ingest.opera_query.requests.get", return_value=_cmr_response([])) as mock_get:
             _query_cmr_granule_ids(self.BBOX, "2024-01-01", "2024-01-15", "descending")
 
         params = mock_get.call_args.kwargs["params"]
@@ -178,9 +176,7 @@ class TestQueryCmrOrbitIds:
             search_after="token123",
         )
         page2 = _cmr_response([{"producer_granule_id": "id-final"}])
-        with patch(
-            "tessera_embeddings.ingest.opera_query.requests.get", side_effect=[page1, page2]
-        ) as mock_get:
+        with patch("tessera_embeddings.ingest.opera_query.requests.get", side_effect=[page1, page2]) as mock_get:
             ids = _query_cmr_granule_ids(self.BBOX, "2024-01-01", "2024-12-31", "ascending")
 
         assert "id-final" in ids
