@@ -53,6 +53,26 @@ class TestComputeStripHeight:
         h = _compute_strip_height(height=2000, width=2000, t_estimate=120, strip_budget_bytes=1)
         assert h == _MIN_STRIP_H
 
+    def test_floor_override_warns(self, caplog):
+        # A budget too small to fit _MIN_STRIP_H at this T/W: the floor wins and
+        # the resident pair exceeds the budget, which must be logged loudly so an
+        # OOM is traceable to the budget rather than looking like a silent breach.
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger=_actors_mod.logger.name):
+            h = _compute_strip_height(height=2000, width=2000, t_estimate=120, strip_budget_bytes=1)
+        assert h == _MIN_STRIP_H
+        assert any("_MIN_STRIP_H" in r.message and "overrides the byte budget" in r.message for r in caplog.records)
+
+    def test_no_warn_when_budget_fits_floor(self, caplog):
+        # The default 4 GiB budget at T=120 derives ~445 rows (well above the
+        # floor), so the override warning must NOT fire on the normal dense path.
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger=_actors_mod.logger.name):
+            _compute_strip_height(height=2000, width=2000, t_estimate=120, strip_budget_bytes=4 * 1024**3)
+        assert not any("overrides the byte budget" in r.message for r in caplog.records)
+
     def test_never_exceeds_height(self):
         h = _compute_strip_height(height=300, width=2000, t_estimate=1, strip_budget_bytes=10**12)
         assert h == 300

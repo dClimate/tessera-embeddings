@@ -81,8 +81,29 @@ def _compute_strip_height(*, height: int, width: int, t_estimate: int, strip_bud
         return height
     # Striping is active: two strips are resident under the prefetch, so each
     # must fit half the budget for the pair to stay within it.
-    strip_h = (strip_budget_bytes // 2) // bytes_per_row
-    strip_h = max(_MIN_STRIP_H, min(int(strip_h), height))
+    budget_strip_h = (strip_budget_bytes // 2) // bytes_per_row
+    strip_h = max(_MIN_STRIP_H, min(int(budget_strip_h), height))
+    if strip_h > budget_strip_h and strip_h < height:
+        # _MIN_STRIP_H floored the strip above the budget-derived height, so the
+        # two prefetched strips will exceed strip_budget_bytes. We deliberately
+        # honour the floor rather than degenerate into tiny high-overhead reads
+        # (see _MIN_STRIP_H), but warn loudly so an OOM here is traceable to a
+        # budget set too low for this chunk's T/W rather than looking like a
+        # silent breach of the documented bound.
+        pair_bytes = 2 * strip_h * bytes_per_row
+        logger.warning(
+            "Strip floor _MIN_STRIP_H=%d overrides the byte budget: "
+            "budget-derived strip_h=%d, using %d. Resident input pair ~%.2f GiB "
+            "exceeds strip_budget_bytes=%.2f GiB (W=%d, T_estimate=%d). Raise "
+            "strip_budget_bytes or lower W/T to restore the 2-strip bound.",
+            _MIN_STRIP_H,
+            int(budget_strip_h),
+            strip_h,
+            pair_bytes / 1024**3,
+            strip_budget_bytes / 1024**3,
+            width,
+            t_estimate,
+        )
     return strip_h
 
 
@@ -359,6 +380,10 @@ class InferenceActor:
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="strip-prefetch") as pool:
                 next_future = pool.submit(_load_strip, strips[0]) if strips else None
 
+                # Bound to None so the first iteration's `del` has a target; each
+                # iteration rebinds both before use.
+                chunk_data: ChunkData | None = None
+                dataset: MosaicChunkInferenceDataset | None = None
                 for i, strip in enumerate(strips):
                     assert next_future is not None
                     # The previous strip reported "inference"; flip back to
@@ -367,6 +392,15 @@ class InferenceActor:
                     # by _poll_tracker. (Strip 0's "loading" was reported above.)
                     if tracker and i > 0:
                         tracker.report.remote(chunk.label, 0, 0, "loading")  # type: ignore[union-attr]
+
+                    # Release the previous strip's input arrays BEFORE blocking
+                    # on this strip's load and submitting the next prefetch. The
+                    # dataset retains chunk_data.s2_bands (dataset.py), so without
+                    # this drop the prior strip's dataset, the current strip, and
+                    # the prefetched next strip could all be resident at once —
+                    # three strips, though _compute_strip_height sizes for two.
+                    del chunk_data, dataset
+
                     chunk_data = next_future.result()
 
                     # Kick off the next strip's load before running inference on this one.
