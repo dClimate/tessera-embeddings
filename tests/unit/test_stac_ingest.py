@@ -1,0 +1,530 @@
+"""Unit tests for ingest/stac.py - STAC ingestion with provider/collection config."""
+
+import numpy as np
+import pytest
+import xarray as xr
+
+from tessera_embeddings.config import (
+    LANDSAT_C2_BANDS,
+    S1_GRD_BANDS,
+    S2_L2A_BANDS,
+    CollectionConfig,
+    STACProvider,
+)
+from tessera_embeddings.ingest.stac import (
+    _apply_baseline_corrections_by_date,
+    _build_stac_query,
+    _extract_baseline,
+    _extract_baselines,
+    _filter_existing_dates,
+    _get_collection_config,
+    _get_provider_config,
+    ingest_tile,
+)
+
+
+class TestBaselineCorrection:
+    """Tests for _apply_baseline_corrections_by_date function."""
+
+    def _make_dataset(self, bands_data, dates):
+        """Create a dataset with time dimension from {band: 2d_array} dict."""
+        coords = {
+            "time": [np.datetime64(d, "ns") for d in dates],
+            "northing": np.arange(bands_data[next(iter(bands_data))].shape[-2]),
+            "easting": np.arange(bands_data[next(iter(bands_data))].shape[-1]),
+        }
+        data_vars = {band: (["time", "northing", "easting"], arr) for band, arr in bands_data.items()}
+        return xr.Dataset(data_vars, coords=coords)
+
+    def test_subtracts_offset_when_baseline_gte_400(self):
+        """Date with baseline>=400 should have 1000 subtracted."""
+        values = np.array([[[1500, 2000], [3000, 4000]]], dtype=np.uint16)
+        data = self._make_dataset(
+            {"B02": values.copy(), "B03": values.copy()},
+            ["2024-01-01"],
+        )
+
+        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400})
+
+        expected = np.array([[[500, 1000], [2000, 3000]]], dtype=np.int16)
+        np.testing.assert_array_equal(result["B02"].values, expected)
+        np.testing.assert_array_equal(result["B03"].values, expected)
+
+    def test_low_values_go_negative_after_correction(self):
+        """Values below 1000 become negative after offset is applied."""
+        values = np.array([[[500, 800], [1000, 1500]]], dtype=np.uint16)
+        data = self._make_dataset({"B02": values}, ["2024-01-01"])
+
+        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400})
+
+        # 500-1000=-500, 800-1000=-200, 1000-1000=0, 1500-1000=500
+        np.testing.assert_array_equal(
+            result["B02"].values,
+            np.array([[[-500, -200], [0, 500]]], dtype=np.int16),
+        )
+
+    def test_skips_correction_when_baseline_lt_400(self):
+        """Dates with baseline < 400 should not have any correction applied."""
+        original = np.array([[[1500, 2000], [3000, 4000]]], dtype=np.uint16)
+        data = self._make_dataset({"B02": original.copy()}, ["2024-01-01"])
+
+        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 399})
+
+        # Values should be unchanged (cast to int16 but same magnitude)
+        np.testing.assert_array_equal(
+            result["B02"].values,
+            original.astype(np.int16),
+        )
+
+    def test_only_corrects_specified_bands(self):
+        """When bands parameter is provided, only those bands are corrected."""
+        values = np.array([[[2000]]], dtype=np.uint16)
+        data = self._make_dataset(
+            {"B02": values.copy(), "B03": values.copy()},
+            ["2024-01-01"],
+        )
+
+        result = _apply_baseline_corrections_by_date(data, baselines={"2024-01-01": 400}, bands=["B02"])
+
+        assert result["B02"].values[0, 0, 0] == 1000
+        assert result["B03"].values[0, 0, 0] == 2000
+
+    def test_corrects_only_dates_above_threshold(self):
+        """Only dates with baseline >= threshold get corrected."""
+        values = np.array([[[2000]], [[2000]], [[2000]]], dtype=np.uint16)
+        data = self._make_dataset(
+            {"B02": values.copy()},
+            ["2024-01-01", "2024-01-06", "2024-01-11"],
+        )
+
+        result = _apply_baseline_corrections_by_date(
+            data,
+            baselines={
+                "2024-01-01": 400,  # corrected
+                "2024-01-06": 399,  # not corrected
+                "2024-01-11": 510,  # corrected
+            },
+        )
+
+        assert result["B02"].values[0, 0, 0] == 1000  # corrected
+        assert result["B02"].values[1, 0, 0] == 2000  # unchanged
+        assert result["B02"].values[2, 0, 0] == 1000  # corrected
+
+
+class TestDateFiltering:
+    """Tests for filtering STAC items by existing dates."""
+
+    def test_filter_existing_dates_removes_already_processed_items(self, mock_stac_item):
+        """Items with dates in existing_dates should be filtered out."""
+        items = [
+            mock_stac_item("2024-01-01"),
+            mock_stac_item("2024-01-06"),
+            mock_stac_item("2024-01-11"),
+            mock_stac_item("2024-01-16"),
+            mock_stac_item("2024-01-21"),
+        ]
+        existing_dates = {"2024-01-01", "2024-01-11"}
+
+        result = _filter_existing_dates(items, existing_dates)
+
+        assert len(result) == 3
+        result_dates = {item.datetime.strftime("%Y-%m-%d") for item in result}
+        assert result_dates == {"2024-01-06", "2024-01-16", "2024-01-21"}
+
+    def test_filter_existing_dates_returns_all_when_none_exist(self, mock_stac_item):
+        """When existing_dates is empty, all items should be returned."""
+        items = [mock_stac_item("2024-01-01"), mock_stac_item("2024-01-06")]
+
+        result = _filter_existing_dates(items, set())
+
+        assert len(result) == 2
+
+    def test_filter_existing_dates_with_empty_items_returns_empty(self):
+        """Empty items list should return empty list gracefully."""
+        result = _filter_existing_dates([], {"2024-01-01", "2024-01-06"})
+
+        assert result == []
+        assert isinstance(result, list)
+
+
+class TestBaselineExtraction:
+    """Tests for parsing baseline version from STAC item properties."""
+
+    def test_extract_baseline_parses_400_correctly(self, mock_stac_item):
+        """Baseline "04.00" should parse to integer 400."""
+        item = mock_stac_item("2024-01-01", baseline="04.00")
+        assert _extract_baseline(item) == 400
+
+    def test_extract_baseline_parses_510_correctly(self, mock_stac_item):
+        """Baseline "05.10" should parse to integer 510."""
+        item = mock_stac_item("2024-01-01", baseline="05.10")
+        assert _extract_baseline(item) == 510
+
+    def test_extract_baseline_returns_zero_when_missing(self, mock_stac_item):
+        """Missing baseline property should return 0."""
+        item = mock_stac_item("2024-01-01", baseline=None)
+        # Remove the baseline property
+        del item.properties["s2:processing_baseline"]
+        assert _extract_baseline(item) == 0
+
+    def test_extract_baselines_returns_dict_mapping_dates_to_baselines(self, mock_stac_item):
+        """extract_baselines should return dict of date -> baseline."""
+        items = [
+            mock_stac_item("2024-01-01", baseline="04.00"),
+            mock_stac_item("2024-01-06", baseline="05.10"),
+        ]
+
+        result = _extract_baselines(items)
+
+        assert result == {"2024-01-01": 400, "2024-01-06": 510}
+
+
+class TestProviderConfiguration:
+    """Tests for STAC provider and collection configuration."""
+
+    @pytest.mark.parametrize(
+        "provider_name, expected_catalog_url",
+        [
+            ("earth-search", "https://earth-search.aws.element84.com/v1"),
+            ("planetary-computer", "https://planetarycomputer.microsoft.com/api/stac/v1"),
+        ],
+    )
+    def test_get_provider_config_returns_expected_provider(self, provider_name, expected_catalog_url):
+        """Known providers resolve to the correct STACProvider catalog + collections."""
+        provider = _get_provider_config(provider_name)
+
+        assert isinstance(provider, STACProvider)
+        assert provider.catalog_url == expected_catalog_url
+        assert "sentinel-2-l2a" in provider.collections
+
+    def test_get_provider_config_raises_on_unknown_provider(self):
+        """Unknown provider should raise ValueError with available options."""
+        with pytest.raises(ValueError, match="Unknown provider"):
+            _get_provider_config("nonexistent-provider")
+
+    @pytest.mark.parametrize(
+        "provider_name,collection_alias,expected_bands",
+        [
+            ("earth-search", "sentinel-2-l2a", S2_L2A_BANDS),
+            ("earth-search", "sentinel-1-grd", S1_GRD_BANDS),
+            ("earth-search", "landsat-c2-l2", LANDSAT_C2_BANDS),
+            ("planetary-computer", "sentinel-2-l2a", S2_L2A_BANDS),
+        ],
+    )
+    def test_get_collection_config_returns_correct_bands(self, provider_name, collection_alias, expected_bands):
+        """Collection configs should return appropriate bands for each dataset."""
+        config = _get_collection_config(provider_name, collection_alias)
+
+        assert config.bands == expected_bands
+
+    @pytest.mark.parametrize(
+        "provider_name,collection_alias,expected_correction",
+        [
+            # Earth Search S2 COGs are already BOA-corrected; its S1 threshold
+            # constant is None — so both are False.
+            ("earth-search", "sentinel-2-l2a", False),
+            ("earth-search", "sentinel-1-grd", False),
+            ("earth-search", "landsat-c2-l2", False),
+            # Planetary Computer S2 sets a baseline_threshold (=400) → True.
+            # This proves the flag can be True, not just hardcoded False.
+            ("planetary-computer", "sentinel-2-l2a", True),
+            ("planetary-computer", "landsat-c2-l2", False),
+        ],
+    )
+    def test_baseline_correction_flag_set_correctly(self, provider_name, collection_alias, expected_correction):
+        """requires_baseline_correction reflects whether baseline_threshold is set."""
+        config = _get_collection_config(provider_name, collection_alias)
+
+        assert config.requires_baseline_correction == expected_correction
+
+    def test_get_collection_config_raises_on_unknown_collection(self):
+        """Unknown collection should raise ValueError with available options."""
+        with pytest.raises(ValueError, match="Unknown collection"):
+            _get_collection_config("earth-search", "nonexistent-collection")
+
+
+class TestSTACQueryBuilder:
+    """Tests for STAC query parameter construction."""
+
+    @pytest.mark.parametrize(
+        "provider,collection,tile_id,expected_property,expected_value",
+        [
+            ("earth-search", "sentinel-2-l2a", "33UUP", "grid:code", "MGRS-33UUP"),
+            ("earth-search", "landsat-c2-l2", "042", "landsat:wrs_path", "042"),
+            ("planetary-computer", "sentinel-2-l2a", "33UUP", "s2:mgrs_tile", "33UUP"),
+        ],
+    )
+    def test_build_stac_query_uses_correct_tile_property(
+        self, provider, collection, tile_id, expected_property, expected_value
+    ):
+        """Query builder produces correct tile property and prefix per provider/collection."""
+        config = _get_collection_config(provider, collection)
+        query = _build_stac_query(config, tile_id, "2024-01-01", "2024-01-31")
+
+        assert query["collections"] == [config.collection_id]
+        assert query["datetime"] == "2024-01-01/2024-01-31"
+        assert expected_property in query["query"]
+        assert query["query"][expected_property]["eq"] == expected_value
+
+
+class TestIngestTile:
+    """Tests for the high-level ingest_tile function."""
+
+    def test_ingest_tile_returns_none_when_all_dates_exist(self, mock_stac_item, sample_reflectance_data, monkeypatch):
+        """When all queried dates already exist, returns (None, baselines)."""
+        # Mock the STAC query to return items we control
+        items = [
+            mock_stac_item("2024-01-01", baseline="04.00"),
+            mock_stac_item("2024-01-06", baseline="04.00"),
+        ]
+
+        def mock_query(*args, **kwargs):
+            return items
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
+
+        # All dates already exist
+        existing_dates = {"2024-01-01", "2024-01-06"}
+
+        result_data, result_baselines = ingest_tile(
+            provider="earth-search",
+            collection="sentinel-2-l2a",
+            tile_id="33UUP",
+            start_date="2024-01-01",
+            end_date="2024-01-10",
+            existing_dates=existing_dates,
+        )
+
+        assert result_data is None
+        assert result_baselines == {"2024-01-01": 400, "2024-01-06": 400}
+
+    def test_ingest_tile_applies_baseline_correction(self, mock_stac_item, sample_reflectance_data, monkeypatch):
+        """Data from baseline >= 400 should have correction applied."""
+        # Mock STAC query
+        items = [mock_stac_item("2024-01-01", baseline="04.00")]
+
+        def mock_query(*args, **kwargs):
+            return items
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
+
+        # Mock load_from_stac to return controlled data
+        # Values of 2000 should stay same
+        raw_data = sample_reflectance_data(["2024-01-01"], height=32, width=32, seed=42)
+        # Set known values for verification (use "blue" - common name for B02)
+        raw_data["blue"].values[:] = 2000
+
+        def mock_load(*args, **kwargs):
+            return raw_data
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._load_from_stac", mock_load)
+
+        result_data, result_baselines = ingest_tile(
+            provider="earth-search",
+            collection="sentinel-2-l2a",
+            tile_id="33UUP",
+            start_date="2024-01-01",
+            end_date="2024-01-10",
+            existing_dates=None,
+        )
+
+        assert result_data is not None
+        # blue (B02) values should stay same
+        assert result_data["blue"].values[0, 0, 0] == 2000
+        assert result_baselines == {"2024-01-01": 400}
+
+    def test_ingest_tile_does_not_correct_extra_bands(self, mock_stac_item, sample_reflectance_data, monkeypatch):
+        """Extra bands (like SCL) should NOT have baseline correction applied."""
+        items = [mock_stac_item("2024-01-01", baseline="04.00")]
+
+        def mock_query(*args, **kwargs):
+            return items
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
+
+        # Create data with an extra "scl" band
+        raw_data = sample_reflectance_data(["2024-01-01"], height=32, width=32, seed=42)
+        raw_data["blue"].values[:] = 2000
+        scl_values = np.full((1, 32, 32), 4, dtype=np.uint8)  # 4 = vegetation
+        raw_data["scl"] = (["time", "northing", "easting"], scl_values)
+
+        def mock_load(*args, **kwargs):
+            return raw_data
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._load_from_stac", mock_load)
+
+        result_data, _ = ingest_tile(
+            provider="earth-search",
+            collection="sentinel-2-l2a",
+            tile_id="33UUP",
+            start_date="2024-01-01",
+            end_date="2024-01-10",
+            existing_dates=None,
+            extra_bands=["scl"],
+        )
+
+        assert result_data is not None
+        # blue doesn't need to be corrected
+        assert result_data["blue"].values[0, 0, 0] == 2000
+        # scl should NOT be corrected (still 4)
+        assert result_data["scl"].values[0, 0, 0] == 4
+
+    def test_ingest_tile_applies_post_load_fn(self, mock_stac_item, sample_reflectance_data, monkeypatch):
+        """post_load_fn should be applied after loading and baseline correction."""
+        items = [mock_stac_item("2024-01-01", baseline="02.00")]  # No baseline correction
+
+        def mock_query(*args, **kwargs):
+            return items
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
+
+        raw_data = sample_reflectance_data(["2024-01-01"], height=32, width=32, seed=42)
+        raw_data["blue"].values[:] = 100
+
+        def mock_load(*args, **kwargs):
+            return raw_data
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._load_from_stac", mock_load)
+
+        # Post-load function that doubles all blue values
+        def double_blue(ds):
+            return ds.assign(blue=ds["blue"] * 2)
+
+        result_data, _ = ingest_tile(
+            provider="earth-search",
+            collection="sentinel-2-l2a",
+            tile_id="33UUP",
+            start_date="2024-01-01",
+            end_date="2024-01-10",
+            existing_dates=None,
+            post_load_fn=double_blue,
+        )
+
+        assert result_data is not None
+        assert result_data["blue"].values[0, 0, 0] == 200
+
+    def test_ingest_tile_applies_item_filter_fn(self, mock_stac_item, sample_reflectance_data, monkeypatch):
+        """item_filter_fn should filter items before date filtering and loading."""
+        items = [
+            mock_stac_item("2024-01-01", baseline="04.00"),
+            mock_stac_item("2024-01-06", baseline="04.00"),
+            mock_stac_item("2024-01-11", baseline="04.00"),
+        ]
+
+        def mock_query(*args, **kwargs):
+            return items
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
+
+        raw_data = sample_reflectance_data(["2024-01-01"], height=32, width=32, seed=42)
+
+        def mock_load(*args, **kwargs):
+            return raw_data
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._load_from_stac", mock_load)
+
+        # Filter that keeps only the first item
+        def keep_first(items_list):
+            return items_list[:1]
+
+        result_data, result_baselines = ingest_tile(
+            provider="earth-search",
+            collection="sentinel-2-l2a",
+            tile_id="33UUP",
+            start_date="2024-01-01",
+            end_date="2024-01-15",
+            existing_dates=None,
+            item_filter_fn=keep_first,
+        )
+
+        assert result_data is not None
+        # Baselines should only contain the filtered item's date
+        # (baselines are extracted AFTER item_filter_fn)
+        assert "2024-01-01" in result_baselines
+
+    def test_ingest_tile_item_filter_fn_returns_none_when_empty(self, mock_stac_item, monkeypatch):
+        """When item_filter_fn removes all items, returns (None, {})."""
+        items = [mock_stac_item("2024-01-01", baseline="04.00")]
+
+        def mock_query(*args, **kwargs):
+            return items
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
+
+        result_data, result_baselines = ingest_tile(
+            provider="earth-search",
+            collection="sentinel-2-l2a",
+            tile_id="33UUP",
+            start_date="2024-01-01",
+            end_date="2024-01-10",
+            existing_dates=None,
+            item_filter_fn=lambda items: [],  # Remove all items
+        )
+
+        assert result_data is None
+        assert result_baselines == {}
+
+
+class TestBuildStacQueryBboxFallback:
+    """Tests for _build_stac_query bbox fallback behavior."""
+
+    def test_uses_tile_property_when_available(self):
+        """Collections with tile_id_property should use property-based query."""
+        config = _get_collection_config("earth-search", "sentinel-2-l2a")
+        query = _build_stac_query(config, "33UUP", "2024-01-01", "2024-01-31")
+
+        assert "query" in query
+        assert "bbox" not in query
+
+    def test_falls_back_to_bbox_when_no_tile_property(self):
+        """Collections with tile_id_property=None should use bbox query."""
+        config = CollectionConfig(
+            collection_id="OPERA_L2_RTC-S1_V1_1",
+            bands=["0_VV", "0_VH"],
+            resolution=10,
+            tile_id_property=None,
+        )
+        bbox = (11.0, 48.0, 12.0, 49.0)
+        query = _build_stac_query(config, "33UUP", "2024-01-01", "2024-01-31", bbox=bbox)
+
+        assert "bbox" in query
+        assert query["bbox"] == bbox
+
+    def test_raises_when_no_tile_property_and_no_bbox(self):
+        """Collections with tile_id_property=None and no bbox should raise."""
+        config = CollectionConfig(
+            collection_id="OPERA_L2_RTC-S1_V1_1",
+            bands=["0_VV", "0_VH"],
+            resolution=10,
+            tile_id_property=None,
+        )
+
+        with pytest.raises(ValueError, match="no tile_id_property"):
+            _build_stac_query(config, "33UUP", "2024-01-01", "2024-01-31")
+
+    def test_tile_id_none_with_bbox_uses_bbox_query(self):
+        """tile_id=None with bbox should use bbox-based query, even when
+        collection has a tile_id_property (ROI-based ingestion).
+        """
+        config = _get_collection_config("earth-search", "sentinel-2-l2a")
+        bbox = (-95.0, 45.0, -94.0, 46.0)
+        query = _build_stac_query(config, None, "2024-01-01", "2024-01-31", bbox=bbox)
+
+        assert "bbox" in query
+        assert query["bbox"] == bbox
+
+    def test_tile_id_none_without_bbox_raises(self):
+        """tile_id=None without bbox should raise ValueError."""
+        config = _get_collection_config("earth-search", "sentinel-2-l2a")
+
+        with pytest.raises(ValueError, match="no bbox was provided"):
+            _build_stac_query(config, None, "2024-01-01", "2024-01-31")
+
+    def test_tile_id_with_tile_property_unchanged(self):
+        """Existing behavior: tile_id + tile_id_property → property-based query."""
+        config = _get_collection_config("earth-search", "sentinel-2-l2a")
+        query = _build_stac_query(config, "33UUP", "2024-01-01", "2024-01-31")
+
+        assert "query" in query
+        assert "bbox" not in query
+        assert query["query"]["grid:code"]["eq"] == "MGRS-33UUP"
