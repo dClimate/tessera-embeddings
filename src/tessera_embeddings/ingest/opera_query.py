@@ -17,6 +17,8 @@ from typing import Any
 
 import mgrs
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from tessera_embeddings.config import S1_OPERA_BANDS
 from tessera_embeddings.ingest.auth import get_edl_session, resolve_item_assets, rewrite_assets_to_s3
@@ -28,6 +30,26 @@ logger = logging.getLogger(__name__)
 _CMR_GRANULE_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
 _CMR_OPERA_SHORT_NAME = "OPERA_L2_RTC-S1_V1"
 _CMR_PROVIDER = "ASF"
+
+# CMR intermittently times out or returns 5xx under load. urllib3's Retry
+# retries read timeouts (``read`` defaults to ``total``) as well as the
+# listed statuses, with exponential backoff honoring Retry-After.
+_CMR_RETRY = Retry(
+    total=6,
+    backoff_factor=2,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET"]),
+    respect_retry_after_header=True,
+)
+
+
+def _cmr_session() -> requests.Session:
+    """Build a requests Session with retry/backoff for CMR Granule queries."""
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=_CMR_RETRY)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def mgrs_tile_to_bbox(tile_id: str) -> tuple[float, float, float, float]:
@@ -148,8 +170,9 @@ def _query_cmr_granule_ids(
     ids: set[str] = set()
     headers: dict[str, str] = {}
 
+    session = _cmr_session()
     while True:
-        resp = requests.get(_CMR_GRANULE_URL, params=params, headers=headers, timeout=30)
+        resp = session.get(_CMR_GRANULE_URL, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
         body = resp.json()
 
