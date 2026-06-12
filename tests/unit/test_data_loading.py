@@ -428,10 +428,9 @@ class TestSharedStoreOpener:
         assert mock_open.call_count == 2
 
     def test_strips_share_one_open_per_store(self):
-        """Probing T then loading three strips opens each store exactly once."""
+        """Loading three strips through a shared opener opens each store once."""
         with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()) as mock_open:
             opener = make_store_opener()
-            _dl_mod.count_s2_window_timesteps("s3://b/m", _TIME_WINDOW, store_opener=opener)
             for y_sub in (slice(0, 4), slice(4, 8), slice(8, 12)):
                 load_chunk(
                     self._CHUNK,
@@ -444,7 +443,7 @@ class TestSharedStoreOpener:
 
         opened_paths = [call.args[0] for call in mock_open.call_args_list]
         # reflectance + sar_ascending + sar_descending, each opened once total
-        # across the probe and all three strips.
+        # across all three strips.
         assert sorted(opened_paths) == [
             "s3://b/m/reflectance.zarr",
             "s3://b/m/sar_ascending.zarr",

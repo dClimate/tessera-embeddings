@@ -140,25 +140,11 @@ REPRESENTATION_DIM = 192
 DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
 # Spatial read-tile size for inference. The read/ChunkSpec grid stays 2000x2000;
-# the *resident input working set* is bounded separately via northing strips (see
-# InferenceConfig.strip_budget_bytes), so a 2000x2000 chunk's peak host RAM is
-# capped by the strip budget rather than fixed by T x H x W. Independent of the
-# storage chunk size written at ingest (config.ingest.INGEST_CHUNK_SIZE).
+# the *resident input working set* is bounded separately via fixed-height
+# northing strips (see actors._STRIP_HEIGHT), so a 2000x2000 chunk's peak host
+# RAM is capped by the strip height rather than fixed by T x H x W. Independent
+# of the storage chunk size written at ingest (config.ingest.INGEST_CHUNK_SIZE).
 INFERENCE_CHUNK_SIZE = 2000
-
-# Default byte budget bounding the resident input working set per chunk (see
-# InferenceConfig.strip_budget_bytes). Sized so a normal-density chunk (T~=40
-# valid S2 timesteps) resolves to a SINGLE strip — strip_h >= 2000, identical to
-# the unstriped path — while a dense T~=120 chunk splits into multiple narrower
-# strips. The actor sizes the strip from the dominant resident input cost: the
-# S2 band array at T * W * 10 bands * 2 bytes/elem per northing row. At T=40,
-# W=2000 that is ~1.6 MB/row, so all 2000 rows fit under 4 GiB (one strip). Once
-# a chunk splits, the 1-deep prefetch keeps two strips resident at once, so each
-# is sized against HALF the budget for the pair to stay within it: at T=120,
-# ~4.8 MB/row, 2 GiB / 4.8 MB ~= 445 rows -> ceil(2000/445) = 5 strips. Tune
-# down to force more, narrower strips (lower peak RAM, higher read
-# amplification) or up to disable striping entirely.
-DEFAULT_STRIP_BUDGET_BYTES = 4 * 1024**3
 
 
 @final
@@ -189,15 +175,6 @@ class InferenceConfig:
             inputs_bucket: Base path for input Icechunk stores.
             output_bucket: Base path for output embeddings.
             chunk_size: Spatial chunk size in pixels.
-            strip_budget_bytes: Byte budget bounding the resident *input*
-                working set per chunk. ``process_chunk`` derives a northing
-                strip height from this budget and the chunk's valid-timestep
-                count, then loads/infers one strip at a time (full easting
-                width) while the output buffers stay whole-chunk. A
-                normal-density chunk resolves to a single strip (identical to
-                the unstriped path); dense chunks split into several narrower
-                strips so peak host RAM stays bounded. See
-                ``DEFAULT_STRIP_BUDGET_BYTES``.
 
         Ray cluster:
             ray_address: Ray cluster address (None for local mode).
@@ -235,7 +212,6 @@ class InferenceConfig:
     inputs_bucket: str = ""
     output_bucket: str = ""
     chunk_size: int = INFERENCE_CHUNK_SIZE
-    strip_budget_bytes: int = DEFAULT_STRIP_BUDGET_BYTES
 
     # Ray cluster
     ray_address: str | None = None
@@ -249,8 +225,6 @@ class InferenceConfig:
             raise ValueError(f"Invalid norm_source: {self.norm_source!r}. Must be one of {valid}.")
         if self.s1_orbit not in {"ascending", "descending", "both"}:
             raise ValueError(f"Invalid s1_orbit: {self.s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
-        if self.strip_budget_bytes <= 0:
-            raise ValueError(f"Invalid strip_budget_bytes: {self.strip_budget_bytes!r}. Must be a positive integer.")
         self.num_obs_checkpoints = _normalize_obs_checkpoints(self.num_obs_checkpoints)
 
         # v1.1 sampling is deterministic — no repeat variance to measure.

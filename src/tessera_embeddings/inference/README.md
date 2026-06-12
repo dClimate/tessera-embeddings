@@ -163,26 +163,22 @@ are loaded through a 1-deep prefetch pipeline (strip *i+1* loads while strip *i*
 GPU), the same pattern as the sub-batch prefetcher in `inference.py`.
 
 ```text
-whole-chunk footprint = T_estimate × H × W × 10 × 2
-  ≤ strip_budget_bytes               → 1 strip → byte-for-byte the unstriped path
-  >  strip_budget_bytes (striping on) → strip_h = (strip_budget_bytes / 2) / (T_estimate × W × 10 × 2)
-                                        clamped to [256, H]
-  T_estimate ≈ 40  → fits → 1 strip
-  T_estimate ≈ 120 → strip_h ≈ 445 → 5 strips → two resident strips stay under budget
+strip height = 286 rows (actors._STRIP_HEIGHT), fixed
+  H = 2000 → ceil(2000 / 286) = 7 strips, each full easting width
+  H ≤ 286  → 1 strip → byte-for-byte the unstriped path
 ```
 
 The strip loop runs a 1-deep prefetch (strip *i+1* loads while strip *i* runs the GPU), so
-once a chunk splits **two strips are resident at once**. Strips are therefore sized against
-*half* the budget when striping is active, so the prefetched pair peaks under
-`strip_budget_bytes` rather than ~2× it; a chunk whose whole-height footprint already fits the
-budget loads as a single strip (no prefetched neighbour) sized against the full budget.
+once a chunk splits **two strips are resident at once**. The strip height is therefore the
+bound on the *pair*: 286 rows was empirically the largest height holding that pair below 90%
+of the default 16 GB worker box even in extreme-coverage Sentinel-2 scenarios (~200 valid
+observations). A chunk no taller than one strip loads whole (no prefetched neighbour).
 
-`T_estimate` comes from `count_s2_window_timesteps`, which reads only the 1-D `time`
-coordinate (no spatial read) — an upper bound on `T_valid`, so strip sizing is conservative.
-The byte budget is `InferenceConfig.strip_budget_bytes` (default 4 GiB): lower it to force
-narrower strips (lower peak RAM, higher read amplification); raise it past the whole-chunk
-footprint to disable striping. **Striping is the only lever that makes peak RAM independent
-of observation density** — every other lever lowers the plateau by a fixed amount.
+The height is **independent of observation density**, so no per-chunk timestep probe is needed
+— it is sized for the densest case and is safe for all others. Lower-density chunks read the
+same 286-row strips with fewer timesteps per row and sit well under the ceiling. **Fixed-height
+striping is the only lever that makes peak RAM independent of observation density** — every
+other lever lowers the plateau by a fixed amount.
 
 Read cost: strips overlap shared `(time=1, 4000, 4000)` store chunks, so a split chunk
 re-touches the same on-disk chunks once per strip. The icechunk repo is opened with a 512 MB
@@ -428,7 +424,6 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | `latent_dim` | 192 | Transformer hidden dim (must match checkpoint) |
 | `representation_dim` | 192 | Model output dim; first 128 dims are saved to the store |
 | `dim_feedforward` | 2048 | Transformer FFN width |
-| `strip_budget_bytes` | 4 GiB | Byte budget for one resident input strip; bounds peak load RAM independent of T (see 4a′). Lower → narrower strips; raise past the whole-chunk footprint to disable striping |
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
 **Architecture params** (`nhead`, `num_encoder_layers`, `dim_feedforward`, etc.) **must match

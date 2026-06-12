@@ -185,29 +185,6 @@ def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.nd
     return indices, compute_doy(times[indices])
 
 
-def count_s2_window_timesteps(
-    mosaic_base: str, time_window: TimeWindow, store_opener: StoreOpener | None = None
-) -> int:
-    """Return how many S2 timesteps fall inside ``time_window`` for this mosaic.
-
-    Reads only the reflectance store's 1-D ``time`` coordinate (no spatial
-    data), so it is a cheap probe of the upper bound on the per-chunk valid
-    timestep count ``T`` before any band load. Used by the inference actor to
-    size northing strips ahead of the first full read. The true post-pruning
-    ``T_kept`` is <= this value, so sizing on it is conservative (strips end up
-    no wider than the budget allows).
-
-    ``store_opener`` defaults to a fresh repo open; pass a shared opener (see
-    ``make_store_opener``) to reuse the reflectance handle the strip loads use,
-    so the probe primes the chunk cache instead of opening a throwaway repo.
-    """
-    if store_opener is None:
-        store_opener = open_store_as_zarr_group
-    root = store_opener(f"{mosaic_base}/reflectance.zarr")
-    window_indices, _ = _filter_times_from_zarr(root, time_window)
-    return len(window_indices)
-
-
 def _active_orbits(s1_orbit: str) -> tuple[str, ...]:
     """Return the orbit directions active for a given ``s1_orbit`` setting."""
     if s1_orbit == "both":
