@@ -29,6 +29,13 @@ up. The work-stealing scheduler will dispatch chunks to actors that come
 online later, so we don't need to wait for everyone.
 """
 
+MAX_ACTORS_TO_WAIT_FOR = 50
+"""Never wait for more than this number of actors.
+
+More than 50 actors is too onerous to wait for and frequently fails.
+We queue gracefully anyways
+"""
+
 
 def wait_for_actors(
     actors: list[ray.actor.ActorHandle],
