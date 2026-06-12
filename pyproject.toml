@@ -77,6 +77,8 @@ aws = [
     "s3fs",
     "dask-cloudprovider[aws]",
     "prefect-aws",
+    # Serves the Dask scheduler dashboard (port-forwarded over SSM).
+    "bokeh",
 ]
 all = [
     "tessera_embeddings[inference,prefect,aws]",

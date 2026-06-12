@@ -171,6 +171,39 @@ def get_fargate_config(
     )
 
 
+def log_dashboard_ssm_command(
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    cluster: ECSCluster,
+) -> None:
+    """Log a copy-pasteable SSM port-forward command for the Dask dashboard.
+
+    The SSM target must point at the *scheduler* Fargate task (where the
+    dashboard runs). The caller supplies their own AWS profile via
+    ``--profile`` — it is deliberately not baked into the logged command.
+
+    Best-effort: if the scheduler task metadata isn't shaped as expected
+    (e.g. an EC2 scheduler), logs a warning and returns without raising.
+    """
+    try:
+        scheduler = cluster.scheduler
+        cluster_name, task_id = scheduler.task_arn.rsplit("/", 2)[1:]
+        runtime_id = scheduler.task["containers"][0]["runtimeId"]
+        ssm_target = f"ecs:{cluster_name}_{task_id}_{runtime_id}"
+    except (AttributeError, KeyError, IndexError, ValueError) as exc:
+        log.warning("Could not build SSM dashboard command: %s", exc)
+        return
+
+    log.info(
+        "To view the Dask dashboard, run (supply your own --profile):\n\n"
+        "aws ssm start-session \\\n"
+        f"  --target {ssm_target} \\\n"
+        "  --document-name AWS-StartPortForwardingSessionToRemoteHost \\\n"
+        '  --parameters \'{"host":["localhost"],"portNumber":["8787"],"localPortNumber":["8787"]}\' \\\n'
+        "  --profile <your-aws-profile>\n\n"
+        "Then open http://localhost:8787/status"
+    )
+
+
 @contextlib.contextmanager
 def ecs_cluster(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
@@ -307,6 +340,7 @@ def ecs_cluster(
 
     log.info("Cluster created: %s", cluster)
     log.info("Dashboard: %s", cluster.dashboard_link)
+    log_dashboard_ssm_command(log, cluster)
 
     cluster.adapt(minimum=min_workers, maximum=max_workers)
     log.info("Adaptive scaling configured: min=%d, max=%d", min_workers, max_workers)
