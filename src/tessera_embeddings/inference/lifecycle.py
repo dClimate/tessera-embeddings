@@ -21,21 +21,6 @@ download + model load to GPU. Tune via ``run_inference``'s parameter rather
 than monkey-patching this module-level default.
 """
 
-MIN_ACTOR_FRACTION = 0.25
-"""Fraction of requested actors that must be ready before work can start.
-
-A quarter of the fleet is enough to make progress while the rest catches
-up. The work-stealing scheduler will dispatch chunks to actors that come
-online later, so we don't need to wait for everyone.
-"""
-
-MAX_ACTORS_TO_WAIT_FOR = 50
-"""Never wait for more than this number of actors.
-
-More than 50 actors is too onerous to wait for and frequently fails.
-We queue gracefully anyways
-"""
-
 
 def wait_for_actors(
     actors: list[ray.actor.ActorHandle],
@@ -48,20 +33,25 @@ def wait_for_actors(
 ) -> tuple[list[ray.actor.ActorHandle], list[str], set[int]]:
     """Wait for enough actors to initialize, then return all actors with readiness info.
 
-    Waits up to ``init_timeout_sec`` for at least ``min_actor_fraction`` of
-    the requested actors to be ready. Once the minimum threshold is met,
-    returns immediately so work can start. Actors that aren't ready yet
-    are still included in the returned lists — the work-stealing scheduler
-    treats them as initializing and will dispatch work to them once they
-    come online.
+    Waits up to ``init_timeout_sec`` for at least ``min_required`` of the
+    requested actors to be ready. Once that threshold is met, returns
+    immediately so work can start. Actors that aren't ready yet are still
+    included in the returned lists — the work-stealing scheduler treats
+    them as initializing and will dispatch work to them once they come
+    online.
+
+    Callers typically pass ``min_required=1`` so the run starts as soon as
+    the first actor is live: cloud providers roll out instances with large
+    timing variation, and waiting for a fraction of the fleet just stalls
+    the run. The 30s poll window below still scoops up any fast-arriving
+    actors before returning.
 
     Args:
         actors: List of actor handles (just created, not yet confirmed ready).
         num_requested: Original number of actors requested.
         min_required: Minimum number of actors that must be ready before work
-            starts. Caller computes this as the lesser of the fractional
-            minimum (``MIN_ACTOR_FRACTION * num_requested``) and
-            ``MAX_ACTORS_TO_WAIT_FOR``.
+            starts. Usually 1 so the run starts with the first live actor and
+            the rest join via work-stealing.
         started_at: Monotonic timestamp when actor creation started.
         log: Logger.
         init_timeout_sec: Per-call timeout override.
