@@ -30,7 +30,9 @@ from icechunk.xarray import to_icechunk
 
 from tessera_embeddings.config import S2_L2A_BANDS
 from tessera_embeddings.storage.zarr_store import (
+    _CHUNK_CACHE_BYTES,
     S3Config,
+    _default_repo_config,
     _open_writable_session,
     _write_new,
     compute_doy,
@@ -467,3 +469,29 @@ class TestWriteDataset:
         assert len(doy) == 2
         assert doy[0] == 1  # Jan 1
         assert doy[1] == 167  # June 15
+
+
+class TestDefaultRepoConfig:
+    """The chunk cache is always applied; max_concurrent_requests stays optional.
+
+    Striped inference re-reads the same (time=1, 4000, 4000) store chunks once
+    per northing strip, so the cache must be set on every repo open — including
+    the common path where no concurrency cap is passed (the old early-return
+    bug dropped the cache entirely in that case).
+    """
+
+    def test_cache_applied_without_concurrency_cap(self):
+        config = _default_repo_config()
+        assert config is not None
+        assert config.caching is not None
+        assert config.caching.num_bytes_chunks == _CHUNK_CACHE_BYTES
+
+    def test_cache_applied_with_concurrency_cap(self):
+        config = _default_repo_config(max_concurrent_requests=64)
+        assert config.caching is not None
+        assert config.caching.num_bytes_chunks == _CHUNK_CACHE_BYTES
+        assert config.max_concurrent_requests == 64
+
+    def test_returns_config_not_none_by_default(self):
+        # Previously returned None when no cap was passed; must now always build one.
+        assert _default_repo_config() is not None

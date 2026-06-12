@@ -29,10 +29,11 @@ Input stores (Icechunk/Zarr on S3):
   │  Ray Cluster  (EC2, g5.xlarge × N)          │
   │  ┌─────────────────────────────────────┐    │
   │  │ InferenceActor (1 GPU each)         │    │
-  │  │  1. load_chunk()        ← selective  │    │
-  │  │  2. Dataset valid-px filter          │    │
-  │  │  3. sample_s2/s1_batch()             │    │
-  │  │  4. model forward  (FP16, B=3584)    │    │
+  │  │  per northing strip (bounds RAM):    │    │
+  │  │   1. load_chunk(y_sub=…)  ← selective│    │
+  │  │   2. Dataset valid-px filter         │    │
+  │  │   3. sample_s2/s1_batch()            │    │
+  │  │   4. model forward  (FP16, B=3584)   │    │
   │  │  5. writer.write_chunk() → staging   │    │
   │  └─────────────────────────────────────┘    │
   │  Work-stealing: actors pull from queue      │
@@ -109,7 +110,9 @@ Each chunk goes through four sub-steps:
 
 #### 4a. Data Loading (`data_loading.py`)
 
-Two-phase loading keeps peak worker RAM ~2 GB rather than ~15 GB:
+Two-phase loading lowers peak worker RAM by dropping empty dates before the band read. This
+caps RAM for typical chunks but does not *bound* it — peak still scales with `T_valid`, which
+is what northing striping (4a′) addresses for dense chunks:
 
 ```text
 All timesteps in the ROI time axis
@@ -140,6 +143,44 @@ gracefully when only one orbit was ingested.
 Output: `ChunkData` — numpy arrays for S2 bands/masks/DOYs, S1 ascending/descending
 bands/DOYs, and per-pixel observation counts (`s2_obs_count`, `s1_asc_obs_count`,
 `s1_desc_obs_count`) as uint16 arrays of shape (H, W).
+
+#### 4a′. Northing Striping (bounds peak input RAM independent of T)
+
+The SCL pre-filter above caps peak RAM for *typical* chunks, but it does not bound it: the
+resident S2 band array is `T_valid × H × W × 10 × 2` bytes, which scales with the timestep
+count. On dense ROIs `T_valid` can reach ~120, so a 2000×2000 chunk's `s2_bands` alone is
+~9.6 GB in a single `np.empty` — and on a 16 GB `g5.xlarge` worker that OOMs the loader
+*before* inference runs. `T` is not a free variable (v1.1 uses every valid observation), so
+the only lever is the spatial working set.
+
+`process_chunk` therefore loads each chunk as a sequence of **northing strips** (full easting
+width) rather than all at once. `load_chunk(..., y_sub=<slice>)` reads only a chunk-relative
+horizontal band; each strip is a self-contained `ChunkData` that is bucketed, run through
+inference, and written into whole-chunk output buffers by row-slice. Only the *inputs* are
+sub-tiled — the int8 output buffer (`H × W × 128`, ~0.5 GB) is held whole, so the write path,
+obs-count maps, and `assembly.py` are untouched (a single `write_chunk` at the end). Strips
+are loaded through a 1-deep prefetch pipeline (strip *i+1* loads while strip *i* runs the
+GPU), the same pattern as the sub-batch prefetcher in `inference.py`.
+
+```text
+strip_h = strip_budget_bytes / (T_estimate × W × 10 × 2)   clamped to [256, H]
+  T_estimate ≈ 40  → strip_h ≥ H  → 1 strip  → byte-for-byte the unstriped path
+  T_estimate ≈ 120 → strip_h ≈ 670 → 3 strips → peak input ~⅓ of the whole chunk
+```
+
+`T_estimate` comes from `count_s2_window_timesteps`, which reads only the 1-D `time`
+coordinate (no spatial read) — an upper bound on `T_valid`, so strip sizing is conservative.
+The byte budget is `InferenceConfig.strip_budget_bytes` (default 4 GiB): lower it to force
+narrower strips (lower peak RAM, higher read amplification); raise it past the whole-chunk
+footprint to disable striping. **Striping is the only lever that makes peak RAM independent
+of observation density** — every other lever lowers the plateau by a fixed amount.
+
+Read cost: strips overlap shared `(time=1, 4000, 4000)` store chunks, so a split chunk
+re-touches the same on-disk chunks once per strip. The icechunk repo is opened with a 512 MB
+chunk cache (`zarr_store.py::_default_repo_config`) so those re-reads hit cache rather than
+re-fetching S3 — measured strip read penalty ~1.35× (vs 2.37× uncached) on a dense chunk,
+which stays under the per-chunk compute time and is hidden by the prefetch pipeline. Normal
+single-strip chunks pay nothing.
 
 #### 4b. Valid Pixel Filtering + Bucketing (`dataset.py`)
 
@@ -375,6 +416,7 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | `latent_dim` | 192 | Transformer hidden dim (must match checkpoint) |
 | `representation_dim` | 192 | Model output dim; first 128 dims are saved to the store |
 | `dim_feedforward` | 2048 | Transformer FFN width |
+| `strip_budget_bytes` | 4 GiB | Byte budget for one resident input strip; bounds peak load RAM independent of T (see 4a′). Lower → narrower strips; raise past the whole-chunk footprint to disable striping |
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
 **Architecture params** (`nhead`, `num_encoder_layers`, `dim_feedforward`, etc.) **must match

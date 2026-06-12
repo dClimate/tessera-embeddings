@@ -185,10 +185,24 @@ def _create_storage(
     return icechunk.local_filesystem_storage(local_path)
 
 
-def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk.RepositoryConfig | None:
-    """RepositoryConfig overrides. Returns None when no overrides are set.
+# Per-repo chunk cache budget. Inference reads each (time=1, 4000, 4000) store
+# chunk once per spatial strip; when a dense chunk is split into northing strips
+# the same on-disk chunk is touched by every strip, so an LRU chunk cache turns
+# the per-strip re-reads into cache hits. 512 MB holds enough decoded chunks to
+# keep the measured strip read penalty at ~1.35x (vs 2.37x uncached), which
+# stays under the per-chunk compute envelope and is hidden by the strip prefetch
+# pipeline. Applied to every repo open — the cache is bounded and harmless for
+# write paths that never re-read.
+_CHUNK_CACHE_BYTES = 512 * 1024**2
 
-    When ``max_concurrent_requests`` is provided, caps per-repo HTTP
+
+def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk.RepositoryConfig:
+    """Build the RepositoryConfig overrides applied to every repo open.
+
+    Always sets a bounded chunk cache (see ``_CHUNK_CACHE_BYTES``) so striped
+    inference reads hit cache instead of re-fetching shared store chunks.
+
+    When ``max_concurrent_requests`` is provided, also caps per-repo HTTP
     concurrency. Assembly at cornbelt scale fans out thousands of concurrent
     PUTs to one zarr prefix, blowing past S3's ~3.5K/s per-prefix limit and
     triggering 503 SlowDown. Icechunk's default is 256 concurrent HTTP
@@ -197,10 +211,10 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     Retry/backoff is left at icechunk's defaults — SlowDown is already
     classified as retriable by the underlying AWS SDK.
     """
-    if max_concurrent_requests is None:
-        return None
     config = icechunk.RepositoryConfig.default()
-    config.max_concurrent_requests = max_concurrent_requests
+    config.caching = icechunk.CachingConfig(num_bytes_chunks=_CHUNK_CACHE_BYTES)
+    if max_concurrent_requests is not None:
+        config.max_concurrent_requests = max_concurrent_requests
     return config
 
 
