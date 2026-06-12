@@ -145,6 +145,21 @@ def _cmr_response(entries, search_after=None):
     return resp
 
 
+def _patch_cmr_session(**get_kwargs):
+    """Patch ``_cmr_session`` so its session's ``.get`` is a controllable mock.
+
+    The query helper issues requests via ``_cmr_session().get(...)`` (a
+    retry-mounted Session), not the module-level ``requests.get``. This patches
+    the session factory and returns ``(patcher, mock_get)`` so callers can make
+    assertions on ``mock_get`` while the context manager is active.
+    """
+    mock_get = MagicMock(**get_kwargs)
+    session = MagicMock()
+    session.get = mock_get
+    patcher = patch("tessera_embeddings.ingest.opera_query._cmr_session", return_value=session)
+    return patcher, mock_get
+
+
 class TestQueryCmrOrbitIds:
     """Tests for _query_cmr_granule_ids()."""
 
@@ -155,7 +170,8 @@ class TestQueryCmrOrbitIds:
             {"producer_granule_id": "OPERA_L2_RTC-S1_T035-073245-IW3_20240101_v1.0"},
             {"producer_granule_id": "OPERA_L2_RTC-S1_T035-073246-IW2_20240101_v1.0"},
         ]
-        with patch("tessera_embeddings.ingest.opera_query.requests.get", return_value=_cmr_response(entries)):
+        patcher, _ = _patch_cmr_session(return_value=_cmr_response(entries))
+        with patcher:
             ids = _query_cmr_granule_ids(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
 
         assert ids == {
@@ -164,7 +180,8 @@ class TestQueryCmrOrbitIds:
         }
 
     def test_passes_attribute_filter(self):
-        with patch("tessera_embeddings.ingest.opera_query.requests.get", return_value=_cmr_response([])) as mock_get:
+        patcher, mock_get = _patch_cmr_session(return_value=_cmr_response([]))
+        with patcher:
             _query_cmr_granule_ids(self.BBOX, "2024-01-01", "2024-01-15", "descending")
 
         params = mock_get.call_args.kwargs["params"]
@@ -176,7 +193,8 @@ class TestQueryCmrOrbitIds:
             search_after="token123",
         )
         page2 = _cmr_response([{"producer_granule_id": "id-final"}])
-        with patch("tessera_embeddings.ingest.opera_query.requests.get", side_effect=[page1, page2]) as mock_get:
+        patcher, mock_get = _patch_cmr_session(side_effect=[page1, page2])
+        with patcher:
             ids = _query_cmr_granule_ids(self.BBOX, "2024-01-01", "2024-12-31", "ascending")
 
         assert "id-final" in ids
@@ -184,7 +202,8 @@ class TestQueryCmrOrbitIds:
         assert kwargs2["headers"]["CMR-Search-After"] == "token123"
 
     def test_empty_response(self):
-        with patch("tessera_embeddings.ingest.opera_query.requests.get", return_value=_cmr_response([])):
+        patcher, _ = _patch_cmr_session(return_value=_cmr_response([]))
+        with patcher:
             ids = _query_cmr_granule_ids(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
 
         assert ids == set()
