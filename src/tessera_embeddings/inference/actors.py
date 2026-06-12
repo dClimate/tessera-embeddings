@@ -14,17 +14,19 @@ from __future__ import annotations
 import logging
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import fsspec
+import numpy as np
 import ray
 import requests
 
-from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.inference import EMBEDDING_DIM, S2_BAND_ORDER, InferenceConfig
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.inference.data_loading import load_chunk
+from tessera_embeddings.inference.data_loading import count_s2_window_timesteps, load_chunk, make_store_opener
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 
 if TYPE_CHECKING:
@@ -32,9 +34,86 @@ if TYPE_CHECKING:
 
     import torch
 
+    from tessera_embeddings.inference.data_loading import ChunkData
     from tessera_embeddings.inference.models.ssl_model import MultimodalBTInferenceModel
 
 logger = logging.getLogger(__name__)
+
+# Floor on derived strip height. A strip narrower than this reads so few
+# northing rows that the per-strip fixed overhead (window-time filter, zarr
+# group open, dataset bucketing) dominates and read amplification climbs without
+# meaningfully lowering peak RAM. Dense chunks bottom out here rather than
+# degenerating into hundreds of one-row reads.
+_MIN_STRIP_H = 256
+
+# Bytes per northing row of resident S2 *input* — the dominant term in the
+# per-chunk working set (masks at 1 byte/elem and SAR at ~10x fewer timesteps
+# are second order). One row is W * 10 bands * 2 bytes (uint16) * T_estimate;
+# this constant is the per-(row, timestep) part, multiplied by W and T at call
+# time.
+_S2_BYTES_PER_ROW_TIMESTEP = len(S2_BAND_ORDER) * np.dtype(np.uint16).itemsize
+
+
+def _compute_strip_height(*, height: int, width: int, t_estimate: int, strip_budget_bytes: int) -> int:
+    """Derive the northing strip height that keeps resident input under budget.
+
+    The resident input is dominated by the S2 band array, ``T * W * 10 * 2``
+    bytes, which scales linearly in the northing extent. The strip loop in
+    ``process_chunk`` runs a 1-deep prefetch, so when a chunk splits the next
+    strip loads while the current one is still live — *two* strips coexist. We
+    therefore size against half the budget once striping kicks in, so that pair
+    stays under ``strip_budget_bytes`` rather than peaking at ~2x it.
+
+    A chunk whose whole-height footprint already fits the budget loads as a
+    single strip (no prefetched neighbour to coexist with) — byte-for-byte the
+    unstriped path, sized against the full budget. Otherwise we solve for the
+    largest strip height whose S2 band footprint fits ``strip_budget_bytes / 2``
+    and clamp it to ``[_MIN_STRIP_H, height]``. ``t_estimate`` of 0 (no
+    timesteps) returns the full height.
+    """
+    if t_estimate <= 0:
+        return height
+    bytes_per_row = width * t_estimate * _S2_BYTES_PER_ROW_TIMESTEP
+    if bytes_per_row <= 0:
+        return height
+    # Single strip if the whole chunk fits — no prefetched neighbour to bound.
+    if height * bytes_per_row <= strip_budget_bytes:
+        return height
+    # Striping is active: two strips are resident under the prefetch, so each
+    # must fit half the budget for the pair to stay within it.
+    budget_strip_h = (strip_budget_bytes // 2) // bytes_per_row
+    strip_h = max(_MIN_STRIP_H, min(int(budget_strip_h), height))
+    if strip_h > budget_strip_h and strip_h < height:
+        # _MIN_STRIP_H floored the strip above the budget-derived height, so the
+        # two prefetched strips will exceed strip_budget_bytes. We deliberately
+        # honour the floor rather than degenerate into tiny high-overhead reads
+        # (see _MIN_STRIP_H), but warn loudly so an OOM here is traceable to a
+        # budget set too low for this chunk's T/W rather than looking like a
+        # silent breach of the documented bound.
+        pair_bytes = 2 * strip_h * bytes_per_row
+        logger.warning(
+            "Strip floor _MIN_STRIP_H=%d overrides the byte budget: "
+            "budget-derived strip_h=%d, using %d. Resident input pair ~%.2f GiB "
+            "exceeds strip_budget_bytes=%.2f GiB (W=%d, T_estimate=%d). Raise "
+            "strip_budget_bytes or lower W/T to restore the 2-strip bound.",
+            _MIN_STRIP_H,
+            int(budget_strip_h),
+            strip_h,
+            pair_bytes / 1024**3,
+            strip_budget_bytes / 1024**3,
+            width,
+            t_estimate,
+        )
+    return strip_h
+
+
+def _strip_slices(height: int, strip_h: int) -> list[slice]:
+    """Tile ``[0, height)`` into chunk-relative northing strips of ``strip_h`` rows.
+
+    The final strip is shorter when ``height`` is not a multiple of ``strip_h``.
+    ``strip_h >= height`` yields a single full-height strip.
+    """
+    return [slice(start, min(start + strip_h, height)) for start in range(0, height, strip_h)]
 
 
 def _fetch_ec2_instance_id() -> str:
@@ -236,31 +315,130 @@ class InferenceActor:
             tracker.report.remote(chunk.label, 0, 0, "loading")  # type: ignore[union-attr]
 
         try:
-            # Load data (optimized: only fetch the S2 timesteps the model will sample)
-            chunk_data = load_chunk(
-                chunk,
-                mosaic_base,
-                time_window=self.config.time_window,
-                s1_orbit=self.config.s1_orbit,
+            # Share one set of repo handles across the probe and every strip so
+            # the 512 MB icechunk chunk cache persists for the whole chunk:
+            # overlapping strips re-touch the same store chunks, so a warm cache
+            # turns those re-reads into hits instead of cold S3 fetches.
+            store_opener = make_store_opener()
+
+            # Size northing strips from the byte budget so a dense chunk's
+            # resident *input* stays bounded. Probe the window timestep count
+            # from the 1-D time coord (cheap, no spatial read) to estimate T
+            # before the first full load. A normal-density chunk resolves to a
+            # single full-height strip — byte-for-byte the unstriped path.
+            t_estimate = count_s2_window_timesteps(mosaic_base, self.config.time_window, store_opener=store_opener)
+            strip_h = _compute_strip_height(
+                height=chunk.height,
+                width=chunk.width,
+                t_estimate=t_estimate,
+                strip_budget_bytes=self.config.strip_budget_bytes,
+            )
+            strips = _strip_slices(chunk.height, strip_h)
+            logger.info(
+                "Chunk %s: T_estimate=%d, strip_h=%d -> %d strip(s)",
+                chunk.label,
+                t_estimate,
+                strip_h,
+                len(strips),
             )
 
-            # Build dataset
-            dataset = MosaicChunkInferenceDataset(
-                chunk_data,
-                num_obs_checkpoints=self.config.num_obs_checkpoints,
-                s1_orbit=self.config.s1_orbit,
+            # Whole-chunk output buffers, allocated once and held for the chunk.
+            # We sub-tile INPUTS only; the output and write path are untouched.
+            # save_dim mirrors run_inference: the canonical 128-D slice, or the
+            # full representation width for smaller (test) models.
+            save_dim = min(EMBEDDING_DIM, self.config.representation_dim)
+            embeddings = np.zeros((chunk.height, chunk.width, save_dim), dtype=np.int8)
+            scales = np.full((chunk.height, chunk.width), 1e-8, dtype=np.float32)
+
+            writer = ZarrWriter(staging_base, embedding_dim=save_dim)
+
+            def _load_strip(y_sub: slice) -> ChunkData:
+                return load_chunk(
+                    chunk,
+                    mosaic_base,
+                    time_window=self.config.time_window,
+                    s1_orbit=self.config.s1_orbit,
+                    y_sub=y_sub,
+                    store_opener=store_opener,
+                )
+
+            on_batch = (
+                (lambda b, t: tracker.report.remote(chunk.label, b, t, "inference"))  # type: ignore[union-attr]
+                if tracker
+                else None
             )
 
-            writer = ZarrWriter(staging_base)
+            # accumulate obs counts per strip into whole-chunk buffers so the
+            # single write_chunk carries the full-chunk obs maps.
+            obs_buffers: dict[str, np.ndarray] = {
+                var: np.zeros((chunk.height, chunk.width), dtype=np.uint16) for var in OBS_COUNT_VARS
+            }
 
-            if len(dataset) == 0:
-                # ROI pre-filter means chunks get here only if they intersect the
-                # ROI, so this branch fires only when every pixel in a live chunk
-                # fails the SCL/S1 validity thresholds. Assembly will fill the
-                # chunk's footprint with zeros/NaN from the Dask graph — no
-                # placeholder zarr needed. We still drop a zero-byte skip marker
-                # so verify_staged_completeness can distinguish a legitimate
-                # skip from a silently-failed chunk (Ray worker crash, etc.).
+            total_valid = 0
+            # 1-deep prefetch pipeline: strip i+1 loads while strip i runs
+            # inference (same shape as inference.run_inference's prefetcher).
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="strip-prefetch") as pool:
+                next_future = pool.submit(_load_strip, strips[0]) if strips else None
+
+                # Bound to None so the first iteration's `del` has a target; each
+                # iteration rebinds both before use.
+                chunk_data: ChunkData | None = None
+                dataset: MosaicChunkInferenceDataset | None = None
+                for i, strip in enumerate(strips):
+                    assert next_future is not None
+                    # The previous strip reported "inference"; flip back to
+                    # "loading" before blocking on this strip's read so a slow
+                    # multi-strip load isn't misclassified as an inference stall
+                    # by _poll_tracker. (Strip 0's "loading" was reported above.)
+                    if tracker and i > 0:
+                        tracker.report.remote(chunk.label, 0, 0, "loading")  # type: ignore[union-attr]
+
+                    # Release the previous strip's input arrays BEFORE blocking
+                    # on this strip's load and submitting the next prefetch. The
+                    # dataset retains chunk_data.s2_bands (dataset.py), so without
+                    # this drop the prior strip's dataset, the current strip, and
+                    # the prefetched next strip could all be resident at once —
+                    # three strips, though _compute_strip_height sizes for two.
+                    del chunk_data, dataset
+
+                    chunk_data = next_future.result()
+
+                    # Kick off the next strip's load before running inference on this one.
+                    next_future = pool.submit(_load_strip, strips[i + 1]) if i + 1 < len(strips) else None
+
+                    for var in OBS_COUNT_VARS:
+                        arr = getattr(chunk_data, var)
+                        if arr is not None:
+                            obs_buffers[var][strip] = arr
+
+                    dataset = MosaicChunkInferenceDataset(
+                        chunk_data,
+                        num_obs_checkpoints=self.config.num_obs_checkpoints,
+                        s1_orbit=self.config.s1_orbit,
+                    )
+
+                    if len(dataset) == 0:
+                        # Empty strip: leave its output rows at the zero/1e-8
+                        # initialised value, mirroring run_inference's handling
+                        # of fully-invalid chunks. The strip still contributes
+                        # its (zero) obs counts, already written above.
+                        logger.info("Chunk %s strip %s: no valid pixels, leaving zero-filled", chunk.label, strip)
+                        continue
+
+                    result = run_inference(self.model, dataset, self.config, self.device, on_batch=on_batch)
+                    embeddings[strip] = result.embeddings
+                    scales[strip] = result.scales
+                    total_valid += len(dataset)
+
+            if total_valid == 0:
+                # Every strip was empty. ROI pre-filter means chunks get here
+                # only if they intersect the ROI, so this fires only when every
+                # pixel in a live chunk fails the SCL/S1 validity thresholds.
+                # Assembly will fill the chunk's footprint with zeros/NaN from
+                # the Dask graph — no placeholder zarr needed. We still drop a
+                # zero-byte skip marker so verify_staged_completeness can
+                # distinguish a legitimate skip from a silently-failed chunk
+                # (Ray worker crash, etc.).
                 logger.info("Chunk %s has no valid pixels, skipping (assembly will fill)", chunk.label)
                 writer.write_skip_marker(chunk, run_id)
                 return {
@@ -271,42 +449,32 @@ class InferenceActor:
                     "instance_id": self.instance_id,
                 }
 
-            # Build progress callback (Ray-agnostic: inference.py just calls a function)
-            on_batch = (
-                (lambda b, t: tracker.report.remote(chunk.label, b, t, "inference"))  # type: ignore[union-attr]
-                if tracker
-                else None
-            )
-
-            # Run inference
-            result = run_inference(self.model, dataset, self.config, self.device, on_batch=on_batch)
-
             # Report writing phase before S3 write
             if tracker:
                 tracker.report.remote(chunk.label, 0, 0, "writing")  # type: ignore[union-attr]
 
-            # Write to staging
+            # Single whole-chunk write — assembly / skip-marker logic untouched.
             writer.write_chunk(
                 chunk,
-                result.embeddings,
+                embeddings,
                 run_id,
-                embeddings_std=result.embeddings_std,
-                scales=result.scales,
-                obs_counts={var: getattr(chunk_data, var) for var in OBS_COUNT_VARS},
+                embeddings_std=None,
+                scales=scales,
+                obs_counts=obs_buffers,
             )
 
             elapsed = time.monotonic() - t0
             logger.info(
                 "Chunk %s complete: %d valid pixels, %.1fs",
                 chunk.label,
-                len(dataset),
+                total_valid,
                 elapsed,
             )
 
             return {
                 "chunk": chunk.label,
                 "status": "success",
-                "valid_pixels": len(dataset),
+                "valid_pixels": total_valid,
                 "elapsed_sec": elapsed,
                 "instance_id": self.instance_id,
             }

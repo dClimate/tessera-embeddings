@@ -18,6 +18,7 @@ from tessera_embeddings.inference.data_loading import (
     _load_sar_orbit,
     _load_scl_mask,
     load_chunk,
+    make_store_opener,
     resolve_s1_orbit,
 )
 from tessera_embeddings.storage.zarr_store import compute_doy
@@ -261,6 +262,88 @@ class TestLoadChunkOrchestration:
             load_chunk(_CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="sideways")
 
 
+class TestStripReassembly:
+    """Loading a chunk as N northing strips and concatenating reproduces the whole chunk.
+
+    The storage layout chunks time=1, so narrowing the northing extent never
+    changes which on-disk chunks are read; a strip is a self-contained read of
+    the same bytes. Per-strip pruning may keep a different T_kept per strip, so
+    bands/masks/doys are compared per strip against the matching rows of the
+    whole-chunk load.
+    """
+
+    # A taller chunk so it actually splits into multiple strips.
+    _TALL_CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
+
+    def _side_effect(self, n_t_s2=10, n_t_sar=5):
+        h, w = self._TALL_CHUNK.height, self._TALL_CHUNK.width
+        s2_root = _make_s2_zarr_group(n_t_s2, h, w, seed=10)
+        sar_asc = _make_sar_zarr_group(n_t_sar, h, w, seed=20)
+        sar_desc = _make_sar_zarr_group(n_t_sar, h, w, seed=30)
+
+        def _open_store(path):
+            if "reflectance" in path:
+                return s2_root
+            if "ascending" in path:
+                return sar_asc
+            if "descending" in path:
+                return sar_desc
+            raise ValueError(f"Unexpected store path: {path}")
+
+        return _open_store
+
+    def _load(self, y_sub=None, s1_orbit="both"):
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()):
+            return load_chunk(self._TALL_CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit=s1_orbit, y_sub=y_sub)
+
+    def test_y_sub_none_matches_full_chunk_dims(self):
+        whole = self._load(y_sub=None)
+        assert whole.height == self._TALL_CHUNK.height
+        assert whole.width == self._TALL_CHUNK.width
+
+    def test_strip_dims_reflect_strip(self):
+        strip = self._load(y_sub=slice(4, 8))
+        assert strip.height == 4
+        assert strip.width == self._TALL_CHUNK.width
+        assert strip.s2_bands.shape[1] == 4
+        assert strip.s2_bands.shape[2] == self._TALL_CHUNK.width
+
+    def test_strips_reassemble_to_whole_chunk(self):
+        whole = self._load(y_sub=None)
+        # Three strips of height 4 covering the 12-row chunk.
+        slices = [slice(0, 4), slice(4, 8), slice(8, 12)]
+        strips = [self._load(y_sub=s) for s in slices]
+
+        # obs_count is per-pixel and row-independent: concatenating strips along
+        # northing must equal the whole-chunk obs_count exactly.
+        for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
+            reassembled = np.concatenate([getattr(st, var) for st in strips], axis=0)
+            np.testing.assert_array_equal(reassembled, getattr(whole, var), err_msg=var)
+
+        # Bands/masks: each strip's kept timesteps are a self-contained slice.
+        # Compare each strip's rows against the whole-chunk array's matching rows,
+        # restricted to the strip's kept doys (a strip may prune differently).
+        for s, st in zip(slices, strips, strict=True):
+            # S2: align on doys, then compare the strip's rows of those timesteps.
+            for d_idx, doy in enumerate(st.s2_doys):
+                whole_t = np.where(whole.s2_doys == doy)[0]
+                assert whole_t.size == 1, f"doy {doy} not uniquely in whole chunk"
+                np.testing.assert_array_equal(
+                    st.s2_bands[d_idx], whole.s2_bands[whole_t[0], s, :, :], err_msg=f"s2_bands doy={doy}"
+                )
+                np.testing.assert_array_equal(
+                    st.s2_masks[d_idx], whole.s2_masks[whole_t[0], s, :], err_msg=f"s2_masks doy={doy}"
+                )
+
+    def test_strip_reads_identical_pixels(self):
+        """A single strip read returns the same pixels as the matching rows of a whole read."""
+        whole = self._load(y_sub=None)
+        strip = self._load(y_sub=slice(8, 12))
+        # SAR has no per-pixel pruning here (random nonzero), so timesteps align 1:1.
+        np.testing.assert_array_equal(strip.s1_asc_doys, whole.s1_asc_doys)
+        np.testing.assert_array_equal(strip.s1_asc_bands, whole.s1_asc_bands[:, 8:12, :, :])
+
+
 class TestResolveS1Orbit:
     """Tests for resolve_s1_orbit: downgrade 'both' when only one store is present."""
 
@@ -302,3 +385,68 @@ class TestResolveS1Orbit:
             pytest.raises(InsufficientCoverageError, match="no SAR stores found"),
         ):
             resolve_s1_orbit("s3://b/m", "both")
+
+
+class TestSharedStoreOpener:
+    """A shared opener reuses one repo handle per store path across strip loads.
+
+    Reopening per strip would discard the icechunk chunk cache between strips;
+    the strip loop builds one ``make_store_opener`` per chunk so overlapping
+    strips re-touch the same store handle (and warm cache) instead.
+    """
+
+    _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
+
+    def _side_effect(self):
+        h, w = self._CHUNK.height, self._CHUNK.width
+        s2_root = _make_s2_zarr_group(10, h, w, seed=10)
+        sar_asc = _make_sar_zarr_group(5, h, w, seed=20)
+        sar_desc = _make_sar_zarr_group(5, h, w, seed=30)
+
+        def _open_store(path):
+            if "reflectance" in path:
+                return s2_root
+            if "ascending" in path:
+                return sar_asc
+            if "descending" in path:
+                return sar_desc
+            raise ValueError(f"Unexpected store path: {path}")
+
+        return _open_store
+
+    def test_opener_caches_each_path(self):
+        """make_store_opener opens each distinct path once and returns the same group."""
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()) as mock_open:
+            opener = make_store_opener()
+            first = opener("s3://b/m/reflectance.zarr")
+            second = opener("s3://b/m/reflectance.zarr")
+            other = opener("s3://b/m/sar_ascending.zarr")
+
+        assert first is second  # same handle reused
+        assert other is not first
+        # reflectance opened once despite two requests; sar once.
+        assert mock_open.call_count == 2
+
+    def test_strips_share_one_open_per_store(self):
+        """Probing T then loading three strips opens each store exactly once."""
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()) as mock_open:
+            opener = make_store_opener()
+            _dl_mod.count_s2_window_timesteps("s3://b/m", _TIME_WINDOW, store_opener=opener)
+            for y_sub in (slice(0, 4), slice(4, 8), slice(8, 12)):
+                load_chunk(
+                    self._CHUNK,
+                    "s3://b/m",
+                    time_window=_TIME_WINDOW,
+                    s1_orbit="both",
+                    y_sub=y_sub,
+                    store_opener=opener,
+                )
+
+        opened_paths = [call.args[0] for call in mock_open.call_args_list]
+        # reflectance + sar_ascending + sar_descending, each opened once total
+        # across the probe and all three strips.
+        assert sorted(opened_paths) == [
+            "s3://b/m/reflectance.zarr",
+            "s3://b/m/sar_ascending.zarr",
+            "s3://b/m/sar_descending.zarr",
+        ]
