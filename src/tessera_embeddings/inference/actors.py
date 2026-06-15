@@ -44,13 +44,7 @@ logger = logging.getLogger(__name__)
 # strips resident at once, so the real ceiling is on the *pair* — hence the
 # budget is half of what we're willing to spend on bands overall. 4.5 GB/strip
 # => a 9 GB pair, which held peak host RAM under ~90% of the default 16 GB
-# worker box in the densest observed chunks. The old fixed 286-row height
-# (commit "Hard-code 286-row strip height") sized for that same pair but assumed
-# ~200 valid timesteps in *every* chunk and so split every chunk into 7 strips,
-# re-decompressing the shared (time=1,4000,4000) store chunks ~7x. Sizing from
-# each chunk's true post-prune T_kept (see _strip_height_for_density) instead
-# lets the sparse majority load in one full-height strip — 1x reads — while only
-# genuinely dense chunks split. The full-chunk SCL mask is resident across the
+# worker box in the densest observed chunks. The full-chunk SCL mask is resident across the
 # whole loop alongside the bands, so the sizer charges it against this budget too.
 _S2_STRIP_BYTE_BUDGET = int(4.5 * 1024**3)
 
