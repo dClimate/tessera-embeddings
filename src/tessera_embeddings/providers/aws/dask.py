@@ -187,9 +187,13 @@ def log_dashboard_ssm_command(
     try:
         scheduler = cluster.scheduler
         cluster_name, task_id = scheduler.task_arn.rsplit("/", 2)[1:]
-        runtime_id = scheduler.task["containers"][0]["runtimeId"]
+        # The scheduler task has multiple containers (dask-scheduler plus
+        # injected sidecars like the SSM/ECS-Exec guard); ordering isn't
+        # stable, so look up by name.
+        scheduler_container = next(c for c in scheduler.task["containers"] if c["name"] == "dask-scheduler")
+        runtime_id = scheduler_container["runtimeId"]
         ssm_target = f"ecs:{cluster_name}_{task_id}_{runtime_id}"
-    except (AttributeError, KeyError, IndexError, ValueError) as exc:
+    except (AttributeError, KeyError, IndexError, StopIteration, ValueError) as exc:
         log.warning("Could not build SSM dashboard command: %s", exc)
         return
 
