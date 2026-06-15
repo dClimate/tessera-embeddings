@@ -346,6 +346,31 @@ def _write_new(
     logger.info(f"Created {store_path}")
 
 
+def _commit_preserving_attrs(
+    session: "icechunk.Session",
+    write: "Callable[[icechunk.Session], None]",
+    message: str,
+    update_attrs: dict[str, Any] | None = None,
+) -> None:
+    """Run a ``to_icechunk`` write, then commit with root attrs preserved.
+
+    ``to_icechunk`` overwrites root attrs with the (typically empty)
+    ``data.attrs`` — destroying crs, ``_manifest``, etc. We snapshot them
+    before the write and restore (plus any ``update_attrs``) after, then commit.
+    Shared by the append and region-write paths.
+    """
+    root = zarr.open_group(session.store, mode="r")
+    preserved_attrs = dict(root.attrs)
+
+    write(session)
+
+    root = zarr.open_group(session.store, mode="r+")
+    root.attrs.update(preserved_attrs)
+    if update_attrs:
+        root.attrs.update(update_attrs)
+    session.commit(message)
+
+
 def _write_append(
     store_path: str,
     data: xr.Dataset,
@@ -356,18 +381,12 @@ def _write_append(
     repo = _open_repo(store_path)
     session = repo.writable_session("main")
 
-    # Snapshot root attrs before to_icechunk, which overwrites them with
-    # the (typically empty) data.attrs — destroying crs, _manifest, etc.
-    root = zarr.open_group(session.store, mode="r")
-    preserved_attrs = dict(root.attrs)
-
-    to_icechunk(data, session, mode="a", append_dim="time", align_chunks=True)
-
-    root = zarr.open_group(session.store, mode="r+")
-    root.attrs.update(preserved_attrs)
-    if update_attrs:
-        root.attrs.update(update_attrs)
-    session.commit(message)
+    _commit_preserving_attrs(
+        session,
+        lambda s: to_icechunk(data, s, mode="a", append_dim="time", align_chunks=True),
+        message,
+        update_attrs,
+    )
     logger.info(f"Appended to {store_path}")
 
 
@@ -432,8 +451,7 @@ def _pad_region_to_chunks(
     for dim, sl in region.items():
         cs = chunk_sizes[dim]
         size = existing.sizes[dim]
-        start = sl.start if sl.start is not None else 0
-        stop = sl.stop if sl.stop is not None else size
+        start, stop, _ = sl.indices(size)
         new_start = (start // cs) * cs
         new_stop = min(((stop + cs - 1) // cs) * cs, size)
         widened[dim] = slice(new_start, new_stop)
@@ -472,11 +490,7 @@ def _drop_region_coords(data: xr.Dataset, region_dims: "set[str]") -> xr.Dataset
     authoritative), and a region write requires every written variable to share
     a dim with the region — so coords spanning only non-region dims must go too.
     """
-    drop = [
-        name
-        for name in data.coords
-        if name in region_dims or not region_dims.intersection(data[name].dims)
-    ]
+    drop = [name for name in data.coords if name in region_dims or not region_dims.intersection(data[name].dims)]
     return data.drop_vars(drop)
 
 
@@ -493,23 +507,18 @@ def _write_region(
     repo = _open_repo(store_path, get_credentials=get_credentials, region=region_name)
     session = repo.writable_session("main")
 
-    # Snapshot root attrs: to_icechunk overwrites them with data.attrs.
-    root = zarr.open_group(session.store, mode="r")
-    preserved_attrs = dict(root.attrs)
-
     # Committed view of the store, used to pad unaligned regions. Nothing has
     # been written in this session yet, so this reflects committed data.
     existing = xr.open_zarr(session.store, consolidated=False)
     padded, widened = _pad_region_to_chunks(existing, data, region)
-
     to_write = _drop_region_coords(padded, set(widened))
-    to_icechunk(to_write, session, mode="r+", region=widened, align_chunks=True, split_every=8)
 
-    root = zarr.open_group(session.store, mode="r+")
-    root.attrs.update(preserved_attrs)
-    if update_attrs:
-        root.attrs.update(update_attrs)
-    session.commit(message)
+    _commit_preserving_attrs(
+        session,
+        lambda s: to_icechunk(to_write, s, mode="r+", region=widened, align_chunks=True, split_every=8),
+        message,
+        update_attrs,
+    )
     logger.info(f"Wrote region {widened} to {store_path}")
 
 

@@ -498,16 +498,21 @@ def _single_date_block(date, value, *, height, width, n0=0, e0=0, chunks=None):
     return ds.chunk(chunks) if chunks else ds
 
 
+def _make_region_store(local_zarr_path, sample_reflectance_data, dates, *, chunks=SPLIT_CHUNKS, name="rw"):
+    """Write a 1000x1000 reflectance store under ``name`` and return its path."""
+    data = sample_reflectance_data(dates, height=1000, width=1000)
+    store_path = str(local_zarr_path / name / "reflectance.zarr")
+    write_dataset(
+        store_path, data, tile_id="33UUP", baselines=dict.fromkeys(dates, 400), chunks=chunks, crs="EPSG:32615"
+    )
+    return store_path
+
+
 class TestResolveRegion:
     """Tests for coordinate-range -> integer-slice resolution."""
 
-    def _store(self, local_zarr_path, sample_reflectance_data, dates, *, chunks=SPLIT_CHUNKS):
-        data = sample_reflectance_data(dates, height=1000, width=1000)
-        store_path = str(local_zarr_path / "resolve" / "reflectance.zarr")
-        write_dataset(
-            store_path, data, tile_id="33UUP", baselines=dict.fromkeys(dates, 400), chunks=chunks, crs="EPSG:32615"
-        )
-        return store_path
+    def _store(self, local_zarr_path, sample_reflectance_data, dates):
+        return _make_region_store(local_zarr_path, sample_reflectance_data, dates, name="resolve")
 
     def test_single_date_resolves_to_one_index(self, local_zarr_path, sample_reflectance_data):
         dates = ["2024-01-01", "2024-01-06", "2024-01-11"]
@@ -585,13 +590,8 @@ class TestPadRegionToChunks:
 class TestWriteRegion:
     """End-to-end region overwrite tests."""
 
-    def _store(self, local_zarr_path, sample_reflectance_data, dates, *, chunks=SPLIT_CHUNKS, name="rw"):
-        data = sample_reflectance_data(dates, height=1000, width=1000)
-        store_path = str(local_zarr_path / name / "reflectance.zarr")
-        write_dataset(
-            store_path, data, tile_id="33UUP", baselines=dict.fromkeys(dates, 400), chunks=chunks, crs="EPSG:32615"
-        )
-        return store_path
+    def _store(self, local_zarr_path, sample_reflectance_data, dates, *, name="rw"):
+        return _make_region_store(local_zarr_path, sample_reflectance_data, dates, name=name)
 
     def test_overwrite_full_timestep(self, local_zarr_path, sample_reflectance_data):
         """Overwriting one date leaves the others byte-for-byte intact."""
