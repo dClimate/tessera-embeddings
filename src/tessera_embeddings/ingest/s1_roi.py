@@ -158,6 +158,8 @@ def ingest_s1_roi_sar(
         batch_start_str = batch_start.strftime("%Y-%m-%d")
         batch_end_str = batch_end.strftime("%Y-%m-%d")
 
+        log.info("[%s] Batch %s..%s: querying catalog", orbit, batch_start_str, batch_end_str)
+
         # Re-read existing dates each batch so prior-batch writes are skipped.
         existing_dates = get_existing_dates(orbit_store)
 

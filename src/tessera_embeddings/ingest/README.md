@@ -60,14 +60,17 @@ only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equiva
 property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbox()`.
 
 `_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry`
-passed into `StacApiIO` (`max_retries=Retry(total=8, backoff_factor=2,
-status_forcelist=(429, 500, 502, 503, 504))`). Because `search.items()` paginates
-lazily, each page fetch is a separate HTTP call — configuring retries on the underlying
-`HTTPAdapter` means a transient 5xx on page N is retried in place, instead of throwing
-away prior pages and restarting the whole query. This matters most for CMR-STAC, which
-returns 502/503 under load on large date-range queries. Note that `StacApiIO`'s default
-`max_retries=5` passes a bare int to urllib3, which has an empty `status_forcelist` and
-therefore does **not** retry 5xx responses — the explicit `Retry` object is required.
+built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed
+into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504)`).
+The subclass logs each retry attempt at WARNING — urllib3 otherwise retries silently inside
+the `HTTPAdapter`, making a slow query indistinguishable from a hang. Because
+`search.items()` paginates lazily, each page fetch is a separate HTTP call — configuring
+retries on the underlying `HTTPAdapter` means a transient 5xx on page N is retried in
+place, instead of throwing away prior pages and restarting the whole query. This matters
+most for CMR-STAC, which returns 502/503 under load on large date-range queries. Note that
+`StacApiIO`'s default `max_retries=5` passes a bare int to urllib3, which has an empty
+`status_forcelist` and therefore does **not** retry 5xx responses — the explicit `Retry`
+object is required.
 
 Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
 cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
