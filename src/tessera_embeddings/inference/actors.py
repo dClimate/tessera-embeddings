@@ -351,7 +351,7 @@ class InferenceActor:
             # full representation width for smaller (test) models.
             save_dim = min(EMBEDDING_DIM, self.config.representation_dim)
             embeddings = np.zeros((chunk.height, chunk.width, save_dim), dtype=np.int8)
-            scales = np.full((chunk.height, chunk.width), 1e-8, dtype=np.float32)
+            scales = np.full((chunk.height, chunk.width), np.nan, dtype=np.float32)
 
             writer = ZarrWriter(staging_base, embedding_dim=save_dim)
 
@@ -425,10 +425,11 @@ class InferenceActor:
                     )
 
                     if len(dataset) == 0:
-                        # Empty strip: leave its output rows at the zero/1e-8
-                        # initialised value, mirroring run_inference's handling
-                        # of fully-invalid chunks. The strip still contributes
-                        # its (zero) obs counts, already written above.
+                        # Empty strip: leave its output rows at the initialised
+                        # zero embeddings / NaN scale, mirroring run_inference's
+                        # handling of fully-invalid chunks and the NaN convention
+                        # for "no embedding here" (see #39). The strip still
+                        # contributes its (zero) obs counts, already written above.
                         logger.info("Chunk %s strip %s: no valid pixels, leaving zero-filled", chunk.label, strip)
                         continue
 

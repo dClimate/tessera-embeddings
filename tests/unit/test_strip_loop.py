@@ -201,7 +201,9 @@ class TestProcessChunkStriping:
         # pixels go through the model, but float accumulation order differs
         # slightly across batch groupings. The drift is well below the int8
         # quantization step, so dequantized values are indistinguishable.
-        np.testing.assert_allclose(write_one["scales"], write_many["scales"], rtol=1e-6, atol=1e-10)
+        # equal_nan: ungenerated pixels carry a NaN scale in both tilings, and
+        # the same pixels are ungenerated regardless of how the input is striped.
+        np.testing.assert_allclose(write_one["scales"], write_many["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
         for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
             np.testing.assert_array_equal(write_one["obs_counts"][var], write_many["obs_counts"][var], err_msg=var)
 
