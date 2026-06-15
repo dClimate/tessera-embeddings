@@ -397,6 +397,7 @@ class TestSharedMaskBundle:
             b_idx = np.where(bundled.s2_doys == doy)[0]
             assert b_idx.size == 1, f"doy {doy} missing from bundled strip"
             np.testing.assert_array_equal(inline.s2_bands[d_idx], bundled.s2_bands[b_idx[0]], err_msg=f"doy={doy}")
+            np.testing.assert_array_equal(inline.s2_masks[d_idx], bundled.s2_masks[b_idx[0]], err_msg=f"doy={doy}")
         np.testing.assert_array_equal(inline.s2_obs_count, bundled.s2_obs_count)
 
 
