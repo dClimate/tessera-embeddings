@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
     import torch
 
-    from tessera_embeddings.inference.data_loading import ChunkData
+    from tessera_embeddings.inference.data_loading import ChunkData, S2MaskBundle
     from tessera_embeddings.inference.models.ssl_model import MultimodalBTInferenceModel
 
 logger = logging.getLogger(__name__)
@@ -355,7 +355,10 @@ class InferenceActor:
 
             writer = ZarrWriter(staging_base, embedding_dim=save_dim)
 
-            def _load_strip(y_sub: slice) -> ChunkData:
+            # mask_bundle is passed as an explicit submit() arg rather than
+            # captured, so the loop can `del` the only strong reference once the
+            # last strip has loaded (a closure capture can't be deleted).
+            def _load_strip(y_sub: slice, bundle: S2MaskBundle) -> ChunkData:
                 return load_chunk(
                     chunk,
                     mosaic_base,
@@ -363,7 +366,7 @@ class InferenceActor:
                     s1_orbit=self.config.s1_orbit,
                     y_sub=y_sub,
                     store_opener=store_opener,
-                    mask_bundle=mask_bundle,
+                    mask_bundle=bundle,
                 )
 
             on_batch = (
@@ -382,7 +385,7 @@ class InferenceActor:
             # 1-deep prefetch pipeline: strip i+1 loads while strip i runs
             # inference (same shape as inference.run_inference's prefetcher).
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="strip-prefetch") as pool:
-                next_future = pool.submit(_load_strip, strips[0]) if strips else None
+                next_future = pool.submit(_load_strip, strips[0], mask_bundle) if strips else None
 
                 # Bound to None so the first iteration's `del` has a target; each
                 # iteration rebinds both before use.
@@ -408,7 +411,7 @@ class InferenceActor:
                     chunk_data = next_future.result()
 
                     # Kick off the next strip's load before running inference on this one.
-                    next_future = pool.submit(_load_strip, strips[i + 1]) if i + 1 < len(strips) else None
+                    next_future = pool.submit(_load_strip, strips[i + 1], mask_bundle) if i + 1 < len(strips) else None
 
                     for var in OBS_COUNT_VARS:
                         arr = getattr(chunk_data, var)
@@ -433,6 +436,12 @@ class InferenceActor:
                     embeddings[strip] = result.embeddings
                     scales[strip] = result.scales
                     total_valid += len(dataset)
+
+            # All strips done: the last strip's inputs and the full-chunk SCL
+            # mask are no longer needed (obs counts and embeddings already live
+            # in the whole-chunk output buffers). Free them before the S3 write
+            # so peak RAM doesn't carry a dead strip + mask through the write.
+            del chunk_data, dataset, mask_bundle
 
             if total_valid == 0:
                 # Every strip was empty. ROI pre-filter means chunks get here
