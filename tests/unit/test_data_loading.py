@@ -389,9 +389,7 @@ class TestSharedMaskBundle:
             bundled = load_chunk(
                 self._CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="both", y_sub=strip, mask_bundle=bundle
             )
-            inline = load_chunk(
-                self._CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="both", y_sub=strip
-            )
+            inline = load_chunk(self._CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="both", y_sub=strip)
         # The bundle prunes at the chunk level while the inline strip prunes on
         # its own rows, so the bundled strip may carry extra (strip-empty)
         # timesteps. Align on doys and compare the shared timesteps' bands/masks.

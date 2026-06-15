@@ -21,6 +21,7 @@ import tessera_embeddings.inference.data_loading as _dl_mod
 from tessera_embeddings.config.inference import S2_BAND_ORDER
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.actors import (
+    _MIN_STRIP_H,
     _S2_STRIP_BYTE_BUDGET,
     InferenceActor,
     _strip_height_for_density,
@@ -44,25 +45,31 @@ class TestStripSlices:
 
 
 class TestStripHeightForDensity:
-    """The density-based strip sizer keeps a strip's S2 bands under budget."""
+    """The density-based strip sizer keeps a strip's S2 working set under budget."""
 
     def test_resident_bytes_stay_under_budget(self):
-        # 10 bands x uint16 = 20 bytes per (obs, px).
-        for t_kept, width in [(50, 2000), (200, 2000), (1, 4000), (180, 1000)]:
-            h = _strip_height_for_density(t_kept, width)
+        # 10 bands x uint16 = 20 bytes per (obs, px). The resident pair is two
+        # band strips plus the single shared full-chunk mask; it must fit twice
+        # the per-strip budget, for every case that sizes above the floor.
+        for t_kept, width, height in [(50, 2000, 2000), (200, 2000, 2000), (1, 4000, 4000), (180, 1000, 1000)]:
+            h = _strip_height_for_density(t_kept, width, height)
             assert h >= 1
-            resident = t_kept * h * width * len(S2_BAND_ORDER) * 2
-            assert resident <= _S2_STRIP_BYTE_BUDGET
+            if h <= _MIN_STRIP_H:
+                continue  # floored case may breach the budget by design
+            mask_bytes = t_kept * height * width
+            pair = 2 * t_kept * h * width * len(S2_BAND_ORDER) * 2 + mask_bytes
+            assert pair <= 2 * _S2_STRIP_BYTE_BUDGET
 
     def test_sparser_chunks_get_taller_strips(self):
         # Fewer timesteps -> a taller strip fits the same byte budget.
-        sparse = _strip_height_for_density(20, 2000)
-        dense = _strip_height_for_density(200, 2000)
+        sparse = _strip_height_for_density(20, 2000, 2000)
+        dense = _strip_height_for_density(200, 2000, 2000)
         assert sparse > dense
 
-    def test_extreme_density_floors_at_one_row(self):
-        # A pathologically dense chunk still makes progress one row at a time.
-        assert _strip_height_for_density(10**9, 4000) == 1
+    def test_extreme_density_floors_at_min_strip_h(self):
+        # A pathologically dense chunk bottoms out at the floor (breaching the
+        # byte budget, logged) rather than degenerating into tiny reads.
+        assert _strip_height_for_density(10**9, 4000, 4000) == _MIN_STRIP_H
 
 
 # ---------------------------------------------------------------------------
