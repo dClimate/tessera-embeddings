@@ -19,7 +19,6 @@ from odc.geo.geobox import GeoBox
 from pystac import Item
 from pystac_client import Client
 from pystac_client.stac_api_io import StacApiIO
-from urllib3.util.retry import Retry
 
 from tessera_embeddings.config import (
     PROVIDERS,
@@ -30,6 +29,7 @@ from tessera_embeddings.config import (
 )
 from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
+from tessera_embeddings.ingest._http import make_logging_retry
 
 # =============================================================================
 # GDAL/Rasterio Configuration
@@ -58,7 +58,9 @@ def chunks_to_odc(chunks: dict[str, int]) -> dict[str, int]:
 
 logger = logging.getLogger(__name__)
 
-_STAC_RETRY = Retry(
+
+_STAC_RETRY = make_logging_retry(
+    "STAC",
     total=8,
     backoff_factor=2,
     status_forcelist=(429, 500, 502, 503, 504),
@@ -467,13 +469,13 @@ def _query_stac_items(
     query_params = _build_stac_query(collection_config, tile_id, start_date, end_date, bbox=bbox)
 
     t0 = time.monotonic()
-    logger.debug(f"Opening STAC catalog: {provider.catalog_url}")
+    logger.info(f"Opening STAC catalog: {provider.catalog_url}")
     stac_io = StacApiIO(max_retries=_STAC_RETRY, timeout=_STAC_TIMEOUT)
     client = Client.open(provider.catalog_url, stac_io=stac_io)
-    logger.debug(f"STAC catalog opened in {time.monotonic() - t0:.1f}s, executing search")
+    logger.info(f"STAC catalog opened in {time.monotonic() - t0:.1f}s, executing search")
     search = client.search(**query_params, limit=250, max_items=None)
     items = list(search.items())
-    logger.debug(f"STAC query returned {len(items)} items in {time.monotonic() - t0:.1f}s total")
+    logger.info(f"STAC query returned {len(items)} items in {time.monotonic() - t0:.1f}s total")
 
     return items
 

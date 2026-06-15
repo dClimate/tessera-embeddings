@@ -9,6 +9,7 @@ derive the CRS, and prepare items for loading.
 from __future__ import annotations
 
 import logging
+import time
 import warnings
 from collections import defaultdict
 from collections.abc import Callable
@@ -18,9 +19,9 @@ from typing import Any
 import mgrs
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from tessera_embeddings.config import S1_OPERA_BANDS
+from tessera_embeddings.ingest._http import make_logging_retry
 from tessera_embeddings.ingest.auth import get_edl_session, resolve_item_assets, rewrite_assets_to_s3
 
 logger = logging.getLogger(__name__)
@@ -31,10 +32,12 @@ _CMR_GRANULE_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
 _CMR_OPERA_SHORT_NAME = "OPERA_L2_RTC-S1_V1"
 _CMR_PROVIDER = "ASF"
 
+
 # CMR intermittently times out or returns 5xx under load. urllib3's Retry
 # retries read timeouts (``read`` defaults to ``total``) as well as the
 # listed statuses, with exponential backoff honoring Retry-After.
-_CMR_RETRY = Retry(
+_CMR_RETRY = make_logging_retry(
+    "CMR",
     total=6,
     backoff_factor=2,
     status_forcelist=(429, 500, 502, 503, 504),
@@ -170,8 +173,12 @@ def _query_cmr_granule_ids(
     ids: set[str] = set()
     headers: dict[str, str] = {}
 
+    logger.info(f"CMR orbit query ({orbit_direction}) starting for {start_date}..{end_date} bbox={bbox}")
+    t0 = time.monotonic()
     session = _cmr_session()
+    page = 0
     while True:
+        page += 1
         resp = session.get(_CMR_GRANULE_URL, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
         body = resp.json()
@@ -181,6 +188,10 @@ def _query_cmr_granule_ids(
             break
 
         ids.update(entry["producer_granule_id"] for entry in entries)
+        logger.info(
+            f"CMR orbit query ({orbit_direction}): page {page} returned {len(entries)} entries "
+            f"({len(ids)} granules so far, {time.monotonic() - t0:.1f}s)"
+        )
 
         search_after = resp.headers.get("CMR-Search-After")
         if search_after and len(entries) == params["page_size"]:
@@ -188,7 +199,10 @@ def _query_cmr_granule_ids(
         else:
             break
 
-    logger.debug(f"CMR orbit query ({orbit_direction}): {len(ids)} granules for bbox={bbox}")
+    logger.info(
+        f"CMR orbit query ({orbit_direction}): {len(ids)} granules across {page} page(s) "
+        f"in {time.monotonic() - t0:.1f}s"
+    )
     return ids
 
 
