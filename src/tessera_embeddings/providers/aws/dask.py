@@ -49,7 +49,7 @@ from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_fixe
 # Default Fargate task sizes for ingest workloads. Callers can override
 # per-call via ``ecs_cluster``'s ``worker_cpu`` / ``worker_mem`` arguments.
 DEFAULT_INGEST_WORKER_CPU = 4096
-DEFAULT_INGEST_WORKER_MEM = 8192
+DEFAULT_INGEST_WORKER_MEM = 16384
 
 # Schedulers don't need much memory but benefit from a few cores so
 # graph construction and dashboard responsiveness stay smooth.
