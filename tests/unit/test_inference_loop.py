@@ -125,6 +125,36 @@ class TestPrepareGpu:
         for name, param in test_model.named_parameters():
             torch.testing.assert_close(param, params_before[name])
 
+    def test_dtype_conversion_is_idempotent(self, test_model, monkeypatch):
+        """Re-running on an already-converted model skips the re-cast.
+
+        Actors reuse one persistent model across every strip, so _prepare_gpu
+        is invoked once per strip. The cast must happen on the first call and
+        be skipped thereafter — hoisting the one-time cost off the per-strip
+        path. Simulated with a CUDA device + bf16 support so no GPU is needed.
+        """
+        device = torch.device("cuda")
+        monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+        # Profiling/diagnostics helpers touch real CUDA; stub them out.
+        monkeypatch.setattr("tessera_embeddings.inference.inference.log_cuda_diagnostics", lambda *a, **k: None)
+        monkeypatch.setattr("tessera_embeddings.inference.inference.log_autocast_dtype_probe", lambda *a, **k: None)
+
+        casts = {"count": 0}
+        real_bfloat16 = test_model.bfloat16
+
+        def counting_bfloat16():
+            casts["count"] += 1
+            return real_bfloat16()
+
+        monkeypatch.setattr(test_model, "bfloat16", counting_bfloat16)
+
+        first = _prepare_gpu(test_model, device)
+        second = _prepare_gpu(test_model, device)
+
+        assert first == torch.bfloat16
+        assert second == torch.bfloat16
+        assert casts["count"] == 1  # converted once, skipped on the second call
+
 
 class TestProcessSubBatch:
     """Tests for the split _prepare_batch / _run_gpu_sub_batch helpers."""

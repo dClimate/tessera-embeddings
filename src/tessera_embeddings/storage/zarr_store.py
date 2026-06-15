@@ -185,24 +185,30 @@ def _create_storage(
     return icechunk.local_filesystem_storage(local_path)
 
 
-# Per-repo chunk cache budget. Inference reads each (time=1, 4000, 4000) store
-# chunk once per spatial strip; when a dense chunk is split into northing strips
-# the same on-disk chunk is touched by every strip, so an LRU chunk cache turns
-# the per-strip re-reads into cache hits. 512 MB holds enough decoded chunks to
-# keep the measured strip read penalty at ~1.35x (vs 2.37x uncached), which
-# stays under the per-chunk compute envelope and is hidden by the strip prefetch
-# pipeline. Applied to every repo open — the cache is bounded and harmless for
-# write paths that never re-read.
-_CHUNK_CACHE_BYTES = 512 * 1024**2
-
-
 def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk.RepositoryConfig:
     """Build the RepositoryConfig overrides applied to every repo open.
 
-    Always sets a bounded chunk cache (see ``_CHUNK_CACHE_BYTES``) so striped
-    inference reads hit cache instead of re-fetching shared store chunks.
+    Leaves icechunk's chunk cache at its (small) default. An earlier version
+    set a 512 MB chunk cache to absorb the per-strip re-reads of striped
+    inference, but a real-store A/B showed it does not help the path it was
+    meant for:
+      * icechunk caches *compressed* chunk bytes and decompresses above the
+        cache, so a hit saves the S3 GET but not the (zstd) decode — it cannot
+        relieve a decompression-bound load.
+      * a dense strip reads all 10 S2 bands x T_kept timesteps band-major, a
+        working set ~8-16x the 512 MB cache, so cross-strip reuse thrashes to a
+        ~0% hit rate (measured: a cache 8x smaller than the working set was no
+        faster than no cache at all, and slightly slower from bookkeeping).
+      * density-based striping (actors._strip_height_for_density) now loads the
+        sparse majority of chunks in a single full-height strip, so they have
+        no per-strip re-reads for a cache to serve in the first place.
+    The 512 MB also cost ~1.5 GB resident (three stores opened per chunk)
+    competing with the per-strip band budget on a 16 GB worker. Sizing the
+    cache to a whole strip (~9 GB) would make hits land, but only fits 32 GB
+    boxes; the principled alternative is band-interleaved reads (reuse distance
+    10 chunks instead of 10 x T_kept). Neither is enabled here.
 
-    When ``max_concurrent_requests`` is provided, also caps per-repo HTTP
+    When ``max_concurrent_requests`` is provided, caps per-repo HTTP
     concurrency. Assembly at cornbelt scale fans out thousands of concurrent
     PUTs to one zarr prefix, blowing past S3's ~3.5K/s per-prefix limit and
     triggering 503 SlowDown. Icechunk's default is 256 concurrent HTTP
@@ -212,7 +218,6 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     classified as retriable by the underlying AWS SDK.
     """
     config = icechunk.RepositoryConfig.default()
-    config.caching = icechunk.CachingConfig(num_bytes_chunks=_CHUNK_CACHE_BYTES)
     if max_concurrent_requests is not None:
         config.max_concurrent_requests = max_concurrent_requests
     return config

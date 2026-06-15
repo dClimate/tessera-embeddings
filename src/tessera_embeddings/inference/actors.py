@@ -26,7 +26,7 @@ import requests
 from tessera_embeddings.config.inference import EMBEDDING_DIM, S2_BAND_ORDER, InferenceConfig
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.inference.data_loading import count_s2_window_timesteps, load_chunk, make_store_opener
+from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 
 if TYPE_CHECKING:
@@ -39,72 +39,37 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Floor on derived strip height. A strip narrower than this reads so few
-# northing rows that the per-strip fixed overhead (window-time filter, zarr
-# group open, dataset bucketing) dominates and read amplification climbs without
-# meaningfully lowering peak RAM. Dense chunks bottom out here rather than
-# degenerating into hundreds of one-row reads.
-_MIN_STRIP_H = 256
+# Host-RAM budget (bytes) for the resident S2 reflectance working set of a
+# single strip. The S2 bands dominate the input footprint, and the 1-deep strip
+# prefetch keeps two strips resident at once, so the real ceiling is on the
+# *pair* — hence the strip budget is half of what we're willing to spend on S2
+# bands overall. 4.5 GB/strip => a 9 GB pair, which held peak host RAM under
+# ~90% of the default 16 GB worker box in the densest observed chunks. The old
+# fixed 286-row height (commit "Hard-code 286-row strip height") sized for that
+# same pair but assumed ~200 valid timesteps in *every* chunk and so split every
+# chunk into 7 strips, re-decompressing the shared (time=1,4000,4000) store
+# chunks ~7x. Sizing from each chunk's true post-prune T_kept (see
+# _strip_height_for_density) instead lets the sparse majority load in one
+# full-height strip — 1x reads — while only genuinely dense chunks split.
+_S2_STRIP_BYTE_BUDGET = int(4.5 * 1024**3)
 
-# Bytes per northing row of resident S2 *input* — the dominant term in the
-# per-chunk working set (masks at 1 byte/elem and SAR at ~10x fewer timesteps
-# are second order). One row is W * 10 bands * 2 bytes (uint16) * T_estimate;
-# this constant is the per-(row, timestep) part, multiplied by W and T at call
-# time.
-_S2_BYTES_PER_ROW_TIMESTEP = len(S2_BAND_ORDER) * np.dtype(np.uint16).itemsize
+# Per-(timestep, pixel) byte cost of resident S2 bands: 10 bands x uint16.
+_S2_BYTES_PER_OBS_PX = len(S2_BAND_ORDER) * 2
 
 
-def _compute_strip_height(*, height: int, width: int, t_estimate: int, strip_budget_bytes: int) -> int:
-    """Derive the northing strip height that keeps resident input under budget.
+def _strip_height_for_density(t_kept: int, width: int) -> int:
+    """Largest northing strip height (rows) whose S2 band working set fits budget.
 
-    The resident input is dominated by the S2 band array, ``T * W * 10 * 2``
-    bytes, which scales linearly in the northing extent. The strip loop in
-    ``process_chunk`` runs a 1-deep prefetch, so when a chunk splits the next
-    strip loads while the current one is still live — *two* strips coexist. We
-    therefore size against half the budget once striping kicks in, so that pair
-    stays under ``strip_budget_bytes`` rather than peaking at ~2x it.
-
-    A chunk whose whole-height footprint already fits the budget loads as a
-    single strip (no prefetched neighbour to coexist with) — byte-for-byte the
-    unstriped path, sized against the full budget. Otherwise we solve for the
-    largest strip height whose S2 band footprint fits ``strip_budget_bytes / 2``
-    and clamp it to ``[_MIN_STRIP_H, height]``. ``t_estimate`` of 0 (no
-    timesteps) returns the full height.
+    A strip's resident S2 bands cost ``t_kept * strip_h * width *
+    _S2_BYTES_PER_OBS_PX`` bytes; solve for the tallest ``strip_h`` under
+    ``_S2_STRIP_BYTE_BUDGET``. ``t_kept`` is this chunk's true post-prune valid
+    timestep count (from the shared full-chunk SCL mask), so sparse chunks get
+    tall strips — often the whole 2000-row chunk in one piece — and only dense
+    chunks split. Always at least 1 row so a pathologically dense chunk still
+    makes progress.
     """
-    if t_estimate <= 0:
-        return height
-    bytes_per_row = width * t_estimate * _S2_BYTES_PER_ROW_TIMESTEP
-    if bytes_per_row <= 0:
-        return height
-    # Single strip if the whole chunk fits — no prefetched neighbour to bound.
-    if height * bytes_per_row <= strip_budget_bytes:
-        return height
-    # Striping is active: two strips are resident under the prefetch, so each
-    # must fit half the budget for the pair to stay within it.
-    budget_strip_h = (strip_budget_bytes // 2) // bytes_per_row
-    strip_h = max(_MIN_STRIP_H, min(int(budget_strip_h), height))
-    if strip_h > budget_strip_h and strip_h < height:
-        # _MIN_STRIP_H floored the strip above the budget-derived height, so the
-        # two prefetched strips will exceed strip_budget_bytes. We deliberately
-        # honour the floor rather than degenerate into tiny high-overhead reads
-        # (see _MIN_STRIP_H), but warn loudly so an OOM here is traceable to a
-        # budget set too low for this chunk's T/W rather than looking like a
-        # silent breach of the documented bound.
-        pair_bytes = 2 * strip_h * bytes_per_row
-        logger.warning(
-            "Strip floor _MIN_STRIP_H=%d overrides the byte budget: "
-            "budget-derived strip_h=%d, using %d. Resident input pair ~%.2f GiB "
-            "exceeds strip_budget_bytes=%.2f GiB (W=%d, T_estimate=%d). Raise "
-            "strip_budget_bytes or lower W/T to restore the 2-strip bound.",
-            _MIN_STRIP_H,
-            int(budget_strip_h),
-            strip_h,
-            pair_bytes / 1024**3,
-            strip_budget_bytes / 1024**3,
-            width,
-            t_estimate,
-        )
-    return strip_h
+    per_row = max(1, t_kept) * width * _S2_BYTES_PER_OBS_PX
+    return max(1, _S2_STRIP_BYTE_BUDGET // per_row)
 
 
 def _strip_slices(height: int, strip_h: int) -> list[slice]:
@@ -315,29 +280,32 @@ class InferenceActor:
             tracker.report.remote(chunk.label, 0, 0, "loading")  # type: ignore[union-attr]
 
         try:
-            # Share one set of repo handles across the probe and every strip so
-            # the 512 MB icechunk chunk cache persists for the whole chunk:
-            # overlapping strips re-touch the same store chunks, so a warm cache
-            # turns those re-reads into hits instead of cold S3 fetches.
+            # Share one set of repo handles across every strip so a split chunk
+            # re-paying the icechunk repo open + manifest load per strip is
+            # avoided (see make_store_opener). Chunk *data* re-reads are not
+            # cached — a dense strip's working set dwarfs the chunk cache.
             store_opener = make_store_opener()
 
-            # Size northing strips from the byte budget so a dense chunk's
-            # resident *input* stays bounded. Probe the window timestep count
-            # from the 1-D time coord (cheap, no spatial read) to estimate T
-            # before the first full load. A normal-density chunk resolves to a
-            # single full-height strip — byte-for-byte the unstriped path.
-            t_estimate = count_s2_window_timesteps(mosaic_base, self.config.time_window, store_opener=store_opener)
-            strip_h = _compute_strip_height(
-                height=chunk.height,
-                width=chunk.width,
-                t_estimate=t_estimate,
-                strip_budget_bytes=self.config.strip_budget_bytes,
+            # Load the full-chunk S2 SCL mask once: it (a) gives this chunk's
+            # true post-prune valid-timestep count T_kept, used to size the
+            # strip height to the chunk's actual density, and (b) is sliced per
+            # strip so SCL is decompressed once instead of once per strip. SCL is
+            # 1 byte/px vs reflectance's 20, so this is a cheap up-front read.
+            mask_bundle = load_s2_mask_bundle(
+                mosaic_base, chunk, self.config.time_window, store_opener=store_opener
             )
+            t_kept = int(mask_bundle.mask.shape[0])
+
+            # Size strips from the chunk's real density rather than a fixed
+            # height: sparse chunks (the majority) fit in one full-height strip
+            # and pay 1x reflectance reads; only dense chunks split. A strip's
+            # resident S2 bands are bounded by _S2_STRIP_BYTE_BUDGET.
+            strip_h = _strip_height_for_density(t_kept, chunk.width)
             strips = _strip_slices(chunk.height, strip_h)
             logger.info(
-                "Chunk %s: T_estimate=%d, strip_h=%d -> %d strip(s)",
+                "Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s)",
                 chunk.label,
-                t_estimate,
+                t_kept,
                 strip_h,
                 len(strips),
             )
@@ -360,6 +328,7 @@ class InferenceActor:
                     s1_orbit=self.config.s1_orbit,
                     y_sub=y_sub,
                     store_opener=store_opener,
+                    mask_bundle=mask_bundle,
                 )
 
             on_batch = (
@@ -398,7 +367,7 @@ class InferenceActor:
                     # dataset retains chunk_data.s2_bands (dataset.py), so without
                     # this drop the prior strip's dataset, the current strip, and
                     # the prefetched next strip could all be resident at once —
-                    # three strips, though _compute_strip_height sizes for two.
+                    # three strips, though the strip budget is sized for two.
                     del chunk_data, dataset
 
                     chunk_data = next_future.result()

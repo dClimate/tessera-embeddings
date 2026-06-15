@@ -163,36 +163,41 @@ are loaded through a 1-deep prefetch pipeline (strip *i+1* loads while strip *i*
 GPU), the same pattern as the sub-batch prefetcher in `inference.py`.
 
 ```text
-whole-chunk footprint = T_estimate × H × W × 10 × 2
-  ≤ strip_budget_bytes               → 1 strip → byte-for-byte the unstriped path
-  >  strip_budget_bytes (striping on) → strip_h = (strip_budget_bytes / 2) / (T_estimate × W × 10 × 2)
-                                        clamped to [256, H]
-  T_estimate ≈ 40  → fits → 1 strip
-  T_estimate ≈ 120 → strip_h ≈ 445 → 5 strips → two resident strips stay under budget
+strip height = density-sized (actors._strip_height_for_density)
+  budget per strip = _S2_STRIP_BYTE_BUDGET (4.5 GB of resident S2 bands)
+  strip_h = budget / (T_kept × W × 20 bytes)          # 10 bands × uint16
+  sparse chunk (e.g. T_kept=30) → strip_h ≥ 2000 → 1 strip, 1× reads
+  dense  chunk (e.g. T_kept=200) → strip_h ≈ 286 → ~7 strips
 ```
 
-The strip loop runs a 1-deep prefetch (strip *i+1* loads while strip *i* runs the GPU), so
-once a chunk splits **two strips are resident at once**. Strips are therefore sized against
-*half* the budget when striping is active, so the prefetched pair peaks under
-`strip_budget_bytes` rather than ~2× it; a chunk whose whole-height footprint already fits the
-budget loads as a single strip (no prefetched neighbour) sized against the full budget.
+The strip height is derived per chunk from its **true post-prune timestep count** `T_kept`,
+read from a full-chunk SCL mask loaded once up front (see below). The strip loop runs a 1-deep
+prefetch (strip *i+1* loads while strip *i* runs the GPU), so once a chunk splits **two strips
+are resident at once**; the byte budget is the bound on a single strip, sized so the pair holds
+under ~90% of the default 16 GB worker box. A chunk that fits in one strip loads whole (no
+prefetched neighbour) — byte-for-byte the unstriped path.
 
-`T_estimate` comes from `count_s2_window_timesteps`, which reads only the 1-D `time`
-coordinate (no spatial read) — an upper bound on `T_valid`, so strip sizing is conservative.
-The byte budget is `InferenceConfig.strip_budget_bytes` (default 4 GiB): lower it to force
-narrower strips (lower peak RAM, higher read amplification); raise it past the whole-chunk
-footprint to disable striping. **Striping is the only lever that makes peak RAM independent
-of observation density** — every other lever lowers the plateau by a fixed amount.
+Sizing from real density is what keeps the read cost low. The earlier design used a **fixed**
+286-row height sized for the worst case (~200 observations) and so split *every* chunk into 7
+strips, re-decompressing the shared `(time=1, 4000, 4000)` store chunks ~7×. But dense chunks
+are the rare case: the **majority of chunks are sparse**, fit in a single full-height strip,
+and now pay **1× reflectance reads**. Only genuinely dense chunks split, and for those the
+re-read penalty is proportional to their (larger) compute time and stays hidden behind the
+prefetch pipeline.
 
-Read cost: strips overlap shared `(time=1, 4000, 4000)` store chunks, so a split chunk
-re-touches the same on-disk chunks once per strip. The icechunk repo is opened with a 512 MB
-chunk cache (`zarr_store.py::_default_repo_config`), but that cache lives on the repo handle —
-so the strip loop opens each store **once per chunk** (`data_loading.make_store_opener`) and
-reuses the handle (and its warm cache) across every strip, rather than reopening cold per
-strip and discarding the cache. Those re-reads then hit cache rather than re-fetching S3 —
-measured strip read penalty ~1.35× (vs 2.37× uncached) on a dense chunk, which stays under the
-per-chunk compute time and is hidden by the prefetch pipeline. Normal single-strip chunks pay
-nothing.
+Two reads are decoupled. **SCL** (1 byte/px) is loaded once for the whole chunk
+(`load_s2_mask_bundle`) and sliced per strip — it is never re-decompressed, and it doubles as
+the `T_kept` source for sizing. **Reflectance bands** (20 bytes/px) are still read per strip on
+the chunks that split; that per-strip read is exactly the working set the byte budget bounds.
+
+No chunk cache absorbs those per-strip band re-reads, by design. A real-store A/B (see
+`zarr_store._default_repo_config`) found the former 512 MB icechunk chunk cache useless on this
+path: icechunk caches *compressed* bytes and zstd-decodes above the cache, so a hit saves the
+S3 GET but never the decompression; and a dense strip's band-major working set (10 bands ×
+`T_kept`) runs ~8–16× the cache, thrashing to a ~0% cross-strip hit rate (measured: a cache 8×
+under the working set was no faster than no cache). Density sizing is the lever — sparse chunks
+don't re-read at all, and the shared repo handle (`data_loading.make_store_opener`) only
+amortises the repo open / manifest load, not chunk data.
 
 #### 4b. Valid Pixel Filtering + Bucketing (`dataset.py`)
 
@@ -428,7 +433,6 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | `latent_dim` | 192 | Transformer hidden dim (must match checkpoint) |
 | `representation_dim` | 192 | Model output dim; first 128 dims are saved to the store |
 | `dim_feedforward` | 2048 | Transformer FFN width |
-| `strip_budget_bytes` | 4 GiB | Byte budget for one resident input strip; bounds peak load RAM independent of T (see 4a′). Lower → narrower strips; raise past the whole-chunk footprint to disable striping |
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
 **Architecture params** (`nhead`, `num_encoder_layers`, `dim_feedforward`, etc.) **must match
