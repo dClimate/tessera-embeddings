@@ -11,7 +11,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | Module | Purpose |
 |---|---|
 | `stac.py` | STAC-based data loading via `odc.stac.load`. Handles multiple providers (Earth Search, Planetary Computer), S2 baseline correction, and date filtering. |
-| `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, orbit-direction filtering via native CMR Granule Search API (CMR-STAC silently ignores the `query` extension), UTM EPSG derivation, and asset preparation. |
+| `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, item construction from the native CMR Granule Search API (bypasses CMR-STAC search; orbit-direction filtered server-side), UTM EPSG derivation, and asset preparation. |
 | `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary STS credentials) and legacy CloudFront signed URL resolution. |
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
@@ -24,15 +24,17 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 The high-level entry point is `ingest_tile()` in `stac.py`. It runs five stages in sequence:
 
 ```text
-1. STAC query        — find items for the tile/bbox + date range
-2. Item filtering    — apply sensor-specific pre-filters (e.g. orbit direction for S1)
+1. Item query        — find items for the tile/bbox + date range (S1: native CMR
+                       granule query, orbit-filtered server-side)
+2. Item filtering    — optional item_filter_fn pre-filter hook
 3. Date dedup        — drop items whose dates are already in the Zarr store
 4. odc.stac.load     — lazy-load COGs into a Dask-backed xarray Dataset
 5. Corrections       — baseline correction (S2) or dB conversion (S1)
 ```
 
-`query_stac_items` and `load_stac_items` expose these stages separately for flows that need
-to check for new data before spinning up a Dask cluster (see `has_new_stac_dates`).
+`query_stac_items` and `load_stac_items` expose these stages separately so a flow could
+check for new data before spinning up a Dask cluster (see `has_new_stac_dates`, which is
+not yet wired into any flow — [issue #47](https://github.com/dClimate/tessera-embeddings/issues/47)).
 
 ### STAC Providers and Collections
 
@@ -60,14 +62,23 @@ only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equiva
 property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbox()`.
 
 `_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry`
-passed into `StacApiIO` (`max_retries=Retry(total=8, backoff_factor=2,
-status_forcelist=(429, 500, 502, 503, 504))`). Because `search.items()` paginates
-lazily, each page fetch is a separate HTTP call — configuring retries on the underlying
-`HTTPAdapter` means a transient 5xx on page N is retried in place, instead of throwing
-away prior pages and restarting the whole query. This matters most for CMR-STAC, which
-returns 502/503 under load on large date-range queries. Note that `StacApiIO`'s default
-`max_retries=5` passes a bare int to urllib3, which has an empty `status_forcelist` and
-therefore does **not** retry 5xx responses — the explicit `Retry` object is required.
+built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed
+into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504)`).
+The subclass logs each retry attempt at WARNING — urllib3 otherwise retries silently inside
+the `HTTPAdapter`, making a slow query indistinguishable from a hang. Because
+`search.items()` paginates lazily, each page fetch is a separate HTTP call — configuring
+retries on the underlying `HTTPAdapter` means a transient 5xx on page N is retried in
+place, instead of throwing away prior pages and restarting the whole query. This matters
+most for CMR-STAC, which returns 502/503 under load on large date-range queries. Note that
+`StacApiIO`'s default `max_retries=5` passes a bare int to urllib3, which has an empty
+`status_forcelist` and therefore does **not** retry 5xx responses — the explicit `Retry`
+object is required.
+
+The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting
+to 250. This applies only to providers queried through `client.search()` (Earth Search,
+Planetary Computer) — the OPERA `cmr-asf` path bypasses CMR-STAC search entirely and queries
+the native CMR Granule API. See
+[ADR 007](../../../context_docs/decisions/007-native-cmr-granule-query.md) for the full rationale.
 
 Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
 cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
@@ -135,7 +146,7 @@ These happen before `odc.stac.load` is called:
 |---|---|---|
 | **Date dedup** | `stac._filter_existing_dates` | Drops STAC items whose date is already written to the store. |
 | **Item sort** | `stac.query_stac_items` | For S2: sorts by `(date, cloud_cover)` so mosaicking picks the clearest tile. |
-| **Orbit filter** | `opera_query.make_s1_item_rewriter` | Keeps only OPERA bursts matching the desired orbit direction. |
+| **Item provider** | `opera_query.make_s1_item_provider` | Builds orbit-filtered OPERA items directly from the native CMR granule API (bypasses CMR-STAC search). |
 | **URL rewriting** | `auth.rewrite_assets_to_s3` | Rewrites HTTPS datapool/earthdatacloud URLs to `s3://` URIs. |
 | **Timestamp normalisation** | `opera_query.normalize_opera_timestamps` | Sets all OPERA burst timestamps on the same date to noon UTC so `odc.stac.load` groups them into a single mosaic. |
 
@@ -329,6 +340,13 @@ formula in the background section above applies to estimating how many tasks a g
 window width will produce; the 30-day default keeps each batch well within the scheduler's
 RAM budget at cornbelt scale.
 
+Batch windows are inclusive on both ends and do not overlap: each batch spans `batch_days`
+calendar days, and the loop advances `batch_start` to the day *after* `batch_end`. Because
+CMR/STAC also treat their query end date as inclusive, each day is queried by exactly one
+batch — a batch boundary that landed on the same day as the next batch's start would page
+that day twice, wasteful at CONUS scale where each day is many pages of bursts. The overall
+`[start_date, end_date]` range is inclusive of `end_date`.
+
 ### Lazy evaluation throughout
 
 `odc.stac.load` returns a Dask-backed xarray Dataset with no raster data read yet. All
@@ -374,9 +392,16 @@ Dask operations. (Inference reads 2000×2000 sub-tiles out of these 4000×4000 c
 
 ### has_new_stac_dates pre-check
 
-Flows call `has_new_stac_dates` before provisioning a Dask cluster. It queries the STAC
-catalog and checks for new dates without reading any raster data or starting Fargate tasks.
-If nothing is new the flow exits early.
+`has_new_stac_dates` is meant to run before provisioning a Dask cluster: it queries the STAC
+catalog and checks for new dates without reading any raster data or starting Fargate tasks,
+so a flow can exit early when nothing is new.
+
+**Not yet wired into any flow** — until it is, the caller is responsible for not passing date
+ranges that overlap what's already in the store (otherwise we spin up a cluster and iterate
+batches only to discover there's nothing to write). Wiring it into the S1/S2 ROI flows is
+tracked in [issue #47](https://github.com/dClimate/tessera-embeddings/issues/47). When doing
+so, avoid sharing one OPERA `item_provider_fn` between the pre-check and the real query — the
+provider re-queries CMR on every call, so reuse would double the query cost.
 
 ---
 
@@ -487,14 +512,16 @@ for out-of-region access where S3 direct is not available, but is significantly 
 
 ## OPERA-Specific Query Quirks
 
-### Orbit Direction Filtering
+### Native granule query (orbit filtering + item construction)
 
-`make_s1_item_rewriter` builds an `item_filter_fn` that filters OPERA bursts by ascending or
-descending orbit. CMR-STAC **silently ignores** the `query` extension for CMR additional
-attributes such as `ASCENDING_DESCENDING`, so passing orbit direction to a STAC search has
-no effect.
+`make_s1_item_provider` builds an `item_provider_fn` that returns ready-to-load OPERA items
+**without calling CMR-STAC `client.search()` at all**. CMR-STAC's cursor pagination
+intermittently 500s on CONUS-scale queries (nasa/cmr-stac#408) and pages internally at ~100
+items regardless of the requested `limit` (#411); it also **silently ignores** the `query`
+extension for CMR additional attributes such as `ASCENDING_DESCENDING`. The native CMR
+Granule Search API has none of these problems.
 
-The workaround queries the native CMR Granule Search API directly:
+The provider queries the granule API directly:
 
 ```text
 GET https://cmr.earthdata.nasa.gov/search/granules.json
@@ -502,11 +529,18 @@ GET https://cmr.earthdata.nasa.gov/search/granules.json
     &attribute[]=string,ASCENDING_DESCENDING,ASCENDING
     &bounding_box=...
     &temporal=...
+    &page_size=2000
 ```
 
-This returns a paginated list of matching `producer_granule_id` values. The STAC items are
-then filtered by matching their `id` against this set. CMR pagination is handled via the
-`CMR-Search-After` response header.
+Orbit direction is filtered **server-side** via `attribute[]`, so the response already
+contains only the desired orbit — no separate STAC search and no local granule-ID
+intersection. Each granule entry's data download links (`rel` ending `/data#`, href ending
+`_VV.tif` / `_VH.tif`) are mapped onto the `S1_OPERA_BANDS` asset keys (`0_VV`, `0_VH`) to
+construct `pystac.Item`s shape-compatible with the rest of the pipeline. The granule's
+`title`, `time_start`, and `polygons` supply the item id, datetime, and geometry. CMR
+pagination is handled via the `CMR-Search-After` response header, which pages cleanly at
+2000 against the same host. See
+[ADR 007](../../../context_docs/decisions/007-native-cmr-granule-query.md) for the full rationale.
 
 ### Burst Timestamp Normalisation
 

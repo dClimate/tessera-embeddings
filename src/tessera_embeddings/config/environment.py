@@ -59,13 +59,17 @@ def configure_gdal_environment() -> None:
     # os.environ.setdefault("CPL_VSIL_CURL_CHUNK_SIZE", "YES")
 
     # LOGGING
-    # Configure the `src` package logger so all module-level loggers (stac.py,
-    # zarr_store.py, etc.) emit to stderr, which the ECS awslogs driver captures.
-    # Reads SRC_LOG_LEVEL env var; defaults to DEBUG for now.
-    level = os.environ.get("SRC_LOG_LEVEL", "DEBUG").upper()
-    src_logger = logging.getLogger("src")
-    src_logger.setLevel(getattr(logging, level, logging.INFO))
-    if not src_logger.handlers:
+    # Configure the `tessera_embeddings` package logger so all module-level
+    # loggers (getLogger(__name__) in stac.py, zarr_store.py, etc.) emit to
+    # stderr, which the ECS awslogs driver captures. The package logger name
+    # must match the module loggers' parent — they are getLogger(__name__),
+    # i.e. "tessera_embeddings.*" — or the level/handler never apply and the
+    # loggers fall through to the root WARNING default.
+    # Reads SRC_LOG_LEVEL env var; defaults to INFO.
+    level = os.environ.get("SRC_LOG_LEVEL", "INFO").upper()
+    pkg_logger = logging.getLogger("tessera_embeddings")
+    pkg_logger.setLevel(getattr(logging, level, logging.INFO))
+    if not pkg_logger.handlers:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s - %(message)s"))
-        src_logger.addHandler(handler)
+        pkg_logger.addHandler(handler)
