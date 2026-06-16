@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+from types import TracebackType
 
+from urllib3.connectionpool import ConnectionPool
+from urllib3.response import BaseHTTPResponse
 from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
@@ -29,7 +32,15 @@ def make_logging_retry(label: str, **kwargs: object) -> Retry:
     """
 
     class _LoggingRetry(Retry):
-        def increment(self, method=None, url=None, response=None, error=None, _pool=None, _stacktrace=None):  # noqa: ANN001 ANN202
+        def increment(
+            self,
+            method: str | None = None,
+            url: str | None = None,
+            response: BaseHTTPResponse | None = None,
+            error: Exception | None = None,
+            _pool: ConnectionPool | None = None,
+            _stacktrace: TracebackType | None = None,
+        ) -> _LoggingRetry:
             if error is not None:
                 logger.warning("%s retry: %s %s — %s", label, method, url, error)
             elif response is not None:
