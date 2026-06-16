@@ -70,6 +70,12 @@ def _strip_height_for_density(t_kept: int, width: int, height: int) -> int:
     ``2 * bands(strip_h) + mask <= 2 * _S2_STRIP_BYTE_BUDGET`` — i.e. each strip's
     bands must fit the budget minus half the resident mask.
 
+    When a single full-height strip already fits the pair budget (no sibling, so
+    only one band copy is resident), we return ``height`` outright: splitting
+    below that point buys no RAM headroom — the prefetched pair's resident bands
+    still total the full chunk at the strip boundary — while adding a redundant
+    inference pass over the ragged tail.
+
     ``t_kept`` is this chunk's true post-prune valid-timestep count, so sparse
     chunks get tall strips (often the whole chunk in one piece) and only dense
     chunks split. A chunk dense enough to drive the height below ``_MIN_STRIP_H``
@@ -80,6 +86,12 @@ def _strip_height_for_density(t_kept: int, width: int, height: int) -> int:
     # Full-chunk SCL mask (bool, 1 byte/px) stays resident the whole loop; one
     # copy is shared by the prefetched pair, so charge half of it to each strip.
     mask_bytes = t * height * width
+    # Fast path: a single strip has no prefetched sibling, so it's held to the
+    # full pair budget, not half. Splitting below this buys no RAM headroom (the
+    # prefetched pair equals the full chunk at the boundary) yet adds a redundant
+    # inference pass over the ragged tail.
+    if t * height * width * _S2_BYTES_PER_OBS_PX + mask_bytes <= 2 * _S2_STRIP_BYTE_BUDGET:
+        return height
     band_budget = _S2_STRIP_BYTE_BUDGET - mask_bytes // 2
     per_row = t * width * _S2_BYTES_PER_OBS_PX
     budget_h = max(0, band_budget) // per_row

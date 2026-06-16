@@ -66,6 +66,18 @@ class TestStripHeightForDensity:
         dense = _strip_height_for_density(200, 2000, 2000)
         assert sparse > dense
 
+    def test_single_strip_when_full_height_fits_pair_budget(self):
+        # A chunk whose full-height bands + mask fit the pair budget runs as one
+        # strip: splitting off a ragged tail buys no RAM headroom (the prefetched
+        # pair's resident bands equal the full chunk at the boundary) while adding
+        # a redundant inference pass. T_kept=60 at 2000x2000 sits just inside the
+        # budget, where the half-budget solve would otherwise yield a 1963-row
+        # strip plus a 37-row tail.
+        h = _strip_height_for_density(60, 2000, 2000)
+        assert h == 2000
+        full = 60 * 2000 * 2000 * len(S2_BAND_ORDER) * 2 + 60 * 2000 * 2000
+        assert full <= 2 * _S2_STRIP_BYTE_BUDGET
+
     def test_extreme_density_floors_at_min_strip_h(self):
         # A pathologically dense chunk bottoms out at the floor (breaching the
         # byte budget, logged) rather than degenerating into tiny reads.
