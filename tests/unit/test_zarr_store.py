@@ -547,9 +547,7 @@ class TestResolveRegion:
         # the axis [2024-01-06, 2024-01-01, 2024-01-20].
         def _append(date):
             ds = sample_reflectance_data([date], height=1000, width=1000)
-            write_dataset(
-                store_path, ds, tile_id="33UUP", baselines={date: 400}, chunks=SPLIT_CHUNKS, crs="EPSG:32615"
-            )
+            write_dataset(store_path, ds, tile_id="33UUP", baselines={date: 400}, chunks=SPLIT_CHUNKS, crs="EPSG:32615")
 
         store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-06"])
         _append("2024-01-01")
