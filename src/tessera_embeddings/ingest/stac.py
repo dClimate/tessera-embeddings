@@ -450,6 +450,7 @@ def _query_stac_items(
     start_date: str,
     end_date: str,
     bbox: tuple[float, float, float, float] | None = None,
+    item_provider_fn: Callable[[], list[Any]] | None = None,
 ) -> list[Any]:
     """Query STAC catalog for items matching tile and date range.
 
@@ -462,10 +463,17 @@ def _query_stac_items(
         start_date: Start date (YYYY-MM-DD)
         end_date: End date (YYYY-MM-DD)
         bbox: Optional bounding box for spatial query fallback
+        item_provider_fn: Optional callable that returns ready-to-load items,
+            bypassing CMR-STAC ``client.search()`` entirely. Used by the
+            ``cmr-asf`` OPERA path, which builds items from the native CMR
+            granule API to avoid CMR-STAC's 500-prone cursor pagination.
 
     Returns:
         List of pystac Items
     """
+    if item_provider_fn is not None:
+        return item_provider_fn()
+
     query_params = _build_stac_query(collection_config, tile_id, start_date, end_date, bbox=bbox)
 
     t0 = time.monotonic()
@@ -489,11 +497,27 @@ def has_new_stac_dates(
     existing_dates: set[str],
     bbox: tuple[float, float, float, float] | None = None,
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
+    item_provider_fn: Callable[[], list[Any]] | None = None,
 ) -> bool:
     """Check whether a STAC catalog has new dates not yet in the store.
 
     Lightweight check that queries STAC and filters without loading raster data.
-    Used by downstream flows to decide whether to spin up a Dask cluster.
+    Intended as a pre-flight gate so a flow can decide whether to spin up a
+    Dask cluster before iterating batches — today nothing does this, so the
+    caller is responsible for not passing date ranges that overlap the store.
+
+    .. note::
+       **Currently unused.** No flow calls this yet; wiring it into the S1/S2
+       ROI flows is tracked in
+       https://github.com/dClimate/tessera-embeddings/issues/47.
+
+       When wiring it up, do **not** pass the same ``item_provider_fn`` object
+       to both this function and ``query_stac_items`` for one batch: the
+       provider built by ``opera_query.make_s1_item_provider`` issues a fresh
+       CONUS-scale CMR granule query on every call (it no longer caches at
+       construction time), so reusing it across the pre-check and the real
+       query would double the query cost. Build a provider per call site, or
+       have the gate consume the items the subsequent ingest will load.
 
     Args:
         provider: Provider name (e.g., "earth-search", "cmr-asf")
@@ -504,6 +528,8 @@ def has_new_stac_dates(
         existing_dates: Dates already in store (YYYY-MM-DD strings)
         bbox: Optional bounding box for spatial query fallback
         item_filter_fn: Optional pre-filter (e.g., orbit direction filtering)
+        item_provider_fn: Optional callable returning items directly,
+            bypassing CMR-STAC search (OPERA native-granule path).
 
     Returns:
         True if at least one new date is available
@@ -520,6 +546,7 @@ def has_new_stac_dates(
         start_date,
         end_date,
         bbox=bbox,
+        item_provider_fn=item_provider_fn,
     )
     if not items:
         logger.debug(f"No items found for {query_label}")
@@ -546,6 +573,7 @@ def query_stac_items(
     existing_dates: set[str] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
+    item_provider_fn: Callable[[], list[Any]] | None = None,
 ) -> tuple[list[Any], dict[str, int]]:
     """Query STAC catalog, filter items, and extract baselines.
 
@@ -562,6 +590,8 @@ def query_stac_items(
         existing_dates: Dates already in store (to skip). None = return all.
         bbox: Optional bounding box for spatial query fallback
         item_filter_fn: Optional pre-filter (e.g., orbit direction filtering)
+        item_provider_fn: Optional callable returning items directly,
+            bypassing CMR-STAC search (OPERA native-granule path).
 
     Returns:
         Tuple of (items, baselines) where:
@@ -572,7 +602,15 @@ def query_stac_items(
     provider_config = _get_provider_config(provider)
     collection_config = _get_collection_config(provider, collection)
 
-    items = _query_stac_items(provider_config, collection_config, tile_id, start_date, end_date, bbox=bbox)
+    items = _query_stac_items(
+        provider_config,
+        collection_config,
+        tile_id,
+        start_date,
+        end_date,
+        bbox=bbox,
+        item_provider_fn=item_provider_fn,
+    )
 
     query_label = f"tile {tile_id}" if tile_id else f"bbox {bbox}"
     if not items:
@@ -713,6 +751,7 @@ def ingest_tile(
     resolution: int | None = None,
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
+    item_provider_fn: Callable[[], list[Any]] | None = None,
     preserve_low_values: bool = False,
     groupby: str = "time",
     geobox: GeoBox | None = None,
@@ -751,6 +790,9 @@ def ingest_tile(
               and baseline correction (e.g., amplitude-to-dB conversion).
         item_filter_fn: Optional function applied to STAC items before date
               filtering (e.g., orbit direction filtering).
+        item_provider_fn: Optional callable that returns ready-to-load items,
+              bypassing CMR-STAC search entirely. Used by the OPERA RTC-S1
+              path to build items from the native CMR granule API.
         preserve_low_values: When True, baseline correction only subtracts
               from pixels >= abs(offset), matching Tessera's harmonize_arr().
               When False (default), subtracts from all pixels.
@@ -775,6 +817,7 @@ def ingest_tile(
         existing_dates=existing_dates,
         bbox=bbox,
         item_filter_fn=item_filter_fn,
+        item_provider_fn=item_provider_fn,
     )
 
     if not items:

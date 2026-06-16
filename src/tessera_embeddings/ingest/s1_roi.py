@@ -38,7 +38,7 @@ import dask.distributed
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
-from tessera_embeddings.ingest.opera_query import make_s1_item_rewriter
+from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import apply_roi_mask
 from tessera_embeddings.ingest.stac import ingest_tile
@@ -199,7 +199,7 @@ def ingest_s1_roi_sar(
             chunks=INGEST_CHUNKS,
             resampling="bilinear",
             groupby="solar_day",
-            item_filter_fn=make_s1_item_rewriter(
+            item_provider_fn=make_s1_item_provider(
                 orbit,
                 roi.bbox_wgs84,
                 batch_start_str,

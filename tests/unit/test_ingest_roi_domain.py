@@ -100,7 +100,7 @@ def test_no_prefect_or_get_client_in_domain_modules() -> None:
                     raise AssertionError(f"{path} calls {fn.attr}()")
 
 
-@patch("tessera_embeddings.ingest.s1_roi.make_s1_item_rewriter")
+@patch("tessera_embeddings.ingest.s1_roi.make_s1_item_provider")
 @patch("tessera_embeddings.ingest.s1_roi.get_existing_dates", return_value=set())
 @patch("tessera_embeddings.ingest.s1_roi.read_roi_mask")
 @patch("tessera_embeddings.ingest.s1_roi.read_roi_metadata")
@@ -112,7 +112,7 @@ def test_s1_batch_windows_are_half_open_no_boundary_overlap(
     mock_read_meta,
     mock_read_mask,
     mock_existing,
-    mock_rewriter,
+    mock_provider,
 ):
     """Each batch queries a half-open window so no calendar day is queried twice.
 
@@ -150,9 +150,9 @@ def test_s1_batch_windows_are_half_open_no_boundary_overlap(
     for prev_end, next_start in pairwise(windows):
         assert prev_end < next_start, f"boundary day re-queried: {prev_end} >= {next_start}"
 
-    # The item rewriter is built for the same half-open window as the query.
-    rewriter_windows = [(c.args[2], c.args[3]) for c in mock_rewriter.call_args_list]
-    assert rewriter_windows == windows
+    # The item provider is built for the same half-open window as the query.
+    provider_windows = [(c.args[2], c.args[3]) for c in mock_provider.call_args_list]
+    assert provider_windows == windows
 
 
 @patch("tessera_embeddings.ingest.stac.Client")

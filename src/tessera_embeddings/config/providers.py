@@ -65,12 +65,12 @@ class STACProvider:
     max_page_size: int = 250
     """STAC search page size (the ``limit`` per page request).
 
-    CONUS-scale bbox queries return tens of thousands of items; at the
-    default 250 that is hundreds of sequential page requests, each an
-    independent chance of an intermittent 5xx that — once retries are
-    exhausted — fails the whole query. Larger pages cut the request count
-    proportionally. CMR-STAC honors up to 2000 (the native CMR Granule
-    query already pages at 2000 against the same host)."""
+    Used only by providers queried through ``client.search()`` (Earth Search,
+    Planetary Computer). The OPERA ``cmr-asf`` path bypasses CMR-STAC search
+    entirely and queries the native CMR granule API instead (see
+    ``opera_query.make_s1_item_provider``), so this value does not apply there.
+    Raising it for CMR-STAC made the 500s worse, not better — see
+    context_docs/decisions/007-native-cmr-granule-query.md."""
 
 
 # =============================================================================
@@ -123,7 +123,6 @@ PROVIDERS: dict[str, STACProvider] = {
     "cmr-asf": STACProvider(
         name="NASA CMR-STAC (ASF)",
         catalog_url="https://cmr.earthdata.nasa.gov/stac/ASF",
-        max_page_size=2000,
         collections={
             "opera-rtc-s1": CollectionConfig(
                 collection_id="OPERA_L2_RTC-S1_V1_1",
