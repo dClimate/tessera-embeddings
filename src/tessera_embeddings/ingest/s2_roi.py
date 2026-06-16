@@ -236,6 +236,8 @@ def ingest_s2_roi_reflectance(
             continue
 
         # Phase 2: load all bands with the same solar_day grouping.
+        # Reflectance bands resample bilinear; load_stac_items pins the
+        # categorical SCL band to nearest so its class codes stay valid.
         day_ds = load_stac_items(
             day_items,
             provider=provider,
@@ -244,7 +246,7 @@ def ingest_s2_roi_reflectance(
             bbox=roi.bbox_wgs84,
             chunks=INGEST_CHUNKS,
             extra_bands=["scl"],
-            resampling="nearest",
+            resampling="bilinear",
             groupby="solar_day",
             geobox=roi.geobox,
         )
