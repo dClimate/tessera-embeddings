@@ -11,6 +11,7 @@ This file is one of the few places in the package that imports from
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Any
 
@@ -20,6 +21,7 @@ from prefect import get_run_logger, task
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
+from tessera_embeddings.storage.zarr_store import credentials_provider
 
 
 @task(name="process-roi-reflectance")
@@ -82,19 +84,54 @@ def process_roi_sar(
     (secrets enter at flow entry only) means the *flow* constructs the
     closures over Prefect Blocks / env vars; this task shell never
     reads credentials directly.
+
+    When ``use_s3_direct`` is set, this task resolves IAM credentials in the
+    Dask **worker** process where the domain function's store writes and ROI
+    reads actually run — the worker holds the IAM role, and the credentials
+    (live access key / secret / STS token) stay off the orchestration
+    boundary rather than crossing it as serialized parameters (Hard rule #5):
+
+    1. Registers an IAM-resolving icechunk credential provider for the
+       duration of the ingest call, so store writes keep using IAM-role
+       creds after ``set_s3_credentials`` overwrites the ``AWS_*`` env vars
+       with OPERA-scoped STS tokens. Scoped to a ``with`` block so a reused
+       Dask worker is not left pinned to the IAM provider for later,
+       unrelated icechunk opens.
+    2. Resolves IAM ``storage_options`` for the ROI-mask reads, so those
+       reads survive the same env-var overwrite.
+
+    Confining the botocore-backed helpers to providers/aws/ (imported
+    lazily) keeps the storage layer cloud-agnostic per the architecture
+    rules.
     """
-    result = ingest_s1_roi_sar(
-        roi_zarr_path=roi_zarr_path,
-        start_date=start_date,
-        end_date=end_date,
-        store_path=store_path,
-        client=get_client(),
-        orbit=orbit,
-        batch_days=batch_days,
-        edl_credentials_fn=edl_credentials_fn,
-        apply_credentials_fn=apply_credentials_fn,
-        use_s3_direct=use_s3_direct,
-        log=get_run_logger(),
-        storage_options=storage_options,
-    )
+    cred_provider_cm: Any = nullcontext()
+    if use_s3_direct:
+        # Lazy import: providers.aws.credentials pulls in botocore, which lives
+        # only in the optional `aws` extra. A prefect-only install (e.g. Prefect
+        # on GCP) must be able to import this task module without it.
+        from tessera_embeddings.providers.aws.credentials import (
+            iam_icechunk_credentials,
+            iam_s3_storage_options,
+        )
+
+        cred_provider_cm = credentials_provider(iam_icechunk_credentials)
+
+        if storage_options is None and roi_zarr_path.startswith("s3://"):
+            storage_options = iam_s3_storage_options()
+
+    with cred_provider_cm:
+        result = ingest_s1_roi_sar(
+            roi_zarr_path=roi_zarr_path,
+            start_date=start_date,
+            end_date=end_date,
+            store_path=store_path,
+            client=get_client(),
+            orbit=orbit,
+            batch_days=batch_days,
+            edl_credentials_fn=edl_credentials_fn,
+            apply_credentials_fn=apply_credentials_fn,
+            use_s3_direct=use_s3_direct,
+            log=get_run_logger(),
+            storage_options=storage_options,
+        )
     return asdict(result)

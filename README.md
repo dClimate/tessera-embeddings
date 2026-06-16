@@ -114,7 +114,8 @@ coupled, so end-to-end is the primary demo. `--skip-inference` is the
 fast path for contributors iterating on ingest changes without waiting
 for CPU torch. Production inference always runs on GPU. See
 [`docs/quickstart.md`](docs/quickstart.md) for prerequisites
-(Earthdata Login credentials for OPERA, model checkpoint download).
+(Earthdata Login credentials for OPERA; the model checkpoint is
+pulled from HuggingFace automatically).
 
 ## Running at scale
 
@@ -204,10 +205,14 @@ scheduler RAM:  ~1 GB                   scheduler RAM: <50 MB
 overhead:       95% of wall-clock       overhead:      <5%
 ```
 
-The defaults (`DEFAULT_CHUNK_SIZE = 2000`) are calibrated for the
-inference pipeline; if you go smaller you'll watch the Dask scheduler
-hang on graph construction before any worker does any work, and
-larger you'll OOM on a g5.2xlarge. If you change them, profile.
+Storage and read granularity are tuned separately. Ingest writes
+`INGEST_CHUNK_SIZE = 4000` storage chunks to keep the satellite-ingest
+Dask graph small (¼ the spatial tasks), while inference reads
+`INFERENCE_CHUNK_SIZE = 2000` sub-tiles out of them — small enough to keep
+peak GPU-node RAM in check. Zarr's `oindex` reads the 2000 sub-tile out
+of a 4000 chunk without any alignment requirement. Go smaller on the
+read size and the Dask scheduler hangs on graph construction; larger and
+you OOM on a g5.2xlarge. If you change either, profile.
 
 ### Using these architecture checks in your own repo
 

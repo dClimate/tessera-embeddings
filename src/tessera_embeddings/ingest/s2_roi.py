@@ -37,7 +37,7 @@ import xarray as xr
 from odc.geo.geobox import GeoBox
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
-from tessera_embeddings.config.inference import TESSERA_CHUNKS
+from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE, apply_roi_mask
@@ -192,9 +192,9 @@ def ingest_s2_roi_reflectance(
 
     ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path)
 
-    # time=1 matches TESSERA_CHUNKS so each date is an independent Dask task:
+    # time=1 matches INGEST_CHUNKS so each date is an independent Dask task:
     # fully parallel across dates with no rechunk at write time.
-    spatial_chunks = {"northing": TESSERA_CHUNKS["northing"], "easting": TESSERA_CHUNKS["easting"]}
+    spatial_chunks = {"northing": INGEST_CHUNKS["northing"], "easting": INGEST_CHUNKS["easting"]}
 
     # Persist the ROI mask on workers so per-day graphs reference small
     # future keys instead of re-reading from Zarr each time.
@@ -229,22 +229,24 @@ def ingest_s2_roi_reflectance(
     for day_items in items_by_date.values():
         # Phase 1: SCL-only coverage check — tiny graph.
         passes, any_valid = _compute_scl_phase(
-            day_items, roi.geobox, TESSERA_CHUNKS, roi_mask, roi_pixel_count, min_valid_coverage, client
+            day_items, roi.geobox, INGEST_CHUNKS, roi_mask, roi_pixel_count, min_valid_coverage, client
         )
         if not passes:
             total_filtered += 1
             continue
 
         # Phase 2: load all bands with the same solar_day grouping.
+        # Reflectance bands resample bilinear; load_stac_items pins the
+        # categorical SCL band to nearest so its class codes stay valid.
         day_ds = load_stac_items(
             day_items,
             provider=provider,
             collection=collection,
             baselines=baselines,
             bbox=roi.bbox_wgs84,
-            chunks=TESSERA_CHUNKS,
+            chunks=INGEST_CHUNKS,
             extra_bands=["scl"],
-            resampling="nearest",
+            resampling="bilinear",
             groupby="solar_day",
             geobox=roi.geobox,
         )
@@ -271,7 +273,7 @@ def ingest_s2_roi_reflectance(
                     day_ds,
                     tile_id=roi_zarr_path,
                     baselines=baselines,
-                    chunks=TESSERA_CHUNKS,
+                    chunks=INGEST_CHUNKS,
                     manifest=ingest_manifest,
                     crs=roi.native_crs,
                 )

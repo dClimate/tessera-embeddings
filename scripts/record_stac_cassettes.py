@@ -100,7 +100,7 @@ def _record_s1_search_and_orbit() -> Path:
     """
     from pystac_client import Client
 
-    from tessera_embeddings.ingest.opera_query import _query_cmr_granule_ids
+    from tessera_embeddings.ingest.opera_query import _query_cmr_granules
 
     cassette_path = CASSETTE_DIR / "test_s1_roi_parity.yaml"
     print(f"\n[3/3] Recording OPERA search + orbit filter → {cassette_path.name}")
@@ -118,8 +118,8 @@ def _record_s1_search_and_orbit() -> Path:
         print(f"  Captured {len(opera_items)} OPERA items")
 
         # Part B: CMR Granule Search API for ascending orbit filter
-        ascending_ids = _query_cmr_granule_ids(BBOX, START_DATE, END_DATE, "ascending")
-        print(f"  Captured {len(ascending_ids)} ascending granule IDs from CMR")
+        ascending_items = _query_cmr_granules(BBOX, START_DATE, END_DATE, "ascending")
+        print(f"  Captured {len(ascending_items)} ascending OPERA items from CMR")
     return cassette_path
 
 

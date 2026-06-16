@@ -49,7 +49,7 @@ from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_fixe
 # Default Fargate task sizes for ingest workloads. Callers can override
 # per-call via ``ecs_cluster``'s ``worker_cpu`` / ``worker_mem`` arguments.
 DEFAULT_INGEST_WORKER_CPU = 4096
-DEFAULT_INGEST_WORKER_MEM = 8192
+DEFAULT_INGEST_WORKER_MEM = 16384
 
 # Schedulers don't need much memory but benefit from a few cores so
 # graph construction and dashboard responsiveness stay smooth.
@@ -168,6 +168,43 @@ def get_fargate_config(
         worker_cpu=worker_cpu,
         worker_mem=worker_mem,
         cloudwatch_logs_group=log_group,
+    )
+
+
+def log_dashboard_ssm_command(
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    cluster: ECSCluster,
+) -> None:
+    """Log a copy-pasteable SSM port-forward command for the Dask dashboard.
+
+    The SSM target must point at the *scheduler* Fargate task (where the
+    dashboard runs). The caller supplies their own AWS profile via
+    ``--profile`` — it is deliberately not baked into the logged command.
+
+    Best-effort: if the scheduler task metadata isn't shaped as expected
+    (e.g. an EC2 scheduler), logs a warning and returns without raising.
+    """
+    try:
+        scheduler = cluster.scheduler
+        cluster_name, task_id = scheduler.task_arn.rsplit("/", 2)[1:]
+        # The scheduler task has multiple containers (dask-scheduler plus
+        # injected sidecars like the SSM/ECS-Exec guard); ordering isn't
+        # stable, so look up by name.
+        scheduler_container = next(c for c in scheduler.task["containers"] if c["name"] == "dask-scheduler")
+        runtime_id = scheduler_container["runtimeId"]
+        ssm_target = f"ecs:{cluster_name}_{task_id}_{runtime_id}"
+    except (AttributeError, KeyError, IndexError, StopIteration, ValueError) as exc:
+        log.warning("Could not build SSM dashboard command: %s", exc)
+        return
+
+    log.info(
+        "To view the Dask dashboard, run (supply your own --profile):\n\n"
+        "aws ssm start-session \\\n"
+        f"  --target {ssm_target} \\\n"
+        "  --document-name AWS-StartPortForwardingSessionToRemoteHost \\\n"
+        '  --parameters \'{"host":["localhost"],"portNumber":["8787"],"localPortNumber":["8787"]}\' \\\n'
+        "  --profile <your-aws-profile>\n\n"
+        "Then open http://localhost:8787/status"
     )
 
 
@@ -307,6 +344,7 @@ def ecs_cluster(
 
     log.info("Cluster created: %s", cluster)
     log.info("Dashboard: %s", cluster.dashboard_link)
+    log_dashboard_ssm_command(log, cluster)
 
     cluster.adapt(minimum=min_workers, maximum=max_workers)
     log.info("Adaptive scaling configured: min=%d, max=%d", min_workers, max_workers)

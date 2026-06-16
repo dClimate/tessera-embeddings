@@ -123,6 +123,16 @@ def test_store_for_distinguishes_kinds(paths: BucketPaths, roi_name: str) -> Non
     assert len(set(uris.values())) == len(_KINDS)
 
 
+@given(paths=_bucket_paths(), roi_name=_ROI_NAMES)
+def test_store_for_path_shapes(paths: BucketPaths, roi_name: str) -> None:
+    """Each kind produces the correct path structure."""
+    assert paths.store_for(roi_name, "roi") == f"{paths.inputs}/rois/zarrs/{roi_name}.zarr"
+    assert paths.store_for(roi_name, "reflectance") == f"{paths.inputs}/mosaics/{roi_name}/reflectance.zarr"
+    assert paths.store_for(roi_name, "sar_ascending") == f"{paths.inputs}/mosaics/{roi_name}/sar_ascending.zarr"
+    assert paths.store_for(roi_name, "sar_descending") == f"{paths.inputs}/mosaics/{roi_name}/sar_descending.zarr"
+    assert paths.store_for(roi_name, "embeddings") == f"{paths.outputs}/embeddings/{roi_name}.zarr"
+
+
 # ---------------------------------------------------------------------------
 # Manifest serialization round-trip
 # ---------------------------------------------------------------------------

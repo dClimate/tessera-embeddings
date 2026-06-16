@@ -139,11 +139,14 @@ REPRESENTATION_DIM = 192
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.
 DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
-# Spatial chunk size for storage and inference. 2000x2000 keeps peak RAM ~9.8 GB on
-# g5.2xlarge (31 GB), providing comfortable headroom.
-DEFAULT_CHUNK_SIZE = 2000
-
-TESSERA_CHUNKS = {"time": 1, "northing": DEFAULT_CHUNK_SIZE, "easting": DEFAULT_CHUNK_SIZE}
+# Spatial read-tile size for inference. The read/ChunkSpec grid stays 2000x2000;
+# the *resident input working set* is bounded separately via density-sized
+# northing strips (see actors._strip_height_for_density), so a 2000x2000 chunk's
+# peak host RAM is capped by a per-strip byte budget rather than fixed by
+# T x H x W. Sparse chunks load in one full-height strip; only dense chunks
+# split. Independent of the storage chunk size written at ingest
+# (config.ingest.INGEST_CHUNK_SIZE).
+INFERENCE_CHUNK_SIZE = 2000
 
 
 @final
@@ -177,7 +180,6 @@ class InferenceConfig:
 
         Ray cluster:
             ray_address: Ray cluster address (None for local mode).
-            gpu_instance_type: EC2 instance type for GPU workers.
             use_spot: Whether to use spot instances.
             max_gpu_workers: Maximum number of GPU workers.
     """
@@ -211,11 +213,10 @@ class InferenceConfig:
     checkpoint_path: str = ""
     inputs_bucket: str = ""
     output_bucket: str = ""
-    chunk_size: int = DEFAULT_CHUNK_SIZE
+    chunk_size: int = INFERENCE_CHUNK_SIZE
 
     # Ray cluster
     ray_address: str | None = None
-    gpu_instance_type: str = "g5.2xlarge"
     use_spot: bool = False
     max_gpu_workers: int = 500
 

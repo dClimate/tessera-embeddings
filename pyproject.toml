@@ -60,6 +60,10 @@ inference = [
     "torch",
     "ray[default]",
     "scikit-learn",
+    # fsspec's HTTP backend (used to pull model checkpoints from URLs such as
+    # HuggingFace `resolve/main` links) requires aiohttp; it isn't pulled in by
+    # fsspec itself. Already resolved in uv.lock.
+    "aiohttp",
 ]
 prefect = [
     "prefect>=3.0",
@@ -73,6 +77,8 @@ aws = [
     "s3fs",
     "dask-cloudprovider[aws]",
     "prefect-aws",
+    # Serves the Dask scheduler dashboard (port-forwarded over SSM).
+    "bokeh",
 ]
 all = [
     "tessera_embeddings[inference,prefect,aws]",

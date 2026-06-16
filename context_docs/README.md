@@ -16,7 +16,8 @@ context_docs/
 │   ├── 003-tenacity-retries-not-prefect-native.md
 │   ├── 004-duck-typed-providers.md
 │   ├── 005-multi-lock-file-strategy.md
-│   └── 006-adapter-policy.md
+│   ├── 006-adapter-policy.md
+│   └── 007-native-cmr-granule-query.md
 └── design/           Long-form framing docs (ported from planning)
     ├── open_sourcing_conceptual_background.md
     └── orchestration_infra_leakage_audit.md

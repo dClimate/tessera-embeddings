@@ -42,11 +42,16 @@ s1_orbit: both
 # Local Dask cluster size on the runner host.
 n_workers: 2
 
-# Optional override for the directory containing the model checkpoint.
-# null means the runner looks under {inputs}/models/. Set this to keep
-# checkpoints outside the inputs tree so they survive a data wipe.
-# Example: checkpoint_dir: /tmp/tessera-models
-checkpoint_dir: /tmp/tessera-models
+# Model checkpoint. The quickstart pulls the v1.1 AWS encoder straight from
+# HuggingFace — no manual download needed. The runner caches it locally on
+# first use (under the system temp dir off AWS, or NVMe on a DLAMI host).
+checkpoint_url: https://huggingface.co/geotessera/TESSERA-V-1.1/resolve/main/tessera_v1_1_aws_encoder.pt
+
+# Optional override for the directory containing the model checkpoint, used
+# only when checkpoint_url is null. null means the runner looks under
+# {inputs}/models/. Set this to keep checkpoints outside the inputs tree so
+# they survive a data wipe. Example: checkpoint_dir: /tmp/tessera-models
+checkpoint_dir: null
 
 # Device for inference. "auto" uses a GPU if torch.cuda.is_available(),
 # otherwise falls back to CPU. Set to "cpu" or "cuda" to override.

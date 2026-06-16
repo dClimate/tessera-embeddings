@@ -26,13 +26,14 @@ Input stores (Icechunk/Zarr on S3):
             │
             ▼
   ┌─────────────────────────────────────────────┐
-  │  Ray Cluster  (EC2, g5.2xlarge × N)         │
+  │  Ray Cluster  (EC2, g5.xlarge × N)          │
   │  ┌─────────────────────────────────────┐    │
   │  │ InferenceActor (1 GPU each)         │    │
-  │  │  1. load_chunk()        ← selective  │    │
-  │  │  2. Dataset valid-px filter          │    │
-  │  │  3. sample_s2/s1_batch()             │    │
-  │  │  4. model forward  (FP16, B=3584)    │    │
+  │  │  per northing strip (bounds RAM):    │    │
+  │  │   1. load_chunk(y_sub=…)  ← selective│    │
+  │  │   2. Dataset valid-px filter         │    │
+  │  │   3. sample_s2/s1_batch()            │    │
+  │  │   4. model forward  (FP16, B=3584)   │    │
   │  │  5. writer.write_chunk() → staging   │    │
   │  └─────────────────────────────────────┘    │
   │  Work-stealing: actors pull from queue      │
@@ -63,7 +64,9 @@ Input stores (Icechunk/Zarr on S3):
 
 The input mosaic is divided into a grid of 2000×2000 pixel `ChunkSpec` objects (edge chunks may
 be smaller). 2000 px balances peak RAM during inference (~10 GB vs. ~37 GB at 3000 px) against
-scheduling overhead.
+scheduling overhead. This read-tile size is independent of the store's on-disk chunk size: the
+mosaic is written with larger 4000×4000 chunks at ingest (`INGEST_CHUNK_SIZE`), and `load_chunk`
+reads the 2000×2000 sub-tile out of them via `zarr.Array.oindex` with no alignment requirement.
 
 `filter_chunks_by_roi_mask` then drops any chunk whose footprint does not intersect the ROI
 zarr mask produced by `generate_roi`. Only the surviving **live chunks** are dispatched to
@@ -88,7 +91,7 @@ The cluster is managed in a context manager so it automatically tears down after
 
 **Cluster topology:**
 - Head: m5.2xlarge — GCS + autoscaler, no inference work
-- Workers: g5.2xlarge (1× A10G 24 GB VRAM, 32 GB RAM) — on-demand, single AZ
+- Workers: g5.xlarge (1× A10G 24 GB VRAM, 16 GB RAM) — on-demand, single AZ
 - Workers use a Packer-built AMI with all dependencies pre-installed; boot ready in ~1 minute
 
 ### 3. Inference Actors
@@ -107,7 +110,9 @@ Each chunk goes through four sub-steps:
 
 #### 4a. Data Loading (`data_loading.py`)
 
-Two-phase loading keeps peak worker RAM ~2 GB rather than ~15 GB:
+Two-phase loading lowers peak worker RAM by dropping empty dates before the band read. This
+caps RAM for typical chunks but does not *bound* it — peak still scales with `T_valid`, which
+is what northing striping (4a′) addresses for dense chunks:
 
 ```text
 All timesteps in the ROI time axis
@@ -138,6 +143,36 @@ gracefully when only one orbit was ingested.
 Output: `ChunkData` — numpy arrays for S2 bands/masks/DOYs, S1 ascending/descending
 bands/DOYs, and per-pixel observation counts (`s2_obs_count`, `s1_asc_obs_count`,
 `s1_desc_obs_count`) as uint16 arrays of shape (H, W).
+
+#### 4a′. Northing Striping (bounds peak input RAM independent of T)
+
+The SCL pre-filter above caps peak RAM for *typical* chunks, but it does not bound it: the
+resident S2 band array is `T_valid × H × W × 10 × 2` bytes, which scales with the timestep
+count. On dense ROIs `T_valid` can reach ~120, so a 2000×2000 chunk's `s2_bands` alone is
+~9.6 GB in a single `np.empty` — and on a 16 GB `g5.xlarge` worker that OOMs the loader
+*before* inference runs. `T` is not a free variable (v1.1 uses every valid observation), so
+the only lever is the spatial working set.
+
+`process_chunk` therefore loads each chunk as a sequence of **northing strips** (full easting
+width) rather than all at once. `load_chunk(..., y_sub=<slice>)` reads only a chunk-relative
+horizontal band; each strip is a self-contained `ChunkData` that is bucketed, run through
+inference, and written into whole-chunk output buffers by row-slice. Only the *inputs* are
+sub-tiled — the int8 output buffer (`H × W × 128`, ~0.5 GB) is held whole, so the write path,
+obs-count maps, and `assembly.py` are untouched (a single `write_chunk` at the end). Strips
+are loaded through a 1-deep prefetch pipeline (strip *i+1* loads while strip *i* runs the
+GPU), the same pattern as the sub-batch prefetcher in `inference.py`.
+
+The strip height is derived per chunk from its **true post-prune timestep count** `T_kept`,
+read from a full-chunk SCL mask loaded once up front (see below). The strip loop runs a 1-deep
+prefetch (strip *i+1* loads while strip *i* runs the GPU), so once a chunk splits **two strips
+are resident at once**; the byte budget is the bound on a single strip, sized so the pair holds
+under ~90% of the default 16 GB worker box. A chunk that fits in one strip loads whole (no
+prefetched neighbour) — byte-for-byte the unstriped path.
+
+Two reads are decoupled. **SCL** (1 byte/px) is loaded once for the whole chunk
+(`load_s2_mask_bundle`) and sliced per strip — it is never re-decompressed, and it doubles as
+the `T_kept` source for sizing. **Reflectance bands** (20 bytes/px) are still read per strip on
+the chunks that split; that per-strip read is exactly the working set the byte budget bounds.
 
 #### 4b. Valid Pixel Filtering + Bucketing (`dataset.py`)
 
@@ -193,7 +228,7 @@ target is reached. Over-sampled pixels are uniformly sub-sampled.
   preparation (data loading + normalization) while the GPU runs the previous forward pass.
 - **FP16** — `model.half()` halves memory bandwidth; bucket-level aggregation absorbs FP16
   noise without repeat-averaging.
-- **`torch.compile` is disabled** — on g5.2xlarge (15.4 GB VRAM), CUDA graph capture
+- **`torch.compile` is disabled** — on g5.xlarge (15.4 GB VRAM), CUDA graph capture
   consumed 11.6 GB and slowed forward passes (3,770 ms vs. 1,944 ms) due to GRU
   recompilation per unique sequence length.
 - **cuDNN benchmark mode** — fastest algorithm for GRU/conv ops.
@@ -212,6 +247,16 @@ before staging. This reduces staged and final store sizes by ~4×.
 is computed. Embeddings are scaled so that the max maps to ±127 (the int8 range), then
 rounded and clipped. The per-pixel scale factor (float32) is stored alongside the
 quantized embeddings so the original values can be reconstructed:
+
+**Per-bucket, not whole-chunk.** Quantization is per-pixel independent (each pixel's scale
+comes only from its own 128 channels), so `run_inference` quantizes each bucket's rows via
+`quantize_rows` the moment they come off the GPU, accumulating directly into skinny int8 +
+scale buffers. It never materializes the full `(H, W, 128)` chunk in float32. This is
+numerically identical to quantizing the whole array at the end, but shrinks the resident
+accumulator ~4× (~2 GB → ~0.5 GB at `chunk_size=2000`) and removes the end-of-chunk
+whole-array quantize and its multi-GB float32 temporaries — lowering the per-chunk host-RAM
+plateau. `quantize_embeddings` remains as the `(H, W, D)` entry point and delegates to
+`quantize_rows`.
 
 ```
 reconstructed = quantized.astype(float32) * scale[..., np.newaxis]
@@ -363,7 +408,6 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | `latent_dim` | 192 | Transformer hidden dim (must match checkpoint) |
 | `representation_dim` | 192 | Model output dim; first 128 dims are saved to the store |
 | `dim_feedforward` | 2048 | Transformer FFN width |
-| `gpu_instance_type` | `g5.2xlarge` | Worker EC2 type |
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
 **Architecture params** (`nhead`, `num_encoder_layers`, `dim_feedforward`, etc.) **must match

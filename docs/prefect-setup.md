@@ -133,16 +133,22 @@ load Blocks themselves (architecture rule #5). The pattern:
 @flow(name="ingest_s1_roi_sar")
 def ingest_s1_roi_sar(...):
     edl = Secret.load("edl-credentials").get()  # at flow entry
-    edl_env_fn = lambda: {                      # closure
+    edl_env = {
         "EARTHDATA_USERNAME": edl["username"],
         "EARTHDATA_PASSWORD": edl["password"],
     }
-    # ...pass edl_env_fn to the domain function
+    # ...inject edl_env into workers via extra_worker_env
 ```
 
 A `Secret` block stores `{"username": ..., "password": ...}`. The
-flow loads it once, builds a closure, hands the closure off. Domain
-code never sees `Block.load`.
+flow loads it once, in the flow body, and injects the values into
+the worker environment. Domain code never sees `Block.load`.
+
+> Note: the flow reads secrets in its **own body** rather than
+> accepting an injected callable. Flows are launched as Prefect
+> deployments whose parameters must be JSON-serializable, so a
+> callable could never cross that boundary anyway — `_default_edl_env`
+> is the env-var default; swap in a `Secret.load` here when needed.
 
 ## Common gotchas
 
@@ -168,7 +174,7 @@ while "Building Dask graph"; eventually fails.
 
 Cause: chunk size too small → graph too big. See
 [`README.md`](../README.md) §"Why chunk size dominates everything".
-The package defaults to `DEFAULT_CHUNK_SIZE = 2000` — change with
+The package defaults to `INFERENCE_CHUNK_SIZE = 2000` — change with
 care.
 
 ### ECS task definition diff between dev branches

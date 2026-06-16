@@ -35,7 +35,7 @@ from prefect import flow, get_run_logger
 from pydantic import BaseModel
 
 from tessera_embeddings.config.dask import AssemblyConfig
-from tessera_embeddings.config.inference import DEFAULT_CHUNK_SIZE, checkpoint_filename
+from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import ZarrWriter
@@ -75,6 +75,12 @@ class EmbeddingsDevParams(BaseModel):
     skip_coverage_check: bool = False
     cleanup_staging: bool = True
     output_name_suffix: str = ""
+    # Dev-iteration escape hatch. When set (requires code_bucket), the provider
+    # tars this local dir and uploads it to s3://{code_bucket}/code/... *before*
+    # ``ray up``, so workers run your working-tree code without a CI round-trip.
+    # None (default) = no upload: workers use AMI-baked source, or a tarball a
+    # CI workflow already put in code_bucket. See providers/aws/gotchas.md.
+    sync_source_path: str | None = None
 
 
 def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
@@ -108,6 +114,10 @@ def tessera_embeddings(
     time_window_end: str,
     paths: BucketPaths,
     ami_ssm_name: str,
+    ssm_prefix: str = "/tessera/ray/",
+    cloudwatch_log_group: str = "/ec2/tessera/ray",
+    code_bucket: str | None = None,
+    code_suffix: str = "",
     num_actors: int = 20,
     s1_orbit: str = "ascending",
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
@@ -123,6 +133,26 @@ def tessera_embeddings(
             :class:`BucketPaths`). Replaces the reference repo's
             ``dev: bool`` toggle.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
+        ssm_prefix: SSM Parameter Store prefix under which the Ray
+            cluster resource IDs (security group, instance profile,
+            subnets, key pair) are published by the deployment's infra.
+            Defaults to the OSS ``/tessera/ray/``; deployments that
+            publish under a different prefix must override this.
+        cloudwatch_log_group: CloudWatch log group the Ray workers write
+            agent logs to. Must match the group the deployment's infra
+            creates and grants the worker role access to.
+        code_bucket: S3 bucket (no ``s3://`` prefix) workers pull the
+            source tarball from, at
+            ``s3://{code_bucket}/code/src{code_suffix}.tar.gz``. Setting
+            this only *points* workers at the tarball — it does not
+            upload one; an external/CI workflow is expected to have put
+            it there (the general production path when source ships as an
+            S3 artifact). Leave ``None`` for AMI-baked source. See
+            ``dev_params.sync_source_path`` to also upload from the local
+            tree. See ``providers/aws/gotchas.md`` for the three modes.
+        code_suffix: Filename suffix for the source tarball (e.g.
+            ``"-mybranch"``, letting branches coexist in one bucket).
+            Empty for production tarballs.
         num_actors: Number of GPU actors to create.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
         dev_params: See :class:`EmbeddingsDevParams`.
@@ -185,7 +215,7 @@ def tessera_embeddings(
             )
             chunk_size = detected
 
-    chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, chunk_size or DEFAULT_CHUNK_SIZE, log)
+    chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, chunk_size or INFERENCE_CHUNK_SIZE, log)
 
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_zarr_path)
     log.info(
@@ -229,7 +259,15 @@ def tessera_embeddings(
         return _run_assembly(log=log, chunks=chunks, results=None, **assemble_kwargs)
 
     global _active_resolved_yaml, _active_cluster_name
-    with ray_cluster(log, ami_ssm_name=ami_ssm_name) as resolved_yaml:
+    with ray_cluster(
+        log,
+        ami_ssm_name=ami_ssm_name,
+        ssm_prefix=ssm_prefix,
+        cloudwatch_log_group=cloudwatch_log_group,
+        code_bucket=code_bucket,
+        code_suffix=code_suffix,
+        sync_source_path=Path(dev_params.sync_source_path) if dev_params.sync_source_path else None,
+    ) as resolved_yaml:
         _active_resolved_yaml = resolved_yaml
         if resolved_yaml and Path(resolved_yaml).exists():
             with Path(resolved_yaml).open() as _f:

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import xarray as xr
 import zarr
 
-from tessera_embeddings.config.inference import DEFAULT_CHUNK_SIZE
+from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ class ChunkSpec:
 def enumerate_chunks(
     total_y: int,
     total_x: int,
-    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_size: int = INFERENCE_CHUNK_SIZE,
 ) -> list[ChunkSpec]:
     """Enumerate all spatial chunks for a mosaic of given dimensions.
 
@@ -100,7 +100,7 @@ def enumerate_chunks(
 
 def enumerate_chunks_from_dataset(
     ds: xr.Dataset,
-    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_size: int = INFERENCE_CHUNK_SIZE,
 ) -> list[ChunkSpec]:
     """Enumerate chunks from an xarray Dataset's spatial dimensions.
 

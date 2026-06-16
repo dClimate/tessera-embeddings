@@ -39,6 +39,7 @@ from shapely.geometry import mapping, shape
 from shapely.ops import transform as shp_transform
 from shapely.ops import unary_union
 
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.storage.manifest import RoiManifest
 
 logger = logging.getLogger(__name__)
@@ -356,7 +357,7 @@ def check_output_exists(output_path: str) -> bool:
 def rasterize_roi_zarr(
     output_path: str,
     resolution: float,
-    chunk_size: int = 2000,
+    chunk_size: int = INGEST_CHUNK_SIZE,
     force_crs: str | None = None,
     input_path: str | None = None,
     geometries: list | None = None,
@@ -377,8 +378,10 @@ def rasterize_roi_zarr(
     Args:
         output_path: Path to output Zarr store (local directory or ``s3://`` URI).
         resolution: Output pixel size in meters.
-        chunk_size: Spatial chunk size in pixels (default 2000, matching
-            the ingestion pipeline's ``load_chunks``).
+        chunk_size: Spatial chunk size in pixels (default
+            ``INGEST_CHUNK_SIZE``, matching the ingestion pipeline's
+            ``load_chunks`` so the ROI mask read during ingest is a clean
+            merge rather than a cross-chunk shuffle).
         force_crs: Optional EPSG string (e.g. ``"EPSG:32633"``) to override
             automatic UTM zone selection.
         input_path: Path to input GeoJSON file (local or ``s3://``).

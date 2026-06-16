@@ -10,6 +10,7 @@ the function lives in the domain layer with no Prefect coupling.
 from __future__ import annotations
 
 import inspect
+from itertools import pairwise
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -97,6 +98,67 @@ def test_no_prefect_or_get_client_in_domain_modules() -> None:
                     raise AssertionError(f"{path} calls {fn.id}()")
                 if isinstance(fn, ast.Attribute) and fn.attr in forbidden_calls:
                     raise AssertionError(f"{path} calls {fn.attr}()")
+
+
+@patch("tessera_embeddings.ingest.s1_roi.make_s1_item_provider")
+@patch("tessera_embeddings.ingest.s1_roi.get_existing_dates", return_value=set())
+@patch("tessera_embeddings.ingest.s1_roi.read_roi_mask")
+@patch("tessera_embeddings.ingest.s1_roi.read_roi_metadata")
+@patch("tessera_embeddings.ingest.s1_roi.IngestManifest")
+@patch("tessera_embeddings.ingest.s1_roi.ingest_tile", return_value=(None, None))
+def test_s1_batch_windows_tile_inclusive_range_without_overlap(
+    mock_ingest_tile,
+    mock_manifest,
+    mock_read_meta,
+    mock_read_mask,
+    mock_existing,
+    mock_provider,
+):
+    """Batches tile the inclusive [start, end] range with no day queried twice.
+
+    Two regressions guarded here:
+
+    * CMR/STAC treat their end date as inclusive, so a batch advancing to
+      ``batch_start = batch_end`` re-queries every batch boundary day. The
+      loop must advance to the day *after* ``batch_end``.
+    * ``end_date`` is inclusive: the final day must be queried, not dropped.
+    """
+    mock_read_meta.return_value = MagicMock(bbox_wgs84=(-105.0, 39.0, -104.0, 40.0))
+
+    result = ingest_s1_roi_sar(
+        roi_zarr_path="/tmp/roi.zarr",
+        start_date="2024-01-01",
+        end_date="2024-03-01",
+        store_path="/tmp/store",
+        client=MagicMock(),
+        orbit="ascending",
+        batch_days=30,
+    )
+
+    # ingest_tile returned no data each batch, so nothing was written.
+    assert result.status == "skipped"
+
+    windows = [(c.kwargs["start_date"], c.kwargs["end_date"]) for c in mock_ingest_tile.call_args_list]
+
+    # 30-day inclusive batches tile [2024-01-01, 2024-03-01]: each batch
+    # covers batch_days calendar days, the next starts the following day, and
+    # the trailing batch lands exactly on the inclusive end_date.
+    assert windows == [
+        ("2024-01-01", "2024-01-30"),
+        ("2024-01-31", "2024-02-29"),
+        ("2024-03-01", "2024-03-01"),
+    ]
+
+    # No day appears as both a window end and the next window's start.
+    for (_, prev_end), (next_start, _) in pairwise(windows):
+        assert prev_end < next_start, f"boundary day re-queried: {prev_end} >= {next_start}"
+
+    # end_date is inclusive: the last batch's queried end is end_date itself.
+    assert windows[-1][1] == "2024-03-01"
+
+    # The item provider is built for the same window as the query.
+    provider_windows = [(c.args[2], c.args[3]) for c in mock_provider.call_args_list]
+    assert provider_windows == windows
 
 
 @patch("tessera_embeddings.ingest.stac.Client")

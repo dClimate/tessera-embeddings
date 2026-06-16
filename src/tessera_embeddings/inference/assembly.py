@@ -16,7 +16,7 @@ import datetime
 import logging
 import subprocess
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import dask.array as da
 import fsspec
@@ -251,7 +251,7 @@ class ZarrWriter:
         run_id: str,
         scales: np.ndarray,
         embeddings_std: np.ndarray | None = None,
-        obs_counts: dict[str, np.ndarray | None] | None = None,
+        obs_counts: Mapping[str, np.ndarray | None] | None = None,
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 

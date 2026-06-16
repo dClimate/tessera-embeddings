@@ -8,13 +8,13 @@ Uses Icechunk for transactional writes with atomic commit semantics.
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
-import dask.array as da
 import fsspec
 import icechunk
 import numpy as np
@@ -27,11 +27,6 @@ from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
 from tessera_embeddings.utils import utcnow_iso
 
 logger = logging.getLogger(__name__)
-
-# Default chunking for Zarr storage arrays.
-# time=1 keeps each date separate for efficient single-date reads and appends.
-# Full spatial chunks reasonable with icechunk and simplifies task graph
-DEFAULT_CHUNKS = {"time": 1, "northing": 10980, "easting": 10980}
 
 # Standard time encoding for all stores
 TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"}
@@ -99,6 +94,38 @@ def _parse_s3_url(url: str) -> tuple[str, str]:
 _DEFAULT_S3_REGION = "us-west-2"
 
 
+# Process-wide fallback credential provider for icechunk S3 storage. When set,
+# _create_storage uses it for any S3 open that didn't receive an explicit
+# get_credentials. The S1 ingest path registers an IAM-resolving callback here
+# (via the AWS provider) so icechunk writes keep using IAM-role creds even
+# after set_s3_credentials overwrites the AWS_* env vars with OPERA-scoped STS
+# tokens. Stays None in the open-source layer, keeping it cloud-agnostic.
+_default_credentials_provider: "Callable[[], icechunk.S3StaticCredentials] | None" = None
+
+
+@contextmanager
+def credentials_provider(
+    provider: "Callable[[], icechunk.S3StaticCredentials] | None",
+) -> "Iterator[None]":
+    """Temporarily register a fallback credential provider for icechunk S3 opens.
+
+    Used by :func:`_create_storage` whenever an S3 open inside the ``with``
+    block has no explicit ``get_credentials``. Scoped to the block so a
+    reused process (e.g. a Dask worker) is not left pinned to ``provider``
+    for later, unrelated icechunk opens. The previous provider is restored
+    even if the body raises. See the module-level
+    ``_default_credentials_provider`` note for why the S1 ingest path needs
+    this.
+    """
+    global _default_credentials_provider
+    previous = _default_credentials_provider
+    _default_credentials_provider = provider
+    try:
+        yield
+    finally:
+        _default_credentials_provider = previous
+
+
 def _create_storage(
     store_path: str,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
@@ -132,6 +159,16 @@ def _create_storage(
         bucket, prefix = _parse_s3_url(store_path)
         if _s3_config_override:
             return _s3_config_override.make_storage(prefix_override=prefix)
+        # Fall back to a globally-registered credential provider when the
+        # caller didn't pass one explicitly. This is how the S1 ingest path
+        # keeps icechunk on IAM-role creds: set_s3_credentials overwrites the
+        # AWS_* env vars with OPERA-scoped STS tokens for GDAL reads, and
+        # icechunk's default AWS chain would otherwise pick those up and get
+        # AccessDenied writing our own store. The S1 ingest task registers an
+        # IAM-resolving callback via credentials_provider(). See
+        # tessera_embeddings.providers.aws.credentials.
+        if get_credentials is None:
+            get_credentials = _default_credentials_provider
         s3_kwargs: dict = {
             "bucket": bucket,
             "prefix": prefix,
@@ -148,8 +185,11 @@ def _create_storage(
     return icechunk.local_filesystem_storage(local_path)
 
 
-def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk.RepositoryConfig | None:
-    """RepositoryConfig overrides. Returns None when no overrides are set.
+def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk.RepositoryConfig:
+    """Build the RepositoryConfig overrides applied to every repo open.
+
+    Chunk cache is left at icechunk's (small) default — see
+    context_docs/decisions/007-icechunk-chunk-cache-disabled.md.
 
     When ``max_concurrent_requests`` is provided, caps per-repo HTTP
     concurrency. Assembly at cornbelt scale fans out thousands of concurrent
@@ -160,10 +200,9 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     Retry/backoff is left at icechunk's defaults — SlowDown is already
     classified as retriable by the underlying AWS SDK.
     """
-    if max_concurrent_requests is None:
-        return None
     config = icechunk.RepositoryConfig.default()
-    config.max_concurrent_requests = max_concurrent_requests
+    if max_concurrent_requests is not None:
+        config.max_concurrent_requests = max_concurrent_requests
     return config
 
 
@@ -356,17 +395,29 @@ def compute_doy(timestamps: np.ndarray) -> np.ndarray:
     return ((timestamps.astype("datetime64[D]") - years).astype(int) + 1).astype(np.int32)
 
 
-def _write_dataset_impl(
+def write_dataset(
     store_path: str,
     data: xr.Dataset,
     tile_id: str,
     baselines: dict[str, int],
-    chunks: dict[str, int] | None = None,
+    chunks: dict[str, int],
     manifest: IngestManifest | None = None,
-    crs: str | None = None,
+    *,
+    crs: str,
 ) -> None:
-    """Shared implementation for write_dataset and write_reflectance."""
-    effective_chunks = chunks if chunks is not None else DEFAULT_CHUNKS
+    """Write dataset to Icechunk Zarr store, creating or appending as needed.
+
+    Args:
+        store_path: Path to the Zarr store (local or s3://).
+        data: xarray Dataset with (time, northing, easting) dimensions.
+        tile_id: Tile identifier for store metadata.
+        baselines: Dict mapping date strings to baseline integers.
+        chunks: Chunk sizes dict with ``time``, ``northing``, and ``easting`` keys.
+        manifest: Typed manifest for append-safety validation.
+            Written on create, validated on append.
+        crs: CRS authority code (e.g. ``"EPSG:32615"``). Stored in root
+            attrs so downstream consumers can determine the projection.
+    """
     existing_dates = get_existing_dates(store_path)
 
     # Normalize time to nanosecond resolution to match TIME_ENCODING.
@@ -375,7 +426,6 @@ def _write_dataset_impl(
     if data.time.dtype != np.dtype("datetime64[ns]"):
         data = data.assign_coords(time=data.time.values.astype("datetime64[ns]"))
 
-    # Compute DOY coordinate
     doy = compute_doy(data.time.values)
 
     if existing_dates:
@@ -399,11 +449,10 @@ def _write_dataset_impl(
             },
         )
     else:
-        # Create new store with encoding
         chunk_sizes = (
-            effective_chunks["time"],
-            min(effective_chunks["northing"], data.sizes["northing"]),
-            min(effective_chunks["easting"], data.sizes["easting"]),
+            chunks["time"],
+            min(chunks["northing"], data.sizes["northing"]),
+            min(chunks["easting"], data.sizes["easting"]),
         )
         encoding: dict[str, Any] = {str(var): {"chunks": chunk_sizes} for var in data.data_vars}
         encoding["time"] = TIME_ENCODING
@@ -414,118 +463,14 @@ def _write_dataset_impl(
             "doy": doy.tolist(),
             "created_at": utcnow_iso(),
             "last_appended": utcnow_iso(),
+            "crs": crs,
         }
-        if crs:
-            store_attrs["crs"] = crs
         if manifest:
             store_attrs["_manifest"] = manifest.to_dict()
             logger.info("Writing _manifest to %s", store_path)
 
         data.attrs.update(store_attrs)
         _write_new(store_path, data, encoding, f"Create with {data.sizes['time']} dates")
-
-
-def write_dataset(
-    store_path: str,
-    data: xr.Dataset,
-    tile_id: str,
-    baselines: dict[str, int],
-    chunks: dict[str, int] | None = None,
-    manifest: IngestManifest | None = None,
-    *,
-    crs: str,
-) -> None:
-    """Write dataset to Icechunk Zarr store, creating or appending as needed.
-
-    Args:
-        store_path: Path to the Zarr store (local or s3://).
-        data: xarray Dataset with (time, northing, easting) dimensions.
-        tile_id: Tile identifier for store metadata.
-        baselines: Dict mapping date strings to baseline integers.
-        chunks: Optional chunk sizes dict. Defaults to DEFAULT_CHUNKS.
-        manifest: Typed manifest for append-safety validation.
-            Written on create, validated on append.
-        crs: CRS authority code (e.g. ``"EPSG:32615"``). Stored in root
-            attrs so downstream consumers can determine the projection.
-    """
-    _write_dataset_impl(store_path, data, tile_id, baselines, chunks, manifest, crs=crs)
-
-
-def write_reflectance(
-    store_path: str,
-    data: xr.Dataset,
-    tile_id: str,
-    baselines: dict[str, int],
-    chunks: dict[str, int] | None = None,
-    manifest: IngestManifest | None = None,
-    *,
-    crs: str | None = None,
-) -> None:
-    """Backward-compatible wrapper: writes reflectance without requiring CRS.
-
-    Prefer ``write_dataset`` for new code — it enforces CRS.
-    """
-    _write_dataset_impl(store_path, data, tile_id, baselines, chunks, manifest, crs=crs)
-
-
-def write_cloudmask(
-    store_path: str,
-    mask: np.ndarray | da.Array,
-    timestamps: list[np.datetime64],
-    tile_id: str | None = None,
-    model_version: str | None = None,
-    chunks: dict[str, int] | None = None,
-    *,
-    northing: np.ndarray,
-    easting: np.ndarray,
-) -> None:
-    """Write cloud mask data, creating store if needed or appending if exists.
-
-    Args:
-        store_path: Path to the Zarr store.
-        mask: Cloud mask array with shape (time, northing, easting).
-        timestamps: Full timestamps for each time slice. Using full timestamps
-            (not just dates) preserves distinct acquisitions on the same day.
-        tile_id: Tile ID for new stores (required for creation).
-        model_version: Model version for new stores (required for creation).
-        chunks: Optional chunk sizes dict. Defaults to DEFAULT_CHUNKS.
-        northing: 1-D UTM northing coordinate array (metres). Required — a
-            store without spatial coordinates does not satisfy the GeoZarr contract.
-        easting: 1-D UTM easting coordinate array (metres, paired with ``northing``).
-    """
-    effective_chunks = chunks if chunks is not None else DEFAULT_CHUNKS
-
-    if mask.ndim != 3 or mask.shape[0] != len(timestamps):
-        raise ValueError(f"mask shape {mask.shape} doesn't match {len(timestamps)} timestamps")
-
-    # Build dataset with full timestamps to handle multiple acquisitions per day
-    mask_ds = xr.DataArray(
-        mask,
-        dims=["time", "northing", "easting"],
-        coords={"time": timestamps, "northing": northing, "easting": easting},
-        name="mask",
-    ).to_dataset()
-
-    chunk_sizes = {
-        "time": 1,
-        "northing": min(effective_chunks["northing"], mask.shape[1]),
-        "easting": min(effective_chunks["easting"], mask.shape[2]),
-    }
-    mask_ds = mask_ds.chunk(chunk_sizes)
-
-    if get_existing_dates(store_path):
-        _write_append(store_path, mask_ds, f"Append {len(timestamps)} cloudmask timestamps")
-    else:
-        if not tile_id or not model_version:
-            raise ValueError("tile_id and model_version required for new cloudmask store")
-        mask_ds.attrs.update(
-            {
-                "tile_id": tile_id,
-                "model_version": model_version,
-                "created_at": utcnow_iso(),
-            }
-        )
-        _write_new(store_path, mask_ds, {"time": TIME_ENCODING}, f"Create with {len(timestamps)} timestamps")
 
 
 # =============================================================================

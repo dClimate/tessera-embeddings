@@ -37,7 +37,7 @@ The AWS implementation owns five concerns:
 ## The cluster YAML template
 
 `providers/aws/cluster.yaml.template` ships a working default for an
-A10G GPU pool on `g5.2xlarge`. Account-bound IDs are absent; comments
+A10G GPU pool on `g5.xlarge`. Account-bound IDs are absent; comments
 flag every injection point with `# INJECT: <what>`.
 
 **Why runtime injection from SSM?** Account-bound IDs (security
@@ -92,17 +92,28 @@ package install location), edit the `head_start_ray_commands` /
 
 ## Code sync (`sync_source_path`)
 
-Two supported paths for getting application code onto workers:
+Three supported paths for getting application code onto workers,
+selected by which of `code_bucket` / `sync_source_path` you set:
 
-1. **AMI-baked (default, recommended for production).** Skip
-   `sync_source_path` entirely; the source is already inside the
-   AMI's venv. The `aws s3 cp` line in `setup_commands` becomes a
-   no-op or you remove it from your customised template.
-2. **Runtime sync (dev iteration).** Set
-   `sync_source_path=Path("src/tessera_embeddings")` and pass
-   `code_bucket="my-dev-bucket"`. The provider tars the directory and
-   uploads it to `s3://{code_bucket}/code/src{code_suffix}.tar.gz`
-   before `ray up`. Workers pull this tarball during `setup_commands`.
+1. **AMI-baked (default — neither set).** The source is already
+   inside the AMI's venv. Leave both `None`; the `{CODE_BUCKET}`
+   placeholder is left untouched (so a customised template should
+   omit or no-op the `aws s3 cp` line). Recommended for production
+   when source is versioned into the AMI.
+2. **Pre-uploaded tarball (`code_bucket` only).** The provider
+   rewrites the `setup_commands` `aws s3 cp` line to pull
+   `s3://{code_bucket}/code/src{code_suffix}.tar.gz`, but does **not**
+   upload anything — the tarball must already exist, having been put
+   there by an external/CI workflow. This is the general production
+   path when code ships as a versioned S3 artifact rather than baked
+   into the AMI. ⚠️ If you set `code_bucket` but the tarball isn't
+   present, `setup_commands` fails at `ray up`.
+3. **Runtime sync (`code_bucket` + `sync_source_path` — dev
+   iteration).** Set `sync_source_path=Path("src/tessera_embeddings")`
+   and `code_bucket="my-dev-bucket"`. The provider tars the directory,
+   uploads it to the same key, *then* launches — so workers pull
+   whatever is in your working tree. Skips the CI round-trip for fast
+   local iteration.
 
 `code_suffix` lets multiple branches coexist in the same bucket
 (e.g. `-mybranch` → `src-mybranch.tar.gz`). The reference repo
