@@ -25,20 +25,21 @@ EXPECTED_GDAL_VARS = {
 
 
 @pytest.fixture
-def restore_src_logger():
-    """Snapshot the ``src`` logger's level/handlers and restore them after the test.
+def restore_pkg_logger():
+    """Snapshot the ``tessera_embeddings`` logger's level/handlers and restore them after the test.
 
-    ``configure_gdal_environment`` mutates the process-global ``src`` logger, so
-    without this the logging tests would leak state into each other.
+    ``configure_gdal_environment`` mutates the process-global
+    ``tessera_embeddings`` logger, so without this the logging tests would leak
+    state into each other.
     """
-    src_logger = logging.getLogger("src")
-    saved_level = src_logger.level
-    saved_handlers = src_logger.handlers[:]
+    pkg_logger = logging.getLogger("tessera_embeddings")
+    saved_level = pkg_logger.level
+    saved_handlers = pkg_logger.handlers[:]
     try:
-        yield src_logger
+        yield pkg_logger
     finally:
-        src_logger.setLevel(saved_level)
-        src_logger.handlers[:] = saved_handlers
+        pkg_logger.setLevel(saved_level)
+        pkg_logger.handlers[:] = saved_handlers
 
 
 class TestGdalEnvironment:
@@ -69,48 +70,48 @@ class TestGdalEnvironment:
         assert os.environ[var] == override
 
 
-class TestSrcLoggerSetup:
+class TestPkgLoggerSetup:
     """Tests for the logging branch of configure_gdal_environment."""
 
-    def test_defaults_to_debug_level(self, monkeypatch, restore_src_logger):
-        """With SRC_LOG_LEVEL unset, the src logger is configured at DEBUG."""
+    def test_defaults_to_info_level(self, monkeypatch, restore_pkg_logger):
+        """With SRC_LOG_LEVEL unset, the package logger is configured at INFO."""
         monkeypatch.delenv("SRC_LOG_LEVEL", raising=False)
         configure_gdal_environment()
-        assert restore_src_logger.level == logging.DEBUG
+        assert restore_pkg_logger.level == logging.INFO
 
     @pytest.mark.parametrize(
         "level_str, expected",
         [
             ("WARNING", logging.WARNING),
             ("error", logging.ERROR),  # lower-case is upper-cased before lookup
-            ("INFO", logging.INFO),
+            ("DEBUG", logging.DEBUG),
         ],
     )
-    def test_respects_src_log_level(self, monkeypatch, restore_src_logger, level_str, expected):
+    def test_respects_src_log_level(self, monkeypatch, restore_pkg_logger, level_str, expected):
         """SRC_LOG_LEVEL is parsed (case-insensitively) into the logger level."""
         monkeypatch.setenv("SRC_LOG_LEVEL", level_str)
         configure_gdal_environment()
-        assert restore_src_logger.level == expected
+        assert restore_pkg_logger.level == expected
 
-    def test_invalid_level_falls_back_to_info(self, monkeypatch, restore_src_logger):
+    def test_invalid_level_falls_back_to_info(self, monkeypatch, restore_pkg_logger):
         """An unrecognized level name falls back to INFO rather than raising."""
         monkeypatch.setenv("SRC_LOG_LEVEL", "NOTALEVEL")
         configure_gdal_environment()
-        assert restore_src_logger.level == logging.INFO
+        assert restore_pkg_logger.level == logging.INFO
 
-    def test_attaches_a_handler(self, monkeypatch, restore_src_logger):
-        """A StreamHandler is attached when the src logger has none."""
+    def test_attaches_a_handler(self, monkeypatch, restore_pkg_logger):
+        """A StreamHandler is attached when the package logger has none."""
         monkeypatch.delenv("SRC_LOG_LEVEL", raising=False)
-        restore_src_logger.handlers[:] = []
+        restore_pkg_logger.handlers[:] = []
         configure_gdal_environment()
-        assert len(restore_src_logger.handlers) == 1
-        assert isinstance(restore_src_logger.handlers[0], logging.StreamHandler)
+        assert len(restore_pkg_logger.handlers) == 1
+        assert isinstance(restore_pkg_logger.handlers[0], logging.StreamHandler)
 
-    def test_does_not_add_duplicate_handlers(self, monkeypatch, restore_src_logger):
+    def test_does_not_add_duplicate_handlers(self, monkeypatch, restore_pkg_logger):
         """Repeated calls must not stack duplicate handlers (the `if not handlers` guard)."""
         monkeypatch.delenv("SRC_LOG_LEVEL", raising=False)
-        restore_src_logger.handlers[:] = []
+        restore_pkg_logger.handlers[:] = []
         configure_gdal_environment()
         configure_gdal_environment()
         configure_gdal_environment()
-        assert len(restore_src_logger.handlers) == 1
+        assert len(restore_pkg_logger.handlers) == 1
