@@ -473,7 +473,7 @@ def _query_stac_items(
     stac_io = StacApiIO(max_retries=_STAC_RETRY, timeout=_STAC_TIMEOUT)
     client = Client.open(provider.catalog_url, stac_io=stac_io)
     logger.info(f"STAC catalog opened in {time.monotonic() - t0:.1f}s, executing search")
-    search = client.search(**query_params, limit=250, max_items=None)
+    search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
     items = list(search.items())
     logger.info(f"STAC query returned {len(items)} items in {time.monotonic() - t0:.1f}s total")
 

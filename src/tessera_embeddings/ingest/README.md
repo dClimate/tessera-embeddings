@@ -72,6 +72,13 @@ most for CMR-STAC, which returns 502/503 under load on large date-range queries.
 `status_forcelist` and therefore does **not** retry 5xx responses — the explicit `Retry`
 object is required.
 
+The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting
+to 250 but set to 2000 for `cmr-asf`. CONUS-scale bbox queries return tens of thousands of
+items; at 250 that is hundreds of sequential page requests, each an independent chance of
+an intermittent 5xx that fails the whole query once its retries are exhausted. Larger pages
+cut the request count — and thus the catastrophic-failure probability — proportionally.
+2000 is known-safe against this host: the native CMR Granule query already pages at 2000.
+
 Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
 cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
 are sorted by `(date, eo:cloud_cover)` so that within a solar-day mosaic the clearest tile
