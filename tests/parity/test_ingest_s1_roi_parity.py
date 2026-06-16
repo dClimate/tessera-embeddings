@@ -90,6 +90,18 @@ def _bearer_session_factory(token: str) -> requests.Session:
     return session
 
 
+@pytest.mark.xfail(
+    reason=(
+        "Committed cassette was recorded against the old CMR-STAC-search path; "
+        "OPERA now resolves items via the native CMR granule API, so the cassette "
+        "no longer matches on replay. Re-recording trips the credential-safety "
+        "guard (~116 MB). Tracked in "
+        "https://github.com/dClimate/tessera-embeddings/issues/45 — see "
+        "context_docs/decisions/007-native-cmr-granule-query.md."
+    ),
+    strict=False,
+    raises=Exception,
+)
 @pytest.mark.parity
 @pytest.mark.integration
 @pytest.mark.vcr(CASSETTE_NAME)
