@@ -14,6 +14,16 @@ concerns specific to OPERA:
   and monkey-patches the auth session to use Bearer for the test
   duration. The patch is local — auth.py and production behaviour
   are unchanged.
+
+.. note::
+   The committed cassette was recorded against the old CMR-STAC-search
+   ingest path. Since OPERA now resolves items directly from the native
+   CMR granule API (no ``client.search()``), the cassette no longer
+   matches on replay and this test fails. Re-recording produces a
+   ~116 MB cassette (COG bodies + auth redirects) that trips the
+   credential-safety guard and is too large to commit. Tracked in
+   https://github.com/dClimate/tessera-embeddings/issues/45 — see
+   context_docs/decisions/007-native-cmr-granule-query.md.
 """
 
 from __future__ import annotations
