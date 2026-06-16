@@ -340,11 +340,12 @@ formula in the background section above applies to estimating how many tasks a g
 window width will produce; the 30-day default keeps each batch well within the scheduler's
 RAM budget at cornbelt scale.
 
-Batch windows are half-open: the loop strides `batch_start = batch_end`, and each batch's
-CMR/STAC query is bounded to the day *before* `batch_end` (the queries treat their end date
-as inclusive). This keeps the boundary day from being queried in two consecutive batches —
-without it every batch would redundantly page an extra day from CMR/STAC, which is wasteful
-at CONUS scale where each day is many pages of bursts.
+Batch windows are inclusive on both ends and do not overlap: each batch spans `batch_days`
+calendar days, and the loop advances `batch_start` to the day *after* `batch_end`. Because
+CMR/STAC also treat their query end date as inclusive, each day is queried by exactly one
+batch — a batch boundary that landed on the same day as the next batch's start would page
+that day twice, wasteful at CONUS scale where each day is many pages of bursts. The overall
+`[start_date, end_date]` range is inclusive of `end_date`.
 
 ### Lazy evaluation throughout
 

@@ -47,10 +47,9 @@ from tests.parity.helpers import assert_zarr_equivalent
 CASSETTE_NAME = "test_s1_roi_parity"
 
 # Denver, CO. July 2024 has 5 ascending and 4 descending OPERA granules.
-# end_date is exclusive (the ingest loop walks up to but not including it),
-# so 2024-08-01 covers all of July. batch_days=31 keeps it a single batch
-# whose inclusive CMR/STAC query end lands on 2024-07-31.
-DENVER_DATES = ("2024-07-01", "2024-08-01")
+# end_date is inclusive; batch_days=31 keeps all of July in a single batch
+# whose CMR/STAC query end lands on 2024-07-31.
+DENVER_DATES = ("2024-07-01", "2024-07-31")
 DENVER_BATCH_DAYS = 31
 FORCE_CRS = "EPSG:32613"  # UTM zone 13N covers Denver
 

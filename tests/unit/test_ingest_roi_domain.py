@@ -106,7 +106,7 @@ def test_no_prefect_or_get_client_in_domain_modules() -> None:
 @patch("tessera_embeddings.ingest.s1_roi.read_roi_metadata")
 @patch("tessera_embeddings.ingest.s1_roi.IngestManifest")
 @patch("tessera_embeddings.ingest.s1_roi.ingest_tile", return_value=(None, None))
-def test_s1_batch_windows_are_half_open_no_boundary_overlap(
+def test_s1_batch_windows_tile_inclusive_range_without_overlap(
     mock_ingest_tile,
     mock_manifest,
     mock_read_meta,
@@ -114,12 +114,14 @@ def test_s1_batch_windows_are_half_open_no_boundary_overlap(
     mock_existing,
     mock_provider,
 ):
-    """Each batch queries a half-open window so no calendar day is queried twice.
+    """Batches tile the inclusive [start, end] range with no day queried twice.
 
-    Regression: CMR/STAC treat their end date as inclusive while the loop
-    strides ``batch_start = batch_end``. Querying through ``batch_end``
-    would re-query every batch-boundary day in the next batch; the query
-    end must be ``batch_end - 1 day``.
+    Two regressions guarded here:
+
+    * CMR/STAC treat their end date as inclusive, so a batch advancing to
+      ``batch_start = batch_end`` re-queries every batch boundary day. The
+      loop must advance to the day *after* ``batch_end``.
+    * ``end_date`` is inclusive: the final day must be queried, not dropped.
     """
     mock_read_meta.return_value = MagicMock(bbox_wgs84=(-105.0, 39.0, -104.0, 40.0))
 
@@ -138,19 +140,23 @@ def test_s1_batch_windows_are_half_open_no_boundary_overlap(
 
     windows = [(c.kwargs["start_date"], c.kwargs["end_date"]) for c in mock_ingest_tile.call_args_list]
 
-    # Two 30-day batches tile [2024-01-01, 2024-03-01). Each queried end is
-    # ``batch_end - 1 day``: the first stops at 01-30 (next batch starts
-    # 01-31), the last stops one day short of the exclusive end_date.
+    # 30-day inclusive batches tile [2024-01-01, 2024-03-01]: each batch
+    # covers batch_days calendar days, the next starts the following day, and
+    # the trailing batch lands exactly on the inclusive end_date.
     assert windows == [
         ("2024-01-01", "2024-01-30"),
         ("2024-01-31", "2024-02-29"),
+        ("2024-03-01", "2024-03-01"),
     ]
 
     # No day appears as both a window end and the next window's start.
-    for prev_end, next_start in pairwise(windows):
+    for (_, prev_end), (next_start, _) in pairwise(windows):
         assert prev_end < next_start, f"boundary day re-queried: {prev_end} >= {next_start}"
 
-    # The item provider is built for the same half-open window as the query.
+    # end_date is inclusive: the last batch's queried end is end_date itself.
+    assert windows[-1][1] == "2024-03-01"
+
+    # The item provider is built for the same window as the query.
     provider_windows = [(c.args[2], c.args[3]) for c in mock_provider.call_args_list]
     assert provider_windows == windows
 
