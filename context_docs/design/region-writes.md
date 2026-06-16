@@ -47,7 +47,7 @@ snapshots and restores root attrs because `to_icechunk` clobbers them with
 `data.attrs` (zarr_store.py:344-354). Reads already do arbitrary spatial slicing
 via `oindex`. No `region=` anywhere in the write path.
 
-```
+```text
    CREATE (mode="w")          APPEND (append_dim="time")     REGION (mode="r+")  ← new
    whole array, new store     extend the time axis           overwrite a slice of an
    ┌───────────────┐          ┌───────────────┬──┐           existing array
@@ -369,6 +369,15 @@ Phase 1 ships the primitive; Phase 2 wires callers:
    a future flow parallelizes uncoordinated writes to one array.
 9. **No true mid-array insert in scope** — deferred (resize + back-to-front
    shift + coord rewrite across commits; icechunk #1873 ordering hazard).
+10. **Region slices are normalized and validated** — `_pad_region_to_chunks`
+    resolves open bounds (`slice(None)`) via `slice.indices`, rejects non-unit
+    steps and empty slices, transposes incoming data to the store's dim order,
+    and asserts each variable's shape matches the region (so a broadcastable
+    smaller array can't silently fill the whole region).
+11. **`resolve_region` requires contiguous hits** — a coordinate range that
+    straddles a gap on an unsorted axis is rejected rather than silently widened
+    to cover intervening cells. Forward `get_credentials`/`s3_region` so the
+    resolve and write open the same store.
 
 ---
 

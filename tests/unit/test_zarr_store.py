@@ -540,6 +540,25 @@ class TestResolveRegion:
         with pytest.raises(ValueError, match="selects no existing coordinate"):
             resolve_region(store_path, time=("2025-01-01", "2025-01-01"))
 
+    def test_non_contiguous_range_raises(self, local_zarr_path, sample_reflectance_data):
+        """An out-of-order time axis whose range straddles a gap is rejected."""
+
+        # write_dataset appends without sorting, so append out of order to build
+        # the axis [2024-01-06, 2024-01-01, 2024-01-20].
+        def _append(date):
+            ds = sample_reflectance_data([date], height=1000, width=1000)
+            write_dataset(
+                store_path, ds, tile_id="33UUP", baselines={date: 400}, chunks=SPLIT_CHUNKS, crs="EPSG:32615"
+            )
+
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-06"])
+        _append("2024-01-01")
+        _append("2024-01-20")
+
+        # Range 01-06..01-20 matches indices 0 and 2 — non-contiguous (gap at 1).
+        with pytest.raises(ValueError, match="non-contiguous"):
+            resolve_region(store_path, time=("2024-01-06", "2024-01-20"))
+
 
 class TestPadRegionToChunks:
     """Unit tests for the read-modify-write chunk padding (no store I/O)."""
@@ -585,6 +604,45 @@ class TestPadRegionToChunks:
         mask = np.ones(arr.shape[1:], dtype=bool)
         mask[100:300, 250:610] = False
         assert (arr[0][mask] == 0).all()
+
+    def test_open_bound_slice_is_normalized(self):
+        """slice(None) on a padded dim resolves to the full axis, no None arithmetic."""
+        existing = self._existing()
+        # northing full axis (slice(None)); easting unaligned so padding kicks in.
+        data = _single_date_block("2024-01-01", 4, height=1000, width=360, e0=250, chunks=ONE_BLOCK)
+        region = {"northing": slice(None), "easting": slice(250, 610)}
+        padded, widened = _pad_region_to_chunks(existing, data, region)
+        assert widened == {"northing": slice(0, 1000), "easting": slice(0, 1000)}
+        assert (padded["blue"].values[0, :, 250:610] == 4).all()
+
+    def test_mismatched_shape_is_rejected(self):
+        """A region-covering promise is enforced: a too-small input can't broadcast."""
+        existing = self._existing()
+        # region spans 200 northing rows but data only supplies 1 -> would broadcast.
+        data = _single_date_block("2024-01-01", 9, height=1, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
+        region = {"northing": slice(100, 300), "easting": slice(250, 610)}
+        with pytest.raises(ValueError, match="expected"):
+            _pad_region_to_chunks(existing, data, region)
+
+    def test_non_unit_step_is_rejected(self):
+        existing = self._existing()
+        data = _single_date_block("2024-01-01", 9, height=250, width=500, chunks=ONE_BLOCK)
+        with pytest.raises(ValueError, match="step 1"):
+            _pad_region_to_chunks(existing, data, {"northing": slice(0, 500, 2)})
+
+    def test_transposed_input_is_realigned(self):
+        """Input with swapped northing/easting is transposed to store order, not corrupted."""
+        existing = self._existing()
+        # Build data with easting before northing, unaligned so padding runs.
+        arr = np.full((1, 360, 200), 6, dtype=np.uint16)  # (time, easting, northing)
+        data = xr.Dataset(
+            {"blue": (["time", "easting", "northing"], arr)},
+            coords={"time": [np.datetime64("2024-01-01", "ns")]},
+        ).chunk(ONE_BLOCK)
+        region = {"northing": slice(100, 300), "easting": slice(250, 610)}
+        padded, _ = _pad_region_to_chunks(existing, data, region)
+        assert padded["blue"].dims == ("time", "northing", "easting")
+        assert (padded["blue"].values[0, 100:300, 250:610] == 6).all()
 
 
 class TestWriteRegion:
