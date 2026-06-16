@@ -180,26 +180,36 @@ def resolve_region(
 ```python
 def _pad_region_to_chunks(store_array, data, region):
     """Widen each region dim to enclosing whole-chunk bounds, backfilling
-    boundary cells from the store so the r+ write sees only whole chunks.
+    the shell from the store so the r+ write sees only whole chunks.
 
-    Interior chunks are fully overwritten (no read); only edge chunks are
-    read-modify-written. Returns (padded_data, widened_region)."""
+    Returns (padded_data, widened_region)."""
 ```
 
 - Reads store chunk sizes from the opened array (`.chunks`), **not** from
   config — the store is authoritative.
-- RMW **only the boundary chunks** per axis. The shell is read as a lazy dask
-  slab on the store's chunk grid (`existing.isel(widened)`); interior whole
-  chunks are fully overwritten by the overlay, so dask culls their read tasks
-  and only the partial edge chunks are actually fetched.
+- **Validates shape on every path first.** Each written variable is transposed
+  to the store's dim order and asserted to cover exactly the region (region
+  length on each region dim, full store length elsewhere). This runs before the
+  aligned/padded split, so neither path can let dask/NumPy broadcasting silently
+  repeat a too-small (or axis-missing) input across the region.
+- Reads the enclosing chunks as a lazy dask slab on the store's chunk grid
+  (`existing.isel(widened)`). **Note:** the positional overlay below keeps *every*
+  overlapped chunk — including interior chunks fully covered by the region —
+  dependent on that read, so a large unaligned write fetches the whole widened
+  slab, not just its edge chunks. The extra IO is bounded by the padding (at most
+  one chunk per region face) and is acceptable at current tile sizes. Reading
+  only the boundary chunks would require an edge-concatenation rebuild (interior
+  blocks sourced straight from `incoming`, edges read-modify-written) and is
+  deferred until tile scale makes the slab read costly.
 - **Overlay via positional dask `setitem`**, not label-based `combine_first`:
   `shell[idx] = data[var].data`, where `idx` is the region offset *within* the
   widened frame. Positional overlay sidesteps coordinate-label alignment
   pitfalls (e.g. descending northing) — the store's coords are authoritative and
   the incoming data is placed by index. Incoming values win; untouched cells
   keep the shell (store) value.
-- Aligned regions are a **pass-through**: when no edge needs widening,
-  `(data, region)` is returned unchanged with no store read.
+- Aligned regions **skip the store read**: when no edge needs widening, the
+  shape-validated data is returned with the (already whole-chunk) region, no
+  shell slab fetched or overlaid.
 - Result is whole-chunk on every axis → `r+` validation passes.
 
 This means **callers pass any region they want** (aligned or not); the primitive

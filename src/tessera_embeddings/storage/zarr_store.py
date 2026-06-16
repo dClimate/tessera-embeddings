@@ -352,7 +352,8 @@ def _write_new(
 
 def _commit_preserving_attrs(
     session: "icechunk.Session",
-    write: "Callable[[icechunk.Session], None]",
+    data: xr.Dataset,
+    write_kwargs: dict[str, Any],
     message: str,
     update_attrs: dict[str, Any] | None = None,
 ) -> None:
@@ -361,12 +362,13 @@ def _commit_preserving_attrs(
     ``to_icechunk`` overwrites root attrs with the (typically empty)
     ``data.attrs`` — destroying crs, ``_manifest``, etc. We snapshot them
     before the write and restore (plus any ``update_attrs``) after, then commit.
-    Shared by the append and region-write paths.
+    Shared by the append and region-write paths; ``write_kwargs`` carries the
+    mode-specific arguments (``mode``, ``append_dim``/``region``, etc.).
     """
     root = zarr.open_group(session.store, mode="r")
     preserved_attrs = dict(root.attrs)
 
-    write(session)
+    to_icechunk(data, session, **write_kwargs)
 
     root = zarr.open_group(session.store, mode="r+")
     root.attrs.update(preserved_attrs)
@@ -387,7 +389,8 @@ def _write_append(
 
     _commit_preserving_attrs(
         session,
-        lambda s: to_icechunk(data, s, mode="a", append_dim="time", align_chunks=True),
+        data,
+        {"mode": "a", "append_dim": "time", "align_chunks": True},
         message,
         update_attrs,
     )
@@ -409,21 +412,51 @@ def _store_chunk_sizes(existing: xr.Dataset, dims: "tuple[str, ...]") -> dict[st
     """
     sizes: dict[str, int] = {}
     for dim in dims:
-        per_var = set()
         for var in existing.data_vars:
             chunks = existing[var].chunks
             if chunks is None:
                 continue
             axis = existing[var].dims.index(dim)
-            per_var.add(chunks[axis][0])  # first block = nominal chunk size
-        if len(per_var) > 1:
-            raise ValueError(
-                f"Store data_vars disagree on chunk size for {dim!r}: {per_var}. "
-                "Region writes require uniform chunking across variables."
-            )
-        if per_var:
-            sizes[dim] = per_var.pop()
+            size = chunks[axis][0]  # first block = nominal chunk size
+            if dim in sizes and sizes[dim] != size:
+                raise ValueError(
+                    f"Store data_vars disagree on chunk size for {dim!r}: {sizes[dim]} vs {size}. "
+                    "Region writes require uniform chunking across variables."
+                )
+            sizes[dim] = size
     return sizes
+
+
+def _match_region_shapes(
+    existing: xr.Dataset,
+    data: xr.Dataset,
+    normalized: dict[str, slice],
+    region: dict[str, slice],
+) -> xr.Dataset:
+    """Transpose each var to store dim order and assert it covers exactly the region.
+
+    ``region`` is the caller's original (for the error message); ``normalized``
+    holds the resolved integer bounds. A written variable must match the region's
+    length along every region dim and the store's full length along the rest —
+    dask/NumPy broadcasting would otherwise silently repeat a smaller (or missing
+    one of the selected axes) array across the whole region instead of rejecting
+    it. Returns a dataset with every var transposed to the store's dim order so a
+    transposed input can't overlay onto the wrong axes.
+    """
+    matched: dict[str, xr.DataArray] = {}
+    for var in data.data_vars:
+        name = str(var)
+        dims = existing[name].dims  # store dimension order is authoritative
+        incoming = data[name].transpose(*dims)
+        expected = tuple(
+            (normalized[d].stop - normalized[d].start) if d in normalized else existing.sizes[d] for d in dims
+        )
+        if incoming.shape != expected:
+            raise ValueError(
+                f"Region data for {name!r} has shape {incoming.shape}, expected {expected} for region {region}."
+            )
+        matched[name] = incoming
+    return xr.Dataset(matched, coords=data.coords)
 
 
 def _pad_region_to_chunks(
@@ -443,10 +476,14 @@ def _pad_region_to_chunks(
     Returns ``(padded, widened)``. When ``region`` is already chunk-aligned this
     returns ``(data, region)`` unchanged — no store read.
 
-    Only boundary chunks are actually fetched: the shell is read as a lazy
-    dask slab on the store's chunk grid, then a positional ``setitem`` overlays
-    the incoming data. Interior chunks are wholly overwritten, so dask culls
-    their read tasks; only the partially-overwritten edge chunks are read.
+    Padding reads the enclosing chunks as a lazy dask slab on the store's chunk
+    grid, then a positional ``setitem`` overlays the incoming data. Note this
+    keeps every overlapped chunk — including interior chunks fully covered by
+    the region — dependent on the store read, so a large unaligned write fetches
+    the whole widened slab, not just its edge chunks. That extra IO is bounded by
+    the padding (at most one chunk per region face) and is acceptable at current
+    tile sizes; reading only the boundary chunks would need an edge-concatenation
+    rebuild and is deferred.
     """
     # Normalize region slices up front: resolve open bounds (slice(None)) to
     # concrete indices, reject non-unit steps, and reject empty slices, so the
@@ -459,6 +496,14 @@ def _pad_region_to_chunks(
         if start >= stop:
             raise ValueError(f"Region slice for {dim!r} is empty: {sl!r}.")
         normalized[dim] = slice(start, stop)
+
+    # Assert every written variable covers exactly the region before any write.
+    # Done for both the aligned and padded paths: on the aligned path
+    # ``to_icechunk`` would otherwise reject (or, for a missing axis, broadcast)
+    # a wrongly shaped array deep inside its writer with a cryptic error; here we
+    # fail early with a clear message. Returns data matched to the store's dim
+    # order (a transposed input would otherwise overlay onto the wrong axes).
+    matched = _match_region_shapes(existing, data, normalized, region)
 
     chunk_sizes = _store_chunk_sizes(existing, tuple(normalized))
 
@@ -474,27 +519,15 @@ def _pad_region_to_chunks(
             needs_pad = True
 
     if not needs_pad:
-        return data, widened
+        return matched, widened
 
     # Lazy shell from the store on its own chunk grid (committed data).
     slab = existing.isel(widened)
 
     padded_vars: dict[str, Any] = {}
-    for var in data.data_vars:
-        name = str(var)
+    for name, incoming in matched.data_vars.items():
+        name = str(name)
         dims = slab[name].dims  # store dimension order is authoritative
-        # Match incoming data to the store's dim order (a transposed input would
-        # otherwise overlay onto the wrong axes) and assert it covers exactly the
-        # region — dask/NumPy broadcasting would silently repeat a smaller array
-        # across the whole region instead of rejecting it.
-        incoming = data[name].transpose(*dims)
-        expected = tuple(
-            (normalized[d].stop - normalized[d].start) if d in normalized else existing.sizes[d] for d in dims
-        )
-        if incoming.shape != expected:
-            raise ValueError(
-                f"Region data for {name!r} has shape {incoming.shape}, expected {expected} for region {region}."
-            )
         shell = slab[name].data.copy()  # dask array on store chunk grid
         idx = tuple(
             slice(normalized[d].start - widened[d].start, normalized[d].stop - widened[d].start)
@@ -544,7 +577,8 @@ def _write_region(
 
         _commit_preserving_attrs(
             session,
-            lambda s: to_icechunk(to_write, s, mode="r+", region=widened, align_chunks=True, split_every=8),
+            to_write,
+            {"mode": "r+", "region": widened, "align_chunks": True, "split_every": 8},
             message,
             update_attrs,
         )
@@ -606,8 +640,12 @@ def resolve_region(
 ) -> dict[str, slice]:
     """Map coordinate-value ranges to half-open integer slices for an existing store.
 
-    Each argument is an inclusive ``(low, high)`` coordinate range or ``None``
-    (= the full axis, omitted from the result). ``time`` accepts anything
+    Each argument is a fully-inclusive ``(low, high)`` coordinate range or
+    ``None`` (= the full axis, omitted from the result). Both ends are matched
+    (``coord >= low & coord <= high``); the returned slices are half-open
+    ``[start, stop)`` in the usual Python sense. ``(low, high)`` may be given in
+    either order — they're sorted before matching — so a descending axis can be
+    addressed low-to-high or high-to-low. ``time`` accepts anything
     ``np.datetime64`` understands. Spatial bounds are matched against the
     store's ``northing``/``easting`` coordinate values regardless of axis
     direction (northing typically descends).
@@ -641,6 +679,8 @@ def resolve_region(
                 high: Any = np.datetime64(str(raw_high), "ns")
             else:
                 low, high = raw_low, raw_high
+            # Accept the range in either order: a descending axis (northing) is
+            # often addressed high-to-low, so sort the bounds before masking.
             lo_b, hi_b = (low, high) if low <= high else (high, low)
             mask = (coord >= lo_b) & (coord <= hi_b)
             hits = np.flatnonzero(mask)

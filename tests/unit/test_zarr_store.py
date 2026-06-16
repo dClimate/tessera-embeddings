@@ -572,14 +572,28 @@ class TestPadRegionToChunks:
         )
         return ds.chunk({"time": 1, "northing": chunk, "easting": chunk})
 
-    def test_aligned_region_is_passthrough(self):
-        """A chunk-aligned region returns the input unchanged (no store read)."""
+    def test_aligned_region_needs_no_store_read(self):
+        """A chunk-aligned region returns the incoming values unchanged (no store read).
+
+        The data is shape-validated and matched to the store's dim order, but the
+        values pass straight through — no shell slab is read or overlaid.
+        """
         existing = self._existing()
         data = _single_date_block("2024-01-01", 7, height=500, width=500, chunks=ONE_BLOCK)
         region = {"northing": slice(0, 500), "easting": slice(500, 1000)}
         padded, widened = _pad_region_to_chunks(existing, data, region)
         assert widened == region
-        assert padded is data
+        assert padded["blue"].dims == ("time", "northing", "easting")
+        assert (padded["blue"].values == 7).all()
+
+    def test_aligned_region_rejects_mismatched_shape(self):
+        """The aligned fast path still validates shape (no silent broadcast)."""
+        existing = self._existing()
+        # region spans 500 northing rows but data supplies 1 -> would broadcast.
+        data = _single_date_block("2024-01-01", 7, height=1, width=500, e0=500, chunks=ONE_BLOCK)
+        region = {"northing": slice(0, 500), "easting": slice(500, 1000)}
+        with pytest.raises(ValueError, match="expected"):
+            _pad_region_to_chunks(existing, data, region)
 
     def test_unaligned_region_widens_to_chunk_bounds(self):
         existing = self._existing()
