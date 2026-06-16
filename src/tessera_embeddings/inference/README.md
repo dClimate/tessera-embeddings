@@ -162,37 +162,17 @@ obs-count maps, and `assembly.py` are untouched (a single `write_chunk` at the e
 are loaded through a 1-deep prefetch pipeline (strip *i+1* loads while strip *i* runs the
 GPU), the same pattern as the sub-batch prefetcher in `inference.py`.
 
-```text
-whole-chunk footprint = T_estimate × H × W × 10 × 2
-  ≤ strip_budget_bytes               → 1 strip → byte-for-byte the unstriped path
-  >  strip_budget_bytes (striping on) → strip_h = (strip_budget_bytes / 2) / (T_estimate × W × 10 × 2)
-                                        clamped to [256, H]
-  T_estimate ≈ 40  → fits → 1 strip
-  T_estimate ≈ 120 → strip_h ≈ 445 → 5 strips → two resident strips stay under budget
-```
+The strip height is derived per chunk from its **true post-prune timestep count** `T_kept`,
+read from a full-chunk SCL mask loaded once up front (see below). The strip loop runs a 1-deep
+prefetch (strip *i+1* loads while strip *i* runs the GPU), so once a chunk splits **two strips
+are resident at once**; the byte budget is the bound on a single strip, sized so the pair holds
+under ~90% of the default 16 GB worker box. A chunk that fits in one strip loads whole (no
+prefetched neighbour) — byte-for-byte the unstriped path.
 
-The strip loop runs a 1-deep prefetch (strip *i+1* loads while strip *i* runs the GPU), so
-once a chunk splits **two strips are resident at once**. Strips are therefore sized against
-*half* the budget when striping is active, so the prefetched pair peaks under
-`strip_budget_bytes` rather than ~2× it; a chunk whose whole-height footprint already fits the
-budget loads as a single strip (no prefetched neighbour) sized against the full budget.
-
-`T_estimate` comes from `count_s2_window_timesteps`, which reads only the 1-D `time`
-coordinate (no spatial read) — an upper bound on `T_valid`, so strip sizing is conservative.
-The byte budget is `InferenceConfig.strip_budget_bytes` (default 4 GiB): lower it to force
-narrower strips (lower peak RAM, higher read amplification); raise it past the whole-chunk
-footprint to disable striping. **Striping is the only lever that makes peak RAM independent
-of observation density** — every other lever lowers the plateau by a fixed amount.
-
-Read cost: strips overlap shared `(time=1, 4000, 4000)` store chunks, so a split chunk
-re-touches the same on-disk chunks once per strip. The icechunk repo is opened with a 512 MB
-chunk cache (`zarr_store.py::_default_repo_config`), but that cache lives on the repo handle —
-so the strip loop opens each store **once per chunk** (`data_loading.make_store_opener`) and
-reuses the handle (and its warm cache) across every strip, rather than reopening cold per
-strip and discarding the cache. Those re-reads then hit cache rather than re-fetching S3 —
-measured strip read penalty ~1.35× (vs 2.37× uncached) on a dense chunk, which stays under the
-per-chunk compute time and is hidden by the prefetch pipeline. Normal single-strip chunks pay
-nothing.
+Two reads are decoupled. **SCL** (1 byte/px) is loaded once for the whole chunk
+(`load_s2_mask_bundle`) and sliced per strip — it is never re-decompressed, and it doubles as
+the `T_kept` source for sizing. **Reflectance bands** (20 bytes/px) are still read per strip on
+the chunks that split; that per-strip read is exactly the working set the byte budget bounds.
 
 #### 4b. Valid Pixel Filtering + Bucketing (`dataset.py`)
 
@@ -428,7 +408,6 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 | `latent_dim` | 192 | Transformer hidden dim (must match checkpoint) |
 | `representation_dim` | 192 | Model output dim; first 128 dims are saved to the store |
 | `dim_feedforward` | 2048 | Transformer FFN width |
-| `strip_budget_bytes` | 4 GiB | Byte budget for one resident input strip; bounds peak load RAM independent of T (see 4a′). Lower → narrower strips; raise past the whole-chunk footprint to disable striping |
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
 **Architecture params** (`nhead`, `num_encoder_layers`, `dim_feedforward`, etc.) **must match

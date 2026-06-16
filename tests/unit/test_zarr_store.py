@@ -24,13 +24,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import icechunk
 import numpy as np
 import pytest
 from icechunk.xarray import to_icechunk
 
 from tessera_embeddings.config import S2_L2A_BANDS
 from tessera_embeddings.storage.zarr_store import (
-    _CHUNK_CACHE_BYTES,
     S3Config,
     _default_repo_config,
     _open_writable_session,
@@ -472,26 +472,27 @@ class TestWriteDataset:
 
 
 class TestDefaultRepoConfig:
-    """The chunk cache is always applied; max_concurrent_requests stays optional.
+    """No chunk-cache override is applied; max_concurrent_requests stays optional.
 
-    Striped inference re-reads the same (time=1, 4000, 4000) store chunks once
-    per northing strip, so the cache must be set on every repo open — including
-    the common path where no concurrency cap is passed (the old early-return
-    bug dropped the cache entirely in that case).
+    A real-store A/B showed a chunk cache does not help striped inference (it
+    caches compressed bytes — a hit saves the S3 GET but not the decompression —
+    and a dense strip's band-major working set dwarfs any affordable cache, so
+    cross-strip reuse thrashes to ~0% hits). The config now leaves icechunk's
+    default cache in place rather than pinning a large one that only burned RAM.
     """
 
-    def test_cache_applied_without_concurrency_cap(self):
+    def test_no_cache_override_without_concurrency_cap(self):
         config = _default_repo_config()
         assert config is not None
-        assert config.caching is not None
-        assert config.caching.num_bytes_chunks == _CHUNK_CACHE_BYTES
+        # We no longer override caching: it stays at the icechunk default,
+        # which is None on a freshly-defaulted config (icechunk then applies
+        # its own internal cache sizing).
+        assert config.caching == icechunk.RepositoryConfig.default().caching
 
-    def test_cache_applied_with_concurrency_cap(self):
+    def test_concurrency_cap_applied(self):
         config = _default_repo_config(max_concurrent_requests=64)
-        assert config.caching is not None
-        assert config.caching.num_bytes_chunks == _CHUNK_CACHE_BYTES
         assert config.max_concurrent_requests == 64
 
     def test_returns_config_not_none_by_default(self):
-        # Previously returned None when no cap was passed; must now always build one.
+        # Must always build a config even when no cap is passed.
         assert _default_repo_config() is not None

@@ -1,10 +1,10 @@
 """Tests for the spatial-striping strip loop in InferenceActor.process_chunk.
 
-Covers the strip-height derivation helpers and an end-to-end equality check
-that running a chunk as a single strip vs. several northing strips produces
-bit-identical embeddings, scales, and obs counts. Striping bounds the resident
-*input* working set only; the output buffers and write path are whole-chunk, so
-the result must not depend on how the input is tiled.
+Covers the strip-tiling helper and an end-to-end equality check that running a
+chunk as a single strip vs. several northing strips produces bit-identical
+embeddings, scales, and obs counts. Striping bounds the resident *input*
+working set only; the output buffers and write path are whole-chunk, so the
+result must not depend on how the input is tiled.
 """
 
 from __future__ import annotations
@@ -22,64 +22,12 @@ from tessera_embeddings.config.inference import S2_BAND_ORDER
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.actors import (
     _MIN_STRIP_H,
+    _S2_STRIP_BYTE_BUDGET,
     InferenceActor,
-    _compute_strip_height,
+    _strip_height_for_density,
     _strip_slices,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-
-
-class TestComputeStripHeight:
-    """Unit tests for the byte-budget -> strip-height derivation."""
-
-    def test_large_budget_is_single_strip(self):
-        # A budget far above the chunk footprint resolves to the full height.
-        h = _compute_strip_height(height=2000, width=2000, t_estimate=40, strip_budget_bytes=10**12)
-        assert h == 2000
-
-    def test_dense_chunk_splits(self):
-        # T=120, W=2000, 4 GiB budget. Whole-chunk footprint (~9.6 GiB) exceeds
-        # the budget so striping kicks in; strips are sized against half the
-        # budget (the 1-deep prefetch keeps two resident), -> ~445 rows -> 5
-        # strips of a 2000-row chunk.
-        budget = 4 * 1024**3
-        h = _compute_strip_height(height=2000, width=2000, t_estimate=120, strip_budget_bytes=budget)
-        assert h < 2000
-        n_strips = len(_strip_slices(2000, h))
-        assert n_strips >= 2
-
-    def test_clamped_to_min_strip(self):
-        # An absurdly small budget never produces a sub-_MIN_STRIP_H strip.
-        h = _compute_strip_height(height=2000, width=2000, t_estimate=120, strip_budget_bytes=1)
-        assert h == _MIN_STRIP_H
-
-    def test_floor_override_warns(self, caplog):
-        # A budget too small to fit _MIN_STRIP_H at this T/W: the floor wins and
-        # the resident pair exceeds the budget, which must be logged loudly so an
-        # OOM is traceable to the budget rather than looking like a silent breach.
-        import logging
-
-        with caplog.at_level(logging.WARNING, logger=_actors_mod.logger.name):
-            h = _compute_strip_height(height=2000, width=2000, t_estimate=120, strip_budget_bytes=1)
-        assert h == _MIN_STRIP_H
-        assert any("_MIN_STRIP_H" in r.message and "overrides the byte budget" in r.message for r in caplog.records)
-
-    def test_no_warn_when_budget_fits_floor(self, caplog):
-        # The default 4 GiB budget at T=120 derives ~445 rows (well above the
-        # floor), so the override warning must NOT fire on the normal dense path.
-        import logging
-
-        with caplog.at_level(logging.WARNING, logger=_actors_mod.logger.name):
-            _compute_strip_height(height=2000, width=2000, t_estimate=120, strip_budget_bytes=4 * 1024**3)
-        assert not any("overrides the byte budget" in r.message for r in caplog.records)
-
-    def test_never_exceeds_height(self):
-        h = _compute_strip_height(height=300, width=2000, t_estimate=1, strip_budget_bytes=10**12)
-        assert h == 300
-
-    def test_zero_timesteps_is_full_height(self):
-        h = _compute_strip_height(height=2000, width=2000, t_estimate=0, strip_budget_bytes=4 * 1024**3)
-        assert h == 2000
 
 
 class TestStripSlices:
@@ -94,6 +42,46 @@ class TestStripSlices:
 
     def test_ragged_final_strip(self):
         assert _strip_slices(10, 4) == [slice(0, 4), slice(4, 8), slice(8, 10)]
+
+
+class TestStripHeightForDensity:
+    """The density-based strip sizer keeps a strip's S2 working set under budget."""
+
+    def test_resident_bytes_stay_under_budget(self):
+        # 10 bands x uint16 = 20 bytes per (obs, px). The resident pair is two
+        # band strips plus the single shared full-chunk mask; it must fit twice
+        # the per-strip budget, for every case that sizes above the floor.
+        for t_kept, width, height in [(50, 2000, 2000), (200, 2000, 2000), (1, 4000, 4000), (180, 1000, 1000)]:
+            h = _strip_height_for_density(t_kept, width, height)
+            assert h >= 1
+            if h <= _MIN_STRIP_H:
+                continue  # floored case may breach the budget by design
+            mask_bytes = t_kept * height * width
+            pair = 2 * t_kept * h * width * len(S2_BAND_ORDER) * 2 + mask_bytes
+            assert pair <= 2 * _S2_STRIP_BYTE_BUDGET
+
+    def test_sparser_chunks_get_taller_strips(self):
+        # Fewer timesteps -> a taller strip fits the same byte budget.
+        sparse = _strip_height_for_density(20, 2000, 2000)
+        dense = _strip_height_for_density(200, 2000, 2000)
+        assert sparse > dense
+
+    def test_single_strip_when_full_height_fits_pair_budget(self):
+        # A chunk whose full-height bands + mask fit the pair budget runs as one
+        # strip: splitting off a ragged tail buys no RAM headroom (the prefetched
+        # pair's resident bands equal the full chunk at the boundary) while adding
+        # a redundant inference pass. T_kept=60 at 2000x2000 sits just inside the
+        # budget, where the half-budget solve would otherwise yield a 1963-row
+        # strip plus a 37-row tail.
+        h = _strip_height_for_density(60, 2000, 2000)
+        assert h == 2000
+        full = 60 * 2000 * 2000 * len(S2_BAND_ORDER) * 2 + 60 * 2000 * 2000
+        assert full <= 2 * _S2_STRIP_BYTE_BUDGET
+
+    def test_extreme_density_floors_at_min_strip_h(self):
+        # A pathologically dense chunk bottoms out at the floor (breaching the
+        # byte budget, logged) rather than degenerating into tiny reads.
+        assert _strip_height_for_density(10**9, 4000, 4000) == _MIN_STRIP_H
 
 
 # ---------------------------------------------------------------------------
@@ -184,10 +172,9 @@ def _open_store_side_effect():
     return _open_store
 
 
-def _run_process_chunk(inference_config, test_model, *, budget_bytes):
-    """Run process_chunk with the strip budget set, capturing the write."""
+def _run_process_chunk(inference_config, test_model):
+    """Run process_chunk capturing the single whole-chunk write."""
     inference_config.s1_orbit = "both"
-    inference_config.strip_budget_bytes = budget_bytes
     # Synthetic stores carry 2024 dates; align the window so the filter keeps them.
     inference_config.time_window = parse_time_window("December 2024")
     actor = _make_actor(inference_config, test_model)
@@ -207,17 +194,14 @@ class TestProcessChunkStriping:
     """1-strip vs N-strip equality and skip-marker behavior."""
 
     def test_single_vs_multi_strip_identical(self, inference_config, test_model):
-        # Huge budget -> one strip (== unstriped path).
-        res_one, write_one = _run_process_chunk(inference_config, test_model, budget_bytes=10**12)
-        # Tiny per-row budget forces a multi-strip split (clamped to _MIN_STRIP_H,
-        # but chunk height 12 < _MIN_STRIP_H so we instead pick a budget that
-        # yields strip_h well below the chunk height): use a budget sized for ~4 rows.
-        # bytes/row = W * T * 10 * 2; with W=10, T<=8 that's <= 1600 bytes/row.
-        # Aim for strip_h ~= 4 by budgeting ~4 rows; min-strip clamp only bites
-        # above the chunk height, so for this tiny chunk we bypass the clamp by
-        # patching _MIN_STRIP_H low for the multi-strip run.
-        with patch.object(_actors_mod, "_MIN_STRIP_H", 4):
-            res_many, write_many = _run_process_chunk(inference_config, test_model, budget_bytes=4 * 10 * 8 * 10 * 2)
+        # Force strip height by overriding the density-based sizer, so the test
+        # controls the tiling regardless of the synthetic chunk's T_kept.
+        # Height above the chunk height -> one strip (== unstriped path).
+        with patch.object(_actors_mod, "_strip_height_for_density", lambda *a, **k: 10**6):
+            res_one, write_one = _run_process_chunk(inference_config, test_model)
+        # A small strip height forces a multi-strip split of this tiny chunk.
+        with patch.object(_actors_mod, "_strip_height_for_density", lambda *a, **k: 4):
+            res_many, write_many = _run_process_chunk(inference_config, test_model)
 
         assert res_one["status"] == "success"
         assert res_many["status"] == "success"
@@ -229,27 +213,20 @@ class TestProcessChunkStriping:
         # pixels go through the model, but float accumulation order differs
         # slightly across batch groupings. The drift is well below the int8
         # quantization step, so dequantized values are indistinguishable.
-        np.testing.assert_allclose(write_one["scales"], write_many["scales"], rtol=1e-6, atol=1e-10)
+        # equal_nan: ungenerated pixels carry a NaN scale in both tilings, and
+        # the same pixels are ungenerated regardless of how the input is striped.
+        np.testing.assert_allclose(write_one["scales"], write_many["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
         for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
             np.testing.assert_array_equal(write_one["obs_counts"][var], write_many["obs_counts"][var], err_msg=var)
 
     def test_multi_strip_actually_splits(self):
-        # The tiny budget used in the equality test (sized for ~4 northing rows)
-        # genuinely splits this chunk once the _MIN_STRIP_H clamp is lowered.
-        with patch.object(_actors_mod, "_MIN_STRIP_H", 4):
-            h = _compute_strip_height(
-                height=_CHUNK.height,
-                width=_CHUNK.width,
-                t_estimate=8,
-                strip_budget_bytes=4 * 10 * 8 * 10 * 2,
-            )
-        assert h < _CHUNK.height
-        assert len(_strip_slices(_CHUNK.height, h)) >= 2
+        # The strip height used in the equality test genuinely splits this chunk.
+        assert _CHUNK.height > 4
+        assert len(_strip_slices(_CHUNK.height, 4)) >= 2
 
     def test_all_empty_chunk_writes_skip_marker(self, inference_config, test_model):
         """A chunk with zero valid pixels across all strips writes a skip marker."""
         inference_config.s1_orbit = "both"
-        inference_config.strip_budget_bytes = 10**12
         inference_config.time_window = parse_time_window("December 2024")
         actor = _make_actor(inference_config, test_model)
 

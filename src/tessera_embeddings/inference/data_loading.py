@@ -34,19 +34,20 @@ logger = logging.getLogger(__name__)
 # A function that maps a store path to an open zarr group. The default is
 # ``open_store_as_zarr_group`` (a fresh repo open per call). The strip loop
 # passes a memoizing opener (see ``make_store_opener``) so every strip of a
-# chunk shares one repo handle — and thus one persistent 512 MB chunk cache —
-# rather than reopening cold and discarding the cache between strips.
+# chunk reuses one repo handle rather than re-paying the repo-open and
+# manifest-load cost on each strip.
 StoreOpener = Callable[[str], zarr.Group]
 
 
 def make_store_opener() -> StoreOpener:
     """Return a store opener that opens each distinct path once and reuses it.
 
-    Holding the opened zarr groups alive keeps their icechunk chunk cache warm
-    across calls. Intended to live for the duration of one chunk's strip loop:
-    overlapping northing strips re-touch the same ``(time=1, 4000, 4000)`` store
-    chunks, so a shared cache turns the per-strip re-reads into cache hits
-    instead of repeated S3 fetches.
+    Intended to live for the duration of one chunk's strip loop: each strip of
+    a split chunk would otherwise reopen the same three stores, re-paying the
+    icechunk repo-open and manifest load every time. (It does not amortise chunk
+    *data* re-reads: a dense strip's working set far exceeds icechunk's chunk
+    cache, so cross-strip reuse does not hit — see
+    ``zarr_store._default_repo_config``.)
     """
     cache: dict[str, zarr.Group] = {}
 
@@ -58,6 +59,39 @@ def make_store_opener() -> StoreOpener:
         return group
 
     return _open
+
+
+@dataclass
+class S2MaskBundle:
+    """Full-chunk S2 SCL validity, loaded once and shared across northing strips.
+
+    The strip loop reads SCL for the whole chunk a single time, then slices this
+    bundle per strip instead of re-decompressing SCL on every strip. SCL chunks
+    on disk are ``(time=1, 4000, 4000)``, so any sub-region read decompresses the
+    whole chunk anyway; loading once and slicing turns the per-strip SCL re-reads
+    into pure in-memory views. The mask is also what sizes the strip height (see
+    ``actors._strip_height_for_density``): its ``T_kept`` is the true post-pruning
+    timestep count for *this* chunk, so sparse chunks get tall strips (often the
+    whole chunk) and only genuinely dense chunks split.
+
+    Timesteps are pruned at the *chunk* level — any timestep with no valid pixel
+    anywhere in the chunk is dropped, since the per-pixel resampler can never draw
+    it. A strip may therefore carry a timestep that is empty within its own rows;
+    that wastes a little band memory for that strip but keeps pruning a single
+    whole-chunk decision rather than a per-strip one.
+
+    Attributes:
+        mask: Binary SCL validity, shape (T_kept, chunk_height, W), bool.
+        doys: Day-of-year per kept timestep, shape (T_kept,), int32.
+        abs_indices: Absolute store-level time indices of kept timesteps, (T_kept,).
+        obs_count: Per-pixel valid-timestep count from the full (pre-prune) mask,
+            shape (chunk_height, W), uint16.
+    """
+
+    mask: np.ndarray
+    doys: np.ndarray
+    abs_indices: np.ndarray
+    obs_count: np.ndarray
 
 
 @dataclass
@@ -183,29 +217,6 @@ def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.nd
         msg = f"No observations found within time window {window.months[0]}-{window.months[-1]}"
         raise RuntimeError(msg)
     return indices, compute_doy(times[indices])
-
-
-def count_s2_window_timesteps(
-    mosaic_base: str, time_window: TimeWindow, store_opener: StoreOpener | None = None
-) -> int:
-    """Return how many S2 timesteps fall inside ``time_window`` for this mosaic.
-
-    Reads only the reflectance store's 1-D ``time`` coordinate (no spatial
-    data), so it is a cheap probe of the upper bound on the per-chunk valid
-    timestep count ``T`` before any band load. Used by the inference actor to
-    size northing strips ahead of the first full read. The true post-pruning
-    ``T_kept`` is <= this value, so sizing on it is conservative (strips end up
-    no wider than the budget allows).
-
-    ``store_opener`` defaults to a fresh repo open; pass a shared opener (see
-    ``make_store_opener``) to reuse the reflectance handle the strip loads use,
-    so the probe primes the chunk cache instead of opening a throwaway repo.
-    """
-    if store_opener is None:
-        store_opener = open_store_as_zarr_group
-    root = store_opener(f"{mosaic_base}/reflectance.zarr")
-    window_indices, _ = _filter_times_from_zarr(root, time_window)
-    return len(window_indices)
 
 
 def _active_orbits(s1_orbit: str) -> tuple[str, ...]:
@@ -336,19 +347,71 @@ def _resolve_y_slice(chunk: ChunkSpec, y_sub: slice | None) -> slice:
     return slice(chunk.y_start + y_sub.start, chunk.y_start + y_sub.stop)
 
 
+def load_s2_mask_bundle(
+    mosaic_base: str,
+    chunk: ChunkSpec,
+    time_window: TimeWindow,
+    store_opener: StoreOpener | None = None,
+) -> S2MaskBundle:
+    """Load and prune the full-chunk S2 SCL mask once for reuse across strips.
+
+    Reads SCL for the entire chunk extent (all easting, all northing), computes
+    the per-pixel obs count from the un-pruned mask, then drops timesteps with no
+    valid pixel anywhere in the chunk. The result is shared by every strip's
+    band load (sliced, not re-read) and is what sizes the strip height.
+
+    SCL is 1 byte/pixel — far cheaper than the 20 bytes/pixel of reflectance — so
+    loading the whole chunk's mask up front is a small fixed cost that removes the
+    per-strip SCL re-decompression entirely. See :class:`S2MaskBundle`.
+    """
+    if store_opener is None:
+        store_opener = open_store_as_zarr_group
+    root = store_opener(f"{mosaic_base}/reflectance.zarr")
+    window_indices, doys_full = _filter_times_from_zarr(root, time_window)
+    y_slice = slice(chunk.y_start, chunk.y_stop)
+    x_slice = slice(chunk.x_start, chunk.x_stop)
+
+    mask_full = _load_scl_mask(root, window_indices, y_slice, x_slice)
+    t_full = mask_full.shape[0]
+    # obs_count from the full (pre-prune) mask so pixels aren't under-counted.
+    obs_count = mask_full.sum(axis=0).astype(np.uint16)
+    logger.info("Loaded full-chunk SCL for %d S2 timesteps", t_full)
+
+    # Prune timesteps with no valid pixel anywhere in the chunk — the v1.1
+    # per-pixel resampler only draws from valid indices, so fully-empty
+    # timesteps would never be read by any strip.
+    nonempty_t = mask_full.any(axis=(1, 2))
+    kept = np.where(nonempty_t)[0]
+    if len(kept) < t_full:
+        logger.info("Pruned %d/%d empty S2 timesteps (chunk-level)", t_full - len(kept), t_full)
+
+    return S2MaskBundle(
+        mask=mask_full[kept],
+        doys=doys_full[kept],
+        abs_indices=window_indices[kept],
+        obs_count=obs_count,
+    )
+
+
 def _load_s2(
     mosaic_base: str,
     chunk: ChunkSpec,
     time_window: TimeWindow,
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
+    mask_bundle: S2MaskBundle | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load all S2 timesteps in the window that have any valid pixel in the (sub-)chunk.
 
     ``y_sub`` is an optional chunk-relative northing slice. When given, only
-    that horizontal strip of the chunk is read (full easting width); pruning and
-    obs counts are computed on the strip's own pixels. ``None`` reads the full
-    chunk.
+    that horizontal strip of the chunk is read (full easting width). ``None``
+    reads the full chunk.
+
+    ``mask_bundle`` is an optional precomputed full-chunk SCL bundle (see
+    :func:`load_s2_mask_bundle`). When supplied, the SCL is sliced from it rather
+    than re-read — chunk-level timestep pruning has already happened, so the band
+    load reads exactly the bundle's kept timesteps. When ``None`` (the unstriped
+    default path), SCL is loaded and pruned inline as before.
 
     Returns:
         Tuple of (s2_bands, s2_masks, s2_doys, s2_obs_count):
@@ -361,9 +424,23 @@ def _load_s2(
         store_opener = open_store_as_zarr_group
     store_path = f"{mosaic_base}/reflectance.zarr"
     root = store_opener(store_path)
+    x_slice = slice(chunk.x_start, chunk.x_stop)
+
+    if mask_bundle is not None:
+        # Slice the shared full-chunk mask to this strip's rows; the chunk-level
+        # prune already chose the kept timesteps, so band reads match the bundle.
+        rows = y_sub if y_sub is not None else slice(0, chunk.height)
+        s2_masks = mask_bundle.mask[:, rows, :]
+        s2_obs_count = mask_bundle.obs_count[rows, :]
+        s2_doys = mask_bundle.doys
+        abs_kept = mask_bundle.abs_indices
+        y_slice = _resolve_y_slice(chunk, y_sub)
+        s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice)
+        logger.info("Loaded S2 bands shape %s (sliced shared mask)", s2_bands.shape)
+        return s2_bands, s2_masks, s2_doys, s2_obs_count
+
     window_indices, s2_doys_full = _filter_times_from_zarr(root, time_window)
     y_slice = _resolve_y_slice(chunk, y_sub)
-    x_slice = slice(chunk.x_start, chunk.x_stop)
 
     abs_indices = window_indices
     s2_masks_full = _load_scl_mask(root, abs_indices, y_slice, x_slice)
@@ -430,6 +507,7 @@ def load_chunk(
     s1_orbit: Literal["ascending", "descending", "both"] = "ascending",
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
+    mask_bundle: S2MaskBundle | None = None,
 ) -> ChunkData:
     """Load all data for one spatial chunk (or a northing strip of it) for v1.1 inference.
 
@@ -441,8 +519,8 @@ def load_chunk(
             ``"descending"``, or ``"both"``.
         store_opener: Maps a store path to an open zarr group. Defaults to a
             fresh repo open per call; the strip loop passes one shared opener
-            (see ``make_store_opener``) for all strips of a chunk so the 512 MB
-            chunk cache persists across strips instead of starting cold on each.
+            (see ``make_store_opener``) for all strips of a chunk so each strip
+            reuses one repo handle instead of re-paying the repo open per strip.
         y_sub: Optional chunk-relative northing slice bounding the resident
             input working set. When given, only that horizontal strip of the
             chunk is read (full easting width) and the returned ``ChunkData``
@@ -451,6 +529,11 @@ def load_chunk(
             on the strip's own pixels (so a strip may keep a different T_kept
             than its neighbour). ``None`` reads the whole chunk, reproducing
             the unstriped behaviour byte-for-byte.
+        mask_bundle: Optional precomputed full-chunk S2 SCL bundle (see
+            :func:`load_s2_mask_bundle`). When supplied, S2 SCL is sliced from
+            it per strip instead of re-read, and timestep pruning uses the
+            chunk-level decision baked into the bundle. The strip loop loads the
+            bundle once and passes it to every strip; ``None`` loads SCL inline.
 
     Returns:
         ChunkData with all S2 timesteps that have any valid pixel in the
@@ -469,7 +552,7 @@ def load_chunk(
     )
 
     s2_bands, s2_masks, s2_doys, s2_obs_count = _load_s2(
-        mosaic_base, chunk, time_window, y_sub=y_sub, store_opener=store_opener
+        mosaic_base, chunk, time_window, y_sub=y_sub, store_opener=store_opener, mask_bundle=mask_bundle
     )
 
     s1_asc_bands, s1_asc_doys = (

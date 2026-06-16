@@ -18,6 +18,7 @@ from tessera_embeddings.inference.data_loading import (
     _load_sar_orbit,
     _load_scl_mask,
     load_chunk,
+    load_s2_mask_bundle,
     make_store_opener,
     resolve_s1_orbit,
 )
@@ -344,6 +345,62 @@ class TestStripReassembly:
         np.testing.assert_array_equal(strip.s1_asc_bands, whole.s1_asc_bands[:, 8:12, :, :])
 
 
+class TestSharedMaskBundle:
+    """A precomputed full-chunk SCL bundle, sliced per strip, matches inline loads.
+
+    The strip loop loads SCL once for the whole chunk and slices it per strip
+    instead of re-reading. The bundle path must produce the same bands, masks,
+    doys, and obs counts as the inline (mask_bundle=None) path it replaces.
+    """
+
+    _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
+
+    def _side_effect(self, n_t_s2=10, n_t_sar=5):
+        h, w = self._CHUNK.height, self._CHUNK.width
+        s2_root = _make_s2_zarr_group(n_t_s2, h, w, seed=10)
+        sar_asc = _make_sar_zarr_group(n_t_sar, h, w, seed=20)
+        sar_desc = _make_sar_zarr_group(n_t_sar, h, w, seed=30)
+
+        def _open_store(path):
+            if "reflectance" in path:
+                return s2_root
+            if "ascending" in path:
+                return sar_asc
+            if "descending" in path:
+                return sar_desc
+            raise ValueError(f"Unexpected store path: {path}")
+
+        return _open_store
+
+    def test_bundle_tkept_matches_inline_prune(self):
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()):
+            bundle = load_s2_mask_bundle("s3://b/m", self._CHUNK, _TIME_WINDOW)
+            _, inline_masks, inline_doys, inline_obs = _load_s2("s3://b/m", self._CHUNK, _TIME_WINDOW)
+        # Same kept timesteps and same per-pixel obs count.
+        np.testing.assert_array_equal(bundle.doys, inline_doys)
+        np.testing.assert_array_equal(bundle.obs_count, inline_obs)
+        np.testing.assert_array_equal(bundle.mask, inline_masks)
+
+    def test_strip_via_bundle_matches_inline_strip(self):
+        strip = slice(4, 8)
+        opener = self._side_effect()
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=opener):
+            bundle = load_s2_mask_bundle("s3://b/m", self._CHUNK, _TIME_WINDOW)
+            bundled = load_chunk(
+                self._CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="both", y_sub=strip, mask_bundle=bundle
+            )
+            inline = load_chunk(self._CHUNK, "s3://b/m", time_window=_TIME_WINDOW, s1_orbit="both", y_sub=strip)
+        # The bundle prunes at the chunk level while the inline strip prunes on
+        # its own rows, so the bundled strip may carry extra (strip-empty)
+        # timesteps. Align on doys and compare the shared timesteps' bands/masks.
+        for d_idx, doy in enumerate(inline.s2_doys):
+            b_idx = np.where(bundled.s2_doys == doy)[0]
+            assert b_idx.size == 1, f"doy {doy} missing from bundled strip"
+            np.testing.assert_array_equal(inline.s2_bands[d_idx], bundled.s2_bands[b_idx[0]], err_msg=f"doy={doy}")
+            np.testing.assert_array_equal(inline.s2_masks[d_idx], bundled.s2_masks[b_idx[0]], err_msg=f"doy={doy}")
+        np.testing.assert_array_equal(inline.s2_obs_count, bundled.s2_obs_count)
+
+
 class TestResolveS1Orbit:
     """Tests for resolve_s1_orbit: downgrade 'both' when only one store is present."""
 
@@ -390,9 +447,9 @@ class TestResolveS1Orbit:
 class TestSharedStoreOpener:
     """A shared opener reuses one repo handle per store path across strip loads.
 
-    Reopening per strip would discard the icechunk chunk cache between strips;
-    the strip loop builds one ``make_store_opener`` per chunk so overlapping
-    strips re-touch the same store handle (and warm cache) instead.
+    Reopening per strip would re-pay the icechunk repo open + manifest load
+    every strip; the strip loop builds one ``make_store_opener`` per chunk so
+    each strip reuses the same store handle instead.
     """
 
     _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
@@ -428,10 +485,9 @@ class TestSharedStoreOpener:
         assert mock_open.call_count == 2
 
     def test_strips_share_one_open_per_store(self):
-        """Probing T then loading three strips opens each store exactly once."""
+        """Loading three strips through a shared opener opens each store once."""
         with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()) as mock_open:
             opener = make_store_opener()
-            _dl_mod.count_s2_window_timesteps("s3://b/m", _TIME_WINDOW, store_opener=opener)
             for y_sub in (slice(0, 4), slice(4, 8), slice(8, 12)):
                 load_chunk(
                     self._CHUNK,
@@ -444,7 +500,7 @@ class TestSharedStoreOpener:
 
         opened_paths = [call.args[0] for call in mock_open.call_args_list]
         # reflectance + sar_ascending + sar_descending, each opened once total
-        # across the probe and all three strips.
+        # across all three strips.
         assert sorted(opened_paths) == [
             "s3://b/m/reflectance.zarr",
             "s3://b/m/sar_ascending.zarr",
