@@ -340,6 +340,13 @@ formula in the background section above applies to estimating how many tasks a g
 window width will produce; the 30-day default keeps each batch well within the scheduler's
 RAM budget at cornbelt scale.
 
+Batch windows are inclusive on both ends and do not overlap: each batch spans `batch_days`
+calendar days, and the loop advances `batch_start` to the day *after* `batch_end`. Because
+CMR/STAC also treat their query end date as inclusive, each day is queried by exactly one
+batch — a batch boundary that landed on the same day as the next batch's start would page
+that day twice, wasteful at CONUS scale where each day is many pages of bursts. The overall
+`[start_date, end_date]` range is inclusive of `end_date`.
+
 ### Lazy evaluation throughout
 
 `odc.stac.load` returns a Dask-backed xarray Dataset with no raster data read yet. All

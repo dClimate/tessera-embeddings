@@ -47,7 +47,10 @@ from tests.parity.helpers import assert_zarr_equivalent
 CASSETTE_NAME = "test_s1_roi_parity"
 
 # Denver, CO. July 2024 has 5 ascending and 4 descending OPERA granules.
+# end_date is inclusive; batch_days=31 keeps all of July in a single batch
+# whose CMR/STAC query end lands on 2024-07-31.
 DENVER_DATES = ("2024-07-01", "2024-07-31")
+DENVER_BATCH_DAYS = 31
 FORCE_CRS = "EPSG:32613"  # UTM zone 13N covers Denver
 
 
@@ -153,6 +156,7 @@ def test_s1_roi_parity(
         store_path=str(domain_store),
         client=parity_cluster,
         orbit="ascending",
+        batch_days=DENVER_BATCH_DAYS,
         use_s3_direct=False,
         edl_credentials_fn=None,
         apply_credentials_fn=None,
@@ -166,6 +170,7 @@ def test_s1_roi_parity(
         end_date=DENVER_DATES[1],
         store_path=str(flow_store),
         orbit="ascending",
+        batch_days=DENVER_BATCH_DAYS,
         use_s3_direct=False,
         use_local=True,
     )

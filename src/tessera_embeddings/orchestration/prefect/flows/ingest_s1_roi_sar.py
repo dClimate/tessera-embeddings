@@ -90,7 +90,7 @@ def ingest_s1_roi_sar(
     Args:
         roi_zarr_path: Any fsspec-compatible URI to the Zarr ROI store.
         start_date: Inclusive start date (``YYYY-MM-DD``).
-        end_date: Exclusive end date (``YYYY-MM-DD``).
+        end_date: Inclusive end date (``YYYY-MM-DD``).
         store_path: Base path for satellite mosaics; creates
             ``sar_<orbit>.zarr`` underneath.
         min_workers: Minimum Dask workers.
