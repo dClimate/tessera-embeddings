@@ -158,6 +158,12 @@ def ingest_s1_roi_sar(
         batch_start_str = batch_start.strftime("%Y-%m-%d")
         batch_end_str = batch_end.strftime("%Y-%m-%d")
 
+        # CMR/STAC treat their end date as inclusive; the loop strides
+        # ``batch_start = batch_end``. Querying through ``batch_end - 1 day``
+        # keeps batches half-open so each day is paged from CMR/STAC exactly
+        # once across the run.
+        query_end_str = (batch_end - timedelta(days=1)).strftime("%Y-%m-%d")
+
         log.info("[%s] Batch %s..%s: querying catalog", orbit, batch_start_str, batch_end_str)
 
         # Re-read existing dates each batch so prior-batch writes are skipped.
@@ -187,7 +193,7 @@ def ingest_s1_roi_sar(
             collection="opera-rtc-s1",
             tile_id=None,
             start_date=batch_start_str,
-            end_date=batch_end_str,
+            end_date=query_end_str,
             existing_dates=existing_dates,
             bbox=roi.bbox_wgs84,
             chunks=INGEST_CHUNKS,
@@ -197,7 +203,7 @@ def ingest_s1_roi_sar(
                 orbit,
                 roi.bbox_wgs84,
                 batch_start_str,
-                batch_end_str,
+                query_end_str,
                 use_s3_direct=use_s3_direct,
             ),
             post_load_fn=amplitude_to_db,
