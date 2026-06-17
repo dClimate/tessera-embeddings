@@ -737,6 +737,32 @@ class TestWriteRegion:
         with pytest.raises(ValueError, match="non-empty region"):
             write_region(store_path, new, region={})
 
+    def test_unaligned_region_write_under_distributed_client(self, local_zarr_path, sample_reflectance_data):
+        """An unaligned region write succeeds with a distributed client active.
+
+        Padding builds a lazy dask shell read from the store; ``to_icechunk``
+        pickles that source graph to the workers. Reading the shell from the
+        *writable* session would raise "must opt-in to pickle writable
+        sessions"; reading it from a readonly session pickles cleanly. This
+        guards that the read step uses a readonly session.
+        """
+        distributed = pytest.importorskip("distributed")
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rw_distributed")
+        original = open_store(store_path)["blue"].values.copy()
+
+        # Deliberately unaligned (mid-chunk) box so the padding/read path runs.
+        sub = _single_date_block("2024-01-01", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
+        region = {"time": slice(0, 1), "northing": slice(100, 300), "easting": slice(250, 610)}
+
+        with distributed.Client(processes=True, n_workers=2, threads_per_worker=1, dashboard_address=":0") as client:
+            write_region(store_path, sub, region=region)
+
+        back = open_store(store_path)["blue"].values
+        assert (back[0, 100:300, 250:610] == 9).all()
+        mask = np.ones(back.shape[1:], dtype=bool)
+        mask[100:300, 250:610] = False
+        np.testing.assert_array_equal(back[0][mask], original[0][mask])
+
     def test_failed_region_write_leaves_prior_commit_intact(
         self, local_zarr_path, sample_reflectance_data, monkeypatch
     ):
