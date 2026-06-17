@@ -13,6 +13,8 @@ from __future__ import annotations
 import pytest
 from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_fixed
 
+pytest.importorskip("dask_cloudprovider", reason="dask-cloudprovider not installed (AWS extras)")
+
 from tessera_embeddings.providers.aws.dask import (
     _RETRYABLE_CLUSTER_START_ERRORS,
     _is_retryable_cluster_start_error,
