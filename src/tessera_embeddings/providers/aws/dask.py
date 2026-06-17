@@ -376,7 +376,7 @@ def ecs_cluster(
         reraise=True,
         before_sleep=lambda rs: log.warning(
             "FargateCluster start failed (%s); retry %d",
-            rs.outcome.exception(),
+            rs.outcome.exception() if rs.outcome is not None else "unknown",
             rs.attempt_number,
         ),
     )
