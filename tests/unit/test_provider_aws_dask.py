@@ -37,9 +37,7 @@ class TestRetryablePredicate:
         """RunTask placement rejection: dask raises RuntimeError(response) with
         the whole run_task response, whose failure reason is ``RESOURCE:ENI``.
         """
-        exc = RuntimeError(
-            "{'tasks': [], 'failures': [{'reason': 'RESOURCE:ENI'}]}"
-        )
+        exc = RuntimeError("{'tasks': [], 'failures': [{'reason': 'RESOURCE:ENI'}]}")
         assert _is_retryable_cluster_start_error(exc) is True
 
     def test_describe_tasks_race_retries(self) -> None:

@@ -102,9 +102,7 @@ def _is_retryable_cluster_start_error(exc: BaseException) -> bool:
     IAM denial, image pull failure) is a real misconfiguration and must fail
     fast rather than burn retries.
     """
-    return isinstance(exc, RuntimeError) and any(
-        s in str(exc) for s in _RETRYABLE_CLUSTER_START_ERRORS
-    )
+    return isinstance(exc, RuntimeError) and any(s in str(exc) for s in _RETRYABLE_CLUSTER_START_ERRORS)
 
 
 @dataclass(frozen=True)
