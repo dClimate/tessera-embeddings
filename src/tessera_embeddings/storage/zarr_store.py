@@ -556,9 +556,14 @@ def _write_region(
     repo = _open_repo(store_path, get_credentials=get_credentials, region=region_name)
     session = repo.writable_session("main")
 
-    # Committed view of the store, used to pad unaligned regions. Nothing has
-    # been written in this session yet, so this reflects committed data.
-    existing = xr.open_zarr(session.store, consolidated=False)
+    # Committed view for padding unaligned regions. Read from a *readonly*
+    # session (not ``session.store``): the lazy pad shell's graph is handed to
+    # ``to_icechunk``, which under a distributed client pickles it to the
+    # workers. A writable session refuses to pickle; a readonly one (same
+    # committed HEAD, identical shell) pickles freely. The write target still
+    # uses the writable session, which ``to_icechunk`` forks internally.
+    read_session = repo.readonly_session(branch="main")
+    existing = xr.open_zarr(read_session.store, consolidated=False)
     try:
         padded, widened = _pad_region_to_chunks(existing, data, region)
         to_write = _drop_region_coords(padded, set(widened))
