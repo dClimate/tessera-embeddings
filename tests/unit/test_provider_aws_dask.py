@@ -33,6 +33,15 @@ class TestRetryablePredicate:
         exc = RuntimeError("Cluster failed to start: Scheduler failed to start")
         assert _is_retryable_cluster_start_error(exc) is True
 
+    def test_eni_placement_failure_retries(self) -> None:
+        """RunTask placement rejection: dask raises RuntimeError(response) with
+        the whole run_task response, whose failure reason is ``RESOURCE:ENI``.
+        """
+        exc = RuntimeError(
+            "{'tasks': [], 'failures': [{'reason': 'RESOURCE:ENI'}]}"
+        )
+        assert _is_retryable_cluster_start_error(exc) is True
+
     def test_describe_tasks_race_retries(self) -> None:
         """The original describe_tasks read-after-write race still matches."""
         exc = RuntimeError("Cluster failed to start: not enough values to unpack (expected 1, got 0)")
