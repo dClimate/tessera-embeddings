@@ -1,9 +1,24 @@
 """Zarr store management utilities for reflectance and cloudmask data.
 
-This module provides functions for creating, reading, and appending to Zarr stores
+This module provides functions for creating, reading, and writing Zarr stores
 that hold preprocessed Sentinel-2 reflectance data and cloud masks.
 
 Uses Icechunk for transactional writes with atomic commit semantics.
+
+Three write paths, all committing atomically:
+
+- **create** (:func:`write_dataset` on a fresh store) — ``to_icechunk`` mode
+  ``"w"`` writes the whole array.
+- **append** (:func:`write_dataset` on an existing store) — mode ``"a"`` with
+  ``append_dim="time"`` extends the time axis.
+- **region overwrite** (:func:`write_region`) — mode ``"r+"`` rewrites an
+  existing temporal/spatial slice in place. The region need not be
+  chunk-aligned: :func:`_pad_region_to_chunks` widens unaligned edges to chunk
+  boundaries and backfills the untouched cells from the store
+  (read-modify-write), because ``align_chunks=True`` only remaps the producer's
+  dask blocks and ``mode="r+"`` rejects partial-chunk writes. Use
+  :func:`resolve_region` to turn coordinate ranges into the integer slices
+  ``write_region`` expects.
 """
 
 import logging
@@ -297,9 +312,13 @@ def open_or_create_repo(
 # =============================================================================
 
 
-def _open_readonly(store_path: str) -> xr.Dataset:
+def _open_readonly(
+    store_path: str,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    region: str | None = None,
+) -> xr.Dataset:
     """Open store for reading. Returns xarray Dataset."""
-    repo = _open_repo(store_path)
+    repo = _open_repo(store_path, get_credentials=get_credentials, region=region)
     session = repo.readonly_session(branch="main")
     return xr.open_zarr(session.store, consolidated=False)
 
@@ -319,6 +338,33 @@ def _write_new(
     logger.info(f"Created {store_path}")
 
 
+def _commit_preserving_attrs(
+    session: "icechunk.Session",
+    data: xr.Dataset,
+    write_kwargs: dict[str, Any],
+    message: str,
+    update_attrs: dict[str, Any] | None = None,
+) -> None:
+    """Run a ``to_icechunk`` write, then commit with root attrs preserved.
+
+    ``to_icechunk`` overwrites root attrs with the (typically empty)
+    ``data.attrs`` — destroying crs, ``_manifest``, etc. We snapshot them
+    before the write and restore (plus any ``update_attrs``) after, then commit.
+    Shared by the append and region-write paths; ``write_kwargs`` carries the
+    mode-specific arguments (``mode``, ``append_dim``/``region``, etc.).
+    """
+    root = zarr.open_group(session.store, mode="r")
+    preserved_attrs = dict(root.attrs)
+
+    to_icechunk(data, session, **write_kwargs)
+
+    root = zarr.open_group(session.store, mode="r+")
+    root.attrs.update(preserved_attrs)
+    if update_attrs:
+        root.attrs.update(update_attrs)
+    session.commit(message)
+
+
 def _write_append(
     store_path: str,
     data: xr.Dataset,
@@ -329,19 +375,204 @@ def _write_append(
     repo = _open_repo(store_path)
     session = repo.writable_session("main")
 
-    # Snapshot root attrs before to_icechunk, which overwrites them with
-    # the (typically empty) data.attrs — destroying crs, _manifest, etc.
-    root = zarr.open_group(session.store, mode="r")
-    preserved_attrs = dict(root.attrs)
-
-    to_icechunk(data, session, mode="a", append_dim="time", align_chunks=True)
-
-    root = zarr.open_group(session.store, mode="r+")
-    root.attrs.update(preserved_attrs)
-    if update_attrs:
-        root.attrs.update(update_attrs)
-    session.commit(message)
+    _commit_preserving_attrs(
+        session,
+        data,
+        {"mode": "a", "append_dim": "time", "align_chunks": True},
+        message,
+        update_attrs,
+    )
     logger.info(f"Appended to {store_path}")
+
+
+# =============================================================================
+# Region Writes (overwrite-in-place of a temporal/spatial slice)
+# =============================================================================
+
+
+def _store_chunk_sizes(existing: xr.Dataset, dims: "tuple[str, ...]") -> dict[str, int]:
+    """Read the on-disk chunk size per dimension from the existing store.
+
+    The store is authoritative for chunking (config may have drifted), so we
+    read it off the opened arrays rather than INGEST_CHUNKS. All data_vars in
+    our stores share identical chunking on the spatial/temporal dims; we assert
+    that here so the single widened region we compute is valid for every var.
+    """
+    sizes: dict[str, int] = {}
+    for dim in dims:
+        for var in existing.data_vars:
+            chunks = existing[var].chunks
+            if chunks is None:
+                continue
+            axis = existing[var].dims.index(dim)
+            size = chunks[axis][0]  # first block = nominal chunk size
+            if dim in sizes and sizes[dim] != size:
+                raise ValueError(
+                    f"Store data_vars disagree on chunk size for {dim!r}: {sizes[dim]} vs {size}. "
+                    "Region writes require uniform chunking across variables."
+                )
+            sizes[dim] = size
+    return sizes
+
+
+def _match_region_shapes(
+    existing: xr.Dataset,
+    data: xr.Dataset,
+    normalized: dict[str, slice],
+    region: dict[str, slice],
+) -> xr.Dataset:
+    """Transpose each var to store dim order and assert it covers exactly the region.
+
+    ``region`` is the caller's original (for the error message); ``normalized``
+    holds the resolved integer bounds. A written variable must match the region's
+    length along every region dim and the store's full length along the rest —
+    dask/NumPy broadcasting would otherwise silently repeat a smaller (or missing
+    one of the selected axes) array across the whole region instead of rejecting
+    it. Returns a dataset with every var transposed to the store's dim order so a
+    transposed input can't overlay onto the wrong axes.
+    """
+    matched: dict[str, xr.DataArray] = {}
+    for var in data.data_vars:
+        name = str(var)
+        dims = existing[name].dims  # store dimension order is authoritative
+        incoming = data[name].transpose(*dims)
+        expected = tuple(
+            (normalized[d].stop - normalized[d].start) if d in normalized else existing.sizes[d] for d in dims
+        )
+        if incoming.shape != expected:
+            raise ValueError(
+                f"Region data for {name!r} has shape {incoming.shape}, expected {expected} for region {region}."
+            )
+        matched[name] = incoming
+    return xr.Dataset(matched, coords=data.coords)
+
+
+def _pad_region_to_chunks(
+    existing: xr.Dataset,
+    data: xr.Dataset,
+    region: dict[str, slice],
+) -> "tuple[xr.Dataset, dict[str, slice]]":
+    """Widen ``region`` to whole-chunk bounds, backfilling the shell from the store.
+
+    Icechunk's ``mode="r+"`` rejects a region whose edges fall mid-chunk
+    (xarray ``allow_partial_chunks=False``), and ``align_chunks=True`` only
+    remaps the *producer's* dask blocks — it never reads neighbouring on-disk
+    data. So an unaligned region must be padded out to its enclosing chunk
+    boundaries, with the newly-included-but-unchanged cells read back from the
+    store and the incoming values overlaid on top.
+
+    Returns ``(padded, widened)``. When ``region`` is already chunk-aligned this
+    returns ``(data, region)`` unchanged — no store read.
+
+    Padding reads the enclosing chunks as a lazy dask slab on the store's chunk
+    grid, then a positional ``setitem`` overlays the incoming data. Note this
+    keeps every overlapped chunk — including interior chunks fully covered by
+    the region — dependent on the store read, so a large unaligned write fetches
+    the whole widened slab, not just its edge chunks. That extra IO is bounded by
+    the padding (at most one chunk per region face) and is acceptable at current
+    tile sizes; reading only the boundary chunks would need an edge-concatenation
+    rebuild and is deferred.
+    """
+    # Normalize region slices up front: resolve open bounds (slice(None)) to
+    # concrete indices, reject non-unit steps, and reject empty slices, so the
+    # offset arithmetic below is always well-defined.
+    normalized: dict[str, slice] = {}
+    for dim, sl in region.items():
+        if sl.step not in (None, 1):
+            raise ValueError(f"Region slice for {dim!r} must have step 1, got {sl.step!r}.")
+        start, stop, _ = sl.indices(existing.sizes[dim])
+        if start >= stop:
+            raise ValueError(f"Region slice for {dim!r} is empty: {sl!r}.")
+        normalized[dim] = slice(start, stop)
+
+    # Assert every written variable covers exactly the region before any write.
+    # Done for both the aligned and padded paths: on the aligned path
+    # ``to_icechunk`` would otherwise reject (or, for a missing axis, broadcast)
+    # a wrongly shaped array deep inside its writer with a cryptic error; here we
+    # fail early with a clear message. Returns data matched to the store's dim
+    # order (a transposed input would otherwise overlay onto the wrong axes).
+    matched = _match_region_shapes(existing, data, normalized, region)
+
+    chunk_sizes = _store_chunk_sizes(existing, tuple(normalized))
+
+    widened: dict[str, slice] = {}
+    needs_pad = False
+    for dim, sl in normalized.items():
+        cs = chunk_sizes[dim]
+        size = existing.sizes[dim]
+        new_start = (sl.start // cs) * cs
+        new_stop = min(((sl.stop + cs - 1) // cs) * cs, size)
+        widened[dim] = slice(new_start, new_stop)
+        if new_start != sl.start or new_stop != sl.stop:
+            needs_pad = True
+
+    if not needs_pad:
+        return matched, widened
+
+    # Lazy shell from the store on its own chunk grid (committed data).
+    slab = existing.isel(widened)
+
+    padded_vars: dict[str, Any] = {}
+    for name, incoming in matched.data_vars.items():
+        name = str(name)
+        dims = slab[name].dims  # store dimension order is authoritative
+        shell = slab[name].data.copy()  # dask array on store chunk grid
+        idx = tuple(
+            slice(normalized[d].start - widened[d].start, normalized[d].stop - widened[d].start)
+            if d in normalized
+            else slice(None)
+            for d in dims
+        )
+        shell[idx] = incoming.data  # positional overlay; incoming wins
+        padded_vars[name] = (dims, shell)
+
+    # Coords come from the store slab (authoritative); they're dropped before
+    # the region write anyway, but carrying them keeps the dataset well-formed.
+    padded = xr.Dataset(padded_vars, coords=slab.coords)
+    return padded, widened
+
+
+def _drop_region_coords(data: xr.Dataset, region_dims: "set[str]") -> xr.Dataset:
+    """Drop coords xarray won't accept on a region write.
+
+    xarray rejects writing a region-dim's own coordinate (the store's coords are
+    authoritative), and a region write requires every written variable to share
+    a dim with the region — so coords spanning only non-region dims must go too.
+    """
+    drop = [name for name in data.coords if name in region_dims or not region_dims.intersection(data[name].dims)]
+    return data.drop_vars(drop)
+
+
+def _write_region(
+    store_path: str,
+    data: xr.Dataset,
+    region: dict[str, slice],
+    message: str,
+    update_attrs: dict[str, Any] | None = None,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    region_name: str | None = None,
+) -> None:
+    """Overwrite an existing region of a store in a single atomic commit."""
+    repo = _open_repo(store_path, get_credentials=get_credentials, region=region_name)
+    session = repo.writable_session("main")
+
+    # Committed view of the store, used to pad unaligned regions. Nothing has
+    # been written in this session yet, so this reflects committed data.
+    existing = xr.open_zarr(session.store, consolidated=False)
+    try:
+        padded, widened = _pad_region_to_chunks(existing, data, region)
+        to_write = _drop_region_coords(padded, set(widened))
+
+        _commit_preserving_attrs(
+            session,
+            to_write,
+            {"mode": "r+", "region": widened, "align_chunks": True, "split_every": 8},
+            message,
+            update_attrs,
+        )
+    finally:
+        existing.close()
+    logger.info(f"Wrote region {widened} to {store_path}")
 
 
 # =============================================================================
@@ -384,6 +615,119 @@ def get_existing_dates(store_path: str) -> set[str]:
     except Exception as e:
         logger.warning(f"Could not read dates from {store_path}: {e}")
         return set()
+
+
+def resolve_region(
+    store_path: str,
+    *,
+    time: "tuple[Any, Any] | None" = None,
+    northing: "tuple[float, float] | None" = None,
+    easting: "tuple[float, float] | None" = None,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+) -> dict[str, slice]:
+    """Map coordinate-value ranges to half-open integer slices for an existing store.
+
+    Each argument is a fully-inclusive ``(low, high)`` coordinate range or
+    ``None`` (= the full axis, omitted from the result). Both ends are matched
+    (``coord >= low & coord <= high``); the returned slices are half-open
+    ``[start, stop)`` in the usual Python sense. ``(low, high)`` may be given in
+    either order — they're sorted before matching — so a descending axis can be
+    addressed low-to-high or high-to-low. ``time`` accepts anything
+    ``np.datetime64`` understands. Spatial bounds are matched against the
+    store's ``northing``/``easting`` coordinate values regardless of axis
+    direction (northing typically descends).
+
+    ``get_credentials``/``s3_region`` are forwarded to the store opener so a
+    store outside the default S3 region can be resolved with the same options
+    later passed to :func:`write_region`.
+
+    Returns a dict of integer slices suitable for :func:`write_region`. Only
+    dims with a non-``None`` range are included; an empty dict means "the whole
+    array" (which the caller should treat as a plain overwrite, not a region).
+
+    Enforces the overwrite-in-place contract: the requested range must select at
+    least one existing coordinate. A range that matches nothing (e.g. a date not
+    in the store) raises ``ValueError`` — appending new coordinates is
+    :func:`write_dataset`'s job, not a region write's. The matched coordinates
+    must also be contiguous; a range straddling a gap (e.g. an out-of-order time
+    axis) raises rather than silently widening the slice to cover the gap.
+    """
+    ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region)
+    try:
+        ranges = {"time": time, "northing": northing, "easting": easting}
+        region: dict[str, slice] = {}
+        for dim, rng in ranges.items():
+            if rng is None:
+                continue
+            coord = ds[dim].values
+            raw_low, raw_high = rng
+            if dim == "time":
+                low: Any = np.datetime64(str(raw_low), "ns")
+                high: Any = np.datetime64(str(raw_high), "ns")
+            else:
+                low, high = raw_low, raw_high
+            # Accept the range in either order: a descending axis (northing) is
+            # often addressed high-to-low, so sort the bounds before masking.
+            lo_b, hi_b = (low, high) if low <= high else (high, low)
+            mask = (coord >= lo_b) & (coord <= hi_b)
+            hits = np.flatnonzero(mask)
+            if hits.size == 0:
+                raise ValueError(
+                    f"Region {dim}={rng!r} selects no existing coordinate in {store_path}. "
+                    "Region writes overwrite in place; use write_dataset to add new coordinates."
+                )
+            if hits[-1] - hits[0] + 1 != hits.size:
+                raise ValueError(
+                    f"Region {dim}={rng!r} selects non-contiguous coordinates in {store_path} "
+                    "(the axis is unsorted or has gaps). A region must be a single contiguous slice."
+                )
+            region[dim] = slice(int(hits[0]), int(hits[-1]) + 1)
+        return region
+    finally:
+        ds.close()
+
+
+def write_region(
+    store_path: str,
+    data: xr.Dataset,
+    *,
+    region: dict[str, slice],
+    update_attrs: dict[str, Any] | None = None,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+) -> None:
+    """Overwrite a region of an existing store in place, in one atomic commit.
+
+    ``region`` maps dimension names (``time``/``northing``/``easting``) to
+    integer slices — typically from :func:`resolve_region`. Dimensions absent
+    from ``region`` are written in full. ``data`` must already cover exactly the
+    cells the region selects (same shape along each region dim); its own
+    coordinate values are ignored (the store's coords are authoritative) and are
+    dropped before writing.
+
+    The region need not be chunk-aligned: unaligned edges are padded out to the
+    enclosing chunk boundaries and the untouched cells backfilled from the store
+    (read-modify-write), so the caller never has to reason about chunk
+    boundaries. ``update_attrs`` is merged into root attrs after the write
+    (root attrs are otherwise preserved across the write).
+
+    Contract: every region dim must already exist in the store at the given
+    indices. This overwrites committed data — see the region-writes design doc
+    for the consistency caveats when a single logical region is split across
+    multiple calls.
+    """
+    if not region:
+        raise ValueError("write_region requires a non-empty region; use write_dataset for full writes.")
+    _write_region(
+        store_path,
+        data,
+        region,
+        message=f"Overwrite region {region}",
+        update_attrs=update_attrs,
+        get_credentials=get_credentials,
+        region_name=s3_region,
+    )
 
 
 def compute_doy(timestamps: np.ndarray) -> np.ndarray:

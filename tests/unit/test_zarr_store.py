@@ -27,6 +27,7 @@ from pathlib import Path
 import icechunk
 import numpy as np
 import pytest
+import xarray as xr
 from icechunk.xarray import to_icechunk
 
 from tessera_embeddings.config import S2_L2A_BANDS
@@ -34,12 +35,15 @@ from tessera_embeddings.storage.zarr_store import (
     S3Config,
     _default_repo_config,
     _open_writable_session,
+    _pad_region_to_chunks,
     _write_new,
     compute_doy,
     get_existing_dates,
     open_store,
+    resolve_region,
     set_s3_config,
     write_dataset,
+    write_region,
 )
 
 # Chunk dicts replacing the reference's TESSERA_CHUNKS / DEFAULT_CHUNKS.
@@ -469,6 +473,288 @@ class TestWriteDataset:
         assert len(doy) == 2
         assert doy[0] == 1  # Jan 1
         assert doy[1] == 167  # June 15
+
+
+# Single-block spatial chunking: the whole sub-box is one dask chunk, so the
+# RMW pad / region write decides the on-disk layout, not the input chunking.
+ONE_BLOCK = {"time": 1, "northing": -1, "easting": -1}
+
+
+def _single_date_block(date, value, *, height, width, n0=0, e0=0, chunks=None):
+    """Build a one-timestep ``blue`` dataset filled with ``value``.
+
+    ``n0``/``e0`` offset the spatial coords so a sub-box carries the right
+    coordinate labels (write_region ignores them, but they keep the dataset
+    well-formed and document intent). ``chunks`` optionally rechunks.
+    """
+    ds = xr.Dataset(
+        {"blue": (["time", "northing", "easting"], np.full((1, height, width), value, dtype=np.uint16))},
+        coords={
+            "time": [np.datetime64(date, "ns")],
+            "northing": np.arange(n0, n0 + height),
+            "easting": np.arange(e0, e0 + width),
+        },
+    )
+    return ds.chunk(chunks) if chunks else ds
+
+
+def _make_region_store(local_zarr_path, sample_reflectance_data, dates, *, chunks=SPLIT_CHUNKS, name="rw"):
+    """Write a 1000x1000 reflectance store under ``name`` and return its path."""
+    data = sample_reflectance_data(dates, height=1000, width=1000)
+    store_path = str(local_zarr_path / name / "reflectance.zarr")
+    write_dataset(
+        store_path, data, tile_id="33UUP", baselines=dict.fromkeys(dates, 400), chunks=chunks, crs="EPSG:32615"
+    )
+    return store_path
+
+
+class TestResolveRegion:
+    """Tests for coordinate-range -> integer-slice resolution."""
+
+    def _store(self, local_zarr_path, sample_reflectance_data, dates):
+        return _make_region_store(local_zarr_path, sample_reflectance_data, dates, name="resolve")
+
+    def test_single_date_resolves_to_one_index(self, local_zarr_path, sample_reflectance_data):
+        dates = ["2024-01-01", "2024-01-06", "2024-01-11"]
+        store_path = self._store(local_zarr_path, sample_reflectance_data, dates)
+        assert resolve_region(store_path, time=("2024-01-06", "2024-01-06")) == {"time": slice(1, 2)}
+
+    def test_date_range_resolves_to_half_open_slice(self, local_zarr_path, sample_reflectance_data):
+        dates = ["2024-01-01", "2024-01-06", "2024-01-11"]
+        store_path = self._store(local_zarr_path, sample_reflectance_data, dates)
+        assert resolve_region(store_path, time=("2024-01-01", "2024-01-06")) == {"time": slice(0, 2)}
+
+    def test_spatial_range_resolves_against_coords(self, local_zarr_path, sample_reflectance_data):
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"])
+        region = resolve_region(store_path, northing=(100, 299), easting=(250, 609))
+        assert region == {"northing": slice(100, 300), "easting": slice(250, 610)}
+
+    def test_none_axis_is_omitted(self, local_zarr_path, sample_reflectance_data):
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01", "2024-01-06"])
+        region = resolve_region(store_path, time=("2024-01-01", "2024-01-01"))
+        assert set(region) == {"time"}
+
+    def test_nonexistent_date_raises(self, local_zarr_path, sample_reflectance_data):
+        """The overwrite-in-place contract: a date not in the store is rejected."""
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"])
+        with pytest.raises(ValueError, match="selects no existing coordinate"):
+            resolve_region(store_path, time=("2025-01-01", "2025-01-01"))
+
+    def test_non_contiguous_range_raises(self, local_zarr_path, sample_reflectance_data):
+        """An out-of-order time axis whose range straddles a gap is rejected."""
+
+        # write_dataset appends without sorting, so append out of order to build
+        # the axis [2024-01-06, 2024-01-01, 2024-01-20].
+        def _append(date):
+            ds = sample_reflectance_data([date], height=1000, width=1000)
+            write_dataset(store_path, ds, tile_id="33UUP", baselines={date: 400}, chunks=SPLIT_CHUNKS, crs="EPSG:32615")
+
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-06"])
+        _append("2024-01-01")
+        _append("2024-01-20")
+
+        # Range 01-06..01-20 matches indices 0 and 2 — non-contiguous (gap at 1).
+        with pytest.raises(ValueError, match="non-contiguous"):
+            resolve_region(store_path, time=("2024-01-06", "2024-01-20"))
+
+
+class TestPadRegionToChunks:
+    """Unit tests for the read-modify-write chunk padding (no store I/O)."""
+
+    def _existing(self, *, height=1000, width=1000, chunk=500):
+        ds = xr.Dataset(
+            {"blue": (["time", "northing", "easting"], np.zeros((1, height, width), dtype=np.uint16))},
+            coords={
+                "time": [np.datetime64("2024-01-01", "ns")],
+                "northing": np.arange(height),
+                "easting": np.arange(width),
+            },
+        )
+        return ds.chunk({"time": 1, "northing": chunk, "easting": chunk})
+
+    def test_aligned_region_needs_no_store_read(self):
+        """A chunk-aligned region returns the incoming values unchanged (no store read).
+
+        The data is shape-validated and matched to the store's dim order, but the
+        values pass straight through — no shell slab is read or overlaid.
+        """
+        existing = self._existing()
+        data = _single_date_block("2024-01-01", 7, height=500, width=500, chunks=ONE_BLOCK)
+        region = {"northing": slice(0, 500), "easting": slice(500, 1000)}
+        padded, widened = _pad_region_to_chunks(existing, data, region)
+        assert widened == region
+        assert padded["blue"].dims == ("time", "northing", "easting")
+        assert (padded["blue"].values == 7).all()
+
+    def test_aligned_region_rejects_mismatched_shape(self):
+        """The aligned fast path still validates shape (no silent broadcast)."""
+        existing = self._existing()
+        # region spans 500 northing rows but data supplies 1 -> would broadcast.
+        data = _single_date_block("2024-01-01", 7, height=1, width=500, e0=500, chunks=ONE_BLOCK)
+        region = {"northing": slice(0, 500), "easting": slice(500, 1000)}
+        with pytest.raises(ValueError, match="expected"):
+            _pad_region_to_chunks(existing, data, region)
+
+    def test_unaligned_region_widens_to_chunk_bounds(self):
+        existing = self._existing()
+        data = _single_date_block("2024-01-01", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
+        region = {"northing": slice(100, 300), "easting": slice(250, 610)}
+        _padded, widened = _pad_region_to_chunks(existing, data, region)
+        # northing 100:300 -> 0:500 ; easting 250:610 -> 0:1000 (both edges snap out)
+        assert widened == {"northing": slice(0, 500), "easting": slice(0, 1000)}
+
+    def test_padded_overlay_preserves_shell_and_writes_data(self):
+        """Widened frame holds incoming values inside the region, zeros (store) outside."""
+        existing = self._existing()
+        data = _single_date_block("2024-01-01", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
+        region = {"northing": slice(100, 300), "easting": slice(250, 610)}
+        padded, widened = _pad_region_to_chunks(existing, data, region)
+        arr = padded["blue"].values
+        # region cells -> 9 (positions relative to the widened frame, which starts at 0,0)
+        assert (arr[0, 100:300, 250:610] == 9).all()
+        # everything else in the widened frame -> shell value (0)
+        mask = np.ones(arr.shape[1:], dtype=bool)
+        mask[100:300, 250:610] = False
+        assert (arr[0][mask] == 0).all()
+
+    def test_open_bound_slice_is_normalized(self):
+        """slice(None) on a padded dim resolves to the full axis, no None arithmetic."""
+        existing = self._existing()
+        # northing full axis (slice(None)); easting unaligned so padding kicks in.
+        data = _single_date_block("2024-01-01", 4, height=1000, width=360, e0=250, chunks=ONE_BLOCK)
+        region = {"northing": slice(None), "easting": slice(250, 610)}
+        padded, widened = _pad_region_to_chunks(existing, data, region)
+        assert widened == {"northing": slice(0, 1000), "easting": slice(0, 1000)}
+        assert (padded["blue"].values[0, :, 250:610] == 4).all()
+
+    def test_mismatched_shape_is_rejected(self):
+        """A region-covering promise is enforced: a too-small input can't broadcast."""
+        existing = self._existing()
+        # region spans 200 northing rows but data only supplies 1 -> would broadcast.
+        data = _single_date_block("2024-01-01", 9, height=1, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
+        region = {"northing": slice(100, 300), "easting": slice(250, 610)}
+        with pytest.raises(ValueError, match="expected"):
+            _pad_region_to_chunks(existing, data, region)
+
+    def test_non_unit_step_is_rejected(self):
+        existing = self._existing()
+        data = _single_date_block("2024-01-01", 9, height=250, width=500, chunks=ONE_BLOCK)
+        with pytest.raises(ValueError, match="step 1"):
+            _pad_region_to_chunks(existing, data, {"northing": slice(0, 500, 2)})
+
+    def test_transposed_input_is_realigned(self):
+        """Input with swapped northing/easting is transposed to store order, not corrupted."""
+        existing = self._existing()
+        # Build data with easting before northing, unaligned so padding runs.
+        arr = np.full((1, 360, 200), 6, dtype=np.uint16)  # (time, easting, northing)
+        data = xr.Dataset(
+            {"blue": (["time", "easting", "northing"], arr)},
+            coords={"time": [np.datetime64("2024-01-01", "ns")]},
+        ).chunk(ONE_BLOCK)
+        region = {"northing": slice(100, 300), "easting": slice(250, 610)}
+        padded, _ = _pad_region_to_chunks(existing, data, region)
+        assert padded["blue"].dims == ("time", "northing", "easting")
+        assert (padded["blue"].values[0, 100:300, 250:610] == 6).all()
+
+
+class TestWriteRegion:
+    """End-to-end region overwrite tests."""
+
+    def _store(self, local_zarr_path, sample_reflectance_data, dates, *, name="rw"):
+        return _make_region_store(local_zarr_path, sample_reflectance_data, dates, name=name)
+
+    def test_overwrite_full_timestep(self, local_zarr_path, sample_reflectance_data):
+        """Overwriting one date leaves the others byte-for-byte intact."""
+        dates = ["2024-01-01", "2024-01-06", "2024-01-11"]
+        store_path = self._store(local_zarr_path, sample_reflectance_data, dates)
+        original = open_store(store_path)["blue"].values.copy()
+
+        new = _single_date_block("2024-01-06", 7, height=1000, width=1000, chunks=SPLIT_CHUNKS)
+        region = resolve_region(store_path, time=("2024-01-06", "2024-01-06"))
+        write_region(store_path, new, region=region)
+
+        back = open_store(store_path)["blue"].values
+        assert (back[1] == 7).all()
+        np.testing.assert_array_equal(back[0], original[0])
+        np.testing.assert_array_equal(back[2], original[2])
+
+    def test_overwrite_aligned_spatial_box(self, local_zarr_path, sample_reflectance_data):
+        """A chunk-aligned spatial sub-box overwrites only its cells."""
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rw_aligned")
+        original = open_store(store_path)["blue"].values.copy()
+
+        sub = _single_date_block("2024-01-01", 5, height=500, width=500, n0=500, e0=0, chunks=ONE_BLOCK)
+        region = {"time": slice(0, 1), "northing": slice(500, 1000), "easting": slice(0, 500)}
+        write_region(store_path, sub, region=region)
+
+        back = open_store(store_path)["blue"].values
+        assert (back[0, 500:1000, 0:500] == 5).all()
+        mask = np.ones(back.shape[1:], dtype=bool)
+        mask[500:1000, 0:500] = False
+        np.testing.assert_array_equal(back[0][mask], original[0][mask])
+
+    def test_overwrite_unaligned_spatial_box_backfills_neighbors(self, local_zarr_path, sample_reflectance_data):
+        """An unaligned box is padded; cells sharing its boundary chunks survive."""
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rw_unaligned")
+        original = open_store(store_path)["blue"].values.copy()
+
+        sub = _single_date_block("2024-01-01", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
+        region = {"time": slice(0, 1), "northing": slice(100, 300), "easting": slice(250, 610)}
+        write_region(store_path, sub, region=region)
+
+        back = open_store(store_path)["blue"].values
+        assert (back[0, 100:300, 250:610] == 9).all()
+        mask = np.ones(back.shape[1:], dtype=bool)
+        mask[100:300, 250:610] = False
+        np.testing.assert_array_equal(back[0][mask], original[0][mask])
+
+    def test_region_write_preserves_root_attrs(self, local_zarr_path, sample_reflectance_data):
+        """CRS / tile_id and other root attrs survive a region write."""
+        dates = ["2024-01-01", "2024-01-06"]
+        store_path = self._store(local_zarr_path, sample_reflectance_data, dates, name="rw_attrs")
+
+        new = _single_date_block("2024-01-06", 3, height=1000, width=1000, chunks=SPLIT_CHUNKS)
+        write_region(store_path, new, region=resolve_region(store_path, time=("2024-01-06", "2024-01-06")))
+
+        ds = open_store(store_path)
+        assert ds.attrs["crs"] == "EPSG:32615"
+        assert ds.attrs["tile_id"] == "33UUP"
+
+    def test_update_attrs_merged(self, local_zarr_path, sample_reflectance_data):
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rw_update_attrs")
+        new = _single_date_block("2024-01-01", 1, height=1000, width=1000, chunks=SPLIT_CHUNKS)
+        write_region(
+            store_path,
+            new,
+            region={"time": slice(0, 1)},
+            update_attrs={"reprocessed": "2026-06-15"},
+        )
+        assert open_store(store_path).attrs["reprocessed"] == "2026-06-15"
+
+    def test_empty_region_rejected(self, local_zarr_path, sample_reflectance_data):
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rw_empty")
+        new = _single_date_block("2024-01-01", 1, height=1000, width=1000, chunks=SPLIT_CHUNKS)
+        with pytest.raises(ValueError, match="non-empty region"):
+            write_region(store_path, new, region={})
+
+    def test_failed_region_write_leaves_prior_commit_intact(
+        self, local_zarr_path, sample_reflectance_data, monkeypatch
+    ):
+        """If to_icechunk raises mid-write, the last committed state is unchanged."""
+        dates = ["2024-01-01", "2024-01-06"]
+        store_path = self._store(local_zarr_path, sample_reflectance_data, dates, name="rw_fail")
+        original = open_store(store_path)["blue"].values.copy()
+
+        def failing_to_icechunk(*args, **kwargs):
+            raise RuntimeError("Simulated region write failure")
+
+        monkeypatch.setattr("tessera_embeddings.storage.zarr_store.to_icechunk", failing_to_icechunk)
+
+        new = _single_date_block("2024-01-06", 7, height=1000, width=1000, chunks=SPLIT_CHUNKS)
+        with pytest.raises(RuntimeError, match="Simulated region write failure"):
+            write_region(store_path, new, region=resolve_region(store_path, time=("2024-01-06", "2024-01-06")))
+
+        np.testing.assert_array_equal(open_store(store_path)["blue"].values, original)
 
 
 class TestDefaultRepoConfig:
