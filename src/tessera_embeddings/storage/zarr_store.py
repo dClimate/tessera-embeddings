@@ -552,7 +552,15 @@ def _write_region(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region_name: str | None = None,
 ) -> None:
-    """Overwrite an existing region of a store in a single atomic commit."""
+    """Overwrite an existing region of a store in a single atomic commit.
+
+    Logs per-phase timing at DEBUG so the serial flow-runner cost of a region
+    write (the dominant cost vs. cluster execution at scale) can be localized:
+    ``open`` (open the writable + readonly sessions over the store),
+    ``pad`` (build the padding shell graph), and ``write+commit`` (the
+    ``to_icechunk`` graph build + distributed write + icechunk commit).
+    """
+    t0 = time.monotonic()
     repo = _open_repo(store_path, get_credentials=get_credentials, region=region_name)
     session = repo.writable_session("main")
 
@@ -564,20 +572,30 @@ def _write_region(
     # uses the writable session, which ``to_icechunk`` forks internally.
     read_session = repo.readonly_session(branch="main")
     existing = xr.open_zarr(read_session.store, consolidated=False)
+    t_open = time.monotonic()
     try:
         padded, widened = _pad_region_to_chunks(existing, data, region)
-        to_write = _drop_region_coords(padded, set(widened))
+        t_pad = time.monotonic()
 
         _commit_preserving_attrs(
             session,
-            to_write,
+            _drop_region_coords(padded, set(widened)),
             {"mode": "r+", "region": widened, "align_chunks": True, "split_every": 8},
             message,
             update_attrs,
         )
+        t_commit = time.monotonic()
     finally:
         existing.close()
-    logger.info(f"Wrote region {widened} to {store_path}")
+    logger.info(
+        "Wrote region %s to %s (open=%.1fs pad=%.1fs write+commit=%.1fs total=%.1fs)",
+        widened,
+        store_path,
+        t_open - t0,
+        t_pad - t_open,
+        t_commit - t_pad,
+        t_commit - t0,
+    )
 
 
 # =============================================================================
