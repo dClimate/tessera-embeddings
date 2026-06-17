@@ -201,7 +201,7 @@ class InferenceConfig:
     batch_size: int = 3584
     num_workers: int = 4
     norm_source: Literal["mpc", "aws"] = "aws"
-    s1_orbit: Literal["ascending", "descending", "both"] = "ascending"
+    s1_orbit: Literal["ascending", "descending", "both"] = "both"
     # Deterministic sampling under v1.1 — no repeat variance; forced False in __post_init__.
     compute_std: bool = False
 

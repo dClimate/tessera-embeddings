@@ -70,7 +70,7 @@ def process_roi_sar(
     start_date: str,
     end_date: str,
     store_path: str,
-    orbit: S1Orbit = "ascending",
+    orbit: S1Orbit,
     batch_days: int = 30,
     edl_credentials_fn: Callable[[], dict[str, str]] | None = None,
     apply_credentials_fn: Callable[[dict[str, str]], None] | None = None,

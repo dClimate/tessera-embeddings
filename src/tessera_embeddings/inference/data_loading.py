@@ -264,7 +264,7 @@ def resolve_s1_orbit(mosaic_base: str, s1_orbit: str) -> str:
 def check_time_window_coverage(
     mosaic_base: str,
     window: TimeWindow,
-    s1_orbit: str = "ascending",
+    s1_orbit: str = "both",
     skip_coverage_check: bool = False,
 ) -> None:
     """Verify that source stores span the requested time window.
@@ -504,7 +504,7 @@ def load_chunk(
     chunk: ChunkSpec,
     mosaic_base: str,
     time_window: TimeWindow,
-    s1_orbit: Literal["ascending", "descending", "both"] = "ascending",
+    s1_orbit: Literal["ascending", "descending", "both"] = "both",
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
     mask_bundle: S2MaskBundle | None = None,

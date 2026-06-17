@@ -119,7 +119,7 @@ def tessera_embeddings(
     code_bucket: str | None = None,
     code_suffix: str = "",
     num_actors: int = 20,
-    s1_orbit: str = "ascending",
+    s1_orbit: str = "both",
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
 ) -> dict[str, Any]:
     """Generate Tessera embeddings for a mosaicked ROI.
