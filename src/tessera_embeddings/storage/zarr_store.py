@@ -356,13 +356,26 @@ def _commit_preserving_attrs(
     root = zarr.open_group(session.store, mode="r")
     preserved_attrs = dict(root.attrs)
 
+    t0 = time.monotonic()
     to_icechunk(data, session, **write_kwargs)
+    t_write = time.monotonic()
 
     root = zarr.open_group(session.store, mode="r+")
     root.attrs.update(preserved_attrs)
     if update_attrs:
         root.attrs.update(update_attrs)
     session.commit(message)
+    t_commit = time.monotonic()
+
+    # Split the dominant region-write cost (measured at ~97% of total) into its
+    # two halves: the to_icechunk distributed write+graph-build vs. the icechunk
+    # commit/snapshot. Tells us whether to attack commit count (batching) or the
+    # write itself.
+    logger.info(
+        "commit-preserving-attrs: to_icechunk=%.1fs commit=%.1fs",
+        t_write - t0,
+        t_commit - t_write,
+    )
 
 
 def _write_append(
