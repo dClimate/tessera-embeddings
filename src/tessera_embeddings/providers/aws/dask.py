@@ -44,7 +44,12 @@ from typing import Any
 
 import dask
 from dask_cloudprovider.aws import ECSCluster, FargateCluster
-from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_fixed
+from tenacity import (
+    Retrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 
 # Default Fargate task sizes for ingest workloads. Callers can override
 # per-call via ``ecs_cluster``'s ``worker_cpu`` / ``worker_mem`` arguments.
@@ -57,6 +62,47 @@ DEFAULT_INGEST_SCHEDULER_CPU = 4096
 DEFAULT_INGEST_SCHEDULER_MEM = 8192
 
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/ecs/tessera/dask"
+
+# Substrings of transient cluster-start failures worth retrying. All are ECS
+# races/limits that clear on their own, not configuration errors:
+#   * "not enough values to unpack" — dask-cloudprovider's Task._update_task
+#     (ecs.py) calls run_task then immediately describe_tasks on the returned
+#     ARN; when the ECS control plane hasn't caught up, describe_tasks returns
+#     no task and the ``[self.task] = ...`` unpack raises, wrapped by _start()
+#     as RuntimeError("Cluster failed to start: not enough values to unpack").
+#   * "RESOURCE:ENI" — ECS RunTask rejects placement before creating a task
+#     when the subnet's ENI/IP capacity is exhausted. dask-cloudprovider's
+#     Task.start (ecs.py) raises ``RuntimeError(response)`` with the whole
+#     run_task response when ``tasks`` is empty, and AWS reports that placement
+#     failure reason as ``RESOURCE:ENI`` in that response.
+#   * "Scheduler failed to start" — the scheduler Fargate task didn't reach
+#     RUNNING in time, typically ENI/IP exhaustion when many clusters launch in
+#     a burst (e.g. a fan-out ingest) and their interfaces haven't drained yet.
+#     NOTE: dask-cloudprovider raises this same generic string for *any* task
+#     that fails to reach RUNNING, including permanent misconfigurations (bad
+#     image/command). It is not distinguishable from the transient ENI case by
+#     message alone, so we treat it as retryable; the cost of a wrong guess is
+#     bounded (a permanent failure burns ~3 backed-off retries before surfacing
+#     the original error via reraise=True).
+# distributed's spec._start() calls _close() before re-raising, so a failed
+# scheduler task is torn down before the exception surfaces — a fresh
+# constructor on retry starts clean, with no orphaned task/ENI to leak.
+_RETRYABLE_CLUSTER_START_ERRORS = (
+    "not enough values to unpack",
+    "RESOURCE:ENI",
+    "Scheduler failed to start",
+)
+
+
+def _is_retryable_cluster_start_error(exc: BaseException) -> bool:
+    """True if ``exc`` is a transient cluster-start failure worth retrying.
+
+    Matches the RuntimeErrors dask-cloudprovider / distributed raise for the
+    ECS races in ``_RETRYABLE_CLUSTER_START_ERRORS``. Anything else (bad subnet,
+    IAM denial, image pull failure) is a real misconfiguration and must fail
+    fast rather than burn retries.
+    """
+    return isinstance(exc, RuntimeError) and any(s in str(exc) for s in _RETRYABLE_CLUSTER_START_ERRORS)
 
 
 @dataclass(frozen=True)
@@ -111,9 +157,14 @@ class FargateConfig:
                 # Use unsigned requests for public S3 buckets (e.g. sentinel-s2-l1c)
                 "AWS_NO_SIGN_REQUEST": "YES",
             },
-            # dask-cloudprovider's stale-resource cleanup iterates all IAM
-            # roles, which fails on AWS SSO reserved roles. CDK manages our
-            # cleanup, so we skip it here.
+            # Keep True. dask-cloudprovider's startup sweep for stale resources
+            # from prior runs iterates all IAM roles, which fails on AWS SSO
+            # reserved roles — flipping to False breaks cluster construction
+            # every time, not just after a crash. It also only targets debris
+            # from runs that died without closing; it does NOT speed reclamation
+            # of ENIs from clusters that closed normally (the source of
+            # post-burst start failures — see _RETRYABLE_CLUSTER_START_ERRORS).
+            # CDK manages our cleanup, so we skip the sweep here.
             "skip_cleanup": True,
         }
         if self.environment:
@@ -310,22 +361,23 @@ def ecs_cluster(
 
     safe_kwargs = {k: v for k, v in cluster_kwargs.items() if k != "environment"}
 
-    # Retry the cluster constructor to dodge an ECS describe_tasks read-after-write race.
-    # dask-cloudprovider's Task._update_task (ecs.py:171-188) calls run_task and immediately
-    # calls describe_tasks on the returned ARN. When the ECS control plane hasn't caught up,
-    # describe_tasks returns {"tasks": [], "failures": [...MISSING...]} and the
-    # `[self.task] = ...["tasks"]` unpack raises ValueError, which _start() wraps as
-    # RuntimeError("Cluster failed to start: not enough values to unpack ..."). The library
-    # only retries ThrottlingException, so we retry the whole constructor here.
+    # Retry the cluster constructor on transient ECS start failures (the
+    # describe_tasks read-after-write race and scheduler-start/ENI exhaustion —
+    # see ``_RETRYABLE_CLUSTER_START_ERRORS``). dask-cloudprovider itself only
+    # retries ThrottlingException, so we wrap the whole constructor. Randomized
+    # exponential backoff (up to 120s) gives a drained ENI/IP pool time to
+    # recover after a burst of cluster launches; the jitter desynchronizes the
+    # many flows that exhausted ENIs together so they don't wake and re-collide
+    # on RunTask in lockstep, which a deterministic schedule would preserve.
     retrying = Retrying(
-        retry=retry_if_exception(
-            lambda exc: isinstance(exc, RuntimeError) and "not enough values to unpack" in str(exc)
-        ),
-        stop=stop_after_attempt(3),
-        wait=wait_fixed(5),
+        retry=retry_if_exception(_is_retryable_cluster_start_error),
+        stop=stop_after_attempt(4),
+        wait=wait_random_exponential(multiplier=10, max=120),
         reraise=True,
         before_sleep=lambda rs: log.warning(
-            "FargateCluster start hit ECS describe_tasks race (attempt %d); retrying", rs.attempt_number
+            "FargateCluster start failed (%s); retry %d",
+            rs.outcome.exception() if rs.outcome is not None else "unknown",
+            rs.attempt_number,
         ),
     )
 
