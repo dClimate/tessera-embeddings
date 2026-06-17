@@ -200,11 +200,77 @@ def _create_storage(
     return icechunk.local_filesystem_storage(local_path)
 
 
+# Process-wide opt-in for manifest splitting along the time axis. None = off
+# (icechunk's default single-manifest-per-array layout); an int = the split size
+# in time-chunks. A store's manifest is the index mapping every chunk to its
+# storage location; by default it is ONE object per array, so every commit
+# rewrites the whole manifest — O(total store size), independent of how few
+# chunks the commit changed. At mosaic scale (hundreds of dates x thousands of
+# spatial chunks x many bands) that single manifest is huge and dominates commit
+# time. Splitting along time into shards of N time-chunks means a commit touching
+# a handful of dates rewrites only the affected shard(s).
+#
+# This is OFF by default and opt-in via ``manifest_time_split`` because (a) it's
+# only a win on the large, frequently-region-written mosaic stores, and (b) the
+# split size must be applied consistently across a store's create and all later
+# opens — a process-wide override (like ``credentials_provider``) guarantees that
+# without threading a parameter through every public entry point.
+_manifest_time_split_size: int | None = None
+
+# A sensible default for the mosaic stores: time chunk size is 1 (INGEST_CHUNKS),
+# so this is also a count of dates per shard. 256 keeps a full-history store to a
+# handful of shards while a typical few-date region write rewrites just one.
+DEFAULT_MANIFEST_TIME_SPLIT_SIZE = 256
+
+
+@contextmanager
+def manifest_time_split(split_size: int | None = DEFAULT_MANIFEST_TIME_SPLIT_SIZE) -> "Iterator[None]":
+    """Enable manifest splitting along the time axis for repos opened in this block.
+
+    Every ``_open_repo`` / ``_create_repo`` inside the ``with`` block applies a
+    time-axis :class:`icechunk.ManifestSplittingConfig` of ``split_size``
+    time-chunks, so commits rewrite only the touched time-shards rather than the
+    whole array manifest. Pass ``None`` to explicitly disable within a block.
+
+    Scoped like :func:`credentials_provider`: the previous setting is restored on
+    exit even if the body raises, so a reused process (e.g. a Dask worker) is not
+    left globally pinned. The split size must match across a store's create and
+    every later open — wrap the whole merge in one block to keep them consistent.
+    """
+    global _manifest_time_split_size
+    previous = _manifest_time_split_size
+    _manifest_time_split_size = split_size
+    try:
+        yield
+    finally:
+        _manifest_time_split_size = previous
+
+
+def _manifest_splitting_config(split_size: int) -> icechunk.ManifestSplittingConfig:
+    """Split every array's manifest along the ``time`` dimension into ``split_size`` shards.
+
+    Applies to all arrays (``AnyArray``), keyed on the dimension *named* ``time``
+    so it tracks the axis regardless of position.
+    """
+    return icechunk.ManifestSplittingConfig.from_dict(
+        {
+            icechunk.ManifestSplitCondition.AnyArray(): {
+                icechunk.ManifestSplitDimCondition.DimensionName("time"): split_size,
+            }
+        }
+    )
+
+
 def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk.RepositoryConfig:
     """Build the RepositoryConfig overrides applied to every repo open.
 
     Chunk cache is left at icechunk's (small) default — see
     context_docs/decisions/007-icechunk-chunk-cache-disabled.md.
+
+    **Manifest splitting** along the time axis is applied only when opted in via
+    :func:`manifest_time_split` (off by default). When active it bounds a commit's
+    manifest rewrite to the time-shards it touched, the dominant region-write cost
+    on the mosaic stores.
 
     When ``max_concurrent_requests`` is provided, caps per-repo HTTP
     concurrency. Assembly at cornbelt scale fans out thousands of concurrent
@@ -216,6 +282,10 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     classified as retriable by the underlying AWS SDK.
     """
     config = icechunk.RepositoryConfig.default()
+    if _manifest_time_split_size is not None:
+        config.manifest = icechunk.ManifestConfig(
+            splitting=_manifest_splitting_config(_manifest_time_split_size)
+        )
     if max_concurrent_requests is not None:
         config.max_concurrent_requests = max_concurrent_requests
     return config
