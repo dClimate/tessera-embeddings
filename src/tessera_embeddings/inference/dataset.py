@@ -52,7 +52,7 @@ class MosaicChunkInferenceDataset:
         self,
         chunk_data: ChunkData,
         num_obs_checkpoints: tuple[int, ...] = DEFAULT_NUM_OBS_CHECKPOINTS,
-        s1_orbit: Literal["ascending", "descending", "both"] = "ascending",
+        s1_orbit: Literal["ascending", "descending", "both"] = "both",
     ) -> None:
         self.num_obs_checkpoints = _normalize_obs_checkpoints(num_obs_checkpoints)
         self.s1_orbit = s1_orbit

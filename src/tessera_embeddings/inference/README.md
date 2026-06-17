@@ -216,6 +216,13 @@ Each modality uses its own `(mean, std)` from `S1_ASC_BAND_MEAN/STD` and
 `S1_DESC_BAND_MEAN/STD` in `config/inference.py`. Ascending and descending are normalised
 separately before concatenation so that the model sees per-orbit statistics, not blended ones.
 
+> **Why `s1_orbit="both"` is safe for v1.1:** The v1.1 model uses a single merged S1
+> backbone (`split_s1_modalities=False`), but Cambridge confirmed that ascending and
+> descending observations are each normalised with their **own** mean/std before being
+> concatenated — exactly matching v1.1 training-time preprocessing. This makes mixing
+> both orbits correct and preferred, in contrast to v1 where the two orbits shared
+> normalisation statistics.
+
 `build_resample_indices` handles under-sampled pixels (fewer valid timesteps than the
 bucket target) via deterministic repeat-padding — last valid timestep is duplicated until
 target is reached. Over-sampled pixels are uniformly sub-sampled.
@@ -403,7 +410,7 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 |---|---|---|
 | `batch_size` | 3584 | GPU pixels per forward pass within a bucket |
 | `num_obs_checkpoints` | `range(8, 257, 8)` | Bucketed sequence-length schedule; pixels binned to nearest checkpoint |
-| `s1_orbit` | `"ascending"` | `"ascending"`, `"descending"`, or `"both"` |
+| `s1_orbit` | `"both"` | `"ascending"`, `"descending"`, or `"both"` |
 | `norm_source` | `"mpc"` | Band stats origin; `"aws"` for the AWS-normalised encoder checkpoint |
 | `latent_dim` | 192 | Transformer hidden dim (must match checkpoint) |
 | `representation_dim` | 192 | Model output dim; first 128 dims are saved to the store |

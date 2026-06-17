@@ -82,7 +82,7 @@ def ingest_s1_roi_sar(
     end_date: str,
     store_path: str,
     client: dask.distributed.Client,
-    orbit: S1Orbit = "ascending",
+    orbit: S1Orbit,
     batch_days: int = 30,
     edl_credentials_fn: Callable[[], dict[str, str]] | None = None,
     apply_credentials_fn: Callable[[dict[str, str]], None] | None = None,

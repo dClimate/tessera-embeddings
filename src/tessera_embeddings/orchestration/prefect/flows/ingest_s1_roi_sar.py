@@ -80,7 +80,7 @@ def ingest_s1_roi_sar(
     min_workers: int = 1,
     max_workers: int = 50,
     batch_days: int = 30,
-    orbit: S1Orbit = "ascending",
+    orbit: S1Orbit,
     use_s3_direct: bool = True,
     use_local: bool = False,
     storage_options: dict | None = None,

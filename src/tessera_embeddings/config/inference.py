@@ -107,10 +107,10 @@ _NORM_STATS: dict[str, dict[str, list[float]]] = {
             1680.7367,
             1585.5529,
         ],
-        "s1_asc_mean": [5664.5439, 2802.9736],
-        "s1_asc_std": [1678.7821, 1786.0414],
-        "s1_desc_mean": [5710.6992, 2830.1045],
-        "s1_desc_std": [1616.1969, 1761.8499],
+        "s1_asc_mean": [5697.0859, 2838.6687],
+        "s1_asc_std": [1671.3737, 1789.4116],
+        "s1_desc_mean": [5759.1367, 2873.2854],
+        "s1_desc_std": [1583.2858, 1747.8390],
     },
 }
 
@@ -201,7 +201,7 @@ class InferenceConfig:
     batch_size: int = 3584
     num_workers: int = 4
     norm_source: Literal["mpc", "aws"] = "aws"
-    s1_orbit: Literal["ascending", "descending", "both"] = "ascending"
+    s1_orbit: Literal["ascending", "descending", "both"] = "both"
     # Deterministic sampling under v1.1 — no repeat variance; forced False in __post_init__.
     compute_std: bool = False
 

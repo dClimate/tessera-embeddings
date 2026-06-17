@@ -83,7 +83,7 @@ async def tessera_full_pipeline(
     ingest_max_workers: int | None = None,
     num_actors: int | None = None,
     # Behaviour
-    s1_orbit: str = "ascending",
+    s1_orbit: str = "both",
     skip_coverage_check: bool = False,
     ami_ssm_name: str = "/tessera/ray/ami-id",
     ssm_prefix: str = "/tessera/ray/",
