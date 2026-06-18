@@ -283,9 +283,7 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     """
     config = icechunk.RepositoryConfig.default()
     if _manifest_time_split_size is not None:
-        config.manifest = icechunk.ManifestConfig(
-            splitting=_manifest_splitting_config(_manifest_time_split_size)
-        )
+        config.manifest = icechunk.ManifestConfig(splitting=_manifest_splitting_config(_manifest_time_split_size))
     if max_concurrent_requests is not None:
         config.max_concurrent_requests = max_concurrent_requests
     return config
@@ -629,10 +627,14 @@ def _write_region(
     # Committed view for padding unaligned regions. Read from a *readonly*
     # session (not ``session.store``): the lazy pad shell's graph is handed to
     # ``to_icechunk``, which under a distributed client pickles it to the
-    # workers. A writable session refuses to pickle; a readonly one (same
-    # committed HEAD, identical shell) pickles freely. The write target still
-    # uses the writable session, which ``to_icechunk`` forks internally.
-    read_session = repo.readonly_session(branch="main")
+    # workers. A writable session refuses to pickle; a readonly one pickles
+    # freely. Pin it to the writable session's base snapshot rather than
+    # re-resolving ``branch="main"`` so the shell is read from exactly the
+    # snapshot we commit on top of — a concurrent commit between the two opens
+    # can't make the shell come from a different snapshot than the write base.
+    # The write target still uses the writable session, which ``to_icechunk``
+    # forks internally.
+    read_session = repo.readonly_session(snapshot_id=session.snapshot_id)
     existing = xr.open_zarr(read_session.store, consolidated=False)
     try:
         padded, widened = _pad_region_to_chunks(existing, data, region)
