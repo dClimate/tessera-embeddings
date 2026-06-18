@@ -236,6 +236,7 @@ def tessera_embeddings(
     from tessera_embeddings.providers.aws.ray import ray_cluster
 
     assemble_kwargs: dict[str, Any] = {
+        "chunk_size": chunk_size or INFERENCE_CHUNK_SIZE,
         "n_live_chunks": len(live_chunks),
         "total_y": total_y,
         "total_x": total_x,
@@ -256,7 +257,7 @@ def tessera_embeddings(
     if dev_params.assembly_only:
         log.info("Assembly-only mode: verifying staged chunks from run %s", dev_params.previous_run_id)
         ZarrWriter(staging_base).verify_staged_completeness(run_id, live_chunks, log=log)
-        return _run_assembly(log=log, chunks=chunks, results=None, **assemble_kwargs)
+        return _run_assembly(log=log, result_stats=None, **assemble_kwargs)
 
     global _active_resolved_yaml, _active_cluster_name
     with ray_cluster(
@@ -316,14 +317,19 @@ def tessera_embeddings(
         }
 
     ZarrWriter(staging_base).verify_staged_completeness(run_id, live_chunks, log=log)
-    return _run_assembly(log=log, chunks=chunks, results=results, **assemble_kwargs)
+    result_stats = {
+        "succeeded": len(succeeded),
+        "skipped": len(skipped),
+        "failed": len(failed),
+        "total_valid_pixels": sum(r.get("valid_pixels", 0) for r in results),
+    }
+    return _run_assembly(log=log, result_stats=result_stats, **assemble_kwargs)
 
 
 def _run_assembly(
     *,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
-    chunks: list,
-    results: list | None,
+    result_stats: dict | None,
     **assemble_kwargs: Any,  # noqa: ANN401 — pass-through to the assembly task
 ) -> dict[str, Any]:
     """Provision the assembly Dask cluster and submit the assembly task."""
@@ -345,8 +351,7 @@ def _run_assembly(
         log.info("Assembly Dask cluster ready: scaling to %d workers", max_workers)
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         return _assemble_inner.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-            chunks=chunks,
-            results=results,
+            result_stats=result_stats,
             n_workers=max_workers,
             **assemble_kwargs,
         )
@@ -355,15 +360,20 @@ def _run_assembly(
 @flow(name="tessera_embeddings_assemble_inner")
 def _assemble_inner(
     *,
-    chunks: list,
-    results: list | None,
+    result_stats: dict | None,
     n_workers: int,
     **assemble_kwargs: Any,  # noqa: ANN401 — pass-through to the assembly task
 ) -> dict[str, Any]:
-    """Inner flow that submits the assembly task to the configured Dask runner."""
+    """Inner flow that submits the assembly task to the configured Dask runner.
+
+    The full chunk grid is intentionally *not* a parameter here — the
+    task re-enumerates it from ``total_y``/``total_x``/``chunk_size`` (in
+    ``assemble_kwargs``). Likewise the per-chunk inference results are
+    pre-aggregated into ``result_stats`` upstream. Both keep this flow's
+    serialized parameters under Prefect's 524,288-byte limit on large ROIs.
+    """
     future = assemble_embeddings_task.submit(
-        chunks=chunks,
-        results=results,
+        result_stats=result_stats,
         n_workers=n_workers,
         **assemble_kwargs,
     )

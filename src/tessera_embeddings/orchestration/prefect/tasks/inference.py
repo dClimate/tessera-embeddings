@@ -27,7 +27,7 @@ from prefect import get_run_logger, task
 
 from tessera_embeddings.config.inference import InferenceConfig, TimeWindow
 from tessera_embeddings.inference.assembly import ZarrWriter
-from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks
 from tessera_embeddings.inference.orchestration_helpers import (
     checkpoint_to_version,
     read_upstream_manifests,
@@ -70,7 +70,7 @@ def run_inference_task(
 @task(name="assemble-embeddings")
 def assemble_embeddings_task(
     *,
-    chunks: list[ChunkSpec],
+    chunk_size: int,
     n_live_chunks: int,
     total_y: int,
     total_x: int,
@@ -83,7 +83,7 @@ def assemble_embeddings_task(
     t0: float,
     n_workers: int,
     run_started_at: datetime.datetime | None = None,
-    results: list[dict] | None = None,
+    result_stats: dict | None = None,
     mosaic_base: str | None = None,
     time_window: TimeWindow | None = None,
     cleanup_staging: bool = True,
@@ -98,8 +98,16 @@ def assemble_embeddings_task(
     cluster's ``max_workers`` value, used by the assembler to divide
     the fleet-wide S3 concurrency budget across workers.
 
+    The full chunk grid is reconstructed in-task from ``total_y``,
+    ``total_x``, and ``chunk_size`` via :func:`enumerate_chunks` rather
+    than passed in. The grid is purely a function of those three scalars,
+    and shipping the materialized ``list[ChunkSpec]`` across the inner
+    flow's parameter boundary blows Prefect's 524,288-byte flow-run
+    parameter limit for large ROIs.
+
     Args:
-        chunks: Full chunk grid (live + non-live).
+        chunk_size: Square chunk edge length in pixels; the grid is
+            re-enumerated from this plus the mosaic dimensions.
         n_live_chunks: Number of chunks intersecting the ROI mask.
         total_y: Mosaic height in pixels.
         total_x: Mosaic width in pixels.
@@ -117,6 +125,11 @@ def assemble_embeddings_task(
             projected coordinates and CRS from the reflectance store.
         time_window: 12-month inference window. Falls back to
             ``config.time_window``.
+        result_stats: Pre-aggregated inference outcome counts
+            (``succeeded``, ``skipped``, ``failed``, ``total_valid_pixels``);
+            ``None`` in assemble-only mode. Aggregated in the calling flow
+            so the per-chunk result dicts never cross the inner flow's
+            parameter boundary (the 524,288-byte limit).
         cleanup_staging: If True, delete staged chunk zarrs after
             successful assembly. Disable for resumable dev runs.
         output_name_suffix: Optional suffix appended to the output
@@ -127,6 +140,8 @@ def assemble_embeddings_task(
         s3_region: Optional S3 region override.
     """
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] = get_run_logger()
+
+    chunks = enumerate_chunks(total_y, total_x, chunk_size)
 
     zarr_name = f"{roi_name}{output_name_suffix}"
     output_path = f"{output_bucket.rstrip('/')}/embeddings/{zarr_name}.zarr"
@@ -167,10 +182,10 @@ def assemble_embeddings_task(
             log.warning("Staging cleanup failed for run %s", run_id, exc_info=True)
 
     elapsed = time.monotonic() - t0
-    total_pixels = sum(r.get("valid_pixels", 0) for r in results) if results else 0
-    succeeded = len([r for r in results if r["status"] == "success"]) if results else len(chunks)
-    skipped = len([r for r in results if r["status"] == "skipped"]) if results else 0
-    failed = len([r for r in results if r["status"] == "failed"]) if results else 0
+    total_pixels = result_stats["total_valid_pixels"] if result_stats else 0
+    succeeded = result_stats["succeeded"] if result_stats else len(chunks)
+    skipped = result_stats["skipped"] if result_stats else 0
+    failed = result_stats["failed"] if result_stats else 0
 
     summary = {
         "run_id": run_id,
