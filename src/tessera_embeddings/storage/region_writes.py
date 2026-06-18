@@ -73,6 +73,33 @@ def _match_region_shapes(
     return xr.Dataset(matched, coords=data.coords)
 
 
+def _strip_region(
+    dims: "tuple[str, ...]",
+    cur: dict[str, slice],
+    pad_dim: str,
+    *,
+    side: str,
+    widened: dict[str, slice],
+) -> dict[str, slice]:
+    """The ``isel`` indexer for a store edge strip on the ``pad_dim`` face.
+
+    Along ``pad_dim`` the strip is the pad margin between the current (pre-pad)
+    extent and the widened bound on the requested ``side`` (``"lo"`` / ``"hi"``).
+    Along every other axis it spans whatever extent the growing block currently
+    has: ``widened`` for axes already padded, the region extent for axes not yet
+    padded, and the full axis for dims absent from the region (omitted, so ``isel``
+    takes all). Matching the block's current span on the other axes is what lets a
+    plain ``da.concatenate`` fill the corner cells from the store.
+    """
+    region: dict[str, slice] = {}
+    for d in dims:
+        if d == pad_dim:
+            region[d] = slice(widened[d].start, cur[d].start) if side == "lo" else slice(cur[d].stop, widened[d].stop)
+        elif d in cur:
+            region[d] = cur[d]
+    return region
+
+
 def _pad_region_to_chunks(
     existing: xr.Dataset,
     data: xr.Dataset,
@@ -90,14 +117,17 @@ def _pad_region_to_chunks(
     Returns ``(padded, widened)``. When ``region`` is already chunk-aligned this
     returns ``(data, region)`` unchanged — no store read.
 
-    Padding reads the enclosing chunks as a lazy dask slab on the store's chunk
-    grid, then a positional ``setitem`` overlays the incoming data. Note this
-    keeps every overlapped chunk — including interior chunks fully covered by
-    the region — dependent on the store read, so a large unaligned write fetches
-    the whole widened slab, not just its edge chunks. That extra IO is bounded by
-    the padding (at most one chunk per region face) and is acceptable at current
-    tile sizes; reading only the boundary chunks would need an edge-concatenation
-    rebuild and is deferred.
+    Padding wraps the incoming block in store-read edge strips: for each unaligned
+    face, a thin slab covering only the pad margin (``widened`` minus
+    ``normalized`` on that face) is read from the store and ``da.concatenate``-d
+    onto the block, one axis at a time. The interior — every cell the incoming
+    data covers — is never read or copied; only the boundary frame touches the
+    store. Concatenating axis by axis, with each strip spanning the
+    already-extended extent on previously-padded axes, fills the corner cells from
+    the store too. This is far cheaper to build than overlaying the incoming data
+    onto a full-window shell via dask ``__setitem__`` (which rewrites the task
+    graph over every chunk in the window): for a region inset within a few chunks,
+    the cost scales with the perimeter, not the area.
     """
     # Normalize region slices up front: resolve open bounds (slice(None)) to
     # concrete indices, reject non-unit steps, and reject empty slices, so the
@@ -135,26 +165,37 @@ def _pad_region_to_chunks(
     if not needs_pad:
         return matched, widened
 
-    # Lazy shell from the store on its own chunk grid (committed data).
-    slab = existing.isel(widened)
+    # Per-dim low/high pad margins (cells of widening on each face). A dim with
+    # no margin contributes no edge strip.
+    pad_lo = {d: normalized[d].start - widened[d].start for d in normalized}
+    pad_hi = {d: widened[d].stop - normalized[d].stop for d in normalized}
 
     padded_vars: dict[str, Any] = {}
     for name, incoming in matched.data_vars.items():
         name = str(name)
-        dims = slab[name].dims  # store dimension order is authoritative
-        shell = slab[name].data.copy()  # dask array on store chunk grid
-        idx = tuple(
-            slice(normalized[d].start - widened[d].start, normalized[d].stop - widened[d].start)
-            if d in normalized
-            else slice(None)
-            for d in dims
-        )
-        shell[idx] = incoming.data  # positional overlay; incoming wins
-        padded_vars[name] = (dims, shell)
+        dims = tuple(str(d) for d in existing[name].dims)  # store dim order is authoritative
+        block = incoming.transpose(*dims).data
+        # Grow the incoming block to the widened bounds one axis at a time. After
+        # axis k is padded the block already spans widened on axes < k, so the
+        # strip read for axis k covers that extended extent — which backfills the
+        # corner cells from the store without a separate corner read.
+        cur = {d: normalized[d] for d in normalized}  # current extent per padded dim
+        for axis, dim in enumerate(dims):
+            if dim not in normalized:
+                continue
+            lo, hi = pad_lo[dim], pad_hi[dim]
+            if lo:
+                strip = existing[name].isel(_strip_region(dims, cur, dim, side="lo", widened=widened))
+                block = da.concatenate([strip.transpose(*dims).data, block], axis=axis)
+            if hi:
+                strip = existing[name].isel(_strip_region(dims, cur, dim, side="hi", widened=widened))
+                block = da.concatenate([block, strip.transpose(*dims).data], axis=axis)
+            cur[dim] = widened[dim]  # this axis now spans the widened extent
+        padded_vars[name] = (dims, block)
 
-    # Coords come from the store slab (authoritative); they're dropped before
-    # the region write anyway, but carrying them keeps the dataset well-formed.
-    padded = xr.Dataset(padded_vars, coords=slab.coords)
+    # Coords come from the store's widened slab (authoritative); they're dropped
+    # before the region write anyway, but carrying them keeps the dataset well-formed.
+    padded = xr.Dataset(padded_vars, coords=existing.isel(widened).coords)
     return padded, widened
 
 
