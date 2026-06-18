@@ -376,6 +376,18 @@ With align_chunks=True:
    quantized embeddings use default compression. Appends to existing store if present.
 5. Delete _all versions_ of the staged chunk zarrs (unless `dev` flag is passed).
 
+**Manifest splitting (experimental).** The whole `writer.assemble` call is wrapped in
+`manifest_split({"northing": 32, "easting": 32})` (see `tasks/inference.py`). By default
+icechunk keeps one manifest object per array, so every commit rewrites the entire chunk
+index — O(store size) regardless of how few chunks changed. Splitting tiles the manifest
+into 32-chunk-per-axis shards; with 500×500 px on-disk sub-chunks that's ~16k px/shard,
+matching `zarr_store.DEFAULT_MANIFEST_SPLIT_SIZES`' target. No `time` split is applied:
+assembly only ever writes a single timestep, so one time shard equals the whole array and
+splitting time would be a no-op. The split config is persisted via `repo.save_config()` so
+it survives the session being shipped to Dask workers, and is baked in at create time — any
+later append to the same store must run under the same `manifest_split` block to stay
+consistent.
+
 **Why PCodec for the final store:** Embeddings are 128-dim float32 vectors — dense, continuous,
 and without the spatial redundancy that makes byte-shuffle + zstd effective for reflectance
 data. PCodec is a floating-point-aware codec that models the distribution of float values

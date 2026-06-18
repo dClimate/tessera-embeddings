@@ -34,6 +34,7 @@ from tessera_embeddings.inference.orchestration_helpers import (
 )
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.manifest import EmbeddingManifest
+from tessera_embeddings.storage.zarr_store import manifest_split
 
 
 @task(name="run-inference")
@@ -156,24 +157,30 @@ def assemble_embeddings_task(
         upstream_manifests=upstream_manifests,
     )
 
-    writer.assemble(
-        chunks,
-        total_y,
-        total_x,
-        run_id,
-        output_path,
-        roi_zarr_path=roi_zarr_path,
-        run_started_at=run_started_at,
-        mosaic_base=mosaic_base,
-        log=log,
-        time_window=time_window or config.time_window,
-        tile_id=roi_name,
-        model_version=model_version,
-        manifest=embedding_manifest,
-        n_workers=n_workers,
-        get_credentials=get_credentials,
-        s3_region=s3_region,
-    )
+    # Split each spatial axis's manifest into 32-chunk shards. Embeddings are
+    # written in 500-px spatial chunks, so a 32-chunk shard is ~16k px/axis —
+    # matching DEFAULT_MANIFEST_SPLIT_SIZES' ~16k-px target. No time split:
+    # assembly only ever writes a single timestep, so one time shard == the
+    # whole array and splitting time would be a no-op.
+    with manifest_split({"northing": 32, "easting": 32}):
+        writer.assemble(
+            chunks,
+            total_y,
+            total_x,
+            run_id,
+            output_path,
+            roi_zarr_path=roi_zarr_path,
+            run_started_at=run_started_at,
+            mosaic_base=mosaic_base,
+            log=log,
+            time_window=time_window or config.time_window,
+            tile_id=roi_name,
+            model_version=model_version,
+            manifest=embedding_manifest,
+            n_workers=n_workers,
+            get_credentials=get_credentials,
+            s3_region=s3_region,
+        )
 
     if cleanup_staging:
         try:
