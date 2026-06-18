@@ -299,6 +299,24 @@ in production Icechunk pipelines. Manual fork/merge stays available if a future
 flow needs all-or-nothing atomicity across a set of regions; it's an
 orchestration-layer optimization, not a primitive-level prerequisite.
 
+> **Update: the fork/merge batch path is now implemented** as `write_regions`
+> (`_write_regions` / `_aligned_region_sources`). It takes a list of
+> `(data, region)` items, pads each (reusing `_pad_region_to_chunks`), fans all
+> regions through **one** `icechunk.dask.store_dask` compute on a single
+> `session.fork()` — full cluster saturation across every region at once instead
+> of one compute wave per region — then `session.merge`es the changesets and
+> commits **once**. `store_dask` writes chunk data into the pre-seeded arrays via
+> the fork and never rewrites the root group, so root attrs survive without the
+> snapshot/restore dance `to_icechunk` needs; `update_attrs` is still applied
+> explicitly before the commit. Because the merge does **no** conflict
+> resolution, the caller must guarantee the regions are mutually
+> **chunk-disjoint**. A store whose `time` chunk size is 1 makes this trivial:
+> writes at distinct time indices never share a chunk regardless of spatial
+> overlap, so a batch of per-time-index writes is always safe. Sources are
+> explicitly rechunked to the store grid because the raw `store_dask` path does
+> no `align_chunks` realignment. The single-region `write_region` /
+> per-region-commit path is unchanged.
+
 ### 5.5 NaN-fill / population semantics
 
 There is no sentinel distinguishing "never written" from "legitimately NaN"
