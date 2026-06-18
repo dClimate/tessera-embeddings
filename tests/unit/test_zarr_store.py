@@ -31,10 +31,11 @@ import xarray as xr
 from icechunk.xarray import to_icechunk
 
 from tessera_embeddings.config import S2_L2A_BANDS
-from tessera_embeddings.storage.region_writes import _pad_region_to_chunks
+from tessera_embeddings.storage.region_writes import _aligned_region_sources, _pad_region_to_chunks
 from tessera_embeddings.storage.zarr_store import (
     S3Config,
     _default_repo_config,
+    _open_repo,
     _open_writable_session,
     _write_new,
     compute_doy,
@@ -944,6 +945,33 @@ class TestWriteRegions:
         # Northing remainder of each written date untouched.
         np.testing.assert_array_equal(back[0, 500:, :], original[0, 500:, :])
         np.testing.assert_array_equal(back[1, 500:, :], original[1, 500:, :])
+
+    def test_omitted_dim_source_stays_on_store_chunk_grid(self, local_zarr_path, sample_reflectance_data):
+        """A dim omitted from the region is rechunked to the store grid, not one block.
+
+        ``easting`` is absent, so the item covers the full 1000-wide axis. The
+        source dask array must split that axis on the store's 500-chunk grid
+        (two blocks) rather than coalescing it into one full-axis block — a
+        full-axis block would destroy store-grid parallelism and can OOM a
+        worker on large stores.
+        """
+        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rws_grid")
+        full = _single_date_block("2024-01-01", 5, height=500, width=1000, n0=0, e0=0, chunks=ONE_BLOCK)
+
+        repo = _open_repo(store_path)
+        session = repo.writable_session("main")
+        existing = open_store(store_path)
+        try:
+            fork = session.fork()
+            sources, _targets, _regions, _widened = _aligned_region_sources(
+                existing, [(full, {"time": slice(0, 1), "northing": slice(0, 500)})], fork
+            )
+        finally:
+            existing.close()
+
+        # SPLIT_CHUNKS easting == 500 over a 1000-wide axis -> two blocks of 500.
+        easting_axis = 2  # (time, northing, easting)
+        assert sources[0].chunks[easting_axis] == (500, 500)
 
 
 class TestDefaultRepoConfig:
