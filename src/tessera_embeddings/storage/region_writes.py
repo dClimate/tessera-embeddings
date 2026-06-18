@@ -199,7 +199,7 @@ def _aligned_region_sources(
     # a region is written in full, and it must still land on the store chunk grid
     # rather than coalescing the whole axis into one dask block (a full-axis block
     # would destroy store-grid parallelism and can OOM a worker on large stores).
-    chunk_sizes = _store_chunk_sizes(existing, tuple(existing.sizes))
+    chunk_sizes = _store_chunk_sizes(existing, tuple(str(d) for d in existing.sizes))
     for data, region in region_items:
         padded, widened = _pad_region_to_chunks(existing, data, region)
         widened_per_item.append(widened)
