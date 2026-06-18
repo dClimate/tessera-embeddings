@@ -310,12 +310,12 @@ orchestration-layer optimization, not a primitive-level prerequisite.
 > snapshot/restore dance `to_icechunk` needs; `update_attrs` is still applied
 > explicitly before the commit. Because the merge does **no** conflict
 > resolution, the caller must guarantee the regions are mutually
-> **chunk-disjoint**. Its first consumer is the yield-embeddings region-merge
-> flow, which batches a feature's per-date-run writes: the master's `time` chunk
-> size is 1, so runs on distinct time indices never share a chunk regardless of
-> spatial overlap. Sources are explicitly rechunked to the store grid because the
-> raw `store_dask` path does no `align_chunks` realignment. The single-region
-> `write_region` / per-region-commit path is unchanged.
+> **chunk-disjoint**. A store whose `time` chunk size is 1 makes this trivial:
+> writes at distinct time indices never share a chunk regardless of spatial
+> overlap, so a batch of per-time-index writes is always safe. Sources are
+> explicitly rechunked to the store grid because the raw `store_dask` path does
+> no `align_chunks` realignment. The single-region `write_region` /
+> per-region-commit path is unchanged.
 
 ### 5.5 NaN-fill / population semantics
 

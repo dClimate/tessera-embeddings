@@ -171,7 +171,7 @@ def _drop_region_coords(data: xr.Dataset, region_dims: "set[str]") -> xr.Dataset
 
 def _aligned_region_sources(
     existing: xr.Dataset,
-    items: "list[tuple[xr.Dataset, dict[str, slice]]]",
+    region_items: "list[tuple[xr.Dataset, dict[str, slice]]]",
     fork: "icechunk.ForkSession",
 ) -> "tuple[list[da.Array], list[zarr.Array], list[tuple[slice, ...]], list[dict[str, slice]]]":
     """Build the ``(sources, targets, regions, widened)`` lists for one distributed store.
@@ -195,7 +195,7 @@ def _aligned_region_sources(
     targets: list[zarr.Array] = []
     regions: list[tuple[slice, ...]] = []
     widened_per_item: list[dict[str, slice]] = []
-    for data, region in items:
+    for data, region in region_items:
         padded, widened = _pad_region_to_chunks(existing, data, region)
         widened_per_item.append(widened)
         chunk_sizes = _store_chunk_sizes(existing, tuple(widened))
@@ -204,8 +204,9 @@ def _aligned_region_sources(
             dims = existing[name].dims  # store dimension order is authoritative
             arr = padded[name].transpose(*dims).data
             grid = tuple(chunk_sizes.get(str(d), existing.sizes[d]) for d in dims)
-            source = da.from_array(arr, chunks=grid) if not isinstance(arr, da.Array) else arr.rechunk(grid)
-            sources.append(source)
+            # The blended insert + backfilled-shell block, rechunked to the grid.
+            aligned = da.from_array(arr, chunks=grid) if not isinstance(arr, da.Array) else arr.rechunk(grid)
+            sources.append(aligned)
             targets.append(zarr.open_array(fork.store, path=name, mode="a"))
             regions.append(tuple(widened.get(str(d), slice(None)) for d in dims))
     return sources, targets, regions, widened_per_item

@@ -219,33 +219,33 @@ def _create_storage(
 # manifest is the index mapping every chunk to its storage location; by default
 # it is ONE object per array, so every commit rewrites the whole manifest —
 # O(total store size), independent of how few chunks the commit changed. At
-# mosaic scale (hundreds of dates x thousands of spatial chunks x many bands)
-# that single manifest is huge and dominates commit time. Splitting bounds a
-# commit's rewrite to the shards it touches.
+# continental scale (hundreds of dates x thousands of spatial chunks x many
+# bands) that single manifest is huge and dominates commit time. Splitting
+# bounds a commit's rewrite to the shards it touches.
 #
 # For the region-write merge workload the dominant axis is SPATIAL, not time:
 # the manifest entry count is n_dates x northing_chunks x easting_chunks, and
-# production masters run tens of chunks per spatial axis against often <256 dates
-# — so the manifest is spatially dominated. Each write_region commits one
-# feature's compact, scattered spatial block (~3x3 chunks) across a date run, so
-# a 2D split on (northing, easting) localizes the rewrite to the few tiles a
-# feature overlaps. A time split would be a no-op at <=256 dates (one shard ==
-# the whole array) and, on the dense >256-date stores, still rewrites every
-# spatial chunk within a touched time-shard. Time remains selectable (include a
-# ``"time"`` key) and composes with the spatial split, but is not the default.
+# large continental stores run tens of chunks per spatial axis against often
+# <256 dates — so the manifest is spatially dominated. Each write_region commits
+# one compact, scattered spatial block (~3x3 chunks) across a date run, so a 2D
+# split on (northing, easting) localizes the rewrite to the few tiles that block
+# overlaps. A time split would be a no-op at <=256 dates (one shard == the whole
+# array) and, on the dense >256-date stores, still rewrites every spatial chunk
+# within a touched time-shard. Time remains selectable (include a ``"time"``
+# key) and composes with the spatial split, but is not the default.
 #
 # This is OFF by default and opt-in via ``manifest_split`` because (a) it's only
-# a win on the large, frequently-region-written mosaic stores, and (b) the split
-# config must be applied consistently across a store's create and all later opens
-# — a process-wide override (like ``credentials_provider``) guarantees that
-# without threading a parameter through every public entry point.
+# a win on large, frequently-region-written stores, and (b) the split config
+# must be applied consistently across a store's create and all later opens — a
+# process-wide override (like ``credentials_provider``) guarantees that without
+# threading a parameter through every public entry point.
 _manifest_split_sizes: dict[str, int] | None = None
 
-# Default for the mosaic stores: a 2D spatial split at 4 chunks per axis. With
-# INGEST_CHUNK_SIZE=4000 that's ~16k px/shard — a touch larger than the typical
-# ~3x3-chunk feature write, so most commits hit only 1-4 tiles, while shard
-# objects stay in the low hundreds on a ~50x50-chunk master. Features are
-# spatially scattered, so a per-feature commit rewrites only its tiles rather
+# Default for large continental stores: a 2D spatial split at 4 chunks per axis.
+# With INGEST_CHUNK_SIZE=4000 that's ~16k px/shard — a touch larger than a
+# typical ~3x3-chunk region write, so most commits hit only 1-4 tiles, while
+# shard objects stay in the low hundreds on a ~50x50-chunk store. Region writes
+# are spatially scattered, so a per-write commit rewrites only its tiles rather
 # than a full-height stripe (which a 1D split would force).
 DEFAULT_MANIFEST_SPLIT_SIZES = {"northing": 4, "easting": 4}
 
@@ -301,7 +301,7 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     **Manifest splitting** is applied only when opted in via
     :func:`manifest_split` (off by default). When active it bounds a commit's
     manifest rewrite to the shards it touched, the dominant region-write cost on
-    the mosaic stores.
+    large continental stores.
 
     When ``max_concurrent_requests`` is provided, caps per-repo HTTP
     concurrency. Assembly at cornbelt scale fans out thousands of concurrent
@@ -532,7 +532,7 @@ def _write_region(
 
 def _write_regions(
     store_path: str,
-    items: "list[tuple[xr.Dataset, dict[str, slice]]]",
+    region_items: "list[tuple[xr.Dataset, dict[str, slice]]]",
     message: str,
     update_attrs: dict[str, Any] | None = None,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
@@ -541,15 +541,17 @@ def _write_regions(
 ) -> list[dict[str, slice]]:
     """Overwrite many regions of a store in ONE distributed write and ONE commit.
 
-    All ``items`` are padded, fanned through a single ``icechunk.dask.store_dask``
+    All ``region_items`` are padded, fanned through a single ``icechunk.dask.store_dask``
     (one ``da.compute`` across every region's chunks — full cluster saturation
     rather than one compute wave per region), then merged into one changeset and
     committed once. The caller MUST guarantee the regions are mutually
     chunk-disjoint: ``store_dask`` merges their changesets with no conflict
     resolution, so two items touching the same Zarr chunk would race
-    (last-writer-wins). For the region-merge workload disjointness comes from the
-    time axis — the master's ``time`` chunk size is 1, so regions at distinct time
-    indices never share a chunk regardless of spatial overlap.
+    (last-writer-wins). One simple way to guarantee disjointness is a store whose
+    ``time`` chunk size is 1: regions at distinct time indices then never share a
+    chunk regardless of spatial overlap, so a batch of per-time-index writes is
+    always safe. Stores intended for batched region overwrites are recommended to
+    chunk that way.
 
     Returns the widened (chunk-aligned) region of each item, in order.
     """
@@ -566,7 +568,7 @@ def _write_regions(
         # snapshot/restore dance _commit_preserving_attrs needs for to_icechunk. We
         # still apply update_attrs explicitly before committing.
         fork = session.fork()
-        sources, targets, regions, widened = _aligned_region_sources(existing, items, fork)
+        sources, targets, regions, widened = _aligned_region_sources(existing, region_items, fork)
         _assert_regions_chunk_disjoint(widened)
         merged = store_dask(sources=sources, targets=targets, regions=regions, split_every=split_every)
         session.merge(merged)
@@ -576,7 +578,7 @@ def _write_regions(
         session.commit(message)
     finally:
         existing.close()
-    logger.info("Wrote %d region(s) to %s in one commit", len(items), store_path)
+    logger.info("Wrote %d region(s) to %s in one commit", len(region_items), store_path)
     return widened
 
 
@@ -737,7 +739,7 @@ def write_region(
 
 def write_regions(
     store_path: str,
-    items: "list[tuple[xr.Dataset, dict[str, slice]]]",
+    region_items: "list[tuple[xr.Dataset, dict[str, slice]]]",
     *,
     update_attrs: dict[str, Any] | None = None,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
@@ -756,20 +758,20 @@ def write_regions(
     **Caller-enforced invariant:** the regions must be mutually *chunk-disjoint*.
     The batch is merged with no conflict resolution, so two items whose padded
     extents share a Zarr chunk would race (last-writer-wins) and silently drop
-    data. Disjointness is the caller's responsibility: in the region-merge
-    pipeline it follows from the master's ``time`` chunk size being 1 (regions at
-    distinct time indices never share a chunk, whatever their spatial overlap),
-    so a feature's per-date-run regions are always safe to batch.
+    data. Disjointness is the caller's responsibility. A store whose ``time``
+    chunk size is 1 makes it trivial: regions at distinct time indices never
+    share a chunk, whatever their spatial overlap, so a batch of per-time-index
+    writes is always safe.
     """
-    if not items:
+    if not region_items:
         raise ValueError("write_regions requires at least one (data, region) item.")
-    for _, region in items:
+    for _, region in region_items:
         if not region:
             raise ValueError("write_regions requires a non-empty region per item; use write_dataset for full writes.")
     return _write_regions(
         store_path,
-        items,
-        message=f"Overwrite {len(items)} region(s)",
+        region_items,
+        message=f"Overwrite {len(region_items)} region(s)",
         update_attrs=update_attrs,
         get_credentials=get_credentials,
         region_name=s3_region,
