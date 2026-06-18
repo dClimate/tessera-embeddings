@@ -619,6 +619,66 @@ class TestPadRegionToChunks:
         mask[100:300, 250:610] = False
         assert (arr[0][mask] == 0).all()
 
+    def test_padded_shell_backfills_exact_store_cells_including_corners(self):
+        """Each backfilled pad cell carries its OWN store value, not a neighbour's.
+
+        The shell here varies per cell (value == northing*10000 + easting), so a
+        mis-indexed boundary block or a corner filled from the wrong source would
+        put a wrong number in a specific cell — invisible against a uniform-fill
+        shell. Region is unaligned on BOTH axes at BOTH ends, so all four edges and
+        all four corners are exercised.
+        """
+        h = w = 1000
+        ny, nx = np.mgrid[0:h, 0:w]
+        shell = (ny.astype(np.uint32) * 10000 + nx.astype(np.uint32)).astype(np.uint32)
+        existing = xr.Dataset(
+            {"blue": (["time", "northing", "easting"], shell[None])},
+            coords={
+                "time": [np.datetime64("2024-01-01", "ns")],
+                "northing": np.arange(h),
+                "easting": np.arange(w),
+            },
+        ).chunk({"time": 1, "northing": 500, "easting": 500})
+
+        # Region inset within the chunk on every face: northing 100:400 widens to
+        # 0:500, easting 250:610 widens to 0:1000 -> margins on all four sides.
+        data = _single_date_block("2024-01-01", 7, height=300, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
+        region = {"northing": slice(100, 400), "easting": slice(250, 610)}
+        padded, widened = _pad_region_to_chunks(existing, data, region)
+        arr = padded["blue"].values[0]
+
+        # Inside the region -> incoming value.
+        assert (arr[100:400, 250:610] == 7).all()
+        # Every other cell in the widened frame -> its exact original store value.
+        expected = shell[0:500, 0:1000].astype(arr.dtype)
+        mask = np.ones_like(arr, dtype=bool)
+        mask[100:400, 250:610] = False
+        np.testing.assert_array_equal(arr[mask], expected[mask])
+
+    def test_padded_output_is_grid_chunked(self):
+        """The padded shell is chunked exactly on the store grid (downstream rechunk is a no-op).
+
+        da.block assembles store-sized blocks, so the output's chunk sizes match
+        the store's (time=1, 500, 500). Rechunking to that grid must add zero new
+        tasks — the regression guard that locks in "no off-grid shuffle." A future
+        refactor that reintroduced off-grid block boundaries would fail here.
+        """
+        existing = self._existing(height=1000, width=1000, chunk=500)
+        data = _single_date_block("2024-01-01", 7, height=300, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
+        region = {"northing": slice(100, 400), "easting": slice(250, 610)}
+        padded, _ = _pad_region_to_chunks(existing, data, region)
+        arr = padded["blue"].data
+        # First (and only full) block per axis equals the store chunk size.
+        assert arr.chunksize == (1, 500, 500)
+        # rechunk(grid) is a no-op: it must not grow the task graph.
+        grid = (1, 500, 500)
+        assert len(arr.rechunk(grid).__dask_graph__()) == len(arr.__dask_graph__())
+        # And no shuffle tasks were introduced building the shell.
+        assert not any(
+            str(k[0] if isinstance(k, tuple) else k).startswith(("rechunk-merge", "rechunk-split"))
+            for k in arr.__dask_graph__()
+        )
+
     def test_open_bound_slice_is_normalized(self):
         """slice(None) on a padded dim resolves to the full axis, no None arithmetic."""
         existing = self._existing()

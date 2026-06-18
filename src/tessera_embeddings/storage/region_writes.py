@@ -73,6 +73,64 @@ def _match_region_shapes(
     return xr.Dataset(matched, coords=data.coords)
 
 
+def _widened_block_grid(
+    existing: xr.Dataset,
+    name: str,
+    dims: "tuple[str, ...]",
+    normalized: dict[str, slice],
+    widened: dict[str, slice],
+    chunk_sizes: dict[str, int],
+) -> Any:  # chunk_sizes covers every dim in ``dims`` (region dims and omitted ones)
+    """Nested list of store-grid blocks tiling the widened frame, for ``da.block``.
+
+    Walks the widened frame on the store's chunk grid (one block per on-disk
+    chunk; the trailing block on an axis may be partial where ``widened`` clamps
+    to the array end) and emits, for each block:
+
+    - a ``da.zeros`` placeholder (no store read) when the block lies fully inside
+      the region box on every region dim — those cells are 100% overwritten by
+      the incoming overlay, so their contents never reach the store;
+    - the store slab ``existing[name].isel(<that block>)`` otherwise — a boundary
+      or corner block carries the real on-disk values for the cells the incoming
+      data does not cover (the read-modify-write backfill).
+
+    A dim absent from ``region`` spans its full axis and is always inside the
+    region box (the overlay covers it whole), so it never forces a store read on
+    its own; it still tiles on the store grid so the assembled array stays
+    grid-chunked. The nested list depth matches ``len(dims)``; ``da.block`` reads
+    the store only for perimeter blocks, never the interior.
+    """
+    var = existing[name]
+    dtype = var.dtype
+    # Store-grid block boundaries per dim: region dims tile the widened extent
+    # (start is chunk-aligned by construction), omitted dims tile the full axis.
+    block_slices: list[list[slice]] = []
+    for dim in dims:
+        cs = chunk_sizes[dim]  # nominal on-disk chunk size for this axis
+        frame = widened[dim] if dim in widened else slice(0, existing.sizes[dim])
+        edges: list[slice] = []
+        start = frame.start
+        while start < frame.stop:
+            edges.append(slice(start, min(start + cs, frame.stop)))
+            start += cs
+        block_slices.append(edges)
+
+    def build(axis: int, chosen: "list[slice]") -> Any:
+        if axis == len(dims):
+            inside = all(
+                normalized[d].start <= chosen[k].start and chosen[k].stop <= normalized[d].stop
+                for k, d in enumerate(dims)
+                if d in normalized
+            )
+            if inside:
+                shape = tuple(s.stop - s.start for s in chosen)
+                return da.zeros(shape, dtype=dtype, chunks=shape)  # placeholder; overlaid, never read
+            return var.isel({dims[k]: chosen[k] for k in range(len(dims))}).data
+        return [build(axis + 1, chosen + [sl]) for sl in block_slices[axis]]
+
+    return build(0, [])
+
+
 def _pad_region_to_chunks(
     existing: xr.Dataset,
     data: xr.Dataset,
@@ -90,14 +148,15 @@ def _pad_region_to_chunks(
     Returns ``(padded, widened)``. When ``region`` is already chunk-aligned this
     returns ``(data, region)`` unchanged — no store read.
 
-    Padding reads the enclosing chunks as a lazy dask slab on the store's chunk
-    grid, then a positional ``setitem`` overlays the incoming data. Note this
-    keeps every overlapped chunk — including interior chunks fully covered by
-    the region — dependent on the store read, so a large unaligned write fetches
-    the whole widened slab, not just its edge chunks. That extra IO is bounded by
-    the padding (at most one chunk per region face) and is acceptable at current
-    tile sizes; reading only the boundary chunks would need an edge-concatenation
-    rebuild and is deferred.
+    The widened shell is assembled with :func:`_widened_block_grid` as a
+    ``da.block`` of store-grid blocks: interior blocks (fully overwritten by the
+    incoming overlay) are cheap ``da.zeros`` placeholders that read nothing, while
+    only perimeter blocks read the store for the cells the incoming data does not
+    cover. A positional ``setitem`` then overlays the incoming data. ``da.block``
+    chunks the output exactly on the store grid, so the downstream
+    ``rechunk(grid)`` in :func:`_aligned_region_sources` stays a no-op (no shuffle
+    tasks) — the output is byte-identical to a full-window shell overlay, but only
+    the boundary chunks touch the store.
     """
     # Normalize region slices up front: resolve open bounds (slice(None)) to
     # concrete indices, reject non-unit steps, and reject empty slices, so the
@@ -135,14 +194,17 @@ def _pad_region_to_chunks(
     if not needs_pad:
         return matched, widened
 
-    # Lazy shell from the store on its own chunk grid (committed data).
-    slab = existing.isel(widened)
+    # Chunk sizes for EVERY store dim, not just the region's: an omitted dim still
+    # tiles on the store grid so the assembled shell stays grid-chunked end to end.
+    all_chunk_sizes = _store_chunk_sizes(existing, tuple(str(d) for d in existing.sizes))
 
     padded_vars: dict[str, Any] = {}
     for name, incoming in matched.data_vars.items():
         name = str(name)
-        dims = slab[name].dims  # store dimension order is authoritative
-        shell = slab[name].data.copy()  # dask array on store chunk grid
+        dims = tuple(str(d) for d in existing[name].dims)  # store dim order is authoritative
+        # Grid of store-sized blocks: interior placeholders (no read) + perimeter
+        # store reads. da.block chunks the result exactly on the store grid.
+        shell = da.block(_widened_block_grid(existing, name, dims, normalized, widened, all_chunk_sizes))
         idx = tuple(
             slice(normalized[d].start - widened[d].start, normalized[d].stop - widened[d].start)
             if d in normalized
@@ -152,9 +214,9 @@ def _pad_region_to_chunks(
         shell[idx] = incoming.data  # positional overlay; incoming wins
         padded_vars[name] = (dims, shell)
 
-    # Coords come from the store slab (authoritative); they're dropped before
-    # the region write anyway, but carrying them keeps the dataset well-formed.
-    padded = xr.Dataset(padded_vars, coords=slab.coords)
+    # Coords come from the store's widened slab (authoritative); they're dropped
+    # before the region write anyway, but carrying them keeps the dataset well-formed.
+    padded = xr.Dataset(padded_vars, coords=existing.isel(widened).coords)
     return padded, widened
 
 
