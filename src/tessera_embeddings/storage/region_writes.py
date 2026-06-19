@@ -8,12 +8,43 @@ merge, commit) lives next to the public ``write_region`` / ``write_regions``
 wrappers in ``zarr_store``; this module is the geometry those wrappers lean on.
 """
 
+from collections.abc import Iterator
 from typing import Any
 
 import dask.array as da
 import icechunk
 import xarray as xr
 import zarr
+from dask.highlevelgraph import HighLevelGraph, MaterializedLayer
+
+
+def _cull_graph(arr: da.Array) -> da.Array:
+    """Cull a Dask array's HighLevelGraph to only the keys reachable from its
+    outputs, rewrapped as a single MaterializedLayer.
+
+    A Dask array sliced off a zarr store (``xr.open_zarr(...).isel(...)``) keeps the
+    *whole* store's chunk layer in its graph — ``isel`` prunes coordinates, not the
+    graph. For a large store that is millions of keys per slice; building many such
+    slices (one RMW shell per region item) explodes the graph the scheduler must
+    ingest. Culling collapses it to just the chunks this array actually reads. The
+    single-MaterializedLayer rewrap keeps downstream HLG merges from tripping over
+    dangling layer references. Value- and chunk-identical to the input — only the
+    graph shrinks.
+    """
+
+    def _flat_keys(keys: object) -> "Iterator[Any]":
+        if isinstance(keys, list):
+            for k in keys:
+                yield from _flat_keys(k)
+        else:
+            yield keys
+
+    output_keys = set(_flat_keys(arr.__dask_keys__()))
+    graph = arr.__dask_graph__()
+    assert isinstance(graph, HighLevelGraph)  # da.Array graphs are always HLGs
+    culled = dict(graph.cull(output_keys))
+    new_hlg = HighLevelGraph({arr.name: MaterializedLayer(culled)}, {arr.name: set()})
+    return da.Array(new_hlg, arr.name, arr.chunks, arr.dtype, meta=arr._meta)
 
 
 def _store_chunk_sizes(existing: xr.Dataset, dims: "tuple[str, ...]") -> dict[str, int]:
@@ -142,7 +173,12 @@ def _pad_region_to_chunks(
     for name, incoming in matched.data_vars.items():
         name = str(name)
         dims = slab[name].dims  # store dimension order is authoritative
-        shell = slab[name].data.copy()  # dask array on store chunk grid
+        # Cull the shell's graph to just the widened chunks it reads. isel() does
+        # not prune the store's chunk layer, so without this each shell drags the
+        # whole store array's graph (millions of keys on a large store); callers
+        # that build many region items then hand the scheduler a multi-billion-key
+        # graph. See the shell-cull design note.
+        shell = _cull_graph(slab[name].data).copy()  # dask array on store chunk grid
         idx = tuple(
             slice(normalized[d].start - widened[d].start, normalized[d].stop - widened[d].start)
             if d in normalized

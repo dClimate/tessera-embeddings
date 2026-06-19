@@ -24,6 +24,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import dask.array as da
 import icechunk
 import numpy as np
 import pytest
@@ -31,7 +32,7 @@ import xarray as xr
 from icechunk.xarray import to_icechunk
 
 from tessera_embeddings.config import S2_L2A_BANDS
-from tessera_embeddings.storage.region_writes import _aligned_region_sources, _pad_region_to_chunks
+from tessera_embeddings.storage.region_writes import _aligned_region_sources, _cull_graph, _pad_region_to_chunks
 from tessera_embeddings.storage.zarr_store import (
     S3Config,
     _default_repo_config,
@@ -657,6 +658,37 @@ class TestPadRegionToChunks:
         padded, _ = _pad_region_to_chunks(existing, data, region)
         assert padded["blue"].dims == ("time", "northing", "easting")
         assert (padded["blue"].values[0, 100:300, 250:610] == 6).all()
+
+    def test_padded_shell_graph_is_culled_to_widened_chunks(self):
+        """The RMW shell's Dask graph must scale with the WIDENED region's chunks,
+        not the whole store. Guards the _cull_graph in _pad_region_to_chunks: an
+        un-culled isel() shell drags the entire store layer, exploding the graph the
+        scheduler ingests. Value-parity tests can't catch a dropped cull — only a
+        graph-size check can.
+        """
+        # A bigger store so "whole store layer" is clearly larger than one region.
+        existing = self._existing(height=4000, width=4000, chunk=500)  # 8x8 = 64 chunks
+        # Unaligned region crossing a chunk boundary, touching a 2x2 block of chunks
+        # (widens to [0:1000, 0:1000]).
+        data = _single_date_block("2024-01-01", 9, height=500, width=500, n0=100, e0=100, chunks=ONE_BLOCK)
+        region = {"northing": slice(100, 600), "easting": slice(100, 600)}
+        padded, widened = _pad_region_to_chunks(existing, data, region)
+        assert widened == {"northing": slice(0, 1000), "easting": slice(0, 1000)}
+        n_keys = len(padded["blue"].data.__dask_graph__())
+        # Widened region is 2x2 = 4 store chunks; the padded graph should be a small
+        # multiple of that (overlay + a few layers), nowhere near the 64-chunk store.
+        # Bound generously to stay robust to dask layer details while failing loudly
+        # if the full store layer leaks back in (un-culled would be ~64+ chunk keys
+        # plus the setitem fan-out, an order of magnitude more).
+        assert n_keys < 40, f"shell graph has {n_keys} keys — _cull_graph likely not applied"
+
+    def test_cull_graph_shrinks_graph_preserving_values(self):
+        """_cull_graph drops unreachable keys but is value-identical to its input."""
+        store = da.zeros((4000, 4000), chunks=500, dtype="uint16")  # 8x8 = 64 chunks
+        sliced = store[0:1000, 0:1000]  # touches a 2x2 block of chunks
+        culled = _cull_graph(sliced)
+        assert len(culled.__dask_graph__()) < len(sliced.__dask_graph__())
+        assert da.equal(sliced, culled).all().compute()
 
 
 class TestWriteRegion:
