@@ -376,7 +376,7 @@ With align_chunks=True:
    quantized embeddings use default compression. Appends to existing store if present.
 5. Delete _all versions_ of the staged chunk zarrs (unless `dev` flag is passed).
 
-**Manifest splitting (experimental).** The whole `writer.assemble` call is wrapped in
+**Manifest splitting.** The whole `writer.assemble` call is wrapped in
 `manifest_split({"northing": 32, "easting": 32})` (see `tasks/inference.py`). By default
 icechunk keeps one manifest object per array, so every commit rewrites the entire chunk
 index — O(store size) regardless of how few chunks changed. Splitting tiles the manifest
@@ -384,9 +384,14 @@ into 32-chunk-per-axis shards; with 500×500 px on-disk sub-chunks that's ~16k p
 matching `zarr_store.DEFAULT_MANIFEST_SPLIT_SIZES`' target. No `time` split is applied:
 assembly only ever writes a single timestep, so one time shard equals the whole array and
 splitting time would be a no-op. The split config is persisted via `repo.save_config()` so
-it survives the session being shipped to Dask workers, and is baked in at create time — any
-later append to the same store must run under the same `manifest_split` block to stay
-consistent.
+it survives the session being shipped to Dask workers.
+
+The split applies to both new and pre-existing stores. A store created before this change
+has a single unsplit manifest; the first append under the `manifest_split` block re-shards
+the touched array in that commit (a one-time migration — old chunk data is untouched and
+reads back unchanged), and every commit after it rewrites only the shards it touches. So
+existing stores pick up the same bounded-commit speedup on their next assembly run, with no
+manual migration step.
 
 **Why PCodec for the final store:** Embeddings are 128-dim float32 vectors — dense, continuous,
 and without the spatial redundancy that makes byte-shuffle + zstd effective for reflectance

@@ -162,6 +162,15 @@ def assemble_embeddings_task(
     # matching DEFAULT_MANIFEST_SPLIT_SIZES' ~16k-px target. No time split:
     # assembly only ever writes a single timestep, so one time shard == the
     # whole array and splitting time would be a no-op.
+    #
+    # This wraps appends to pre-existing stores too, which is intentional and
+    # safe. A store created before splitting was introduced has one unsplit
+    # manifest; the first append under this block re-shards the touched array
+    # in that commit (a one-time migration — existing chunk data is untouched
+    # and reads back identically), and every later commit rewrites only the
+    # shards it touches. icechunk merges the split config into the store's
+    # persisted config on open, so the layout follows the array forward with no
+    # manual migration. Verified against icechunk 2.0.4.
     with manifest_split({"northing": 32, "easting": 32}):
         writer.assemble(
             chunks,
