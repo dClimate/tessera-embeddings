@@ -56,10 +56,10 @@ from tenacity import (
 DEFAULT_INGEST_WORKER_CPU = 4096
 DEFAULT_INGEST_WORKER_MEM = 16384
 
-# Schedulers benefit from a few cores for graph construction and dashboard
-# responsiveness. 16 GiB gives headroom for large HLG graphs without OOM.
+# Schedulers don't need much memory but benefit from a few cores so
+# graph construction and dashboard responsiveness stay smooth.
 DEFAULT_INGEST_SCHEDULER_CPU = 4096
-DEFAULT_INGEST_SCHEDULER_MEM = 16384
+DEFAULT_INGEST_SCHEDULER_MEM = 8192
 
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/ecs/tessera/dask"
 
@@ -327,12 +327,7 @@ def ecs_cluster(
         for key, val in extra_scheduler_env.items():
             os.environ[key] = val
 
-    config = get_fargate_config(
-        scheduler_cpu=scheduler_cpu if scheduler_cpu is not None else DEFAULT_INGEST_SCHEDULER_CPU,
-        scheduler_mem=scheduler_mem if scheduler_mem is not None else DEFAULT_INGEST_SCHEDULER_MEM,
-        worker_cpu=worker_cpu if worker_cpu is not None else DEFAULT_INGEST_WORKER_CPU,
-        worker_mem=worker_mem if worker_mem is not None else DEFAULT_INGEST_WORKER_MEM,
-    )
+    config = get_fargate_config()
     cluster_kwargs = config.to_cluster_kwargs()
 
     if extra_worker_env:
