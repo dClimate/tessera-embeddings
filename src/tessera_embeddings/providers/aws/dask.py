@@ -267,6 +267,8 @@ def ecs_cluster(
     max_workers: int = 50,
     worker_cpu: int | None = None,
     worker_mem: int | None = None,
+    scheduler_cpu: int | None = None,
+    scheduler_mem: int | None = None,
     worker_nthreads: int | None = None,
     worker_nprocs: int | None = None,
     extra_worker_env: dict[str, str] | None = None,
@@ -286,6 +288,8 @@ def ecs_cluster(
         max_workers: Maximum Fargate tasks for adaptive scaling.
         worker_cpu: Override worker CPU units.
         worker_mem: Override worker memory in MiB.
+        scheduler_cpu: Override scheduler CPU units.
+        scheduler_mem: Override scheduler memory in MiB.
         worker_nthreads: Threads per worker process.
         worker_nprocs: Worker processes per Fargate task. Set
             ``worker_nprocs > 1`` with ``worker_nthreads=1`` for
@@ -348,6 +352,10 @@ def ecs_cluster(
         cluster_kwargs["worker_cpu"] = worker_cpu
     if worker_mem is not None:
         cluster_kwargs["worker_mem"] = worker_mem
+    if scheduler_cpu is not None:
+        cluster_kwargs["scheduler_cpu"] = scheduler_cpu
+    if scheduler_mem is not None:
+        cluster_kwargs["scheduler_mem"] = scheduler_mem
     if image is not None:
         cluster_kwargs["image"] = image
 
