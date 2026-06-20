@@ -753,6 +753,59 @@ class TestPadRegionToChunks:
         ref[idx] = data["blue"].transpose("time", "northing", "easting").data
         np.testing.assert_array_equal(padded["blue"].values, ref.compute())
 
+    def test_guard_rejects_transposed_zarr_axis_order(self):
+        """The shell indexes the raw zarr array positionally; if its physical axis
+        order disagrees with the store view's named dims the guard must fire, since
+        the slices would otherwise land on the wrong axes and silently corrupt the
+        backfill.
+        """
+        import zarr
+
+        existing = self._existing(height=1000, width=1000, chunk=500)
+        # A zarr array whose physical axes are (time, EASTING, NORTHING) — swapped
+        # relative to the view's (time, northing, easting) — but tagged with the
+        # view's dim names, so positional indexing would mismatch.
+        store = zarr.storage.MemoryStore()
+        g = zarr.open_group(store, mode="w")
+        g.create_array(
+            "blue",
+            shape=(1, 1000, 1000),
+            chunks=(1, 500, 500),
+            dtype="uint16",
+            dimension_names=("time", "easting", "northing"),
+        )
+        group = zarr.open_group(store, mode="r")
+
+        data = _single_date_block("2024-01-01", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
+        region = {"northing": slice(100, 300), "easting": slice(250, 610)}
+        with pytest.raises(ValueError, match="axis order"):
+            _pad_region_to_chunks(existing, data, region, group)
+
+    def test_guard_rejects_chunk_grid_mismatch(self):
+        """If the raw zarr array's chunk grid disagrees with the store view's, the
+        widened region (computed from the view) would not align to the shell blocks;
+        the guard must reject it rather than emit a mis-aligned write.
+        """
+        import zarr
+
+        existing = self._existing(height=1000, width=1000, chunk=500)
+        # Same shape/dims as the view, but a different chunk grid (250 vs 500).
+        store = zarr.storage.MemoryStore()
+        g = zarr.open_group(store, mode="w")
+        g.create_array(
+            "blue",
+            shape=(1, 1000, 1000),
+            chunks=(1, 250, 250),
+            dtype="uint16",
+            dimension_names=("time", "northing", "easting"),
+        )
+        group = zarr.open_group(store, mode="r")
+
+        data = _single_date_block("2024-01-01", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
+        region = {"northing": slice(100, 300), "easting": slice(250, 610)}
+        with pytest.raises(ValueError, match="Chunk grid"):
+            _pad_region_to_chunks(existing, data, region, group)
+
 
 class TestWriteRegion:
     """End-to-end region overwrite tests."""

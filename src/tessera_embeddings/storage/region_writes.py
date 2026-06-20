@@ -109,6 +109,47 @@ def _store_chunk_sizes(existing: xr.Dataset, dims: "tuple[str, ...]") -> dict[st
     return sizes
 
 
+def _assert_zarr_layout_matches_dims(zarr_arr: zarr.Array, var: xr.DataArray, name: str) -> None:
+    """Assert the raw zarr array's physical layout matches the xarray view's.
+
+    The zarr-direct shell indexes ``zarr_arr`` POSITIONALLY by axis, while the
+    slice bounds and chunk grid are computed from xarray's *named* dims. The two
+    only line up if the array's physical axis order and per-axis chunk grid match
+    the xarray view's dim order and chunking. They do for stores written through
+    this package (xarray records ``_ARRAY_DIMENSIONS`` in dim order, ``open_zarr``
+    preserves it, and both views share one snapshot) — but nothing enforces it, so
+    a transposed write, a per-var dim permutation, or a chunk grid sourced from
+    config instead of the store would silently slice the wrong axes and corrupt the
+    backfill. Fail loudly here instead.
+    """
+    dims = tuple(str(d) for d in var.dims)
+    if zarr_arr.ndim != len(dims):
+        raise ValueError(
+            f"Zarr array {name!r} has {zarr_arr.ndim} axes but the store view has dims {dims}; "
+            "the zarr-direct padding shell cannot map named dims onto physical axes."
+        )
+    # zarr v3 records dim names in physical-axis order; check they match the view's.
+    # (v2 metadata has no dimension_names — getattr yields None, skipping the check.)
+    zarr_dim_names = getattr(zarr_arr.metadata, "dimension_names", None)
+    if zarr_dim_names is not None and tuple(zarr_dim_names) != dims:
+        raise ValueError(
+            f"Zarr array {name!r} axis order {tuple(zarr_dim_names)} does not match store view dims {dims}; "
+            "the zarr-direct padding shell indexes axes positionally and would slice the wrong axes."
+        )
+    # Per-axis nominal chunk size must agree between the raw array (used to build the
+    # shell blocks) and the xarray view (used to widen the region).
+    view_chunks = var.chunks
+    if view_chunks is not None:
+        for axis, dim in enumerate(dims):
+            zarr_chunk = zarr_arr.chunks[axis]
+            view_chunk = view_chunks[axis][0]  # first block = nominal chunk size
+            if zarr_chunk != view_chunk:
+                raise ValueError(
+                    f"Chunk grid for {name!r} dim {dim!r} disagrees: zarr {zarr_chunk} vs store view "
+                    f"{view_chunk}. The widened region (from the view) would not align to the shell blocks."
+                )
+
+
 def _match_region_shapes(
     existing: xr.Dataset,
     data: xr.Dataset,
@@ -219,6 +260,16 @@ def _pad_region_to_chunks(
         # group[name] is a data-var array; zarr v3 stubs widen __getitem__ to
         # Array | Group, so narrow it for the slab builder.
         zarr_arr = cast("zarr.Array", group[name])
+        # The shell is built by indexing the raw zarr array POSITIONALLY by axis,
+        # but slab_slices/widened/chunk grid are all keyed by xarray's named dims.
+        # That crossing is only safe if the named-dim order and per-axis chunk grid
+        # match the raw array's physical layout. They do today (xarray writes
+        # _ARRAY_DIMENSIONS in dim order and open_zarr preserves it; both views come
+        # from the same snapshot), but it's an unasserted invariant — a transposed
+        # write, mixed per-var dim orders, or sourcing chunk sizes from config would
+        # silently slice the wrong axes / mis-align the backfill. Assert it so that
+        # failure mode is loud, not silent.
+        _assert_zarr_layout_matches_dims(zarr_arr, existing[name], name)
         # Per-axis slices for the widened region in store dim order; a dim absent
         # from the region spans its full axis.
         slab_slices = tuple(widened[d] if d in widened else slice(None) for d in dims)
