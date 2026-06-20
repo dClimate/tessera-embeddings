@@ -43,6 +43,7 @@ from tessera_embeddings.storage.zarr_store import (
     open_store,
     open_store_as_zarr_group,
     resolve_region,
+    rollback_commits,
     set_s3_config,
     write_dataset,
     write_region,
@@ -169,6 +170,85 @@ class TestReflectanceStore:
         _write_reflectance(store_path, data, tile_id="33UUP", baselines=dict.fromkeys(dates, 400))
 
         assert get_existing_dates(store_path) == set(dates)
+
+
+class TestRollbackCommits:
+    """Tests for rolling a branch's HEAD back by n commits."""
+
+    def _build_history(self, store_path, sample_reflectance_data, dates):
+        """Write one create + (len(dates)-1) appends, one commit per date."""
+        first, *rest = dates
+        data = sample_reflectance_data([first], height=64, width=64, seed=0)
+        _write_reflectance(store_path, data, tile_id="33UUP", baselines={first: 400})
+        for i, date in enumerate(rest, start=1):
+            data = sample_reflectance_data([date], height=64, width=64, seed=i)
+            _write_reflectance(store_path, data, tile_id="33UUP", baselines={date: 400})
+
+    def test_rollback_drops_last_commits(self, local_zarr_path, sample_reflectance_data):
+        """Rolling back n appends restores the time dim to its earlier length."""
+        store_path = str(local_zarr_path / "rb" / "reflectance.zarr")
+        dates = ["2024-01-01", "2024-01-06", "2024-01-11", "2024-01-16"]
+        self._build_history(store_path, sample_reflectance_data, dates)
+        assert open_store(store_path).sizes["time"] == 4
+
+        rollback_commits(store_path, 2)
+
+        ds = open_store(store_path)
+        assert ds.sizes["time"] == 2
+        assert get_existing_dates(store_path) == set(dates[:2])
+
+    def test_rollback_returns_target_snapshot_id(self, local_zarr_path, sample_reflectance_data):
+        """The returned id matches the snapshot n commits back from HEAD."""
+        store_path = str(local_zarr_path / "rb_id" / "reflectance.zarr")
+        self._build_history(store_path, sample_reflectance_data, ["2024-01-01", "2024-01-06", "2024-01-11"])
+
+        repo = _open_repo(store_path)
+        history = list(repo.ancestry(branch="main"))
+        expected_target = history[1].id  # one commit back
+
+        new_head = rollback_commits(store_path, 1)
+
+        assert new_head == expected_target
+        assert _open_repo(store_path).lookup_branch("main") == expected_target
+
+    def test_dry_run_does_not_move_branch(self, local_zarr_path, sample_reflectance_data):
+        """dry_run resolves the target id but leaves HEAD untouched."""
+        store_path = str(local_zarr_path / "rb_dry" / "reflectance.zarr")
+        self._build_history(store_path, sample_reflectance_data, ["2024-01-01", "2024-01-06", "2024-01-11"])
+
+        head_before = _open_repo(store_path).lookup_branch("main")
+
+        target = rollback_commits(store_path, 1, dry_run=True)
+
+        assert _open_repo(store_path).lookup_branch("main") == head_before
+        assert target != head_before
+        assert open_store(store_path).sizes["time"] == 3
+
+    def test_rollback_is_reversible(self, local_zarr_path, sample_reflectance_data):
+        """The dropped snapshots survive, so resetting back restores the data."""
+        store_path = str(local_zarr_path / "rb_rev" / "reflectance.zarr")
+        self._build_history(store_path, sample_reflectance_data, ["2024-01-01", "2024-01-06", "2024-01-11"])
+
+        original_head = _open_repo(store_path).lookup_branch("main")
+        rollback_commits(store_path, 2)
+        assert open_store(store_path).sizes["time"] == 1
+
+        _open_repo(store_path).reset_branch("main", original_head)
+        assert open_store(store_path).sizes["time"] == 3
+
+    def test_n_below_one_raises(self, local_zarr_path, sample_reflectance_data):
+        store_path = str(local_zarr_path / "rb_zero" / "reflectance.zarr")
+        self._build_history(store_path, sample_reflectance_data, ["2024-01-01", "2024-01-06"])
+        with pytest.raises(ValueError, match="n must be >= 1"):
+            rollback_commits(store_path, 0)
+
+    def test_rollback_past_root_raises(self, local_zarr_path, sample_reflectance_data):
+        """Cannot drop the entire history, including the root commit."""
+        store_path = str(local_zarr_path / "rb_root" / "reflectance.zarr")
+        self._build_history(store_path, sample_reflectance_data, ["2024-01-01", "2024-01-06"])
+        # 2 commits (create + 1 append) + the icechunk root => 3 snapshots.
+        with pytest.raises(ValueError, match="only"):
+            rollback_commits(store_path, 3)
 
 
 class TestIcechunkTransactions:
