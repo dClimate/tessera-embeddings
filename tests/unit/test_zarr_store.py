@@ -41,6 +41,7 @@ from tessera_embeddings.storage.zarr_store import (
     compute_doy,
     get_existing_dates,
     open_store,
+    open_store_as_zarr_group,
     resolve_region,
     set_s3_config,
     write_dataset,
@@ -574,6 +575,25 @@ class TestPadRegionToChunks:
         )
         return ds.chunk({"time": 1, "northing": chunk, "easting": chunk})
 
+    def _group(self, existing):
+        """A raw zarr group mirroring ``existing`` (shape/chunks/dtype/values).
+
+        The padding shell now reads straight from the raw zarr group rather than
+        ``existing.isel(...)``, so these unit tests need an on-disk-style group
+        backing the in-memory ``existing``. Values match (all zeros), so the
+        shell-preservation assertions are unchanged.
+        """
+        import zarr
+
+        store = zarr.storage.MemoryStore()
+        g = zarr.open_group(store, mode="w")
+        for name in existing.data_vars:
+            var = existing[str(name)]
+            chunks = tuple(c[0] for c in var.chunks)  # nominal chunk size per dim
+            arr = g.create_array(str(name), shape=var.shape, chunks=chunks, dtype=var.dtype)
+            arr[:] = var.values
+        return zarr.open_group(store, mode="r")
+
     def test_aligned_region_needs_no_store_read(self):
         """A chunk-aligned region returns the incoming values unchanged (no store read).
 
@@ -583,7 +603,7 @@ class TestPadRegionToChunks:
         existing = self._existing()
         data = _single_date_block("2024-01-01", 7, height=500, width=500, chunks=ONE_BLOCK)
         region = {"northing": slice(0, 500), "easting": slice(500, 1000)}
-        padded, widened = _pad_region_to_chunks(existing, data, region)
+        padded, widened = _pad_region_to_chunks(existing, data, region, self._group(existing))
         assert widened == region
         assert padded["blue"].dims == ("time", "northing", "easting")
         assert (padded["blue"].values == 7).all()
@@ -595,13 +615,13 @@ class TestPadRegionToChunks:
         data = _single_date_block("2024-01-01", 7, height=1, width=500, e0=500, chunks=ONE_BLOCK)
         region = {"northing": slice(0, 500), "easting": slice(500, 1000)}
         with pytest.raises(ValueError, match="expected"):
-            _pad_region_to_chunks(existing, data, region)
+            _pad_region_to_chunks(existing, data, region, self._group(existing))
 
     def test_unaligned_region_widens_to_chunk_bounds(self):
         existing = self._existing()
         data = _single_date_block("2024-01-01", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
         region = {"northing": slice(100, 300), "easting": slice(250, 610)}
-        _padded, widened = _pad_region_to_chunks(existing, data, region)
+        _padded, widened = _pad_region_to_chunks(existing, data, region, self._group(existing))
         # northing 100:300 -> 0:500 ; easting 250:610 -> 0:1000 (both edges snap out)
         assert widened == {"northing": slice(0, 500), "easting": slice(0, 1000)}
 
@@ -610,7 +630,7 @@ class TestPadRegionToChunks:
         existing = self._existing()
         data = _single_date_block("2024-01-01", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
         region = {"northing": slice(100, 300), "easting": slice(250, 610)}
-        padded, widened = _pad_region_to_chunks(existing, data, region)
+        padded, widened = _pad_region_to_chunks(existing, data, region, self._group(existing))
         arr = padded["blue"].values
         # region cells -> 9 (positions relative to the widened frame, which starts at 0,0)
         assert (arr[0, 100:300, 250:610] == 9).all()
@@ -625,7 +645,7 @@ class TestPadRegionToChunks:
         # northing full axis (slice(None)); easting unaligned so padding kicks in.
         data = _single_date_block("2024-01-01", 4, height=1000, width=360, e0=250, chunks=ONE_BLOCK)
         region = {"northing": slice(None), "easting": slice(250, 610)}
-        padded, widened = _pad_region_to_chunks(existing, data, region)
+        padded, widened = _pad_region_to_chunks(existing, data, region, self._group(existing))
         assert widened == {"northing": slice(0, 1000), "easting": slice(0, 1000)}
         assert (padded["blue"].values[0, :, 250:610] == 4).all()
 
@@ -636,13 +656,13 @@ class TestPadRegionToChunks:
         data = _single_date_block("2024-01-01", 9, height=1, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
         region = {"northing": slice(100, 300), "easting": slice(250, 610)}
         with pytest.raises(ValueError, match="expected"):
-            _pad_region_to_chunks(existing, data, region)
+            _pad_region_to_chunks(existing, data, region, self._group(existing))
 
     def test_non_unit_step_is_rejected(self):
         existing = self._existing()
         data = _single_date_block("2024-01-01", 9, height=250, width=500, chunks=ONE_BLOCK)
         with pytest.raises(ValueError, match="step 1"):
-            _pad_region_to_chunks(existing, data, {"northing": slice(0, 500, 2)})
+            _pad_region_to_chunks(existing, data, {"northing": slice(0, 500, 2)}, self._group(existing))
 
     def test_transposed_input_is_realigned(self):
         """Input with swapped northing/easting is transposed to store order, not corrupted."""
@@ -654,9 +674,84 @@ class TestPadRegionToChunks:
             coords={"time": [np.datetime64("2024-01-01", "ns")]},
         ).chunk(ONE_BLOCK)
         region = {"northing": slice(100, 300), "easting": slice(250, 610)}
-        padded, _ = _pad_region_to_chunks(existing, data, region)
+        padded, _ = _pad_region_to_chunks(existing, data, region, self._group(existing))
         assert padded["blue"].dims == ("time", "northing", "easting")
         assert (padded["blue"].values[0, 100:300, 250:610] == 6).all()
+
+    def _existing_nt(self, *, nt, height=100, width=100, chunk=50):
+        """An ``existing`` whose time axis is ``nt`` long (time chunk 1).
+
+        Kept small spatially: the graph-size property is independent of spatial
+        extent, and a long time axis must not balloon memory just to assert it.
+        """
+        ds = xr.Dataset(
+            {"blue": (["time", "northing", "easting"], np.zeros((nt, height, width), dtype=np.uint16))},
+            coords={
+                "time": np.array([np.datetime64("2024-01-01", "ns") + np.timedelta64(i, "D") for i in range(nt)]),
+                "northing": np.arange(height),
+                "easting": np.arange(width),
+            },
+        )
+        return ds.chunk({"time": 1, "northing": chunk, "easting": chunk})
+
+    def test_padded_shell_graph_is_slab_local_and_flat_in_time(self):
+        """The shell's dask graph must scale with the WIDENED slab's chunks, not the
+        store's time length — the property that makes the zarr-direct shell flat in
+        master time and kills the scheduler OOM. ``existing.isel(widened)`` carried
+        the whole-store time-chunk layer into every shell, so its graph grew with the
+        master's total dates; value-parity tests can't catch that regression, only a
+        graph-size check independent of ``nt`` can.
+        """
+        # 100x100 store at 50-px chunks; region 10:30 x 10:70 widens to a 1x1x2 block slab.
+        region = {"time": slice(0, 1), "northing": slice(10, 30), "easting": slice(10, 70)}
+        data = _single_date_block("2024-01-01", 9, height=20, width=60, n0=10, e0=10, chunks=ONE_BLOCK)
+
+        sizes = {}
+        for nt in (5, 500):
+            existing = self._existing_nt(nt=nt)
+            padded, widened = _pad_region_to_chunks(existing, data, region, self._group(existing))
+            assert widened["northing"] == slice(0, 50) and widened["easting"] == slice(0, 100)
+            sizes[nt] = len(padded["blue"].data.__dask_graph__())
+
+        # Widened slab is 1 time x 1 northing-block x 2 easting-blocks = 2 read tasks,
+        # plus the setitem overlay fan-out — a small constant. The whole point: it must
+        # NOT grow from nt=5 to nt=500. An un-fixed isel shell would scale with nt.
+        assert sizes[5] == sizes[500], f"shell graph scales with store time length: {sizes}"
+        assert sizes[5] < 40, f"shell graph has {sizes[5]} keys — not slab-local"
+
+    def test_zarr_direct_shell_matches_isel(self):
+        """The zarr-direct shell is numerically identical to the old
+        ``existing.isel(widened)`` slab — same backfilled store values outside the
+        region, same overlaid incoming inside — so output bytes are unchanged.
+        """
+        rng = np.random.default_rng(0)
+        # Non-zero store values so an isel/zarr-direct divergence would actually show.
+        store_vals = rng.integers(0, 9000, size=(1, 1000, 1000), dtype=np.uint16)
+        existing = xr.Dataset(
+            {"blue": (["time", "northing", "easting"], store_vals)},
+            coords={
+                "time": [np.datetime64("2024-01-01", "ns")],
+                "northing": np.arange(1000),
+                "easting": np.arange(1000),
+            },
+        ).chunk({"time": 1, "northing": 500, "easting": 500})
+        group = self._group(existing)
+
+        data = _single_date_block("2024-01-01", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
+        region = {"northing": slice(100, 300), "easting": slice(250, 610)}
+        padded, widened = _pad_region_to_chunks(existing, data, region, group)
+
+        # Oracle: the pre-zarr-direct construction (isel shell + positional overlay).
+        ref = existing.isel(widened)["blue"].data.copy()
+        n0 = region["northing"].start - widened["northing"].start
+        e0 = region["easting"].start - widened["easting"].start
+        idx = (
+            slice(None),
+            slice(n0, n0 + (region["northing"].stop - region["northing"].start)),
+            slice(e0, e0 + (region["easting"].stop - region["easting"].start)),
+        )
+        ref[idx] = data["blue"].transpose("time", "northing", "easting").data
+        np.testing.assert_array_equal(padded["blue"].values, ref.compute())
 
 
 class TestWriteRegion:
@@ -961,10 +1056,11 @@ class TestWriteRegions:
         repo = _open_repo(store_path)
         session = repo.writable_session("main")
         existing = open_store(store_path)
+        group = open_store_as_zarr_group(store_path)
         try:
             fork = session.fork()
             sources, _targets, _regions, _widened = _aligned_region_sources(
-                existing, [(full, {"time": slice(0, 1), "northing": slice(0, 500)})], fork
+                existing, [(full, {"time": slice(0, 1), "northing": slice(0, 500)})], fork, group
             )
         finally:
             existing.close()

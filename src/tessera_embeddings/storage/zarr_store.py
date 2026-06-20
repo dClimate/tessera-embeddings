@@ -514,8 +514,13 @@ def _write_region(
     # forks internally.
     read_session = repo.readonly_session(snapshot_id=session.snapshot_id)
     existing = xr.open_zarr(read_session.store, consolidated=False)
+    # Raw zarr group on the SAME readonly session, for the zarr-direct padding
+    # shell (one read task per overlapping chunk, no whole-store layer). Must be
+    # this session — same pinned snapshot as ``existing`` and pickle-safe to
+    # workers — not a fresh branch="main" group.
+    group = zarr.open_group(read_session.store, mode="r")
     try:
-        padded, widened = _pad_region_to_chunks(existing, data, region)
+        padded, widened = _pad_region_to_chunks(existing, data, region, group)
         to_write = _drop_region_coords(padded, set(widened))
 
         _commit_preserving_attrs(
@@ -562,13 +567,16 @@ def _write_regions(
     # pickle-safe padding-shell reason as _write_region (see its comment).
     read_session = repo.readonly_session(snapshot_id=session.snapshot_id)
     existing = xr.open_zarr(read_session.store, consolidated=False)
+    # Raw zarr group on the SAME readonly session for zarr-direct padding shells
+    # (see _write_region for why this session and not a fresh branch="main" one).
+    group = zarr.open_group(read_session.store, mode="r")
     try:
         # store_dask writes chunk data into pre-existing (seeded) arrays via the
         # fork; it never rewrites the root group, so root attrs survive without the
         # snapshot/restore dance _commit_preserving_attrs needs for to_icechunk. We
         # still apply update_attrs explicitly before committing.
         fork = session.fork()
-        sources, targets, regions, widened = _aligned_region_sources(existing, region_items, fork)
+        sources, targets, regions, widened = _aligned_region_sources(existing, region_items, fork, group)
         _assert_regions_chunk_disjoint(widened)
         merged = store_dask(sources=sources, targets=targets, regions=regions, split_every=split_every)
         session.merge(merged)
