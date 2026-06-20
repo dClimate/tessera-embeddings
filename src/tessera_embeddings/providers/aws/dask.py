@@ -56,10 +56,10 @@ from tenacity import (
 DEFAULT_INGEST_WORKER_CPU = 4096
 DEFAULT_INGEST_WORKER_MEM = 16384
 
-# Schedulers don't need much memory but benefit from a few cores so
-# graph construction and dashboard responsiveness stay smooth.
+# Schedulers benefit from a few cores for graph construction and dashboard
+# responsiveness. 16 GiB gives headroom for large HLG graphs without OOM.
 DEFAULT_INGEST_SCHEDULER_CPU = 4096
-DEFAULT_INGEST_SCHEDULER_MEM = 8192
+DEFAULT_INGEST_SCHEDULER_MEM = 16384
 
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/ecs/tessera/dask"
 
@@ -267,6 +267,8 @@ def ecs_cluster(
     max_workers: int = 50,
     worker_cpu: int | None = None,
     worker_mem: int | None = None,
+    scheduler_cpu: int | None = None,
+    scheduler_mem: int | None = None,
     worker_nthreads: int | None = None,
     worker_nprocs: int | None = None,
     extra_worker_env: dict[str, str] | None = None,
@@ -286,6 +288,8 @@ def ecs_cluster(
         max_workers: Maximum Fargate tasks for adaptive scaling.
         worker_cpu: Override worker CPU units.
         worker_mem: Override worker memory in MiB.
+        scheduler_cpu: Override scheduler CPU units.
+        scheduler_mem: Override scheduler memory in MiB.
         worker_nthreads: Threads per worker process.
         worker_nprocs: Worker processes per Fargate task. Set
             ``worker_nprocs > 1`` with ``worker_nthreads=1`` for
@@ -323,7 +327,12 @@ def ecs_cluster(
         for key, val in extra_scheduler_env.items():
             os.environ[key] = val
 
-    config = get_fargate_config()
+    config = get_fargate_config(
+        scheduler_cpu=scheduler_cpu if scheduler_cpu is not None else DEFAULT_INGEST_SCHEDULER_CPU,
+        scheduler_mem=scheduler_mem if scheduler_mem is not None else DEFAULT_INGEST_SCHEDULER_MEM,
+        worker_cpu=worker_cpu if worker_cpu is not None else DEFAULT_INGEST_WORKER_CPU,
+        worker_mem=worker_mem if worker_mem is not None else DEFAULT_INGEST_WORKER_MEM,
+    )
     cluster_kwargs = config.to_cluster_kwargs()
 
     if extra_worker_env:
@@ -344,10 +353,6 @@ def ecs_cluster(
             cluster_kwargs["subnets"] = [scheduler_subnet]
         log.info("EC2 scheduler enabled via capacity provider: %s", capacity_provider)
 
-    if worker_cpu is not None:
-        cluster_kwargs["worker_cpu"] = worker_cpu
-    if worker_mem is not None:
-        cluster_kwargs["worker_mem"] = worker_mem
     if image is not None:
         cluster_kwargs["image"] = image
 
