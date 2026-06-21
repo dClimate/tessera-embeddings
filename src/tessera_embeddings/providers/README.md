@@ -44,6 +44,35 @@ providers/
     └── dask.py               LocalCluster ctx manager
 ```
 
+## Scheduler health logging (Dask)
+
+`ecs_cluster` registers a `SchedulerResourceLogger` (a `distributed`
+`SchedulerPlugin`) on the scheduler at startup. The cluster dashboard
+shows aggregate *worker* load, but the scheduler is a single
+event-loop process that builds every graph and routes every task —
+its own pressure is invisible there until it stalls (the built-in
+`Event loop was unresponsive for Ns` warning) or the ECS task is
+silently OOM-killed.
+
+The plugin runs a `PeriodicCallback` on the scheduler's event loop and
+emits one line every `DEFAULT_SCHEDULER_PROFILE_INTERVAL_S` (30s) to
+the `dask-scheduler` CloudWatch stream:
+
+```
+scheduler health: cpu=83% rss=6.41GiB mem=80% lag=0.2s fds=412 threads=22 workers=148 tasks=51234 processing=296 no-worker=0
+```
+
+| Field | Meaning / why it matters |
+|---|---|
+| `cpu` | Scheduler process CPU %, interval-averaged (can exceed 100% across threads). Sustained ~100% precedes event-loop stalls. |
+| `rss` / `mem` | Process resident memory, absolute and as % of the container limit. The OOM predictor. |
+| `lag` | Event-loop lag — how late the callback fired vs. schedule. The leading measure behind the "unresponsive" warning. |
+| `fds` / `threads` | Open file descriptors and thread count — catches connection/fd leaks. |
+| `workers` / `tasks` | Cluster size and total tracked tasks, with `processing` (in flight) and `no-worker` (stuck waiting). A rising backlog means the scheduler is falling behind. |
+
+Registration is best-effort: a failure logs a warning and the run
+continues, since this is diagnostics only.
+
 ## When a provider is needed
 
 ```
