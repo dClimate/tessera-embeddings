@@ -274,6 +274,8 @@ def tessera_embeddings(
             with Path(resolved_yaml).open() as _f:
                 _active_cluster_name = yaml.safe_load(_f).get("cluster_name")
 
+        from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+
         results = run_inference_task(
             num_actors=num_actors,
             config=config,
@@ -282,6 +284,7 @@ def tessera_embeddings(
             staging_base=staging_base,
             run_id=run_id,
             t0=t0,
+            get_credentials=iam_icechunk_credentials,
         )
     _active_resolved_yaml = None
     _active_cluster_name = None

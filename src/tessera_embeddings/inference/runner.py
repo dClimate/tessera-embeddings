@@ -17,6 +17,7 @@ import contextlib
 import logging
 import time
 from collections.abc import Callable
+from typing import Any
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -41,6 +42,7 @@ def run_inference(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     *,
     on_actor_retire: Callable[[str], None] | None = None,
+    get_credentials: Callable[[], Any] | None = None,
 ) -> list[dict]:
     """Create Ray actors, run work-stealing inference, return per-chunk results.
 
@@ -65,6 +67,10 @@ def run_inference(
             when a misbehaving actor is removed from the pool. The AWS
             provider injects an EC2-terminator here so dead instances stop
             billing immediately; the local provider passes ``None``.
+        get_credentials: Optional icechunk S3 credential provider injected into
+            every actor so store opens refresh credentials. The AWS provider
+            passes ``iam_icechunk_credentials``; the local provider passes
+            ``None`` (icechunk's default chain). See :class:`InferenceActor`.
 
     Returns:
         Per-chunk result dicts (status, valid pixel count, timing, etc.),
@@ -112,7 +118,7 @@ def run_inference(
     )
     t_actors = time.monotonic()
     actor_cls = InferenceActor.options(num_gpus=config.num_gpus)  # type: ignore[attr-defined]
-    actors = [actor_cls.remote(config, config.checkpoint_path) for _ in range(num_actors)]
+    actors = [actor_cls.remote(config, config.checkpoint_path, get_credentials) for _ in range(num_actors)]
     progress_tracker: ray.actor.ActorHandle | None = None
     try:
         # Start as soon as a single actor is live. Cloud providers roll out
@@ -154,6 +160,7 @@ def run_inference(
             tracker=progress_tracker,
             still_initializing=still_initializing,
             on_actor_retire=on_actor_retire,
+            get_credentials=get_credentials,
         )
     finally:
         log.info("Killing %d actors to release resource reservations", len(actors))

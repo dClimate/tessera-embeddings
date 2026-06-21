@@ -151,6 +151,7 @@ def _make_actor(inference_config, test_model):
     actor.device = torch.device("cpu")
     actor.model = test_model
     actor.instance_id = "test-instance"
+    actor._get_credentials = None  # no scoped provider; opens use the default chain
     return actor
 
 

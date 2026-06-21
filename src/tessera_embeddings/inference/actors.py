@@ -11,6 +11,7 @@ torch is only needed on GPU workers at runtime.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import tempfile
 import time
@@ -28,12 +29,13 @@ from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
-from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 from tessera_embeddings.storage.zarr_store import credentials_provider
 
 if TYPE_CHECKING:
     import types
+    from collections.abc import Callable
 
+    import icechunk
     import torch
 
     from tessera_embeddings.inference.data_loading import ChunkData, S2MaskBundle
@@ -253,14 +255,32 @@ class InferenceActor:
 
         # CPU-only worker (local runner, smoke tests)
         InferenceActor.options(num_gpus=0).remote(config, ckpt)
+
+    The optional ``get_credentials`` callback is the icechunk S3 credential
+    provider used for every store open in :meth:`process_chunk`. It is injected
+    by the cloud-aware caller (the AWS provider passes
+    ``iam_icechunk_credentials``) so this domain actor stays free of any
+    cloud-SDK import. When ``None``, icechunk falls back to its default AWS
+    credential chain — fine for local/moto runs, but on long-lived cloud
+    workers that chain can fail to refresh the instance-profile token; see
+    ``providers.aws.credentials.iam_icechunk_credentials``.
     """
 
-    def __init__(self, config: InferenceConfig, checkpoint_path: str) -> None:
+    def __init__(
+        self,
+        config: InferenceConfig,
+        checkpoint_path: str,
+        get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    ) -> None:
         """Initialize actor: download checkpoint (if S3) and load model onto GPU.
 
         Args:
             config: Inference configuration.
             checkpoint_path: S3 URI or local path to the model checkpoint.
+            get_credentials: Optional icechunk S3 credential provider applied
+                (via :func:`credentials_provider`) for the duration of every
+                :meth:`process_chunk` call. Injected by the cloud-aware caller;
+                ``None`` uses icechunk's default credential chain.
         """
         import torch as _torch
 
@@ -269,6 +289,7 @@ class InferenceActor:
         _configure_actor_logging()
 
         self.config = config
+        self._get_credentials = get_credentials
         self.instance_id = _fetch_ec2_instance_id()
         self.device = _torch.device("cpu") if self.config.num_gpus == 0 else _select_device(_torch, self.instance_id)
 
@@ -308,15 +329,16 @@ class InferenceActor:
     ) -> dict[str, str | int | float]:
         """Process a single spatial chunk: load data, run inference, write output.
 
-        Reads and the staging write are wrapped in a scoped
-        :func:`credentials_provider` so every icechunk S3 open resolves through
-        :func:`iam_icechunk_credentials`. That botocore-backed callback carries an
+        When a ``get_credentials`` provider was injected at construction, reads
+        and the staging write run inside a scoped :func:`credentials_provider`
+        so every icechunk S3 open resolves through it. The AWS provider passes
+        ``iam_icechunk_credentials``, a botocore-backed callback carrying an
         ``expires_after`` so icechunk periodically re-invokes it and botocore
-        refreshes the instance-profile token. Without it, icechunk falls back to
-        the Rust AWS SDK's default chain, which resolves the instance-profile
-        credential once and — on a long-lived actor — can fail to refresh it,
-        failing this chunk and every subsequent one in the process with
-        "no providers in chain provided credentials".
+        refreshes the instance-profile token. Without an injected provider,
+        icechunk falls back to the Rust AWS SDK's default chain, which resolves
+        the instance-profile credential once and — on a long-lived actor — can
+        fail to refresh it, failing this chunk and every subsequent one in the
+        process with "no providers in chain provided credentials".
 
         Args:
             chunk: Spatial chunk specification.
@@ -329,7 +351,12 @@ class InferenceActor:
         Returns:
             Result dict with chunk label, status, pixel count, and timing.
         """
-        with credentials_provider(iam_icechunk_credentials):
+        cred_scope = (
+            credentials_provider(self._get_credentials)
+            if self._get_credentials is not None
+            else contextlib.nullcontext()
+        )
+        with cred_scope:
             return self._process_chunk(chunk, mosaic_base, staging_base, run_id, tracker)
 
     def _process_chunk(
