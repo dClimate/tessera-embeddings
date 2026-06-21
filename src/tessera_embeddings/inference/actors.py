@@ -43,12 +43,12 @@ logger = logging.getLogger(__name__)
 # strip. The 1-deep strip prefetch keeps two band strips resident at once (plus
 # the shared full-chunk SCL mask, charged against this budget too), so the real
 # ceiling is on the *pair*: 7.0 GB/strip => a 14 GB pair. The remaining headroom
-# on the 32 GB g6.2xlarge worker box must absorb the non-S2 resident set the
+# on the 32 GB g6e.xlarge worker box must absorb the non-S2 resident set the
 # sizer does not model — the SAR stack (no cheap pre-read count, so it can spike
 # on dense-S1 chunks), the whole-chunk int8 embedding + scale buffers, and the
 # model (~4 GB combined on the densest chunks). 7.0 GB/strip raises the prior
 # 4.0 GB ceiling with the move from the 16 GB g5.xlarge box to the 32 GB
-# g6.2xlarge, but stops short of a full 2x: 4.0 GB was already OOMing on the
+# g6e.xlarge, but stops short of a full 2x: 4.0 GB was already OOMing on the
 # 16 GB box, so the doubled-box budget keeps a deliberate ~4 GB cushion.
 _S2_STRIP_BYTE_BUDGET = int(7.0 * 1024**3)
 
