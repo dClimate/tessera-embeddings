@@ -962,14 +962,21 @@ class ZarrWriter:
                 "embeddings": {"chunks": (1, sub_h, sub_w, sub_band)},
                 "time": {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"},
             }
+            # fill_value=NaN matches the out-of-ROI fill used in the mosaic
+            # graph for these float vars, so all-empty sub-chunks collapse to
+            # no object on write (zarr's write_empty_chunks=False default) and
+            # don't inflate the S3 prefix. The default 0.0 fill would never
+            # match the NaN footprint, forcing a real object per empty chunk.
             if compute_std:
                 encoding_ic["embedding_std"] = {
                     "chunks": (1, sub_h, sub_w, sub_band),
+                    "fill_value": float("nan"),
                     "serializer": pcodec_serializer(),
                     "compressors": None,
                 }
             encoding_ic["scales"] = {
                 "chunks": (1, sub_h, sub_w),
+                "fill_value": float("nan"),
                 "serializer": pcodec_serializer(),
                 "compressors": None,
             }
