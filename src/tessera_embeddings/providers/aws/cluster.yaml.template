@@ -12,8 +12,8 @@
 #   - `cluster_name`: prefix for EC2 ray-cluster-name tags
 #   - `provider.region`: AWS region (must match SSM region)
 #   - `available_node_types[*].node_config.InstanceType`: head and worker
-#     instance types (the defaults assume an A10G GPU with 24 GB VRAM —
-#     `g5.xlarge` for workers, `m5.2xlarge` for the head)
+#     instance types (the defaults assume an L4 GPU with 24 GB VRAM —
+#     `g6.2xlarge` for workers, `m5.2xlarge` for the head)
 #   - `min_workers` / `max_workers`: pool sizing
 #   - `idle_timeout_minutes`: autoscaler idle-down delay
 #
@@ -68,12 +68,12 @@ available_node_types:
         min_workers: 0
         max_workers: 0
 
-    # On-demand GPU workers (~$0.81/hr at us-west-2 g5.xlarge pricing)
+    # On-demand GPU workers (~$0.98/hr at us-west-2 g6.2xlarge pricing)
     # min_workers > 0 pre-warms the pool so the first batch of actors does
     # not pay autoscaler cold-start latency (~30-60s per scale cycle).
     gpu-workers-ondemand:
         node_config:
-            InstanceType: g5.xlarge
+            InstanceType: g6.2xlarge
             # INJECT: ImageId, KeyName, SecurityGroupIds, IamInstanceProfile,
             # SubnetIds, TagSpecifications (same set as head)
             BlockDeviceMappings:
@@ -82,7 +82,7 @@ available_node_types:
                       VolumeSize: 80
                       VolumeType: gp3
         resources:
-            CPU: 4
+            CPU: 8
             GPU: 1
         min_workers: 2
         max_workers: 500
@@ -91,7 +91,7 @@ available_node_types:
     # Set max_workers > 0 to enable.
     gpu-workers-spot:
         node_config:
-            InstanceType: g5.xlarge
+            InstanceType: g6.2xlarge
             InstanceMarketOptions:
                 MarketType: spot
             # INJECT: ImageId, KeyName, SecurityGroupIds, IamInstanceProfile,
@@ -102,7 +102,7 @@ available_node_types:
                       VolumeSize: 80
                       VolumeType: gp3
         resources:
-            CPU: 4
+            CPU: 8
             GPU: 1
         min_workers: 0
         max_workers: 0
