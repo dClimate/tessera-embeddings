@@ -34,3 +34,34 @@ def test_invalid_max_workers_raises() -> None:
     """``max_workers`` must be a positive integer."""
     with pytest.raises(ValueError, match="max_workers must be > 0"):
         AssemblyConfig(max_workers=0)
+
+
+def test_default_max_workers_honors_s3_concurrency_target() -> None:
+    """Default worker cap must not exceed the aggregate S3 PUT target.
+
+    ``per_worker_cap`` floors at 1, so aggregate PUT concurrency is
+    ``>= n_workers``. If the default cap exceeded
+    ``TARGET_AGGREGATE_S3_CONCURRENCY`` the fleet would burst over S3's
+    per-prefix rate and draw ``503 SlowDown`` on append. Locks the two
+    constants in sync (see assembly.TARGET_AGGREGATE_S3_CONCURRENCY).
+    """
+    from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
+
+    assert AssemblyConfig().max_workers <= TARGET_AGGREGATE_S3_CONCURRENCY
+
+
+def test_aggregate_put_concurrency_stays_under_target_at_cap() -> None:
+    """At any live-chunk count, n_workers * per_worker_cap <= target.
+
+    Mirrors the ``per_worker_cap = max(1, target // n_workers)`` math in
+    ``ZarrWriter.assemble`` and checks the product never blows the target,
+    including the 2761-live-chunk ROI that pins n_workers at the cap.
+    """
+    from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
+
+    cfg = AssemblyConfig()
+    target = TARGET_AGGREGATE_S3_CONCURRENCY
+    for n_live in (1, 50, 250, 850, 2761, 10_000):
+        n_workers = cfg.compute_n_workers(n_live)
+        per_worker_cap = max(1, target // n_workers)
+        assert n_workers * per_worker_cap <= target, f"{n_live=} blew target"

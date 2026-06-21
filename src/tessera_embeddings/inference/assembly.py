@@ -84,7 +84,15 @@ worker forks a fresh Repository when ``to_icechunk`` ships the session out. So
 the effective aggregate concurrency is ``n_workers * per_worker_cap``, not the
 per-worker cap alone. We target ~100 concurrent PUTs fleet-wide (roughly 1/35 of
 S3's ~3500 req/s/prefix ceiling at ~100 ms PUT latency) to leave headroom for
-retries and avoid 503 SlowDown on single-prefix fan-out at cornbelt scale.
+retries and avoid 503 SlowDown.
+
+icechunk writes chunk objects to a flat ``chunks/<random-id>`` keyspace, so the
+keys spread across S3 partitions well — but partition splitting is adaptive and a
+hard burst overruns the per-prefix rate before (and even after) S3 adapts, which
+is exactly the SlowDown observed at 800 concurrent PUTs. The invariant that keeps
+us under target is ``AssemblyConfig.max_workers <= TARGET_AGGREGATE_S3_CONCURRENCY``:
+since ``per_worker_cap`` floors at 1, aggregate is >= n_workers, so the worker cap
+must not exceed the target. Keep these two constants in sync.
 """
 
 
@@ -917,7 +925,16 @@ class ZarrWriter:
         # cap is per-Repository (per-worker after session fork), so we must
         # pre-divide by n_workers to keep aggregate under S3's per-prefix
         # ceiling. See TARGET_AGGREGATE_S3_CONCURRENCY for the rationale.
-        per_worker_cap = max(4, TARGET_AGGREGATE_S3_CONCURRENCY // n_workers)
+        #
+        # The floor is 1, not a larger number: every forked Repository issues at
+        # least 1 concurrent PUT, so aggregate >= n_workers regardless of the
+        # divisor. A floor above 1 only holds the target while n_workers is small
+        # enough that the division still lands >= the floor; past that it pins at
+        # the floor and aggregate grows linearly with n_workers, blowing the
+        # target (e.g. floor=4 at 200 workers -> 800 concurrent PUTs -> SlowDown).
+        # AssemblyConfig.max_workers is capped at the target so n_workers never
+        # drives aggregate over it.
+        per_worker_cap = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // n_workers)
 
         # Split each spatial axis's manifest into 32-chunk shards. Embeddings are
         # written in 500-px spatial chunks, so a 32-chunk shard is ~16k px/axis —
