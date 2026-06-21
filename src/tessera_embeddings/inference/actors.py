@@ -28,6 +28,8 @@ from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
+from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+from tessera_embeddings.storage.zarr_store import credentials_provider
 
 if TYPE_CHECKING:
     import types
@@ -306,6 +308,16 @@ class InferenceActor:
     ) -> dict[str, str | int | float]:
         """Process a single spatial chunk: load data, run inference, write output.
 
+        Reads and the staging write are wrapped in a scoped
+        :func:`credentials_provider` so every icechunk S3 open resolves through
+        :func:`iam_icechunk_credentials`. That botocore-backed callback carries an
+        ``expires_after`` so icechunk periodically re-invokes it and botocore
+        refreshes the instance-profile token. Without it, icechunk falls back to
+        the Rust AWS SDK's default chain, which resolves the instance-profile
+        credential once and — on a long-lived actor — can fail to refresh it,
+        failing this chunk and every subsequent one in the process with
+        "no providers in chain provided credentials".
+
         Args:
             chunk: Spatial chunk specification.
             mosaic_base: Base path for the mosaic stores
@@ -316,6 +328,22 @@ class InferenceActor:
 
         Returns:
             Result dict with chunk label, status, pixel count, and timing.
+        """
+        with credentials_provider(iam_icechunk_credentials):
+            return self._process_chunk(chunk, mosaic_base, staging_base, run_id, tracker)
+
+    def _process_chunk(
+        self,
+        chunk: ChunkSpec,
+        mosaic_base: str,
+        staging_base: str,
+        run_id: str,
+        tracker: ray.actor.ActorHandle | None = None,
+    ) -> dict[str, str | int | float]:
+        """Run the load → inference → write pipeline for one chunk.
+
+        Always invoked through :meth:`process_chunk`, which establishes the
+        scoped icechunk credential provider this body's S3 opens depend on.
         """
         from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
         from tessera_embeddings.inference.inference import run_inference
