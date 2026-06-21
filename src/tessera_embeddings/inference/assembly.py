@@ -31,7 +31,7 @@ from tessera_embeddings.config.inference import EMBEDDING_DIM, TimeWindow
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
-from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store
+from tessera_embeddings.storage.zarr_store import manifest_split, open_or_create_repo, open_store
 
 # PCodec is intentionally used as a Zarr v3 serializer; silence the
 # "not in the Zarr version 3 specification" warning it emits on every instantiation.
@@ -918,122 +918,142 @@ class ZarrWriter:
         # pre-divide by n_workers to keep aggregate under S3's per-prefix
         # ceiling. See TARGET_AGGREGATE_S3_CONCURRENCY for the rationale.
         per_worker_cap = max(4, TARGET_AGGREGATE_S3_CONCURRENCY // n_workers)
-        # scatter_initial_credentials: to_icechunk pickles the session out to
-        # every Dask worker. With a credential callback, eager scatter
-        # caches one credential set on the driver so workers don't all stampede
-        # the credential provider on deserialisation.
-        repo, is_new = open_or_create_repo(
-            output_path,
-            max_concurrent_requests=per_worker_cap,
-            get_credentials=get_credentials,
-            region=s3_region,
-            scatter_initial_credentials=get_credentials is not None,
-        )
-        # Persist the cap into the repo's config blob. to_icechunk ships the
-        # session out and each worker re-opens the Repository — without
-        # save_config, those workers read the persisted config (defaults) and
-        # the runtime override is silently dropped, so concurrency stays at
-        # icechunk's 256 default regardless of what we pass here.
-        repo.save_config()
-        session = repo.writable_session("main")
 
-        # Validate manifest before appending to an existing store
-        if not is_new and manifest:
-            prev_root = zarr.open_group(session.store, mode="r")
-            manifest.validate_against(extract_manifest(prev_root.attrs), output_path)
+        # Split each spatial axis's manifest into 32-chunk shards. Embeddings are
+        # written in 500-px spatial chunks, so a 32-chunk shard is ~16k px/axis —
+        # matching DEFAULT_MANIFEST_SPLIT_SIZES' ~16k-px target. No time split:
+        # assembly only ever writes a single timestep, so one time shard == the
+        # whole array and splitting time would be a no-op.
+        #
+        # This wraps appends to pre-existing stores too, which is intentional and
+        # safe. A store created before splitting was introduced has one unsplit
+        # manifest; the first append under this block re-shards the touched array
+        # in that commit (a one-time migration — existing chunk data is untouched
+        # and reads back identically), and every later commit rewrites only the
+        # shards it touches. icechunk merges the split config into the store's
+        # persisted config on open, so the layout follows the array forward with no
+        # manual migration. Verified against icechunk 2.0.4.
+        #
+        # The context is scoped tightly here — around the output store open/write
+        # only — so that read-only opens of other stores (e.g. the mosaic base for
+        # spatial coords) are not inadvertently opened under the split config.
+        with manifest_split({"northing": 32, "easting": 32}):
+            # scatter_initial_credentials: to_icechunk pickles the session out to
+            # every Dask worker. With a credential callback, eager scatter
+            # caches one credential set on the driver so workers don't all stampede
+            # the credential provider on deserialisation.
+            repo, is_new = open_or_create_repo(
+                output_path,
+                max_concurrent_requests=per_worker_cap,
+                get_credentials=get_credentials,
+                region=s3_region,
+                scatter_initial_credentials=get_credentials is not None,
+            )
+            # Persist the cap into the repo's config blob. to_icechunk ships the
+            # session out and each worker re-opens the Repository — without
+            # save_config, those workers read the persisted config (defaults) and
+            # the runtime override is silently dropped, so concurrency stays at
+            # icechunk's 256 default regardless of what we pass here.
+            repo.save_config()
+            session = repo.writable_session("main")
 
-        # Snapshot existing time_windows BEFORE to_icechunk, which may
-        # overwrite root attrs on append.
-        prev_time_windows: dict = {}
-        if not is_new and time_window:
-            prev_root = zarr.open_group(session.store, mode="r")
-            prev_time_windows = dict(prev_root.attrs.get("time_windows", {}))  # type: ignore[arg-type]
+            # Validate manifest before appending to an existing store
+            if not is_new and manifest:
+                prev_root = zarr.open_group(session.store, mode="r")
+                manifest.validate_against(extract_manifest(prev_root.attrs), output_path)
 
-        if is_new:
-            # Output zarr sub-chunking is read from the staged files directly,
-            # not from dask block size: dask blocks are ChunkSpec-sized (one
-            # task per ChunkSpec, keeps the scheduler graph small), but on-disk
-            # zarr chunks must remain 500x500x(embedding_dim/BAND_CHUNK_DIVISOR)
-            # for downstream partial-read performance. to_icechunk handles the
-            # per-dask-block fan-out into smaller zarr chunks via align_chunks=True.
-            sub_h, sub_w, sub_band = self._detect_staged_chunk_size(run_id, live_chunks, "embeddings")
-            _log.info("Output zarr sub-chunks: (%d, %d, %d) from staged files", sub_h, sub_w, sub_band)
-            encoding_ic: dict[str, dict] = {
-                "embeddings": {"chunks": (1, sub_h, sub_w, sub_band)},
-                "time": {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"},
-            }
-            # fill_value=NaN matches the out-of-ROI fill used in the mosaic
-            # graph for these float vars, so all-empty sub-chunks collapse to
-            # no object on write (zarr's write_empty_chunks=False default) and
-            # don't inflate the S3 prefix. The default 0.0 fill would never
-            # match the NaN footprint, forcing a real object per empty chunk.
-            if compute_std:
-                encoding_ic["embedding_std"] = {
-                    "chunks": (1, sub_h, sub_w, sub_band),
+            # Snapshot existing time_windows BEFORE to_icechunk, which may
+            # overwrite root attrs on append.
+            prev_time_windows: dict = {}
+            if not is_new and time_window:
+                prev_root = zarr.open_group(session.store, mode="r")
+                prev_time_windows = dict(prev_root.attrs.get("time_windows", {}))  # type: ignore[arg-type]
+
+            if is_new:
+                # Output zarr sub-chunking is read from the staged files directly,
+                # not from dask block size: dask blocks are ChunkSpec-sized (one
+                # task per ChunkSpec, keeps the scheduler graph small), but on-disk
+                # zarr chunks must remain 500x500x(embedding_dim/BAND_CHUNK_DIVISOR)
+                # for downstream partial-read performance. to_icechunk handles the
+                # per-dask-block fan-out into smaller zarr chunks via align_chunks=True.
+                sub_h, sub_w, sub_band = self._detect_staged_chunk_size(run_id, live_chunks, "embeddings")
+                _log.info("Output zarr sub-chunks: (%d, %d, %d) from staged files", sub_h, sub_w, sub_band)
+                encoding_ic: dict[str, dict] = {
+                    "embeddings": {"chunks": (1, sub_h, sub_w, sub_band)},
+                    "time": {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"},
+                }
+                # fill_value=NaN matches the out-of-ROI fill used in the mosaic
+                # graph for these float vars, so all-empty sub-chunks collapse to
+                # no object on write (zarr's write_empty_chunks=False default) and
+                # don't inflate the S3 prefix. The default 0.0 fill would never
+                # match the NaN footprint, forcing a real object per empty chunk.
+                if compute_std:
+                    encoding_ic["embedding_std"] = {
+                        "chunks": (1, sub_h, sub_w, sub_band),
+                        "fill_value": float("nan"),
+                        "serializer": pcodec_serializer(),
+                        "compressors": None,
+                    }
+                encoding_ic["scales"] = {
+                    "chunks": (1, sub_h, sub_w),
                     "fill_value": float("nan"),
                     "serializer": pcodec_serializer(),
                     "compressors": None,
                 }
-            encoding_ic["scales"] = {
-                "chunks": (1, sub_h, sub_w),
-                "fill_value": float("nan"),
-                "serializer": pcodec_serializer(),
-                "compressors": None,
-            }
-            for obs_var in OBS_COUNT_VARS:
-                if obs_var in mosaic:
-                    encoding_ic[obs_var] = {"chunks": (1, sub_h, sub_w), "compressors": None}
-            to_icechunk(mosaic, session, mode="w", encoding=encoding_ic, align_chunks=True, split_every=8)
-            _log.info("Wrote new store at %s", output_path)
-        else:
-            # Existing store: append along time (no encoding — existing metadata preserved)
-            to_icechunk(mosaic, session, mode="a", append_dim="time", align_chunks=True, split_every=8)
-            _log.info("Appended to existing store at %s", output_path)
+                for obs_var in OBS_COUNT_VARS:
+                    if obs_var in mosaic:
+                        encoding_ic[obs_var] = {"chunks": (1, sub_h, sub_w), "compressors": None}
+                to_icechunk(mosaic, session, mode="w", encoding=encoding_ic, align_chunks=True, split_every=8)
+                _log.info("Wrote new store at %s", output_path)
+            else:
+                # Existing store: append along time (no encoding — existing metadata preserved)
+                to_icechunk(mosaic, session, mode="a", append_dim="time", align_chunks=True, split_every=8)
+                _log.info("Appended to existing store at %s", output_path)
 
-        # Set root attrs on same session
-        root = zarr.open_group(session.store, mode="r+")
-        root.attrs["run_id"] = run_id
-        root.attrs["total_y"] = total_y
-        root.attrs["total_x"] = total_x
-        root.attrs["embedding_dim"] = self.embedding_dim
-        root.attrs["run_started_at"] = started.isoformat()
-        root.attrs["run_completed_at"] = datetime.datetime.now(datetime.UTC).isoformat()
+            # Set root attrs on same session
+            root = zarr.open_group(session.store, mode="r+")
+            root.attrs["run_id"] = run_id
+            root.attrs["total_y"] = total_y
+            root.attrs["total_x"] = total_x
+            root.attrs["embedding_dim"] = self.embedding_dim
+            root.attrs["run_started_at"] = started.isoformat()
+            root.attrs["run_completed_at"] = datetime.datetime.now(datetime.UTC).isoformat()
 
-        # GeoZarr convention attributes (proj:, spatial:, tessera:).
-        # Set on every write (create and append) so they survive to_icechunk attr overwrites.
-        conv_attrs = build_convention_attrs(
-            tile_id=tile_id,
-            epsg_code=spatial.crs if spatial else None,
-            total_y=total_y,
-            total_x=total_x,
-            embedding_dim=self.embedding_dim,
-            y_coords=spatial.northing if spatial else None,
-            x_coords=spatial.easting if spatial else None,
-            model_version=model_version,
-            n_tiles=len(chunks),
-        )
-        if conv_attrs:
-            root.attrs.update(conv_attrs)
+            # GeoZarr convention attributes (proj:, spatial:, tessera:).
+            # Set on every write (create and append) so they survive to_icechunk attr overwrites.
+            conv_attrs = build_convention_attrs(
+                tile_id=tile_id,
+                epsg_code=spatial.crs if spatial else None,
+                total_y=total_y,
+                total_x=total_x,
+                embedding_dim=self.embedding_dim,
+                y_coords=spatial.northing if spatial else None,
+                x_coords=spatial.easting if spatial else None,
+                model_version=model_version,
+                n_tiles=len(chunks),
+            )
+            if conv_attrs:
+                root.attrs.update(conv_attrs)
 
-        if manifest:
-            root.attrs["_manifest"] = manifest.to_dict()
-            _log.info("Wrote _manifest to %s", output_path)
+            if manifest:
+                root.attrs["_manifest"] = manifest.to_dict()
+                _log.info("Wrote _manifest to %s", output_path)
 
-        # Merge time_windows: combine previously-snapshotted entries with the
-        # current window, then write back to root attrs. This ensures each
-        # appended time step retains its provenance.
-        if time_window:
-            window_meta: dict[str, list[str]] = {
-                "range": [
-                    f"{time_window.window_start[0]}-{time_window.window_start[1]:02d}",
-                    f"{time_window.window_end[0]}-{time_window.window_end[1]:02d}",
-                ],
-            }
-            prev_time_windows[time_window.window_end_label] = window_meta
-            root.attrs["time_windows"] = prev_time_windows
-            root.attrs["time_convention"] = "12mo_window_end"
+            # Merge time_windows: combine previously-snapshotted entries with the
+            # current window, then write back to root attrs. This ensures each
+            # appended time step retains its provenance.
+            if time_window:
+                window_meta: dict[str, list[str]] = {
+                    "range": [
+                        f"{time_window.window_start[0]}-{time_window.window_start[1]:02d}",
+                        f"{time_window.window_end[0]}-{time_window.window_end[1]:02d}",
+                    ],
+                }
+                prev_time_windows[time_window.window_end_label] = window_meta
+                root.attrs["time_windows"] = prev_time_windows
+                root.attrs["time_convention"] = "12mo_window_end"
 
-        session.commit(f"Run {run_id}: {len(chunks)} chunks assembled")
+            session.commit(f"Run {run_id}: {len(chunks)} chunks assembled")
         _log.info("Assembly complete: %s", output_path)
         return output_path
 
