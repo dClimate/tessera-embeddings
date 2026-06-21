@@ -42,14 +42,15 @@ logger = logging.getLogger(__name__)
 # Host-RAM budget (bytes) for the resident S2 *input* working set of a single
 # strip. The 1-deep strip prefetch keeps two band strips resident at once (plus
 # the shared full-chunk SCL mask, charged against this budget too), so the real
-# ceiling is on the *pair*: 4.0 GB/strip => an 8 GB pair. The remaining headroom
-# on the default 16 GB worker box must absorb the non-S2 resident set the sizer
-# does not model — the SAR stack (no cheap pre-read count, so it can spike on
-# dense-S1 chunks), the whole-chunk int8 embedding + scale buffers, and the
-# model (~4 GB combined on the densest chunks). 4.0 GB/strip was determined
-# empirically to be as high as we can safely go: above it, a chunk at the
-# single-strip ceiling with near-max SAR density crosses the 95% OOM line.
-_S2_STRIP_BYTE_BUDGET = int(4.0 * 1024**3)
+# ceiling is on the *pair*: 7.0 GB/strip => a 14 GB pair. The remaining headroom
+# on the 32 GB g6e.xlarge worker box must absorb the non-S2 resident set the
+# sizer does not model — the SAR stack (no cheap pre-read count, so it can spike
+# on dense-S1 chunks), the whole-chunk int8 embedding + scale buffers, and the
+# model (~4 GB combined on the densest chunks). 7.0 GB/strip raises the prior
+# 4.0 GB ceiling with the move from the 16 GB g5.xlarge box to the 32 GB
+# g6e.xlarge, but stops short of a full 2x: 4.0 GB was already OOMing on the
+# 16 GB box, so the doubled-box budget keeps a deliberate ~4 GB cushion.
+_S2_STRIP_BYTE_BUDGET = int(7.0 * 1024**3)
 
 # Per-(timestep, pixel) byte cost of resident S2 bands: 10 bands x uint16.
 _S2_BYTES_PER_OBS_PX = len(S2_BAND_ORDER) * 2
