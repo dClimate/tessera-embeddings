@@ -411,15 +411,42 @@ def open_or_create_repo(
 # =============================================================================
 
 
+# Sentinel: caller did not pass ``chunks``, so let ``xr.open_zarr`` apply its own
+# default (one dask block per on-disk chunk). Distinct from ``chunks=None``, which
+# is a real, meaningful value (open zarr-lazy with no dask graph).
+class _ChunksUnset:
+    pass
+
+
+_CHUNKS_UNSET = _ChunksUnset()
+
+# Accepted ``chunks`` values, mirroring ``xr.open_zarr``: a per-dimension mapping,
+# a uniform block size, ``"auto"``, or ``None`` (no dask graph).
+type ChunksArg = dict | int | str | None | _ChunksUnset
+
+
 def _open_readonly(
     store_path: str,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
+    chunks: "ChunksArg" = _CHUNKS_UNSET,
 ) -> xr.Dataset:
-    """Open store for reading. Returns xarray Dataset."""
+    """Open store for reading. Returns xarray Dataset.
+
+    ``chunks`` is forwarded to :func:`xarray.open_zarr` only when set; the default
+    builds one dask task per on-disk chunk — fine for tile-scale stores, but on a
+    CONUS-scale embeddings store the band axis alone is 32 chunks and the graph is
+    ``n_time x n_y x n_x x 32`` tasks, large enough that even a lazy ``isel``/``sel``
+    OOMs while manipulating the graph. Pass ``chunks=None`` to open zarr-lazy with
+    no dask graph: slicing is then pure metadata and chunks are read only when
+    ``.values`` is pulled — the right choice for interactive or selective reads of
+    large stores.
+    """
     repo = _open_repo(store_path, get_credentials=get_credentials, region=region)
     session = repo.readonly_session(branch="main")
-    return xr.open_zarr(session.store, consolidated=False)
+    if isinstance(chunks, _ChunksUnset):
+        return xr.open_zarr(session.store, consolidated=False)
+    return xr.open_zarr(session.store, consolidated=False, chunks=chunks)
 
 
 @cleanup_on_failure
@@ -587,9 +614,13 @@ def _write_regions(
 # =============================================================================
 
 
-def open_store(store_path: str) -> xr.Dataset:
-    """Open an Icechunk store for reading as an xarray Dataset."""
-    return _open_readonly(store_path)
+def open_store(store_path: str, chunks: "ChunksArg" = _CHUNKS_UNSET) -> xr.Dataset:
+    """Open an Icechunk store for reading as an xarray Dataset.
+
+    Pass ``chunks=None`` for large (e.g. CONUS-scale) stores to skip the dask
+    task graph and slice lazily on metadata alone — see :func:`_open_readonly`.
+    """
+    return _open_readonly(store_path, chunks=chunks)
 
 
 def open_store_as_zarr_group(store_path: str) -> zarr.Group:
