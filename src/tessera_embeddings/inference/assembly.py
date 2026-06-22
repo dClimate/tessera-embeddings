@@ -1081,8 +1081,8 @@ class ZarrWriter:
     ) -> None:
         """Delete the staging directory for a completed run.
 
-        Local paths are removed with ``shutil.rmtree``.
-        S3 paths are removed with ``s5cmd rm``.
+        S3 paths are removed with ``s5cmd rm``, falling back to fsspec's
+        ``rm`` if s5cmd is unavailable or fails. Non-S3 paths use fsspec.
 
         Args:
             run_id: Run identifier whose staging artifacts should be deleted.
@@ -1092,6 +1092,16 @@ class ZarrWriter:
         target = f"{self.staging_base}/{run_id}"
 
         _log.info("Cleaning up staging: %s", target)
+
+        # For S3, prefer s5cmd: it deletes far faster than fsspec's per-key
+        # serial DELETEs. Fall back to fsspec if s5cmd is unavailable or errors.
+        if fsspec.utils.get_protocol(target) == "s3":
+            try:
+                _s5cmd_rm(target, _log)
+                return
+            except (FileNotFoundError, RuntimeError) as exc:
+                _log.warning("s5cmd cleanup of %s failed (%s) — falling back to fsspec", target, exc)
+
         try:
             fs = _fs_for(target)
             if fs.exists(target):
