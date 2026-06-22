@@ -162,7 +162,7 @@ def _s5cmd_rm(s3_url: str, log: logging.Logger | logging.LoggerAdapter[logging.L
         FileNotFoundError: If the s5cmd binary is not on PATH.
         RuntimeError: If s5cmd exits with a non-zero status.
     """
-    cmd = ["s5cmd", "rm", f"{s3_url.rstrip('/')}/*"]
+    cmd = ["s5cmd", "--numworkers", "1024", "rm", f"{s3_url.rstrip('/')}/*"]
     log.info("Running: %s", " ".join(cmd))
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
