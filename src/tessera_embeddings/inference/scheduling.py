@@ -68,7 +68,6 @@ class ActorPool:
         self._get_credentials = get_credentials
 
         self.actor_deaths: int = 0
-        self.max_actor_deaths: int = len(actors)
 
         # ref → (chunk_label, actor_idx)
         self.pending: dict[ray.ObjectRef, tuple[str, int]] = {}
@@ -92,6 +91,16 @@ class ActorPool:
     def live_count(self) -> int:
         """Number of non-retired actor slots."""
         return len(self.actors) - len(self._retired)
+
+    @property
+    def max_actor_deaths(self) -> int:
+        """Death count that signals a systemic failure.
+
+        Tracks the current pool size so the threshold scales as later batches
+        of actors are added — a fixed batch-1 count would trip the alarm far
+        too early on a large fleet built up incrementally.
+        """
+        return len(self.actors)
 
     # ------------------------------------------------------------------
     # Instance-ID resolution
@@ -251,6 +260,24 @@ class ActorPool:
         self._pending_iid_refs[actor_idx] = self.actors[actor_idx].get_instance_id.remote()  # type: ignore[union-attr]
         self.actor_instance_ids[actor_idx] = placeholder_iid
         self._initializing.add(actor_idx)
+
+    def add_actors(self, new_actors: list[ray.actor.ActorHandle]) -> None:
+        """Append a freshly-requested batch of actors to the pool.
+
+        Each new slot is marked initializing (with a non-blocking
+        ``get_instance_id`` fetch) so it flows into ``dispatch_idle`` once its
+        ``__init__`` completes — exactly like the late-joining actors from the
+        first batch. Called only from the single-threaded work-stealing loop,
+        so no locking is required.
+
+        Args:
+            new_actors: Newly created actor handles to add to the pool.
+        """
+        for actor in new_actors:
+            idx = len(self.actors)
+            self.actors.append(actor)
+            self.actor_instance_ids.append("pending-init")
+            self.mark_initializing(idx)
 
     def replace(self, actor_idx: int, instance_id: str) -> None:
         """Spawn a replacement actor for a dead slot and log the death count.
@@ -425,6 +452,54 @@ def _poll_tracker(
         log.debug("Tracker poll failed (non-fatal): %s", exc)
 
 
+def _batch_actors_to_request(
+    *,
+    requested: int,
+    target: int,
+    outstanding: int,
+    alive_gpu_nodes: int,
+    secs_since_last_batch: float,
+    placement_timeout_sec: float,
+    batch_size: int,
+    placement_tolerance: int = 2,
+) -> tuple[int, bool]:
+    """Decide how many actors to request for the next batch.
+
+    Pure decision function (no Ray calls) so the gate can be unit-tested in
+    isolation. The next batch is requested once the prior batch's instances
+    have joined the cluster (placement), or once placement has timed out so a
+    capacity shortfall can't gate every remaining batch forever.
+
+    Args:
+        requested: Actors requested so far (``len(pool.actors)``).
+        target: Total actors the run should eventually reach.
+        outstanding: In-flight + queued chunks. Caps requests so we don't
+            provision more actors than there is work left.
+        alive_gpu_nodes: GPU nodes currently joined to the cluster.
+        secs_since_last_batch: Seconds since the last batch was requested.
+        placement_timeout_sec: Placement-wait escape hatch.
+        batch_size: Actors per batch.
+        placement_tolerance: Stragglers tolerated before the prior batch counts
+            as placed, so one slow instance doesn't gate the next request.
+
+    Returns:
+        ``(n, timed_out)`` — number of actors to request (0 = none) and whether
+        the placement timeout (rather than placement itself) allowed it. The
+        flag is only meaningful when ``n > 0``; the caller uses it for logging.
+    """
+    if requested >= target:
+        return 0, False
+    # Don't over-provision: once the pool already holds at least as many actors
+    # as there is work left, no further batches are needed.
+    if requested >= outstanding:
+        return 0, False
+    placed = alive_gpu_nodes >= requested - placement_tolerance
+    timed_out = secs_since_last_batch > placement_timeout_sec
+    if not (placed or timed_out):
+        return 0, False
+    return min(batch_size, target - requested), (timed_out and not placed)
+
+
 # ---------------------------------------------------------------------------
 # Main scheduler
 # ---------------------------------------------------------------------------
@@ -446,6 +521,9 @@ def _process_chunks_work_stealing(
     still_initializing: set[int] | None = None,
     on_actor_retire: Callable[[str], None] | None = None,
     get_credentials: Callable[[], Any] | None = None,
+    actor_factory: Callable[[int], list[ray.actor.ActorHandle]] | None = None,
+    total_actors_target: int | None = None,
+    placement_timeout_sec: float = 300.0,
 ) -> list[dict]:
     """Process chunks with dynamic work-stealing across actors.
 
@@ -476,6 +554,18 @@ def _process_chunks_work_stealing(
             Used to consistently and swiftly terminate EC2 instances and save compute costs
         get_credentials: Optional icechunk S3 credential provider injected into
             every actor (seeded and replacement) so store opens refresh creds.
+        actor_factory: Optional callable ``(n) -> [handles]`` that requests ``n``
+            new actors. When provided (with ``total_actors_target``), the loop
+            requests actors in batches: the caller supplies the first batch, and
+            subsequent batches are requested here once the prior batch's
+            instances have joined the cluster. ``None`` disables batching — the
+            caller's ``actors`` list is the whole fleet.
+        total_actors_target: Total actors the run should eventually reach. The
+            loop stops requesting once ``len(pool.actors)`` reaches this. Ignored
+            when ``actor_factory`` is None.
+        placement_timeout_sec: Max seconds to wait for a batch's instances to be
+            placed before requesting the next batch anyway (capacity-shortfall
+            escape hatch).
 
     Returns:
         List of result dicts (status, chunk label, timing, etc.).
@@ -502,6 +592,44 @@ def _process_chunks_work_stealing(
     last_log_count = 0
     stall_threshold_sec = 300.0
     max_simultaneous_stalls = max(3, len(actors) // 10)
+
+    # --- Actor-batch requesting ---
+    # When batching is enabled the caller supplies only the first batch of
+    # actors; the loop requests the rest here, pacing the demand the autoscaler
+    # forwards to AWS. The gate is placement (instances joined as GPU nodes),
+    # not readiness, so a slow checkpoint load never stalls the next AWS ask.
+    batching_enabled = (
+        actor_factory is not None and total_actors_target is not None and config.actor_request_batch_size > 0
+    )
+    last_batch_at = time.monotonic()
+
+    def _maybe_request_next_batch() -> None:
+        nonlocal last_batch_at
+        if not batching_enabled:
+            return
+        assert actor_factory is not None and total_actors_target is not None  # narrowed by batching_enabled
+        alive_gpu_nodes = sum(1 for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) > 0)
+        n, timed_out = _batch_actors_to_request(
+            requested=len(pool.actors),
+            target=total_actors_target,
+            outstanding=len(pool.pending) + len(chunk_queue),
+            alive_gpu_nodes=alive_gpu_nodes,
+            secs_since_last_batch=time.monotonic() - last_batch_at,
+            placement_timeout_sec=placement_timeout_sec,
+            batch_size=config.actor_request_batch_size,
+        )
+        if n == 0:
+            return
+        pool.add_actors(actor_factory(n))
+        last_batch_at = time.monotonic()
+        log.info(
+            "Requested actor batch: +%d (%d/%d total, %d GPU nodes placed)%s",
+            n,
+            len(pool.actors),
+            total_actors_target,
+            alive_gpu_nodes,
+            " — placement timed out, requesting anyway" if timed_out else "",
+        )
 
     # --- Main work-stealing loop ---
     # Runs while there is in-flight work OR queued chunks waiting for
@@ -584,9 +712,12 @@ def _process_chunks_work_stealing(
             if chunk_queue and actor_idx not in pool._initializing:
                 pool.submit(actor_idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker)
 
-        # Check if any initializing actors have finished __init__ and can
-        # start receiving work, then dispatch queued chunks to all idle
-        # actors, then retire actors idle past the grace period.
+        # Request the next actor batch if the prior batch has been placed (or
+        # placement timed out), then check if any initializing actors have
+        # finished __init__ and can start receiving work, then dispatch queued
+        # chunks to all idle actors, then retire actors idle past the grace
+        # period.
+        _maybe_request_next_batch()
         pool.resolve_initializing()
         pool.dispatch_idle(chunk_queue, mosaic_base, staging_base, run_id, tracker)
         pool.retire_idle(len(pool.pending) + len(chunk_queue))

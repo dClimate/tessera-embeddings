@@ -118,7 +118,23 @@ def run_inference(
     )
     t_actors = time.monotonic()
     actor_cls = InferenceActor.options(num_gpus=config.num_gpus)  # type: ignore[attr-defined]
-    actors = [actor_cls.remote(config, config.checkpoint_path, get_credentials) for _ in range(num_actors)]
+
+    def actor_factory(n: int) -> list[ray.actor.ActorHandle]:
+        """Request ``n`` new inference actors (one .remote() each)."""
+        return [actor_cls.remote(config, config.checkpoint_path, get_credentials) for _ in range(n)]
+
+    # Request the first batch up front; the work-stealing scheduler requests
+    # the rest as instances are placed (see scheduling._maybe_request_next_batch).
+    # batch_size <= 0 disables batching: request the whole fleet at once.
+    batch_size = config.actor_request_batch_size
+    first_batch = min(batch_size, num_actors) if batch_size > 0 else num_actors
+    actors = actor_factory(first_batch)
+    if batch_size > 0 and first_batch < num_actors:
+        log.info(
+            "Actor batching enabled: requesting %d at a time (batch 1/%d actors now)",
+            batch_size,
+            num_actors,
+        )
     progress_tracker: ray.actor.ActorHandle | None = None
     try:
         # Start as soon as a single actor is live. Cloud providers roll out
@@ -128,7 +144,7 @@ def run_inference(
         min_required = 1
         log.info("Waiting for actors to initialize (need at least %d / %d)...", min_required, num_actors)
         actors, actor_instance_ids, still_initializing = wait_for_actors(
-            actors, num_actors, min_required, t_actors, log
+            actors, len(actors), min_required, t_actors, log
         )
 
         # --- Process chunks with work-stealing ---
@@ -161,6 +177,9 @@ def run_inference(
             still_initializing=still_initializing,
             on_actor_retire=on_actor_retire,
             get_credentials=get_credentials,
+            actor_factory=actor_factory,
+            total_actors_target=num_actors,
+            placement_timeout_sec=config.actor_batch_placement_timeout_sec,
         )
     finally:
         log.info("Killing %d actors to release resource reservations", len(actors))
