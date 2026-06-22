@@ -580,6 +580,8 @@ class TestBatchActorsToRequest:
             target=200,
             outstanding=200,
             alive_gpu_nodes=50,
+            nodes_at_last_batch=0,
+            last_batch_size=50,
             secs_since_last_batch=1.0,
             placement_timeout_sec=300.0,
             batch_size=50,
@@ -596,7 +598,7 @@ class TestBatchActorsToRequest:
         assert self._call(requested=200, target=200) == (0, False)
 
     def test_no_request_when_prior_batch_not_placed(self) -> None:
-        # Only 40 of the requested 50 instances have joined the cluster.
+        # Only 40 of the last batch's 50 instances have joined the cluster.
         assert self._call(requested=50, alive_gpu_nodes=40) == (0, False)
 
     def test_straggler_within_tolerance_still_placed(self) -> None:
@@ -616,6 +618,27 @@ class TestBatchActorsToRequest:
     def test_no_request_when_pool_covers_outstanding_work(self) -> None:
         # Only 30 chunks left but 50 actors already requested — don't over-provision.
         assert self._call(requested=50, outstanding=30) == (0, False)
+
+    def test_partial_final_batch_clamped_to_outstanding_work(self) -> None:
+        # 50 actors requested, only 60 chunks left: request 10, not a full
+        # batch of 50 (which would grow the pool to 100 for 60 chunks).
+        n, _ = self._call(requested=50, outstanding=60, target=200, alive_gpu_nodes=50)
+        assert n == 10
+
+    def test_placement_measured_incrementally_after_timeout(self) -> None:
+        # First batch (50) timed out with only 40 placed; a later batch grew the
+        # pool to 100 and those instances joined (90 nodes total). The increment
+        # since the last batch (90 - 40 = 50) covers that batch's 50 actors, so
+        # placement is satisfied even though 90 < 100 - tolerance cumulatively.
+        n, timed_out = self._call(
+            requested=100,
+            outstanding=200,
+            alive_gpu_nodes=90,
+            nodes_at_last_batch=40,
+            last_batch_size=50,
+        )
+        assert n == 50
+        assert timed_out is False
 
 
 # ===========================================================================

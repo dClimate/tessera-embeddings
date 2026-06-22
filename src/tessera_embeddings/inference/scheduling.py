@@ -458,6 +458,8 @@ def _batch_actors_to_request(
     target: int,
     outstanding: int,
     alive_gpu_nodes: int,
+    nodes_at_last_batch: int,
+    last_batch_size: int,
     secs_since_last_batch: float,
     placement_timeout_sec: float,
     batch_size: int,
@@ -470,12 +472,23 @@ def _batch_actors_to_request(
     have joined the cluster (placement), or once placement has timed out so a
     capacity shortfall can't gate every remaining batch forever.
 
+    Placement is measured *incrementally* — as nodes joined since the last
+    batch was requested, relative to that batch's size — rather than against
+    the cumulative requested count. This keeps a single timed-out partial batch
+    from permanently gating every later batch on the timeout path: once a
+    subsequent batch places, its increment satisfies the check even though the
+    earlier shortfall is never made up.
+
     Args:
         requested: Actors requested so far (``len(pool.actors)``).
         target: Total actors the run should eventually reach.
         outstanding: In-flight + queued chunks. Caps requests so we don't
             provision more actors than there is work left.
         alive_gpu_nodes: GPU nodes currently joined to the cluster.
+        nodes_at_last_batch: GPU nodes that were joined when the last batch was
+            requested. The baseline for the incremental placement check.
+        last_batch_size: Number of actors in the last batch requested. The
+            increment expected to join before the prior batch counts as placed.
         secs_since_last_batch: Seconds since the last batch was requested.
         placement_timeout_sec: Placement-wait escape hatch.
         batch_size: Actors per batch.
@@ -493,11 +506,13 @@ def _batch_actors_to_request(
     # as there is work left, no further batches are needed.
     if requested >= outstanding:
         return 0, False
-    placed = alive_gpu_nodes >= requested - placement_tolerance
+    placed = alive_gpu_nodes - nodes_at_last_batch >= last_batch_size - placement_tolerance
     timed_out = secs_since_last_batch > placement_timeout_sec
     if not (placed or timed_out):
         return 0, False
-    return min(batch_size, target - requested), (timed_out and not placed)
+    # Clamp to both the remaining target and the remaining work, so a partial
+    # final batch never over-provisions actors past what's left to do.
+    return min(batch_size, target - requested, outstanding - requested), (timed_out and not placed)
 
 
 # ---------------------------------------------------------------------------
@@ -591,7 +606,16 @@ def _process_chunks_work_stealing(
     results: list[dict] = []
     last_log_count = 0
     stall_threshold_sec = 300.0
-    max_simultaneous_stalls = max(3, len(actors) // 10)
+
+    # Stall threshold scales with the eventual fleet size, not just the first
+    # batch. With batching, ``actors`` holds only the initial subset, so a
+    # threshold frozen at batch-1/10 would abort a large run after a handful of
+    # stalls even once later batches join. Recomputed each iteration (see loop)
+    # against the larger of the current pool and the target so it tracks the
+    # pool as it grows.
+    def _stall_threshold() -> int:
+        fleet = max(len(pool.actors), total_actors_target or 0)
+        return max(3, fleet // 10)
 
     # --- Actor-batch requesting ---
     # When batching is enabled the caller supplies only the first batch of
@@ -602,9 +626,16 @@ def _process_chunks_work_stealing(
         actor_factory is not None and total_actors_target is not None and config.actor_request_batch_size > 0
     )
     last_batch_at = time.monotonic()
+    # Placement baseline for the incremental check in _batch_actors_to_request:
+    # the GPU-node count and size of the most recently requested batch. The
+    # first batch was already requested by the caller, so seed last_batch_size
+    # from the pool we were handed; nodes_at_last_batch starts at 0 because no
+    # GPU nodes are guaranteed present before the first batch is placed.
+    nodes_at_last_batch = 0
+    last_batch_size = len(pool.actors)
 
     def _maybe_request_next_batch() -> None:
-        nonlocal last_batch_at
+        nonlocal last_batch_at, nodes_at_last_batch, last_batch_size
         if not batching_enabled:
             return
         assert actor_factory is not None and total_actors_target is not None  # narrowed by batching_enabled
@@ -614,6 +645,8 @@ def _process_chunks_work_stealing(
             target=total_actors_target,
             outstanding=len(pool.pending) + len(chunk_queue),
             alive_gpu_nodes=alive_gpu_nodes,
+            nodes_at_last_batch=nodes_at_last_batch,
+            last_batch_size=last_batch_size,
             secs_since_last_batch=time.monotonic() - last_batch_at,
             placement_timeout_sec=placement_timeout_sec,
             batch_size=config.actor_request_batch_size,
@@ -622,6 +655,8 @@ def _process_chunks_work_stealing(
             return
         pool.add_actors(actor_factory(n))
         last_batch_at = time.monotonic()
+        nodes_at_last_batch = alive_gpu_nodes
+        last_batch_size = n
         log.info(
             "Requested actor batch: +%d (%d/%d total, %d GPU nodes placed)%s",
             n,
@@ -647,7 +682,7 @@ def _process_chunks_work_stealing(
         # Poll tracker on every iteration (including timeouts with no completions)
         # so stall detection stays responsive.
         if tracker:
-            _poll_tracker(tracker, len(results), n_total, stall_threshold_sec, max_simultaneous_stalls, log)
+            _poll_tracker(tracker, len(results), n_total, stall_threshold_sec, _stall_threshold(), log)
 
         # --- Handle completed (or failed) chunks ---
         for ref in ready_refs:
