@@ -417,6 +417,22 @@ general-purpose codecs. The tradeoff is that PCodec decompresses the entire on-d
 to read any slice of it (no partial decode), which is why staged chunks use 500×500
 sub-chunks to cap decode buffer size.
 
+**Reading the output store.** On a CONUS-scale store, open with `chunks=None` for
+interactive or selective reads:
+
+```python
+ds = open_store(store_path, chunks=None)   # or xr.open_zarr(session.store, consolidated=False, chunks=None)
+ds.isel(time=0).sel(northing=slice(...), easting=slice(...)).embeddings.values
+```
+
+The default chunking builds one dask task per on-disk chunk. With 500×500×4
+sub-chunks the band axis alone is 32 chunks (128/4), so the graph is
+`n_time × n_y × n_x × 32` tasks — large enough at CONUS extent that even a *lazy*
+`isel`/`sel` OOMs while manipulating the graph, before any chunk data is read.
+`chunks=None` opens the store zarr-lazy with no dask graph: slicing is pure
+metadata and chunks load only when `.values` is pulled. This is unrelated to
+manifest splitting — the split bounds commit/manifest cost, not the dask graph.
+
 ---
 
 ## Fault Tolerance
