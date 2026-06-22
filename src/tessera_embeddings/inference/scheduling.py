@@ -16,7 +16,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import cast
+from typing import Any, cast
 
 import ray
 
@@ -42,6 +42,7 @@ class ActorPool:
         *,
         idle_grace_sec: int = 120,
         on_retire: Callable[[str], None] | None = None,
+        get_credentials: Callable[[], Any] | None = None,
     ) -> None:
         """Initialise the pool from already-ready actor handles.
 
@@ -54,6 +55,9 @@ class ActorPool:
             on_retire: Optional callback invoked with the EC2 instance ID after
                 an idle actor is killed. Used to terminate the underlying EC2
                 instance immediately rather than waiting for the autoscaler.
+            get_credentials: Optional icechunk S3 credential provider injected
+                into every actor (including replacements) so store opens refresh
+                credentials. See :class:`InferenceActor`.
         """
         self.actors = actors
         self.actor_instance_ids = actor_instance_ids
@@ -61,6 +65,7 @@ class ActorPool:
         self.log = log
         self.idle_grace_sec = idle_grace_sec
         self._on_retire = on_retire
+        self._get_credentials = get_credentials
 
         self.actor_deaths: int = 0
         self.max_actor_deaths: int = len(actors)
@@ -280,7 +285,9 @@ class ActorPool:
                 self.actor_deaths,
             )
 
-        new_actor = InferenceActor.remote(self.config, self.config.checkpoint_path)  # type: ignore[attr-defined]
+        new_actor = InferenceActor.remote(  # type: ignore[attr-defined]
+            self.config, self.config.checkpoint_path, self._get_credentials
+        )
         self.actors[actor_idx] = new_actor
         self.mark_initializing(actor_idx, placeholder_iid=f"pending-replacement-of-{instance_id}")
 
@@ -438,6 +445,7 @@ def _process_chunks_work_stealing(
     max_chunk_retries: int = 2,
     still_initializing: set[int] | None = None,
     on_actor_retire: Callable[[str], None] | None = None,
+    get_credentials: Callable[[], Any] | None = None,
 ) -> list[dict]:
     """Process chunks with dynamic work-stealing across actors.
 
@@ -466,6 +474,9 @@ def _process_chunks_work_stealing(
             will pick up work via ``dispatch_idle`` once they come online.
         on_actor_retire: Callback to be triggered when the actor is removed from the pool.
             Used to consistently and swiftly terminate EC2 instances and save compute costs
+        get_credentials: Optional icechunk S3 credential provider injected into
+            every actor (seeded and replacement) so store opens refresh creds.
+
     Returns:
         List of result dicts (status, chunk label, timing, etc.).
     """
@@ -473,7 +484,9 @@ def _process_chunks_work_stealing(
     n_total = len(chunk_queue)
     chunk_by_label = {c.label: c for c in chunks}
 
-    pool = ActorPool(actors, actor_instance_ids, config, log, on_retire=on_actor_retire)
+    pool = ActorPool(
+        actors, actor_instance_ids, config, log, on_retire=on_actor_retire, get_credentials=get_credentials
+    )
 
     # Mark actors that haven't finished __init__ yet. seed() skips them —
     # they'll receive work via dispatch_idle once resolve_initializing

@@ -104,6 +104,22 @@ before work is dispatched.
 > **Why NVMe?** EBS sequential read saturates at ~42 MB/s. `torch.load` with mmap on EBS
 > causes multi-minute hangs. NVMe is ~35× faster.
 
+**Icechunk credentials (injected, not imported).** `InferenceActor` takes a `get_credentials`
+callback and wraps each `process_chunk` in `storage.zarr_store.credentials_provider(...)`, so
+every store open resolves through it. The AWS-aware orchestration layer injects
+`providers.aws.credentials.iam_icechunk_credentials` (threaded
+runner → scheduling → actor, including replacement actors); the actor itself imports no AWS
+module so `inference/` stays domain-pure (enforced by `tests/architecture`). With no callback
+injected (local/dev runs) icechunk uses its default credential chain.
+
+This matters because long-lived actors outlive the credential resolved at startup. The Rust
+SDK's default chain resolves the instance-profile credential once and may fail to refresh it;
+when it lapses, the failing chunk **and every subsequent chunk on that actor** error with
+`no providers in chain provided credentials`. Routing through `iam_icechunk_credentials`
+(botocore-backed, self-refreshing) fixes this — but note the IMDS-throttling gotcha documented
+in `ingest/README.md`: `_resolve_iam_credentials` must stay `lru_cache`d so the callback's
+15-min re-invocation does **not** trigger a cold IMDS resolve each time.
+
 ### 4. Per-Chunk Inference (inside each actor)
 
 Each chunk goes through four sub-steps:
