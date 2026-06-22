@@ -280,14 +280,20 @@ class ActorPool:
             self.mark_initializing(idx)
 
     def replace(self, actor_idx: int, instance_id: str) -> None:
-        """Spawn a replacement actor for a dead slot and log the death count.
+        """Kill the actor in a slot and spawn a replacement; log the death count.
 
         Fires a non-blocking get_instance_id.remote() so the new EC2 instance
         ID is resolved lazily before the next dispatch or error report.
 
+        The outgoing actor is killed before being replaced. On a process death
+        (OOM, segfault) that ``ray.kill`` is a no-op — the actor is already gone.
+        When the actor instead caught its error internally and is still alive
+        (e.g. a sporadic CUDA error reported as ``status="failed"``), the kill is
+        what actually removes the wedged worker so it can't pick up more chunks.
+
         Args:
-            actor_idx: Slot index of the dead actor.
-            instance_id: Instance ID of the actor that died (for log context).
+            actor_idx: Slot index of the actor to replace.
+            instance_id: Instance ID of the actor being replaced (for log context).
         """
         self.actor_deaths += 1
         if self.actor_deaths >= self.max_actor_deaths:
@@ -311,6 +317,12 @@ class ActorPool:
                 instance_id,
                 self.actor_deaths,
             )
+
+        # Kill the outgoing actor before replacing the slot. A no-op if it
+        # already died; the actual removal when it caught its error and is still
+        # live (so a chunk-failing actor never gets handed another chunk).
+        with contextlib.suppress(Exception):
+            ray.kill(self.actors[actor_idx])
 
         new_actor = InferenceActor.remote(  # type: ignore[attr-defined]
             self.config, self.config.checkpoint_path, self._get_credentials
@@ -546,9 +558,13 @@ def _process_chunks_work_stealing(
     to whichever actor finishes first. This naturally load-balances: fast
     actors cycle through more chunks, slow actors hold fewer.
 
-    If an actor dies (OOM), a replacement is created and the failed chunk is
-    re-queued up to ``max_chunk_retries`` times. This prevents a single transient
-    failure from killing a multi-hour GPU run.
+    When a chunk fails — whether the actor process died (OOM, segfault) or the
+    actor caught its own error and returned ``status="failed"`` (e.g. a sporadic
+    CUDA error) — the failing actor is killed and replaced and the chunk is
+    re-queued up to ``max_chunk_retries`` times so the retry lands on a healthy
+    worker. Killing on every failure (not just death) keeps an actor that has
+    started failing, which tends to keep failing, from being handed more chunks.
+    This prevents a single transient failure from killing a multi-hour GPU run.
 
     Args:
         actors: List of ready Ray actor handles.
@@ -666,6 +682,66 @@ def _process_chunks_work_stealing(
             " — placement timed out, requesting anyway" if timed_out else "",
         )
 
+    def _handle_failure(chunk_label: str, actor_idx: int, error: str) -> None:
+        """Retry a failed chunk on a different worker and kill the failing actor.
+
+        Shared by both failure modes: an actor whose process died (ray.get
+        raised) and an actor that caught its own error and returned
+        status="failed" while still alive. In both cases the chunk is re-queued
+        up to ``max_chunk_retries`` times and the actor is killed + replaced, so
+        the retry lands on a healthy worker and the failing one — which tends to
+        keep failing on subsequent chunks — is taken out of rotation.
+
+        Args:
+            chunk_label: Label of the chunk that failed.
+            actor_idx: Slot of the actor that failed it.
+            error: Error string (from the exception or the failed result dict).
+        """
+        if tracker:
+            tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
+        pool.resolve_iid(actor_idx)
+        instance_id = pool.actor_instance_ids[actor_idx]
+        attempts = pool.chunk_attempts.get(chunk_label, 1)
+        # attempts starts at 1 on first submission, so max_chunk_retries=2
+        # means first try + 2 re-queues = 3 total attempts.
+        if attempts <= max_chunk_retries:
+            log.warning(
+                "Chunk %s FAILED on instance %s (actor %d, attempt %d/%d): %s — re-queuing",
+                chunk_label,
+                instance_id,
+                actor_idx,
+                attempts,
+                max_chunk_retries,
+                error,
+            )
+            chunk_queue.append(chunk_by_label[chunk_label])
+        else:
+            log.error(
+                "Chunk %s PERMANENTLY FAILED on instance %s (actor %d, attempt %d/%d): %s",
+                chunk_label,
+                instance_id,
+                actor_idx,
+                attempts,
+                max_chunk_retries,
+                error,
+            )
+            results.append(
+                {
+                    "chunk": chunk_label,
+                    "status": "failed",
+                    "error": error,
+                    "instance_id": instance_id,
+                    "attempts": attempts,
+                }
+            )
+
+        # Query CloudWatch for resource telemetry leading up to the failure
+        log_worker_failure_diagnostic(instance_id, chunk_label, error, log)
+
+        # Kill the failing actor and spawn a replacement (queues Ray init in
+        # the background). The kill is a no-op if the actor process already died.
+        pool.replace(actor_idx, instance_id)
+
     # --- Main work-stealing loop ---
     # Runs while there is in-flight work OR queued chunks waiting for
     # initializing actors to come online.
@@ -689,61 +765,32 @@ def _process_chunks_work_stealing(
             chunk_label, actor_idx = pool.pending.pop(ref)
 
             try:
-                # Success path: collect result, clear tracker entry
                 result = ray.get(ref)
-                results.append(result)
-                if tracker:
-                    tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
-                pool._initializing.discard(actor_idx)
             except Exception as e:
-                # Failure path: resolve instance ID for error context, then
-                # either re-queue the chunk or mark it permanently failed.
-                if tracker:
-                    tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
-                pool.resolve_iid(actor_idx)
-                instance_id = pool.actor_instance_ids[actor_idx]
-                attempts = pool.chunk_attempts.get(chunk_label, 1)
-                # attempts starts at 1 on first submission, so max_chunk_retries=2
-                # means first try + 2 re-queues = 3 total attempts.
-                if attempts <= max_chunk_retries:
-                    log.warning(
-                        "Chunk %s FAILED on instance %s (actor %d, attempt %d/%d): %s — re-queuing",
-                        chunk_label,
-                        instance_id,
-                        actor_idx,
-                        attempts,
-                        max_chunk_retries,
-                        e,
-                    )
-                    chunk_queue.append(chunk_by_label[chunk_label])
+                # The actor process died (OOM, segfault, CUDA process abort) so
+                # ray.get raised. Stringify and route through the same handling
+                # as an actor that caught its own error and returned "failed".
+                _handle_failure(chunk_label, actor_idx, str(e))
+            else:
+                # ray.get succeeded, but the actor catches its own exceptions and
+                # returns status="failed" rather than raising (see actors.py). A
+                # sporadic CUDA error arrives this way with the actor still alive,
+                # so failed results take the same kill-and-retry path as a death —
+                # otherwise the chunk would never retry and the wedged actor, which
+                # tends to keep failing, would be handed the next chunk below.
+                if result.get("status") == "failed":
+                    _handle_failure(chunk_label, actor_idx, str(result.get("error", "unknown")))
                 else:
-                    log.error(
-                        "Chunk %s PERMANENTLY FAILED on instance %s (actor %d, attempt %d/%d): %s",
-                        chunk_label,
-                        instance_id,
-                        actor_idx,
-                        attempts,
-                        max_chunk_retries,
-                        e,
-                    )
-                    results.append(
-                        {
-                            "chunk": chunk_label,
-                            "status": "failed",
-                            "error": str(e),
-                            "instance_id": instance_id,
-                            "attempts": attempts,
-                        }
-                    )
-
-                # Query CloudWatch for resource telemetry leading up to the failure
-                log_worker_failure_diagnostic(instance_id, chunk_label, str(e), log)
-
-                # Dead actor → spawn replacement (queues Ray init in background)
-                pool.replace(actor_idx, instance_id)
+                    results.append(result)
+                    if tracker:
+                        tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
+                    pool._initializing.discard(actor_idx)
 
             # Immediately re-feed the actor that just freed up, unless it's a
-            # freshly-spawned replacement still initializing (30-120s).
+            # freshly-spawned replacement still initializing (30-120s). A failed
+            # actor was killed and replaced by _handle_failure, so it's now
+            # initializing and skipped here — its retried chunk goes to a
+            # different, healthy actor via dispatch_idle below.
             if chunk_queue and actor_idx not in pool._initializing:
                 pool.submit(actor_idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker)
 
