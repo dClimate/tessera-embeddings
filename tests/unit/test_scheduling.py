@@ -50,7 +50,7 @@ def _do_replace(pool: ActorPool, actor_idx: int = 0) -> None:
     mock_actor = MagicMock()
     mock_actor.get_instance_id.remote.return_value = MagicMock()
     with patch.object(_sched_mod, "InferenceActor") as cls:
-        cls.remote.return_value = mock_actor
+        cls.options.return_value.remote.return_value = mock_actor
         pool.replace(actor_idx, "i-dead")
 
 
@@ -507,7 +507,7 @@ class TestReplace:
         mock_new = MagicMock()
         mock_new.get_instance_id.remote.return_value = MagicMock()
         with patch.object(_sched_mod, "InferenceActor") as cls:
-            cls.remote.return_value = mock_new
+            cls.options.return_value.remote.return_value = mock_new
             pool.replace(0, "i-dead")
         assert pool.actors[0] is not original
         assert pool.actors[0] is mock_new
@@ -529,7 +529,7 @@ class TestReplace:
             patch.object(_sched_mod, "InferenceActor") as cls,
             patch.object(_sched_mod.ray, "kill") as mock_kill,
         ):
-            cls.remote.return_value = mock_new
+            cls.options.return_value.remote.return_value = mock_new
             pool.replace(0, "i-dead")
         mock_kill.assert_called_once_with(outgoing)
 
@@ -542,7 +542,7 @@ class TestReplace:
             patch.object(_sched_mod, "InferenceActor") as cls,
             patch.object(_sched_mod.ray, "kill", side_effect=RuntimeError("already dead")),
         ):
-            cls.remote.return_value = mock_new
+            cls.options.return_value.remote.return_value = mock_new
             pool.replace(0, "i-dead")
         assert pool.actors[0] is mock_new
         assert 0 in pool._initializing
@@ -749,7 +749,7 @@ class TestWorkStealingLoopCondition:
                 if kw.get("timeout", 60) == 0
                 else fake_wait(refs, **kw)
             )
-            cls.remote.return_value = replacement_actor
+            cls.options.return_value.remote.return_value = replacement_actor
 
             results = _process_chunks_work_stealing(
                 actors=[actor],
@@ -830,7 +830,7 @@ class TestWorkStealingReturnedFailure:
             patch.object(_sched_mod, "log_worker_failure_diagnostic"),
             patch.object(_sched_mod.time, "sleep"),
         ):
-            cls.remote.return_value = replacement_actor
+            cls.options.return_value.remote.return_value = replacement_actor
             results = _process_chunks_work_stealing(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],
@@ -885,7 +885,7 @@ class TestWorkStealingReturnedFailure:
             patch.object(_sched_mod, "log_worker_failure_diagnostic"),
             patch.object(_sched_mod.time, "sleep"),
         ):
-            cls.remote.return_value = replacement
+            cls.options.return_value.remote.return_value = replacement
             results = _process_chunks_work_stealing(
                 actors=[actor],
                 actor_instance_ids=["i-0000"],

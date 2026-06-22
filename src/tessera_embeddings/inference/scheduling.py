@@ -324,7 +324,7 @@ class ActorPool:
         with contextlib.suppress(Exception):
             ray.kill(self.actors[actor_idx])
 
-        new_actor = InferenceActor.remote(  # type: ignore[attr-defined]
+        new_actor = InferenceActor.options(num_gpus=self.config.num_gpus).remote(  # type: ignore[attr-defined]
             self.config, self.config.checkpoint_path, self._get_credentials
         )
         self.actors[actor_idx] = new_actor
