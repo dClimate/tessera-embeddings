@@ -406,6 +406,70 @@ def open_or_create_repo(
         ), True
 
 
+def rollback_commits(
+    store_path: str,
+    n: int,
+    *,
+    branch: str = "main",
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    region: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Roll a branch's HEAD back by ``n`` commits and return the new HEAD id.
+
+    Icechunk has no destructive "undo": a rollback is a non-fast-forward
+    ``reset_branch`` that re-points the branch at an older snapshot. The ``n``
+    snapshots being dropped are not deleted — they remain reachable by id until
+    expiry/garbage collection, so the rollback is itself reversible (reset back
+    to the old HEAD id).
+
+    Args:
+        store_path: Local path or S3 URI of the store.
+        n: Number of commits to drop from the tip. Must be >= 1 and leave at
+            least one snapshot (you cannot roll back past the root/init commit).
+        branch: Branch to reset. Defaults to ``"main"``.
+        get_credentials: Optional credential callback (see :func:`_create_storage`).
+        region: Optional S3 region override.
+        dry_run: When True, resolve and return the target snapshot id without
+            moving the branch. Useful for eyeballing the target before committing.
+
+    Returns:
+        The id of the snapshot the branch now points at (or *would* point at,
+        when ``dry_run`` is True).
+
+    Raises:
+        ValueError: If ``n < 1`` or ``n`` would drop the entire history.
+    """
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+
+    repo = _open_repo(store_path, get_credentials=get_credentials, region=region)
+
+    # ancestry is newest-first: history[0] is the current HEAD, history[n] is
+    # the snapshot n commits back. The final entry is the repo's root commit.
+    history = list(repo.ancestry(branch=branch))
+    current = history[0]
+    if n >= len(history):
+        raise ValueError(
+            f"Cannot roll back {n} commits: branch {branch!r} has only "
+            f"{len(history)} snapshot(s), including the root commit."
+        )
+
+    target = history[n]
+    logger.info(
+        "Rolling back %s on %r by %d commit(s): %s -> %s%s",
+        store_path,
+        branch,
+        n,
+        current.id,
+        target.id,
+        " (dry run)" if dry_run else "",
+    )
+    if not dry_run:
+        repo.reset_branch(branch, target.id, from_snapshot_id=current.id)
+    return target.id
+
+
 # =============================================================================
 # Session Helpers (used by all read/write operations)
 # =============================================================================
@@ -541,8 +605,13 @@ def _write_region(
     # forks internally.
     read_session = repo.readonly_session(snapshot_id=session.snapshot_id)
     existing = xr.open_zarr(read_session.store, consolidated=False)
+    # Raw zarr group on the SAME readonly session, for the zarr-direct padding
+    # shell (one read task per overlapping chunk, no whole-store layer). Must be
+    # this session — same pinned snapshot as ``existing`` and pickle-safe to
+    # workers — not a fresh branch="main" group.
+    group = zarr.open_group(read_session.store, mode="r")
     try:
-        padded, widened = _pad_region_to_chunks(existing, data, region)
+        padded, widened = _pad_region_to_chunks(existing, data, region, group)
         to_write = _drop_region_coords(padded, set(widened))
 
         _commit_preserving_attrs(
@@ -589,13 +658,16 @@ def _write_regions(
     # pickle-safe padding-shell reason as _write_region (see its comment).
     read_session = repo.readonly_session(snapshot_id=session.snapshot_id)
     existing = xr.open_zarr(read_session.store, consolidated=False)
+    # Raw zarr group on the SAME readonly session for zarr-direct padding shells
+    # (see _write_region for why this session and not a fresh branch="main" one).
+    group = zarr.open_group(read_session.store, mode="r")
     try:
         # store_dask writes chunk data into pre-existing (seeded) arrays via the
         # fork; it never rewrites the root group, so root attrs survive without the
         # snapshot/restore dance _commit_preserving_attrs needs for to_icechunk. We
         # still apply update_attrs explicitly before committing.
         fork = session.fork()
-        sources, targets, regions, widened = _aligned_region_sources(existing, region_items, fork)
+        sources, targets, regions, widened = _aligned_region_sources(existing, region_items, fork, group)
         _assert_regions_chunk_disjoint(widened)
         merged = store_dask(sources=sources, targets=targets, regions=regions, split_every=split_every)
         session.merge(merged)

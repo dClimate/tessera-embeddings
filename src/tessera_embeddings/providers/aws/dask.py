@@ -40,16 +40,23 @@ import os
 import random
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from distributed import Scheduler
 
 import dask
+import psutil
 from dask_cloudprovider.aws import ECSCluster, FargateCluster
+from distributed import Client
+from distributed.diagnostics.plugin import SchedulerPlugin
 from tenacity import (
     Retrying,
     retry_if_exception,
     stop_after_attempt,
     wait_random_exponential,
 )
+from tornado.ioloop import PeriodicCallback
 
 # Default Fargate task sizes for ingest workloads. Callers can override
 # per-call via ``ecs_cluster``'s ``worker_cpu`` / ``worker_mem`` arguments.
@@ -62,6 +69,130 @@ DEFAULT_INGEST_SCHEDULER_CPU = 4096
 DEFAULT_INGEST_SCHEDULER_MEM = 8192
 
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/ecs/tessera/dask"
+
+# How often the scheduler logs its own resource usage. The default scheduler
+# logs are event-driven (worker register/connect) and say nothing about the
+# scheduler process's own load, so a slow event loop only shows up as the
+# after-the-fact "unresponsive for Ns" warning. A steady heartbeat makes the
+# run-up to that visible.
+DEFAULT_SCHEDULER_PROFILE_INTERVAL_S = 30.0
+
+
+class SchedulerResourceLogger(SchedulerPlugin):
+    """Log the scheduler *process's own* health on a fixed interval.
+
+    The cluster dashboard surfaces aggregate worker load, but stress on the
+    scheduler itself — the single event-loop process that builds every graph
+    and routes every task — is otherwise invisible until it stalls and emits
+    the built-in ``Event loop was unresponsive for Ns`` warning, or the ECS
+    task is OOM-killed with no warning at all. This plugin runs a
+    :class:`~tornado.ioloop.PeriodicCallback` on the scheduler's event loop and
+    logs the signals that precede those failures to the ``dask-scheduler``
+    stream, so the run-up is traceable rather than only the aftermath.
+
+    Each line reports:
+
+    - ``cpu`` — scheduler process CPU %, averaged over the interval (can exceed
+      100% across threads). Sustained ~100% on the GIL-bound loop is the
+      precursor to event-loop stalls.
+    - ``rss`` / ``mem`` — process resident memory, absolute and as a percent of
+      the container memory limit. The OOM predictor; the whole reason the
+      scheduler task is sized at all.
+    - ``lag`` — event-loop lag: how late this callback fired versus its
+      schedule. The direct, leading measure of the "unresponsive" warning.
+    - ``fds`` / ``threads`` — open file descriptors and thread count, to catch
+      connection/fd leaks and thread blow-ups.
+    - ``workers`` / ``tasks`` — cluster size and total tracked tasks, with a
+      breakdown of tasks in flight (``processing``) and stuck waiting
+      (``no-worker``) — a rising backlog signals the scheduler falling behind.
+
+    Instantiated on the client but pickled to and run inside the scheduler
+    process, so ``psutil.Process()`` measures the scheduler, not the client.
+    """
+
+    name = "scheduler-resource-logger"
+
+    def __init__(self, interval_s: float = DEFAULT_SCHEDULER_PROFILE_INTERVAL_S) -> None:
+        self.interval_s = interval_s
+        self._proc: psutil.Process | None = None
+        self._callback: PeriodicCallback | None = None
+        self._scheduler: Any = None
+        self._mem_limit_bytes: int | None = None
+        self._expected_next_s: float | None = None
+
+    async def start(self, scheduler: Scheduler) -> None:
+        """Bind to the scheduler and start the periodic probe (called in-process).
+
+        Async to match :class:`SchedulerPlugin`'s declared signature; the body
+        is non-blocking (no ``await``) — it just wires up the PeriodicCallback.
+        """
+        self._scheduler = scheduler
+        self._proc = psutil.Process()
+        # Prime cpu_percent so the first real reading is an interval delta
+        # rather than the meaningless 0.0 the first call always returns.
+        self._proc.cpu_percent(None)
+        # Container memory ceiling (cgroup limit on Fargate). psutil reads the
+        # cgroup-aware total inside a container; fall back to None if unknown.
+        try:
+            self._mem_limit_bytes = psutil.virtual_memory().total
+        except psutil.Error:
+            self._mem_limit_bytes = None
+        self._callback = PeriodicCallback(self._log_usage, self.interval_s * 1000)
+        self._callback.start()
+
+    async def before_close(self) -> None:
+        """Stop the periodic probe before the scheduler shuts down.
+
+        Async to match the supertype; the body is non-blocking.
+        """
+        if self._callback is not None:
+            self._callback.stop()
+            self._callback = None
+
+    def _log_usage(self) -> None:
+        proc = self._proc
+        sched = self._scheduler
+        if proc is None:
+            return
+        log = logging.getLogger("distributed.scheduler")
+        try:
+            # Event-loop lag: how far past the scheduled fire time we actually
+            # ran. Large values mean the loop was blocked (GIL-bound work, big
+            # graph) — the same condition behind the "unresponsive" warnings.
+            now = sched.loop.time() if sched is not None else None
+            lag_s = 0.0
+            if now is not None and self._expected_next_s is not None:
+                lag_s = max(0.0, now - self._expected_next_s)
+            if now is not None:
+                self._expected_next_s = now + self.interval_s
+
+            cpu_pct = proc.cpu_percent(None)
+            rss = proc.memory_info().rss
+            rss_gib = rss / 1024**3
+            mem_pct = (100.0 * rss / self._mem_limit_bytes) if self._mem_limit_bytes else float("nan")
+
+            n_workers = len(sched.workers) if sched is not None else -1
+            n_tasks = len(sched.tasks) if sched is not None else -1
+            processing = sum(len(w.processing) for w in sched.workers.values()) if sched is not None else -1
+            no_worker = len(getattr(sched, "unrunnable", ())) if sched is not None else -1
+
+            log.info(
+                "scheduler health: cpu=%.0f%% rss=%.2fGiB mem=%.0f%% lag=%.1fs "
+                "fds=%d threads=%d workers=%d tasks=%d processing=%d no-worker=%d",
+                cpu_pct,
+                rss_gib,
+                mem_pct,
+                lag_s,
+                proc.num_fds(),
+                proc.num_threads(),
+                n_workers,
+                n_tasks,
+                processing,
+                no_worker,
+            )
+        except (psutil.Error, AttributeError) as e:
+            log.warning("scheduler health probe failed: %s", e)
+
 
 # Substrings of transient cluster-start failures worth retrying. All are ECS
 # races/limits that clear on their own, not configuration errors:
@@ -267,6 +398,8 @@ def ecs_cluster(
     max_workers: int = 50,
     worker_cpu: int | None = None,
     worker_mem: int | None = None,
+    scheduler_cpu: int | None = None,
+    scheduler_mem: int | None = None,
     worker_nthreads: int | None = None,
     worker_nprocs: int | None = None,
     extra_worker_env: dict[str, str] | None = None,
@@ -286,6 +419,8 @@ def ecs_cluster(
         max_workers: Maximum Fargate tasks for adaptive scaling.
         worker_cpu: Override worker CPU units.
         worker_mem: Override worker memory in MiB.
+        scheduler_cpu: Override scheduler CPU units.
+        scheduler_mem: Override scheduler memory in MiB.
         worker_nthreads: Threads per worker process.
         worker_nprocs: Worker processes per Fargate task. Set
             ``worker_nprocs > 1`` with ``worker_nthreads=1`` for
@@ -348,6 +483,10 @@ def ecs_cluster(
         cluster_kwargs["worker_cpu"] = worker_cpu
     if worker_mem is not None:
         cluster_kwargs["worker_mem"] = worker_mem
+    if scheduler_cpu is not None:
+        cluster_kwargs["scheduler_cpu"] = scheduler_cpu
+    if scheduler_mem is not None:
+        cluster_kwargs["scheduler_mem"] = scheduler_mem
     if image is not None:
         cluster_kwargs["image"] = image
 
@@ -400,6 +539,18 @@ def ecs_cluster(
 
     cluster.adapt(minimum=min_workers, maximum=max_workers)
     log.info("Adaptive scaling configured: min=%d, max=%d", min_workers, max_workers)
+
+    # Register the scheduler health heartbeat. A short-lived Client is the only
+    # way to push a SchedulerPlugin onto a remote scheduler; the plugin persists
+    # on the scheduler after this Client closes, independent of the task-runner
+    # Client the flow opens next. Best-effort: a registration failure must not
+    # take down the run, since this is diagnostics only.
+    try:
+        with Client(cluster, timeout="60s") as client:
+            client.register_plugin(SchedulerResourceLogger(), name=SchedulerResourceLogger.name)
+        log.info("Scheduler health logging enabled (every %.0fs)", DEFAULT_SCHEDULER_PROFILE_INTERVAL_S)
+    except Exception as e:
+        log.warning("Could not enable scheduler health logging: %s", e)
 
     try:
         yield cluster
