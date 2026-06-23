@@ -24,8 +24,10 @@ from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     BAND_CHUNK_DIVISOR,
     OBS_COUNT_VARS,
+    STAGED_READ_CONFIG_KWARGS,
     IncompleteStageError,
     ZarrWriter,
+    _staged_storage_options,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.quantization import quantize_embeddings
@@ -65,6 +67,33 @@ def dask_client():
     client = Client(n_workers=2, threads_per_worker=1, memory_limit="2GB")
     yield client
     client.close()
+
+
+class TestStagedStorageOptions:
+    """Tests for _staged_storage_options: attach botocore retries on S3, nowhere else.
+
+    Assembly must stay backend-agnostic — the adaptive-retry config is a botocore
+    client setting and is meaningless for local/other backends, so it is gated on
+    the ``s3`` protocol.
+    """
+
+    def test_s3_path_gets_adaptive_retry_config(self):
+        opts = _staged_storage_options("s3://bucket/staging/run/chunk_0_0.zarr")
+        assert opts == {"config_kwargs": STAGED_READ_CONFIG_KWARGS}
+        # adaptive mode is the load-bearing part: it recognizes SlowDown and
+        # self-throttles, unlike botocore's default legacy mode.
+        assert opts["config_kwargs"]["retries"]["mode"] == "adaptive"
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/tmp/staging/run/chunk_0_0.zarr",
+            "file:///tmp/staging/run/chunk_0_0.zarr",
+            "relative/staging/chunk_0_0.zarr",
+        ],
+    )
+    def test_non_s3_path_gets_no_options(self, path):
+        assert _staged_storage_options(path) is None
 
 
 class TestWriteChunk:
