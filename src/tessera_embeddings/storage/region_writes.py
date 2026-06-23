@@ -290,9 +290,12 @@ def _pad_region_to_chunks(
 
     # Coords come from the lazy store view (authoritative). They're 1-D and dropped
     # before the region write anyway, but carrying them keeps the dataset
-    # well-formed; isel on coords is cheap and (unlike the data-var shell) never
-    # touches the heavy chunk layer.
-    padded = xr.Dataset(padded_vars, coords=existing.isel(widened).coords)
+    # well-formed. Slice only the coordinate variables: ``existing.isel(widened)``
+    # would index every data var too — building (and immediately discarding) a
+    # per-region dask slice of the master's whole chunk layer for each one. Slicing
+    # the coords-only dataset never touches the heavy data-var graph.
+    coords = existing.coords.to_dataset().isel(widened).coords
+    padded = xr.Dataset(padded_vars, coords=coords)
     return padded, widened
 
 
