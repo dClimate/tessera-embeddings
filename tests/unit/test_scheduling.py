@@ -14,7 +14,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import tessera_embeddings.inference.scheduling as _sched_mod
-from tessera_embeddings.inference.scheduling import ActorPool, _poll_tracker, _process_chunks_work_stealing
+from tessera_embeddings.inference.scheduling import (
+    ActorPool,
+    _batch_actors_to_request,
+    _poll_tracker,
+    _process_chunks_work_stealing,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,7 +50,7 @@ def _do_replace(pool: ActorPool, actor_idx: int = 0) -> None:
     mock_actor = MagicMock()
     mock_actor.get_instance_id.remote.return_value = MagicMock()
     with patch.object(_sched_mod, "InferenceActor") as cls:
-        cls.remote.return_value = mock_actor
+        cls.options.return_value.remote.return_value = mock_actor
         pool.replace(actor_idx, "i-dead")
 
 
@@ -502,12 +507,171 @@ class TestReplace:
         mock_new = MagicMock()
         mock_new.get_instance_id.remote.return_value = MagicMock()
         with patch.object(_sched_mod, "InferenceActor") as cls:
-            cls.remote.return_value = mock_new
+            cls.options.return_value.remote.return_value = mock_new
             pool.replace(0, "i-dead")
         assert pool.actors[0] is not original
         assert pool.actors[0] is mock_new
         assert 0 in pool._initializing
         assert "pending-replacement-of-i-dead" in pool.actor_instance_ids[0]
+
+    def test_replace_kills_outgoing_actor(self) -> None:
+        """The actor in the slot is killed before the replacement takes over.
+
+        Critical for the still-alive failure path: an actor that caught a CUDA
+        error and returned status="failed" must be torn down so it can't pick up
+        another chunk.
+        """
+        pool = _make_pool(2)
+        outgoing = pool.actors[0]
+        mock_new = MagicMock()
+        mock_new.get_instance_id.remote.return_value = MagicMock()
+        with (
+            patch.object(_sched_mod, "InferenceActor") as cls,
+            patch.object(_sched_mod.ray, "kill") as mock_kill,
+        ):
+            cls.options.return_value.remote.return_value = mock_new
+            pool.replace(0, "i-dead")
+        mock_kill.assert_called_once_with(outgoing)
+
+    def test_replace_kill_exception_suppressed(self) -> None:
+        """A kill failure (process already dead) doesn't break replacement."""
+        pool = _make_pool(2)
+        mock_new = MagicMock()
+        mock_new.get_instance_id.remote.return_value = MagicMock()
+        with (
+            patch.object(_sched_mod, "InferenceActor") as cls,
+            patch.object(_sched_mod.ray, "kill", side_effect=RuntimeError("already dead")),
+        ):
+            cls.options.return_value.remote.return_value = mock_new
+            pool.replace(0, "i-dead")
+        assert pool.actors[0] is mock_new
+        assert 0 in pool._initializing
+
+
+# ===========================================================================
+# ActorPool.add_actors
+# ===========================================================================
+
+
+class TestAddActors:
+    """Tests for ActorPool.add_actors (growable pool)."""
+
+    def test_appends_and_marks_initializing(self) -> None:
+        pool = _make_pool(2)
+        new = [MagicMock(name="new_0"), MagicMock(name="new_1")]
+        for a in new:
+            a.get_instance_id.remote.return_value = MagicMock()
+        pool.add_actors(new)
+        assert len(pool.actors) == 4
+        assert len(pool.actor_instance_ids) == 4
+        # New slots are initializing with placeholder IDs until resolved.
+        assert pool._initializing == {2, 3}
+        assert pool.actor_instance_ids[2] == "pending-init"
+        assert pool.actor_instance_ids[3] == "pending-init"
+
+    def test_max_actor_deaths_tracks_growth(self) -> None:
+        """The systemic-death threshold scales as batches are added."""
+        pool = _make_pool(2)
+        assert pool.max_actor_deaths == 2
+        extra = [MagicMock(), MagicMock(), MagicMock()]
+        for a in extra:
+            a.get_instance_id.remote.return_value = MagicMock()
+        pool.add_actors(extra)
+        assert pool.max_actor_deaths == 5
+
+    def test_added_actor_gets_work_via_dispatch_idle(self) -> None:
+        """An appended actor receives queued work once it resolves."""
+        pool = _make_pool(1)
+        pool.pending[MagicMock()] = ("seeded", 0)  # original actor busy
+        new = MagicMock(name="new")
+        new.get_instance_id.remote.return_value = MagicMock()
+        new.process_chunk.remote.return_value = MagicMock()
+        pool.add_actors([new])
+        ref = pool._pending_iid_refs[1]
+        queue: deque = deque([_fake_chunk("c0")])
+        with (
+            patch.object(_sched_mod.ray, "wait", return_value=([ref], [])),
+            patch.object(_sched_mod.ray, "get", return_value="i-new"),
+        ):
+            pool.resolve_initializing()
+            pool.dispatch_idle(queue, "m", "s", "r", None)
+        assert 1 in {aidx for _, aidx in pool.pending.values()}
+        assert len(queue) == 0
+
+
+# ===========================================================================
+# _batch_actors_to_request
+# ===========================================================================
+
+
+class TestBatchActorsToRequest:
+    """Tests for the pure batch-decision function."""
+
+    def _call(self, **overrides) -> tuple[int, bool]:
+        kwargs = dict(
+            requested=50,
+            target=200,
+            outstanding=200,
+            alive_gpu_nodes=50,
+            nodes_at_last_batch=0,
+            last_batch_size=50,
+            secs_since_last_batch=1.0,
+            placement_timeout_sec=300.0,
+            batch_size=50,
+        )
+        kwargs.update(overrides)
+        return _batch_actors_to_request(**kwargs)
+
+    def test_requests_next_batch_when_placed(self) -> None:
+        n, timed_out = self._call(alive_gpu_nodes=50)
+        assert n == 50
+        assert timed_out is False
+
+    def test_no_request_when_target_reached(self) -> None:
+        assert self._call(requested=200, target=200) == (0, False)
+
+    def test_no_request_when_prior_batch_not_placed(self) -> None:
+        # Only 40 of the last batch's 50 instances have joined the cluster.
+        assert self._call(requested=50, alive_gpu_nodes=40) == (0, False)
+
+    def test_straggler_within_tolerance_still_placed(self) -> None:
+        # 48/50 placed is within the default tolerance of 2.
+        n, _ = self._call(requested=50, alive_gpu_nodes=48)
+        assert n == 50
+
+    def test_timeout_forces_request_despite_no_placement(self) -> None:
+        n, timed_out = self._call(alive_gpu_nodes=10, secs_since_last_batch=301.0)
+        assert n == 50
+        assert timed_out is True
+
+    def test_final_batch_clamped_to_target(self) -> None:
+        n, _ = self._call(requested=180, target=200, alive_gpu_nodes=180, outstanding=200)
+        assert n == 20
+
+    def test_no_request_when_pool_covers_outstanding_work(self) -> None:
+        # Only 30 chunks left but 50 actors already requested — don't over-provision.
+        assert self._call(requested=50, outstanding=30) == (0, False)
+
+    def test_partial_final_batch_clamped_to_outstanding_work(self) -> None:
+        # 50 actors requested, only 60 chunks left: request 10, not a full
+        # batch of 50 (which would grow the pool to 100 for 60 chunks).
+        n, _ = self._call(requested=50, outstanding=60, target=200, alive_gpu_nodes=50)
+        assert n == 10
+
+    def test_placement_measured_incrementally_after_timeout(self) -> None:
+        # First batch (50) timed out with only 40 placed; a later batch grew the
+        # pool to 100 and those instances joined (90 nodes total). The increment
+        # since the last batch (90 - 40 = 50) covers that batch's 50 actors, so
+        # placement is satisfied even though 90 < 100 - tolerance cumulatively.
+        n, timed_out = self._call(
+            requested=100,
+            outstanding=200,
+            alive_gpu_nodes=90,
+            nodes_at_last_batch=40,
+            last_batch_size=50,
+        )
+        assert n == 50
+        assert timed_out is False
 
 
 # ===========================================================================
@@ -585,7 +749,7 @@ class TestWorkStealingLoopCondition:
                 if kw.get("timeout", 60) == 0
                 else fake_wait(refs, **kw)
             )
-            cls.remote.return_value = replacement_actor
+            cls.options.return_value.remote.return_value = replacement_actor
 
             results = _process_chunks_work_stealing(
                 actors=[actor],
@@ -603,3 +767,253 @@ class TestWorkStealingLoopCondition:
         # The chunk must have been processed despite the actor dying
         assert len(results) == 1
         assert results[0]["status"] == "ok"
+
+
+# ===========================================================================
+# _process_chunks_work_stealing — returned-failure retry path
+# ===========================================================================
+
+
+class TestWorkStealingReturnedFailure:
+    """An actor that returns status="failed" (vs. dying) is retried + killed."""
+
+    def test_returned_failure_requeues_chunk_and_replaces_actor(self) -> None:
+        """A chunk that comes back status="failed" retries on a fresh actor.
+
+        The original actor catches its CUDA error and returns a failed result
+        (ray.get succeeds), so this exercises the success-path branch that must
+        nonetheless kill+replace the actor and re-queue the chunk — rather than
+        recording the failure and feeding the wedged actor the next chunk.
+        """
+        actor = MagicMock(name="actor_0")
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        chunk = _fake_chunk("c0")
+
+        seed_ref = MagicMock(name="seed_ref")
+        retry_ref = MagicMock(name="retry_ref")
+        iid_ref = MagicMock(name="iid_ref")
+
+        actor.process_chunk.remote.return_value = seed_ref
+        actor.get_instance_id.remote.return_value = iid_ref
+
+        replacement_actor = MagicMock(name="replacement_actor")
+        replacement_actor.process_chunk.remote.return_value = retry_ref
+        replacement_actor.get_instance_id.remote.return_value = iid_ref
+
+        failed_result = {"chunk": "c0", "status": "failed", "error": "CUDA error: misaligned address"}
+        ok_result = {"chunk": "c0", "status": "ok"}
+
+        def fake_get(ref, *args, **kwargs):
+            if ref is seed_ref:
+                return failed_result  # actor caught its own error, returned failed
+            if ref is retry_ref:
+                return ok_result
+            if ref is iid_ref:
+                return "i-replacement"
+            return MagicMock()
+
+        def fake_wait(refs, **kw):
+            if kw.get("timeout", 60) == 0:  # resolve_iid / resolve_initializing
+                return (list(refs), [])
+            if seed_ref in refs:
+                return ([seed_ref], [r for r in refs if r is not seed_ref])
+            if retry_ref in refs:
+                return ([retry_ref], [r for r in refs if r is not retry_ref])
+            return ([], list(refs))
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
+            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
+            patch.object(_sched_mod.ray, "kill") as mock_kill,
+            patch.object(_sched_mod, "InferenceActor") as cls,
+            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
+            patch.object(_sched_mod.time, "sleep"),
+        ):
+            cls.options.return_value.remote.return_value = replacement_actor
+            results = _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=[chunk],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+                max_chunk_retries=2,
+            )
+
+        # The failing actor was killed and the chunk retried to success — the
+        # final result is the retry's success, not the original failed dict.
+        mock_kill.assert_called_once_with(actor)
+        assert len(results) == 1
+        assert results[0]["status"] == "ok"
+
+    def test_returned_failure_permanent_after_retries_exhausted(self) -> None:
+        """A chunk that keeps coming back failed is recorded failed after retries."""
+        actor = MagicMock(name="actor_0")
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        chunk = _fake_chunk("c0")
+
+        iid_ref = MagicMock(name="iid_ref")
+        actor.get_instance_id.remote.return_value = iid_ref
+        # Every submission (seed + 2 retries) returns a distinct failed ref.
+        refs = [MagicMock(name=f"ref_{i}") for i in range(3)]
+        actor.process_chunk.remote.side_effect = refs
+
+        replacement = MagicMock(name="replacement")
+        replacement.get_instance_id.remote.return_value = iid_ref
+        replacement.process_chunk.remote.side_effect = lambda *a, **k: refs[-1]
+
+        def fake_get(ref, *args, **kwargs):
+            if ref is iid_ref:
+                return "i-x"
+            return {"chunk": "c0", "status": "failed", "error": "CUDA error"}
+
+        def fake_wait(refs_in, **kw):
+            if kw.get("timeout", 60) == 0:
+                return (list(refs_in), [])
+            return ([refs_in[0]], list(refs_in[1:])) if refs_in else ([], [])
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
+            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod, "InferenceActor") as cls,
+            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
+            patch.object(_sched_mod.time, "sleep"),
+        ):
+            cls.options.return_value.remote.return_value = replacement
+            results = _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=[chunk],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+                max_chunk_retries=2,
+            )
+
+        # First try + 2 retries all failed → one permanent-failure result.
+        assert len(results) == 1
+        assert results[0]["status"] == "failed"
+        assert results[0]["attempts"] == 3
+
+
+# ===========================================================================
+# _process_chunks_work_stealing — actor batching
+# ===========================================================================
+
+
+class TestWorkStealingBatching:
+    """Verify the loop requests later actor batches as the pool drains work."""
+
+    def test_second_batch_requested_after_first_placed(self) -> None:
+        """Starting with one actor and a batch size of 2, the loop requests the
+        remaining batch via the factory (placement always satisfied here) and
+        grows the pool until the target is reached.
+        """
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        config.actor_request_batch_size = 2
+
+        chunks = [_fake_chunk(f"c{i}") for i in range(4)]
+
+        def _make_actor(iid: str) -> MagicMock:
+            a = MagicMock()
+            iid_ref = MagicMock()
+            iid_ref._iid = iid
+            a.get_instance_id.remote.return_value = iid_ref
+            a.process_chunk.remote.side_effect = lambda *args, **kwargs: MagicMock()
+            return a
+
+        factory_calls: list[int] = []
+
+        def factory(n: int) -> list[MagicMock]:
+            factory_calls.append(n)
+            return [_make_actor("i-new") for _ in range(n)]
+
+        actor0 = _make_actor("i-0000")
+
+        def fake_nodes():
+            return [{"Alive": True, "Resources": {"GPU": 1}}] * 16
+
+        def fake_get(ref, *args, **kwargs):
+            if getattr(ref, "_iid", None):
+                return ref._iid
+            return {"chunk": "x", "status": "ok"}
+
+        def fake_wait(refs, num_returns=1, timeout=60):
+            # timeout=0 → resolve_iid / resolve_initializing: report all done.
+            if timeout == 0:
+                return (list(refs), [])
+            # Main loop: complete one pending chunk per iteration.
+            if refs:
+                return ([refs[0]], list(refs[1:]))
+            return ([], [])
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
+            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
+            patch.object(_sched_mod.ray, "nodes", side_effect=fake_nodes),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.time, "sleep"),
+        ):
+            results = _process_chunks_work_stealing(
+                actors=[actor0],
+                actor_instance_ids=["i-0000"],
+                chunks=chunks,
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+                actor_factory=factory,
+                total_actors_target=3,
+                placement_timeout_sec=300.0,
+            )
+
+        # The factory was invoked for the remaining 2 actors (target 3, started with 1).
+        assert factory_calls == [2]
+        # Every chunk was processed.
+        assert len(results) == 4
+
+    def test_no_batching_when_factory_absent(self) -> None:
+        """With no actor_factory the loop never tries to grow the pool."""
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        config.actor_request_batch_size = 2  # set, but no factory → disabled
+
+        actor0 = MagicMock()
+        actor0.process_chunk.remote.side_effect = lambda *a, **k: MagicMock()
+
+        def fake_wait(refs, num_returns=1, timeout=60):
+            if timeout == 0:
+                return (list(refs), [])
+            return ([refs[0]], list(refs[1:])) if refs else ([], [])
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
+            patch.object(_sched_mod.ray, "get", return_value={"chunk": "x", "status": "ok"}),
+            patch.object(_sched_mod.ray, "nodes", side_effect=AssertionError("nodes() must not be polled")),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.time, "sleep"),
+        ):
+            results = _process_chunks_work_stealing(
+                actors=[actor0],
+                actor_instance_ids=["i-0000"],
+                chunks=[_fake_chunk("c0")],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+            )
+        assert len(results) == 1

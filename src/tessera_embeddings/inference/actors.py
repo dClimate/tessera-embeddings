@@ -11,6 +11,7 @@ torch is only needed on GPU workers at runtime.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import tempfile
 import time
@@ -28,10 +29,13 @@ from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
+from tessera_embeddings.storage.zarr_store import credentials_provider
 
 if TYPE_CHECKING:
     import types
+    from collections.abc import Callable
 
+    import icechunk
     import torch
 
     from tessera_embeddings.inference.data_loading import ChunkData, S2MaskBundle
@@ -42,14 +46,15 @@ logger = logging.getLogger(__name__)
 # Host-RAM budget (bytes) for the resident S2 *input* working set of a single
 # strip. The 1-deep strip prefetch keeps two band strips resident at once (plus
 # the shared full-chunk SCL mask, charged against this budget too), so the real
-# ceiling is on the *pair*: 4.0 GB/strip => an 8 GB pair. The remaining headroom
-# on the default 16 GB worker box must absorb the non-S2 resident set the sizer
-# does not model — the SAR stack (no cheap pre-read count, so it can spike on
-# dense-S1 chunks), the whole-chunk int8 embedding + scale buffers, and the
-# model (~4 GB combined on the densest chunks). 4.0 GB/strip was determined
-# empirically to be as high as we can safely go: above it, a chunk at the
-# single-strip ceiling with near-max SAR density crosses the 95% OOM line.
-_S2_STRIP_BYTE_BUDGET = int(4.0 * 1024**3)
+# ceiling is on the *pair*: 7.0 GB/strip => a 14 GB pair. The remaining headroom
+# on the 32 GB g6e.xlarge worker box must absorb the non-S2 resident set the
+# sizer does not model — the SAR stack (no cheap pre-read count, so it can spike
+# on dense-S1 chunks), the whole-chunk int8 embedding + scale buffers, and the
+# model (~4 GB combined on the densest chunks). 7.0 GB/strip raises the prior
+# 4.0 GB ceiling with the move from the 16 GB g5.xlarge box to the 32 GB
+# g6e.xlarge, but stops short of a full 2x: 4.0 GB was already OOMing on the
+# 16 GB box, so the doubled-box budget keeps a deliberate ~4 GB cushion.
+_S2_STRIP_BYTE_BUDGET = int(7.0 * 1024**3)
 
 # Per-(timestep, pixel) byte cost of resident S2 bands: 10 bands x uint16.
 _S2_BYTES_PER_OBS_PX = len(S2_BAND_ORDER) * 2
@@ -250,14 +255,32 @@ class InferenceActor:
 
         # CPU-only worker (local runner, smoke tests)
         InferenceActor.options(num_gpus=0).remote(config, ckpt)
+
+    The optional ``get_credentials`` callback is the icechunk S3 credential
+    provider used for every store open in :meth:`process_chunk`. It is injected
+    by the cloud-aware caller (the AWS provider passes
+    ``iam_icechunk_credentials``) so this domain actor stays free of any
+    cloud-SDK import. When ``None``, icechunk falls back to its default AWS
+    credential chain — fine for local/moto runs, but on long-lived cloud
+    workers that chain can fail to refresh the instance-profile token; see
+    ``providers.aws.credentials.iam_icechunk_credentials``.
     """
 
-    def __init__(self, config: InferenceConfig, checkpoint_path: str) -> None:
+    def __init__(
+        self,
+        config: InferenceConfig,
+        checkpoint_path: str,
+        get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    ) -> None:
         """Initialize actor: download checkpoint (if S3) and load model onto GPU.
 
         Args:
             config: Inference configuration.
             checkpoint_path: S3 URI or local path to the model checkpoint.
+            get_credentials: Optional icechunk S3 credential provider applied
+                (via :func:`credentials_provider`) for the duration of every
+                :meth:`process_chunk` call. Injected by the cloud-aware caller;
+                ``None`` uses icechunk's default credential chain.
         """
         import torch as _torch
 
@@ -266,6 +289,7 @@ class InferenceActor:
         _configure_actor_logging()
 
         self.config = config
+        self._get_credentials = get_credentials
         self.instance_id = _fetch_ec2_instance_id()
         self.device = _torch.device("cpu") if self.config.num_gpus == 0 else _select_device(_torch, self.instance_id)
 
@@ -305,6 +329,17 @@ class InferenceActor:
     ) -> dict[str, str | int | float]:
         """Process a single spatial chunk: load data, run inference, write output.
 
+        When a ``get_credentials`` provider was injected at construction, reads
+        and the staging write run inside a scoped :func:`credentials_provider`
+        so every icechunk S3 open resolves through it. The AWS provider passes
+        ``iam_icechunk_credentials``, a botocore-backed callback carrying an
+        ``expires_after`` so icechunk periodically re-invokes it and botocore
+        refreshes the instance-profile token. Without an injected provider,
+        icechunk falls back to the Rust AWS SDK's default chain, which resolves
+        the instance-profile credential once and — on a long-lived actor — can
+        fail to refresh it, failing this chunk and every subsequent one in the
+        process with "no providers in chain provided credentials".
+
         Args:
             chunk: Spatial chunk specification.
             mosaic_base: Base path for the mosaic stores
@@ -315,6 +350,27 @@ class InferenceActor:
 
         Returns:
             Result dict with chunk label, status, pixel count, and timing.
+        """
+        cred_scope = (
+            credentials_provider(self._get_credentials)
+            if self._get_credentials is not None
+            else contextlib.nullcontext()
+        )
+        with cred_scope:
+            return self._process_chunk(chunk, mosaic_base, staging_base, run_id, tracker)
+
+    def _process_chunk(
+        self,
+        chunk: ChunkSpec,
+        mosaic_base: str,
+        staging_base: str,
+        run_id: str,
+        tracker: ray.actor.ActorHandle | None = None,
+    ) -> dict[str, str | int | float]:
+        """Run the load → inference → write pipeline for one chunk.
+
+        Always invoked through :meth:`process_chunk`, which establishes the
+        scoped icechunk credential provider this body's S3 opens depend on.
         """
         from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
         from tessera_embeddings.inference.inference import run_inference

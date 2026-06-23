@@ -1,8 +1,14 @@
 """Tests for chunk_spec module: grid enumeration and edge handling."""
 
+import numpy as np
 import pytest
+import zarr
 
-from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks
+from tessera_embeddings.inference.chunk_spec import (
+    ChunkSpec,
+    enumerate_chunks,
+    filter_chunks_by_roi_mask,
+)
 
 
 class TestChunkSpec:
@@ -87,3 +93,42 @@ class TestEnumerateChunks:
     def test_parametrized_counts(self, total_y, total_x, chunk_size, expected_count):
         chunks = enumerate_chunks(total_y, total_x, chunk_size)
         assert len(chunks) == expected_count
+
+
+class TestFilterChunksByRoiMask:
+    """Tests for the thread-pooled ROI mask intersection filter."""
+
+    def _write_mask(self, tmp_path, arr):
+        path = str(tmp_path / "roi.zarr")
+        z = zarr.open(path, mode="w", shape=arr.shape, chunks=(100, 100), dtype="bool")
+        z[:] = arr
+        return path
+
+    def test_keeps_only_intersecting_chunks(self, tmp_path):
+        # 4x4 grid of 100px chunks; light up two scattered chunks.
+        mask = np.zeros((400, 400), dtype=bool)
+        mask[50, 50] = True  # chunk (0, 0)
+        mask[250, 350] = True  # chunk (2, 3)
+        path = self._write_mask(tmp_path, mask)
+
+        chunks = enumerate_chunks(400, 400, 100)
+        live = filter_chunks_by_roi_mask(chunks, path)
+
+        assert {(c.row, c.col) for c in live} == {(0, 0), (2, 3)}
+
+    def test_preserves_row_major_order(self, tmp_path):
+        # All chunks live — the thread pool must not reorder the result.
+        mask = np.ones((400, 400), dtype=bool)
+        path = self._write_mask(tmp_path, mask)
+
+        chunks = enumerate_chunks(400, 400, 100)
+        live = filter_chunks_by_roi_mask(chunks, path)
+
+        assert live == chunks
+
+    def test_empty_mask_drops_everything(self, tmp_path):
+        mask = np.zeros((400, 400), dtype=bool)
+        path = self._write_mask(tmp_path, mask)
+
+        chunks = enumerate_chunks(400, 400, 100)
+        assert filter_chunks_by_roi_mask(chunks, path) == []

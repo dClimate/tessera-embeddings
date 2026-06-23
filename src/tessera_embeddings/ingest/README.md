@@ -481,6 +481,30 @@ credentials, bypassing the env vars. The mechanism:
   Dask task runner the domain function (and its store writes) execute in a *worker* process,
   so a provider registered in the flow-runner process would never reach them.
 
+**IMDS throttling — why `_resolve_iam_credentials` is `lru_cache`d (gotcha).** The credential
+machinery has two distinct TTLs, and conflating them overwhelms the EC2 Instance Metadata
+Service (IMDS):
+
+- `iam_icechunk_credentials` sets `expires_after=15min` on the returned `S3StaticCredentials`.
+  This is how often **icechunk** re-invokes our callback per repo client — it is *not* how
+  often we should touch IMDS.
+- `_resolve_iam_credentials` is `@lru_cache(maxsize=1)`, so the botocore session — and the
+  live `RefreshableCredentials` it returns — is built **once per process**. For an IAM role
+  botocore hands back a `RefreshableCredentials` that serves its in-memory credential and
+  refreshes itself in the background; `get_frozen_credentials()` is a pure expiry-time check
+  that only re-hits IMDS inside botocore's refresh window (~advisory 15 min before the ~6h
+  token expiry), lock-guarded so concurrent callers don't stampede.
+
+Without the cache, every callback built a *fresh* session and did a **cold IMDS resolve**.
+Under many concurrent workers/threads that bursts IMDS past its per-instance rate limit, and
+the SDK surfaces it as `failed to load IMDS session token / invalid token` or
+`no providers in chain provided credentials` — transient, but enough to fail a run of chunks
+before recovering. Caching the session decouples "how often icechunk asks" from "how often we
+hit IMDS": the former stays at 15 min, the latter drops to roughly once per token lifetime.
+`lru_cache` does not cache exceptions, so a failed cold resolve still retries next call. The
+same provider is injected into inference workers (see `inference/README.md`), where long-lived
+Ray actors made this the dominant failure mode.
+
 ### URL Rewriting
 
 CMR-STAC returns HTTPS asset URLs in two formats depending on satellite vintage:

@@ -51,6 +51,8 @@ from tessera_embeddings.ingest.stac import (
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset
 
+logger = logging.getLogger(__name__)
+
 
 @final
 @dataclass(frozen=True)
@@ -128,7 +130,19 @@ def _compute_scl_phase(
         ``(passes_coverage, any_valid)``. ``any_valid`` is persisted on
         workers when ``passes_coverage`` is True; ``None`` otherwise.
     """
-    scl_ds = _load_scl_only(day_items, geobox, load_chunks)
+    try:
+        scl_ds = _load_scl_only(day_items, geobox, load_chunks)
+    except ValueError as exc:
+        # Earth-search occasionally publishes asset-incomplete items (missing
+        # SCL and/or reflectance bands). odc.stac.load resolves bands eagerly,
+        # so one such item in the day group raises "No such band/alias: scl"
+        # before any graph is built. Drop the whole date rather than crash the
+        # run; Phase 2 would hit the same wall on the same items.
+        if "No such band/alias" not in str(exc):
+            raise
+        logger.warning("Dropping date: SCL load failed on asset-incomplete STAC item(s): %s", exc)
+        return False, None
+
     invalid_classes = np.array(sorted(S2_SCL_INVALID_CLASSES), dtype=scl_ds["scl"].dtype)
 
     # solar_day grouping fuses all same-day tiles into exactly one time slice

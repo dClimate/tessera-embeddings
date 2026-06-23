@@ -182,6 +182,13 @@ class InferenceConfig:
             ray_address: Ray cluster address (None for local mode).
             use_spot: Whether to use spot instances.
             max_gpu_workers: Maximum number of GPU workers.
+            actor_request_batch_size: Request actors this many at a time (0 =
+                all at once). Paces the EC2 demand the autoscaler forwards to
+                AWS, which fulfils a large simultaneous ask slowly. Inference
+                still starts on the first ready actor.
+            actor_batch_placement_timeout_sec: Max seconds to wait for a batch's
+                instances to join the cluster before requesting the next batch
+                regardless (capacity-shortfall escape hatch).
     """
 
     # Time window (required — no default)
@@ -219,6 +226,19 @@ class InferenceConfig:
     ray_address: str | None = None
     use_spot: bool = False
     max_gpu_workers: int = 500
+
+    # Actor request batching. AWS fulfils a large simultaneous EC2 ask slowly,
+    # so we can request actors in batches and let the autoscaler see demand for
+    # only one batch at a time. 0 disables batching (request all actors up
+    # front — the historical behaviour). When enabled, inference still starts on
+    # the first ready actor; subsequent batches are requested by the
+    # work-stealing loop once the prior batch's instances have joined the
+    # cluster (placement), so a slow model load never gates the next AWS ask.
+    actor_request_batch_size: int = 50
+    # Max seconds to wait for a batch's instances to be placed before requesting
+    # the next batch anyway. Escape hatch so a capacity shortfall (e.g. AWS only
+    # provisions 48/50) can't gate every remaining batch forever.
+    actor_batch_placement_timeout_sec: float = 300.0
 
     def __post_init__(self) -> None:
         """Validate and normalise config fields."""

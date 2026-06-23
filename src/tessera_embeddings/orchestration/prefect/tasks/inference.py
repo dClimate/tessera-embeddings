@@ -47,6 +47,7 @@ def run_inference_task(
     run_id: str,
     t0: float,
     on_actor_retire: Callable[[str], None] | None = None,
+    get_credentials: Callable[[], Any] | None = None,
 ) -> list[dict]:
     """Prefect task: create Ray actors, run work-stealing inference.
 
@@ -64,6 +65,7 @@ def run_inference_task(
         t0=t0,
         log=get_run_logger(),
         on_actor_retire=on_actor_retire,
+        get_credentials=get_credentials,
     )
 
 

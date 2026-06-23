@@ -104,6 +104,22 @@ before work is dispatched.
 > **Why NVMe?** EBS sequential read saturates at ~42 MB/s. `torch.load` with mmap on EBS
 > causes multi-minute hangs. NVMe is ~35× faster.
 
+**Icechunk credentials (injected, not imported).** `InferenceActor` takes a `get_credentials`
+callback and wraps each `process_chunk` in `storage.zarr_store.credentials_provider(...)`, so
+every store open resolves through it. The AWS-aware orchestration layer injects
+`providers.aws.credentials.iam_icechunk_credentials` (threaded
+runner → scheduling → actor, including replacement actors); the actor itself imports no AWS
+module so `inference/` stays domain-pure (enforced by `tests/architecture`). With no callback
+injected (local/dev runs) icechunk uses its default credential chain.
+
+This matters because long-lived actors outlive the credential resolved at startup. The Rust
+SDK's default chain resolves the instance-profile credential once and may fail to refresh it;
+when it lapses, the failing chunk **and every subsequent chunk on that actor** error with
+`no providers in chain provided credentials`. Routing through `iam_icechunk_credentials`
+(botocore-backed, self-refreshing) fixes this — but note the IMDS-throttling gotcha documented
+in `ingest/README.md`: `_resolve_iam_credentials` must stay `lru_cache`d so the callback's
+15-min re-invocation does **not** trigger a cold IMDS resolve each time.
+
 ### 4. Per-Chunk Inference (inside each actor)
 
 Each chunk goes through four sub-steps:
@@ -376,6 +392,23 @@ With align_chunks=True:
    quantized embeddings use default compression. Appends to existing store if present.
 5. Delete _all versions_ of the staged chunk zarrs (unless `dev` flag is passed).
 
+**Manifest splitting.** The whole `writer.assemble` call is wrapped in
+`manifest_split({"northing": 32, "easting": 32})` (see `tasks/inference.py`). By default
+icechunk keeps one manifest object per array, so every commit rewrites the entire chunk
+index — O(store size) regardless of how few chunks changed. Splitting tiles the manifest
+into 32-chunk-per-axis shards; with 500×500 px on-disk sub-chunks that's ~16k px/shard,
+matching `zarr_store.DEFAULT_MANIFEST_SPLIT_SIZES`' target. No `time` split is applied:
+assembly only ever writes a single timestep, so one time shard equals the whole array and
+splitting time would be a no-op. The split config is persisted via `repo.save_config()` so
+it survives the session being shipped to Dask workers.
+
+The split applies to both new and pre-existing stores. A store created before this change
+has a single unsplit manifest; the first append under the `manifest_split` block re-shards
+the touched array in that commit (a one-time migration — old chunk data is untouched and
+reads back unchanged), and every commit after it rewrites only the shards it touches. So
+existing stores pick up the same bounded-commit speedup on their next assembly run, with no
+manual migration step.
+
 **Why PCodec for the final store:** Embeddings are 128-dim float32 vectors — dense, continuous,
 and without the spatial redundancy that makes byte-shuffle + zstd effective for reflectance
 data. PCodec is a floating-point-aware codec that models the distribution of float values
@@ -383,6 +416,22 @@ directly, achieving significantly better compression ratios on this kind of data
 general-purpose codecs. The tradeoff is that PCodec decompresses the entire on-disk chunk
 to read any slice of it (no partial decode), which is why staged chunks use 500×500
 sub-chunks to cap decode buffer size.
+
+**Reading the output store.** On a CONUS-scale store, open with `chunks=None` for
+interactive or selective reads:
+
+```python
+ds = open_store(store_path, chunks=None)   # or xr.open_zarr(session.store, consolidated=False, chunks=None)
+ds.isel(time=0).sel(northing=slice(...), easting=slice(...)).embeddings.values
+```
+
+The default chunking builds one dask task per on-disk chunk. With 500×500×4
+sub-chunks the band axis alone is 32 chunks (128/4), so the graph is
+`n_time × n_y × n_x × 32` tasks — large enough at CONUS extent that even a *lazy*
+`isel`/`sel` OOMs while manipulating the graph, before any chunk data is read.
+`chunks=None` opens the store zarr-lazy with no dask graph: slicing is pure
+metadata and chunks load only when `.values` is pulled. This is unrelated to
+manifest splitting — the split bounds commit/manifest cost, not the dask graph.
 
 ---
 

@@ -18,6 +18,7 @@ Usage in the S1 ingest flow::
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import icechunk
@@ -34,8 +35,9 @@ if TYPE_CHECKING:
 _ICECHUNK_CRED_TTL = timedelta(minutes=15)
 
 
+@lru_cache(maxsize=1)
 def _resolve_iam_credentials() -> Credentials:
-    """Resolve IAM credentials, skipping the botocore ``env`` provider.
+    """Resolve IAM credentials once per process, skipping the ``env`` provider.
 
     Removing the ``env`` provider from the credential chain forces resolution
     to the IAM role (instance-metadata on EC2, container credentials on ECS,
@@ -43,9 +45,21 @@ def _resolve_iam_credentials() -> Credentials:
     has overridden the ``AWS_*`` env vars with OPERA-scoped STS tokens for
     GDAL reads.
 
+    The result is cached for the process lifetime: botocore returns a live
+    ``RefreshableCredentials`` for an IAM role, which serves its in-memory
+    credential and refreshes itself in the background (with botocore's own IMDS
+    retry/backoff). Caching the *session* — rather than building a fresh one per
+    call — is what makes that refresh effective: a transient IMDS blip during
+    normal operation returns the still-valid cached credential untouched, and
+    IMDS is only contacted during botocore's refresh window. A fresh session
+    each call would instead do a cold IMDS resolve every time, turning every
+    momentary IMDS throttle into a credential failure. ``lru_cache`` does not
+    cache exceptions, so a failed cold resolve still retries on the next call.
+
     Returns the live botocore credentials object (not a frozen snapshot) so
     callers can read the credential expiry off refreshable creds. Call
-    ``get_frozen_credentials()`` on the result for a serializable snapshot.
+    ``get_frozen_credentials()`` on the result for a serializable snapshot;
+    on refreshable creds that call is what triggers a background refresh.
 
     Raises:
         RuntimeError: If no AWS credentials are found outside env vars.
