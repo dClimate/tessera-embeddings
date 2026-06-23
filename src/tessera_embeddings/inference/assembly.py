@@ -40,6 +40,30 @@ warnings.filterwarnings("ignore", message="Numcodecs codecs are not in the Zarr 
 logger = logging.getLogger(__name__)
 
 
+STAGED_READ_CONFIG_KWARGS = {"retries": {"max_attempts": 10, "mode": "adaptive"}}
+"""botocore retry config for staged-Zarr GETs during assembly.
+
+Staged reads fan out across every Dask worker at once, so a momentary GET burst
+can trip S3 into a 503 SlowDown even well under the per-prefix ceiling. botocore's
+default ``legacy`` mode makes 5 attempts, has no client-side rate limiting, and
+doesn't recognize ``SlowDown`` in its throttle set, so the burst exhausts retries
+and fails the block. ``adaptive`` mode adds explicit ``SlowDown`` handling plus a
+token-bucket rate limiter that self-throttles when S3 pushes back — that feedback
+loop, not the higher attempt count, is the actual fix.
+"""
+
+
+def _staged_storage_options(path: str) -> dict | None:
+    """Return s3fs storage options for a staged read, or ``None`` for non-S3 paths.
+
+    The retry config is a botocore client setting and only applies to the S3
+    backend; local staging paths (``/tmp/...``) get ``None`` and open normally.
+    """
+    if fsspec.utils.get_protocol(path) == "s3":
+        return {"config_kwargs": STAGED_READ_CONFIG_KWARGS}
+    return None
+
+
 def _fs_for(uri: str, storage_options: dict | None = None) -> fsspec.AbstractFileSystem:
     """Return an fsspec filesystem inferred from the URI scheme.
 
@@ -131,7 +155,7 @@ def _assemble_var_block(
     path = live_lookup.get((row, col))
     if path is None:
         return template
-    group = zarr.open_group(path, mode="r")
+    group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
     try:
         # template shape is (1, H, W[, D]); the staged array is (H, W[, D]).
         arr = np.asarray(group[var_name][...])  # type: ignore[index]
@@ -368,7 +392,7 @@ class ZarrWriter:
             raise FileNotFoundError(f"No staged chunks found for run '{run_id}' under {self.staging_base}")
         path = f"{self.staging_base}/{run_id}/{labels[0]}.zarr"
         try:
-            group = zarr.open_group(path, mode="r")
+            group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
         except Exception as exc:
             raise FileNotFoundError(f"Cannot open {path}: {exc}") from exc
         arr: zarr.Array = group["embeddings"]  # type: ignore[assignment]
@@ -486,7 +510,7 @@ class ZarrWriter:
         path = self._staging_path(run_id, chunk)
         expected_shape = (chunk.height, chunk.width, self.embedding_dim)
         try:
-            group = zarr.open_group(path, mode="r")
+            group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
             for var in required_vars:
                 if var not in group:
                     return f"missing variable '{var}'"
@@ -588,7 +612,7 @@ class ZarrWriter:
         probe = max(chunks, key=lambda c: c.height * c.width)
         path = self._staging_path(run_id, probe)
         try:
-            group = zarr.open_group(path, mode="r")
+            group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
             return {v for v in var_names if v in group}
         except (FileNotFoundError, KeyError, zarr.errors.GroupNotFoundError):
             return set()
@@ -612,7 +636,7 @@ class ZarrWriter:
         """
         largest = max(chunks, key=lambda c: c.height * c.width)
         probe_path = self._staging_path(run_id, largest)
-        group = zarr.open_group(probe_path, mode="r")
+        group = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
         return tuple(group[var_name].metadata.chunk_grid.chunk_shape)  # type: ignore[union-attr]
 
     def _chunk_grid_sizes(self, chunks: list[ChunkSpec]) -> tuple[tuple[int, ...], tuple[int, ...]]:
