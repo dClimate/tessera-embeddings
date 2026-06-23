@@ -193,6 +193,7 @@ class SchedulerResourceLogger(SchedulerPlugin):
         except (psutil.Error, AttributeError) as e:
             log.warning("scheduler health probe failed: %s", e)
 
+
 # Substrings of transient cluster-start failures worth retrying. All are ECS
 # races/limits that clear on their own, not configuration errors:
 #   * "not enough values to unpack" — dask-cloudprovider's Task._update_task
