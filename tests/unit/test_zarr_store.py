@@ -775,12 +775,12 @@ class TestPadRegionToChunks:
         return ds.chunk({"time": 1, "northing": chunk, "easting": chunk})
 
     def test_padded_shell_graph_is_slab_local_and_flat_in_time(self):
-        """The shell's dask graph must scale with the WIDENED slab's chunks, not the
-        store's time length — the property that makes the zarr-direct shell flat in
-        master time and kills the scheduler OOM. ``existing.isel(widened)`` carried
-        the whole-store time-chunk layer into every shell, so its graph grew with the
-        master's total dates; value-parity tests can't catch that regression, only a
-        graph-size check independent of ``nt`` can.
+        """The padded block's dask graph must scale with the region's edge strips, not
+        the store's time length — the property that keeps the zarr-direct strips flat
+        in master time and kills the scheduler OOM. Reading the strips through the lazy
+        ``existing`` view would carry the whole-store time-chunk layer into every one,
+        so the graph would grow with the master's total dates; value-parity tests can't
+        catch that regression, only a graph-size check independent of ``nt`` can.
         """
         # 100x100 store at 50-px chunks; region 10:30 x 10:70 widens to a 1x1x2 block slab.
         region = {"time": slice(0, 1), "northing": slice(10, 30), "easting": slice(10, 70)}
@@ -793,11 +793,12 @@ class TestPadRegionToChunks:
             assert widened["northing"] == slice(0, 50) and widened["easting"] == slice(0, 100)
             sizes[nt] = len(padded["blue"].data.__dask_graph__())
 
-        # Widened slab is 1 time x 1 northing-block x 2 easting-blocks = 2 read tasks,
-        # plus the setitem overlay fan-out — a small constant. The whole point: it must
-        # NOT grow from nt=5 to nt=500. An un-fixed isel shell would scale with nt.
-        assert sizes[5] == sizes[500], f"shell graph scales with store time length: {sizes}"
-        assert sizes[5] < 40, f"shell graph has {sizes[5]} keys — not slab-local"
+        # The block is the incoming insert grown by an edge strip per unaligned face
+        # (here all four), each a zarr-direct read concatenated on — a small constant
+        # set by the perimeter, not the slab area. The whole point: it must NOT grow
+        # from nt=5 to nt=500. A lazy-view strip read would scale with nt.
+        assert sizes[5] == sizes[500], f"strip graph scales with store time length: {sizes}"
+        assert sizes[5] < 100, f"strip graph has {sizes[5]} keys — not perimeter-local"
 
     def test_zarr_direct_shell_matches_isel(self):
         """The zarr-direct shell is numerically identical to the old

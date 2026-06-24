@@ -199,8 +199,8 @@ def _pad_region_to_chunks(store_array, data, region):
   slab, not just its edge chunks. The extra IO is bounded by the padding (at most
   one chunk per region face) and is acceptable at current tile sizes. Reading
   only the boundary chunks would require an edge-concatenation rebuild (interior
-  blocks sourced straight from `incoming`, edges read-modify-written) and is
-  deferred until tile scale makes the slab read costly.
+  blocks sourced straight from `incoming`, edges read-modify-written) — since
+  built, see §9.
 - **Overlay via positional dask `setitem`**, not label-based `combine_first`:
   `shell[idx] = data[var].data`, where `idx` is the region offset *within* the
   widened frame. Positional overlay sidesteps coordinate-label alignment
@@ -417,3 +417,53 @@ Phase 1 ships the primitive; Phase 2 wires callers:
 | Unaligned regions | RMW pad (`_pad_region_to_chunks`) | `align_chunks=True` can't pad partial boundary chunks in `r+`; callers shouldn't bear manual alignment. The genuinely new work — references only pad the time axis. |
 | Commit strategy | Per-region commit | Distribution already free via `to_icechunk`; fork/merge only adds cross-region atomicity, not needed yet. |
 | Chunk sizes | Read from store array `.chunks` | Store is authoritative; config may drift. |
+| Backfill shape | Edge strips (§9), evolved from full-slab RMW | IO `O(perimeter)` not `O(area)`; required at state/CONUS scale. |
+
+---
+
+## 9. Backfill evolution — full slab → zarr-direct edge strips
+
+The RMW pad's backfill went through three shapes as the master grew from
+100km-tile to state/CONUS scale. Each fixed a distinct scaling wall; the history
+matters because the failure modes look similar (a stalled flow-runner) but have
+different causes.
+
+**v1 — full slab via the lazy view (`existing.isel(widened)` + `setitem`).**
+Read the whole widened slab as a lazy dask slab off the store *view*, then
+overlaid the incoming block with a positional `setitem`. Two problems compounded
+as the store grew: (a) the view's graph references **every chunk of the whole
+store array**, so `isel` drags an `O(total store chunks)` layer into every
+shell — independent of how much the write covers; and (b) `setitem` over a full
+lazy slab rewires the graph across every chunk in the window, `O(slab area)`.
+Fine at tile scale; at CONUS it builds ~1.7M graph nodes for a single run and
+the flow-runner stalls before any compute.
+
+**v2 — full slab via zarr-direct reads (`_slab_array_from_zarr`).** Fixed (a):
+enumerate, in closed form, only the chunk blocks the widened slab touches and
+emit one read task per block on a fresh `HighLevelGraph` with no parent layer.
+Graph drops to `O(slab chunks)`, flat in store size — the scheduler-OOM fix.
+But the backfill still reads the **entire widened slab**, interior included,
+even though every interior cell is overwritten by the incoming data. IO is still
+`O(area)`: a Nebraska-scale box reads ~126 chunks per write/var, ~80 of them
+discarded interior. That wasted read is what made state-scale merge batches take
+~7 minutes each.
+
+**v3 (current) — zarr-direct edge strips.** Read only the pad margin on each
+unaligned face (a thin slab per face), `da.concatenate`-d onto the incoming
+block one axis at a time; the interior is never read. Concatenating axis by axis
+— each strip spanning the already-extended extent on previously-padded axes —
+backfills the corner cells with no separate corner read. IO drops to
+`O(perimeter)`: Nebraska ~126→46 reads/var, Texas ~357→76, the ratio widening
+with ROI size. Strips are read zarr-direct (keeping v2's `O(perimeter chunks)`
+graph); reading them through the lazy view would reintroduce v1's whole-store
+layer.
+
+**The tradeoff.** Edge strips add a small, fixed number of graph nodes per face
+(strip read + concat op) versus v2's single slab read — `+~400` nodes/var at a
+100-chunk box, `+~800` at Texas scale. In absolute terms that's negligible
+(~sub-second flow-runner build), and it buys the `O(area)→O(perimeter)` IO cut.
+Output is byte-identical to v2 across both paths (verified in
+`tests/unit/test_zarr_store.py::TestPadRegionToChunks`). The graph-size test
+asserts the strip count is flat in store time length — the invariant that
+distinguishes a zarr-direct strip from a lazy-view one — not an absolute node
+count, since the perimeter constant is the part that doesn't matter.

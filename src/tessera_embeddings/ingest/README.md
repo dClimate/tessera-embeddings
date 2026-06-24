@@ -390,6 +390,26 @@ Dask operations. (Inference reads 2000×2000 sub-tiles out of these 4000×4000 c
 `zarr.Array.oindex`, which needs no such alignment — see
 [`inference/README.md`](../inference/README.md).)
 
+### Region-write chunk padding
+
+`write_region(s)` overwrites a coordinate sub-box in place. Icechunk's `r+` mode rejects a
+region whose edges fall mid-chunk, so an unaligned box is widened out to its enclosing chunk
+bounds and the newly-included cells are backfilled from the store so they round-trip
+unchanged. The backfill reads **only the perimeter strips** of the widened box (one thin slab
+per unaligned face, `da.concatenate`-d onto the incoming block), not the interior — every
+interior cell is overwritten by the incoming data and never needs reading. The strips are
+read straight from the raw Zarr group (`_slab_array_from_zarr`), so each strip's graph is
+`O(strip chunks)` on a fresh layer; reading them through the lazy store view (`isel`) instead
+would drag the whole store's chunk layer into the graph (`O(total store chunks)`), which the
+flow-runner cannot build at continental scale.
+
+The tradeoff: edge strips add a small, fixed number of graph nodes per face versus reading the
+whole widened slab in one shot (`+~400` nodes/var at a 100-chunk box, insignificant in
+absolute terms), in exchange for cutting the backfill **IO from `O(area)` to `O(perimeter)`** —
+e.g. ~126→46 chunk reads per write for a Nebraska-scale box, the difference that keeps
+state-scale region-merges from stalling on wasted reads. See
+[`context_docs/design/region-writes.md`](../../../context_docs/design/region-writes.md).
+
 ### has_new_stac_dates pre-check
 
 `has_new_stac_dates` is meant to run before provisioning a Dask cluster: it queries the STAC
