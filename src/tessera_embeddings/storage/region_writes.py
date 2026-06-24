@@ -182,37 +182,123 @@ def _match_region_shapes(
     return xr.Dataset(matched, coords=data.coords)
 
 
-def _strip_slices(
-    dims: "tuple[str, ...]",
-    cur: dict[str, slice],
-    pad_dim: str,
-    *,
-    side: str,
-    widened: dict[str, slice],
-) -> "tuple[slice, ...]":
-    """Positional axis slices for a store edge strip on the ``pad_dim`` face.
+def _blend_block(
+    zarr_arr: zarr.Array,
+    store_slices: tuple[slice, ...],
+    incoming_block: np.ndarray,
+    dst_slices: tuple[slice, ...],
+) -> np.ndarray:
+    """Read one boundary store chunk and overlay the incoming overlap window onto it.
 
-    Emitted as a positional tuple because the strip is read straight from the raw
-    zarr array (indexed by axis), not by named dim. Along ``pad_dim`` the strip
-    spans the pad margin between the current (pre-pad) extent and the widened bound
-    on the requested ``side`` (``"lo"`` / ``"hi"``). Along every other axis it
-    spans whatever extent the growing block currently has — ``widened`` for axes
-    already padded, the region extent for axes not yet padded (both carried in
-    ``cur``), and the full axis for dims absent from the region. Matching the
-    block's current span on the other axes is what lets a plain ``da.concatenate``
-    fill the corner cells from the store with no separate corner read.
+    The unit of work for a grid chunk that straddles the region edge: the store
+    chunk is read whole (so the pad cells outside the region round-trip unchanged)
+    and the incoming sub-window is written over the cells the region covers
+    (``dst_slices``, positions relative to the chunk). Incoming wins on overlap.
+    The read is copied because the zarr read may alias a buffer we must not mutate.
     """
-    slices: list[slice] = []
-    for d in dims:
-        if d == pad_dim:
-            slices.append(
-                slice(widened[d].start, cur[d].start) if side == "lo" else slice(cur[d].stop, widened[d].stop)
-            )
-        elif d in cur:
-            slices.append(cur[d])
+    base = np.array(zarr_arr[store_slices], copy=True)
+    base[dst_slices] = incoming_block
+    return base
+
+
+def _grid_tiled_region_source(
+    zarr_arr: zarr.Array,
+    incoming: da.Array,
+    dims: "tuple[str, ...]",
+    normalized: dict[str, slice],
+    widened: dict[str, slice],
+    chunk_sizes: dict[str, int],
+    store_sizes: dict[str, int],
+    name: str,
+) -> da.Array:
+    """Build a Dask array whose blocks ARE the store grid chunks over ``widened``.
+
+    The write source for one variable, constructed in closed form as exactly one
+    HLG task per output grid chunk so the source lands block-for-chunk on the store
+    with no realignment. Each grid chunk falls into one of three cases against the
+    (pre-widening) ``normalized`` region:
+
+    * **Pure pad** — no overlap with the region: read that store chunk straight
+      from the raw zarr array. Backfills a widening cell unchanged.
+    * **Fully inside** — the whole grid chunk lies within the region: reference the
+      incoming block covering it directly, no store read.
+    * **Boundary** — partial overlap: read the store chunk and overlay the incoming
+      overlap window on top (:func:`_blend_block`), preserving read-modify-write
+      semantics. Only boundary chunks touch the store, so the store IO stays on the
+      region's perimeter — the same frame-only read the prior edge-strip approach
+      gave, without the off-grid intermediate a downstream rechunk would undo.
+
+    ``widened``'s origin is chunk-aligned by construction, so grid chunks tile
+    ``[widened.start, widened.stop)`` at the store chunk size, the last possibly
+    short (store edge). ``incoming`` is indexed by ``coord - normalized.start``; the
+    per-overlap window is forced to a single block (``rechunk(-1)``) so it is one
+    dependency key per inside/boundary task. The incoming array is a genuine lazy
+    dependency (its read graph composes in via :func:`HighLevelGraph.from_collections`);
+    nothing is materialized at build time.
+
+    The graph sits on a fresh HLG: the only parent layers are the incoming source's
+    own (unavoidable — it is the data being written), never the master's whole
+    chunk layer, so the source stays ``O(grid chunks)`` in the master's size.
+    """
+    # Per axis: the grid-chunk start coordinates (absolute store coords), the chunk
+    # size, the widened stop (to clamp a short final chunk), and the region bounds.
+    # A dim absent from the region spans its full axis and has no pad/overlap split.
+    axis_bounds: list[list[int]] = []
+    axis_meta: list[tuple[int, int, int, int]] = []  # (chunk, widened_stop, region_lo, region_hi)
+    for dim in dims:
+        cs = chunk_sizes[dim]
+        if dim in widened:
+            w_start, w_stop = widened[dim].start, widened[dim].stop
+            r_lo, r_hi = normalized[dim].start, normalized[dim].stop
         else:
-            slices.append(slice(None))
-    return tuple(slices)
+            w_start, w_stop = 0, store_sizes[dim]
+            r_lo, r_hi = 0, store_sizes[dim]
+        axis_bounds.append(list(range(w_start, w_stop, cs)))
+        axis_meta.append((cs, w_stop, r_lo, r_hi))
+
+    out_chunks = tuple(
+        tuple(min(b + cs, w_stop) - b for b in bounds)
+        for bounds, (cs, w_stop, _r_lo, _r_hi) in zip(axis_bounds, axis_meta, strict=True)
+    )
+
+    dsk: dict[tuple, Any] = {}
+    deps: list[da.Array] = []
+    for block_idx in itertools.product(*(range(len(bounds)) for bounds in axis_bounds)):
+        store_slices: list[slice] = []
+        # Per axis: (overlap_lo, overlap_hi, chunk_lo, chunk_hi, region_lo) in absolute coords.
+        ov: list[tuple[int, int, int, int, int]] = []
+        for axis, bi in enumerate(block_idx):
+            cs, w_stop, r_lo, r_hi = axis_meta[axis]
+            b_lo = axis_bounds[axis][bi]
+            b_hi = min(b_lo + cs, w_stop)
+            store_slices.append(slice(b_lo, b_hi))
+            ov.append((max(b_lo, r_lo), min(b_hi, r_hi), b_lo, b_hi, r_lo))
+        store_slices_t = tuple(store_slices)
+
+        pure_pad = any(o_lo >= o_hi for o_lo, o_hi, *_ in ov)
+        fully_inside = all(o_lo == b_lo and o_hi == b_hi for o_lo, o_hi, b_lo, b_hi, _ in ov)
+
+        if pure_pad:
+            dsk[(name, *block_idx)] = (_read_zarr_block, zarr_arr, store_slices_t)
+            continue
+
+        # Incoming sub-window for this chunk's overlap, in incoming-local coords
+        # (region origin maps to incoming index 0). Forced to a single block so the
+        # task references one dependency key.
+        inc_window = incoming[tuple(slice(o_lo - r_lo, o_hi - r_lo) for o_lo, o_hi, _b_lo, _b_hi, r_lo in ov)]
+        inc_window = inc_window.rechunk(-1)
+        deps.append(inc_window)
+        inc_keys = list(da.core.flatten(inc_window.__dask_keys__()))
+        inc_key = inc_keys[0]
+
+        if fully_inside:
+            dsk[(name, *block_idx)] = inc_key
+        else:
+            dst_slices = tuple(slice(o_lo - b_lo, o_hi - b_lo) for o_lo, o_hi, b_lo, _b_hi, _ in ov)
+            dsk[(name, *block_idx)] = (_blend_block, zarr_arr, store_slices_t, inc_key, dst_slices)
+
+    hlg = HighLevelGraph.from_collections(name, dsk, dependencies=deps)  # type: ignore[arg-type]
+    return da.Array(hlg, name, out_chunks, dtype=zarr_arr.dtype)
 
 
 def _pad_region_to_chunks(
@@ -231,26 +317,22 @@ def _pad_region_to_chunks(
     store so they round-trip unchanged through the write.
 
     Returns ``(padded, widened)``. When ``region`` is already chunk-aligned this
-    returns ``(data, region)`` unchanged — no store read.
+    returns ``(data, widened)`` with the data passed through unchanged — no store
+    read. The ``padded`` block is built grid-tiled (see
+    :func:`_grid_tiled_region_source`): one dask block per store chunk over the
+    widened bounds, so it lands block-for-chunk on the store with no realignment.
+    Each block is either an incoming block (cells the region covers), a store chunk
+    read whole (a pure widening cell), or a boundary chunk read whole with the
+    incoming overlap window overlaid — so the store IO stays on the region's
+    *perimeter*, not its area.
 
-    Padding wraps the incoming block in store-read **edge strips**: for each
-    unaligned face, a thin slab covering only the pad margin (``widened`` minus
-    ``normalized`` on that face) is read and ``da.concatenate``-d onto the block,
-    one axis at a time. The interior — every cell the incoming data covers — is
-    never read; only the boundary frame touches the store, so the IO scales with
-    the region's *perimeter*, not its area. Concatenating axis by axis, with each
-    strip spanning the already-extended extent on previously-padded axes, fills
-    the corner cells from the store too (no separate corner read).
-
-    Every strip is read **straight from the raw zarr ``group``** (the readonly
-    session pinned to the write base snapshot, same view ``existing`` opens), via
-    :func:`_slab_array_from_zarr`: one read task per overlapping chunk block, on a
-    fresh graph with no whole-store parent layer. Reading instead through the lazy
-    ``existing`` view (``isel``) carries the master's *entire* chunk layer into
-    every strip — a graph sized ``O(total store chunks)`` regardless of how much
-    the batch writes, which the flow-runner cannot build at continental scale.
-    Building the strips zarr-direct keeps the graph ``O(perimeter chunks)`` and
-    the IO to the frame.
+    Every store read is taken **straight from the raw zarr ``group``** (the readonly
+    session pinned to the write base snapshot, same view ``existing`` opens): one
+    read task per chunk, on a fresh graph with no whole-store parent layer. Reading
+    instead through the lazy ``existing`` view (``isel``) carries the master's
+    *entire* chunk layer into every read — a graph sized ``O(total store chunks)``
+    regardless of how much the batch writes, which the flow-runner cannot build at
+    continental scale. The grid-tiled source keeps the graph ``O(grid chunks)``.
     """
     # Normalize region slices up front: resolve open bounds (slice(None)) to
     # concrete indices, reject non-unit steps, and reject empty slices, so the
@@ -288,53 +370,38 @@ def _pad_region_to_chunks(
     if not needs_pad:
         return matched, widened
 
-    # Per-dim low/high pad margins (cells of widening on each face). A dim with
-    # no margin contributes no edge strip.
-    pad_lo = {d: normalized[d].start - widened[d].start for d in normalized}
-    pad_hi = {d: widened[d].stop - normalized[d].stop for d in normalized}
+    # Grid chunk sizes for EVERY store dim (a dim absent from the region is written
+    # in full and must still tile on the store grid, not coalesce its whole axis).
+    grid_sizes = _store_chunk_sizes(existing, tuple(str(d) for d in existing.sizes))
+    store_sizes = {str(d): existing.sizes[d] for d in existing.sizes}
 
     padded_vars: dict[str, Any] = {}
     for name, incoming in matched.data_vars.items():
         name = str(name)
         dims = tuple(str(d) for d in existing[name].dims)  # store dimension order is authoritative
         # group[name] is a data-var array; zarr v3 stubs widen __getitem__ to
-        # Array | Group, so narrow it for the slab builder.
+        # Array | Group, so narrow it for the grid tiler.
         zarr_arr = cast("zarr.Array", group[name])
-        # The strips are built by indexing the raw zarr array POSITIONALLY by axis,
-        # but the slice bounds/widened/chunk grid are all keyed by xarray's named
-        # dims. That crossing is only safe if the named-dim order and per-axis chunk
-        # grid match the raw array's physical layout. They do today (xarray writes
+        # The grid tiler indexes the raw zarr array POSITIONALLY by axis, but the
+        # slice bounds/widened/chunk grid are all keyed by xarray's named dims. That
+        # crossing is only safe if the named-dim order and per-axis chunk grid match
+        # the raw array's physical layout. They do today (xarray writes
         # _ARRAY_DIMENSIONS in dim order and open_zarr preserves it; both views come
         # from the same snapshot), but it's an unasserted invariant — a transposed
         # write, mixed per-var dim orders, or sourcing chunk sizes from config would
         # silently slice the wrong axes / mis-align the backfill. Assert it so that
         # failure mode is loud, not silent.
         _assert_zarr_layout_matches_dims(zarr_arr, existing[name], name)
-        # Grow the incoming block to the widened bounds one axis at a time. After
-        # axis k is padded the block already spans widened on axes < k, so the strip
-        # read for axis k covers that extended extent — which backfills the corner
-        # cells from the store without a separate corner read. Each strip is read
-        # zarr-direct (O(strip chunks), no whole-store layer); the interior is never
-        # read.
-        block = incoming.transpose(*dims).data
-        cur = {d: normalized[d] for d in normalized}  # current extent per padded dim
-        for axis, dim in enumerate(dims):
-            if dim not in normalized:
-                continue
-            lo, hi = pad_lo[dim], pad_hi[dim]
-            if lo:
-                slc = _strip_slices(dims, cur, dim, side="lo", widened=widened)
-                strip = _slab_array_from_zarr(
-                    zarr_arr, slc, f"strip-lo-{name}-{tokenize(zarr_arr, slc)}", band_single_chunk=False
-                )
-                block = da.concatenate([strip, block], axis=axis)
-            if hi:
-                slc = _strip_slices(dims, cur, dim, side="hi", widened=widened)
-                strip = _slab_array_from_zarr(
-                    zarr_arr, slc, f"strip-hi-{name}-{tokenize(zarr_arr, slc)}", band_single_chunk=False
-                )
-                block = da.concatenate([block, strip], axis=axis)
-            cur[dim] = widened[dim]  # this axis now spans the widened extent
+        block = _grid_tiled_region_source(
+            zarr_arr,
+            incoming.transpose(*dims).data,
+            dims,
+            normalized,
+            widened,
+            grid_sizes,
+            store_sizes,
+            f"gridsrc-{name}-{tokenize(zarr_arr, widened, normalized)}",
+        )
         padded_vars[name] = (dims, block)
 
     # Coords come from the lazy store view (authoritative). They're 1-D and dropped
@@ -368,13 +435,15 @@ def _aligned_region_sources(
     """Build the ``(sources, targets, regions, widened)`` lists for one distributed store.
 
     Each ``(data, region)`` is padded to whole-chunk bounds (reusing
-    :func:`_pad_region_to_chunks`'s read-modify-write shell for unaligned edges),
-    then every written variable is transposed to the store's dim order and
-    rechunked to the store's on-disk chunk grid so each dask block maps onto whole
-    Zarr chunks — the alignment ``write_region`` gets from ``align_chunks=True``,
-    done explicitly here because the raw ``store_dask`` path performs no
-    realignment. The widened region's start is chunk-aligned by construction, so a
-    grid-rechunked source lands block-for-chunk on the store.
+    :func:`_pad_region_to_chunks`'s read-modify-write backfill for unaligned edges),
+    then every written variable is transposed to the store's dim order and rechunked
+    to the store's on-disk chunk grid so each dask block maps onto whole Zarr chunks
+    — the alignment ``write_region`` gets from ``align_chunks=True``, done explicitly
+    here because the raw ``store_dask`` path performs no realignment. The unaligned
+    path returns an already grid-tiled source, so the ``rechunk`` is a no-op there;
+    on the aligned fast path it tiles the pass-through incoming onto the grid. Either
+    way the widened region's start is chunk-aligned by construction, so the source
+    lands block-for-chunk on the store.
 
     Targets are opened against ``fork.store`` (the pickleable fork shipped to
     workers); the same variable appearing in several items yields several target

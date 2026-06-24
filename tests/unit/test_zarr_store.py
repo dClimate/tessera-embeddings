@@ -774,31 +774,56 @@ class TestPadRegionToChunks:
         )
         return ds.chunk({"time": 1, "northing": chunk, "easting": chunk})
 
+    @staticmethod
+    def _task_groups(graph):
+        """Count dask graph keys by task-group prefix (the bit before the token)."""
+        from collections import Counter
+
+        groups: Counter[str] = Counter()
+        for key in graph:
+            name = key[0] if isinstance(key, tuple) else str(key)
+            groups[name.split("-")[0] if isinstance(name, str) else name] += 1
+        return groups
+
     def test_padded_shell_graph_is_slab_local_and_flat_in_time(self):
-        """The padded block's dask graph must scale with the region's edge strips, not
-        the store's time length — the property that keeps the zarr-direct strips flat
-        in master time and kills the scheduler OOM. Reading the strips through the lazy
-        ``existing`` view would carry the whole-store time-chunk layer into every one,
-        so the graph would grow with the master's total dates; value-parity tests can't
-        catch that regression, only a graph-size check independent of ``nt`` can.
+        """The grid-tiled source's dask graph must scale with the region's grid chunks,
+        not the store's time length — the property that keeps the source flat in master
+        time and kills the scheduler OOM. Reading the backfill through the lazy
+        ``existing`` view would carry the whole-store time-chunk layer into it, so the
+        graph would grow with the master's total dates; a value-parity test can't catch
+        that, only a graph-size check independent of ``nt`` can. The same check also
+        guards that the grid-tiled construction emits NO all-to-all ``rechunk`` /
+        ``concatenate`` groups (the scheduler-bound ops the off-grid intermediate +
+        downstream rechunk used to dominate) and stays ``O(grid chunks)``.
         """
-        # 100x100 store at 50-px chunks; region 10:30 x 10:70 widens to a 1x1x2 block slab.
+        # 100x100 store at 50-px chunks; region 10:30 x 10:70 widens to a 1x1x2 grid slab.
         region = {"time": slice(0, 1), "northing": slice(10, 30), "easting": slice(10, 70)}
         data = _single_date_block("2024-01-01", 9, height=20, width=60, n0=10, e0=10, chunks=ONE_BLOCK)
 
         sizes = {}
+        groups_by_nt = {}
         for nt in (5, 500):
             existing = self._existing_nt(nt=nt)
             padded, widened = _pad_region_to_chunks(existing, data, region, self._group(existing))
             assert widened["northing"] == slice(0, 50) and widened["easting"] == slice(0, 100)
-            sizes[nt] = len(padded["blue"].data.__dask_graph__())
+            graph = padded["blue"].data.__dask_graph__()
+            sizes[nt] = len(graph)
+            groups_by_nt[nt] = self._task_groups(graph)
 
-        # The block is the incoming insert grown by an edge strip per unaligned face
-        # (here all four), each a zarr-direct read concatenated on — a small constant
-        # set by the perimeter, not the slab area. The whole point: it must NOT grow
-        # from nt=5 to nt=500. A lazy-view strip read would scale with nt.
-        assert sizes[5] == sizes[500], f"strip graph scales with store time length: {sizes}"
-        assert sizes[5] < 100, f"strip graph has {sizes[5]} keys — not perimeter-local"
+        # The source is one task per grid chunk over the widened bounds (here 1x1x2),
+        # each a store read, an incoming block, or a boundary blend — a small constant
+        # set by the grid, not the slab area or master time. It must NOT grow from nt=5
+        # to nt=500; a lazy-view backfill read would scale with nt.
+        assert sizes[5] == sizes[500], f"source graph scales with store time length: {sizes}"
+        assert sizes[5] < 100, f"source graph has {sizes[5]} keys — not grid-local"
+
+        # The off-grid concat + grid rechunk are gone: no scheduler-bound all-to-all
+        # groups remain in the source graph (the slicing of the incoming insert may
+        # leave plain ``getitem`` splits, which are embarrassingly parallel, not
+        # all-to-all).
+        for nt, groups in groups_by_nt.items():
+            assert "concatenate" not in groups, f"nt={nt}: source graph still has concatenate: {dict(groups)}"
+            assert "rechunk" not in groups, f"nt={nt}: source graph still has rechunk: {dict(groups)}"
 
     def test_zarr_direct_shell_matches_isel(self):
         """The zarr-direct shell is numerically identical to the old
@@ -833,6 +858,50 @@ class TestPadRegionToChunks:
         )
         ref[idx] = data["blue"].transpose("time", "northing", "easting").data
         np.testing.assert_array_equal(padded["blue"].values, ref.compute())
+
+    def test_grid_tiled_boundary_blend_multi_time(self):
+        """Multi-time unaligned region: every cell matches a per-pixel oracle.
+
+        The store is filled with spatially- AND temporally-varying values, so a
+        boundary chunk's blend that mis-placed the incoming overlay (wrong offset,
+        wrong axis, or wrong time index) would leave the wrong store value showing
+        and fail the assert. A run spanning several time indices (each its own time
+        chunk) exercises the time axis as an outer block dim.
+        """
+        rng = np.random.default_rng(7)
+        nt = 5
+        store_vals = rng.integers(0, 9000, size=(nt, 60, 60), dtype=np.uint16)
+        existing = xr.Dataset(
+            {"blue": (["time", "northing", "easting"], store_vals)},
+            coords={
+                "time": [np.datetime64("2024-01-01", "ns") + np.timedelta64(i, "D") for i in range(nt)],
+                "northing": np.arange(60),
+                "easting": np.arange(60),
+            },
+        ).chunk({"time": 1, "northing": 20, "easting": 20})
+        group = self._group(existing)
+
+        # 3-date run on a box unaligned on all four spatial faces (13:47 x 7:51).
+        t0, run = 1, 3
+        inc = rng.integers(0, 9000, size=(run, 34, 44), dtype=np.uint16)
+        data = xr.Dataset(
+            {"blue": (["time", "northing", "easting"], inc)},
+            coords={"time": [existing.time.values[t0 + i] for i in range(run)]},
+        ).chunk(ONE_BLOCK)
+        region = {"time": slice(t0, t0 + run), "northing": slice(13, 47), "easting": slice(7, 51)}
+
+        padded, widened = _pad_region_to_chunks(existing, data, region, group)
+        assert widened == {
+            "time": slice(t0, t0 + run),
+            "northing": slice(0, 60),
+            "easting": slice(0, 60),
+        }
+
+        # Per-pixel oracle: store values over the widened box, with incoming overlaid
+        # on exactly the region cells (relative to the widened origin).
+        ref = store_vals[t0 : t0 + run, 0:60, 0:60].copy()
+        ref[:, 13:47, 7:51] = inc
+        np.testing.assert_array_equal(padded["blue"].values, ref)
 
     def test_guard_rejects_transposed_zarr_axis_order(self):
         """The shell indexes the raw zarr array positionally; if its physical axis

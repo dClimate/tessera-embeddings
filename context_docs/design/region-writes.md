@@ -421,12 +421,12 @@ Phase 1 ships the primitive; Phase 2 wires callers:
 
 ---
 
-## 9. Backfill evolution — full slab → zarr-direct edge strips
+## 9. Backfill evolution — full slab → zarr-direct edge strips → grid-tiled source
 
-The RMW pad's backfill went through three shapes as the master grew from
+The RMW pad's backfill went through four shapes as the master grew from
 100km-tile to state/CONUS scale. Each fixed a distinct scaling wall; the history
-matters because the failure modes look similar (a stalled flow-runner) but have
-different causes.
+matters because the failure modes look similar (a stalled or scheduler-pegged
+flow-runner) but have different causes.
 
 **v1 — full slab via the lazy view (`existing.isel(widened)` + `setitem`).**
 Read the whole widened slab as a lazy dask slab off the store *view*, then
@@ -448,22 +448,41 @@ even though every interior cell is overwritten by the incoming data. IO is still
 discarded interior. That wasted read is what made state-scale merge batches take
 ~7 minutes each.
 
-**v3 (current) — zarr-direct edge strips.** Read only the pad margin on each
-unaligned face (a thin slab per face), `da.concatenate`-d onto the incoming
-block one axis at a time; the interior is never read. Concatenating axis by axis
-— each strip spanning the already-extended extent on previously-padded axes —
-backfills the corner cells with no separate corner read. IO drops to
-`O(perimeter)`: Nebraska ~126→46 reads/var, Texas ~357→76, the ratio widening
-with ROI size. Strips are read zarr-direct (keeping v2's `O(perimeter chunks)`
-graph); reading them through the lazy view would reintroduce v1's whole-store
-layer.
+**v3 — zarr-direct edge strips.** Read only the pad margin on each unaligned
+face (a thin slab per face), `da.concatenate`-d onto the incoming block one axis
+at a time; the interior is never read. Concatenating axis by axis — each strip
+spanning the already-extended extent on previously-padded axes — backfills the
+corner cells with no separate corner read. IO drops to `O(perimeter)`: Nebraska
+~126→46 reads/var, Texas ~357→76, the ratio widening with ROI size. Strips are
+read zarr-direct (keeping v2's `O(perimeter chunks)` graph); reading them through
+the lazy view would reintroduce v1's whole-store layer. The catch: the strip
+concat deliberately builds an **off-grid** block (chunk boundaries at the strip
+widths, not the store's 4000 grid), so the downstream `rechunk` in
+`_aligned_region_sources` that maps the source onto the store grid had to undo it
+all-to-all. On a batched merge that `rechunk` (split `getitem` + merge
+`concatenate`) dominated the Dask graph — ~95% of all tasks — and pegged the
+scheduler at 100% while workers idled. The merge had become scheduler-bound.
 
-**The tradeoff.** Edge strips add a small, fixed number of graph nodes per face
-(strip read + concat op) versus v2's single slab read — `+~400` nodes/var at a
-100-chunk box, `+~800` at Texas scale. In absolute terms that's negligible
-(~sub-second flow-runner build), and it buys the `O(area)→O(perimeter)` IO cut.
-Output is byte-identical to v2 across both paths (verified in
-`tests/unit/test_zarr_store.py::TestPadRegionToChunks`). The graph-size test
-asserts the strip count is flat in store time length — the invariant that
-distinguishes a zarr-direct strip from a lazy-view one — not an absolute node
-count, since the perimeter constant is the part that doesn't matter.
+**v4 (current) — closed-form grid-tiled source.** Build the write source, in
+closed form, as one HLG task per *output store-grid chunk* over the widened
+bounds — so the source already lands block-for-chunk on the store and the
+downstream `rechunk` is a genuine no-op. Each grid chunk is one of: a **pure-pad**
+chunk (no region overlap) read straight from zarr; a **fully-inside** chunk that
+references the incoming block directly (no store read); or a **boundary** chunk
+read whole with the incoming overlap window overlaid (`_blend_block`). Store IO
+stays `O(perimeter)` exactly as v3 (only boundary/pad chunks read), but there is
+no off-grid intermediate and so **no `concatenate` and no grid `rechunk`** — the
+scheduler-bound all-to-all groups vanish. Measured at an Iowa-ish 9×14-grid,
+3-date, 4-var batch (with a realistically multi-chunk lazy incoming): total Dask
+tasks drop ~41.2k → ~9.7k (≈4.2×), the `concatenate` group (≈19k tasks) goes to
+zero, and `rechunk` falls ≈20.2k → ≈1.5k (the residual is the per-window
+single-block collapse on the lazy incoming, not all-to-all). The incoming feature
+array is referenced as a genuine lazy Dask dependency (nothing materialized at
+build time); its own read graph composes in — unavoidable, it is the data being
+written — but the master's whole chunk layer never does, so the source stays
+`O(grid chunks)` in store size. Output is byte-identical to v3 across aligned,
+unaligned-all-faces, edge-of-store, multi-time, and boundary-blend cases
+(verified in `tests/unit/test_zarr_store.py::TestPadRegionToChunks`). The
+graph-size test asserts both the flat-in-store-time invariant (distinguishing a
+zarr-direct source from a lazy-view one) and the absence of the `concatenate` /
+`rechunk` groups.
