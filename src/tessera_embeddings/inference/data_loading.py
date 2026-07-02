@@ -15,7 +15,9 @@ loaded eagerly.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
@@ -30,6 +32,26 @@ from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.storage.zarr_store import compute_doy, open_store_as_zarr_group
 
 logger = logging.getLogger(__name__)
+
+
+# Worker cap for the concurrent S2 band read (see ``_load_s2_bands``). The 10
+# bands are independent zarr arrays, so their reads fan out across a thread
+# pool. Unlike the latency-bound ROI probe (``chunk_spec._ROI_PROBE_WORKERS``,
+# oversubscribed x4), this read is decompression-bound: with time chunked at 1,
+# each band's ``oindex`` already issues its per-timestep S3 GETs concurrently,
+# so the serial cost we remove is the 10 decompression waves, not GET latency.
+# Decompression runs in Rust with the GIL released, so it scales to cores — but
+# only to cores, so we cap at the allocated CPU count (never above the band
+# count) to keep decompression cores busy without oversubscribing. Uses
+# ``sched_getaffinity`` where available (Linux inference actors) so a
+# cgroup/affinity-pinned worker sees its real allocation, not the host's.
+def _band_read_workers() -> int:
+    try:
+        allocated = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except AttributeError:  # macOS/Windows: no affinity API
+        allocated = os.cpu_count() or 4
+    return max(1, min(len(S2_BAND_ORDER), allocated))
+
 
 # A function that maps a store path to an open zarr group. The default is
 # ``open_store_as_zarr_group`` (a fresh repo open per call). The strip loop
@@ -175,8 +197,21 @@ def _load_s2_bands(
     h = y_slice.stop - y_slice.start
     w = x_slice.stop - x_slice.start
     result = np.empty((t, h, w, len(S2_BAND_ORDER)), dtype=ref.dtype)
-    for i, band in enumerate(S2_BAND_ORDER):
+
+    # The 10 bands are independent zarr arrays and each thread writes a distinct
+    # ``result[..., i]`` column, so the reads have no shared mutable state and
+    # run concurrently. Reading one band per iteration is serial across 10
+    # decompression waves; fanning them out collapses those to one wave bounded
+    # by the allocated cores (see ``_band_read_workers``). Concurrent reads on
+    # one readonly icechunk session store (an immutable snapshot view) are safe
+    # — only concurrent *commits* are not; verified against a real store.
+    def _read_band(i: int, band: str) -> None:
         result[:, :, :, i] = root[band].oindex[time_indices, y_slice, x_slice]
+
+    with ThreadPoolExecutor(max_workers=_band_read_workers()) as pool:
+        # Drain the map so any read exception propagates instead of being
+        # swallowed with a partially-filled ``result``.
+        list(pool.map(lambda ib: _read_band(*ib), enumerate(S2_BAND_ORDER)))
     return result
 
 
