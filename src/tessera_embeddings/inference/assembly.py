@@ -962,9 +962,17 @@ class ZarrWriter:
 
         # Split each spatial axis's manifest into 32-chunk shards. Embeddings are
         # written in 500-px spatial chunks, so a 32-chunk shard is ~16k px/axis —
-        # matching DEFAULT_MANIFEST_SPLIT_SIZES' ~16k-px target. No time split:
-        # assembly only ever writes a single timestep, so one time shard == the
-        # whole array and splitting time would be a no-op.
+        # matching DEFAULT_MANIFEST_SPLIT_SIZES' ~16k-px target.
+        #
+        # Time is split at 1 shard per timestep. An assembly append writes one
+        # full-spatial-extent timestep, so it touches every spatial shard — and
+        # since manifest objects are immutable, each touched shard is rewritten in
+        # full. With "time": 1 each timestep is its own shard, so an append writes a
+        # new shard and rewrites zero prior ones; the per-append manifest rewrite
+        # (and the peak worker RAM building it) stays bounded by a single timestep
+        # rather than the whole time series. We never region-write across time on
+        # this store (appends only add whole timesteps) and the series tops out at
+        # ~30 dates, so the extra shard objects and read fan-out are negligible.
         #
         # This wraps appends to pre-existing stores too, which is intentional and
         # safe. A store created before splitting was introduced has one unsplit
@@ -978,7 +986,7 @@ class ZarrWriter:
         # The context is scoped tightly here — around the output store open/write
         # only — so that read-only opens of other stores (e.g. the mosaic base for
         # spatial coords) are not inadvertently opened under the split config.
-        with manifest_split({"northing": 32, "easting": 32}):
+        with manifest_split({"northing": 32, "easting": 32, "time": 1}):
             # scatter_initial_credentials: to_icechunk pickles the session out to
             # every Dask worker. With a credential callback, eager scatter
             # caches one credential set on the driver so workers don't all stampede
