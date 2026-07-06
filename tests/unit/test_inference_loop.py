@@ -8,10 +8,10 @@ import torch
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 from tessera_embeddings.inference.inference import (
-    _BatchTimings,
     _prepare_batch,
     _prepare_gpu,
-    _run_gpu_sub_batch,
+    _quantize_and_write,
+    _transfer_and_forward,
     run_inference,
 )
 
@@ -93,6 +93,56 @@ class TestRunInference:
 
         assert np.any(result.embeddings != 0)
 
+    def test_pipelined_output_matches_serial_reference(self, sample_chunk_data, inference_config, test_model):
+        """The pipelined loop is byte-identical to a strictly-serial reference.
+
+        run_inference overlaps each batch's quantize+scatter-write with the next
+        batch's forward on a worker thread. Quantization is per-row and each
+        sub-batch writes only its own (disjoint) global_idxs, so the reordering
+        must not change the result. Build a serial reference by driving the same
+        two primitives (_transfer_and_forward → _quantize_and_write) in strict
+        order and assert exact equality — this guards the async global_idxs
+        handoff. Uses a chunk large enough (with batch_size=16) to span many
+        sub-batches across both buckets so the overlap path is actually taken.
+        """
+        from tessera_embeddings.inference.inference import _quantize_and_write, _transfer_and_forward
+
+        h, w = 24, 24
+        chunk = sample_chunk_data(height=h, width=w, t_s2=10, t_s1a=5, t_s1d=5)
+        device = torch.device("cpu")
+        save_dim = inference_config.representation_dim
+
+        # Serial reference: same primitives, no pipelining.
+        dataset_ref = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
+        ref_q = np.zeros((h * w, save_dim), dtype=np.int8)
+        ref_scales = np.full(h * w, np.nan, dtype=np.float32)
+        with torch.no_grad():
+            for bucket_key, pixel_indices in dataset_ref.iter_buckets(largest_first=True):
+                n = int(pixel_indices.size)
+                for start in range(0, n, inference_config.batch_size):
+                    end = min(start + inference_config.batch_size, n)
+                    batch, _ = _prepare_batch(dataset_ref, bucket_key, start, end)
+                    z_host, global_idxs, _, _ = _transfer_and_forward(
+                        test_model, batch, bucket_key, device, None, save_dim
+                    )
+                    _quantize_and_write(z_host, global_idxs, ref_q, ref_scales)
+        ref_emb = ref_q.reshape(h, w, save_dim)
+        ref_scales_2d = ref_scales.reshape(h, w)
+
+        # Ensure the reference actually spanned multiple sub-batches (else the
+        # test wouldn't exercise the overlap it claims to).
+        total_valid = sum(int(pi.size) for _, pi in dataset_ref.iter_buckets())
+        assert total_valid > inference_config.batch_size, "chunk too small to exercise pipelining"
+
+        dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
+        result = run_inference(test_model, dataset, inference_config, device)
+
+        np.testing.assert_array_equal(result.embeddings, ref_emb)
+        # NaN-aware comparison for scales (invalid pixels are NaN in both).
+        np.testing.assert_array_equal(np.isnan(result.scales), np.isnan(ref_scales_2d))
+        finite = ~np.isnan(ref_scales_2d)
+        np.testing.assert_array_equal(result.scales[finite], ref_scales_2d[finite])
+
     def test_compute_std_is_coerced_off(self, sample_chunk_data, inference_config, test_model):
         """compute_std is silently forced off under v1.1; embeddings_std is None."""
         h, w = 8, 8
@@ -157,10 +207,31 @@ class TestPrepareGpu:
 
 
 class TestProcessSubBatch:
-    """Tests for the split _prepare_batch / _run_gpu_sub_batch helpers."""
+    """Tests for the split _transfer_and_forward / _quantize_and_write primitives."""
 
-    def test_returns_batch_timings(self, sample_chunk_data, inference_config, test_model):
-        """_run_gpu_sub_batch returns _BatchTimings with all non-negative values."""
+    def test_transfer_and_forward_returns_host_embeddings(self, sample_chunk_data, inference_config, test_model):
+        """_transfer_and_forward returns a (B, save_dim) host array and non-negative times."""
+        chunk = sample_chunk_data(height=5, width=5, t_s2=10, t_s1a=5, t_s1d=5)
+        dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
+        device = torch.device("cpu")
+        save_dim = inference_config.representation_dim
+
+        bucket_key, pixel_indices = next(iter(dataset.iter_buckets()))
+        end = min(inference_config.batch_size, int(pixel_indices.size))
+        batch, _ = _prepare_batch(dataset, bucket_key, 0, end)
+
+        with torch.no_grad():
+            z_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
+                test_model, batch, bucket_key, device, None, save_dim, config=inference_config
+            )
+
+        assert z_host.shape == (end, save_dim)
+        assert global_idxs.shape == (end,)
+        assert transfer_secs >= 0
+        assert forward_secs >= 0
+
+    def test_quantize_and_write_writes_to_flat_out(self, sample_chunk_data, inference_config, test_model):
+        """_quantize_and_write scatters non-zero int8 rows into the output buffers."""
         chunk = sample_chunk_data(height=5, width=5, t_s2=10, t_s1a=5, t_s1d=5)
         dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
         device = torch.device("cpu")
@@ -171,54 +242,14 @@ class TestProcessSubBatch:
 
         bucket_key, pixel_indices = next(iter(dataset.iter_buckets()))
         end = min(inference_config.batch_size, int(pixel_indices.size))
-        batch, get_batch_secs = _prepare_batch(dataset, bucket_key, 0, end)
+        batch, _ = _prepare_batch(dataset, bucket_key, 0, end)
 
         with torch.no_grad():
-            bt = _run_gpu_sub_batch(
-                test_model,
-                batch,
-                bucket_key,
-                device,
-                None,
-                flat_q,
-                flat_scales,
-                get_batch_secs,
-                config=inference_config,
-                save_dim=save_dim,
+            z_host, global_idxs, _, _ = _transfer_and_forward(
+                test_model, batch, bucket_key, device, None, save_dim, config=inference_config
             )
-
-        assert isinstance(bt, _BatchTimings)
-        assert bt.get_batch >= 0
-        assert bt.transfer >= 0
-        assert bt.forward >= 0
-        assert bt.postprocess >= 0
-
-    def test_writes_to_flat_out(self, sample_chunk_data, inference_config, test_model):
-        """_run_gpu_sub_batch writes non-zero values into the output buffers."""
-        chunk = sample_chunk_data(height=5, width=5, t_s2=10, t_s1a=5, t_s1d=5)
-        dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
-        device = torch.device("cpu")
-        h, w = dataset.H, dataset.W
-        save_dim = inference_config.representation_dim
-        flat_q = np.zeros((h * w, save_dim), dtype=np.int8)
-        flat_scales = np.full(h * w, np.nan, dtype=np.float32)
-
-        bucket_key, pixel_indices = next(iter(dataset.iter_buckets()))
-        end = min(inference_config.batch_size, int(pixel_indices.size))
-        batch, get_batch_secs = _prepare_batch(dataset, bucket_key, 0, end)
-
-        with torch.no_grad():
-            _run_gpu_sub_batch(
-                test_model,
-                batch,
-                bucket_key,
-                device,
-                None,
-                flat_q,
-                flat_scales,
-                get_batch_secs,
-                config=inference_config,
-                save_dim=save_dim,
-            )
+        _quantize_and_write(z_host, global_idxs, flat_q, flat_scales)
 
         assert np.any(flat_q != 0)
+        # Only this bucket's pixels were written; their scales are now finite.
+        assert np.isfinite(flat_scales[global_idxs]).all()
