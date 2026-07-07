@@ -33,7 +33,7 @@ Input stores (Icechunk/Zarr on S3):
   │  │   1. load_chunk(y_sub=…)  ← selective│    │
   │  │   2. Dataset valid-px filter         │    │
   │  │   3. sample_s2/s1_batch()            │    │
-  │  │   4. model forward  (FP16, B=14336)   │    │
+  │  │   4. model forward  (FP16, B=7168)   │    │
   │  │  5. writer.write_chunk() → staging   │    │
   │  └─────────────────────────────────────┘    │
   │  Work-stealing: actors pull from queue      │
@@ -457,7 +457,7 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `batch_size` | 14336 | GPU pixels per forward pass within a bucket |
+| `batch_size` | 7168 | GPU pixels per forward pass within a bucket |
 | `num_obs_checkpoints` | `range(8, 257, 8)` | Bucketed sequence-length schedule; pixels binned to nearest checkpoint |
 | `s1_orbit` | `"both"` | `"ascending"`, `"descending"`, or `"both"` |
 | `norm_source` | `"mpc"` | Band stats origin; `"aws"` for the AWS-normalised encoder checkpoint |

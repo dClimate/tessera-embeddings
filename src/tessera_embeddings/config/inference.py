@@ -205,7 +205,7 @@ class InferenceConfig:
     num_obs_checkpoints: tuple[int, ...] = field(default_factory=lambda: DEFAULT_NUM_OBS_CHECKPOINTS)
 
     # Inference
-    batch_size: int = 14336
+    batch_size: int = 7168
     num_workers: int = 4
     norm_source: Literal["mpc", "aws"] = "aws"
     s1_orbit: Literal["ascending", "descending", "both"] = "both"

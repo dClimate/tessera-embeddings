@@ -96,7 +96,7 @@ config = InferenceConfig(
 
 Key architecture fields default to the v1.1 production checkpoint shape:
 `latent_dim=192`, `dim_feedforward=2048`, `representation_dim=192`.
-Only override if loading a different checkpoint. `batch_size=14336` controls
+Only override if loading a different checkpoint. `batch_size=7168` controls
 per-GPU pixels per forward pass within a bucket.
 
 ## Secrets enter at the flow boundary
