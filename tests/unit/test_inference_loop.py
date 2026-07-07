@@ -10,8 +10,8 @@ from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 from tessera_embeddings.inference.inference import (
     _prepare_batch,
     _prepare_gpu,
-    _quantize_and_write,
     _transfer_and_forward,
+    _write_quantized_rows,
     run_inference,
 )
 
@@ -105,7 +105,7 @@ class TestRunInference:
         handoff. Uses a chunk large enough (with batch_size=16) to span many
         sub-batches across both buckets so the overlap path is actually taken.
         """
-        from tessera_embeddings.inference.inference import _quantize_and_write, _transfer_and_forward
+        from tessera_embeddings.inference.inference import _transfer_and_forward, _write_quantized_rows
 
         h, w = 24, 24
         chunk = sample_chunk_data(height=h, width=w, t_s2=10, t_s1a=5, t_s1d=5)
@@ -122,10 +122,10 @@ class TestRunInference:
                 for start in range(0, n, inference_config.batch_size):
                     end = min(start + inference_config.batch_size, n)
                     batch, _ = _prepare_batch(dataset_ref, bucket_key, start, end)
-                    z_host, global_idxs, _, _ = _transfer_and_forward(
+                    q_host, scales_host, global_idxs, _, _ = _transfer_and_forward(
                         test_model, batch, bucket_key, device, None, save_dim
                     )
-                    _quantize_and_write(z_host, global_idxs, ref_q, ref_scales)
+                    _write_quantized_rows(q_host, scales_host, global_idxs, ref_q, ref_scales)
         ref_emb = ref_q.reshape(h, w, save_dim)
         ref_scales_2d = ref_scales.reshape(h, w)
 
@@ -207,10 +207,10 @@ class TestPrepareGpu:
 
 
 class TestProcessSubBatch:
-    """Tests for the split _transfer_and_forward / _quantize_and_write primitives."""
+    """Tests for the split _transfer_and_forward / _write_quantized_rows primitives."""
 
-    def test_transfer_and_forward_returns_host_embeddings(self, sample_chunk_data, inference_config, test_model):
-        """_transfer_and_forward returns a (B, save_dim) host array and non-negative times."""
+    def test_transfer_and_forward_returns_quantized_host_rows(self, sample_chunk_data, inference_config, test_model):
+        """_transfer_and_forward returns on-device-quantized int8 rows + scales on the host."""
         chunk = sample_chunk_data(height=5, width=5, t_s2=10, t_s1a=5, t_s1d=5)
         dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
         device = torch.device("cpu")
@@ -221,17 +221,20 @@ class TestProcessSubBatch:
         batch, _ = _prepare_batch(dataset, bucket_key, 0, end)
 
         with torch.no_grad():
-            z_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
+            q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
                 test_model, batch, bucket_key, device, None, save_dim, config=inference_config
             )
 
-        assert z_host.shape == (end, save_dim)
+        assert q_host.shape == (end, save_dim)
+        assert q_host.dtype == np.int8
+        assert scales_host.shape == (end,)
+        assert scales_host.dtype == np.float32
         assert global_idxs.shape == (end,)
         assert transfer_secs >= 0
         assert forward_secs >= 0
 
-    def test_quantize_and_write_writes_to_flat_out(self, sample_chunk_data, inference_config, test_model):
-        """_quantize_and_write scatters non-zero int8 rows into the output buffers."""
+    def test_write_quantized_rows_writes_to_flat_out(self, sample_chunk_data, inference_config, test_model):
+        """_write_quantized_rows scatters non-zero int8 rows into the output buffers."""
         chunk = sample_chunk_data(height=5, width=5, t_s2=10, t_s1a=5, t_s1d=5)
         dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
         device = torch.device("cpu")
@@ -245,10 +248,10 @@ class TestProcessSubBatch:
         batch, _ = _prepare_batch(dataset, bucket_key, 0, end)
 
         with torch.no_grad():
-            z_host, global_idxs, _, _ = _transfer_and_forward(
+            q_host, scales_host, global_idxs, _, _ = _transfer_and_forward(
                 test_model, batch, bucket_key, device, None, save_dim, config=inference_config
             )
-        _quantize_and_write(z_host, global_idxs, flat_q, flat_scales)
+        _write_quantized_rows(q_host, scales_host, global_idxs, flat_q, flat_scales)
 
         assert np.any(flat_q != 0)
         # Only this bucket's pixels were written; their scales are now finite.

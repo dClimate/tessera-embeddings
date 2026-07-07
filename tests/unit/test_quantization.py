@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 
 from tessera_embeddings.inference.quantization import (
     dequantize_embeddings,
     quantize_embeddings,
     quantize_rows,
+    quantize_rows_torch,
 )
 
 
@@ -115,6 +117,52 @@ def test_nonfinite_raises() -> None:
     bad[1, 3] = np.inf
     with pytest.raises(ValueError, match="non-finite"):
         quantize_rows(bad)
+
+
+def test_torch_quantize_matches_numpy_rows() -> None:
+    """quantize_rows_torch (on-device path) is bit-identical to numpy quantize_rows.
+
+    The inference loop quantizes on the GPU and scatter-writes the int8 result,
+    so the on-device path must produce exactly the same int8 codes and scales as
+    the CPU golden path on the same float32 input. Run on CPU tensors so this
+    holds without a GPU; the arithmetic is device-independent.
+    """
+    rng = np.random.default_rng(7)
+    # Mix of scales, a zero row (scale floor), and a saturating row.
+    rows = (rng.standard_normal((64, 128)) * 3.0).astype(np.float32)
+    rows[0] = 0.0
+    rows[1] = 5.0
+    rows[2, 0] = 127.0
+
+    q_np, s_np = quantize_rows(rows)
+    q_t, s_t = quantize_rows_torch(torch.from_numpy(rows))
+
+    np.testing.assert_array_equal(q_t.numpy(), q_np)
+    np.testing.assert_array_equal(s_t.numpy(), s_np)
+
+
+def test_torch_quantize_matches_numpy_from_reduced_precision() -> None:
+    """A bf16 input quantizes identically whether cast to f32 on GPU or CPU first.
+
+    The forward emits bf16/fp16; quantize_rows_torch casts to float32 internally,
+    matching the CPU path which quantizes the ``.float()`` output. Feeding the
+    same bf16 values through both must agree exactly.
+    """
+    rng = np.random.default_rng(11)
+    rows_bf16 = torch.from_numpy((rng.standard_normal((32, 128)) * 2.0).astype(np.float32)).bfloat16()
+
+    q_t, s_t = quantize_rows_torch(rows_bf16)
+    q_np, s_np = quantize_rows(rows_bf16.float().numpy())
+
+    np.testing.assert_array_equal(q_t.numpy(), q_np)
+    np.testing.assert_array_equal(s_t.numpy(), s_np)
+
+
+def test_torch_quantize_nonfinite_raises() -> None:
+    bad = torch.zeros((2, 128))
+    bad[1, 3] = float("inf")
+    with pytest.raises(ValueError, match="non-finite"):
+        quantize_rows_torch(bad)
 
 
 def test_round_trip_recovers_within_scale() -> None:

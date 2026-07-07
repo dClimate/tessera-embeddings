@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,7 +31,7 @@ from tessera_embeddings.inference.profiling import (
     log_effective_tflops,
     log_profiled_batch_summary,
 )
-from tessera_embeddings.inference.quantization import quantize_rows
+from tessera_embeddings.inference.quantization import quantize_rows_torch
 
 logger = logging.getLogger(__name__)
 
@@ -153,22 +153,26 @@ def _transfer_and_forward(
     *,
     profile: bool = False,
     config: InferenceConfig | None = None,
-) -> tuple[np.ndarray, np.ndarray, float, float]:
-    """GPU-bound half of a sub-batch: transfer → forward → slice → copy to host.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Transfer → forward → slice → quantize on-device → copy int8 to host.
 
     Must be called inside a ``torch.no_grad()`` context, on the thread that owns
-    the GPU. Returns ``(z_host, global_idxs, transfer_secs, forward_secs)`` where
-    ``z_host`` is the ``(B, save_dim)`` float32 CPU array ready for
-    :func:`_quantize_and_write`. Quantization is deliberately *not* done here so
-    the caller can run it off-thread, overlapping the next batch's forward.
+    the GPU. Returns ``(q_host, scales_host, global_idxs, transfer_secs,
+    forward_secs)`` where ``q_host`` is the ``(B, save_dim)`` int8 array and
+    ``scales_host`` the ``(B,)`` float32 scales, both already on the host and
+    ready for :func:`_write_quantized_rows`.
 
-    On CUDA the input transfer and forward run on the default stream with no
-    intervening ``synchronize`` — the trailing ``.cpu()`` is itself the sync
-    point, so ordering is preserved. The per-phase times are therefore
-    coarse-grained wall clock (transfer time folds into the forward-then-copy
-    span); they exist for rough logging, not precise attribution. When
-    ``profile`` is set we add one ``synchronize`` so the one-shot profile batch
-    reports an accurate forward time.
+    Quantization runs on-device (:func:`quantize_rows_torch`) in the forward's
+    compute stream, so its seq-length-independent cost folds into GPU work rather
+    than gating a separate CPU stage — the case that hurt low-observation chunks,
+    whose forwards are tiny. It also shrinks the D2H copy ~4x (int8 + scales vs.
+    float32 embeddings).
+
+    On CUDA the transfer, forward, and quantize run on the default stream with no
+    intervening ``synchronize`` — the trailing ``.cpu()`` is the sync point, so
+    ordering is preserved. Per-phase times are coarse wall clock (for rough
+    logging, not precise attribution); ``profile`` adds one ``synchronize`` so
+    the one-shot profile batch reports an accurate forward time.
     """
     tb1 = time.monotonic()
 
@@ -212,31 +216,30 @@ def _transfer_and_forward(
                 num_layers=config.num_encoder_layers,
             )
 
-    # Slice 192-D rep to canonical save_dim and pull to host. The .cpu() blocks
-    # until the forward completes, which is what bounds the GPU work for this
-    # batch; quantization then happens on the returned host array.
-    z_host = z[:, :save_dim].float().cpu().numpy()
-    return z_host, global_idxs, tb2 - tb1, tb3 - tb2
+    # Slice 192-D rep to canonical save_dim, quantize on-device, then pull the
+    # compact int8 + scales to host in one D2H. The .cpu() blocks until the
+    # forward+quantize complete, which is what bounds the GPU work for this batch.
+    q, scales = quantize_rows_torch(z[:, :save_dim])
+    q_host = q.cpu().numpy()
+    scales_host = scales.cpu().numpy()
+    return q_host, scales_host, global_idxs, tb2 - tb1, tb3 - tb2
 
 
-def _quantize_and_write(
-    z_host: np.ndarray,
+def _write_quantized_rows(
+    q_host: np.ndarray,
+    scales_host: np.ndarray,
     global_idxs: np.ndarray,
     flat_q: np.ndarray,
     flat_scales: np.ndarray,
 ) -> None:
-    """CPU-bound half of a sub-batch: quantize host embeddings and scatter-write.
+    """Scatter already-quantized rows into the flat output buffers in place.
 
-    Writes int8 values into ``flat_q[global_idxs]`` and their scales into
-    ``flat_scales[global_idxs]`` in place. Per-row quantization is numerically
-    identical to quantizing the whole chunk at the end (see
-    :func:`quantize_rows`). Safe to run on a worker thread concurrently with the
-    next batch's forward: each call writes only its own bucket's ``global_idxs``,
-    which are disjoint across sub-batches, so there is no write contention.
+    A cheap memcpy — the arithmetic now happens on-device in
+    :func:`_transfer_and_forward`. Each call writes only its own bucket's
+    ``global_idxs`` (disjoint across sub-batches), so writes never contend.
     """
-    q, s = quantize_rows(z_host)
-    flat_q[global_idxs] = q
-    flat_scales[global_idxs] = s
+    flat_q[global_idxs] = q_host
+    flat_scales[global_idxs] = scales_host
 
 
 def run_inference(
@@ -320,23 +323,14 @@ def run_inference(
             end = min(start + batch_size, n_in_bucket)
             sub_batches.append((bucket_key, start, end))
 
-    # Two single-worker pools pipeline the CPU work around the GPU forward:
-    #   - prefetch: CPU batch prep for i+1 while the GPU runs i (as before).
-    #   - quantize: the (D2H copy already done) quantize + scatter-write for i-1
-    #     while the GPU runs i. The GPU never waits on quantization; it only
-    #     blocks on the .cpu() inside _transfer_and_forward, which is the true
-    #     bound on per-batch GPU work.
-    # Each pool stays depth-1: CPU prep (~165ms) and quantize both fit inside one
-    # forward (~250ms), so the GPU consumes faster than either producer and a
-    # deeper queue would just sit full. A quantize exception surfaces when its
-    # future is awaited (the following iteration, or the end-of-loop drain).
-    with (
-        torch.no_grad(),
-        ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch") as pool,
-        ThreadPoolExecutor(max_workers=1, thread_name_prefix="quantize") as quant_pool,
-    ):
+    # One prefetch worker pipelines CPU batch prep for i+1 while the GPU runs i.
+    # CPU prep (~165ms) < forward, so the GPU consumes faster than the prefetcher
+    # produces and a deeper queue would just sit full. Quantization is no longer a
+    # CPU stage — it runs on-device inside _transfer_and_forward — so the write is
+    # a cheap inline scatter with no second pool (that pool gated low-observation
+    # chunks, whose tiny forwards couldn't hide the thread handoff).
+    with torch.no_grad(), ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch") as pool:
         next_future = pool.submit(_prepare_batch, dataset, *sub_batches[0]) if sub_batches else None
-        quant_future: Future[None] | None = None
 
         for i, (bucket_key, start, end) in enumerate(sub_batches):
             assert next_future is not None
@@ -348,7 +342,7 @@ def run_inference(
             )
 
             tb0 = time.monotonic()
-            z_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
+            q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
                 model,
                 batch,
                 bucket_key,
@@ -358,15 +352,7 @@ def run_inference(
                 profile=(sub_batch_idx == PROFILE_BATCH_IDX),
                 config=config,
             )
-
-            # The GPU work for i is done (the .cpu() above joined it). Now that
-            # i's host embeddings are in hand, wait on i-1's quantize (it ran
-            # during i's forward) and hand i off to the same worker so it
-            # overlaps i+1's forward. Awaiting here keeps the quantize pool
-            # depth-1 and propagates any quantize exception in loop order.
-            if quant_future is not None:
-                quant_future.result()
-            quant_future = quant_pool.submit(_quantize_and_write, z_host, global_idxs, flat_q, flat_scales)
+            _write_quantized_rows(q_host, scales_host, global_idxs, flat_q, flat_scales)
 
             t_total += _BatchTimings(
                 get_batch=get_batch_secs,
@@ -402,11 +388,6 @@ def run_inference(
                     avg.postprocess,
                     avg.total,
                 )
-
-        # Drain the last batch's quantize before reading flat_q/flat_scales.
-        # Inside the `with` so a failure still tears down both pools.
-        if quant_future is not None:
-            quant_future.result()
 
     # Rows were already quantized per bucket on arrival; just reshape to (H,W,*).
     out = flat_q.reshape(h, w, save_dim)
