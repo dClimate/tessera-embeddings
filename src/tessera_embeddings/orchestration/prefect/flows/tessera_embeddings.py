@@ -349,6 +349,11 @@ def _run_assembly(
         log,
         min_workers=min_workers,
         max_workers=max_workers,
+        # 24 GiB for headroom on the assembly commit, which is memory intensive:
+        # merging the write changeset and building the manifest for a full-
+        # spatial-extent timestep peaks well above the ingest workers' needs.
+        # 24576 MiB is a valid Fargate combo at 4 vCPU.
+        worker_mem=24576,
         extra_worker_env=extra_worker_env,
     ) as cluster:
         log.info("Assembly Dask cluster ready: scaling to %d workers", max_workers)
