@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.orchestration.prefect.flows import generate_roi as flow_module
 from tests.parity.helpers import assert_zarr_equivalent
@@ -43,8 +44,8 @@ def test_generate_roi_parity(tmp_path: Path, fixture_quickstart_roi: Path, monke
     # Flow appends a CRS suffix to the output filename when force_crs is set;
     # mirror that exactly on the domain-call side so the two outputs are at
     # paths the same shape.
-    out_a = bucket_a / "zarrs" / "test_epsg32615.zarr"
-    out_b = bucket_b / "zarrs" / "test_epsg32615.zarr"
+    out_a = bucket_a / "zarrs" / "test_epsg32613.zarr"
+    out_b = bucket_b / "zarrs" / "test_epsg32613.zarr"
 
     # The Prefect flow reads the geojson from {bucket}/geojsons/{name}.geojson,
     # so stage the fixture there before invoking it.
@@ -53,15 +54,15 @@ def test_generate_roi_parity(tmp_path: Path, fixture_quickstart_roi: Path, monke
     shutil.copy(fixture_quickstart_roi, geojson_dir / "test.geojson")
 
     # The GeoJSON ships with OGC:CRS84 (geographic, degrees). Force a
-    # UTM CRS so rasterisation works in metres. Story County, IA falls
-    # in UTM zone 15 N.
-    force_crs = "EPSG:32615"
+    # UTM CRS so rasterisation works in metres. Denver, CO falls
+    # in UTM zone 13N.
+    force_crs = "EPSG:32613"
 
     # Domain function path
     rasterize_roi_zarr(
         output_path=str(out_a),
         resolution=10.0,
-        chunk_size=2000,
+        chunk_size=INGEST_CHUNK_SIZE,
         force_crs=force_crs,
         input_path=str(fixture_quickstart_roi),
     )
@@ -73,7 +74,7 @@ def test_generate_roi_parity(tmp_path: Path, fixture_quickstart_roi: Path, monke
         roi_bucket=str(bucket_b),
         roi_name="test",
         resolution=10.0,
-        chunk_size=2000,
+        chunk_size=INGEST_CHUNK_SIZE,
         force_crs=force_crs,
     )
 

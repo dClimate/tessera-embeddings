@@ -35,12 +35,12 @@ from prefect import flow, get_run_logger
 from pydantic import BaseModel
 
 from tessera_embeddings.config.dask import AssemblyConfig
-from tessera_embeddings.config.inference import DEFAULT_CHUNK_SIZE, checkpoint_filename
+from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
-from tessera_embeddings.inference.data_loading import check_time_window_coverage
+from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
     compute_assembly_worker_counts,
@@ -75,6 +75,12 @@ class EmbeddingsDevParams(BaseModel):
     skip_coverage_check: bool = False
     cleanup_staging: bool = True
     output_name_suffix: str = ""
+    # Dev-iteration escape hatch. When set (requires code_bucket), the provider
+    # tars this local dir and uploads it to s3://{code_bucket}/code/... *before*
+    # ``ray up``, so workers run your working-tree code without a CI round-trip.
+    # None (default) = no upload: workers use AMI-baked source, or a tarball a
+    # CI workflow already put in code_bucket. See providers/aws/gotchas.md.
+    sync_source_path: str | None = None
 
 
 def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
@@ -108,8 +114,12 @@ def tessera_embeddings(
     time_window_end: str,
     paths: BucketPaths,
     ami_ssm_name: str,
+    ssm_prefix: str = "/tessera/ray/",
+    cloudwatch_log_group: str = "/ec2/tessera/ray",
+    code_bucket: str | None = None,
+    code_suffix: str = "",
     num_actors: int = 20,
-    s1_orbit: str = "ascending",
+    s1_orbit: str = "both",
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
 ) -> dict[str, Any]:
     """Generate Tessera embeddings for a mosaicked ROI.
@@ -123,6 +133,26 @@ def tessera_embeddings(
             :class:`BucketPaths`). Replaces the reference repo's
             ``dev: bool`` toggle.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
+        ssm_prefix: SSM Parameter Store prefix under which the Ray
+            cluster resource IDs (security group, instance profile,
+            subnets, key pair) are published by the deployment's infra.
+            Defaults to the OSS ``/tessera/ray/``; deployments that
+            publish under a different prefix must override this.
+        cloudwatch_log_group: CloudWatch log group the Ray workers write
+            agent logs to. Must match the group the deployment's infra
+            creates and grants the worker role access to.
+        code_bucket: S3 bucket (no ``s3://`` prefix) workers pull the
+            source tarball from, at
+            ``s3://{code_bucket}/code/src{code_suffix}.tar.gz``. Setting
+            this only *points* workers at the tarball — it does not
+            upload one; an external/CI workflow is expected to have put
+            it there (the general production path when source ships as an
+            S3 artifact). Leave ``None`` for AMI-baked source. See
+            ``dev_params.sync_source_path`` to also upload from the local
+            tree. See ``providers/aws/gotchas.md`` for the three modes.
+        code_suffix: Filename suffix for the source tarball (e.g.
+            ``"-mybranch"``, letting branches coexist in one bucket).
+            Empty for production tarballs.
         num_actors: Number of GPU actors to create.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
         dev_params: See :class:`EmbeddingsDevParams`.
@@ -157,16 +187,20 @@ def tessera_embeddings(
 
     checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename()}"
 
+    mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
+    log.info("Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s", roi_name, mosaic_base, run_id)
+
+    resolved_s1_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
+    if resolved_s1_orbit != s1_orbit:
+        log.info("s1_orbit resolved: %s → %s", s1_orbit, resolved_s1_orbit)
+
     config = build_inference_config(
-        s1_orbit=s1_orbit,
+        s1_orbit=resolved_s1_orbit,
         time_window=time_window,
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
     )
-
-    mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
-    log.info("Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s", roi_name, mosaic_base, run_id)
 
     staging_base = f"{output_bucket.rstrip('/')}/staging"
 
@@ -181,7 +215,7 @@ def tessera_embeddings(
             )
             chunk_size = detected
 
-    chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, chunk_size or DEFAULT_CHUNK_SIZE, log)
+    chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, chunk_size or INFERENCE_CHUNK_SIZE, log)
 
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_zarr_path)
     log.info(
@@ -202,6 +236,7 @@ def tessera_embeddings(
     from tessera_embeddings.providers.aws.ray import ray_cluster
 
     assemble_kwargs: dict[str, Any] = {
+        "chunk_size": chunk_size or INFERENCE_CHUNK_SIZE,
         "n_live_chunks": len(live_chunks),
         "total_y": total_y,
         "total_x": total_x,
@@ -222,14 +257,24 @@ def tessera_embeddings(
     if dev_params.assembly_only:
         log.info("Assembly-only mode: verifying staged chunks from run %s", dev_params.previous_run_id)
         ZarrWriter(staging_base).verify_staged_completeness(run_id, live_chunks, log=log)
-        return _run_assembly(log=log, chunks=chunks, results=None, **assemble_kwargs)
+        return _run_assembly(log=log, result_stats=None, **assemble_kwargs)
 
     global _active_resolved_yaml, _active_cluster_name
-    with ray_cluster(log, ami_ssm_name=ami_ssm_name) as resolved_yaml:
+    with ray_cluster(
+        log,
+        ami_ssm_name=ami_ssm_name,
+        ssm_prefix=ssm_prefix,
+        cloudwatch_log_group=cloudwatch_log_group,
+        code_bucket=code_bucket,
+        code_suffix=code_suffix,
+        sync_source_path=Path(dev_params.sync_source_path) if dev_params.sync_source_path else None,
+    ) as resolved_yaml:
         _active_resolved_yaml = resolved_yaml
         if resolved_yaml and Path(resolved_yaml).exists():
             with Path(resolved_yaml).open() as _f:
                 _active_cluster_name = yaml.safe_load(_f).get("cluster_name")
+
+        from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 
         results = run_inference_task(
             num_actors=num_actors,
@@ -239,6 +284,7 @@ def tessera_embeddings(
             staging_base=staging_base,
             run_id=run_id,
             t0=t0,
+            get_credentials=iam_icechunk_credentials,
         )
     _active_resolved_yaml = None
     _active_cluster_name = None
@@ -246,9 +292,7 @@ def tessera_embeddings(
     succeeded = [r for r in results if r["status"] == "success"]
     skipped = [r for r in results if r["status"] == "skipped"]
     failed = [r for r in results if r["status"] == "failed"]
-    log.info(
-        "Chunk results: %d succeeded, %d skipped, %d failed", len(succeeded), len(skipped), len(failed)
-    )
+    log.info("Chunk results: %d succeeded, %d skipped, %d failed", len(succeeded), len(skipped), len(failed))
     if failed:
         for failure in failed:
             log.error(
@@ -276,14 +320,19 @@ def tessera_embeddings(
         }
 
     ZarrWriter(staging_base).verify_staged_completeness(run_id, live_chunks, log=log)
-    return _run_assembly(log=log, chunks=chunks, results=results, **assemble_kwargs)
+    result_stats = {
+        "succeeded": len(succeeded),
+        "skipped": len(skipped),
+        "failed": len(failed),
+        "total_valid_pixels": sum(r.get("valid_pixels", 0) for r in results),
+    }
+    return _run_assembly(log=log, result_stats=result_stats, **assemble_kwargs)
 
 
 def _run_assembly(
     *,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
-    chunks: list,
-    results: list | None,
+    result_stats: dict | None,
     **assemble_kwargs: Any,  # noqa: ANN401 — pass-through to the assembly task
 ) -> dict[str, Any]:
     """Provision the assembly Dask cluster and submit the assembly task."""
@@ -300,13 +349,17 @@ def _run_assembly(
         log,
         min_workers=min_workers,
         max_workers=max_workers,
+        # 24 GiB for headroom on the assembly commit, which is memory intensive:
+        # merging the write changeset and building the manifest for a full-
+        # spatial-extent timestep peaks well above the ingest workers' needs.
+        # 24576 MiB is a valid Fargate combo at 4 vCPU.
+        worker_mem=24576,
         extra_worker_env=extra_worker_env,
     ) as cluster:
         log.info("Assembly Dask cluster ready: scaling to %d workers", max_workers)
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         return _assemble_inner.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-            chunks=chunks,
-            results=results,
+            result_stats=result_stats,
             n_workers=max_workers,
             **assemble_kwargs,
         )
@@ -315,15 +368,20 @@ def _run_assembly(
 @flow(name="tessera_embeddings_assemble_inner")
 def _assemble_inner(
     *,
-    chunks: list,
-    results: list | None,
+    result_stats: dict | None,
     n_workers: int,
     **assemble_kwargs: Any,  # noqa: ANN401 — pass-through to the assembly task
 ) -> dict[str, Any]:
-    """Inner flow that submits the assembly task to the configured Dask runner."""
+    """Inner flow that submits the assembly task to the configured Dask runner.
+
+    The full chunk grid is intentionally *not* a parameter here — the
+    task re-enumerates it from ``total_y``/``total_x``/``chunk_size`` (in
+    ``assemble_kwargs``). Likewise the per-chunk inference results are
+    pre-aggregated into ``result_stats`` upstream. Both keep this flow's
+    serialized parameters under Prefect's 524,288-byte limit on large ROIs.
+    """
     future = assemble_embeddings_task.submit(
-        chunks=chunks,
-        results=results,
+        result_stats=result_stats,
         n_workers=n_workers,
         **assemble_kwargs,
     )

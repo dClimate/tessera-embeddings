@@ -20,12 +20,12 @@ import logging
 import os
 import re
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 import requests
 from dask.distributed import WorkerPlugin, get_client
 from odc.loader._rio import ThreadSession as _OdcThreadSession  # type: ignore[attr-defined]
 from odc.loader._rio import _local as _odc_thread_session  # type: ignore[attr-defined]
-from osgeo import gdal
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -39,6 +39,16 @@ _AUTH_HOST = "urs.earthdata.nasa.gov"
 _EDL_TOKEN_URL = f"https://{_AUTH_HOST}/api/users/token"
 _S3_CREDENTIALS_URL = "https://cumulus.asf.alaska.edu/s3credentials"
 _OPERA_S3_BUCKET = "asf-cumulus-prod-opera-products"
+
+# Hosts that are trusted to receive EDL credentials across redirects. The
+# datapool → URS → cumulus → CloudFront chain stays within asf.alaska.edu,
+# earthdatacloud.nasa.gov, and urs.earthdata.nasa.gov; any redirect to a
+# host outside this set must drop the Authorization header.
+_TRUSTED_AUTH_SUFFIXES = (
+    "urs.earthdata.nasa.gov",
+    "asf.alaska.edu",
+    "earthdatacloud.nasa.gov",
+)
 
 # Two HTTPS URL patterns for OPERA RTC-S1 assets:
 #   1. datapool (flat):      https://datapool.asf.alaska.edu/RTC/OPERA-S1/{filename}
@@ -74,22 +84,47 @@ class _EDLSession(requests.Session):
         self.mount("http://", adapter)
 
     def rebuild_auth(self, prepared_request: requests.PreparedRequest, response: requests.Response) -> None:
-        """Re-inject auth header for redirects targeting the URS host.
+        """Re-inject auth on cross-domain redirects within the EDL/ASF chain.
 
-        The default ``requests`` behavior strips Authorization on cross-domain
-        redirects.  By the time a redirect reaches URS, the header is already
-        gone from an earlier hop (e.g. datapool → cumulus stripped it).  So we
-        must actively re-apply ``self.auth`` rather than just skipping the
-        strip — a plain ``return`` would preserve "already missing".
+        ``requests`` strips Authorization on every cross-domain redirect, and
+        by the time a redirect reaches URS the header is already gone from an
+        earlier hop (datapool → cumulus stripped it).  We must actively
+        re-apply credentials, not just skip the strip — a plain ``return``
+        would preserve "already missing".
+
+        The two auth modes are scoped differently because they carry very
+        different blast radii:
+
+        * **Basic auth** via ``self.auth`` is the user's permanent EDL
+          password.  It is only re-injected on redirects to URS
+          (``urs.earthdata.nasa.gov``), the OAuth handshake target.  Other
+          ASF / Earthdata Cloud hosts in the chain don't need it — URS issues
+          a token / sets cookies and redirects onward — and sending the
+          password to non-URS hosts would leak the user's credentials.
+
+        * **Bearer token** via ``self.headers['Authorization']`` (the local
+          SAML fallback) is scoped and time-limited.  Session headers get
+          merged into the prepared request before ``rebuild_auth`` runs, so
+          requests' default behaviour strips it on every cross-domain hop —
+          we must restore it across the whole trusted chain (datapool → URS
+          → cumulus → CloudFront) for the bearer path to work at all.
         """
-        redirect_url = prepared_request.url or ""
+        redirect_host = (urlparse(prepared_request.url or "").hostname or "").lower()
 
-        if _AUTH_HOST in redirect_url and self.auth:
-            # Heading to URS — re-inject credentials that earlier hops stripped
-            prepared_request.prepare_auth(self.auth, redirect_url)
-            return
+        if self.auth:
+            # Basic-auth path: only URS may receive the user's password.
+            if redirect_host == _AUTH_HOST or redirect_host.endswith("." + _AUTH_HOST):
+                prepared_request.prepare_auth(self.auth, prepared_request.url or "")
+                return
+        else:
+            session_auth = self.headers.get("Authorization")
+            if session_auth and any(
+                redirect_host == h or redirect_host.endswith("." + h) for h in _TRUSTED_AUTH_SUFFIXES
+            ):
+                prepared_request.headers["Authorization"] = session_auth
+                return
 
-        # All other redirects: default behaviour (strip cross-domain auth)
+        # Untrusted target (or no creds to re-inject): default strip behaviour.
         super().rebuild_auth(prepared_request, response)
 
 
@@ -130,10 +165,9 @@ def get_edl_session() -> _EDLSession:
     token = os.environ.get("EARTHDATA_TOKEN")
 
     if token:
-        # LOCAL-ONLY FALLBACK: bearer must be set at session level (not
-        # per-request) so it survives ASF's cross-domain redirects —
-        # requests strips per-request Authorization on cross-domain
-        # hops but leaves session.headers alone.
+        # LOCAL-ONLY FALLBACK: set bearer at session level so _EDLSession's
+        # rebuild_auth can re-inject it on each hop of the cross-domain
+        # redirect chain (datapool → URS → cumulus → CloudFront).
         session = _EDLSession()
         session.headers["Authorization"] = f"Bearer {token}"
         return session
@@ -331,12 +365,6 @@ def _build_aws_env(creds: dict[str, str]) -> dict[str, str]:
     }
 
 
-def _apply_gdal_config(env: dict[str, str]) -> None:
-    """Set GDAL config options so /vsis3/ bypasses its credential cache."""
-    for key, val in env.items():
-        gdal.SetConfigOption(key, val)
-
-
 def _patch_odc_thread_session_for_env_drift() -> None:
     """Make odc.loader's per-thread AWSSession cache self-invalidate on env drift.
 
@@ -394,15 +422,12 @@ class _S3CredentialPlugin(WorkerPlugin):
 
     def setup(self, worker: object) -> None:  # noqa: ARG002
         os.environ.update(self.env)
-        # GDAL's /vsis3/ handler caches credentials resolved from env vars
-        # in a static member (VSIS3HandleHelper).  VSICurlClearCache only
-        # clears curl handles and file-property caches — NOT the credential
-        # cache.  SetConfigOption bypasses that cache entirely: GDAL checks
-        # config options before env vars and re-reads them on every file open.
-        _apply_gdal_config(self.env)
-        gdal.VSICurlClearCache()
         # Reset the main-thread AWSSession cache. Task pool threads handle
-        # their own reset via the module-level env-drift patch.
+        # their own reset via the module-level env-drift patch, which detects
+        # the env mismatch on the next session() call and rebuilds. Together
+        # they ensure rasterio.env.Env (used by odc.loader on every /vsis3/
+        # open) signs with the new key — making gdal.SetConfigOption and
+        # gdal.VSICurlClearCache redundant for credential refresh.
         _odc_thread_session.reset()
 
 
@@ -439,11 +464,13 @@ def set_s3_credentials(creds: dict[str, str]) -> None:
     except ValueError as e:
         raise RuntimeError("No Dask client found — S3 credentials cannot be broadcast to workers") from e
 
-    # Set on orchestrator too — both env vars (for boto3/rasterio session
-    # creation) and GDAL config options (bypasses GDAL's credential cache).
+    # Set on orchestrator too. odc.loader's rio_env() wraps rasterio.env.Env
+    # around _local.session() on every /vsis3/ open, and rasterio.env.Env
+    # passes the AWSSession's frozen credentials into GDAL on entry — so
+    # updating os.environ is sufficient for GDAL to sign with the new key.
     env = _build_aws_env(creds)
     os.environ.update(env)
-    _apply_gdal_config(env)
+    _odc_thread_session.reset()
 
 
 def rewrite_assets_to_s3(item: pystac.Item, band_keys: list[str]) -> None:

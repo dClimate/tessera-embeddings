@@ -200,9 +200,7 @@ def log_worker_failure_diagnostic(
             brief "no diagnostics available" message instead.
     """
     try:
-        diagnostic = build_worker_failure_diagnostic(
-            instance_id, chunk_label, error_msg, fetch_events=fetch_events
-        )
+        diagnostic = build_worker_failure_diagnostic(instance_id, chunk_label, error_msg, fetch_events=fetch_events)
         if diagnostic:
             log.warning(diagnostic)
         else:

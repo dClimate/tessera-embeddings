@@ -21,42 +21,40 @@ download + model load to GPU. Tune via ``run_inference``'s parameter rather
 than monkey-patching this module-level default.
 """
 
-MIN_ACTOR_FRACTION = 0.25
-"""Fraction of requested actors that must be ready before work can start.
-
-A quarter of the fleet is enough to make progress while the rest catches
-up. The work-stealing scheduler will dispatch chunks to actors that come
-online later, so we don't need to wait for everyone.
-"""
-
 
 def wait_for_actors(
     actors: list[ray.actor.ActorHandle],
     num_requested: int,
+    min_required: int,
     started_at: float,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     *,
     init_timeout_sec: float = ACTOR_INIT_TIMEOUT_SEC,
-    min_actor_fraction: float = MIN_ACTOR_FRACTION,
 ) -> tuple[list[ray.actor.ActorHandle], list[str], set[int]]:
     """Wait for enough actors to initialize, then return all actors with readiness info.
 
-    Waits up to ``init_timeout_sec`` for at least ``min_actor_fraction`` of
-    the requested actors to be ready. Once the minimum threshold is met,
-    returns immediately so work can start. Actors that aren't ready yet
-    are still included in the returned lists — the work-stealing scheduler
-    treats them as initializing and will dispatch work to them once they
-    come online.
+    Waits up to ``init_timeout_sec`` for at least ``min_required`` of the
+    requested actors to be ready. Once that threshold is met, returns
+    immediately so work can start. Actors that aren't ready yet are still
+    included in the returned lists — the work-stealing scheduler treats
+    them as initializing and will dispatch work to them once they come
+    online.
+
+    Callers typically pass ``min_required=1`` so the run starts as soon as
+    the first actor is live: cloud providers roll out instances with large
+    timing variation, and waiting for a fraction of the fleet just stalls
+    the run. The 30s poll window below still scoops up any fast-arriving
+    actors before returning.
 
     Args:
         actors: List of actor handles (just created, not yet confirmed ready).
         num_requested: Original number of actors requested.
+        min_required: Minimum number of actors that must be ready before work
+            starts. Usually 1 so the run starts with the first live actor and
+            the rest join via work-stealing.
         started_at: Monotonic timestamp when actor creation started.
         log: Logger.
         init_timeout_sec: Per-call timeout override.
-        min_actor_fraction: Fraction of requested actors that must be ready
-            before this function returns. Defaults to
-            :data:`MIN_ACTOR_FRACTION`.
 
     Returns:
         Tuple of (actors, actor_instance_ids, still_initializing). Instance
@@ -65,10 +63,9 @@ def wait_for_actors(
         actor indices that haven't responded yet.
 
     Raises:
-        RuntimeError: If fewer than ``min_actor_fraction`` of the requested
-            actors initialized within the timeout.
+        RuntimeError: If fewer than ``min_required`` actors initialized
+            within the timeout.
     """
-    min_required = max(1, int(num_requested * min_actor_fraction))
     ping_refs: list[Any] = [a.ping.remote() for a in actors]  # type: ignore[union-attr]
     ref_to_idx: dict[Any, int] = {ref: i for i, ref in enumerate(ping_refs)}
 

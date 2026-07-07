@@ -37,8 +37,8 @@ from typing import Literal, final
 import dask.distributed
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
-from tessera_embeddings.config.inference import TESSERA_CHUNKS
-from tessera_embeddings.ingest.opera_query import make_s1_item_rewriter
+from tessera_embeddings.config.ingest import INGEST_CHUNKS
+from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import apply_roi_mask
 from tessera_embeddings.ingest.stac import ingest_tile
@@ -82,7 +82,7 @@ def ingest_s1_roi_sar(
     end_date: str,
     store_path: str,
     client: dask.distributed.Client,
-    orbit: S1Orbit = "ascending",
+    orbit: S1Orbit,
     batch_days: int = 30,
     edl_credentials_fn: Callable[[], dict[str, str]] | None = None,
     apply_credentials_fn: Callable[[dict[str, str]], None] | None = None,
@@ -99,8 +99,7 @@ def ingest_s1_roi_sar(
     Args:
         roi_zarr_path: Path to the Zarr ROI store (any fsspec-compatible URI).
         start_date: Inclusive start date (``YYYY-MM-DD``).
-        end_date: Exclusive end date (``YYYY-MM-DD``); the loop walks
-            up to but does not include this date.
+        end_date: Inclusive end date (``YYYY-MM-DD``).
         store_path: Base path for satellite mosaics; the function
             creates ``sar_<orbit>.zarr`` underneath.
         client: Connected :class:`dask.distributed.Client`. Callers
@@ -142,9 +141,9 @@ def ingest_s1_roi_sar(
 
     ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path)
 
-    # Load chunks: spatial multiples of TESSERA_CHUNKS so rechunk at
+    # Load chunks: spatial multiples of INGEST_CHUNKS so rechunk at
     # write time is a pure split with no cross-chunk shuffling.
-    spatial_chunks = {"northing": TESSERA_CHUNKS["northing"], "easting": TESSERA_CHUNKS["easting"]}
+    spatial_chunks = {"northing": INGEST_CHUNKS["northing"], "easting": INGEST_CHUNKS["easting"]}
 
     last_cred_refresh: float = float("-inf")
 
@@ -153,10 +152,15 @@ def ingest_s1_roi_sar(
     batch_start = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
-    while batch_start < end_dt:
-        batch_end = min(batch_start + timedelta(days=batch_days), end_dt)
+    while batch_start <= end_dt:
+        # Inclusive batch window of up to ``batch_days`` calendar days. CMR/STAC
+        # also treat their end date as inclusive, and the loop advances to the
+        # day after ``batch_end``, so each day is queried by exactly one batch.
+        batch_end = min(batch_start + timedelta(days=batch_days - 1), end_dt)
         batch_start_str = batch_start.strftime("%Y-%m-%d")
         batch_end_str = batch_end.strftime("%Y-%m-%d")
+
+        log.info("[%s] Batch %s..%s: querying catalog", orbit, batch_start_str, batch_end_str)
 
         # Re-read existing dates each batch so prior-batch writes are skipped.
         existing_dates = get_existing_dates(orbit_store)
@@ -188,10 +192,10 @@ def ingest_s1_roi_sar(
             end_date=batch_end_str,
             existing_dates=existing_dates,
             bbox=roi.bbox_wgs84,
-            chunks=TESSERA_CHUNKS,
+            chunks=INGEST_CHUNKS,
             resampling="bilinear",
             groupby="solar_day",
-            item_filter_fn=make_s1_item_rewriter(
+            item_provider_fn=make_s1_item_provider(
                 orbit,
                 roi.bbox_wgs84,
                 batch_start_str,
@@ -216,7 +220,7 @@ def ingest_s1_roi_sar(
                         data,
                         tile_id=roi_zarr_path,
                         baselines=baselines,
-                        chunks=TESSERA_CHUNKS,
+                        chunks=INGEST_CHUNKS,
                         manifest=ingest_manifest,
                         crs=roi.native_crs,
                     )
@@ -231,7 +235,7 @@ def ingest_s1_roi_sar(
                 total_processed,
             )
 
-        batch_start = batch_end
+        batch_start = batch_end + timedelta(days=1)
 
     if total_processed == 0:
         return SarIngestResult(

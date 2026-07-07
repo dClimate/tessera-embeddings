@@ -15,6 +15,7 @@ from typing import Any
 from tessera_embeddings.config.dask import AssemblyConfig
 from tessera_embeddings.config.inference import InferenceConfig, TimeWindow
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks_from_dataset
+from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.storage.manifest import extract_manifest
 from tessera_embeddings.storage.zarr_store import open_store
 
@@ -44,10 +45,8 @@ def read_upstream_manifests(
 ) -> dict[str, dict[str, Any] | None]:
     """Read ``_manifest`` attrs from all active ingest stores under ``mosaic_base``."""
     store_names = ["reflectance"]
-    if s1_orbit == "ascending":
-        store_names.append("sar_ascending")
-    elif s1_orbit == "descending":
-        store_names.append("sar_descending")
+    for orbit in _active_orbits(s1_orbit):
+        store_names.append(f"sar_{orbit}")
 
     manifests: dict[str, dict[str, Any] | None] = {}
     for name in store_names:

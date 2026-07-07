@@ -17,10 +17,13 @@ full end-to-end CPU inference.
   Launchpad account.
 - **~5 GB of free disk** at the paths in `examples/quickstart/config.yaml`
   (default `/tmp/tessera/...`).
-- **A Tessera model checkpoint**, only for the full-pipeline run.
-  Download from the public release; set `checkpoint_dir` in
-  `examples/quickstart/config.yaml` to its parent directory. The
-  expected filename comes from
+- **A Tessera model checkpoint** — no manual download needed. The
+  bundled `examples/quickstart/config.yaml` sets `checkpoint_url` to
+  the public v1.1 AWS encoder on HuggingFace; the runner fetches and
+  caches it locally on first use (under the system temp dir, or NVMe
+  on an AWS DLAMI host). To use a checkpoint you already have on disk,
+  set `checkpoint_url: null` and point `checkpoint_dir` at its parent
+  directory instead — the expected filename comes from
   `tessera_embeddings.checkpoint_filename()` (or
   `checkpoint_filename(norm_source="aws")` for the AWS-normalised
   encoder).
@@ -79,7 +82,7 @@ worked and your EDL credentials are fine.
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --group inference --group prefect
+uv sync --all-extras
 source .venv/bin/activate
 
 # Pick ONE of:
@@ -93,10 +96,12 @@ python -m tessera_embeddings.orchestration.runners.plain \
     --skip-inference
 ```
 
-> **macOS note:** use `python -m` after activating the venv, not `uv run python -m`.
-> On macOS, `uv run` wraps Python in a subprocess; macOS security callbacks kill the
-> Ray GCS C++ process before it finishes starting (Ray issue #54047). Activating the
-> venv and calling `python` directly avoids the subprocess wrapper.
+> **Important:** always run via `python -m` after activating the venv — do **not** use
+> `uv run python -m`. `uv run` spawns Python in a child subprocess; on macOS the OS
+> security layer kills the Ray GCS C++ process before it finishes starting
+> (Ray issue #54047), and on Linux the subprocess wrapper can interfere with Ray's
+> signal handling. `source .venv/bin/activate` followed by plain `python` avoids
+> both problems.
 
 What happens:
 
@@ -108,9 +113,9 @@ What happens:
 5. Stop. No inference. No assembly.
 ```
 
-Output: `${paths.preprocessed}/quickstart_story_county_ia/{reflectance.zarr, sar_ascending.zarr}`.
+Output: `${paths.inputs}/quickstart_denver_co/{reflectance.zarr, sar_ascending.zarr}`.
 
-## Full pipeline (30+ minutes)
+## Full pipeline (30+ minutes on CPU, much faster on GPU)
 
 Same command without `--skip-inference`:
 
@@ -123,23 +128,34 @@ python -m tessera_embeddings.orchestration.runners.plain \
 Now the runner adds two steps:
 
 ```
-6. Local Ray cluster, num_gpus=0       (1 actor, model loads on CPU)
-7. Inference: 1 chunk of ROI           (~15-30 min on a laptop)
+6. Local Ray cluster (GPU if available, else CPU)
+7. Inference: 1 chunk of ROI           (~15-30 min CPU, ~1-2 min GPU)
 8. Local Dask cluster, assemble        (~2 min)
 ```
+
+The `device` field in `config.yaml` controls this:
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` (default) | GPU if `torch.cuda.is_available()`, else CPU |
+| `cpu` | always CPU, even if a GPU is present |
+| `cuda` | always GPU — fails if no CUDA device is visible |
 
 Output:
 `${paths.outputs}/embeddings/quickstart_story_county_ia.zarr` — a
 128-dim per-pixel Tessera embedding store at 10 m resolution.
 
-## Why the laptop run is slow on purpose
+## Why the CPU run is slow on purpose
 
 CPU torch is slow. **It is the credibility test, not the path you'd
 use in production.** If the same domain functions that power the
-production GPU pipeline also work — without modification — on a
-laptop with `num_gpus=0`, then the inference layer has no GPU-specific
+production GPU pipeline also work — without modification — on a CPU
+laptop (`device: cpu`), then the inference layer has no GPU-specific
 coupling. That's the strongest decoupling proof we can run without
 deploying to multiple cloud targets.
+
+If you have a GPU locally, set `device: auto` (the default) or `device: cuda`
+in `config.yaml` and the plain runner will use it.
 
 For real workloads, run the Prefect flow against
 `providers/aws/ray.py`. See
@@ -178,7 +194,7 @@ Story County, IA (roughly 84×101 pixels at 10 m resolution, one inference chunk
   and export `EARTHDATA_TOKEN` instead. Bearer takes precedence
   over `EARTHDATA_USERNAME` + `EARTHDATA_PASSWORD` when both are set.
 - **`ModuleNotFoundError: ray`** during the inference step → re-run
-  `uv sync --group dev --group inference --group prefect`.
+  `uv sync --all-extras`.
 - **The runner hangs on "Building Dask graph…"** → check chunk size
   in your config. See [`README.md`](../README.md) §"Why chunk size
   dominates everything".

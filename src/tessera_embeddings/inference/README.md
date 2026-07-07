@@ -26,13 +26,14 @@ Input stores (Icechunk/Zarr on S3):
             │
             ▼
   ┌─────────────────────────────────────────────┐
-  │  Ray Cluster  (EC2, g5.2xlarge × N)         │
+  │  Ray Cluster  (EC2, g5.xlarge × N)          │
   │  ┌─────────────────────────────────────┐    │
   │  │ InferenceActor (1 GPU each)         │    │
-  │  │  1. load_chunk()        ← selective  │    │
-  │  │  2. Dataset valid-px filter          │    │
-  │  │  3. sample_s2/s1_batch()             │    │
-  │  │  4. model forward  (FP16, B=3584)    │    │
+  │  │  per northing strip (bounds RAM):    │    │
+  │  │   1. load_chunk(y_sub=…)  ← selective│    │
+  │  │   2. Dataset valid-px filter         │    │
+  │  │   3. sample_s2/s1_batch()            │    │
+  │  │   4. model forward  (FP16, B=3584)   │    │
   │  │  5. writer.write_chunk() → staging   │    │
   │  └─────────────────────────────────────┘    │
   │  Work-stealing: actors pull from queue      │
@@ -63,7 +64,9 @@ Input stores (Icechunk/Zarr on S3):
 
 The input mosaic is divided into a grid of 2000×2000 pixel `ChunkSpec` objects (edge chunks may
 be smaller). 2000 px balances peak RAM during inference (~10 GB vs. ~37 GB at 3000 px) against
-scheduling overhead.
+scheduling overhead. This read-tile size is independent of the store's on-disk chunk size: the
+mosaic is written with larger 4000×4000 chunks at ingest (`INGEST_CHUNK_SIZE`), and `load_chunk`
+reads the 2000×2000 sub-tile out of them via `zarr.Array.oindex` with no alignment requirement.
 
 `filter_chunks_by_roi_mask` then drops any chunk whose footprint does not intersect the ROI
 zarr mask produced by `generate_roi`. Only the surviving **live chunks** are dispatched to
@@ -88,7 +91,7 @@ The cluster is managed in a context manager so it automatically tears down after
 
 **Cluster topology:**
 - Head: m5.2xlarge — GCS + autoscaler, no inference work
-- Workers: g5.2xlarge (1× A10G 24 GB VRAM, 32 GB RAM) — on-demand, single AZ
+- Workers: g5.xlarge (1× A10G 24 GB VRAM, 16 GB RAM) — on-demand, single AZ
 - Workers use a Packer-built AMI with all dependencies pre-installed; boot ready in ~1 minute
 
 ### 3. Inference Actors
@@ -101,13 +104,31 @@ before work is dispatched.
 > **Why NVMe?** EBS sequential read saturates at ~42 MB/s. `torch.load` with mmap on EBS
 > causes multi-minute hangs. NVMe is ~35× faster.
 
+**Icechunk credentials (injected, not imported).** `InferenceActor` takes a `get_credentials`
+callback and wraps each `process_chunk` in `storage.zarr_store.credentials_provider(...)`, so
+every store open resolves through it. The AWS-aware orchestration layer injects
+`providers.aws.credentials.iam_icechunk_credentials` (threaded
+runner → scheduling → actor, including replacement actors); the actor itself imports no AWS
+module so `inference/` stays domain-pure (enforced by `tests/architecture`). With no callback
+injected (local/dev runs) icechunk uses its default credential chain.
+
+This matters because long-lived actors outlive the credential resolved at startup. The Rust
+SDK's default chain resolves the instance-profile credential once and may fail to refresh it;
+when it lapses, the failing chunk **and every subsequent chunk on that actor** error with
+`no providers in chain provided credentials`. Routing through `iam_icechunk_credentials`
+(botocore-backed, self-refreshing) fixes this — but note the IMDS-throttling gotcha documented
+in `ingest/README.md`: `_resolve_iam_credentials` must stay `lru_cache`d so the callback's
+15-min re-invocation does **not** trigger a cold IMDS resolve each time.
+
 ### 4. Per-Chunk Inference (inside each actor)
 
 Each chunk goes through four sub-steps:
 
 #### 4a. Data Loading (`data_loading.py`)
 
-Two-phase loading keeps peak worker RAM ~2 GB rather than ~15 GB:
+Two-phase loading lowers peak worker RAM by dropping empty dates before the band read. This
+caps RAM for typical chunks but does not *bound* it — peak still scales with `T_valid`, which
+is what northing striping (4a′) addresses for dense chunks:
 
 ```text
 All timesteps in the ROI time axis
@@ -138,6 +159,36 @@ gracefully when only one orbit was ingested.
 Output: `ChunkData` — numpy arrays for S2 bands/masks/DOYs, S1 ascending/descending
 bands/DOYs, and per-pixel observation counts (`s2_obs_count`, `s1_asc_obs_count`,
 `s1_desc_obs_count`) as uint16 arrays of shape (H, W).
+
+#### 4a′. Northing Striping (bounds peak input RAM independent of T)
+
+The SCL pre-filter above caps peak RAM for *typical* chunks, but it does not bound it: the
+resident S2 band array is `T_valid × H × W × 10 × 2` bytes, which scales with the timestep
+count. On dense ROIs `T_valid` can reach ~120, so a 2000×2000 chunk's `s2_bands` alone is
+~9.6 GB in a single `np.empty` — and on a 16 GB `g5.xlarge` worker that OOMs the loader
+*before* inference runs. `T` is not a free variable (v1.1 uses every valid observation), so
+the only lever is the spatial working set.
+
+`process_chunk` therefore loads each chunk as a sequence of **northing strips** (full easting
+width) rather than all at once. `load_chunk(..., y_sub=<slice>)` reads only a chunk-relative
+horizontal band; each strip is a self-contained `ChunkData` that is bucketed, run through
+inference, and written into whole-chunk output buffers by row-slice. Only the *inputs* are
+sub-tiled — the int8 output buffer (`H × W × 128`, ~0.5 GB) is held whole, so the write path,
+obs-count maps, and `assembly.py` are untouched (a single `write_chunk` at the end). Strips
+are loaded through a 1-deep prefetch pipeline (strip *i+1* loads while strip *i* runs the
+GPU), the same pattern as the sub-batch prefetcher in `inference.py`.
+
+The strip height is derived per chunk from its **true post-prune timestep count** `T_kept`,
+read from a full-chunk SCL mask loaded once up front (see below). The strip loop runs a 1-deep
+prefetch (strip *i+1* loads while strip *i* runs the GPU), so once a chunk splits **two strips
+are resident at once**; the byte budget is the bound on a single strip, sized so the pair holds
+under ~90% of the default 16 GB worker box. A chunk that fits in one strip loads whole (no
+prefetched neighbour) — byte-for-byte the unstriped path.
+
+Two reads are decoupled. **SCL** (1 byte/px) is loaded once for the whole chunk
+(`load_s2_mask_bundle`) and sliced per strip — it is never re-decompressed, and it doubles as
+the `T_kept` source for sizing. **Reflectance bands** (20 bytes/px) are still read per strip on
+the chunks that split; that per-strip read is exactly the working set the byte budget bounds.
 
 #### 4b. Valid Pixel Filtering + Bucketing (`dataset.py`)
 
@@ -181,6 +232,13 @@ Each modality uses its own `(mean, std)` from `S1_ASC_BAND_MEAN/STD` and
 `S1_DESC_BAND_MEAN/STD` in `config/inference.py`. Ascending and descending are normalised
 separately before concatenation so that the model sees per-orbit statistics, not blended ones.
 
+> **Why `s1_orbit="both"` is safe for v1.1:** The v1.1 model uses a single merged S1
+> backbone (`split_s1_modalities=False`), but Cambridge confirmed that ascending and
+> descending observations are each normalised with their **own** mean/std before being
+> concatenated — exactly matching v1.1 training-time preprocessing. This makes mixing
+> both orbits correct and preferred, in contrast to v1 where the two orbits shared
+> normalisation statistics.
+
 `build_resample_indices` handles under-sampled pixels (fewer valid timesteps than the
 bucket target) via deterministic repeat-padding — last valid timestep is duplicated until
 target is reached. Over-sampled pixels are uniformly sub-sampled.
@@ -191,9 +249,11 @@ target is reached. Over-sampled pixels are uniformly sub-sampled.
   smallest; the largest bucket sets the "hot" GPU allocation so smaller buckets reuse it.
 - **Prefetch thread** — a `ThreadPoolExecutor(max_workers=1)` pipelines CPU batch
   preparation (data loading + normalization) while the GPU runs the previous forward pass.
-- **FP16** — `model.half()` halves memory bandwidth; bucket-level aggregation (instead of
-  repeat averaging) absorbs FP16 noise.
-- **`torch.compile` is disabled** — GRU recompilation per unique seq_len makes it slower.
+- **FP16** — `model.half()` halves memory bandwidth; bucket-level aggregation absorbs FP16
+  noise without repeat-averaging.
+- **`torch.compile` is disabled** — on g5.xlarge (15.4 GB VRAM), CUDA graph capture
+  consumed 11.6 GB and slowed forward passes (3,770 ms vs. 1,944 ms) due to GRU
+  recompilation per unique sequence length.
 - **cuDNN benchmark mode** — fastest algorithm for GRU/conv ops.
 - **Throughput:** ~1,300 px/sec per A10G; 100 actors ≈ 130,000 px/sec.
 
@@ -210,6 +270,16 @@ before staging. This reduces staged and final store sizes by ~4×.
 is computed. Embeddings are scaled so that the max maps to ±127 (the int8 range), then
 rounded and clipped. The per-pixel scale factor (float32) is stored alongside the
 quantized embeddings so the original values can be reconstructed:
+
+**Per-bucket, not whole-chunk.** Quantization is per-pixel independent (each pixel's scale
+comes only from its own 128 channels), so `run_inference` quantizes each bucket's rows via
+`quantize_rows` the moment they come off the GPU, accumulating directly into skinny int8 +
+scale buffers. It never materializes the full `(H, W, 128)` chunk in float32. This is
+numerically identical to quantizing the whole array at the end, but shrinks the resident
+accumulator ~4× (~2 GB → ~0.5 GB at `chunk_size=2000`) and removes the end-of-chunk
+whole-array quantize and its multi-GB float32 temporaries — lowering the per-chunk host-RAM
+plateau. `quantize_embeddings` remains as the `(H, W, D)` entry point and delegates to
+`quantize_rows`.
 
 ```
 reconstructed = quantized.astype(float32) * scale[..., np.newaxis]
@@ -322,6 +392,23 @@ With align_chunks=True:
    quantized embeddings use default compression. Appends to existing store if present.
 5. Delete _all versions_ of the staged chunk zarrs (unless `dev` flag is passed).
 
+**Manifest splitting.** The whole `writer.assemble` call is wrapped in
+`manifest_split({"northing": 32, "easting": 32})` (see `tasks/inference.py`). By default
+icechunk keeps one manifest object per array, so every commit rewrites the entire chunk
+index — O(store size) regardless of how few chunks changed. Splitting tiles the manifest
+into 32-chunk-per-axis shards; with 500×500 px on-disk sub-chunks that's ~16k px/shard,
+matching `zarr_store.DEFAULT_MANIFEST_SPLIT_SIZES`' target. No `time` split is applied:
+assembly only ever writes a single timestep, so one time shard equals the whole array and
+splitting time would be a no-op. The split config is persisted via `repo.save_config()` so
+it survives the session being shipped to Dask workers.
+
+The split applies to both new and pre-existing stores. A store created before this change
+has a single unsplit manifest; the first append under the `manifest_split` block re-shards
+the touched array in that commit (a one-time migration — old chunk data is untouched and
+reads back unchanged), and every commit after it rewrites only the shards it touches. So
+existing stores pick up the same bounded-commit speedup on their next assembly run, with no
+manual migration step.
+
 **Why PCodec for the final store:** Embeddings are 128-dim float32 vectors — dense, continuous,
 and without the spatial redundancy that makes byte-shuffle + zstd effective for reflectance
 data. PCodec is a floating-point-aware codec that models the distribution of float values
@@ -329,6 +416,22 @@ directly, achieving significantly better compression ratios on this kind of data
 general-purpose codecs. The tradeoff is that PCodec decompresses the entire on-disk chunk
 to read any slice of it (no partial decode), which is why staged chunks use 500×500
 sub-chunks to cap decode buffer size.
+
+**Reading the output store.** On a CONUS-scale store, open with `chunks=None` for
+interactive or selective reads:
+
+```python
+ds = open_store(store_path, chunks=None)   # or xr.open_zarr(session.store, consolidated=False, chunks=None)
+ds.isel(time=0).sel(northing=slice(...), easting=slice(...)).embeddings.values
+```
+
+The default chunking builds one dask task per on-disk chunk. With 500×500×4
+sub-chunks the band axis alone is 32 chunks (128/4), so the graph is
+`n_time × n_y × n_x × 32` tasks — large enough at CONUS extent that even a *lazy*
+`isel`/`sel` OOMs while manipulating the graph, before any chunk data is read.
+`chunks=None` opens the store zarr-lazy with no dask graph: slicing is pure
+metadata and chunks load only when `.values` is pulled. This is unrelated to
+manifest splitting — the split bounds commit/manifest cost, not the dask graph.
 
 ---
 
@@ -354,14 +457,13 @@ the main loop; `ActorPool` encapsulates actor state and lifecycle operations
 
 | Parameter | Default | Notes |
 |---|---|---|
-| `batch_size` | 3584 | GPU pixels per forward pass |
+| `batch_size` | 3584 | GPU pixels per forward pass within a bucket |
 | `num_obs_checkpoints` | `range(8, 257, 8)` | Bucketed sequence-length schedule; pixels binned to nearest checkpoint |
-| `s1_orbit` | `"ascending"` | `"ascending"`, `"descending"`, or `"both"` |
+| `s1_orbit` | `"both"` | `"ascending"`, `"descending"`, or `"both"` |
 | `norm_source` | `"mpc"` | Band stats origin; `"aws"` for the AWS-normalised encoder checkpoint |
 | `latent_dim` | 192 | Transformer hidden dim (must match checkpoint) |
 | `representation_dim` | 192 | Model output dim; first 128 dims are saved to the store |
 | `dim_feedforward` | 2048 | Transformer FFN width |
-| `gpu_instance_type` | `g5.2xlarge` | Worker EC2 type |
 | `max_gpu_workers` | 500 | Ray autoscaler ceiling |
 
 **Architecture params** (`nhead`, `num_encoder_layers`, `dim_feedforward`, etc.) **must match

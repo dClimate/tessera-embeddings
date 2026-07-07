@@ -31,7 +31,7 @@ from tessera_embeddings.inference.profiling import (
     log_effective_tflops,
     log_profiled_batch_summary,
 )
-from tessera_embeddings.inference.quantization import quantize_embeddings
+from tessera_embeddings.inference.quantization import quantize_rows
 
 logger = logging.getLogger(__name__)
 
@@ -84,24 +84,51 @@ class InferenceResult:
     scales: np.ndarray
 
 
-def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> bool:
+def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> torch.dtype | None:
     """Configure model and GPU for inference.
 
-    On CUDA: converts to FP16, enables cuDNN benchmark mode, probes autocast dtypes.
+    On CUDA: converts to BF16 (preferred) and enables cuDNN benchmark mode.
+    Falls back to FP16 on GPUs that don't support BF16 (e.g. T4, compute
+    capability < 8.0). BF16 is strongly preferred — it has the same exponent
+    range as FP32 and avoids overflow on large intermediate activations. The
+    FP16 fallback is functional but carries a risk of inf/NaN from saturation
+    at 65504; treat it as a best-effort path, not a validated production config.
+
+    The dtype conversion is idempotent: actors reuse one persistent model
+    across every strip and chunk, so once converted the model already carries
+    the target dtype and we skip the (non-trivial) re-cast. This hoists the
+    one-time conversion cost to the first strip instead of paying it per strip.
 
     Returns:
-        Whether to use FP16 (True when device is CUDA).
+        The reduced-precision dtype to use for inputs (bfloat16 or float16), or None
+        on CPU (inputs stay float32).
     """
     log_cuda_diagnostics(device)
 
-    if device.type == "cuda":
-        model.half()
-        logger.info("Model converted to FP16")
-        torch.backends.cudnn.benchmark = True
-        logger.debug("cuDNN benchmark mode enabled")
+    if device.type != "cuda":
+        log_autocast_dtype_probe(device, dtype=None)
+        return None
 
-    log_autocast_dtype_probe(device)
-    return device.type == "cuda"
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    current_dtype = next(model.parameters()).dtype
+    if current_dtype == dtype:
+        logger.debug("Model already in %s; skipping conversion", dtype)
+    elif dtype == torch.bfloat16:
+        model.bfloat16()
+        logger.info("Model converted to BF16")
+    else:
+        model.half()
+        logger.warning("BF16 not supported on this GPU; falling back to FP16")
+
+    # benchmark=False: with variable bucket shapes (per-bucket seq lengths +
+    # partial final sub-batches) the autotuner re-searches constantly for little
+    # gain, and inflates the host-side cuDNN footprint by trial-loading multiple
+    # algorithms and holding the largest workspace it tried. Disabling it lowers
+    # the first-batch host-RAM plateau. See inference RAM investigation.
+    torch.backends.cudnn.benchmark = False
+    logger.debug("cuDNN benchmark mode disabled (variable input shapes)")
+    log_autocast_dtype_probe(device, dtype=dtype)
+    return dtype
 
 
 def _prepare_batch(
@@ -121,18 +148,22 @@ def _run_gpu_sub_batch(
     batch: dict[str, np.ndarray],
     bucket_key: tuple[int, int],
     device: torch.device,
-    use_fp16: bool,
-    flat_out: np.ndarray,
+    reduced_precision_dtype: torch.dtype | None,
+    flat_q: np.ndarray,
+    flat_scales: np.ndarray,
     get_batch_secs: float,
     *,
     profile: bool = False,
     config: InferenceConfig | None = None,
     save_dim: int = EMBEDDING_DIM,
 ) -> _BatchTimings:
-    """Transfer → forward → slice → write for a pre-prepared batch.
+    """Transfer → forward → slice → quantize → write for a pre-prepared batch.
 
     Must be called inside a ``torch.no_grad()`` context.
-    Writes into ``flat_out[global_idxs]`` in place.
+    Quantizes the batch's rows on arrival and writes int8 values into
+    ``flat_q[global_idxs]`` and their scales into ``flat_scales[global_idxs]``
+    in place. Per-row quantization is numerically identical to quantizing the
+    whole chunk at the end (see :func:`quantize_rows`).
     """
     tb1 = time.monotonic()
 
@@ -142,9 +173,9 @@ def _run_gpu_sub_batch(
 
     s2_input = torch.from_numpy(s2_np).to(device, non_blocking=True)
     s1_input = torch.from_numpy(s1_np).to(device, non_blocking=True)
-    if use_fp16:
-        s2_input = s2_input.half()
-        s1_input = s1_input.half()
+    if reduced_precision_dtype is not None:
+        s2_input = s2_input.to(reduced_precision_dtype)
+        s1_input = s1_input.to(reduced_precision_dtype)
     if device.type == "cuda":
         torch.cuda.synchronize()
     tb2 = time.monotonic()
@@ -180,9 +211,12 @@ def _run_gpu_sub_batch(
                 num_layers=config.num_encoder_layers,
             )
 
-    # Slice 192-D rep to canonical save_dim, then to CPU.
+    # Slice 192-D rep to canonical save_dim, to CPU, then quantize this bucket's
+    # rows immediately so we never buffer the whole chunk in float32.
     z = z[:, :save_dim].float()
-    flat_out[global_idxs] = z.cpu().numpy()
+    q, s = quantize_rows(z.cpu().numpy())
+    flat_q[global_idxs] = q
+    flat_scales[global_idxs] = s
     tb4 = time.monotonic()
 
     return _BatchTimings(
@@ -213,9 +247,12 @@ def run_inference(
 
     Returns:
         InferenceResult with:
-          - embeddings: (H, W, 128) int8 quantized. Zeros for invalid pixels.
+          - embeddings: (H, W, 128) int8 quantized. Zeros for pixels whose
+            embeddings can't be generated (failed validity, or outside the ROI
+            but inside the bbox).
           - embeddings_std: Always None under v1.1.
-          - scales: (H, W) float32 per-pixel scale factors.
+          - scales: (H, W) float32 per-pixel scale factors. NaN for those same
+            can't-generate pixels.
     """
     if config.batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {config.batch_size}")
@@ -231,7 +268,16 @@ def run_inference(
     save_dim = min(EMBEDDING_DIM, config.representation_dim)
 
     h, w = dataset.H, dataset.W
-    flat_out = np.zeros((h * w, save_dim), dtype=np.float32)
+    # Quantize per bucket into skinny int8 + scale buffers instead of accumulating
+    # the whole chunk in float32 (4x smaller resident accumulator). Pixels whose
+    # embeddings can't be generated — failed validity, or outside the ROI but
+    # inside the bbox (zeroed during ingest, so they fail the nonzero check and
+    # never enter a bucket) — keep their initial values: embeddings 0 in every
+    # band, scale NaN. Only pixels run through the model overwrite their slot via
+    # flat_scales[global_idxs] = s. This matches the NaN-scale / 0-embedding fill
+    # assembly applies to skipped and non-intersecting chunks.
+    flat_q = np.zeros((h * w, save_dim), dtype=np.int8)
+    flat_scales = np.full(h * w, np.nan, dtype=np.float32)
 
     logger.info(
         "Starting v1.1 inference: %d buckets, %d sub-batches, %d valid pixels, batch_size=%d",
@@ -240,7 +286,7 @@ def run_inference(
         n_valid,
         batch_size,
     )
-    use_fp16 = _prepare_gpu(model, device)
+    reduced_precision_dtype = _prepare_gpu(model, device)
 
     t_total = _BatchTimings(0.0, 0.0, 0.0, 0.0)
     pixels_processed = 0
@@ -266,9 +312,7 @@ def run_inference(
     # CPU prep (~165ms) < forward (~250ms), so the GPU consumes faster than the
     # prefetcher produces and a deeper queue would just sit full.
     with torch.no_grad(), ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch") as pool:
-        next_future = (
-            pool.submit(_prepare_batch, dataset, *sub_batches[0]) if sub_batches else None
-        )
+        next_future = pool.submit(_prepare_batch, dataset, *sub_batches[0]) if sub_batches else None
 
         for i, (bucket_key, start, end) in enumerate(sub_batches):
             assert next_future is not None
@@ -276,9 +320,7 @@ def run_inference(
 
             # Kick off prefetch of i+1 before the GPU work on i starts.
             next_future = (
-                pool.submit(_prepare_batch, dataset, *sub_batches[i + 1])
-                if i + 1 < len(sub_batches)
-                else None
+                pool.submit(_prepare_batch, dataset, *sub_batches[i + 1]) if i + 1 < len(sub_batches) else None
             )
 
             bt = _run_gpu_sub_batch(
@@ -286,8 +328,9 @@ def run_inference(
                 batch,
                 bucket_key,
                 device,
-                use_fp16,
-                flat_out,
+                reduced_precision_dtype,
+                flat_q,
+                flat_scales,
                 get_batch_secs,
                 profile=(sub_batch_idx == PROFILE_BATCH_IDX),
                 config=config,
@@ -323,8 +366,9 @@ def run_inference(
                     avg.total,
                 )
 
-    out = flat_out.reshape(h, w, save_dim)
-    out, scales = quantize_embeddings(out)
+    # Rows were already quantized per bucket on arrival; just reshape to (H,W,*).
+    out = flat_q.reshape(h, w, save_dim)
+    scales = flat_scales.reshape(h, w)
     logger.info("Quantized embeddings to int8 (scales shape %s)", scales.shape)
 
     elapsed = time.monotonic() - t0

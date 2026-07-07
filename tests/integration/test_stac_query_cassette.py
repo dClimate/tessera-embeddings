@@ -1,7 +1,9 @@
 """Integration test: STAC query against a recorded cassette.
 
 This exercises the cassette infrastructure end-to-end and is the
-canonical example for any future cassette-backed ingest test.
+canonical example for any future cassette-backed ingest test. The
+AOI is Denver, CO — chosen because it has both ascending and
+descending OPERA RTC-S1 coverage in July 2024.
 
 Run with::
 
@@ -46,11 +48,11 @@ def vcr_config() -> dict:
 
 
 @pytest.mark.integration
-@pytest.mark.vcr  # cassette: tests/fixtures/stac_cassettes/test_s2_stac_search_against_story_county.yaml
-def test_s2_stac_search_against_story_county() -> None:
-    """A pystac-client search against Earth Search returns ~12 items.
+@pytest.mark.vcr  # cassette: tests/fixtures/stac_cassettes/test_s2_stac_search_against_denver.yaml
+def test_s2_stac_search_against_denver() -> None:
+    """A pystac-client search against Earth Search returns items for Denver.
 
-    Inputs match the bundled quickstart AOI (Story County, IA) so the
+    Inputs match the bundled quickstart AOI (Denver, CO) so the
     cassette captures the realistic case. Item count is the
     invariant the test asserts; specific item IDs are too volatile.
     """
@@ -59,7 +61,7 @@ def test_s2_stac_search_against_story_county() -> None:
     es = Client.open("https://earth-search.aws.element84.com/v1")
     search = es.search(
         collections=["sentinel-2-l2a"],
-        bbox=[-93.65, 42.00, -93.55, 42.10],
+        bbox=[-105.020, 39.740, -105.010, 39.750],
         datetime="2024-07-01/2024-07-31",
         max_items=200,
     )

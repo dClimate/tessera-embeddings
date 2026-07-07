@@ -1,10 +1,13 @@
 """Orchestrator-free pipeline runner.
 
-Default: runs ROI generation → S2 + S1 ingestion → CPU inference →
-assembly end-to-end on a small example ROI using local Ray + local
-Dask. Slow (~30+ min on a developer laptop) but proves the layer
-separation is real — every step calls the same domain function the
-Prefect flows do.
+Runs ROI generation → S2 + S1 ingestion → inference → assembly
+end-to-end using local Ray + local Dask. Proves layer separation
+is real — every step calls the same domain function the Prefect
+flows do.
+
+Device is controlled by the ``device`` key in the YAML config
+(``"auto"`` | ``"cpu"`` | ``"cuda"``; default ``"auto"`` uses
+a GPU when one is available).
 
 ``--skip-inference`` short-circuits after ingestion for fast contributor
 iteration on the ingest path.
@@ -19,17 +22,19 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from dask.distributed import Client
 
 from tessera_embeddings.config.dask import AssemblyConfig
-from tessera_embeddings.config.inference import DEFAULT_CHUNK_SIZE, checkpoint_filename
+from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
+from tessera_embeddings.inference.data_loading import _active_orbits, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
     checkpoint_to_version,
@@ -38,14 +43,40 @@ from tessera_embeddings.inference.orchestration_helpers import (
     read_upstream_manifests,
 )
 from tessera_embeddings.inference.runner import run_inference
+from tessera_embeddings.ingest.auth import get_s3_credentials, set_s3_credentials
 from tessera_embeddings.ingest.roi import rasterize_roi_zarr
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
-from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
+from tessera_embeddings.ingest.s1_roi import ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
 from tessera_embeddings.providers.local.dask import local_cluster
 from tessera_embeddings.providers.local.ray import ray_cluster
-from tessera_embeddings.inference.data_loading import resolve_s1_orbit
 from tessera_embeddings.storage.manifest import EmbeddingManifest
+
+
+def _resolve_num_gpus(device: str) -> int:
+    """Map the config ``device`` field to a Ray num_gpus count.
+
+    ``"auto"`` probes :func:`torch.cuda.is_available` at runtime so the
+    same config works on a CPU-only laptop and a single-GPU dev box.
+    Falls back to 0 if torch is not installed.
+
+    Raises:
+        ValueError: if ``device`` is not one of ``"cpu"``, ``"cuda"``, ``"auto"``.
+        RuntimeError: if ``device="cuda"`` but CUDA is not available.
+    """
+    if device not in {"cpu", "cuda", "auto"}:
+        raise ValueError(f"device must be 'auto', 'cpu', or 'cuda'; got {device!r}")
+    if device == "cpu":
+        return 0
+    try:
+        import torch
+
+        available = torch.cuda.is_available()
+    except ImportError:
+        available = False
+    if device == "cuda" and not available:
+        raise RuntimeError("device='cuda' requested but no CUDA device is visible on this host")
+    return 1 if available else 0
 
 
 @contextmanager
@@ -62,7 +93,7 @@ def _run_ingest(
     roi_name: str,
     start_date: str,
     end_date: str,
-    s1_orbit: S1Orbit,
+    s1_orbit: Literal["ascending", "descending", "both"],
     n_workers: int,
     log: logging.Logger,
     storage_options: dict | None,
@@ -91,19 +122,26 @@ def _run_ingest(
         )
         log.info("S2 ingestion: %s", s2_result)
 
-        log.info("Ingesting S1 SAR (orbit=%s, use_s3_direct=%s)", s1_orbit, s1_use_s3_direct)
-        s1_result = ingest_s1_roi_sar(
-            roi_zarr_path=roi_path,
-            start_date=start_date,
-            end_date=end_date,
-            store_path=mosaic_base,
-            client=client,
-            orbit=s1_orbit,
-            use_s3_direct=s1_use_s3_direct,
-            log=log,
-            storage_options=storage_options,
-        )
-        log.info("S1 ingestion: %s", s1_result)
+        for orbit in _active_orbits(s1_orbit):
+            log.info("Ingesting S1 SAR (orbit=%s, use_s3_direct=%s)", orbit, s1_use_s3_direct)
+            # When S3 direct is on, the domain function expects callables that fetch
+            # ASF STS credentials and broadcast them to the cluster. The Prefect
+            # flow wires these the same way; without them GDAL hits /vsis3/ with no
+            # AWS env vars and ASF rejects the request.
+            s1_result = ingest_s1_roi_sar(
+                roi_zarr_path=roi_path,
+                start_date=start_date,
+                end_date=end_date,
+                store_path=mosaic_base,
+                client=client,
+                orbit=orbit,  # type: ignore[arg-type]
+                use_s3_direct=s1_use_s3_direct,
+                edl_credentials_fn=get_s3_credentials if s1_use_s3_direct else None,
+                apply_credentials_fn=set_s3_credentials if s1_use_s3_direct else None,
+                log=log,
+                storage_options=storage_options,
+            )
+            log.info("S1 ingestion (%s): %s", orbit, s1_result)
 
 
 def _run_inference_and_assemble(
@@ -112,57 +150,58 @@ def _run_inference_and_assemble(
     roi_name: str,
     paths: BucketPaths,
     time_window_end: str,
-    s1_orbit: S1Orbit,
+    s1_orbit: Literal["ascending", "descending", "both"],
     checkpoint_dir: str | None,
+    checkpoint_url: str | None,
+    num_gpus: int,
     log: logging.Logger,
 ) -> dict[str, Any]:
-    """Run CPU inference under local Ray, then assemble under local Dask."""
+    """Run inference under local Ray, then assemble under local Dask."""
     inputs_bucket = paths.inputs
     output_bucket = paths.outputs
 
     time_window = parse_time_window(time_window_end)
-    model_dir = checkpoint_dir or f"{inputs_bucket.rstrip('/')}/models"
-    checkpoint_path = f"{model_dir.rstrip('/')}/{checkpoint_filename()}"
-
-    config = build_inference_config(
-        s1_orbit=s1_orbit,
-        time_window=time_window,
-        checkpoint_path=checkpoint_path,
-        inputs_bucket=inputs_bucket,
-        output_bucket=output_bucket,
-        num_gpus=0,  # CPU inference for the plain runner
-    )
+    # A full checkpoint URL/path (e.g. a HuggingFace `resolve/main` link) wins;
+    # otherwise derive `{checkpoint_dir or {inputs}/models}/{canonical filename}`.
+    # Remote URIs (s3://, https://, …) are downloaded and cached by the actor.
+    if checkpoint_url:
+        checkpoint_path = checkpoint_url
+    else:
+        model_dir = checkpoint_dir or f"{inputs_bucket.rstrip('/')}/models"
+        checkpoint_path = f"{model_dir.rstrip('/')}/{checkpoint_filename()}"
 
     mosaic_base = paths.store_for(roi_name, "reflectance").rsplit("/", 1)[0]
     staging_base = f"{output_bucket.rstrip('/')}/staging"
 
     # Probe for available SAR stores before dispatching inference; if s1_orbit="both"
     # is requested but only one orbit was ingested, fall back gracefully.
-    effective_orbit = resolve_s1_orbit(mosaic_base, config.s1_orbit)
-    if effective_orbit != config.s1_orbit:
-        config = build_inference_config(
-            s1_orbit=effective_orbit,
-            time_window=time_window,
-            checkpoint_path=checkpoint_path,
-            inputs_bucket=inputs_bucket,
-            output_bucket=output_bucket,
-            num_gpus=0,
-        )
+    effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
+    config = build_inference_config(
+        s1_orbit=effective_orbit,
+        time_window=time_window,
+        checkpoint_path=checkpoint_path,
+        inputs_bucket=inputs_bucket,
+        output_bucket=output_bucket,
+        num_gpus=num_gpus,
+    )
 
-    chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, config.chunk_size or DEFAULT_CHUNK_SIZE, log)
+    chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, config.chunk_size or INFERENCE_CHUNK_SIZE, log)
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_path)
     log.info("ROI filter: %d/%d chunks intersect the ROI", len(live_chunks), len(chunks))
 
     run_id = uuid.uuid4().hex[:12]
     t0 = time.monotonic()
 
-    log.warning(
-        "Running CPU inference on %d chunks. Expect this to take a while; "
-        "use --skip-inference for ingest-only sanity checks.",
-        len(live_chunks),
-    )
+    if num_gpus == 0:
+        log.warning(
+            "Running CPU inference on %d chunks. Expect this to take a while; "
+            "use --skip-inference for ingest-only sanity checks.",
+            len(live_chunks),
+        )
+    else:
+        log.info("Running GPU inference on %d chunks (num_gpus=%d).", len(live_chunks), num_gpus)
 
-    with ray_cluster(num_gpus=0):
+    with ray_cluster(num_gpus=num_gpus):
         results = run_inference(
             num_actors=1,
             config=config,
@@ -227,7 +266,6 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
             paths:
               inputs: file:///tmp/tessera/inputs
               outputs: file:///tmp/tessera/outputs
-              preprocessed: file:///tmp/tessera/preprocessed
             roi:
               name: my-roi
               geojson: examples/quickstart/roi.geojson    # optional
@@ -238,9 +276,11 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
             time_range:
               start: "2024-07-01"
               end: "2025-07-01"
-            s1_orbit: ascending
+            s1_orbit: ascending    # or "descending" or "both"
             n_workers: 2
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
+            checkpoint_url: null    # full checkpoint URI (s3://, https://, …); overrides checkpoint_dir
+            device: auto            # "auto" | "cpu" | "cuda"
             storage_options: null
 
         skip_inference: When True, stop after ingestion. Useful for
@@ -274,7 +314,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         rasterize_roi_zarr(
             output_path=roi_path,
             resolution=roi_cfg.get("resolution", 10.0),
-            chunk_size=roi_cfg.get("chunk_size", DEFAULT_CHUNK_SIZE),
+            chunk_size=roi_cfg.get("chunk_size", INGEST_CHUNK_SIZE),
             force_crs=roi_cfg.get("force_crs"),
             input_path=roi_cfg["geojson"],
         )
@@ -289,7 +329,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         roi_name=roi_name,
         start_date=time_range["start"],
         end_date=time_range["end"],
-        s1_orbit=cfg.get("s1_orbit", "ascending"),
+        s1_orbit=cfg.get("s1_orbit", "both"),
         n_workers=cfg.get("n_workers", 2),
         log=log,
         storage_options=cfg.get("storage_options"),
@@ -304,14 +344,17 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         log.info("Skipping inference + assembly (--skip-inference)")
         return None
 
-    # Stages 3 + 4: CPU inference + assembly
+    # Stages 3 + 4: inference + assembly
+    num_gpus = _resolve_num_gpus(cfg.get("device", "auto"))
     summary = _run_inference_and_assemble(
         roi_path=roi_path,
         roi_name=roi_name,
         paths=paths,
         time_window_end=cfg["time_window_end"],
-        s1_orbit=cfg.get("s1_orbit", "ascending"),
+        s1_orbit=cfg.get("s1_orbit", "both"),
         checkpoint_dir=cfg.get("checkpoint_dir"),
+        checkpoint_url=cfg.get("checkpoint_url"),
+        num_gpus=num_gpus,
         log=log,
     )
     log.info("Pipeline complete: %s", summary)

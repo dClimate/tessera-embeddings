@@ -18,6 +18,7 @@ from __future__ import annotations
 import zarr
 from prefect import flow, get_run_logger
 
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.errors import ConfigMismatchError  # noqa: F401  (re-exported for callers)
 from tessera_embeddings.ingest.roi import (
     check_output_exists,
@@ -44,7 +45,7 @@ def generate_roi(
     tile_names: str | None = None,
     output_name: str | None = None,
     resolution: float = 10.0,
-    chunk_size: int = 2000,
+    chunk_size: int = INGEST_CHUNK_SIZE,
     force_crs: str | None = None,
 ) -> str:
     """Generate a chunked Zarr ROI mask and write it to the configured bucket.
@@ -65,8 +66,9 @@ def generate_roi(
         output_name: Override for the derived output filename in tile
             mode. Ignored in GeoJSON mode (use ``roi_name`` directly).
         resolution: Output pixel size in metres.
-        chunk_size: Spatial chunk size in pixels (default 2000, matches
-            the ingestion pipeline's TESSERA_CHUNKS).
+        chunk_size: Spatial chunk size in pixels (default
+            ``INGEST_CHUNK_SIZE``, matches the ingestion pipeline's
+            ``INGEST_CHUNKS``).
         force_crs: Override CRS as an EPSG string (e.g.
             ``"EPSG:32633"``). Default: auto-select UTM zone from the
             geometry centroid.

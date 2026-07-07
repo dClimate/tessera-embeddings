@@ -13,18 +13,18 @@
 paths:
   inputs: file:///tmp/tessera/inputs
   outputs: file:///tmp/tessera/outputs
-  preprocessed: file:///tmp/tessera/preprocessed
 
 roi:
-  # 10 km box over Story County, IA (Ames) — top corn-producing county.
+  # ~1 km box in Denver, CO — covered by both ascending and descending
+  # OPERA RTC-S1 tracks, making it a good quickstart AOI for s1_orbit=both.
   # See examples/quickstart/README.md for why this AOI was chosen.
-  name: quickstart_story_county_ia
+  name: quickstart_denver_co
   geojson: examples/quickstart/roi.geojson
   resolution: 10.0
   chunk_size: 2000
-  # Story County, IA falls in UTM zone 15N. Rasterisation requires a
+  # Denver, CO falls in UTM zone 13N. Rasterisation requires a
   # projected CRS (metres, not degrees); the GeoJSON itself is CRS84.
-  force_crs: "EPSG:32615"
+  force_crs: "EPSG:32613"
 
 # Ingest date range. Keep narrow for quickstart speed; widen for
 # realistic comparison against production.
@@ -37,16 +37,25 @@ time_range:
 time_window_end: "August 2024"
 
 # Single-orbit ingest is enough for the quickstart.
-s1_orbit: ascending
+s1_orbit: both
 
 # Local Dask cluster size on the runner host.
 n_workers: 2
 
-# Optional override for the directory containing the model checkpoint.
-# null means the runner looks under {inputs}/models/. Set this to keep
-# checkpoints outside the inputs tree so they survive a data wipe.
-# Example: checkpoint_dir: /tmp/tessera-models
-checkpoint_dir: /tmp/tessera-models
+# Model checkpoint. The quickstart pulls the v1.1 AWS encoder straight from
+# HuggingFace — no manual download needed. The runner caches it locally on
+# first use (under the system temp dir off AWS, or NVMe on a DLAMI host).
+checkpoint_url: https://huggingface.co/geotessera/TESSERA-V-1.1/resolve/main/tessera_v1_1_aws_encoder.pt
+
+# Optional override for the directory containing the model checkpoint, used
+# only when checkpoint_url is null. null means the runner looks under
+# {inputs}/models/. Set this to keep checkpoints outside the inputs tree so
+# they survive a data wipe. Example: checkpoint_dir: /tmp/tessera-models
+checkpoint_dir: null
+
+# Device for inference. "auto" uses a GPU if torch.cuda.is_available(),
+# otherwise falls back to CPU. Set to "cpu" or "cuda" to override.
+device: auto
 
 # fsspec storage options. null lets fsspec auto-detect; for s3:// you
 # might pass {anon: false} or a dict with key/secret.

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
@@ -27,7 +26,7 @@ def _make_chunk_data(
         rng = np.random.default_rng(42)
 
     s2_bands = rng.integers(100, 3000, (n_s2, H, W, 10), dtype=np.uint16)
-    s2_masks = rng.integers(0, 2, (n_s2, H, W), dtype=np.int32)
+    s2_masks = rng.integers(0, 2, (n_s2, H, W)).astype(bool)
     s2_doys = np.arange(n_s2, dtype=np.int32) * 16
 
     if n_s1a > 0:
@@ -96,8 +95,8 @@ def test_get_bucket_batch_shapes() -> None:
     for (s2_bin, s1_bin), idxs in ds.iter_buckets():
         batch = ds.get_bucket_batch((s2_bin, s1_bin), 0, min(4, len(idxs)))
         b = batch["s2"].shape[0]
-        assert batch["s2"].shape == (b, s2_bin, 11)   # 10 bands + DOY
-        assert batch["s1"].shape == (b, s1_bin, 3)    # 2 bands + DOY
+        assert batch["s2"].shape == (b, s2_bin, 11)  # 10 bands + DOY
+        assert batch["s1"].shape == (b, s1_bin, 3)  # 2 bands + DOY
         assert batch["global_idxs"].shape == (b,)
         break  # one bucket is enough for shape checks
 
@@ -107,7 +106,7 @@ def test_no_valid_pixels_empty_dataset() -> None:
     H, W = 4, 4
     chunk_data = ChunkData(
         s2_bands=np.zeros((10, H, W, 10), dtype=np.uint16),
-        s2_masks=np.zeros((10, H, W), dtype=np.int32),
+        s2_masks=np.zeros((10, H, W), dtype=bool),
         s2_doys=np.arange(10, dtype=np.int32),
         s1_asc_bands=np.zeros((6, H, W, 2), dtype=np.float32),
         s1_asc_doys=np.arange(6, dtype=np.int32),

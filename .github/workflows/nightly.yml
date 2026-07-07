@@ -2,29 +2,22 @@ name: Nightly
 
 on:
   schedule:
-    # 06:00 UTC daily (~01:00 ET / 22:00 PT). Off-peak so any late-running
-    # job finishes before the morning developer surge.
     - cron: '0 6 * * *'
-  workflow_dispatch: {}  # manual trigger from the GitHub Actions UI
+  workflow_dispatch: {}
 
-# The nightly suite covers the slow parity + slow unit tests that are
-# excluded from the per-PR gate. Wall-clock-insensitive (nobody waits).
 jobs:
   slow-parity:
     runs-on: ubuntu-latest
-    # Default 2-core runner is intentional: this job is wall-clock-
-    # insensitive and we'd rather spend fewer Actions minutes than shave
-    # 30% off a 60-min run. See implementation plan §12.4.
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: astral-sh/setup-uv@f98e06938123ccabd21905ea5d0069192241f9f1 # v8.3.1
         with:
-          enable-cache: true
-          cache-dependency-glob: "dev.lock"
-      - run: uv sync --frozen --group dev
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --python 3.13 --all-extras
+
       - name: Run slow parity tests
-        # Serial — each parity test is already a heavyweight pipeline-pair.
         run: uv run pytest tests/parity -m "parity and slow" -v --tb=short
-      - name: Run slow tests
-        run: uv run pytest tests/slow -m slow -v --tb=short

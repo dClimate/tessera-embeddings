@@ -203,7 +203,7 @@ class TemporalPositionalEncoder(nn.Module):
         # CHANGED: Pre-compute div_term as a non-persistent buffer. It depends only on
         # d_model, not on input data, so recomputing it every forward call wastes ~18ms
         # per backbone. Non-persistent (persistent=False) so it's excluded from state_dict
-        # and doesn't break checkpoint loading. Still moves with .to(device) / .half().
+        # and doesn't break checkpoint loading. Still moves with .to(device) / .bfloat16().
         # Stored in FP32 for numerical precision in sin/cos; output is cast to model dtype.
         div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * -(math.log(10000.0) / d_model))
         self.register_buffer("div_term", div_term, persistent=False)
@@ -218,9 +218,9 @@ class TemporalPositionalEncoder(nn.Module):
             Positional encoding of shape (B, T, d_model).
         """
         # CHANGED: Compute in FP32 for numerical precision, then cast output to match
-        # the caller's dtype (FP16 when model.half() is active). Without this cast,
+        # the caller's dtype (BF16 when model.bfloat16() is active). Without this cast,
         # the FP32 positional encoding contaminates all downstream ops via PyTorch's
-        # automatic dtype promotion (FP16 + FP32 = FP32), causing the entire transformer
+        # automatic dtype promotion (BF16 + FP32 = FP32), causing the entire transformer
         # and GRU to run in FP32 — 7 TFLOPS instead of 20-30 TFLOPS on T4 tensor cores.
         # See ai/debug/inference_throughput_profiling_2026-02-23.md for full analysis.
         position = doy.unsqueeze(-1).float()
@@ -348,5 +348,3 @@ class TransformerEncoder(nn.Module):
             )
 
         return result
-
-

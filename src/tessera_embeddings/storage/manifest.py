@@ -198,7 +198,7 @@ class EmbeddingManifest(StoreManifest):
     sar_manifest_hash: str | None = None
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "EmbeddingManifest":
+    def from_dict(cls, d: dict[str, Any]) -> EmbeddingManifest:
         """Deserialize, coercing ``num_obs_checkpoints`` list → tuple."""
         field_names = {f.name for f in fields(cls)}
         kwargs = {k: v for k, v in d.items() if k in field_names}

@@ -27,8 +27,21 @@ def checkpoint_filename(norm_source: str = "aws") -> str:
         norm_source: Which checkpoint to use — ``"aws"`` (default) or ``"mpc"``.
     """
     if norm_source not in _CHECKPOINT_NAMES:
-        raise ValueError(f"Unknown norm_source: {norm_source!r}. Must be 'aws' or 'mpc'.")
+        valid = ", ".join(repr(k) for k in _CHECKPOINT_NAMES)
+        raise ValueError(f"Unknown norm_source: {norm_source!r}. Must be one of {valid}.")
     return _CHECKPOINT_NAMES[norm_source]
+
+
+def _normalize_obs_checkpoints(checkpoints: tuple[int, ...]) -> tuple[int, ...]:
+    """Coerce and validate a num_obs_checkpoints value.
+
+    Deduplicates, sorts, and filters out non-positive values. Safe to call on
+    values arriving as lists from YAML deserialization.
+    """
+    result = tuple(sorted({int(v) for v in checkpoints if int(v) > 0}))
+    if not result:
+        raise ValueError("num_obs_checkpoints must contain at least one positive integer")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -40,24 +53,64 @@ def checkpoint_filename(norm_source: str = "aws") -> str:
 
 _NORM_STATS: dict[str, dict[str, list[float]]] = {
     "mpc": {
-        "s2_mean": [2683.4553, 2223.3630, 2432.0950, 3633.1970, 3602.1755,
-                    3006.4324, 3400.2710, 3515.6392, 2456.9163, 1983.8783],
-        "s2_std":  [2739.5217, 2846.2993, 2690.8250, 2290.0439, 2088.8970,
-                    2673.1106, 2381.4521, 2229.5225, 1601.0942, 1495.3545],
+        "s2_mean": [
+            2683.4553,
+            2223.3630,
+            2432.0950,
+            3633.1970,
+            3602.1755,
+            3006.4324,
+            3400.2710,
+            3515.6392,
+            2456.9163,
+            1983.8783,
+        ],
+        "s2_std": [
+            2739.5217,
+            2846.2993,
+            2690.8250,
+            2290.0439,
+            2088.8970,
+            2673.1106,
+            2381.4521,
+            2229.5225,
+            1601.0942,
+            1495.3545,
+        ],
         "s1_asc_mean": [5588.3291, 3025.6270],
-        "s1_asc_std":  [1713.4646, 1693.0471],
+        "s1_asc_std": [1713.4646, 1693.0471],
         "s1_desc_mean": [5552.9683, 2955.0520],
-        "s1_desc_std":  [1685.5857, 1677.6414],
+        "s1_desc_std": [1685.5857, 1677.6414],
     },
     "aws": {
-        "s2_mean": [2793.6589, 2356.7776, 2551.0496, 3741.9229, 3713.7844,
-                    3120.1997, 3516.3342, 3637.0342, 2501.0283, 2038.1504],
-        "s2_std":  [2810.0093, 2933.8835, 2755.6360, 2344.5027, 2145.7986,
-                    2743.9019, 2438.8601, 2286.5977, 1680.7367, 1585.5529],
-        "s1_asc_mean": [5664.5439, 2802.9736],
-        "s1_asc_std":  [1678.7821, 1786.0414],
-        "s1_desc_mean": [5710.6992, 2830.1045],
-        "s1_desc_std":  [1616.1969, 1761.8499],
+        "s2_mean": [
+            2793.6589,
+            2356.7776,
+            2551.0496,
+            3741.9229,
+            3713.7844,
+            3120.1997,
+            3516.3342,
+            3637.0342,
+            2501.0283,
+            2038.1504,
+        ],
+        "s2_std": [
+            2810.0093,
+            2933.8835,
+            2755.6360,
+            2344.5027,
+            2145.7986,
+            2743.9019,
+            2438.8601,
+            2286.5977,
+            1680.7367,
+            1585.5529,
+        ],
+        "s1_asc_mean": [5697.0859, 2838.6687],
+        "s1_asc_std": [1671.3737, 1789.4116],
+        "s1_desc_mean": [5759.1367, 2873.2854],
+        "s1_desc_std": [1583.2858, 1747.8390],
     },
 }
 
@@ -86,11 +139,14 @@ REPRESENTATION_DIM = 192
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.
 DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
-# Spatial chunk size for storage and inference. 2000x2000 keeps peak RAM ~9.8 GB on
-# g5.2xlarge (31 GB), providing comfortable headroom.
-DEFAULT_CHUNK_SIZE = 2000
-
-TESSERA_CHUNKS = {"time": 1, "northing": DEFAULT_CHUNK_SIZE, "easting": DEFAULT_CHUNK_SIZE}
+# Spatial read-tile size for inference. The read/ChunkSpec grid stays 2000x2000;
+# the *resident input working set* is bounded separately via density-sized
+# northing strips (see actors._strip_height_for_density), so a 2000x2000 chunk's
+# peak host RAM is capped by a per-strip byte budget rather than fixed by
+# T x H x W. Sparse chunks load in one full-height strip; only dense chunks
+# split. Independent of the storage chunk size written at ingest
+# (config.ingest.INGEST_CHUNK_SIZE).
+INFERENCE_CHUNK_SIZE = 2000
 
 
 @final
@@ -124,9 +180,15 @@ class InferenceConfig:
 
         Ray cluster:
             ray_address: Ray cluster address (None for local mode).
-            gpu_instance_type: EC2 instance type for GPU workers.
             use_spot: Whether to use spot instances.
             max_gpu_workers: Maximum number of GPU workers.
+            actor_request_batch_size: Request actors this many at a time (0 =
+                all at once). Paces the EC2 demand the autoscaler forwards to
+                AWS, which fulfils a large simultaneous ask slowly. Inference
+                still starts on the first ready actor.
+            actor_batch_placement_timeout_sec: Max seconds to wait for a batch's
+                instances to join the cluster before requesting the next batch
+                regardless (capacity-shortfall escape hatch).
     """
 
     # Time window (required — no default)
@@ -143,10 +205,10 @@ class InferenceConfig:
     num_obs_checkpoints: tuple[int, ...] = field(default_factory=lambda: DEFAULT_NUM_OBS_CHECKPOINTS)
 
     # Inference
-    batch_size: int = 2048
+    batch_size: int = 3584
     num_workers: int = 4
     norm_source: Literal["mpc", "aws"] = "aws"
-    s1_orbit: Literal["ascending", "descending", "both"] = "ascending"
+    s1_orbit: Literal["ascending", "descending", "both"] = "both"
     # Deterministic sampling under v1.1 — no repeat variance; forced False in __post_init__.
     compute_std: bool = False
 
@@ -158,49 +220,34 @@ class InferenceConfig:
     checkpoint_path: str = ""
     inputs_bucket: str = ""
     output_bucket: str = ""
-    chunk_size: int = DEFAULT_CHUNK_SIZE
+    chunk_size: int = INFERENCE_CHUNK_SIZE
 
     # Ray cluster
     ray_address: str | None = None
-    gpu_instance_type: str = "g5.2xlarge"
     use_spot: bool = False
     max_gpu_workers: int = 500
+
+    # Actor request batching. AWS fulfils a large simultaneous EC2 ask slowly,
+    # so we can request actors in batches and let the autoscaler see demand for
+    # only one batch at a time. 0 disables batching (request all actors up
+    # front — the historical behaviour). When enabled, inference still starts on
+    # the first ready actor; subsequent batches are requested by the
+    # work-stealing loop once the prior batch's instances have joined the
+    # cluster (placement), so a slow model load never gates the next AWS ask.
+    actor_request_batch_size: int = 50
+    # Max seconds to wait for a batch's instances to be placed before requesting
+    # the next batch anyway. Escape hatch so a capacity shortfall (e.g. AWS only
+    # provisions 48/50) can't gate every remaining batch forever.
+    actor_batch_placement_timeout_sec: float = 300.0
 
     def __post_init__(self) -> None:
         """Validate and normalise config fields."""
         if self.norm_source not in _NORM_STATS:
-            raise ValueError(f"Invalid norm_source: {self.norm_source!r}. Must be 'aws' or 'mpc'.")
+            valid = ", ".join(repr(k) for k in _NORM_STATS)
+            raise ValueError(f"Invalid norm_source: {self.norm_source!r}. Must be one of {valid}.")
         if self.s1_orbit not in {"ascending", "descending", "both"}:
-            raise ValueError(
-                f"Invalid s1_orbit: {self.s1_orbit!r}. Must be 'ascending', 'descending', or 'both'."
-            )
-        if not self.num_obs_checkpoints:
-            raise ValueError("num_obs_checkpoints must contain at least one positive integer")
-        # Coerce to sorted tuple (may arrive as list via YAML/dict overrides).
-        self.num_obs_checkpoints = tuple(sorted({int(v) for v in self.num_obs_checkpoints if int(v) > 0}))
+            raise ValueError(f"Invalid s1_orbit: {self.s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
+        self.num_obs_checkpoints = _normalize_obs_checkpoints(self.num_obs_checkpoints)
 
         # v1.1 sampling is deterministic — no repeat variance to measure.
         self.compute_std = False
-
-        # Populate band stats from norm_source if not explicitly provided.
-        stats = _NORM_STATS[self.norm_source]
-        if not self.s2_band_mean:
-            self.s2_band_mean = list(stats["s2_mean"])
-        if not self.s2_band_std:
-            self.s2_band_std = list(stats["s2_std"])
-        if not self.s1_asc_band_mean:
-            self.s1_asc_band_mean = list(stats["s1_asc_mean"])
-        if not self.s1_asc_band_std:
-            self.s1_asc_band_std = list(stats["s1_asc_std"])
-        if not self.s1_desc_band_mean:
-            self.s1_desc_band_mean = list(stats["s1_desc_mean"])
-        if not self.s1_desc_band_std:
-            self.s1_desc_band_std = list(stats["s1_desc_std"])
-
-    # Band statistics — populated from norm_source in __post_init__ if empty.
-    s2_band_mean: list[float] = field(default_factory=list)
-    s2_band_std: list[float] = field(default_factory=list)
-    s1_asc_band_mean: list[float] = field(default_factory=list)
-    s1_asc_band_std: list[float] = field(default_factory=list)
-    s1_desc_band_mean: list[float] = field(default_factory=list)
-    s1_desc_band_std: list[float] = field(default_factory=list)

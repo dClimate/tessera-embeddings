@@ -62,6 +62,17 @@ you've stored the EC2 resource IDs your Ray nodes need.
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/ec2/tessera/ray"
 """Default CloudWatch log group for Ray agent logs."""
 
+PROJECT_TAG_VALUE = "tessera-embeddings"
+"""Value of the ``Project`` EC2 tag stamped on every Ray node.
+
+The deployment's runner IAM role conditions ``ec2:TerminateInstances`` on
+``aws:ResourceTag/Project`` equal to this value, so that ``ray down`` (which
+terminates nodes using the driver's credentials) and the
+:func:`terminate_ray_instances_by_tag` fallback are both authorised. Without
+this tag every teardown terminate is IAM-denied and the instances leak. Keep
+this in lockstep with the deployment's IAM condition (yield CDK:
+``ray_inference.py`` ``RayEc2Terminate``)."""
+
 _REQUIRED_SSM_KEYS = frozenset(
     {"security-group-id", "instance-profile-arn", "private-subnet-ids", "key-pair-name", "key-pair-id"}
 )
@@ -98,7 +109,7 @@ def _build_cloudwatch_setup_command(
         " && sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl"
         " -a fetch-config -m ec2 -s"
         " -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json"
-        ' 2>/dev/null || echo "CloudWatch agent not available (non-fatal)"'
+        ' || echo "WARNING: CloudWatch agent not available — logs will not ship to CloudWatch" >&2'
     )
 
 
@@ -165,9 +176,11 @@ def _resolve_ray_config(
             ``private-subnet-ids``, ``key-pair-name``, ``key-pair-id``.
         cluster_name: Override the template's ``cluster_name``. Required
             for running multiple clusters concurrently.
-        instance_tags: EC2 tags to apply to every node. List of
-            ``{"Key": str, "Value": str}`` dicts. ``None`` means no tags
-            beyond Ray's own ``ray-cluster-name`` tag.
+        instance_tags: Extra EC2 tags to apply to every node, on top of
+            the always-present ``Project`` tag (see :data:`PROJECT_TAG_VALUE`)
+            and Ray's own ``ray-cluster-name`` tag. List of
+            ``{"Key": str, "Value": str}`` dicts; a ``Project`` key here
+            overrides the default. ``None`` means only the defaults.
         code_bucket: S3 bucket name (without ``s3://``) substituted for
             ``{CODE_BUCKET}`` in setup_commands. ``None`` leaves the
             placeholder; pair with ``sync_source_path=None`` to disable
@@ -211,9 +224,14 @@ def _resolve_ray_config(
     all_subnet_ids = [s.strip() for s in params["private-subnet-ids"].split(",")]
     iam_profile = {"Arn": params["instance-profile-arn"]}
     key_name = params["key-pair-name"]
-    tag_specs: list[dict[str, Any]] = []
-    if instance_tags:
-        tag_specs.append({"ResourceType": "instance", "Tags": instance_tags})
+    # Always stamp the Project tag so teardown terminates are IAM-authorised
+    # (see PROJECT_TAG_VALUE). Caller-supplied tags win on key collision.
+    merged_tags = [{"Key": "Project", "Value": PROJECT_TAG_VALUE}]
+    caller_keys = {t["Key"] for t in (instance_tags or [])}
+    if "Project" in caller_keys:
+        merged_tags = []
+    merged_tags.extend(instance_tags or [])
+    tag_specs: list[dict[str, Any]] = [{"ResourceType": "instance", "Tags": merged_tags}]
 
     # Pin all nodes to a single AZ to avoid cross-AZ data transfer costs.
     # Pick the subnet with the fewest running Ray instances to spread
@@ -260,11 +278,19 @@ def _resolve_ray_config(
 
     # Inject the CloudWatch agent setup command (replaces any heredoc-style
     # cloudwatch entry in the template, which would break over SSH).
+    #
+    # Append it to the *_start_ray_commands, NOT setup_commands: setup_commands
+    # run before `ray start`, so the agent would resolve its file paths while
+    # /tmp/ray/session_latest is empty or stale, then `ray start` repoints the
+    # session_latest symlink out from under it and no logs ship. Starting the
+    # agent after `ray start` guarantees the session and its log files already
+    # exist when fetch-config discovers them. Strip any pre-existing cloudwatch
+    # entries from every command list so we don't double-start.
     cw_cmd = _build_cloudwatch_setup_command(cloudwatch_template, cloudwatch_log_group)
-    config["setup_commands"] = [
-        cmd for cmd in config.get("setup_commands", []) if "cloudwatch" not in str(cmd).lower()
-    ]
-    config["setup_commands"].append(cw_cmd)
+    for key in ("setup_commands", "head_start_ray_commands", "worker_start_ray_commands"):
+        config[key] = [cmd for cmd in config.get(key, []) if "cloudwatch" not in str(cmd).lower()]
+    config["head_start_ray_commands"].append(cw_cmd)
+    config["worker_start_ray_commands"].append(cw_cmd)
 
     # Substitute {CODE_BUCKET} and {CODE_SUFFIX} in setup_commands.
     if code_bucket is not None:
@@ -388,6 +414,58 @@ def _start_ray_cluster(
     log.info("Ray head node IP: %s", head_ip)
 
     return resolved_yaml, head_ip
+
+
+def _log_ray_dashboard_ssm_command(
+    cluster_name: str,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    *,
+    region: str,
+) -> None:
+    """Log a copy-pasteable SSM command to port-forward the Ray dashboard.
+
+    Finds the head node by its ``ray-cluster-name`` + ``ray-node-type=head``
+    tags and emits an ``aws ssm start-session`` block that forwards the
+    dashboard (port 8265) to ``localhost``. The head listens on 8265 with
+    ``--dashboard-host=0.0.0.0`` and the EC2 role carries
+    ``AmazonSSMManagedInstanceCore``, so the port-forward works against the
+    instance ID.
+
+    Best-effort: warns and returns on any failure, never raises. No
+    ``--profile`` is printed — credentials come from the operator's
+    environment (``AWS_PROFILE`` or their default).
+
+    Args:
+        cluster_name: Resolved, unique ``ray-cluster-name`` tag value (with
+            the uuid8 suffix) that Ray actually tagged instances with.
+        log: Logger.
+        region: AWS region.
+    """
+    try:
+        ec2 = boto3.client("ec2", region_name=region)
+        resp = ec2.describe_instances(
+            Filters=[
+                {"Name": "tag:ray-cluster-name", "Values": [cluster_name]},
+                {"Name": "tag:ray-node-type", "Values": ["head"]},
+                {"Name": "instance-state-name", "Values": ["running"]},
+            ],
+        )
+        reservations = resp.get("Reservations", [])
+        instances = reservations[0].get("Instances", []) if reservations else []
+        if not instances:
+            log.warning("Could not find Ray head node for dashboard command")
+            return
+        instance_id = instances[0]["InstanceId"]
+        log.info(
+            "To view the Ray dashboard, run:\n\n"
+            "aws ssm start-session \\\n"
+            f"  --target {instance_id} \\\n"
+            "  --document-name AWS-StartPortForwardingSessionToRemoteHost \\\n"
+            '  --parameters \'{"host":["localhost"],"portNumber":["8265"],"localPortNumber":["8265"]}\'\n\n'
+            "Then open http://localhost:8265"
+        )
+    except Exception:
+        log.warning("Could not generate Ray dashboard command", exc_info=True)
 
 
 def make_instance_terminator(
@@ -573,6 +651,8 @@ def ray_cluster(
             head_address = f"ray://{head_ip}:10001"
             log.info("Connecting to Ray at %s", head_address)
             ray.init(address=head_address, ignore_reinit_error=True)
+
+            _log_ray_dashboard_ssm_command(cluster_name, log, region=region)
 
         yield resolved_yaml
     finally:

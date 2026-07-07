@@ -21,8 +21,8 @@ orchestrator.
 
 from tessera_embeddings.config.dask import AssemblyConfig
 from tessera_embeddings.config.inference import (
-    DEFAULT_CHUNK_SIZE,
     EMBEDDING_DIM,
+    INFERENCE_CHUNK_SIZE,
     InferenceConfig,
     checkpoint_filename,
 )
@@ -33,7 +33,6 @@ from tessera_embeddings.errors import (
     CorruptedStoreError,
     InsufficientCoverageError,
 )
-from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.ingest.s1_roi import (
     S1Orbit,
     SarIngestResult,
@@ -44,9 +43,18 @@ from tessera_embeddings.ingest.s2_roi import (
     ingest_s2_roi_reflectance,
 )
 
+
+def __getattr__(name: str) -> object:
+    if name == "run_inference":
+        from tessera_embeddings.inference.runner import run_inference
+
+        return run_inference
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
-    "DEFAULT_CHUNK_SIZE",
     "EMBEDDING_DIM",
+    "INFERENCE_CHUNK_SIZE",
     "AssemblyConfig",
     "BucketPaths",
     "ConfigMismatchError",

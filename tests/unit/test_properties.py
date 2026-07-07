@@ -89,7 +89,7 @@ def test_sliding_window_respects_concurrency_cap(n_jobs: int, max_concurrent: in
 # ---------------------------------------------------------------------------
 
 
-_KINDS = ["reflectance", "sar_ascending", "sar_descending", "embeddings", "staging", "roi"]
+_KINDS = ["reflectance", "sar_ascending", "sar_descending", "embeddings", "roi"]
 
 
 @st.composite
@@ -98,7 +98,6 @@ def _bucket_paths(draw: st.DrawFn) -> BucketPaths:
     return BucketPaths(
         inputs=f"{schemes}/inputs",
         outputs=f"{schemes}/outputs",
-        preprocessed=f"{schemes}/preprocessed",
     )
 
 
@@ -124,6 +123,16 @@ def test_store_for_distinguishes_kinds(paths: BucketPaths, roi_name: str) -> Non
     assert len(set(uris.values())) == len(_KINDS)
 
 
+@given(paths=_bucket_paths(), roi_name=_ROI_NAMES)
+def test_store_for_path_shapes(paths: BucketPaths, roi_name: str) -> None:
+    """Each kind produces the correct path structure."""
+    assert paths.store_for(roi_name, "roi") == f"{paths.inputs}/rois/zarrs/{roi_name}.zarr"
+    assert paths.store_for(roi_name, "reflectance") == f"{paths.inputs}/mosaics/{roi_name}/reflectance.zarr"
+    assert paths.store_for(roi_name, "sar_ascending") == f"{paths.inputs}/mosaics/{roi_name}/sar_ascending.zarr"
+    assert paths.store_for(roi_name, "sar_descending") == f"{paths.inputs}/mosaics/{roi_name}/sar_descending.zarr"
+    assert paths.store_for(roi_name, "embeddings") == f"{paths.outputs}/embeddings/{roi_name}.zarr"
+
+
 # ---------------------------------------------------------------------------
 # Manifest serialization round-trip
 # ---------------------------------------------------------------------------
@@ -145,9 +154,9 @@ def test_roi_manifest_round_trip(resolution: float, chunk_size: int, crs: str | 
 
 @given(
     model_checkpoint=st.text(min_size=1, max_size=80),
-    num_obs_checkpoints=st.lists(
-        st.integers(min_value=1, max_value=256), min_size=1, max_size=32
-    ).map(lambda xs: tuple(sorted(set(xs)))),
+    num_obs_checkpoints=st.lists(st.integers(min_value=1, max_value=256), min_size=1, max_size=32).map(
+        lambda xs: tuple(sorted(set(xs)))
+    ),
     reflectance_manifest_hash=st.one_of(st.none(), st.text(min_size=1, max_size=64)),
     sar_manifest_hash=st.one_of(st.none(), st.text(min_size=1, max_size=64)),
 )

@@ -33,8 +33,9 @@ from pathlib import Path
 
 import vcr  # vcrpy
 
-# AOI matches examples/quickstart/roi.geojson — Story County, IA.
-BBOX = (-93.65, 42.00, -93.55, 42.10)
+# AOI matches examples/quickstart/roi.geojson — Denver, CO.
+# Denver has both ascending and descending OPERA RTC-S1 coverage in July 2024.
+BBOX = (-105.020, 39.740, -105.010, 39.750)
 DATETIME = "2024-07-01/2024-07-31"
 START_DATE = "2024-07-01"
 END_DATE = "2024-07-31"
@@ -74,7 +75,7 @@ def _record_s2_integration_smoke() -> Path:
     """Record the integration smoke test cassette."""
     from pystac_client import Client
 
-    cassette_path = CASSETTE_DIR / "test_s2_stac_search_against_story_county.yaml"
+    cassette_path = CASSETTE_DIR / "test_s2_stac_search_against_denver.yaml"
     print(f"\n[2/3] Recording S2 integration smoke → {cassette_path.name}")
 
     with vcr.VCR(record_mode="once", **VCR_CONFIG).use_cassette(str(cassette_path)):
@@ -99,7 +100,7 @@ def _record_s1_search_and_orbit() -> Path:
     """
     from pystac_client import Client
 
-    from tessera_embeddings.ingest.opera_query import _query_cmr_granule_ids
+    from tessera_embeddings.ingest.opera_query import _query_cmr_granules
 
     cassette_path = CASSETTE_DIR / "test_s1_roi_parity.yaml"
     print(f"\n[3/3] Recording OPERA search + orbit filter → {cassette_path.name}")
@@ -117,8 +118,8 @@ def _record_s1_search_and_orbit() -> Path:
         print(f"  Captured {len(opera_items)} OPERA items")
 
         # Part B: CMR Granule Search API for ascending orbit filter
-        ascending_ids = _query_cmr_granule_ids(BBOX, START_DATE, END_DATE, "ascending")
-        print(f"  Captured {len(ascending_ids)} ascending granule IDs from CMR")
+        ascending_items = _query_cmr_granules(BBOX, START_DATE, END_DATE, "ascending")
+        print(f"  Captured {len(ascending_items)} ascending OPERA items from CMR")
     return cassette_path
 
 

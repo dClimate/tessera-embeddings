@@ -6,7 +6,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 authors = [
-    { name = "Tessera Embeddings contributors" },
+    { name = "Evan Schechter", email = "evan@arbol.io" },
+    { name = "Robert Banick", email = "robert.banick@arbol.io" },
 ]
 keywords = ["satellite", "remote-sensing", "embeddings", "tessera", "sentinel"]
 classifiers = [
@@ -21,9 +22,10 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 
-# Ingest-only essentials. Torch / Ray / Prefect / AWS are opt-in groups
-# (see [dependency-groups] below). `pip install tessera_embeddings` from
-# PyPI gives the minimal domain library; shipped lock files stack groups.
+# Base install: the ingestion pipeline (Sentinel-2/S1 ingest, Zarr store
+# management). No torch, no Ray. Add [inference] to unlock Tessera embedding
+# generation — that is what this library is for. The split is practical:
+# torch is large and CUDA variants are platform-specific.
 dependencies = [
     "xarray",
     "dask",
@@ -31,9 +33,6 @@ dependencies = [
     "zarr",
     "icechunk",
     "fsspec",
-    # gdal Python bindings must match the libgdal installed on the system.
-    # Bump in lockstep with the system library.
-    "gdal==3.13.0",
     "odc-stac",
     "odc-geo",
     "rasterio",
@@ -57,29 +56,38 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Pure-stdlib package exposing the architecture-test runner so downstream
-# repos can enforce the same layer rules without pulling pytest.
-architecture-tests = []
-
-[dependency-groups]
 inference = [
     "torch",
     "ray[default]",
     "scikit-learn",
+    # fsspec's HTTP backend (used to pull model checkpoints from URLs such as
+    # HuggingFace `resolve/main` links) requires aiohttp; it isn't pulled in by
+    # fsspec itself. Already resolved in uv.lock.
+    "aiohttp",
 ]
 prefect = [
     "prefect>=3.0",
     "prefect-dask",
 ]
 # prefect-aws lives here, not in `prefect`, so a Prefect user on GCP
-# isn't forced to pull AWS-specific Prefect blocks. Groups compose.
+# isn't forced to pull AWS-specific Prefect blocks.
 aws = [
     "boto3",
     "botocore",
     "s3fs",
     "dask-cloudprovider[aws]",
     "prefect-aws",
+    # Serves the Dask scheduler dashboard (port-forwarded over SSM).
+    "bokeh",
 ]
+all = [
+    "tessera_embeddings[inference,prefect,aws]",
+]
+# Pure-stdlib package exposing the architecture-test runner so downstream
+# repos can enforce the same layer rules without pulling pytest.
+architecture-tests = []
+
+[dependency-groups]
 dev = [
     "pytest",
     "pytest-asyncio",

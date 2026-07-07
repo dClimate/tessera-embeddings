@@ -20,6 +20,7 @@ from moto import mock_aws
 
 from tessera_embeddings.providers.aws.ray import (
     DEFAULT_CLUSTER_TEMPLATE,
+    PROJECT_TAG_VALUE,
     _pick_least_loaded_subnet,
     _resolve_ray_config,
     cleanup_ray_tempfiles,
@@ -36,12 +37,8 @@ def _seed_ssm_and_vpc() -> tuple[str, list[str], str]:
 
     # VPC + 2 subnets (so _pick_least_loaded_subnet has something to choose between)
     vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]
-    subnet_a = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.1.0/24", AvailabilityZone=f"{REGION}a")[
-        "Subnet"
-    ]
-    subnet_b = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.2.0/24", AvailabilityZone=f"{REGION}b")[
-        "Subnet"
-    ]
+    subnet_a = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.1.0/24", AvailabilityZone=f"{REGION}a")["Subnet"]
+    subnet_b = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.2.0/24", AvailabilityZone=f"{REGION}b")["Subnet"]
     subnet_ids = [subnet_a["SubnetId"], subnet_b["SubnetId"]]
 
     key_pair = ec2.create_key_pair(KeyName="test-key")
@@ -101,8 +98,63 @@ def test_resolve_ray_config_writes_a_complete_yaml(tmp_path: Path) -> None:
             assert nc["SubnetIds"][0] in subnet_ids
             assert nc["TagSpecifications"][0]["Tags"] == [{"Key": "Project", "Value": "tessera-test"}]
 
-        # CloudWatch setup command was injected
-        assert any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["setup_commands"])
+        # CloudWatch agent command was injected into the start_ray commands
+        # (after `ray start`, so the Ray session/logs exist when the agent
+        # resolves file paths) — not setup_commands, which run too early.
+        assert any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["head_start_ray_commands"])
+        assert any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["worker_start_ray_commands"])
+        assert not any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["setup_commands"])
+    finally:
+        cleanup_ray_tempfiles(resolved)
+
+
+@mock_aws
+def test_resolve_ray_config_stamps_project_tag_by_default(tmp_path: Path) -> None:
+    """With no instance_tags, every node still gets the Project tag.
+
+    The runner IAM role conditions ec2:TerminateInstances on this tag, so a
+    missing Project tag makes teardown terminates IAM-denied (instances leak).
+    """
+    ami_param, _, _ = _seed_ssm_and_vpc()
+
+    resolved = _resolve_ray_config(
+        DEFAULT_CLUSTER_TEMPLATE,
+        region=REGION,
+        ami_ssm_name=ami_param,
+        ssm_prefix=SSM_PREFIX,
+        cluster_name="test-cluster",
+        instance_tags=None,
+    )
+
+    try:
+        config = yaml.safe_load(Path(resolved).read_text())
+        for node in config["available_node_types"].values():
+            tags = node["node_config"]["TagSpecifications"][0]["Tags"]
+            assert {"Key": "Project", "Value": PROJECT_TAG_VALUE} in tags
+    finally:
+        cleanup_ray_tempfiles(resolved)
+
+
+@mock_aws
+def test_resolve_ray_config_merges_project_tag_with_extra_tags(tmp_path: Path) -> None:
+    """Extra tags coexist with the always-present Project tag."""
+    ami_param, _, _ = _seed_ssm_and_vpc()
+
+    resolved = _resolve_ray_config(
+        DEFAULT_CLUSTER_TEMPLATE,
+        region=REGION,
+        ami_ssm_name=ami_param,
+        ssm_prefix=SSM_PREFIX,
+        cluster_name="test-cluster",
+        instance_tags=[{"Key": "Team", "Value": "geo"}],
+    )
+
+    try:
+        config = yaml.safe_load(Path(resolved).read_text())
+        for node in config["available_node_types"].values():
+            tags = node["node_config"]["TagSpecifications"][0]["Tags"]
+            assert {"Key": "Project", "Value": PROJECT_TAG_VALUE} in tags
+            assert {"Key": "Team", "Value": "geo"} in tags
     finally:
         cleanup_ray_tempfiles(resolved)
 
@@ -130,12 +182,8 @@ def test_pick_least_loaded_subnet_returns_least_loaded() -> None:
     """Subnet with the fewest tagged Ray instances wins."""
     ec2 = boto3.client("ec2", region_name=REGION)
     vpc = ec2.create_vpc(CidrBlock="10.0.0.0/16")["Vpc"]
-    subnet_a = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.1.0/24", AvailabilityZone=f"{REGION}a")[
-        "Subnet"
-    ]
-    subnet_b = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.2.0/24", AvailabilityZone=f"{REGION}b")[
-        "Subnet"
-    ]
+    subnet_a = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.1.0/24", AvailabilityZone=f"{REGION}a")["Subnet"]
+    subnet_b = ec2.create_subnet(VpcId=vpc["VpcId"], CidrBlock="10.0.2.0/24", AvailabilityZone=f"{REGION}b")["Subnet"]
     # Run 2 instances in subnet_a tagged for our cluster — subnet_b should win
     ec2.run_instances(
         ImageId="ami-x",

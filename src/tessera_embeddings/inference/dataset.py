@@ -26,6 +26,7 @@ from tessera_embeddings.config.inference import (
     S1_DESC_BAND_STD,
     S2_BAND_MEAN,
     S2_BAND_STD,
+    _normalize_obs_checkpoints,
 )
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.sampling import compute_bin_keys, resample_s1_bucket, resample_s2_bucket
@@ -51,11 +52,9 @@ class MosaicChunkInferenceDataset:
         self,
         chunk_data: ChunkData,
         num_obs_checkpoints: tuple[int, ...] = DEFAULT_NUM_OBS_CHECKPOINTS,
-        s1_orbit: Literal["ascending", "descending", "both"] = "ascending",
+        s1_orbit: Literal["ascending", "descending", "both"] = "both",
     ) -> None:
-        self.num_obs_checkpoints = tuple(sorted({int(v) for v in num_obs_checkpoints if int(v) > 0}))
-        if not self.num_obs_checkpoints:
-            raise ValueError("num_obs_checkpoints must contain at least one positive integer")
+        self.num_obs_checkpoints = _normalize_obs_checkpoints(num_obs_checkpoints)
         self.s1_orbit = s1_orbit
         self.H = chunk_data.height
         self.W = chunk_data.width
@@ -94,9 +93,15 @@ class MosaicChunkInferenceDataset:
         for t in range(s2_bands.shape[0]):
             s2_nonzero |= np.any(s2_bands[t] != 0, axis=-1)
 
-        s1_asc_valid = np.any(s1_asc != 0, axis=-1).sum(axis=0)
-        s1_desc_valid = np.any(s1_desc != 0, axis=-1).sum(axis=0)
-        s1_total_valid = (s1_asc_valid + s1_desc_valid).astype(np.int32)
+        if chunk_data.s1_asc_obs_count is not None:
+            s1_asc_valid = chunk_data.s1_asc_obs_count.astype(np.int32)
+        else:
+            s1_asc_valid = np.any(s1_asc != 0, axis=-1).sum(axis=0).astype(np.int32)
+        if chunk_data.s1_desc_obs_count is not None:
+            s1_desc_valid = chunk_data.s1_desc_obs_count.astype(np.int32)
+        else:
+            s1_desc_valid = np.any(s1_desc != 0, axis=-1).sum(axis=0).astype(np.int32)
+        s1_total_valid = s1_asc_valid + s1_desc_valid
 
         valid_mask = s2_nonzero & (s2_valid_count > 0) & (s1_total_valid > 0)
         rows, cols = np.where(valid_mask)
@@ -194,17 +199,17 @@ class MosaicChunkInferenceDataset:
 
         # S2: (T_s2, H, W, 10) → (T_s2, B, 10) → (B, T_s2, 10)
         s2_bands = self._s2_bands[:, rows, cols, :].transpose(1, 0, 2)
-        s2_masks = self._s2_masks[:, rows, cols].T.astype(np.int32, copy=False)
+        s2_masks = self._s2_masks[:, rows, cols].T
         s2_doys = np.broadcast_to(self._s2_doys[None, :], (b, len(self._s2_doys))).astype(np.int32, copy=False)
 
         s1_asc_bands = self._s1_asc_bands[:, rows, cols, :].transpose(1, 0, 2)
-        s1_asc_doys = np.broadcast_to(
-            self._s1_asc_doys[None, :], (b, len(self._s1_asc_doys))
-        ).astype(np.int32, copy=False)
+        s1_asc_doys = np.broadcast_to(self._s1_asc_doys[None, :], (b, len(self._s1_asc_doys))).astype(
+            np.int32, copy=False
+        )
         s1_desc_bands = self._s1_desc_bands[:, rows, cols, :].transpose(1, 0, 2)
-        s1_desc_doys = np.broadcast_to(
-            self._s1_desc_doys[None, :], (b, len(self._s1_desc_doys))
-        ).astype(np.int32, copy=False)
+        s1_desc_doys = np.broadcast_to(self._s1_desc_doys[None, :], (b, len(self._s1_desc_doys))).astype(
+            np.int32, copy=False
+        )
 
         s2 = resample_s2_bucket(
             s2_bands,

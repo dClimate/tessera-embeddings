@@ -62,6 +62,15 @@ class STACProvider:
     name: str
     catalog_url: str
     collections: dict[str, CollectionConfig] = field(default_factory=dict)
+    max_page_size: int = 250
+    """STAC search page size (the ``limit`` per page request).
+
+    Used only by providers queried through ``client.search()`` (Earth Search,
+    Planetary Computer). The OPERA ``cmr-asf`` path bypasses CMR-STAC search
+    entirely and queries the native CMR granule API instead (see
+    ``opera_query.make_s1_item_provider``), so this value does not apply there.
+    Raising it for CMR-STAC made the 500s worse, not better — see
+    context_docs/decisions/007-native-cmr-granule-query.md."""
 
 
 # =============================================================================

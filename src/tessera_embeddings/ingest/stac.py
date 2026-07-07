@@ -14,12 +14,11 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as np
-import tenacity
 import xarray as xr
 from odc.geo.geobox import GeoBox
 from pystac import Item
 from pystac_client import Client
-from pystac_client.exceptions import APIError
+from pystac_client.stac_api_io import StacApiIO
 
 from tessera_embeddings.config import (
     PROVIDERS,
@@ -29,7 +28,8 @@ from tessera_embeddings.config import (
     STACProvider,
 )
 from tessera_embeddings.config.environment import configure_gdal_environment
-from tessera_embeddings.config.inference import TESSERA_CHUNKS
+from tessera_embeddings.config.ingest import INGEST_CHUNKS
+from tessera_embeddings.ingest._http import make_logging_retry
 
 # =============================================================================
 # GDAL/Rasterio Configuration
@@ -57,6 +57,19 @@ def chunks_to_odc(chunks: dict[str, int]) -> dict[str, int]:
 
 
 logger = logging.getLogger(__name__)
+
+
+_STAC_RETRY = make_logging_retry(
+    "STAC",
+    total=8,
+    backoff_factor=2,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET", "POST"]),
+    respect_retry_after_header=True,
+)
+# (connect_timeout, read_timeout) in seconds. Without an explicit timeout,
+# a stalled TCP connection blocks indefinitely and the retry logic never fires.
+_STAC_TIMEOUT = (10, 60)
 
 
 def _get_provider_config(provider_name: str) -> STACProvider:
@@ -264,7 +277,7 @@ def _load_from_stac(
         collection_config: Collection configuration with bands and resolution
         bbox: Optional bounding box (minx, miny, maxx, maxy) in EPSG:4326
               to spatially subset the load. Ignored when geobox is provided.
-        chunks: Optional chunk sizes for dask. Defaults to TESSERA_CHUNKS.
+        chunks: Optional chunk sizes for dask. Defaults to INGEST_CHUNKS.
               Accepts both project convention (northing/easting) and odc
               convention (y/x) — translated automatically.
         extra_bands: Additional bands to load alongside the collection's primary
@@ -295,7 +308,7 @@ def _load_from_stac(
     if not items:
         raise ValueError("No items to load")
 
-    load_chunks = chunks_to_odc(chunks if chunks is not None else TESSERA_CHUNKS)
+    load_chunks = chunks_to_odc(chunks if chunks is not None else INGEST_CHUNKS)
 
     # Merge extra bands with primary bands
     all_bands = list(collection_config.bands)
@@ -430,13 +443,6 @@ def _apply_baseline_corrections_by_date(
 # =============================================================================
 
 
-@tenacity.retry(
-    retry=tenacity.retry_if_exception_type(APIError),
-    wait=tenacity.wait_exponential(multiplier=10, max=120),
-    stop=tenacity.stop_after_attempt(4),
-    before_sleep=tenacity.before_sleep_log(logger, logging.WARNING),
-    reraise=True,
-)
 def _query_stac_items(
     provider: STACProvider,
     collection_config: CollectionConfig,
@@ -444,6 +450,7 @@ def _query_stac_items(
     start_date: str,
     end_date: str,
     bbox: tuple[float, float, float, float] | None = None,
+    item_provider_fn: Callable[[], list[Any]] | None = None,
 ) -> list[Any]:
     """Query STAC catalog for items matching tile and date range.
 
@@ -456,19 +463,27 @@ def _query_stac_items(
         start_date: Start date (YYYY-MM-DD)
         end_date: End date (YYYY-MM-DD)
         bbox: Optional bounding box for spatial query fallback
+        item_provider_fn: Optional callable that returns ready-to-load items,
+            bypassing CMR-STAC ``client.search()`` entirely. Used by the
+            ``cmr-asf`` OPERA path, which builds items from the native CMR
+            granule API to avoid CMR-STAC's 500-prone cursor pagination.
 
     Returns:
         List of pystac Items
     """
+    if item_provider_fn is not None:
+        return item_provider_fn()
+
     query_params = _build_stac_query(collection_config, tile_id, start_date, end_date, bbox=bbox)
 
     t0 = time.monotonic()
-    logger.debug(f"Opening STAC catalog: {provider.catalog_url}")
-    client = Client.open(provider.catalog_url)
-    logger.debug(f"STAC catalog opened in {time.monotonic() - t0:.1f}s, executing search")
-    search = client.search(**query_params, limit=250, max_items=None)
+    logger.info(f"Opening STAC catalog: {provider.catalog_url}")
+    stac_io = StacApiIO(max_retries=_STAC_RETRY, timeout=_STAC_TIMEOUT)
+    client = Client.open(provider.catalog_url, stac_io=stac_io)
+    logger.info(f"STAC catalog opened in {time.monotonic() - t0:.1f}s, executing search")
+    search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
     items = list(search.items())
-    logger.debug(f"STAC query returned {len(items)} items in {time.monotonic() - t0:.1f}s total")
+    logger.info(f"STAC query returned {len(items)} items in {time.monotonic() - t0:.1f}s total")
 
     return items
 
@@ -482,11 +497,27 @@ def has_new_stac_dates(
     existing_dates: set[str],
     bbox: tuple[float, float, float, float] | None = None,
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
+    item_provider_fn: Callable[[], list[Any]] | None = None,
 ) -> bool:
     """Check whether a STAC catalog has new dates not yet in the store.
 
     Lightweight check that queries STAC and filters without loading raster data.
-    Used by downstream flows to decide whether to spin up a Dask cluster.
+    Intended as a pre-flight gate so a flow can decide whether to spin up a
+    Dask cluster before iterating batches — today nothing does this, so the
+    caller is responsible for not passing date ranges that overlap the store.
+
+    .. note::
+       **Currently unused.** No flow calls this yet; wiring it into the S1/S2
+       ROI flows is tracked in
+       https://github.com/dClimate/tessera-embeddings/issues/47.
+
+       When wiring it up, do **not** pass the same ``item_provider_fn`` object
+       to both this function and ``query_stac_items`` for one batch: the
+       provider built by ``opera_query.make_s1_item_provider`` issues a fresh
+       CONUS-scale CMR granule query on every call (it no longer caches at
+       construction time), so reusing it across the pre-check and the real
+       query would double the query cost. Build a provider per call site, or
+       have the gate consume the items the subsequent ingest will load.
 
     Args:
         provider: Provider name (e.g., "earth-search", "cmr-asf")
@@ -497,6 +528,8 @@ def has_new_stac_dates(
         existing_dates: Dates already in store (YYYY-MM-DD strings)
         bbox: Optional bounding box for spatial query fallback
         item_filter_fn: Optional pre-filter (e.g., orbit direction filtering)
+        item_provider_fn: Optional callable returning items directly,
+            bypassing CMR-STAC search (OPERA native-granule path).
 
     Returns:
         True if at least one new date is available
@@ -513,6 +546,7 @@ def has_new_stac_dates(
         start_date,
         end_date,
         bbox=bbox,
+        item_provider_fn=item_provider_fn,
     )
     if not items:
         logger.debug(f"No items found for {query_label}")
@@ -539,6 +573,7 @@ def query_stac_items(
     existing_dates: set[str] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
+    item_provider_fn: Callable[[], list[Any]] | None = None,
 ) -> tuple[list[Any], dict[str, int]]:
     """Query STAC catalog, filter items, and extract baselines.
 
@@ -555,6 +590,8 @@ def query_stac_items(
         existing_dates: Dates already in store (to skip). None = return all.
         bbox: Optional bounding box for spatial query fallback
         item_filter_fn: Optional pre-filter (e.g., orbit direction filtering)
+        item_provider_fn: Optional callable returning items directly,
+            bypassing CMR-STAC search (OPERA native-granule path).
 
     Returns:
         Tuple of (items, baselines) where:
@@ -565,7 +602,15 @@ def query_stac_items(
     provider_config = _get_provider_config(provider)
     collection_config = _get_collection_config(provider, collection)
 
-    items = _query_stac_items(provider_config, collection_config, tile_id, start_date, end_date, bbox=bbox)
+    items = _query_stac_items(
+        provider_config,
+        collection_config,
+        tile_id,
+        start_date,
+        end_date,
+        bbox=bbox,
+        item_provider_fn=item_provider_fn,
+    )
 
     query_label = f"tile {tile_id}" if tile_id else f"bbox {bbox}"
     if not items:
@@ -706,6 +751,7 @@ def ingest_tile(
     resolution: int | None = None,
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
+    item_provider_fn: Callable[[], list[Any]] | None = None,
     preserve_low_values: bool = False,
     groupby: str = "time",
     geobox: GeoBox | None = None,
@@ -732,7 +778,7 @@ def ingest_tile(
               Also used as STAC query fallback when tile_id is None or
               tile_id_property is None.
         chunks: Optional chunk sizes for odc.stac.load. Defaults to
-              TESSERA_CHUNKS. Accepts northing/easting or y/x keys —
+              INGEST_CHUNKS. Accepts northing/easting or y/x keys —
               translated automatically before passing to odc.stac.load.
         extra_bands: Additional bands to load (e.g., ["scl"]).
         resampling: Resampling method for primary bands (default "bilinear").
@@ -744,6 +790,9 @@ def ingest_tile(
               and baseline correction (e.g., amplitude-to-dB conversion).
         item_filter_fn: Optional function applied to STAC items before date
               filtering (e.g., orbit direction filtering).
+        item_provider_fn: Optional callable that returns ready-to-load items,
+              bypassing CMR-STAC search entirely. Used by the OPERA RTC-S1
+              path to build items from the native CMR granule API.
         preserve_low_values: When True, baseline correction only subtracts
               from pixels >= abs(offset), matching Tessera's harmonize_arr().
               When False (default), subtracts from all pixels.
@@ -768,6 +817,7 @@ def ingest_tile(
         existing_dates=existing_dates,
         bbox=bbox,
         item_filter_fn=item_filter_fn,
+        item_provider_fn=item_provider_fn,
     )
 
     if not items:

@@ -30,6 +30,7 @@ from pydantic import BaseModel
 from tessera_embeddings.config.dask import compute_pipeline_cluster_sizing
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
+from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.orchestration.prefect.flows.generate_roi import _crs_suffix
 
 
@@ -82,9 +83,14 @@ async def tessera_full_pipeline(
     ingest_max_workers: int | None = None,
     num_actors: int | None = None,
     # Behaviour
-    s1_orbit: str = "ascending",
+    s1_orbit: str = "both",
     skip_coverage_check: bool = False,
     ami_ssm_name: str = "/tessera/ray/ami-id",
+    ssm_prefix: str = "/tessera/ray/",
+    cloudwatch_log_group: str = "/ec2/tessera/ray",
+    code_bucket: str | None = None,
+    code_suffix: str = "",
+    sync_source_path: str | None = None,
 ) -> dict:
     """End-to-end pipeline: ROI → S1+S2 ingestion → Tessera embeddings.
 
@@ -104,18 +110,36 @@ async def tessera_full_pipeline(
             = auto-size from chunk count).
         ingest_max_workers: Override for ingest Dask max_workers.
         num_actors: Override for Ray GPU actor count.
-        s1_orbit: SAR orbit direction.
+        s1_orbit: SAR orbit direction — ``"ascending"``, ``"descending"``,
+            or ``"both"``. ``"both"`` ingests both orbits concurrently.
         skip_coverage_check: Skip the time-window coverage validation
             on the embeddings stage.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
+        ssm_prefix: SSM Parameter Store prefix under which the Ray
+            cluster resource IDs are published by the deployment's infra.
+            Forwarded to the embeddings stage; deployments that publish
+            under a different prefix must override the OSS ``/tessera/ray/``.
+        cloudwatch_log_group: CloudWatch log group the Ray workers write
+            agent logs to. Forwarded to the embeddings stage; must match
+            the group the deployment's infra creates and grants access to.
+        code_bucket: S3 bucket (no ``s3://`` prefix) workers pull the
+            source tarball from. Setting it only points workers at an
+            existing tarball (expected to be uploaded by CI — the general
+            production path); it does not upload one. Forwarded to the
+            embeddings stage; leave ``None`` for AMI-baked source.
+        code_suffix: Source tarball filename suffix. Forwarded to the
+            embeddings stage.
+        sync_source_path: Dev-iteration only. Local source dir to tar and
+            upload before ``ray up`` (requires ``code_bucket``), so
+            workers run your working-tree code without a CI round-trip.
+            Forwarded into the embeddings stage's ``dev_params``.
 
     Returns:
         Dict with the run IDs of every child flow.
     """
     log = get_run_logger()
 
-    if s1_orbit not in {"ascending", "descending"}:
-        raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending' or 'descending'.")
+    _active_orbits(s1_orbit)  # validates
 
     inputs_bucket = paths.inputs
 
@@ -151,8 +175,16 @@ async def tessera_full_pipeline(
     )
     _check_completed(roi_run, "generate_roi")
 
-    roi_zarr_path = f"{inputs_bucket.rstrip('/')}/rois/zarrs/{canonical_name}{_crs_suffix(force_crs)}.zarr"
-    store_path = f"{inputs_bucket.rstrip('/')}/mosaics/{canonical_name}"
+    # The CRS suffix is part of the ROI's canonical identity, not just the
+    # ROI-zarr filename: it must thread through the mosaic dir and the
+    # downstream embeddings roi_name too, or `store_for(roi_name, "roi")` in
+    # the embeddings flow rebuilds an unsuffixed path that doesn't exist (and
+    # CRS variants would collide on the mosaic/embeddings paths). generate_roi
+    # stays the sole place that *derives* the suffix; everything after it uses
+    # this suffixed id uniformly. force_crs=None → roi_id == canonical_name.
+    roi_id = f"{canonical_name}{_crs_suffix(force_crs)}"
+    roi_zarr_path = f"{inputs_bucket.rstrip('/')}/rois/zarrs/{roi_id}.zarr"
+    store_path = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_id}"
     log.info("ROI generated: %s (run_id=%s)", roi_zarr_path, roi_run.id)
 
     # Auto-size cluster from ROI chunk count
@@ -181,16 +213,21 @@ async def tessera_full_pipeline(
         "min_workers": ingest_min_workers,
         "max_workers": ingest_max_workers,
     }
-    s1_run, s2_run = await asyncio.gather(
+    s1_orbits_to_ingest = _active_orbits(s1_orbit)
+    s1_coros = [
         arun_deployment(
             deployments.ingest_s1_roi_sar,
-            parameters={**ingest_params_common, "orbit": s1_orbit},
-        ),
-        arun_deployment(deployments.ingest_s2_roi_reflectance, parameters=ingest_params_common),
-    )
-    _check_completed(s1_run, "ingest_s1_roi_sar")
+            parameters={**ingest_params_common, "orbit": orbit},
+        )
+        for orbit in s1_orbits_to_ingest
+    ]
+    s2_coro = arun_deployment(deployments.ingest_s2_roi_reflectance, parameters=ingest_params_common)
+    results = await asyncio.gather(*s1_coros, s2_coro)
+    *s1_runs, s2_run = results
+    for orbit, s1_run in zip(s1_orbits_to_ingest, s1_runs, strict=True):
+        _check_completed(s1_run, f"ingest_s1_roi_sar ({orbit})")
+        log.info("S1 %s ingestion complete (run_id=%s)", orbit, s1_run.id)
     _check_completed(s2_run, "ingest_s2_roi_reflectance")
-    log.info("S1 ingestion complete (run_id=%s)", s1_run.id)
     log.info("S2 ingestion complete (run_id=%s)", s2_run.id)
 
     # Stage 3: Tessera embeddings
@@ -198,13 +235,20 @@ async def tessera_full_pipeline(
     embeddings_run = await arun_deployment(
         deployments.tessera_embeddings,
         parameters={
-            "roi_name": canonical_name,
+            "roi_name": roi_id,
             "time_window_end": time_window_end,
             "paths": paths.model_dump(),
             "ami_ssm_name": ami_ssm_name,
+            "ssm_prefix": ssm_prefix,
+            "cloudwatch_log_group": cloudwatch_log_group,
+            "code_bucket": code_bucket,
+            "code_suffix": code_suffix,
             "num_actors": num_actors,
             "s1_orbit": s1_orbit,
-            "dev_params": {"skip_coverage_check": skip_coverage_check},
+            "dev_params": {
+                "skip_coverage_check": skip_coverage_check,
+                "sync_source_path": sync_source_path,
+            },
         },
     )
     _check_completed(embeddings_run, "tessera_embeddings")
@@ -212,7 +256,7 @@ async def tessera_full_pipeline(
 
     return {
         "roi_run_id": str(roi_run.id),
-        "s1_run_id": str(s1_run.id),
+        "s1_run_ids": [str(r.id) for r in s1_runs],
         "s2_run_id": str(s2_run.id),
         "embeddings_run_id": str(embeddings_run.id),
     }

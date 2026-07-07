@@ -11,7 +11,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | Module | Purpose |
 |---|---|
 | `stac.py` | STAC-based data loading via `odc.stac.load`. Handles multiple providers (Earth Search, Planetary Computer), S2 baseline correction, and date filtering. |
-| `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, orbit-direction filtering via native CMR Granule Search API (CMR-STAC silently ignores the `query` extension), UTM EPSG derivation, and asset preparation. |
+| `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, item construction from the native CMR Granule Search API (bypasses CMR-STAC search; orbit-direction filtered server-side), UTM EPSG derivation, and asset preparation. |
 | `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary STS credentials) and legacy CloudFront signed URL resolution. |
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
@@ -24,15 +24,17 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 The high-level entry point is `ingest_tile()` in `stac.py`. It runs five stages in sequence:
 
 ```text
-1. STAC query        — find items for the tile/bbox + date range
-2. Item filtering    — apply sensor-specific pre-filters (e.g. orbit direction for S1)
+1. Item query        — find items for the tile/bbox + date range (S1: native CMR
+                       granule query, orbit-filtered server-side)
+2. Item filtering    — optional item_filter_fn pre-filter hook
 3. Date dedup        — drop items whose dates are already in the Zarr store
 4. odc.stac.load     — lazy-load COGs into a Dask-backed xarray Dataset
 5. Corrections       — baseline correction (S2) or dB conversion (S1)
 ```
 
-`query_stac_items` and `load_stac_items` expose these stages separately for flows that need
-to check for new data before spinning up a Dask cluster (see `has_new_stac_dates`).
+`query_stac_items` and `load_stac_items` expose these stages separately so a flow could
+check for new data before spinning up a Dask cluster (see `has_new_stac_dates`, which is
+not yet wired into any flow — [issue #47](https://github.com/dClimate/tessera-embeddings/issues/47)).
 
 ### STAC Providers and Collections
 
@@ -60,14 +62,23 @@ only items for that specific MGRS tile. OPERA RTC-S1 on CMR-STAC lacks an equiva
 property, so queries use a bbox derived from the MGRS tile via `mgrs_tile_to_bbox()`.
 
 `_query_stac_items` configures retries at the HTTP layer via a custom `urllib3.Retry`
-passed into `StacApiIO` (`max_retries=Retry(total=8, backoff_factor=2,
-status_forcelist=(429, 500, 502, 503, 504))`). Because `search.items()` paginates
-lazily, each page fetch is a separate HTTP call — configuring retries on the underlying
-`HTTPAdapter` means a transient 5xx on page N is retried in place, instead of throwing
-away prior pages and restarting the whole query. This matters most for CMR-STAC, which
-returns 502/503 under load on large date-range queries. Note that `StacApiIO`'s default
-`max_retries=5` passes a bare int to urllib3, which has an empty `status_forcelist` and
-therefore does **not** retry 5xx responses — the explicit `Retry` object is required.
+built by `make_logging_retry()` (`_http.py`, shared with the CMR Granule query) and passed
+into `StacApiIO` (`total=8, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504)`).
+The subclass logs each retry attempt at WARNING — urllib3 otherwise retries silently inside
+the `HTTPAdapter`, making a slow query indistinguishable from a hang. Because
+`search.items()` paginates lazily, each page fetch is a separate HTTP call — configuring
+retries on the underlying `HTTPAdapter` means a transient 5xx on page N is retried in
+place, instead of throwing away prior pages and restarting the whole query. This matters
+most for CMR-STAC, which returns 502/503 under load on large date-range queries. Note that
+`StacApiIO`'s default `max_retries=5` passes a bare int to urllib3, which has an empty
+`status_forcelist` and therefore does **not** retry 5xx responses — the explicit `Retry`
+object is required.
+
+The page size is `STACProvider.max_page_size` (the `limit` per page request), defaulting
+to 250. This applies only to providers queried through `client.search()` (Earth Search,
+Planetary Computer) — the OPERA `cmr-asf` path bypasses CMR-STAC search entirely and queries
+the native CMR Granule API. See
+[ADR 007](../../../context_docs/decisions/007-native-cmr-granule-query.md) for the full rationale.
 
 Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
 cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
@@ -135,7 +146,7 @@ These happen before `odc.stac.load` is called:
 |---|---|---|
 | **Date dedup** | `stac._filter_existing_dates` | Drops STAC items whose date is already written to the store. |
 | **Item sort** | `stac.query_stac_items` | For S2: sorts by `(date, cloud_cover)` so mosaicking picks the clearest tile. |
-| **Orbit filter** | `opera_query.make_s1_item_rewriter` | Keeps only OPERA bursts matching the desired orbit direction. |
+| **Item provider** | `opera_query.make_s1_item_provider` | Builds orbit-filtered OPERA items directly from the native CMR granule API (bypasses CMR-STAC search). |
 | **URL rewriting** | `auth.rewrite_assets_to_s3` | Rewrites HTTPS datapool/earthdatacloud URLs to `s3://` URIs. |
 | **Timestamp normalisation** | `opera_query.normalize_opera_timestamps` | Sets all OPERA burst timestamps on the same date to noon UTC so `odc.stac.load` groups them into a single mosaic. |
 
@@ -242,28 +253,34 @@ expansion to TaskStates happens only when the graph is submitted to the schedule
 #### How task count multiplies: operations × chunk dimensions
 
 Each Dask operation (read, transform, write) adds a new layer. Each layer has one task per
-combination of *chunk coordinates* across all chunked dimensions. For S2 ingestion over a
-large ROI (e.g. cornbelt scale: ~75×50 grid of 2000×2000 px spatial chunks), the S2 flow
-processes one date at a time, so the time dimension is always 1:
+combination of *chunk coordinates* across all chunked dimensions. Ingest writes 4000×4000 px
+storage chunks (`INGEST_CHUNK_SIZE`), deliberately larger than the 2000×2000 inference
+read-tile size, precisely to keep this task count down. For S2 ingestion over a large ROI
+(e.g. cornbelt scale: ~38×25 grid of 4000×4000 px spatial chunks), the S2 flow processes one
+date at a time, so the time dimension is always 1:
 
 ```text
   Dimensions per single S2 date (ingest_s2_roi_reflectance):
-    spatial chunks:   ~3,750  (75×50 grid)
+    spatial chunks:     ~950  (38×25 grid of 4000×4000 px)
     dates:                 1  (one date per loop iteration)
     band variables:       10  (each S2 band is a separate xarray variable)
 
   Operation            tasks per layer                          notes
   ────────────────────────────────────────────────────────────────────────
-  odc.stac read     3,750 × 1 × 10 =  37,500   one task per (chunk, band var)
-  baseline corr.    3,750 × 1 × 10 =  37,500
-  ROI mask          3,750 × 1 × 10 =  37,500
-  zarr write        3,750 × 1 × 10 =  37,500
+  odc.stac read       950 × 1 × 10 =   9,500   one task per (chunk, band var)
+  baseline corr.      950 × 1 × 10 =   9,500
+  ROI mask            950 × 1 × 10 =   9,500
+  zarr write          950 × 1 × 10 =   9,500
                                     ─────────
-        per-date total:               150,000 tasks ≈ 0.2 GB scheduler RAM   ✓
+        per-date total:                38,000 tasks ≈ 0.06 GB scheduler RAM   ✓
 
   Full year (all ~100 S2 dates in one graph, hypothetically):
-  3,750 × 100 × 10 × 4 = 15,000,000 tasks ≈ 22 GB scheduler RAM             ✗ OOM
+  950 × 100 × 10 × 4 = 3,800,000 tasks ≈ 5.6 GB scheduler RAM                ✗ OOM
 ```
+
+Had ingest reused the 2000×2000 inference tile size, every count above would be 4× higher —
+that 4× on the satellite-ingest graph is the reason storage and inference chunk sizes are
+decoupled.
 
 The two flows keep task count bounded via different mechanisms — per-date iteration for S2,
 time-windowed batching for S1 — described in the sections below. The same scheduler-RAM
@@ -323,6 +340,13 @@ formula in the background section above applies to estimating how many tasks a g
 window width will produce; the 30-day default keeps each batch well within the scheduler's
 RAM budget at cornbelt scale.
 
+Batch windows are inclusive on both ends and do not overlap: each batch spans `batch_days`
+calendar days, and the loop advances `batch_start` to the day *after* `batch_end`. Because
+CMR/STAC also treat their query end date as inclusive, each day is queried by exactly one
+batch — a batch boundary that landed on the same day as the next batch's start would page
+that day twice, wasteful at CONUS scale where each day is many pages of bursts. The overall
+`[start_date, end_date]` range is inclusive of `end_date`.
+
 ### Lazy evaluation throughout
 
 `odc.stac.load` returns a Dask-backed xarray Dataset with no raster data read yet. All
@@ -358,17 +382,26 @@ resilience (retry counts, timeouts, connection pooling) that affect all subseque
 
 ### Chunk alignment
 
-The ROI Zarr mask is generated with `chunk_size` matching `TESSERA_CHUNKS` so that
+The ROI Zarr mask is generated with `chunk_size` matching `INGEST_CHUNKS` so that
 `da.from_zarr` reads are zero-copy — each Dask partition maps to exactly one Zarr chunk.
 The same chunk sizes are passed to `odc.stac.load` (after translating `northing`/`easting`
 to `y`/`x`) so band arrays and the mask share the same partition boundaries for aligned
-Dask operations.
+Dask operations. (Inference reads 2000×2000 sub-tiles out of these 4000×4000 chunks via
+`zarr.Array.oindex`, which needs no such alignment — see
+[`inference/README.md`](../inference/README.md).)
 
 ### has_new_stac_dates pre-check
 
-Flows call `has_new_stac_dates` before provisioning a Dask cluster. It queries the STAC
-catalog and checks for new dates without reading any raster data or starting Fargate tasks.
-If nothing is new the flow exits early.
+`has_new_stac_dates` is meant to run before provisioning a Dask cluster: it queries the STAC
+catalog and checks for new dates without reading any raster data or starting Fargate tasks,
+so a flow can exit early when nothing is new.
+
+**Not yet wired into any flow** — until it is, the caller is responsible for not passing date
+ranges that overlap what's already in the store (otherwise we spin up a cluster and iterate
+batches only to discover there's nothing to write). Wiring it into the S1/S2 ROI flows is
+tracked in [issue #47](https://github.com/dClimate/tessera-embeddings/issues/47). When doing
+so, avoid sharing one OPERA `item_provider_fn` between the pre-check and the real query — the
+provider re-queries CMR on every call, so reuse would double the query cost.
 
 ---
 
@@ -401,33 +434,76 @@ You must also approve the **ASF Cumulus** application at
    `asf-cumulus-prod-opera-products` bucket in `us-west-2`.
 
 `set_s3_credentials` then injects these onto both the orchestrator process and all current and
-future Dask workers via a `WorkerPlugin`. It sets both environment variables (for boto3/rasterio
-session creation) and GDAL config options (which bypass GDAL's internal credential cache that
-can hold stale values).
-
-**Why GDAL config options are needed in addition to env vars**: GDAL's `/vsis3/` handler caches
-credentials resolved from env vars in a static C++ member. `VSICurlClearCache()` flushes curl
-handles and file-property caches but does **not** flush the credential cache.
-`gdal.SetConfigOption` bypasses the cache entirely because GDAL checks config options before
-env vars and re-reads them on every file open.
+future Dask workers via a `WorkerPlugin`. It sets `AWS_*` environment variables (consumed by
+boto3 when `odc.loader` builds an `AWSSession`) and resets the cached per-thread session so the
+next `/vsis3/` open picks up the new credentials.
 
 **Per-thread AWSSession cache**: `odc.loader` caches a boto3 `AWSSession` per thread in
 `threading.local` on first use and ignores subsequent env var updates for that thread's
 lifetime. Dask task pool threads are long-lived, so the initial 1hr STS token was getting
 pinned across refreshes and expiring mid-read. `auth.py` patches `odc.loader._rio.ThreadSession`
 at module import time so each thread self-detects `AWS_ACCESS_KEY_ID` drift and rebuilds its
-cached session. This reaches into private `odc.loader` internals (`_OdcThreadSession`, `_local`)
-and is a version-sensitive hook — if odc renames those symbols, the import fails loudly and the
-test in `tests/unit/ingestion/test_edl_auth.py::TestOdcThreadSessionEnvDriftPatch` catches the
-break in CI before it hits a 1hr cloud run.
+cached session from current env vars. `rasterio.env.Env` (entered by `odc.loader.rio_env()` on
+every `/vsis3/` open) then hands the refreshed `AWSSession`'s frozen credentials to GDAL — so
+no `gdal.SetConfigOption` or `VSICurlClearCache` is needed. This reaches into private
+`odc.loader` internals (`_OdcThreadSession`, `_local`) and is a version-sensitive hook — if odc
+renames those symbols, the import fails loudly and the regression tests in
+`tests/unit/test_auth.py` catch the break in CI before it hits a 1hr cloud run.
+
+This was empirically verified on a us-west-2 EC2 box (2026-05-20): a four-month S1 ingest
+run at `cred_refresh_interval_sec=60` over a persistent local Dask cluster forced multiple
+mid-run STS refreshes; every batch's `/vsis3/` reads succeeded, confirming the env-drift
+patch plus orchestrator-side `_local.reset()` are sufficient without explicit GDAL
+credential-cache calls.
 
 OPERA asset STS credentials are intentionally **never cleaned up** from env vars. This avoids
 a race condition where one Dask task's cleanup could remove credentials another task still
-needs. Icechunk/Zarr write operations on the project's own S3 bucket stay isolated by being
-configured with an explicit credential callback (see ``storage.zarr_store._create_storage``
-``get_credentials``); the AWS-provider implementation passes a callback that resolves
-deployment credentials directly from the IAM role, so it is unaffected by whatever
-``AWS_*`` env vars OPERA's STS session has set.
+needs. The consequence is subtle: once `set_s3_credentials` runs, the `AWS_*` env vars hold
+OPERA-scoped STS tokens that grant access **only** to `asf-cumulus-prod-opera-products`. Any
+S3 access to the project's *own* bucket that resolves credentials from those env vars — every
+icechunk `Repository.open`/`create` in the S1 write path, not just the initial create — then
+fails with `AccessDenied`.
+
+Icechunk/Zarr operations on the project's own bucket therefore must resolve **IAM-role**
+credentials, bypassing the env vars. The mechanism:
+
+- `providers/aws/credentials.py::iam_icechunk_credentials` resolves credentials from the
+  botocore chain with the `env` provider **removed**, so it always lands on the deployment's
+  IAM role (instance-metadata / ECS task role / local SSO) regardless of what STS tokens the
+  env vars hold. It returns `icechunk.S3StaticCredentials`.
+- `storage.zarr_store` exposes a process-wide `set_credentials_provider()` hook.
+  `_create_storage` uses the registered provider as the `get_credentials` callback for any S3
+  open lacking an explicit one. The storage layer ships this as `None` and never imports
+  botocore (it must stay cloud-agnostic, per the `no-botocore-outside-aws-provider`
+  architecture rule); only the AWS provider supplies the concrete callback.
+- The `process_roi_sar` Prefect task registers `iam_icechunk_credentials` via that hook when
+  `use_s3_direct=True`. **This must happen in the task shell, not the flow body** — with the
+  Dask task runner the domain function (and its store writes) execute in a *worker* process,
+  so a provider registered in the flow-runner process would never reach them.
+
+**IMDS throttling — why `_resolve_iam_credentials` is `lru_cache`d (gotcha).** The credential
+machinery has two distinct TTLs, and conflating them overwhelms the EC2 Instance Metadata
+Service (IMDS):
+
+- `iam_icechunk_credentials` sets `expires_after=15min` on the returned `S3StaticCredentials`.
+  This is how often **icechunk** re-invokes our callback per repo client — it is *not* how
+  often we should touch IMDS.
+- `_resolve_iam_credentials` is `@lru_cache(maxsize=1)`, so the botocore session — and the
+  live `RefreshableCredentials` it returns — is built **once per process**. For an IAM role
+  botocore hands back a `RefreshableCredentials` that serves its in-memory credential and
+  refreshes itself in the background; `get_frozen_credentials()` is a pure expiry-time check
+  that only re-hits IMDS inside botocore's refresh window (~advisory 15 min before the ~6h
+  token expiry), lock-guarded so concurrent callers don't stampede.
+
+Without the cache, every callback built a *fresh* session and did a **cold IMDS resolve**.
+Under many concurrent workers/threads that bursts IMDS past its per-instance rate limit, and
+the SDK surfaces it as `failed to load IMDS session token / invalid token` or
+`no providers in chain provided credentials` — transient, but enough to fail a run of chunks
+before recovering. Caching the session decouples "how often icechunk asks" from "how often we
+hit IMDS": the former stays at 15 min, the latter drops to roughly once per token lifetime.
+`lru_cache` does not cache exceptions, so a failed cold resolve still retries next call. The
+same provider is injected into inference workers (see `inference/README.md`), where long-lived
+Ray actors made this the dominant failure mode.
 
 ### URL Rewriting
 
@@ -460,14 +536,16 @@ for out-of-region access where S3 direct is not available, but is significantly 
 
 ## OPERA-Specific Query Quirks
 
-### Orbit Direction Filtering
+### Native granule query (orbit filtering + item construction)
 
-`make_s1_item_rewriter` builds an `item_filter_fn` that filters OPERA bursts by ascending or
-descending orbit. CMR-STAC **silently ignores** the `query` extension for CMR additional
-attributes such as `ASCENDING_DESCENDING`, so passing orbit direction to a STAC search has
-no effect.
+`make_s1_item_provider` builds an `item_provider_fn` that returns ready-to-load OPERA items
+**without calling CMR-STAC `client.search()` at all**. CMR-STAC's cursor pagination
+intermittently 500s on CONUS-scale queries (nasa/cmr-stac#408) and pages internally at ~100
+items regardless of the requested `limit` (#411); it also **silently ignores** the `query`
+extension for CMR additional attributes such as `ASCENDING_DESCENDING`. The native CMR
+Granule Search API has none of these problems.
 
-The workaround queries the native CMR Granule Search API directly:
+The provider queries the granule API directly:
 
 ```text
 GET https://cmr.earthdata.nasa.gov/search/granules.json
@@ -475,11 +553,18 @@ GET https://cmr.earthdata.nasa.gov/search/granules.json
     &attribute[]=string,ASCENDING_DESCENDING,ASCENDING
     &bounding_box=...
     &temporal=...
+    &page_size=2000
 ```
 
-This returns a paginated list of matching `producer_granule_id` values. The STAC items are
-then filtered by matching their `id` against this set. CMR pagination is handled via the
-`CMR-Search-After` response header.
+Orbit direction is filtered **server-side** via `attribute[]`, so the response already
+contains only the desired orbit — no separate STAC search and no local granule-ID
+intersection. Each granule entry's data download links (`rel` ending `/data#`, href ending
+`_VV.tif` / `_VH.tif`) are mapped onto the `S1_OPERA_BANDS` asset keys (`0_VV`, `0_VH`) to
+construct `pystac.Item`s shape-compatible with the rest of the pipeline. The granule's
+`title`, `time_start`, and `polygons` supply the item id, datetime, and geometry. CMR
+pagination is handled via the `CMR-Search-After` response header, which pages cleanly at
+2000 against the same host. See
+[ADR 007](../../../context_docs/decisions/007-native-cmr-granule-query.md) for the full rationale.
 
 ### Burst Timestamp Normalisation
 

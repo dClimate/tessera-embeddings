@@ -51,37 +51,42 @@ def log_cuda_diagnostics(device: torch.device) -> None:
     )
 
 
-def log_autocast_dtype_probe(device: torch.device) -> None:
+def log_autocast_dtype_probe(device: torch.device, dtype: torch.dtype | None = None) -> None:
     """Probe which dtypes autocast actually uses for key operations.
 
     Creates small test tensors and runs them through matmul, Linear, GRU,
     LayerNorm, and TransformerEncoderLayer under autocast. Logs the output
-    dtype of each — this reveals whether tensor cores can engage (FP16) or
-    whether autocast is silently keeping ops in FP32.
+    dtype of each — this reveals whether tensor cores can engage or whether
+    autocast is silently keeping ops in FP32.
 
     Critical for understanding GRU behavior: PyTorch autocast may force RNNs
     to FP32 for numerical stability, which would explain FP32-like throughput
-    despite FP16 model weights.
+    despite reduced-precision model weights.
+
+    Args:
+        device: Target device. No-op on CPU.
+        dtype: The reduced-precision dtype the model was cast to (bfloat16 or
+            float16). Probes are skipped if None (CPU path).
     """
-    if device.type != "cuda":
+    if device.type != "cuda" or dtype is None:
         return
 
     # 2D tensor for matmul/linear/layernorm probes
-    a2d = torch.randn(32, 512, device=device, dtype=torch.float16)
-    w2d = torch.randn(512, 512, device=device, dtype=torch.float16)
+    a2d = torch.randn(32, 512, device=device, dtype=dtype)
+    w2d = torch.randn(512, 512, device=device, dtype=dtype)
     # 3D tensor for GRU and transformer probes: (batch, seq_len, d_model)
-    a3d = torch.randn(4, 20, 512, device=device, dtype=torch.float16)
+    a3d = torch.randn(4, 20, 512, device=device, dtype=dtype)
 
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+    with torch.no_grad(), torch.autocast("cuda", dtype=dtype):
         mm_out = torch.mm(a2d, w2d)
 
-        lin = torch.nn.Linear(512, 512, device=device).half()
+        lin = torch.nn.Linear(512, 512, device=device).to(dtype)
         lin_out = lin(a2d)
 
-        gru = torch.nn.GRU(512, 512, batch_first=True, device=device).half()
+        gru = torch.nn.GRU(512, 512, batch_first=True, device=device).to(dtype)
         gru_out, _ = gru(a3d)
 
-        ln = torch.nn.LayerNorm(512, device=device).half()
+        ln = torch.nn.LayerNorm(512, device=device).to(dtype)
         ln_out = ln(a2d)
 
         tel = torch.nn.TransformerEncoderLayer(
@@ -91,11 +96,12 @@ def log_autocast_dtype_probe(device: torch.device) -> None:
             batch_first=True,
             device=device,
             dropout=0.0,
-        ).half()
+        ).to(dtype)
         tel_out = tel(a3d)
 
     logger.debug(
-        "AUTOCAST DTYPE PROBE: matmul=%s | linear=%s | GRU=%s | layernorm=%s | transformer_layer=%s",
+        "AUTOCAST DTYPE PROBE (%s): matmul=%s | linear=%s | GRU=%s | layernorm=%s | transformer_layer=%s",
+        dtype,
         mm_out.dtype,
         lin_out.dtype,
         gru_out.dtype,
@@ -170,9 +176,9 @@ def log_effective_tflops(
 
     Compares against GPU theoretical peaks to determine hardware utilization.
     Reference hardware: A10G (current production GPU).
-      - A10G FP16: 125 TFLOPS (peak), ~40-60 TFLOPS (realistic with overhead)
+      - A10G BF16: 125 TFLOPS (peak), ~40-60 TFLOPS (realistic with overhead)
       - A10G memory bandwidth: 600 GB/s
-    Historical: T4 FP16=65 peak, L4 FP16=121 peak.
+    Historical: T4 BF16=65 peak, L4 BF16=121 peak.
 
     Only counts transformer layer FLOPs (attention + FFN), which dominate the model.
     GRU, embedding MLP, and positional encoding are excluded (< 5% of total FLOPs).
@@ -196,12 +202,12 @@ def log_effective_tflops(
     logger.debug(
         "EFFECTIVE TFLOPS: %.2f TFLOPS (transformer layers only) | "
         "forward=%.1fms | effective_batch=%d | "
-        "A10G FP16=125 TFLOPS (peak) ~40-60 (real) | mem_bw=600 GB/s | "
+        "A10G BF16=125 TFLOPS (peak) ~40-60 (real) | mem_bw=600 GB/s | "
         "verdict=%s",
         effective_tflops,
         forward_ms,
         effective_batch,
-        "FP16 tensor cores ACTIVE"
+        "BF16 tensor cores ACTIVE"
         if effective_tflops > 20
         else "FP32 range or poor utilization"
         if effective_tflops < 12

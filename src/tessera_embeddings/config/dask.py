@@ -53,12 +53,22 @@ class AssemblyConfig(_ChunkScaledClusterConfig):
     cluster that assembles staged chunk Zarrs into the final output.
 
     Worker count is derived from *live* (ROI-intersecting) chunks, not
-    the full grid, so very sparse ROIs don't oversaturate S3 with
-    writes. Calibrated so ~850 live chunks → 20 workers, scaling up to
-    200 workers for dense ROIs.
+    the full grid: only live chunks have staged data to read and write,
+    so they account for essentially all the work — non-intersecting
+    chunks are constant fill in the Dask graph and never touch S3.
+    Calibrated so ~850 live chunks → 85 workers, scaling up to the
+    ``max_workers`` cap once an ROI exceeds that.
+
+    ``max_workers`` is capped at 100 to match
+    ``assembly.TARGET_AGGREGATE_S3_CONCURRENCY``. Each Dask worker forks its
+    own icechunk Repository that issues at least 1 concurrent S3 PUT, so
+    aggregate PUT concurrency is >= n_workers. Capping workers at the target
+    keeps the fleet-wide PUT rate under S3's ~3500 req/s/prefix ceiling; a
+    higher cap would burst over it and draw ``503 SlowDown`` on append.
     """
 
-    chunks_per_worker: int = 40
+    chunks_per_worker: int = 10
+    max_workers: int = 100
 
 
 # Auto-sizing caps for the master pipeline's ingest cluster + Ray pool.

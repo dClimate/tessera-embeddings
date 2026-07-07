@@ -58,7 +58,7 @@ known-first-party = ["tessera_embeddings"]
 convention = "google"
 
 [lint.per-file-ignores]
-"tests/**/*.py" = ["ANN", "ARG", "RUF059", "F841", "D102"]
+"tests/**/*.py" = ["ANN", "ARG", "RUF059", "F841", "D102", "D103", "N803", "N806", "C408"]
 "examples/**/*.py" = ["T201"]
 "scripts/**/*.py" = ["T201"]
 "src/tessera_embeddings/architecture_tests/**/*.py" = ["T201"]

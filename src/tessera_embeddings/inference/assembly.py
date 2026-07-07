@@ -16,7 +16,7 @@ import datetime
 import logging
 import subprocess
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import dask.array as da
 import fsspec
@@ -31,13 +31,37 @@ from tessera_embeddings.config.inference import EMBEDDING_DIM, TimeWindow
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
-from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store
+from tessera_embeddings.storage.zarr_store import manifest_split, open_or_create_repo, open_store
 
 # PCodec is intentionally used as a Zarr v3 serializer; silence the
 # "not in the Zarr version 3 specification" warning it emits on every instantiation.
 warnings.filterwarnings("ignore", message="Numcodecs codecs are not in the Zarr version 3")
 
 logger = logging.getLogger(__name__)
+
+
+STAGED_READ_CONFIG_KWARGS = {"retries": {"max_attempts": 10, "mode": "adaptive"}}
+"""botocore retry config for staged-Zarr GETs during assembly.
+
+Staged reads fan out across every Dask worker at once, so a momentary GET burst
+can trip S3 into a 503 SlowDown even well under the per-prefix ceiling. botocore's
+default ``legacy`` mode makes 5 attempts, has no client-side rate limiting, and
+doesn't recognize ``SlowDown`` in its throttle set, so the burst exhausts retries
+and fails the block. ``adaptive`` mode adds explicit ``SlowDown`` handling plus a
+token-bucket rate limiter that self-throttles when S3 pushes back — that feedback
+loop, not the higher attempt count, is the actual fix.
+"""
+
+
+def _staged_storage_options(path: str) -> dict | None:
+    """Return s3fs storage options for a staged read, or ``None`` for non-S3 paths.
+
+    The retry config is a botocore client setting and only applies to the S3
+    backend; local staging paths (``/tmp/...``) get ``None`` and open normally.
+    """
+    if fsspec.utils.get_protocol(path) == "s3":
+        return {"config_kwargs": STAGED_READ_CONFIG_KWARGS}
+    return None
 
 
 def _fs_for(uri: str, storage_options: dict | None = None) -> fsspec.AbstractFileSystem:
@@ -84,7 +108,15 @@ worker forks a fresh Repository when ``to_icechunk`` ships the session out. So
 the effective aggregate concurrency is ``n_workers * per_worker_cap``, not the
 per-worker cap alone. We target ~100 concurrent PUTs fleet-wide (roughly 1/35 of
 S3's ~3500 req/s/prefix ceiling at ~100 ms PUT latency) to leave headroom for
-retries and avoid 503 SlowDown on single-prefix fan-out at cornbelt scale.
+retries and avoid 503 SlowDown.
+
+icechunk writes chunk objects to a flat ``chunks/<random-id>`` keyspace, so the
+keys spread across S3 partitions well — but partition splitting is adaptive and a
+hard burst overruns the per-prefix rate before (and even after) S3 adapts, which
+is exactly the SlowDown observed at 800 concurrent PUTs. The invariant that keeps
+us under target is ``AssemblyConfig.max_workers <= TARGET_AGGREGATE_S3_CONCURRENCY``:
+since ``per_worker_cap`` floors at 1, aggregate is >= n_workers, so the worker cap
+must not exceed the target. Keep these two constants in sync.
 """
 
 
@@ -123,7 +155,7 @@ def _assemble_var_block(
     path = live_lookup.get((row, col))
     if path is None:
         return template
-    group = zarr.open_group(path, mode="r")
+    group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
     try:
         # template shape is (1, H, W[, D]); the staged array is (H, W[, D]).
         arr = np.asarray(group[var_name][...])  # type: ignore[index]
@@ -251,7 +283,7 @@ class ZarrWriter:
         run_id: str,
         scales: np.ndarray,
         embeddings_std: np.ndarray | None = None,
-        obs_counts: dict[str, np.ndarray | None] | None = None,
+        obs_counts: Mapping[str, np.ndarray | None] | None = None,
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
@@ -360,7 +392,7 @@ class ZarrWriter:
             raise FileNotFoundError(f"No staged chunks found for run '{run_id}' under {self.staging_base}")
         path = f"{self.staging_base}/{run_id}/{labels[0]}.zarr"
         try:
-            group = zarr.open_group(path, mode="r")
+            group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
         except Exception as exc:
             raise FileNotFoundError(f"Cannot open {path}: {exc}") from exc
         arr: zarr.Array = group["embeddings"]  # type: ignore[assignment]
@@ -478,7 +510,7 @@ class ZarrWriter:
         path = self._staging_path(run_id, chunk)
         expected_shape = (chunk.height, chunk.width, self.embedding_dim)
         try:
-            group = zarr.open_group(path, mode="r")
+            group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
             for var in required_vars:
                 if var not in group:
                     return f"missing variable '{var}'"
@@ -580,7 +612,7 @@ class ZarrWriter:
         probe = max(chunks, key=lambda c: c.height * c.width)
         path = self._staging_path(run_id, probe)
         try:
-            group = zarr.open_group(path, mode="r")
+            group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
             return {v for v in var_names if v in group}
         except (FileNotFoundError, KeyError, zarr.errors.GroupNotFoundError):
             return set()
@@ -604,7 +636,7 @@ class ZarrWriter:
         """
         largest = max(chunks, key=lambda c: c.height * c.width)
         probe_path = self._staging_path(run_id, largest)
-        group = zarr.open_group(probe_path, mode="r")
+        group = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
         return tuple(group[var_name].metadata.chunk_grid.chunk_shape)  # type: ignore[union-attr]
 
     def _chunk_grid_sizes(self, chunks: list[ChunkSpec]) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -917,116 +949,160 @@ class ZarrWriter:
         # cap is per-Repository (per-worker after session fork), so we must
         # pre-divide by n_workers to keep aggregate under S3's per-prefix
         # ceiling. See TARGET_AGGREGATE_S3_CONCURRENCY for the rationale.
-        per_worker_cap = max(4, TARGET_AGGREGATE_S3_CONCURRENCY // n_workers)
-        # scatter_initial_credentials: to_icechunk pickles the session out to
-        # every Dask worker. With a credential callback, eager scatter
-        # caches one credential set on the driver so workers don't all stampede
-        # the credential provider on deserialisation.
-        repo, is_new = open_or_create_repo(
-            output_path,
-            max_concurrent_requests=per_worker_cap,
-            get_credentials=get_credentials,
-            region=s3_region,
-            scatter_initial_credentials=get_credentials is not None,
-        )
-        # Persist the cap into the repo's config blob. to_icechunk ships the
-        # session out and each worker re-opens the Repository — without
-        # save_config, those workers read the persisted config (defaults) and
-        # the runtime override is silently dropped, so concurrency stays at
-        # icechunk's 256 default regardless of what we pass here.
-        repo.save_config()
-        session = repo.writable_session("main")
+        #
+        # The floor is 1, not a larger number: every forked Repository issues at
+        # least 1 concurrent PUT, so aggregate >= n_workers regardless of the
+        # divisor. A floor above 1 only holds the target while n_workers is small
+        # enough that the division still lands >= the floor; past that it pins at
+        # the floor and aggregate grows linearly with n_workers, blowing the
+        # target (e.g. floor=4 at 200 workers -> 800 concurrent PUTs -> SlowDown).
+        # AssemblyConfig.max_workers is capped at the target so n_workers never
+        # drives aggregate over it.
+        per_worker_cap = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // n_workers)
 
-        # Validate manifest before appending to an existing store
-        if not is_new and manifest:
-            prev_root = zarr.open_group(session.store, mode="r")
-            manifest.validate_against(extract_manifest(prev_root.attrs), output_path)
+        # Split each spatial axis's manifest into 32-chunk shards. Embeddings are
+        # written in 500-px spatial chunks, so a 32-chunk shard is ~16k px/axis —
+        # matching DEFAULT_MANIFEST_SPLIT_SIZES' ~16k-px target.
+        #
+        # Time is split at 1 shard per timestep. An assembly append writes one
+        # full-spatial-extent timestep, so it touches every spatial shard — and
+        # since manifest objects are immutable, each touched shard is rewritten in
+        # full. With "time": 1 each timestep is its own shard, so an append writes a
+        # new shard and rewrites zero prior ones; the per-append manifest rewrite
+        # (and the peak worker RAM building it) stays bounded by a single timestep
+        # rather than the whole time series. We never region-write across time on
+        # this store (appends only add whole timesteps) and the series tops out at
+        # ~30 dates, so the extra shard objects and read fan-out are negligible.
+        #
+        # This wraps appends to pre-existing stores too, which is intentional and
+        # safe. A store created before splitting was introduced has one unsplit
+        # manifest; the first append under this block re-shards the touched array
+        # in that commit (a one-time migration — existing chunk data is untouched
+        # and reads back identically), and every later commit rewrites only the
+        # shards it touches. icechunk merges the split config into the store's
+        # persisted config on open, so the layout follows the array forward with no
+        # manual migration. Verified against icechunk 2.0.4.
+        #
+        # The context is scoped tightly here — around the output store open/write
+        # only — so that read-only opens of other stores (e.g. the mosaic base for
+        # spatial coords) are not inadvertently opened under the split config.
+        with manifest_split({"northing": 32, "easting": 32, "time": 1}):
+            # scatter_initial_credentials: to_icechunk pickles the session out to
+            # every Dask worker. With a credential callback, eager scatter
+            # caches one credential set on the driver so workers don't all stampede
+            # the credential provider on deserialisation.
+            repo, is_new = open_or_create_repo(
+                output_path,
+                max_concurrent_requests=per_worker_cap,
+                get_credentials=get_credentials,
+                region=s3_region,
+                scatter_initial_credentials=get_credentials is not None,
+            )
+            # Persist the cap into the repo's config blob. to_icechunk ships the
+            # session out and each worker re-opens the Repository — without
+            # save_config, those workers read the persisted config (defaults) and
+            # the runtime override is silently dropped, so concurrency stays at
+            # icechunk's 256 default regardless of what we pass here.
+            repo.save_config()
+            session = repo.writable_session("main")
 
-        # Snapshot existing time_windows BEFORE to_icechunk, which may
-        # overwrite root attrs on append.
-        prev_time_windows: dict = {}
-        if not is_new and time_window:
-            prev_root = zarr.open_group(session.store, mode="r")
-            prev_time_windows = dict(prev_root.attrs.get("time_windows", {}))  # type: ignore[arg-type]
+            # Validate manifest before appending to an existing store
+            if not is_new and manifest:
+                prev_root = zarr.open_group(session.store, mode="r")
+                manifest.validate_against(extract_manifest(prev_root.attrs), output_path)
 
-        if is_new:
-            # Output zarr sub-chunking is read from the staged files directly,
-            # not from dask block size: dask blocks are ChunkSpec-sized (one
-            # task per ChunkSpec, keeps the scheduler graph small), but on-disk
-            # zarr chunks must remain 500x500x(embedding_dim/BAND_CHUNK_DIVISOR)
-            # for downstream partial-read performance. to_icechunk handles the
-            # per-dask-block fan-out into smaller zarr chunks via align_chunks=True.
-            sub_h, sub_w, sub_band = self._detect_staged_chunk_size(run_id, live_chunks, "embeddings")
-            _log.info("Output zarr sub-chunks: (%d, %d, %d) from staged files", sub_h, sub_w, sub_band)
-            encoding_ic: dict[str, dict] = {
-                "embeddings": {"chunks": (1, sub_h, sub_w, sub_band)},
-                "time": {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"},
-            }
-            if compute_std:
-                encoding_ic["embedding_std"] = {
-                    "chunks": (1, sub_h, sub_w, sub_band),
+            # Snapshot existing time_windows BEFORE to_icechunk, which may
+            # overwrite root attrs on append.
+            prev_time_windows: dict = {}
+            if not is_new and time_window:
+                prev_root = zarr.open_group(session.store, mode="r")
+                prev_time_windows = dict(prev_root.attrs.get("time_windows", {}))  # type: ignore[arg-type]
+
+            if is_new:
+                # Output zarr sub-chunking is read from the staged files directly,
+                # not from dask block size: dask blocks are ChunkSpec-sized (one
+                # task per ChunkSpec, keeps the scheduler graph small), but on-disk
+                # zarr chunks must remain 500x500x(embedding_dim/BAND_CHUNK_DIVISOR)
+                # for downstream partial-read performance. to_icechunk handles the
+                # per-dask-block fan-out into smaller zarr chunks via align_chunks=True.
+                sub_h, sub_w, sub_band = self._detect_staged_chunk_size(run_id, live_chunks, "embeddings")
+                _log.info("Output zarr sub-chunks: (%d, %d, %d) from staged files", sub_h, sub_w, sub_band)
+                encoding_ic: dict[str, dict] = {
+                    "embeddings": {"chunks": (1, sub_h, sub_w, sub_band)},
+                    "time": {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"},
+                }
+                # fill_value=NaN matches the out-of-ROI fill used in the mosaic
+                # graph for these float vars, so all-empty sub-chunks collapse to
+                # no object on write (zarr's write_empty_chunks=False default) and
+                # don't inflate the S3 prefix. The default 0.0 fill would never
+                # match the NaN footprint, forcing a real object per empty chunk.
+                if compute_std:
+                    encoding_ic["embedding_std"] = {
+                        "chunks": (1, sub_h, sub_w, sub_band),
+                        "fill_value": float("nan"),
+                        "serializer": pcodec_serializer(),
+                        "compressors": None,
+                    }
+                encoding_ic["scales"] = {
+                    "chunks": (1, sub_h, sub_w),
+                    "fill_value": float("nan"),
                     "serializer": pcodec_serializer(),
                     "compressors": None,
                 }
-            encoding_ic["scales"] = {
-                "chunks": (1, sub_h, sub_w),
-                "serializer": pcodec_serializer(),
-                "compressors": None,
-            }
-            for obs_var in OBS_COUNT_VARS:
-                if obs_var in mosaic:
-                    encoding_ic[obs_var] = {"chunks": (1, sub_h, sub_w), "compressors": None}
-            to_icechunk(mosaic, session, mode="w", encoding=encoding_ic, align_chunks=True, split_every=8)
-            _log.info("Wrote new store at %s", output_path)
-        else:
-            # Existing store: append along time (no encoding — existing metadata preserved)
-            to_icechunk(mosaic, session, mode="a", append_dim="time", align_chunks=True, split_every=8)
-            _log.info("Appended to existing store at %s", output_path)
+                for obs_var in OBS_COUNT_VARS:
+                    if obs_var in mosaic:
+                        encoding_ic[obs_var] = {"chunks": (1, sub_h, sub_w), "compressors": None}
+                to_icechunk(mosaic, session, mode="w", encoding=encoding_ic, align_chunks=True, split_every=8)
+                _log.info("Wrote new store at %s", output_path)
+            else:
+                # Existing store: append along time (no encoding — existing metadata preserved)
+                to_icechunk(mosaic, session, mode="a", append_dim="time", align_chunks=True, split_every=8)
+                _log.info("Appended to existing store at %s", output_path)
 
-        # Set root attrs on same session
-        root = zarr.open_group(session.store, mode="r+")
-        root.attrs["run_id"] = run_id
-        root.attrs["total_y"] = total_y
-        root.attrs["total_x"] = total_x
-        root.attrs["embedding_dim"] = self.embedding_dim
-        root.attrs["run_started_at"] = started.isoformat()
-        root.attrs["run_completed_at"] = datetime.datetime.now(datetime.UTC).isoformat()
+            # Set root attrs on same session
+            root = zarr.open_group(session.store, mode="r+")
+            root.attrs["run_id"] = run_id
+            root.attrs["total_y"] = total_y
+            root.attrs["total_x"] = total_x
+            root.attrs["embedding_dim"] = self.embedding_dim
+            root.attrs["run_started_at"] = started.isoformat()
+            root.attrs["run_completed_at"] = datetime.datetime.now(datetime.UTC).isoformat()
 
-        # GeoZarr convention attributes (proj:, spatial:, tessera:).
-        # Set on every write (create and append) so they survive to_icechunk attr overwrites.
-        conv_attrs = build_convention_attrs(
-            tile_id=tile_id,
-            epsg_code=spatial.crs if spatial else None,
-            total_y=total_y,
-            total_x=total_x,
-            embedding_dim=self.embedding_dim,
-            y_coords=spatial.northing if spatial else None,
-            x_coords=spatial.easting if spatial else None,
-            model_version=model_version,
-            n_tiles=len(chunks),
-        )
-        if conv_attrs:
-            root.attrs.update(conv_attrs)
+            # GeoZarr convention attributes (proj:, spatial:, tessera:).
+            # Set on every write (create and append) so they survive to_icechunk attr overwrites.
+            conv_attrs = build_convention_attrs(
+                tile_id=tile_id,
+                epsg_code=spatial.crs if spatial else None,
+                total_y=total_y,
+                total_x=total_x,
+                embedding_dim=self.embedding_dim,
+                y_coords=spatial.northing if spatial else None,
+                x_coords=spatial.easting if spatial else None,
+                model_version=model_version,
+                n_tiles=len(chunks),
+            )
+            if conv_attrs:
+                root.attrs.update(conv_attrs)
 
-        if manifest:
-            root.attrs["_manifest"] = manifest.to_dict()
-            _log.info("Wrote _manifest to %s", output_path)
+            if manifest:
+                root.attrs["_manifest"] = manifest.to_dict()
+                _log.info("Wrote _manifest to %s", output_path)
 
-        # Merge time_windows: combine previously-snapshotted entries with the
-        # current window, then write back to root attrs. This ensures each
-        # appended time step retains its provenance.
-        if time_window:
-            window_meta: dict[str, list[str]] = {
-                "range": [
-                    f"{time_window.window_start[0]}-{time_window.window_start[1]:02d}",
-                    f"{time_window.window_end[0]}-{time_window.window_end[1]:02d}",
-                ],
-            }
-            prev_time_windows[time_window.window_end_label] = window_meta
-            root.attrs["time_windows"] = prev_time_windows
-            root.attrs["time_convention"] = "12mo_window_end"
+            # Merge time_windows: combine previously-snapshotted entries with the
+            # current window, then write back to root attrs. This ensures each
+            # appended time step retains its provenance.
+            if time_window:
+                window_meta: dict[str, list[str]] = {
+                    "range": [
+                        f"{time_window.window_start[0]}-{time_window.window_start[1]:02d}",
+                        f"{time_window.window_end[0]}-{time_window.window_end[1]:02d}",
+                    ],
+                }
+                prev_time_windows[time_window.window_end_label] = window_meta
+                root.attrs["time_windows"] = prev_time_windows
+                root.attrs["time_convention"] = "12mo_window_end"
 
-        session.commit(f"Run {run_id}: {len(chunks)} chunks assembled")
+            session.commit(f"Run {run_id}: {len(chunks)} chunks assembled")
         _log.info("Assembly complete: %s", output_path)
         return output_path
 
@@ -1037,8 +1113,8 @@ class ZarrWriter:
     ) -> None:
         """Delete the staging directory for a completed run.
 
-        Local paths are removed with ``shutil.rmtree``.
-        S3 paths are removed with ``s5cmd rm``.
+        S3 paths are removed with ``s5cmd rm``, falling back to fsspec's
+        ``rm`` if s5cmd is unavailable or fails. Non-S3 paths use fsspec.
 
         Args:
             run_id: Run identifier whose staging artifacts should be deleted.
@@ -1048,6 +1124,16 @@ class ZarrWriter:
         target = f"{self.staging_base}/{run_id}"
 
         _log.info("Cleaning up staging: %s", target)
+
+        # For S3, prefer s5cmd: it deletes far faster than fsspec's per-key
+        # serial DELETEs. Fall back to fsspec if s5cmd is unavailable or errors.
+        if fsspec.utils.get_protocol(target) == "s3":
+            try:
+                _s5cmd_rm(target, _log)
+                return
+            except (FileNotFoundError, RuntimeError) as exc:
+                _log.warning("s5cmd cleanup of %s failed (%s) — falling back to fsspec", target, exc)
+
         try:
             fs = _fs_for(target)
             if fs.exists(target):

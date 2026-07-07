@@ -8,14 +8,20 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import xarray as xr
 import zarr
 
-from tessera_embeddings.config.inference import DEFAULT_CHUNK_SIZE
+from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
+
+# Probing the ROI mask is I/O-latency bound (one S3 read + decompress per
+# chunk), so oversubscribe relative to CPU count — the reads release the GIL.
+_ROI_PROBE_WORKERS = min(32, (os.cpu_count() or 4) * 4)
 
 
 @dataclass(frozen=True)
@@ -57,7 +63,7 @@ class ChunkSpec:
 def enumerate_chunks(
     total_y: int,
     total_x: int,
-    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_size: int = INFERENCE_CHUNK_SIZE,
 ) -> list[ChunkSpec]:
     """Enumerate all spatial chunks for a mosaic of given dimensions.
 
@@ -100,7 +106,7 @@ def enumerate_chunks(
 
 def enumerate_chunks_from_dataset(
     ds: xr.Dataset,
-    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_size: int = INFERENCE_CHUNK_SIZE,
 ) -> list[ChunkSpec]:
     """Enumerate chunks from an xarray Dataset's spatial dimensions.
 
@@ -134,9 +140,17 @@ def filter_chunks_by_roi_mask(
         Subset of *chunks* that contain at least one ROI pixel.
     """
     mask = zarr.open(roi_zarr_path, mode="r")
-    live: list[ChunkSpec] = []
-    for chunk in chunks:
-        if mask[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop].any():  # type: ignore[index]
-            live.append(chunk)
+
+    def intersects(chunk: ChunkSpec) -> bool:
+        return bool(mask[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop].any())  # type: ignore[index]
+
+    # One window read per chunk dominated by S3 latency + decompression; fan
+    # the reads out across a thread pool (the GIL is released during both) so
+    # wall time scales with the slowest reads rather than their sum. Order is
+    # preserved so the live subset keeps the input's row-major chunk ordering.
+    with ThreadPoolExecutor(max_workers=_ROI_PROBE_WORKERS) as pool:
+        hits = pool.map(intersects, chunks)
+    live = [chunk for chunk, hit in zip(chunks, hits, strict=True) if hit]
+
     logger.info("ROI filter: %d/%d chunks intersect the ROI mask", len(live), len(chunks))
     return live

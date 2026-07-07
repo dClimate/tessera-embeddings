@@ -62,34 +62,42 @@ run this at production scale. They are examples, not requirements.
 
 ## Installation
 
-We ship pre-solved lock files for the environments users actually
-need. Fresh-clone convenience: `uv sync` with no flags does the right
-thing for laptop contributors.
+`tessera_embeddings` is an inference library. The base install is the
+ingestion pipeline (Sentinel-2/S1 data preparation, Zarr store management —
+no torch, no Ray). Add `[inference]` for the Tessera embedding model and
+distributed execution — that is what this library is for. The split is
+practical: torch is large and CUDA variants are platform-specific.
+
+```bash
+# Typical install — ingestion pipeline + Tessera inference
+pip install tessera_embeddings[inference]
+
+# Full production stack — inference + Prefect orchestration + AWS:
+pip install tessera_embeddings[inference,prefect,aws]
+
+# GPU (CUDA 12.1) — install torch first so pip keeps the CUDA wheel:
+pip install "torch==2.6.0+cu121" --index-url https://download.pytorch.org/whl/cu121
+pip install "tessera_embeddings[inference]"
+```
+
+For contributors:
 
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync                                    # reads uv.lock (universal CPU)
-
-# Explicit variants:
-uv sync --frozen -r inference-cpu.lock     # cross-platform CPU torch + Ray + Prefect
-uv sync --frozen -r inference-cu121.lock   # Linux x86_64, CUDA 12.1 (matches production AMI)
-uv sync --frozen -r dev.lock               # superset of inference-cpu + pytest/ruff/mypy
+uv sync --all-extras   # resolves uv.lock; all extras + dev tools
 ```
 
-`inference-cpu.lock` is `--universal` (Linux x86_64, macOS arm64/x86_64,
-Linux arm64). `inference-cu121.lock` is Linux x86_64 only — CUDA torch
-wheels don't exist for other platforms. See
-[`docs/environment-setup.md`](docs/environment-setup.md) for the full
-matrix, MPS/Apple Silicon status, Windows guidance (use WSL2), and the
-rationale for the multi-lock-file setup.
+`uv.lock` at repo root is the single lock file. See
+[`docs/environment-setup.md`](docs/environment-setup.md) for CUDA GPU
+installs and platform guidance.
 
 ## Quickstart
 
 ```bash
 git clone https://github.com/dClimate/tessera-embeddings
 cd tessera-embeddings
-uv sync --frozen -r inference-cpu.lock
+uv sync --all-extras   # resolves uv.lock; all extras + dev tools
 
 # End-to-end pipeline on the bundled Story-County, IA quickstart ROI.
 # Ingest → cloud mask → CPU inference → assemble. Expect ~30+ minutes;
@@ -106,7 +114,8 @@ coupled, so end-to-end is the primary demo. `--skip-inference` is the
 fast path for contributors iterating on ingest changes without waiting
 for CPU torch. Production inference always runs on GPU. See
 [`docs/quickstart.md`](docs/quickstart.md) for prerequisites
-(Earthdata Login credentials for OPERA, model checkpoint download).
+(Earthdata Login credentials for OPERA; the model checkpoint is
+pulled from HuggingFace automatically).
 
 ## Running at scale
 
@@ -196,10 +205,14 @@ scheduler RAM:  ~1 GB                   scheduler RAM: <50 MB
 overhead:       95% of wall-clock       overhead:      <5%
 ```
 
-The defaults (`DEFAULT_CHUNK_SIZE = 2000`) are calibrated for the
-inference pipeline; if you go smaller you'll watch the Dask scheduler
-hang on graph construction before any worker does any work, and
-larger you'll OOM on a g5.2xlarge. If you change them, profile.
+Storage and read granularity are tuned separately. Ingest writes
+`INGEST_CHUNK_SIZE = 4000` storage chunks to keep the satellite-ingest
+Dask graph small (¼ the spatial tasks), while inference reads
+`INFERENCE_CHUNK_SIZE = 2000` sub-tiles out of them — small enough to keep
+peak GPU-node RAM in check. Zarr's `oindex` reads the 2000 sub-tile out
+of a 4000 chunk without any alignment requirement. Go smaller on the
+read size and the Dask scheduler hangs on graph construction; larger and
+you OOM on a g5.2xlarge. If you change either, profile.
 
 ### Using these architecture checks in your own repo
 
