@@ -185,6 +185,27 @@ def test_full_masked_roi_equals_union_of_feature_windows(tmp_path):
     assert np.array_equal(full_mask, union)
 
 
+def test_full_masked_roi_bbox_is_union_of_feature_bboxes(tmp_path):
+    """The mask's ``bbox_wgs84`` attr must be the union of the features' WGS84
+    bounds (guards ``_union_bounds`` by value, not just shape).
+    """
+    feats = [
+        _feature("a", _master_cells(slice(10, 30), slice(20, 50))),
+        _feature("b", _master_cells(slice(100, 140), slice(200, 260))),
+    ]
+    out = str(tmp_path / "masked.zarr")
+    rasterize_full_masked_roi(out, master_geobox=_MASTER, features=feats)
+
+    bbox = zarr.open(out, mode="r").attrs["bbox_wgs84"]
+    bounds = [f.geometry_wgs84.bounds for f in feats]
+    assert bbox == [
+        min(b[0] for b in bounds),
+        min(b[1] for b in bounds),
+        max(b[2] for b in bounds),
+        max(b[3] for b in bounds),
+    ]
+
+
 def test_full_masked_roi_empty_features_raises(tmp_path):
     with pytest.raises(ValueError, match="features is empty"):
         rasterize_full_masked_roi(str(tmp_path / "x.zarr"), master_geobox=_MASTER, features=[])
