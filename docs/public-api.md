@@ -66,6 +66,10 @@ rather than re-exported from the top-level package:
 - `tessera_embeddings.architecture_tests` — reusable architecture-rule
   checker. Run via
   `python -m tessera_embeddings.architecture_tests --source path/`.
+- `tessera_embeddings.storage` — Icechunk/Zarr store management:
+  `zarr_store` (open / create / append / region-write) and
+  `empty_store` (all-fill store seeding — `create_empty_store`,
+  `create_empty_store_from_coords`, `VarSpec`, `daily_times`).
 
 ## Privacy conventions
 
