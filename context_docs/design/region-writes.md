@@ -1,5 +1,15 @@
 # Region Writes for Icechunk Stores
 
+> **Status (updated).** The single-region `write_region` path described here is
+> current. The **batch** path (`write_regions` / `_write_regions` /
+> `_aligned_region_sources`, built on `icechunk.dask.store_dask`) was **removed**
+> as unused: its `O(runs × bands × spatial_chunks)` Dask task graph — built
+> single-threaded on the flow runner before any compute — made continental merges
+> take days. Its replacement — a process-parallel raw-Zarr region merge, no Dask —
+> lands in a stacked follow-up PR. The `store_dask` references in §3.2, §5.4, and
+> the §5.4 update note below are retained as history; the code they describe no
+> longer exists.
+
 Design + implementation plan for adding **region-scoped writes** (overwrite a
 time slice and/or spatial sub-box of an existing store) to
 `storage/zarr_store.py`. Today the module supports only whole-array `create`
@@ -417,3 +427,4 @@ Phase 1 ships the primitive; Phase 2 wires callers:
 | Unaligned regions | RMW pad (`_pad_region_to_chunks`) | `align_chunks=True` can't pad partial boundary chunks in `r+`; callers shouldn't bear manual alignment. The genuinely new work — references only pad the time axis. |
 | Commit strategy | Per-region commit | Distribution already free via `to_icechunk`; fork/merge only adds cross-region atomicity, not needed yet. |
 | Chunk sizes | Read from store array `.chunks` | Store is authoritative; config may drift. |
+| Storage hang protection | Finite per-attempt timeouts + backed-off retries in `_default_repo_config` | Icechunk defaults to unbounded timeouts and a single try, so a wedged socket (`sk_wait_data`) blocks a write forever. Applied at every repo open — region writes inherit it for free. Values and full rationale in `zarr_store._default_repo_config`'s docstring. |

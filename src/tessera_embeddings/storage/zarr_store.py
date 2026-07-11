@@ -20,11 +20,10 @@ Three write paths, all committing atomically:
   :func:`resolve_region` to turn coordinate ranges into the integer slices
   ``write_region`` expects.
 
-:func:`write_regions` is the **batch** variant of the region-overwrite path:
-many regions written in a single ``icechunk.dask.store_dask`` compute on one
-``session.fork()``, merged into one commit. The caller must guarantee the
-regions are mutually chunk-disjoint (it does no conflict resolution). See the
-region-writes design doc for the fork/merge rationale.
+The batch variant of the region-overwrite path (a Dask-graph write of many
+regions at once) was removed as unused; batch merging of many grid-aligned
+stores into one master — process-parallel raw-zarr chunk writes, no Dask —
+arrives in a stacked follow-up PR.
 """
 
 import logging
@@ -41,14 +40,11 @@ import icechunk
 import numpy as np
 import xarray as xr
 import zarr
-from icechunk.dask import store_dask
 from icechunk.xarray import to_icechunk
 
 from tessera_embeddings.errors import CorruptedStoreError
 from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (
-    _aligned_region_sources,
-    _assert_regions_chunk_disjoint,
     _drop_region_coords,
     _pad_region_to_chunks,
 )
@@ -249,6 +245,27 @@ _manifest_split_sizes: dict[str, int] | None = None
 # than a full-height stripe (which a 1D split would force).
 DEFAULT_MANIFEST_SPLIT_SIZES = {"northing": 4, "easting": 4}
 
+# Per-attempt request timeouts (ms) pushed onto every repo's icechunk storage
+# config (see _default_repo_config) and inherited by every session and fork. These
+# cap a SINGLE object-store attempt so a hung socket fails the attempt instead of
+# blocking forever; the retry settings below then re-issue it with backoff.
+# ``read_timeout_ms`` is the one that bites the diagnosed production hang (a worker
+# stuck in ``sk_wait_data`` mid-response). The failure mode is request-level, not
+# merge-specific — every open (writes, reads, distributed assembly) is exposed — so
+# these are package-wide defaults.
+_DEFAULT_CONNECT_TIMEOUT_MS = 30_000
+_DEFAULT_READ_TIMEOUT_MS = 120_000
+_DEFAULT_OPERATION_ATTEMPT_TIMEOUT_MS = 180_000
+
+# Storage retry policy applied alongside the timeouts. Icechunk's default is a
+# single try with no backoff, so a timed-out attempt would propagate as an error
+# rather than being retried; bump tries + exponential backoff so a transient drop
+# is absorbed in-process. SlowDown (503) is already retriable in the AWS SDK; this
+# extends that to the timed-out/dropped-connection case.
+_DEFAULT_STORAGE_MAX_TRIES = 10
+_DEFAULT_STORAGE_INITIAL_BACKOFF_MS = 200
+_DEFAULT_STORAGE_MAX_BACKOFF_MS = 30_000
+
 
 @contextmanager
 def manifest_split(split_sizes: "dict[str, int] | None" = DEFAULT_MANIFEST_SPLIT_SIZES) -> "Iterator[None]":
@@ -309,14 +326,36 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     triggering 503 SlowDown. Icechunk's default is 256 concurrent HTTP
     requests per repo; callers that fan out across many workers should set
     this lower (e.g. 64) so aggregate request rate stays under S3's ceiling.
-    Retry/backoff is left at icechunk's defaults — SlowDown is already
-    classified as retriable by the underlying AWS SDK.
+
+    **Storage timeouts + retries** are always applied. Icechunk defaults to
+    unbounded per-attempt timeouts and a single try, so a wedged socket
+    (diagnosed in production: a worker stuck in ``sk_wait_data`` mid-response)
+    blocks forever. We set finite connect/read/operation-attempt timeouts so a
+    single attempt fails instead of hanging, and a backed-off retry budget so a
+    transient drop is absorbed in-process. Tradeoff: a *retriable* failure
+    (sustained 5xx, repeated timeouts) now takes minutes to surface across the
+    ``max_tries`` budget instead of failing fast; non-retriable errors (403 etc.)
+    still fail immediately.
     """
     config = icechunk.RepositoryConfig.default()
     if _manifest_split_sizes:
         config.manifest = icechunk.ManifestConfig(splitting=_manifest_splitting_config(_manifest_split_sizes))
     if max_concurrent_requests is not None:
         config.max_concurrent_requests = max_concurrent_requests
+    # Mutate the existing StorageSettings in place (RepositoryConfig.default() may
+    # leave storage=None) so any fields icechunk seeded survive.
+    storage = config.storage or icechunk.StorageSettings()
+    storage.timeouts = icechunk.StorageTimeoutSettings(
+        connect_timeout_ms=_DEFAULT_CONNECT_TIMEOUT_MS,
+        read_timeout_ms=_DEFAULT_READ_TIMEOUT_MS,
+        operation_attempt_timeout_ms=_DEFAULT_OPERATION_ATTEMPT_TIMEOUT_MS,
+    )
+    storage.retries = icechunk.StorageRetriesSettings(
+        max_tries=_DEFAULT_STORAGE_MAX_TRIES,
+        initial_backoff_ms=_DEFAULT_STORAGE_INITIAL_BACKOFF_MS,
+        max_backoff_ms=_DEFAULT_STORAGE_MAX_BACKOFF_MS,
+    )
+    config.storage = storage
     return config
 
 
@@ -626,61 +665,6 @@ def _write_region(
     logger.info(f"Wrote region {widened} to {store_path}")
 
 
-def _write_regions(
-    store_path: str,
-    region_items: "list[tuple[xr.Dataset, dict[str, slice]]]",
-    message: str,
-    update_attrs: dict[str, Any] | None = None,
-    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
-    region_name: str | None = None,
-    split_every: int = 8,
-) -> list[dict[str, slice]]:
-    """Overwrite many regions of a store in ONE distributed write and ONE commit.
-
-    All ``region_items`` are padded, fanned through a single ``icechunk.dask.store_dask``
-    (one ``da.compute`` across every region's chunks — full cluster saturation
-    rather than one compute wave per region), then merged into one changeset and
-    committed once. The caller MUST guarantee the regions are mutually
-    chunk-disjoint: ``store_dask`` merges their changesets with no conflict
-    resolution, so two items touching the same Zarr chunk would race
-    (last-writer-wins). One simple way to guarantee disjointness is a store whose
-    ``time`` chunk size is 1: regions at distinct time indices then never share a
-    chunk regardless of spatial overlap, so a batch of per-time-index writes is
-    always safe. Stores intended for batched region overwrites are recommended to
-    chunk that way.
-
-    Returns the widened (chunk-aligned) region of each item, in order.
-    """
-    repo = _open_repo(store_path, get_credentials=get_credentials, region=region_name)
-    session = repo.writable_session("main")
-
-    # Readonly view pinned to the write base snapshot, for the same
-    # pickle-safe padding-shell reason as _write_region (see its comment).
-    read_session = repo.readonly_session(snapshot_id=session.snapshot_id)
-    existing = xr.open_zarr(read_session.store, consolidated=False)
-    # Raw zarr group on the SAME readonly session for zarr-direct padding shells
-    # (see _write_region for why this session and not a fresh branch="main" one).
-    group = zarr.open_group(read_session.store, mode="r")
-    try:
-        # store_dask writes chunk data into pre-existing (seeded) arrays via the
-        # fork; it never rewrites the root group, so root attrs survive without the
-        # snapshot/restore dance _commit_preserving_attrs needs for to_icechunk. We
-        # still apply update_attrs explicitly before committing.
-        fork = session.fork()
-        sources, targets, regions, widened = _aligned_region_sources(existing, region_items, fork, group)
-        _assert_regions_chunk_disjoint(widened)
-        merged = store_dask(sources=sources, targets=targets, regions=regions, split_every=split_every)
-        session.merge(merged)
-        if update_attrs:
-            root = zarr.open_group(session.store, mode="r+")
-            root.attrs.update(update_attrs)
-        session.commit(message)
-    finally:
-        existing.close()
-    logger.info("Wrote %d region(s) to %s in one commit", len(region_items), store_path)
-    return widened
-
-
 # =============================================================================
 # Public API
 # =============================================================================
@@ -695,7 +679,7 @@ def open_store(store_path: str, chunks: "ChunksArg" = _CHUNKS_UNSET) -> xr.Datas
     return _open_readonly(store_path, chunks=chunks)
 
 
-def open_store_as_zarr_group(store_path: str) -> zarr.Group:
+def open_store_as_zarr_group(store_path: str, max_concurrent_requests: int | None = None) -> zarr.Group:
     """Open an Icechunk store for reading as a raw zarr Group.
 
     Bypasses xarray/dask entirely. Use when you need to read large arrays into
@@ -703,8 +687,13 @@ def open_store_as_zarr_group(store_path: str) -> zarr.Group:
     reflectance bands for inference, where each ``.values`` call on the xarray
     path would build and execute a fresh dask graph per variable and hold
     scheduler state until the dataset handle dies.
+
+    ``max_concurrent_requests`` caps per-repo HTTP concurrency (icechunk default
+    256). Pass it when many processes read one S3 prefix concurrently — e.g. the
+    region merge's worker forks all reading one feature store — so the aggregate
+    GET rate stays under S3's per-prefix ceiling.
     """
-    repo = _open_repo(store_path)
+    repo = _open_repo(store_path, max_concurrent_requests=max_concurrent_requests)
     session = repo.readonly_session(branch="main")
     return zarr.open_group(session.store, mode="r")
 
@@ -763,7 +752,10 @@ def resolve_region(
     must also be contiguous; a range straddling a gap (e.g. an out-of-order time
     axis) raises rather than silently widening the slice to cover the gap.
     """
-    ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region)
+    # chunks=None: only the 1-D northing/easting/time coords are read here, never
+    # pixels, so skip building a per-chunk dask graph — matters when this is called
+    # repeatedly (e.g. resolving many features against a continental master).
+    ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region, chunks=None)
     try:
         ranges = {"time": time, "northing": northing, "easting": easting}
         region: dict[str, slice] = {}
@@ -837,48 +829,6 @@ def write_region(
         update_attrs=update_attrs,
         get_credentials=get_credentials,
         region_name=s3_region,
-    )
-
-
-def write_regions(
-    store_path: str,
-    region_items: "list[tuple[xr.Dataset, dict[str, slice]]]",
-    *,
-    update_attrs: dict[str, Any] | None = None,
-    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
-    s3_region: str | None = None,
-    split_every: int = 8,
-) -> list[dict[str, slice]]:
-    """Overwrite several regions of a store in ONE distributed write and ONE commit.
-
-    Like :func:`write_region` but for a batch: every ``(data, region)`` is padded
-    and fanned through a single distributed compute (full cluster saturation
-    across all regions at once), merged into one changeset, and committed once —
-    instead of one compute wave and one commit per region. Each ``data`` follows
-    the same contract as :func:`write_region` (covers exactly its region's cells;
-    own coords ignored). Returns each item's widened (chunk-aligned) region.
-
-    **Caller-enforced invariant:** the regions must be mutually *chunk-disjoint*.
-    The batch is merged with no conflict resolution, so two items whose padded
-    extents share a Zarr chunk would race (last-writer-wins) and silently drop
-    data. Disjointness is the caller's responsibility. A store whose ``time``
-    chunk size is 1 makes it trivial: regions at distinct time indices never
-    share a chunk, whatever their spatial overlap, so a batch of per-time-index
-    writes is always safe.
-    """
-    if not region_items:
-        raise ValueError("write_regions requires at least one (data, region) item.")
-    for _, region in region_items:
-        if not region:
-            raise ValueError("write_regions requires a non-empty region per item; use write_dataset for full writes.")
-    return _write_regions(
-        store_path,
-        region_items,
-        message=f"Overwrite {len(region_items)} region(s)",
-        update_attrs=update_attrs,
-        get_credentials=get_credentials,
-        region_name=s3_region,
-        split_every=split_every,
     )
 
 

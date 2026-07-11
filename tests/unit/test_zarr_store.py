@@ -31,8 +31,14 @@ import xarray as xr
 from icechunk.xarray import to_icechunk
 
 from tessera_embeddings.config import S2_L2A_BANDS
-from tessera_embeddings.storage.region_writes import _aligned_region_sources, _pad_region_to_chunks
+from tessera_embeddings.storage.region_writes import _pad_region_to_chunks
 from tessera_embeddings.storage.zarr_store import (
+    _DEFAULT_CONNECT_TIMEOUT_MS,
+    _DEFAULT_OPERATION_ATTEMPT_TIMEOUT_MS,
+    _DEFAULT_READ_TIMEOUT_MS,
+    _DEFAULT_STORAGE_INITIAL_BACKOFF_MS,
+    _DEFAULT_STORAGE_MAX_BACKOFF_MS,
+    _DEFAULT_STORAGE_MAX_TRIES,
     S3Config,
     _default_repo_config,
     _open_repo,
@@ -41,13 +47,11 @@ from tessera_embeddings.storage.zarr_store import (
     compute_doy,
     get_existing_dates,
     open_store,
-    open_store_as_zarr_group,
     resolve_region,
     rollback_commits,
     set_s3_config,
     write_dataset,
     write_region,
-    write_regions,
 )
 
 # Chunk dicts replacing the reference's TESSERA_CHUNKS / DEFAULT_CHUNKS.
@@ -1013,196 +1017,6 @@ class TestWriteRegion:
         np.testing.assert_array_equal(open_store(store_path)["blue"].values, original)
 
 
-class TestWriteRegions:
-    """Batch region overwrite: many regions, one distributed compute, one commit."""
-
-    def _store(self, local_zarr_path, sample_reflectance_data, dates, *, name="rws"):
-        return _make_region_store(local_zarr_path, sample_reflectance_data, dates, name=name)
-
-    def test_rejects_empty_items(self, local_zarr_path, sample_reflectance_data):
-        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rws_empty_items")
-        with pytest.raises(ValueError, match="at least one"):
-            write_regions(store_path, [])
-
-    def test_rejects_empty_region_item(self, local_zarr_path, sample_reflectance_data):
-        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rws_empty_region")
-        new = _single_date_block("2024-01-01", 1, height=1000, width=1000, chunks=SPLIT_CHUNKS)
-        with pytest.raises(ValueError, match="non-empty region"):
-            write_regions(store_path, [(new, {})])
-
-    def test_multiple_time_disjoint_runs_one_commit(self, local_zarr_path, sample_reflectance_data):
-        """Two time-disjoint runs written together land correctly; others untouched.
-
-        Mirrors the merge workload: same spatial box on disjoint time indices,
-        which (time chunk == 1) are guaranteed chunk-disjoint.
-        """
-        dates = ["2024-01-01", "2024-01-06", "2024-01-11", "2024-01-16"]
-        store_path = self._store(local_zarr_path, sample_reflectance_data, dates, name="rws_runs")
-        original = open_store(store_path)["blue"].values.copy()
-
-        # Aligned spatial box, two runs: a 2-date run {0,1} and a 1-date run {3}.
-        runA = xr.Dataset(
-            {"blue": (["time", "northing", "easting"], np.full((2, 500, 500), 7, np.uint16))},
-            coords={
-                "time": [np.datetime64(d, "ns") for d in dates[0:2]],
-                "northing": np.arange(500),
-                "easting": np.arange(500),
-            },
-        ).chunk(ONE_BLOCK)
-        runB = _single_date_block("2024-01-16", 8, height=500, width=500, n0=0, e0=0, chunks=ONE_BLOCK)
-
-        spatial = {"northing": slice(0, 500), "easting": slice(0, 500)}
-        widened = write_regions(
-            store_path,
-            [(runA, {"time": slice(0, 2), **spatial}), (runB, {"time": slice(3, 4), **spatial})],
-        )
-        assert len(widened) == 2
-
-        back = open_store(store_path)["blue"].values
-        assert (back[0, 0:500, 0:500] == 7).all()
-        assert (back[1, 0:500, 0:500] == 7).all()
-        assert (back[3, 0:500, 0:500] == 8).all()
-        # Untouched date intact.
-        np.testing.assert_array_equal(back[2], original[2])
-        # Untouched spatial remainder of written dates intact.
-        mask = np.ones(back.shape[1:], dtype=bool)
-        mask[0:500, 0:500] = False
-        for t in (0, 1, 3):
-            np.testing.assert_array_equal(back[t][mask], original[t][mask])
-
-    def test_unaligned_runs_backfill_and_preserve_attrs(self, local_zarr_path, sample_reflectance_data):
-        """Unaligned boxes are padded; root attrs survive; update_attrs merged."""
-        dates = ["2024-01-01", "2024-01-06", "2024-01-11"]
-        store_path = self._store(local_zarr_path, sample_reflectance_data, dates, name="rws_unaligned")
-        original = open_store(store_path)["blue"].values.copy()
-
-        sub0 = _single_date_block("2024-01-01", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
-        sub2 = _single_date_block("2024-01-11", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
-        spatial = {"northing": slice(100, 300), "easting": slice(250, 610)}
-        write_regions(
-            store_path,
-            [(sub0, {"time": slice(0, 1), **spatial}), (sub2, {"time": slice(2, 3), **spatial})],
-            update_attrs={"reprocessed": "2026-06-18"},
-        )
-
-        ds = open_store(store_path)
-        back = ds["blue"].values
-        for t in (0, 2):
-            assert (back[t, 100:300, 250:610] == 9).all()
-            mask = np.ones(back.shape[1:], dtype=bool)
-            mask[100:300, 250:610] = False
-            np.testing.assert_array_equal(back[t][mask], original[t][mask])
-        np.testing.assert_array_equal(back[1], original[1])
-        assert ds.attrs["crs"] == "EPSG:32615"
-        assert ds.attrs["tile_id"] == "33UUP"
-        assert ds.attrs["reprocessed"] == "2026-06-18"
-
-    def test_batch_under_distributed_client(self, local_zarr_path, sample_reflectance_data):
-        """Unaligned batch write succeeds with a real distributed client active.
-
-        Guards that the padding shell (read from a readonly session) and the
-        forked write graph both pickle to workers — the multi-region analogue of
-        the single-region distributed guard.
-        """
-        distributed = pytest.importorskip("distributed")
-        dates = ["2024-01-01", "2024-01-06"]
-        store_path = self._store(local_zarr_path, sample_reflectance_data, dates, name="rws_distributed")
-        original = open_store(store_path)["blue"].values.copy()
-
-        sub0 = _single_date_block("2024-01-01", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
-        sub1 = _single_date_block("2024-01-06", 9, height=200, width=360, n0=100, e0=250, chunks=ONE_BLOCK)
-        spatial = {"northing": slice(100, 300), "easting": slice(250, 610)}
-        with distributed.Client(processes=True, n_workers=2, threads_per_worker=1, dashboard_address=":0"):
-            write_regions(
-                store_path,
-                [(sub0, {"time": slice(0, 1), **spatial}), (sub1, {"time": slice(1, 2), **spatial})],
-            )
-
-        back = open_store(store_path)["blue"].values
-        for t in (0, 1):
-            assert (back[t, 100:300, 250:610] == 9).all()
-            mask = np.ones(back.shape[1:], dtype=bool)
-            mask[100:300, 250:610] = False
-            np.testing.assert_array_equal(back[t][mask], original[t][mask])
-
-    def test_rejects_chunk_overlapping_items(self, local_zarr_path, sample_reflectance_data):
-        """Two items whose widened regions share a Zarr chunk are rejected (no silent loss).
-
-        Same time index, two unaligned spatial boxes that both fall inside the
-        500x500 corner chunk — so each widens to 0:500 x 0:500 and they collide
-        in chunk space. Nothing must be committed.
-        """
-        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rws_overlap")
-        original = open_store(store_path)["blue"].values.copy()
-
-        a = _single_date_block("2024-01-01", 7, height=200, width=100, n0=0, e0=0, chunks=ONE_BLOCK)
-        b = _single_date_block("2024-01-01", 8, height=200, width=100, n0=0, e0=200, chunks=ONE_BLOCK)
-        with pytest.raises(ValueError, match="not chunk-disjoint"):
-            write_regions(
-                store_path,
-                [
-                    (a, {"time": slice(0, 1), "northing": slice(0, 200), "easting": slice(0, 100)}),
-                    (b, {"time": slice(0, 1), "northing": slice(0, 200), "easting": slice(200, 300)}),
-                ],
-            )
-        np.testing.assert_array_equal(open_store(store_path)["blue"].values, original)
-
-    def test_partial_region_writes_omitted_dim_in_full(self, local_zarr_path, sample_reflectance_data):
-        """A region omitting a dim writes that dim in full (the slice(None) path).
-
-        ``easting`` is absent from both regions, so each item covers the store's
-        full easting span; disjointness comes from the distinct time indices.
-        """
-        dates = ["2024-01-01", "2024-01-06"]
-        store_path = self._store(local_zarr_path, sample_reflectance_data, dates, name="rws_partial")
-        original = open_store(store_path)["blue"].values.copy()
-
-        full0 = _single_date_block("2024-01-01", 5, height=500, width=1000, n0=0, e0=0, chunks=ONE_BLOCK)
-        full1 = _single_date_block("2024-01-06", 6, height=500, width=1000, n0=0, e0=0, chunks=ONE_BLOCK)
-        write_regions(
-            store_path,
-            [
-                (full0, {"time": slice(0, 1), "northing": slice(0, 500)}),
-                (full1, {"time": slice(1, 2), "northing": slice(0, 500)}),
-            ],
-        )
-
-        back = open_store(store_path)["blue"].values
-        assert (back[0, 0:500, :] == 5).all()
-        assert (back[1, 0:500, :] == 6).all()
-        # Northing remainder of each written date untouched.
-        np.testing.assert_array_equal(back[0, 500:, :], original[0, 500:, :])
-        np.testing.assert_array_equal(back[1, 500:, :], original[1, 500:, :])
-
-    def test_omitted_dim_source_stays_on_store_chunk_grid(self, local_zarr_path, sample_reflectance_data):
-        """A dim omitted from the region is rechunked to the store grid, not one block.
-
-        ``easting`` is absent, so the item covers the full 1000-wide axis. The
-        source dask array must split that axis on the store's 500-chunk grid
-        (two blocks) rather than coalescing it into one full-axis block — a
-        full-axis block would destroy store-grid parallelism and can OOM a
-        worker on large stores.
-        """
-        store_path = self._store(local_zarr_path, sample_reflectance_data, ["2024-01-01"], name="rws_grid")
-        full = _single_date_block("2024-01-01", 5, height=500, width=1000, n0=0, e0=0, chunks=ONE_BLOCK)
-
-        repo = _open_repo(store_path)
-        session = repo.writable_session("main")
-        existing = open_store(store_path)
-        group = open_store_as_zarr_group(store_path)
-        try:
-            fork = session.fork()
-            sources, _targets, _regions, _widened = _aligned_region_sources(
-                existing, [(full, {"time": slice(0, 1), "northing": slice(0, 500)})], fork, group
-            )
-        finally:
-            existing.close()
-
-        # SPLIT_CHUNKS easting == 500 over a 1000-wide axis -> two blocks of 500.
-        easting_axis = 2  # (time, northing, easting)
-        assert sources[0].chunks[easting_axis] == (500, 500)
-
-
 class TestDefaultRepoConfig:
     """No chunk-cache override is applied; max_concurrent_requests stays optional.
 
@@ -1228,3 +1042,25 @@ class TestDefaultRepoConfig:
     def test_returns_config_not_none_by_default(self):
         # Must always build a config even when no cap is passed.
         assert _default_repo_config() is not None
+
+    def test_storage_timeouts_and_retries_applied(self):
+        # Every repo open inherits finite per-attempt timeouts and a backed-off
+        # retry budget so a wedged socket fails the attempt instead of hanging
+        # forever (see context_docs/design/region-merge.md → "Hang protection").
+        storage = _default_repo_config().storage
+        assert storage is not None
+        assert storage.timeouts.connect_timeout_ms == _DEFAULT_CONNECT_TIMEOUT_MS
+        assert storage.timeouts.read_timeout_ms == _DEFAULT_READ_TIMEOUT_MS
+        assert storage.timeouts.operation_attempt_timeout_ms == _DEFAULT_OPERATION_ATTEMPT_TIMEOUT_MS
+        assert storage.retries.max_tries == _DEFAULT_STORAGE_MAX_TRIES
+        assert storage.retries.initial_backoff_ms == _DEFAULT_STORAGE_INITIAL_BACKOFF_MS
+        assert storage.retries.max_backoff_ms == _DEFAULT_STORAGE_MAX_BACKOFF_MS
+
+    def test_timeouts_compose_with_concurrency_cap(self):
+        # The cap and the storage timeouts must coexist in one config — setting the
+        # concurrency cap must not drop the hang-protection settings.
+        config = _default_repo_config(max_concurrent_requests=64)
+        assert config.max_concurrent_requests == 64
+        assert config.storage is not None
+        assert config.storage.timeouts.read_timeout_ms == _DEFAULT_READ_TIMEOUT_MS
+        assert config.storage.retries.max_tries == _DEFAULT_STORAGE_MAX_TRIES
