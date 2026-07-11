@@ -53,6 +53,10 @@ dependencies = [
     "python-dotenv",
     "numpy",
     "pandas",
+    # Powers the region-merge CPU-stall watchdog (storage/region_merge.py):
+    # system-wide busy-CPU sampling to tell a wedged worker pool from a large
+    # but progressing copy. Core to the merge, so it lives in the base install.
+    "psutil",
 ]
 
 [project.optional-dependencies]

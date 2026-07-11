@@ -5,9 +5,10 @@
 > `_aligned_region_sources`, built on `icechunk.dask.store_dask`) was **removed**
 > as unused: its `O(runs × bands × spatial_chunks)` Dask task graph — built
 > single-threaded on the flow runner before any compute — made continental merges
-> take days. Its replacement — a process-parallel raw-Zarr region merge, no Dask —
-> lands in a stacked follow-up PR. The `store_dask` references in §3.2, §5.4, and
-> the §5.4 update note below are retained as history; the code they describe no
+> take days. Batch merging of many grid-aligned stores into one master is now
+> `storage/region_merge.py` — process-parallel raw-Zarr chunk writes, no Dask — see
+> [`region-merge.md`](region-merge.md). The `store_dask` references in §3.2, §5.4,
+> and the §5.4 update note below are retained as history; the code they describe no
 > longer exists.
 
 Design + implementation plan for adding **region-scoped writes** (overwrite a
