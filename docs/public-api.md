@@ -67,9 +67,16 @@ rather than re-exported from the top-level package:
   checker. Run via
   `python -m tessera_embeddings.architecture_tests --source path/`.
 - `tessera_embeddings.storage` — Icechunk/Zarr store management:
-  `zarr_store` (open / create / append / region-write) and
+  `zarr_store` (open / create / append / region-write),
   `empty_store` (all-fill store seeding — `create_empty_store`,
-  `create_empty_store_from_coords`, `VarSpec`, `daily_times`).
+  `create_empty_store_from_coords`, `VarSpec`, `daily_times`),
+  `region_merge` (no-cluster merge of grid-aligned stores into a master —
+  `merge_stores` (the full seed→merge→cleanup driver),
+  `merge_feature_into_master`, `gather_time_union`, `read_master_axes`,
+  `read_store_times`, `delete_store`). The `merge-mosaic` flow
+  (`orchestration.prefect.flows.merge_mosaic`) is a thin deployment wrapper over
+  `merge_stores`. See the how-to [`docs/region-merge.md`](region-merge.md) and the
+  design [`context_docs/design/region-merge.md`](../context_docs/design/region-merge.md).
 
 ## Privacy conventions
 

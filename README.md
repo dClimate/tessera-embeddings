@@ -282,7 +282,7 @@ src/tessera_embeddings/
   config/                pydantic config models
   ingest/                STAC ingestion, ROI rasterization, auth
   inference/             GPU inference (Ray actors, work-stealing scheduler)
-  storage/               Zarr stores, manifests, empty-store seeding
+  storage/               Zarr stores, manifests, empty-store seeding, region merge
   orchestration/
     concurrency.py       sliding_window_submit — shared by flows + runners
     prefect/             Prefect — 100% quarantined here
@@ -299,6 +299,9 @@ src/tessera_embeddings/
 
 - [`docs/quickstart.md`](docs/quickstart.md) — laptop demo
   end-to-end, including GPU inference.
+- [`docs/region-merge.md`](docs/region-merge.md) — sparsely
+  populating and maintaining a large ROI by merging many regional
+  mosaics into one master store (the multiple-regional-inserts use case).
 - [`docs/environment-setup.md`](docs/environment-setup.md) — lock
   files, CUDA variants, uv setup.
 - [`docs/configuration.md`](docs/configuration.md) — the pydantic
