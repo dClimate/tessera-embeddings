@@ -42,28 +42,37 @@ to master row/column `i`. It is the **caller's** responsibility, established whe
 the region stores are produced — not something the merge can retrofit.
 
 The reliable way to guarantee it: derive every region grid from the master grid.
-Given the master's `odc.geo` geobox (from `read_roi_metadata(master_roi_path).geobox`),
-snap each region to a window of it:
+The `ingest.feature_grid` module does exactly this — given a GeoJSON of regions and
+the master's `odc.geo` geobox (from `read_roi_metadata(master_roi_path).geobox`), it
+snaps each feature to a grid-aligned window of the master and rasterizes it into a
+mask the ingest path reads:
 
 ```python
-from odc.geo.geom import Geometry
+from tessera_embeddings.ingest.feature_grid import (
+    load_features, assert_features_disjoint, feature_window, rasterize_feature_roi,
+)
 
-window = master_geobox.enclosing(Geometry(region_geometry, crs=master_geobox.crs))
-yroi, xroi = master_geobox.overlap_roi(window)     # clamp to the master extent
-sub_geobox = master_geobox[yroi, xroi]             # exact pixel-subset, by construction
-# ...ingest / write the region onto sub_geobox.coordinates...
+features = load_features(geojson, target_crs=master.native_crs, id_property="tile_id")
+assert_features_disjoint(features)                       # region writes overwrite — disjoint required
+for feat in features:
+    sub_geobox = feature_window(master.geobox, feat.geometry)   # exact pixel-subset, by construction
+    rasterize_feature_roi(f"{roi_base}/{feat.feature_id}.zarr",
+                          master_geobox=master.geobox, feature=feat)
+    # ...ingest the region onto that ROI, producing a store on sub_geobox's grid...
 ```
 
-`enclosing` snaps the geometry's bounds outward to whole master pixels sharing the
-master's origin and resolution, so the sub-geobox's coordinates are an exact subset
-of the master's. Regions must also be **disjoint** (region writes overwrite, so two
-regions covering the same master cell would last-writer-win).
+`feature_window` uses `master_geobox.enclosing`, which snaps the geometry's bounds
+outward to whole master pixels sharing the master's origin and resolution, so the
+window's coordinates are an exact subset of the master's. `assert_features_disjoint`
+enforces the no-overlap requirement (region writes overwrite, so two regions
+covering the same master cell would last-writer-win).
 
 `merge_stores`/`merge_feature_into_master` *validate* the snap (extent, coordinate
 alignment to a quarter-pixel, dtype, chunking) and raise a clear `ValueError` if a
-region is not snapped — but they cannot fix it. Automating this (a production
-fan-out that snaps regions from a GeoJSON and dispatches per-region ingests) is
-planned but not yet in this repo; see "Producing the region stores" below.
+region is not snapped — but they cannot fix it. The `feature_grid` helpers above
+guarantee it. Wrapping them into a single fan-out flow (load a GeoJSON → snap +
+rasterize each → dispatch one ingest per region → gate → merge) is planned but not
+yet in this repo; see "Producing the region stores" below.
 
 ## The recipe
 
@@ -169,12 +178,15 @@ Passed through `merge_stores` (and the flow) to each region's copy:
 
 The merge consumes region stores; producing them is upstream of this page.
 Anything that writes a `(time, northing, easting)` Zarr on the master grid — i.e.
-onto a `master_geobox.enclosing(geom)` window (see the precondition above) — is a
-valid region. The real path is a per-region satellite ingest: run the S2/S1 ingest
-(see [quickstart.md](quickstart.md)) once per region against its snapped ROI, then
-merge the results here.
+onto a `feature_window(master_geobox, geom)` (see the precondition above) — is a
+valid region. The real path is a per-region satellite ingest: snap + rasterize each
+region's ROI with `ingest.feature_grid`, run the S2/S1 ingest (see
+[quickstart.md](quickstart.md)) once per region against that ROI, then merge the
+results here. `feature_grid.classify_store` / `classify_mask` give the
+skip/re-run/manual-curation triage a fan-out needs.
 
-Orchestrating that fan-out (load a GeoJSON of regions → snap each to the master
-grid → dispatch one ingest per region → gate → merge) is planned but not yet in
-this repo. Until then, produce the snapped region stores with your own loop and
-pass their paths to `merge_stores`.
+`feature_grid` is the geometry + triage **foundation**; wrapping it into a single
+fan-out flow (load a GeoJSON → snap + rasterize each → dispatch one ingest per
+region → gate → merge) is planned but not yet in this repo. Until then, drive that
+loop yourself with the `feature_grid` helpers and pass the resulting store paths to
+`merge_stores`.

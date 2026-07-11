@@ -1,4 +1,11 @@
-"""Sliding-window concurrent submission, orchestrator-agnostic.
+"""Orchestrator-agnostic concurrency primitives.
+
+Two tools, neither importing Prefect:
+
+* :func:`sliding_window_submit` — bounded fan-out over any Future-like submitter
+  (Prefect task, thread pool, plain runner).
+* :class:`DispatchThrottle` — bounded-concurrency + rate-paced launcher for a burst
+  of async dispatches against a rate-limited backend (e.g. many deployment runs).
 
 The reference repo's flow utilities ship a Prefect-only
 ``sliding_window_submit`` that calls ``task_fn.submit(**kwargs)``. We
@@ -34,10 +41,13 @@ This module imports nothing from Prefect.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
+import random
 import threading
-from collections.abc import Callable, Iterable
-from typing import Any, Protocol
+import time
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any, Protocol, TypeVar
 
 
 class _Future(Protocol):
@@ -119,3 +129,80 @@ def sliding_window_submit[K](
             future.add_done_callback(_on_done)
 
     return completed
+
+
+# --------------------------------------------------------------------------- #
+# Rate-limited async dispatch throttle
+# --------------------------------------------------------------------------- #
+
+# Minimum seconds between two consecutive dispatch launches. Bounds the launch
+# rate to ≈ 1 / this — sized comfortably under a backend's sustained API rate so a
+# wide fan-out never trips it (e.g. ECS RegisterTaskDefinition throttling when a
+# flow fans out many deployment runs at once).
+DISPATCH_MIN_INTERVAL_SEC = 1.0
+
+# Upper bound (seconds) on the extra uniform random jitter added to each launch
+# interval, so launches are not perfectly periodic (which could resonate with
+# another actor dispatching on the same beat). Launches end up spaced
+# DISPATCH_MIN_INTERVAL_SEC .. DISPATCH_MIN_INTERVAL_SEC + DISPATCH_JITTER_SEC apart.
+DISPATCH_JITTER_SEC = 2.0
+
+_T = TypeVar("_T")
+
+
+class DispatchThrottle:
+    """Bound concurrency and pace the launch rate of many async dispatches.
+
+    For fan-outs that fire a burst of asynchronous calls (e.g. dispatching many
+    deployment runs via a Prefect ``arun_deployment``) against a backend with an
+    API rate limit. Firing in lockstep trips the limit; this owns the mitigation in
+    one place so every fan-out gets it rather than re-implementing per-call jitter.
+    It:
+
+    * caps how many dispatches are in flight at once (a semaphore), and
+    * **paces the launch moments** — it serialises the instants dispatches are
+      released so consecutive launches are at least :data:`DISPATCH_MIN_INTERVAL_SEC`
+      apart, plus uniform random jitter up to :data:`DISPATCH_JITTER_SEC`. The
+      guaranteed minimum interval bounds the call rate deterministically — unlike a
+      bare per-dispatch random sleep, it does not cluster when many semaphore slots
+      free simultaneously.
+
+    This is deterministic pacing, **not** retry machinery — no backoff loop, no
+    catch of the throttle exception. Pure asyncio (no Prefect, no boto3): callers
+    pass a zero-arg coroutine factory that performs the actual dispatch, so the
+    dispatch surface stays patchable under test. Construct one per fan-out; it is
+    single-event-loop and lives for the duration of one run.
+    """
+
+    def __init__(self, max_concurrency: int) -> None:
+        self._sem = asyncio.Semaphore(max_concurrency)
+        # Serialises the pacing computation+sleep so launches are released one at a
+        # time, each at least an interval after the previous.
+        self._gate = asyncio.Lock()
+        # Monotonic instant the next launch is allowed. 0.0 ⇒ the first launch is
+        # immediate (it never waits).
+        self._next_at = 0.0
+
+    async def run(self, launch: Callable[[], Awaitable[_T]]) -> _T:
+        """Acquire a concurrency slot, pace the launch, then await ``launch()``.
+
+        ``launch`` is a zero-arg callable returning the dispatch awaitable (e.g.
+        ``lambda: arun_deployment(ref, parameters=params)``). The dispatches still
+        run concurrently up to the semaphore; the throttle only staggers the
+        *moments* they start.
+        """
+        async with self._sem:
+            await self._pace()
+            return await launch()
+
+    async def _pace(self) -> None:
+        """Block until this dispatch's paced launch slot, holding the gate so
+        siblings queue behind it and inherit the next slot.
+        """
+        async with self._gate:
+            now = time.monotonic()
+            wait = self._next_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now += wait
+            self._next_at = now + DISPATCH_MIN_INTERVAL_SEC + random.uniform(0, DISPATCH_JITTER_SEC)

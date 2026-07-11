@@ -11,13 +11,16 @@ runtime. We verify three behaviours:
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
 import pytest
 
-from tessera_embeddings.orchestration.concurrency import sliding_window_submit
+from tessera_embeddings.orchestration import concurrency
+from tessera_embeddings.orchestration.concurrency import DispatchThrottle, sliding_window_submit
 
 
 def test_returns_one_pair_per_job() -> None:
@@ -102,3 +105,67 @@ def test_handles_empty_input() -> None:
             max_concurrent=4,
         )
     assert completed == []
+
+
+# --------------------------------------------------------------------------- #
+# DispatchThrottle
+# --------------------------------------------------------------------------- #
+
+
+def test_throttle_runs_all_dispatches() -> None:
+    """Every wrapped dispatch runs and its result is returned."""
+
+    async def main() -> list[int]:
+        throttle = DispatchThrottle(4)
+
+        async def job(i: int) -> int:
+            return i * 2
+
+        return await asyncio.gather(*(throttle.run(lambda i=i: job(i)) for i in range(10)))
+
+    assert sorted(asyncio.run(main())) == [i * 2 for i in range(10)]
+
+
+def test_throttle_caps_concurrency(monkeypatch) -> None:
+    """No more than ``max_concurrency`` dispatches are ever in flight at once."""
+    monkeypatch.setattr(concurrency, "DISPATCH_MIN_INTERVAL_SEC", 0.0)
+    monkeypatch.setattr(concurrency, "DISPATCH_JITTER_SEC", 0.0)
+
+    async def main() -> int:
+        throttle = DispatchThrottle(3)
+        in_flight = 0
+        peak = 0
+
+        async def job() -> None:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.02)
+            in_flight -= 1
+
+        await asyncio.gather(*(throttle.run(lambda: job()) for _ in range(12)))
+        return peak
+
+    assert asyncio.run(main()) <= 3
+
+
+def test_throttle_paces_launch_rate(monkeypatch) -> None:
+    """Consecutive launches are released at least the min interval apart, even when
+    the concurrency cap would otherwise let them all fire at once.
+    """
+    monkeypatch.setattr(concurrency, "DISPATCH_MIN_INTERVAL_SEC", 0.03)
+    monkeypatch.setattr(concurrency, "DISPATCH_JITTER_SEC", 0.0)
+
+    async def main() -> list[float]:
+        throttle = DispatchThrottle(10)  # not the limiter — pacing is
+        launched: list[float] = []
+
+        async def job() -> None:
+            launched.append(time.monotonic())
+
+        await asyncio.gather(*(throttle.run(lambda: job()) for _ in range(4)))
+        return launched
+
+    times = sorted(asyncio.run(main()))
+    gaps = [b - a for a, b in itertools.pairwise(times)]
+    assert all(g >= 0.025 for g in gaps), f"launches not paced: {gaps}"

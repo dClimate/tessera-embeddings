@@ -63,6 +63,10 @@ rather than re-exported from the top-level package:
 - `tessera_embeddings.orchestration.prefect.tasks` — thin task shells.
 - `tessera_embeddings.orchestration.runners.plain` — orchestrator-free
   YAML-driven pipeline runner.
+- `tessera_embeddings.orchestration.concurrency` — orchestrator-agnostic
+  concurrency primitives: `sliding_window_submit` (bounded fan-out over any
+  Future-like submitter) and `DispatchThrottle` (bounded-concurrency + rate-paced
+  launcher for a burst of async dispatches against a rate-limited backend).
 - `tessera_embeddings.architecture_tests` — reusable architecture-rule
   checker. Run via
   `python -m tessera_embeddings.architecture_tests --source path/`.
@@ -77,6 +81,12 @@ rather than re-exported from the top-level package:
   (`orchestration.prefect.flows.merge_mosaic`) is a thin deployment wrapper over
   `merge_stores`. See the how-to [`docs/region-merge.md`](region-merge.md) and the
   design [`context_docs/design/region-merge.md`](../context_docs/design/region-merge.md).
+- `tessera_embeddings.ingest.feature_grid` — rasterize FeatureCollection features
+  onto a shared master grid as exact pixel-subsets (the region-merge precondition):
+  `load_features`, `feature_window`, `assert_features_disjoint`,
+  `rasterize_feature_roi`, `rasterize_full_masked_roi`, plus store triage
+  (`classify_mask`, `classify_store` → `StoreDiagnosis`). The geometry foundation
+  for a fan-out that produces the per-region stores `merge_stores` merges.
 
 ## Privacy conventions
 
