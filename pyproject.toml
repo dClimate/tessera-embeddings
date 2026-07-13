@@ -99,6 +99,10 @@ dev = [
     "hypothesis",
     "vcrpy",
     "pytest-recording",
+    # Empty-store tests build grids from explicit affine transforms. affine
+    # arrives transitively via odc-geo, but the tests import it directly, so
+    # declare it.
+    "affine",
 ]
 
 [tool.uv.sources]

@@ -282,7 +282,7 @@ src/tessera_embeddings/
   config/                pydantic config models
   ingest/                STAC ingestion, ROI rasterization, auth
   inference/             GPU inference (Ray actors, work-stealing scheduler)
-  storage/               Zarr stores, manifests
+  storage/               Zarr stores, manifests, empty-store seeding
   orchestration/
     concurrency.py       sliding_window_submit — shared by flows + runners
     prefect/             Prefect — 100% quarantined here
