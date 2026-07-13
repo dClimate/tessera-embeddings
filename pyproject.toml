@@ -31,7 +31,7 @@ dependencies = [
     "dask",
     "distributed",
     "zarr",
-    "icechunk",
+    "icechunk>=2.1.1",
     "fsspec",
     "odc-stac",
     "odc-geo",
@@ -103,6 +103,13 @@ dev = [
     # arrives transitively via odc-geo, but the tests import it directly, so
     # declare it.
     "affine",
+]
+# Standalone scale-test benchmarks under scripts/scale_tests/ (NOT pytest).
+# Kept out of the package deps: only needed to *run* the scale campaign.
+scale-tests = [
+    "psutil",  # RSS sampling for commit-memory metrics
+    "boto3",  # T7 raw-PUT ramp + S3 results mirror
+    "s3fs",  # fsspec S3 backend for object_stats / store I/O on --backend s3
 ]
 
 [tool.uv.sources]

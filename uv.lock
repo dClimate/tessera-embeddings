@@ -4516,6 +4516,11 @@ dev = [
     { name = "ruff" },
     { name = "vcrpy" },
 ]
+scale-tests = [
+    { name = "boto3" },
+    { name = "psutil" },
+    { name = "s3fs" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -4574,6 +4579,11 @@ dev = [
     { name = "pytest-xdist" },
     { name = "ruff" },
     { name = "vcrpy" },
+]
+scale-tests = [
+    { name = "boto3" },
+    { name = "psutil" },
+    { name = "s3fs" },
 ]
 
 [[package]]

@@ -17,10 +17,15 @@ context_docs/
 │   ├── 004-duck-typed-providers.md
 │   ├── 005-multi-lock-file-strategy.md
 │   ├── 006-adapter-policy.md
-│   └── 007-native-cmr-granule-query.md
+│   ├── 007-icechunk-chunk-cache-disabled.md
+│   ├── 007-native-cmr-granule-query.md
+│   └── 008-global-store-architecture.md
 └── design/           Long-form framing docs (ported from planning)
+    ├── global-store-test-impl-spec.md
+    ├── global-store-test-plan.md
     ├── open_sourcing_conceptual_background.md
-    └── orchestration_infra_leakage_audit.md
+    ├── orchestration_infra_leakage_audit.md
+    └── region-writes.md
 ```
 
 ## How to read these

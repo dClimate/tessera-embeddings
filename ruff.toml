@@ -61,4 +61,7 @@ convention = "google"
 "tests/**/*.py" = ["ANN", "ARG", "RUF059", "F841", "D102", "D103", "N803", "N806", "C408"]
 "examples/**/*.py" = ["T201"]
 "scripts/**/*.py" = ["T201"]
+# Scale-test benchmarks use conventional short module aliases (V=variants,
+# SB=store_builder) that read well across these many-call scripts.
+"scripts/scale_tests/**/*.py" = ["N812"]
 "src/tessera_embeddings/architecture_tests/**/*.py" = ["T201"]
