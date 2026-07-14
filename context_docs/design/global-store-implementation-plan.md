@@ -71,9 +71,27 @@ new `storage/zone_grid.py`.*
     (when computed) mirrors `scales`.
 - **`storage/zone_grid.py`**: the 120-zone registry — group name, EPSG
   (326xx N / 327xx S), pixel grid (10 m), northing/easting extents snapped to
-  the 20,480 m shard pitch, coord-array builders. Proposed defaults (OPEN
-  QUESTION #1): easting 166,000–834,000 m; northing N 0–9,331,200 m (84°N),
-  S 1,105,920–10,000,000 m (80°S); group names = EPSG code strings (`"32601"`).
+  the 20,480 m shard pitch, coord-array builders. **Extents are derived from an
+  authoritative source, not hand-typed (Q1, resolved):** each EPSG:326xx/327xx
+  CRS carries its official area-of-use in the EPSG registry, which we already
+  ship via `pyproj` (`CRS.area_of_use` → project → snap outward to shard
+  pitch). A small generator script emits the registry table into
+  `zone_grid.py`, and a pinning test asserts the values against pyproj so an
+  EPSG-database bump can't silently move the grid. (This is the "reference UTM
+  grid from an authoritative source" — the EPSG dataset itself; it needs no
+  vendored GeoJSON. If the partner later supplies a specific grid file, the
+  generator regenerates from that instead.) Expected values ≈ easting
+  166,000–834,000 m; northing N 0–9,331,200 m (84°N), S 1,105,920–10,000,000 m
+  (80°S). Group names = EPSG code strings (`"32601"`).
+  **Boundary policy (default, veto-able):** pure nominal 6° longitude bands —
+  disjoint coverage, every pixel-center belongs to exactly one zone; the
+  Norway/Svalbard MGRS width exceptions (32V, 31X–37X) are NOT honored (they
+  exist for navigation, not data grids, and would make zone extents irregular
+  for no storage benefit).
+- **Annual time axis (Q2, resolved):** one timestep per calendar year,
+  timestamped `YYYY-01-01T00:00:00` (int64 ns, `TIME_ENCODING`), with a
+  group-level `time_convention: "calendar_year"` attr replacing the per-run
+  `12mo_window_end` convention for the global store.
 
 ### W2 — Group-aware storage primitives
 
@@ -118,7 +136,7 @@ new `storage/zone_grid.py`.*
 - **Commit gate**: `CommitGate` protocol + in-process semaphore impl, default
   cap **6** (middle of the run-1-mandated 4–8). Cross-machine gating for the
   real campaign belongs to the orchestrator (Prefect global concurrency limit
-  on the commit step — OPEN QUESTION #5); the library primitive enforces it
+  on the commit step — confirmed home, Q5); the library primitive enforces it
   within a process and documents the contract.
 
 ### W4 — Assembly rewritten on vanilla Zarr (the big one)
@@ -157,8 +175,8 @@ entirely.
    — workers get it explicitly).
 5. **Parity gate before the old engine is deleted:** run old vs new assembly on
    the same staged inputs (plain runner, small ROI); assert value-identical
-   arrays and equivalent attrs. Recommend wholesale deletion after parity
-   (OPEN QUESTION #3).
+   arrays and equivalent attrs. The old engine is then **deleted outright**
+   (Q3, resolved) — no compatibility flag.
 
 Memory envelope: ~1–1.5 GB per worker (staged read + shard block); 8 workers
 ≈ 12 GB — fine on current runners, far below the Dask cluster footprint.
@@ -224,20 +242,31 @@ the assembly engine.
 - **Upstream watch** — zarr PR #3004 (partial-shard reads) only helps reads;
   icechunk #1600/#1558 don't bite at our commit sizes (verified flat, run 1).
 - **Cross-machine commit gating** is orchestration-level; the library cap alone
-  doesn't protect a 120-job fleet (documented contract, OPEN QUESTION #5).
+  doesn't protect a 120-job fleet (documented contract; Prefect global
+  concurrency limit owns fleet-level gating — Q5, resolved).
 
-## 5. Open questions (tracked; answers fold into W1–W5)
+## 5. Questions — resolved 2026-07-14
 
-1. **Zone grid spec** — exact per-zone northing/easting extents and group
-   naming; partner conventions? (Proposed defaults in W1.)
-2. **Annual time coordinate** — `YYYY-01-01` timestamps, or the existing
-   `12mo_window_end` convention? (Affects the seeded axis + `time_convention`
-   attr.)
-3. **Delete the Dask assembly engine after parity, or keep behind a flag for
-   one release?** (Recommend delete.)
-4. **Global-store variable set** — embeddings + scales + obs counts
-   (+ `embedding_std` when computed), all sharded? (Assumed yes.)
-5. **Campaign orchestration home** — Prefect (yield-embeddings) global
-   concurrency limit as the cross-machine commit gate? (Assumed yes.)
-6. **Single-ROI default layout** — keep `LEGACY` as the default for existing
-   entry points (strict D8), with `GLOBAL_V1` opt-in? (Assumed yes.)
+1. **Zone grid spec** → derive from an authoritative source: the **EPSG
+   registry** (each zone CRS's official area-of-use, via `pyproj`), projected
+   and snapped to shard pitch; generator + pinning test; no vendored grid file
+   unless the partner supplies one. Group names = EPSG code strings.
+2. **Annual time coordinate** → `YYYY-01-01` calendar-year timestamps
+   (`time_convention: "calendar_year"`).
+3. **Dask assembly engine** → **deleted outright** after the parity gate.
+4. **Global-store variable set** → confirmed: embeddings + scales + obs counts
+   (+ `embedding_std` when computed), all sharded on the same 2048² grid.
+5. **Cross-machine commit gate** → Prefect global concurrency limit
+   (yield-embeddings side); library ships the in-process primitive + contract.
+6. **Single-ROI default layout** → `LEGACY` stays the default for single-ROI
+   entry points; `GLOBAL_V1` is opt-in (strict D8).
+
+### Remaining defaults (proceeding unless vetoed)
+
+- **Zone boundary policy:** pure nominal 6° longitude bands, disjoint, no
+  Norway/Svalbard MGRS exceptions (see W1). Navigation conventions, not data
+  conventions.
+- **Campaign land mask (W5 input):** the source of "which chunks get inference"
+  per zone (Natural Earth / OSM land polygons / partner-supplied) is a
+  campaign-ops choice needed before the first zone fill, **not** before PRs
+  1–4; the zone-fill runner takes it as an input.
