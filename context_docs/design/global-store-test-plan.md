@@ -6,8 +6,13 @@ decision there. The tests are **interlocking scripts** sharing one harness,
 one metrics schema, and each other's artifacts — designed so results compose
 into the decision matrix at the bottom rather than being one-off experiments.
 
-Status: plan only. Scripts to be written under `scripts/scale_tests/`
-(standalone, not pytest — they run for hours against real S3 and cost money).
+> **Status: EXECUTED, scoping concluded (2026-07-14).** All scripts are
+> implemented under `scripts/scale_tests/` (T0–T8) and have run on S3 bench
+> (`run1`, `d3`, `d3v2`). Every decision D1–D9 is now FIRM — see ADR-008's
+> "Conclusion" for the settled architecture. The one deferred item is GC
+> duration at 10⁸-object scale (D7), to be measured against a large repo before
+> the production GC cadence is fixed. The plan below is retained as the method of
+> record and as a regression harness.
 
 ---
 

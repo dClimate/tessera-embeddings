@@ -1,5 +1,14 @@
 # D3 settlement plan — shard or not shard the global embeddings store
 
+> **RESOLVED (2026-07-14): ADOPT `c256_sharded`, and shard `scales` too.** Runs
+> `d3` + `d3v2` (t8) passed all gates: reads leaner *and* faster (wire 1.23 vs
+> 8.69 MB/pt, reproducible; scattered p95 131 vs 217 ms), the shard-aligned +
+> land-masked writer builds at **0.46×** the unsharded time with lean ~3.5 GB
+> shards, and the embeddings array consolidates 403→9 objects (post-GC). E4 also
+> showed the object-count win is capped unless `scales` is sharded too, so it is.
+> Production writer must be shard-aligned + land-masked. See ADR-008 D3 for the
+> full write-up; the plan below is retained as the method of record.
+
 Companion to ADR-008 decision **D3**. Run 1 flipped sharding from "optional,
 probably not" to "strong contender" — this plan defines the experiments that
 turn that into a decision, the criteria for calling it, and the tooling

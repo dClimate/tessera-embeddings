@@ -1,22 +1,27 @@
 # 008 — Global embeddings store: architecture decisions
 
-**Status:** Provisional — decision register below marks each decision FIRM or
-PENDING a named test in the companion test plan
-(`context_docs/design/global-store-test-plan.md`). Supersede individual
-decisions with follow-up ADRs as test evidence lands.
+**Status:** **Accepted — scoping concluded (2026-07-14).** All decisions
+D1–D9 are FIRM, each backed by S3-bench evidence from runs `run1`, `d3`, and
+`d3v2` (test program in `context_docs/design/global-store-test-plan.md`). One
+operational measurement is explicitly *deferred, not blocking* — GC duration at
+10⁸-object scale (D7) — to be taken against a large repo before/while the
+campaign runs. The next work is **implementation** of the group-aware, sharded,
+land-masked write path, not further scoping. Supersede individual decisions with
+follow-up ADRs only if production reveals something these runs didn't.
 
-**Run 1 (2026-07-14, S3 bench, icechunk 2.1.1, `arbol-tessera-embeddings-dev`):**
-full T0–T7 pass **including the 5-variant T1 sweep** — moved **D1**, **D2**,
-**D4** to FIRM, added a hard commit-concurrency constraint to **D5/D6**,
-validated the D7 mechanism.
+**Evidence runs (all 2026-07-14, S3 bench, icechunk 2.1.1,
+`arbol-tessera-embeddings-dev`):**
+- `run1` — full T0–T7 incl. the 5-variant T1 sweep → D1, D2, D4 FIRM;
+  D5/D6 commit-concurrency constraint; D7 mechanism validated.
+- `d3` / `d3v2` — t8 sharding experiments (E1–E4), the second with the
+  land-masked production writer → **D3 FIRM: adopt `c256_sharded`, shard
+  `scales` too.** Reads are leaner *and* faster (wire 1.23 vs 8.69 MB/pt,
+  reproducible; scattered p95 131 vs 217 ms); the masked writer is **0.46×** the
+  unsharded build (the run-1 2.8× was unaligned RMW) and writes lean shards
+  (~3.5 GB, ocean elided); the embeddings array consolidates 403→9 objects.
 
-**Run d3 (2026-07-14, t8 experiments) settled the last open decision, D3:**
-**adopt `c256_sharded`** — E1 showed lean partial reads (1.23 vs 8.74 MB/pt),
-E2 showed shard-*aligned* writes are 0.6× the unsharded build (the 2.8× was
-unaligned RMW), E3 showed scattered reads still favor sharding. D3 is FIRM with
-two production-writer conditions (shard-aligned + land-masked; post-GC object
-count). All decisions D1–D9 are now FIRM. See "Run 1 evidence" and the D3 body
-for numbers.
+See the "Conclusion" section at the bottom for the final architecture in one
+place, and "Run evidence" for the full numbers.
 
 ## Context
 
@@ -119,7 +124,7 @@ bytes per pixel and read slower (384/500 ≈ 334–339 ms). The current
 refs. Going below 256 px isn't worth it (below the 3–15 MB optimum, 4× more
 refs). So: 256 px spatial, full 128-band dim, int8+zstd. FIRM.
 
-### D3 — Sharding: **ADOPT `c256_sharded`** (FIRM — confirmed by t8 run d3; production writer must be shard-aligned + land-masked)
+### D3 — Sharding: **ADOPT `c256_sharded`; shard `scales` too** (FIRM — confirmed by t8 runs d3 + d3v2; production writer is shard-aligned + land-masked)
 
 Zarr v3 sharding works in icechunk (fixed v1.0.3, caveat-free since 2.0.0,
 requires zarr-python ≥ 3.1.2). Inner chunks per D2 (256 px), shards ~2048² px
@@ -145,37 +150,44 @@ Run 1's one strike — **build 2.8× slower** (420 s vs 152 s) — looked like a
 dealbreaker but was an artifact of writing 256-px chunks that dribble into
 2048² shards (read-modify-write churn).
 
-**Run d3 (t8) settled it — all three decision gates pass:**
+**Runs `d3` + `d3v2` (t8) settled it — all decision gates pass, and the `d3v2`
+run confirmed them with the production (land-masked) writer:**
 
 - **E1 (wire bytes, the gate):** sharded fetched **1.23 MB/point** off the NIC
-  vs full's **8.74 MB**, and was faster (p95 169 vs 249 ms). Sharding does lean
-  *partial* reads — the whole-shard-fetch fear is dead (the run-1 16.5 MB
-  analytic figure was an artifact).
-- **E2 (write penalty, the crux):** shard-**aligned** build ≈ 12 s vs unsharded
-  full ≈ 19 s (**0.6×**) — vs sharded-*chunkwise* ≈ 38 s (2×). The 2.8× was pure
-  unaligned RMW; aligned writes are *faster* than unsharded (9 big sequential
-  shard PUTs beat 400 small ones). Penalty ≪ the 1.5× bar.
-- **E3 (scattered reads):** sharded scattered p95 **124 ms vs full 211 ms** —
+  vs full's **8.69 MB**, faster (p95 164 vs 267 ms) — and **reproducible** (1.23
+  in both `d3` and `d3v2`). Sharding does lean *partial* reads; the whole-shard-
+  fetch fear is dead (the run-1 16.5 MB analytic figure was an artifact).
+- **E2 (write penalty, the crux):** the shard-aligned + land-**masked** writer
+  builds in **0.46×** the unsharded time (~8.3 s vs ~18 s) and writes **lean
+  shards ~3.5 GB** (vs the dense-aligned mode's 12.6 GB — ocean inner chunks are
+  elided as designed). The run-1 2.8× penalty was pure unaligned RMW; aligned
+  masked writes are *faster* than unsharded (9 big shard PUTs beat 400 small).
+- **E3 (scattered reads):** sharded scattered p95 **131 ms vs full 217 ms** —
   better even under a cache-hostile pattern (rule only asked for within 1.2×).
+- **E4 (object count, post-GC):** the embeddings array consolidates **403 → 9
+  objects** with the masked writer (no churn); chunkwise sharding churns
+  (808 → 414 after GC reclaims the RMW debris). Confirms the object-count win is
+  real and requires shard-aligned writes.
 
-**Decision: ADOPT `c256_sharded`.** Reads are leaner *and* faster (even
-scattered), object count drops, and the write penalty vanishes with alignment.
+**Decision: ADOPT `c256_sharded` — and shard `scales` the same way.** All gates
+met (write 0.46× ≤ 1.5×; scattered p95 better than full). Two writer facts fixed
+by the evidence:
 
-**Two production-writer conditions (implementation requirements, not decision
-blockers):**
-1. The zone-fill writer must be **shard-aligned *and* land-masked** — write real
-   data into land inner chunks and leave ocean inner chunks at fill so the codec
-   elides them (one lean shard object per shard; no dense-nodata cost). t8's
-   dense-aligned mode wrote 12.6 GB vs full's 3.46 GB *because the test filled
-   ocean with synth*; the masked writer (`fill_year_shard_aligned(land_chunks=…)`)
-   avoids that. Re-run t8 E2/E4 with the masked mode to confirm lean shards.
-2. Quote object-count reduction from a **post-GC** count (t8 E4 now does
-   pre/post-GC) — the raw `chunks/` count is inflated by RMW churn + the
-   unsharded `scales` array; manifest bytes already trend down (9976 vs 17790).
+1. **The production writer must be shard-aligned + land-masked** (real data into
+   land inner chunks, ocean left at fill so the codec elides it → one lean shard
+   object per shard, no RMW, no dense-nodata). Confirmed by `d3v2` (0.46× build,
+   ~3.5 GB shards). The assembly writer must emit whole shards, never dribble
+   inner chunks.
+2. **`scales` must also be sharded.** `d3v2` E4 showed the store's object count
+   capped at ~414 by the *unsharded* `scales` array even after embeddings
+   consolidated to 9 objects — `scales` is `(time, y, x)` with one chunk per
+   spatial tile, i.e. the *same* object count as embeddings, so leaving it
+   unsharded forfeits half the object-count win (the very thing that justifies
+   sharding). Shard `scales` in the same 2048² shards. This follows from E1–E4 +
+   object-count arithmetic; it wasn't separately benchmarked because the codec
+   and mechanics are identical to the (proven) embeddings sharding.
 
-**Decision rule (met):** shard-aligned write penalty ≤ ~1.5× (measured 0.6×)
-*and* scattered cold point p95 within ~1.2× of `c256_full` (measured better).
-Either way D2 (256 px, full band) holds; sharding is the wrapper.
+D2 (256 px, full band) holds regardless; sharding is the wrapper on both arrays.
 
 ### D4 — Manifest splitting: time-primary, coarse (FIRM — confirmed run 1 T2)
 
@@ -302,11 +314,13 @@ would poison every read benchmark run on our current 2.0.4 pin.
   a commit-retry/rebase helper, GC/expiry helpers, and a zone-fill
   orchestration layer (fork/merge batching) that **caps simultaneous zone-year
   committers to ~4–8** (run-1-mandated; see D5/D6).
-- **Sharded output (D3): the embeddings array is written in 2048² shards of
-  256-px inner chunks, by a shard-aligned + land-masked writer** (real data into
-  land inner chunks, ocean left at fill so the codec elides it → one lean shard
-  object per shard, no RMW). `scales` stays unsharded. The assembly writer must
-  emit whole shards, not dribble inner chunks.
+- **Sharded output (D3): both `embeddings` and `scales` are written in 2048²
+  shards of 256-px inner chunks, by a shard-aligned + land-masked writer** (real
+  data into land inner chunks, ocean left at fill so the codec elides it → one
+  lean shard object per shard, no RMW, no dense nodata). `scales` must be sharded
+  too, not left unsharded — otherwise its per-tile object count caps the
+  reduction (d3v2 E4). The assembly writer must emit whole shards, never dribble
+  inner chunks.
 - Partner-facing facts to socialize early: ~1.7 PB total; the one-repo vs
   repo-per-zone tradeoff and its kill criteria (D5); annual timestep
   convention and empty-year read semantics (D1).
@@ -347,6 +361,11 @@ Full T0–T7 pass against `s3://arbol-tessera-embeddings-dev/global-embeddings`
 - **T6 (GC):** expire/GC/rollback work; 8.4 MB reclaimed; tiny repo → no
   scale-duration number.
 - **T7 (ramp):** 0× `503 SlowDown` at 50→400 PUTs on this (warm) bucket.
+- **T8 (D3 sharding, runs `d3`/`d3v2`):** E1 wire 1.23 vs 8.69 MB/pt
+  (reproducible); E2 masked-aligned write 0.46× the unsharded build, lean shards
+  ~3.5 GB (dense mode 12.6 GB); E3 scattered p95 131 vs 217 ms; E4 embeddings
+  403→9 objects (masked, post-GC), chunkwise churns 808→414. → adopt
+  `c256_sharded`, shard `scales` too.
 
 ## Evidence (key sources)
 
@@ -372,3 +391,36 @@ Full T0–T7 pass against `s3://arbol-tessera-embeddings-dev/global-embeddings`
   changelog (2.x GC parallelization, dry_run).
 - S3: Earthmover scalability blog (2025-04-10: 230 k reads/s, random chunk
   keys, SlowDown = resharding ramp).
+
+## Conclusion — the settled architecture (2026-07-14)
+
+Scoping is complete; every decision below is FIRM with S3-bench evidence. Build
+to this:
+
+- **One Icechunk repo, 120 Zarr groups** (one per UTM zone, own CRS). Metadata
+  cost is trivial (38 KB snapshot at 120 groups); readers open a single group,
+  never the whole datatree. (D5)
+- **Per-group arrays `(time, northing, easting, band)`**, time chunk 1, band not
+  split. **`embeddings` int8+zstd and `scales` float32+PCodec, both written in
+  2048² shards of 256-px inner chunks.** (D2, D3)
+- **Pre-allocate the full 2017–2025 time axis** at seed (metadata-only); fill
+  2025 first and backfill as region-inserts; never prepend during fills. (D1)
+- **Manifest split time@1** (one manifest per year per array), spatial split only
+  if a year-manifest exceeds ~2–4 M refs. (D4)
+- **Writer: cooperative fork/merge, one commit per (zone, year)**, shard-aligned
+  + land-masked (whole lean shards, ocean elided), spawn/forkserver only. Cap
+  simultaneous zone-year committers to ~4–8 (uncoordinated commits storm,
+  O(N²)). (D6)
+- **Hygiene:** tag each completed zone-year; expire+GC with cutoffs older than
+  the campaign start; `reset_branch` for rollback. (D7)
+- **All new functionality opt-in**; vanilla single-group stores unchanged. Pin
+  icechunk ≥ 2.1.1. (D8, D9)
+
+**Deferred (operational, not blocking):** GC wall-time at 10⁸-object scale (D7) —
+measure against a large repo before setting the production GC cadence. Watch
+zarr PR #3004 (partial-shard-read); it only improves the sharded read path.
+
+**Next:** implement this write path in `tessera_embeddings.storage` (group-aware
+seeding, sharded land-masked writer, commit-concurrency cap, GC/expiry helpers).
+The scale-test scripts (`scripts/scale_tests/`) remain as regression harness and
+for the deferred GC-at-scale measurement.
