@@ -733,7 +733,12 @@ def open_store_as_zarr_group(
     repo = _open_repo(store_path, max_concurrent_requests=max_concurrent_requests)
     session = repo.readonly_session(branch="main")
     root = zarr.open_group(session.store, mode="r")
-    return root if group is None else root[group]
+    if group is None:
+        return root
+    member = root[group]
+    if not isinstance(member, zarr.Group):
+        raise ValueError(f"{group!r} is not a group in {store_path}")
+    return member
 
 
 def get_existing_dates(store_path: str, group: str | None = None) -> set[str]:

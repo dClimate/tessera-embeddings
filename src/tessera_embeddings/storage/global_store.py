@@ -21,7 +21,6 @@ import icechunk
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM
 from tessera_embeddings.config.store_layout import GLOBAL_V1, StoreLayout
 from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
@@ -35,8 +34,6 @@ from tessera_embeddings.storage.zone_grid import (
     easting_coords,
     northing_coords,
 )
-
-_DIM_SIZES: dict[str, int] = {"band": EMBEDDING_DIM}
 
 
 def create_global_repo(
@@ -72,10 +69,15 @@ def open_global_repo(
     )
 
 
-def _var_shape(dims: tuple[str, ...], nt: int, ny: int, nx: int) -> tuple[int, ...]:
+def _var_shape(dims: tuple[str, ...], nt: int, ny: int, nx: int, band: int) -> tuple[int, ...]:
     """Resolve an array's shape from its dim names and the zone's grid."""
-    sizes = {"time": nt, "northing": ny, "easting": nx, **_DIM_SIZES}
+    sizes = {"time": nt, "northing": ny, "easting": nx, "band": band}
     return tuple(sizes[d] for d in dims)
+
+
+def _layout_band(layout: StoreLayout) -> int:
+    """The band count for a layout — the embeddings array's (unsplit) band chunk."""
+    return layout.arrays["embeddings"].chunks[-1]
 
 
 def _zone_attrs(
@@ -94,7 +96,7 @@ def _zone_attrs(
             epsg_code=spec.crs,  # canonical "EPSG:NNNNN" so proj:code is authority-qualified
             total_y=spec.height,
             total_x=spec.width,
-            embedding_dim=EMBEDDING_DIM,
+            embedding_dim=_layout_band(layout),
             y_coords=north,
             x_coords=east,
             model_version=model_version,
@@ -124,12 +126,13 @@ def seed_zone_groups(
     root = zarr.open_group(session.store, mode="a")
     times = calendar_year_times(years)
     nt = len(times)
+    band = _layout_band(layout)
     for spec in specs:
         node = root.require_group(spec.group_name)
         north = northing_coords(spec)
         east = easting_coords(spec)
         for var, array_layout in layout.arrays.items():
-            shape = _var_shape(array_layout.dims, nt, spec.height, spec.width)
+            shape = _var_shape(array_layout.dims, nt, spec.height, spec.width, band)
             node.create_array(var, **array_layout.create_kwargs(shape))
         _write_coord_arrays(node, {"time": times, "northing": north, "easting": east})
         node.attrs.update(_zone_attrs(spec, north, east, layout, model_version))
