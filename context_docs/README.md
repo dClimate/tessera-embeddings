@@ -21,6 +21,8 @@ context_docs/
 │   ├── 007-native-cmr-granule-query.md
 │   └── 008-global-store-architecture.md
 └── design/           Long-form framing docs (ported from planning)
+    ├── d3-sharding-plan.md
+    ├── global-store-implementation-plan.md
     ├── global-store-test-impl-spec.md
     ├── global-store-test-plan.md
     ├── open_sourcing_conceptual_background.md
