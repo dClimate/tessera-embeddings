@@ -224,21 +224,24 @@ Memory envelope: ~1–1.5 GB per worker (staged read + shard block); 8 workers
   a user-facing deviation from MGRS expectations that must not be discoverable
   only by reading code.
 
-## 3. PR sequencing (each lands green on `global-tessera-scoping`)
+## 3. Staging (two stages of commit-milestones on `global-tessera-scoping`; one eventual PR to main)
 
-| PR | Contents | Size | Depends on |
-|---|---|---|---|
-| 1 | W1: constants (`4096`), `StoreLayout` presets, `zone_grid` | M | — |
-| 2 | W2: group seeding + shards in `VarSpec`, group-aware opens, paths | M | 1 |
-| 3 | W3: shard writer, `commit_with_rebase`, `CommitGate` | M | 2 |
-| 4 | W4: assembly rewrite + `INFERENCE_CHUNK_SIZE=2048` + staged layout + parity test | L | 3 |
-| 5 | W4 cleanup: delete Dask engine + `BAND_CHUNK_DIVISOR` (post-parity) | S | 4 |
-| 6 | W5: tags, GC helpers, campaign status, zone-fill runner | M | 3 |
-| 7 | W6: docs sweep + scale-test wiring to production writer | S | 4,6 |
+The workstreams are *linearly* dependent (later builds on earlier, never the
+reverse), so they don't need bundling — but seven separate PRs was ceremony.
+Development follows the pattern that worked for `scripts/scale_tests/` (M0–M5):
+verified commit-milestones on this branch, each landing green with its tests,
+merged to `main` as a single PR at the end. Two stages, because exactly two
+boundaries carry real risk-attribution value:
 
-Ingest 4096 (PR 1) and inference 2048 (PR 4) land separately on purpose: the
-former is standalone; the latter must move in lockstep with staged layout and
-the assembly engine.
+| Stage | Contents (workstreams) | Why it's a boundary |
+|---|---|---|
+| **A — foundations** | W1 constants (`INGEST_CHUNK_SIZE=4096`) + `StoreLayout` presets + zone grid; W2 group seeding, `VarSpec.shards`, group-aware opens, paths; W3 shard writer, `commit_with_rebase`, `CommitGate`; W5 tags, GC helpers, campaign status, zone-fill runner | Purely **additive** — no existing behavior touched except the 4096 flip (one line, called out in its commit; affects new ingests independently of assembly, so it must be attributable on its own) |
+| **B — assembly rewrite** | W4: vanilla-Zarr engine + `INFERENCE_CHUNK_SIZE=2048` + staged layout `(256,256,128)` + parity test vs. the old engine, then **delete** the Dask engine + `BAND_CHUNK_DIVISOR` in the same stage once parity passes; W6 docs sweep + scale-test wiring | The one change that **replaces** verified behavior — isolated on top of already-verified foundations so a parity regression's suspect surface is the rewrite diff alone, and a revert is clean |
+
+Inference 2048 rides with Stage B (it must move in lockstep with staged layout
+and the engine); ingest 4096 rides with Stage A (standalone). Deleting the old
+engine inside Stage B is safe on a feature branch — main sees introduce-and-
+delete as one merge, and the parity test is the gate, not elapsed time.
 
 ## 4. Risks
 
@@ -278,4 +281,4 @@ the assembly engine.
    an input (same contract as today's ROI-mask zarr) and we assume it lands —
    no fallback mask is built.
 
-**The plan is final — no open questions remain.** PR 1 is unblocked.
+**The plan is final — no open questions remain.** Stage A is unblocked.
