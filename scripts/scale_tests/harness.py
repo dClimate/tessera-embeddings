@@ -13,6 +13,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import re
 import subprocess
 import sys
 import threading
@@ -95,7 +96,14 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-id", required=True, help="Groups all artifacts of one run.")
     parser.add_argument("--backend", choices=[_LOCAL, _S3], default=_LOCAL)
     parser.add_argument("--scale", choices=[_TINY, _BENCH], default=_TINY)
-    parser.add_argument("--bucket", default=None, help="S3 bucket (required for --backend s3).")
+    parser.add_argument(
+        "--bucket",
+        default=None,
+        help=(
+            "S3 bucket for --backend s3. Accepts a bare name, 'bucket/prefix', or "
+            "'s3://bucket/prefix' — a prefix acts as the default --store-root."
+        ),
+    )
     parser.add_argument(
         "--results-dir",
         default=None,
@@ -111,18 +119,54 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--phase", default=None, help="Run a single phase by name.")
 
 
+def _parse_bucket_arg(raw: str) -> tuple[str, str | None]:
+    """Split a ``--bucket`` value into ``(bare_bucket_name, prefix_or_None)``.
+
+    Accepts a bare name (``arbol-tessera-embeddings-dev``), a ``bucket/prefix``
+    path, or a full ``s3://bucket/prefix`` URI (with or without trailing slash).
+    Returns the *bare* bucket name — which is what ``boto3``/T7 and the results
+    mirror require — plus any prefix, used to derive the default store root.
+
+    Raises ``SystemExit`` with a clear message on a malformed value, rather than
+    letting a mangled name reach S3 as a cryptic ``InvalidBucketName``.
+    """
+    s = raw.strip()
+    if s.startswith("s3://"):
+        s = s[len("s3://") :]
+    s = s.strip("/")
+    bucket, _, prefix = s.partition("/")
+    # boto3's own bucket-name rule; catches the double-scheme mangling early.
+    if not re.fullmatch(r"[a-zA-Z0-9.\-_]{1,255}", bucket):
+        raise SystemExit(
+            f"--bucket {raw!r} does not resolve to a valid S3 bucket name (got {bucket!r}). "
+            "Pass a bare name, 'bucket/prefix', or 's3://bucket/prefix'."
+        )
+    return bucket, (prefix.strip("/") or None)
+
+
 def config_from_args(args: argparse.Namespace) -> RunConfig:
-    """Build a :class:`RunConfig` from parsed args, validating S3 requirements."""
-    if args.backend == _S3 and not args.bucket:
-        raise SystemExit("--bucket is required with --backend s3")
+    """Build a :class:`RunConfig` from parsed args, validating S3 requirements.
+
+    ``--bucket`` is normalized to a bare name (a prefix or ``s3://`` scheme is
+    accepted and, absent an explicit ``--store-root``, the prefix becomes the
+    store root). ``--store-root``, when given, always wins.
+    """
+    bucket: str | None = None
+    bucket_prefix: str | None = None
+    if args.backend == _S3:
+        if not args.bucket:
+            raise SystemExit("--bucket is required with --backend s3")
+        bucket, bucket_prefix = _parse_bucket_arg(args.bucket)
 
     results_dir = Path(args.results_dir) if args.results_dir else Path.cwd() / "scale_test_results"
     results_dir = results_dir / args.run_id
 
     if args.store_root:
-        store_root = args.store_root
+        store_root = args.store_root  # explicit override always wins
     elif args.backend == _S3:
-        store_root = f"s3://{args.bucket}/scale_tests/{args.run_id}"
+        # A prefix from --bucket is treated exactly as if passed to --store-root;
+        # a bare bucket gets the harness-managed scale_tests/<run-id> layout.
+        store_root = f"s3://{bucket}/{bucket_prefix}" if bucket_prefix else f"s3://{bucket}/scale_tests/{args.run_id}"
     else:
         store_root = str((Path.cwd() / "scale_test_stores" / args.run_id).resolve())
 
@@ -130,7 +174,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         run_id=args.run_id,
         backend=args.backend,
         scale=args.scale,
-        bucket=args.bucket,
+        bucket=bucket,
         results_dir=results_dir,
         store_root=store_root,
         real_sample=Path(args.real_sample) if args.real_sample else None,

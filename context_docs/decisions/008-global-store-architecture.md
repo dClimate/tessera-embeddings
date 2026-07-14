@@ -5,6 +5,13 @@ PENDING a named test in the companion test plan
 (`context_docs/design/global-store-test-plan.md`). Supersede individual
 decisions with follow-up ADRs as test evidence lands.
 
+**Run 1 (2026-07-14, S3 bench, icechunk 2.1.1, `arbol-tessera-embeddings-dev`):**
+first full T0–T7 pass landed. It moved **D1** and **D4** to FIRM, added a hard
+commit-concurrency constraint to **D5/D6**, and validated the D7 mechanism. It
+did **not** settle **D2/D3** — only the `c256_full` variant was built, so the
+chunk-shape/sharding comparison still needs the remaining four variants. See
+"Run 1 evidence" at the bottom for the numbers behind these changes.
+
 ## Context
 
 We will generate 10 m TESSERA embeddings for the entire globe, one timestep
@@ -52,7 +59,7 @@ create/append/region-write paths; storage timeouts+retries; `rollback_commits`.
 
 ## Decision register
 
-### D1 — Pre-allocate the full 2017–2025 time axis; never prepend (FIRM; verify T3)
+### D1 — Pre-allocate the full 2017–2025 time axis; never prepend (FIRM — confirmed run 1 T3)
 
 Seed every zone group with all nine annual timesteps and fully-written
 coordinate arrays at creation. Fill 2025 first, then backfill older years as
@@ -74,7 +81,7 @@ sentinel (int8 `embeddings` fill 0 alone is ambiguous); reads of unfilled
 years succeed silently, so each group maintains a `years_complete` attr
 updated **in the same commit** as the year's data.
 
-### D2 — Chunk shape: full band dimension, spatial 256–500 px (PENDING T1)
+### D2 — Chunk shape: full band dimension, spatial 256–500 px (PENDING T1 — variant sweep still owed)
 
 Never split the 128-band axis. Keep dim order (time, northing, easting,
 band) — band varies fastest, so one pixel's full vector is contiguous inside
@@ -110,7 +117,7 @@ place only if T1 shows small chunks win reads *and* T2 shows ref-count pain.
 If adopted: inner chunks per D2, shards ~2048² px (~0.5 GB objects),
 shard-aligned writes mandatory.
 
-### D4 — Manifest splitting: time-primary, coarse (PENDING T2/T4)
+### D4 — Manifest splitting: time-primary, coarse (FIRM — confirmed run 1 T2)
 
 Split every array's manifest on **time at 1 chunk per window** (= one
 manifest per year per zone array), adding spatial splits only for zones whose
@@ -125,7 +132,7 @@ probe in T2: icechunk #1600 (open) observed append times growing linearly
 with cumulative refs *despite* splitting. Note `rewrite_manifests()` is
 repo-wide only — no per-group targeting.
 
-### D5 — One repo, 120 groups — provisional, with kill criteria (PENDING T4/T5)
+### D5 — One repo, 120 groups — viable *with a commit-concurrency cap* (PENDING D2/D3; commit constraint FIRM from run 1)
 
 Adopt the single-repo/120-group layout the partner expects, subject to:
 
@@ -142,14 +149,29 @@ atomicity, so the fallback loses nothing semantically; official guidance is
 to scope repos to arrays needing consistent transactional updates. This is a
 partner conversation to have **before** implementation, with test evidence.
 
-### D6 — Commit strategy: cooperative fork/merge, one commit per zone-year (FIRM shape; parameters PENDING T2/T5)
+**Run 1 result (decisive on the commit path).** The *structure* is fine: 120
+groups → a 38 KB snapshot re-serialized per commit, single-group opens ~0.15 s,
+per-group commit flat (~0.25 s) regardless of group count. But **uncoordinated
+concurrent commits storm**: auto-rebase retries grow ≈ linearly with the number
+of simultaneous committers (O(N²) aggregate), so the N=16 kill criterion above
+is *breached* under the pathological all-at-once pattern (median 7.5 retries,
+commit ~10× the uncontended 0.2 s). This does **not** kill one-repo — it kills
+letting all zones commit to `main` at once. **Constraint (now FIRM): a
+commit-concurrency cap of ~4–8 simultaneous committers** (a queue/semaphore in
+the orchestration layer), or per-zone repos. Reader-side: whole-repo
+`open_datatree` over 120 groups took ~31 s (vs 0.15 s per group) — readers must
+open a single zone group, never the datatree (icechunk #1462). Final one-repo
+vs per-zone go/no-go stays open only pending D2/D3 and a *paced-commit* re-test;
+the naive-concurrency question is settled.
+
+### D6 — Commit strategy: cooperative fork/merge, one commit per zone-year (FIRM shape; pacing cap FIRM from run 1)
 
 Within a zone-year: `session.fork()` → pickled ForkSessions to workers →
 `merge(*sessions)` → **one commit** (multiprocessing start method must be
 spawn/forkserver — fork deadlocks icechunk's runtime). Across zones: commits
 to distinct groups with a bounded rebase-retry loop (`ConflictDetector`;
-cross-group commits should auto-rebase cleanly — smoke-tested in T0), paced
-so the branch-tip CAS isn't slammed by 120 simultaneous committers.
+cross-group commits auto-rebase cleanly — confirmed in run 1 T0), **paced
+behind a concurrency cap** so the branch-tip CAS isn't slammed.
 
 Why: commit-time memory is ~400 B/ref and single commits ≥ ~7×10⁷ refs panic
 (icechunk #1558 open) — zone-year commits (~10⁵–10⁶ refs) sit far below that.
@@ -157,6 +179,12 @@ Icechunk v2 targets "tens of thousands" of commits per repo; one commit per
 zone-year ≈ 1,100 total (vs. yield-embeddings' per-slab pattern, ~400
 commits/timestep, which would blow past it). Never mix array-metadata updates
 with concurrent chunk writes (see D1).
+
+**Run 1 made the pacing non-optional (see D5):** retries scale ≈ N−1 with N
+simultaneous committers, so the orchestration layer MUST cap simultaneous
+zone-year committers to ~4–8 (measured: N=2 → ~0.5 retries/0.5 s commit; N=8 →
+~3.5/1.3 s; N=16 → ~7.5/2.2 s; N=120 → ~58/15 s). Cross-group conflict-freedom
+held: zero unresolvable conflicts at every N.
 
 ### D7 — Snapshot hygiene: tags + expiry policy (FIRM policy; cadence PENDING T6)
 
@@ -167,6 +195,14 @@ the oldest concurrent session). `expire_snapshots` → `garbage_collect`, always
 `dry_run=True` first; GC is LIST-bound over the whole repo prefix (hours at
 10⁸+ objects — sized in T6). Failed fork sessions orphan chunks until GC;
 budget storage for that. Rollback stays `reset_branch` (`rollback_commits`).
+
+**Run 1:** expire → GC → rollback all worked on S3 (tagged snapshot protected,
+8.4 MB reclaimed, clean `reset_branch` + re-commit). But the repo was tiny (~100
+objects), so the run gives **no GC-duration-at-scale number** — that still needs
+a large-repo timing run before a cadence is fixed. Warm-up: run 1 T7 saw **zero
+`503 SlowDown` from 50→400 concurrent PUTs** on `arbol-tessera-embeddings-dev`
+(an already-partitioned bucket), so no cold-bucket ramp is needed there; a
+brand-new bucket may still need warm-up.
 
 ### D8 — Everything opt-in; vanilla stores unchanged (FIRM)
 
@@ -204,13 +240,45 @@ would poison every read benchmark run on our current 2.0.4 pin.
   threading through write/open/resolve paths, per-group attrs (CRS,
   `_manifest`, `years_complete`), a repo+group path model in `BucketPaths`,
   a commit-retry/rebase helper, GC/expiry helpers, and a zone-fill
-  orchestration layer (fork/merge batching).
+  orchestration layer (fork/merge batching) that **caps simultaneous zone-year
+  committers to ~4–8** (run-1-mandated; see D5/D6).
 - Partner-facing facts to socialize early: ~1.7 PB total; the one-repo vs
   repo-per-zone tradeoff and its kill criteria (D5); annual timestep
   convention and empty-year read semantics (D1).
 - Watch upstream: zarr release containing partial-shard-read optimization
   (PR #3004) — re-run T1's sharded variant when it ships; icechunk #1600 and
   #1558 resolutions may relax D4/D6 parameters.
+
+## Run 1 evidence (2026-07-14, S3 bench, icechunk 2.1.1)
+
+Full T0–T7 pass against `s3://arbol-tessera-embeddings-dev/global-embeddings`
+(run id `run1`, 689 metric rows). Numbers that moved decisions:
+
+- **T0 (cross-group conflicts):** 3 simultaneous commits to distinct groups →
+  retries [1, 2, 0], **0 unresolvable, 0 failed** — cross-group conflict-freedom
+  holds under real object-store CAS (local couldn't show this). Same-chunk:
+  `UseOurs` resolved, bare `ConflictDetector` correctly left one writer
+  unresolvable. → underpins D5/D6.
+- **T1 (reads, `c256_full` only):** point-vector p95 ≈ 193 ms, open ≈ 0.13 s,
+  one 4.2 MB chunk per point read. **Only one variant built — D2/D3 not yet
+  decidable.** Remaining sweep: `c500_band4`, `c500_full`, `c384_full`,
+  `c256_sharded`.
+- **T2 (writes/splitting):** year-fill commit **flat** 0.367→0.353 s across 9
+  years (no #1600 growth with time@1). Split A/B: `time1` → 7 manifests / ~1.5 KB
+  snapshots; `time1_spatial` → **379 manifests / 14 KB snapshots / 5.5 s commit
+  spike**. → D4 FIRM. Commit RSS ~2.3 GB at ≤12.5 K refs (consistent with the
+  ~400 B/ref model; bench zone tops out ~12 K refs, so the 10⁷ regime is
+  unreached — needs a larger zone to probe #1558).
+- **T3 (pre-alloc/prepend):** seed data-chunks == 0 (metadata-only holds);
+  prepend shift commits cheap (0.3–0.6 s) but manifest grew 0.55→8.2 MB over 8
+  shifts; shift-vs-writer conflict `unresolvable`. → D1 FIRM.
+- **T4 (120 groups):** snapshot 5 KB→38 KB (12→120 groups), per-group commit
+  flat (~0.25 s), single-group open 0.15 s, **whole-repo `open_datatree` ~31 s**.
+- **T5 (contention):** retries ≈ N−1; N=16 breaches the kill threshold. → the
+  D5/D6 commit-concurrency cap.
+- **T6 (GC):** expire/GC/rollback work; 8.4 MB reclaimed; tiny repo → no
+  scale-duration number.
+- **T7 (ramp):** 0× `503 SlowDown` at 50→400 PUTs on this (warm) bucket.
 
 ## Evidence (key sources)
 

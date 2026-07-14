@@ -53,13 +53,18 @@ uv run python -m scale_tests.t5_contention --run-id dev --backend local --scale 
 uv run python -m scale_tests.t6_gc_bench   --run-id dev --backend local --scale tiny
 
 # the real campaign, in-region on the throwaway bucket
-uv run python -m scale_tests.t0_smoke      --run-id run1 --backend s3 --scale bench --bucket MY-THROWAWAY
-# ... t1..t6 the same ...
-uv run python -m scale_tests.t7_ramp       --run-id run1 --backend s3 --scale bench --bucket MY-THROWAWAY   # LAST
+uv run python -m scale_tests.t0_smoke      --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
+uv run python -m scale_tests.t1_read_bench --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/ --variant c256_full
+uv run python -m scale_tests.t2_write_bench --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
+uv run python -m scale_tests.t3_prealloc   --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
+uv run python -m scale_tests.t4_group_scale --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
+uv run python -m scale_tests.t5_contention --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
+uv run python -m scale_tests.t6_gc_bench   --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
+uv run python -m scale_tests.t7_ramp       --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
 
 # collate + tear down
 uv run python -m scale_tests.report   --run-id run1
-uv run python -m scale_tests.teardown --run-id run1 --backend s3 --bucket MY-THROWAWAY
+uv run python -m scale_tests.teardown --run-id run1 --backend s3 --bucket arbol-tessera-embeddings-dev/global-embeddings/
 ```
 
 Install the extra deps once: `uv sync --group scale-tests`.
@@ -75,7 +80,7 @@ benchmarks.
 | `--run-id` | groups all artifacts of one run (required) |
 | `--backend` | `local` (default) or `s3` |
 | `--scale` | `tiny` (default, laptop) or `bench` (real numbers) |
-| `--bucket` | S3 bucket (required with `--backend s3`) |
+| `--bucket` | S3 bucket, required with `--backend s3`. Accepts a bare name, `bucket/prefix`, or `s3://bucket/prefix`; a prefix becomes the default `--store-root`, and the bare bucket name is used for T7 + the results mirror. |
 | `--variant` | restrict to one variant (T1) |
 | `--phase` | run a single phase by name |
 | `--results-dir` / `--store-root` | override output/store locations |
