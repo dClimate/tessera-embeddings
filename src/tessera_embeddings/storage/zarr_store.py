@@ -359,6 +359,34 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     return config
 
 
+# Preload scan cap for the global store: 120 groups x ~5 arrays = ~600 nodes, so
+# the icechunk default of 50 (issue #1464) never reaches later groups' coord
+# arrays. 1200 covers the node count with headroom; refs cap is generous because
+# coord manifests are tiny.
+_GLOBAL_PRELOAD_MAX_ARRAYS = 1200
+_GLOBAL_PRELOAD_MAX_REFS = 1_000_000
+
+
+def global_store_config(max_concurrent_requests: int | None = None) -> icechunk.RepositoryConfig:
+    """RepositoryConfig for the 120-group global store (ADR-008 D4/D5).
+
+    Layers on :func:`_default_repo_config` (timeouts + retries): manifest split
+    **time@1** (one manifest per year per array, so a year fill rewrites only
+    that year's manifests), and preload tuning so coordinate manifests across all
+    120 groups are preloaded. Persist with ``repo.save_config()`` on create so
+    re-opens (and forked workers) inherit it.
+    """
+    config = _default_repo_config(max_concurrent_requests)
+    config.manifest = icechunk.ManifestConfig(
+        splitting=_manifest_splitting_config({"time": 1}),
+        preload=icechunk.ManifestPreloadConfig(
+            max_arrays_to_scan=_GLOBAL_PRELOAD_MAX_ARRAYS,
+            max_total_refs=_GLOBAL_PRELOAD_MAX_REFS,
+        ),
+    )
+    return config
+
+
 def _open_repo(
     store_path: str,
     max_concurrent_requests: int | None = None,
@@ -533,6 +561,7 @@ def _open_readonly(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
     chunks: "ChunksArg" = _CHUNKS_UNSET,
+    group: str | None = None,
 ) -> xr.Dataset:
     """Open store for reading. Returns xarray Dataset.
 
@@ -544,12 +573,16 @@ def _open_readonly(
     no dask graph: slicing is then pure metadata and chunks are read only when
     ``.values`` is pulled — the right choice for interactive or selective reads of
     large stores.
+
+    ``group`` selects a Zarr group within the store (the global store's per-zone
+    layout). ``None`` reads the root. Readers should target a single group; never
+    open the whole 120-group repo as a datatree (~200x slower — ADR-008 D5).
     """
     repo = _open_repo(store_path, get_credentials=get_credentials, region=region)
     session = repo.readonly_session(branch="main")
     if isinstance(chunks, _ChunksUnset):
-        return xr.open_zarr(session.store, consolidated=False)
-    return xr.open_zarr(session.store, consolidated=False, chunks=chunks)
+        return xr.open_zarr(session.store, consolidated=False, group=group)
+    return xr.open_zarr(session.store, consolidated=False, chunks=chunks, group=group)
 
 
 @cleanup_on_failure
@@ -670,16 +703,19 @@ def _write_region(
 # =============================================================================
 
 
-def open_store(store_path: str, chunks: "ChunksArg" = _CHUNKS_UNSET) -> xr.Dataset:
+def open_store(store_path: str, chunks: "ChunksArg" = _CHUNKS_UNSET, group: str | None = None) -> xr.Dataset:
     """Open an Icechunk store for reading as an xarray Dataset.
 
     Pass ``chunks=None`` for large (e.g. CONUS-scale) stores to skip the dask
     task graph and slice lazily on metadata alone — see :func:`_open_readonly`.
+    ``group`` selects one Zarr group (the global store's per-zone layout).
     """
-    return _open_readonly(store_path, chunks=chunks)
+    return _open_readonly(store_path, chunks=chunks, group=group)
 
 
-def open_store_as_zarr_group(store_path: str, max_concurrent_requests: int | None = None) -> zarr.Group:
+def open_store_as_zarr_group(
+    store_path: str, max_concurrent_requests: int | None = None, group: str | None = None
+) -> zarr.Group:
     """Open an Icechunk store for reading as a raw zarr Group.
 
     Bypasses xarray/dask entirely. Use when you need to read large arrays into
@@ -691,19 +727,21 @@ def open_store_as_zarr_group(store_path: str, max_concurrent_requests: int | Non
     ``max_concurrent_requests`` caps per-repo HTTP concurrency (icechunk default
     256). Pass it when many processes read one S3 prefix concurrently — e.g. the
     region merge's worker forks all reading one feature store — so the aggregate
-    GET rate stays under S3's per-prefix ceiling.
+    GET rate stays under S3's per-prefix ceiling. ``group`` selects one Zarr
+    group (the global store's per-zone layout); ``None`` returns the root group.
     """
     repo = _open_repo(store_path, max_concurrent_requests=max_concurrent_requests)
     session = repo.readonly_session(branch="main")
-    return zarr.open_group(session.store, mode="r")
+    root = zarr.open_group(session.store, mode="r")
+    return root if group is None else root[group]
 
 
-def get_existing_dates(store_path: str) -> set[str]:
+def get_existing_dates(store_path: str, group: str | None = None) -> set[str]:
     """Get dates already present in a store. Returns empty set if store doesn't exist."""
     t0 = time.monotonic()
     logger.debug(f"Opening store: {store_path}")
     try:
-        ds = _open_readonly(store_path)
+        ds = _open_readonly(store_path, group=group)
         dates = {str(t.values)[:10] for t in ds.time}
         ds.close()
         logger.debug(f"Store has {len(dates)} existing dates ({time.monotonic() - t0:.1f}s)")
@@ -724,6 +762,7 @@ def resolve_region(
     easting: "tuple[float, float] | None" = None,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
+    group: str | None = None,
 ) -> dict[str, slice]:
     """Map coordinate-value ranges to half-open integer slices for an existing store.
 
@@ -755,7 +794,7 @@ def resolve_region(
     # chunks=None: only the 1-D northing/easting/time coords are read here, never
     # pixels, so skip building a per-chunk dask graph — matters when this is called
     # repeatedly (e.g. resolving many features against a continental master).
-    ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region, chunks=None)
+    ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region, chunks=None, group=group)
     try:
         ranges = {"time": time, "northing": northing, "easting": easting}
         region: dict[str, slice] = {}

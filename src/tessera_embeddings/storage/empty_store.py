@@ -115,6 +115,9 @@ class VarSpec:
     forwarded to ``zarr.Group.create_array`` verbatim — the default ``"auto"``
     matches what xarray's zarr backend would pick, while a caller can pin e.g.
     ``pcodec_serializer()`` + ``compressors=None`` for a float embeddings array.
+    ``shards`` (element counts per dim, or ``None``) wraps the inner chunks in a
+    Zarr v3 sharding codec — required by the global store's ``GLOBAL_V1`` layout
+    (ADR-008 D3). It is clamped to a whole multiple of the (clamped) chunks.
     """
 
     dims: tuple[str, ...]
@@ -123,12 +126,64 @@ class VarSpec:
     fill_value: Any = _DEFAULT_FILL
     serializer: Any = "auto"
     compressors: Any = "auto"
+    shards: tuple[int, ...] | None = None
 
     def resolved_fill(self) -> float | int:
         """The fill value to write: the explicit ``fill_value`` or the per-dtype default."""
         if self.fill_value is _DEFAULT_FILL:
             return _fill_for_dtype(self.dtype)
         return self.fill_value
+
+
+def _write_coord_arrays(node: zarr.Group, coords: dict[str, np.ndarray]) -> None:
+    """Write 1-D coordinate arrays onto a zarr group node.
+
+    ``time`` is special-cased: stored as int64 nanoseconds with
+    :data:`TIME_ENCODING` (matching ``write_dataset``); other coords are written
+    as their values. Shared by the single-store and multi-group seed paths.
+    """
+    for name, values in coords.items():
+        if name == "time":
+            time_int = np.asarray(values, dtype="datetime64[ns]").astype("int64")
+            time_arr = node.create_array("time", data=time_int, chunks=(len(time_int),), dimension_names=("time",))
+            time_arr.attrs.update(TIME_ENCODING)
+        else:
+            arr = np.asarray(values)
+            node.create_array(name, data=arr, chunks=(len(arr),), dimension_names=(name,))
+
+
+def _write_group_schema(
+    node: zarr.Group,
+    coords: dict[str, np.ndarray],
+    var_specs: dict[str, VarSpec],
+    attrs: dict | None,
+) -> None:
+    """Create schema-only data arrays + coord arrays + attrs on a group node.
+
+    Data variables are created with shape/chunks/shards but no chunk data (all
+    fill), so cost is independent of spatial extent. Used for both the root of a
+    single store and each zone group of the global store.
+    """
+    for name, spec in var_specs.items():
+        shape = tuple(len(coords[d]) for d in spec.dims)
+        chunks = tuple(min(c, s) for c, s in zip(spec.chunks, shape, strict=True))
+        kwargs: dict[str, Any] = {
+            "shape": shape,
+            "chunks": chunks,
+            "dtype": spec.dtype,
+            "fill_value": spec.resolved_fill(),
+            "dimension_names": spec.dims,
+            "serializer": spec.serializer,
+            "compressors": spec.compressors,
+        }
+        if spec.shards is not None:
+            kwargs["shards"] = tuple(
+                max(c, (min(sh, s) // c) * c) for sh, s, c in zip(spec.shards, shape, chunks, strict=True)
+            )
+        node.create_array(name, **kwargs)
+    _write_coord_arrays(node, coords)
+    if attrs:
+        node.attrs.update(attrs)
 
 
 def create_empty_store_from_coords(
@@ -139,6 +194,7 @@ def create_empty_store_from_coords(
     commit_msg: str,
     attrs: dict | None = None,
     repo: Repository | None = None,
+    group: str | None = None,
 ) -> None:
     """Create an all-fill Icechunk store from explicit coords and var schemas.
 
@@ -168,6 +224,11 @@ def create_empty_store_from_coords(
             the same prefix. When given, cleanup-on-failure is skipped (the
             caller owns the repo lifecycle); when ``None``, the repo is created
             here and a partial store is removed on error.
+        group: Optional Zarr group to seed. ``None`` (default) opens the root
+            with ``mode="w"`` (today's behavior — clobbers any existing root).
+            A group name opens root with ``mode="a"`` and ``require_group``s the
+            named group, so sibling groups can be seeded into one repo without
+            clobbering (the 120-zone global-store layout, ADR-008 D5).
     """
     for name, spec in var_specs.items():
         missing = [d for d in spec.dims if d not in coords]
@@ -182,37 +243,11 @@ def create_empty_store_from_coords(
     session = repo.writable_session("main")
     store = session.store
     try:
-        root = zarr.open_group(store, mode="w")
-
-        # Data variables: schema only, no chunks written (all fill).
-        for name, spec in var_specs.items():
-            shape = tuple(len(coords[d]) for d in spec.dims)
-            chunks = tuple(min(c, s) for c, s in zip(spec.chunks, shape, strict=True))
-            root.create_array(
-                name,
-                shape=shape,
-                chunks=chunks,
-                dtype=spec.dtype,
-                fill_value=spec.resolved_fill(),
-                dimension_names=spec.dims,
-                serializer=spec.serializer,
-                compressors=spec.compressors,
-            )
-
-        # Coordinate arrays — 1-D, written in full. ``time`` is stored as int64
-        # nanoseconds since epoch to match TIME_ENCODING; others as their values.
-        for name, values in coords.items():
-            if name == "time":
-                time_int = np.asarray(values, dtype="datetime64[ns]").astype("int64")
-                time_arr = root.create_array("time", data=time_int, chunks=(len(time_int),), dimension_names=("time",))
-                time_arr.attrs.update(TIME_ENCODING)
-            else:
-                arr = np.asarray(values)
-                root.create_array(name, data=arr, chunks=(len(arr),), dimension_names=(name,))
-
-        if attrs:
-            root.attrs.update(attrs)
-
+        # group=None clobbers the root (mode="w"); a group name adds to the repo
+        # (mode="a") so sibling zone groups coexist.
+        root = zarr.open_group(store, mode="w" if group is None else "a")
+        target = root if group is None else root.require_group(group)
+        _write_group_schema(target, coords, var_specs, attrs)
         session.commit(commit_msg)
     except Exception:
         # Mirror write_dataset's cleanup_on_failure — delete partial store on

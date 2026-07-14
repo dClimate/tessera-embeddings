@@ -61,3 +61,12 @@ class BucketPaths(BaseModel):
             return posixpath.join(self.inputs, "mosaics", roi_name, f"{kind}.zarr")
         else:  # embeddings
             return posixpath.join(self.outputs, "embeddings", f"{roi_name}.zarr")
+
+    def global_store(self, name: str = "tessera") -> str:
+        """Return the URI of the single global-embeddings Icechunk repo.
+
+        The global campaign writes all 120 UTM-zone groups into one repo
+        (ADR-008 D5), addressed by zone group name — unlike :meth:`store_for`,
+        which is one ``.zarr`` per (roi, kind).
+        """
+        return posixpath.join(self.outputs, "global", f"{name}.icechunk")
