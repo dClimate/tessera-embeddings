@@ -6,11 +6,13 @@ PENDING a named test in the companion test plan
 decisions with follow-up ADRs as test evidence lands.
 
 **Run 1 (2026-07-14, S3 bench, icechunk 2.1.1, `arbol-tessera-embeddings-dev`):**
-first full T0–T7 pass landed. It moved **D1** and **D4** to FIRM, added a hard
-commit-concurrency constraint to **D5/D6**, and validated the D7 mechanism. It
-did **not** settle **D2/D3** — only the `c256_full` variant was built, so the
-chunk-shape/sharding comparison still needs the remaining four variants. See
-"Run 1 evidence" at the bottom for the numbers behind these changes.
+full T0–T7 pass **including the 5-variant T1 sweep**. It moved **D1**, **D2**,
+and **D4** to FIRM, added a hard commit-concurrency constraint to **D5/D6**, and
+validated the D7 mechanism. The one remaining open decision is **D3 (sharding)**:
+run 1 showed sharded reads tie/beat unsharded and cut object count ~64×, at a
+2.8× write cost — promising enough that D3 flipped from "optional" to "strong
+contender pending a shard-aligned write test" (`design/d3-sharding-plan.md`).
+See "Run 1 evidence" at the bottom for the numbers.
 
 ## Context
 
@@ -81,7 +83,7 @@ sentinel (int8 `embeddings` fill 0 alone is ambiguous); reads of unfilled
 years succeed silently, so each group maintains a `years_complete` attr
 updated **in the same commit** as the year's data.
 
-### D2 — Chunk shape: full band dimension, spatial 256–500 px (PENDING T1 — variant sweep still owed)
+### D2 — Chunk shape: full band dimension, **spatial 256 px** (FIRM — confirmed run 1 T1 sweep)
 
 Never split the 128-band axis. Keep dim order (time, northing, easting,
 band) — band varies fastest, so one pixel's full vector is contiguous inside
@@ -104,18 +106,48 @@ channel dim. `(1, 256, 256, 128)` = 8.4 MB sits in the sweet spot and yields
 numbers are from synthetic benchmarks; quantized-embedding compressibility
 shifts compressed GET sizes, hence T1.
 
-### D3 — Sharding: optional variant, not the foundation (PENDING T1/T2)
+**Run 1 result (spatial size settled).** Cold point-vector p95 by variant:
+`c256_full` 193 ms, `c256_sharded` 199 ms, `c500_band4` 219 ms, `c384_full`
+334 ms, `c500_full` 339 ms. **256 px wins**: bigger spatial chunks fetch more
+bytes per pixel and read slower (384/500 ≈ 334–339 ms). The current
+`c500_band4` band-split is beaten on every axis — 219 ms p95 *and* 31.8 MB /
+**32 GETs** per point-read (8×/32× the amplification of `c256_full`) *and* ~1.7 B
+refs. Going below 256 px isn't worth it (below the 3–15 MB optimum, 4× more
+refs). So: 256 px spatial, full 128-band dim, int8+zstd. FIRM.
+
+### D3 — Sharding: strong contender (was "optional"); D2-spatial reads don't lose (PENDING shard-aligned write test — see `design/d3-sharding-plan.md`)
 
 Zarr v3 sharding works in icechunk (fixed v1.0.3, caveat-free since 2.0.0,
-requires zarr-python ≥ 3.1.2) but: maintainers call it "not heavily tested";
-reading k inner chunks costs k separate ranged GETs (no coalescing —
-icechunk #1316 open; the zarr-side fix PR #3004 merged but unreleased as of
-zarr 3.2.1); partial-shard writes are whole-shard read-modify-write. Icechunk
-manifests already solve the metadata side of the small-object problem
-(Earthmover's own ERA5 uses ~500 KB chunks, unsharded). Sharding earns its
-place only if T1 shows small chunks win reads *and* T2 shows ref-count pain.
-If adopted: inner chunks per D2, shards ~2048² px (~0.5 GB objects),
-shard-aligned writes mandatory.
+requires zarr-python ≥ 3.1.2). Inner chunks per D2 (256 px), shards ~2048² px
+(64 inner chunks, ~0.5 GB objects), shard-aligned writes strongly preferred.
+
+**Run 1 upended the earlier "optional, adopt only if reads win" stance — the
+reads do *not* lose:**
+
+- **Point p95:** `c256_sharded` 199 ms vs `c256_full` 193 ms — a 6 ms *tie*
+  (the report's bare "full wins" verdict is p95-only and misleading).
+- **Point p50:** 29 ms vs 117 ms — sharding **4× faster** in the common case
+  (large shards keep nearby points warm; the win is locality-dependent).
+- **Aggregate read phase:** 563 s vs 1323 s — sharded ran the full read suite in
+  under half the time. Bulk throughput was marginally *higher* (2014 vs
+  1897 MB/s), so the no-coalescing worry (#1316) did **not** bite at these sizes
+  (a point read needs one inner chunk = one ranged GET; the latency proves
+  partial reads, not whole-shard fetches — despite what the analytic
+  `bytes_fetched` metric reports).
+- **Object count:** ~64× fewer refs (~3.2 M vs ~205 M over 9 yr) — a large win
+  for manifest size, GC feasibility, listing, and reader request cost.
+
+The one real cost: **build was 2.8× slower** (420 s vs 152 s) — sharding's
+write amplification. But the test writes 256-px chunks that dribble into 2048²
+shards (heavy read-modify-write); a shard-aligned writer should shrink this. For
+a **write-once/read-many** published dataset, a one-time write cost buying a
+permanent read + object-count win is a favorable trade *if* the penalty is
+containable. That is the open question, and the only thing standing between D3
+and a decision — hence the settlement plan in `design/d3-sharding-plan.md`.
+
+**Decision rule:** adopt sharding if the shard-aligned write penalty falls to
+≤ ~1.5× *and* scattered (non-local) cold point-read p95 stays within ~1.2× of
+`c256_full`; otherwise ship `c256_full`. Either way D2 (256 px, full band) holds.
 
 ### D4 — Manifest splitting: time-primary, coarse (FIRM — confirmed run 1 T2)
 
@@ -259,10 +291,13 @@ Full T0–T7 pass against `s3://arbol-tessera-embeddings-dev/global-embeddings`
   holds under real object-store CAS (local couldn't show this). Same-chunk:
   `UseOurs` resolved, bare `ConflictDetector` correctly left one writer
   unresolvable. → underpins D5/D6.
-- **T1 (reads, `c256_full` only):** point-vector p95 ≈ 193 ms, open ≈ 0.13 s,
-  one 4.2 MB chunk per point read. **Only one variant built — D2/D3 not yet
-  decidable.** Remaining sweep: `c500_band4`, `c500_full`, `c384_full`,
-  `c256_sharded`.
+- **T1 (reads, full 5-variant sweep):** cold point-vector p95 — `c256_full`
+  193 ms (p50 117, 4.2 MB/pt), `c256_sharded` 199 ms (p50 **29**, ~4.2 MB/pt
+  real), `c500_band4` 219 ms (**31.8 MB / 32 GETs**/pt), `c384_full` 334 ms
+  (9.2 MB/pt), `c500_full` 339 ms. Build wall: full 152 s, sharded 420 s (2.8×).
+  Aggregate read phase: sharded 563 s vs full 1323 s. → **D2 FIRM (256 + full
+  band); D3 now a strong contender** (reads tie/better, 64× fewer objects, write
+  2.8× — pending shard-aligned write test).
 - **T2 (writes/splitting):** year-fill commit **flat** 0.367→0.353 s across 9
   years (no #1600 growth with time@1). Split A/B: `time1` → 7 manifests / ~1.5 KB
   snapshots; `time1_spatial` → **379 manifests / 14 KB snapshots / 5.5 s commit

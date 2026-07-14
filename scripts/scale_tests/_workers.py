@@ -62,6 +62,38 @@ def write_fork(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns an i
     return fork
 
 
+def write_fork_shards(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns a ForkSession
+    """Shard-aligned variant of :func:`write_fork` (test plan D3 / E2).
+
+    Writes one full shard-sized block per assigned shard in a single array
+    assignment, so the Zarr sharding codec emits each shard object once with no
+    read-modify-write. Writes the *whole* shard region (dense — ocean inner
+    chunks included), which is the faithful shard-aligned write pattern.
+
+    Payload keys mirror :func:`write_fork` but with ``shards`` (list of
+    ``[sy, sx]`` shard indices) and ``shard_yx`` (``[shard_y, shard_x]``).
+    """
+    fork = payload["fork"]
+    group = payload["group"]
+    year = int(payload["year_index"])
+    sh_y, sh_x = payload["shard_yx"]
+    ny, nx = payload["zone_hw"]
+    band = int(payload["band"])
+    seed = int(payload["seed"])
+
+    root = zarr.open_group(fork.store, mode="a")
+    emb = root[group]["embeddings"]
+    scl = root[group]["scales"]
+    for sy, sx in payload["shards"]:
+        y0, x0 = sy * sh_y, sx * sh_x
+        y1, x1 = min(y0 + sh_y, ny), min(x0 + sh_x, nx)
+        h, w = y1 - y0, x1 - x0
+        idx = (year, sy, sx)
+        emb[year : year + 1, y0:y1, x0:x1, :] = synth.embedding_block((1, h, w, band), seed=seed, block_index=idx)
+        scl[year : year + 1, y0:y1, x0:x1] = synth.scales_block((1, h, w), seed=seed, block_index=idx)
+    return fork
+
+
 def _solver(kind: str) -> icechunk.ConflictSolver:
     """Map a payload solver name to an icechunk conflict solver."""
     if kind == "detector":

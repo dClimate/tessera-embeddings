@@ -19,7 +19,7 @@ import zarr
 
 from scale_tests import harness
 from scale_tests import variants as V
-from scale_tests._workers import write_fork
+from scale_tests._workers import write_fork, write_fork_shards
 from scale_tests.synth import land_mask
 from scale_tests.zone_geometry import YEARS, MockZone
 
@@ -196,5 +196,87 @@ def fill_year(
         commit_wall_s=commit_wall,
         snapshot_id=snapshot_id,
         n_chunks=len(chunk_list),
+        n_workers=len(payloads),
+    )
+
+
+def shards_for_chunks(variant: V.Variant, chunk_list: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Return the ``(sy, sx)`` shard indices that contain >=1 of ``chunk_list``."""
+    if variant.shards is None:
+        raise ValueError(f"{variant.name} is not sharded")
+    _, sh_y, sh_x, _ = variant.shards
+    _, cy, cx, _ = variant.chunks
+    shards = {(yc * cy // sh_y, xc * cx // sh_x) for yc, xc in chunk_list}
+    return sorted(shards)
+
+
+def fill_year_shard_aligned(
+    cfg: harness.RunConfig,
+    store: str,
+    group: str,
+    variant: V.Variant,
+    zone: MockZone,
+    year_index: int,
+    shard_list: list[tuple[int, int]],
+    *,
+    n_workers: int,
+    seed: int = 0,
+    repo_config=None,  # noqa: ANN001 — optional icechunk.RepositoryConfig
+) -> FillResult:
+    """Fill one year **shard-aligned**: one full 2048²-block write per shard.
+
+    The D3/E2 counterpart to :func:`fill_year` — each shard object is emitted
+    once by the sharding codec (no read-modify-write), at the cost of writing
+    the whole (dense) shard region. Requires a sharded ``variant``.
+    """
+    if variant.shards is None:
+        raise ValueError(f"{variant.name} is not sharded; use fill_year")
+    if not shard_list:
+        raise ValueError("shard_list is empty; nothing to fill")
+
+    repo = harness.open_repo(cfg, store, config=repo_config)
+    session = repo.writable_session("main")
+    fork = session.fork()
+    parts = _partition(shard_list, n_workers)
+    payloads = [
+        {
+            "fork": fork,
+            "group": group,
+            "year_index": year_index,
+            "shards": part,
+            "shard_yx": [variant.shards[1], variant.shards[2]],
+            "zone_hw": [zone.height, zone.width],
+            "band": V.BAND,
+            "seed": seed,
+        }
+        for part in parts
+    ]
+
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx) as ex:
+        forks = list(ex.map(write_fork_shards, payloads))
+
+    merge_start = time.monotonic()
+    session.merge(*forks)
+    merge_wall = time.monotonic() - merge_start
+
+    commit_start = time.monotonic()
+    snapshot_id = session.commit(f"shard-aligned fill {group} year {YEARS[year_index]} ({len(shard_list)} shards)")
+    commit_wall = time.monotonic() - commit_start
+
+    logger.info(
+        "shard-aligned filled %s/%s: %d shards, merge %.2fs commit %.2fs",
+        store,
+        group,
+        len(shard_list),
+        merge_wall,
+        commit_wall,
+    )
+    return FillResult(
+        refs_committed=len(shard_list),  # one shard object per shard
+        merge_wall_s=merge_wall,
+        commit_wall_s=commit_wall,
+        snapshot_id=snapshot_id,
+        n_chunks=len(shard_list),
         n_workers=len(payloads),
     )

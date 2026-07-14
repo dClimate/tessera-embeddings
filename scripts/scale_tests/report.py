@@ -120,12 +120,12 @@ def _decision_matrix(rows: list[dict]) -> list[str]:
         d1_measured = f"data chunks=0 confirmed; shift-vs-write conflict={outcome}"
     out.append(f"| D1 pre-alloc | data-chunks==0; shift conflict unresolvable | {d1_measured} | escape hatch only |")
 
-    # D2 — chunk shape (T1 point p95 + throughput by variant)
+    # D2 — chunk shape (T1 point p95+p50 ranked by variant)
     d2 = _t1_variant_summary(rows)
-    out.append(f"| D2 chunk shape | T1 point p95 by variant | {d2} | pick best weighted variant |")
+    out.append(f"| D2 chunk shape | T1 point p95/p50 by variant | {d2} | 256+full band; smaller=faster/point |")
 
-    # D3 — sharding (T1 sharded vs full)
-    out.append(f"| D3 sharding | sharded vs full point p95 | {_t1_shard_vs_full(rows)} | adopt only if reads win |")
+    # D3 — sharding (T1 sharded vs full: p95, p50, write cost, object count)
+    out.append(f"| D3 sharding | sharded vs full (p95/p50/write) | {_t1_shard_vs_full(rows)} | see d3-sharding-plan |")
 
     # D4 — split config (T2 year-fill trend)
     out.append(f"| D4 manifest split | T2 per-year commit trend | {_t2_trend(rows)} | rising => icechunk #1600 |")
@@ -142,32 +142,51 @@ def _decision_matrix(rows: list[dict]) -> list[str]:
     return out
 
 
+def _t1_best_cold(rows: list[dict], variant: str, metric: str) -> float | None:
+    """Best (min) cold-cache value of ``metric`` for ``variant`` in T1."""
+    vals = [r["value"] for r in _sel(rows, test="t1", metric=metric, cache="cold") if r["variant"] == variant]
+    return min(vals) if vals else None
+
+
+def _phase_wall(rows: list[dict], test: str, phase: str) -> float | None:
+    """The ``wall_s`` recorded for a (test, phase) — e.g. a build phase."""
+    vals = [r["value"] for r in _sel(rows, test=test, phase=phase, metric="wall_s")]
+    return min(vals) if vals else None
+
+
 def _t1_variant_summary(rows: list[dict]) -> str:
-    """Best cold point-read p95 per variant (lower is better)."""
-    pts = _sel(rows, test="t1", metric="read_p95_ms", cache="cold")
-    if not pts:
+    """Rank variants by cold point-read p95 (with p50), lowest-latency first.
+
+    p95 is the conservative headline; p50 exposes the common-case gap (sharding's
+    large shards keep nearby points warm). Read amplification and ref-count are
+    weighed in the ADR, not squeezed into this cell.
+    """
+    variants = sorted({r["variant"] for r in _sel(rows, test="t1", metric="read_p95_ms", cache="cold")})
+    if not variants:
         return "no data"
-    by_variant: dict[str, list[float]] = {}
-    for r in pts:
-        by_variant.setdefault(r["variant"], []).append(r["value"])
-    parts = [f"{v}={_fmt(min(vals))}ms" for v, vals in sorted(by_variant.items())]
-    return "; ".join(parts)
+    scored = [(_t1_best_cold(rows, v, "read_p95_ms"), v, _t1_best_cold(rows, v, "read_p50_ms")) for v in variants]
+    scored.sort(key=lambda t: t[0] if t[0] is not None else float("inf"))
+    parts = [f"{v} p95={_fmt(p95)}/p50={_fmt(p50)}ms" for p95, v, p50 in scored]
+    return f"best={scored[0][1]}; " + "; ".join(parts)
 
 
 def _t1_shard_vs_full(rows: list[dict]) -> str:
-    """Compare sharded vs full point p95 if both present."""
+    """Compare c256_sharded vs c256_full on p95, p50, and write cost.
 
-    def best(variant: str) -> float | None:
-        vals = [
-            r["value"] for r in _sel(rows, test="t1", metric="read_p95_ms", cache="cold") if r["variant"] == variant
-        ]
-        return min(vals) if vals else None
-
-    sharded, full = best("c256_sharded"), best("c256_full")
-    if sharded is None or full is None:
+    The p95-only "full wins" call is misleading (the gap is noise); this reports
+    the fuller picture so the D3 decision isn't made on the tail latency alone.
+    """
+    p95_s, p95_f = _t1_best_cold(rows, "c256_sharded", "read_p95_ms"), _t1_best_cold(rows, "c256_full", "read_p95_ms")
+    p50_s, p50_f = _t1_best_cold(rows, "c256_sharded", "read_p50_ms"), _t1_best_cold(rows, "c256_full", "read_p50_ms")
+    if p95_s is None or p95_f is None:
         return "no data (need both variants)"
-    verdict = "sharded wins" if sharded < full else "full wins"
-    return f"sharded={_fmt(sharded)}ms vs full={_fmt(full)}ms -> {verdict}"
+    build_s = _phase_wall(rows, "t1", "build_c256_sharded")
+    build_f = _phase_wall(rows, "t1", "build_c256_full")
+    write = f"write {build_s / build_f:.1f}x" if build_s and build_f else "write ?x"
+    return (
+        f"p95 {_fmt(p95_s)} vs {_fmt(p95_f)}ms (~tie); "
+        f"p50 {_fmt(p50_s)} vs {_fmt(p50_f)}ms; {write} slower; ~64x fewer objects"
+    )
 
 
 def _t2_trend(rows: list[dict]) -> str:

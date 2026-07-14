@@ -47,6 +47,7 @@ METRICS = frozenset(
         "refs_committed",
         "manifest_count",
         "manifest_bytes",
+        "bytes_written",
         "snapshot_bytes",
         "objects_listed",
         "objects_deleted",

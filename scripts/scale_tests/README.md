@@ -31,6 +31,8 @@ scale_tests/
 ├── t5_contention.py  concurrent-writer commit contention   → ADR D5/D6
 ├── t6_gc_bench.py    GC / expiry / rollback                → ADR D7
 ├── t7_ramp.py        fresh-bucket PUT ramp (S3 only)       → campaign warm-up
+├── t8_sharding.py    shard vs unshard: write-align, bytes, → ADR D3 (see
+│                     scattered reads, object count            design/d3-sharding-plan.md)
 ├── report.py         collate metrics → decision matrix markdown
 └── teardown.py       delete a run's stores; verify $0 residue
 ```
@@ -61,6 +63,9 @@ uv run python -m scale_tests.t4_group_scale --run-id run1 --backend s3 --scale b
 uv run python -m scale_tests.t5_contention --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
 uv run python -m scale_tests.t6_gc_bench   --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
 uv run python -m scale_tests.t7_ramp       --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
+
+# D3 settlement (separate run; see design/d3-sharding-plan.md)
+uv run python -m scale_tests.t8_sharding   --run-id d3   --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
 
 # collate + tear down
 uv run python -m scale_tests.report   --run-id run1

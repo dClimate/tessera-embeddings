@@ -98,9 +98,7 @@ def phase_for_n(cfg: harness.RunConfig, n: int) -> None:
         harness.emit_metric(cfg, TEST, phase, "retries", r["retries"], "count", n=n, group=r["group"])
         harness.emit_metric(cfg, TEST, phase, "commit_wall_s", r["commit_wall_s"], "s", n=n, group=r["group"])
     harness.emit_metric(cfg, TEST, phase, "wall_s", total_wall, "s", n=n, kind="total")
-    harness.emit_metric(
-        cfg, TEST, phase, "commit_wall_s", float(np.percentile(commit_walls, 95)), "s", n=n, stat="p95"
-    )
+    harness.emit_metric(cfg, TEST, phase, "commit_wall_s", float(np.percentile(commit_walls, 95)), "s", n=n, stat="p95")
     logger.info(
         "N=%d: total %.2fs, retries max=%d mean=%.1f, unresolvable=%d failed=%d",
         n,
@@ -112,8 +110,7 @@ def phase_for_n(cfg: harness.RunConfig, n: int) -> None:
     )
     if unresolvable or failed:
         raise SystemExit(
-            f"N={n}: distinct-group commits did not all resolve "
-            f"(unresolvable={unresolvable}, failed={failed})"
+            f"N={n}: distinct-group commits did not all resolve (unresolvable={unresolvable}, failed={failed})"
         )
 
 
