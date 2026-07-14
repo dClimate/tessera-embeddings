@@ -1,0 +1,256 @@
+"""Zone-fill runner: mask → (stubbed) inference → shard assembly → tag."""
+
+from __future__ import annotations
+
+import logging
+
+import numpy as np
+import pytest
+import zarr
+
+from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
+from tessera_embeddings.config.time_windows import TimeWindow
+from tessera_embeddings.inference.assembly import ZarrWriter
+from tessera_embeddings.orchestration.runners import zone_fill
+from tessera_embeddings.storage import global_store
+from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
+from tessera_embeddings.storage.zone_grid import ZoneSpec
+
+log = logging.getLogger("test_zone_fill")
+
+_BAND = 8
+_TILE = 64  # miniature shard pitch (== inference tile size, D3)
+_INNER = 32
+_NY = _NX = 2 * _TILE  # 2x2 tile grid
+_ZONE = "32601"
+_YEARS = (2024, 2025)
+
+_EMB = ArrayLayout(DIMS_4D, (1, _INNER, _INNER, _BAND), "int8", 0, "zstd", shards=(1, _TILE, _TILE, _BAND))
+_SCL = ArrayLayout(DIMS_3D, (1, _INNER, _INNER), "float32", float("nan"), "pcodec", shards=(1, _TILE, _TILE))
+SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL})
+
+# 10 m pixels -> metre extents for a _NY x _NX pixel zone.
+_SPEC = ZoneSpec(_ZONE, "N", 1, (0.0, _NX * 10.0), (0.0, _NY * 10.0))
+
+_WINDOW = TimeWindow(
+    window_start=(2024, 7),
+    window_end=(2025, 6),
+    months=tuple([(2024, m) for m in range(7, 13)] + [(2025, m) for m in range(1, 7)]),
+    window_end_label="2025-06-01",
+)
+
+
+def _config() -> InferenceConfig:
+    return InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0)
+
+
+def _seed_global(tmp_path) -> str:
+    store = str(tmp_path / "global.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_SPEC], years=_YEARS, layout=SMALL)
+    return store
+
+
+def _make_mosaic(tmp_path, ny: int = _NY, nx: int = _NX) -> str:
+    """A minimal reflectance store so enumerate_mosaic_chunks can read the grid."""
+    base = str(tmp_path / "mosaics")
+    create_empty_store_from_coords(
+        f"{base}/reflectance.zarr",
+        coords={
+            "time": np.array(["2025-01-01"], dtype="datetime64[ns]"),
+            "northing": np.arange(ny, dtype="float64"),
+            "easting": np.arange(nx, dtype="float64"),
+        },
+        var_specs={"red": VarSpec(dims=("time", "northing", "easting"), dtype=np.dtype("uint16"), chunks=(1, ny, nx))},
+        commit_msg="seed test mosaic",
+    )
+    return base
+
+
+def _make_mask(tmp_path, live_tiles: list[tuple[int, int]]) -> str:
+    """Boolean mask on the zone grid with True inside the given tile positions."""
+    path = str(tmp_path / "land_mask.zarr")
+    arr = zarr.open(path, mode="w", shape=(_NY, _NX), chunks=(_NY, _NX), dtype="bool")
+    arr[:] = False
+    for row, col in live_tiles:
+        arr[row * _TILE : (row + 1) * _TILE, col * _TILE : (col + 1) * _TILE] = True
+    return path
+
+
+def _staging_inference_stub(staged: dict[str, np.ndarray]):
+    """A run_inference stand-in that stages every tile and reports success.
+
+    Records what it staged into ``staged`` (label -> embeddings) so tests can
+    compare the assembled store against it.
+    """
+
+    def stub(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
+        rng = np.random.default_rng(5)
+        writer = ZarrWriter(staging_base, embedding_dim=_BAND)
+        results = []
+        for chunk in chunks:
+            emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
+            scales = rng.random((chunk.height, chunk.width)).astype(np.float32)
+            writer.write_chunk(chunk, emb, run_id, scales=scales)
+            staged[chunk.label] = emb
+            results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
+        return results
+
+    return stub
+
+
+def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
+    """Live tiles land as shards at the year index; the cell is tagged and cleaned up."""
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0), (0, 1), (1, 1)])
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
+
+    summary = zone_fill.fill_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2025,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="runZ",
+    )
+
+    assert summary["empty"] is False
+    assert summary["live_tiles"] == 3
+    assert summary["total_tiles"] == 4
+    assert summary["succeeded"] == 3
+    assert summary["tag"] == "zone-32601-2025"
+
+    repo = global_store.open_global_repo(store)
+    assert repo.lookup_tag("zone-32601-2025") == summary["snapshot_id"]
+    node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
+    assert node.attrs["years_complete"] == [2025]
+    assert node.attrs["runs"]["2025"]["run_id"] == "runZ"
+    # 2025 is index 1 on the (2024, 2025) axis; staged tiles match, ocean tile is fill.
+    result = np.asarray(node["embeddings"][1])
+    assert np.all(result[_TILE:, :_TILE] == 0), "unmasked tile must stay at fill"
+    for label, emb in staged.items():
+        row, col = (int(p) for p in label.split("_")[1:])
+        got = result[row * _TILE : (row + 1) * _TILE, col * _TILE : (col + 1) * _TILE]
+        np.testing.assert_array_equal(got, emb, err_msg=label)
+    # Staging cleaned up after success.
+    assert not (tmp_path / "staging" / "runZ").exists()
+
+
+def test_all_ocean_cell_marked_complete_without_inference(tmp_path, monkeypatch):
+    """An all-ocean cell lands (years_complete + tag) with no inference at all."""
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [])  # nothing lives
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("run_inference must not be called for an all-ocean cell")
+
+    monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
+
+    summary = zone_fill.fill_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2024,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="runE",
+    )
+
+    assert summary["empty"] is True
+    assert summary["live_tiles"] == 0
+    repo = global_store.open_global_repo(store)
+    node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
+    assert node.attrs["years_complete"] == [2024]
+    assert node.attrs["runs"]["2024"] == {**node.attrs["runs"]["2024"], "run_id": "runE", "empty": True}
+    assert repo.lookup_tag("zone-32601-2024") == summary["snapshot_id"]
+
+
+def test_unseeded_zone_raises(tmp_path):
+    store = _seed_global(tmp_path)
+    with pytest.raises(ValueError, match="not seeded"):
+        zone_fill.fill_zone_year(
+            store_path=store,
+            zone="32660",
+            year=2025,
+            land_mask_path=str(tmp_path / "mask.zarr"),
+            mosaic_base=str(tmp_path / "mosaics"),
+            staging_base=str(tmp_path / "staging"),
+            config=_config(),
+            num_actors=1,
+            log=log,
+        )
+
+
+def test_chunk_size_shard_mismatch_raises(tmp_path):
+    store = _seed_global(tmp_path)
+    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE * 2, num_gpus=0)
+    with pytest.raises(ValueError, match="1 inference tile == 1 shard"):
+        zone_fill.fill_zone_year(
+            store_path=store,
+            zone=_ZONE,
+            year=2025,
+            land_mask_path=str(tmp_path / "mask.zarr"),
+            mosaic_base=str(tmp_path / "mosaics"),
+            staging_base=str(tmp_path / "staging"),
+            config=config,
+            num_actors=1,
+            log=log,
+        )
+
+
+def test_mosaic_grid_mismatch_raises(tmp_path):
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path, ny=_NY + _TILE)  # taller than the zone grid
+    with pytest.raises(ValueError, match="does not match"):
+        zone_fill.fill_zone_year(
+            store_path=store,
+            zone=_ZONE,
+            year=2025,
+            land_mask_path=_make_mask(tmp_path, [(0, 0)]),
+            mosaic_base=mosaic_base,
+            staging_base=str(tmp_path / "staging"),
+            config=_config(),
+            num_actors=1,
+            log=log,
+        )
+
+
+def test_inference_failure_aborts_before_assembly(tmp_path, monkeypatch):
+    """A failed tile raises and neither assembles nor tags."""
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0)])
+
+    def failing_inference(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
+        return [{"chunk": chunks[0].label, "status": "failed", "error": "boom"}]
+
+    monkeypatch.setattr(zone_fill, "run_inference", failing_inference)
+
+    with pytest.raises(RuntimeError, match="1 tiles failed"):
+        zone_fill.fill_zone_year(
+            store_path=store,
+            zone=_ZONE,
+            year=2025,
+            land_mask_path=mask,
+            mosaic_base=mosaic_base,
+            staging_base=str(tmp_path / "staging"),
+            config=_config(),
+            num_actors=1,
+            log=log,
+        )
+
+    repo = global_store.open_global_repo(store)
+    node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
+    assert node.attrs["years_complete"] == []
+    assert "zone-32601-2025" not in repo.list_tags()

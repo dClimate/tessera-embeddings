@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
@@ -29,6 +30,7 @@ from typing import cast
 import icechunk
 import zarr
 
+from tessera_embeddings.storage.shard_writer import CommitGate, commit_with_rebase
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES
 
 logger = logging.getLogger(__name__)
@@ -103,6 +105,46 @@ def tag_year_complete(
     repo.create_tag(tag, sid)
     logger.info("tagged %s -> %s (%d zones)", tag, sid, len(expected))
     return tag
+
+
+def mark_zone_year_empty(
+    repo: icechunk.Repository,
+    zone: str,
+    year: int,
+    *,
+    run_id: str | None = None,
+    gate: CommitGate | None = None,
+) -> str:
+    """Mark a ``(zone, year)`` complete with **no data** — an all-ocean cell.
+
+    Some of the 120 zones (and some zone-years under the partner land mask)
+    contain no land at all, so there is nothing to stage or shard-write — but
+    the campaign work list (:meth:`CampaignStatus.pending`) must still see them
+    land. This advances ``years_complete`` (and ``runs`` provenance when
+    ``run_id`` is given) in one gated commit, exactly as
+    :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` would,
+    minus the shards. Idempotent: a year already marked commits nothing new but
+    still returns the branch tip. Returns the snapshot id to tag.
+    """
+    session = repo.writable_session("main")
+    root = zarr.open_group(session.store, mode="a")
+    node = cast(zarr.Group, root[zone])
+    raw = node.attrs.get("years_complete", [])
+    done = [int(y) for y in raw] if isinstance(raw, list) else []
+    if year not in done:
+        node.attrs["years_complete"] = sorted([*done, year])
+    if run_id is not None:
+        runs = dict(node.attrs.get("runs", {}))  # type: ignore[arg-type]
+        runs[str(year)] = {
+            "run_id": run_id,
+            "assembled_at": datetime.now(UTC).isoformat(),
+            "empty": True,
+        }
+        node.attrs["runs"] = runs
+    if not session.has_uncommitted_changes:
+        return repo.lookup_branch("main")
+    with gate if gate is not None else nullcontext():
+        return commit_with_rebase(session, f"mark {zone} year {year} complete (no land)")
 
 
 @dataclass(frozen=True)

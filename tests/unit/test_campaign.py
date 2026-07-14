@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pytest
+import zarr
 
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import campaign, global_store
@@ -184,3 +185,28 @@ def test_expire_and_gc_keeps_tagged_snapshot(tmp_path):
     campaign.expire_and_gc(repo, older_than=cutoff)
     # the tagged snapshot is reachable via the tag even though HEAD moved on
     assert tagged in {s.id for s in repo.ancestry(tag="zone-32601-2023")}
+
+
+# --- mark_zone_year_empty ----------------------------------------------------
+
+
+def test_mark_zone_year_empty_advances_completion(tmp_path):
+    """An all-ocean cell lands in years_complete + runs without any shard data."""
+    _, repo = _seed(tmp_path)
+    snapshot = campaign.mark_zone_year_empty(repo, "32601", 2024, run_id="runE")
+
+    status = campaign.campaign_status(repo, years=_YEARS)
+    assert status.has("32601", 2024)
+    assert not status.has("32602", 2024)
+    assert snapshot == repo.lookup_branch("main")
+
+    node = zarr.open_group(repo.readonly_session("main").store, mode="r")["32601"]
+    assert node.attrs["runs"]["2024"] == {**node.attrs["runs"]["2024"], "run_id": "runE", "empty": True}
+
+
+def test_mark_zone_year_empty_idempotent_without_run_id(tmp_path):
+    """Re-marking an already-complete year without provenance commits nothing new."""
+    _, repo = _seed(tmp_path)
+    first = campaign.mark_zone_year_empty(repo, "32601", 2024)
+    again = campaign.mark_zone_year_empty(repo, "32601", 2024)
+    assert first == again == repo.lookup_branch("main")
