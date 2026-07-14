@@ -46,7 +46,8 @@ YEAR = 0  # stores are seeded with a single-year axis
 
 STORE_FULL = "t8_full"
 STORE_SHARDED = "t8_sharded"  # chunkwise (matches T1)
-STORE_ALIGNED = "t8_sharded_aligned"
+STORE_ALIGNED = "t8_sharded_aligned"  # dense shards (writes ocean too)
+STORE_MASKED = "t8_sharded_masked"  # production-representative: land-only, ocean elided
 
 N_POINTS_TINY = 100
 N_POINTS_BENCH = 500
@@ -110,7 +111,7 @@ def phase_write_alignment(cfg: harness.RunConfig) -> None:
         res = SB.fill_year(cfg, STORE_SHARDED, GROUP, SHARDED, zone, YEAR, land, n_workers=nw, seed=SEED)
     _emit_build(cfg, "sharded_chunkwise", t.seconds, res.commit_wall_s, _chunk_bytes(cfg, STORE_SHARDED))
 
-    # (c) sharded, shard-aligned (one full-shard write per shard)
+    # (c) sharded, shard-aligned DENSE (writes ocean too — the "write everything" point)
     _seed(cfg, STORE_ALIGNED, SHARDED, zone)
     shards = SB.shards_for_chunks(SHARDED, land)
     with harness.timer() as t:
@@ -119,7 +120,17 @@ def phase_write_alignment(cfg: harness.RunConfig) -> None:
         )
     _emit_build(cfg, "sharded_aligned", t.seconds, res.commit_wall_s, _chunk_bytes(cfg, STORE_ALIGNED))
 
-    logger.info("write_alignment built full / sharded-chunkwise / sharded-aligned (%d shards)", len(shards))
+    # (d) sharded, shard-aligned + land-MASKED (production writer: ocean elided)
+    _seed(cfg, STORE_MASKED, SHARDED, zone)
+    with harness.timer() as t:
+        res = SB.fill_year_shard_aligned(
+            cfg, STORE_MASKED, GROUP, SHARDED, zone, YEAR, shards, n_workers=nw, seed=SEED, land_chunks=land
+        )
+    _emit_build(cfg, "sharded_masked", t.seconds, res.commit_wall_s, _chunk_bytes(cfg, STORE_MASKED))
+
+    logger.info(
+        "write_alignment built full / sharded-chunkwise / sharded-aligned / sharded-masked (%d shards)", len(shards)
+    )
 
 
 def _emit_build(
@@ -248,13 +259,44 @@ def phase_scattered_reads(cfg: harness.RunConfig) -> None:
 
 
 def phase_object_count(cfg: harness.RunConfig) -> None:
-    """E4: actual objects + manifest bytes, full vs sharded (chunkwise + aligned)."""
-    for mode, store in (("full", STORE_FULL), ("sharded_chunkwise", STORE_SHARDED), ("sharded_aligned", STORE_ALIGNED)):
-        n_obj, _ = _chunk_bytes(cfg, store)
+    """E4: objects + manifest bytes, full vs sharded, pre- and post-GC.
+
+    Raw ``chunks/`` object counts include stale/superseded objects from
+    read-modify-write churn (chunkwise sharding) — GC removes them, so the
+    post-GC count is the live-object figure to quote.
+    """
+    stores = (
+        ("full", STORE_FULL),
+        ("sharded_chunkwise", STORE_SHARDED),
+        ("sharded_aligned", STORE_ALIGNED),
+        ("sharded_masked", STORE_MASKED),
+    )
+    for mode, store in stores:
+        pre_obj, _ = _chunk_bytes(cfg, store)
         _, man_bytes = harness.object_stats(harness.store_uri(cfg, store) + "/manifests")
-        harness.emit_metric(cfg, TEST, "object_count", "objects_listed", n_obj, "count", mode=mode, where="chunks")
+        harness.emit_metric(
+            cfg, TEST, "object_count", "objects_listed", pre_obj, "count", mode=mode, when="pre_gc", where="chunks"
+        )
         harness.emit_metric(cfg, TEST, "object_count", "manifest_bytes", man_bytes, "bytes", mode=mode)
-        logger.info("E4 %s: %d chunk objects, %d manifest bytes", mode, n_obj, man_bytes)
+        post_obj = _gc_and_count(cfg, store)
+        harness.emit_metric(
+            cfg, TEST, "object_count", "objects_listed", post_obj, "count", mode=mode, when="post_gc", where="chunks"
+        )
+        logger.info(
+            "E4 %s: %d -> %d chunk objects (pre/post-GC), %d manifest bytes", mode, pre_obj, post_obj, man_bytes
+        )
+
+
+def _gc_and_count(cfg: harness.RunConfig, store: str) -> int:
+    """Expire + GC the store, then return the live chunk-object count."""
+    import datetime
+
+    repo = harness.open_repo(cfg, store)
+    cutoff = datetime.datetime.now(datetime.UTC)
+    repo.expire_snapshots(older_than=cutoff)
+    repo.garbage_collect(cutoff, dry_run=False)
+    n_obj, _ = _chunk_bytes(cfg, store)
+    return n_obj
 
 
 # ── point sampling ───────────────────────────────────────────────────────────

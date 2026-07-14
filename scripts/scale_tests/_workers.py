@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 import icechunk
+import numpy as np
 import zarr
 
 from scale_tests import synth
@@ -65,13 +66,20 @@ def write_fork(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns an i
 def write_fork_shards(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns a ForkSession
     """Shard-aligned variant of :func:`write_fork` (test plan D3 / E2).
 
-    Writes one full shard-sized block per assigned shard in a single array
-    assignment, so the Zarr sharding codec emits each shard object once with no
-    read-modify-write. Writes the *whole* shard region (dense — ocean inner
-    chunks included), which is the faithful shard-aligned write pattern.
+    One full shard-sized block per assigned shard in a single array assignment,
+    so the Zarr sharding codec emits each shard object once with no
+    read-modify-write. Two modes:
 
-    Payload keys mirror :func:`write_fork` but with ``shards`` (list of
-    ``[sy, sx]`` shard indices) and ``shard_yx`` (``[shard_y, shard_x]``).
+    * **dense** (``land`` absent) — writes synth data across the whole shard
+      region (ocean included); the faithful "write everything" comparison point.
+    * **land-masked** (``land`` = list of ``[yc, xc]`` land inner-chunk indices,
+      with ``chunk_yx``) — writes synth data only into land inner chunks and
+      leaves ocean inner chunks at the fill value, so the codec elides them.
+      This is the production-representative writer: one lean shard object per
+      shard, no dense nodata.
+
+    Payload keys mirror :func:`write_fork` plus ``shards`` (``[sy, sx]``),
+    ``shard_yx`` (``[shard_y, shard_x]``), and optionally ``land`` + ``chunk_yx``.
     """
     fork = payload["fork"]
     group = payload["group"]
@@ -80,6 +88,9 @@ def write_fork_shards(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     ny, nx = payload["zone_hw"]
     band = int(payload["band"])
     seed = int(payload["seed"])
+    land = payload.get("land")
+    land_set = {tuple(c) for c in land} if land is not None else None
+    cy, cx = payload.get("chunk_yx", (0, 0))
 
     root = zarr.open_group(fork.store, mode="a")
     emb = root[group]["embeddings"]
@@ -88,9 +99,29 @@ def write_fork_shards(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
         y0, x0 = sy * sh_y, sx * sh_x
         y1, x1 = min(y0 + sh_y, ny), min(x0 + sh_x, nx)
         h, w = y1 - y0, x1 - x0
-        idx = (year, sy, sx)
-        emb[year : year + 1, y0:y1, x0:x1, :] = synth.embedding_block((1, h, w, band), seed=seed, block_index=idx)
-        scl[year : year + 1, y0:y1, x0:x1] = synth.scales_block((1, h, w), seed=seed, block_index=idx)
+        if land_set is None:
+            idx = (year, sy, sx)
+            emb_block = synth.embedding_block((1, h, w, band), seed=seed, block_index=idx)
+            scl_block = synth.scales_block((1, h, w), seed=seed, block_index=idx)
+        else:
+            # Fill (0 / NaN) everywhere, then paint land inner chunks; all-fill
+            # ocean inner chunks are elided by the sharding codec on write.
+            emb_block = np.zeros((1, h, w, band), dtype="int8")
+            scl_block = np.full((1, h, w), np.float32("nan"), dtype="float32")
+            for yc, xc in land_set:
+                if yc * cy // sh_y != sy or xc * cx // sh_x != sx:
+                    continue  # inner chunk not in this shard
+                iy0, ix0 = yc * cy - y0, xc * cx - x0
+                ih, iw = min(cy, h - iy0), min(cx, w - ix0)
+                bidx = (year, yc, xc)
+                emb_block[0, iy0 : iy0 + ih, ix0 : ix0 + iw, :] = synth.embedding_block(
+                    (1, ih, iw, band), seed=seed, block_index=bidx
+                )[0]
+                scl_block[0, iy0 : iy0 + ih, ix0 : ix0 + iw] = synth.scales_block(
+                    (1, ih, iw), seed=seed, block_index=bidx
+                )[0]
+        emb[year : year + 1, y0:y1, x0:x1, :] = emb_block
+        scl[year : year + 1, y0:y1, x0:x1] = scl_block
     return fork
 
 

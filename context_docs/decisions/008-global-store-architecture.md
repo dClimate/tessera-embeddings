@@ -6,13 +6,17 @@ PENDING a named test in the companion test plan
 decisions with follow-up ADRs as test evidence lands.
 
 **Run 1 (2026-07-14, S3 bench, icechunk 2.1.1, `arbol-tessera-embeddings-dev`):**
-full T0–T7 pass **including the 5-variant T1 sweep**. It moved **D1**, **D2**,
-and **D4** to FIRM, added a hard commit-concurrency constraint to **D5/D6**, and
-validated the D7 mechanism. The one remaining open decision is **D3 (sharding)**:
-run 1 showed sharded reads tie/beat unsharded and cut object count ~64×, at a
-2.8× write cost — promising enough that D3 flipped from "optional" to "strong
-contender pending a shard-aligned write test" (`design/d3-sharding-plan.md`).
-See "Run 1 evidence" at the bottom for the numbers.
+full T0–T7 pass **including the 5-variant T1 sweep** — moved **D1**, **D2**,
+**D4** to FIRM, added a hard commit-concurrency constraint to **D5/D6**,
+validated the D7 mechanism.
+
+**Run d3 (2026-07-14, t8 experiments) settled the last open decision, D3:**
+**adopt `c256_sharded`** — E1 showed lean partial reads (1.23 vs 8.74 MB/pt),
+E2 showed shard-*aligned* writes are 0.6× the unsharded build (the 2.8× was
+unaligned RMW), E3 showed scattered reads still favor sharding. D3 is FIRM with
+two production-writer conditions (shard-aligned + land-masked; post-GC object
+count). All decisions D1–D9 are now FIRM. See "Run 1 evidence" and the D3 body
+for numbers.
 
 ## Context
 
@@ -115,7 +119,7 @@ bytes per pixel and read slower (384/500 ≈ 334–339 ms). The current
 refs. Going below 256 px isn't worth it (below the 3–15 MB optimum, 4× more
 refs). So: 256 px spatial, full 128-band dim, int8+zstd. FIRM.
 
-### D3 — Sharding: strong contender (was "optional"); D2-spatial reads don't lose (PENDING shard-aligned write test — see `design/d3-sharding-plan.md`)
+### D3 — Sharding: **ADOPT `c256_sharded`** (FIRM — confirmed by t8 run d3; production writer must be shard-aligned + land-masked)
 
 Zarr v3 sharding works in icechunk (fixed v1.0.3, caveat-free since 2.0.0,
 requires zarr-python ≥ 3.1.2). Inner chunks per D2 (256 px), shards ~2048² px
@@ -137,17 +141,41 @@ reads do *not* lose:**
 - **Object count:** ~64× fewer refs (~3.2 M vs ~205 M over 9 yr) — a large win
   for manifest size, GC feasibility, listing, and reader request cost.
 
-The one real cost: **build was 2.8× slower** (420 s vs 152 s) — sharding's
-write amplification. But the test writes 256-px chunks that dribble into 2048²
-shards (heavy read-modify-write); a shard-aligned writer should shrink this. For
-a **write-once/read-many** published dataset, a one-time write cost buying a
-permanent read + object-count win is a favorable trade *if* the penalty is
-containable. That is the open question, and the only thing standing between D3
-and a decision — hence the settlement plan in `design/d3-sharding-plan.md`.
+Run 1's one strike — **build 2.8× slower** (420 s vs 152 s) — looked like a
+dealbreaker but was an artifact of writing 256-px chunks that dribble into
+2048² shards (read-modify-write churn).
 
-**Decision rule:** adopt sharding if the shard-aligned write penalty falls to
-≤ ~1.5× *and* scattered (non-local) cold point-read p95 stays within ~1.2× of
-`c256_full`; otherwise ship `c256_full`. Either way D2 (256 px, full band) holds.
+**Run d3 (t8) settled it — all three decision gates pass:**
+
+- **E1 (wire bytes, the gate):** sharded fetched **1.23 MB/point** off the NIC
+  vs full's **8.74 MB**, and was faster (p95 169 vs 249 ms). Sharding does lean
+  *partial* reads — the whole-shard-fetch fear is dead (the run-1 16.5 MB
+  analytic figure was an artifact).
+- **E2 (write penalty, the crux):** shard-**aligned** build ≈ 12 s vs unsharded
+  full ≈ 19 s (**0.6×**) — vs sharded-*chunkwise* ≈ 38 s (2×). The 2.8× was pure
+  unaligned RMW; aligned writes are *faster* than unsharded (9 big sequential
+  shard PUTs beat 400 small ones). Penalty ≪ the 1.5× bar.
+- **E3 (scattered reads):** sharded scattered p95 **124 ms vs full 211 ms** —
+  better even under a cache-hostile pattern (rule only asked for within 1.2×).
+
+**Decision: ADOPT `c256_sharded`.** Reads are leaner *and* faster (even
+scattered), object count drops, and the write penalty vanishes with alignment.
+
+**Two production-writer conditions (implementation requirements, not decision
+blockers):**
+1. The zone-fill writer must be **shard-aligned *and* land-masked** — write real
+   data into land inner chunks and leave ocean inner chunks at fill so the codec
+   elides them (one lean shard object per shard; no dense-nodata cost). t8's
+   dense-aligned mode wrote 12.6 GB vs full's 3.46 GB *because the test filled
+   ocean with synth*; the masked writer (`fill_year_shard_aligned(land_chunks=…)`)
+   avoids that. Re-run t8 E2/E4 with the masked mode to confirm lean shards.
+2. Quote object-count reduction from a **post-GC** count (t8 E4 now does
+   pre/post-GC) — the raw `chunks/` count is inflated by RMW churn + the
+   unsharded `scales` array; manifest bytes already trend down (9976 vs 17790).
+
+**Decision rule (met):** shard-aligned write penalty ≤ ~1.5× (measured 0.6×)
+*and* scattered cold point p95 within ~1.2× of `c256_full` (measured better).
+Either way D2 (256 px, full band) holds; sharding is the wrapper.
 
 ### D4 — Manifest splitting: time-primary, coarse (FIRM — confirmed run 1 T2)
 
@@ -274,6 +302,11 @@ would poison every read benchmark run on our current 2.0.4 pin.
   a commit-retry/rebase helper, GC/expiry helpers, and a zone-fill
   orchestration layer (fork/merge batching) that **caps simultaneous zone-year
   committers to ~4–8** (run-1-mandated; see D5/D6).
+- **Sharded output (D3): the embeddings array is written in 2048² shards of
+  256-px inner chunks, by a shard-aligned + land-masked writer** (real data into
+  land inner chunks, ocean left at fill so the codec elides it → one lean shard
+  object per shard, no RMW). `scales` stays unsharded. The assembly writer must
+  emit whole shards, not dribble inner chunks.
 - Partner-facing facts to socialize early: ~1.7 PB total; the one-repo vs
   repo-per-zone tradeoff and its kill criteria (D5); annual timestep
   convention and empty-year read semantics (D1).

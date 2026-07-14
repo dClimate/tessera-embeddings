@@ -124,8 +124,9 @@ def _decision_matrix(rows: list[dict]) -> list[str]:
     d2 = _t1_variant_summary(rows)
     out.append(f"| D2 chunk shape | T1 point p95/p50 by variant | {d2} | 256+full band; smaller=faster/point |")
 
-    # D3 — sharding (T1 sharded vs full: p95, p50, write cost, object count)
-    out.append(f"| D3 sharding | sharded vs full (p95/p50/write) | {_t1_shard_vs_full(rows)} | see d3-sharding-plan |")
+    # D3 — sharding: prefer the T8 settlement (write ratio, wire bytes, scattered
+    # p95) and apply the decision rule; fall back to the T1 sweep if T8 absent.
+    out.append(f"| D3 sharding | T8 write/wire/scattered (else T1) | {_d3_summary(rows)} | see d3-sharding-plan |")
 
     # D4 — split config (T2 year-fill trend)
     out.append(f"| D4 manifest split | T2 per-year commit trend | {_t2_trend(rows)} | rising => icechunk #1600 |")
@@ -187,6 +188,49 @@ def _t1_shard_vs_full(rows: list[dict]) -> str:
         f"p95 {_fmt(p95_s)} vs {_fmt(p95_f)}ms (~tie); "
         f"p50 {_fmt(p50_s)} vs {_fmt(p50_f)}ms; {write} slower; ~64x fewer objects"
     )
+
+
+def _t8_build_wall(rows: list[dict], mode: str) -> float | None:
+    """T8 write_alignment build wall for a mode (full / sharded_* )."""
+    hits = _sel(rows, test="t8", phase="write_alignment", metric="wall_s", kind="build", mode=mode)
+    return hits[0]["value"] if hits else None
+
+
+def _t8_by_variant(rows: list[dict], phase: str, metric: str, variant: str) -> float | None:
+    """T8 value for a metric where the row's (top-level) variant matches."""
+    hits = [r for r in _sel(rows, test="t8", phase=phase, metric=metric) if r.get("variant") == variant]
+    return hits[0]["value"] if hits else None
+
+
+def _d3_summary(rows: list[dict]) -> str:
+    """Apply the D3 decision rule to T8 (write <=1.5x and scattered p95 <=1.2x).
+
+    Prefers the land-masked aligned writer; falls back to the dense aligned
+    build, then to the T1 sweep if T8 is absent entirely.
+    """
+    build_full = _t8_build_wall(rows, "full")
+    mode = "sharded_masked" if _t8_build_wall(rows, "sharded_masked") is not None else "sharded_aligned"
+    build_aligned = _t8_build_wall(rows, mode)
+    if build_full is None or build_aligned is None:
+        return _t1_shard_vs_full(rows)  # T8 not run — fall back to the T1 sweep
+
+    wire_s = _t8_by_variant(rows, "bytes_on_wire", "bytes_fetched", "c256_sharded")
+    wire_f = _t8_by_variant(rows, "bytes_on_wire", "bytes_fetched", "c256_full")
+    scat_s = _t8_by_variant(rows, "scattered_reads", "read_p95_ms", "c256_sharded")
+    scat_f = _t8_by_variant(rows, "scattered_reads", "read_p95_ms", "c256_full")
+
+    ratio = build_aligned / build_full
+    write_ok = ratio <= 1.5
+    read_ok = scat_s is not None and scat_f is not None and scat_s <= 1.2 * scat_f
+    verdict = "ADOPT sharding" if (write_ok and read_ok) else "ship c256_full"
+
+    parts = []
+    if wire_s is not None and wire_f is not None:
+        parts.append(f"wire {_fmt(wire_s / 1e6)} vs {_fmt(wire_f / 1e6)}MB/pt")
+    parts.append(f"{mode.replace('sharded_', '')}-write {ratio:.2f}x full")
+    if scat_s is not None and scat_f is not None:
+        parts.append(f"scattered p95 {_fmt(scat_s)} vs {_fmt(scat_f)}ms")
+    return "; ".join(parts) + f" -> {verdict}"
 
 
 def _t2_trend(rows: list[dict]) -> str:

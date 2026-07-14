@@ -221,13 +221,17 @@ def fill_year_shard_aligned(
     *,
     n_workers: int,
     seed: int = 0,
+    land_chunks: list[tuple[int, int]] | None = None,
     repo_config=None,  # noqa: ANN001 — optional icechunk.RepositoryConfig
 ) -> FillResult:
-    """Fill one year **shard-aligned**: one full 2048²-block write per shard.
+    """Fill one year **shard-aligned**: one full-shard-block write per shard.
 
     The D3/E2 counterpart to :func:`fill_year` — each shard object is emitted
-    once by the sharding codec (no read-modify-write), at the cost of writing
-    the whole (dense) shard region. Requires a sharded ``variant``.
+    once by the sharding codec (no read-modify-write). Requires a sharded
+    ``variant``. With ``land_chunks`` given, writes synth data only into those
+    inner chunks and leaves ocean inner chunks at fill (elided by the codec) —
+    the production-representative writer (lean shards, no dense nodata). Without
+    it, writes dense shards (the E2 "write everything" comparison point).
     """
     if variant.shards is None:
         raise ValueError(f"{variant.name} is not sharded; use fill_year")
@@ -238,6 +242,7 @@ def fill_year_shard_aligned(
     session = repo.writable_session("main")
     fork = session.fork()
     parts = _partition(shard_list, n_workers)
+    land = [list(c) for c in land_chunks] if land_chunks is not None else None
     payloads = [
         {
             "fork": fork,
@@ -245,9 +250,11 @@ def fill_year_shard_aligned(
             "year_index": year_index,
             "shards": part,
             "shard_yx": [variant.shards[1], variant.shards[2]],
+            "chunk_yx": [variant.chunks[1], variant.chunks[2]],
             "zone_hw": [zone.height, zone.width],
             "band": V.BAND,
             "seed": seed,
+            "land": land,
         }
         for part in parts
     ]
