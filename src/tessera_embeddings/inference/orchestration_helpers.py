@@ -12,31 +12,11 @@ import gc
 import logging
 from typing import Any
 
-from tessera_embeddings.config.dask import AssemblyConfig
 from tessera_embeddings.config.inference import InferenceConfig, TimeWindow
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks_from_dataset
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.storage.manifest import extract_manifest
 from tessera_embeddings.storage.zarr_store import open_store
-
-_ASSEMBLY_MIN_WORKERS_FLOOR = 5
-_ASSEMBLY_MIN_WORKERS_FRACTION = 4
-
-
-def compute_assembly_worker_counts(n_live_chunks: int, config: AssemblyConfig | None = None) -> tuple[int, int]:
-    """Return ``(min_workers, max_workers)`` for the assembly Dask cluster.
-
-    ``min_workers`` is floored at :data:`_ASSEMBLY_MIN_WORKERS_FLOOR` and
-    capped at ``max_workers`` so it never exceeds the maximum on small
-    ROIs.
-    """
-    cfg = config or AssemblyConfig()
-    max_workers = cfg.compute_n_workers(n_live_chunks)
-    min_workers = min(
-        max(_ASSEMBLY_MIN_WORKERS_FLOOR, max_workers // _ASSEMBLY_MIN_WORKERS_FRACTION + 1),
-        max_workers,
-    )
-    return min_workers, max_workers
 
 
 def read_upstream_manifests(

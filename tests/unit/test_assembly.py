@@ -1,13 +1,12 @@
 """Tests for ZarrWriter: staging round-trips, raw-zarr assembly, cleanup dispatch.
 
 Assembly tests exercise the fork/merge engine (``assemble``/``assemble_global``)
-directly — no Dask. ``TestEngineParity`` is the implementation plan's W4 parity
-gate: it runs the legacy Dask engine and the raw-zarr engine on identical staged
-inputs and asserts value- and attr-identical stores; it is deleted together with
-the legacy engine. cleanup_staging coverage diverges from the reference repo:
-this repo's cleanup_staging prefers s5cmd for S3 with an fsspec fallback, so
-TestCleanupStagingDispatch exercises the routing decision instead of error
-propagation.
+directly — no Dask. The W4 parity gate (legacy Dask engine vs this engine on
+identical staged inputs) passed and was deleted together with the legacy engine;
+see the implementation plan. cleanup_staging coverage diverges from the
+reference repo: this repo's cleanup_staging prefers s5cmd for S3 with an fsspec
+fallback, so TestCleanupStagingDispatch exercises the routing decision instead
+of error propagation.
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ import numpy as np
 import pytest
 import xarray as xr
 import zarr
-from dask.distributed import Client
 
 import tessera_embeddings.inference.assembly as _assembly_mod
 from tessera_embeddings.config.inference import EMBEDDING_DIM
@@ -62,18 +60,6 @@ def _quantized_embeddings(
     """Generate random float32 embeddings and return (int8_quantized, scales)."""
     raw = rng.standard_normal((h, w, dim)).astype(np.float32)
     return quantize_embeddings(raw)
-
-
-@pytest.fixture(scope="class")
-def dask_client():
-    """Local Dask client for the LEGACY engine's side of the parity gate.
-
-    Only ``TestEngineParity`` needs it (``to_icechunk`` under a distributed
-    client); it is deleted together with the legacy engine.
-    """
-    client = Client(n_workers=2, threads_per_worker=1, memory_limit="2GB")
-    yield client
-    client.close()
 
 
 class TestStagedStorageOptions:
@@ -609,9 +595,9 @@ class TestAssembly:
     def test_assemble_treats_skip_marker_chunks_as_fill(self, tmp_path):
         """A live chunk with a skip marker (no staged zarr) falls through to zero-fill.
 
-        Regression for a crash where assemble() passed skip-marker chunks into
-        _build_mosaic's live_labels, and _assemble_var_block then attempted to
-        open the non-existent zarr group and raised GroupNotFoundError.
+        Regression (originally against the Dask engine): skip-marked chunks must
+        never be treated as staged — a worker opening the non-existent zarr
+        would raise GroupNotFoundError. Their footprint stays at the fill value.
         """
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -1389,87 +1375,3 @@ class TestAssembleGlobal:
         writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
         with pytest.raises(IncompleteStageError, match="no staged chunks"):
             writer.assemble_global(store_path, self.ZONE, year=2025, run_id="empty_run", n_workers=1)
-
-
-class TestEngineParity:
-    """W4 parity gate: the raw-zarr engine must reproduce the Dask engine exactly.
-
-    Runs both engines on identical staged inputs (create, then a second-window
-    append) and asserts value-identical arrays, identical coords, and equivalent
-    root attrs. Deleted together with the legacy engine once the gate has
-    served its purpose.
-    """
-
-    def _window(self, end_year: int) -> TimeWindow:
-        return TimeWindow(
-            window_start=(end_year - 1, 7),
-            window_end=(end_year, 6),
-            months=tuple([(end_year - 1, m) for m in range(7, 13)] + [(end_year, m) for m in range(1, 7)]),
-            window_end_label=f"{end_year}-06-01",
-        )
-
-    def _stage_run(self, writer: ZarrWriter, chunks, run_id: str, seed: int) -> None:
-        """Stage a mixed run: 3 tiles with data + obs counts, 1 skip marker."""
-        rng = np.random.default_rng(seed)
-        for i, chunk in enumerate(chunks):
-            if i == 2:
-                writer.write_skip_marker(chunk, run_id)
-                continue
-            emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
-            obs = {
-                var: rng.integers(0, 200, size=(chunk.height, chunk.width)).astype(np.uint16) for var in OBS_COUNT_VARS
-            }
-            writer.write_chunk(chunk, emb, run_id, scales=scales, obs_counts=obs)
-
-    def _assert_stores_equal(self, new_path: str, legacy_path: str) -> None:
-        ds_new = open_store(new_path)
-        ds_legacy = open_store(legacy_path)
-        assert set(ds_new.data_vars) == set(ds_legacy.data_vars)
-        for var in ds_legacy.data_vars:
-            assert ds_new[var].dims == ds_legacy[var].dims, var
-            assert ds_new[var].dtype == ds_legacy[var].dtype, var
-            np.testing.assert_array_equal(ds_new[var].values, ds_legacy[var].values, err_msg=var)
-        for coord in ds_legacy.coords:
-            np.testing.assert_array_equal(ds_new[coord].values, ds_legacy[coord].values, err_msg=str(coord))
-        attrs_new = dict(ds_new.attrs)
-        attrs_legacy = dict(ds_legacy.attrs)
-        # The only expected difference: completion timestamps taken at different moments.
-        attrs_new.pop("run_completed_at")
-        attrs_legacy.pop("run_completed_at")
-        assert attrs_new == attrs_legacy
-
-    def test_create_and_append_parity(self, tmp_path, dask_client):
-        """Both engines produce identical stores on create AND on a second-window append."""
-        chunks = [
-            ChunkSpec(row=0, col=0, y_start=0, y_stop=6, x_start=0, x_stop=6),
-            ChunkSpec(row=0, col=1, y_start=0, y_stop=6, x_start=6, x_stop=10),
-            ChunkSpec(row=1, col=0, y_start=6, y_stop=9, x_start=0, x_stop=6),  # skip-marked
-            ChunkSpec(row=1, col=1, y_start=6, y_stop=9, x_start=6, x_stop=10),
-        ]
-        total_y, total_x = 9, 10
-        roi = _make_full_roi_mask(tmp_path, total_y, total_x)
-        started = datetime.datetime(2025, 7, 1, tzinfo=datetime.UTC)
-
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        self._stage_run(writer, chunks, "run2025", seed=11)
-        self._stage_run(writer, chunks, "run2026", seed=22)
-
-        paths = {"new": str(tmp_path / "new.zarr"), "legacy": str(tmp_path / "legacy.zarr")}
-        for name, output in paths.items():
-            engine = writer.assemble if name == "new" else writer._assemble_dask_legacy
-            for run_id, end_year in (("run2025", 2025), ("run2026", 2026)):
-                engine(
-                    chunks,
-                    total_y,
-                    total_x,
-                    run_id,
-                    output,
-                    roi_zarr_path=roi,
-                    run_started_at=started,
-                    time_window=self._window(end_year),
-                    tile_id="33UWP",
-                    model_version="parity_model_v1",
-                    n_workers=1,
-                )
-
-        self._assert_stores_equal(paths["new"], paths["legacy"])

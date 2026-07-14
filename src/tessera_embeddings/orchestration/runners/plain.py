@@ -1,9 +1,9 @@
 """Orchestrator-free pipeline runner.
 
 Runs ROI generation → S2 + S1 ingestion → inference → assembly
-end-to-end using local Ray + local Dask. Proves layer separation
-is real — every step calls the same domain function the Prefect
-flows do.
+end-to-end using local Dask for ingest, local Ray for inference, and
+worker processes for assembly. Proves layer separation is real —
+every step calls the same domain function the Prefect flows do.
 
 Device is controlled by the ``device`` key in the YAML config
 (``"auto"`` | ``"cpu"`` | ``"cuda"``; default ``"auto"`` uses
@@ -27,7 +27,7 @@ from typing import Any, Literal
 import yaml
 from dask.distributed import Client
 
-from tessera_embeddings.config.dask import AssemblyConfig
+from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.paths import BucketPaths
@@ -38,7 +38,6 @@ from tessera_embeddings.inference.data_loading import _active_orbits, resolve_s1
 from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
     checkpoint_to_version,
-    compute_assembly_worker_counts,
     enumerate_mosaic_chunks,
     read_upstream_manifests,
 )
@@ -156,7 +155,7 @@ def _run_inference_and_assemble(
     num_gpus: int,
     log: logging.Logger,
 ) -> dict[str, Any]:
-    """Run inference under local Ray, then assemble under local Dask."""
+    """Run inference under local Ray, then assemble with local worker processes."""
     inputs_bucket = paths.inputs
     output_bucket = paths.outputs
 
@@ -218,9 +217,9 @@ def _run_inference_and_assemble(
         msg = f"{len(failed)} chunks failed during inference"
         raise RuntimeError(msg)
 
-    # Assembly under local Dask
+    # Assembly: worker processes on this host (raw-zarr fork/merge — no Dask)
     n_live = len(live_chunks)
-    _min_workers, max_workers = compute_assembly_worker_counts(n_live, AssemblyConfig())
+    n_assembly_workers = AssemblyConfig().compute_n_workers(n_live)
     output_path = f"{output_bucket.rstrip('/')}/embeddings/{roi_name}.zarr"
     writer = ZarrWriter(staging_base)
     model_version = checkpoint_to_version(config.checkpoint_path)
@@ -231,22 +230,21 @@ def _run_inference_and_assemble(
         upstream_manifests=upstream_manifests,
     )
 
-    with _dask_client(min(2, max_workers)):
-        writer.assemble(
-            chunks,
-            total_y,
-            total_x,
-            run_id,
-            output_path,
-            roi_zarr_path=roi_path,
-            mosaic_base=mosaic_base,
-            log=log,
-            time_window=time_window,
-            tile_id=roi_name,
-            model_version=model_version,
-            manifest=manifest,
-            n_workers=max_workers,
-        )
+    writer.assemble(
+        chunks,
+        total_y,
+        total_x,
+        run_id,
+        output_path,
+        roi_zarr_path=roi_path,
+        mosaic_base=mosaic_base,
+        log=log,
+        time_window=time_window,
+        tile_id=roi_name,
+        model_version=model_version,
+        manifest=manifest,
+        n_workers=n_assembly_workers,
+    )
 
     return {
         "run_id": run_id,

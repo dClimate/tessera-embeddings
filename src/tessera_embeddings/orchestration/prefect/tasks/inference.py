@@ -8,10 +8,10 @@ Two shells:
   cluster the flow has already entered.
 * :func:`assemble_embeddings_task` — wraps
   :class:`tessera_embeddings.inference.assembly.ZarrWriter` ``.assemble``.
-  Runs on the Prefect flow runner; the assembly Dask cluster is
-  managed by the calling flow.
+  Runs on the Prefect flow runner; the raw-zarr engine forks its own
+  worker processes on that host (no Dask cluster).
 
-Cluster lifecycle (Ray + Dask) is the *flow's* concern, not the task's.
+Cluster lifecycle (Ray) is the *flow's* concern, not the task's.
 That keeps each task shell thin enough to be obviously correct.
 """
 
@@ -95,10 +95,9 @@ def assemble_embeddings_task(
 ) -> dict:
     """Prefect task: assemble staged chunks into the final Icechunk store.
 
-    The Dask cluster is managed by the flow that calls this task — the
-    task itself does no cluster provisioning. ``n_workers`` is the
-    cluster's ``max_workers`` value, used by the assembler to divide
-    the fleet-wide S3 concurrency budget across workers.
+    The raw-zarr engine forks ``n_workers`` worker processes on this host;
+    the same count divides the fleet-wide S3 concurrency budget into the
+    per-fork request cap. No cluster is provisioned.
 
     The full chunk grid is reconstructed in-task from ``total_y``,
     ``total_x``, and ``chunk_size`` via :func:`enumerate_chunks` rather
@@ -120,7 +119,7 @@ def assemble_embeddings_task(
         roi_zarr_path: Path to the ROI boolean zarr.
         config: Inference configuration.
         t0: Flow start time for elapsed logging.
-        n_workers: Max Dask worker count for this assembly run.
+        n_workers: Worker-process count for this assembly run.
         run_started_at: Flow trigger time for the time coordinate.
         results: Inference result dicts; ``None`` in assemble-only mode.
         mosaic_base: Base path for input mosaic stores. Used to copy

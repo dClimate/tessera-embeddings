@@ -114,7 +114,8 @@ class VarSpec:
     pass an explicit value to override. ``serializer`` / ``compressors`` are
     forwarded to ``zarr.Group.create_array`` verbatim — the default ``"auto"``
     matches what xarray's zarr backend would pick, while a caller can pin e.g.
-    ``pcodec_serializer()`` + ``compressors=None`` for a float embeddings array.
+    a PCodec serializer + ``compressors=None`` for a float array (the
+    ``config.store_layout`` presets do exactly this for ``scales``).
     ``shards`` (element counts per dim, or ``None``) wraps the inner chunks in a
     Zarr v3 sharding codec — required by the global store's ``GLOBAL_V1`` layout
     (ADR-008 D3). It is clamped to a whole multiple of the (clamped) chunks.

@@ -11,8 +11,8 @@ Architecture::
       ├── Pre-filter chunks against the ROI mask
       ├── Spin up Ray cluster (head on-demand, GPU workers configurable)
       ├── Submit chunk work to Ray GPU actors via run_inference_task
-      ├── Spin up Dask cluster, run assemble_embeddings_task
-      └── Tear down both clusters; on-cancellation hook covers partials
+      ├── Run assemble_embeddings_task on the flow runner (worker processes)
+      └── Tear down the Ray cluster; on-cancellation hook covers partials
 
 The ``BucketPaths`` parameter is the deployment-supplied storage
 contract — there is no ``dev: bool`` toggle. Callers (typically a
@@ -34,7 +34,7 @@ import yaml
 from prefect import flow, get_run_logger
 from pydantic import BaseModel
 
-from tessera_embeddings.config.dask import AssemblyConfig
+from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
@@ -43,10 +43,8 @@ from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
-    compute_assembly_worker_counts,
     enumerate_mosaic_chunks,
 )
-from tessera_embeddings.orchestration.prefect.flows._dask_runner import get_task_runner_for_cluster
 from tessera_embeddings.orchestration.prefect.tasks.inference import (
     assemble_embeddings_task,
     run_inference_task,
@@ -335,54 +333,17 @@ def _run_assembly(
     result_stats: dict | None,
     **assemble_kwargs: Any,  # noqa: ANN401 — pass-through to the assembly task
 ) -> dict[str, Any]:
-    """Provision the assembly Dask cluster and submit the assembly task."""
-    n_live_chunks = assemble_kwargs["n_live_chunks"]
-    min_workers, max_workers = compute_assembly_worker_counts(n_live_chunks, AssemblyConfig())
+    """Run the assembly task on the flow runner with a local worker-process pool.
 
-    from tessera_embeddings.providers.aws.dask import ecs_cluster
-
-    extra_worker_env = {
-        "AWS_NO_SIGN_REQUEST": "NO",  # use signed requests for the project's S3 bucket
-        "MALLOC_TRIM_THRESHOLD_": "0",  # eagerly return freed memory to the OS
-    }
-    with ecs_cluster(
-        log,
-        min_workers=min_workers,
-        max_workers=max_workers,
-        # 24 GiB for headroom on the assembly commit, which is memory intensive:
-        # merging the write changeset and building the manifest for a full-
-        # spatial-extent timestep peaks well above the ingest workers' needs.
-        # 24576 MiB is a valid Fargate combo at 4 vCPU.
-        worker_mem=24576,
-        extra_worker_env=extra_worker_env,
-    ) as cluster:
-        log.info("Assembly Dask cluster ready: scaling to %d workers", max_workers)
-        task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
-        return _assemble_inner.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-            result_stats=result_stats,
-            n_workers=max_workers,
-            **assemble_kwargs,
-        )
-
-
-@flow(name="tessera_embeddings_assemble_inner")
-def _assemble_inner(
-    *,
-    result_stats: dict | None,
-    n_workers: int,
-    **assemble_kwargs: Any,  # noqa: ANN401 — pass-through to the assembly task
-) -> dict[str, Any]:
-    """Inner flow that submits the assembly task to the configured Dask runner.
-
-    The full chunk grid is intentionally *not* a parameter here — the
-    task re-enumerates it from ``total_y``/``total_x``/``chunk_size`` (in
-    ``assemble_kwargs``). Likewise the per-chunk inference results are
-    pre-aggregated into ``result_stats`` upstream. Both keep this flow's
-    serialized parameters under Prefect's 524,288-byte limit on large ROIs.
+    No cluster to provision: the raw-zarr engine forks worker processes on this
+    host (see ``inference.assembly``), so the task runs directly under the
+    flow's default runner. ``AssemblyConfig`` sizes the pool from the live
+    chunk count within its RAM/S3 budget.
     """
-    future = assemble_embeddings_task.submit(
+    n_workers = AssemblyConfig().compute_n_workers(assemble_kwargs["n_live_chunks"])
+    log.info("Assembling on the flow runner with %d worker process(es)", n_workers)
+    return assemble_embeddings_task(
         result_stats=result_stats,
         n_workers=n_workers,
         **assemble_kwargs,
     )
-    return future.result()

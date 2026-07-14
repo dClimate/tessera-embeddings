@@ -19,7 +19,7 @@ function works under Prefect flows, the plain runner, and any future
 orchestrator.
 """
 
-from tessera_embeddings.config.dask import AssemblyConfig
+from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
     INFERENCE_CHUNK_SIZE,
