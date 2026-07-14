@@ -1,15 +1,19 @@
-"""Tests for ZarrWriter: round-trip write/read, assembly, and cleanup dispatch.
+"""Tests for ZarrWriter: staging round-trips, raw-zarr assembly, cleanup dispatch.
 
-Ported from the yield-modeling reference repo, adapted to tessera-embeddings'
-import paths. cleanup_staging coverage diverges from the reference: this repo's
-cleanup_staging prefers s5cmd for S3 with an fsspec fallback (rather than
-propagating s5cmd errors), so TestCleanupStagingDispatch exercises the routing
-decision instead of error propagation.
+Assembly tests exercise the fork/merge engine (``assemble``/``assemble_global``)
+directly — no Dask. ``TestEngineParity`` is the implementation plan's W4 parity
+gate: it runs the legacy Dask engine and the raw-zarr engine on identical staged
+inputs and asserts value- and attr-identical stores; it is deleted together with
+the legacy engine. cleanup_staging coverage diverges from the reference repo:
+this repo's cleanup_staging prefers s5cmd for S3 with an fsspec fallback, so
+TestCleanupStagingDispatch exercises the routing decision instead of error
+propagation.
 """
 
 from __future__ import annotations
 
-import pickle
+import datetime
+import itertools
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -20,17 +24,19 @@ from dask.distributed import Client
 
 import tessera_embeddings.inference.assembly as _assembly_mod
 from tessera_embeddings.config.inference import EMBEDDING_DIM
+from tessera_embeddings.config.store_layout import INNER_PX
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
-    BAND_CHUNK_DIVISOR,
     OBS_COUNT_VARS,
     STAGED_READ_CONFIG_KWARGS,
     IncompleteStageError,
     ZarrWriter,
+    _partition_bands,
     _staged_storage_options,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.quantization import quantize_embeddings
+from tessera_embeddings.storage.global_store import create_global_repo, open_global_repo
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store
 
 
@@ -60,9 +66,10 @@ def _quantized_embeddings(
 
 @pytest.fixture(scope="class")
 def dask_client():
-    """Local Dask client for assembly tests (exercises Dask code path in to_icechunk).
+    """Local Dask client for the LEGACY engine's side of the parity gate.
 
-    Class-scoped to avoid creating/destroying a Dask cluster for every test method.
+    Only ``TestEngineParity`` needs it (``to_icechunk`` under a distributed
+    client); it is deleted together with the legacy engine.
     """
     client = Client(n_workers=2, threads_per_worker=1, memory_limit="2GB")
     yield client
@@ -190,9 +197,9 @@ class TestWriteChunk:
 
 
 class TestAssembly:
-    """Tests for ZarrWriter.assemble (Dask-based parallel assembly via to_icechunk)."""
+    """Tests for ZarrWriter.assemble (raw-zarr fork/merge engine)."""
 
-    def test_assemble_multiple_chunks(self, tmp_path, dask_client):
+    def test_assemble_multiple_chunks(self, tmp_path):
         """Assemble 2x2 chunk grid into single output store."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -230,7 +237,7 @@ class TestAssembly:
         assert ds["embeddings"].shape == (1, 8, 10, EMBEDDING_DIM)
         assert "time" in ds.coords
 
-    def test_assemble_xarray_readable(self, tmp_path, dask_client):
+    def test_assemble_xarray_readable(self, tmp_path):
         """Assembled output must be readable with correct dims and coords."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -269,7 +276,7 @@ class TestAssembly:
         np.testing.assert_array_equal(ds.coords["easting"].values, np.arange(10))
         np.testing.assert_array_equal(ds.coords["band"].values, np.arange(EMBEDDING_DIM))
 
-    def test_assemble_with_std(self, tmp_path, dask_client):
+    def test_assemble_with_std(self, tmp_path):
         """Assembly includes embedding_std when compute_std=True."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -298,8 +305,8 @@ class TestAssembly:
         np.testing.assert_array_equal(ds["embeddings"].values[0, ...], emb)
         np.testing.assert_array_almost_equal(ds["embedding_std"].values[0, ...], std, decimal=5)
 
-    def test_assemble_appends_to_existing_store(self, tmp_path, dask_client):
-        """Second assemble call appends along time dimension instead of overwriting."""
+    def test_assemble_appends_to_existing_store(self, tmp_path):
+        """A second assemble at a NEW time value extends the time axis."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
         writer = ZarrWriter(staging)
@@ -308,23 +315,39 @@ class TestAssembly:
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
 
         roi = _make_full_roi_mask(tmp_path, 5, 5)
+        day1 = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
+        day2 = datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC)
 
         # Run 1
         emb1, scales1 = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1)
         writer.assemble(
-            [chunk], total_y=5, total_x=5, run_id="run1", output_path=output, roi_zarr_path=roi, n_workers=1
+            [chunk],
+            total_y=5,
+            total_x=5,
+            run_id="run1",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=day1,
+            n_workers=1,
         )
 
         ds = open_store(output)
         assert ds["embeddings"].shape == (1, 5, 5, EMBEDDING_DIM)
         ds.close()
 
-        # Run 2 — should append
+        # Run 2 at a later date — should append
         emb2, scales2 = _quantized_embeddings(rng, 5, 5)
         writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2)
         writer.assemble(
-            [chunk], total_y=5, total_x=5, run_id="run2", output_path=output, roi_zarr_path=roi, n_workers=1
+            [chunk],
+            total_y=5,
+            total_x=5,
+            run_id="run2",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=day2,
+            n_workers=1,
         )
 
         ds = open_store(output)
@@ -332,8 +355,100 @@ class TestAssembly:
         assert ds.sizes["time"] == 2
         np.testing.assert_array_equal(ds["embeddings"].values[0, ...], emb1)
         np.testing.assert_array_equal(ds["embeddings"].values[1, ...], emb2)
+        np.testing.assert_array_equal(
+            ds.coords["time"].values, np.array(["2024-06-01", "2025-06-01"], dtype="datetime64[ns]")
+        )
 
-    def test_assemble_append_with_std(self, tmp_path, dask_client):
+    def test_assemble_same_date_overwrites_in_place(self, tmp_path):
+        """Re-assembling an existing time value overwrites that index (idempotent resume)."""
+        staging = str(tmp_path / "staging")
+        output = str(tmp_path / "output.zarr")
+        writer = ZarrWriter(staging)
+
+        rng = np.random.default_rng(42)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5)
+        roi = _make_full_roi_mask(tmp_path, 5, 5)
+        day = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
+
+        emb1, scales1 = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1)
+        writer.assemble(
+            [chunk],
+            total_y=5,
+            total_x=5,
+            run_id="run1",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=day,
+            n_workers=1,
+        )
+
+        emb2, scales2 = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2)
+        writer.assemble(
+            [chunk],
+            total_y=5,
+            total_x=5,
+            run_id="run2",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=day,
+            n_workers=1,
+        )
+
+        ds = open_store(output)
+        assert ds.sizes["time"] == 1, "same time value must overwrite, not append a duplicate timestep"
+        np.testing.assert_array_equal(ds["embeddings"].values[0, ...], emb2)
+        assert ds.attrs["run_id"] == "run2"
+
+    def test_assemble_multiband_parallel_matches_serial(self, tmp_path):
+        """n_workers>1 partitions into y-bands across processes; result matches serial.
+
+        The grid is taller than one output chunk (LEGACY 500-px northing chunks)
+        with tile boundaries that do NOT fall on chunk boundaries, so the run
+        exercises band-aligned splitting of staged tiles and x/y partial-chunk
+        read-modify-writes inside a fork.
+        """
+        rng = np.random.default_rng(7)
+        total_y, total_x = 1100, 12
+        chunks = [
+            ChunkSpec(row=0, col=0, y_start=0, y_stop=600, x_start=0, x_stop=12),
+            ChunkSpec(row=1, col=0, y_start=600, y_stop=1100, x_start=0, x_stop=12),
+        ]
+        roi = _make_full_roi_mask(tmp_path, total_y, total_x)
+
+        expected = np.zeros((total_y, total_x, EMBEDDING_DIM), dtype=np.int8)
+        staged: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for chunk in chunks:
+            emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
+            staged[chunk.label] = (emb, scales)
+            expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop, :] = emb
+
+        outputs = {}
+        for name, n_workers in (("serial", 1), ("parallel", 2)):
+            writer = ZarrWriter(str(tmp_path / f"staging_{name}"))
+            for chunk in chunks:
+                emb, scales = staged[chunk.label]
+                writer.write_chunk(chunk, emb, run_id="run1", scales=scales)
+            output = str(tmp_path / f"output_{name}.zarr")
+            writer.assemble(
+                chunks,
+                total_y=total_y,
+                total_x=total_x,
+                run_id="run1",
+                output_path=output,
+                roi_zarr_path=roi,
+                n_workers=n_workers,
+            )
+            outputs[name] = output
+
+        ds_serial = open_store(outputs["serial"])
+        ds_parallel = open_store(outputs["parallel"])
+        np.testing.assert_array_equal(ds_parallel["embeddings"].values[0, ...], expected)
+        np.testing.assert_array_equal(ds_parallel["embeddings"].values, ds_serial["embeddings"].values)
+        np.testing.assert_array_equal(ds_parallel["scales"].values, ds_serial["scales"].values)
+
+    def test_assemble_append_with_std(self, tmp_path):
         """Append preserves both embedding and embedding_std across runs."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -356,10 +471,11 @@ class TestAssembly:
             output_path=output,
             compute_std=True,
             roi_zarr_path=roi,
+            run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
             n_workers=1,
         )
 
-        # Run 2 with std
+        # Run 2 with std, at a later date
         emb2, scales2 = _quantized_embeddings(rng, 4, 4)
         std2 = rng.random((4, 4, EMBEDDING_DIM)).astype(np.float32)
         writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, embeddings_std=std2)
@@ -371,6 +487,7 @@ class TestAssembly:
             output_path=output,
             compute_std=True,
             roi_zarr_path=roi,
+            run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
             n_workers=1,
         )
 
@@ -380,7 +497,7 @@ class TestAssembly:
         np.testing.assert_array_almost_equal(ds["embedding_std"].values[0, ...], std1, decimal=5)
         np.testing.assert_array_almost_equal(ds["embedding_std"].values[1, ...], std2, decimal=5)
 
-    def test_append_preserves_time_windows_across_runs(self, tmp_path, dask_client):
+    def test_append_preserves_time_windows_across_runs(self, tmp_path):
         """Regression: appending a second time window must merge into existing time_windows, not overwrite."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -446,7 +563,7 @@ class TestAssembly:
         assert tw_dict2["2024-12-01"]["range"] == ["2024-01", "2024-12"]
         assert tw_dict2["2025-01-01"]["range"] == ["2024-02", "2025-01"]
 
-    def test_assemble_with_obs_counts(self, tmp_path, dask_client):
+    def test_assemble_with_obs_counts(self, tmp_path):
         """Stage 2x2 grid with obs counts, assemble, verify final zarr has all three vars."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -489,7 +606,7 @@ class TestAssembly:
             assert ds[var].dtype == np.uint16
             np.testing.assert_array_equal(ds[var].values[0], expected_obs[var])
 
-    def test_assemble_treats_skip_marker_chunks_as_fill(self, tmp_path, dask_client):
+    def test_assemble_treats_skip_marker_chunks_as_fill(self, tmp_path):
         """A live chunk with a skip marker (no staged zarr) falls through to zero-fill.
 
         Regression for a crash where assemble() passed skip-marker chunks into
@@ -540,7 +657,7 @@ class TestAssembly:
         assert skipped_region.shape == (skipped_chunk.height, skipped_chunk.width, EMBEDDING_DIM)
         assert np.all(skipped_region == 0)
 
-    def test_assemble_sparse_roi_non_live_chunks_are_zero_filled(self, tmp_path, dask_client):
+    def test_assemble_sparse_roi_non_live_chunks_are_zero_filled(self, tmp_path):
         """Chunks outside the ROI mask are zero-filled without requiring staged data."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -592,7 +709,7 @@ class TestAssembly:
         non_live_region = result[non_live.y_start : non_live.y_stop, non_live.x_start : non_live.x_stop]
         assert np.all(non_live_region == 0), "Non-live chunk region must be zero-filled"
 
-    def test_assemble_sparse_roi_scales_nan_filled_for_non_live(self, tmp_path, dask_client):
+    def test_assemble_sparse_roi_scales_nan_filled_for_non_live(self, tmp_path):
         """`scales` variable is NaN-filled for chunks outside the ROI mask."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -784,52 +901,30 @@ def _write_monolithic_staged_zarr(path: str, embeddings: np.ndarray, y_start: in
     ds.to_zarr(path, mode="w", encoding=encoding)
 
 
-class TestMonolithicChunks:
-    """Tests for assembly of staged files with monolithic (non-sub-chunked) chunks.
+class TestStagedLayout:
+    """The staged-file on-disk layout: inner-chunk-sized pieces, full band, raw.
 
-    Production data from earlier runs may have chunks=(2500, 2500, 128), meaning each
-    staged file is a single on-disk chunk. _build_var_grid must detect this and create
-    one task per staged file (not 25 sub-tasks that each read the full chunk).
+    A staged tile must be exactly the inner-chunk grid of the output region it
+    becomes (ADR-008 D2: the band axis is never split), and the engine must
+    also read older/foreign staged layouts (e.g. monolithic chunks) correctly —
+    workers slice whatever chunk grid the staged file has.
     """
 
-    def test_detect_monolithic_chunk_size(self, tmp_path):
-        """_detect_staged_chunk_size reads actual on-disk chunks, not assumed 500x500."""
-        staging = str(tmp_path / "staging")
-        writer = ZarrWriter(staging)
-        run_id = "mono_detect"
+    def test_write_chunk_stages_inner_chunks_full_band(self, tmp_path):
+        """write_chunk sub-chunks at INNER_PX spatially and never splits the band."""
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=600, x_start=0, x_stop=600)
+        rng = np.random.default_rng(42)
+        emb, scales = _quantized_embeddings(rng, 600, 600)
+        path = writer.write_chunk(chunk, emb, "run1", scales=scales)
 
-        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=20, x_start=0, x_stop=20)
-        emb = np.random.default_rng(42).random((20, 20, EMBEDDING_DIM)).astype(np.float32)
-        path = writer._staging_path(run_id, chunk)
-        _write_monolithic_staged_zarr(path, emb, 0, 0)
-
-        # Verify on-disk chunks are monolithic
         g = zarr.open_group(path, mode="r")
-        assert g["embeddings"].metadata.chunk_grid.chunk_shape == (20, 20, EMBEDDING_DIM)
+        assert g["embeddings"].metadata.chunk_grid.chunk_shape == (INNER_PX, INNER_PX, EMBEDDING_DIM)
+        assert g["scales"].metadata.chunk_grid.chunk_shape == (INNER_PX, INNER_PX)
+        # Raw staging: no compressors, zero codec CPU on the GPU actors.
+        assert g["embeddings"].compressors == ()
 
-        # _detect_staged_chunk_size should return the monolithic shape
-        h, w, band = writer._detect_staged_chunk_size(run_id, [chunk], "embeddings")
-        assert h == 20
-        assert w == 20
-        assert band == EMBEDDING_DIM
-
-    def test_detect_subchunked_size(self, tmp_path):
-        """_detect_staged_chunk_size returns sub-chunked sizes from write_chunk."""
-        staging = str(tmp_path / "staging")
-        writer = ZarrWriter(staging)
-        run_id = "sub_detect"
-
-        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=10)
-        emb, scales = _quantized_embeddings(np.random.default_rng(42), 10, 10)
-        writer.write_chunk(chunk, emb, run_id, scales=scales)
-
-        # write_chunk uses min(500, height) for spatial, EMBEDDING_DIM // BAND_CHUNK_DIVISOR for band
-        h, w, band = writer._detect_staged_chunk_size(run_id, [chunk], "embeddings")
-        assert h == 10
-        assert w == 10
-        assert band == EMBEDDING_DIM // BAND_CHUNK_DIVISOR
-
-    def test_assemble_monolithic_roundtrip(self, tmp_path, dask_client):
+    def test_assemble_monolithic_roundtrip(self, tmp_path):
         """Assembly of monolithic-chunked staged files produces correct output."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -866,120 +961,37 @@ class TestMonolithicChunks:
         np.testing.assert_array_equal(result, expected)
         assert ds["embeddings"].shape == (1, 14, 16, EMBEDDING_DIM)
 
-    def test_monolithic_one_task_per_chunk(self, tmp_path):
-        """Monolithic staged files produce one dask task per ChunkSpec, not 25."""
-        staging = str(tmp_path / "staging")
-        writer = ZarrWriter(staging)
-        run_id = "task_count"
 
-        rng = np.random.default_rng(42)
-        chunks = [
-            ChunkSpec(row=0, col=0, y_start=0, y_stop=20, x_start=0, x_stop=20),
-            ChunkSpec(row=0, col=1, y_start=0, y_stop=20, x_start=20, x_stop=40),
-        ]
-        for chunk in chunks:
-            emb, _ = _quantized_embeddings(rng, chunk.height, chunk.width)
-            path = writer._staging_path(run_id, chunk)
-            _write_monolithic_staged_zarr(path, emb, chunk.y_start, chunk.x_start)
+class TestPartitionBands:
+    """Band partitioning: granularity-aligned, disjoint, covering, load-balanced."""
 
-        live_labels = {c.label for c in chunks}
-        arr = writer._build_var_grid(chunks, live_labels, run_id, "embeddings")
+    @pytest.mark.parametrize(
+        ("total_y", "granularity", "n_workers", "expected"),
+        [
+            (100, 500, 4, [(0, 100)]),  # smaller than one unit -> one band
+            (4500, 500, 3, [(0, 1500), (1500, 3000), (3000, 4500)]),  # even split
+            (1100, 500, 2, [(0, 1000), (1000, 1100)]),  # ragged tail on the last band
+            (8, 3, 2, [(0, 6), (6, 8)]),  # tiny units still align interior boundaries
+        ],
+    )
+    def test_partition_shapes(self, total_y, granularity, n_workers, expected):
+        assert _partition_bands(total_y, granularity, n_workers) == expected
 
-        # Monolithic 20x20 chunks → each file is one task → 2 total tasks
-        assert arr.npartitions == 2
-
-
-class TestGraphSize:
-    """Regression tests for the assembly graph size.
-
-    The old implementation emitted one materialized graph entry per sub-chunk,
-    causing the Dask scheduler to OOM on large ROIs (~3M tasks for a 40x40
-    ChunkSpec grid at sub_band=4). The map_blocks design produces two
-    unmaterialized Blockwise layers whose size is independent of block count.
-    """
-
-    def _chunk_grid(self, n_rows: int, n_cols: int, chunk_size: int = 20) -> list[ChunkSpec]:
-        return [
-            ChunkSpec(
-                row=r,
-                col=c,
-                y_start=r * chunk_size,
-                y_stop=(r + 1) * chunk_size,
-                x_start=c * chunk_size,
-                x_stop=(c + 1) * chunk_size,
-            )
-            for r in range(n_rows)
-            for c in range(n_cols)
-        ]
-
-    def _stage_one_chunk(self, writer: ZarrWriter, chunk: ChunkSpec, run_id: str) -> None:
-        rng = np.random.default_rng(0)
-        emb = rng.standard_normal((chunk.height, chunk.width, EMBEDDING_DIM)).astype(np.float32)
-        _write_monolithic_staged_zarr(writer._staging_path(run_id, chunk), emb, chunk.y_start, chunk.x_start)
-
-    def test_graph_layers_stay_unmaterialized(self, tmp_path):
-        """_build_var_grid returns an array whose graph layers are all Blockwise and unmaterialized."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        run_id = "graph_layers"
-        chunks = self._chunk_grid(4, 4)
-        # Stage one live chunk (the detector probes staged files, so at least one is required).
-        self._stage_one_chunk(writer, chunks[0], run_id)
-        live_labels = {chunks[0].label}
-
-        arr = writer._build_var_grid(chunks, live_labels, run_id, "embeddings")
-        graph = arr.__dask_graph__()
-        for layer in graph.layers.values():
-            assert not layer.is_materialized(), f"layer {type(layer).__name__} is materialized"
-
-    def test_graph_size_independent_of_grid_size(self, tmp_path):
-        """Serialized graph size is nearly constant across grid sizes (1x1, 10x10, 50x50).
-
-        The map_blocks design produces two unmaterialized Blockwise layers whose
-        pickled size grows only with hash/chunks-spec metadata, not with n_blocks.
-        A 2500x increase in blocks must produce less than a 5x increase in size —
-        this would catch a regression to the old per-block materialized graph.
-        """
-        sizes: dict[int, int] = {}
-        for n_side in (1, 10, 50):
-            run_id = f"grid_{n_side}"
-            writer = ZarrWriter(str(tmp_path / f"staging_{n_side}"))
-            chunks = self._chunk_grid(n_side, n_side)
-            self._stage_one_chunk(writer, chunks[0], run_id)
-            live_labels = {chunks[0].label}
-
-            arr = writer._build_var_grid(chunks, live_labels, run_id, "embeddings")
-            graph = arr.__dask_graph__()
-            sizes[n_side] = sum(len(pickle.dumps(layer)) for layer in graph.layers.values())
-
-        assert sizes[50] < sizes[1] * 5, f"graph size grew non-trivially with grid size: {sizes}"
-
-    def test_dense_sparse_graph_size_equal(self, tmp_path):
-        """Fully dense and fully sparse grids produce comparably small graphs.
-
-        Old implementation: sparse grids caused the explosion (per-fill-chunk tasks).
-        New implementation: density affects only the live_lookup dict, not graph size.
-        """
-        run_id = "density"
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        chunks = self._chunk_grid(6, 6)
-        self._stage_one_chunk(writer, chunks[0], run_id)
-
-        # Sparse: only one live chunk
-        arr_sparse = writer._build_var_grid(chunks, {chunks[0].label}, run_id, "embeddings")
-        # Dense: pretend all are live (staged file detection only probes one)
-        arr_dense = writer._build_var_grid(chunks, {c.label for c in chunks}, run_id, "embeddings")
-
-        size_sparse = sum(len(pickle.dumps(layer)) for layer in arr_sparse.__dask_graph__().layers.values())
-        size_dense = sum(len(pickle.dumps(layer)) for layer in arr_dense.__dask_graph__().layers.values())
-        # Dense graph can be larger only by the lookup dict; still bounded and small.
-        assert size_dense < 500_000, f"dense graph unexpectedly large: {size_dense} bytes"
-        assert size_sparse < 500_000, f"sparse graph unexpectedly large: {size_sparse} bytes"
+    @pytest.mark.parametrize(("total_y", "granularity", "n_workers"), [(10_000, 500, 7), (2048, 2048, 8), (1, 500, 3)])
+    def test_partition_invariants(self, total_y, granularity, n_workers):
+        bands = _partition_bands(total_y, granularity, n_workers)
+        assert bands[0][0] == 0
+        assert bands[-1][1] == total_y
+        assert len(bands) <= n_workers
+        for (_, stop), (start, _) in itertools.pairwise(bands):
+            assert stop == start, "bands must tile [0, total_y) with no gaps or overlap"
+            assert stop % granularity == 0, "interior boundaries must land on the write granularity"
 
 
 class TestAssemblyValidation:
     """Tests for assembly-time validation and metadata correctness."""
 
-    def test_assemble_validates_grid_extent(self, tmp_path, dask_client):
+    def test_assemble_validates_grid_extent(self, tmp_path):
         """Mismatched total_y/total_x raises ValueError."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -1001,7 +1013,7 @@ class TestAssemblyValidation:
                 n_workers=1,
             )
 
-    def test_assemble_root_attrs(self, tmp_path, dask_client):
+    def test_assemble_root_attrs(self, tmp_path):
         """Assembled store has correct root attributes."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -1033,7 +1045,7 @@ class TestAssemblyValidation:
         assert "run_started_at" in attrs
         assert "run_completed_at" in attrs
 
-    def test_assemble_sets_geozarr_convention_attrs(self, tmp_path, dask_client):
+    def test_assemble_sets_geozarr_convention_attrs(self, tmp_path):
         """Convention attrs (proj:, spatial:, tessera:) are set on the root group."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
@@ -1265,3 +1277,199 @@ class TestVerifyStagedCompleteness:
 
         with pytest.raises(IncompleteStageError, match="1 unexpected"):
             writer.verify_staged_completeness("run1", list(self.CHUNKS))
+
+
+class TestAssembleGlobal:
+    """assemble_global: staged tiles -> whole shards of a pre-seeded zone group."""
+
+    TILE = 64  # miniature shard pitch so a unit test never touches 2048² arrays
+    INNER = 32
+    ZONE = "32601"
+    YEARS = (2024, 2025)
+
+    def _seed_zone_repo(self, tmp_path, ny: int, nx: int, dim: int):
+        """A miniature GLOBAL_V1-shaped zone group: sharded arrays + calendar-year time axis."""
+        store_path = str(tmp_path / "global.icechunk")
+        repo = create_global_repo(store_path)
+        session = repo.writable_session("main")
+        root = zarr.open_group(session.store, mode="a")
+        node = root.require_group(self.ZONE)
+        times = np.array([f"{y}-01-01" for y in self.YEARS], dtype="datetime64[ns]")
+        node.create_array(
+            "embeddings",
+            shape=(len(times), ny, nx, dim),
+            chunks=(1, self.INNER, self.INNER, dim),
+            shards=(1, self.TILE, self.TILE, dim),
+            dtype="int8",
+            fill_value=0,
+            dimension_names=("time", "northing", "easting", "band"),
+        )
+        node.create_array(
+            "scales",
+            shape=(len(times), ny, nx),
+            chunks=(1, self.INNER, self.INNER),
+            shards=(1, self.TILE, self.TILE),
+            dtype="float32",
+            fill_value=float("nan"),
+            dimension_names=("time", "northing", "easting"),
+        )
+        time_int = times.astype("int64")
+        time_arr = node.create_array("time", data=time_int, chunks=(len(time_int),), dimension_names=("time",))
+        time_arr.attrs.update({"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"})
+        node.attrs["years_complete"] = []
+        session.commit("seed test zone")
+        return store_path
+
+    def test_fills_year_from_staged_tiles(self, tmp_path):
+        """Staged tiles land as whole shards at the right year index; provenance attrs update."""
+        dim = 8
+        ny = nx = 2 * self.TILE  # 2x2 tile/shard grid
+        store_path = self._seed_zone_repo(tmp_path, ny, nx, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+
+        rng = np.random.default_rng(3)
+        expected = np.zeros((ny, nx, dim), dtype=np.int8)
+        expected_scales = np.full((ny, nx), np.nan, dtype=np.float32)
+        # Stage 3 of 4 tiles — (1, 0) stays ocean/fill.
+        for row, col in ((0, 0), (0, 1), (1, 1)):
+            chunk = ChunkSpec(
+                row=row,
+                col=col,
+                y_start=row * self.TILE,
+                y_stop=(row + 1) * self.TILE,
+                x_start=col * self.TILE,
+                x_stop=(col + 1) * self.TILE,
+            )
+            emb = rng.integers(-100, 100, size=(self.TILE, self.TILE, dim)).astype(np.int8)
+            scales = rng.random((self.TILE, self.TILE)).astype(np.float32)
+            writer.write_chunk(chunk, emb, "runG", scales=scales)
+            expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop] = emb
+            expected_scales[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop] = scales
+
+        snapshot = writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runG", n_workers=1)
+        assert snapshot
+
+        repo = open_global_repo(store_path)
+        node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[self.ZONE]
+        # 2025 is index 1; 2024 (index 0) must remain untouched fill.
+        np.testing.assert_array_equal(np.asarray(node["embeddings"][1]), expected)
+        np.testing.assert_array_equal(np.asarray(node["embeddings"][0]), np.zeros_like(expected))
+        np.testing.assert_array_equal(np.asarray(node["scales"][1]), expected_scales)
+        assert node.attrs["years_complete"] == [2025]
+        assert node.attrs["runs"]["2025"]["run_id"] == "runG"
+
+    def test_year_off_axis_raises(self, tmp_path):
+        """A year outside the pre-allocated axis is a loud error (D1: never resize)."""
+        dim = 8
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE)
+        emb = np.ones((self.TILE, self.TILE, dim), dtype=np.int8)
+        writer.write_chunk(chunk, emb, "runG", scales=np.ones((self.TILE, self.TILE), dtype=np.float32))
+
+        with pytest.raises(ValueError, match="not on 32601's pre-allocated time axis"):
+            writer.assemble_global(store_path, self.ZONE, year=1999, run_id="runG", n_workers=1)
+
+    def test_tile_shard_mismatch_raises(self, tmp_path):
+        """Staged tiles that aren't one-shard-sized violate the 1:1 contract (D3)."""
+        dim = 8
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        half = self.TILE // 2
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=half, x_start=0, x_stop=half)
+        emb = np.ones((half, half, dim), dtype=np.int8)
+        writer.write_chunk(chunk, emb, "runG", scales=np.ones((half, half), dtype=np.float32))
+
+        with pytest.raises(ValueError, match="1 inference tile == 1 shard"):
+            writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runG", n_workers=1)
+
+    def test_no_staged_tiles_raises(self, tmp_path):
+        dim = 8
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        with pytest.raises(IncompleteStageError, match="no staged chunks"):
+            writer.assemble_global(store_path, self.ZONE, year=2025, run_id="empty_run", n_workers=1)
+
+
+class TestEngineParity:
+    """W4 parity gate: the raw-zarr engine must reproduce the Dask engine exactly.
+
+    Runs both engines on identical staged inputs (create, then a second-window
+    append) and asserts value-identical arrays, identical coords, and equivalent
+    root attrs. Deleted together with the legacy engine once the gate has
+    served its purpose.
+    """
+
+    def _window(self, end_year: int) -> TimeWindow:
+        return TimeWindow(
+            window_start=(end_year - 1, 7),
+            window_end=(end_year, 6),
+            months=tuple([(end_year - 1, m) for m in range(7, 13)] + [(end_year, m) for m in range(1, 7)]),
+            window_end_label=f"{end_year}-06-01",
+        )
+
+    def _stage_run(self, writer: ZarrWriter, chunks, run_id: str, seed: int) -> None:
+        """Stage a mixed run: 3 tiles with data + obs counts, 1 skip marker."""
+        rng = np.random.default_rng(seed)
+        for i, chunk in enumerate(chunks):
+            if i == 2:
+                writer.write_skip_marker(chunk, run_id)
+                continue
+            emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
+            obs = {
+                var: rng.integers(0, 200, size=(chunk.height, chunk.width)).astype(np.uint16) for var in OBS_COUNT_VARS
+            }
+            writer.write_chunk(chunk, emb, run_id, scales=scales, obs_counts=obs)
+
+    def _assert_stores_equal(self, new_path: str, legacy_path: str) -> None:
+        ds_new = open_store(new_path)
+        ds_legacy = open_store(legacy_path)
+        assert set(ds_new.data_vars) == set(ds_legacy.data_vars)
+        for var in ds_legacy.data_vars:
+            assert ds_new[var].dims == ds_legacy[var].dims, var
+            assert ds_new[var].dtype == ds_legacy[var].dtype, var
+            np.testing.assert_array_equal(ds_new[var].values, ds_legacy[var].values, err_msg=var)
+        for coord in ds_legacy.coords:
+            np.testing.assert_array_equal(ds_new[coord].values, ds_legacy[coord].values, err_msg=str(coord))
+        attrs_new = dict(ds_new.attrs)
+        attrs_legacy = dict(ds_legacy.attrs)
+        # The only expected difference: completion timestamps taken at different moments.
+        attrs_new.pop("run_completed_at")
+        attrs_legacy.pop("run_completed_at")
+        assert attrs_new == attrs_legacy
+
+    def test_create_and_append_parity(self, tmp_path, dask_client):
+        """Both engines produce identical stores on create AND on a second-window append."""
+        chunks = [
+            ChunkSpec(row=0, col=0, y_start=0, y_stop=6, x_start=0, x_stop=6),
+            ChunkSpec(row=0, col=1, y_start=0, y_stop=6, x_start=6, x_stop=10),
+            ChunkSpec(row=1, col=0, y_start=6, y_stop=9, x_start=0, x_stop=6),  # skip-marked
+            ChunkSpec(row=1, col=1, y_start=6, y_stop=9, x_start=6, x_stop=10),
+        ]
+        total_y, total_x = 9, 10
+        roi = _make_full_roi_mask(tmp_path, total_y, total_x)
+        started = datetime.datetime(2025, 7, 1, tzinfo=datetime.UTC)
+
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        self._stage_run(writer, chunks, "run2025", seed=11)
+        self._stage_run(writer, chunks, "run2026", seed=22)
+
+        paths = {"new": str(tmp_path / "new.zarr"), "legacy": str(tmp_path / "legacy.zarr")}
+        for name, output in paths.items():
+            engine = writer.assemble if name == "new" else writer._assemble_dask_legacy
+            for run_id, end_year in (("run2025", 2025), ("run2026", 2026)):
+                engine(
+                    chunks,
+                    total_y,
+                    total_x,
+                    run_id,
+                    output,
+                    roi_zarr_path=roi,
+                    run_started_at=started,
+                    time_window=self._window(end_year),
+                    tile_id="33UWP",
+                    model_version="parity_model_v1",
+                    n_workers=1,
+                )
+
+        self._assert_stores_equal(paths["new"], paths["legacy"])

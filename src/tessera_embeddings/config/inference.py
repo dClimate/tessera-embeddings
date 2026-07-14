@@ -139,14 +139,16 @@ REPRESENTATION_DIM = 192
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.
 DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
-# Spatial read-tile size for inference. The read/ChunkSpec grid stays 2000x2000;
-# the *resident input working set* is bounded separately via density-sized
-# northing strips (see actors._strip_height_for_density), so a 2000x2000 chunk's
-# peak host RAM is capped by a per-strip byte budget rather than fixed by
-# T x H x W. Sparse chunks load in one full-height strip; only dense chunks
-# split. Independent of the storage chunk size written at ingest
-# (config.ingest.INGEST_CHUNK_SIZE).
-INFERENCE_CHUNK_SIZE = 2000
+# Spatial read-tile size for inference. 2048 aligns the ChunkSpec grid with the
+# global store's shard grid (ADR-008 D3): one inference tile == one 2048-px
+# shard == 2x2 tiles per 4096-px ingest chunk, so assembly writes whole, lean
+# shards with no read-modify-write. The *resident input working set* is bounded
+# separately via density-sized northing strips (see
+# actors._strip_height_for_density), so a 2048x2048 chunk's peak host RAM is
+# capped by a per-strip byte budget rather than fixed by T x H x W. Sparse
+# chunks load in one full-height strip; only dense chunks split. Independent of
+# the storage chunk size written at ingest (config.ingest.INGEST_CHUNK_SIZE).
+INFERENCE_CHUNK_SIZE = 2048
 
 
 @final

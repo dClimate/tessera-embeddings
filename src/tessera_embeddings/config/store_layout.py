@@ -124,18 +124,23 @@ def _obs(chunks: tuple[int, ...], shards: tuple[int, ...] | None, codec: str) ->
 
 # Today's single-ROI output, reproduced exactly (D8 — vanilla users unaffected).
 # Band split into 4 (== EMBEDDING_DIM // 32), unsharded; PCodec floats; raw obs.
+# ``embedding_std`` is 4-D (per-band std, mirroring ``embeddings``) as the
+# historical engine wrote it; it is never produced under v1.1 (deterministic
+# sampling forces ``compute_std=False``) but the schema must stay faithful.
 LEGACY = StoreLayout(
     name="legacy",
     arrays={
         "embeddings": ArrayLayout(DIMS_4D, (1, 500, 500, EMBEDDING_DIM // 32), "int8", 0, _ZSTD),
         "scales": ArrayLayout(DIMS_3D, (1, 500, 500), "float32", float("nan"), _PCODEC),
-        "embedding_std": ArrayLayout(DIMS_3D, (1, 500, 500), "float32", float("nan"), _PCODEC),
+        "embedding_std": ArrayLayout(DIMS_4D, (1, 500, 500, EMBEDDING_DIM // 32), "float32", float("nan"), _PCODEC),
         **_obs((1, 500, 500), None, _RAW),
     },
 )
 
 # The global campaign: 256-px full-band inner chunks in 2048² shards; scales
-# sharded the same way (D3). 8x8 = 64 inner chunks per shard.
+# sharded the same way (D3). 8x8 = 64 inner chunks per shard. ``embedding_std``
+# mirrors ``scales``' treatment (float32 + PCodec, same spatial shards) on its
+# natural per-band 4-D dims; never produced under v1.1 (see LEGACY note).
 _INNER_4D = (1, 256, 256, EMBEDDING_DIM)
 _SHARD_4D = (1, 2048, 2048, EMBEDDING_DIM)
 _INNER_3D = (1, 256, 256)
@@ -145,7 +150,7 @@ GLOBAL_V1 = StoreLayout(
     arrays={
         "embeddings": ArrayLayout(DIMS_4D, _INNER_4D, "int8", 0, _ZSTD, shards=_SHARD_4D),
         "scales": ArrayLayout(DIMS_3D, _INNER_3D, "float32", float("nan"), _PCODEC, shards=_SHARD_3D),
-        "embedding_std": ArrayLayout(DIMS_3D, _INNER_3D, "float32", float("nan"), _PCODEC, shards=_SHARD_3D),
+        "embedding_std": ArrayLayout(DIMS_4D, _INNER_4D, "float32", float("nan"), _PCODEC, shards=_SHARD_4D),
         **_obs(_INNER_3D, _SHARD_3D, _ZSTD),
     },
 )

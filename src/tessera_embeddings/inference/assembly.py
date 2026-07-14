@@ -1,12 +1,30 @@
 """Embedding output writers.
 
 Staged writes (one Zarr per chunk) use raw uncompressed bytes for zero CPU
-overhead on GPU actors. The final Icechunk store uses PCodec for long-term
-storage efficiency.
+overhead on GPU actors; the on-disk staged pieces are inner-chunk-sized
+(``INNER_PX`` = 256 px, full band) so a staged tile is exactly the inner-chunk
+grid of the output region it becomes. The final Icechunk store's geometry
+(chunks, shards, codecs) comes from a :class:`StoreLayout` preset — ``LEGACY``
+for single-ROI stores, ``GLOBAL_V1`` for the global campaign's zone groups.
 
-PCodec is an array-to-bytes codec (serializer) in the Zarr v3 codec pipeline,
-not a bytes-to-bytes compressor. It must be passed via the `serializer` encoding
-key when writing via xarray, or via the `serializer` parameter in zarr.create_array.
+Assembly is raw-zarr, not Dask: the coordinator forks an icechunk session,
+worker processes write staged-tile pixels straight into the output arrays via
+plain zarr assignment, and the coordinator merges the forks and commits once
+(the cooperative fork/merge model shared with
+:mod:`tessera_embeddings.storage.shard_writer`). No task graph is ever built
+over the store, so assembly cost scales with the *live* pixels, not the grid.
+
+Two write-conflict regimes, one engine:
+
+* **Single-ROI** (``assemble``): output chunks (500 px) don't align with the
+  2048-px inference tiles, so workers partition the mosaic into *northing bands
+  aligned to the output write granularity* — no two forks ever touch the same
+  output chunk, and x-boundary partial chunks are read-modify-written
+  sequentially inside one fork (icechunk sessions are read-your-writes).
+* **Global** (``assemble_global``): one inference tile == one 2048-px shard
+  (ADR-008 D3), so whole tiles round-robin across workers via
+  :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` — every
+  shard object is emitted once, lean, with ocean inner chunks elided.
 """
 
 from __future__ import annotations
@@ -14,9 +32,13 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import logging
+import multiprocessing
 import subprocess
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
+from typing import Any, cast
 
 import dask.array as da
 import fsspec
@@ -28,9 +50,13 @@ from icechunk.xarray import to_icechunk
 from zarr.codecs.numcodecs import PCodec as PCodecZarr3
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM, TimeWindow
+from tessera_embeddings.config.store_layout import INNER_PX, LEGACY, OBS_COUNT_VARS, StoreLayout
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.conventions import build_convention_attrs
+from tessera_embeddings.storage.empty_store import _write_coord_arrays
+from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
+from tessera_embeddings.storage.shard_writer import CommitGate, commit_with_rebase, write_year_shards
 from tessera_embeddings.storage.zarr_store import manifest_split, open_or_create_repo, open_store
 
 # PCodec is intentionally used as a Zarr v3 serializer; silence the
@@ -91,32 +117,26 @@ class SpatialCoords:
     crs: str | None = None
 
 
-OBS_COUNT_VARS = ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count")
-
-BAND_CHUNK_DIVISOR = 32
-"""
-Divisor applied to embedding_dim to set the band chunk size for staged and final Zarr stores.
-NOTE this ended up not being necessary after cutting spatial chunks down to 500x500, leaving it here
-in case it's useful down the road.
-"""
-
 TARGET_AGGREGATE_S3_CONCURRENCY = 100
 """Fleet-wide ceiling on concurrent S3 PUTs during assembly, divided across workers.
 
-icechunk's ``max_concurrent_requests`` is per-Repository-instance, and every Dask
-worker forks a fresh Repository when ``to_icechunk`` ships the session out. So
-the effective aggregate concurrency is ``n_workers * per_worker_cap``, not the
-per-worker cap alone. We target ~100 concurrent PUTs fleet-wide (roughly 1/35 of
-S3's ~3500 req/s/prefix ceiling at ~100 ms PUT latency) to leave headroom for
-retries and avoid 503 SlowDown.
+icechunk's ``max_concurrent_requests`` is per-Repository-instance, and each
+assembly worker process carries its own pickled fork of the session (and thus
+its own request pool). So the effective aggregate concurrency is
+``n_workers * per_worker_cap``, not the per-worker cap alone. We target ~100
+concurrent PUTs fleet-wide (roughly 1/35 of S3's ~3500 req/s/prefix ceiling at
+~100 ms PUT latency) to leave headroom for retries and avoid 503 SlowDown.
+
+The coordinator opens the repo with ``max_concurrent_requests = target //
+n_workers`` and the forks inherit it — no ``save_config`` persistence needed,
+because forks travel by pickle rather than re-opening the repo from its URI.
 
 icechunk writes chunk objects to a flat ``chunks/<random-id>`` keyspace, so the
 keys spread across S3 partitions well — but partition splitting is adaptive and a
 hard burst overruns the per-prefix rate before (and even after) S3 adapts, which
-is exactly the SlowDown observed at 800 concurrent PUTs. The invariant that keeps
-us under target is ``AssemblyConfig.max_workers <= TARGET_AGGREGATE_S3_CONCURRENCY``:
-since ``per_worker_cap`` floors at 1, aggregate is >= n_workers, so the worker cap
-must not exceed the target. Keep these two constants in sync.
+is exactly the SlowDown observed at 800 concurrent PUTs. Since ``per_worker_cap``
+floors at 1, aggregate is >= n_workers — keep worker counts at or under this
+target (``AssemblyConfig`` caps them far lower).
 """
 
 
@@ -226,12 +246,154 @@ def read_spatial_coords(mosaic_base: str) -> SpatialCoords:
     return coords
 
 
-class ZarrWriter:
-    """Write embeddings to Zarr stores with pcodec compression.
+# =============================================================================
+# Raw-zarr assembly engine (module-level so spawn workers can unpickle them)
+# =============================================================================
 
-    Phase 1: Each chunk is written as a standalone Zarr store at a staging location.
-    Phase 2: Staged chunks are assembled in parallel via Dask into a single
-    Icechunk store using ``to_icechunk()``.
+
+def _partition_bands(total_y: int, granularity: int, n_workers: int) -> list[tuple[int, int]]:
+    """Split ``[0, total_y)`` into at most ``n_workers`` bands aligned to ``granularity``.
+
+    Bands start and end on multiples of the output's northing write granularity
+    (shard height when sharded, chunk height otherwise), so no two workers ever
+    touch the same output chunk — the fork/merge write-conflict invariant.
+    Whole granularity units are spread as evenly as possible; the last band
+    absorbs the ragged tail.
+    """
+    n_units = -(-total_y // granularity)
+    n_bands = max(1, min(n_workers, n_units))
+    base, extra = divmod(n_units, n_bands)
+    bands: list[tuple[int, int]] = []
+    y = 0
+    for i in range(n_bands):
+        units = base + (1 if i < extra else 0)
+        y_stop = min(total_y, y + units * granularity)
+        bands.append((y, y_stop))
+        y = y_stop
+    return bands
+
+
+def _write_granularity(node: zarr.Group, variables: Iterable[str]) -> int:
+    """The output's northing write granularity: shard height if sharded, else chunk height.
+
+    All data variables must agree (both presets do); a disagreement would let
+    two bands share an output object, so it is an error rather than a max().
+    """
+    sizes = {}
+    for var in variables:
+        arr = cast(zarr.Array, node[var])
+        sizes[var] = (arr.shards or arr.chunks)[1]
+    if len(set(sizes.values())) != 1:
+        raise ValueError(f"Data variables disagree on northing write granularity: {sizes}")
+    return next(iter(sizes.values()))
+
+
+def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns a ForkSession
+    """Write one northing band's staged-tile slices into a forked session.
+
+    For each staged tile overlapping the band, reads the tile's overlapping
+    y-slice (one slice in flight per worker — peak RAM is bounded by one tile,
+    ~0.5 GB int8 at 2048 px) and writes it into every output array with a plain
+    zarr assignment. Partial output chunks at tile x-boundaries are
+    read-modify-written sequentially within this fork (icechunk sessions are
+    read-your-writes), so the merged result is exact. Returns the fork for the
+    coordinator to merge.
+    """
+    fork = payload["fork"]
+    t = int(payload["time_index"])
+    y0b, y1b = payload["band"]
+    root = zarr.open_group(fork.store, mode="a")
+    arrays = {var: cast(zarr.Array, root[var]) for var in payload["variables"]}
+    for tile, path in payload["tiles"]:
+        y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
+        staged = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
+        for var, arr in arrays.items():
+            block = np.asarray(cast(zarr.Array, staged[var])[y0 - tile.y_start : y1 - tile.y_start])[np.newaxis]
+            if arr.ndim == 4:
+                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop, :] = block
+            else:
+                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = block
+        # Drop the group reference so its file handles / S3 connections are
+        # immediately collectable before the next tile's read.
+        del staged
+    return fork
+
+
+def _read_time_values(node: zarr.Group) -> np.ndarray:
+    """Decode a group's ``time`` coordinate to ``datetime64[ns]`` values."""
+    time_arr = cast(zarr.Array, node["time"])
+    units = str(time_arr.attrs.get("units", ""))
+    if not units.startswith("nanoseconds since 1970-01-01"):
+        raise ValueError(
+            f"Unsupported time units {units!r} on {node.store!r} — every engine-written "
+            "store uses TIME_ENCODING (nanoseconds since 1970-01-01)."
+        )
+    return np.asarray(time_arr[:]).astype("int64").astype("datetime64[ns]")
+
+
+def _extend_time_axis(node: zarr.Group, time_date: np.datetime64) -> int:
+    """Grow every time-dimmed array by one step and write the new timestamp.
+
+    An append IS a resize plus a write at the new index — doing it explicitly
+    replaces the old engine's ``to_icechunk(mode="a", append_dim="time")`` and
+    keeps raw zarr the only write path. Returns the new timestep's index.
+    """
+    nt = cast(zarr.Array, node["time"]).shape[0]
+    for name, arr in node.arrays():
+        # Zarr v2 metadata has no dimension_names; every engine-written store is v3.
+        dims = getattr(arr.metadata, "dimension_names", None)
+        if name != "time" and dims and dims[0] == "time":
+            arr.resize((nt + 1, *arr.shape[1:]))
+    time_arr = cast(zarr.Array, node["time"])
+    time_arr.resize((nt + 1,))
+    time_arr[nt] = time_date.astype("datetime64[ns]").astype("int64")
+    return nt
+
+
+def _label_to_grid(label: str) -> tuple[int, int]:
+    """Parse a staged ``chunk_{row}_{col}`` label into ``(row, col)``."""
+    parts = label.split("_")
+    if len(parts) != 3 or parts[0] != "chunk":
+        raise ValueError(f"Staged label {label!r} is not of the form 'chunk_<row>_<col>'")
+    return int(parts[1]), int(parts[2])
+
+
+@dataclasses.dataclass(frozen=True)
+class StagedShardSource:
+    """:class:`~tessera_embeddings.storage.shard_writer.ShardSource` over staged tiles.
+
+    The global write path's 1:1 mapping (ADR-008 D3): one staged 2048-px
+    inference tile is exactly one output shard, so ``live_shards`` is the staged
+    tile grid positions and ``load`` returns each staged variable whole, with a
+    leading time axis. Frozen dataclass of plain strings/tuples so the shard
+    writer can pickle it to spawned workers.
+    """
+
+    staging_base: str
+    run_id: str
+    shards: tuple[tuple[int, int], ...]
+    variables: tuple[str, ...]
+
+    def live_shards(self) -> list[tuple[int, int]]:
+        """The staged ``(row, col)`` tile positions — shard indices, 1:1."""
+        return list(self.shards)
+
+    def load(self, shard: tuple[int, int]) -> dict[str, np.ndarray]:
+        """Read one staged tile whole and return ``{var: (1, h, w[, band]) block}``."""
+        sy, sx = shard
+        path = f"{self.staging_base}/{self.run_id}/chunk_{sy}_{sx}.zarr"
+        group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
+        return {var: np.asarray(cast(zarr.Array, group[var])[:])[np.newaxis] for var in self.variables}
+
+
+class ZarrWriter:
+    """Write embeddings to Zarr stores.
+
+    Phase 1: each chunk is written as a standalone raw Zarr at a staging
+    location (:meth:`write_chunk`, on GPU actors). Phase 2: staged chunks are
+    assembled into the final Icechunk store with raw-zarr fork/merge writes —
+    :meth:`assemble` for standalone single-ROI stores, :meth:`assemble_global`
+    for a pre-allocated zone group of the global store.
     """
 
     def __init__(self, staging_base: str, embedding_dim: int = EMBEDDING_DIM) -> None:
@@ -309,9 +471,12 @@ class ZarrWriter:
             raise ValueError(msg)
 
         path = self._staging_path(run_id, chunk)
-        # Sub-chunk staged files so assembly tasks operate on small, not monolithic, chunks
-        staged_chunks = (min(500, chunk.height), min(500, chunk.width), self.embedding_dim // BAND_CHUNK_DIVISOR)
-        staged_chunks_2d = (min(500, chunk.height), min(500, chunk.width))
+        # Sub-chunk staged files at inner-chunk size, full band (ADR-008 D2: the
+        # band axis is never split). A staged 2048-px tile is then exactly the
+        # 8x8 inner-chunk grid of the shard it becomes, and assembly's banded
+        # y-slice reads stay aligned to whole staged pieces.
+        staged_chunks = (min(INNER_PX, chunk.height), min(INNER_PX, chunk.width), self.embedding_dim)
+        staged_chunks_2d = (min(INNER_PX, chunk.height), min(INNER_PX, chunk.width))
 
         data_vars: dict[str, tuple[list[str], np.ndarray]] = {
             "embeddings": (["northing", "easting", "band"], embeddings),
@@ -825,6 +990,38 @@ class ZarrWriter:
 
         return ds
 
+    def _create_schema(
+        self,
+        root: zarr.Group,
+        layout: StoreLayout,
+        variables: Iterable[str],
+        total_y: int,
+        total_x: int,
+        time_date: np.datetime64,
+        spatial: SpatialCoords | None,
+    ) -> None:
+        """Create the output arrays (schema only, no chunk data) and coordinates.
+
+        Geometry comes from the :class:`StoreLayout` preset — the single source
+        of truth shared with the global store's seeder — not from the staged
+        files, so the on-disk output is identical regardless of how inference
+        tiled the mosaic. Cost is independent of extent (no pixels written).
+        """
+        sizes = {"time": 1, "northing": total_y, "easting": total_x, "band": self.embedding_dim}
+        for var in variables:
+            array_layout = layout.for_var(var)
+            shape = tuple(sizes[d] for d in array_layout.dims)
+            root.create_array(var, **array_layout.create_kwargs(shape))
+        _write_coord_arrays(
+            root,
+            {
+                "time": np.asarray([time_date], dtype="datetime64[ns]"),
+                "northing": spatial.northing if spatial else np.arange(total_y),
+                "easting": spatial.easting if spatial else np.arange(total_x),
+                "band": np.arange(self.embedding_dim),
+            },
+        )
+
     def assemble(
         self,
         chunks: list[ChunkSpec],
@@ -845,8 +1042,385 @@ class ZarrWriter:
         n_workers: int,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
+        layout: StoreLayout = LEGACY,
+        gate: CommitGate | None = None,
     ) -> str:
-        """Assemble staged chunk Zarrs into the output Icechunk store.
+        """Assemble staged chunk Zarrs into a standalone Icechunk store.
+
+        Raw-zarr fork/merge engine (no Dask): worker processes write staged-tile
+        pixels for disjoint, granularity-aligned northing bands straight into
+        the output arrays; the coordinator merges the forks, sets root attrs,
+        and commits once via
+        :func:`~tessera_embeddings.storage.shard_writer.commit_with_rebase`.
+
+        Create-or-extend semantics on the time axis:
+
+        * fresh store → schema + coords from ``layout`` (``LEGACY`` by default —
+          today's single-ROI geometry, D8) in a first metadata-only commit;
+        * existing store, new time value → every time-dimmed array is resized by
+          one step (explicitly — this replaces ``mode="a"`` appends) in a first
+          commit;
+        * existing store, time value already present → its index is overwritten
+          in place (idempotent resume: a crashed assembly re-run lands on the
+          same index instead of appending a duplicate timestep).
+
+        The fill itself is always the second, single data commit, so a crash
+        mid-fill leaves only an all-fill timestep that the re-run overwrites.
+
+        Inference only stages chunks that intersect the ROI mask and had valid
+        pixels; everything else is never written, so those positions read back
+        as the layout's fill (0 for int8, NaN for floats) exactly as the old
+        engine's fill templates produced.
+
+        Args:
+            chunks: Full chunk grid (both live and non-live).
+            total_y: Total mosaic height.
+            total_x: Total mosaic width.
+            run_id: Run identifier (locates staged files).
+            output_path: Final output Icechunk store path.
+            roi_zarr_path: Path to the ROI boolean zarr. Assembly re-enumerates
+                live chunks from this to avoid marshaling the list through
+                Prefect.
+            compute_std: Whether staged chunks contain embedding_std data.
+            run_started_at: Flow trigger time for the time coordinate. Falls
+                back to now. Ignored when *time_window* is provided.
+            mosaic_base: Base path for the input mosaic stores. If provided,
+                the reflectance store supplies projected coordinates and CRS.
+            log: Optional logger (e.g. Prefect's run logger).
+            time_window: If provided, the window end month is the time
+                coordinate and window metadata lands in dataset attributes.
+            tile_id: Sentinel-2 MGRS tile ID for ``proj:`` convention attrs
+                when the mosaic store carries no ``crs`` attr.
+            model_version: Model version string for ``tessera:model_version``.
+            manifest: Typed manifest for append-safety validation. Written on
+                create, validated before extending an existing store.
+            n_workers: Worker *process* count. Also divides
+                ``TARGET_AGGREGATE_S3_CONCURRENCY`` into the per-fork request
+                cap so fleet-wide PUT concurrency stays under S3's ceiling.
+            get_credentials: Optional icechunk credential callback for the
+                output store (see ``zarr_store._create_storage``).
+            s3_region: Optional S3 region override for the output store.
+            layout: Output geometry preset. ``LEGACY`` (default) reproduces
+                today's single-ROI stores exactly; only new stores consult it.
+            gate: Optional commit gate when many assemblies share a process.
+
+        Returns:
+            Path to the assembled output store.
+        """
+        _log = log or logger
+
+        # Determine which chunks have staged zarrs. A chunk that intersects the
+        # ROI but was skipped during inference (all pixels failed validity) has
+        # a skip marker instead of a zarr — its footprint stays at fill.
+        roi_live_chunks = filter_chunks_by_roi_mask(chunks, roi_zarr_path)
+        skipped_labels = set(self._list_skip_marker_labels(run_id))
+        live_chunks = [c for c in roi_live_chunks if c.label not in skipped_labels]
+        if not live_chunks:
+            raise IncompleteStageError(
+                f"Run {run_id!r} has no staged chunks to assemble under {self.staging_base} "
+                f"({len(roi_live_chunks)} ROI chunks, all skipped or unstaged)."
+            )
+        _log.info(
+            "Assembling %d chunks (%d live with staged zarr, %d skipped, %d fill) into %s",
+            len(chunks),
+            len(live_chunks),
+            len(roi_live_chunks) - len(live_chunks),
+            len(chunks) - len(roi_live_chunks),
+            output_path,
+        )
+
+        # Validate that total_y/total_x match the actual chunk grid extent.
+        actual_y = max(c.y_stop for c in chunks)
+        actual_x = max(c.x_stop for c in chunks)
+        if actual_y != total_y or actual_x != total_x:
+            msg = f"total_y/total_x ({total_y}, {total_x}) doesn't match chunk grid extent ({actual_y}, {actual_x})"
+            raise ValueError(msg)
+
+        started = run_started_at or datetime.datetime.now(datetime.UTC)
+
+        # Projected coordinates and CRS from the input reflectance store.
+        spatial: SpatialCoords | None = None
+        if mosaic_base:
+            spatial = read_spatial_coords(mosaic_base)
+            _log.info("Using projected coordinates from %s", mosaic_base)
+
+        if time_window:
+            time_date = np.datetime64(time_window.window_end_label, "ns")
+        else:
+            time_date = np.datetime64(started.date(), "ns")
+
+        staged_obs = self._staged_vars_present(run_id, live_chunks, OBS_COUNT_VARS)
+        variables = ["embeddings", "scales"]
+        if compute_std:
+            variables.append("embedding_std")
+        variables += [v for v in OBS_COUNT_VARS if v in staged_obs]
+
+        # Divide the fleet-wide S3 concurrency target across worker forks; see
+        # TARGET_AGGREGATE_S3_CONCURRENCY. Forks inherit the repo config through
+        # the pickled session, so no save_config round-trip is needed.
+        per_worker_cap = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // max(1, n_workers))
+
+        # Manifest split (same tiling as the old engine): each spatial axis at
+        # 32 chunks/shard (~16k px at 500-px chunks) and time at 1 shard per
+        # timestep, so a one-timestep write rewrites no prior year's manifests.
+        with manifest_split({"northing": 32, "easting": 32, "time": 1}):
+            repo, is_new = open_or_create_repo(
+                output_path,
+                max_concurrent_requests=per_worker_cap,
+                get_credentials=get_credentials,
+                region=s3_region,
+                scatter_initial_credentials=get_credentials is not None,
+            )
+
+        # --- Phase 1: schema (create) or time-axis placement (extend) --------
+        session = repo.writable_session("main")
+        root = zarr.open_group(session.store, mode="a")
+        # "time" absent means a created-but-never-seeded repo (e.g. a crash
+        # between repo creation and the schema commit) — treat as fresh.
+        if is_new or "time" not in root:
+            self._create_schema(root, layout, variables, total_y, total_x, time_date, spatial)
+            session.commit(f"Run {run_id}: create schema ({layout.name})")
+            time_index = 0
+            _log.info("Created %s with layout %s", output_path, layout.name)
+        else:
+            if manifest:
+                manifest.validate_against(extract_manifest(root.attrs), output_path)
+            times = _read_time_values(root)
+            hits = np.flatnonzero(times == time_date)
+            if hits.size:
+                time_index = int(hits[0])
+                _log.warning(
+                    "Time %s already exists at index %d in %s — overwriting live positions in place",
+                    time_date,
+                    time_index,
+                    output_path,
+                )
+            else:
+                time_index = _extend_time_axis(root, time_date)
+                session.commit(f"Run {run_id}: extend time axis to {time_date}")
+                _log.info("Extended %s time axis to index %d (%s)", output_path, time_index, time_date)
+
+        # --- Phase 2: banded parallel fill (fork/merge) -----------------------
+        session = repo.writable_session("main")
+        granularity = _write_granularity(zarr.open_group(session.store, mode="r"), variables)
+        bands = _partition_bands(total_y, granularity, n_workers)
+        fork = session.fork()
+        payloads = []
+        for band in bands:
+            y0b, y1b = band
+            tiles = [(c, self._staging_path(run_id, c)) for c in live_chunks if c.y_start < y1b and c.y_stop > y0b]
+            if tiles:
+                payloads.append(
+                    {
+                        "fork": fork,
+                        "band": band,
+                        "time_index": time_index,
+                        "variables": tuple(variables),
+                        "tiles": tiles,
+                    }
+                )
+        _log.info(
+            "Filling %d band(s) (granularity %d px) across %d process(es)",
+            len(payloads),
+            granularity,
+            min(len(payloads), n_workers),
+        )
+        if len(payloads) == 1:
+            forks = [_fill_band_worker(payloads[0])]
+        else:
+            ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx) as ex:
+                forks = list(ex.map(_fill_band_worker, payloads))
+        session.merge(*forks)
+
+        # --- Phase 3: root attrs + one data commit ----------------------------
+        node = zarr.open_group(session.store, mode="a")
+        attrs: dict[str, Any] = {
+            "run_id": run_id,
+            "total_y": total_y,
+            "total_x": total_x,
+            "embedding_dim": self.embedding_dim,
+            "run_started_at": started.isoformat(),
+            "run_completed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        }
+        conv_attrs = build_convention_attrs(
+            tile_id=tile_id,
+            epsg_code=spatial.crs if spatial else None,
+            total_y=total_y,
+            total_x=total_x,
+            embedding_dim=self.embedding_dim,
+            y_coords=spatial.northing if spatial else None,
+            x_coords=spatial.easting if spatial else None,
+            model_version=model_version,
+            n_tiles=len(chunks),
+        )
+        if conv_attrs:
+            attrs.update(conv_attrs)
+        if manifest:
+            attrs["_manifest"] = manifest.to_dict()
+            _log.info("Wrote _manifest to %s", output_path)
+        if time_window:
+            # Raw writes never clobber attrs, so prior windows are read straight
+            # off the store (no pre-write snapshot dance) and merged.
+            windows: dict[str, Any] = dict(node.attrs.get("time_windows", {}))  # type: ignore[arg-type]
+            windows[time_window.window_end_label] = {
+                "range": [
+                    f"{time_window.window_start[0]}-{time_window.window_start[1]:02d}",
+                    f"{time_window.window_end[0]}-{time_window.window_end[1]:02d}",
+                ],
+            }
+            attrs["time_windows"] = windows
+            attrs["time_convention"] = "12mo_window_end"
+        node.attrs.update(attrs)
+
+        with gate if gate is not None else nullcontext():
+            commit_with_rebase(session, f"Run {run_id}: {len(chunks)} chunks assembled")
+        _log.info("Assembly complete: %s", output_path)
+        return output_path
+
+    def assemble_global(
+        self,
+        store_path: str,
+        zone: str,
+        *,
+        year: int,
+        run_id: str,
+        n_workers: int = 8,
+        gate: CommitGate | None = None,
+        get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+        s3_region: str | None = None,
+        log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+    ) -> str:
+        """Assemble a run's staged tiles into one (zone, year) of the global store.
+
+        The global write path (ADR-008 D3/D6): every staged tile is exactly one
+        output shard, written whole and lean by
+        :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` —
+        fork/merge across ``n_workers`` processes, one commit per (zone, year)
+        behind ``gate``, ``years_complete`` and per-year run provenance updated
+        in the same commit. The zone group must already be seeded
+        (:func:`~tessera_embeddings.storage.global_store.seed_zone_groups`);
+        nothing is ever created or resized here (D1).
+
+        The caller (the zone-fill runner) is responsible for staged-completeness
+        verification against the campaign land mask
+        (:meth:`verify_staged_completeness`) — this method writes whatever tiles
+        are staged. ``embedding_std`` is never staged under v1.1.
+
+        Args:
+            store_path: URI of the global Icechunk repo
+                (``BucketPaths.global_store()``).
+            zone: Zone group name (EPSG code string, e.g. ``"32601"``).
+            year: Campaign calendar year to fill — must be on the group's
+                pre-allocated time axis.
+            run_id: Run identifier (locates staged files).
+            n_workers: Worker process count; also divides
+                ``TARGET_AGGREGATE_S3_CONCURRENCY`` into the per-fork cap.
+            gate: Optional commit gate shared across the zone-year fills this
+                process drives (fleet-wide gating is the orchestrator's job).
+            get_credentials: Optional icechunk credential callback.
+            s3_region: Optional S3 region override.
+            log: Optional logger.
+
+        Returns:
+            The commit snapshot id.
+        """
+        _log = log or logger
+
+        labels = self._list_staged_labels(run_id)
+        if not labels:
+            raise IncompleteStageError(f"Run {run_id!r} has no staged chunks under {self.staging_base}")
+        shards = tuple(sorted(_label_to_grid(label) for label in labels))
+
+        per_worker_cap = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // max(1, n_workers))
+        repo = open_global_repo(
+            store_path,
+            get_credentials=get_credentials,
+            region=s3_region,
+            max_concurrent_requests=per_worker_cap,
+        )
+
+        # One readonly probe: year index, shard pitch, variables, run provenance.
+        probe = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone]
+        node = cast(zarr.Group, probe)
+        times = _read_time_values(node)
+        hits = np.flatnonzero(times == np.datetime64(f"{year}-01-01", "ns"))
+        if hits.size == 0:
+            raise ValueError(
+                f"Year {year} is not on {zone}'s pre-allocated time axis "
+                f"({np.datetime_as_string(times, unit='D').tolist()}) — the axis is fixed at seeding (ADR-008 D1)."
+            )
+        year_index = int(hits[0])
+
+        emb = cast(zarr.Array, node["embeddings"])
+        shard_px = (emb.shards or emb.chunks)[1]
+        staged_px = self.detect_staged_chunk_size(run_id)
+        if staged_px != shard_px:
+            raise ValueError(
+                f"Staged tiles are {staged_px} px but {zone} shards are {shard_px} px — "
+                "the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
+            )
+
+        probe_path = f"{self.staging_base}/{run_id}/{labels[0]}.zarr"
+        staged_group = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
+        variables = tuple(
+            v for v in ("embeddings", "scales", "embedding_std", *OBS_COUNT_VARS) if v in staged_group and v in node
+        )
+
+        runs: dict[str, Any] = dict(node.attrs.get("runs", {}))  # type: ignore[arg-type]
+        runs[str(year)] = {
+            "run_id": run_id,
+            "assembled_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        }
+
+        _log.info(
+            "Assembling %d staged tiles into %s/%s year %d (index %d, vars %s, %d workers)",
+            len(shards),
+            store_path,
+            zone,
+            year,
+            year_index,
+            list(variables),
+            n_workers,
+        )
+        source = StagedShardSource(staging_base=self.staging_base, run_id=run_id, shards=shards, variables=variables)
+        snapshot = write_year_shards(
+            repo,
+            zone,
+            year_index,
+            source,
+            n_workers=n_workers,
+            gate=gate,
+            shard_px=shard_px,
+            commit_msg=f"Run {run_id}: fill {zone} year {year}",
+            extra_attrs={"runs": runs},
+        )
+        _log.info("Global assembly complete: %s/%s year %d (snapshot %s)", store_path, zone, year, snapshot)
+        return snapshot
+
+    def _assemble_dask_legacy(
+        self,
+        chunks: list[ChunkSpec],
+        total_y: int,
+        total_x: int,
+        run_id: str,
+        output_path: str,
+        *,
+        roi_zarr_path: str,
+        compute_std: bool = False,
+        run_started_at: datetime.datetime | None = None,
+        mosaic_base: str | None = None,
+        log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+        time_window: TimeWindow | None = None,
+        tile_id: str | None = None,
+        model_version: str | None = None,
+        manifest: EmbeddingManifest | None = None,
+        n_workers: int,
+        get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+        s3_region: str | None = None,
+    ) -> str:
+        """LEGACY Dask engine — kept only as the parity-gate reference for
+        :meth:`assemble`; deleted once the gate passes (implementation plan W4).
 
         Builds a lazy Dask-backed mosaic from staged sub-chunks and writes via
         ``to_icechunk()``. Appends along the time dimension if the output store

@@ -144,13 +144,15 @@ def write_year_shards(
     gate: CommitGate | None = None,
     shard_px: int = SHARD_PX,
     commit_msg: str | None = None,
+    extra_attrs: dict[str, Any] | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
     Forks the session, writes the source's live shards across ``n_workers``
     (in-process when 1, else spawned processes), merges, advances
     ``years_complete``, and commits behind ``gate`` via :func:`commit_with_rebase`.
-    Returns the commit snapshot id.
+    ``extra_attrs`` (e.g. per-fill run provenance) is merged into the group's
+    attrs in the same commit. Returns the commit snapshot id.
     """
     session = repo.writable_session("main")
     fork = session.fork()
@@ -178,6 +180,8 @@ def write_year_shards(
     done: list[int] = [int(y) for y in raw] if isinstance(raw, list) else []
     if year_label not in done:
         node.attrs["years_complete"] = sorted([*done, year_label])
+    if extra_attrs:
+        node.attrs.update(extra_attrs)
 
     with gate if gate is not None else nullcontext():
         return commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}")
