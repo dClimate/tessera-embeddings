@@ -83,11 +83,15 @@ new `storage/zone_grid.py`.*
   generator regenerates from that instead.) Expected values ≈ easting
   166,000–834,000 m; northing N 0–9,331,200 m (84°N), S 1,105,920–10,000,000 m
   (80°S). Group names = EPSG code strings (`"32601"`).
-  **Boundary policy (default, veto-able):** pure nominal 6° longitude bands —
-  disjoint coverage, every pixel-center belongs to exactly one zone; the
-  Norway/Svalbard MGRS width exceptions (32V, 31X–37X) are NOT honored (they
-  exist for navigation, not data grids, and would make zone extents irregular
-  for no storage benefit).
+  **Boundary policy (decided):** pure nominal 6° longitude bands — disjoint
+  coverage, every pixel-center belongs to exactly one zone; the Norway/Svalbard
+  MGRS width exceptions (32V, 31X–37X) are **not** honored (they exist for
+  navigation, not data grids, and would make zone extents irregular for no
+  storage benefit). This deviation from MGRS expectations MUST be documented
+  user-facing: in the `zone_grid` module docstring, the storage README section
+  on the global layout, and the dataset-level attrs
+  (`zone_scheme: "utm_6deg_nominal"`) so downstream consumers can't misassume
+  MGRS behavior (W6 carries the docs task).
 - **Annual time axis (Q2, resolved):** one timestep per calendar year,
   timestamped `YYYY-01-01T00:00:00` (int64 ns, `TIME_ENCODING`), with a
   group-level `time_convention: "calendar_year"` attr replacing the per-run
@@ -196,9 +200,11 @@ Memory envelope: ~1–1.5 GB per worker (staged read + shard block); 8 workers
 - Resume/progress: `years_complete` per group + staged-file markers are the
   resume state; a `campaign_status(repo)` reader summarizing zone×year fill.
 - Zone-fill runner: orchestration-facing composition — for (zone, year):
-  enumerate zone ChunkSpecs → inference (existing Ray path) → `assemble()` in
-  global mode → tag. The Prefect/AWS wiring lives downstream (yield-embeddings);
-  the OSS side ships the callable.
+  enumerate zone ChunkSpecs against the **partner-supplied campaign land mask**
+  (an input to the runner, same contract as today's ROI-mask zarr; assumed
+  delivered — no fallback mask is built) → inference (existing Ray path) →
+  `assemble()` in global mode → tag. The Prefect/AWS wiring lives downstream
+  (yield-embeddings); the OSS side ships the callable.
 
 ### W6 — Verification & docs
 
@@ -212,7 +218,11 @@ Memory envelope: ~1–1.5 GB per worker (staged read + shard block); 8 workers
   (same metrics, real code path) and spot-check on S3.
 - Docs: storage module docstrings + README (three write paths → four: create /
   append / region / **shard-assemble**), `context_docs` updates, ADR-008 stays
-  the source of truth for *why*.
+  the source of truth for *why*. Includes the **zone-boundary-policy note**
+  (pure 6° bands, no Norway/Svalbard MGRS exceptions) in the zone_grid
+  docstring, the README global-layout section, and the `zone_scheme` attr —
+  a user-facing deviation from MGRS expectations that must not be discoverable
+  only by reading code.
 
 ## 3. PR sequencing (each lands green on `global-tessera-scoping`)
 
@@ -261,12 +271,11 @@ the assembly engine.
 6. **Single-ROI default layout** → `LEGACY` stays the default for single-ROI
    entry points; `GLOBAL_V1` is opt-in (strict D8).
 
-### Remaining defaults (proceeding unless vetoed)
+7. **Zone boundary policy** → confirmed: pure nominal 6° longitude bands,
+   disjoint, **no Norway/Svalbard MGRS exceptions**. Must be documented
+   user-facing (zone_grid docstring, README, `zone_scheme` attr — W6).
+8. **Campaign land mask** → partner-supplied; the zone-fill runner takes it as
+   an input (same contract as today's ROI-mask zarr) and we assume it lands —
+   no fallback mask is built.
 
-- **Zone boundary policy:** pure nominal 6° longitude bands, disjoint, no
-  Norway/Svalbard MGRS exceptions (see W1). Navigation conventions, not data
-  conventions.
-- **Campaign land mask (W5 input):** the source of "which chunks get inference"
-  per zone (Natural Earth / OSM land polygons / partner-supplied) is a
-  campaign-ops choice needed before the first zone fill, **not** before PRs
-  1–4; the zone-fill runner takes it as an input.
+**The plan is final — no open questions remain.** PR 1 is unblocked.
