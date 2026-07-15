@@ -85,9 +85,12 @@ and known land/ocean points.
   (~1.96 Tpx) not the ~1.49 Tpx land-only estimate in ADR-008 — ~30% more
   pixels. Storage and compute scale with this; flagged for campaign budgeting.
 
-## Open questions for the partner
+## Partner questions — confirmed (2026-07-15)
 
-- Confirm the **registry** (not a bucket listing) is the authority and the
-  `SHA256SUM` extras are v1-era leftovers (our reconciliation assumes this).
-- Confirm the **~1-cell sea buffer width is stable** across versions (the cost
-  model and coverage extents depend on it).
+Both confirmed "yes, for our purposes" by the maintainer:
+
+- The **registry** (not a bucket listing) is the authority; the `SHA256SUM` /
+  bucket extras are v1-era leftovers to be ignored. Our reconciliation
+  (`registry ⊆ bucket`, extras reported but non-authoritative) is correct.
+- The **~1-cell sea buffer width is stable** across versions, so the coverage
+  extents and the buffered-coverage cost model (~1.96 Tpx) hold.
