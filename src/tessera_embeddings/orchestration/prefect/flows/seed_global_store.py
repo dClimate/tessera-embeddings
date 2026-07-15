@@ -1,0 +1,74 @@
+"""Seed the 120 UTM-zone groups of the global embeddings store (ADR-008 D1).
+
+Metadata-only and cluster-less — like :mod:`generate_roi`, it runs entirely on
+the flow runner (creating a zone group is a handful of schema arrays with no
+chunk data, so cost is independent of extent). Idempotent: it seeds only the
+groups not already present, so a re-run after a partial seed finishes the job
+without touching (and thus without corrupting) the zones already landed.
+
+This is the first step of the global campaign — run it once before any
+:mod:`fill_zone_year` runs; the fill runner treats the seeded group as the grid
+authority and creates nothing.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import icechunk
+from prefect import flow, get_run_logger
+
+from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.storage.campaign import campaign_status
+from tessera_embeddings.storage.global_store import create_global_repo, open_global_repo, seed_zone_groups
+from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES
+
+
+@flow(name="seed-global-store")
+def seed_global_store(
+    *,
+    paths: BucketPaths,
+    name: str = "tessera",
+    years: tuple[int, ...] = CAMPAIGN_YEARS,
+    model_version: str | None = None,
+) -> dict[str, Any]:
+    """Create the global-store repo (if absent) and seed every unseeded zone group.
+
+    Args:
+        paths: Deployment storage contract; the repo is ``paths.global_store(name)``.
+        name: Global-store repo basename (default ``"tessera"``).
+        years: Campaign year axis to pre-allocate on each group (fixed at seeding).
+        model_version: Optional model-version attr stamped on each group.
+
+    Returns:
+        Summary: store path, zones seeded this run, zones already present, total.
+    """
+    log = get_run_logger()
+    store_path = paths.global_store(name)
+
+    # Open-or-create with the global config (manifest split + preload). A missing
+    # repo raises on open; create_global_repo persists the config via save_config.
+    try:
+        repo = open_global_repo(store_path)
+        seeded = set(campaign_status(repo, years=years).zones)
+    except (FileNotFoundError, icechunk.IcechunkError):
+        log.info("Creating global store %s", store_path)
+        repo = create_global_repo(store_path)
+        seeded = set()
+
+    todo = [spec for zone_name, spec in ZONES.items() if zone_name not in seeded]
+    if not todo:
+        log.info("All %d zone groups already seeded in %s", len(ZONES), store_path)
+        return {"store_path": store_path, "seeded_now": 0, "already_seeded": len(seeded), "total": len(ZONES)}
+
+    snapshot = seed_zone_groups(
+        repo, todo, years=years, model_version=model_version, commit_msg=f"seed {len(todo)} zone group(s)"
+    )
+    log.info("Seeded %d zone group(s) into %s (%s)", len(todo), store_path, snapshot)
+    return {
+        "store_path": store_path,
+        "seeded_now": len(todo),
+        "already_seeded": len(seeded),
+        "total": len(ZONES),
+        "snapshot_id": snapshot,
+    }

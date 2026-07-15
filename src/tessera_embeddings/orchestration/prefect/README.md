@@ -11,13 +11,40 @@ orchestration/prefect/
 │   ├── generate_roi.py
 │   ├── ingest_s2_roi_reflectance.py
 │   ├── ingest_s1_roi_sar.py
-│   ├── tessera_embeddings.py        # ROI → mosaic → inference → assembly
-│   └── tessera_full_pipeline.py     # master: chains the four above via run_deployment
+│   ├── tessera_embeddings.py        # single-ROI: ROI → mosaic → inference → assembly
+│   ├── tessera_full_pipeline.py     # single-ROI master: chains the four above via run_deployment
+│   ├── build_land_mask.py           # global campaign: registry → per-zone coverage bitmaps (no cluster)
+│   ├── seed_global_store.py         # global campaign: seed the 120 UTM-zone groups (no cluster)
+│   ├── fill_zone_year.py            # global campaign: one (zone, year) via Ray → assembly → tag
+│   └── run_global_campaign.py       # global campaign driver: dispatch every pending (zone, year)
 ├── tasks/                  Layer 2: thin @task wrappers (~20 LOC each)
 │   ├── ingest.py                    # process_roi_reflectance, process_roi_sar
-│   └── inference.py                 # run_inference_task, assemble_embeddings_task
+│   ├── inference.py                 # run_inference_task, assemble_embeddings_task
+│   └── land_mask.py                 # build / verify / validate coverage (no-cluster steps)
 └── _dask_runner.py         internal helper: prefect_dask DaskTaskRunner factory
 ```
+
+## Global campaign (120 UTM zones)
+
+The global 10 m embeddings campaign (ADR-008) has its own four flows, distinct
+from the single-ROI path above:
+
+```
+build_land_mask   →   seed_global_store   →   run_global_campaign
+(coverage bitmaps)    (metadata-only)          └─ per pending (zone, year): fill_zone_year (Ray)
+```
+
+`run_global_campaign` reads live progress via `storage.campaign.campaign_status`
+and dispatches a `fill-zone-year` deployment run per pending cell, **year by
+year** (outer serial loop) with **bounded zone parallelism** within each year.
+This is safe because inference is independent across zones and only *same-zone*
+fills conflict (shared group attrs → `RebaseFailedError`) — the year-serial loop
+guarantees a zone never fills two years at once. The fleet-wide **committer
+bound is a Prefect global concurrency limit** (`commit_limit_name`, ADR-008 D6),
+passed to every fill so commits stay under the storm threshold while GPU
+inference runs unbounded. `build_land_mask` and `seed_global_store` are
+cluster-less (they run on the flow runner like `generate_roi`); only
+`fill_zone_year` provisions Ray.
 
 ## Master pipeline
 
@@ -45,6 +72,10 @@ override.
 | `ingest_s1_roi_sar.py` | OPERA RTC-S1 ingest with EDL auth, batched windows, amplitude-to-dB conversion, orbit filtering. Writes `sar_<orbit>.zarr`. |
 | `tessera_embeddings.py` | Distributed GPU inference: spin up Ray cluster, work-stealing dispatch across actors, Dask-based assembly. On-cancellation hook tears down EC2 instances. |
 | `tessera_full_pipeline.py` | Async master flow chaining the four above via `arun_deployment`. |
+| `build_land_mask.py` | Global campaign: build per-zone coverage bitmaps from the partner delivery registry (ADR-010). Optional pre-build delivery verification + post-build validation. No cluster. |
+| `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
+| `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commit gate = a Prefect global concurrency limit. |
+| `run_global_campaign.py` | Global campaign driver: dispatch a `fill-zone-year` run per pending `(zone, year)`, year-serial with bounded zone parallelism. |
 
 > **Why so many flow files?** The two-flow pattern below explains the inner/outer
 > split per file. The flows themselves are kept thin — task-graph discipline
