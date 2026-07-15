@@ -397,6 +397,34 @@ emitted once, lean (all-fill inner chunks elided, so ocean costs nothing), with
 zone-fill runner (`orchestration/runners/zone_fill.py`) drives it: partner land mask →
 inference → `assemble_global` → `campaign.tag_zone_year`.
 
+#### Write units vs read units, per layout
+
+The write path and the read path deliberately touch different granularities —
+what a writer emits in one go is much larger than what a reader must fetch:
+
+```text
+                  LEGACY (single-ROI)             GLOBAL_V1 (zone group)
+─────────────────────────────────────────────────────────────────────────────
+S3 object       = one 500×500×4 chunk (~a few   = one 2048² shard (≤ ~0.5 GB:
+                  hundred KB)                     8×8 inner chunks + index)
+
+writer emits    band worker streams tile        shard worker emits whole
+                y-slices; partial edge chunks    shard objects, exactly once
+                read-modify-write in-fork        (never read-modify-write)
+
+reader fetches  whole chunk objects under       shard index (one small GET),
+                the window (~KBs per point,      then ranged-GETs of only the
+                ×32 band chunks for full         overlapped inner chunks
+                depth)                           (~8.4 MB per point, full band)
+
+commit rewrites manifest tiles the write        that year's manifests only
+                touched (32-chunk 2D split)      (time@1 split)
+```
+
+The commit row is the manifest-splitting story: an Icechunk manifest maps
+chunks → objects, one per array by default, so unsplit commits are O(store).
+See the README's "Manifest splitting" diagram for the visual.
+
 **S3 concurrency.** The coordinator opens the repo with `max_concurrent_requests =
 TARGET_AGGREGATE_S3_CONCURRENCY // n_workers`; forks inherit it through pickling (no
 `save_config` round-trip needed), so fleet-wide PUT concurrency stays under S3's

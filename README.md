@@ -224,6 +224,20 @@ ingest chunk    4096 px  = 2×2 inference tiles
 inference tile  2048 px  = 1 output shard (global store)
 shard           2048 px  = 8×8 inner chunks
 inner chunk      256 px  = the unit downstream readers decode
+
+one ingest store chunk (4096²) — what one satellite read/write touches
+┌─ inference tile (2048²) ─┬─ inference tile (2048²) ─┐
+│ ░░░░░░░░░░░░░░░░░░░░░░░░ │                          │
+│ ░ 8×8 grid of 256²     ░ │   each tile is read out  │
+│ ░ inner chunks — the   ░ │   of the ingest chunk by │
+│ ░ same grid the output ░ │   one GPU actor, staged  │
+│ ░ shard will store     ░ │   as one file, and lands │
+│ ░░░░░░░░░░░░░░░░░░░░░░░░ │   as ONE shard object    │
+├──────────────────────────┼──────────────────────────┤
+│                          │                          │
+│    inference tile        │    inference tile        │
+│                          │                          │
+└──────────────────────────┴──────────────────────────┘
 ```
 
 ### Using these architecture checks in your own repo
@@ -286,6 +300,63 @@ fourth):
 4. **shard-assemble** — staged inference tiles written as whole, lean
    2048-px shards into a pre-allocated zone group, one fork/merge commit
    per (zone, year), gated to a handful of concurrent committers.
+
+### Anatomy of a shard: what a write emits, what a read fetches
+
+A shard is one S3 object wrapping an 8×8 grid of independently
+compressed **inner chunks**, plus a tiny index mapping each inner chunk
+to its byte range inside the object:
+
+```
+zone group "32601" ▸ embeddings ▸ year 2025 ▸ one shard
+┌─ shard object (2048² px × 128 bands ≈ 0.5 GB max on S3) ────────────┐
+│   8×8 inner chunks, 256² px × 128 bands (~8.4 MB int8+zstd each)    │
+│   ┌────┬────┬────┬────┬────┬────┬────┬────┐                         │
+│   │▓▓▓▓│▓▓▓▓│▓▓▓▓│    │    │▓▓▓▓│▓▓▓▓│▓▓▓▓│   ▓ = land: encoded    │
+│   ├────┼────┼────┼────┼────┼────┼────┼────┤       bytes + an index  │
+│   │▓▓▓▓│▓▓▓▓│    │    │    │    │▓▓▓▓│▓▓▓▓│       entry             │
+│   ├────┼────┼────┼────┼────┼────┼────┼────┤                         │
+│   │▓▓▓▓│    │    │    │    │    │    │▓▓▓▓│   blank = ocean (fill): │
+│   └────┴────┴────┴────┴────┴────┴────┴────┘       zero bytes stored │
+│   + shard index: inner chunk → (offset, length)    — a "lean" shard │
+└──────────────────────────────────────────────────────────────────────┘
+
+WRITE  1 staged inference tile (2048²) == 1 shard: the assembly worker
+       emits the whole object exactly once — no read-modify-write, and
+       an all-ocean tile costs nothing (never staged, never written).
+READ   a point/window read GETs the shard index, then ranged-GETs only
+       the inner chunks it overlaps — ~8 MB per point, not 0.5 GB.
+       (LEGACY single-ROI stores are unsharded: chunk == object.)
+```
+
+### Manifest splitting: why a commit costs one year, not the store
+
+An Icechunk **manifest** is the index mapping every chunk to its object.
+By default there is one per array — so every commit rewrites the whole
+index, O(store), regardless of how little changed. The global store
+splits manifests at `time@1`:
+
+```
+    unsplit (default)                     split time@1 (global store)
+    one manifest per array                one manifest per (array, year)
+
+    MANIFEST: all 9 years                 M2017 M2018 ⋯ M2024 M2025
+    ┌────────────────────────┐            ┌────┐┌────┐  ┌────┐┌────┐
+    │ every (year, y, x)     │            │ ρρ ││ ρρ │  │ ρρ ││ ρρ │
+    │ chunk → object ref     │            └────┘└────┘  └────┘└─▲──┘
+    └───────────▲────────────┘                                  │
+                │                         WRITE  filling 2025 rewrites
+    WRITE  ANY commit rewrites                   only M2025 — commit
+           the whole thing:                      cost stays O(one year)
+           O(entire store)                       for all nine years
+                                          READ   opening a group loads
+                                                 only the manifests of
+                                                 the arrays/years read
+```
+
+Single-ROI stores use the same idea spatially: a 32-chunk-per-axis 2D
+split so a region overwrite rewrites only the manifest tiles it touches
+(see `zarr_store.manifest_split`).
 
 The per-zone pixel grids are derived from the EPSG registry
 (`storage/zone_grid.py`), snapped to the 20,480 m shard pitch.

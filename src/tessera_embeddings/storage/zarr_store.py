@@ -311,6 +311,17 @@ def manifest_split(split_sizes: "dict[str, int] | None" = DEFAULT_MANIFEST_SPLIT
     exit even if the body raises, so a reused process (e.g. a Dask worker) is not
     left globally pinned. The split config must match across a store's create and
     every later open — wrap the whole merge in one block to keep them consistent.
+
+    What splitting buys, pictorially (spatial 2D split shown; ``time@1`` is the
+    same idea along the time axis — see :func:`global_store_config`)::
+
+        unsplit: 1 manifest/array          split 4x4: 1 manifest/16-chunk tile
+        ┌─────────────────────┐            ┌────┬────┬────┬────┐
+        │ every chunk's ref   │            │    │    │    │    │
+        │ (all years, all     │            ├────┼────┼─▓▓─┼────┤ a region write
+        │  positions)         │            ├────┼────┼────┼────┤ rewrites only
+        └─────────▲───────────┘            └────┴────┴────┴────┘ its tile(s) ▓
+                  └── ANY commit rewrites it all: O(store)
     """
     global _manifest_split_sizes
     previous = _manifest_split_sizes
