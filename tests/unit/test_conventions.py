@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from tessera_embeddings.inference.conventions import build_convention_attrs, tile_id_to_epsg
+from tessera_embeddings.inference.conventions import ENCODER_VERSION, build_convention_attrs, tile_id_to_epsg
 
 
 class TestTileIdToEpsg:
@@ -60,8 +60,7 @@ class TestBuildConventionAttrs:
             embedding_dim=128,
             y_coords=y_coords,
             x_coords=x_coords,
-            model_version="best_model_fsdp_20250608",
-            n_tiles=24,
+            model_version="1.1",
         )
 
         # zarr_conventions should contain all three
@@ -69,7 +68,7 @@ class TestBuildConventionAttrs:
         names = [c["name"] for c in conventions]
         assert "proj:" in names
         assert "spatial:" in names
-        assert "tessera:" in names
+        assert "geoemb:" in names
         # Each convention has a UUID
         for conv in conventions:
             assert "uuid" in conv
@@ -92,12 +91,20 @@ class TestBuildConventionAttrs:
         assert bbox[0] < bbox[2]  # xmin < xmax
         assert bbox[1] < bbox[3]  # ymin < ymax
 
-        # tessera:
-        assert attrs["tessera:dataset_version"] == "v1"
-        assert attrs["tessera:n_bands"] == 128
-        assert attrs["tessera:quantization_method"] == "absmax_per_pixel"
-        assert attrs["tessera:model_version"] == "best_model_fsdp_20250608"
-        assert attrs["tessera:n_tiles"] == 24
+        # geoemb: — required fields per the convention schema
+        assert attrs["geoemb:type"] == "pixel"
+        assert attrs["geoemb:dimensions"] == 128
+        assert attrs["geoemb:model"] == "https://geotessera.org/model/1.1"
+        assert attrs["geoemb:source_data"] == ["s3://sentinel-cogs", "https://datapool.asf.alaska.edu/RTC/OPERA-S1"]
+        assert attrs["geoemb:data_type"] == "int8"
+        assert attrs["geoemb:gsd"] == 10.0
+        assert attrs["geoemb:spatial_layout"] == "utm_zones"
+        assert attrs["geoemb:build_version"] == "1.1"
+        quant = attrs["geoemb:quantization"]
+        assert quant["method"] == "per_pixel_scale"
+        assert quant["original_dtype"] == "float32"
+        assert quant["quantized_dtype"] == "int8"
+        assert quant["scale"] == {"type": "array", "array_name": "scales", "nodata": "NaN"}
 
     def test_no_tile_id_no_coords_skips_proj_spatial(self) -> None:
         attrs = build_convention_attrs(
@@ -107,12 +114,13 @@ class TestBuildConventionAttrs:
         )
         assert "proj:code" not in attrs
         assert "spatial:dimensions" not in attrs
-        # tessera: should still be present
-        assert attrs["tessera:dataset_version"] == "v1"
+        # geoemb: should still be present (its required fields don't need CRS/coords)
+        assert attrs["geoemb:type"] == "pixel"
+        assert attrs["geoemb:dimensions"] == 128
         names = [c["name"] for c in attrs["zarr_conventions"]]
         assert "proj:" not in names
         assert "spatial:" not in names
-        assert "tessera:" in names
+        assert "geoemb:" in names
 
     def test_non_mgrs_tile_id_omits_proj(self) -> None:
         """When tile_id isn't an MGRS tile, proj: fields are omitted."""
@@ -132,16 +140,18 @@ class TestBuildConventionAttrs:
         # spatial: still present since coords are provided
         assert "spatial:" in names
 
-    def test_optional_fields_omitted_when_none(self) -> None:
+    def test_model_version_defaults_to_encoder_version(self) -> None:
+        """With no explicit model_version, geoemb:model + build_version use the
+        pipeline's encoder checkpoint version.
+        """
         attrs = build_convention_attrs(
             total_y=10,
             total_x=10,
             embedding_dim=128,
             model_version=None,
-            n_tiles=None,
         )
-        assert "tessera:model_version" not in attrs
-        assert "tessera:n_tiles" not in attrs
+        assert attrs["geoemb:build_version"] == ENCODER_VERSION
+        assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"
 
     def test_epsg_code_overrides_tile_id(self) -> None:
         """When both tile_id and epsg_code are provided, epsg_code wins."""

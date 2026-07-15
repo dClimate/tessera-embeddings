@@ -23,6 +23,14 @@ A Python library for:
 - **Coarsening and assembling** the output into analysis-ready stores
   at configurable resolution.
 
+Output stores are self-describing via GeoZarr conventions: every embedding
+store carries the [`proj:`](https://github.com/zarr-conventions/geo-proj) and
+[`spatial:`](https://github.com/zarr-conventions/spatial) conventions for
+CRS/affine metadata, plus the
+[`geoemb:` geoembeddings convention](https://github.com/geo-embeddings/embeddings-zarr-convention)
+for encoder-model provenance and quantization (built in
+[`inference/conventions.py`](src/tessera_embeddings/inference/conventions.py)).
+
 The domain code — the scientific transformations, the inference
 engine, the Zarr I/O — is cloud-agnostic and orchestrator-agnostic.
 It's plain Python over `xarray`, `dask`, `zarr`, `ray`, and `fsspec`.

@@ -1,12 +1,17 @@
 """GeoZarr convention attribute builders for embedding stores.
 
-Implements the proj:, spatial:, and tessera: Zarr conventions as purely
+Implements the proj:, spatial:, and geoemb: Zarr conventions as purely
 additive metadata on the root group. No store layout changes.
+
+The geoembeddings (``geoemb:``) convention supersedes the earlier ``tessera:``
+convention: it records encoder-model provenance, source datasets, and a
+structured quantization/dequantization description (see the ``geoemb:`` fields
+below). The mapping follows the convention repo's own ``tessera_example.json``.
 
 References:
     - proj:    https://github.com/zarr-conventions/geo-proj
     - spatial: https://github.com/zarr-conventions/spatial
-    - tessera: https://github.com/ucam-eo/zarr-convention-tessera
+    - geoemb:  https://github.com/geo-embeddings/embeddings-zarr-convention
 """
 
 from __future__ import annotations
@@ -35,13 +40,30 @@ _SPATIAL_CONVENTION = {
     "description": "Spatial coordinate information",
 }
 
-_TESSERA_CONVENTION = {
-    "schema_url": "https://raw.githubusercontent.com/ucam-eo/zarr-convention-tessera/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/ucam-eo/zarr-convention-tessera/blob/v1/README.md",
-    "uuid": "e7f90d5f-019e-4a38-802f-9fa695e26c71",
-    "name": "tessera:",
-    "description": "Quantised geospatial embedding vectors with per-pixel dequantisation scales",
+_GEOEMB_CONVENTION = {
+    "schema_url": "https://raw.githubusercontent.com/geo-embeddings/embeddings-zarr-convention/refs/tags/v1/schema.json",
+    "spec_url": "https://github.com/geo-embeddings/embeddings-zarr-convention/blob/v1/README.md",
+    "uuid": "61c12cc5-0e28-4056-999a-480cf3fb7e4c",
+    "name": "geoemb:",
+    "description": "Geoembeddings convention for geospatial embedding arrays with model provenance",
 }
+
+# --- geoemb: field defaults (this pipeline's fixed provenance) --------------
+#: Encoder checkpoint version (v1.1 pipeline). Versions both the model URL and
+#: ``geoemb:build_version``; overridable per call via ``model_version``.
+ENCODER_VERSION = "1.1"
+#: Model reference URL, versioned by the encoder checkpoint.
+_MODEL_URL_TEMPLATE = "https://geotessera.org/model/{version}"
+#: Precise source datasets we pull from: Sentinel-2 L2A COGs (Earth Search AWS
+#: Open Data) and OPERA RTC-S1 (ASF datapool).
+DEFAULT_SOURCE_DATA: tuple[str, ...] = (
+    "s3://sentinel-cogs",
+    "https://datapool.asf.alaska.edu/RTC/OPERA-S1",
+)
+#: Ground sample distance in metres (10 m embeddings grid).
+GSD_METERS = 10.0
+#: Storage dtype of the quantized embeddings.
+QUANTIZED_DTYPE = "int8"
 
 
 def tile_id_to_epsg(tile_id: str) -> str | None:
@@ -182,13 +204,16 @@ def build_convention_attrs(
     y_coords: np.ndarray | None = None,
     x_coords: np.ndarray | None = None,
     model_version: str | None = None,
-    n_tiles: int | None = None,
+    data_type: str = QUANTIZED_DTYPE,
+    gsd: float = GSD_METERS,
+    spatial_layout: str = "utm_zones",
+    source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
 ) -> dict:
     """Build GeoZarr convention attributes for the root group.
 
     Returns a flat dict of attributes to set on the Zarr root group.
     Includes ``zarr_conventions`` registration, ``proj:*``, ``spatial:*``,
-    and ``tessera:*`` metadata.
+    and ``geoemb:*`` metadata (the geoembeddings convention).
 
     *epsg_code* takes precedence over *tile_id* for determining the CRS.
     This allows callers who reproject data to record the actual output CRS
@@ -196,6 +221,13 @@ def build_convention_attrs(
 
     If neither *epsg_code* nor *tile_id* resolve to a valid EPSG code,
     ``proj:`` conventions are omitted (no CRS info available).
+
+    The ``geoemb:`` fields record encoder-model provenance and quantization:
+    *model_version* (the encoder checkpoint version, default
+    :data:`ENCODER_VERSION`) versions both ``geoemb:model`` and
+    ``geoemb:build_version``; *data_type* is the quantized storage dtype;
+    *gsd* the ground sample distance in metres; *spatial_layout* is
+    ``"utm_zones"`` or ``"global"``; *source_data* the source-dataset URLs.
     """
     conventions: list[dict] = []
     attrs: dict = {}
@@ -224,15 +256,25 @@ def build_convention_attrs(
         attrs["spatial:bbox"] = _compute_bbox(y_coords, x_coords)
         attrs["spatial:registration"] = "pixel"
 
-    # --- tessera: convention ---
-    conventions.append(_TESSERA_CONVENTION)
-    attrs["tessera:dataset_version"] = "v1"
-    attrs["tessera:n_bands"] = embedding_dim
-    attrs["tessera:quantization_method"] = "absmax_per_pixel"
-    if model_version:
-        attrs["tessera:model_version"] = model_version
-    if n_tiles is not None:
-        attrs["tessera:n_tiles"] = n_tiles
+    # --- geoemb: convention ---
+    version = model_version or ENCODER_VERSION
+    conventions.append(_GEOEMB_CONVENTION)
+    attrs["geoemb:type"] = "pixel"  # per-pixel embeddings (not chip)
+    attrs["geoemb:dimensions"] = embedding_dim
+    attrs["geoemb:model"] = _MODEL_URL_TEMPLATE.format(version=version)
+    attrs["geoemb:source_data"] = list(source_data)
+    attrs["geoemb:data_type"] = data_type
+    attrs["geoemb:gsd"] = gsd
+    attrs["geoemb:spatial_layout"] = spatial_layout
+    attrs["geoemb:build_version"] = version
+    attrs["geoemb:quantization"] = {
+        "method": "per_pixel_scale",  # absmax-per-pixel: value = quantized * scale
+        "original_dtype": "float32",
+        "quantized_dtype": data_type,
+        # Per-pixel float32 dequantization factors live in the `scales` array;
+        # absent/ocean pixels carry NaN there (assembly fills float vars NaN).
+        "scale": {"type": "array", "array_name": "scales", "nodata": "NaN"},
+    }
 
     if conventions:
         attrs["zarr_conventions"] = conventions
