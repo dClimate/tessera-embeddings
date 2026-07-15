@@ -36,6 +36,7 @@ METRICS = frozenset(
     {
         "wall_s",
         "commit_wall_s",
+        "commit_wall_p95_s",
         "merge_wall_s",
         "peak_rss_bytes",
         "read_p50_ms",

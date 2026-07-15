@@ -267,6 +267,14 @@ def fill_year_shard_aligned(
     session.merge(*forks)
     merge_wall = time.monotonic() - merge_start
 
+    # Advance years_complete in the same commit as the data (ADR D1), mirroring
+    # fill_year so both fill paths expose identical completion metadata.
+    root = zarr.open_group(session.store, mode="a")
+    grp = root[group]
+    done = list(grp.attrs.get("years_complete", []))
+    if YEARS[year_index] not in done:
+        grp.attrs["years_complete"] = sorted([*done, YEARS[year_index]])
+
     commit_start = time.monotonic()
     snapshot_id = session.commit(f"shard-aligned fill {group} year {YEARS[year_index]} ({len(shard_list)} shards)")
     commit_wall = time.monotonic() - commit_start

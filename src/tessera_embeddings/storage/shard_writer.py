@@ -152,7 +152,15 @@ def write_year_shards(
     (in-process when 1, else spawned processes), merges, advances
     ``years_complete``, and commits behind ``gate`` via :func:`commit_with_rebase`.
     ``extra_attrs`` (e.g. per-fill run provenance) is merged into the group's
-    attrs in the same commit. Returns the commit snapshot id.
+    attrs in the same commit.
+
+    Concurrency contract: concurrent commits to *different* groups rebase
+    cleanly (disjoint nodes), but two concurrent fills of the *same* group both
+    rewrite its ``years_complete``/``extra_attrs`` and
+    :class:`icechunk.ConflictDetector` cannot auto-merge attribute conflicts —
+    the loser fails with ``RebaseFailedError`` (loud, retriable) rather than
+    silently dropping an update. Orchestrate one fill per zone at a time.
+    Returns the commit snapshot id.
     """
     session = repo.writable_session("main")
     fork = session.fork()

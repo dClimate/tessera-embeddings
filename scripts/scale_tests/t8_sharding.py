@@ -321,7 +321,12 @@ def _sample_points(
         for yc, xc in land:
             by_shard.setdefault((yc * cy // sh_y, xc * cx // sh_x), []).append((yc, xc))
         shard_keys = sorted(by_shard)
-        chunks = [by_shard[shard_keys[i % len(shard_keys)]][0] for i in range(n)]
+        # Rotate within each shard's land-chunk list too, so repeated visits to
+        # a shard sample different inner chunks instead of re-reading the first.
+        chunks = [
+            by_shard[key][(i // len(shard_keys)) % len(by_shard[key])]
+            for i, key in ((j, shard_keys[j % len(shard_keys)]) for j in range(n))
+        ]
     else:
         chunks = [land[int(rng.integers(len(land)))] for _ in range(n)]
     pts: list[tuple[int, int]] = []

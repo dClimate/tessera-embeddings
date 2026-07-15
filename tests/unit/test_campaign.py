@@ -204,9 +204,24 @@ def test_mark_zone_year_empty_advances_completion(tmp_path):
     assert node.attrs["runs"]["2024"] == {**node.attrs["runs"]["2024"], "run_id": "runE", "empty": True}
 
 
-def test_mark_zone_year_empty_idempotent_without_run_id(tmp_path):
-    """Re-marking an already-complete year without provenance commits nothing new."""
+def test_mark_zone_year_empty_idempotent(tmp_path):
+    """Re-marking an already-complete year commits nothing new — even with a run_id.
+
+    A retry of a completed empty cell must return the same snapshot so the
+    existing zone-year tag still matches (tag_zone_year refuses to move tags).
+    """
     _, repo = _seed(tmp_path)
-    first = campaign.mark_zone_year_empty(repo, "32601", 2024)
-    again = campaign.mark_zone_year_empty(repo, "32601", 2024)
+    first = campaign.mark_zone_year_empty(repo, "32601", 2024, run_id="runA")
+    again = campaign.mark_zone_year_empty(repo, "32601", 2024, run_id="runB")
     assert first == again == repo.lookup_branch("main")
+    node = zarr.open_group(repo.readonly_session("main").store, mode="r")["32601"]
+    assert node.attrs["runs"]["2024"]["run_id"] == "runA", "original provenance must be preserved"
+
+
+def test_mark_zone_year_empty_off_axis_year_raises(tmp_path):
+    """A year outside the pre-allocated axis must never enter years_complete (D1)."""
+    _, repo = _seed(tmp_path)
+    with pytest.raises(ValueError, match="not on 32601's pre-allocated time axis"):
+        campaign.mark_zone_year_empty(repo, "32601", 1999)
+    status = campaign.campaign_status(repo, years=_YEARS)
+    assert not status.has("32601", 1999)

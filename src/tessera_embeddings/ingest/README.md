@@ -78,7 +78,7 @@ The page size is `STACProvider.max_page_size` (the `limit` per page request), de
 to 250. This applies only to providers queried through `client.search()` (Earth Search,
 Planetary Computer) — the OPERA `cmr-asf` path bypasses CMR-STAC search entirely and queries
 the native CMR Granule API. See
-[ADR 007](../../../context_docs/decisions/007-native-cmr-granule-query.md) for the full rationale.
+[ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md) for the full rationale.
 
 Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
 cloud classification is handled later (SCL for S2, ML model for inference). For S2, items
@@ -564,7 +564,7 @@ construct `pystac.Item`s shape-compatible with the rest of the pipeline. The gra
 `title`, `time_start`, and `polygons` supply the item id, datetime, and geometry. CMR
 pagination is handled via the `CMR-Search-After` response header, which pages cleanly at
 2000 against the same host. See
-[ADR 007](../../../context_docs/decisions/007-native-cmr-granule-query.md) for the full rationale.
+[ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md) for the full rationale.
 
 ### Burst Timestamp Normalisation
 

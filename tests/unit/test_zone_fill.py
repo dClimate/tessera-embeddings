@@ -254,3 +254,83 @@ def test_inference_failure_aborts_before_assembly(tmp_path, monkeypatch):
     node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
     assert node.attrs["years_complete"] == []
     assert "zone-32601-2025" not in repo.list_tags()
+
+
+def test_completed_and_tagged_cell_short_circuits(tmp_path, monkeypatch):
+    """A retry of a landed, tagged cell returns its snapshot without re-running anything."""
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0)])
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
+
+    first = zone_fill.fill_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2025,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="run1",
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("a completed+tagged cell must not re-run inference")
+
+    monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
+    retry = zone_fill.fill_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2025,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="run2",
+    )
+    assert retry["already_complete"] is True
+    assert retry["snapshot_id"] == first["snapshot_id"]
+    assert retry["tag"] == first["tag"]
+
+
+def test_all_tiles_skipped_marks_complete_empty(tmp_path, monkeypatch):
+    """Live tiles that all skip (zero valid pixels) land as an empty cell, tagged."""
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0), (1, 1)])
+
+    def all_skip_inference(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
+        writer = ZarrWriter(staging_base, embedding_dim=_BAND)
+        results = []
+        for chunk in chunks:
+            writer.write_skip_marker(chunk, run_id)
+            results.append({"chunk": chunk.label, "status": "skipped", "valid_pixels": 0, "elapsed_sec": 0.0})
+        return results
+
+    monkeypatch.setattr(zone_fill, "run_inference", all_skip_inference)
+
+    summary = zone_fill.fill_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2025,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="runS",
+    )
+
+    assert summary["empty"] is True
+    assert summary["skipped"] == 2
+    repo = global_store.open_global_repo(store)
+    node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
+    assert node.attrs["years_complete"] == [2025]
+    assert node.attrs["runs"]["2025"]["empty"] is True
+    assert repo.lookup_tag("zone-32601-2025") == summary["snapshot_id"]

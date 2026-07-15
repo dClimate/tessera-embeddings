@@ -24,10 +24,20 @@ Contracts (all caller-owned):
 - **Commit gating**: ``gate`` bounds concurrent commits within this process;
   fleet-wide gating across machines is the orchestrator's job (D6, ≤4-8
   simultaneous committers).
+- **One fill per zone at a time**: concurrent fills of *different* zones
+  commit to disjoint groups and rebase cleanly, but two concurrent fills of
+  the *same* zone (different years) both rewrite that group's
+  ``years_complete``/``runs`` attrs and icechunk's ``ConflictDetector`` cannot
+  auto-merge attribute conflicts — the loser raises ``RebaseFailedError``.
+  Schedule zone-parallel, year-serial.
 
-An all-ocean cell (the mask selects no tiles) is legitimate: it is marked
-complete with no data (:func:`~tessera_embeddings.storage.campaign.mark_zone_year_empty`)
-and tagged, so the campaign work list converges.
+An all-ocean cell (the mask selects no tiles) — or a cell whose live tiles all
+skip (zero valid pixels) — is legitimate: it is marked complete with no data
+(:func:`~tessera_embeddings.storage.campaign.mark_zone_year_empty`) and tagged,
+so the campaign work list converges. A cell that is already complete *and*
+tagged short-circuits without re-running anything (a deliberate refill
+requires deleting the ``zone-{zone}-{year}`` tag first — campaign history is
+never silently rewritten).
 """
 
 from __future__ import annotations
@@ -47,7 +57,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import enumerate_chunks, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.orchestration_helpers import enumerate_mosaic_chunks
 from tessera_embeddings.inference.runner import run_inference
-from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year
+from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.shard_writer import CommitGate
 
@@ -108,7 +118,27 @@ def fill_zone_year(
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
     if zone not in root:
         raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
-    emb = cast(zarr.Array, cast(zarr.Group, root[zone])["embeddings"])
+    node = cast(zarr.Group, root[zone])
+
+    # Idempotent retry: a cell that already landed AND was tagged is done —
+    # re-running it would produce a new snapshot that tag_zone_year rightly
+    # refuses to move the tag to. Deliberate refills must delete the tag first.
+    landed_years = node.attrs.get("years_complete", [])
+    tag = zone_year_tag(zone, year)
+    if isinstance(landed_years, list) and year in landed_years and tag in repo.list_tags():
+        snapshot = repo.lookup_tag(tag)
+        log.info("Zone %s year %d already complete and tagged (%s) — nothing to do", zone, year, tag)
+        return {
+            "zone": zone,
+            "year": year,
+            "run_id": run_id,
+            "already_complete": True,
+            "snapshot_id": snapshot,
+            "tag": tag,
+            "elapsed_sec": time.monotonic() - t0,
+        }
+
+    emb = cast(zarr.Array, node["embeddings"])
     _, ny, nx, _ = emb.shape
     shard_px = (emb.shards or emb.chunks)[1]
     if config.chunk_size != shard_px:
@@ -170,6 +200,26 @@ def fill_zone_year(
 
     writer = ZarrWriter(staging_base)
     writer.verify_staged_completeness(run_id, live, log=log)
+
+    if not writer._list_staged_labels(run_id):
+        # Every live tile resolved to a skip marker (zero valid pixels under
+        # the validity filters) — a legitimate no-data cell, same as all-ocean.
+        snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id, gate=gate)
+        tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
+        log.info("Zone %s year %d: all %d live tiles skipped — marked complete empty (%s)", zone, year, len(live), tag)
+        if cleanup_staging:
+            try:
+                writer.cleanup_staging(run_id, log)
+            except Exception:
+                log.warning("Staging cleanup failed for run %s", run_id, exc_info=True)
+        return {
+            **summary,
+            "empty": True,
+            "snapshot_id": snapshot,
+            "tag": tag,
+            "skipped": sum(r["status"] == "skipped" for r in results),
+            "elapsed_sec": time.monotonic() - t0,
+        }
 
     n_workers = n_assembly_workers or AssemblyConfig().compute_n_workers(len(live))
     snapshot = writer.assemble_global(

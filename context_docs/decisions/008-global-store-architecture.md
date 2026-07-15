@@ -204,7 +204,7 @@ probe in T2: icechunk #1600 (open) observed append times growing linearly
 with cumulative refs *despite* splitting. Note `rewrite_manifests()` is
 repo-wide only — no per-group targeting.
 
-### D5 — One repo, 120 groups — viable *with a commit-concurrency cap* (PENDING D2/D3; commit constraint FIRM from run 1)
+### D5 — One repo, 120 groups — adopted *with a commit-concurrency cap* (FIRM; commit constraint FIRM from run 1)
 
 Adopt the single-repo/120-group layout the partner expects, subject to:
 
@@ -232,9 +232,9 @@ letting all zones commit to `main` at once. **Constraint (now FIRM): a
 commit-concurrency cap of ~4–8 simultaneous committers** (a queue/semaphore in
 the orchestration layer), or per-zone repos. Reader-side: whole-repo
 `open_datatree` over 120 groups took ~31 s (vs 0.15 s per group) — readers must
-open a single zone group, never the datatree (icechunk #1462). Final one-repo
-vs per-zone go/no-go stays open only pending D2/D3 and a *paced-commit* re-test;
-the naive-concurrency question is settled.
+open a single zone group, never the datatree (icechunk #1462). With D2/D3
+settled by the T1/d3/d3v2 sweeps, the one-repo layout is the decision — capped
+committers, single-group readers; the naive-concurrency question is settled.
 
 ### D6 — Commit strategy: cooperative fork/merge, one commit per zone-year (FIRM shape; pacing cap FIRM from run 1)
 

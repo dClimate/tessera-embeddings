@@ -48,6 +48,7 @@ def test_coords_and_attrs(tmp_path):
     assert g["easting"].shape == (2048,)
     assert g["northing"].shape == (4096,)
     assert g["time"].shape == (3,)
+    assert g["band"].shape == (EMBEDDING_DIM,)  # band coord present for xarray consumers
     attrs = dict(g.attrs)
     assert attrs["crs"] == "EPSG:32601"
     assert attrs["years_complete"] == []

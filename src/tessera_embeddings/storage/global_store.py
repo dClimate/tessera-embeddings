@@ -76,8 +76,22 @@ def _var_shape(dims: tuple[str, ...], nt: int, ny: int, nx: int, band: int) -> t
 
 
 def _layout_band(layout: StoreLayout) -> int:
-    """The band count for a layout — the embeddings array's (unsplit) band chunk."""
-    return layout.arrays["embeddings"].chunks[-1]
+    """The band extent for a layout — the embeddings array's full-band chunk.
+
+    Only valid for layouts that never split the band axis (ADR-008 D2), where
+    the band chunk size IS the band count. Guards what it can: a sharded layout
+    whose band chunk differs from its band shard is split by construction and
+    is rejected. ``LEGACY`` (band split into 4) is not a valid zone-seeding
+    layout for the same reason.
+    """
+    emb = layout.arrays["embeddings"]
+    band = emb.chunks[-1]
+    if emb.shards is not None and emb.shards[-1] != band:
+        raise ValueError(
+            f"Layout {layout.name!r} splits the band axis (chunk {band} != shard {emb.shards[-1]}) — "
+            "zone seeding requires full-band chunks (ADR-008 D2)."
+        )
+    return band
 
 
 def _zone_attrs(
@@ -134,7 +148,7 @@ def seed_zone_groups(
         for var, array_layout in layout.arrays.items():
             shape = _var_shape(array_layout.dims, nt, spec.height, spec.width, band)
             node.create_array(var, **array_layout.create_kwargs(shape))
-        _write_coord_arrays(node, {"time": times, "northing": north, "easting": east})
+        _write_coord_arrays(node, {"time": times, "northing": north, "easting": east, "band": np.arange(band)})
         node.attrs.update(_zone_attrs(spec, north, east, layout, model_version))
     return session.commit(commit_msg or f"seed {len(specs)} zone group(s)")
 

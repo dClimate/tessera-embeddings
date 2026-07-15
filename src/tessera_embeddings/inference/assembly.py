@@ -53,7 +53,12 @@ from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
 from tessera_embeddings.storage.shard_writer import CommitGate, commit_with_rebase, write_year_shards
-from tessera_embeddings.storage.zarr_store import manifest_split, open_or_create_repo, open_store
+from tessera_embeddings.storage.zarr_store import (
+    manifest_split,
+    open_or_create_repo,
+    open_store,
+    read_time_values,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +234,10 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     ~0.5 GB int8 at 2048 px) and writes it into every output array with a plain
     zarr assignment. Partial output chunks at tile x-boundaries are
     read-modify-written sequentially within this fork (icechunk sessions are
-    read-your-writes), so the merged result is exact. Returns the fork for the
+    read-your-writes), so the merged result is exact. ``payload["clear"]``
+    tiles (skip-marked on a same-date overwrite — see :meth:`ZarrWriter.assemble`)
+    get the fill value written over their footprint so a prior run's data
+    can't survive under a rerun's skip marker. Returns the fork for the
     coordinator to merge.
     """
     fork = payload["fork"]
@@ -237,6 +245,15 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     y0b, y1b = payload["band"]
     root = zarr.open_group(fork.store, mode="a")
     arrays = {var: cast(zarr.Array, root[var]) for var in payload["variables"]}
+    for tile in payload["clear"]:
+        y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
+        for arr in arrays.values():
+            shape = (1, y1 - y0, tile.width, *arr.shape[3:]) if arr.ndim == 4 else (1, y1 - y0, tile.width)
+            block = np.full(shape, arr.fill_value, dtype=arr.dtype)
+            if arr.ndim == 4:
+                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop, :] = block
+            else:
+                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = block
     for tile, path in payload["tiles"]:
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
         staged = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
@@ -250,18 +267,6 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
         # immediately collectable before the next tile's read.
         del staged
     return fork
-
-
-def _read_time_values(node: zarr.Group) -> np.ndarray:
-    """Decode a group's ``time`` coordinate to ``datetime64[ns]`` values."""
-    time_arr = cast(zarr.Array, node["time"])
-    units = str(time_arr.attrs.get("units", ""))
-    if not units.startswith("nanoseconds since 1970-01-01"):
-        raise ValueError(
-            f"Unsupported time units {units!r} on {node.store!r} — every engine-written "
-            "store uses TIME_ENCODING (nanoseconds since 1970-01-01)."
-        )
-    return np.asarray(time_arr[:]).astype("int64").astype("datetime64[ns]")
 
 
 def _extend_time_axis(node: zarr.Group, time_date: np.datetime64) -> int:
@@ -366,6 +371,10 @@ class ZarrWriter:
         """
         path = self._skip_marker_path(run_id, chunk)
         fs = _fs_for(path)
+        # A run whose FIRST artifact is a skip marker has no staging dir yet on
+        # directory-backed filesystems (write_chunk's to_zarr creates it as a
+        # side effect; a bare open() does not). No-op on object stores.
+        fs.makedirs(path.rsplit("/", 1)[0], exist_ok=True)
         with fs.open(path, "wb") as f:
             f.write(b"")
         logger.info("Wrote skip marker for %s to %s", chunk.label, path)
@@ -787,7 +796,12 @@ class ZarrWriter:
           commit;
         * existing store, time value already present → its index is overwritten
           in place (idempotent resume: a crashed assembly re-run lands on the
-          same index instead of appending a duplicate timestep).
+          same index instead of appending a duplicate timestep). Live positions
+          are rewritten and skip-marked chunks' footprints are reset to fill (a
+          prior run's data must not survive under a rerun's skip marker);
+          positions **outside the current ROI mask** are not touched — a
+          same-date re-assembly assumes the same grid and mask, so shrink the
+          ROI only with a fresh date (or a fresh store).
 
         The fill itself is always the second, single data commit, so a crash
         mid-fill leaves only an all-fill timestep that the re-run overwrites.
@@ -900,6 +914,7 @@ class ZarrWriter:
         # --- Phase 1: schema (create) or time-axis placement (extend) --------
         session = repo.writable_session("main")
         root = zarr.open_group(session.store, mode="a")
+        overwrite = False
         # "time" absent means a created-but-never-seeded repo (e.g. a crash
         # between repo creation and the schema commit) — treat as fresh.
         if is_new or "time" not in root:
@@ -910,12 +925,14 @@ class ZarrWriter:
         else:
             if manifest:
                 manifest.validate_against(extract_manifest(root.attrs), output_path)
-            times = _read_time_values(root)
+            times = read_time_values(root)
             hits = np.flatnonzero(times == time_date)
             if hits.size:
                 time_index = int(hits[0])
+                overwrite = True
                 _log.warning(
-                    "Time %s already exists at index %d in %s — overwriting live positions in place",
+                    "Time %s already exists at index %d in %s — overwriting in place "
+                    "(live positions rewritten, skip-marked footprints reset to fill)",
                     time_date,
                     time_index,
                     output_path,
@@ -930,11 +947,15 @@ class ZarrWriter:
         granularity = _write_granularity(zarr.open_group(session.store, mode="r"), variables)
         bands = _partition_bands(total_y, granularity, n_workers)
         fork = session.fork()
+        # On a same-date overwrite, ROI-live chunks that this run skip-marked
+        # must be reset to fill — a prior run may have written real data there.
+        clear_chunks = [c for c in roi_live_chunks if c.label in skipped_labels] if overwrite else []
         payloads = []
         for band in bands:
             y0b, y1b = band
             tiles = [(c, self._staging_path(run_id, c)) for c in live_chunks if c.y_start < y1b and c.y_stop > y0b]
-            if tiles:
+            clear = [c for c in clear_chunks if c.y_start < y1b and c.y_stop > y0b]
+            if tiles or clear:
                 payloads.append(
                     {
                         "fork": fork,
@@ -942,6 +963,7 @@ class ZarrWriter:
                         "time_index": time_index,
                         "variables": tuple(variables),
                         "tiles": tiles,
+                        "clear": clear,
                     }
                 )
         _log.info(
@@ -1068,7 +1090,7 @@ class ZarrWriter:
         # One readonly probe: year index, shard pitch, variables, run provenance.
         probe = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone]
         node = cast(zarr.Group, probe)
-        times = _read_time_values(node)
+        times = read_time_values(node)
         hits = np.flatnonzero(times == np.datetime64(f"{year}-01-01", "ns"))
         if hits.size == 0:
             raise ValueError(
@@ -1088,6 +1110,12 @@ class ZarrWriter:
 
         probe_path = f"{self.staging_base}/{run_id}/{labels[0]}.zarr"
         staged_group = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
+        missing = [v for v in ("embeddings", "scales") if v not in staged_group]
+        if missing:
+            raise IncompleteStageError(
+                f"Staged tile {probe_path} is missing required variable(s) {missing} — refusing to "
+                "mark the year complete over a corrupt or partial staged run."
+            )
         variables = tuple(
             v for v in ("embeddings", "scales", "embedding_std", *OBS_COUNT_VARS) if v in staged_group and v in node
         )

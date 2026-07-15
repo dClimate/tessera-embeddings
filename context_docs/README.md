@@ -18,8 +18,8 @@ context_docs/
 │   ├── 005-multi-lock-file-strategy.md
 │   ├── 006-adapter-policy.md
 │   ├── 007-icechunk-chunk-cache-disabled.md
-│   ├── 007-native-cmr-granule-query.md
-│   └── 008-global-store-architecture.md
+│   ├── 008-global-store-architecture.md
+│   └── 009-native-cmr-granule-query.md
 └── design/           Long-form framing docs (ported from planning)
     ├── d3-sharding-plan.md
     ├── global-store-implementation-plan.md

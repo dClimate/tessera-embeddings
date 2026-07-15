@@ -28,15 +28,17 @@ from datetime import UTC, datetime
 from typing import cast
 
 import icechunk
+import numpy as np
 import zarr
 
 from tessera_embeddings.storage.shard_writer import CommitGate, commit_with_rebase
+from tessera_embeddings.storage.zarr_store import read_time_values
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES
 
 logger = logging.getLogger(__name__)
 
 
-def _zone_year_tag(zone: str, year: int) -> str:
+def zone_year_tag(zone: str, year: int) -> str:
     """Tag name for a landed ``(zone, year)`` fill, e.g. ``"zone-32601-2023"``."""
     return f"zone-{zone}-{year}"
 
@@ -61,7 +63,7 @@ def tag_zone_year(
     pointing at the same snapshot is a no-op; a tag pointing *elsewhere* raises
     rather than silently moving campaign history.
     """
-    tag = _zone_year_tag(zone, year)
+    tag = zone_year_tag(zone, year)
     sid = snapshot_id or repo.lookup_branch(branch)
     if tag in repo.list_tags():
         current = repo.lookup_tag(tag)
@@ -123,16 +125,25 @@ def mark_zone_year_empty(
     land. This advances ``years_complete`` (and ``runs`` provenance when
     ``run_id`` is given) in one gated commit, exactly as
     :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` would,
-    minus the shards. Idempotent: a year already marked commits nothing new but
-    still returns the branch tip. Returns the snapshot id to tag.
+    minus the shards. ``year`` must be on the group's pre-allocated time axis
+    (D1) — an off-axis year must never enter ``years_complete``. Idempotent: a
+    year already marked returns the branch tip untouched (its original
+    provenance preserved). Returns the snapshot id to tag.
     """
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
     node = cast(zarr.Group, root[zone])
+    times = read_time_values(node)
+    if not (times == np.datetime64(f"{year}-01-01", "ns")).any():
+        raise ValueError(
+            f"Year {year} is not on {zone}'s pre-allocated time axis — refusing to mark an "
+            "off-axis year complete (ADR-008 D1: the axis is fixed at seeding)."
+        )
     raw = node.attrs.get("years_complete", [])
     done = [int(y) for y in raw] if isinstance(raw, list) else []
-    if year not in done:
-        node.attrs["years_complete"] = sorted([*done, year])
+    if year in done:
+        return repo.lookup_branch("main")
+    node.attrs["years_complete"] = sorted([*done, year])
     if run_id is not None:
         runs = dict(node.attrs.get("runs", {}))  # type: ignore[arg-type]
         runs[str(year)] = {
@@ -141,8 +152,6 @@ def mark_zone_year_empty(
             "empty": True,
         }
         node.attrs["runs"] = runs
-    if not session.has_uncommitted_changes:
-        return repo.lookup_branch("main")
     with gate if gate is not None else nullcontext():
         return commit_with_rebase(session, f"mark {zone} year {year} complete (no land)")
 

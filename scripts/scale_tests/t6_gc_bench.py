@@ -124,11 +124,12 @@ def phase_rollback(cfg: harness.RunConfig) -> None:
         return
     current, target = history[0], history[1]
 
-    # Old snapshot stays readable by id after the branch moves.
+    repo.reset_branch("main", target.id, from_snapshot_id=current.id)
+
+    # Old snapshot stays readable by id after the branch moves — read it
+    # post-move, or the drill only proves it was readable as the branch tip.
     old_session = repo.readonly_session(snapshot_id=current.id)
     _ = zarr.open_group(old_session.store, mode="r")[GROUP]["embeddings"].shape
-
-    repo.reset_branch("main", target.id, from_snapshot_id=current.id)
     if repo.lookup_branch("main") != target.id:
         raise SystemExit("reset_branch did not move the branch tip")
 

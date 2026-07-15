@@ -50,6 +50,7 @@ import numpy as np
 import zarr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
+from tessera_embeddings.config.store_layout import clamp_chunks_and_shards
 from tessera_embeddings.storage.zarr_store import TIME_ENCODING, _create_repo, compute_doy
 from tessera_embeddings.utils import utcnow_iso
 
@@ -167,7 +168,9 @@ def _write_group_schema(
     """
     for name, spec in var_specs.items():
         shape = tuple(len(coords[d]) for d in spec.dims)
-        chunks = tuple(min(c, s) for c, s in zip(spec.chunks, shape, strict=True))
+        # One clamp implementation for on-disk geometry, shared with
+        # ArrayLayout.create_kwargs (config.store_layout).
+        chunks, shards = clamp_chunks_and_shards(shape, spec.chunks, spec.shards)
         kwargs: dict[str, Any] = {
             "shape": shape,
             "chunks": chunks,
@@ -177,10 +180,8 @@ def _write_group_schema(
             "serializer": spec.serializer,
             "compressors": spec.compressors,
         }
-        if spec.shards is not None:
-            kwargs["shards"] = tuple(
-                max(c, (min(sh, s) // c) * c) for sh, s, c in zip(spec.shards, shape, chunks, strict=True)
-            )
+        if shards is not None:
+            kwargs["shards"] = shards
         node.create_array(name, **kwargs)
     _write_coord_arrays(node, coords)
     if attrs:

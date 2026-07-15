@@ -98,7 +98,9 @@ def phase_for_n(cfg: harness.RunConfig, n: int) -> None:
         harness.emit_metric(cfg, TEST, phase, "retries", r["retries"], "count", n=n, group=r["group"])
         harness.emit_metric(cfg, TEST, phase, "commit_wall_s", r["commit_wall_s"], "s", n=n, group=r["group"])
     harness.emit_metric(cfg, TEST, phase, "wall_s", total_wall, "s", n=n, kind="total")
-    harness.emit_metric(cfg, TEST, phase, "commit_wall_s", float(np.percentile(commit_walls, 95)), "s", n=n, stat="p95")
+    # Distinct metric name: reusing "commit_wall_s" would pool this derived
+    # aggregate with the raw per-committer rows in report.py's tables.
+    harness.emit_metric(cfg, TEST, phase, "commit_wall_p95_s", float(np.percentile(commit_walls, 95)), "s", n=n)
     logger.info(
         "N=%d: total %.2fs, retries max=%d mean=%.1f, unresolvable=%d failed=%d",
         n,

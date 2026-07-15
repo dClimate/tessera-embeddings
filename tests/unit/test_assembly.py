@@ -387,6 +387,57 @@ class TestAssembly:
         np.testing.assert_array_equal(ds["embeddings"].values[0, ...], emb2)
         assert ds.attrs["run_id"] == "run2"
 
+    def test_same_date_overwrite_clears_skip_marked_footprints(self, tmp_path):
+        """A rerun's skip marker must reset the chunk to fill, not expose the prior run's data."""
+        staging = str(tmp_path / "staging")
+        output = str(tmp_path / "output.zarr")
+        writer = ZarrWriter(staging)
+
+        rng = np.random.default_rng(42)
+        chunks = [
+            ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5),
+            ChunkSpec(row=0, col=1, y_start=0, y_stop=5, x_start=5, x_stop=10),
+        ]
+        roi = _make_full_roi_mask(tmp_path, 5, 10)
+        day = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
+
+        # Run 1: both chunks carry real data.
+        for chunk in chunks:
+            emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
+            writer.write_chunk(chunk, emb, "run1", scales=scales)
+        writer.assemble(
+            chunks,
+            total_y=5,
+            total_x=10,
+            run_id="run1",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=day,
+            n_workers=1,
+        )
+
+        # Run 2, same date: chunk_0_1 now has zero valid pixels (skip marker).
+        emb2, scales2 = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunks[0], emb2, "run2", scales=scales2)
+        writer.write_skip_marker(chunks[1], "run2")
+        writer.assemble(
+            chunks,
+            total_y=5,
+            total_x=10,
+            run_id="run2",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=day,
+            n_workers=1,
+        )
+
+        ds = open_store(output)
+        assert ds.sizes["time"] == 1
+        result = ds["embeddings"].values[0, ...]
+        np.testing.assert_array_equal(result[:, :5, :], emb2)
+        assert np.all(result[:, 5:, :] == 0), "run1's data must not survive under run2's skip marker"
+        assert np.all(np.isnan(ds["scales"].values[0, :, 5:])), "scales must reset to NaN fill too"
+
     def test_assemble_multiband_parallel_matches_serial(self, tmp_path):
         """n_workers>1 partitions into y-bands across processes; result matches serial.
 
@@ -1375,3 +1426,17 @@ class TestAssembleGlobal:
         writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
         with pytest.raises(IncompleteStageError, match="no staged chunks"):
             writer.assemble_global(store_path, self.ZONE, year=2025, run_id="empty_run", n_workers=1)
+
+    def test_staged_tile_missing_required_var_raises(self, tmp_path):
+        """A staged tile without embeddings/scales must abort, not silently drop the variable."""
+        dim = 8
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)
+        staging = tmp_path / "staging"
+        # Hand-roll a corrupt staged tile: embeddings only, no scales.
+        path = str(staging / "runC" / "chunk_0_0.zarr")
+        g = zarr.open_group(path, mode="w")
+        g.create_array("embeddings", data=np.ones((self.TILE, self.TILE, dim), dtype="int8"))
+        writer = ZarrWriter(str(staging), embedding_dim=dim)
+
+        with pytest.raises(IncompleteStageError, match="missing required variable"):
+            writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runC", n_workers=1)

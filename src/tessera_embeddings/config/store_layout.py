@@ -52,6 +52,27 @@ def pcodec_serializer() -> _PCodecZarr3:
     return _PCodecZarr3()
 
 
+def clamp_chunks_and_shards(
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    shards: tuple[int, ...] | None,
+) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+    """Clamp nominal chunk/shard sizes to an array's ``shape``.
+
+    Chunks are clamped to the shape; shards are clamped to the shape and then
+    floored to a whole multiple of the clamped chunks (Zarr v3 requires shards
+    to be exact chunk multiples), never below one chunk — so a store smaller
+    than one nominal chunk/shard still creates cleanly. The single
+    implementation of this load-bearing geometry math; both
+    :meth:`ArrayLayout.create_kwargs` and the empty-store seeder call it.
+    """
+    clamped = tuple(min(c, s) for c, s in zip(chunks, shape, strict=True))
+    if shards is None:
+        return clamped, None
+    clamped_shards = tuple(max(c, (min(sh, s) // c) * c) for sh, s, c in zip(shards, shape, clamped, strict=True))
+    return clamped, clamped_shards
+
+
 @dataclasses.dataclass(frozen=True)
 class ArrayLayout:
     """On-disk geometry for one data variable.
@@ -77,7 +98,7 @@ class ArrayLayout:
         """
         if len(shape) != len(self.dims):
             raise ValueError(f"shape {shape} has {len(shape)} dims, layout expects {len(self.dims)} ({self.dims})")
-        chunks = tuple(min(c, s) for c, s in zip(self.chunks, shape, strict=True))
+        chunks, shards = clamp_chunks_and_shards(shape, self.chunks, self.shards)
         kwargs: dict = {
             "shape": shape,
             "chunks": chunks,
@@ -85,10 +106,8 @@ class ArrayLayout:
             "fill_value": self.fill_value,
             "dimension_names": self.dims,
         }
-        if self.shards is not None:
-            kwargs["shards"] = tuple(
-                max(c, (min(sh, s) // c) * c) for sh, s, c in zip(self.shards, shape, chunks, strict=True)
-            )
+        if shards is not None:
+            kwargs["shards"] = shards
         if self.codec == _PCODEC:
             kwargs["serializer"] = pcodec_serializer()
             kwargs["compressors"] = None

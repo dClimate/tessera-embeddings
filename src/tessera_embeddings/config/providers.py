@@ -70,7 +70,7 @@ class STACProvider:
     entirely and queries the native CMR granule API instead (see
     ``opera_query.make_s1_item_provider``), so this value does not apply there.
     Raising it for CMR-STAC made the 500s worse, not better — see
-    context_docs/decisions/007-native-cmr-granule-query.md."""
+    context_docs/decisions/009-native-cmr-granule-query.md."""
 
 
 # =============================================================================

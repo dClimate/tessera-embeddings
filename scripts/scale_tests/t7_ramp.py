@@ -31,9 +31,13 @@ OBJECTS_PER_LEVEL = 400
 def _put_many(bucket: str, prefix: str, concurrency: int, n_objects: int) -> tuple[int, float]:
     """PUT ``n_objects`` at the given concurrency; return (503 count, wall_s)."""
     import boto3
+    from botocore.config import Config
     from botocore.exceptions import ClientError
 
-    client = boto3.client("s3")
+    # botocore's default pool is 10 connections; without this the high ramp
+    # levels would serialize on the pool and never actually hit S3 at the
+    # requested concurrency.
+    client = boto3.client("s3", config=Config(max_pool_connections=max(10, concurrency)))
     body = b"\0" * OBJECT_BYTES
     slowdowns = 0
 
