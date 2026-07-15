@@ -31,7 +31,10 @@ def read_upstream_manifests(
     manifests: dict[str, dict[str, Any] | None] = {}
     for name in store_names:
         path = f"{mosaic_base}/{name}.zarr"
-        ds = open_store(path)
+        # chunks=None: read only the root attrs off metadata. Default chunking
+        # would build a Dask task per stored chunk of a full-zone mosaic on the
+        # flow runner just to read one attr dict — pure overhead.
+        ds = open_store(path, chunks=None)
         try:
             manifests[name] = extract_manifest(ds.attrs)
         finally:
@@ -62,7 +65,9 @@ def enumerate_mosaic_chunks(
     """
     reflectance_path = f"{mosaic_base}/reflectance.zarr"
     log.info("Reading store metadata from %s", reflectance_path)
-    ds = open_store(reflectance_path)
+    # chunks=None: only the dim sizes are read here (never pixels), so skip
+    # building a Dask task graph over every chunk of the full-zone mosaic.
+    ds = open_store(reflectance_path, chunks=None)
     try:
         chunks = enumerate_chunks_from_dataset(ds, chunk_size)
         total_y, total_x = ds.sizes["northing"], ds.sizes["easting"]

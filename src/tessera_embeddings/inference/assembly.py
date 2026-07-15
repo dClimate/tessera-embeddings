@@ -299,6 +299,17 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
                     f"Staged tile {path} variable {var!r} has dtype {staged_arr.dtype} but the destination "
                     f"array is {arr.dtype} — a silent cast would corrupt the output."
                 )
+            # Validate the full shape too: a singleton spatial or band dim would
+            # broadcast over the destination region and commit repeated values.
+            # 4-D destination (embeddings/std) → staged tile is (h, w, band);
+            # 3-D (scales/obs) → (h, w).
+            spatial_hw = (tile.y_stop - tile.y_start, tile.x_stop - tile.x_start)
+            expected_shape = (*spatial_hw, arr.shape[3]) if arr.ndim == 4 else spatial_hw
+            if staged_arr.shape != expected_shape:
+                raise ValueError(
+                    f"Staged tile {path} variable {var!r} has shape {staged_arr.shape}, expected "
+                    f"{expected_shape} — a singleton/off-grid dim would broadcast and corrupt the output."
+                )
             block = np.asarray(staged_arr[y0 - tile.y_start : y1 - tile.y_start])[np.newaxis]
             arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = block
         # Drop the group reference so its file handles / S3 connections are
@@ -348,6 +359,7 @@ class StagedShardSource:
     variables: tuple[str, ...]
     shard_px: int
     dtypes: tuple[tuple[str, str], ...] = ()  # (var, dtype) expectations from the probe
+    embedding_dim: int = 0  # band width for 4-D vars; 0 = skip the band check
 
     def live_shards(self) -> list[tuple[int, int]]:
         """The staged ``(row, col)`` tile positions — shard indices, 1:1."""
@@ -378,6 +390,15 @@ class StagedShardSource:
                 raise ValueError(
                     f"Staged tile {path} has {var} extent {h} x {w} px but shards are {self.shard_px} px — "
                     "truncated or off-grid tile (ADR-008 D3 requires whole tiles)."
+                )
+            # Also validate the trailing band axis of 4-D vars (embeddings /
+            # embedding_std): a (1, px, px, 1) block would broadcast across all
+            # destination bands and commit repeated values under a shape check
+            # that only looked at [1:3].
+            if self.embedding_dim and block.ndim == 4 and block.shape[3] != self.embedding_dim:
+                raise ValueError(
+                    f"Staged tile {path} has {var} band width {block.shape[3]} but expected "
+                    f"{self.embedding_dim} — a singleton band would broadcast over the output."
                 )
             blocks[var] = block
         return blocks
@@ -1023,13 +1044,16 @@ class ZarrWriter:
             # existing coordinates and silently misgeoreferenced. Compare CRS +
             # coordinate endpoints against the stored grid (half-pixel absolute
             # tolerance, as in the zone-fill runner) when mosaic coords are known.
-            # Only when the store already HAS a CRS: the CRS attr is written in
-            # Phase 3, so a fresh create that crashed after the schema commit
-            # (Phase 1) reaches this branch on retry with no CRS yet — validating
-            # then would wrongly reject the recovery instead of completing it.
-            stored_crs = root.attrs.get("crs")
-            if spatial is not None and stored_crs is not None:
-                if spatial.crs != stored_crs:
+            #
+            # CRS is checked only when present: it is written in Phase 3, so a
+            # fresh create that crashed after the schema commit (Phase 1) reaches
+            # this branch on retry with no CRS yet. The coordinate ARRAYS, though,
+            # are committed in Phase 1 — so validate endpoints even on that
+            # recovery path, or a shifted retry mosaic would write positionally
+            # over the already-committed grid.
+            if spatial is not None:
+                stored_crs = root.attrs.get("crs")
+                if stored_crs is not None and spatial.crs != stored_crs:
                     raise ValueError(
                         f"Mosaic CRS {spatial.crs!r} does not match existing store {output_path} "
                         f"CRS {stored_crs!r} — appending would misgeoreference the timestep."
@@ -1306,6 +1330,7 @@ class ZarrWriter:
             variables=variables,
             shard_px=shard_px,
             dtypes=probe_dtypes,
+            embedding_dim=self.embedding_dim,
         )
         snapshot = write_year_shards(
             repo,
