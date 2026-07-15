@@ -35,7 +35,7 @@ from tessera_embeddings.inference.assembly import (
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.quantization import quantize_embeddings
 from tessera_embeddings.storage.global_store import create_global_repo, open_global_repo
-from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store
+from tessera_embeddings.storage.zarr_store import TIME_ENCODING, open_or_create_repo, open_store
 
 
 def _dummy_scales(h: int, w: int) -> np.ndarray:
@@ -1014,9 +1014,21 @@ class TestPartitionBands:
     def test_partition_shapes(self, total_y, granularity, n_workers, expected):
         assert _partition_bands(total_y, granularity, n_workers) == expected
 
+    def test_weighted_partition_balances_clustered_work(self):
+        """With live tiles clustered at the bottom, boundaries follow the work, not the height."""
+        # 10 units of 500 px; all 20 tiles live in the last two units.
+        weights = [0, 0, 0, 0, 0, 0, 0, 0, 10, 10]
+        bands = _partition_bands(5000, 500, 2, weights=weights)
+        assert bands == [(0, 4500), (4500, 5000)], "each band should carry ~half the live tiles"
+        # Uniform weights reproduce the unweighted split.
+        assert _partition_bands(5000, 500, 2, weights=[1] * 10) == _partition_bands(5000, 500, 2)
+
+    @pytest.mark.parametrize("weights", [None, [3, 0, 0, 1, 0, 7, 0, 0, 2, 5, 0, 0, 0, 0, 1, 0, 0, 0, 0, 4]])
     @pytest.mark.parametrize(("total_y", "granularity", "n_workers"), [(10_000, 500, 7), (2048, 2048, 8), (1, 500, 3)])
-    def test_partition_invariants(self, total_y, granularity, n_workers):
-        bands = _partition_bands(total_y, granularity, n_workers)
+    def test_partition_invariants(self, total_y, granularity, n_workers, weights):
+        n_units = -(-total_y // granularity)
+        w = weights[:n_units] if weights else None
+        bands = _partition_bands(total_y, granularity, n_workers, weights=w)
         assert bands[0][0] == 0
         assert bands[-1][1] == total_y
         assert len(bands) <= n_workers
@@ -1352,7 +1364,7 @@ class TestAssembleGlobal:
         )
         time_int = times.astype("int64")
         time_arr = node.create_array("time", data=time_int, chunks=(len(time_int),), dimension_names=("time",))
-        time_arr.attrs.update({"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"})
+        time_arr.attrs.update(TIME_ENCODING)
         node.attrs["years_complete"] = []
         session.commit("seed test zone")
         return store_path

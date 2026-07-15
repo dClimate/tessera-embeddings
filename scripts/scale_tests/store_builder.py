@@ -22,6 +22,7 @@ from scale_tests import variants as V
 from scale_tests._workers import write_fork, write_fork_shards
 from scale_tests.synth import land_mask
 from scale_tests.zone_geometry import YEARS, MockZone
+from tessera_embeddings.storage.shard_writer import _partition
 
 logger = logging.getLogger("scale_tests.builder")
 
@@ -109,12 +110,6 @@ class FillResult:
     snapshot_id: str
     n_chunks: int
     n_workers: int
-
-
-def _partition(items: list, n: int) -> list[list]:
-    """Round-robin partition ``items`` into ``n`` lists (drops empty tail lists)."""
-    parts = [items[i::n] for i in range(n)]
-    return [p for p in parts if p]
 
 
 def fill_year(

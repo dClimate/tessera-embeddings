@@ -29,14 +29,13 @@ Two write-conflict regimes, one engine:
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import datetime
+import itertools
 import logging
-import multiprocessing
 import subprocess
-from collections.abc import Callable, Iterable, Mapping
-from concurrent.futures import ProcessPoolExecutor
-from contextlib import nullcontext
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, cast
 
 import fsspec
@@ -47,17 +46,25 @@ import zarr
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM, TimeWindow
 from tessera_embeddings.config.store_layout import INNER_PX, LEGACY, OBS_COUNT_VARS, StoreLayout
-from tessera_embeddings.inference.chunk_spec import ChunkSpec, filter_chunks_by_roi_mask
+from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
 from tessera_embeddings.inference.conventions import build_convention_attrs
+from tessera_embeddings.storage.campaign import run_provenance
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
-from tessera_embeddings.storage.global_store import open_global_repo
+from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
-from tessera_embeddings.storage.shard_writer import CommitGate, commit_with_rebase, write_year_shards
+from tessera_embeddings.storage.shard_writer import (
+    CommitGate,
+    commit_with_rebase,
+    run_forked,
+    shard_pitch,
+    write_year_shards,
+)
 from tessera_embeddings.storage.zarr_store import (
     manifest_split,
     open_or_create_repo,
     open_store,
     read_time_values,
+    time_index_of,
 )
 
 logger = logging.getLogger(__name__)
@@ -189,23 +196,48 @@ def read_spatial_coords(mosaic_base: str) -> SpatialCoords:
 # =============================================================================
 
 
-def _partition_bands(total_y: int, granularity: int, n_workers: int) -> list[tuple[int, int]]:
+def _partition_bands(
+    total_y: int,
+    granularity: int,
+    n_workers: int,
+    weights: Sequence[int] | None = None,
+) -> list[tuple[int, int]]:
     """Split ``[0, total_y)`` into at most ``n_workers`` bands aligned to ``granularity``.
 
     Bands start and end on multiples of the output's northing write granularity
     (shard height when sharded, chunk height otherwise), so no two workers ever
     touch the same output chunk — the fork/merge write-conflict invariant.
-    Whole granularity units are spread as evenly as possible; the last band
-    absorbs the ragged tail.
+
+    Without ``weights``, whole granularity units are spread as evenly as
+    possible. With ``weights`` (work per unit — live tiles overlapping it),
+    boundaries balance total work per band instead of raw height: an ROI mask
+    clusters live tiles spatially, and equal-height bands would leave most
+    workers idle while one drags the assembly. Either way the bands tile
+    ``[0, total_y)`` exactly and the last band absorbs the ragged tail.
     """
     n_units = -(-total_y // granularity)
     n_bands = max(1, min(n_workers, n_units))
-    base, extra = divmod(n_units, n_bands)
+    if weights is None or sum(weights) == 0:
+        base, extra = divmod(n_units, n_bands)
+        unit_counts = [base + (1 if i < extra else 0) for i in range(n_bands)]
+        cuts = list(itertools.accumulate(unit_counts))
+    else:
+        prefix = list(itertools.accumulate(weights))
+        cuts = []
+        start = 0
+        for b in range(1, n_bands):
+            # First unit index whose cumulative weight reaches the band's share;
+            # +1 because prefix[i] includes unit i, and the cut is exclusive.
+            cut = bisect.bisect_left(prefix, prefix[-1] * b / n_bands, lo=start) + 1
+            # Every band keeps at least one unit so the tiling stays exact.
+            cut = min(max(cut, start + 1), n_units - (n_bands - b))
+            cuts.append(cut)
+            start = cut
+        cuts.append(n_units)
     bands: list[tuple[int, int]] = []
     y = 0
-    for i in range(n_bands):
-        units = base + (1 if i < extra else 0)
-        y_stop = min(total_y, y + units * granularity)
+    for cut in cuts:
+        y_stop = min(total_y, cut * granularity)
         bands.append((y, y_stop))
         y = y_stop
     return bands
@@ -217,10 +249,7 @@ def _write_granularity(node: zarr.Group, variables: Iterable[str]) -> int:
     All data variables must agree (both presets do); a disagreement would let
     two bands share an output object, so it is an error rather than a max().
     """
-    sizes = {}
-    for var in variables:
-        arr = cast(zarr.Array, node[var])
-        sizes[var] = (arr.shards or arr.chunks)[1]
+    sizes = {var: shard_pitch(cast(zarr.Array, node[var])) for var in variables}
     if len(set(sizes.values())) != 1:
         raise ValueError(f"Data variables disagree on northing write granularity: {sizes}")
     return next(iter(sizes.values()))
@@ -245,24 +274,19 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     y0b, y1b = payload["band"]
     root = zarr.open_group(fork.store, mode="a")
     arrays = {var: cast(zarr.Array, root[var]) for var in payload["variables"]}
+    # Trailing dims (band) not indexed are written in full, so each assignment
+    # below covers both the 3-D and 4-D arrays.
     for tile in payload["clear"]:
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
         for arr in arrays.values():
-            shape = (1, y1 - y0, tile.width, *arr.shape[3:]) if arr.ndim == 4 else (1, y1 - y0, tile.width)
-            block = np.full(shape, arr.fill_value, dtype=arr.dtype)
-            if arr.ndim == 4:
-                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop, :] = block
-            else:
-                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = block
+            shape = (1, y1 - y0, tile.width, *arr.shape[3:])
+            arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = np.full(shape, arr.fill_value, dtype=arr.dtype)
     for tile, path in payload["tiles"]:
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
         staged = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
         for var, arr in arrays.items():
             block = np.asarray(cast(zarr.Array, staged[var])[y0 - tile.y_start : y1 - tile.y_start])[np.newaxis]
-            if arr.ndim == 4:
-                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop, :] = block
-            else:
-                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = block
+            arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = block
         # Drop the group reference so its file handles / S3 connections are
         # immediately collectable before the next tile's read.
         del staged
@@ -288,14 +312,6 @@ def _extend_time_axis(node: zarr.Group, time_date: np.datetime64) -> int:
     return nt
 
 
-def _label_to_grid(label: str) -> tuple[int, int]:
-    """Parse a staged ``chunk_{row}_{col}`` label into ``(row, col)``."""
-    parts = label.split("_")
-    if len(parts) != 3 or parts[0] != "chunk":
-        raise ValueError(f"Staged label {label!r} is not of the form 'chunk_<row>_<col>'")
-    return int(parts[1]), int(parts[2])
-
-
 @dataclasses.dataclass(frozen=True)
 class StagedShardSource:
     """:class:`~tessera_embeddings.storage.shard_writer.ShardSource` over staged tiles.
@@ -319,7 +335,7 @@ class StagedShardSource:
     def load(self, shard: tuple[int, int]) -> dict[str, np.ndarray]:
         """Read one staged tile whole and return ``{var: (1, h, w[, band]) block}``."""
         sy, sx = shard
-        path = f"{self.staging_base}/{self.run_id}/chunk_{sy}_{sx}.zarr"
+        path = f"{self.staging_base}/{self.run_id}/{chunk_label(sy, sx)}.zarr"
         group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
         return {var: np.asarray(cast(zarr.Array, group[var])[:])[np.newaxis] for var in self.variables}
 
@@ -511,8 +527,12 @@ class ZarrWriter:
         run_id: str,
         expected_chunks: list[ChunkSpec],
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
-    ) -> None:
+    ) -> set[str]:
         """Verify all expected chunks have either a staged zarr or a skip marker.
+
+        Returns the labels that have staged zarrs (an empty set means every
+        live chunk resolved to a skip marker), so callers don't re-LIST the
+        staging prefix to learn what verification already read.
 
         A live (ROI-intersecting) chunk can resolve in two ways: inference
         produced embeddings (staged zarr), or every pixel failed the validity
@@ -534,8 +554,8 @@ class ZarrWriter:
                 don't match any expected chunk.
         """
         _log = log or logger
-        staged = set(self._list_staged_labels(run_id))
-        skipped = set(self._list_skip_marker_labels(run_id))
+        staged_list, skipped_list = self._list_run_labels(run_id)
+        staged, skipped = set(staged_list), set(skipped_list)
         resolved = staged | skipped
         expected = {c.label for c in expected_chunks}
 
@@ -570,21 +590,14 @@ class ZarrWriter:
             len(resolved),
             len(expected),
         )
+        return staged
 
-    def _list_staged_labels(self, run_id: str) -> list[str]:
-        """List chunk labels that have staged Zarrs in the run directory.
+    def _list_run_names(self, run_id: str) -> list[str]:
+        """One listing of the run's staging directory, as bare entry names.
 
-        Returns:
-            List of chunk label strings (e.g. ``["chunk_0_0", "chunk_0_1"]``).
-            Empty list if the staging directory doesn't exist.
+        The single owner of the staging LIST (a full prefix scan on S3 — at
+        zone scale ~15k objects, so callers derive everything from one pass).
         """
-        return self._list_labels_by_suffix(run_id, ".zarr")
-
-    def _list_skip_marker_labels(self, run_id: str) -> list[str]:
-        """List chunk labels that have skip markers in the run directory."""
-        return self._list_labels_by_suffix(run_id, ".skipped")
-
-    def _list_labels_by_suffix(self, run_id: str, suffix: str) -> list[str]:
         staging_dir = f"{self.staging_base}/{run_id}"
         fs = _fs_for(staging_dir)
         try:
@@ -596,12 +609,27 @@ class ZarrWriter:
             entries = fs.ls(staging_dir, detail=False, refresh=True)
         except FileNotFoundError:
             return []
-        labels = []
-        for entry in entries:
-            name = entry.rstrip("/").rsplit("/", 1)[-1]
-            if name.endswith(suffix):
-                labels.append(name.removesuffix(suffix))
-        return labels
+        return [entry.rstrip("/").rsplit("/", 1)[-1] for entry in entries]
+
+    def _list_run_labels(self, run_id: str) -> tuple[list[str], list[str]]:
+        """``(staged zarr labels, skip-marker labels)`` from one staging LIST."""
+        names = self._list_run_names(run_id)
+        staged = [n.removesuffix(".zarr") for n in names if n.endswith(".zarr")]
+        skipped = [n.removesuffix(".skipped") for n in names if n.endswith(".skipped")]
+        return staged, skipped
+
+    def _list_staged_labels(self, run_id: str) -> list[str]:
+        """List chunk labels that have staged Zarrs in the run directory.
+
+        Returns:
+            List of chunk label strings (e.g. ``["chunk_0_0", "chunk_0_1"]``).
+            Empty list if the staging directory doesn't exist.
+        """
+        return self._list_run_labels(run_id)[0]
+
+    def _list_skip_marker_labels(self, run_id: str) -> list[str]:
+        """List chunk labels that have skip markers in the run directory."""
+        return self._list_run_labels(run_id)[1]
 
     def _validate_staged_chunk(
         self,
@@ -655,8 +683,8 @@ class ZarrWriter:
                 paths so the user can remove them before retrying.
         """
         _log = log or logger
-        staged_labels = self._list_staged_labels(run_id)
-        skip_marker_labels = set(self._list_skip_marker_labels(run_id))
+        staged_labels, skip_list = self._list_run_labels(run_id)
+        skip_marker_labels = set(skip_list)
         if not staged_labels and not skip_marker_labels:
             _log.info("No staged chunks or skip markers found for run %s — starting fresh", run_id)
             return set()
@@ -712,7 +740,7 @@ class ZarrWriter:
     def _staged_vars_present(self, run_id: str, chunks: list[ChunkSpec], var_names: tuple[str, ...]) -> set[str]:
         """Check which variables exist in the staged Zarrs.
 
-        Probes the largest chunk (same logic as _detect_staged_chunk_size).
+        Probes the largest chunk (edge chunks may lack interior geometry).
         Opens the zarr group once and checks all variable names. Callers must
         pass only chunks that have staged files.
         """
@@ -742,10 +770,7 @@ class ZarrWriter:
         tiled the mosaic. Cost is independent of extent (no pixels written).
         """
         sizes = {"time": 1, "northing": total_y, "easting": total_x, "band": self.embedding_dim}
-        for var in variables:
-            array_layout = layout.for_var(var)
-            shape = tuple(sizes[d] for d in array_layout.dims)
-            root.create_array(var, **array_layout.create_kwargs(shape))
+        create_layout_arrays(root, layout, variables, sizes)
         _write_coord_arrays(
             root,
             {
@@ -777,7 +802,6 @@ class ZarrWriter:
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
         layout: StoreLayout = LEGACY,
-        gate: CommitGate | None = None,
     ) -> str:
         """Assemble staged chunk Zarrs into a standalone Icechunk store.
 
@@ -841,7 +865,6 @@ class ZarrWriter:
             s3_region: Optional S3 region override for the output store.
             layout: Output geometry preset. ``LEGACY`` (default) reproduces
                 today's single-ROI stores exactly; only new stores consult it.
-            gate: Optional commit gate when many assemblies share a process.
 
         Returns:
             Path to the assembled output store.
@@ -945,12 +968,16 @@ class ZarrWriter:
         # --- Phase 2: banded parallel fill (fork/merge) -----------------------
         session = repo.writable_session("main")
         granularity = _write_granularity(zarr.open_group(session.store, mode="r"), variables)
-        bands = _partition_bands(total_y, granularity, n_workers)
-        fork = session.fork()
+        # Weight bands by live tiles so clustered ROIs don't starve most workers.
+        unit_weights = [0] * (-(-total_y // granularity))
+        for c in live_chunks:
+            for unit in range(c.y_start // granularity, -(-c.y_stop // granularity)):
+                unit_weights[unit] += 1
+        bands = _partition_bands(total_y, granularity, n_workers, weights=unit_weights)
         # On a same-date overwrite, ROI-live chunks that this run skip-marked
         # must be reset to fill — a prior run may have written real data there.
         clear_chunks = [c for c in roi_live_chunks if c.label in skipped_labels] if overwrite else []
-        payloads = []
+        payloads: list[dict[str, Any]] = []
         for band in bands:
             y0b, y1b = band
             tiles = [(c, self._staging_path(run_id, c)) for c in live_chunks if c.y_start < y1b and c.y_stop > y0b]
@@ -958,7 +985,6 @@ class ZarrWriter:
             if tiles or clear:
                 payloads.append(
                     {
-                        "fork": fork,
                         "band": band,
                         "time_index": time_index,
                         "variables": tuple(variables),
@@ -972,13 +998,7 @@ class ZarrWriter:
             granularity,
             min(len(payloads), n_workers),
         )
-        if len(payloads) == 1:
-            forks = [_fill_band_worker(payloads[0])]
-        else:
-            ctx = multiprocessing.get_context("spawn")
-            with ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx) as ex:
-                forks = list(ex.map(_fill_band_worker, payloads))
-        session.merge(*forks)
+        run_forked(session, _fill_band_worker, payloads)
 
         # --- Phase 3: root attrs + one data commit ----------------------------
         node = zarr.open_group(session.store, mode="a")
@@ -1020,8 +1040,7 @@ class ZarrWriter:
             attrs["time_convention"] = "12mo_window_end"
         node.attrs.update(attrs)
 
-        with gate if gate is not None else nullcontext():
-            commit_with_rebase(session, f"Run {run_id}: {len(chunks)} chunks assembled")
+        commit_with_rebase(session, f"Run {run_id}: {len(chunks)} chunks assembled")
         _log.info("Assembly complete: %s", output_path)
         return output_path
 
@@ -1077,7 +1096,7 @@ class ZarrWriter:
         labels = self._list_staged_labels(run_id)
         if not labels:
             raise IncompleteStageError(f"Run {run_id!r} has no staged chunks under {self.staging_base}")
-        shards = tuple(sorted(_label_to_grid(label) for label in labels))
+        shards = tuple(sorted(parse_chunk_label(label) for label in labels))
 
         per_worker_cap = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // max(1, n_workers))
         repo = open_global_repo(
@@ -1087,27 +1106,20 @@ class ZarrWriter:
             max_concurrent_requests=per_worker_cap,
         )
 
-        # One readonly probe: year index, shard pitch, variables, run provenance.
-        probe = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone]
-        node = cast(zarr.Group, probe)
-        times = read_time_values(node)
-        hits = np.flatnonzero(times == np.datetime64(f"{year}-01-01", "ns"))
-        if hits.size == 0:
+        # One readonly probe of the zone group: year index, shard pitch, variables.
+        node = cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone])
+        year_index = time_index_of(node, np.datetime64(f"{year}-01-01", "ns"))
+        if year_index is None:
             raise ValueError(
                 f"Year {year} is not on {zone}'s pre-allocated time axis "
-                f"({np.datetime_as_string(times, unit='D').tolist()}) — the axis is fixed at seeding (ADR-008 D1)."
+                f"({np.datetime_as_string(read_time_values(node), unit='D').tolist()}) — "
+                "the axis is fixed at seeding (ADR-008 D1)."
             )
-        year_index = int(hits[0])
+        shard_px = shard_pitch(cast(zarr.Array, node["embeddings"]))
 
-        emb = cast(zarr.Array, node["embeddings"])
-        shard_px = (emb.shards or emb.chunks)[1]
-        staged_px = self.detect_staged_chunk_size(run_id)
-        if staged_px != shard_px:
-            raise ValueError(
-                f"Staged tiles are {staged_px} px but {zone} shards are {shard_px} px — "
-                "the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
-            )
-
+        # One probe of a staged tile: required vars, variable set, tile pitch
+        # (max(h, w) covers non-square edge tiles — zone grids don't have them,
+        # but the guard must not pass a half-tile).
         probe_path = f"{self.staging_base}/{run_id}/{labels[0]}.zarr"
         staged_group = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
         missing = [v for v in ("embeddings", "scales") if v not in staged_group]
@@ -1116,15 +1128,17 @@ class ZarrWriter:
                 f"Staged tile {probe_path} is missing required variable(s) {missing} — refusing to "
                 "mark the year complete over a corrupt or partial staged run."
             )
+        staged_px = max(cast(zarr.Array, staged_group["embeddings"]).shape[:2])
+        if staged_px != shard_px:
+            raise ValueError(
+                f"Staged tiles are {staged_px} px but {zone} shards are {shard_px} px — "
+                "the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
+            )
         variables = tuple(
             v for v in ("embeddings", "scales", "embedding_std", *OBS_COUNT_VARS) if v in staged_group and v in node
         )
 
-        runs: dict[str, Any] = dict(node.attrs.get("runs", {}))  # type: ignore[arg-type]
-        runs[str(year)] = {
-            "run_id": run_id,
-            "assembled_at": datetime.datetime.now(datetime.UTC).isoformat(),
-        }
+        runs = run_provenance(node.attrs.get("runs"), year, run_id)
 
         _log.info(
             "Assembling %d staged tiles into %s/%s year %d (index %d, vars %s, %d workers)",

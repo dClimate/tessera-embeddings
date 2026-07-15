@@ -69,10 +69,24 @@ def open_global_repo(
     )
 
 
-def _var_shape(dims: tuple[str, ...], nt: int, ny: int, nx: int, band: int) -> tuple[int, ...]:
-    """Resolve an array's shape from its dim names and the zone's grid."""
-    sizes = {"time": nt, "northing": ny, "easting": nx, "band": band}
-    return tuple(sizes[d] for d in dims)
+def create_layout_arrays(
+    node: zarr.Group,
+    layout: StoreLayout,
+    variables: Iterable[str],
+    sizes: dict[str, int],
+) -> None:
+    """Create schema-only arrays on ``node`` for each variable, sized from ``sizes``.
+
+    The one loop that applies a :class:`StoreLayout` to a group — shared by the
+    zone-group seeder here and the single-ROI schema creator in
+    :mod:`tessera_embeddings.inference.assembly`, so the two write paths cannot
+    diverge in how a layout becomes on-disk arrays. ``sizes`` maps dim name →
+    extent (``{"time": ..., "northing": ..., "easting": ..., "band": ...}``).
+    """
+    for var in variables:
+        array_layout = layout.for_var(var)
+        shape = tuple(sizes[d] for d in array_layout.dims)
+        node.create_array(var, **array_layout.create_kwargs(shape))
 
 
 def _layout_band(layout: StoreLayout) -> int:
@@ -145,9 +159,8 @@ def seed_zone_groups(
         node = root.require_group(spec.group_name)
         north = northing_coords(spec)
         east = easting_coords(spec)
-        for var, array_layout in layout.arrays.items():
-            shape = _var_shape(array_layout.dims, nt, spec.height, spec.width, band)
-            node.create_array(var, **array_layout.create_kwargs(shape))
+        sizes = {"time": nt, "northing": spec.height, "easting": spec.width, "band": band}
+        create_layout_arrays(node, layout, layout.arrays, sizes)
         _write_coord_arrays(node, {"time": times, "northing": north, "easting": east, "band": np.arange(band)})
         node.attrs.update(_zone_attrs(spec, north, east, layout, model_version))
     return session.commit(commit_msg or f"seed {len(specs)} zone group(s)")

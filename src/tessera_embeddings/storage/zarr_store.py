@@ -78,6 +78,12 @@ def read_time_values(node: zarr.Group) -> np.ndarray:
     return np.asarray(time_arr[:]).astype("int64").astype("datetime64[ns]")  # type: ignore[index]
 
 
+def time_index_of(node: zarr.Group, value: np.datetime64) -> int | None:
+    """Index of ``value`` on a group's time axis, or ``None`` if absent."""
+    hits = np.flatnonzero(read_time_values(node) == value)
+    return int(hits[0]) if hits.size else None
+
+
 # =============================================================================
 # Store Cleanup Utilities
 # =============================================================================

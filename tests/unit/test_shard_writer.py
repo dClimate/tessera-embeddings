@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import zarr
 
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import global_store, zarr_store
 from tessera_embeddings.storage.shard_writer import (
-    SemaphoreCommitGate,
+    DEFAULT_COMMIT_CAP,
     commit_with_rebase,
     write_year_shards,
 )
@@ -99,15 +101,17 @@ def test_commit_with_rebase_resolves_concurrent_disjoint_commits(tmp_path):
 
 
 def test_semaphore_gate_allows_and_bounds():
-    gate = SemaphoreCommitGate(max_concurrent=1)
+    """A plain threading.Semaphore is the in-process commit gate (cap from DEFAULT_COMMIT_CAP)."""
+    assert DEFAULT_COMMIT_CAP == 6
+    gate = threading.Semaphore(1)
     with gate:
-        assert not gate._sem.acquire(blocking=False)  # cap reached
-    assert gate._sem.acquire(blocking=False)  # released
+        assert not gate.acquire(blocking=False)  # cap reached
+    assert gate.acquire(blocking=False)  # released
 
 
 def test_write_year_shards_behind_gate(tmp_path):
     store, repo = _seed(tmp_path)
-    gate = SemaphoreCommitGate(max_concurrent=2)
+    gate = threading.Semaphore(2)
     sid = write_year_shards(
         repo, "32601", year_index=2, source=_OneInnerChunkSource(), n_workers=1, gate=gate, shard_px=_SHARD
     )

@@ -25,10 +25,7 @@ logger = logging.getLogger("scale_tests.teardown")
 def _rm_prefix(uri: str) -> tuple[int, int]:
     """Delete everything under ``uri``; return (objects_before, objects_after)."""
     before, _ = harness.object_stats(uri)
-    if uri.startswith("s3://"):
-        fs, path = fsspec.filesystem("s3"), uri[len("s3://") :]
-    else:
-        fs, path = fsspec.filesystem("file"), uri
+    fs, path = harness.fs_and_path(uri)
     if fs.exists(path):
         fs.rm(path, recursive=True)
     after, _ = harness.object_stats(uri)

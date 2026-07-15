@@ -54,16 +54,10 @@ WORKLOADS = (
 
 def _open_group(store_uri: str, group: str, async_concurrency: int) -> zarr.Group:
     """Open a store read-only as a raw zarr group at a given async concurrency."""
-    import icechunk
-
-    from tessera_embeddings.storage import zarr_store
+    from scale_tests._workers import _open_repo
 
     zarr.config.set({"async.concurrency": async_concurrency})
-    repo = icechunk.Repository.open(
-        zarr_store._create_storage(store_uri),
-        config=zarr_store._default_repo_config(None),
-    )
-    session = repo.readonly_session(branch="main")
+    session = _open_repo(store_uri).readonly_session(branch="main")
     return zarr.open_group(session.store, mode="r")[group]
 
 
@@ -169,12 +163,7 @@ def _point_stats(latencies: list[float], variant: V.Variant, mean_chunk_bytes: f
 def _chunk_mean_bytes(cfg: harness.RunConfig, store: str) -> float:
     """Mean on-disk bytes per chunk object (for analytic ``bytes_fetched``)."""
     uri = harness.store_uri(cfg, store)
-    import fsspec
-
-    if uri.startswith("s3://"):
-        fs, path = fsspec.filesystem("s3"), uri[len("s3://") :]
-    else:
-        fs, path = fsspec.filesystem("file"), uri
+    fs, path = harness.fs_and_path(uri)
     if not fs.exists(path):
         return 0.0
     entries = fs.find(path, detail=True)

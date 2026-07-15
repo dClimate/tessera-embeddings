@@ -57,7 +57,20 @@ class ChunkSpec:
     @property
     def label(self) -> str:
         """Human-readable label for this chunk."""
-        return f"chunk_{self.row}_{self.col}"
+        return chunk_label(self.row, self.col)
+
+
+def chunk_label(row: int, col: int) -> str:
+    """The staged-artifact label for a grid position (single owner of the format)."""
+    return f"chunk_{row}_{col}"
+
+
+def parse_chunk_label(label: str) -> tuple[int, int]:
+    """Parse a :func:`chunk_label` back into ``(row, col)``; raises on anything else."""
+    parts = label.split("_")
+    if len(parts) != 3 or parts[0] != "chunk":
+        raise ValueError(f"Label {label!r} is not of the form 'chunk_<row>_<col>'")
+    return int(parts[1]), int(parts[2])
 
 
 def enumerate_chunks(

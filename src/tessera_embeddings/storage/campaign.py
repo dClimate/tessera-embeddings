@@ -13,27 +13,24 @@ The bookkeeping around the shard-writer fills (ADR-008 D7). Three concerns:
 
 Reads the ``years_complete`` attr that :func:`tessera_embeddings.storage.shard_writer.write_year_shards`
 advances in the same commit as the data (D1), so status is always consistent with
-what has actually landed. The zone-fill *runner* (inference -> assemble -> tag) is
-orchestration-facing and lands with the assembly rewrite (Stage B / W4), which
-provides ``assemble()`` in global mode.
+what has actually landed. The zone-fill *runner* (inference -> assemble -> tag)
+lives in :mod:`tessera_embeddings.orchestration.runners.zone_fill`.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
 import icechunk
-import numpy as np
 import zarr
 
 from tessera_embeddings.storage.shard_writer import CommitGate, commit_with_rebase
-from tessera_embeddings.storage.zarr_store import read_time_values
-from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES
+from tessera_embeddings.storage.zarr_store import time_index_of
+from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES, year_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +43,35 @@ def zone_year_tag(zone: str, year: int) -> str:
 def _year_complete_tag(year: int) -> str:
     """Tag name for an all-zones-complete year, e.g. ``"year-2023-complete"``."""
     return f"year-{year}-complete"
+
+
+def _ensure_tag(repo: icechunk.Repository, tag: str, sid: str) -> str:
+    """Create ``tag`` at ``sid``, idempotently — the refuse-to-move policy's one home.
+
+    A tag already at ``sid`` is a no-op (resume); a tag pointing elsewhere raises
+    rather than silently moving campaign history.
+    """
+    if tag in repo.list_tags():
+        current = repo.lookup_tag(tag)
+        if current != sid:
+            raise ValueError(f"tag {tag!r} already exists at snapshot {current}; refusing to move it to {sid}")
+        return tag
+    repo.create_tag(tag, sid)
+    logger.info("tagged %s -> %s", tag, sid)
+    return tag
+
+
+def run_provenance(existing: object, year: int, run_id: str, *, empty: bool = False) -> dict:
+    """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
+
+    Both fill paths use this — the shard write (``assemble_global``) and the
+    no-data marking (:func:`mark_zone_year_empty`) — so the provenance record
+    shape can only change in one place.
+    """
+    record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat()}
+    if empty:
+        record["empty"] = True
+    return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
 
 
 def tag_zone_year(
@@ -63,16 +89,7 @@ def tag_zone_year(
     pointing at the same snapshot is a no-op; a tag pointing *elsewhere* raises
     rather than silently moving campaign history.
     """
-    tag = zone_year_tag(zone, year)
-    sid = snapshot_id or repo.lookup_branch(branch)
-    if tag in repo.list_tags():
-        current = repo.lookup_tag(tag)
-        if current != sid:
-            raise ValueError(f"tag {tag!r} already exists at snapshot {current}; refusing to move it to {sid}")
-        return tag
-    repo.create_tag(tag, sid)
-    logger.info("tagged %s -> %s", tag, sid)
-    return tag
+    return _ensure_tag(repo, zone_year_tag(zone, year), snapshot_id or repo.lookup_branch(branch))
 
 
 def tag_year_complete(
@@ -97,16 +114,7 @@ def tag_year_complete(
             f"cannot tag year {year} complete: {len(missing)}/{len(expected)} zone(s) "
             f"have not landed it (e.g. {missing[:5]})"
         )
-    tag = _year_complete_tag(year)
-    sid = snapshot_id or repo.lookup_branch(branch)
-    if tag in repo.list_tags():
-        current = repo.lookup_tag(tag)
-        if current != sid:
-            raise ValueError(f"tag {tag!r} already exists at snapshot {current}; refusing to move it to {sid}")
-        return tag
-    repo.create_tag(tag, sid)
-    logger.info("tagged %s -> %s (%d zones)", tag, sid, len(expected))
-    return tag
+    return _ensure_tag(repo, _year_complete_tag(year), snapshot_id or repo.lookup_branch(branch))
 
 
 def mark_zone_year_empty(
@@ -133,8 +141,7 @@ def mark_zone_year_empty(
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
     node = cast(zarr.Group, root[zone])
-    times = read_time_values(node)
-    if not (times == np.datetime64(f"{year}-01-01", "ns")).any():
+    if time_index_of(node, year_timestamp(year)) is None:
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — refusing to mark an "
             "off-axis year complete (ADR-008 D1: the axis is fixed at seeding)."
@@ -145,15 +152,8 @@ def mark_zone_year_empty(
         return repo.lookup_branch("main")
     node.attrs["years_complete"] = sorted([*done, year])
     if run_id is not None:
-        runs = dict(node.attrs.get("runs", {}))  # type: ignore[arg-type]
-        runs[str(year)] = {
-            "run_id": run_id,
-            "assembled_at": datetime.now(UTC).isoformat(),
-            "empty": True,
-        }
-        node.attrs["runs"] = runs
-    with gate if gate is not None else nullcontext():
-        return commit_with_rebase(session, f"mark {zone} year {year} complete (no land)")
+        node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year, run_id, empty=True)
+    return commit_with_rebase(session, f"mark {zone} year {year} complete (no land)", gate=gate)
 
 
 @dataclass(frozen=True)
@@ -164,14 +164,13 @@ class ExpireGCResult:
     gc: icechunk.GCSummary  # objects deleted (or, on dry-run, that would be)
 
 
-def _validate_cutoff(older_than: datetime) -> datetime:
+def _validate_cutoff(older_than: datetime) -> None:
     """Reject a cutoff that icechunk (or the campaign guard) would refuse."""
     if older_than.tzinfo is None:
         raise ValueError("older_than must be timezone-aware; icechunk rejects naive datetimes")
     now = datetime.now(UTC)
     if older_than >= now:
         raise ValueError(f"older_than {older_than!r} must be strictly in the past (now={now!r})")
-    return now
 
 
 def expire_and_gc(

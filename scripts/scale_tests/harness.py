@@ -239,6 +239,16 @@ def open_repo(cfg: RunConfig, name: str, config: icechunk.RepositoryConfig | Non
     )
 
 
+def fs_and_path(uri: str) -> tuple[fsspec.AbstractFileSystem, str]:
+    """Resolve a store URI to ``(fsspec filesystem, backend path)``.
+
+    The one owner of the s3://-vs-local dispatch the harness needs everywhere.
+    """
+    if uri.startswith("s3://"):
+        return fsspec.filesystem("s3"), uri[len("s3://") :]
+    return fsspec.filesystem("file"), uri
+
+
 def reset_store(cfg: RunConfig, name: str) -> None:
     """Delete a named store so a phase can re-seed from a clean prefix.
 
@@ -246,12 +256,7 @@ def reset_store(cfg: RunConfig, name: str) -> None:
     seeds must clear any partial store left by an earlier crashed attempt.
     """
     uri = store_uri(cfg, name)
-    if uri.startswith("s3://"):
-        fs = fsspec.filesystem("s3")
-        path = uri[len("s3://") :]
-    else:
-        fs = fsspec.filesystem("file")
-        path = uri
+    fs, path = fs_and_path(uri)
     if fs.exists(path):
         fs.rm(path, recursive=True)
 
@@ -505,12 +510,7 @@ def object_stats(uri: str) -> tuple[int, int]:
     Works for both local paths and ``s3://`` URIs. Used for ``objects_listed``,
     ``manifest_bytes`` (point at ``.../manifests``), and ``snapshot_bytes``.
     """
-    if uri.startswith("s3://"):
-        fs = fsspec.filesystem("s3")
-        path = uri[len("s3://") :]
-    else:
-        fs = fsspec.filesystem("file")
-        path = uri
+    fs, path = fs_and_path(uri)
     if not fs.exists(path):
         return (0, 0)
     entries = fs.find(path, detail=True)
@@ -525,12 +525,7 @@ def newest_object_bytes(uri: str) -> int:
     Used to size the just-written snapshot file (``snapshot_bytes``) after a
     commit, since each commit writes a fresh snapshot object.
     """
-    if uri.startswith("s3://"):
-        fs = fsspec.filesystem("s3")
-        path = uri[len("s3://") :]
-    else:
-        fs = fsspec.filesystem("file")
-        path = uri
+    fs, path = fs_and_path(uri)
     if not fs.exists(path):
         return 0
     entries = fs.find(path, detail=True)

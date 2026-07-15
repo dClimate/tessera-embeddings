@@ -59,7 +59,7 @@ from tessera_embeddings.inference.orchestration_helpers import enumerate_mosaic_
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
-from tessera_embeddings.storage.shard_writer import CommitGate
+from tessera_embeddings.storage.shard_writer import CommitGate, shard_pitch
 
 
 def fill_zone_year(
@@ -140,7 +140,7 @@ def fill_zone_year(
 
     emb = cast(zarr.Array, node["embeddings"])
     _, ny, nx, _ = emb.shape
-    shard_px = (emb.shards or emb.chunks)[1]
+    shard_px = shard_pitch(emb)
     if config.chunk_size != shard_px:
         raise ValueError(
             f"config.chunk_size={config.chunk_size} but {zone} shards are {shard_px} px — "
@@ -173,14 +173,26 @@ def fill_zone_year(
         "total_tiles": len(chunks),
         "live_tiles": len(live),
     }
+    writer = ZarrWriter(staging_base)
 
-    if not live:
-        # All-ocean cell: nothing to stage or write, but the campaign work
-        # list must still see it land.
+    def _cleanup() -> None:
+        if cleanup_staging:
+            try:
+                writer.cleanup_staging(run_id, log)
+            except Exception:
+                log.warning("Staging cleanup failed for run %s", run_id, exc_info=True)
+
+    def _finish_empty(**extra: float) -> dict[str, Any]:
+        # A no-data cell (all-ocean, or every live tile skipped) still lands:
+        # years_complete + provenance in one commit, then the zone-year tag.
         snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id, gate=gate)
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
-        log.info("Zone %s year %d has no land under the mask — marked complete empty (%s)", zone, year, tag)
-        return {**summary, "empty": True, "snapshot_id": snapshot, "tag": tag, "elapsed_sec": time.monotonic() - t0}
+        return {**summary, "empty": True, "snapshot_id": snapshot, "tag": tag, **extra}
+
+    if not live:
+        result = _finish_empty(elapsed_sec=time.monotonic() - t0)
+        log.info("Zone %s year %d has no land under the mask — marked complete empty (%s)", zone, year, result["tag"])
+        return result
 
     results = run_inference(
         num_actors,
@@ -198,28 +210,22 @@ def fill_zone_year(
     if failed:
         raise RuntimeError(f"{len(failed)} tiles failed during inference for zone {zone} year {year} (run {run_id})")
 
-    writer = ZarrWriter(staging_base)
-    writer.verify_staged_completeness(run_id, live, log=log)
-
-    if not writer._list_staged_labels(run_id):
+    staged_labels = writer.verify_staged_completeness(run_id, live, log=log)
+    if not staged_labels:
         # Every live tile resolved to a skip marker (zero valid pixels under
         # the validity filters) — a legitimate no-data cell, same as all-ocean.
-        snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id, gate=gate)
-        tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
-        log.info("Zone %s year %d: all %d live tiles skipped — marked complete empty (%s)", zone, year, len(live), tag)
-        if cleanup_staging:
-            try:
-                writer.cleanup_staging(run_id, log)
-            except Exception:
-                log.warning("Staging cleanup failed for run %s", run_id, exc_info=True)
-        return {
-            **summary,
-            "empty": True,
-            "snapshot_id": snapshot,
-            "tag": tag,
-            "skipped": sum(r["status"] == "skipped" for r in results),
-            "elapsed_sec": time.monotonic() - t0,
-        }
+        _cleanup()
+        result = _finish_empty(
+            skipped=sum(r["status"] == "skipped" for r in results), elapsed_sec=time.monotonic() - t0
+        )
+        log.info(
+            "Zone %s year %d: all %d live tiles skipped — marked complete empty (%s)",
+            zone,
+            year,
+            len(live),
+            result["tag"],
+        )
+        return result
 
     n_workers = n_assembly_workers or AssemblyConfig().compute_n_workers(len(live))
     snapshot = writer.assemble_global(
@@ -234,12 +240,7 @@ def fill_zone_year(
         log=log,
     )
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
-
-    if cleanup_staging:
-        try:
-            writer.cleanup_staging(run_id, log)
-        except Exception:
-            log.warning("Staging cleanup failed for run %s", run_id, exc_info=True)
+    _cleanup()
 
     return {
         **summary,

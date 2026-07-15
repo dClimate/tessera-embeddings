@@ -12,8 +12,11 @@ import dataclasses
 
 import numpy as np
 
-#: The annual timesteps of the campaign (2025 filled first, then backwards).
-YEARS: tuple[int, ...] = tuple(range(2017, 2026))
+from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, calendar_year_times
+
+#: The annual timesteps of the campaign (2025 filled first, then backwards) —
+#: the library's axis, so the harness's join keys can't drift from it.
+YEARS: tuple[int, ...] = CAMPAIGN_YEARS
 
 #: 10 m pixel spacing, in metres (matches the real 10 m embeddings grid).
 PIXEL_M: float = 10.0
@@ -53,7 +56,7 @@ def zone_for(scale: str, *, full_height: bool = False) -> MockZone:
 
 def times(years: tuple[int, ...] = YEARS) -> np.ndarray:
     """Return one ``datetime64[ns]`` timestamp per year (Jan 1), ascending."""
-    return np.array([np.datetime64(f"{y}-01-01", "ns") for y in years])
+    return calendar_year_times(years)
 
 
 def coords(zone: MockZone, years: tuple[int, ...] = YEARS) -> dict[str, np.ndarray]:

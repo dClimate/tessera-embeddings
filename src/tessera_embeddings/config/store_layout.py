@@ -156,14 +156,20 @@ LEGACY = StoreLayout(
     },
 )
 
+#: The 2048-px shard pitch (also the aligned inference tile size) and the
+#: 256-px inner-chunk size — the single numeric source the GLOBAL_V1 preset
+#: is built from, so the constants and the preset cannot drift.
+SHARD_PX: int = 2048
+INNER_PX: int = 256
+
 # The global campaign: 256-px full-band inner chunks in 2048² shards; scales
 # sharded the same way (D3). 8x8 = 64 inner chunks per shard. ``embedding_std``
 # mirrors ``scales``' treatment (float32 + PCodec, same spatial shards) on its
 # natural per-band 4-D dims; never produced under v1.1 (see LEGACY note).
-_INNER_4D = (1, 256, 256, EMBEDDING_DIM)
-_SHARD_4D = (1, 2048, 2048, EMBEDDING_DIM)
-_INNER_3D = (1, 256, 256)
-_SHARD_3D = (1, 2048, 2048)
+_INNER_4D = (1, INNER_PX, INNER_PX, EMBEDDING_DIM)
+_SHARD_4D = (1, SHARD_PX, SHARD_PX, EMBEDDING_DIM)
+_INNER_3D = (1, INNER_PX, INNER_PX)
+_SHARD_3D = (1, SHARD_PX, SHARD_PX)
 GLOBAL_V1 = StoreLayout(
     name="global_v1",
     arrays={
@@ -173,7 +179,3 @@ GLOBAL_V1 = StoreLayout(
         **_obs(_INNER_3D, _SHARD_3D, _ZSTD),
     },
 )
-
-#: The 2048-px shard pitch (also the aligned inference tile size).
-SHARD_PX: int = 2048
-INNER_PX: int = 256

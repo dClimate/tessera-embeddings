@@ -1,13 +1,13 @@
-"""Multi-group empty-store seeding (the primitive the library still lacks).
+"""Multi-group empty-store seeding for the benchmark harness.
 
-The library's ``create_empty_store_from_coords`` opens the *root* group with
-``mode="w"`` and so cannot seed sibling groups (it clobbers). These helpers do
-the group-aware seed the 120-UTM-zone layout needs: ``require_group`` per zone,
+Group-aware seeding for the 120-UTM-zone layout: ``require_group`` per zone,
 schema-only data arrays (no chunk objects written — creation cost is independent
 of extent, ADR D1), fully-written 1-D coordinate arrays, and per-group attrs.
 
-This is script code that *demonstrates* the needed primitive; the real one will
-land in ``tessera_embeddings.storage`` once the tests justify the design.
+The production twin is ``tessera_embeddings.storage.global_store.seed_zone_groups``
+(which this harness prototyped); this copy stays deliberately independent so
+benchmark variants can seed arbitrary geometries without threading them through
+the library's ``StoreLayout`` presets.
 """
 
 from __future__ import annotations

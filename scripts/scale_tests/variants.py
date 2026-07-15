@@ -13,12 +13,13 @@ import dataclasses
 
 import numpy as np
 
-from tessera_embeddings.config.store_layout import pcodec_serializer
+from tessera_embeddings.config.inference import EMBEDDING_DIM
+from tessera_embeddings.config.store_layout import clamp_chunks_and_shards, pcodec_serializer
 
 #: Canonical dimension order for embedding arrays (ADR D2: band varies fastest).
 DIMS: tuple[str, str, str, str] = ("time", "northing", "easting", "band")
-#: Embedding channel count (config.inference.EMBEDDING_DIM).
-BAND: int = 128
+#: Embedding channel count.
+BAND: int = EMBEDDING_DIM
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,7 +74,7 @@ def embeddings_array_kwargs(variant: Variant, shape: tuple[int, int, int, int]) 
     ``"auto"``. Chunks are clamped to the shape so a store smaller than one
     nominal chunk still creates cleanly (the library ingest path clamps too).
     """
-    chunks = tuple(min(c, s) for c, s in zip(variant.chunks, shape, strict=True))
+    chunks, shards = clamp_chunks_and_shards(shape, variant.chunks, variant.shards)
     kwargs: dict = {
         "shape": shape,
         "chunks": chunks,
@@ -83,10 +84,7 @@ def embeddings_array_kwargs(variant: Variant, shape: tuple[int, int, int, int]) 
         "serializer": "auto",
         "compressors": "auto",
     }
-    if variant.shards is not None:
-        # Clamp shards to shape too, and keep them a whole multiple of the
-        # (possibly clamped) chunks so tiny/local stores stay valid.
-        shards = tuple(max(c, (min(sh, s) // c) * c) for sh, s, c in zip(variant.shards, shape, chunks, strict=True))
+    if shards is not None:
         kwargs["shards"] = shards
     return kwargs
 
@@ -100,7 +98,7 @@ def scales_array_kwargs(variant: Variant, shape: tuple[int, int, int]) -> dict:
     unsharded: sharding is an ``embeddings``-only question here.
     """
     spatial = (variant.chunks[0], variant.chunks[1], variant.chunks[2])
-    chunks = tuple(min(c, s) for c, s in zip(spatial, shape, strict=True))
+    chunks, _ = clamp_chunks_and_shards(shape, spatial, None)
     return {
         "shape": shape,
         "chunks": chunks,

@@ -115,11 +115,9 @@ class VarSpec:
     pass an explicit value to override. ``serializer`` / ``compressors`` are
     forwarded to ``zarr.Group.create_array`` verbatim — the default ``"auto"``
     matches what xarray's zarr backend would pick, while a caller can pin e.g.
-    a PCodec serializer + ``compressors=None`` for a float array (the
-    ``config.store_layout`` presets do exactly this for ``scales``).
-    ``shards`` (element counts per dim, or ``None``) wraps the inner chunks in a
-    Zarr v3 sharding codec — required by the global store's ``GLOBAL_V1`` layout
-    (ADR-008 D3). It is clamped to a whole multiple of the (clamped) chunks.
+    a PCodec serializer + ``compressors=None`` for a float array. (Sharded
+    layouts belong to the global store's ``ArrayLayout``/``StoreLayout`` path —
+    see ``config.store_layout`` and ``storage.global_store``.)
     """
 
     dims: tuple[str, ...]
@@ -128,7 +126,6 @@ class VarSpec:
     fill_value: Any = _DEFAULT_FILL
     serializer: Any = "auto"
     compressors: Any = "auto"
-    shards: tuple[int, ...] | None = None
 
     def resolved_fill(self) -> float | int:
         """The fill value to write: the explicit ``fill_value`` or the per-dtype default."""
@@ -162,27 +159,24 @@ def _write_group_schema(
 ) -> None:
     """Create schema-only data arrays + coord arrays + attrs on a group node.
 
-    Data variables are created with shape/chunks/shards but no chunk data (all
-    fill), so cost is independent of spatial extent. Used for both the root of a
-    single store and each zone group of the global store.
+    Data variables are created with shape/chunks but no chunk data (all fill),
+    so cost is independent of spatial extent.
     """
     for name, spec in var_specs.items():
         shape = tuple(len(coords[d]) for d in spec.dims)
         # One clamp implementation for on-disk geometry, shared with
         # ArrayLayout.create_kwargs (config.store_layout).
-        chunks, shards = clamp_chunks_and_shards(shape, spec.chunks, spec.shards)
-        kwargs: dict[str, Any] = {
-            "shape": shape,
-            "chunks": chunks,
-            "dtype": spec.dtype,
-            "fill_value": spec.resolved_fill(),
-            "dimension_names": spec.dims,
-            "serializer": spec.serializer,
-            "compressors": spec.compressors,
-        }
-        if shards is not None:
-            kwargs["shards"] = shards
-        node.create_array(name, **kwargs)
+        chunks, _ = clamp_chunks_and_shards(shape, spec.chunks, None)
+        node.create_array(
+            name,
+            shape=shape,
+            chunks=chunks,
+            dtype=spec.dtype,
+            fill_value=spec.resolved_fill(),
+            dimension_names=spec.dims,
+            serializer=spec.serializer,
+            compressors=spec.compressors,
+        )
     _write_coord_arrays(node, coords)
     if attrs:
         node.attrs.update(attrs)
@@ -196,7 +190,6 @@ def create_empty_store_from_coords(
     commit_msg: str,
     attrs: dict | None = None,
     repo: Repository | None = None,
-    group: str | None = None,
 ) -> None:
     """Create an all-fill Icechunk store from explicit coords and var schemas.
 
@@ -226,11 +219,6 @@ def create_empty_store_from_coords(
             the same prefix. When given, cleanup-on-failure is skipped (the
             caller owns the repo lifecycle); when ``None``, the repo is created
             here and a partial store is removed on error.
-        group: Optional Zarr group to seed. ``None`` (default) opens the root
-            with ``mode="w"`` (today's behavior — clobbers any existing root).
-            A group name opens root with ``mode="a"`` and ``require_group``s the
-            named group, so sibling groups can be seeded into one repo without
-            clobbering (the 120-zone global-store layout, ADR-008 D5).
     """
     for name, spec in var_specs.items():
         missing = [d for d in spec.dims if d not in coords]
@@ -245,11 +233,8 @@ def create_empty_store_from_coords(
     session = repo.writable_session("main")
     store = session.store
     try:
-        # group=None clobbers the root (mode="w"); a group name adds to the repo
-        # (mode="a") so sibling zone groups coexist.
-        root = zarr.open_group(store, mode="w" if group is None else "a")
-        target = root if group is None else root.require_group(group)
-        _write_group_schema(target, coords, var_specs, attrs)
+        root = zarr.open_group(store, mode="w")
+        _write_group_schema(root, coords, var_specs, attrs)
         session.commit(commit_msg)
     except Exception:
         # Mirror write_dataset's cleanup_on_failure — delete partial store on

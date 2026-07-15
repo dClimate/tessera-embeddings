@@ -145,6 +145,16 @@ def northing_coords(spec: ZoneSpec) -> np.ndarray:
     return spec.northing[1] - (np.arange(spec.height, dtype="float64") + 0.5) * PIXEL_M
 
 
+def year_timestamp(year: int) -> np.datetime64:
+    """The Q2 calendar-year convention, encoded once: ``year`` → ``YYYY-01-01`` ns."""
+    return np.datetime64(f"{year}-01-01", "ns")
+
+
+def year_of(value: np.datetime64 | np.ndarray) -> int:
+    """Inverse of :func:`year_timestamp`: a (scalar) timestamp's calendar year."""
+    return int(np.asarray(value).astype("datetime64[Y]").astype(int)) + 1970
+
+
 def calendar_year_times(years: tuple[int, ...] = CAMPAIGN_YEARS) -> np.ndarray:
     """Return one ``datetime64[ns]`` per year at ``YYYY-01-01`` (Q2 convention)."""
-    return np.array([np.datetime64(f"{y}-01-01", "ns") for y in years])
+    return np.array([year_timestamp(y) for y in years])
