@@ -1,22 +1,56 @@
 """GeoZarr convention attribute builders for embedding stores.
 
-Implements the proj:, spatial:, and tessera: Zarr conventions as purely
+Implements the proj:, spatial:, and geoemb: Zarr conventions as purely
 additive metadata on the root group. No store layout changes.
+
+The geoembeddings (``geoemb:``) convention supersedes the earlier ``tessera:``
+convention: it records encoder-model provenance, source datasets, and a
+structured quantization/dequantization description (see the ``geoemb:`` fields
+below). The mapping follows the convention repo's own ``tessera_example.json``.
 
 References:
     - proj:    https://github.com/zarr-conventions/geo-proj
     - spatial: https://github.com/zarr-conventions/spatial
-    - tessera: https://github.com/ucam-eo/zarr-convention-tessera
+    - geoemb:  https://github.com/geo-embeddings/embeddings-zarr-convention
 """
 
 from __future__ import annotations
 
 import logging
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
 
 import numpy as np
 from pyproj import CRS
 
 logger = logging.getLogger(__name__)
+
+
+def _software_version() -> str:
+    """Version of this package that built the store (``geoemb:build_version``)."""
+    try:
+        return _dist_version("tessera_embeddings")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _is_metre_crs(epsg_code: str | None) -> bool:
+    """Whether an EPSG code's horizontal axes are metres.
+
+    ``geoemb:gsd`` is defined in metres, so the coordinate spacing may only be
+    used as the GSD for a metre-based (projected) CRS. A geographic CRS
+    (e.g. EPSG:4326, degrees) or a US-survey-foot CRS must not have its spacing
+    mislabelled as metres.
+    """
+    if not epsg_code:
+        return False
+    try:
+        crs = CRS.from_user_input(epsg_code)
+    except Exception:
+        return False
+    units = [getattr(a, "unit_name", "").lower() for a in crs.axis_info]
+    return bool(units) and all(u in ("metre", "meter") for u in units)
+
 
 # Convention registration metadata (UUID + schema URLs)
 _PROJ_CONVENTION = {
@@ -35,13 +69,33 @@ _SPATIAL_CONVENTION = {
     "description": "Spatial coordinate information",
 }
 
-_TESSERA_CONVENTION = {
-    "schema_url": "https://raw.githubusercontent.com/ucam-eo/zarr-convention-tessera/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/ucam-eo/zarr-convention-tessera/blob/v1/README.md",
-    "uuid": "e7f90d5f-019e-4a38-802f-9fa695e26c71",
-    "name": "tessera:",
-    "description": "Quantised geospatial embedding vectors with per-pixel dequantisation scales",
+# The convention repo has not cut a `v1` tag, so `refs/tags/v1` 404s. We pin the
+# schema/spec URLs to an immutable commit SHA that DOES resolve, so the emitted
+# registration is dereferenceable. Switch to `refs/tags/v1` once upstream tags it.
+_GEOEMB_REF = "0655212938f36351245dbd3e5e8868f811d43663"
+_GEOEMB_CONVENTION = {
+    "schema_url": f"https://raw.githubusercontent.com/geo-embeddings/embeddings-zarr-convention/{_GEOEMB_REF}/schema.json",
+    "spec_url": f"https://github.com/geo-embeddings/embeddings-zarr-convention/blob/{_GEOEMB_REF}/README.md",
+    "uuid": "61c12cc5-0e28-4056-999a-480cf3fb7e4c",
+    "name": "geoemb:",
+    "description": "Geoembeddings convention for geospatial embedding arrays with model provenance",
 }
+
+# --- geoemb: field defaults (this pipeline's fixed provenance) --------------
+#: Encoder checkpoint version (v1.1 pipeline). Versions the ``geoemb:model`` URL;
+#: overridable per call via ``model_version``. (``geoemb:build_version`` is the
+#: software/package version, not this.)
+ENCODER_VERSION = "1.1"
+#: Public encoder reference URL, keyed by the encoder version (ENCODER_VERSION).
+_MODEL_URL_TEMPLATE = "https://geotessera.org/model/{version}"
+#: Precise source datasets we pull from: Sentinel-2 L2A COGs (Earth Search AWS
+#: Open Data) and OPERA RTC-S1 (ASF datapool).
+DEFAULT_SOURCE_DATA: tuple[str, ...] = (
+    "s3://sentinel-cogs",
+    "https://datapool.asf.alaska.edu/RTC/OPERA-S1",
+)
+#: Storage dtype of the quantized embeddings.
+QUANTIZED_DTYPE = "int8"
 
 
 def tile_id_to_epsg(tile_id: str) -> str | None:
@@ -182,13 +236,17 @@ def build_convention_attrs(
     y_coords: np.ndarray | None = None,
     x_coords: np.ndarray | None = None,
     model_version: str | None = None,
-    n_tiles: int | None = None,
+    model_url: str | None = None,
+    data_type: str = QUANTIZED_DTYPE,
+    gsd: float | None = None,
+    spatial_layout: str | None = None,
+    source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
 ) -> dict:
     """Build GeoZarr convention attributes for the root group.
 
     Returns a flat dict of attributes to set on the Zarr root group.
     Includes ``zarr_conventions`` registration, ``proj:*``, ``spatial:*``,
-    and ``tessera:*`` metadata.
+    and ``geoemb:*`` metadata (the geoembeddings convention).
 
     *epsg_code* takes precedence over *tile_id* for determining the CRS.
     This allows callers who reproject data to record the actual output CRS
@@ -196,6 +254,20 @@ def build_convention_attrs(
 
     If neither *epsg_code* nor *tile_id* resolve to a valid EPSG code,
     ``proj:`` conventions are omitted (no CRS info available).
+
+    The ``geoemb:`` fields record encoder-model provenance and quantization:
+    ``geoemb:model`` is the PUBLIC encoder reference URL — *model_url* when a
+    caller supplies the exact public URI for the encoder it used, else derived
+    from :data:`ENCODER_VERSION`. It is NEVER built from *model_version*, which
+    in production is an internal checkpoint filename stem; that is recorded as a
+    plain ``checkpoint_id`` provenance attr. ``geoemb:build_version`` is the
+    software/package version. *data_type* is the quantized storage dtype.
+    *gsd* (metres) is emitted only when trustworthy — derived from a metre-based
+    CRS's coordinate spacing, or an explicit *gsd* the caller vouches for; for a
+    non-metre CRS (e.g. degrees/feet) or absent coords it is OMITTED (optional
+    field, no false metre value). *spatial_layout* is ``"utm_zones"``/``"global"``
+    and OMITTED when ``None`` (a single-ROI store has no utmNN/global groups);
+    *source_data* the source-dataset URLs.
     """
     conventions: list[dict] = []
     attrs: dict = {}
@@ -224,15 +296,48 @@ def build_convention_attrs(
         attrs["spatial:bbox"] = _compute_bbox(y_coords, x_coords)
         attrs["spatial:registration"] = "pixel"
 
-    # --- tessera: convention ---
-    conventions.append(_TESSERA_CONVENTION)
-    attrs["tessera:dataset_version"] = "v1"
-    attrs["tessera:n_bands"] = embedding_dim
-    attrs["tessera:quantization_method"] = "absmax_per_pixel"
+    # --- geoemb: convention ---
+    conventions.append(_GEOEMB_CONVENTION)
+    attrs["geoemb:type"] = "pixel"  # per-pixel embeddings (not chip)
+    attrs["geoemb:dimensions"] = embedding_dim
+    # geoemb:model is the PUBLIC encoder reference URL. A caller passes the exact
+    # public URI for the encoder it used (model_url); otherwise we derive it from
+    # the pipeline's public encoder version (ENCODER_VERSION). It is NEVER built
+    # from *model_version*, which in production is an internal checkpoint filename
+    # stem (checkpoint_to_version(...)) — that is kept as separate `checkpoint_id`
+    # provenance, so a v1.0 / future / custom checkpoint doesn't advertise a
+    # synthetic or wrong public model URL.
+    attrs["geoemb:model"] = model_url or _MODEL_URL_TEMPLATE.format(version=ENCODER_VERSION)
     if model_version:
-        attrs["tessera:model_version"] = model_version
-    if n_tiles is not None:
-        attrs["tessera:n_tiles"] = n_tiles
+        attrs["checkpoint_id"] = model_version
+    attrs["geoemb:source_data"] = list(source_data)
+    attrs["geoemb:data_type"] = data_type
+    # geoemb:gsd is OPTIONAL and defined in metres, so emit it ONLY with a
+    # trustworthy metric value: derived from the coordinate spacing of a
+    # metre-based CRS, or an explicit gsd the caller vouches for. A non-metre CRS
+    # (EPSG:4326 degrees, foot-based) or missing coords → OMIT it entirely rather
+    # than advertise a false metre value.
+    if x_coords is not None and len(x_coords) > 1 and _is_metre_crs(effective_epsg):
+        attrs["geoemb:gsd"] = abs(float(np.median(np.diff(x_coords))))
+    elif gsd is not None:
+        attrs["geoemb:gsd"] = gsd
+    # spatial_layout is OPTIONAL and only meaningful for a store organised into
+    # utmNN / global groups. A single-ROI store writes arrays at its own root,
+    # so omit it unless a caller (e.g. the 120-group campaign) sets it.
+    if spatial_layout is not None:
+        attrs["geoemb:spatial_layout"] = spatial_layout
+    # build_version is the SOFTWARE build (this package) per the convention;
+    # the public encoder reference is geoemb:model and the checkpoint id (if any)
+    # is the plain checkpoint_id attr above.
+    attrs["geoemb:build_version"] = _software_version()
+    attrs["geoemb:quantization"] = {
+        "method": "per_pixel_scale",  # absmax-per-pixel: value = quantized * scale
+        "original_dtype": "float32",
+        "quantized_dtype": data_type,
+        # Per-pixel float32 dequantization factors live in the `scales` array;
+        # absent/ocean pixels carry NaN there (assembly fills float vars NaN).
+        "scale": {"type": "array", "array_name": "scales", "nodata": "NaN"},
+    }
 
     if conventions:
         attrs["zarr_conventions"] = conventions

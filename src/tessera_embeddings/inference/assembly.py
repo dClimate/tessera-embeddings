@@ -1068,7 +1068,7 @@ class ZarrWriter:
             root.attrs["run_started_at"] = started.isoformat()
             root.attrs["run_completed_at"] = datetime.datetime.now(datetime.UTC).isoformat()
 
-            # GeoZarr convention attributes (proj:, spatial:, tessera:).
+            # GeoZarr convention attributes (proj:, spatial:, geoemb:).
             # Set on every write (create and append) so they survive to_icechunk attr overwrites.
             conv_attrs = build_convention_attrs(
                 tile_id=tile_id,
@@ -1079,9 +1079,15 @@ class ZarrWriter:
                 y_coords=spatial.northing if spatial else None,
                 x_coords=spatial.easting if spatial else None,
                 model_version=model_version,
-                n_tiles=len(chunks),
             )
             if conv_attrs:
+                # Drop any retired tessera:* attrs first: appending to a store
+                # created before the geoemb switch would otherwise leave the old
+                # keys behind (dict.update only overwrites the keys it carries),
+                # so the store would advertise both conventions. zarr_conventions
+                # itself is replaced wholesale by the update.
+                for stale in [k for k in root.attrs if str(k).startswith("tessera:")]:
+                    del root.attrs[stale]
                 root.attrs.update(conv_attrs)
 
             if manifest:
