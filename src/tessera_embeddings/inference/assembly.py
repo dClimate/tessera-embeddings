@@ -973,6 +973,13 @@ class ZarrWriter:
                 region=s3_region,
                 scatter_initial_credentials=get_credentials is not None,
             )
+            # Persist the split on create so a later COLD writer (one that opens
+            # the store outside this manifest_split block) keeps splitting rather
+            # than reverting to O(store) manifest rewrites. Mirrors
+            # create_global_repo; forks in THIS session already inherit it via
+            # the pickled session, so this only matters for future opens.
+            if is_new:
+                repo.save_config()
 
         # --- Phase 1: schema (create) or time-axis placement (extend) --------
         session = repo.writable_session("main")

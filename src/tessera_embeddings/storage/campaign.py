@@ -106,7 +106,14 @@ def tag_year_complete(
     raises with the missing zones otherwise. Idempotent like :func:`tag_zone_year`.
     """
     expected = tuple(expected_zones) if expected_zones is not None else tuple(ZONES)
-    status = campaign_status(repo, branch=branch)
+    # Verify completeness at the SAME snapshot we will tag, not the moving branch
+    # tip — otherwise an explicit older snapshot_id could be tagged "complete"
+    # on the strength of zones that only landed later on the branch.
+    status = (
+        campaign_status(repo, snapshot_id=snapshot_id)
+        if snapshot_id is not None
+        else campaign_status(repo, branch=branch)
+    )
     missing = [z for z in expected if not status.has(z, year)]
     if missing:
         raise ValueError(
@@ -261,15 +268,18 @@ def campaign_status(
     *,
     years: tuple[int, ...] = CAMPAIGN_YEARS,
     branch: str = "main",
+    snapshot_id: str | None = None,
 ) -> CampaignStatus:
     """Summarize zone x year fill from the live ``years_complete`` group attrs.
 
-    Reads read-only from ``branch``'s tip. Only groups that actually exist are
+    Reads read-only from ``branch``'s tip, or from ``snapshot_id`` when given
+    (so a caller can assess completeness at the exact snapshot it is about to
+    tag, not the moving branch tip). Only groups that actually exist are
     reported (a partially seeded campaign is fine); each group's landed years come
     from the ``years_complete`` attr the shard writer advances atomically with the
     data, so the view never claims a year the data doesn't back.
     """
-    session = repo.readonly_session(branch)
+    session = repo.readonly_session(snapshot_id=snapshot_id) if snapshot_id else repo.readonly_session(branch)
     root = zarr.open_group(session.store, mode="r")
     zones: dict[str, tuple[int, ...]] = {}
     for name in sorted(root.group_keys()):

@@ -44,7 +44,11 @@ def main() -> int:
     cfg = harness.config_from_args(args)
     harness.configure_logging()
 
-    if cfg.run_id not in cfg.store_root and not args.force:
+    # Path-COMPONENT match, not substring: substring containment would treat
+    # run_id "dev" as scoping store_root ".../development", so a recursive delete
+    # could take out an unrelated prefix.
+    root_components = cfg.store_root.rstrip("/").replace("://", "/").split("/")
+    if cfg.run_id not in root_components and not args.force:
         raise SystemExit(
             f"store root {cfg.store_root!r} is not scoped by run id {cfg.run_id!r} — a recursive "
             "delete could take out other runs (or a whole shared prefix). Pass --force to override."

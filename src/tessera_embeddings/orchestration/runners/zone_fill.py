@@ -69,7 +69,7 @@ from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_y
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.shard_writer import CommitGate, read_years_complete, shard_pitch
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, time_index_of
-from tessera_embeddings.storage.zone_grid import year_timestamp
+from tessera_embeddings.storage.zone_grid import PIXEL_M, year_timestamp
 
 
 def fill_zone_year(
@@ -203,11 +203,16 @@ def fill_zone_year(
         )
     z_north = cast(zarr.Array, node["northing"])
     z_east = cast(zarr.Array, node["easting"])
+    # Absolute half-pixel tolerance, NOT np.isclose's default relative one: at a
+    # ~9.3e6 m northing the default rtol=1e-5 would admit ~93 m (≈9 px) of drift.
+    # A real shift is ≥1 px (10 m); half a pixel (5 m) sits safely above float32
+    # coordinate roundtrip (~1 m at this magnitude) yet below one pixel.
+    atol = PIXEL_M / 2
     endpoints_match = (
-        np.isclose(spatial.northing[0], z_north[0])
-        and np.isclose(spatial.northing[-1], z_north[-1])
-        and np.isclose(spatial.easting[0], z_east[0])
-        and np.isclose(spatial.easting[-1], z_east[-1])
+        np.isclose(spatial.northing[0], z_north[0], rtol=0.0, atol=atol)
+        and np.isclose(spatial.northing[-1], z_north[-1], rtol=0.0, atol=atol)
+        and np.isclose(spatial.easting[0], z_east[0], rtol=0.0, atol=atol)
+        and np.isclose(spatial.easting[-1], z_east[-1], rtol=0.0, atol=atol)
     )
     if not endpoints_match:
         raise ValueError(
