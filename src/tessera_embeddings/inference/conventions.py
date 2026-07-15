@@ -51,6 +51,7 @@ def _is_metre_crs(epsg_code: str | None) -> bool:
     units = [getattr(a, "unit_name", "").lower() for a in crs.axis_info]
     return bool(units) and all(u in ("metre", "meter") for u in units)
 
+
 # Convention registration metadata (UUID + schema URLs)
 _PROJ_CONVENTION = {
     "schema_url": "https://raw.githubusercontent.com/zarr-experimental/geo-proj/refs/tags/v1/schema.json",

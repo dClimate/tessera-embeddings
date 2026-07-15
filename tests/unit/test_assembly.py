@@ -10,6 +10,7 @@ decision instead of error propagation.
 from __future__ import annotations
 
 import pickle
+from importlib.metadata import version as _dist_version
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -1074,8 +1075,9 @@ class TestAssemblyValidation:
         # geoemb:
         assert attrs["geoemb:type"] == "pixel"
         assert attrs["geoemb:dimensions"] == EMBEDDING_DIM
-        assert attrs["geoemb:model"] == "https://geotessera.org/model/test_model_v1"
-        assert attrs["geoemb:build_version"] == "test_model_v1"
+        assert attrs["geoemb:model"] == "https://geotessera.org/model/test_model_v1"  # model_version -> URL
+        # build_version is the software/package version, NOT the encoder/model version.
+        assert attrs["geoemb:build_version"] == _dist_version("tessera_embeddings")
         assert attrs["geoemb:data_type"] == "int8"
         assert attrs["geoemb:quantization"]["method"] == "per_pixel_scale"
         assert attrs["geoemb:quantization"]["scale"]["array_name"] == "scales"
