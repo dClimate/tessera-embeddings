@@ -98,7 +98,8 @@ class TestBuildConventionAttrs:
         # geoemb: — required fields per the convention schema
         assert attrs["geoemb:type"] == "pixel"
         assert attrs["geoemb:dimensions"] == 128
-        assert attrs["geoemb:model"] == "https://geotessera.org/model/1.1"  # encoder version
+        assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"  # public encoder ref
+        assert attrs["checkpoint_id"] == "1.1"  # supplied model_version -> provenance, not the public URL
         assert attrs["geoemb:source_data"] == ["s3://sentinel-cogs", "https://datapool.asf.alaska.edu/RTC/OPERA-S1"]
         assert attrs["geoemb:data_type"] == "int8"
         assert attrs["geoemb:gsd"] == 10.0  # derived from the 10 m (metre CRS) coordinate spacing
@@ -145,19 +146,22 @@ class TestBuildConventionAttrs:
         # spatial: still present since coords are provided
         assert "spatial:" in names
 
-    def test_model_uses_encoder_version_build_uses_package_version(self) -> None:
-        """geoemb:model is versioned by the encoder checkpoint; geoemb:build_version
-        is the software/package version (they are distinct).
+    def test_model_is_public_ref_build_is_package_checkpoint_is_provenance(self) -> None:
+        """geoemb:model is the PUBLIC encoder reference (ENCODER_VERSION), NOT the
+        supplied checkpoint id; build_version is the package version; the checkpoint
+        id (an internal filename in production) is recorded as checkpoint_id.
         """
         attrs = build_convention_attrs(
             total_y=10,
             total_x=10,
             embedding_dim=128,
-            model_version=None,
+            model_version="best_model_fsdp_20250608_220648_QAT",  # a checkpoint stem, as prod passes
         )
-        assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"
+        assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"  # NOT the checkpoint
+        assert attrs["checkpoint_id"] == "best_model_fsdp_20250608_220648_QAT"
         assert attrs["geoemb:build_version"] == _PKG_VERSION
-        assert attrs["geoemb:build_version"] != ENCODER_VERSION
+        # No checkpoint id supplied -> no checkpoint_id attr.
+        assert "checkpoint_id" not in build_convention_attrs(total_y=10, total_x=10, embedding_dim=128)
 
     def test_spatial_layout_omitted_by_default_included_when_set(self) -> None:
         """spatial_layout is optional: omitted for a root-only single-ROI store,

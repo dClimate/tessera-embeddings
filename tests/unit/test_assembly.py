@@ -31,6 +31,7 @@ from tessera_embeddings.inference.assembly import (
     _staged_storage_options,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.inference.conventions import ENCODER_VERSION
 from tessera_embeddings.inference.quantization import quantize_embeddings
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store
 
@@ -1075,7 +1076,10 @@ class TestAssemblyValidation:
         # geoemb:
         assert attrs["geoemb:type"] == "pixel"
         assert attrs["geoemb:dimensions"] == EMBEDDING_DIM
-        assert attrs["geoemb:model"] == "https://geotessera.org/model/test_model_v1"  # model_version -> URL
+        # model is the PUBLIC encoder reference (not the checkpoint id); the supplied
+        # model_version ("test_model_v1") is recorded as checkpoint_id provenance.
+        assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"
+        assert attrs["checkpoint_id"] == "test_model_v1"
         # build_version is the software/package version, NOT the encoder/model version.
         assert attrs["geoemb:build_version"] == _dist_version("tessera_embeddings")
         assert attrs["geoemb:data_type"] == "int8"

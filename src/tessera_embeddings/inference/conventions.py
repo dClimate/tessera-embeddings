@@ -82,7 +82,7 @@ _GEOEMB_CONVENTION = {
 #: overridable per call via ``model_version``. (``geoemb:build_version`` is the
 #: software/package version, not this.)
 ENCODER_VERSION = "1.1"
-#: Model reference URL, versioned by the encoder checkpoint.
+#: Public encoder reference URL, keyed by the encoder version (ENCODER_VERSION).
 _MODEL_URL_TEMPLATE = "https://geotessera.org/model/{version}"
 #: Precise source datasets we pull from: Sentinel-2 L2A COGs (Earth Search AWS
 #: Open Data) and OPERA RTC-S1 (ASF datapool).
@@ -253,9 +253,12 @@ def build_convention_attrs(
     ``proj:`` conventions are omitted (no CRS info available).
 
     The ``geoemb:`` fields record encoder-model provenance and quantization:
-    *model_version* (the encoder checkpoint version, default
-    :data:`ENCODER_VERSION`) versions the ``geoemb:model`` URL, while
-    ``geoemb:build_version`` is the software/package version;
+    ``geoemb:model`` is the PUBLIC encoder reference URL, keyed by
+    :data:`ENCODER_VERSION` (a real, resolvable reference — not an internal
+    checkpoint filename). *model_version* is the checkpoint identifier callers
+    supply for provenance; it is recorded as a plain ``checkpoint_id`` attr, not
+    used to build the public model URL. ``geoemb:build_version`` is the
+    software/package version.
     *data_type* is the quantized storage dtype; *gsd* the ground sample distance
     in metres (derived from the coordinate spacing only for a metre-based CRS,
     else this nominal value); *spatial_layout* is ``"utm_zones"``/``"global"``
@@ -290,11 +293,18 @@ def build_convention_attrs(
         attrs["spatial:registration"] = "pixel"
 
     # --- geoemb: convention ---
-    version = model_version or ENCODER_VERSION
     conventions.append(_GEOEMB_CONVENTION)
     attrs["geoemb:type"] = "pixel"  # per-pixel embeddings (not chip)
     attrs["geoemb:dimensions"] = embedding_dim
-    attrs["geoemb:model"] = _MODEL_URL_TEMPLATE.format(version=version)
+    # geoemb:model is the PUBLIC encoder reference, keyed by the encoder version
+    # (:data:`ENCODER_VERSION`) — a real, resolvable model URL. It is deliberately
+    # NOT built from *model_version*: production callers pass an internal
+    # checkpoint filename stem there (checkpoint_to_version(...)), which would
+    # write a synthetic, misleading model URL. The checkpoint id is kept as
+    # separate provenance (plain ``checkpoint_id`` attr, not the public model).
+    attrs["geoemb:model"] = _MODEL_URL_TEMPLATE.format(version=ENCODER_VERSION)
+    if model_version:
+        attrs["checkpoint_id"] = model_version
     attrs["geoemb:source_data"] = list(source_data)
     attrs["geoemb:data_type"] = data_type
     # Prefer the actual pixel size from the coordinate spacing (an ROI may be
@@ -310,8 +320,9 @@ def build_convention_attrs(
     # so omit it unless a caller (e.g. the 120-group campaign) sets it.
     if spatial_layout is not None:
         attrs["geoemb:spatial_layout"] = spatial_layout
-    # build_version is the SOFTWARE build (this package) per the convention; the
-    # encoder checkpoint version is carried separately in geoemb:model.
+    # build_version is the SOFTWARE build (this package) per the convention;
+    # the public encoder reference is geoemb:model and the checkpoint id (if any)
+    # is the plain checkpoint_id attr above.
     attrs["geoemb:build_version"] = _software_version()
     attrs["geoemb:quantization"] = {
         "method": "per_pixel_scale",  # absmax-per-pixel: value = quantized * scale
