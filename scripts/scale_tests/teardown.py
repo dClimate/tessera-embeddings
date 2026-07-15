@@ -44,14 +44,20 @@ def main() -> int:
     cfg = harness.config_from_args(args)
     harness.configure_logging()
 
-    # Path-COMPONENT match, not substring: substring containment would treat
-    # run_id "dev" as scoping store_root ".../development", so a recursive delete
-    # could take out an unrelated prefix.
-    root_components = cfg.store_root.rstrip("/").replace("://", "/").split("/")
-    if cfg.run_id not in root_components and not args.force:
+    # The run_id must be the FINAL prefix component of a non-bucket-root store
+    # root — mere membership isn't enough (`--run-id my-bucket` would "scope"
+    # `s3://my-bucket/anything`), and a bucket root with no key prefix must never
+    # be recursively deleted. So require leaf == run_id AND a key beyond the bucket.
+    root = cfg.store_root.rstrip("/")
+    rest = root.split("://", 1)[1] if "://" in root else root
+    parts = [p for p in rest.split("/") if p]
+    leaf = parts[-1] if parts else ""
+    has_key_prefix = len(parts) > 1  # bucket + at least one key component
+    if not args.force and (leaf != cfg.run_id or not has_key_prefix):
         raise SystemExit(
-            f"store root {cfg.store_root!r} is not scoped by run id {cfg.run_id!r} — a recursive "
-            "delete could take out other runs (or a whole shared prefix). Pass --force to override."
+            f"store root {cfg.store_root!r} is not scoped by run id {cfg.run_id!r} (run id must be the "
+            "final key component, and the root must not be a bare bucket) — a recursive delete could take "
+            "out other runs or a whole shared prefix. Pass --force to override."
         )
 
     before, after = _rm_prefix(cfg.store_root)

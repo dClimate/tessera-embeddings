@@ -222,7 +222,10 @@ def _d3_summary(rows: list[dict]) -> str:
     ratio = build_aligned / build_full
     write_ok = ratio <= 1.5
     read_ok = scat_s is not None and scat_f is not None and scat_s <= 1.2 * scat_f
-    verdict = "ADOPT sharding" if (write_ok and read_ok) else "ship c256_full"
+    # E1 wire-bytes is a mandatory gate, fail-closed: sharding must not fetch more
+    # bytes than full, and a run missing the E1 measurement can't earn ADOPT.
+    wire_ok = wire_s is not None and wire_f is not None and wire_s <= wire_f
+    verdict = "ADOPT sharding" if (write_ok and read_ok and wire_ok) else "ship c256_full"
 
     parts = []
     if wire_s is not None and wire_f is not None:

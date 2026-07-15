@@ -117,8 +117,10 @@ async def run_global_campaign(
             _check_completed(run, f"fill {zone}-{year}")
             return str(run.id)
 
+    # Descending: the campaign fills the current year first, then backwards
+    # (ADR-008) — deliver the most-recent year soonest. Override via `years`.
     runs_by_year: dict[int, list[str]] = {}
-    for year in campaign_years:
+    for year in sorted(campaign_years, reverse=True):
         year_zones = [z for z, y in pending if y == year]
         if not year_zones:
             continue
