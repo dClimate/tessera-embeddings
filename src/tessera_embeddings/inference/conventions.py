@@ -206,7 +206,7 @@ def build_convention_attrs(
     model_version: str | None = None,
     data_type: str = QUANTIZED_DTYPE,
     gsd: float = GSD_METERS,
-    spatial_layout: str = "utm_zones",
+    spatial_layout: str | None = None,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
 ) -> dict:
     """Build GeoZarr convention attributes for the root group.
@@ -226,8 +226,10 @@ def build_convention_attrs(
     *model_version* (the encoder checkpoint version, default
     :data:`ENCODER_VERSION`) versions both ``geoemb:model`` and
     ``geoemb:build_version``; *data_type* is the quantized storage dtype;
-    *gsd* the ground sample distance in metres; *spatial_layout* is
-    ``"utm_zones"`` or ``"global"``; *source_data* the source-dataset URLs.
+    *gsd* the ground sample distance in metres (derived from the coordinate
+    spacing when coords are given, else this nominal value); *spatial_layout*
+    is ``"utm_zones"``/``"global"`` and is OMITTED when ``None`` (a single-ROI
+    store has no utmNN/global groups); *source_data* the source-dataset URLs.
     """
     conventions: list[dict] = []
     attrs: dict = {}
@@ -264,8 +266,17 @@ def build_convention_attrs(
     attrs["geoemb:model"] = _MODEL_URL_TEMPLATE.format(version=version)
     attrs["geoemb:source_data"] = list(source_data)
     attrs["geoemb:data_type"] = data_type
-    attrs["geoemb:gsd"] = gsd
-    attrs["geoemb:spatial_layout"] = spatial_layout
+    # Prefer the actual pixel size from the coordinate spacing (an ROI may be
+    # coarsened, e.g. 20 m) over the nominal default.
+    if x_coords is not None and len(x_coords) > 1:
+        attrs["geoemb:gsd"] = abs(float(np.median(np.diff(x_coords))))
+    else:
+        attrs["geoemb:gsd"] = gsd
+    # spatial_layout is OPTIONAL and only meaningful for a store organised into
+    # utmNN / global groups. A single-ROI store writes arrays at its own root,
+    # so omit it unless a caller (e.g. the 120-group campaign) sets it.
+    if spatial_layout is not None:
+        attrs["geoemb:spatial_layout"] = spatial_layout
     attrs["geoemb:build_version"] = version
     attrs["geoemb:quantization"] = {
         "method": "per_pixel_scale",  # absmax-per-pixel: value = quantized * scale

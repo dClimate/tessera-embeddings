@@ -97,8 +97,9 @@ class TestBuildConventionAttrs:
         assert attrs["geoemb:model"] == "https://geotessera.org/model/1.1"
         assert attrs["geoemb:source_data"] == ["s3://sentinel-cogs", "https://datapool.asf.alaska.edu/RTC/OPERA-S1"]
         assert attrs["geoemb:data_type"] == "int8"
-        assert attrs["geoemb:gsd"] == 10.0
-        assert attrs["geoemb:spatial_layout"] == "utm_zones"
+        assert attrs["geoemb:gsd"] == 10.0  # derived from the 10 m coordinate spacing
+        # spatial_layout is omitted by default (single-ROI store, no utmNN groups)
+        assert "geoemb:spatial_layout" not in attrs
         assert attrs["geoemb:build_version"] == "1.1"
         quant = attrs["geoemb:quantization"]
         assert quant["method"] == "per_pixel_scale"
@@ -152,6 +153,23 @@ class TestBuildConventionAttrs:
         )
         assert attrs["geoemb:build_version"] == ENCODER_VERSION
         assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"
+
+    def test_spatial_layout_omitted_by_default_included_when_set(self) -> None:
+        """spatial_layout is optional: omitted for a root-only single-ROI store,
+        present when a multi-group caller (e.g. the campaign) sets it.
+        """
+        assert "geoemb:spatial_layout" not in build_convention_attrs(total_y=10, total_x=10, embedding_dim=128)
+        with_layout = build_convention_attrs(total_y=10, total_x=10, embedding_dim=128, spatial_layout="utm_zones")
+        assert with_layout["geoemb:spatial_layout"] == "utm_zones"
+
+    def test_gsd_derived_from_coordinate_spacing(self) -> None:
+        """Gsd reflects the actual pixel size, not the nominal default."""
+        y = np.arange(1000.0, 800.0, -20.0)  # 20 m spacing
+        x = np.arange(0.0, 200.0, 20.0)
+        attrs = build_convention_attrs(
+            tile_id="33UWP", total_y=10, total_x=10, embedding_dim=128, y_coords=y, x_coords=x
+        )
+        assert attrs["geoemb:gsd"] == 20.0
 
     def test_epsg_code_overrides_tile_id(self) -> None:
         """When both tile_id and epsg_code are provided, epsg_code wins."""

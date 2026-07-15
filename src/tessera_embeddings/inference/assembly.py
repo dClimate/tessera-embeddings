@@ -1081,6 +1081,13 @@ class ZarrWriter:
                 model_version=model_version,
             )
             if conv_attrs:
+                # Drop any retired tessera:* attrs first: appending to a store
+                # created before the geoemb switch would otherwise leave the old
+                # keys behind (dict.update only overwrites the keys it carries),
+                # so the store would advertise both conventions. zarr_conventions
+                # itself is replaced wholesale by the update.
+                for stale in [k for k in root.attrs if str(k).startswith("tessera:")]:
+                    del root.attrs[stale]
                 root.attrs.update(conv_attrs)
 
             if manifest:
