@@ -72,6 +72,25 @@ from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, time
 from tessera_embeddings.storage.zone_grid import PIXEL_M, year_timestamp
 
 
+def zone_has_live_tiles(
+    land_mask_path: str,
+    zone: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> bool:
+    """Whether the coverage bitmap marks ANY 2048-px tile live for ``zone``.
+
+    A cheap one-GET preflight: an all-ocean cell (no live tiles) can be filled
+    empty with no GPU work, so a caller can skip provisioning a Ray cluster for
+    it. This only reads the liveness bitmap; :func:`fill_zone_year` re-reads and
+    attr-validates the coverage group as the authority, so a wrong-zone mask
+    still fails loudly there rather than being trusted here.
+    """
+    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
+    return bool(np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool).any())
+
+
 def fill_zone_year(
     *,
     store_path: str,

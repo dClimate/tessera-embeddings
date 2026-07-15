@@ -414,6 +414,18 @@ def test_coverage_bitmap_shape_mismatch_raises(tmp_path):
         )
 
 
+def test_zone_has_live_tiles_true(tmp_path):
+    """The preflight reports live coverage so the flow provisions a cluster."""
+    mask = _make_mask(tmp_path, [(0, 0)])
+    assert zone_fill.zone_has_live_tiles(mask, _ZONE) is True
+
+
+def test_zone_has_live_tiles_false(tmp_path):
+    """An all-ocean coverage bitmap reports no live tiles (skip the cluster)."""
+    mask = _make_mask(tmp_path, [])
+    assert zone_fill.zone_has_live_tiles(mask, _ZONE) is False
+
+
 def test_off_axis_year_fails_before_inference(tmp_path, monkeypatch):
     """An off-axis year dies before any inference is dispatched."""
     store = _seed_global(tmp_path)

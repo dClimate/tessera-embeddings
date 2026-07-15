@@ -36,7 +36,7 @@ from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.data_loading import resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
-from tessera_embeddings.orchestration.runners.zone_fill import fill_zone_year
+from tessera_embeddings.orchestration.runners.zone_fill import fill_zone_year, zone_has_live_tiles
 from tessera_embeddings.providers.aws.ray import cleanup_ray_tempfiles, terminate_ray_instances_by_tag
 
 # Module-level state for the cancellation hook (set on entry, cleared on exit).
@@ -160,6 +160,31 @@ def fill_zone_year_flow(
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
     from tessera_embeddings.providers.aws.ray import ray_cluster
 
+    land_mask_path = paths.land_mask_store(mask_name)
+    fill_kwargs: dict[str, Any] = {
+        "store_path": paths.global_store(store_name),
+        "zone": zone,
+        "year": year,
+        "land_mask_path": land_mask_path,
+        "mosaic_base": mosaic_base,
+        "staging_base": f"{paths.outputs.rstrip('/')}/staging",
+        "config": config,
+        "num_actors": num_actors,
+        "log": log,
+        "run_id": run_id,
+        "gate": gate,
+        "cleanup_staging": cleanup_staging,
+        "get_credentials": iam_icechunk_credentials,
+    }
+
+    # Preflight: an all-ocean cell (no live tiles) does zero GPU work, so don't
+    # pay to provision a Ray cluster just to mark it empty — the 8 all-ocean
+    # zones alone are 72 no-op cells over the campaign. fill_zone_year still
+    # re-reads + attr-validates the coverage as the authority.
+    if not zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials):
+        log.info("Zone %s year %d has no live tiles — filling empty without a Ray cluster", zone, year)
+        return fill_zone_year(**fill_kwargs)
+
     global _active_resolved_yaml, _active_cluster_name
     with ray_cluster(
         log,
@@ -174,21 +199,7 @@ def fill_zone_year_flow(
             with Path(resolved_yaml).open() as f:
                 _active_cluster_name = yaml.safe_load(f).get("cluster_name")
 
-        summary = fill_zone_year(
-            store_path=paths.global_store(store_name),
-            zone=zone,
-            year=year,
-            land_mask_path=paths.land_mask_store(mask_name),
-            mosaic_base=mosaic_base,
-            staging_base=f"{paths.outputs.rstrip('/')}/staging",
-            config=config,
-            num_actors=num_actors,
-            log=log,
-            run_id=run_id,
-            gate=gate,
-            cleanup_staging=cleanup_staging,
-            get_credentials=iam_icechunk_credentials,
-        )
+        summary = fill_zone_year(**fill_kwargs)
     _active_resolved_yaml = None
     _active_cluster_name = None
 
