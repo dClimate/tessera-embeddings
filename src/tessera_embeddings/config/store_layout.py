@@ -30,15 +30,15 @@ from tessera_embeddings.config.inference import EMBEDDING_DIM
 
 # PCodec is intentionally a Zarr v3 *serializer* (array->bytes), not a
 # bytes->bytes compressor; silence the "not in the Zarr v3 spec" warning it
-# emits on construction. Mirrors inference.assembly (kept local to avoid a
-# config -> inference import).
+# emits on construction. This module is the codec's canonical home
+# (inference.assembly and the scale-test harness import it from here).
 warnings.filterwarnings("ignore", message="Numcodecs codecs are not in the Zarr version 3")
 
 DIMS_4D: tuple[str, str, str, str] = ("time", "northing", "easting", "band")
 DIMS_3D: tuple[str, str, str] = ("time", "northing", "easting")
 
-#: obs-count variables carried through inference (kept local to avoid importing
-#: from inference.assembly).
+#: obs-count variables carried through inference (canonical definition;
+#: inference.assembly re-exports it).
 OBS_COUNT_VARS: tuple[str, ...] = ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count")
 
 # codec keys
@@ -47,8 +47,8 @@ _PCODEC = "pcodec"  # PCodec serializer, no bytes-compressor
 _RAW = "raw"  # default bytes codec, no compressor
 
 
-def _pcodec() -> _PCodecZarr3:
-    """Return a fresh PCodec serializer instance."""
+def pcodec_serializer() -> _PCodecZarr3:
+    """Return a fresh PCodec serializer instance (Zarr v3 array->bytes codec)."""
     return _PCodecZarr3()
 
 
@@ -90,7 +90,7 @@ class ArrayLayout:
                 max(c, (min(sh, s) // c) * c) for sh, s, c in zip(self.shards, shape, chunks, strict=True)
             )
         if self.codec == _PCODEC:
-            kwargs["serializer"] = _pcodec()
+            kwargs["serializer"] = pcodec_serializer()
             kwargs["compressors"] = None
         elif self.codec == _RAW:
             kwargs["serializer"] = "auto"

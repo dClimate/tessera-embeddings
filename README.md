@@ -1,11 +1,11 @@
-# tessera_embeddings
+# TESSERA Inference
 
 [![Lint](https://github.com/dClimate/tessera-embeddings/actions/workflows/lint.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/lint.yml)
 [![Unit tests](https://github.com/dClimate/tessera-embeddings/actions/workflows/unit.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/unit.yml)
 [![Architecture](https://github.com/dClimate/tessera-embeddings/actions/workflows/architecture.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/architecture.yml)
 [![Nightly](https://github.com/dClimate/tessera-embeddings/actions/workflows/nightly.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/nightly.yml)
 
-Generate per-pixel satellite embeddings at scale. Ports the HPC-based
+Generate per-pixel (10m^2) TESSERA satellite embeddings at any scale. Ports the HPC-based
 [Tessera](https://github.com/ucam-eo/tessera) embedding pipeline to a
 cloud-native, distributed architecture that runs on any major cloud —
 or on a laptop (slowly).
@@ -206,13 +206,23 @@ overhead:       95% of wall-clock       overhead:      <5%
 ```
 
 Storage and read granularity are tuned separately. Ingest writes
-`INGEST_CHUNK_SIZE = 4000` storage chunks to keep the satellite-ingest
+`INGEST_CHUNK_SIZE = 4096` storage chunks to keep the satellite-ingest
 Dask graph small (¼ the spatial tasks), while inference reads
-`INFERENCE_CHUNK_SIZE = 2000` sub-tiles out of them — small enough to keep
-peak GPU-node RAM in check. Zarr's `oindex` reads the 2000 sub-tile out
-of a 4000 chunk without any alignment requirement. Go smaller on the
+`INFERENCE_CHUNK_SIZE = 2048` sub-tiles out of them — small enough to keep
+peak GPU-node RAM in check. Zarr's `oindex` reads the 2048 sub-tile out
+of a 4096 chunk without any alignment requirement. Go smaller on the
 read size and the Dask scheduler hangs on graph construction; larger and
 you OOM on a g5.2xlarge. If you change either, profile.
+
+The powers of two are not cosmetic — they align every stage of the
+pipeline on one grid (see the global store below):
+
+```
+ingest chunk    4096 px  = 2×2 inference tiles
+inference tile  2048 px  = 1 output shard (global store)
+shard           2048 px  = 8×8 inner chunks
+inner chunk      256 px  = the unit downstream readers decode
+```
 
 ### Using these architecture checks in your own repo
 
@@ -242,6 +252,52 @@ is implementation detail and may change between minor releases. The
 full public-API surface is listed in
 [`docs/public-api.md`](docs/public-api.md). External code should
 depend only on items listed there.
+
+## The global embeddings store
+
+Beyond single-ROI stores, the library ships the storage layout and write
+path for a **global 10 m campaign**: one Icechunk repo holding 120 Zarr
+groups — one per UTM zone (EPSG:32601–60 north, 32701–60 south) — each
+pre-allocated with a 2017–2025 annual time axis and filled one
+(zone, year) at a time. The architecture is settled in
+[ADR-008](context_docs/decisions/008-global-store-architecture.md); the
+build plan is
+[`context_docs/design/global-store-implementation-plan.md`](context_docs/design/global-store-implementation-plan.md).
+
+```
+one Icechunk repo (BucketPaths.global_store())
+├── 32601/   embeddings (time, northing, easting, band)  int8
+│            (1, 256, 256, 128) inner chunks in (1, 2048, 2048, 128) shards
+│            scales / obs counts sharded on the same 2048² spatial grid
+├── 32602/   … one group per UTM zone, seeded metadata-only up front …
+⋮
+└── 32760/   attrs: crs, zone_scheme, years_complete, runs, conventions
+```
+
+Four write paths, all committing atomically (`storage/zarr_store.py` has
+the first three; `inference/assembly.py` + `storage/shard_writer.py` the
+fourth):
+
+1. **create** — `write_dataset` on a fresh store;
+2. **append** — extend the time axis of an existing store;
+3. **region overwrite** — rewrite a temporal/spatial slice in place;
+4. **shard-assemble** — staged inference tiles written as whole, lean
+   2048-px shards into a pre-allocated zone group, one fork/merge commit
+   per (zone, year), gated to a handful of concurrent committers.
+
+The per-zone pixel grids are derived from the EPSG registry
+(`storage/zone_grid.py`), snapped to the 20,480 m shard pitch.
+**Zone-boundary policy:** zones are pure nominal 6° longitude bands —
+disjoint, every pixel-center in exactly one zone. The Norway/Svalbard
+MGRS width exceptions (32V, 31X–37X) are deliberately **not** honored:
+they exist for navigation, not data grids. Consumers must not assume
+MGRS behavior near those zones; the dataset advertises this via the
+`zone_scheme: "utm_6deg_nominal"` group attribute.
+
+Campaign operations — per-cell tags, snapshot expiry + GC, and a
+zone×year progress reader — live in `storage/campaign.py`; the
+end-to-end (zone, year) fill callable is
+`orchestration/runners/zone_fill.py`.
 
 ## The test that proves decoupling
 

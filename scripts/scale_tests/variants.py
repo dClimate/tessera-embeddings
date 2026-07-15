@@ -13,7 +13,7 @@ import dataclasses
 
 import numpy as np
 
-from tessera_embeddings.inference.assembly import pcodec_serializer
+from tessera_embeddings.config.store_layout import pcodec_serializer
 
 #: Canonical dimension order for embedding arrays (ADR D2: band varies fastest).
 DIMS: tuple[str, str, str, str] = ("time", "northing", "easting", "band")

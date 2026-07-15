@@ -19,7 +19,7 @@ Input stores (Icechunk/Zarr on S3):
   reflectance.zarr / sar_ascending.zarr / sar_descending.zarr
             │
             ▼
-  enumerate_chunks_from_dataset()     ← 2000×2000 px chunks
+  enumerate_chunks_from_dataset()     ← 2048×2048 px chunks
             │
             ▼
   filter_chunks_by_roi_mask()         ← drop chunks outside the ROI
@@ -43,17 +43,23 @@ Input stores (Icechunk/Zarr on S3):
   Staged chunks (S3 staging per run_id) — live chunks only
             │
             ▼
-  ┌────────────────────────────────────────┐
-  │  Dask Cluster (ECS Fargate, 20 workers)│
-  │  writer.assemble() → to_icechunk()     │
-  │  (non-live chunks filled with 0/NaN    │
-  │   directly in the Dask graph)          │
-  └────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────┐
+  │  Worker processes (on the flow runner)      │
+  │  writer.assemble(): fork/merge raw-zarr     │
+  │  writes into disjoint northing bands,       │
+  │  one data commit (no Dask, no task graph;   │
+  │  unstaged footprints stay at fill 0/NaN)    │
+  └─────────────────────────────────────────────┘
             │
             ▼
-  Output:  {roi_name}.zarr  (Icechunk, append on re-run)
+  Output:  {roi_name}.zarr  (Icechunk; time axis extends on re-run)
            embedding dims: (time, northing, easting, 128)
            obs count dims:  (time, northing, easting)  — s2/s1_asc/s1_desc
+
+  Global-campaign variant: writer.assemble_global() writes the same staged
+  tiles as whole 2048-px shards into a pre-seeded UTM zone group of the
+  global store (1 tile == 1 shard), driven by the zone-fill runner
+  (orchestration/runners/zone_fill.py). See ADR-008.
 ```
 
 ---
@@ -62,11 +68,13 @@ Input stores (Icechunk/Zarr on S3):
 
 ### 1. Chunk Enumeration and ROI Pre-Filter
 
-The input mosaic is divided into a grid of 2000×2000 pixel `ChunkSpec` objects (edge chunks may
-be smaller). 2000 px balances peak RAM during inference (~10 GB vs. ~37 GB at 3000 px) against
-scheduling overhead. This read-tile size is independent of the store's on-disk chunk size: the
-mosaic is written with larger 4000×4000 chunks at ingest (`INGEST_CHUNK_SIZE`), and `load_chunk`
-reads the 2000×2000 sub-tile out of them via `zarr.Array.oindex` with no alignment requirement.
+The input mosaic is divided into a grid of 2048×2048 pixel `ChunkSpec` objects (edge chunks may
+be smaller). ~2k px balances peak RAM during inference (~10 GB vs. ~37 GB at 3000 px) against
+scheduling overhead, and 2048 exactly (2¹¹) aligns the tile grid with the global store's shard
+grid — one inference tile is one output shard (ADR-008 D3). The read-tile size is independent
+of the store's on-disk chunk size: the mosaic is written with larger 4096×4096 chunks at ingest
+(`INGEST_CHUNK_SIZE`; 1 ingest chunk = 2×2 inference tiles), and `load_chunk` reads the
+2048×2048 sub-tile out of them via `zarr.Array.oindex` with no alignment requirement.
 
 `filter_chunks_by_roi_mask` then drops any chunk whose footprint does not intersect the ROI
 zarr mask produced by `generate_roi`. Only the surviving **live chunks** are dispatched to
@@ -77,9 +85,9 @@ pre-filtering, only intersecting chunks reach the Ray cluster at all, and the cl
 auto-sized from the live-chunk count.
 
 Non-intersecting chunks have no staged Zarr on S3. Assembly re-runs the same ROI filter
-and fills their footprint with `0` (for `int8` embeddings / `uint16` obs counts) or `NaN`
-(for `float32` scales / std) as constant Dask tasks directly in the mosaic graph — no
-placeholder zarrs are written.
+and simply never writes their footprint, so it reads back as the store's fill value —
+`0` (for `int8` embeddings / `uint16` obs counts) or `NaN` (for `float32` scales / std).
+No placeholder zarrs, no placeholder chunk objects.
 
 ### 2. Ray Cluster Startup
 
@@ -164,7 +172,7 @@ bands/DOYs, and per-pixel observation counts (`s2_obs_count`, `s1_asc_obs_count`
 
 The SCL pre-filter above caps peak RAM for *typical* chunks, but it does not bound it: the
 resident S2 band array is `T_valid × H × W × 10 × 2` bytes, which scales with the timestep
-count. On dense ROIs `T_valid` can reach ~120, so a 2000×2000 chunk's `s2_bands` alone is
+count. On dense ROIs `T_valid` can reach ~120, so a 2048×2048 chunk's `s2_bands` alone is
 ~9.6 GB in a single `np.empty` — and on a 16 GB `g5.xlarge` worker that OOMs the loader
 *before* inference runs. `T` is not a free variable (v1.1 uses every valid observation), so
 the only lever is the spatial working set.
@@ -276,7 +284,7 @@ comes only from its own 128 channels), so `run_inference` quantizes each bucket'
 `quantize_rows` the moment they come off the GPU, accumulating directly into skinny int8 +
 scale buffers. It never materializes the full `(H, W, 128)` chunk in float32. This is
 numerically identical to quantizing the whole array at the end, but shrinks the resident
-accumulator ~4× (~2 GB → ~0.5 GB at `chunk_size=2000`) and removes the end-of-chunk
+accumulator ~4× (~2 GB → ~0.5 GB at `chunk_size=2048`) and removes the end-of-chunk
 whole-array quantize and its multi-GB float32 temporaries — lowering the per-chunk host-RAM
 plateau. `quantize_embeddings` remains as the `(H, W, D)` entry point and delegates to
 `quantize_rows`.
@@ -302,120 +310,116 @@ corruption.
 ### 5. Staged Chunk Writes (`assembly.py`)
 
 Each actor writes its chunk to S3 staging at `{staging_base}/{run_id}/{chunk_label}.zarr`
-using Blosc compression (fast for read-writes). Zarr sub-chunks are 500×500 px —
-smaller sub-chunks prevent multi-GB decompresses during assembly.
+as **raw, uncompressed** zarr (zero codec CPU on GPU-priced nodes). Staged sub-chunks are
+`256×256 × full band` (`INNER_PX`, int8) — exactly the final store's inner-chunk geometry,
+so a staged 2048-px tile *is* the 8×8 inner-chunk grid of the output region it becomes,
+and the band axis is never split (ADR-008 D2).
 
-Alongside embeddings, each staged chunk includes three **observation count** layers
-(`s2_obs_count`, `s1_asc_obs_count`, `s1_desc_obs_count`) — uint16 (H, W) arrays recording
-how many valid timesteps contributed to each pixel. These are carried through assembly into the
-final store as 2D spatial variables (dims: `time, northing, easting`).
+Alongside embeddings, each staged chunk includes float32 `scales` and three **observation
+count** layers (`s2_obs_count`, `s1_asc_obs_count`, `s1_desc_obs_count`) — uint16 (H, W)
+arrays recording how many valid timesteps contributed to each pixel. These are carried
+through assembly into the final store as 2D spatial variables (dims: `time, northing,
+easting`).
 
-### 6. Dask Assembly
+### 6. Raw-Zarr Assembly (fork/merge, no Dask)
 
-After all live chunks complete, a Dask cluster (20-500 workers × 4 GB RAM) reads staged
-chunks and assembles them into the final Icechunk store.
+After all live chunks complete, `writer.assemble` writes the staged tiles straight into
+the final Icechunk store with plain zarr assignments — a pool of worker processes on the
+flow runner, each holding a pickled **fork** of one icechunk session, merged and committed
+once by the coordinator. No task graph is ever built over the store, so assembly cost
+scales with the *live* pixels, not the grid, and the scheduler-RAM ceiling that shaped the
+old Dask engine is gone.
 
-#### Three-layer chunk anatomy
-
-The assembly design deliberately uses three different chunk granularities for three
-independent concerns. Understanding this is key to understanding why the code is shaped
-as it is:
-
-```text
-Layer                   Size              Controls
-──────────────────────────────────────────────────────────────────────
-Dask logical block      2000×2000 px      Scheduler task count (RAM)
-Staged zarr sub-chunk     500×500 px      Per-task read + decode RAM
-Final store sub-chunk     500×500×4       Downstream partial-read cost
-
-                         ┌──────────────────────────┐
-  One Dask task ──────►  │  ChunkSpec  2000×2000 px  │
-  (one entry in the      │  ┌────┬────┬────┬────┐   │
-   scheduler's task      │  │500 │500 │500 │500 │   │
-   graph)                │  ├────┼────┼────┼────┤   │
-                         │  │    │    │    │    │   │
-                         │  ├────┼────┼────┼────┤   │
-                         │  │    │    │    │    │   │
-                         │  ├────┼────┼────┼────┤   │
-                         │  │    │    │    │    │   │
-                         │  └────┴────┴────┴────┘   │
-                         │  16 on-disk sub-chunks    │
-                         └──────────────────────────┘
-                           to_icechunk handles the
-                           fan-out via align_chunks=True
-```
-
-At sub-chunk granularity (millions of tasks), the scheduler's per-task `TaskState` overhead
-(~1.5 KB each — see [`ingest/README.md`](../ingest/README.md#background-how-dask-task-graphs-consume-scheduler-ram))
-exhausted the scheduler's 8 GB RAM during graph expansion before any worker started. At
-ChunkSpec granularity (a few thousand tasks at cornbelt scale), graph planning takes
-seconds.
-
-The mechanism that makes this possible is `align_chunks=True` in the `to_icechunk` call.
-Without it, on-disk sub-chunk size and Dask block size would be forced to match:
+The output geometry comes from a `StoreLayout` preset (`config/store_layout.py`) — the
+same source of truth the global store's seeder uses — not from the staged files:
 
 ```text
-Without align_chunks=True (forced coupling):
-  To write 500×500 on-disk chunks, Dask blocks must also be 500×500.
-  A 2000×2000 ChunkSpec becomes 16 Dask blocks → 16 TaskStates.
-
-  At cornbelt scale: 5,000 ChunkSpecs × 16 sub-chunks × 2 layers
-                   = 160,000 TaskStates — manageable, but grows fast.
-  Add more variables, time steps, or larger ROIs and this explodes.
-
-With align_chunks=True:
-  Dask block = 2000×2000 ChunkSpec → 1 TaskState per variable per ChunkSpec.
-  Worker reads the full 2000×2000 array and writes it in one call.
-  zarr/icechunk splits the write into 500×500 on-disk sub-chunks internally.
-
-  Scheduler graph:  1 TaskState per ChunkSpec  (graph stays small)
-  On-disk layout:  16 sub-chunks per ChunkSpec (reads stay fast)
-  These two numbers are now independent — each can be tuned separately.
+Preset       embeddings                          scales / obs / std
+──────────────────────────────────────────────────────────────────────────
+LEGACY       (1, 500, 500, 4)  int8+zstd         (1, 500, 500)  PCodec / raw
+             unsharded — today's single-ROI      unsharded
+GLOBAL_V1    (1, 256, 256, 128) int8+zstd        (1, 256, 256)  PCodec/zstd
+             in (1, 2048, 2048, 128) shards      in (1, 2048, 2048) shards
 ```
+
+#### Write-conflict discipline: northing bands
+
+Two forks writing the same output chunk would conflict at merge, and LEGACY's 500-px
+chunks don't align with 2048-px tiles. So workers partition the mosaic into **northing
+bands aligned to the output's write granularity** (shard height when sharded, chunk height
+otherwise) — bands are disjoint and span the full easting extent, so no two forks ever
+touch the same output object:
+
+```text
+                    easting ─────────────────►
+            ┌tile 0───────┬tile 1───────┬tile 2──┐
+  worker 0  │             │             │        │  band [0, 1000)     ── fork 0
+            │ ┈┈┈┈┈┈┈┈┈┈┈ band boundary ┈┈┈┈┈┈┈┈ │  (multiple of 500)
+  worker 1  │             │             │        │  band [1000, 2048+…)── fork 1
+            └─────────────┴─────────────┴────────┘
+             a tile straddling a boundary is read
+             twice, once per band, as a y-slice —
+             each worker streams ONE tile-slice at
+             a time (≤ ~0.5 GB int8)
+
+  coordinator:  session.fork() ──► workers write bands ──► merge(*forks)
+                └── one data commit via commit_with_rebase ──┘
+```
+
+Within a band, tile x-boundaries still cut output chunks mid-chunk; those partial chunks
+are read-modify-written *sequentially inside one fork* — icechunk sessions are
+read-your-writes, so the merged result is exact.
 
 #### Assembly steps
 
 1. Re-run `filter_chunks_by_roi_mask` to recover the set of live chunk labels (the list
-   isn't marshaled through Prefect; the ROI zarr path is the source of truth).
-2. Build a lazy Dask mosaic as two unmaterialized `Blockwise` layers, at **ChunkSpec
-   granularity** — one dask block per ChunkSpec (full spatial extent × full band axis):
-    - a `da.full` template of the right shape filled with the fill value (0 for int8
-      embeddings, NaN for floats);
-    - a `map_blocks(_assemble_var_block, live_lookup=…)` on top that, per block, consults
-      a `(row, col) -> staged_path` dict and either reads the entire staged chunk or
-      returns the fill template unchanged.
-3. Output zarr sub-chunking (500×500×4) is set via `to_icechunk(..., encoding=...)` and
-   read from the staged files' on-disk chunk shape. `align_chunks=True` lets
-   `to_icechunk` fan a single dask block out into 512 small on-disk zarr chunks — dask
-   graph stays small, final store layout stays suitable for downstream partial reads.
-4. Write via `xr.Dataset.to_icechunk()` — float32 embeddings use PCodec compression; int8
-   quantized embeddings use default compression. Appends to existing store if present.
-5. Delete _all versions_ of the staged chunk zarrs (unless `dev` flag is passed).
+   isn't marshaled through Prefect; the ROI zarr path is the source of truth), minus
+   skip-marked chunks.
+2. **Phase 1 (metadata commit)** — fresh store: create the layout's array schemas + coord
+   arrays (no chunk data; cost independent of extent). Existing store: validate the
+   `_manifest`, then either resize every time-dimmed array by one step (an append IS a
+   resize + write at the new index) or, when the time value already exists, target its
+   index for an in-place overwrite — **idempotent resume**: a crashed assembly re-run
+   lands on the same index instead of appending a duplicate timestep.
+3. **Phase 2 (data commit)** — fork the session; each worker process writes its band's
+   staged-tile y-slices into every output array; the coordinator merges the forks, sets
+   root attrs (run metadata, GeoZarr conventions, `_manifest`, merged `time_windows`),
+   and commits once via `commit_with_rebase`.
+4. Delete the staged chunk zarrs (unless `cleanup_staging=False`).
 
-**Manifest splitting.** The whole `writer.assemble` call is wrapped in
-`manifest_split({"northing": 32, "easting": 32})` (see `tasks/inference.py`). By default
-icechunk keeps one manifest object per array, so every commit rewrites the entire chunk
-index — O(store size) regardless of how few chunks changed. Splitting tiles the manifest
-into 32-chunk-per-axis shards; with 500×500 px on-disk sub-chunks that's ~16k px/shard,
-matching `zarr_store.DEFAULT_MANIFEST_SPLIT_SIZES`' target. No `time` split is applied:
-assembly only ever writes a single timestep, so one time shard equals the whole array and
-splitting time would be a no-op. The split config is persisted via `repo.save_config()` so
-it survives the session being shipped to Dask workers.
+The **global-campaign variant**, `writer.assemble_global`, skips the banding entirely:
+one staged 2048-px tile is exactly one output shard (D3), so whole tiles round-robin
+across workers via `storage.shard_writer.write_year_shards` — every shard object is
+emitted once, lean (all-fill inner chunks elided, so ocean costs nothing), with
+`years_complete` and per-year run provenance advanced in the same single commit. The
+zone-fill runner (`orchestration/runners/zone_fill.py`) drives it: partner land mask →
+inference → `assemble_global` → `campaign.tag_zone_year`.
+
+**S3 concurrency.** The coordinator opens the repo with `max_concurrent_requests =
+TARGET_AGGREGATE_S3_CONCURRENCY // n_workers`; forks inherit it through pickling (no
+`save_config` round-trip needed), so fleet-wide PUT concurrency stays under S3's
+per-prefix ceiling regardless of worker count.
+
+**Manifest splitting.** `assemble` opens the repo under
+`manifest_split({"northing": 32, "easting": 32, "time": 1})`. By default icechunk keeps
+one manifest object per array, so every commit rewrites the entire chunk index — O(store
+size) regardless of how few chunks changed. Splitting tiles the manifest into
+32-chunk-per-axis spatial shards (~16k px at 500-px chunks) plus one shard per timestep,
+so a one-timestep write rewrites no prior timestep's manifests. The global store bakes
+its own split (`time@1`) into the repo config at seeding (`global_store_config`).
 
 The split applies to both new and pre-existing stores. A store created before this change
-has a single unsplit manifest; the first append under the `manifest_split` block re-shards
+has a single unsplit manifest; the first write under the `manifest_split` block re-shards
 the touched array in that commit (a one-time migration — old chunk data is untouched and
-reads back unchanged), and every commit after it rewrites only the shards it touches. So
-existing stores pick up the same bounded-commit speedup on their next assembly run, with no
-manual migration step.
+reads back unchanged), and every commit after it rewrites only the shards it touches.
 
-**Why PCodec for the final store:** Embeddings are 128-dim float32 vectors — dense, continuous,
-and without the spatial redundancy that makes byte-shuffle + zstd effective for reflectance
-data. PCodec is a floating-point-aware codec that models the distribution of float values
-directly, achieving significantly better compression ratios on this kind of data than
-general-purpose codecs. The tradeoff is that PCodec decompresses the entire on-disk chunk
-to read any slice of it (no partial decode), which is why staged chunks use 500×500
-sub-chunks to cap decode buffer size.
+**Codecs in the final store:** quantized int8 embeddings use the zarr default
+(bytes + zstd). The float32 `scales` (and `embedding_std`, when computed) use **PCodec**,
+a floating-point-aware serializer that models the distribution of float values directly
+and beats general-purpose codecs on this kind of data. The tradeoff is that PCodec
+decompresses the entire on-disk chunk to read any slice of it (no partial decode), which
+is why the inner chunks stay small (500 px legacy / 256 px global). PCodec composes with
+the sharding codec (verified: round-trip + fill on partial shards).
 
 **Reading the output store.** On a CONUS-scale store, open with `chunks=None` for
 interactive or selective reads:
@@ -499,7 +503,7 @@ New code (not ported):
 | `data_loading.py` | Icechunk/Zarr loader with 3-phase selective S2 timestep loading |
 | `dataset.py` | Valid-pixel filtering and lazy per-batch indexing |
 | `quantization.py` | Int8 quantization with per-pixel scale factors and dequantization |
-| `assembly.py` | Staged Zarr writes + Dask-based parallel assembly into Icechunk |
+| `assembly.py` | Staged Zarr writes + raw-zarr fork/merge assembly into Icechunk (single-ROI + global modes) |
 | `actors.py` | Ray actor wrapping the full per-chunk pipeline |
 | `scheduling.py` | Work-stealing scheduler (`_process_chunks_work_stealing`) and `ActorPool` — manages dispatch, actor replacement, idle retirement, and tracker polling |
 | `progress.py` | Lightweight Ray actor (`num_cpus=0`) polled by the flow runner every 60s for batch-level progress and 5-minute stall detection |
@@ -508,7 +512,8 @@ New code (not ported):
 
 ## Accessing the Dask Dashboard
 
-The Dask assembly cluster runs in a private subnet (ECS Fargate). Use SSM port forwarding to reach the Bokeh dashboard:
+Assembly no longer uses Dask — only the *ingest* Dask cluster remains, in a private subnet
+(ECS Fargate). Use SSM port forwarding to reach its Bokeh dashboard:
 
 ```bash
 # Look up TASK_ID and RUNTIME_ID for the Dask scheduler task in the ECS console

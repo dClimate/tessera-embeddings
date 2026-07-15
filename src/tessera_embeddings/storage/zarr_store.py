@@ -5,7 +5,7 @@ that hold preprocessed Sentinel-2 reflectance data and cloud masks.
 
 Uses Icechunk for transactional writes with atomic commit semantics.
 
-Three write paths, all committing atomically:
+Four write paths, all committing atomically:
 
 - **create** (:func:`write_dataset` on a fresh store) — ``to_icechunk`` mode
   ``"w"`` writes the whole array.
@@ -19,11 +19,16 @@ Three write paths, all committing atomically:
   dask blocks and ``mode="r+"`` rejects partial-chunk writes. Use
   :func:`resolve_region` to turn coordinate ranges into the integer slices
   ``write_region`` expects.
+- **shard-assemble** (embeddings only; lives in
+  :mod:`tessera_embeddings.inference.assembly` +
+  :mod:`tessera_embeddings.storage.shard_writer`) — staged inference tiles
+  written straight into the output arrays as raw-zarr fork/merge region
+  writes: granularity-aligned northing bands for standalone stores, whole
+  2048-px shards of a pre-allocated global-store zone group for the campaign
+  (one commit per zone-year, ADR-008).
 
 The batch variant of the region-overwrite path (a Dask-graph write of many
-regions at once) was removed as unused; batch merging of many grid-aligned
-stores into one master — process-parallel raw-zarr chunk writes, no Dask —
-arrives in a stacked follow-up PR.
+regions at once) was removed as unused.
 """
 
 import logging

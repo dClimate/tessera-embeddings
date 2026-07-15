@@ -12,14 +12,14 @@ CI verifies that the names listed here match `tessera_embeddings.__all__`.
   Pass to flows / runners; never read from env inside the package.
 - `InferenceConfig` — frozen-ish dataclass with model, sampling, and
   Ray-actor parameters.
-- `AssemblyConfig` — Dask cluster recipe for the embedding-assembly
-  phase. Subclasses an internal helper; treat the helper as private.
+- `AssemblyConfig` — worker-process pool sizing for the
+  embedding-assembly phase (raw-zarr fork/merge writes, no Dask).
 - `TimeWindow` — 12-month rolling window.
 - `parse_time_window(s: str) -> TimeWindow` — parses
   `"Month YYYY"` strings.
 - `checkpoint_filename(quantized: bool = True) -> str` — canonical
   filename for the bundled model checkpoints.
-- `INFERENCE_CHUNK_SIZE` — pixel size of one spatial chunk (2000).
+- `INFERENCE_CHUNK_SIZE` — pixel size of one spatial chunk (2048).
 - `EMBEDDING_DIM` — output dimension of one Tessera embedding (128).
 
 ## Errors

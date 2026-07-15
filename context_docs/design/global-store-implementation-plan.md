@@ -1,5 +1,13 @@
 # Global store implementation plan
 
+> **Status (2026-07-14): built.** Stage A landed as commits 9367360 (W1),
+> a66ec12+0513edd (W2), 7528051 (W3), aa50d27 (W5); Stage B as ef33f8e (W4
+> new engine + parity gate), bd7abfe (W4 finalize — Dask engine deleted,
+> assembly on worker processes), 4541c02 (zone-fill runner + empty-cell
+> marking), plus the W6 docs sweep. The parity gate (legacy Dask engine vs
+> raw-zarr engine, value/coord/attr-identical on create and append) passed
+> before the deletion. All on `global-tessera-scoping`, one PR to main.
+
 Builds what ADR-008 decided (`context_docs/decisions/008-global-store-architecture.md`
 — see its **Conclusion** for the settled architecture; every design choice below
 traces to a FIRM decision D1–D9 or a measured run-1/d3/d3v2 number). Scoping is

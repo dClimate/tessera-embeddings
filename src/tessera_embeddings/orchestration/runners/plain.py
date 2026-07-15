@@ -268,7 +268,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
               name: my-roi
               geojson: examples/quickstart/roi.geojson    # optional
               resolution: 10.0
-              chunk_size: 2000
+              chunk_size: 2048
               force_crs: null                              # or "EPSG:32615"
             time_window_end: "June 2025"
             time_range:

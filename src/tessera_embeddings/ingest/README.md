@@ -253,15 +253,15 @@ expansion to TaskStates happens only when the graph is submitted to the schedule
 #### How task count multiplies: operations × chunk dimensions
 
 Each Dask operation (read, transform, write) adds a new layer. Each layer has one task per
-combination of *chunk coordinates* across all chunked dimensions. Ingest writes 4000×4000 px
-storage chunks (`INGEST_CHUNK_SIZE`), deliberately larger than the 2000×2000 inference
+combination of *chunk coordinates* across all chunked dimensions. Ingest writes 4096×4096 px
+storage chunks (`INGEST_CHUNK_SIZE`), deliberately larger than the 2048×2048 inference
 read-tile size, precisely to keep this task count down. For S2 ingestion over a large ROI
-(e.g. cornbelt scale: ~38×25 grid of 4000×4000 px spatial chunks), the S2 flow processes one
+(e.g. cornbelt scale: ~38×25 grid of 4096×4096 px spatial chunks), the S2 flow processes one
 date at a time, so the time dimension is always 1:
 
 ```text
   Dimensions per single S2 date (ingest_s2_roi_reflectance):
-    spatial chunks:     ~950  (38×25 grid of 4000×4000 px)
+    spatial chunks:     ~950  (38×25 grid of 4096×4096 px)
     dates:                 1  (one date per loop iteration)
     band variables:       10  (each S2 band is a separate xarray variable)
 
@@ -278,7 +278,7 @@ date at a time, so the time dimension is always 1:
   950 × 100 × 10 × 4 = 3,800,000 tasks ≈ 5.6 GB scheduler RAM                ✗ OOM
 ```
 
-Had ingest reused the 2000×2000 inference tile size, every count above would be 4× higher —
+Had ingest reused the 2048×2048 inference tile size, every count above would be 4× higher —
 that 4× on the satellite-ingest graph is the reason storage and inference chunk sizes are
 decoupled.
 
@@ -386,7 +386,7 @@ The ROI Zarr mask is generated with `chunk_size` matching `INGEST_CHUNKS` so tha
 `da.from_zarr` reads are zero-copy — each Dask partition maps to exactly one Zarr chunk.
 The same chunk sizes are passed to `odc.stac.load` (after translating `northing`/`easting`
 to `y`/`x`) so band arrays and the mask share the same partition boundaries for aligned
-Dask operations. (Inference reads 2000×2000 sub-tiles out of these 4000×4000 chunks via
+Dask operations. (Inference reads 2048×2048 sub-tiles out of these 4096×4096 chunks via
 `zarr.Array.oindex`, which needs no such alignment — see
 [`inference/README.md`](../inference/README.md).)
 
