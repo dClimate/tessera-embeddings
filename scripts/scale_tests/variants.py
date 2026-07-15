@@ -96,11 +96,11 @@ def scales_array_kwargs(variant: Variant, shape: tuple[int, int, int]) -> dict:
     ``scales`` carries the "never written" sentinel (NaN, ADR D1) and is
     co-chunked with the embeddings *spatial* chunks (so one embeddings spatial
     chunk maps to exactly one scales chunk — keeping ref-counting clean), and
-    co-SHARDED with them whenever the variant shards (matching ``GLOBAL_V1``,
+    co-SHARDED with them whenever the variant shards (matching ``GLOBAL``,
     where unsharded scales would cap the object-count win — D3).
     """
     spatial = (variant.chunks[0], variant.chunks[1], variant.chunks[2])
-    # Shard scales whenever the variant shards embeddings — GLOBAL_V1 shards
+    # Shard scales whenever the variant shards embeddings — GLOBAL shards
     # both (D3: unsharded scales caps the object-count win), so the benchmark
     # must measure the same object layout production writes.
     spatial_shards = (variant.shards[0], variant.shards[1], variant.shards[2]) if variant.shards else None

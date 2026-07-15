@@ -336,15 +336,15 @@ same source of truth the global store's seeder uses — not from the staged file
 ```text
 Preset       embeddings                          scales / obs / std
 ──────────────────────────────────────────────────────────────────────────
-LEGACY       (1, 500, 500, 4)  int8+zstd         (1, 500, 500)  PCodec / raw
+SINGLE       (1, 500, 500, 4)  int8+zstd         (1, 500, 500)  PCodec / raw
              unsharded — today's single-ROI      unsharded
-GLOBAL_V1    (1, 256, 256, 128) int8+zstd        (1, 256, 256)  PCodec/zstd
+GLOBAL    (1, 256, 256, 128) int8+zstd        (1, 256, 256)  PCodec/zstd
              in (1, 2048, 2048, 128) shards      in (1, 2048, 2048) shards
 ```
 
 #### Write-conflict discipline: northing bands
 
-Two forks writing the same output chunk would conflict at merge, and LEGACY's 500-px
+Two forks writing the same output chunk would conflict at merge, and SINGLE's 500-px
 chunks don't align with 2048-px tiles. So workers partition the mosaic into **northing
 bands aligned to the output's write granularity** (shard height when sharded, chunk height
 otherwise) — bands are disjoint and span the full easting extent, so no two forks ever
@@ -414,7 +414,7 @@ The write path and the read path deliberately touch different granularities —
 what a writer emits in one go is much larger than what a reader must fetch:
 
 ```text
-                  LEGACY (single-ROI)             GLOBAL_V1 (zone group)
+                  SINGLE (single-ROI)             GLOBAL (zone group)
 ─────────────────────────────────────────────────────────────────────────────
 S3 object       = one 500×500×4 chunk (~a few   = one 2048² shard (≤ ~0.5 GB:
                   hundred KB)                     8×8 inner chunks + index)
@@ -459,7 +459,7 @@ reads back unchanged), and every commit after it rewrites only the shards it tou
 a floating-point-aware serializer that models the distribution of float values directly
 and beats general-purpose codecs on this kind of data. The tradeoff is that PCodec
 decompresses the entire on-disk chunk to read any slice of it (no partial decode), which
-is why the inner chunks stay small (500 px legacy / 256 px global). PCodec composes with
+is why the inner chunks stay small (500 px single / 256 px global). PCodec composes with
 the sharding codec (verified: round-trip + fill on partial shards).
 
 **Reading the output store.** On a CONUS-scale store, open with `chunks=None` for

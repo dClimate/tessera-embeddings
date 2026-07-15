@@ -3,11 +3,11 @@
 The composition layer for the global campaign (ADR-008). One Icechunk repo holds
 120 Zarr groups (one per UTM zone); this module seeds them as pre-allocated,
 metadata-only empty stores — full 2017-2025 time axis, per-zone coordinates and
-CRS, ``GLOBAL_V1`` sharded array schemas — so the campaign can then fill years as
+CRS, ``GLOBAL`` sharded array schemas — so the campaign can then fill years as
 region/shard writes without ever resizing (D1).
 
 Lives above the low-level primitives on purpose: it pulls together
-:mod:`~tessera_embeddings.storage.zone_grid` (the grid), the ``GLOBAL_V1`` layout
+:mod:`~tessera_embeddings.storage.zone_grid` (the grid), the ``GLOBAL`` layout
 (:mod:`~tessera_embeddings.config.store_layout`), the coord/schema writers in
 :mod:`~tessera_embeddings.storage.empty_store`, and GeoZarr convention attrs
 (:func:`~tessera_embeddings.inference.conventions.build_convention_attrs`).
@@ -21,7 +21,7 @@ import icechunk
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.store_layout import GLOBAL_V1, StoreLayout
+from tessera_embeddings.config.store_layout import GLOBAL, StoreLayout
 from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.zarr_store import _create_storage, global_store_config
@@ -95,7 +95,7 @@ def _layout_band(layout: StoreLayout) -> int:
     Zone seeding requires a *sharded* layout (D3 — the whole global write path
     is shard-aligned) whose band axis is never split (D2), so the band chunk
     size IS the band count. Both are enforced here: an unsharded layout
-    (e.g. ``LEGACY``, whose band chunk of 4 would otherwise silently seed
+    (e.g. ``SINGLE``, whose band chunk of 4 would otherwise silently seed
     4-band zones) and a band-split sharded layout are rejected loudly.
     """
     emb = layout.arrays["embeddings"]
@@ -103,7 +103,7 @@ def _layout_band(layout: StoreLayout) -> int:
     if emb.shards is None:
         raise ValueError(
             f"Layout {layout.name!r} is unsharded — zone seeding requires a sharded, "
-            "full-band layout like GLOBAL_V1 (ADR-008 D2/D3)."
+            "full-band layout like GLOBAL (ADR-008 D2/D3)."
         )
     if emb.shards[-1] != band:
         raise ValueError(
@@ -143,7 +143,7 @@ def seed_zone_groups(
     specs: Iterable[ZoneSpec],
     *,
     years: tuple[int, ...] = CAMPAIGN_YEARS,
-    layout: StoreLayout = GLOBAL_V1,
+    layout: StoreLayout = GLOBAL,
     model_version: str | None = None,
     commit_msg: str | None = None,
 ) -> str:
@@ -175,7 +175,7 @@ def seed_all_zones(
     repo: icechunk.Repository,
     *,
     years: tuple[int, ...] = CAMPAIGN_YEARS,
-    layout: StoreLayout = GLOBAL_V1,
+    layout: StoreLayout = GLOBAL,
     model_version: str | None = None,
 ) -> str:
     """Seed all 120 UTM-zone groups in one commit."""

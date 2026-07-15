@@ -326,7 +326,7 @@ WRITE  1 staged inference tile (2048²) == 1 shard: the assembly worker
        an all-ocean tile costs nothing (never staged, never written).
 READ   a point/window read GETs the shard index, then ranged-GETs only
        the inner chunks it overlaps — ~8 MB per point, not 0.5 GB.
-       (LEGACY single-ROI stores are unsharded: chunk == object.)
+       (SINGLE single-ROI stores are unsharded: chunk == object.)
 ```
 
 ### Manifest splitting: why a commit costs one year, not the store

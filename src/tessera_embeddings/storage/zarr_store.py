@@ -399,7 +399,7 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
 
 
 # Preload scan cap for the global store: 120 groups x 10 nodes each (6 data
-# arrays + 4 coords under GLOBAL_V1) = 1200 nodes, so the icechunk default of 50
+# arrays + 4 coords under GLOBAL) = 1200 nodes, so the icechunk default of 50
 # (issue #1464) never reaches later groups' coord arrays. 2400 leaves 2x
 # headroom so schema growth can't silently push trailing zones' coord manifests
 # out of preload; refs cap is generous because coord manifests are tiny.

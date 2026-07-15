@@ -4,8 +4,8 @@ Staged writes (one Zarr per chunk) use raw uncompressed bytes for zero CPU
 overhead on GPU actors; the on-disk staged pieces are inner-chunk-sized
 (``INNER_PX`` = 256 px, full band) so a staged tile is exactly the inner-chunk
 grid of the output region it becomes. The final Icechunk store's geometry
-(chunks, shards, codecs) comes from a :class:`StoreLayout` preset — ``LEGACY``
-for single-ROI stores, ``GLOBAL_V1`` for the global campaign's zone groups.
+(chunks, shards, codecs) comes from a :class:`StoreLayout` preset — ``SINGLE``
+for single-ROI stores, ``GLOBAL`` for the global campaign's zone groups.
 
 Assembly is raw-zarr, not Dask: the coordinator forks an icechunk session,
 worker processes write staged-tile pixels straight into the output arrays via
@@ -45,7 +45,7 @@ import xarray as xr
 import zarr
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM, TimeWindow
-from tessera_embeddings.config.store_layout import INNER_PX, LEGACY, OBS_COUNT_VARS, StoreLayout
+from tessera_embeddings.config.store_layout import INNER_PX, OBS_COUNT_VARS, SINGLE, StoreLayout
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
 from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
@@ -879,7 +879,7 @@ class ZarrWriter:
         n_workers: int,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
-        layout: StoreLayout = LEGACY,
+        layout: StoreLayout = SINGLE,
     ) -> str:
         """Assemble staged chunk Zarrs into a standalone Icechunk store.
 
@@ -891,7 +891,7 @@ class ZarrWriter:
 
         Create-or-extend semantics on the time axis:
 
-        * fresh store → schema + coords from ``layout`` (``LEGACY`` by default —
+        * fresh store → schema + coords from ``layout`` (``SINGLE`` by default —
           today's single-ROI geometry, D8) in a first metadata-only commit;
         * existing store, new time value → every time-dimmed array is resized by
           one step (explicitly — this replaces ``mode="a"`` appends) in a first
@@ -945,7 +945,7 @@ class ZarrWriter:
             get_credentials: Optional icechunk credential callback for the
                 output store (see ``zarr_store._create_storage``).
             s3_region: Optional S3 region override for the output store.
-            layout: Output geometry preset. ``LEGACY`` (default) reproduces
+            layout: Output geometry preset. ``SINGLE`` (default) reproduces
                 today's single-ROI stores exactly; only new stores consult it.
 
         Returns:

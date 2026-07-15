@@ -1,12 +1,9 @@
 """Tests for ZarrWriter: staging round-trips, raw-zarr assembly, cleanup dispatch.
 
 Assembly tests exercise the fork/merge engine (``assemble``/``assemble_global``)
-directly — no Dask. The W4 parity gate (legacy Dask engine vs this engine on
-identical staged inputs) passed and was deleted together with the legacy engine;
-see the implementation plan. cleanup_staging coverage diverges from the
-reference repo: this repo's cleanup_staging prefers s5cmd for S3 with an fsspec
-fallback, so TestCleanupStagingDispatch exercises the routing decision instead
-of error propagation.
+directly — no Dask. cleanup_staging coverage diverges from the reference repo:
+this repo's cleanup_staging prefers s5cmd for S3 with an fsspec fallback,
+so TestCleanupStagingDispatch exercises the routing decision instead of error propagation.
 """
 
 from __future__ import annotations
@@ -441,7 +438,7 @@ class TestAssembly:
     def test_assemble_multiband_parallel_matches_serial(self, tmp_path):
         """n_workers>1 partitions into y-bands across processes; result matches serial.
 
-        The grid is taller than one output chunk (LEGACY 500-px northing chunks)
+        The grid is taller than one output chunk (SINGLE 500-px northing chunks)
         with tile boundaries that do NOT fall on chunk boundaries, so the run
         exercises band-aligned splitting of staged tiles and x/y partial-chunk
         read-modify-writes inside a fork.
@@ -1337,7 +1334,7 @@ class TestAssembleGlobal:
     YEARS = (2024, 2025)
 
     def _seed_zone_repo(self, tmp_path, ny: int, nx: int, dim: int):
-        """A miniature GLOBAL_V1-shaped zone group: sharded arrays + calendar-year time axis."""
+        """A miniature GLOBAL-shaped zone group: sharded arrays + calendar-year time axis."""
         store_path = str(tmp_path / "global.icechunk")
         repo = create_global_repo(store_path)
         session = repo.writable_session("main")

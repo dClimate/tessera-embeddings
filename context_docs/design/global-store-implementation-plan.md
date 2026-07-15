@@ -75,9 +75,9 @@ new `storage/zone_grid.py`.*
 - **`StoreLayout` presets** (new, small): a frozen dataclass naming the output
   geometry per array — inner chunks, shards (or None), serializer/compressor,
   fill. Two presets:
-  - `LEGACY` — today's `(1, 500, 500, 4)` unsharded output; remains the default
+  - `SINGLE` — today's `(1, 500, 500, 4)` unsharded output; remains the default
     for existing single-ROI entry points (D8: vanilla users unaffected).
-  - `GLOBAL_V1` — `(1, 256, 256, 128)` int8+zstd inner chunks in
+  - `GLOBAL` — `(1, 256, 256, 128)` int8+zstd inner chunks in
     `(1, 2048, 2048, 128)` shards for `embeddings`; `scales` float32+PCodec,
     same spatial shards (**sharded — D3**: unsharded `scales` caps the
     object-count win; PCodec-inside-shards verified locally: roundtrip + NaN
@@ -185,7 +185,7 @@ entirely.
    **one commit** via `commit_with_rebase`, behind the gate.
 3. Two targets, one engine: **single-ROI mode** (create-or-append to a
    standalone store — append = `resize` + write at the new index, replacing
-   `mode="a"`; `LEGACY` layout default) and **global mode** (region-write into
+   `mode="a"`; `SINGLE` layout default) and **global mode** (region-write into
    a pre-allocated zone group at a year index — no resize ever, D1).
 4. S3 discipline carries over: `TARGET_AGGREGATE_S3_CONCURRENCY` maps to
    `per_worker_cap = target // n_processes` passed as
@@ -285,8 +285,8 @@ delete as one merge, and the parity test is the gate, not elapsed time.
    (+ `embedding_std` when computed), all sharded on the same 2048² grid.
 5. **Cross-machine commit gate** → Prefect global concurrency limit
    (yield-embeddings side); library ships the in-process primitive + contract.
-6. **Single-ROI default layout** → `LEGACY` stays the default for single-ROI
-   entry points; `GLOBAL_V1` is opt-in (strict D8).
+6. **Single-ROI default layout** → `SINGLE` stays the default for single-ROI
+   entry points; `GLOBAL` is opt-in (strict D8).
 
 7. **Zone boundary policy** → confirmed: pure nominal 6° longitude bands,
    disjoint, **no Norway/Svalbard MGRS exceptions**. Must be documented

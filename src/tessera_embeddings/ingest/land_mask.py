@@ -220,7 +220,7 @@ def build_zone_coverage(zone: str, lons: np.ndarray, lats: np.ndarray) -> ZoneCo
                 # centre beyond UTM's usable range (>84°N / <80°S) whose zone
                 # grid can't represent it. It set no coverage bit; count it so
                 # build_all can surface the loss loudly rather than dropping it
-                # silently. (The v1.1 registry is 59.45°S–83.65°N, so this is 0.)
+                # silently. (The v1.1 registry is 59.45S to 83.65N, so this is 0.)
                 n_clipped += 1
                 continue
             tile_live[
