@@ -137,8 +137,8 @@ def fill_zone_year(
             f"Year {year} is not on {zone}'s pre-allocated time axis — the axis is fixed at seeding (ADR-008 D1)."
         )
     # Permissive by design: require only that the window OVERLAPS `year`, so
-    # non-campaign consumers can drive rolling (non-Jan–Dec) windows. The global
-    # campaign default is a strict Jan–Dec calendar-year window
+    # non-campaign consumers can drive rolling (non-Jan-Dec) windows. The global
+    # campaign default is a strict Jan-Dec calendar-year window
     # (fill_zone_year_flow), which is unambiguous; a window fully DISJOINT from
     # `year` is the operator error we catch here (e.g. a cloned invocation whose
     # year was edited but not its time_window), which would otherwise land
