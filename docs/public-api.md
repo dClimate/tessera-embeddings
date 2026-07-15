@@ -17,8 +17,8 @@ CI verifies that the names listed here match `tessera_embeddings.__all__`.
 - `TimeWindow` — 12-month rolling window.
 - `parse_time_window(s: str) -> TimeWindow` — parses
   `"Month YYYY"` strings.
-- `checkpoint_filename(quantized: bool = True) -> str` — canonical
-  filename for the bundled model checkpoints.
+- `checkpoint_filename(norm_source: str = "aws") -> str` — canonical
+  filename for the bundled model checkpoints (`"aws"` or `"mpc"`).
 - `INFERENCE_CHUNK_SIZE` — pixel size of one spatial chunk (2048).
 - `EMBEDDING_DIM` — output dimension of one Tessera embedding (128).
 

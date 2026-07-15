@@ -174,8 +174,12 @@ while "Building Dask graph"; eventually fails.
 
 Cause: chunk size too small → graph too big. See
 [`README.md`](../README.md) §"Why chunk size dominates everything".
-The package defaults to `INFERENCE_CHUNK_SIZE = 2048` — change with
-care.
+Only *ingest* uses Dask (`INGEST_CHUNK_SIZE = 4096` storage chunks);
+assembly runs as local worker processes on the flow runner — size that
+container for ~12 GB of assembly headroom (`AssemblyConfig` caps 8
+workers × ~1.5 GB staged-tile slices) plus the commit. Don't reach for
+`INFERENCE_CHUNK_SIZE` here: it drives GPU read-tiling, not Dask, and
+must stay equal to the 2048-px shard pitch for the global store (D3).
 
 ### ECS task definition diff between dev branches
 

@@ -334,3 +334,124 @@ def test_all_tiles_skipped_marks_complete_empty(tmp_path, monkeypatch):
     assert node.attrs["years_complete"] == [2025]
     assert node.attrs["runs"]["2025"]["empty"] is True
     assert repo.lookup_tag("zone-32601-2025") == summary["snapshot_id"]
+
+
+def test_wrong_grid_mask_raises(tmp_path):
+    """A mask off the zone grid must be loud — zarr's silent window clamping
+    would otherwise classify the whole zone as ocean and tag it complete-empty.
+    """
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    path = str(tmp_path / "wrong_mask.zarr")
+    arr = zarr.open(path, mode="w", shape=(_NY // 2, _NX // 2), chunks=(_NY // 2, _NX // 2), dtype="bool")
+    arr[:] = True
+
+    with pytest.raises(ValueError, match="must cover the zone extent exactly"):
+        zone_fill.fill_zone_year(
+            store_path=store,
+            zone=_ZONE,
+            year=2025,
+            land_mask_path=path,
+            mosaic_base=mosaic_base,
+            staging_base=str(tmp_path / "staging"),
+            config=_config(),
+            num_actors=1,
+            log=log,
+        )
+
+
+def test_off_axis_year_fails_before_inference(tmp_path, monkeypatch):
+    """An off-axis year dies before any inference is dispatched."""
+    store = _seed_global(tmp_path)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("inference must not run for an off-axis year")
+
+    monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
+    window = TimeWindow(
+        window_start=(2015, 1),
+        window_end=(2015, 12),
+        months=tuple((2015, m) for m in range(1, 13)),
+        window_end_label="2015-12-01",
+    )
+    with pytest.raises(ValueError, match="not on 32601's pre-allocated time axis"):
+        zone_fill.fill_zone_year(
+            store_path=store,
+            zone=_ZONE,
+            year=2015,
+            land_mask_path=str(tmp_path / "mask.zarr"),
+            mosaic_base=str(tmp_path / "mosaics"),
+            staging_base=str(tmp_path / "staging"),
+            config=InferenceConfig(time_window=window, chunk_size=_TILE, num_gpus=0),
+            num_actors=1,
+            log=log,
+        )
+
+
+def test_window_year_mismatch_raises(tmp_path):
+    """A time_window that never touches the target year is an operator error."""
+    store = _seed_global(tmp_path)
+    # _WINDOW covers 2024-07..2025-06; year=2024 and 2025 are both fine — but a
+    # cloned invocation editing year to a slot outside the window must die.
+    window = TimeWindow(
+        window_start=(2025, 1),
+        window_end=(2025, 12),
+        months=tuple((2025, m) for m in range(1, 13)),
+        window_end_label="2025-12-01",
+    )
+    with pytest.raises(ValueError, match="must overlap the calendar-year slot"):
+        zone_fill.fill_zone_year(
+            store_path=store,
+            zone=_ZONE,
+            year=2024,
+            land_mask_path=str(tmp_path / "mask.zarr"),
+            mosaic_base=str(tmp_path / "mosaics"),
+            staging_base=str(tmp_path / "staging"),
+            config=InferenceConfig(time_window=window, chunk_size=_TILE, num_gpus=0),
+            num_actors=1,
+            log=log,
+        )
+
+
+def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatch):
+    """A crash between the fill commit and the tag: retry tags the tip, no re-inference.
+
+    The crash state is constructed by running the fill WITHOUT the tag step
+    (assemble_global directly) — icechunk forbids recreating a deleted tag, so
+    deleting a landed tag would not reproduce the crash window.
+    """
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0)])
+    # Stage one tile and land the fill commit (years_complete advances) with no tag.
+    rng = np.random.default_rng(5)
+    writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=_BAND)
+    chunk_00 = zone_fill.enumerate_chunks(_NY, _NX, _TILE)[0]
+    writer.write_chunk(
+        chunk_00,
+        rng.integers(-100, 100, size=(_TILE, _TILE, _BAND)).astype(np.int8),
+        "run1",
+        scales=rng.random((_TILE, _TILE)).astype(np.float32),
+    )
+    writer.assemble_global(store, _ZONE, year=2025, run_id="run1", n_workers=1)
+    repo = global_store.open_global_repo(store)
+    assert "zone-32601-2025" not in repo.list_tags()
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("a landed cell must not re-run inference just to re-tag")
+
+    monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
+    retry = zone_fill.fill_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2025,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="run2",
+    )
+    assert retry["already_complete"] is True
+    assert repo.lookup_tag("zone-32601-2025") == retry["snapshot_id"]

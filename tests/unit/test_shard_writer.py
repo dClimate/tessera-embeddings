@@ -10,7 +10,6 @@ import zarr
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import global_store, zarr_store
 from tessera_embeddings.storage.shard_writer import (
-    DEFAULT_COMMIT_CAP,
     commit_with_rebase,
     write_year_shards,
 )
@@ -98,15 +97,6 @@ def test_commit_with_rebase_resolves_concurrent_disjoint_commits(tmp_path):
     id1 = commit_with_rebase(s1, "write zone A")
     id2 = commit_with_rebase(s2, "write zone B")  # tip moved -> auto-rebase
     assert id1 and id2 and id1 != id2
-
-
-def test_semaphore_gate_allows_and_bounds():
-    """A plain threading.Semaphore is the in-process commit gate (cap from DEFAULT_COMMIT_CAP)."""
-    assert DEFAULT_COMMIT_CAP == 6
-    gate = threading.Semaphore(1)
-    with gate:
-        assert not gate.acquire(blocking=False)  # cap reached
-    assert gate.acquire(blocking=False)  # released
 
 
 def test_write_year_shards_behind_gate(tmp_path):

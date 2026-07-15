@@ -1,5 +1,11 @@
 # Global store implementation plan
 
+> **Revision note:** some W2/W3 API sketches below were superseded during the
+> build's cleanup pass — `VarSpec.shards` and `create_empty_store_from_coords(group=)`
+> were dropped as unused (the global store seeds via `ArrayLayout`/`StoreLayout`),
+> and the `CommitGate` protocol + semaphore class became a plain
+> `threading.Semaphore` behind a context-manager type alias. The code is the map.
+
 > **Status (2026-07-14): built.** Stage A landed as commits 9367360 (W1),
 > a66ec12+0513edd (W2), 7528051 (W3), aa50d27 (W5); Stage B as ef33f8e (W4
 > new engine + parity gate), bd7abfe (W4 finalize — Dask engine deleted,

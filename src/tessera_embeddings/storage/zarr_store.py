@@ -266,7 +266,7 @@ def _create_storage(
 _manifest_split_sizes: dict[str, int] | None = None
 
 # Default for large continental stores: a 2D spatial split at 4 chunks per axis.
-# With INGEST_CHUNK_SIZE=4000 that's ~16k px/shard — a touch larger than a
+# With INGEST_CHUNK_SIZE=4096 that's ~16k px/shard — a touch larger than a
 # typical ~3x3-chunk region write, so most commits hit only 1-4 tiles, while
 # shard objects stay in the low hundreds on a ~50x50-chunk store. Region writes
 # are spatially scattered, so a per-write commit rewrites only its tiles rather
@@ -387,11 +387,12 @@ def _default_repo_config(max_concurrent_requests: int | None = None) -> icechunk
     return config
 
 
-# Preload scan cap for the global store: 120 groups x ~5 arrays = ~600 nodes, so
-# the icechunk default of 50 (issue #1464) never reaches later groups' coord
-# arrays. 1200 covers the node count with headroom; refs cap is generous because
-# coord manifests are tiny.
-_GLOBAL_PRELOAD_MAX_ARRAYS = 1200
+# Preload scan cap for the global store: 120 groups x 10 nodes each (6 data
+# arrays + 4 coords under GLOBAL_V1) = 1200 nodes, so the icechunk default of 50
+# (issue #1464) never reaches later groups' coord arrays. 2400 leaves 2x
+# headroom so schema growth can't silently push trailing zones' coord manifests
+# out of preload; refs cap is generous because coord manifests are tiny.
+_GLOBAL_PRELOAD_MAX_ARRAYS = 2400
 _GLOBAL_PRELOAD_MAX_REFS = 1_000_000
 
 

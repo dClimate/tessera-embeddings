@@ -28,7 +28,12 @@ from typing import cast
 import icechunk
 import zarr
 
-from tessera_embeddings.storage.shard_writer import CommitGate, commit_with_rebase
+from tessera_embeddings.storage.shard_writer import (
+    CommitGate,
+    commit_with_rebase,
+    read_years_complete,
+    run_provenance,
+)
 from tessera_embeddings.storage.zarr_store import time_index_of
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES, year_timestamp
 
@@ -49,7 +54,9 @@ def _ensure_tag(repo: icechunk.Repository, tag: str, sid: str) -> str:
     """Create ``tag`` at ``sid``, idempotently — the refuse-to-move policy's one home.
 
     A tag already at ``sid`` is a no-op (resume); a tag pointing elsewhere raises
-    rather than silently moving campaign history.
+    rather than silently moving campaign history. Note icechunk tags are
+    write-once *forever* — a deleted tag name can never be recreated — so a
+    deliberate refill must pin its new snapshot under a fresh tag name.
     """
     if tag in repo.list_tags():
         current = repo.lookup_tag(tag)
@@ -59,19 +66,6 @@ def _ensure_tag(repo: icechunk.Repository, tag: str, sid: str) -> str:
     repo.create_tag(tag, sid)
     logger.info("tagged %s -> %s", tag, sid)
     return tag
-
-
-def run_provenance(existing: object, year: int, run_id: str, *, empty: bool = False) -> dict:
-    """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
-
-    Both fill paths use this — the shard write (``assemble_global``) and the
-    no-data marking (:func:`mark_zone_year_empty`) — so the provenance record
-    shape can only change in one place.
-    """
-    record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat()}
-    if empty:
-        record["empty"] = True
-    return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
 
 
 def tag_zone_year(
@@ -136,7 +130,10 @@ def mark_zone_year_empty(
     minus the shards. ``year`` must be on the group's pre-allocated time axis
     (D1) — an off-axis year must never enter ``years_complete``. Idempotent: a
     year already marked returns the branch tip untouched (its original
-    provenance preserved). Returns the snapshot id to tag.
+    provenance preserved) — note the returned id is then the *current* tip, so
+    a tag created from it on a crash-resume may point at a later snapshot than
+    the original mark commit (which remains a protected ancestor). Returns the
+    snapshot id to tag.
     """
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
@@ -146,8 +143,7 @@ def mark_zone_year_empty(
             f"Year {year} is not on {zone}'s pre-allocated time axis — refusing to mark an "
             "off-axis year complete (ADR-008 D1: the axis is fixed at seeding)."
         )
-    raw = node.attrs.get("years_complete", [])
-    done = [int(y) for y in raw] if isinstance(raw, list) else []
+    done = read_years_complete(node)
     if year in done:
         return repo.lookup_branch("main")
     node.attrs["years_complete"] = sorted([*done, year])

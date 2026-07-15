@@ -153,10 +153,12 @@ def phase_split_config_ab(cfg: harness.RunConfig) -> None:
         # Patch-write cost: overwrite one chunk in an already-filled year.
         yc, xc = land[0]
         y0, x0 = yc * cy, xc * cx
+        # Clamp to the chunk's real extent (bench zone is not a 256 multiple).
+        ch, cw = min(cy, zone.height - y0), min(cx, zone.width - x0)
         session = harness.open_repo(cfg, store, config=config).writable_session("main")
         grp = zarr.open_group(session.store, mode="a")[GROUP]
-        grp["embeddings"][len(YEARS) - 1 : len(YEARS), y0 : y0 + cy, x0 : x0 + cx, :] = np.full(
-            (1, cy, cx, V.BAND), 5, "int8"
+        grp["embeddings"][len(YEARS) - 1 : len(YEARS), y0 : y0 + ch, x0 : x0 + cw, :] = np.full(
+            (1, ch, cw, V.BAND), 5, "int8"
         )
         with harness.timer() as t:
             session.commit("patch one chunk")

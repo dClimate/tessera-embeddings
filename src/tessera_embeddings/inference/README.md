@@ -348,7 +348,9 @@ Two forks writing the same output chunk would conflict at merge, and LEGACY's 50
 chunks don't align with 2048-px tiles. So workers partition the mosaic into **northing
 bands aligned to the output's write granularity** (shard height when sharded, chunk height
 otherwise) — bands are disjoint and span the full easting extent, so no two forks ever
-touch the same output object:
+touch the same output object. Band boundaries are **work-weighted** (live tiles per
+granularity unit), not equal-height: an ROI mask clusters live tiles spatially, and
+equal-height bands would leave most workers idle while one dragged the assembly:
 
 ```text
                     easting ─────────────────►

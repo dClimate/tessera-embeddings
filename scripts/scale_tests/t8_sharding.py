@@ -22,6 +22,7 @@ Run from ``scripts/`` (bench, in-region)::
 from __future__ import annotations
 
 import argparse
+import datetime
 import logging
 from typing import Any
 
@@ -289,8 +290,6 @@ def phase_object_count(cfg: harness.RunConfig) -> None:
 
 def _gc_and_count(cfg: harness.RunConfig, store: str) -> int:
     """Expire + GC the store, then return the live chunk-object count."""
-    import datetime
-
     repo = harness.open_repo(cfg, store)
     cutoff = datetime.datetime.now(datetime.UTC)
     repo.expire_snapshots(older_than=cutoff)
@@ -323,10 +322,10 @@ def _sample_points(
         shard_keys = sorted(by_shard)
         # Rotate within each shard's land-chunk list too, so repeated visits to
         # a shard sample different inner chunks instead of re-reading the first.
-        chunks = [
-            by_shard[key][(i // len(shard_keys)) % len(by_shard[key])]
-            for i, key in ((j, shard_keys[j % len(shard_keys)]) for j in range(n))
-        ]
+        chunks = []
+        for i in range(n):
+            in_shard = by_shard[shard_keys[i % len(shard_keys)]]
+            chunks.append(in_shard[(i // len(shard_keys)) % len(in_shard)])
     else:
         chunks = [land[int(rng.integers(len(land)))] for _ in range(n)]
     pts: list[tuple[int, int]] = []

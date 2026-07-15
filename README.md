@@ -192,7 +192,7 @@ means workers can't fit a chunk in memory.
 ```
 ROI: 20 km × 20 km, S2 reflectance, 10 m resolution, 12 dates:
 
-chunks=200×200 (10× too small)        chunks=2000×2000 (the right size)
+chunks=200×200 (10× too small)        chunks=2048×2048 (the right size)
 ─────────────────────────────         ───────────────────────────────
 □□□□□□□□□□  □□□□□□□□□□  □□□□□           ┌────────┐
 □□□□□□□□□□  □□□□□□□□□□  □□□□□           │        │
@@ -211,8 +211,10 @@ Dask graph small (¼ the spatial tasks), while inference reads
 `INFERENCE_CHUNK_SIZE = 2048` sub-tiles out of them — small enough to keep
 peak GPU-node RAM in check. Zarr's `oindex` reads the 2048 sub-tile out
 of a 4096 chunk without any alignment requirement. Go smaller on the
-read size and the Dask scheduler hangs on graph construction; larger and
-you OOM on a g5.2xlarge. If you change either, profile.
+ingest chunk and the satellite-ingest Dask scheduler drowns in tasks;
+go larger on the read tile and you OOM on a g5.2xlarge. And 2048 is
+load-bearing for the global store: one inference tile must equal one
+2048-px shard (ADR-008 D3). If you change either, profile.
 
 The powers of two are not cosmetic — they align every stage of the
 pipeline on one grid (see the global store below):

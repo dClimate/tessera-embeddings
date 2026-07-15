@@ -10,6 +10,7 @@ decided (ADR D2) and not what the variants probe.
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import numpy as np
 
@@ -112,6 +113,4 @@ def scales_array_kwargs(variant: Variant, shape: tuple[int, int, int]) -> dict:
 
 def band_chunks(variant: Variant) -> int:
     """Number of band-axis chunks (embeddings refs per written spatial chunk)."""
-    import math
-
     return math.ceil(BAND / variant.chunks[3])

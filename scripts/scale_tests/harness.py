@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import datetime
 import json
 import logging
 import re
@@ -362,8 +363,6 @@ def emit_metric(
 
 def _utcnow() -> str:
     """UTC timestamp string (kept isolated so it is easy to find/replace)."""
-    import datetime
-
     return datetime.datetime.now(datetime.UTC).isoformat()
 
 

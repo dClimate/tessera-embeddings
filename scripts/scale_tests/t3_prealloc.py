@@ -94,14 +94,18 @@ def phase_fill_and_verify(cfg: harness.RunConfig) -> None:
     _, cy, cx, _ = VARIANT.chunks
     yc, xc = land[0]
     y0, x0 = yc * cy, xc * cx
-    got = grp["embeddings"][year_idx, y0 : y0 + cy, x0 : x0 + cx, :]
-    exp = synth.embedding_block((1, cy, cx, V.BAND), seed=SEED, block_index=(year_idx, yc, xc))[0]
+    # Clamp to the chunk's real extent: the bench zone (20 000 px) is not a
+    # multiple of 256, so an edge chunk in row/col 78 is 32 px — reading a full
+    # cy x cx window there would shape-mismatch the synth block spuriously.
+    ch, cw = min(cy, zone.height - y0), min(cx, zone.width - x0)
+    got = grp["embeddings"][year_idx, y0 : y0 + ch, x0 : x0 + cw, :]
+    exp = synth.embedding_block((1, ch, cw, V.BAND), seed=SEED, block_index=(year_idx, yc, xc))[0]
     if not np.array_equal(got, exp):
         raise SystemExit("filled 2025 does not match synth data")
     # An unfilled year: embeddings read as int8 fill 0, scales as NaN (the sentinel).
-    if not (grp["embeddings"][0, y0 : y0 + cy, x0 : x0 + cx, :] == 0).all():
+    if not (grp["embeddings"][0, y0 : y0 + ch, x0 : x0 + cw, :] == 0).all():
         raise SystemExit("unfilled year embeddings are not all fill=0")
-    if not np.isnan(grp["scales"][0, y0 : y0 + cy, x0 : x0 + cx]).all():
+    if not np.isnan(grp["scales"][0, y0 : y0 + ch, x0 : x0 + cw]).all():
         raise SystemExit("unfilled year scales are not all NaN (sentinel broken)")
     if YEARS[year_idx] not in list(grp.attrs.get("years_complete", [])):
         raise SystemExit("years_complete attr did not record the fill")

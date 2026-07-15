@@ -92,15 +92,20 @@ def create_layout_arrays(
 def _layout_band(layout: StoreLayout) -> int:
     """The band extent for a layout — the embeddings array's full-band chunk.
 
-    Only valid for layouts that never split the band axis (ADR-008 D2), where
-    the band chunk size IS the band count. Guards what it can: a sharded layout
-    whose band chunk differs from its band shard is split by construction and
-    is rejected. ``LEGACY`` (band split into 4) is not a valid zone-seeding
-    layout for the same reason.
+    Zone seeding requires a *sharded* layout (D3 — the whole global write path
+    is shard-aligned) whose band axis is never split (D2), so the band chunk
+    size IS the band count. Both are enforced here: an unsharded layout
+    (e.g. ``LEGACY``, whose band chunk of 4 would otherwise silently seed
+    4-band zones) and a band-split sharded layout are rejected loudly.
     """
     emb = layout.arrays["embeddings"]
     band = emb.chunks[-1]
-    if emb.shards is not None and emb.shards[-1] != band:
+    if emb.shards is None:
+        raise ValueError(
+            f"Layout {layout.name!r} is unsharded — zone seeding requires a sharded, "
+            "full-band layout like GLOBAL_V1 (ADR-008 D2/D3)."
+        )
+    if emb.shards[-1] != band:
         raise ValueError(
             f"Layout {layout.name!r} splits the band axis (chunk {band} != shard {emb.shards[-1]}) — "
             "zone seeding requires full-band chunks (ADR-008 D2)."

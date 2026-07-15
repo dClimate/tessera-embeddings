@@ -1452,3 +1452,126 @@ class TestAssembleGlobal:
 
         with pytest.raises(IncompleteStageError, match="missing required variable"):
             writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runC", n_workers=1)
+
+
+class TestAssembleGuards:
+    """Regression guards from the branch code review: extent, missing vars, tile validation."""
+
+    def _stage_one(self, writer, chunk, run_id, with_obs=False):
+        rng = np.random.default_rng(3)
+        emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
+        obs = (
+            {var: rng.integers(0, 9, size=(chunk.height, chunk.width)).astype(np.uint16) for var in OBS_COUNT_VARS}
+            if with_obs
+            else None
+        )
+        writer.write_chunk(chunk, emb, run_id, scales=scales, obs_counts=obs)
+        return emb
+
+    def test_append_extent_mismatch_raises(self, tmp_path):
+        """A mosaic grid that doesn't match the existing store is a loud error, not a corner write."""
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        output = str(tmp_path / "out.zarr")
+        day = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
+        big = ChunkSpec(row=0, col=0, y_start=0, y_stop=8, x_start=0, x_stop=8)
+        self._stage_one(writer, big, "run1")
+        writer.assemble(
+            [big],
+            total_y=8,
+            total_x=8,
+            run_id="run1",
+            output_path=output,
+            roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 8),
+            run_started_at=day,
+            n_workers=1,
+        )
+
+        small = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
+        self._stage_one(writer, small, "run2")
+        with pytest.raises(ValueError, match="does not match existing store"):
+            writer.assemble(
+                [small],
+                total_y=4,
+                total_x=4,
+                run_id="run2",
+                output_path=output,
+                roi_zarr_path=_make_full_roi_mask(tmp_path / "roi2", 4, 4),
+                run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
+                n_workers=1,
+            )
+
+    def test_append_creates_missing_variables_from_layout(self, tmp_path):
+        """A run staging vars the store lacks creates them (full time extent) instead of KeyError."""
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        output = str(tmp_path / "out.zarr")
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=6, x_start=0, x_stop=6)
+        roi = _make_full_roi_mask(tmp_path, 6, 6)
+
+        # Run 1: no obs counts -> store created without obs arrays.
+        self._stage_one(writer, chunk, "run1", with_obs=False)
+        writer.assemble(
+            [chunk],
+            total_y=6,
+            total_x=6,
+            run_id="run1",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC),
+            n_workers=1,
+        )
+        ds = open_store(output)
+        assert "s2_obs_count" not in ds
+        ds.close()
+
+        # Run 2 at a later date stages obs counts -> arrays created, prior step reads fill.
+        self._stage_one(writer, chunk, "run2", with_obs=True)
+        writer.assemble(
+            [chunk],
+            total_y=6,
+            total_x=6,
+            run_id="run2",
+            output_path=output,
+            roi_zarr_path=roi,
+            run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
+            n_workers=1,
+        )
+        ds = open_store(output)
+        assert ds["s2_obs_count"].shape == (2, 6, 6)
+        assert np.all(ds["s2_obs_count"].values[0] == 0), "pre-existing timestep must read as fill"
+        assert ds["s2_obs_count"].values[1].max() >= 0
+        ds.close()
+
+
+class TestAssembleGlobalGuards:
+    """Per-tile and probe guards on the global shard path."""
+
+    TILE = TestAssembleGlobal.TILE
+    ZONE = TestAssembleGlobal.ZONE
+
+    def test_truncated_non_probe_tile_raises(self, tmp_path):
+        """A short tile that is NOT the probe still fails loudly, naming the tile."""
+        dim = 8
+        seeder = TestAssembleGlobal()
+        store_path = seeder._seed_zone_repo(tmp_path, 2 * self.TILE, self.TILE, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        full = ChunkSpec(row=0, col=0, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE)
+        short = ChunkSpec(row=1, col=0, y_start=self.TILE, y_stop=self.TILE + 8, x_start=0, x_stop=self.TILE)
+        for chunk in (full, short):
+            emb = np.ones((chunk.height, chunk.width, dim), dtype=np.int8)
+            writer.write_chunk(chunk, emb, "runT", scales=np.ones((chunk.height, chunk.width), dtype=np.float32))
+
+        with pytest.raises(ValueError, match=r"chunk_1_0\.zarr is 8 x 64 px"):
+            writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runT", n_workers=1)
+
+    def test_wrong_dtype_probe_raises(self, tmp_path):
+        """Float-staged embeddings must not silently C-cast into the int8 store."""
+        dim = 8
+        seeder = TestAssembleGlobal()
+        store_path = seeder._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE)
+        emb = np.ones((self.TILE, self.TILE, dim), dtype=np.float32)  # unquantized!
+        writer.write_chunk(chunk, emb, "runF", scales=np.ones((self.TILE, self.TILE), dtype=np.float32))
+
+        with pytest.raises(IncompleteStageError, match="dtype float32, expected int8"):
+            writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runF", n_workers=1)

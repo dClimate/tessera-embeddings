@@ -157,7 +157,7 @@ pool driving raw-zarr fork/merge writes (no Dask cluster), sized by
 from tessera_embeddings import AssemblyConfig
 
 cfg = AssemblyConfig()                                # chunks_per_worker=10, max_workers=8
-n_workers = cfg.compute_n_workers(n_live_chunks=25)   # → 3
+n_workers = cfg.compute_n_workers(25)                 # → 3
 ```
 
 The default cap of 8 keeps the pool ~12 GB (one staged-tile slice in

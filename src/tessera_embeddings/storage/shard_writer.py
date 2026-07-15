@@ -28,6 +28,7 @@ import multiprocessing
 from collections.abc import Callable, Iterable
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
+from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
 import icechunk
@@ -35,6 +36,7 @@ import numpy as np
 import zarr
 
 from tessera_embeddings.config.store_layout import SHARD_PX
+from tessera_embeddings.storage.zarr_store import read_time_values
 from tessera_embeddings.storage.zone_grid import year_of
 
 #: Any context manager works as a commit gate (``threading.Semaphore`` is the
@@ -100,15 +102,16 @@ def run_forked(
 ) -> None:
     """Fork ``session``, run ``worker_fn`` over ``payloads``, merge the forks back.
 
-    The shared coordinator scaffolding for cooperative writes: each payload dict
-    gains a ``"fork"`` key (a pickled copy per spawned worker), ``worker_fn``
-    writes into its fork and returns it, and the coordinator merges. One payload
+    The shared coordinator scaffolding for cooperative writes: each payload is
+    shipped to ``worker_fn`` with a ``"fork"`` key added (a pickled copy per
+    spawned worker; caller dicts are not mutated), the worker writes into its
+    fork and returns it, and the coordinator merges. One payload
     runs in-process; more spawn a process pool (``spawn`` context — workers must
     be module-level functions and payloads picklable).
     """
     fork = session.fork()
-    for payload in payloads:
-        payload["fork"] = fork
+    # Copies, not mutation: callers keep their payload dicts fork-free.
+    payloads = [{**payload, "fork": fork} for payload in payloads]
     if len(payloads) == 1:
         forks = [worker_fn(payloads[0])]
     else:
@@ -123,13 +126,35 @@ def _group_node(store: Any, group: str) -> zarr.Group:  # noqa: ANN401 — icech
     return cast(zarr.Group, zarr.open_group(store, mode="a")[group])
 
 
+def read_years_complete(node: zarr.Group) -> list[int]:
+    """A group's ``years_complete`` attr as a sorted list of ints (the one parser)."""
+    raw = node.attrs.get("years_complete", [])
+    return sorted(int(y) for y in raw) if isinstance(raw, list) else []
+
+
+def run_provenance(existing: object, year: int, run_id: str, *, empty: bool = False) -> dict:
+    """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
+
+    Both fill paths use this — the shard write (:func:`write_year_shards`) and
+    the no-data marking (``campaign.mark_zone_year_empty``) — so the provenance
+    record shape can only change in one place.
+    """
+    record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat()}
+    if empty:
+        record["empty"] = True
+    return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
+
+
 def _year_label(node: zarr.Group, year_index: int) -> int:
-    """Read the calendar year at ``year_index`` from a group's time coordinate."""
-    time_arr = cast(zarr.Array, node["time"])
-    return year_of(np.asarray(time_arr[year_index]).astype("datetime64[ns]"))
+    """Read the calendar year at ``year_index`` from a group's time coordinate.
+
+    Decodes via :func:`read_time_values` so a foreign store with non-TIME_ENCODING
+    units errors loudly instead of yielding an epoch-adjacent bogus year.
+    """
+    return year_of(read_time_values(node)[year_index])
 
 
-def _partition(items: list, n: int) -> list[list]:
+def partition_round_robin(items: list, n: int) -> list[list]:
     """Round-robin partition ``items`` into up to ``n`` non-empty lists."""
     parts = [items[i::n] for i in range(n)]
     return [p for p in parts if p]
@@ -169,19 +194,21 @@ def write_year_shards(
     gate: CommitGate | None = None,
     shard_px: int = SHARD_PX,
     commit_msg: str | None = None,
-    extra_attrs: dict[str, Any] | None = None,
+    run_id: str | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
     Forks the session, writes the source's live shards across ``n_workers``
     (in-process when 1, else spawned processes), merges, advances
     ``years_complete``, and commits behind ``gate`` via :func:`commit_with_rebase`.
-    ``extra_attrs`` (e.g. per-fill run provenance) is merged into the group's
-    attrs in the same commit.
+    When ``run_id`` is given, per-year run provenance (:func:`run_provenance`)
+    is merged into the group's ``runs`` attr in the same commit — read and
+    written inside THIS writable session, so a commit landing between a
+    caller's earlier probe and this write cannot be silently clobbered.
 
     Concurrency contract: concurrent commits to *different* groups rebase
     cleanly (disjoint nodes), but two concurrent fills of the *same* group both
-    rewrite its ``years_complete``/``extra_attrs`` and
+    rewrite its ``years_complete``/``runs`` attrs and
     :class:`icechunk.ConflictDetector` cannot auto-merge attribute conflicts —
     the loser fails with ``RebaseFailedError`` (loud, retriable) rather than
     silently dropping an update. Orchestrate one fill per zone at a time.
@@ -194,17 +221,16 @@ def write_year_shards(
 
     payloads: list[dict[str, Any]] = [
         {"group": group, "year_index": year_index, "shards": part, "source": source, "shard_px": shard_px}
-        for part in _partition(shards, max(1, n_workers))
+        for part in partition_round_robin(shards, max(1, n_workers))
     ]
     run_forked(session, _write_shards_worker, payloads)
 
     node = _group_node(session.store, group)
     year_label = _year_label(node, year_index)
-    raw = node.attrs.get("years_complete", [])
-    done: list[int] = [int(y) for y in raw] if isinstance(raw, list) else []
+    done = read_years_complete(node)
     if year_label not in done:
         node.attrs["years_complete"] = sorted([*done, year_label])
-    if extra_attrs:
-        node.attrs.update(extra_attrs)
+    if run_id is not None:
+        node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year_label, run_id)
 
     return commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}", gate=gate)

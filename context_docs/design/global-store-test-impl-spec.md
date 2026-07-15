@@ -100,7 +100,7 @@ Frozen dataclass registry, exactly the five entries from test-plan §3
 (`c500_band4`, `c500_full`, `c384_full`, `c256_full`, `c256_sharded`).
 Fields: `name, chunks: tuple[int,int,int,int], shards: tuple|None`.
 Constants: dims `("time","northing","easting","band")`; `embeddings` int8 +
-PCodec serializer (`tessera_embeddings.inference.assembly.pcodec_serializer`),
+PCodec serializer (now `tessera_embeddings.config.store_layout.pcodec_serializer`),
 `compressors=None`, fill 0; `scales` float32, fill NaN; band=128.
 
 ### 2.5 Geometry & data (`zone_geometry.py`, `synth.py`)

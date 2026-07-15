@@ -34,10 +34,12 @@ Contracts (all caller-owned):
 An all-ocean cell (the mask selects no tiles) — or a cell whose live tiles all
 skip (zero valid pixels) — is legitimate: it is marked complete with no data
 (:func:`~tessera_embeddings.storage.campaign.mark_zone_year_empty`) and tagged,
-so the campaign work list converges. A cell that is already complete *and*
-tagged short-circuits without re-running anything (a deliberate refill
-requires deleting the ``zone-{zone}-{year}`` tag first — campaign history is
-never silently rewritten).
+so the campaign work list converges. A cell that is already complete
+short-circuits without re-running anything (creating the tag if a crash
+landed the fill untagged). Zone-year tags are permanent: icechunk forbids
+recreating even a deleted tag name, so a deliberate refill keeps the old tag
+pointing at the old snapshot and must pin its new snapshot under a fresh,
+manually chosen tag name — campaign history is never silently rewritten.
 """
 
 from __future__ import annotations
@@ -59,7 +61,9 @@ from tessera_embeddings.inference.orchestration_helpers import enumerate_mosaic_
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
-from tessera_embeddings.storage.shard_writer import CommitGate, shard_pitch
+from tessera_embeddings.storage.shard_writer import CommitGate, read_years_complete, shard_pitch
+from tessera_embeddings.storage.zarr_store import time_index_of
+from tessera_embeddings.storage.zone_grid import year_timestamp
 
 
 def fill_zone_year(
@@ -120,14 +124,39 @@ def fill_zone_year(
         raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
     node = cast(zarr.Group, root[zone])
 
-    # Idempotent retry: a cell that already landed AND was tagged is done —
-    # re-running it would produce a new snapshot that tag_zone_year rightly
-    # refuses to move the tag to. Deliberate refills must delete the tag first.
-    landed_years = node.attrs.get("years_complete", [])
+    # Validate the year BEFORE any expensive work: assemble_global re-checks,
+    # but hitting that check after hours of GPU inference would be brutal.
+    if time_index_of(node, year_timestamp(year)) is None:
+        raise ValueError(
+            f"Year {year} is not on {zone}'s pre-allocated time axis — the axis is fixed at seeding (ADR-008 D1)."
+        )
+    # The slot being filled and the window inference computes over must agree:
+    # a window that never touches `year` is an operator error (e.g. a cloned
+    # invocation whose year was edited but not its time_window) that would
+    # otherwise land mislabeled embeddings and tag them permanently complete.
+    window_years = {y for y, _ in config.time_window.months}
+    if year not in window_years:
+        raise ValueError(
+            f"config.time_window ({config.time_window.window_end_label}) covers {sorted(window_years)} "
+            f"but year={year} — the inference window must overlap the calendar-year slot it fills."
+        )
+
+    # Idempotent retry: a cell that already landed is done — re-running it
+    # would produce a new snapshot that tag_zone_year rightly refuses to move
+    # the tag to. If the crash hit between the fill commit and the tag, tag the
+    # current tip now (the fill commit is an ancestor, so retention holds; see
+    # mark_zone_year_empty's attribution note) instead of re-running inference.
+    # Zone-year tags are write-once forever (icechunk forbids tag-name reuse
+    # even after deletion); deliberate refills need a fresh tag name.
     tag = zone_year_tag(zone, year)
-    if isinstance(landed_years, list) and year in landed_years and tag in repo.list_tags():
-        snapshot = repo.lookup_tag(tag)
-        log.info("Zone %s year %d already complete and tagged (%s) — nothing to do", zone, year, tag)
+    if year in read_years_complete(node):
+        if tag in repo.list_tags():
+            snapshot = repo.lookup_tag(tag)
+            log.info("Zone %s year %d already complete and tagged (%s) — nothing to do", zone, year, tag)
+        else:
+            snapshot = repo.lookup_branch("main")
+            tag_zone_year(repo, zone, year, snapshot_id=snapshot)
+            log.info("Zone %s year %d landed but was untagged (crash before tag) — tagged %s", zone, year, tag)
         return {
             "zone": zone,
             "year": year,
@@ -153,6 +182,16 @@ def fill_zone_year(
         raise ValueError(
             f"Mosaic grid ({total_y} x {total_x}) at {mosaic_base} does not match "
             f"zone {zone}'s grid ({ny} x {nx}) — the campaign ingest must cover the zone extent exactly."
+        )
+
+    # The mask must be on the zone grid too: zarr clamps out-of-range windows
+    # to empty instead of raising, so a wrong-grid mask would silently classify
+    # tiles (or the whole zone) as ocean and permanently tag the cell empty.
+    mask_shape = tuple(zarr.open(land_mask_path, mode="r").shape)  # type: ignore[union-attr]
+    if mask_shape != (ny, nx):
+        raise ValueError(
+            f"Land mask {land_mask_path} has shape {mask_shape} but zone {zone}'s grid is "
+            f"({ny}, {nx}) — the campaign mask must cover the zone extent exactly."
         )
 
     chunks = enumerate_chunks(ny, nx, shard_px)
@@ -214,10 +253,13 @@ def fill_zone_year(
     if not staged_labels:
         # Every live tile resolved to a skip marker (zero valid pixels under
         # the validity filters) — a legitimate no-data cell, same as all-ocean.
-        _cleanup()
+        # Mark + tag FIRST, clean up after (matching the data path): a crash
+        # after cleanup but before the tag would otherwise force full
+        # re-inference just to regenerate zero-byte skip markers.
         result = _finish_empty(
             skipped=sum(r["status"] == "skipped" for r in results), elapsed_sec=time.monotonic() - t0
         )
+        _cleanup()
         log.info(
             "Zone %s year %d: all %d live tiles skipped — marked complete empty (%s)",
             zone,
@@ -235,6 +277,7 @@ def fill_zone_year(
         run_id=run_id,
         n_workers=n_workers,
         gate=gate,
+        staged_labels=staged_labels,
         get_credentials=get_credentials,
         s3_region=s3_region,
         log=log,

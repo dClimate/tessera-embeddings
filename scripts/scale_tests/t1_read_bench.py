@@ -24,7 +24,7 @@ from scale_tests import harness
 from scale_tests import store_builder as SB
 from scale_tests import variants as V
 from scale_tests.seeding import embedding_group_spec, seed_groups
-from scale_tests.zone_geometry import YEARS, zone_for
+from scale_tests.zone_geometry import YEARS, MockZone, zone_for
 
 logger = logging.getLogger("scale_tests.t1")
 
@@ -89,8 +89,6 @@ def _variant(name: str) -> V.Variant:
 
 def _land_origins(zone_hw: tuple[int, int], variant: V.Variant, seed: int) -> list[tuple[int, int]]:
     """Pixel origins (y0, x0) of the variant's land chunks over the zone."""
-    from scale_tests.zone_geometry import MockZone
-
     zone = MockZone(zone_hw[0], zone_hw[1])
     _, cy, cx, _ = variant.chunks
     return [(yc * cy, xc * cx) for yc, xc in SB.land_chunks(zone, variant, fraction=LAND_FRACTION, seed=seed)]

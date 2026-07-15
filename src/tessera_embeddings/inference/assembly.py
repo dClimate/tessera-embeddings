@@ -48,7 +48,6 @@ from tessera_embeddings.config.inference import EMBEDDING_DIM, TimeWindow
 from tessera_embeddings.config.store_layout import INNER_PX, LEGACY, OBS_COUNT_VARS, StoreLayout
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
 from tessera_embeddings.inference.conventions import build_convention_attrs
-from tessera_embeddings.storage.campaign import run_provenance
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
@@ -66,6 +65,7 @@ from tessera_embeddings.storage.zarr_store import (
     read_time_values,
     time_index_of,
 )
+from tessera_embeddings.storage.zone_grid import year_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -279,8 +279,9 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     for tile in payload["clear"]:
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
         for arr in arrays.values():
-            shape = (1, y1 - y0, tile.width, *arr.shape[3:])
-            arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = np.full(shape, arr.fill_value, dtype=arr.dtype)
+            # Scalar assignment: zarr broadcasts per-chunk without materializing
+            # the selection (a full-band float32 block here would be ~2 GB).
+            arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = arr.fill_value
     for tile, path in payload["tiles"]:
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
         staged = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
@@ -319,14 +320,19 @@ class StagedShardSource:
     The global write path's 1:1 mapping (ADR-008 D3): one staged 2048-px
     inference tile is exactly one output shard, so ``live_shards`` is the staged
     tile grid positions and ``load`` returns each staged variable whole, with a
-    leading time axis. Frozen dataclass of plain strings/tuples so the shard
-    writer can pickle it to spawned workers.
+    leading time axis. Every tile is validated as it is read — exactly one
+    shard tall/wide and carrying every expected variable — so a truncated or
+    heterogeneous staged run fails loudly (naming the tile) instead of leaving
+    silent fill inside a shard of a year that then gets tagged complete. Frozen
+    dataclass of plain strings/tuples so the shard writer can pickle it to
+    spawned workers.
     """
 
     staging_base: str
     run_id: str
     shards: tuple[tuple[int, int], ...]
     variables: tuple[str, ...]
+    shard_px: int
 
     def live_shards(self) -> list[tuple[int, int]]:
         """The staged ``(row, col)`` tile positions — shard indices, 1:1."""
@@ -337,7 +343,21 @@ class StagedShardSource:
         sy, sx = shard
         path = f"{self.staging_base}/{self.run_id}/{chunk_label(sy, sx)}.zarr"
         group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
-        return {var: np.asarray(cast(zarr.Array, group[var])[:])[np.newaxis] for var in self.variables}
+        blocks: dict[str, np.ndarray] = {}
+        for var in self.variables:
+            if var not in group:
+                raise ValueError(
+                    f"Staged tile {path} is missing variable {var!r} (present in the probed tile) — "
+                    "heterogeneous staged run; re-stage or fix before assembling."
+                )
+            blocks[var] = np.asarray(cast(zarr.Array, group[var])[:])[np.newaxis]
+        h, w = blocks["embeddings"].shape[1:3]
+        if (h, w) != (self.shard_px, self.shard_px):
+            raise ValueError(
+                f"Staged tile {path} is {h} x {w} px but shards are {self.shard_px} px — "
+                "truncated or off-grid tile (ADR-008 D3 requires whole tiles)."
+            )
+        return blocks
 
 
 class ZarrWriter:
@@ -748,9 +768,12 @@ class ZarrWriter:
         path = self._staging_path(run_id, probe)
         try:
             group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
-            return {v for v in var_names if v in group}
-        except (FileNotFoundError, KeyError, zarr.errors.GroupNotFoundError):
-            return set()
+        except FileNotFoundError as exc:  # GroupNotFoundError subclasses this
+            # A silent empty set here would quietly drop every obs-count
+            # variable from the output; a probe that should exist but can't be
+            # opened is a corrupt/partial stage and must be loud.
+            raise IncompleteStageError(f"Cannot open staged probe chunk {path}: {exc}") from exc
+        return {v for v in var_names if v in group}
 
     def _create_schema(
         self,
@@ -828,7 +851,11 @@ class ZarrWriter:
           ROI only with a fresh date (or a fresh store).
 
         The fill itself is always the second, single data commit, so a crash
-        mid-fill leaves only an all-fill timestep that the re-run overwrites.
+        mid-fill leaves only an all-fill timestep that the re-run overwrites —
+        provided the re-run lands on the same time value. With the default
+        date-derived coordinate (no ``time_window``), retry the same day or
+        pass the original ``run_started_at`` explicitly; otherwise the crashed
+        date's all-fill timestep persists as a ghost.
 
         Inference only stages chunks that intersect the ROI mask and had valid
         pixels; everything else is never written, so those positions read back
@@ -948,21 +975,54 @@ class ZarrWriter:
         else:
             if manifest:
                 manifest.validate_against(extract_manifest(root.attrs), output_path)
-            times = read_time_values(root)
-            hits = np.flatnonzero(times == time_date)
-            if hits.size:
-                time_index = int(hits[0])
+            # The store's own grid is authoritative: raw region writes would
+            # silently land in a corner (or be clamp-truncated) on a mismatched
+            # extent — the loud check xarray's append used to provide.
+            emb = cast(zarr.Array, root["embeddings"])
+            if emb.shape[1] != total_y or emb.shape[2] != total_x:
+                raise ValueError(
+                    f"Mosaic extent ({total_y} x {total_x}) does not match existing store "
+                    f"{output_path} ({emb.shape[1]} x {emb.shape[2]}) — wrong output path or ROI grid."
+                )
+            # Variables staged by this run but absent from the store (e.g. a
+            # store created before obs counts, or compute_std newly on) are
+            # created schema-only at the current time extent; prior timesteps
+            # read back as the layout fill. The old engine silently wrote such
+            # variables MISALIGNED with the time axis — creating them properly
+            # is the loud-and-correct replacement.
+            missing = [v for v in variables if v not in root]
+            if missing:
+                nt = cast(zarr.Array, root["time"]).shape[0]
+                sizes = {"time": nt, "northing": total_y, "easting": total_x, "band": self.embedding_dim}
+                create_layout_arrays(root, layout, missing, sizes)
+                _log.info("Created missing variable(s) %s in %s from layout %s", missing, output_path, layout.name)
+            time_index_found = time_index_of(root, time_date)
+            if time_index_found is not None:
+                time_index = time_index_found
                 overwrite = True
+                if missing:
+                    session.commit(f"Run {run_id}: add variables {missing}")
+                untouched = [
+                    name
+                    for name, arr in root.arrays()
+                    if name != "time"
+                    and name not in variables
+                    and (getattr(arr.metadata, "dimension_names", None) or ("",))[0] == "time"
+                ]
                 _log.warning(
                     "Time %s already exists at index %d in %s — overwriting in place "
-                    "(live positions rewritten, skip-marked footprints reset to fill)",
+                    "(live positions rewritten, skip-marked footprints reset to fill%s)",
                     time_date,
                     time_index,
                     output_path,
+                    f"; NOT touched by this run: {untouched}" if untouched else "",
                 )
             else:
                 time_index = _extend_time_axis(root, time_date)
-                session.commit(f"Run {run_id}: extend time axis to {time_date}")
+                session.commit(
+                    f"Run {run_id}: extend time axis to {time_date}"
+                    + (f" (adding variables {missing})" if missing else "")
+                )
                 _log.info("Extended %s time axis to index %d (%s)", output_path, time_index, time_date)
 
         # --- Phase 2: banded parallel fill (fork/merge) -----------------------
@@ -1053,6 +1113,7 @@ class ZarrWriter:
         run_id: str,
         n_workers: int = 8,
         gate: CommitGate | None = None,
+        staged_labels: Iterable[str] | None = None,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
@@ -1070,8 +1131,13 @@ class ZarrWriter:
 
         The caller (the zone-fill runner) is responsible for staged-completeness
         verification against the campaign land mask
-        (:meth:`verify_staged_completeness`) — this method writes whatever tiles
-        are staged. ``embedding_std`` is never staged under v1.1.
+        (:meth:`verify_staged_completeness`) — pass its returned label set as
+        ``staged_labels`` so the verified inventory is, by construction, the
+        assembled inventory (and the staging prefix isn't re-LISTed); when
+        omitted, the staging prefix is listed here. The variable set is probed
+        from one tile (staged runs are homogeneous — one code version stages
+        one variable set); per-tile shape/variable validation happens as tiles
+        are read. ``embedding_std`` is never staged under v1.1.
 
         Args:
             store_path: URI of the global Icechunk repo
@@ -1084,6 +1150,8 @@ class ZarrWriter:
                 ``TARGET_AGGREGATE_S3_CONCURRENCY`` into the per-fork cap.
             gate: Optional commit gate shared across the zone-year fills this
                 process drives (fleet-wide gating is the orchestrator's job).
+            staged_labels: Pre-listed staged tile labels (e.g. the return of
+                :meth:`verify_staged_completeness`); ``None`` lists the prefix.
             get_credentials: Optional icechunk credential callback.
             s3_region: Optional S3 region override.
             log: Optional logger.
@@ -1093,7 +1161,7 @@ class ZarrWriter:
         """
         _log = log or logger
 
-        labels = self._list_staged_labels(run_id)
+        labels = sorted(staged_labels) if staged_labels is not None else self._list_staged_labels(run_id)
         if not labels:
             raise IncompleteStageError(f"Run {run_id!r} has no staged chunks under {self.staging_base}")
         shards = tuple(sorted(parse_chunk_label(label) for label in labels))
@@ -1108,7 +1176,7 @@ class ZarrWriter:
 
         # One readonly probe of the zone group: year index, shard pitch, variables.
         node = cast(zarr.Group, zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[zone])
-        year_index = time_index_of(node, np.datetime64(f"{year}-01-01", "ns"))
+        year_index = time_index_of(node, year_timestamp(year))
         if year_index is None:
             raise ValueError(
                 f"Year {year} is not on {zone}'s pre-allocated time axis "
@@ -1117,9 +1185,9 @@ class ZarrWriter:
             )
         shard_px = shard_pitch(cast(zarr.Array, node["embeddings"]))
 
-        # One probe of a staged tile: required vars, variable set, tile pitch
-        # (max(h, w) covers non-square edge tiles — zone grids don't have them,
-        # but the guard must not pass a half-tile).
+        # One probe of a staged tile: required vars, dtypes, variable set, and
+        # tile pitch (exact — a truncated half-tile must not pass; every other
+        # tile is re-validated by StagedShardSource.load as it is read).
         probe_path = f"{self.staging_base}/{run_id}/{labels[0]}.zarr"
         staged_group = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
         missing = [v for v in ("embeddings", "scales") if v not in staged_group]
@@ -1128,17 +1196,22 @@ class ZarrWriter:
                 f"Staged tile {probe_path} is missing required variable(s) {missing} — refusing to "
                 "mark the year complete over a corrupt or partial staged run."
             )
-        staged_px = max(cast(zarr.Array, staged_group["embeddings"]).shape[:2])
-        if staged_px != shard_px:
+        for var, want in (("embeddings", np.int8), ("scales", np.float32)):
+            got = cast(zarr.Array, staged_group[var]).dtype
+            if got != want:
+                raise IncompleteStageError(
+                    f"Staged tile {probe_path} has {var} dtype {got}, expected {np.dtype(want)} — "
+                    "a raw-zarr write would silently C-cast (wraparound); re-stage correctly."
+                )
+        staged_shape = tuple(cast(zarr.Array, staged_group["embeddings"]).shape[:2])
+        if staged_shape != (shard_px, shard_px):
             raise ValueError(
-                f"Staged tiles are {staged_px} px but {zone} shards are {shard_px} px — "
-                "the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
+                f"Staged tiles are {staged_shape[0]} x {staged_shape[1]} px but {zone} shards are "
+                f"{shard_px} px — the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
             )
         variables = tuple(
             v for v in ("embeddings", "scales", "embedding_std", *OBS_COUNT_VARS) if v in staged_group and v in node
         )
-
-        runs = run_provenance(node.attrs.get("runs"), year, run_id)
 
         _log.info(
             "Assembling %d staged tiles into %s/%s year %d (index %d, vars %s, %d workers)",
@@ -1150,7 +1223,9 @@ class ZarrWriter:
             list(variables),
             n_workers,
         )
-        source = StagedShardSource(staging_base=self.staging_base, run_id=run_id, shards=shards, variables=variables)
+        source = StagedShardSource(
+            staging_base=self.staging_base, run_id=run_id, shards=shards, variables=variables, shard_px=shard_px
+        )
         snapshot = write_year_shards(
             repo,
             zone,
@@ -1160,7 +1235,7 @@ class ZarrWriter:
             gate=gate,
             shard_px=shard_px,
             commit_msg=f"Run {run_id}: fill {zone} year {year}",
-            extra_attrs={"runs": runs},
+            run_id=run_id,
         )
         _log.info("Global assembly complete: %s/%s year %d (snapshot %s)", store_path, zone, year, snapshot)
         return snapshot
