@@ -86,6 +86,7 @@ class ZoneCoverage:
     tile_live: np.ndarray  # bool (n_tile_rows, n_tile_cols)
     chunk_live: np.ndarray  # bool (n_chunk_rows, n_chunk_cols)
     n_cells: int
+    n_clipped: int = 0  # cells whose footprint fell wholly outside the zone extent
 
     @property
     def n_live_tiles(self) -> int:
@@ -210,11 +211,18 @@ def build_zone_coverage(zone: str, lons: np.ndarray, lats: np.ndarray) -> ZoneCo
     tile_live = np.zeros((spec.height // SHARD_PX, spec.width // SHARD_PX), dtype=bool)
     chunk_live = np.zeros((spec.height // INNER_PX, spec.width // INNER_PX), dtype=bool)
     n_cells = len(lons)
+    n_clipped = 0
     if n_cells:
         r0, r1, c0, c1 = project_cells_to_pixel_boxes(lons, lats, spec)
         for i in range(n_cells):
             if r1[i] <= r0[i] or c1[i] <= c0[i]:
-                continue  # footprint clamped entirely outside the zone extent
+                # Footprint fell WHOLLY outside the zone extent — e.g. a cell
+                # centre beyond UTM's usable range (>84°N / <80°S) whose zone
+                # grid can't represent it. It set no coverage bit; count it so
+                # build_all can surface the loss loudly rather than dropping it
+                # silently. (The v1.1 registry is 59.45°S–83.65°N, so this is 0.)
+                n_clipped += 1
+                continue
             tile_live[
                 r0[i] // SHARD_PX : _ceil_div(r1[i], SHARD_PX),
                 c0[i] // SHARD_PX : _ceil_div(c1[i], SHARD_PX),
@@ -223,7 +231,7 @@ def build_zone_coverage(zone: str, lons: np.ndarray, lats: np.ndarray) -> ZoneCo
                 r0[i] // INNER_PX : _ceil_div(r1[i], INNER_PX),
                 c0[i] // INNER_PX : _ceil_div(c1[i], INNER_PX),
             ] = True
-    return ZoneCoverage(zone=zone, tile_live=tile_live, chunk_live=chunk_live, n_cells=n_cells)
+    return ZoneCoverage(zone=zone, tile_live=tile_live, chunk_live=chunk_live, n_cells=n_cells, n_clipped=n_clipped)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -353,6 +361,14 @@ def build_all(
         n_cells_total += cov.n_cells
         n_live_total += cov.n_live_tiles
         zones_with_cells += int(cov.n_cells > 0)
+        if cov.n_clipped:
+            log.warning(
+                "Zone %s: %d/%d registry cell(s) fell outside the UTM zone extent (polar / out-of-range) "
+                "and set NO coverage — they are not representable in this zone grid.",
+                zone,
+                cov.n_clipped,
+                cov.n_cells,
+            )
         log.debug("Zone %s: %d cells → %d live tiles", zone, cov.n_cells, cov.n_live_tiles)
 
     snapshot = session.commit(

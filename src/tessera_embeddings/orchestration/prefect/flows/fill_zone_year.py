@@ -36,7 +36,11 @@ from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.data_loading import resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
-from tessera_embeddings.orchestration.runners.zone_fill import fill_zone_year, zone_has_live_tiles
+from tessera_embeddings.orchestration.runners.zone_fill import (
+    fill_zone_year,
+    zone_has_live_tiles,
+    zone_year_complete,
+)
 from tessera_embeddings.providers.aws.ray import cleanup_ray_tempfiles, terminate_ray_instances_by_tag
 
 # Module-level state for the cancellation hook (set on entry, cleared on exit).
@@ -145,19 +149,24 @@ def fill_zone_year_flow(
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
     from tessera_embeddings.providers.aws.ray import ray_cluster
 
+    store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     mosaic_base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}"
 
-    # Preflight BEFORE probing mosaics or provisioning Ray: an all-ocean cell has
-    # no GPU work (and may have no mosaic store to probe), so short-circuit ahead
-    # of resolve_s1_orbit — which would raise InsufficientCoverageError on a
-    # missing store — and ahead of cluster creation. The 8 all-ocean zones alone
-    # are 72 no-op cells over the campaign. fill_zone_year re-reads + attr-validates
-    # the coverage as the authority.
+    # Preflight BEFORE probing mosaics or provisioning Ray. GPU work is needed
+    # only when the cell has live coverage AND isn't already complete:
+    #  - all-ocean cell (no live tiles): may have no mosaic to probe; fill empty.
+    #  - already-complete cell: the campaign dispatches landed-but-untagged cells
+    #    for crash recovery, where fill_zone_year merely re-creates the tag — no
+    #    inference, so don't pay for a cluster.
+    # Both short-circuit ahead of resolve_s1_orbit (which raises on a missing
+    # store) and cluster creation; fill_zone_year re-validates as the authority.
     has_live = zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials)
+    already_complete = zone_year_complete(store_path, zone, year, get_credentials=iam_icechunk_credentials)
+    needs_cluster = has_live and not already_complete
 
     # resolve_s1_orbit probes the mosaics, so only do it when we'll actually infer.
-    resolved_s1 = resolve_s1_orbit(mosaic_base, s1_orbit) if has_live else s1_orbit
+    resolved_s1 = resolve_s1_orbit(mosaic_base, s1_orbit) if needs_cluster else s1_orbit
     # Default to the strict Jan-Dec calendar-year window for `year` (our global
     # convention: `December {year}` yields a 12-month window spanning Jan-Dec).
     # `time_window_end` overrides for rolling windows — the runner's window check
@@ -173,7 +182,7 @@ def fill_zone_year_flow(
     gate = _PrefectCommitGate(commit_limit_name) if commit_limit_name else None
 
     fill_kwargs: dict[str, Any] = {
-        "store_path": paths.global_store(store_name),
+        "store_path": store_path,
         "zone": zone,
         "year": year,
         "land_mask_path": land_mask_path,
@@ -188,8 +197,9 @@ def fill_zone_year_flow(
         "get_credentials": iam_icechunk_credentials,
     }
 
-    if not has_live:
-        log.info("Zone %s year %d has no live tiles — filling empty without a Ray cluster", zone, year)
+    if not needs_cluster:
+        reason = "already complete (retag only)" if already_complete else "no live tiles (all-ocean)"
+        log.info("Zone %s year %d %s — filling without a Ray cluster", zone, year, reason)
         return fill_zone_year(**fill_kwargs)
 
     global _active_resolved_yaml, _active_cluster_name

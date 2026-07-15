@@ -442,6 +442,30 @@ def test_all_ocean_cell_skips_missing_mosaic(tmp_path, monkeypatch):
     assert summary["live_tiles"] == 0
 
 
+def test_zone_year_complete_reflects_years_complete(tmp_path, monkeypatch):
+    """The preflight helper reports False before a fill (and for an unseeded
+    zone) and True once the (zone, year) has landed."""
+    store = _seed_global(tmp_path)
+    assert zone_fill.zone_year_complete(store, _ZONE, 2025) is False
+    assert zone_fill.zone_year_complete(store, "32660", 2025) is False  # not seeded in this store
+
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
+    zone_fill.fill_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2025,
+        land_mask_path=_make_mask(tmp_path, [(0, 0)]),
+        mosaic_base=_make_mosaic(tmp_path),
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="rc",
+    )
+    assert zone_fill.zone_year_complete(store, _ZONE, 2025) is True
+    assert zone_fill.zone_year_complete(store, _ZONE, 2024) is False
+
+
 def test_zone_has_live_tiles_true(tmp_path):
     """The preflight reports live coverage so the flow provisions a cluster."""
     mask = _make_mask(tmp_path, [(0, 0)])

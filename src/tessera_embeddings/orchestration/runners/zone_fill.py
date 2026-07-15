@@ -91,6 +91,28 @@ def zone_has_live_tiles(
     return bool(np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool).any())
 
 
+def zone_year_complete(
+    store_path: str,
+    zone: str,
+    year: int,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> bool:
+    """Whether ``(zone, year)`` is already recorded in the group's ``years_complete``.
+
+    A cheap metadata read so a caller can skip provisioning a GPU cluster for a
+    crash-recovery retry of a landed-but-untagged cell (:func:`fill_zone_year`
+    re-checks and, for such a cell, only re-creates the tag — no inference).
+    Returns False for an unseeded zone.
+    """
+    repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
+    if zone not in root:
+        return False
+    return year in read_years_complete(cast(zarr.Group, root[zone]))
+
+
 def fill_zone_year(
     *,
     store_path: str,
@@ -283,7 +305,7 @@ def fill_zone_year(
     # coordinate endpoints against the seeded group, the grid authority. (Read
     # only now — an all-ocean cell already returned above without touching the
     # mosaic, which may not even exist.)
-    spatial = read_spatial_coords(mosaic_base)
+    spatial = read_spatial_coords(mosaic_base, get_credentials=get_credentials, s3_region=s3_region)
     total_y, total_x = len(spatial.northing), len(spatial.easting)
     if (total_y, total_x) != (ny, nx):
         raise ValueError(

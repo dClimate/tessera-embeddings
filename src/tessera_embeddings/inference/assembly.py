@@ -61,7 +61,7 @@ from tessera_embeddings.storage.shard_writer import (
 from tessera_embeddings.storage.zarr_store import (
     manifest_split,
     open_or_create_repo,
-    open_store,
+    open_store_as_zarr_group,
     read_time_values,
     time_index_of,
 )
@@ -170,28 +170,36 @@ def _s5cmd_rm(s3_url: str, log: logging.Logger | logging.LoggerAdapter[logging.L
         log.info("s5cmd: no objects found under %s", s3_url)
 
 
-def read_spatial_coords(mosaic_base: str) -> SpatialCoords:
+def read_spatial_coords(
+    mosaic_base: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> SpatialCoords:
     """Read projected x/y coordinates and CRS from the reflectance store.
+
+    Reads via the raw-zarr opener — the 1-D coord arrays and root attrs off
+    metadata, never an xarray/dask graph over the store's data chunks (this runs
+    once per zone-year fill). ``get_credentials``/``s3_region`` are threaded to
+    the opener so an S3 mosaic that authenticates only through the campaign's
+    credential callback (or lives outside the default region) is readable.
 
     Args:
         mosaic_base: Base path for the mosaic stores (e.g., "s3://bucket/mosaics/roi").
+        get_credentials: Optional icechunk credential callback for the mosaic store.
+        s3_region: Optional S3 region override.
 
     Returns:
         SpatialCoords with projected northing and easting arrays.
     """
     reflectance_path = f"{mosaic_base}/reflectance.zarr"
     logger.info("Reading projected coordinates from %s", reflectance_path)
-    # chunks=None: read only the 1-D coord arrays + attrs off metadata, never
-    # building a dask graph over the store's data chunks (this runs once per
-    # zone-year fill, so the graph would be pure overhead on the runner).
-    ref_ds = open_store(reflectance_path, chunks=None)
-    coords = SpatialCoords(
-        northing=ref_ds["northing"].values,
-        easting=ref_ds["easting"].values,
-        crs=ref_ds.attrs.get("crs"),
+    root = open_store_as_zarr_group(reflectance_path, get_credentials=get_credentials, region=s3_region)
+    return SpatialCoords(
+        northing=np.asarray(cast(zarr.Array, root["northing"])),
+        easting=np.asarray(cast(zarr.Array, root["easting"])),
+        crs=cast("str | None", root.attrs.get("crs")),
     )
-    ref_ds.close()
-    return coords
 
 
 # =============================================================================
@@ -977,7 +985,7 @@ class ZarrWriter:
         # Projected coordinates and CRS from the input reflectance store.
         spatial: SpatialCoords | None = None
         if mosaic_base:
-            spatial = read_spatial_coords(mosaic_base)
+            spatial = read_spatial_coords(mosaic_base, get_credentials=get_credentials, s3_region=s3_region)
             _log.info("Using projected coordinates from %s", mosaic_base)
 
         if time_window:
@@ -1277,6 +1285,10 @@ class ZarrWriter:
                 "the axis is fixed at seeding (ADR-008 D1)."
             )
         shard_px = shard_pitch(cast(zarr.Array, node["embeddings"]))
+        # Destination band width is the grid authority for the staged-tile band
+        # check — NOT ZarrWriter.embedding_dim, which defaults to 128 and needn't
+        # match a zone seeded at a different band.
+        dest_band = int(cast(zarr.Array, node["embeddings"]).shape[-1])
 
         # One probe of a staged tile: required vars, dtypes, variable set, and
         # tile pitch (exact — a truncated half-tile must not pass; every other
@@ -1330,7 +1342,7 @@ class ZarrWriter:
             variables=variables,
             shard_px=shard_px,
             dtypes=probe_dtypes,
-            embedding_dim=self.embedding_dim,
+            embedding_dim=dest_band,
         )
         snapshot = write_year_shards(
             repo,
