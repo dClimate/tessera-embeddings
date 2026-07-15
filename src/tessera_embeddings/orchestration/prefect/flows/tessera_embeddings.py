@@ -188,7 +188,11 @@ def tessera_embeddings(
     mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
     log.info("Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s", roi_name, mosaic_base, run_id)
 
-    resolved_s1_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
+    # Probe the SAR stores with the same credential callback the assemble step
+    # uses, so orbit resolution doesn't fall back to the default Icechunk chain.
+    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+
+    resolved_s1_orbit = resolve_s1_orbit(mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials)
     if resolved_s1_orbit != s1_orbit:
         log.info("s1_orbit resolved: %s → %s", s1_orbit, resolved_s1_orbit)
 

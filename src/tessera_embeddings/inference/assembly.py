@@ -813,22 +813,35 @@ class ZarrWriter:
         return valid
 
     def _staged_vars_present(self, run_id: str, chunks: list[ChunkSpec], var_names: tuple[str, ...]) -> set[str]:
-        """Check which variables exist in the staged Zarrs.
+        """Check which of *var_names* exist in the staged Zarrs.
 
-        Probes the largest chunk (edge chunks may lack interior geometry).
-        Opens the zarr group once and checks all variable names. Callers must
-        pass only chunks that have staged files.
+        Probes the two LARGEST chunks (edge chunks may lack interior geometry)
+        and requires them to agree: inferring the variable set from a single
+        tile lets a heterogeneous or resumed stage — old tiles staged without
+        obs counts mixed with newer tiles that have them — silently drop the
+        extra variable from every write. A disagreement is a hard stop instead.
+        Callers must pass only chunks that have staged files.
         """
-        probe = max(chunks, key=lambda c: c.height * c.width)
-        path = self._staging_path(run_id, probe)
-        try:
-            group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
-        except FileNotFoundError as exc:  # GroupNotFoundError subclasses this
-            # A silent empty set here would quietly drop every obs-count
-            # variable from the output; a probe that should exist but can't be
-            # opened is a corrupt/partial stage and must be loud.
-            raise IncompleteStageError(f"Cannot open staged probe chunk {path}: {exc}") from exc
-        return {v for v in var_names if v in group}
+        ranked = sorted(chunks, key=lambda c: c.height * c.width, reverse=True)
+        present: set[str] | None = None
+        for probe in ranked[:2]:
+            path = self._staging_path(run_id, probe)
+            try:
+                group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
+            except FileNotFoundError as exc:  # GroupNotFoundError subclasses this
+                # A silent empty set here would quietly drop every obs-count
+                # variable from the output; a probe that should exist but can't be
+                # opened is a corrupt/partial stage and must be loud.
+                raise IncompleteStageError(f"Cannot open staged probe chunk {path}: {exc}") from exc
+            found = {v for v in var_names if v in group}
+            if present is None:
+                present = found
+            elif found != present:
+                raise IncompleteStageError(
+                    f"Heterogeneous staged run {run_id}: staged tiles disagree on optional vars "
+                    f"({sorted(present)} vs {sorted(found)}) — re-stage with a single inference config."
+                )
+        return present or set()
 
     def _create_schema(
         self,
@@ -1023,8 +1036,24 @@ class ZarrWriter:
             if is_new:
                 repo.save_config()
 
+        # Publish atomically: run the whole schema/extend + data lifecycle on a
+        # private work branch and fast-forward `main` only once the timestep's
+        # data has landed. Committing Phase 1 to `main` directly would advertise
+        # a resized array + new time coordinate (or, for a fresh store, an empty
+        # schema) BEFORE any worker writes — so a crash in Phase 2/3 would leave
+        # `main` serving an all-fill timestep. On the work branch `main` never
+        # observes the half-written state; a failed run leaves it untouched. One
+        # writer per single-ROI store (the campaign uses assemble_global), so a
+        # fixed branch name is safe; a stale ref from a crashed prior attempt is
+        # reset here rather than left to accumulate.
+        base_snapshot = repo.lookup_branch("main")
+        work_branch = "_assemble-wip"
+        if work_branch in repo.list_branches():
+            repo.delete_branch(work_branch)
+        repo.create_branch(work_branch, base_snapshot)
+
         # --- Phase 1: schema (create) or time-axis placement (extend) --------
-        session = repo.writable_session("main")
+        session = repo.writable_session(work_branch)
         root = zarr.open_group(session.store, mode="a")
         overwrite = False
         # "time" absent means a created-but-never-seeded repo (e.g. a crash
@@ -1053,12 +1082,13 @@ class ZarrWriter:
             # coordinate endpoints against the stored grid (half-pixel absolute
             # tolerance, as in the zone-fill runner) when mosaic coords are known.
             #
-            # CRS is checked only when present: it is written in Phase 3, so a
-            # fresh create that crashed after the schema commit (Phase 1) reaches
-            # this branch on retry with no CRS yet. The coordinate ARRAYS, though,
-            # are committed in Phase 1 — so validate endpoints even on that
-            # recovery path, or a shifted retry mosaic would write positionally
-            # over the already-committed grid.
+            # CRS is checked only when present. Atomic publish (the work-branch
+            # fast-forward below) means `main` only ever exposes a COMPLETE store
+            # — CRS included — so a normal re-append always sees it; the None
+            # guard is kept defensive, covering a legacy store left partial by a
+            # pre-atomic-publish engine. The coordinate ARRAYS are the real check
+            # here: comparing endpoints catches a shifted/reversed retry mosaic
+            # that would otherwise write positionally over the existing grid.
             if spatial is not None:
                 stored_crs = root.attrs.get("crs")
                 if stored_crs is not None and spatial.crs != stored_crs:
@@ -1095,8 +1125,13 @@ class ZarrWriter:
             if time_index_found is not None:
                 time_index = time_index_found
                 overwrite = True
-                if missing:
-                    session.commit(f"Run {run_id}: add variables {missing}")
+                # A time-dependent array the store carries but THIS run does not
+                # write (e.g. a store seeded with embedding_std, now filled with
+                # std off; or the other S1 orbit's obs count on a single-orbit
+                # fill) would otherwise keep its PRIOR values at this timestep
+                # while embeddings/scales are overwritten — stale metadata
+                # describing data that no longer exists. Reset those slices to
+                # fill so the overwritten timestep is internally consistent.
                 untouched = [
                     name
                     for name, arr in root.arrays()
@@ -1104,13 +1139,23 @@ class ZarrWriter:
                     and name not in variables
                     and (getattr(arr.metadata, "dimension_names", None) or ("",))[0] == "time"
                 ]
+                for name in untouched:
+                    arr = cast(zarr.Array, root[name])
+                    arr[time_index] = arr.fill_value if arr.fill_value is not None else 0
+                # Newly created vars and the untouched-reset must be committed
+                # before the Phase 2 fork, which opens a fresh session here.
+                if missing or untouched:
+                    parts = ([f"add {missing}"] if missing else []) + (
+                        [f"reset untouched {untouched}"] if untouched else []
+                    )
+                    session.commit(f"Run {run_id}: overwrite {time_date} — {'; '.join(parts)}")
                 _log.warning(
                     "Time %s already exists at index %d in %s — overwriting in place "
                     "(live positions rewritten, skip-marked footprints reset to fill%s)",
                     time_date,
                     time_index,
                     output_path,
-                    f"; NOT touched by this run: {untouched}" if untouched else "",
+                    f"; untouched vars reset to fill: {untouched}" if untouched else "",
                 )
             else:
                 time_index = _extend_time_axis(root, time_date)
@@ -1121,7 +1166,7 @@ class ZarrWriter:
                 _log.info("Extended %s time axis to index %d (%s)", output_path, time_index, time_date)
 
         # --- Phase 2: banded parallel fill (fork/merge) -----------------------
-        session = repo.writable_session("main")
+        session = repo.writable_session(work_branch)
         granularity = _write_granularity(zarr.open_group(session.store, mode="r"), variables)
         # Weight bands by live tiles so clustered ROIs don't starve most workers.
         unit_weights = [0] * (-(-total_y // granularity))
@@ -1196,6 +1241,12 @@ class ZarrWriter:
         node.attrs.update(attrs)
 
         commit_with_rebase(session, f"Run {run_id}: {len(chunks)} chunks assembled")
+        # Atomic publish: fast-forward `main` to the fully-written tip. The guard
+        # fails loudly if another writer advanced `main` since we branched (two
+        # processes assembling the same ROI store — unsupported). Then drop the
+        # work ref; `main` now retains the snapshot.
+        repo.reset_branch("main", repo.lookup_branch(work_branch), from_snapshot_id=base_snapshot)
+        repo.delete_branch(work_branch)
         _log.info("Assembly complete: %s", output_path)
         return output_path
 
@@ -1323,6 +1374,43 @@ class ZarrWriter:
         variables = tuple(
             v for v in ("embeddings", "scales", "embedding_std", *OBS_COUNT_VARS) if v in staged_group and v in node
         )
+
+        # The probe (labels[0]) alone fixes the variable set, so a heterogeneous
+        # or resumed stage — old tiles staged without obs counts mixed with newer
+        # tiles that have them — would silently drop the extra variable from EVERY
+        # shard write. Cross-check the last tile's optional-variable set against
+        # the probe; StagedShardSource.load then enforces the set per tile as it
+        # reads (a tile MISSING an expected var is already loud), turning a silent
+        # drop into a hard stop.
+        optional = ("embedding_std", *OBS_COUNT_VARS)
+        if len(labels) > 1:
+            tail_path = f"{self.staging_base}/{run_id}/{labels[-1]}.zarr"
+            tail_group = zarr.open_group(tail_path, mode="r", storage_options=_staged_storage_options(tail_path))
+            probe_opt = {v for v in optional if v in staged_group and v in node}
+            tail_opt = {v for v in optional if v in tail_group and v in node}
+            if probe_opt != tail_opt:
+                raise IncompleteStageError(
+                    f"Heterogeneous staged run {run_id}: probe tile {labels[0]} carries optional vars "
+                    f"{sorted(probe_opt)} but tile {labels[-1]} carries {sorted(tail_opt)} — re-stage "
+                    "with a single inference config before assembling."
+                )
+
+        # Validate each staged variable's dtype against its DESTINATION array, not
+        # just embeddings/scales (asserted int8/float32 above): a raw-zarr shard
+        # write does a silent C-cast, so a uniformly int64/uint32 observation
+        # count — which agrees with the probe, so StagedShardSource's tile-vs-probe
+        # check passes — would be narrowed into a seeded uint16 without this guard.
+        for v in variables:
+            if v in ("embeddings", "scales"):
+                continue
+            staged_dt = cast(zarr.Array, staged_group[v]).dtype
+            dest_dt = cast(zarr.Array, node[v]).dtype
+            if staged_dt != dest_dt:
+                raise IncompleteStageError(
+                    f"Staged tile {probe_path} has {v} dtype {staged_dt} but {zone}/{v} is seeded "
+                    f"{dest_dt} — a raw-zarr write would silently C-cast; re-stage at the seeded dtype."
+                )
+
         probe_dtypes = tuple((v, str(cast(zarr.Array, staged_group[v]).dtype)) for v in variables)
 
         _log.info(

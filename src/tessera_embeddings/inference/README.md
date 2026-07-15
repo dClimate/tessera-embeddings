@@ -161,8 +161,10 @@ directly from `root["time"]`. `data_loading.py` imports neither `xarray` nor `da
 
 S1 SAR: VV is read first to identify non-empty timesteps, then VH is loaded for survivors.
 Both ascending and descending stores are loaded when `s1_orbit="both"`;
-`resolve_s1_orbit(mosaic_base, s1_orbit)` probes for available stores and falls back
-gracefully when only one orbit was ingested.
+`resolve_s1_orbit(mosaic_base, s1_orbit, *, get_credentials=None, s3_region=None)` probes
+for available stores and falls back gracefully when only one orbit was ingested. Callers
+thread the same credential callback / region they use for the rest of the fill, so the
+probe doesn't drop to the default Icechunk credential chain in a callback-only deployment.
 
 Output: `ChunkData` — numpy arrays for S2 bands/masks/DOYs, S1 ascending/descending
 bands/DOYs, and per-pixel observation counts (`s2_obs_count`, `s1_asc_obs_count`,
@@ -366,6 +368,9 @@ equal-height bands would leave most workers idle while one dragged the assembly:
 
   coordinator:  session.fork() ──► workers write bands ──► merge(*forks)
                 └── one data commit via commit_with_rebase ──┘
+
+  atomic publish:  branch _assemble-wip ──► phases 1–3 commit here ──► fast-forward main
+                   └── main only advances once the timestep's data is fully written ──┘
 ```
 
 Within a band, tile x-boundaries still cut output chunks mid-chunk; those partial chunks
@@ -377,17 +382,27 @@ read-your-writes, so the merged result is exact.
 1. Re-run `filter_chunks_by_roi_mask` to recover the set of live chunk labels (the list
    isn't marshaled through Prefect; the ROI zarr path is the source of truth), minus
    skip-marked chunks.
-2. **Phase 1 (metadata commit)** — fresh store: create the layout's array schemas + coord
-   arrays (no chunk data; cost independent of extent). Existing store: validate the
-   `_manifest`, then either resize every time-dimmed array by one step (an append IS a
-   resize + write at the new index) or, when the time value already exists, target its
-   index for an in-place overwrite — **idempotent resume**: a crashed assembly re-run
-   lands on the same index instead of appending a duplicate timestep.
-3. **Phase 2 (data commit)** — fork the session; each worker process writes its band's
-   staged-tile y-slices into every output array; the coordinator merges the forks, sets
-   root attrs (run metadata, GeoZarr conventions, `_manifest`, merged `time_windows`),
-   and commits once via `commit_with_rebase`.
-4. Delete the staged chunk zarrs (unless `cleanup_staging=False`).
+2. **Phase 1 (schema / time-axis placement)** — all phases run on a private `_assemble-wip`
+   branch, never on `main` directly (see *atomic publish* below). Fresh store: create the
+   layout's array schemas + coord arrays (no chunk data; cost independent of extent).
+   Existing store: validate the `_manifest`, then either resize every time-dimmed array by
+   one step (an append IS a resize + write at the new index) or, when the time value already
+   exists, target its index for an in-place overwrite — **idempotent resume**: a crashed
+   assembly re-run lands on the same index instead of appending a duplicate timestep. On an
+   overwrite, any time-dimmed array this run does NOT write (e.g. `embedding_std` when std
+   is now off, or the other S1 orbit's obs count) is reset to fill at that index, so no
+   stale slice describes the overwritten data.
+3. **Phase 2 (data)** — fork the session; each worker process writes its band's staged-tile
+   y-slices into every output array; the coordinator merges the forks, sets root attrs (run
+   metadata, GeoZarr conventions, `_manifest`, merged `time_windows`), and commits once via
+   `commit_with_rebase`.
+4. **Atomic publish** — fast-forward `main` to the fully-written work-branch tip (guarded by
+   `from_snapshot_id`, so a concurrent writer to the same store fails loudly), then drop the
+   work branch. `main` never observes the half-written state: committing Phase 1 to `main`
+   directly would advertise a resized array + new time coordinate (or, for a fresh store, an
+   empty schema) before any worker writes, so a crash in Phase 2/3 would leave `main` serving
+   an all-fill timestep.
+5. Delete the staged chunk zarrs (unless `cleanup_staging=False`).
 
 The **global-campaign variant**, `writer.assemble_global`, skips the banding entirely:
 one staged 2048-px tile is exactly one output shard (D3), so whole tiles round-robin

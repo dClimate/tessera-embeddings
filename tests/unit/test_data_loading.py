@@ -406,7 +406,7 @@ class TestResolveS1Orbit:
 
     @staticmethod
     def _probe(present_orbits):
-        def _open_store(path):
+        def _open_store(path, **kwargs):  # accepts get_credentials/region like the real opener
             for orbit in ("ascending", "descending"):
                 if f"sar_{orbit}" in path:
                     if orbit in present_orbits:
@@ -442,6 +442,23 @@ class TestResolveS1Orbit:
             pytest.raises(InsufficientCoverageError, match="no SAR stores found"),
         ):
             resolve_s1_orbit("s3://b/m", "both")
+
+    def test_probe_threads_credentials_and_region(self):
+        """The SAR probe must use the caller's credential callback / region, not
+        the default Icechunk chain — else orbit resolution fails in deployments
+        that need the callback.
+        """
+
+        def _creds():
+            return object()
+
+        probe = self._probe({"ascending", "descending"})
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=probe) as m:
+            resolve_s1_orbit("s3://b/m", "both", get_credentials=_creds, s3_region="us-west-2")
+        assert m.call_count == 2
+        for call in m.call_args_list:
+            assert call.kwargs["get_credentials"] is _creds
+            assert call.kwargs["region"] == "us-west-2"
 
 
 class TestSharedStoreOpener:

@@ -113,6 +113,28 @@ def zone_year_complete(
     return year in read_years_complete(cast(zarr.Group, root[zone]))
 
 
+def zone_year_on_axis(
+    store_path: str,
+    zone: str,
+    year: int,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> bool:
+    """Whether ``year`` falls on ``zone``'s pre-allocated time axis.
+
+    A cheap metadata read (no mask, no mosaic) so a caller can decline to
+    provision a GPU cluster for an off-axis / unseeded year: :func:`fill_zone_year`
+    rejects such a year up front, but only after the flow would otherwise have
+    stood up Ray. Returns False for an unseeded zone or an off-axis year.
+    """
+    repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
+    if zone not in root:
+        return False
+    return time_index_of(cast(zarr.Group, root[zone]), year_timestamp(year)) is not None
+
+
 def fill_zone_year(
     *,
     store_path: str,

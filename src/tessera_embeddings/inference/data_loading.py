@@ -228,7 +228,13 @@ def _active_orbits(s1_orbit: str) -> tuple[str, ...]:
     raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
 
 
-def resolve_s1_orbit(mosaic_base: str, s1_orbit: str) -> str:
+def resolve_s1_orbit(
+    mosaic_base: str,
+    s1_orbit: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> str:
     """Downgrade ``s1_orbit="both"`` to a single orbit when only one store exists.
 
     ``"both"`` is a request, not a guarantee — if upstream ingestion only wrote
@@ -238,6 +244,11 @@ def resolve_s1_orbit(mosaic_base: str, s1_orbit: str) -> str:
 
     ``"ascending"`` / ``"descending"`` are returned unchanged without probing;
     a missing store at that point is an error surfaced downstream.
+
+    The SAR stores are opened with the SAME credential callback / region that
+    the runner uses for the rest of the fill (``get_credentials`` / ``s3_region``);
+    without them the probe would fall back to the default Icechunk credential
+    chain and fail at orbit resolution in any deployment that needs the callback.
     """
     if s1_orbit != "both":
         _active_orbits(s1_orbit)  # validates
@@ -247,7 +258,7 @@ def resolve_s1_orbit(mosaic_base: str, s1_orbit: str) -> str:
     for orbit in ("ascending", "descending"):
         path = f"{mosaic_base}/sar_{orbit}.zarr"
         try:
-            open_store_as_zarr_group(path)
+            open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
             present.append(orbit)
         except (FileNotFoundError, icechunk.IcechunkError):
             logger.info("SAR %s store not present at %s — will be excluded", orbit, path)

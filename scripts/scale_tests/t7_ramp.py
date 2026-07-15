@@ -36,8 +36,17 @@ def _put_many(bucket: str, prefix: str, concurrency: int, n_objects: int) -> tup
 
     # botocore's default pool is 10 connections; without this the high ramp
     # levels would serialize on the pool and never actually hit S3 at the
-    # requested concurrency.
-    client = boto3.client("s3", config=Config(max_pool_connections=max(10, concurrency)))
+    # requested concurrency. Retries are disabled (total_max_attempts=1) so
+    # EVERY 503 is counted: T7 measures the raw throttle rate, and botocore's
+    # default internal retry would silently absorb transient SlowDowns that
+    # later succeed, making the ramp under-report throttling.
+    client = boto3.client(
+        "s3",
+        config=Config(
+            max_pool_connections=max(10, concurrency),
+            retries={"total_max_attempts": 1, "mode": "standard"},
+        ),
+    )
     body = b"\0" * OBJECT_BYTES
     slowdowns = 0
 

@@ -40,6 +40,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     fill_zone_year,
     zone_has_live_tiles,
     zone_year_complete,
+    zone_year_on_axis,
 )
 from tessera_embeddings.providers.aws.ray import cleanup_ray_tempfiles, terminate_ray_instances_by_tag
 
@@ -153,20 +154,35 @@ def fill_zone_year_flow(
     land_mask_path = paths.land_mask_store(mask_name)
     mosaic_base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}"
 
-    # Preflight BEFORE probing mosaics or provisioning Ray. GPU work is needed
-    # only when the cell has live coverage AND isn't already complete:
-    #  - all-ocean cell (no live tiles): may have no mosaic to probe; fill empty.
+    # Preflight in ascending cost order — cheapest global-store metadata reads
+    # first, then the mask, then (only if we will truly infer) the mosaic probe
+    # and Ray. GPU work is needed ONLY for a cell that is on-axis, not already
+    # complete, AND has live coverage. Each cheaper short-circuit avoids the more
+    # expensive reads below it; fill_zone_year re-validates as the authority.
     #  - already-complete cell: the campaign dispatches landed-but-untagged cells
-    #    for crash recovery, where fill_zone_year merely re-creates the tag — no
-    #    inference, so don't pay for a cluster.
-    # Both short-circuit ahead of resolve_s1_orbit (which raises on a missing
-    # store) and cluster creation; fill_zone_year re-validates as the authority.
-    has_live = zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials)
+    #    for crash recovery, where fill_zone_year merely re-creates the tag. This
+    #    needs ONLY the global store — so it is checked before the land mask,
+    #    whose unavailability must never block a retag-only recovery.
+    #  - off-axis / unseeded year: fill_zone_year rejects it outright, so resolve
+    #    it here (a global-store read) BEFORE standing up a cluster we'd tear
+    #    straight back down.
+    #  - all-ocean cell (no live tiles): may have no mosaic to probe; fill empty.
     already_complete = zone_year_complete(store_path, zone, year, get_credentials=iam_icechunk_credentials)
-    needs_cluster = has_live and not already_complete
+    on_axis = already_complete or zone_year_on_axis(store_path, zone, year, get_credentials=iam_icechunk_credentials)
+    # Only touch the mask once completion + axis are cleared: an unavailable mask
+    # must not block retag-only recovery, and an off-axis year needs no mask.
+    has_live = (
+        zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials)
+        if (on_axis and not already_complete)
+        else False
+    )
+    needs_cluster = on_axis and not already_complete and has_live
 
-    # resolve_s1_orbit probes the mosaics, so only do it when we'll actually infer.
-    resolved_s1 = resolve_s1_orbit(mosaic_base, s1_orbit) if needs_cluster else s1_orbit
+    # resolve_s1_orbit probes the mosaics (with the same credential callback the
+    # rest of the fill uses), so only do it when we'll actually infer.
+    resolved_s1 = (
+        resolve_s1_orbit(mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials) if needs_cluster else s1_orbit
+    )
     # Default to the strict Jan-Dec calendar-year window for `year` (our global
     # convention: `December {year}` yields a 12-month window spanning Jan-Dec).
     # `time_window_end` overrides for rolling windows — the runner's window check
@@ -198,8 +214,13 @@ def fill_zone_year_flow(
     }
 
     if not needs_cluster:
-        reason = "already complete (retag only)" if already_complete else "no live tiles (all-ocean)"
-        log.info("Zone %s year %d %s — filling without a Ray cluster", zone, year, reason)
+        if already_complete:
+            reason = "already complete (retag only)"
+        elif not on_axis:
+            reason = "year off the pre-allocated axis (runner will reject)"
+        else:
+            reason = "no live tiles (all-ocean)"
+        log.info("Zone %s year %d %s — no Ray cluster", zone, year, reason)
         return fill_zone_year(**fill_kwargs)
 
     global _active_resolved_yaml, _active_cluster_name

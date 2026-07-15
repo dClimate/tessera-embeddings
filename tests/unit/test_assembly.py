@@ -531,6 +531,56 @@ class TestAssembly:
         np.testing.assert_array_almost_equal(ds["embedding_std"].values[0, ...], std1, decimal=5)
         np.testing.assert_array_almost_equal(ds["embedding_std"].values[1, ...], std2, decimal=5)
 
+    def test_same_date_overwrite_resets_untouched_vars_to_fill(self, tmp_path):
+        """A same-date overwrite that drops a variable resets that variable's
+        slice to fill, so no stale metadata describes the overwritten data.
+        """
+        staging = str(tmp_path / "staging")
+        output = str(tmp_path / "output.zarr")
+        writer = ZarrWriter(staging)
+        rng = np.random.default_rng(7)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
+        roi = _make_full_roi_mask(tmp_path, 4, 4)
+        started = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
+
+        # Run 1: with std.
+        emb1, scales1 = _quantized_embeddings(rng, 4, 4)
+        std1 = rng.random((4, 4, EMBEDDING_DIM)).astype(np.float32)
+        writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1, embeddings_std=std1)
+        writer.assemble(
+            [chunk],
+            total_y=4,
+            total_x=4,
+            run_id="run1",
+            output_path=output,
+            compute_std=True,
+            roi_zarr_path=roi,
+            run_started_at=started,
+            n_workers=1,
+        )
+
+        # Run 2: SAME date, WITHOUT std — embedding_std is now untouched and stale.
+        emb2, scales2 = _quantized_embeddings(rng, 4, 4)
+        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2)
+        writer.assemble(
+            [chunk],
+            total_y=4,
+            total_x=4,
+            run_id="run2",
+            output_path=output,
+            compute_std=False,
+            roi_zarr_path=roi,
+            run_started_at=started,
+            n_workers=1,
+        )
+
+        ds = open_store(output)
+        assert ds["embeddings"].shape == (1, 4, 4, EMBEDDING_DIM)  # overwrite, not append
+        # embedding_std at the overwritten timestep is reset to fill (NaN), not stale std1.
+        assert np.isnan(ds["embedding_std"].values[0]).all()
+        # The atomic-publish work branch is cleaned up after a successful assemble.
+        assert "_assemble-wip" not in open_or_create_repo(output)[0].list_branches()
+
     def test_append_preserves_time_windows_across_runs(self, tmp_path):
         """Regression: appending a second time window must merge into existing time_windows, not overwrite."""
         staging = str(tmp_path / "staging")
@@ -1333,8 +1383,12 @@ class TestAssembleGlobal:
     ZONE = "32601"
     YEARS = (2024, 2025)
 
-    def _seed_zone_repo(self, tmp_path, ny: int, nx: int, dim: int):
-        """A miniature GLOBAL-shaped zone group: sharded arrays + calendar-year time axis."""
+    def _seed_zone_repo(self, tmp_path, ny: int, nx: int, dim: int, *, obs_vars: tuple[str, ...] = ()):
+        """A miniature GLOBAL-shaped zone group: sharded arrays + calendar-year time axis.
+
+        ``obs_vars`` seeds the named observation-count arrays (uint16) so tests
+        can exercise the optional-variable dtype / heterogeneity guards.
+        """
         store_path = str(tmp_path / "global.icechunk")
         repo = create_global_repo(store_path)
         session = repo.writable_session("main")
@@ -1359,12 +1413,31 @@ class TestAssembleGlobal:
             fill_value=float("nan"),
             dimension_names=("time", "northing", "easting"),
         )
+        for var in obs_vars:
+            node.create_array(
+                var,
+                shape=(len(times), ny, nx),
+                chunks=(1, self.INNER, self.INNER),
+                shards=(1, self.TILE, self.TILE),
+                dtype="uint16",
+                fill_value=0,
+                dimension_names=("time", "northing", "easting"),
+            )
         time_int = times.astype("int64")
         time_arr = node.create_array("time", data=time_int, chunks=(len(time_int),), dimension_names=("time",))
         time_arr.attrs.update(TIME_ENCODING)
         node.attrs["years_complete"] = []
         session.commit("seed test zone")
         return store_path
+
+    def _stage_raw_tile(self, tmp_path, run_id: str, label: str, dim: int, *, extra: dict | None = None):
+        """Hand-roll a staged tile (embeddings int8 + scales float32, plus *extra*)."""
+        path = str(tmp_path / "staging" / run_id / f"{label}.zarr")
+        g = zarr.open_group(path, mode="w")
+        g.create_array("embeddings", data=np.ones((self.TILE, self.TILE, dim), dtype="int8"))
+        g.create_array("scales", data=np.ones((self.TILE, self.TILE), dtype="float32"))
+        for name, arr in (extra or {}).items():
+            g.create_array(name, data=arr)
 
     def test_fills_year_from_staged_tiles(self, tmp_path):
         """Staged tiles land as whole shards at the right year index; provenance attrs update."""
@@ -1449,6 +1522,48 @@ class TestAssembleGlobal:
 
         with pytest.raises(IncompleteStageError, match="missing required variable"):
             writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runC", n_workers=1)
+
+    def test_staged_obs_dtype_mismatch_raises(self, tmp_path):
+        """An obs count staged at the wrong dtype must abort, not silently narrow.
+
+        A raw-zarr write C-casts, so an int64 obs count would wrap into a seeded
+        uint16 without a loud check. StagedShardSource only cross-checks tiles vs
+        the probe (which agree here), so the guard is destination-dtype-based.
+        """
+        dim = 8
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim, obs_vars=("s2_obs_count",))
+        self._stage_raw_tile(
+            tmp_path,
+            "runD",
+            "chunk_0_0",
+            dim,
+            extra={"s2_obs_count": np.ones((self.TILE, self.TILE), dtype="int64")},
+        )
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        with pytest.raises(IncompleteStageError, match="s2_obs_count dtype int64 but 32601/s2_obs_count is seeded"):
+            writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runD", n_workers=1)
+
+    def test_heterogeneous_staged_optional_vars_raises(self, tmp_path):
+        """Tiles disagreeing on optional vars abort rather than silently dropping.
+
+        Inferring the variable set from a single probe tile would drop an obs
+        count present only in later tiles; the probe/tail cross-check catches it.
+        """
+        dim = 8
+        ny, nx = 2 * self.TILE, self.TILE  # 2x1 tile grid
+        store_path = self._seed_zone_repo(tmp_path, ny, nx, dim, obs_vars=("s2_obs_count",))
+        # Tile (0,0) carries the obs count; tile (1,0) does not.
+        self._stage_raw_tile(
+            tmp_path,
+            "runH",
+            "chunk_0_0",
+            dim,
+            extra={"s2_obs_count": np.ones((self.TILE, self.TILE), dtype="uint16")},
+        )
+        self._stage_raw_tile(tmp_path, "runH", "chunk_1_0", dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        with pytest.raises(IncompleteStageError, match="Heterogeneous staged run"):
+            writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runH", n_workers=1)
 
 
 class TestAssembleGuards:

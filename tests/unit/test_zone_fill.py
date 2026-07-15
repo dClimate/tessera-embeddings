@@ -467,6 +467,17 @@ def test_zone_year_complete_reflects_years_complete(tmp_path, monkeypatch):
     assert zone_fill.zone_year_complete(store, _ZONE, 2024) is False
 
 
+def test_zone_year_on_axis(tmp_path):
+    """The preflight reports True for a seeded year, False off-axis / unseeded —
+    so the flow can decline Ray for a year the runner would reject anyway.
+    """
+    store = _seed_global(tmp_path)
+    assert zone_fill.zone_year_on_axis(store, _ZONE, 2025) is True
+    assert zone_fill.zone_year_on_axis(store, _ZONE, 2024) is True
+    assert zone_fill.zone_year_on_axis(store, _ZONE, 2026) is False  # off the seeded axis
+    assert zone_fill.zone_year_on_axis(store, "32660", 2025) is False  # not seeded in this store
+
+
 def test_zone_has_live_tiles_true(tmp_path):
     """The preflight reports live coverage so the flow provisions a cluster."""
     mask = _make_mask(tmp_path, [(0, 0)])
