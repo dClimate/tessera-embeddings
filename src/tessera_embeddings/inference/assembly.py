@@ -949,7 +949,9 @@ class ZarrWriter:
                 coordinate and window metadata lands in dataset attributes.
             tile_id: Sentinel-2 MGRS tile ID for ``proj:`` convention attrs
                 when the mosaic store carries no ``crs`` attr.
-            model_version: Model version string for ``tessera:model_version``.
+            model_version: Encoder checkpoint identifier, recorded as the
+                ``checkpoint_id`` provenance attr (``geoemb:model`` is the public
+                encoder URL, derived separately).
             manifest: Typed manifest for append-safety validation. Written on
                 create, validated before extending an existing store.
             n_workers: Worker *process* count. Also divides
@@ -1219,7 +1221,6 @@ class ZarrWriter:
             y_coords=spatial.northing if spatial else None,
             x_coords=spatial.easting if spatial else None,
             model_version=model_version,
-            n_tiles=len(chunks),
         )
         if conv_attrs:
             attrs.update(conv_attrs)
@@ -1238,6 +1239,12 @@ class ZarrWriter:
             }
             attrs["time_windows"] = windows
             attrs["time_convention"] = "12mo_window_end"
+        # Drop any retired tessera:* attrs before writing geoemb: appending to a
+        # store created before the geoemb switch would otherwise leave the old
+        # keys behind (update only overwrites the keys it carries), so the store
+        # would advertise both conventions. zarr_conventions is replaced wholesale.
+        for stale in [k for k in node.attrs if str(k).startswith("tessera:")]:
+            del node.attrs[stale]
         node.attrs.update(attrs)
 
         commit_with_rebase(session, f"Run {run_id}: {len(chunks)} chunks assembled")

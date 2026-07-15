@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import itertools
+from importlib.metadata import version as _dist_version
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -30,6 +31,7 @@ from tessera_embeddings.inference.assembly import (
     _staged_storage_options,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.inference.conventions import ENCODER_VERSION
 from tessera_embeddings.inference.quantization import quantize_embeddings
 from tessera_embeddings.storage.global_store import create_global_repo, open_global_repo
 from tessera_embeddings.storage.zarr_store import TIME_ENCODING, open_or_create_repo, open_store
@@ -1142,7 +1144,7 @@ class TestAssemblyValidation:
         assert "run_completed_at" in attrs
 
     def test_assemble_sets_geozarr_convention_attrs(self, tmp_path):
-        """Convention attrs (proj:, spatial:, tessera:) are set on the root group."""
+        """Convention attrs (proj:, spatial:, geoemb:) are set on the root group."""
         staging = str(tmp_path / "staging")
         output = str(tmp_path / "output.zarr")
         writer = ZarrWriter(staging)
@@ -1174,17 +1176,23 @@ class TestAssemblyValidation:
         assert "zarr_conventions" in attrs
         names = [c["name"] for c in attrs["zarr_conventions"]]
         assert "proj:" in names
-        assert "tessera:" in names
+        assert "geoemb:" in names
 
         # proj:
         assert attrs["proj:code"] == "EPSG:32633"
 
-        # tessera:
-        assert attrs["tessera:dataset_version"] == "v1"
-        assert attrs["tessera:n_bands"] == EMBEDDING_DIM
-        assert attrs["tessera:model_version"] == "test_model_v1"
-        assert attrs["tessera:quantization_method"] == "absmax_per_pixel"
-        assert attrs["tessera:n_tiles"] == 1
+        # geoemb:
+        assert attrs["geoemb:type"] == "pixel"
+        assert attrs["geoemb:dimensions"] == EMBEDDING_DIM
+        # model is the PUBLIC encoder reference (not the checkpoint id); the supplied
+        # model_version ("test_model_v1") is recorded as checkpoint_id provenance.
+        assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"
+        assert attrs["checkpoint_id"] == "test_model_v1"
+        # build_version is the software/package version, NOT the encoder/model version.
+        assert attrs["geoemb:build_version"] == _dist_version("tessera_embeddings")
+        assert attrs["geoemb:data_type"] == "int8"
+        assert attrs["geoemb:quantization"]["method"] == "per_pixel_scale"
+        assert attrs["geoemb:quantization"]["scale"]["array_name"] == "scales"
 
 
 class TestScanExistingStagedChunks:
