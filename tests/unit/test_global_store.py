@@ -54,7 +54,29 @@ def test_coords_and_attrs(tmp_path):
     assert attrs["years_complete"] == []
     assert attrs["zone_scheme"] == "utm_6deg_nominal"
     assert attrs["time_convention"] == "calendar_year"
-    assert attrs["proj:code"] == "EPSG:32601"  # GeoZarr conventions merged in
+    assert attrs["proj:code"] == "EPSG:32601"  # per-zone proj: merged in
+    # geoemb: lives once on the root (utm_zones layout), not per zone.
+    assert "geoemb:type" not in attrs
+    zone_conventions = [c["name"] for c in attrs["zarr_conventions"]]
+    assert "geoemb:" not in zone_conventions
+    assert {"proj:", "spatial:"} <= set(zone_conventions)
+
+
+def test_root_carries_geoemb_convention(tmp_path):
+    """Encoder/quantization provenance sits once on the root group (utm_zones layout);
+    zones carry only their own proj:/spatial:.
+    """
+    store = _seed(tmp_path)
+    attrs = dict(zarr_store.open_store_as_zarr_group(store).attrs)
+    assert attrs["geoemb:type"] == "pixel"
+    assert attrs["geoemb:dimensions"] == EMBEDDING_DIM
+    assert attrs["geoemb:spatial_layout"] == "utm_zones"
+    assert attrs["geoemb:gsd"] == 10.0  # fixed 10 m grid across all zones
+    assert attrs["geoemb:data_type"] == "int8"
+    assert "geoemb:build_version" in attrs
+    assert [c["name"] for c in attrs["zarr_conventions"]] == ["geoemb:"]
+    # proj:/spatial: are per-zone, not on the root.
+    assert "proj:code" not in attrs
 
 
 def test_group_aware_open_store_reads_one_zone(tmp_path):

@@ -9,8 +9,14 @@ region/shard writes without ever resizing (D1).
 Lives above the low-level primitives on purpose: it pulls together
 :mod:`~tessera_embeddings.storage.zone_grid` (the grid), the ``GLOBAL`` layout
 (:mod:`~tessera_embeddings.config.store_layout`), the coord/schema writers in
-:mod:`~tessera_embeddings.storage.empty_store`, and GeoZarr convention attrs
-(:func:`~tessera_embeddings.inference.conventions.build_convention_attrs`).
+:mod:`~tessera_embeddings.storage.empty_store`, and GeoZarr convention attrs.
+
+Convention placement follows the geoembeddings ``utm_zones`` layout: the encoder
+and quantization provenance (``geoemb:``) is written ONCE on the root group
+(:func:`~tessera_embeddings.inference.conventions.build_geoemb_root_attrs`, with
+``spatial_layout="utm_zones"``), while each zone group carries only its own
+``proj:``/``spatial:`` (``build_convention_attrs(..., include_geoemb=False)``) —
+their CRS and grid differ by zone.
 """
 
 from __future__ import annotations
@@ -22,11 +28,12 @@ import numpy as np
 import zarr
 
 from tessera_embeddings.config.store_layout import GLOBAL, StoreLayout
-from tessera_embeddings.inference.conventions import build_convention_attrs
+from tessera_embeddings.inference.conventions import build_convention_attrs, build_geoemb_root_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.zarr_store import _create_storage, global_store_config
 from tessera_embeddings.storage.zone_grid import (
     CAMPAIGN_YEARS,
+    PIXEL_M,
     ZONE_SCHEME,
     ZONES,
     ZoneSpec,
@@ -113,10 +120,13 @@ def _layout_band(layout: StoreLayout) -> int:
     return band
 
 
-def _zone_attrs(
-    spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: StoreLayout, model_version: str | None
-) -> dict:
-    """Per-zone group attrs: campaign markers + GeoZarr conventions."""
+def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: StoreLayout) -> dict:
+    """Per-zone group attrs: campaign markers + per-zone ``proj:``/``spatial:``.
+
+    Encoder/quantization provenance (``geoemb:``) is NOT here — in the geoembeddings
+    ``utm_zones`` layout it lives once on the root group (see :func:`_root_attrs`);
+    each zone group carries only its own CRS/grid conventions.
+    """
     attrs: dict = {
         "crs": spec.crs,
         "years_complete": [],
@@ -132,10 +142,24 @@ def _zone_attrs(
             embedding_dim=_layout_band(layout),
             y_coords=north,
             x_coords=east,
-            model_version=model_version,
+            include_geoemb=False,  # geoemb: is stated once on the root, not per zone
         )
     )
     return attrs
+
+
+def _root_attrs(layout: StoreLayout, model_version: str | None) -> dict:
+    """Root-group attrs for the multi-zone campaign store: geoemb: stated once.
+
+    The geoembeddings ``utm_zones`` layout puts the encoder/quantization provenance
+    on the root (identical across all zones), with ``spatial_layout="utm_zones"``.
+    """
+    return build_geoemb_root_attrs(
+        embedding_dim=_layout_band(layout),
+        spatial_layout="utm_zones",
+        gsd=float(PIXEL_M),  # every zone is the same fixed-metre grid; the root has none to derive from
+        model_version=model_version,
+    )
 
 
 def seed_zone_groups(
@@ -157,6 +181,9 @@ def seed_zone_groups(
     specs = list(specs)
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
+    # geoemb: provenance is stated once on the root (utm_zones layout); idempotent
+    # across incremental seeds since every call carries the same values.
+    root.attrs.update(_root_attrs(layout, model_version))
     times = calendar_year_times(years)
     nt = len(times)
     band = _layout_band(layout)
@@ -167,7 +194,7 @@ def seed_zone_groups(
         sizes = {"time": nt, "northing": spec.height, "easting": spec.width, "band": band}
         create_layout_arrays(node, layout, layout.arrays, sizes)
         _write_coord_arrays(node, {"time": times, "northing": north, "easting": east, "band": np.arange(band)})
-        node.attrs.update(_zone_attrs(spec, north, east, layout, model_version))
+        node.attrs.update(_zone_attrs(spec, north, east, layout))
     return session.commit(commit_msg or f"seed {len(specs)} zone group(s)")
 
 
