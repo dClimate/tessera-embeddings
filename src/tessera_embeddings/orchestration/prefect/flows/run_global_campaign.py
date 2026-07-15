@@ -26,9 +26,9 @@ from prefect.deployments import arun_deployment
 
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
-from tessera_embeddings.storage.campaign import campaign_status, tag_year_complete, zone_year_tag
+from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete
 from tessera_embeddings.storage.global_store import open_global_repo
-from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES
+from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, utm_zone_to_group
 
 
 @flow(name="run-global-campaign")
@@ -57,7 +57,13 @@ async def run_global_campaign(
         fill_deployment: ``flow-name/deployment-name`` of the fill deployment.
         store_name: Global-store repo basename.
         years: Campaign years to drive (default: all campaign years).
-        zones: Restrict to these EPSG strings (default: all 120).
+        zones: Restrict the fill chain (inference + assembly) to these UTM zones in
+            the ergonomic ``"<1-60><N|S>"`` form, e.g. ``["33N", "15S"]``; ``None``
+            (default) drives all 120. Either way only cells still needing work are
+            dispatched, so a default re-run of a partially-complete year skips the
+            finished zones and fills only the unfinished ones (see
+            :func:`campaign_work_list`). Ingestion (the per-zone mosaics this reads)
+            is a separate upstream step.
         max_parallel_zones: Max concurrent fill runs *within a year* (bounds
             simultaneous Ray clusters — a cost knob, distinct from the commit
             gate).
@@ -81,16 +87,17 @@ async def run_global_campaign(
     repo = open_global_repo(paths.global_store(store_name))
     status = campaign_status(repo, years=campaign_years)
     existing_tags = set(repo.list_tags())
-    expected = list(zones) if zones is not None else list(ZONES)
 
-    # A cell is DONE only when it is both complete AND tagged. Include
-    # complete-but-untagged cells (a crash between the fill commit and the tag)
-    # so the runner's idempotent retag path runs — filtering on years_complete
-    # alone would skip them forever, and the year is never tagged complete.
-    def _needs_work(zone: str, year: int) -> bool:
-        return not status.has(zone, year) or zone_year_tag(zone, year) not in existing_tags
+    # Callers name zones ergonomically ("33N", "15S"); the store keys groups by EPSG
+    # code ("32633", "32715"). Convert up front so a bad id fails loudly here.
+    expected_zones = [utm_zone_to_group(z) for z in zones] if zones is not None else None
 
-    work = [(z, y) for y in campaign_years for z in expected if _needs_work(z, y)]
+    # Work list = cells still needing a fill, restricted to `zones` (default: all
+    # 120). campaign_work_list is tag-aware: it skips landed-and-tagged cells (so a
+    # default re-run of a partially-complete year only touches the unfinished zones)
+    # and INCLUDES complete-but-untagged cells (crash between fill and tag → the
+    # runner's idempotent retag path runs). See its docstring for the two use cases.
+    work = campaign_work_list(status, existing_tags, expected_zones=expected_zones, years=campaign_years)
     log.info(
         "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d concurrent fills/year, commit limit %r",
         len(work),

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
 
 import numpy as np
 from pyproj import CRS, Transformer
@@ -133,6 +134,25 @@ ZONES: dict[str, ZoneSpec] = _build_zones()
 def zone(epsg: str) -> ZoneSpec:
     """Look up a zone by EPSG code string (e.g. ``"32601"``)."""
     return ZONES[epsg]
+
+
+def utm_zone_to_group(utm_zone: str) -> str:
+    """Map an ergonomic UTM-zone id (``"33N"``, ``"15S"``, ``"3N"``) to its group name.
+
+    The store keys zone groups by EPSG code string (``"32633"`` = UTM 33 North,
+    ``"32715"`` = UTM 15 South); callers prefer the compact ``"<zone><N|S>"`` form.
+    Zone number is 1-60, hemisphere ``N``/``S`` (case-insensitive), optional leading
+    zero. Raises ``ValueError`` on a malformed or out-of-range id.
+    """
+    text = utm_zone.strip().upper()
+    m = re.fullmatch(r"(\d{1,2})([NS])", text)
+    if not m:
+        raise ValueError(f"UTM zone {utm_zone!r} is malformed — expected '<1-60><N|S>', e.g. '33N' or '15S'.")
+    number = int(m.group(1))
+    if not 1 <= number <= 60:
+        raise ValueError(f"UTM zone number {number} out of range (1-60) in {utm_zone!r}.")
+    prefix = "326" if m.group(2) == "N" else "327"
+    return f"{prefix}{number:02d}"
 
 
 def easting_coords(spec: ZoneSpec) -> np.ndarray:

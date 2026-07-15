@@ -60,3 +60,27 @@ def test_northern_vs_southern_extents_differ_only_in_northing():
     s = zg.ZONES["32710"]
     assert n.easting == s.easting
     assert n.northing != s.northing  # N starts at 0; S is shifted for the false-northing offset
+
+
+@pytest.mark.parametrize(
+    "utm_zone, expected",
+    [
+        ("33N", "32633"),
+        ("15S", "32715"),
+        ("1N", "32601"),
+        ("01N", "32601"),
+        ("60S", "32760"),
+        ("33n", "32633"),  # case-insensitive hemisphere
+        (" 7s ", "32707"),  # surrounding whitespace tolerated
+    ],
+)
+def test_utm_zone_to_group(utm_zone, expected):
+    group = zg.utm_zone_to_group(utm_zone)
+    assert group == expected
+    assert group in zg.ZONES  # every parse maps to a real seeded zone
+
+
+@pytest.mark.parametrize("bad", ["", "33", "N33", "0N", "61N", "33X", "33NN", "abc", "-5N"])
+def test_utm_zone_to_group_rejects_malformed(bad):
+    with pytest.raises(ValueError, match="UTM zone"):
+        zg.utm_zone_to_group(bad)

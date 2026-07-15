@@ -11,7 +11,7 @@ import zarr
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import campaign, global_store
 from tessera_embeddings.storage.shard_writer import write_year_shards
-from tessera_embeddings.storage.zone_grid import ZoneSpec
+from tessera_embeddings.storage.zone_grid import ZONES, ZoneSpec
 
 _BAND = 8
 _SHARD = 512
@@ -90,6 +90,50 @@ def test_status_pending_counts_unseeded_zone(tmp_path):
     # An entirely unseeded zone contributes all years to the work list.
     pending = status.pending(expected_zones=("32601", "32602"))
     assert sum(1 for z, _ in pending if z == "32602") == len(_YEARS)
+
+
+# --- campaign_work_list (tag-aware driver work list) -----------------------
+
+
+def test_work_list_filters_to_requested_zones(tmp_path):
+    """The `zones` filter restricts the fill chain to the requested zones only."""
+    _, repo = _seed(tmp_path)
+    status = campaign.campaign_status(repo, years=_YEARS)
+    work = campaign.campaign_work_list(status, set(), expected_zones=("32601",), years=_YEARS)
+    assert {z for z, _ in work} == {"32601"}
+    assert len(work) == len(_YEARS)  # every year of the one requested zone
+
+
+def test_work_list_skips_completed_and_tagged_zones(tmp_path):
+    """A default re-run of a partially-complete year skips the finished zones."""
+    _, repo = _seed(tmp_path)
+    _fill(repo, "32601", year_index=0)  # 2023 lands
+    campaign.tag_zone_year(repo, "32601", 2023)  # ...and is tagged -> DONE
+    status = campaign.campaign_status(repo, years=_YEARS)
+    work = campaign.campaign_work_list(status, set(repo.list_tags()), expected_zones=("32601", "32602"), years=_YEARS)
+    assert ("32601", 2023) not in work  # finished zone-year skipped
+    assert ("32601", 2024) in work  # same zone, unfinished year still runs
+    assert ("32602", 2023) in work  # untouched zone still runs
+
+
+def test_work_list_includes_complete_but_untagged(tmp_path):
+    """A crash between the fill commit and the tag leaves a complete-but-untagged
+    cell; it stays in the work list so the runner's idempotent retag path runs.
+    """
+    _, repo = _seed(tmp_path)
+    _fill(repo, "32601", year_index=0)  # lands in years_complete, NOT tagged
+    status = campaign.campaign_status(repo, years=_YEARS)
+    work = campaign.campaign_work_list(status, set(repo.list_tags()), expected_zones=("32601",), years=_YEARS)
+    assert ("32601", 2023) in work  # complete but untagged -> still dispatched (retag)
+
+
+def test_work_list_defaults_to_all_120_zones(tmp_path):
+    """`expected_zones=None` drives the whole globe (an unseeded zone needs every year)."""
+    _, repo = _seed(tmp_path)  # only 2 zones seeded, but the default list spans all 120
+    status = campaign.campaign_status(repo, years=_YEARS)
+    work = campaign.campaign_work_list(status, set(), years=_YEARS)  # expected_zones=None
+    assert len(work) == len(ZONES) * len(_YEARS)
+    assert ("32660", 2023) in work  # an unseeded zone still needs every year
 
 
 def test_years_fully_complete(tmp_path):

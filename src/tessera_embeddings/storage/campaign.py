@@ -288,3 +288,31 @@ def campaign_status(
         landed = tuple(sorted(int(y) for y in raw)) if isinstance(raw, list) else ()
         zones[name] = landed
     return CampaignStatus(years=tuple(years), zones=zones)
+
+
+def campaign_work_list(
+    status: CampaignStatus,
+    existing_tags: set[str],
+    *,
+    expected_zones: Iterable[str] | None = None,
+    years: Iterable[int] | None = None,
+) -> list[tuple[str, int]]:
+    """The ``(zone, year)`` cells a campaign run should dispatch, tag-aware.
+
+    Like :meth:`CampaignStatus.pending` (same zones filter + year-major order) but a
+    cell counts DONE only when it is BOTH in ``years_complete`` AND has its zone-year
+    tag. Two consequences the plain ``pending`` can't express:
+
+    - **Skip finished zones on a default re-run.** With ``expected_zones=None`` (all
+      120), a year that partially completed and is re-driven only dispatches the
+      zones still missing — a landed-and-tagged zone is filtered out.
+    - **Recover a complete-but-untagged cell.** A crash between the fill commit and
+      the tag leaves a cell in ``years_complete`` but untagged; it is INCLUDED so the
+      fill runner's idempotent retag path runs (filtering on ``years_complete`` alone
+      would skip it forever, and the year's all-120 milestone tag would never land).
+
+    ``expected_zones`` is the zone filter for a subset / repair run (default: all 120).
+    """
+    zone_names = tuple(expected_zones) if expected_zones is not None else tuple(ZONES)
+    yrs = tuple(years) if years is not None else status.years
+    return [(z, y) for y in yrs for z in zone_names if not status.has(z, y) or zone_year_tag(z, y) not in existing_tags]
