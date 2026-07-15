@@ -136,10 +136,13 @@ def fill_zone_year(
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — the axis is fixed at seeding (ADR-008 D1)."
         )
-    # The slot being filled and the window inference computes over must agree:
-    # a window that never touches `year` is an operator error (e.g. a cloned
-    # invocation whose year was edited but not its time_window) that would
-    # otherwise land mislabeled embeddings and tag them permanently complete.
+    # Permissive by design: require only that the window OVERLAPS `year`, so
+    # non-campaign consumers can drive rolling (non-Jan–Dec) windows. The global
+    # campaign default is a strict Jan–Dec calendar-year window
+    # (fill_zone_year_flow), which is unambiguous; a window fully DISJOINT from
+    # `year` is the operator error we catch here (e.g. a cloned invocation whose
+    # year was edited but not its time_window), which would otherwise land
+    # mislabeled embeddings and tag them permanently complete.
     window_years = {y for y, _ in config.time_window.months}
     if year not in window_years:
         raise ValueError(

@@ -141,6 +141,10 @@ def fill_zone_year_flow(
     log = get_run_logger()
     mosaic_base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}"
     resolved_s1 = resolve_s1_orbit(mosaic_base, s1_orbit)
+    # Default to the strict Jan–Dec calendar-year window for `year` (our global
+    # convention: `December {year}` yields a 12-month window spanning Jan–Dec).
+    # `time_window_end` overrides for rolling windows — the runner's window check
+    # is deliberately permissive so non-campaign consumers can use them.
     config = build_inference_config(
         s1_orbit=resolved_s1,
         time_window=parse_time_window(time_window_end or f"December {year}"),

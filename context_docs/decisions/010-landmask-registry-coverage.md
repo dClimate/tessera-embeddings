@@ -75,6 +75,20 @@ violation hard-stops. It also reconciles registry ⊆ bucket (presence-based; th
 `validate` checks bitmap shape/consistency (`tile_live == block-any(chunk_live)`)
 and known land/ocean points.
 
+## Zone-seam overlap — accepted (2026-07-15)
+
+ADR-008 snaps each zone extent OUTWARD to the 2048-px shard pitch (D1/D3), so a
+zone's boundary shards already extend up to ~1 shard (~20 km) past the nominal
+6°/equator line. The coverage builder lights those boundary shards and inference
+fills them completely, so adjacent zones overlap slightly at seams. **Accepted
+as by-design, not clipped:** the overlap is inherent to the shard-snapped grid
+(the builder faithfully fills the defined grid), and it is redundant rather than
+mis-scoped — adjacent zones are in different UTM CRSs, so each store is
+internally self-consistent and a consumer selects the store by the query point's
+nominal band. Clipping to the nominal boundary would be approximate anyway (the
+boundary is a curved meridian, not shard-aligned) and risks dropping legitimate
+near-edge land.
+
 ## Consequences
 
 - The zone-fill mask read drops from ~15k windowed GETs per fill to one ~1 KB
