@@ -444,7 +444,8 @@ def test_all_ocean_cell_skips_missing_mosaic(tmp_path, monkeypatch):
 
 def test_zone_year_complete_reflects_years_complete(tmp_path, monkeypatch):
     """The preflight helper reports False before a fill (and for an unseeded
-    zone) and True once the (zone, year) has landed."""
+    zone) and True once the (zone, year) has landed.
+    """
     store = _seed_global(tmp_path)
     assert zone_fill.zone_year_complete(store, _ZONE, 2025) is False
     assert zone_fill.zone_year_complete(store, "32660", 2025) is False  # not seeded in this store
