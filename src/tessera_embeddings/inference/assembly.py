@@ -629,7 +629,10 @@ class ZarrWriter:
             entries = fs.ls(staging_dir, detail=False, refresh=True)
         except FileNotFoundError:
             return []
-        return [entry.rstrip("/").rsplit("/", 1)[-1] for entry in entries]
+        # Sorted: fs.ls order is backend-dependent (S3 lexicographic, local
+        # filesystems arbitrary), and downstream probes take labels[0] — the
+        # probe tile must not depend on which OS listed the directory.
+        return sorted(entry.rstrip("/").rsplit("/", 1)[-1] for entry in entries)
 
     def _list_run_labels(self, run_id: str) -> tuple[list[str], list[str]]:
         """``(staged zarr labels, skip-marker labels)`` from one staging LIST."""
