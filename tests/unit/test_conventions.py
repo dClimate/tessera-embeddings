@@ -180,16 +180,36 @@ class TestBuildConventionAttrs:
         )
         assert attrs["geoemb:gsd"] == 20.0
 
-    def test_gsd_not_derived_from_geographic_crs_spacing(self) -> None:
-        """A geographic CRS (EPSG:4326, degrees) must NOT have its 0.1° spacing
-        mislabelled as metres — gsd falls back to the explicit value.
+    def test_gsd_omitted_for_geographic_crs(self) -> None:
+        """A geographic CRS (EPSG:4326, degrees) with no explicit gsd OMITS the
+        field entirely — never a false metre value from degree spacing.
         """
         y = np.arange(10.0, 9.0, -0.1)  # 0.1 degree spacing
         x = np.arange(0.0, 1.0, 0.1)
         attrs = build_convention_attrs(
-            epsg_code="EPSG:4326", total_y=10, total_x=10, embedding_dim=128, y_coords=y, x_coords=x, gsd=10.0
+            epsg_code="EPSG:4326", total_y=10, total_x=10, embedding_dim=128, y_coords=y, x_coords=x
         )
-        assert attrs["geoemb:gsd"] == 10.0  # nominal fallback, not 0.1
+        assert "geoemb:gsd" not in attrs  # not 0.1, not a nominal default — absent
+
+    def test_gsd_omitted_without_coords_or_explicit_value(self) -> None:
+        """No coords and no explicit gsd → omit (no trustworthy metric value)."""
+        assert "geoemb:gsd" not in build_convention_attrs(total_y=10, total_x=10, embedding_dim=128)
+
+    def test_gsd_uses_explicit_value_when_supplied(self) -> None:
+        """An explicit gsd the caller vouches for IS emitted (a trustworthy value)."""
+        attrs = build_convention_attrs(total_y=10, total_x=10, embedding_dim=128, gsd=30.0)
+        assert attrs["geoemb:gsd"] == 30.0
+
+    def test_model_url_overrides_derived_public_ref(self) -> None:
+        """A caller can pass the exact public model URI for its encoder; otherwise
+        the URL derives from ENCODER_VERSION (never the checkpoint id).
+        """
+        explicit = build_convention_attrs(
+            total_y=10, total_x=10, embedding_dim=128, model_url="https://geotessera.org/model/1.0"
+        )
+        assert explicit["geoemb:model"] == "https://geotessera.org/model/1.0"
+        derived = build_convention_attrs(total_y=10, total_x=10, embedding_dim=128, model_version="ckpt_stem")
+        assert derived["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"
 
     def test_epsg_code_overrides_tile_id(self) -> None:
         """When both tile_id and epsg_code are provided, epsg_code wins."""

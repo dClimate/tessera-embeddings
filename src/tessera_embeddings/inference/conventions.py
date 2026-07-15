@@ -69,9 +69,13 @@ _SPATIAL_CONVENTION = {
     "description": "Spatial coordinate information",
 }
 
+# The convention repo has not cut a `v1` tag, so `refs/tags/v1` 404s. We pin the
+# schema/spec URLs to an immutable commit SHA that DOES resolve, so the emitted
+# registration is dereferenceable. Switch to `refs/tags/v1` once upstream tags it.
+_GEOEMB_REF = "0655212938f36351245dbd3e5e8868f811d43663"
 _GEOEMB_CONVENTION = {
-    "schema_url": "https://raw.githubusercontent.com/geo-embeddings/embeddings-zarr-convention/refs/tags/v1/schema.json",
-    "spec_url": "https://github.com/geo-embeddings/embeddings-zarr-convention/blob/v1/README.md",
+    "schema_url": f"https://raw.githubusercontent.com/geo-embeddings/embeddings-zarr-convention/{_GEOEMB_REF}/schema.json",
+    "spec_url": f"https://github.com/geo-embeddings/embeddings-zarr-convention/blob/{_GEOEMB_REF}/README.md",
     "uuid": "61c12cc5-0e28-4056-999a-480cf3fb7e4c",
     "name": "geoemb:",
     "description": "Geoembeddings convention for geospatial embedding arrays with model provenance",
@@ -90,8 +94,6 @@ DEFAULT_SOURCE_DATA: tuple[str, ...] = (
     "s3://sentinel-cogs",
     "https://datapool.asf.alaska.edu/RTC/OPERA-S1",
 )
-#: Ground sample distance in metres (10 m embeddings grid).
-GSD_METERS = 10.0
 #: Storage dtype of the quantized embeddings.
 QUANTIZED_DTYPE = "int8"
 
@@ -234,8 +236,9 @@ def build_convention_attrs(
     y_coords: np.ndarray | None = None,
     x_coords: np.ndarray | None = None,
     model_version: str | None = None,
+    model_url: str | None = None,
     data_type: str = QUANTIZED_DTYPE,
-    gsd: float = GSD_METERS,
+    gsd: float | None = None,
     spatial_layout: str | None = None,
     source_data: tuple[str, ...] = DEFAULT_SOURCE_DATA,
 ) -> dict:
@@ -253,16 +256,17 @@ def build_convention_attrs(
     ``proj:`` conventions are omitted (no CRS info available).
 
     The ``geoemb:`` fields record encoder-model provenance and quantization:
-    ``geoemb:model`` is the PUBLIC encoder reference URL, keyed by
-    :data:`ENCODER_VERSION` (a real, resolvable reference — not an internal
-    checkpoint filename). *model_version* is the checkpoint identifier callers
-    supply for provenance; it is recorded as a plain ``checkpoint_id`` attr, not
-    used to build the public model URL. ``geoemb:build_version`` is the
-    software/package version.
-    *data_type* is the quantized storage dtype; *gsd* the ground sample distance
-    in metres (derived from the coordinate spacing only for a metre-based CRS,
-    else this nominal value); *spatial_layout* is ``"utm_zones"``/``"global"``
-    and is OMITTED when ``None`` (a single-ROI store has no utmNN/global groups);
+    ``geoemb:model`` is the PUBLIC encoder reference URL — *model_url* when a
+    caller supplies the exact public URI for the encoder it used, else derived
+    from :data:`ENCODER_VERSION`. It is NEVER built from *model_version*, which
+    in production is an internal checkpoint filename stem; that is recorded as a
+    plain ``checkpoint_id`` provenance attr. ``geoemb:build_version`` is the
+    software/package version. *data_type* is the quantized storage dtype.
+    *gsd* (metres) is emitted only when trustworthy — derived from a metre-based
+    CRS's coordinate spacing, or an explicit *gsd* the caller vouches for; for a
+    non-metre CRS (e.g. degrees/feet) or absent coords it is OMITTED (optional
+    field, no false metre value). *spatial_layout* is ``"utm_zones"``/``"global"``
+    and OMITTED when ``None`` (a single-ROI store has no utmNN/global groups);
     *source_data* the source-dataset URLs.
     """
     conventions: list[dict] = []
@@ -296,24 +300,26 @@ def build_convention_attrs(
     conventions.append(_GEOEMB_CONVENTION)
     attrs["geoemb:type"] = "pixel"  # per-pixel embeddings (not chip)
     attrs["geoemb:dimensions"] = embedding_dim
-    # geoemb:model is the PUBLIC encoder reference, keyed by the encoder version
-    # (:data:`ENCODER_VERSION`) — a real, resolvable model URL. It is deliberately
-    # NOT built from *model_version*: production callers pass an internal
-    # checkpoint filename stem there (checkpoint_to_version(...)), which would
-    # write a synthetic, misleading model URL. The checkpoint id is kept as
-    # separate provenance (plain ``checkpoint_id`` attr, not the public model).
-    attrs["geoemb:model"] = _MODEL_URL_TEMPLATE.format(version=ENCODER_VERSION)
+    # geoemb:model is the PUBLIC encoder reference URL. A caller passes the exact
+    # public URI for the encoder it used (model_url); otherwise we derive it from
+    # the pipeline's public encoder version (ENCODER_VERSION). It is NEVER built
+    # from *model_version*, which in production is an internal checkpoint filename
+    # stem (checkpoint_to_version(...)) — that is kept as separate `checkpoint_id`
+    # provenance, so a v1.0 / future / custom checkpoint doesn't advertise a
+    # synthetic or wrong public model URL.
+    attrs["geoemb:model"] = model_url or _MODEL_URL_TEMPLATE.format(version=ENCODER_VERSION)
     if model_version:
         attrs["checkpoint_id"] = model_version
     attrs["geoemb:source_data"] = list(source_data)
     attrs["geoemb:data_type"] = data_type
-    # Prefer the actual pixel size from the coordinate spacing (an ROI may be
-    # coarsened, e.g. 20 m) over the nominal default — but ONLY for a metre-based
-    # CRS, since geoemb:gsd is defined in metres and a geographic/foot CRS's
-    # spacing would be degrees/feet. Fall back to the explicit gsd otherwise.
+    # geoemb:gsd is OPTIONAL and defined in metres, so emit it ONLY with a
+    # trustworthy metric value: derived from the coordinate spacing of a
+    # metre-based CRS, or an explicit gsd the caller vouches for. A non-metre CRS
+    # (EPSG:4326 degrees, foot-based) or missing coords → OMIT it entirely rather
+    # than advertise a false metre value.
     if x_coords is not None and len(x_coords) > 1 and _is_metre_crs(effective_epsg):
         attrs["geoemb:gsd"] = abs(float(np.median(np.diff(x_coords))))
-    else:
+    elif gsd is not None:
         attrs["geoemb:gsd"] = gsd
     # spatial_layout is OPTIONAL and only meaningful for a store organised into
     # utmNN / global groups. A single-ROI store writes arrays at its own root,
