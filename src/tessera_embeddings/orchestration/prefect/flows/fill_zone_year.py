@@ -76,8 +76,13 @@ def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) 
     log = logging.getLogger(__name__)
     log.warning("Flow cancelled — tearing down Ray cluster")
     if _active_resolved_yaml and Path(_active_resolved_yaml).exists():
-        subprocess.run(["ray", "down", _active_resolved_yaml, "-y"], check=False)
+        rc = subprocess.run(["ray", "down", _active_resolved_yaml, "-y"], check=False).returncode
         cleanup_ray_tempfiles(_active_resolved_yaml)
+        # A non-zero `ray down` leaves EC2 instances running; fall back to
+        # terminating them by cluster tag rather than silently leaking them.
+        if rc != 0 and _active_cluster_name:
+            log.warning("`ray down` exited %d — terminating instances for cluster %r by tag", rc, _active_cluster_name)
+            terminate_ray_instances_by_tag(cluster_name=_active_cluster_name, log=log)
     elif _active_cluster_name:
         terminate_ray_instances_by_tag(cluster_name=_active_cluster_name, log=log)
     else:

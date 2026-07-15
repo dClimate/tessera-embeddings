@@ -29,7 +29,7 @@ orchestration/prefect/
 The global 10 m embeddings campaign (ADR-008) has its own four flows, distinct
 from the single-ROI path above:
 
-```
+```text
 build_land_mask   →   seed_global_store   →   run_global_campaign
 (coverage bitmaps)    (metadata-only)          └─ per pending (zone, year): fill_zone_year (Ray)
 ```

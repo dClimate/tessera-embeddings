@@ -74,6 +74,8 @@ async def run_global_campaign(
         Summary: pending count at start, dispatched run ids per year, totals.
     """
     log = get_run_logger()
+    if max_parallel_zones < 1:
+        raise ValueError(f"max_parallel_zones must be >= 1, got {max_parallel_zones} (Semaphore(0) blocks forever)")
     campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS
 
     repo = open_global_repo(paths.global_store(store_name))
@@ -123,7 +125,17 @@ async def run_global_campaign(
         log.info("Year %d: dispatching %d zone fill(s)", year, len(year_zones))
         # All zones in a year are distinct groups → safe to fill concurrently.
         # The outer loop is serial, so the SAME zone never fills two years at once.
-        runs_by_year[year] = await asyncio.gather(*(_fill(z, year) for z in year_zones))
+        # return_exceptions=True so a single zone's failure doesn't abandon its
+        # siblings mid-flight (default gather() would leave them running orphaned);
+        # we let the whole year settle, then fail loudly with every failure.
+        results = await asyncio.gather(*(_fill(z, year) for z in year_zones), return_exceptions=True)
+        failures = [(z, r) for z, r in zip(year_zones, results, strict=True) if isinstance(r, BaseException)]
+        if failures:
+            raise RuntimeError(
+                f"year {year}: {len(failures)}/{len(year_zones)} zone fill(s) failed "
+                f"(e.g. {failures[0][0]}: {failures[0][1]})"
+            )
+        runs_by_year[year] = [str(r) for r in results]
         log.info("Year %d complete: %d fill(s) landed", year, len(runs_by_year[year]))
 
     dispatched = sum(len(v) for v in runs_by_year.values())

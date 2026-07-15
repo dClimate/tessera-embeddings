@@ -29,6 +29,21 @@ def test_parse_cell_name_rejects_malformed(bad: str) -> None:
         land_mask.parse_cell_name(bad)
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "grid_nan_10.05.tiff",  # non-finite
+        "grid_200.05_10.05.tiff",  # lon out of range
+        "grid_-0.05_95.05.tiff",  # lat out of range
+        "grid_2.4_48.85.tiff",  # lon off the 0.1° cell-centre lattice (2.4*20=48, even)
+        "grid_-0.05_10.0.tiff",  # lat on a cell EDGE, not a centre
+    ],
+)
+def test_parse_cell_name_rejects_invalid_coords(bad: str) -> None:
+    with pytest.raises(ValueError):
+        land_mask.parse_cell_name(bad)
+
+
 def test_zone_for_cell_matches_delivery_samples() -> None:
     # Verified against the partner sample TIFFs' embedded CRS.
     assert land_mask.zone_for_cell(-0.05, 10.05) == "32630"
@@ -163,7 +178,9 @@ def test_validate_rejects_inconsistent_bitmaps(tmp_path) -> None:
 # --------------------------------------------------------------------------- #
 # Delivery spot-check (guards the all-1s assumption)
 # --------------------------------------------------------------------------- #
-def _write_tile(path: str, lon: float, lat: float, value: int, crs: str | None = None) -> None:
+def _write_tile(
+    path: str, lon: float, lat: float, value: int, crs: str | None = None, east_shift_m: float = 0.0
+) -> None:
     spec = zone_grid.zone(land_mask.zone_for_cell(lon, lat))
     west, south, east, north = land_mask._expected_cell_bounds(lon, lat, spec)
     h = w = 64
@@ -177,7 +194,7 @@ def _write_tile(path: str, lon: float, lat: float, value: int, crs: str | None =
         count=1,
         dtype="uint8",
         crs=crs or spec.crs,
-        transform=from_bounds(west, south, east, north, w, h),
+        transform=from_bounds(west, south, east + east_shift_m, north, w, h),
     ) as ds:
         ds.write(arr, 1)
 
@@ -205,4 +222,14 @@ def test_spot_check_delivery_rejects_wrong_crs(tmp_path) -> None:
     lon, lat = land_mask.parse_cell_name(n)
     _write_tile(str(tmp_path / n), lon, lat, value=1, crs="EPSG:32601")  # not the cell's zone
     with pytest.raises(ValueError, match="CRS"):
+        land_mask.spot_check_delivery([n], delivery_uri=str(tmp_path), n=10)
+
+
+def test_spot_check_delivery_rejects_shifted_right_edge(tmp_path) -> None:
+    # Correct west/top but a wrong width (right edge off by 100 m) must fail —
+    # the check compares all four bounds, not only left/top.
+    n = "grid_2.35_48.85.tiff"
+    lon, lat = land_mask.parse_cell_name(n)
+    _write_tile(str(tmp_path / n), lon, lat, value=1, east_shift_m=100.0)
+    with pytest.raises(ValueError, match="bounds"):
         land_mask.spot_check_delivery([n], delivery_uri=str(tmp_path), n=10)

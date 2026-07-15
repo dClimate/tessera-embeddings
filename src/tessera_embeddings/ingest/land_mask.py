@@ -122,7 +122,28 @@ def parse_cell_name(name: str) -> tuple[float, float]:
     parts = body.split("_")
     if len(parts) != 2:
         raise ValueError(f"Registry entry {name!r} does not parse to exactly (lon, lat)")
-    return float(parts[0]), float(parts[1])
+    lon, lat = float(parts[0]), float(parts[1])
+    _validate_cell_center(name, lon, lat)
+    return lon, lat
+
+
+def _validate_cell_center(name: str, lon: float, lat: float) -> None:
+    """Reject non-finite, out-of-range, or off-lattice registry cell centres.
+
+    Centres sit on the 0.1° lattice at ±(0.05 + 0.1·k)°, so ``value * 20`` is an
+    odd integer. A typo (``NaN``, ``|lon| > 180``, or a centre off the lattice)
+    would otherwise be assigned to the wrong zone or produce shifted/clamped
+    coverage — the registry is load-bearing, so fail loudly here.
+    """
+    for axis, value, limit in (("lon", lon, 180.0), ("lat", lat, 90.0)):
+        if not math.isfinite(value):
+            raise ValueError(f"Registry entry {name!r} has non-finite {axis} {value}")
+        if abs(value) > limit:
+            raise ValueError(f"Registry entry {name!r} has out-of-range {axis} {value}")
+        twentieths = value * 20.0
+        nearest = round(twentieths)
+        if abs(twentieths - nearest) > 1e-6 or nearest % 2 == 0:
+            raise ValueError(f"Registry entry {name!r} {axis}={value} is not on the 0.1° cell-centre lattice")
 
 
 @cache
@@ -504,11 +525,14 @@ def spot_check_delivery(
             if ds.crs is None or ds.crs.to_epsg() != int(spec.epsg):
                 raise ValueError(f"{name}: CRS {ds.crs} != zone {zone} ({spec.crs})")
             crs_ok += 1
-            west, _, _, north = _expected_cell_bounds(lon, lat, spec)
+            west, south, east, north = _expected_cell_bounds(lon, lat, spec)
             b = ds.bounds
-            if abs(b.left - west) > tol_m or abs(b.top - north) > tol_m:
+            # Check ALL four edges: a wrong width/height (shifted right/bottom)
+            # must not pass the load-bearing georeferencing check.
+            if max(abs(b.left - west), abs(b.bottom - south), abs(b.right - east), abs(b.top - north)) > tol_m:
                 raise ValueError(
-                    f"{name}: bounds ({b.left:.1f},{b.top:.1f}) off expected ({west:.1f},{north:.1f}) by >{tol_m} m"
+                    f"{name}: bounds {tuple(round(x, 1) for x in b)} off expected "
+                    f"({west:.1f},{south:.1f},{east:.1f},{north:.1f}) by >{tol_m} m"
                 )
             bounds_ok += 1
     log.info("Delivery spot-check: %d tiles all-1s, CRS + bounds OK", len(sample))
