@@ -291,8 +291,11 @@ delete as one merge, and the parity test is the gate, not elapsed time.
 7. **Zone boundary policy** → confirmed: pure nominal 6° longitude bands,
    disjoint, **no Norway/Svalbard MGRS exceptions**. Must be documented
    user-facing (zone_grid docstring, README, `zone_scheme` attr — W6).
-8. **Campaign land mask** → partner-supplied; the zone-fill runner takes it as
-   an input (same contract as today's ROI-mask zarr) and we assume it lands —
-   no fallback mask is built.
+8. **Campaign land mask** → partner-supplied; **now resolved by ADR-010**: the
+   v1.1 delivery is all-1s tiles + a registry, so we build per-zone coverage
+   bitmaps from the registry (`ingest/land_mask.py`, `build-land-mask-coverage`
+   flow) and the zone-fill runner reads `tile_live_2048` to select live tiles.
+   The earlier "same contract as the ROI-mask zarr / no fallback" framing is
+   superseded — see `context_docs/decisions/010-landmask-registry-coverage.md`.
 
 **The plan is final — no open questions remain.** Stage A is unblocked.

@@ -394,10 +394,19 @@ one staged 2048-px tile is exactly one output shard (D3), so whole tiles round-r
 across workers via `storage.shard_writer.write_year_shards` — every shard object is
 emitted once, lean (all-fill inner chunks elided: fully-masked tiles cost nothing and
 no-valid-observation inner chunks vanish; note water pixels ARE SCL-valid, so coastal
-tiles embed their ocean pixels — the land mask selects tiles, not pixels), with
+tiles embed their ocean pixels — the mask selects tiles, not pixels), with
 `years_complete` and per-year run provenance advanced in the same single commit. The
-zone-fill runner (`orchestration/runners/zone_fill.py`) drives it: partner land mask →
+zone-fill runner (`orchestration/runners/zone_fill.py`) drives it: coverage mask →
 inference → `assemble_global` → `campaign.tag_zone_year`.
+
+The **campaign land mask** is not a pixel ROI but a per-zone *coverage bitmap*
+(`tile_live_2048`) built from the partner's delivery registry by
+`ingest/land_mask.py` and the `build-land-mask-coverage` flow (ADR-010). v1.1 tiles are
+all-1s with a ~1-cell sea buffer, so the registry listing *is* the mask: a 2048-px tile
+is live iff a land cell's footprint intersects it. The runner reads one small bitmap
+(one GET) and selects live tiles by direct index — 1 tile == 1 shard == 1 coverage tile
+(D3) — rather than the per-chunk windowed reads `filter_chunks_by_roi_mask` does for the
+single-ROI flows.
 
 #### Write units vs read units, per layout
 

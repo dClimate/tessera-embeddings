@@ -15,6 +15,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
+from tessera_embeddings.storage.zarr_store import open_or_create_repo
 from tessera_embeddings.storage.zone_grid import ZoneSpec, easting_coords, northing_coords
 
 log = logging.getLogger("test_zone_fill")
@@ -71,13 +72,35 @@ def _make_mosaic(tmp_path, ny: int = _NY, nx: int = _NX) -> str:
     return base
 
 
-def _make_mask(tmp_path, live_tiles: list[tuple[int, int]]) -> str:
-    """Boolean mask on the zone grid with True inside the given tile positions."""
-    path = str(tmp_path / "land_mask.zarr")
-    arr = zarr.open(path, mode="w", shape=(_NY, _NX), chunks=(_NY, _NX), dtype="bool")
-    arr[:] = False
+def _make_mask(
+    tmp_path,
+    live_tiles: list[tuple[int, int]],
+    *,
+    zone_attr: str = _ZONE,
+    crs: str | None = None,
+    grid_shape: list[int] | None = None,
+    tile_shape: tuple[int, int] | None = None,
+) -> str:
+    """A coverage-bitmap Icechunk repo (ADR-010) with the given tiles live.
+
+    Mirrors :func:`ingest.land_mask.build_all` for one zone: a ``tile_live_2048``
+    bool array on the tile grid plus the zone/crs/grid_shape attrs the runner
+    guards. The overrides let tests construct wrong-zone / wrong-crs /
+    wrong-shape masks that must be rejected.
+    """
+    crs = _SPEC.crs if crs is None else crs
+    grid_shape = [_NY, _NX] if grid_shape is None else grid_shape
+    nr, nc = tile_shape if tile_shape is not None else (_NY // _TILE, _NX // _TILE)
+    path = str(tmp_path / "coverage.icechunk")
+    repo, _ = open_or_create_repo(path)
+    session = repo.writable_session("main")
+    node = zarr.open_group(session.store, mode="a").require_group(_ZONE)
+    tile_live = np.zeros((nr, nc), dtype=bool)
     for row, col in live_tiles:
-        arr[row * _TILE : (row + 1) * _TILE, col * _TILE : (col + 1) * _TILE] = True
+        tile_live[row, col] = True
+    node.create_array("tile_live_2048", data=tile_live, chunks=(nr, nc), dimension_names=("tile_row", "tile_col"))
+    node.attrs.update({"zone": zone_attr, "crs": crs, "grid_shape": grid_shape})
+    session.commit("seed test coverage")
     return path
 
 
@@ -339,22 +362,50 @@ def test_all_tiles_skipped_marks_complete_empty(tmp_path, monkeypatch):
     assert repo.lookup_tag("zone-32601-2025") == summary["snapshot_id"]
 
 
-def test_wrong_grid_mask_raises(tmp_path):
-    """A mask off the zone grid must be loud — zarr's silent window clamping
-    would otherwise classify the whole zone as ocean and tag it complete-empty.
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"zone_attr": "32602"}, "read positionally"),
+        ({"crs": "EPSG:99999"}, "read positionally"),
+        ({"grid_shape": [_NY // 2, _NX // 2]}, "read positionally"),
+    ],
+)
+def test_wrong_zone_coverage_mask_raises(tmp_path, kwargs, match):
+    """A coverage group whose zone/CRS/grid_shape attrs disagree with the seeded
+    group must be loud — all same-hemisphere zones share one shape, so a
+    wrong-zone mask would otherwise be read positionally and misclassify tiles.
     """
     store = _seed_global(tmp_path)
     mosaic_base = _make_mosaic(tmp_path)
-    path = str(tmp_path / "wrong_mask.zarr")
-    arr = zarr.open(path, mode="w", shape=(_NY // 2, _NX // 2), chunks=(_NY // 2, _NX // 2), dtype="bool")
-    arr[:] = True
+    mask = _make_mask(tmp_path, [(0, 0)], **kwargs)
 
-    with pytest.raises(ValueError, match="must cover the zone extent exactly"):
+    with pytest.raises(ValueError, match=match):
         zone_fill.fill_zone_year(
             store_path=store,
             zone=_ZONE,
             year=2025,
-            land_mask_path=path,
+            land_mask_path=mask,
+            mosaic_base=mosaic_base,
+            staging_base=str(tmp_path / "staging"),
+            config=_config(),
+            num_actors=1,
+            log=log,
+        )
+
+
+def test_coverage_bitmap_shape_mismatch_raises(tmp_path):
+    """A tile_live array inconsistent with the (attr-declared) grid is rejected."""
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    # grid_shape attr says the full zone, but the bitmap is the wrong tile shape.
+    mask = _make_mask(tmp_path, [], tile_shape=(1, 1))
+
+    with pytest.raises(ValueError, match="inconsistent with the seeded grid"):
+        zone_fill.fill_zone_year(
+            store_path=store,
+            zone=_ZONE,
+            year=2025,
+            land_mask_path=mask,
             mosaic_base=mosaic_base,
             staging_base=str(tmp_path / "staging"),
             config=_config(),

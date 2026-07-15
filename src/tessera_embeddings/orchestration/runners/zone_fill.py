@@ -2,7 +2,7 @@
 
 The orchestration-facing composition for the global campaign (ADR-008,
 implementation plan W5): enumerate the zone's shard-aligned tile grid against
-the **partner-supplied campaign land mask**, run Ray inference over the live
+the **campaign land-mask coverage bitmap**, run Ray inference over the live
 tiles, assemble the staged tiles into whole shards of the pre-seeded zone
 group, and tag the landed commit. The Prefect/AWS wiring (work queues, the
 fleet-wide commit gate as a Prefect global concurrency limit, credentials)
@@ -13,15 +13,15 @@ Contracts (all caller-owned):
 - **Ray**: the caller is already inside a Ray context (``ray.init`` or an
   attached cluster), exactly as for
   :func:`tessera_embeddings.inference.runner.run_inference`.
-- **Land mask**: ``land_mask_path`` is a boolean zarr on the zone's pixel grid
-  (same contract as the single-ROI mask). It is partner-supplied and assumed
-  delivered — no fallback mask is built (plan Q8). The mask selects TILES
-  (any land pixel makes the 2048² tile live) — within a live tile, every
-  observation-valid pixel is embedded, and water is SCL-valid, so coastal
-  tiles are dense; only fully-masked tiles cost nothing. Pixel-level land
-  masking inside tiles is a deliberate non-goal at this stage (it matches
-  the longstanding single-ROI ROI-mask semantics); revisit if coastal
-  storage costs demand it.
+- **Land mask**: ``land_mask_path`` is the coverage Icechunk repo
+  (:meth:`BucketPaths.land_mask_store`); this zone's group holds the
+  registry-derived ``tile_live_2048`` bitmap built by
+  :mod:`tessera_embeddings.ingest.land_mask` (ADR-010). A tile is live iff a
+  land cell's footprint intersects it; one ~1 KB GET replaces the per-tile
+  windowed reads of the old pixel mask. Within a live tile every
+  observation-valid pixel is embedded, and water is SCL-valid — the v1.1 mask
+  is all-1s with a ~1-cell sea buffer, so there is no per-pixel land signal to
+  apply, and pixel-level masking inside tiles is moot (not merely deferred).
 - **Zone group**: already seeded
   (:func:`tessera_embeddings.storage.global_store.seed_zone_groups`); the
   group's array shape and shard size are the grid authority. Nothing is
@@ -63,12 +63,12 @@ import zarr
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.inference.assembly import ZarrWriter, read_spatial_coords
-from tessera_embeddings.inference.chunk_spec import enumerate_chunks, filter_chunks_by_roi_mask
+from tessera_embeddings.inference.chunk_spec import enumerate_chunks
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.shard_writer import CommitGate, read_years_complete, shard_pitch
-from tessera_embeddings.storage.zarr_store import time_index_of
+from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, time_index_of
 from tessera_embeddings.storage.zone_grid import year_timestamp
 
 
@@ -216,20 +216,37 @@ def fill_zone_year(
             "shifted or reversed axes would silently misgeoreference the fill."
         )
 
-    # The mask must be on the zone grid too: zarr clamps out-of-range windows
-    # to empty instead of raising, so a wrong-grid mask would silently classify
-    # tiles (or the whole zone) as ocean and permanently tag the cell empty.
-    mask_shape = tuple(zarr.open(land_mask_path, mode="r").shape)  # type: ignore[union-attr]
-    if mask_shape != (ny, nx):
+    # The land mask is this zone's coverage group in the mask repo (ADR-010):
+    # registry-derived tile-liveness bitmaps, not a pixel mask. Open it with the
+    # same helper as the global store and validate its identity by attrs — all
+    # 60 same-hemisphere zones share one grid shape, so a wrong-zone mask would
+    # otherwise be read positionally and silently misclassify tiles (permanently
+    # tagging the cell empty). Guarding zone + CRS + grid_shape closes that hole.
+    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
+    cov_zone = cov.attrs.get("zone")
+    cov_crs = cov.attrs.get("crs")
+    cov_shape = list(cast("list[int]", cov.attrs.get("grid_shape", [])))
+    if cov_zone != zone or cov_crs != zone_crs or cov_shape != [ny, nx]:
         raise ValueError(
-            f"Land mask {land_mask_path} has shape {mask_shape} but zone {zone}'s grid is "
-            f"({ny}, {nx}) — the campaign mask must cover the zone extent exactly."
+            f"Coverage group for {zone} at {land_mask_path} has zone={cov_zone!r} crs={cov_crs!r} "
+            f"grid_shape={cov_shape} — expected zone={zone!r} crs={zone_crs!r} grid_shape={[ny, nx]}. "
+            "A wrong-zone coverage mask would be read positionally and misclassify tiles."
+        )
+    tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
+    n_tile_rows, n_tile_cols = ny // shard_px, nx // shard_px
+    if tile_live.shape != (n_tile_rows, n_tile_cols):
+        raise ValueError(
+            f"Coverage bitmap for {zone} has tile_live shape {tile_live.shape} but the zone's tile grid is "
+            f"({n_tile_rows}, {n_tile_cols}) — the coverage build is inconsistent with the seeded grid."
         )
 
+    # 1 inference tile == 1 shard == 1 coverage tile (ADR-008 D3), so a chunk's
+    # (row, col) ARE its coverage-bitmap indices: liveness is a direct lookup,
+    # not the per-tile windowed read the single-ROI pixel mask needs.
     chunks = enumerate_chunks(ny, nx, shard_px)
-    live = filter_chunks_by_roi_mask(chunks, land_mask_path)
+    live = [c for c in chunks if bool(tile_live[c.row, c.col])]
     log.info(
-        "Zone %s year %d: %d/%d tiles intersect the campaign land mask (run %s)",
+        "Zone %s year %d: %d/%d tiles are live in the campaign coverage mask (run %s)",
         zone,
         year,
         len(live),

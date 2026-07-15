@@ -754,7 +754,12 @@ def open_store(store_path: str, chunks: "ChunksArg" = _CHUNKS_UNSET, group: str 
 
 
 def open_store_as_zarr_group(
-    store_path: str, max_concurrent_requests: int | None = None, group: str | None = None
+    store_path: str,
+    max_concurrent_requests: int | None = None,
+    group: str | None = None,
+    *,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    region: str | None = None,
 ) -> zarr.Group:
     """Open an Icechunk store for reading as a raw zarr Group.
 
@@ -769,8 +774,13 @@ def open_store_as_zarr_group(
     region merge's worker forks all reading one feature store — so the aggregate
     GET rate stays under S3's per-prefix ceiling. ``group`` selects one Zarr
     group (the global store's per-zone layout); ``None`` returns the root group.
+    ``get_credentials``/``region`` are forwarded to the opener so a store outside
+    the default S3 region — or one reachable only via an explicit credential
+    callback — can be read with the same options used for the writer.
     """
-    repo = _open_repo(store_path, max_concurrent_requests=max_concurrent_requests)
+    repo = _open_repo(
+        store_path, max_concurrent_requests=max_concurrent_requests, get_credentials=get_credentials, region=region
+    )
     session = repo.readonly_session(branch="main")
     root = zarr.open_group(session.store, mode="r")
     if group is None:

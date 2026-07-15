@@ -70,3 +70,14 @@ class BucketPaths(BaseModel):
         which is one ``.zarr`` per (roi, kind).
         """
         return posixpath.join(self.outputs, "global", f"{name}.icechunk")
+
+    def land_mask_store(self, name: str = "global") -> str:
+        """Return the URI of the campaign land-mask coverage Icechunk repo.
+
+        One repo of 120 UTM-zone groups (ADR-010), each holding registry-derived
+        coverage bitmaps (``tile_live_2048`` / ``chunk_live_256``) addressed by
+        zone group name — mirroring :meth:`global_store` so the zone-fill runner
+        reads it with the same ``open_store_as_zarr_group(path, group=zone)``
+        helper. Lives under ``inputs`` (it is a campaign input, like ROI masks).
+        """
+        return posixpath.join(self.inputs, "masks", f"{name}.icechunk")
