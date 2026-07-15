@@ -50,17 +50,20 @@ def _year_complete_tag(year: int) -> str:
     return f"year-{year}-complete"
 
 
-def _ensure_tag(repo: icechunk.Repository, tag: str, sid: str) -> str:
+def _ensure_tag(repo: icechunk.Repository, tag: str, sid: str, *, explicit: bool) -> str:
     """Create ``tag`` at ``sid``, idempotently — the refuse-to-move policy's one home.
 
-    A tag already at ``sid`` is a no-op (resume); a tag pointing elsewhere raises
-    rather than silently moving campaign history. Note icechunk tags are
-    write-once *forever* — a deleted tag name can never be recreated — so a
-    deliberate refill must pin its new snapshot under a fresh tag name.
+    An existing tag is a no-op success when the caller took the default
+    snapshot (the branch tip) — the year is already pinned, and a finalization
+    sweep re-tagging after ``main`` advanced must not fail. Only an *explicit*
+    ``snapshot_id`` that disagrees with the existing tag raises, rather than
+    silently moving campaign history. Note icechunk tags are write-once
+    *forever* — a deleted tag name can never be recreated — so a deliberate
+    refill must pin its new snapshot under a fresh tag name.
     """
     if tag in repo.list_tags():
         current = repo.lookup_tag(tag)
-        if current != sid:
+        if explicit and current != sid:
             raise ValueError(f"tag {tag!r} already exists at snapshot {current}; refusing to move it to {sid}")
         return tag
     repo.create_tag(tag, sid)
@@ -83,7 +86,9 @@ def tag_zone_year(
     pointing at the same snapshot is a no-op; a tag pointing *elsewhere* raises
     rather than silently moving campaign history.
     """
-    return _ensure_tag(repo, zone_year_tag(zone, year), snapshot_id or repo.lookup_branch(branch))
+    return _ensure_tag(
+        repo, zone_year_tag(zone, year), snapshot_id or repo.lookup_branch(branch), explicit=snapshot_id is not None
+    )
 
 
 def tag_year_complete(
@@ -108,7 +113,9 @@ def tag_year_complete(
             f"cannot tag year {year} complete: {len(missing)}/{len(expected)} zone(s) "
             f"have not landed it (e.g. {missing[:5]})"
         )
-    return _ensure_tag(repo, _year_complete_tag(year), snapshot_id or repo.lookup_branch(branch))
+    return _ensure_tag(
+        repo, _year_complete_tag(year), snapshot_id or repo.lookup_branch(branch), explicit=snapshot_id is not None
+    )
 
 
 def mark_zone_year_empty(
@@ -233,11 +240,15 @@ class CampaignStatus:
         """The ``(zone, year)`` cells still to fill, for the orchestrator's work list.
 
         Defaults to all 120 zones x the campaign years; a zone not yet seeded counts
-        every year as pending.
+        every year as pending. Ordered year-major (all zones of one year before
+        the next year) so a scheduler draining the list concurrently never
+        queues two years of the SAME zone back to back — same-zone fills must
+        be serial (their attr commits conflict; see
+        :func:`~tessera_embeddings.storage.shard_writer.write_year_shards`).
         """
         zone_names = tuple(expected_zones) if expected_zones is not None else tuple(ZONES)
         yrs = tuple(years) if years is not None else self.years
-        return [(z, y) for z in zone_names for y in yrs if not self.has(z, y)]
+        return [(z, y) for y in yrs for z in zone_names if not self.has(z, y)]
 
     def years_fully_complete(self, *, expected_zones: Iterable[str] | None = None) -> list[int]:
         """Years landed in *every* expected zone (default: all 120)."""

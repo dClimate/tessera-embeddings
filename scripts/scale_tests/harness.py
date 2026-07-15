@@ -169,7 +169,13 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
     elif args.backend == _S3:
         # A prefix from --bucket is treated exactly as if passed to --store-root;
         # a bare bucket gets the harness-managed scale_tests/<run-id> layout.
-        store_root = f"s3://{bucket}/{bucket_prefix}" if bucket_prefix else f"s3://{bucket}/scale_tests/{args.run_id}"
+        # Always scope by run_id: without it, runs sharing a --bucket prefix
+        # clobber each other's stores and teardown deletes them all at once.
+        store_root = (
+            f"s3://{bucket}/{bucket_prefix}/{args.run_id}"
+            if bucket_prefix
+            else f"s3://{bucket}/scale_tests/{args.run_id}"
+        )
     else:
         store_root = str((Path.cwd() / "scale_test_stores" / args.run_id).resolve())
 

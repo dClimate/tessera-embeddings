@@ -15,7 +15,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.orchestration.runners import zone_fill
 from tessera_embeddings.storage import global_store
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
-from tessera_embeddings.storage.zone_grid import ZoneSpec
+from tessera_embeddings.storage.zone_grid import ZoneSpec, easting_coords, northing_coords
 
 log = logging.getLogger("test_zone_fill")
 
@@ -53,17 +53,20 @@ def _seed_global(tmp_path) -> str:
 
 
 def _make_mosaic(tmp_path, ny: int = _NY, nx: int = _NX) -> str:
-    """A minimal reflectance store so enumerate_mosaic_chunks can read the grid."""
+    """A minimal reflectance store on the zone's real grid (CRS + coords validated by the runner)."""
     base = str(tmp_path / "mosaics")
+    north = northing_coords(_SPEC) if ny == _NY else np.arange(ny, dtype="float64")
+    east = easting_coords(_SPEC) if nx == _NX else np.arange(nx, dtype="float64")
     create_empty_store_from_coords(
         f"{base}/reflectance.zarr",
         coords={
             "time": np.array(["2025-01-01"], dtype="datetime64[ns]"),
-            "northing": np.arange(ny, dtype="float64"),
-            "easting": np.arange(nx, dtype="float64"),
+            "northing": north,
+            "easting": east,
         },
         var_specs={"red": VarSpec(dims=("time", "northing", "easting"), dtype=np.dtype("uint16"), chunks=(1, ny, nx))},
         commit_msg="seed test mosaic",
+        attrs={"crs": _SPEC.crs},
     )
     return base
 

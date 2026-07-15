@@ -1560,7 +1560,7 @@ class TestAssembleGlobalGuards:
             emb = np.ones((chunk.height, chunk.width, dim), dtype=np.int8)
             writer.write_chunk(chunk, emb, "runT", scales=np.ones((chunk.height, chunk.width), dtype=np.float32))
 
-        with pytest.raises(ValueError, match=r"chunk_1_0\.zarr is 8 x 64 px"):
+        with pytest.raises(ValueError, match=r"chunk_1_0\.zarr has embeddings extent 8 x 64 px"):
             writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runT", n_workers=1)
 
     def test_wrong_dtype_probe_raises(self, tmp_path):

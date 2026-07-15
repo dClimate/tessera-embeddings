@@ -37,9 +37,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     harness.add_common_args(parser)
     parser.add_argument("--purge-results", action="store_true", help="Also delete local + S3 results.")
+    parser.add_argument(
+        "--force", action="store_true", help="Delete a store root even when it is not scoped by the run id."
+    )
     args = parser.parse_args()
     cfg = harness.config_from_args(args)
     harness.configure_logging()
+
+    if cfg.run_id not in cfg.store_root and not args.force:
+        raise SystemExit(
+            f"store root {cfg.store_root!r} is not scoped by run id {cfg.run_id!r} — a recursive "
+            "delete could take out other runs (or a whole shared prefix). Pass --force to override."
+        )
 
     before, after = _rm_prefix(cfg.store_root)
     logger.info("stores: removed %d objects under %s (%d remain)", before - after, cfg.store_root, after)

@@ -47,7 +47,12 @@ def _put_many(bucket: str, prefix: str, concurrency: int, n_objects: int) -> tup
             return 0
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
-            return 1 if code in ("SlowDown", "503", "ServiceUnavailable") else 0
+            if code in ("SlowDown", "503", "ServiceUnavailable"):
+                return 1
+            # Anything else (AccessDenied, NoSuchBucket, KMS, ...) is a broken
+            # run, not throttling — counting it as a clean PUT would corrupt
+            # the ramp evidence with failed-request "throughput".
+            raise
 
     t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
@@ -60,8 +65,11 @@ def phase_ramp(cfg: harness.RunConfig) -> None:
     ramp = CONCURRENCY_RAMP_TINY if cfg.is_tiny else CONCURRENCY_RAMP_BENCH
     n = OBJECTS_PER_LEVEL
     for concurrency in ramp:
-        prefix = f"scale_tests/{cfg.run_id}/t7_ramp/c{concurrency}"
-        slowdowns, wall = _put_many(cfg.bucket, prefix, concurrency, n)
+        # Under the configured store root (which is run_id-scoped), so
+        # teardown.py's recursive delete actually removes the ramp objects.
+        uri = harness.store_uri(cfg, f"t7_ramp/c{concurrency}")
+        bucket, _, prefix = uri.removeprefix("s3://").partition("/")
+        slowdowns, wall = _put_many(bucket, prefix, concurrency, n)
         puts_per_s = n / wall if wall > 0 else 0.0
         harness.emit_metric(cfg, TEST, "ramp", "slowdown_503_count", slowdowns, "count", concurrency=concurrency, n=n)
         harness.emit_metric(cfg, TEST, "ramp", "puts_per_s", puts_per_s, "count/s", concurrency=concurrency)

@@ -15,7 +15,13 @@ Contracts (all caller-owned):
   :func:`tessera_embeddings.inference.runner.run_inference`.
 - **Land mask**: ``land_mask_path`` is a boolean zarr on the zone's pixel grid
   (same contract as the single-ROI mask). It is partner-supplied and assumed
-  delivered — no fallback mask is built (plan Q8).
+  delivered — no fallback mask is built (plan Q8). The mask selects TILES
+  (any land pixel makes the 2048² tile live) — within a live tile, every
+  observation-valid pixel is embedded, and water is SCL-valid, so coastal
+  tiles are dense; only fully-masked tiles cost nothing. Pixel-level land
+  masking inside tiles is a deliberate non-goal at this stage (it matches
+  the longstanding single-ROI ROI-mask semantics); revisit if coastal
+  storage costs demand it.
 - **Zone group**: already seeded
   (:func:`tessera_embeddings.storage.global_store.seed_zone_groups`); the
   group's array shape and shard size are the grid authority. Nothing is
@@ -51,13 +57,13 @@ from collections.abc import Callable
 from typing import Any, cast
 
 import icechunk
+import numpy as np
 import zarr
 
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import InferenceConfig
-from tessera_embeddings.inference.assembly import ZarrWriter
+from tessera_embeddings.inference.assembly import ZarrWriter, read_spatial_coords
 from tessera_embeddings.inference.chunk_spec import enumerate_chunks, filter_chunks_by_roi_mask
-from tessera_embeddings.inference.orchestration_helpers import enumerate_mosaic_chunks
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
@@ -176,12 +182,38 @@ def fill_zone_year(
             "the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
         )
 
-    # The ingest mosaics must be on the zone grid exactly (campaign contract).
-    _, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, shard_px, log)
+    # The ingest mosaics must be on the zone grid exactly (campaign contract) —
+    # and not just dimensionally: every zone in a hemisphere shares the same
+    # pixel extent, so a same-shaped mosaic for the WRONG zone (or a shifted /
+    # reversed grid) would pass a shape check and be written positionally,
+    # silently misgeoreferencing the whole fill. Compare CRS and coordinate
+    # endpoints against the seeded group, the grid authority.
+    spatial = read_spatial_coords(mosaic_base)
+    total_y, total_x = len(spatial.northing), len(spatial.easting)
     if (total_y, total_x) != (ny, nx):
         raise ValueError(
             f"Mosaic grid ({total_y} x {total_x}) at {mosaic_base} does not match "
             f"zone {zone}'s grid ({ny} x {nx}) — the campaign ingest must cover the zone extent exactly."
+        )
+    zone_crs = node.attrs.get("crs")
+    if spatial.crs != zone_crs:
+        raise ValueError(
+            f"Mosaic CRS {spatial.crs!r} at {mosaic_base} does not match zone {zone}'s CRS "
+            f"{zone_crs!r} — a wrong-zone mosaic would be written positionally and misgeoreferenced."
+        )
+    z_north = cast(zarr.Array, node["northing"])
+    z_east = cast(zarr.Array, node["easting"])
+    endpoints_match = (
+        np.isclose(spatial.northing[0], z_north[0])
+        and np.isclose(spatial.northing[-1], z_north[-1])
+        and np.isclose(spatial.easting[0], z_east[0])
+        and np.isclose(spatial.easting[-1], z_east[-1])
+    )
+    if not endpoints_match:
+        raise ValueError(
+            f"Mosaic coordinates at {mosaic_base} (northing {spatial.northing[0]}..{spatial.northing[-1]}, "
+            f"easting {spatial.easting[0]}..{spatial.easting[-1]}) do not lie on zone {zone}'s grid — "
+            "shifted or reversed axes would silently misgeoreference the fill."
         )
 
     # The mask must be on the zone grid too: zarr clamps out-of-range windows

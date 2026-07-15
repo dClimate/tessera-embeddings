@@ -320,10 +320,11 @@ class StagedShardSource:
     The global write path's 1:1 mapping (ADR-008 D3): one staged 2048-px
     inference tile is exactly one output shard, so ``live_shards`` is the staged
     tile grid positions and ``load`` returns each staged variable whole, with a
-    leading time axis. Every tile is validated as it is read — exactly one
-    shard tall/wide and carrying every expected variable — so a truncated or
-    heterogeneous staged run fails loudly (naming the tile) instead of leaving
-    silent fill inside a shard of a year that then gets tagged complete. Frozen
+    leading time axis. Every tile is validated as it is read — every expected
+    variable present, each exactly one shard tall/wide, and matching the
+    probe's dtype — so a truncated, mixed-version, or corrupt staged run fails
+    loudly (naming the tile and variable) instead of silently casting or
+    leaving fill inside a shard of a year that then gets tagged complete. Frozen
     dataclass of plain strings/tuples so the shard writer can pickle it to
     spawned workers.
     """
@@ -333,6 +334,7 @@ class StagedShardSource:
     shards: tuple[tuple[int, int], ...]
     variables: tuple[str, ...]
     shard_px: int
+    dtypes: tuple[tuple[str, str], ...] = ()  # (var, dtype) expectations from the probe
 
     def live_shards(self) -> list[tuple[int, int]]:
         """The staged ``(row, col)`` tile positions — shard indices, 1:1."""
@@ -343,6 +345,7 @@ class StagedShardSource:
         sy, sx = shard
         path = f"{self.staging_base}/{self.run_id}/{chunk_label(sy, sx)}.zarr"
         group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
+        expected_dtypes = dict(self.dtypes)
         blocks: dict[str, np.ndarray] = {}
         for var in self.variables:
             if var not in group:
@@ -350,13 +353,20 @@ class StagedShardSource:
                     f"Staged tile {path} is missing variable {var!r} (present in the probed tile) — "
                     "heterogeneous staged run; re-stage or fix before assembling."
                 )
-            blocks[var] = np.asarray(cast(zarr.Array, group[var])[:])[np.newaxis]
-        h, w = blocks["embeddings"].shape[1:3]
-        if (h, w) != (self.shard_px, self.shard_px):
-            raise ValueError(
-                f"Staged tile {path} is {h} x {w} px but shards are {self.shard_px} px — "
-                "truncated or off-grid tile (ADR-008 D3 requires whole tiles)."
-            )
+            block = np.asarray(cast(zarr.Array, group[var])[:])[np.newaxis]
+            want = expected_dtypes.get(var)
+            if want is not None and str(block.dtype) != want:
+                raise ValueError(
+                    f"Staged tile {path} has {var} dtype {block.dtype}, expected {want} — a raw-zarr "
+                    "write would silently C-cast (wraparound); mixed-version or corrupt staged run."
+                )
+            h, w = block.shape[1:3]
+            if (h, w) != (self.shard_px, self.shard_px):
+                raise ValueError(
+                    f"Staged tile {path} has {var} extent {h} x {w} px but shards are {self.shard_px} px — "
+                    "truncated or off-grid tile (ADR-008 D3 requires whole tiles)."
+                )
+            blocks[var] = block
         return blocks
 
 
@@ -982,10 +992,11 @@ class ZarrWriter:
             # silently land in a corner (or be clamp-truncated) on a mismatched
             # extent — the loud check xarray's append used to provide.
             emb = cast(zarr.Array, root["embeddings"])
-            if emb.shape[1] != total_y or emb.shape[2] != total_x:
+            if emb.shape[1] != total_y or emb.shape[2] != total_x or emb.shape[3] != self.embedding_dim:
                 raise ValueError(
-                    f"Mosaic extent ({total_y} x {total_x}) does not match existing store "
-                    f"{output_path} ({emb.shape[1]} x {emb.shape[2]}) — wrong output path or ROI grid."
+                    f"Mosaic extent ({total_y} x {total_x} x {self.embedding_dim} bands) does not match "
+                    f"existing store {output_path} ({emb.shape[1]} x {emb.shape[2]} x {emb.shape[3]} bands) "
+                    "— wrong output path, ROI grid, or model width."
                 )
             # Variables staged by this run but absent from the store (e.g. a
             # store created before obs counts, or compute_std newly on) are
@@ -1142,6 +1153,12 @@ class ZarrWriter:
         one variable set); per-tile shape/variable validation happens as tiles
         are read. ``embedding_std`` is never staged under v1.1.
 
+        Refill caveat: only staged tiles are written. A deliberate refill of a
+        landed year (an exceptional, manual operation — the zone-year tag is
+        write-once) whose new run skips or drops tiles the previous run staged
+        leaves the prior data in those shards; a refill must re-stage every
+        previously-live tile, or the operator must clear the year first.
+
         Args:
             store_path: URI of the global Icechunk repo
                 (``BucketPaths.global_store()``).
@@ -1212,9 +1229,16 @@ class ZarrWriter:
                 f"Staged tiles are {staged_shape[0]} x {staged_shape[1]} px but {zone} shards are "
                 f"{shard_px} px — the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
             )
+        missing_dst = [v for v in ("embeddings", "scales") if v not in node]
+        if missing_dst:
+            raise ValueError(
+                f"Zone group {zone} lacks required array(s) {missing_dst} — a fill without them "
+                "could not be dequantized; the group must be seeded with a full GLOBAL layout."
+            )
         variables = tuple(
             v for v in ("embeddings", "scales", "embedding_std", *OBS_COUNT_VARS) if v in staged_group and v in node
         )
+        probe_dtypes = tuple((v, str(cast(zarr.Array, staged_group[v]).dtype)) for v in variables)
 
         _log.info(
             "Assembling %d staged tiles into %s/%s year %d (index %d, vars %s, %d workers)",
@@ -1227,7 +1251,12 @@ class ZarrWriter:
             n_workers,
         )
         source = StagedShardSource(
-            staging_base=self.staging_base, run_id=run_id, shards=shards, variables=variables, shard_px=shard_px
+            staging_base=self.staging_base,
+            run_id=run_id,
+            shards=shards,
+            variables=variables,
+            shard_px=shard_px,
+            dtypes=probe_dtypes,
         )
         snapshot = write_year_shards(
             repo,

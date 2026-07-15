@@ -392,7 +392,9 @@ read-your-writes, so the merged result is exact.
 The **global-campaign variant**, `writer.assemble_global`, skips the banding entirely:
 one staged 2048-px tile is exactly one output shard (D3), so whole tiles round-robin
 across workers via `storage.shard_writer.write_year_shards` — every shard object is
-emitted once, lean (all-fill inner chunks elided, so ocean costs nothing), with
+emitted once, lean (all-fill inner chunks elided: fully-masked tiles cost nothing and
+no-valid-observation inner chunks vanish; note water pixels ARE SCL-valid, so coastal
+tiles embed their ocean pixels — the land mask selects tiles, not pixels), with
 `years_complete` and per-year run provenance advanced in the same single commit. The
 zone-fill runner (`orchestration/runners/zone_fill.py`) drives it: partner land mask →
 inference → `assemble_global` → `campaign.tag_zone_year`.

@@ -121,13 +121,25 @@ def test_tag_zone_year_idempotent(tmp_path):
     assert first == again
 
 
-def test_tag_zone_year_refuses_to_move(tmp_path):
+def test_tag_zone_year_refuses_to_move_explicit(tmp_path):
+    """An EXPLICIT snapshot that disagrees with the existing tag is refused."""
     _, repo = _seed(tmp_path)
     _fill(repo, "32601", year_index=0)
     campaign.tag_zone_year(repo, "32601", 2023)
     _fill(repo, "32601", year_index=1)  # HEAD advances
     with pytest.raises(ValueError, match="refusing to move"):
-        campaign.tag_zone_year(repo, "32601", 2023)  # would point at a new HEAD
+        campaign.tag_zone_year(repo, "32601", 2023, snapshot_id=repo.lookup_branch("main"))
+
+
+def test_tag_zone_year_default_is_idempotent_after_head_moves(tmp_path):
+    """Default-snapshot re-tagging after main advanced is a no-op success (sweep-safe)."""
+    _, repo = _seed(tmp_path)
+    _fill(repo, "32601", year_index=0)
+    campaign.tag_zone_year(repo, "32601", 2023)
+    pinned = repo.lookup_tag("zone-32601-2023")
+    _fill(repo, "32601", year_index=1)  # HEAD advances
+    assert campaign.tag_zone_year(repo, "32601", 2023) == "zone-32601-2023"
+    assert repo.lookup_tag("zone-32601-2023") == pinned, "existing pin must not move"
 
 
 def test_tag_year_complete_requires_all_zones(tmp_path):
