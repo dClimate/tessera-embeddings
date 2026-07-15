@@ -17,11 +17,39 @@ References:
 from __future__ import annotations
 
 import logging
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _dist_version
 
 import numpy as np
 from pyproj import CRS
 
 logger = logging.getLogger(__name__)
+
+
+def _software_version() -> str:
+    """Version of this package that built the store (``geoemb:build_version``)."""
+    try:
+        return _dist_version("tessera_embeddings")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _is_metre_crs(epsg_code: str | None) -> bool:
+    """Whether an EPSG code's horizontal axes are metres.
+
+    ``geoemb:gsd`` is defined in metres, so the coordinate spacing may only be
+    used as the GSD for a metre-based (projected) CRS. A geographic CRS
+    (e.g. EPSG:4326, degrees) or a US-survey-foot CRS must not have its spacing
+    mislabelled as metres.
+    """
+    if not epsg_code:
+        return False
+    try:
+        crs = CRS.from_user_input(epsg_code)
+    except Exception:
+        return False
+    units = [getattr(a, "unit_name", "").lower() for a in crs.axis_info]
+    return bool(units) and all(u in ("metre", "meter") for u in units)
 
 # Convention registration metadata (UUID + schema URLs)
 _PROJ_CONVENTION = {
@@ -49,8 +77,9 @@ _GEOEMB_CONVENTION = {
 }
 
 # --- geoemb: field defaults (this pipeline's fixed provenance) --------------
-#: Encoder checkpoint version (v1.1 pipeline). Versions both the model URL and
-#: ``geoemb:build_version``; overridable per call via ``model_version``.
+#: Encoder checkpoint version (v1.1 pipeline). Versions the ``geoemb:model`` URL;
+#: overridable per call via ``model_version``. (``geoemb:build_version`` is the
+#: software/package version, not this.)
 ENCODER_VERSION = "1.1"
 #: Model reference URL, versioned by the encoder checkpoint.
 _MODEL_URL_TEMPLATE = "https://geotessera.org/model/{version}"
@@ -224,12 +253,13 @@ def build_convention_attrs(
 
     The ``geoemb:`` fields record encoder-model provenance and quantization:
     *model_version* (the encoder checkpoint version, default
-    :data:`ENCODER_VERSION`) versions both ``geoemb:model`` and
-    ``geoemb:build_version``; *data_type* is the quantized storage dtype;
-    *gsd* the ground sample distance in metres (derived from the coordinate
-    spacing when coords are given, else this nominal value); *spatial_layout*
-    is ``"utm_zones"``/``"global"`` and is OMITTED when ``None`` (a single-ROI
-    store has no utmNN/global groups); *source_data* the source-dataset URLs.
+    :data:`ENCODER_VERSION`) versions the ``geoemb:model`` URL, while
+    ``geoemb:build_version`` is the software/package version;
+    *data_type* is the quantized storage dtype; *gsd* the ground sample distance
+    in metres (derived from the coordinate spacing only for a metre-based CRS,
+    else this nominal value); *spatial_layout* is ``"utm_zones"``/``"global"``
+    and is OMITTED when ``None`` (a single-ROI store has no utmNN/global groups);
+    *source_data* the source-dataset URLs.
     """
     conventions: list[dict] = []
     attrs: dict = {}
@@ -267,8 +297,10 @@ def build_convention_attrs(
     attrs["geoemb:source_data"] = list(source_data)
     attrs["geoemb:data_type"] = data_type
     # Prefer the actual pixel size from the coordinate spacing (an ROI may be
-    # coarsened, e.g. 20 m) over the nominal default.
-    if x_coords is not None and len(x_coords) > 1:
+    # coarsened, e.g. 20 m) over the nominal default — but ONLY for a metre-based
+    # CRS, since geoemb:gsd is defined in metres and a geographic/foot CRS's
+    # spacing would be degrees/feet. Fall back to the explicit gsd otherwise.
+    if x_coords is not None and len(x_coords) > 1 and _is_metre_crs(effective_epsg):
         attrs["geoemb:gsd"] = abs(float(np.median(np.diff(x_coords))))
     else:
         attrs["geoemb:gsd"] = gsd
@@ -277,7 +309,9 @@ def build_convention_attrs(
     # so omit it unless a caller (e.g. the 120-group campaign) sets it.
     if spatial_layout is not None:
         attrs["geoemb:spatial_layout"] = spatial_layout
-    attrs["geoemb:build_version"] = version
+    # build_version is the SOFTWARE build (this package) per the convention; the
+    # encoder checkpoint version is carried separately in geoemb:model.
+    attrs["geoemb:build_version"] = _software_version()
     attrs["geoemb:quantization"] = {
         "method": "per_pixel_scale",  # absmax-per-pixel: value = quantized * scale
         "original_dtype": "float32",

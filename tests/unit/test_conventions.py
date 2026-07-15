@@ -1,9 +1,13 @@
 """Tests for GeoZarr convention attribute builders."""
 
+from importlib.metadata import version as _dist_version
+
 import numpy as np
 import pytest
 
 from tessera_embeddings.inference.conventions import ENCODER_VERSION, build_convention_attrs, tile_id_to_epsg
+
+_PKG_VERSION = _dist_version("tessera_embeddings")
 
 
 class TestTileIdToEpsg:
@@ -94,13 +98,13 @@ class TestBuildConventionAttrs:
         # geoemb: — required fields per the convention schema
         assert attrs["geoemb:type"] == "pixel"
         assert attrs["geoemb:dimensions"] == 128
-        assert attrs["geoemb:model"] == "https://geotessera.org/model/1.1"
+        assert attrs["geoemb:model"] == "https://geotessera.org/model/1.1"  # encoder version
         assert attrs["geoemb:source_data"] == ["s3://sentinel-cogs", "https://datapool.asf.alaska.edu/RTC/OPERA-S1"]
         assert attrs["geoemb:data_type"] == "int8"
-        assert attrs["geoemb:gsd"] == 10.0  # derived from the 10 m coordinate spacing
+        assert attrs["geoemb:gsd"] == 10.0  # derived from the 10 m (metre CRS) coordinate spacing
         # spatial_layout is omitted by default (single-ROI store, no utmNN groups)
         assert "geoemb:spatial_layout" not in attrs
-        assert attrs["geoemb:build_version"] == "1.1"
+        assert attrs["geoemb:build_version"] == _PKG_VERSION  # software/package version, not the encoder
         quant = attrs["geoemb:quantization"]
         assert quant["method"] == "per_pixel_scale"
         assert quant["original_dtype"] == "float32"
@@ -141,9 +145,9 @@ class TestBuildConventionAttrs:
         # spatial: still present since coords are provided
         assert "spatial:" in names
 
-    def test_model_version_defaults_to_encoder_version(self) -> None:
-        """With no explicit model_version, geoemb:model + build_version use the
-        pipeline's encoder checkpoint version.
+    def test_model_uses_encoder_version_build_uses_package_version(self) -> None:
+        """geoemb:model is versioned by the encoder checkpoint; geoemb:build_version
+        is the software/package version (they are distinct).
         """
         attrs = build_convention_attrs(
             total_y=10,
@@ -151,8 +155,9 @@ class TestBuildConventionAttrs:
             embedding_dim=128,
             model_version=None,
         )
-        assert attrs["geoemb:build_version"] == ENCODER_VERSION
         assert attrs["geoemb:model"] == f"https://geotessera.org/model/{ENCODER_VERSION}"
+        assert attrs["geoemb:build_version"] == _PKG_VERSION
+        assert attrs["geoemb:build_version"] != ENCODER_VERSION
 
     def test_spatial_layout_omitted_by_default_included_when_set(self) -> None:
         """spatial_layout is optional: omitted for a root-only single-ROI store,
@@ -170,6 +175,17 @@ class TestBuildConventionAttrs:
             tile_id="33UWP", total_y=10, total_x=10, embedding_dim=128, y_coords=y, x_coords=x
         )
         assert attrs["geoemb:gsd"] == 20.0
+
+    def test_gsd_not_derived_from_geographic_crs_spacing(self) -> None:
+        """A geographic CRS (EPSG:4326, degrees) must NOT have its 0.1° spacing
+        mislabelled as metres — gsd falls back to the explicit value.
+        """
+        y = np.arange(10.0, 9.0, -0.1)  # 0.1 degree spacing
+        x = np.arange(0.0, 1.0, 0.1)
+        attrs = build_convention_attrs(
+            epsg_code="EPSG:4326", total_y=10, total_x=10, embedding_dim=128, y_coords=y, x_coords=x, gsd=10.0
+        )
+        assert attrs["geoemb:gsd"] == 10.0  # nominal fallback, not 0.1
 
     def test_epsg_code_overrides_tile_id(self) -> None:
         """When both tile_id and epsg_code are provided, epsg_code wins."""
