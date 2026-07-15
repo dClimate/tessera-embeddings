@@ -65,7 +65,7 @@ from tessera_embeddings.storage.zarr_store import (
     read_time_values,
     time_index_of,
 )
-from tessera_embeddings.storage.zone_grid import year_timestamp
+from tessera_embeddings.storage.zone_grid import PIXEL_M, year_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +181,10 @@ def read_spatial_coords(mosaic_base: str) -> SpatialCoords:
     """
     reflectance_path = f"{mosaic_base}/reflectance.zarr"
     logger.info("Reading projected coordinates from %s", reflectance_path)
-    ref_ds = open_store(reflectance_path)
+    # chunks=None: read only the 1-D coord arrays + attrs off metadata, never
+    # building a dask graph over the store's data chunks (this runs once per
+    # zone-year fill, so the graph would be pure overhead on the runner).
+    ref_ds = open_store(reflectance_path, chunks=None)
     coords = SpatialCoords(
         northing=ref_ds["northing"].values,
         easting=ref_ds["easting"].values,
@@ -1005,6 +1008,31 @@ class ZarrWriter:
                     f"existing store {output_path} ({emb.shape[1]} x {emb.shape[2]} x {emb.shape[3]} bands) "
                     "— wrong output path, ROI grid, or model width."
                 )
+            # Shape alone can't catch a shifted/reversed mosaic on the same grid
+            # size (the manifest omits origin), which would be appended under the
+            # existing coordinates and silently misgeoreferenced. Compare CRS +
+            # coordinate endpoints against the stored grid (half-pixel absolute
+            # tolerance, as in the zone-fill runner) when mosaic coords are known.
+            if spatial is not None:
+                stored_crs = root.attrs.get("crs")
+                if spatial.crs != stored_crs:
+                    raise ValueError(
+                        f"Mosaic CRS {spatial.crs!r} does not match existing store {output_path} "
+                        f"CRS {stored_crs!r} — appending would misgeoreference the timestep."
+                    )
+                z_north = cast(zarr.Array, root["northing"])
+                z_east = cast(zarr.Array, root["easting"])
+                atol = PIXEL_M / 2
+                if not (
+                    np.isclose(spatial.northing[0], z_north[0], rtol=0.0, atol=atol)
+                    and np.isclose(spatial.northing[-1], z_north[-1], rtol=0.0, atol=atol)
+                    and np.isclose(spatial.easting[0], z_east[0], rtol=0.0, atol=atol)
+                    and np.isclose(spatial.easting[-1], z_east[-1], rtol=0.0, atol=atol)
+                ):
+                    raise ValueError(
+                        f"Mosaic coordinates do not lie on existing store {output_path}'s grid "
+                        "(shifted or reversed axes) — appending would silently misgeoreference the timestep."
+                    )
             # Variables staged by this run but absent from the store (e.g. a
             # store created before obs counts, or compute_std newly on) are
             # created schema-only at the current time extent; prior timesteps

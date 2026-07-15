@@ -241,7 +241,11 @@ def _t2_trend(rows: list[dict]) -> str:
     trend = _sel(rows, test="t2", phase="year_fill_trend", metric="commit_wall_s")
     if not trend:
         return "no data"
-    ordered = sorted(trend, key=lambda r: r["params"].get("year", 0))
+    # Fills are emitted 2025 -> 2017 (campaign order), so sort DESCENDING to keep
+    # emission order: first == first-filled (2025), last == last-filled (2017).
+    # An ascending sort would swap the endpoints and mislabel a rising
+    # accumulate-refs commit-time trend as flat.
+    ordered = sorted(trend, key=lambda r: r["params"].get("year", 0), reverse=True)
     first, last = ordered[0]["value"], ordered[-1]["value"]
     direction = "rising" if last > first * 1.5 else "flat"
     return f"commit {_fmt(first)}s->{_fmt(last)}s ({direction})"

@@ -139,8 +139,25 @@ def fill_zone_year_flow(
         tile/inference counts, ``empty`` flag, elapsed seconds).
     """
     log = get_run_logger()
+
+    # Lazily import the AWS providers so the flow file imports on machines
+    # without ray/boto installed (arch tests, local inspection).
+    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+    from tessera_embeddings.providers.aws.ray import ray_cluster
+
+    land_mask_path = paths.land_mask_store(mask_name)
     mosaic_base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}"
-    resolved_s1 = resolve_s1_orbit(mosaic_base, s1_orbit)
+
+    # Preflight BEFORE probing mosaics or provisioning Ray: an all-ocean cell has
+    # no GPU work (and may have no mosaic store to probe), so short-circuit ahead
+    # of resolve_s1_orbit — which would raise InsufficientCoverageError on a
+    # missing store — and ahead of cluster creation. The 8 all-ocean zones alone
+    # are 72 no-op cells over the campaign. fill_zone_year re-reads + attr-validates
+    # the coverage as the authority.
+    has_live = zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials)
+
+    # resolve_s1_orbit probes the mosaics, so only do it when we'll actually infer.
+    resolved_s1 = resolve_s1_orbit(mosaic_base, s1_orbit) if has_live else s1_orbit
     # Default to the strict Jan-Dec calendar-year window for `year` (our global
     # convention: `December {year}` yields a 12-month window spanning Jan-Dec).
     # `time_window_end` overrides for rolling windows — the runner's window check
@@ -155,12 +172,6 @@ def fill_zone_year_flow(
     )
     gate = _PrefectCommitGate(commit_limit_name) if commit_limit_name else None
 
-    # Lazily import the AWS providers so the flow file imports on machines
-    # without ray/boto installed (arch tests, local inspection).
-    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
-    from tessera_embeddings.providers.aws.ray import ray_cluster
-
-    land_mask_path = paths.land_mask_store(mask_name)
     fill_kwargs: dict[str, Any] = {
         "store_path": paths.global_store(store_name),
         "zone": zone,
@@ -177,11 +188,7 @@ def fill_zone_year_flow(
         "get_credentials": iam_icechunk_credentials,
     }
 
-    # Preflight: an all-ocean cell (no live tiles) does zero GPU work, so don't
-    # pay to provision a Ray cluster just to mark it empty — the 8 all-ocean
-    # zones alone are 72 no-op cells over the campaign. fill_zone_year still
-    # re-reads + attr-validates the coverage as the authority.
-    if not zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials):
+    if not has_live:
         log.info("Zone %s year %d has no live tiles — filling empty without a Ray cluster", zone, year)
         return fill_zone_year(**fill_kwargs)
 
