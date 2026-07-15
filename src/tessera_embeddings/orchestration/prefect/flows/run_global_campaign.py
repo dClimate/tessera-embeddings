@@ -26,7 +26,7 @@ from prefect.deployments import arun_deployment
 
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
-from tessera_embeddings.storage.campaign import campaign_status
+from tessera_embeddings.storage.campaign import campaign_status, tag_year_complete
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS
 
@@ -139,6 +139,17 @@ async def run_global_campaign(
             )
         runs_by_year[year] = [str(r) for r in results]
         log.info("Year %d complete: %d fill(s) landed", year, len(runs_by_year[year]))
+
+        # Every expected zone has now landed this year (this run's fills + prior
+        # completions), so pin the year-complete milestone/retention tag. Reads
+        # the branch tip fresh (child runs committed there) and is idempotent.
+        # A ValueError means the tip doesn't yet show all expected zones — the
+        # data landed regardless, so warn rather than abort the campaign.
+        try:
+            year_tag = tag_year_complete(repo, year, expected_zones=zones)
+            log.info("Year %d tagged complete: %s", year, year_tag)
+        except ValueError as exc:
+            log.warning("Year %d not tagged complete (%s) — fills landed, milestone tag skipped", year, exc)
 
     dispatched = sum(len(v) for v in runs_by_year.values())
     log.info("Campaign dispatch complete: %d fill run(s) across %d year(s)", dispatched, len(runs_by_year))
