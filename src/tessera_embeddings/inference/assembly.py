@@ -289,7 +289,17 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
         staged = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
         for var, arr in arrays.items():
-            block = np.asarray(cast(zarr.Array, staged[var])[y0 - tile.y_start : y1 - tile.y_start])[np.newaxis]
+            staged_arr = cast(zarr.Array, staged[var])
+            # Validate dtype before assigning: zarr would silently CAST a float
+            # staged tile into an int8 destination (corrupting it) while the
+            # assembly still commits successfully. Every tile is checked, not
+            # just the probe (a mixed/corrupt run can differ per tile).
+            if staged_arr.dtype != arr.dtype:
+                raise ValueError(
+                    f"Staged tile {path} variable {var!r} has dtype {staged_arr.dtype} but the destination "
+                    f"array is {arr.dtype} — a silent cast would corrupt the output."
+                )
+            block = np.asarray(staged_arr[y0 - tile.y_start : y1 - tile.y_start])[np.newaxis]
             arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = block
         # Drop the group reference so its file handles / S3 connections are
         # immediately collectable before the next tile's read.
@@ -1013,8 +1023,12 @@ class ZarrWriter:
             # existing coordinates and silently misgeoreferenced. Compare CRS +
             # coordinate endpoints against the stored grid (half-pixel absolute
             # tolerance, as in the zone-fill runner) when mosaic coords are known.
-            if spatial is not None:
-                stored_crs = root.attrs.get("crs")
+            # Only when the store already HAS a CRS: the CRS attr is written in
+            # Phase 3, so a fresh create that crashed after the schema commit
+            # (Phase 1) reaches this branch on retry with no CRS yet — validating
+            # then would wrongly reject the recovery instead of completing it.
+            stored_crs = root.attrs.get("crs")
+            if spatial is not None and stored_crs is not None:
                 if spatial.crs != stored_crs:
                     raise ValueError(
                         f"Mosaic CRS {spatial.crs!r} does not match existing store {output_path} "

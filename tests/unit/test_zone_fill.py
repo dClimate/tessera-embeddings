@@ -414,6 +414,34 @@ def test_coverage_bitmap_shape_mismatch_raises(tmp_path):
         )
 
 
+def test_all_ocean_cell_skips_missing_mosaic(tmp_path, monkeypatch):
+    """An all-ocean cell is marked empty WITHOUT reading the mosaic — the coverage
+    check precedes read_spatial_coords, so a zone whose mosaic was never ingested
+    still converges instead of failing on a missing reflectance store.
+    """
+    store = _seed_global(tmp_path)
+    mask = _make_mask(tmp_path, [])  # no live tiles
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("run_inference must not run for an all-ocean cell")
+
+    monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
+    summary = zone_fill.fill_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2024,
+        land_mask_path=mask,
+        mosaic_base=str(tmp_path / "does_not_exist"),  # missing mosaic must not be read
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="runNM",
+    )
+    assert summary["empty"] is True
+    assert summary["live_tiles"] == 0
+
+
 def test_zone_has_live_tiles_true(tmp_path):
     """The preflight reports live coverage so the flow provisions a cluster."""
     mask = _make_mask(tmp_path, [(0, 0)])

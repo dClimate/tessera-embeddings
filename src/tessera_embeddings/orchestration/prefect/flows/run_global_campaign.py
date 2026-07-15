@@ -26,9 +26,9 @@ from prefect.deployments import arun_deployment
 
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
-from tessera_embeddings.storage.campaign import campaign_status, tag_year_complete
+from tessera_embeddings.storage.campaign import campaign_status, tag_year_complete, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
-from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS
+from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES
 
 
 @flow(name="run-global-campaign")
@@ -80,15 +80,21 @@ async def run_global_campaign(
 
     repo = open_global_repo(paths.global_store(store_name))
     status = campaign_status(repo, years=campaign_years)
-    pending = status.pending(expected_zones=zones, years=campaign_years)
-    if not pending:
-        log.info("Campaign already complete for the requested zones/years — nothing to dispatch")
-        return {"pending_at_start": 0, "dispatched": 0, "runs_by_year": {}}
+    existing_tags = set(repo.list_tags())
+    expected = list(zones) if zones is not None else list(ZONES)
 
+    # A cell is DONE only when it is both complete AND tagged. Include
+    # complete-but-untagged cells (a crash between the fill commit and the tag)
+    # so the runner's idempotent retag path runs — filtering on years_complete
+    # alone would skip them forever, and the year is never tagged complete.
+    def _needs_work(zone: str, year: int) -> bool:
+        return not status.has(zone, year) or zone_year_tag(zone, year) not in existing_tags
+
+    work = [(z, y) for y in campaign_years for z in expected if _needs_work(z, y)]
     log.info(
-        "Campaign: %d pending (zone, year) cells across %d year(s); <=%d concurrent fills/year, commit limit %r",
-        len(pending),
-        len({y for _, y in pending}),
+        "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d concurrent fills/year, commit limit %r",
+        len(work),
+        len({y for _, y in work}),
         max_parallel_zones,
         commit_limit_name,
     )
@@ -121,36 +127,36 @@ async def run_global_campaign(
     # (ADR-008) — deliver the most-recent year soonest. Override via `years`.
     runs_by_year: dict[int, list[str]] = {}
     for year in sorted(campaign_years, reverse=True):
-        year_zones = [z for z, y in pending if y == year]
-        if not year_zones:
-            continue
-        log.info("Year %d: dispatching %d zone fill(s)", year, len(year_zones))
-        # All zones in a year are distinct groups → safe to fill concurrently.
-        # The outer loop is serial, so the SAME zone never fills two years at once.
-        # return_exceptions=True so a single zone's failure doesn't abandon its
-        # siblings mid-flight (default gather() would leave them running orphaned);
-        # we let the whole year settle, then fail loudly with every failure.
-        results = await asyncio.gather(*(_fill(z, year) for z in year_zones), return_exceptions=True)
-        failures = [(z, r) for z, r in zip(year_zones, results, strict=True) if isinstance(r, BaseException)]
-        if failures:
-            raise RuntimeError(
-                f"year {year}: {len(failures)}/{len(year_zones)} zone fill(s) failed "
-                f"(e.g. {failures[0][0]}: {failures[0][1]})"
-            )
-        runs_by_year[year] = [str(r) for r in results]
-        log.info("Year %d complete: %d fill(s) landed", year, len(runs_by_year[year]))
+        year_zones = [z for z, y in work if y == year]
+        if year_zones:
+            log.info("Year %d: dispatching %d zone fill(s)", year, len(year_zones))
+            # All zones in a year are distinct groups → safe to fill concurrently.
+            # The outer loop is serial, so the SAME zone never fills two years at once.
+            # return_exceptions=True so a single zone's failure doesn't abandon its
+            # siblings mid-flight (default gather() would leave them running orphaned);
+            # we let the whole year settle, then fail loudly with every failure.
+            results = await asyncio.gather(*(_fill(z, year) for z in year_zones), return_exceptions=True)
+            failures = [(z, r) for z, r in zip(year_zones, results, strict=True) if isinstance(r, BaseException)]
+            if failures:
+                raise RuntimeError(
+                    f"year {year}: {len(failures)}/{len(year_zones)} zone fill(s) failed "
+                    f"(e.g. {failures[0][0]}: {failures[0][1]})"
+                )
+            runs_by_year[year] = [str(r) for r in results]
+            log.info("Year %d: %d fill(s) landed", year, len(runs_by_year[year]))
 
-        # Every expected zone has now landed this year (this run's fills + prior
-        # completions), so pin the year-complete milestone/retention tag. Reads
-        # the branch tip fresh (child runs committed there) and is idempotent.
-        # A ValueError means the tip doesn't yet show all expected zones — the
-        # data landed regardless, so warn rather than abort the campaign.
+        # Backfill the year-complete milestone/retention tag even when NO fills
+        # ran this pass — a prior run may have completed every zone for the year
+        # but crashed before tagging. The milestone is defined over ALL 120 zones
+        # (expected_zones defaults to the full set, NOT this run's `zones` subset,
+        # so a subset/repair run never stamps the global tag prematurely — and
+        # tags are write-once). ValueError = not yet all-120 complete → defer.
         try:
-            year_tag = tag_year_complete(repo, year, expected_zones=zones)
-            log.info("Year %d tagged complete: %s", year, year_tag)
+            year_tag = tag_year_complete(repo, year)
+            log.info("Year %d tagged complete (all 120 zones): %s", year, year_tag)
         except ValueError as exc:
-            log.warning("Year %d not tagged complete (%s) — fills landed, milestone tag skipped", year, exc)
+            log.debug("Year %d not yet complete across all 120 zones (%s) — milestone tag deferred", year, exc)
 
     dispatched = sum(len(v) for v in runs_by_year.values())
     log.info("Campaign dispatch complete: %d fill run(s) across %d year(s)", dispatched, len(runs_by_year))
-    return {"pending_at_start": len(pending), "dispatched": dispatched, "runs_by_year": runs_by_year}
+    return {"work_at_start": len(work), "dispatched": dispatched, "runs_by_year": runs_by_year}

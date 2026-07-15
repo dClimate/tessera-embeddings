@@ -204,51 +204,17 @@ def fill_zone_year(
             "the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
         )
 
-    # The ingest mosaics must be on the zone grid exactly (campaign contract) —
-    # and not just dimensionally: every zone in a hemisphere shares the same
-    # pixel extent, so a same-shaped mosaic for the WRONG zone (or a shifted /
-    # reversed grid) would pass a shape check and be written positionally,
-    # silently misgeoreferencing the whole fill. Compare CRS and coordinate
-    # endpoints against the seeded group, the grid authority.
-    spatial = read_spatial_coords(mosaic_base)
-    total_y, total_x = len(spatial.northing), len(spatial.easting)
-    if (total_y, total_x) != (ny, nx):
-        raise ValueError(
-            f"Mosaic grid ({total_y} x {total_x}) at {mosaic_base} does not match "
-            f"zone {zone}'s grid ({ny} x {nx}) — the campaign ingest must cover the zone extent exactly."
-        )
     zone_crs = node.attrs.get("crs")
-    if spatial.crs != zone_crs:
-        raise ValueError(
-            f"Mosaic CRS {spatial.crs!r} at {mosaic_base} does not match zone {zone}'s CRS "
-            f"{zone_crs!r} — a wrong-zone mosaic would be written positionally and misgeoreferenced."
-        )
-    z_north = cast(zarr.Array, node["northing"])
-    z_east = cast(zarr.Array, node["easting"])
-    # Absolute half-pixel tolerance, NOT np.isclose's default relative one: at a
-    # ~9.3e6 m northing the default rtol=1e-5 would admit ~93 m (≈9 px) of drift.
-    # A real shift is ≥1 px (10 m); half a pixel (5 m) sits safely above float32
-    # coordinate roundtrip (~1 m at this magnitude) yet below one pixel.
-    atol = PIXEL_M / 2
-    endpoints_match = (
-        np.isclose(spatial.northing[0], z_north[0], rtol=0.0, atol=atol)
-        and np.isclose(spatial.northing[-1], z_north[-1], rtol=0.0, atol=atol)
-        and np.isclose(spatial.easting[0], z_east[0], rtol=0.0, atol=atol)
-        and np.isclose(spatial.easting[-1], z_east[-1], rtol=0.0, atol=atol)
-    )
-    if not endpoints_match:
-        raise ValueError(
-            f"Mosaic coordinates at {mosaic_base} (northing {spatial.northing[0]}..{spatial.northing[-1]}, "
-            f"easting {spatial.easting[0]}..{spatial.easting[-1]}) do not lie on zone {zone}'s grid — "
-            "shifted or reversed axes would silently misgeoreference the fill."
-        )
 
-    # The land mask is this zone's coverage group in the mask repo (ADR-010):
-    # registry-derived tile-liveness bitmaps, not a pixel mask. Open it with the
-    # same helper as the global store and validate its identity by attrs — all
-    # 60 same-hemisphere zones share one grid shape, so a wrong-zone mask would
-    # otherwise be read positionally and silently misclassify tiles (permanently
-    # tagging the cell empty). Guarding zone + CRS + grid_shape closes that hole.
+    # Read the coverage mask BEFORE the mosaic: an all-ocean cell (whose ingest
+    # mosaic may never have been created) must reach the empty-cell path below
+    # rather than failing on a missing reflectance store. The land mask is this
+    # zone's coverage group in the mask repo (ADR-010): registry-derived
+    # tile-liveness bitmaps, not a pixel mask. Validate its identity by attrs —
+    # all 60 same-hemisphere zones share one grid shape, so a wrong-zone mask
+    # would otherwise be read positionally and silently misclassify tiles
+    # (permanently tagging the cell empty). Guarding zone + CRS + grid_shape
+    # closes that hole.
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
     cov_zone = cov.attrs.get("zone")
     cov_crs = cov.attrs.get("crs")
@@ -308,6 +274,46 @@ def fill_zone_year(
         result = _finish_empty(elapsed_sec=time.monotonic() - t0)
         log.info("Zone %s year %d has no land under the mask — marked complete empty (%s)", zone, year, result["tag"])
         return result
+
+    # Live tiles will be inferred, so the ingest mosaic must be on the zone grid
+    # EXACTLY (campaign contract) — not just dimensionally. Every zone in a
+    # hemisphere shares the same pixel extent, so a same-shaped mosaic for the
+    # WRONG zone (or a shifted/reversed grid) would pass a shape check and be
+    # written positionally, silently misgeoreferencing the fill. Compare CRS and
+    # coordinate endpoints against the seeded group, the grid authority. (Read
+    # only now — an all-ocean cell already returned above without touching the
+    # mosaic, which may not even exist.)
+    spatial = read_spatial_coords(mosaic_base)
+    total_y, total_x = len(spatial.northing), len(spatial.easting)
+    if (total_y, total_x) != (ny, nx):
+        raise ValueError(
+            f"Mosaic grid ({total_y} x {total_x}) at {mosaic_base} does not match "
+            f"zone {zone}'s grid ({ny} x {nx}) — the campaign ingest must cover the zone extent exactly."
+        )
+    if spatial.crs != zone_crs:
+        raise ValueError(
+            f"Mosaic CRS {spatial.crs!r} at {mosaic_base} does not match zone {zone}'s CRS "
+            f"{zone_crs!r} — a wrong-zone mosaic would be written positionally and misgeoreferenced."
+        )
+    z_north = cast(zarr.Array, node["northing"])
+    z_east = cast(zarr.Array, node["easting"])
+    # Absolute half-pixel tolerance, NOT np.isclose's default relative one: at a
+    # ~9.3e6 m northing the default rtol=1e-5 would admit ~93 m (~9 px) of drift.
+    # A real shift is >=1 px (10 m); half a pixel (5 m) sits safely above float32
+    # coordinate roundtrip (~1 m at this magnitude) yet below one pixel.
+    atol = PIXEL_M / 2
+    endpoints_match = (
+        np.isclose(spatial.northing[0], z_north[0], rtol=0.0, atol=atol)
+        and np.isclose(spatial.northing[-1], z_north[-1], rtol=0.0, atol=atol)
+        and np.isclose(spatial.easting[0], z_east[0], rtol=0.0, atol=atol)
+        and np.isclose(spatial.easting[-1], z_east[-1], rtol=0.0, atol=atol)
+    )
+    if not endpoints_match:
+        raise ValueError(
+            f"Mosaic coordinates at {mosaic_base} (northing {spatial.northing[0]}..{spatial.northing[-1]}, "
+            f"easting {spatial.easting[0]}..{spatial.easting[-1]}) do not lie on zone {zone}'s grid — "
+            "shifted or reversed axes would silently misgeoreference the fill."
+        )
 
     results = run_inference(
         num_actors,
