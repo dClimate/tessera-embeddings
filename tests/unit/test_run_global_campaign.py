@@ -40,9 +40,14 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)  # requested years are on-axis
     monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("33N", 2025)])
     monkeypatch.setattr(mod, "tag_year_complete", _defer_milestone)
-    # Coverage delivery sha read for the staging fingerprint (global per delivery).
+    # Store reads for the staging fingerprint: the coverage delivery sha (global per
+    # delivery) and, for ingest=False, each mosaic store's `last_appended` identity.
     monkeypatch.setattr(
-        mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"registry_sha256": "cov-sha-test"})
+        mod,
+        "open_store_as_zarr_group",
+        lambda *a, **k: SimpleNamespace(
+            attrs={"registry_sha256": "cov-sha-test", "last_appended": "2026-01-01T00:00:00Z"}
+        ),
     )
 
     async def fake_arun(dep, parameters=None):
@@ -120,6 +125,15 @@ def test_ingest_false_run_id_tracks_prebuilt_mosaic_identity(wired, monkeypatch)
     rid1 = _run_with_mosaic_ts("2026-01-01T00:00:00Z")
     rid2 = _run_with_mosaic_ts("2026-06-01T00:00:00Z")  # mosaic replaced → new last_appended
     assert rid1.startswith("33N-2025-") and rid1 != rid2
+
+
+def test_ingest_false_fails_closed_without_mosaic_identity(wired, monkeypatch):
+    """ingest=False fails closed when a prebuilt mosaic store carries no identity
+    attr — better than fingerprinting a partial view and risking a stale resume.
+    """
+    monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={}))
+    with pytest.raises(RuntimeError, match="last_appended"):
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False))
 
 
 def test_default_run_rejects_unseeded_work_zone(wired, monkeypatch):

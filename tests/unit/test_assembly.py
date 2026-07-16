@@ -1530,6 +1530,7 @@ class TestAssembleGlobal:
         g.create_array("scales", data=np.ones((self.TILE, self.TILE), dtype="float32"))
         for name, arr in (extra or {}).items():
             g.create_array(name, data=arr)
+        g.attrs["staged_complete"] = True  # assembly now requires the completion marker
 
     def test_fills_year_from_staged_tiles(self, tmp_path):
         """Staged tiles land as whole shards at the right year index; provenance attrs update."""

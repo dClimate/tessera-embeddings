@@ -22,12 +22,14 @@ import asyncio
 import hashlib
 from typing import Any, cast
 
+import icechunk
 from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
 
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
+from tessera_embeddings.inference.data_loading import _is_missing_repo
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_year_on_axis
@@ -227,23 +229,33 @@ async def run_global_campaign(
         #    mosaic deterministically from the coverage + config, so the sha (plus the
         #    config in the key) pins it.
         #  - ingest=False: the mosaic is an EXTERNAL input we didn't produce, so the
-        #    coverage sha says nothing about it. Fingerprint its own identity
-        #    (reflectance `last_appended`) so replacing the prebuilt mosaic and
-        #    rerunning with the same config starts a fresh staging prefix instead of
-        #    resuming tiles computed from the old mosaic. Best-effort per-cell read.
+        #    coverage sha says nothing about it. Fingerprint the identity of EVERY
+        #    active child store — reflectance AND each SAR orbit (embeddings depend on
+        #    all of them; replacing only a SAR store must still start a fresh staging
+        #    prefix). FAIL CLOSED if a present store lacks an identity attr rather
+        #    than risk resuming stale tiles against a changed mosaic.
         if ingest:
             return coverage_sha
-        try:
-            refl = open_store_as_zarr_group(
-                f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}/reflectance.zarr",
-                get_credentials=iam_icechunk_credentials,
-            )
-            return cast("str | None", refl.attrs.get("last_appended"))
-        except Exception as exc:
-            log.warning(
-                "Could not read prebuilt mosaic identity for %s-%d (%s) — config-only fingerprint", zone, year, exc
-            )
-            return None
+        base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}"
+        ids: list[str] = []
+        for store in ("reflectance", "sar_ascending", "sar_descending"):
+            path = f"{base}/{store}.zarr"
+            try:
+                grp = open_store_as_zarr_group(path, get_credentials=iam_icechunk_credentials)
+            except icechunk.IcechunkError as exc:
+                if _is_missing_repo(exc):
+                    continue  # store absent (e.g. a single-orbit mosaic) — not an active input
+                raise  # a transient/auth error: fail closed rather than fingerprint a partial view
+            identity = grp.attrs.get("last_appended") or grp.attrs.get("created_at")
+            if identity is None:
+                raise ValueError(
+                    f"Prebuilt mosaic store {path} (ingest=False) has no last_appended/created_at identity attr — "
+                    "cannot safely fingerprint it for staging resume. Clear staging, add the attr, or run ingest=True."
+                )
+            ids.append(f"{store}={identity}")
+        if not ids:
+            raise ValueError(f"No mosaic stores found under {base} (ingest=False) — nothing to fill.")
+        return "|".join(ids)
 
     def _staging_run_id(zone: str, year: int) -> str:
         # Fingerprint the staging run_id with the inputs that determine the embeddings

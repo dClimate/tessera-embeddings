@@ -397,6 +397,17 @@ class StagedShardSource:
         sy, sx = shard
         path = f"{self.staging_base}/{self.run_id}/{chunk_label(sy, sx)}.zarr"
         group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
+        # Require the completion marker at ASSEMBLY read too, not only on resume: the
+        # listing paths (verify_staged_completeness / _list_staged_labels) count a
+        # crash-partial .zarr as a valid staged tile, and to_zarr can write array
+        # metadata before all chunk objects. Without this, an assembly-only run (or a
+        # partial that slipped past inference) would read missing chunks as fill and
+        # commit+tag silent holes. The open already happened, so this is free.
+        if not group.attrs.get("staged_complete"):
+            raise IncompleteStageError(
+                f"Staged tile {path} lacks the staged_complete marker — a crashed write_chunk left partial "
+                "chunks (read as fill). Assembling it would publish silent holes; re-infer the tile first."
+            )
         expected_dtypes = dict(self.dtypes)
         blocks: dict[str, np.ndarray] = {}
         for var in self.variables:
@@ -753,21 +764,29 @@ class ZarrWriter:
 
         Returns ``None`` if the tile is complete and valid, else ``(kind, reason)``:
 
-        - ``("incomplete", ...)`` — a crash artifact: unopenable, or missing the
-          ``staged_complete`` marker (to_zarr can create array metadata before all
-          chunk objects, so a crash leaves gaps read as fill). The caller RE-INFERS
-          it (``write_chunk``'s ``mode="w"`` overwrites) rather than raising — with
-          the stable, input-fingerprinted run_id a raise would wedge every retry on
-          the same partial artifact.
+        - ``("incomplete", ...)`` — a crash artifact: genuinely absent
+          (``FileNotFoundError``), or missing the ``staged_complete`` marker (to_zarr
+          can create array metadata before all chunk objects, so a crash leaves gaps
+          read as fill). The caller RE-INFERS it (``write_chunk``'s ``mode="w"``
+          overwrites) rather than raising — with the stable, input-fingerprinted
+          run_id a raise would wedge every retry on the same partial artifact.
         - ``("invalid", ...)`` — a COMPLETE tile (marker present) that is
           structurally wrong (missing var / shape / dtype). The caller raises: this
           is a real anomaly (e.g. a stale wrong-grid store), not a resumable crash.
+
+        Any OTHER open error (auth, throttling, transient network, corrupt metadata)
+        propagates — a valid completed tile must not be silently re-inferred because
+        of a transient read failure.
         """
         path = self._staging_path(run_id, chunk)
         try:
             group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
-        except Exception as exc:  # an unopenable staged zarr is a partial write; re-infer it
-            return ("incomplete", f"could not open (partial write?): {exc}")
+        except FileNotFoundError:
+            # The artifact is genuinely gone (partial/removed) → self-heal by re-inference.
+            # Other open errors (auth, throttling, transient network, corrupt metadata)
+            # must NOT be treated as "partial" — silently excluding + re-inferring a valid
+            # completed tile on a transient read failure is expensive and wrong; propagate.
+            return ("incomplete", "staged zarr not found (partial or removed) — re-infer")
         # The completion marker (written last by write_chunk) is the authority on
         # whether every chunk landed. Absent → a crashed write → re-infer.
         if not group.attrs.get("staged_complete"):
