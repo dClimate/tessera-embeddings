@@ -277,8 +277,16 @@ def check_time_window_coverage(
     window: TimeWindow,
     s1_orbit: str = "both",
     skip_coverage_check: bool = False,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
 ) -> None:
     """Verify that source stores span the requested time window.
+
+    Opens each store with the caller's credential callback / region (same as the
+    rest of the fill); ``skip_coverage_check=True`` still hard-fails an EMPTY
+    store (no in-window data at all) but skips the month-span check, the escape
+    hatch for a legitimately partial window (e.g. an arctic-only edge zone).
 
     Raises:
         InsufficientCoverageError: If any required store does not span the window.
@@ -291,7 +299,7 @@ def check_time_window_coverage(
         stores.append((f"sar_{orbit}", f"{mosaic_base}/sar_{orbit}.zarr"))
 
     for label, path in stores:
-        root = open_store_as_zarr_group(path)
+        root = open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
         times = root["time"][:].astype("datetime64[ns]")
         if len(times) == 0:
             msg = f"{label} store at {path} has no time entries"
