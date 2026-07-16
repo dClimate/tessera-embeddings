@@ -30,6 +30,7 @@ from tessera_embeddings.inference.profiling import (
     log_cuda_diagnostics,
     log_effective_tflops,
     log_profiled_batch_summary,
+    transformer_flops,
 )
 from tessera_embeddings.inference.quantization import quantize_rows_torch
 
@@ -206,14 +207,14 @@ def _transfer_and_forward(
             device=device,
         )
         if config is not None:
-            s2_target = bucket_key[0]
             log_effective_tflops(
                 forward_ms=fwd_ms,
                 batch_size=len(global_idxs),
-                seq_len=s2_target,
+                seq_len=bucket_key[0],
                 d_model=config.latent_dim * 4,
                 dim_feedforward=config.dim_feedforward,
                 num_layers=config.num_encoder_layers,
+                s1_seq_len=bucket_key[1],
             )
 
     # Slice 192-D rep to canonical save_dim, quantize on-device, then pull the
@@ -305,6 +306,12 @@ def run_inference(
 
     t_total = _BatchTimings(0.0, 0.0, 0.0, 0.0)
     pixels_processed = 0
+    # px/s conflates sequence length across chunks (a sparse chunk's pixel is
+    # ~10x cheaper than a dense one's), so also track tokens (= pixels x
+    # (T_s2 + T_s1)) and transformer FLOPs for density-neutral throughput.
+    tokens_processed = 0
+    flops_processed = 0
+    d_model = config.latent_dim * 4
     sub_batch_idx = 0
     t0 = time.monotonic()
 
@@ -360,7 +367,17 @@ def run_inference(
                 forward=forward_secs,
                 postprocess=time.monotonic() - tb0 - transfer_secs - forward_secs,
             )
-            pixels_processed += end - start
+            n_px = end - start
+            pixels_processed += n_px
+            tokens_processed += n_px * (bucket_key[0] + bucket_key[1])
+            flops_processed += transformer_flops(
+                n_px,
+                bucket_key[0],
+                bucket_key[1],
+                d_model=d_model,
+                dim_feedforward=config.dim_feedforward,
+                num_layers=config.num_encoder_layers,
+            )
             sub_batch_idx += 1
 
             if on_batch and (sub_batch_idx % 50 == 0 or sub_batch_idx == total_sub_batches):
@@ -370,11 +387,13 @@ def run_inference(
                 elapsed = time.monotonic() - t0
                 rate = pixels_processed / elapsed if elapsed > 0 else 0
                 logger.info(
-                    "Sub-batch %d/%d — %d px — %.0f px/sec — %.1fs elapsed",
+                    "Sub-batch %d/%d — %d px — %.0f px/sec — %.0f tok/sec — %.2f eff TFLOPS — %.1fs elapsed",
                     sub_batch_idx,
                     total_sub_batches,
                     pixels_processed,
                     rate,
+                    tokens_processed / elapsed if elapsed > 0 else 0,
+                    flops_processed / elapsed / 1e12 if elapsed > 0 else 0,
                     elapsed,
                 )
                 avg = t_total.avg_ms(sub_batch_idx)
@@ -396,12 +415,15 @@ def run_inference(
 
     elapsed = time.monotonic() - t0
     logger.info(
-        "Inference complete: %d valid pixels, output shape %s, dtype %s, %.1fs total, %.0f px/sec avg",
+        "Inference complete: %d valid pixels, output shape %s, dtype %s, %.1fs total, "
+        "%.0f px/sec avg, %.0f tok/sec avg, %.2f eff TFLOPS avg (transformer-only)",
         pixels_processed,
         out.shape,
         out.dtype,
         elapsed,
         pixels_processed / elapsed if elapsed > 0 else 0,
+        tokens_processed / elapsed if elapsed > 0 else 0,
+        flops_processed / elapsed / 1e12 if elapsed > 0 else 0,
     )
 
     return InferenceResult(embeddings=out, embeddings_std=None, scales=scales)

@@ -256,3 +256,27 @@ class TestProcessSubBatch:
         assert np.any(flat_q != 0)
         # Only this bucket's pixels were written; their scales are now finite.
         assert np.isfinite(flat_scales[global_idxs]).all()
+
+
+class TestThroughputAccounting:
+    """Tests for the tokens/s + effective-TFLOPS accounting in run_inference."""
+
+    def test_final_log_reports_tokens_and_tflops(
+        self, sample_chunk_data, inference_config, test_model, caplog
+    ):
+        """The completion log carries density-neutral throughput units.
+
+        px/s conflates sequence length across chunks, so the summary must also
+        report tok/sec and effective TFLOPS for cross-chunk comparison.
+        """
+        import logging
+
+        chunk = sample_chunk_data(height=8, width=8, t_s2=10, t_s1a=5, t_s1d=5)
+        dataset = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
+
+        with caplog.at_level(logging.INFO, logger="tessera_embeddings.inference.inference"):
+            run_inference(test_model, dataset, inference_config, torch.device("cpu"))
+
+        summary = next(r.message for r in caplog.records if r.message.startswith("Inference complete"))
+        assert "tok/sec avg" in summary
+        assert "eff TFLOPS avg" in summary

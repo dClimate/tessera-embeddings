@@ -249,13 +249,18 @@ target is reached. Over-sampled pixels are uniformly sub-sampled.
   smallest; the largest bucket sets the "hot" GPU allocation so smaller buckets reuse it.
 - **Prefetch thread** — a `ThreadPoolExecutor(max_workers=1)` pipelines CPU batch
   preparation (data loading + normalization) while the GPU runs the previous forward pass.
-- **FP16** — `model.half()` halves memory bandwidth; bucket-level aggregation absorbs FP16
-  noise without repeat-averaging.
+- **BF16** — the model is cast to BF16 on CUDA (`_prepare_gpu`); FP16 is a best-effort
+  fallback for pre-Ampere GPUs only (overflow risk above 65504).
 - **`torch.compile` is disabled** — on g5.xlarge (15.4 GB VRAM), CUDA graph capture
   consumed 11.6 GB and slowed forward passes (3,770 ms vs. 1,944 ms) due to GRU
   recompilation per unique sequence length.
-- **cuDNN benchmark mode** — fastest algorithm for GRU/conv ops.
-- **Throughput:** ~1,300 px/sec per A10G; 100 actors ≈ 130,000 px/sec.
+- **cuDNN benchmark mode is disabled** — with variable bucket shapes the autotuner
+  re-searches constantly and inflates host RAM (see `_prepare_gpu`).
+- **Throughput:** ~10–12K px/sec per worker (measured 2026-07, Iowa ROI, L40S). px/sec
+  is density-dependent — a sparse pixel costs ~10× less than a dense one — so the
+  periodic and end-of-chunk summaries also log **tok/sec** (pixels × (T_s2 + T_s1))
+  and **effective TFLOPS** (transformer-layer FLOPs via `profiling.transformer_flops`)
+  for density-neutral comparison across chunks and runs.
 
 Output per chunk: `embeddings` array (H, W, 128) int8 with zeros for invalid pixels,
 plus a per-pixel float32 `scale` factor for dequantization. The model produces 192-D
