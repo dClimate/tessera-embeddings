@@ -311,6 +311,15 @@ target is reached. Over-sampled pixels are uniformly sub-sampled.
   (3,770 ms vs. 1,944 ms) due to GRU recompilation per unique sequence length.
 - **cuDNN benchmark mode is disabled** — with variable bucket shapes the autotuner
   re-searches constantly and inflates host RAM (see `_prepare_gpu`).
+- **Restructured GRU schedule** — the pooling head's `CustomGRU` keeps the checkpoint's
+  per-gate weights but fuses them at forward time: input-side projections for all T run
+  as one GEMM before the loop, and the recurrent r/z gates share one GEMM per step (6
+  small GEMMs + ~12 pointwise kernels per step → 2 GEMMs + ~8). The T-step recurrence
+  remains, but each step is fewer, larger kernels — the launch-bound tail that dominated
+  small-bucket forwards. Validated-equivalence class (ADR 012), reference-tested.
+- **Positional encoding without the zeros buffer** — sin/cos interleave via
+  stack+reshape instead of scatter-writing into a multi-GB FP32 zeros allocation per
+  forward. Bit-identical values.
 - **Throughput:** ~10–12K px/sec per worker (measured 2026-07, Iowa ROI, L40S). px/sec
   is density-dependent — a sparse pixel costs ~10× less than a dense one — so the
   periodic and end-of-chunk summaries also log **tok/sec** (pixels × (T_s2 + T_s1))
