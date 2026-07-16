@@ -741,6 +741,11 @@ def _process_chunks_work_stealing(
         reserved = pool.take_reserved(actor_idx)
         if reserved is not None:
             chunk_queue.appendleft(reserved)
+            log.info(
+                "Returned reserved chunk %s from failed actor %d to the queue front",
+                reserved.label,
+                actor_idx,
+            )
         pool.resolve_iid(actor_idx)
         instance_id = pool.actor_instance_ids[actor_idx]
         attempts = pool.chunk_attempts.get(chunk_label, 1)

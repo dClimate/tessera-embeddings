@@ -66,17 +66,32 @@ class TestStripHeightForDensity:
         dense = _strip_height_for_density(200, 2000, 2000)
         assert sparse > dense
 
-    def test_single_strip_when_full_height_fits_pair_budget(self):
-        # A chunk whose full-height bands + mask fit the pair budget runs as one
-        # strip: splitting off a ragged tail buys no RAM headroom (the prefetched
-        # pair's resident bands equal the full chunk at the boundary) while adding
-        # a redundant inference pass. T_kept=60 at 2000x2000 sits just inside the
-        # budget, where the half-budget solve would otherwise yield a 1963-row
-        # strip plus a 37-row tail.
+    def test_single_strip_when_full_height_fits_one_budget(self):
+        # A chunk whose full-height bands + mask fit ONE budget runs as a single
+        # strip. Single strips are held to one budget (not the pair budget):
+        # cross-chunk prologue prefetch can co-load the next chunk's strip-0
+        # alongside this chunk, so every resident band set must individually
+        # fit one budget for the co-resident pair to fit two.
         h = _strip_height_for_density(60, 2000, 2000)
         assert h == 2000
         full = 60 * 2000 * 2000 * len(S2_BAND_ORDER) * 2 + 60 * 2000 * 2000
-        assert full <= 2 * _S2_STRIP_BYTE_BUDGET
+        assert full <= _S2_STRIP_BYTE_BUDGET
+
+    def test_dense_single_chunk_splits_so_cross_chunk_pair_fits(self):
+        # Regression for the 2026-07-17 OOM (chunk_5_9, T_kept=122): under the
+        # old pair-budget fast path a T=122 chunk ran as ONE ~10 GB strip, and
+        # the cross-chunk prefetch put two of those on a 31 GB node at once.
+        # Now every resident band set must individually fit one budget.
+        for t_kept in (90, 122, 160, 250):
+            h = _strip_height_for_density(t_kept, 2000, 2000)
+            mask_bytes = t_kept * 2000 * 2000
+            per_row = t_kept * 2000 * len(S2_BAND_ORDER) * 2
+            if h == 2000:  # single strip: whole chunk fits one budget
+                assert per_row * 2000 + mask_bytes <= _S2_STRIP_BYTE_BUDGET
+            elif h > _MIN_STRIP_H:  # split: each strip fits budget minus its mask share
+                assert per_row * h <= _S2_STRIP_BYTE_BUDGET - mask_bytes // 2
+        # The OOM case specifically must split.
+        assert _strip_height_for_density(122, 2000, 2000) < 2000
 
     def test_extreme_density_floors_at_min_strip_h(self):
         # A pathologically dense chunk bottoms out at the floor (breaching the

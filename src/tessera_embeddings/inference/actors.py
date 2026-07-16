@@ -100,11 +100,16 @@ def _strip_height_for_density(t_kept: int, width: int, height: int) -> int:
     ``2 * bands(strip_h) + mask <= 2 * _S2_STRIP_BYTE_BUDGET`` — i.e. each strip's
     bands must fit the budget minus half the resident mask.
 
-    When a single full-height strip already fits the pair budget (no sibling, so
-    only one band copy is resident), we return ``height`` outright: splitting
-    below that point buys no RAM headroom — the prefetched pair's resident bands
-    still total the full chunk at the strip boundary — while adding a redundant
-    inference pass over the ragged tail.
+    When a single full-height strip fits ONE budget (bands + its whole mask),
+    we return ``height`` outright. A single strip is deliberately NOT allowed
+    the pair budget: with cross-chunk prologue prefetch there is always a
+    potential sibling — the NEXT chunk's strip-0, loaded (with its own mask and
+    SAR stack) while this chunk's final strip infers — so every resident band
+    set must individually fit one budget for the cross-chunk pair to fit two.
+    The old pair-budget fast path assumed no sibling and OOM-killed workers on
+    dense chunk sequences: two T_kept~120 single-strip chunks co-resident put
+    ~27 GB on a 31 GB node (observed 2026-07-17, chunk_5_9, Ray memory monitor
+    kill at 95%).
 
     ``t_kept`` is this chunk's true post-prune valid-timestep count, so sparse
     chunks get tall strips (often the whole chunk in one piece) and only dense
@@ -116,11 +121,10 @@ def _strip_height_for_density(t_kept: int, width: int, height: int) -> int:
     # Full-chunk SCL mask (bool, 1 byte/px) stays resident the whole loop; one
     # copy is shared by the prefetched pair, so charge half of it to each strip.
     mask_bytes = t * height * width
-    # Fast path: a single strip has no prefetched sibling, so it's held to the
-    # full pair budget, not half. Splitting below this buys no RAM headroom (the
-    # prefetched pair equals the full chunk at the boundary) yet adds a redundant
-    # inference pass over the ragged tail.
-    if t * height * width * _S2_BYTES_PER_OBS_PX + mask_bytes <= 2 * _S2_STRIP_BYTE_BUDGET:
+    # Fast path: the whole chunk fits one budget — single strip. Held to ONE
+    # budget (not the pair) because the cross-chunk prefetch may co-load the
+    # next chunk's strip-0 alongside it; see docstring.
+    if t * height * width * _S2_BYTES_PER_OBS_PX + mask_bytes <= _S2_STRIP_BYTE_BUDGET:
         return height
     band_budget = _S2_STRIP_BYTE_BUDGET - mask_bytes // 2
     per_row = t * width * _S2_BYTES_PER_OBS_PX
