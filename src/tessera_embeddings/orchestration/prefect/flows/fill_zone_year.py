@@ -91,9 +91,13 @@ class _PrefectCommitGate(AbstractContextManager):
 
 
 def _assert_seeded_model_matches(
-    store_path: str, *, allow_model_mismatch: bool, get_credentials: Callable[[], icechunk.S3StaticCredentials] | None
+    store_path: str,
+    *,
+    build_checkpoint: str,
+    allow_model_mismatch: bool,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
 ) -> None:
-    """Refuse to fill a store seeded for a different encoder than this build.
+    """Refuse to fill a store seeded for a different encoder/checkpoint than this build.
 
     The seed stamps ``geoemb:model`` (the encoder-version URL) once at the store
     root; the fill re-derives it from the running code. If a model upgrade slipped
@@ -102,6 +106,15 @@ def _assert_seeded_model_matches(
     single store and permanently tagging the result. A metadata-only read catches
     it before Ray. ``allow_model_mismatch`` is the deliberate-override escape hatch
     (e.g. a store seeded with a custom ``model_url`` the code can't re-derive).
+
+    ``geoemb:model`` versions only the ENCODER (e.g. "1.1"); it does NOT distinguish
+    the concrete checkpoint / norm source (the ``aws`` and ``mpc`` v1.1 checkpoints
+    share one URL). So when the store also recorded a ``checkpoint_id`` (the seed's
+    ``model_version``), require it to match this build's checkpoint (*build_checkpoint*
+    = :func:`checkpoint_filename`) — otherwise two same-URL-but-different checkpoints
+    could be mixed. Absent ``checkpoint_id`` (the default), only the encoder URL is
+    gated. Seed with ``model_version=checkpoint_filename()`` to enable checkpoint-level
+    gating.
     """
     root = open_store_as_zarr_group(store_path, get_credentials=get_credentials)
     seeded = cast("str | None", root.attrs.get("geoemb:model"))
@@ -111,6 +124,13 @@ def _assert_seeded_model_matches(
             f"Global store {store_path} was seeded for encoder {seeded!r} but this build embeds with "
             f"{expected!r} — filling would mix encoders under one store (its root still advertises "
             f"{seeded!r}). Reseed for the new model, or pass allow_model_mismatch=True to override."
+        )
+    seeded_ckpt = cast("str | None", root.attrs.get("checkpoint_id"))
+    if seeded_ckpt is not None and seeded_ckpt != build_checkpoint and not allow_model_mismatch:
+        raise ValueError(
+            f"Global store {store_path} was seeded for checkpoint {seeded_ckpt!r} but this build fills with "
+            f"{build_checkpoint!r} — the encoder URL matches but the concrete checkpoint (norm source) differs, "
+            "so the embeddings would be mixed. Reseed, or pass allow_model_mismatch=True to override."
         )
 
 
@@ -257,7 +277,10 @@ def fill_zone_year_flow(
         # upgrade would otherwise mix encoders under one store and tag it
         # permanently. A cheap metadata-only read; the escape hatch is explicit.
         _assert_seeded_model_matches(
-            store_path, allow_model_mismatch=allow_model_mismatch, get_credentials=iam_icechunk_credentials
+            store_path,
+            build_checkpoint=checkpoint_filename(),
+            allow_model_mismatch=allow_model_mismatch,
+            get_credentials=iam_icechunk_credentials,
         )
         # Fail loudly on a partial/absent mosaic BEFORE provisioning Ray: a
         # zone-wide mosaic missing months is an ingest failure, and the write-once

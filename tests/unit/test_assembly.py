@@ -1303,6 +1303,21 @@ class TestScanExistingStagedChunks:
         with pytest.raises(RuntimeError, match="missing variable 'scales'"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
 
+    def test_missing_completion_marker_rejected(self, tmp_path):
+        """A tile with all required arrays present + correct shape/dtype but NO
+        completion marker is a partial write (to_zarr can create array metadata
+        before all chunk objects) — it must be rejected, not resumed with silent
+        fill-value holes.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = self.CHUNKS[0]
+        self._stage_chunk(writer, chunk, "run1")
+        # Strip only the completion marker — the arrays still look complete.
+        group = zarr.open_group(writer._staging_path("run1", chunk), mode="a")
+        del group.attrs["staged_complete"]
+        with pytest.raises(RuntimeError, match="no staged_complete marker"):
+            writer.scan_existing_staged_chunks("run1", self.CHUNKS)
+
     def test_invalid_shape_raises(self, tmp_path):
         """Staged chunk with wrong shape raises RuntimeError listing the bad path."""
         writer = ZarrWriter(str(tmp_path / "staging"))

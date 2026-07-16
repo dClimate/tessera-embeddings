@@ -40,6 +40,10 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)  # requested years are on-axis
     monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("33N", 2025)])
     monkeypatch.setattr(mod, "tag_year_complete", _defer_milestone)
+    # Coverage delivery sha read for the staging fingerprint (global per delivery).
+    monkeypatch.setattr(
+        mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"registry_sha256": "cov-sha-test"})
+    )
 
     async def fake_arun(dep, parameters=None):
         rec["arun"].append((dep, parameters))
@@ -79,13 +83,22 @@ def test_driver_reads_are_credentialed(wired, monkeypatch):
     assert onaxis.get("get_credentials") is not None
 
 
-def test_fill_gets_stable_per_cell_run_id(wired):
-    """The fill dispatch carries a deterministic run_id per (zone, year) so a retry
-    resumes the same staging prefix instead of orphaning un-resumable shards.
+def _fill_run_id(rec: dict, **kwargs) -> str:
+    rec["arun"].clear()
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
+    return next(p for d, p in rec["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
+
+
+def test_fill_run_id_is_stable_and_input_fingerprinted(wired):
+    """The fill run_id is deterministic per (zone, year) — so a retry resumes the
+    same staging prefix — AND carries an input fingerprint, so a changed input
+    (here min_valid_coverage) yields a DIFFERENT prefix (no stale resume).
     """
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
-    fill_params = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
-    assert fill_params["run_id"] == "33N-2025"
+    base = _fill_run_id(wired)
+    assert base.startswith("33N-2025-")  # cell-scoped prefix + fingerprint suffix
+    assert _fill_run_id(wired) == base  # deterministic across identical runs
+    changed = _fill_run_id(wired, min_valid_coverage=0.5)
+    assert changed.startswith("33N-2025-") and changed != base  # input change → new prefix
 
 
 def test_default_run_rejects_unseeded_work_zone(wired, monkeypatch):

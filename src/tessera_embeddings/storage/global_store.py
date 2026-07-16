@@ -195,9 +195,7 @@ def seed_zone_groups(
         root.attrs.update(new_root)
     else:
         identity = ("geoemb:model", "geoemb:dimensions", "geoemb:data_type", "checkpoint_id")
-        mismatched = {
-            k: (root.attrs.get(k), new_root.get(k)) for k in identity if root.attrs.get(k) != new_root.get(k)
-        }
+        mismatched = {k: (root.attrs.get(k), new_root.get(k)) for k in identity if root.attrs.get(k) != new_root.get(k)}
         if mismatched:
             raise ValueError(
                 f"Refusing to reseed: the store root's encoder provenance is write-once, but this seed "

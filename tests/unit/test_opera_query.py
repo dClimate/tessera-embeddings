@@ -259,9 +259,7 @@ class TestQueryCmrGranules:
 
     def test_normal_bbox_queries_once(self):
         """A west<east bbox issues a single CMR query (no antimeridian split)."""
-        with patch(
-            "tessera_embeddings.ingest.opera_query._query_cmr_granules_one", return_value=[]
-        ) as one:
+        with patch("tessera_embeddings.ingest.opera_query._query_cmr_granules_one", return_value=[]) as one:
             _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
         one.assert_called_once()
 

@@ -19,11 +19,13 @@ every fill so commits stay under the storm threshold while inference runs free.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import hashlib
+from typing import Any, cast
 
 from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
 
+from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import DEFAULT_MIN_VALID_COVERAGE
@@ -32,6 +34,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import zone_year_on_axis
 from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
+from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zone
 
 
@@ -203,17 +206,44 @@ async def run_global_campaign(
         commit_limit_name,
     )
 
+    # Coverage delivery sha for the staging fingerprint below. It is global per
+    # delivery (identical across zone groups), so read it once from any seeded zone;
+    # best-effort — a config-only fingerprint is used if the mask isn't readable.
+    coverage_sha: str | None = None
+    if status.zones:
+        try:
+            cov = open_store_as_zarr_group(
+                paths.land_mask_store(mask_name),
+                group=sorted(status.zones)[0],
+                get_credentials=iam_icechunk_credentials,
+            )
+            coverage_sha = cast("str | None", cov.attrs.get("registry_sha256"))
+        except Exception as exc:  # best-effort — degrade to a config-only fingerprint
+            log.warning("Could not read coverage delivery sha for the staging fingerprint (%s) — config-only", exc)
+
+    def _staging_run_id(zone: str, year: int) -> str:
+        # Fingerprint the staging run_id with the inputs that determine the embeddings
+        # so a retry after a failed fill RESUMES stale staging only when the inputs are
+        # unchanged. A changed threshold / orbit / window / checkpoint, or a new
+        # coverage delivery (which ingest_zone_year rebuilds the mosaic for), yields a
+        # different fingerprint → a fresh staging prefix → no old tiles resumed under
+        # new inputs. Still cell-unique (zone, year) so retries with identical inputs
+        # resume the same prefix (and it stays findable for cleanup).
+        key = (year, min_valid_coverage, s1_orbit, allow_partial_window, checkpoint_filename(), coverage_sha)
+        return f"{zone}-{year}-{hashlib.sha256(repr(key).encode()).hexdigest()[:8]}"
+
     def _fill_params(zone: str, year: int) -> dict[str, Any]:
         return {
             "zone": zone,
             "year": year,
             "paths": paths.model_dump(),
-            # Deterministic, cell-unique run_id: a retry of a failed/cancelled fill
-            # then RESUMES the same staging prefix (and that prefix is findable for
-            # cleanup) instead of the runner minting a fresh uuid every attempt and
-            # orphaning terabytes of un-resumable staged shards. Cell-unique (zone AND
-            # year) so it can never collide with another cell's staged labels.
-            "run_id": f"{zone}-{year}",
+            # Deterministic, input-fingerprinted run_id: a retry of a failed/cancelled
+            # fill RESUMES the same staging prefix (findable for cleanup) instead of
+            # the runner minting a fresh uuid every attempt and orphaning terabytes of
+            # un-resumable shards — but ONLY when the inputs are unchanged (see
+            # _staging_run_id), so a changed threshold/orbit/window/checkpoint or a new
+            # coverage delivery starts a fresh prefix rather than resuming stale tiles.
+            "run_id": _staging_run_id(zone, year),
             "ami_ssm_name": ami_ssm_name,
             "store_name": store_name,
             "mask_name": mask_name,
@@ -247,29 +277,37 @@ async def run_global_campaign(
 
     fill_sem = asyncio.Semaphore(max_parallel_zones)
     ingest_sem = asyncio.Semaphore(max_parallel_ingest)
+    # Bound the cells holding a live mosaic (ingested but not yet cleaned) so
+    # ingestion cannot run ahead of fills and pile up dozens of multi-TB mosaics —
+    # ADR-011's "peak input storage bounded by in-flight cells". Acquired BEFORE
+    # ingest and held through fill + cleanup; sized to fills-at-capacity plus an
+    # ingest look-ahead, so retained mosaics peak at ~this sum, not the whole year.
+    inflight_sem = asyncio.Semaphore(max_parallel_zones + max_parallel_ingest)
 
     async def _process(zone: str, year: int) -> str:
-        # Ingest (if enabled) → fill → drop the transient mosaic. Ingest and fill
-        # have separate concurrency caps; the mosaic is deleted only after the
-        # fill is tagged complete.
+        # Ingest (if enabled) → fill → drop the transient mosaic. The outer
+        # inflight_sem (held across ALL three) backpressures ingestion by fill
+        # throughput so mosaics don't accumulate; ingest_sem/fill_sem cap the
+        # expensive Dask/Ray clusters within.
         #
         # A complete-but-untagged cell (in years_complete, missing its tag) is in
         # the work list only so the fill re-creates the tag — no inference, no
         # mosaic. Skip ingest and cleanup for it entirely.
-        retag_only = status.has(zone, year)
-        did_ingest = ingest and not retag_only
-        if did_ingest:
-            async with ingest_sem:  # each ingest provisions its own Dask cluster
-                irun = await arun_deployment(ingest_deployment, parameters=_ingest_params(zone, year))
-                _check_completed(irun, f"ingest {zone}-{year}")
-        async with fill_sem:  # bound concurrent fills (hence Ray clusters) within a year
-            frun = await arun_deployment(fill_deployment, parameters=_fill_params(zone, year))
-            _check_completed(frun, f"fill {zone}-{year}")
-        # Only delete a mosaic THIS campaign produced: with ingest=False the mosaic
-        # is an upstream input we must not remove.
-        if did_ingest and cleanup_mosaics:
-            delete_prefix(f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}", log=log)
-        return str(frun.id)
+        async with inflight_sem:
+            retag_only = status.has(zone, year)
+            did_ingest = ingest and not retag_only
+            if did_ingest:
+                async with ingest_sem:  # each ingest provisions its own Dask cluster
+                    irun = await arun_deployment(ingest_deployment, parameters=_ingest_params(zone, year))
+                    _check_completed(irun, f"ingest {zone}-{year}")
+            async with fill_sem:  # bound concurrent fills (hence Ray clusters) within a year
+                frun = await arun_deployment(fill_deployment, parameters=_fill_params(zone, year))
+                _check_completed(frun, f"fill {zone}-{year}")
+            # Only delete a mosaic THIS campaign produced: with ingest=False the mosaic
+            # is an upstream input we must not remove.
+            if did_ingest and cleanup_mosaics:
+                delete_prefix(f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}", log=log)
+            return str(frun.id)
 
     # Descending: the campaign fills the current year first, then backwards
     # (ADR-008) — deliver the most-recent year soonest. Override via `years`.

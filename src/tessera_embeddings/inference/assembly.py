@@ -588,6 +588,14 @@ class ZarrWriter:
         )
 
         ds.to_zarr(path, mode="w", encoding=encoding)
+        # Completion marker, written LAST in a SEPARATE op after to_zarr returns:
+        # to_zarr can create every array's metadata before all its chunk objects, so
+        # a crash mid-write leaves a tile with correct vars/shape/dtype but MISSING
+        # chunks (read back as fill). The resume scan requires this marker, so such a
+        # partial tile is rejected + re-inferred instead of skipped and silently
+        # assembled with holes. A crash before this line leaves no marker.
+        marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
+        marker.attrs["staged_complete"] = True
         logger.info("Wrote %s to %s", chunk.label, path)
         return path
 
@@ -757,15 +765,19 @@ class ZarrWriter:
                 # carry the band dim (H, W, band). Validating scales against the 3-D
                 # shape would false-reject every valid tile.
                 expected_shape = (
-                    (chunk.height, chunk.width)
-                    if var == "scales"
-                    else (chunk.height, chunk.width, self.embedding_dim)
+                    (chunk.height, chunk.width) if var == "scales" else (chunk.height, chunk.width, self.embedding_dim)
                 )
                 if arr.shape != expected_shape:
                     return f"'{var}' shape {arr.shape} != expected {expected_shape}"
                 expected_dtype = np.int8 if var == "embeddings" else np.float32
                 if arr.dtype != expected_dtype:
                     return f"'{var}' dtype {arr.dtype} != expected {expected_dtype}"
+            # Presence/shape/dtype pass, but to_zarr can write array metadata before
+            # all chunk objects — so a crash can leave gaps that read as fill. The
+            # completion marker (written last by write_chunk) is the only signal that
+            # every chunk landed; without it the tile is a partial write, not valid.
+            if not group.attrs.get("staged_complete"):
+                return "incomplete write (no staged_complete marker) — a crash mid-write_chunk left partial chunks"
         except Exception as exc:
             return f"failed to open: {exc}"
         return None
@@ -1231,9 +1243,7 @@ class ZarrWriter:
         # published embeddings. Clearing the full non-live footprint (scalar fill,
         # elided for already-empty ocean chunks) makes the overwritten timestep
         # exactly this run's ROI regardless of how the ROI changed between runs.
-        clear_chunks = (
-            [c for c in chunks if c.label not in {lc.label for lc in live_chunks}] if overwrite else []
-        )
+        clear_chunks = [c for c in chunks if c.label not in {lc.label for lc in live_chunks}] if overwrite else []
         payloads: list[dict[str, Any]] = []
         for band in bands:
             y0b, y1b = band

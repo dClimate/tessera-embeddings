@@ -74,7 +74,9 @@ def test_model_guard_rejects_encoder_mismatch(monkeypatch):
         mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"geoemb:model": "https://x/OLD"})
     )
     with pytest.raises(ValueError, match="was seeded for encoder"):
-        mod._assert_seeded_model_matches("s3://in/store", allow_model_mismatch=False, get_credentials=None)
+        mod._assert_seeded_model_matches(
+            "s3://in/store", build_checkpoint="ckpt.pt", allow_model_mismatch=False, get_credentials=None
+        )
 
 
 def test_model_guard_allows_match_override_and_missing(monkeypatch):
@@ -84,15 +86,52 @@ def test_model_guard_allows_match_override_and_missing(monkeypatch):
     monkeypatch.setattr(
         mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"geoemb:model": expected_model_url()})
     )
-    mod._assert_seeded_model_matches("s3://in/store", allow_model_mismatch=False, get_credentials=None)  # matches
+    mod._assert_seeded_model_matches(
+        "s3://in/store", build_checkpoint="ckpt.pt", allow_model_mismatch=False, get_credentials=None
+    )  # matches
 
     monkeypatch.setattr(
         mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"geoemb:model": "https://x/OLD"})
     )
-    mod._assert_seeded_model_matches("s3://in/store", allow_model_mismatch=True, get_credentials=None)  # override
+    mod._assert_seeded_model_matches(
+        "s3://in/store", build_checkpoint="ckpt.pt", allow_model_mismatch=True, get_credentials=None
+    )  # override
 
     monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={}))
-    mod._assert_seeded_model_matches("s3://in/store", allow_model_mismatch=False, get_credentials=None)  # no attr
+    mod._assert_seeded_model_matches(
+        "s3://in/store", build_checkpoint="ckpt.pt", allow_model_mismatch=False, get_credentials=None
+    )  # no attr
+
+
+def test_model_guard_rejects_checkpoint_mismatch(monkeypatch):
+    """Same encoder URL but a different concrete checkpoint (norm source) recorded in
+    checkpoint_id is rejected — geoemb:model versions only the encoder, so the
+    aws/mpc v1.1 checkpoints would otherwise be silently mixed under one URL.
+    """
+    monkeypatch.setattr(
+        mod,
+        "open_store_as_zarr_group",
+        lambda *a, **k: SimpleNamespace(
+            attrs={"geoemb:model": expected_model_url(), "checkpoint_id": "tessera_v1_1_mpc_encoder.pt"}
+        ),
+    )
+    with pytest.raises(ValueError, match="seeded for checkpoint"):
+        mod._assert_seeded_model_matches(
+            "s3://in/store",
+            build_checkpoint="tessera_v1_1_aws_encoder.pt",
+            allow_model_mismatch=False,
+            get_credentials=None,
+        )
+    # A matching checkpoint_id passes; the override tolerates a mismatch.
+    mod._assert_seeded_model_matches(
+        "s3://in/store",
+        build_checkpoint="tessera_v1_1_mpc_encoder.pt",
+        allow_model_mismatch=False,
+        get_credentials=None,
+    )
+    mod._assert_seeded_model_matches(
+        "s3://in/store", build_checkpoint="tessera_v1_1_aws_encoder.pt", allow_model_mismatch=True, get_credentials=None
+    )
 
 
 def test_ray_path_wires_actor_terminator(monkeypatch):
