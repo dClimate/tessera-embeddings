@@ -29,6 +29,15 @@ Performance, same chunks, wall-clock incl. load+write: baseline ~204–341 s/chu
 → P2+3 89–140 s (**2.5–3.5×/worker**); inference px/s 9.6–13.3K → 13.4–27.3K;
 GPU 100% util / busy 1.00 / ~338 W on saturated workers; get_batch 651 → 103 ms.
 
+Sparse/edge coverage 2026-07-17 (P2+3 vs baseline, `--cross-config`):
+chunk_0_22 (3.5% valid): exact 99.85%, max|Δ|=2, cosine ≥ 0.99992, 0 NaN
+mismatches; chunk_3_0: exact 98.06%, same envelope — PASS 2/2. Zero NaN-mask
+mismatches on sparse chunks confirms validity/skip semantics are unchanged
+under the prefetched-prologue path.
+
+Reference dataset (assembled from baseline staging):
+`s3://arbol-tessera-embeddings-dev/embeddings/iowa_epsg5070-reference.zarr/`.
+
 ## Comparison semantics (ADR 012)
 
 - `526db07f32be` vs `a85be572e2fb`: batch size differs (7168 vs 3584) → NOT
