@@ -53,22 +53,34 @@ def _seed_global(tmp_path) -> str:
     return store
 
 
-def _make_mosaic(tmp_path, ny: int = _NY, nx: int = _NX) -> str:
-    """A minimal reflectance store on the zone's real grid (CRS + coords validated by the runner)."""
-    base = str(tmp_path / "mosaics")
-    north = northing_coords(_SPEC) if ny == _NY else np.arange(ny, dtype="float64")
-    east = easting_coords(_SPEC) if nx == _NX else np.arange(nx, dtype="float64")
+def _make_mosaic_store(path: str, north: np.ndarray, east: np.ndarray, ny: int, nx: int, crs: str) -> None:
+    """One mosaic child store (reflectance or SAR) on the given grid."""
     create_empty_store_from_coords(
-        f"{base}/reflectance.zarr",
+        path,
         coords={
             "time": np.array(["2025-01-01"], dtype="datetime64[ns]"),
             "northing": north,
             "easting": east,
         },
         var_specs={"red": VarSpec(dims=("time", "northing", "easting"), dtype=np.dtype("uint16"), chunks=(1, ny, nx))},
-        commit_msg="seed test mosaic",
-        attrs={"crs": _SPEC.crs},
+        commit_msg="seed test mosaic store",
+        attrs={"crs": crs},
     )
+
+
+def _make_mosaic(tmp_path, ny: int = _NY, nx: int = _NX, *, sar: bool = True) -> str:
+    """Reflectance + both SAR stores on the zone grid (CRS + coords validated by the runner).
+
+    The runner validates every ACTIVE store's grid, so a realistic mosaic carries
+    the SAR stores too; ``sar=False`` omits them to exercise a missing-SAR mosaic.
+    """
+    base = str(tmp_path / "mosaics")
+    north = northing_coords(_SPEC) if ny == _NY else np.arange(ny, dtype="float64")
+    east = easting_coords(_SPEC) if nx == _NX else np.arange(nx, dtype="float64")
+    _make_mosaic_store(f"{base}/reflectance.zarr", north, east, ny, nx, _SPEC.crs)
+    if sar:
+        for orbit in ("ascending", "descending"):
+            _make_mosaic_store(f"{base}/sar_{orbit}.zarr", north, east, ny, nx, _SPEC.crs)
     return base
 
 
@@ -239,6 +251,39 @@ def test_mosaic_grid_mismatch_raises(tmp_path):
     store = _seed_global(tmp_path)
     mosaic_base = _make_mosaic(tmp_path, ny=_NY + _TILE)  # taller than the zone grid
     with pytest.raises(ValueError, match="does not match"):
+        zone_fill.fill_zone_year(
+            store_path=store,
+            zone=_ZONE,
+            year=2025,
+            land_mask_path=_make_mask(tmp_path, [(0, 0)]),
+            mosaic_base=mosaic_base,
+            staging_base=str(tmp_path / "staging"),
+            config=_config(),
+            num_actors=1,
+            log=log,
+        )
+
+
+def test_wrong_grid_sar_store_raises(tmp_path, monkeypatch):
+    """A SAR store on a different grid than reflectance is rejected — SAR is read
+    by positional slice, so a stale/wrong-zone SAR store (right shape, wrong
+    coordinates) would silently misgeoreference the fill.
+    """
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path, sar=False)  # reflectance on the zone grid, no SAR yet
+    # sar_ascending on a SHIFTED easting grid (right shape, wrong coordinates);
+    # sar_descending correct, so the failure is unambiguously the ascending store.
+    shifted_east = easting_coords(_SPEC) + 10_000.0
+    _make_mosaic_store(f"{mosaic_base}/sar_ascending.zarr", northing_coords(_SPEC), shifted_east, _NY, _NX, _SPEC.crs)
+    _make_mosaic_store(
+        f"{mosaic_base}/sar_descending.zarr", northing_coords(_SPEC), easting_coords(_SPEC), _NY, _NX, _SPEC.crs
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("inference must not run when a SAR grid is invalid")
+
+    monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
+    with pytest.raises(ValueError, match="SAR ascending"):
         zone_fill.fill_zone_year(
             store_path=store,
             zone=_ZONE,

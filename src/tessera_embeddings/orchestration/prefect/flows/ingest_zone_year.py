@@ -38,7 +38,12 @@ from pydantic import BaseModel
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import InsufficientCoverageError
-from tessera_embeddings.inference.data_loading import _active_orbits, check_time_window_coverage, resolve_s1_orbit
+from tessera_embeddings.inference.data_loading import (
+    _active_orbits,
+    _is_missing_repo,
+    check_time_window_coverage,
+    resolve_s1_orbit,
+)
 from tessera_embeddings.ingest.land_mask import export_zone_roi
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles
@@ -76,14 +81,26 @@ def _coverage_sha(land_mask_path: str, zone: str, *, get_credentials: _Creds, s3
     return cast("str | None", cov.attrs.get("registry_sha256"))
 
 
-def _read_ingest_marker(store_path: str, *, get_credentials: _Creds, s3_region: str | None) -> dict | None:
-    """The store's ``ingest_marker`` fingerprint dict, or ``None`` if absent / unopenable."""
+def _probe_marker(store_path: str, *, get_credentials: _Creds, s3_region: str | None) -> tuple[bool, dict | None]:
+    """``(exists, marker)`` for a mosaic child store.
+
+    ``exists`` is whether the repo is physically present; ``marker`` is its
+    ``ingest_marker`` fingerprint dict (``None`` when present but unmarked). A
+    transient/auth ``IcechunkError`` re-raises rather than reporting "absent":
+    conflating it with a missing repo would let one unreadable store trip the
+    clear-and-rebuild branch and delete a valid mosaic (or ingest over unknown
+    data). Only a genuinely-missing repo reports ``(False, None)``.
+    """
     try:
         root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
-    except (FileNotFoundError, icechunk.IcechunkError):
-        return None
+    except FileNotFoundError:
+        return (False, None)
+    except icechunk.IcechunkError as exc:
+        if _is_missing_repo(exc):
+            return (False, None)
+        raise
     raw = root.attrs.get("ingest_marker")
-    return dict(raw) if isinstance(raw, dict) else None
+    return (True, dict(raw) if isinstance(raw, dict) else None)
 
 
 def _write_ingest_marker(store_path: str, fingerprint: dict, *, get_credentials: _Creds, s3_region: str | None) -> None:
@@ -180,24 +197,29 @@ async def ingest_zone_year(
             return None
         return _mosaic_stores(mosaic_base, effective)
 
-    # (2) Completion-marker probe: every store present for the resolved orbit set
-    #     carries this exact fingerprint? A crash-resumed run then no-ops.
-    probe_stores = _resolved_stores()
-    existing = (
-        [_read_ingest_marker(s, get_credentials=iam_icechunk_credentials, s3_region=None) for s in probe_stores]
-        if probe_stores is not None
-        else []
-    )
-    if existing and all(m == fingerprint for m in existing):
+    # (2) Marker probe over the MAXIMAL candidate set (reflectance + BOTH SAR
+    #     orbits), not just the resolved orbit set: a prior attempt that wrote one
+    #     child store then crashed before stamping any marker leaves data the
+    #     resolved-orbit probe would miss (with no SAR store, `_resolved_stores` is
+    #     None), and appending onto it would dedupe against stale dates then stamp
+    #     the new fingerprint over mixed inputs. Physical existence is the signal.
+    candidates = _mosaic_stores(mosaic_base, "both")
+    probed = {s: _probe_marker(s, get_credentials=iam_icechunk_credentials, s3_region=None) for s in candidates}
+    resolved = _resolved_stores()
+    if resolved is not None and all(probed[s][1] == fingerprint for s in resolved):
         log.info("Zone %s year %d already ingested for %s — skipping", zone, year, fingerprint["window"])
         return {"zone": zone, "year": year, "status": "already_ingested", "fingerprint": fingerprint}
-    if any(m is not None for m in existing):
-        # A present-but-mismatched marker (changed inputs, or an ascending-only prior
-        # run now asked for both): the mosaic was built under different inputs, so a
-        # plain re-ingest would append onto stale data. Clear it for a clean rebuild
-        # — strict=True so a FAILED delete aborts rather than silently ingesting onto
-        # (deduplicated) stale dates and marking the result complete.
-        log.info("Zone %s year %d has a stale ingest marker — clearing %s for a clean rebuild", zone, year, mosaic_base)
+    if any(exists for exists, _ in probed.values()):
+        # Something exists under mosaic_base but it is NOT a clean, fully-marked
+        # mosaic for the current fingerprint: a stale marker (changed inputs, or an
+        # ascending-only prior run now asked for both), a markerless half-write, or a
+        # SAR crash before marking. Appending would dedupe against stale dates then
+        # stamp the new fingerprint over mixed inputs — so clear the whole prefix for
+        # a clean rebuild (strict=True: a FAILED delete aborts rather than ingesting
+        # onto stale data and marking the result complete).
+        log.info(
+            "Zone %s year %d mosaic is stale or partial — clearing %s for a clean rebuild", zone, year, mosaic_base
+        )
         delete_prefix(mosaic_base, log=log, strict=True)
 
     # (3) Ensure the zone ROI zarr (idempotent; regenerates if coverage changed).

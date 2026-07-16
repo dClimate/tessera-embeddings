@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import logging
 import subprocess
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import yaml
 from prefect import flow, get_run_logger
@@ -34,6 +35,7 @@ from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
+from tessera_embeddings.inference.conventions import expected_model_url
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
 from tessera_embeddings.orchestration.runners.zone_fill import (
@@ -43,7 +45,11 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_on_axis,
 )
 from tessera_embeddings.providers.aws.ray import cleanup_ray_tempfiles, terminate_ray_instances_by_tag
+from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
+
+if TYPE_CHECKING:
+    import icechunk
 
 # Module-level state for the cancellation hook (set on entry, cleared on exit).
 _active_resolved_yaml: str | None = None
@@ -75,6 +81,30 @@ class _PrefectCommitGate(AbstractContextManager):
         assert self._cm is not None
         self._cm.__exit__(exc_type, exc, tb)
         self._cm = None
+
+
+def _assert_seeded_model_matches(
+    store_path: str, *, allow_model_mismatch: bool, get_credentials: Callable[[], icechunk.S3StaticCredentials] | None
+) -> None:
+    """Refuse to fill a store seeded for a different encoder than this build.
+
+    The seed stamps ``geoemb:model`` (the encoder-version URL) once at the store
+    root; the fill re-derives it from the running code. If a model upgrade slipped
+    in between seeding and filling, the fill would write embeddings from a NEW
+    encoder while the root still advertises the OLD one — mixing encoders under a
+    single store and permanently tagging the result. A metadata-only read catches
+    it before Ray. ``allow_model_mismatch`` is the deliberate-override escape hatch
+    (e.g. a store seeded with a custom ``model_url`` the code can't re-derive).
+    """
+    root = open_store_as_zarr_group(store_path, get_credentials=get_credentials)
+    seeded = cast("str | None", root.attrs.get("geoemb:model"))
+    expected = expected_model_url()
+    if seeded is not None and seeded != expected and not allow_model_mismatch:
+        raise ValueError(
+            f"Global store {store_path} was seeded for encoder {seeded!r} but this build embeds with "
+            f"{expected!r} — filling would mix encoders under one store (its root still advertises "
+            f"{seeded!r}). Reseed for the new model, or pass allow_model_mismatch=True to override."
+        )
 
 
 def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
@@ -114,7 +144,9 @@ def fill_zone_year_flow(
     commit_limit_name: str | None = None,
     cleanup_staging: bool = True,
     allow_partial_window: bool = False,
+    allow_model_mismatch: bool = False,
     mosaic_base: str | None = None,
+    s3_concurrency: int | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
     """Fill one ``(zone, year)`` cell of the global store on a Ray cluster.
@@ -142,8 +174,14 @@ def fill_zone_year_flow(
         cleanup_staging: Delete staged tiles after a successful fill.
         allow_partial_window: Relax the pre-Ray temporal-coverage gate to
             "non-empty" (default requires the mosaic's months to span the window).
+        allow_model_mismatch: Fill even when the seeded store advertises a
+            different encoder than this build (default rejects — a mid-campaign
+            model upgrade would otherwise mix encoders under one store).
         mosaic_base: Override for the input mosaic prefix (default
             ``{inputs}/mosaics/{zone}/{year}`` — the campaign's per-year layout).
+        s3_concurrency: This fill's slice of the fleet S3-PUT budget for the shard
+            write (``None`` = the full target, for a lone fill). The campaign passes
+            ``target // max_parallel_zones`` so K concurrent fills stay near target.
         run_id: Reuse a prior run's id to resume it (staged tiles are skipped).
 
     Returns:
@@ -207,6 +245,13 @@ def fill_zone_year_flow(
     )
 
     if needs_cluster:
+        # Fail loudly BEFORE provisioning Ray if the store was seeded for a
+        # different encoder than this build embeds with — a mid-campaign model
+        # upgrade would otherwise mix encoders under one store and tag it
+        # permanently. A cheap metadata-only read; the escape hatch is explicit.
+        _assert_seeded_model_matches(
+            store_path, allow_model_mismatch=allow_model_mismatch, get_credentials=iam_icechunk_credentials
+        )
         # Fail loudly on a partial/absent mosaic BEFORE provisioning Ray: a
         # zone-wide mosaic missing months is an ingest failure, and the write-once
         # zone-year tag would otherwise make partial embeddings permanent (the
@@ -239,6 +284,7 @@ def fill_zone_year_flow(
         "run_id": run_id,
         "gate": gate,
         "cleanup_staging": cleanup_staging,
+        "s3_concurrency": s3_concurrency,
         "get_credentials": iam_icechunk_credentials,
     }
 

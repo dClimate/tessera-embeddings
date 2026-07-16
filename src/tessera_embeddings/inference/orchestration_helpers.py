@@ -62,18 +62,23 @@ def enumerate_mosaic_chunks(
     mosaic_base: str,
     chunk_size: int,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    *,
+    get_credentials: Callable[[], Any] | None = None,
+    s3_region: str | None = None,
 ) -> tuple[list[ChunkSpec], int, int]:
     """Open the reflectance store, enumerate the spatial chunk grid, then close it.
 
     The store is explicitly closed and garbage-collected after
     enumeration to release the Icechunk session before the Ray cluster
-    starts (Ray's pickling chokes on a live session).
+    starts (Ray's pickling chokes on a live session). ``get_credentials``/
+    ``s3_region`` are threaded to the open so a callback-only / non-default-region
+    deployment doesn't fall back to the default Icechunk chain on the flow runner.
     """
     reflectance_path = f"{mosaic_base}/reflectance.zarr"
     log.info("Reading store metadata from %s", reflectance_path)
     # chunks=None: only the dim sizes are read here (never pixels), so skip
     # building a Dask task graph over every chunk of the full-zone mosaic.
-    ds = open_store(reflectance_path, chunks=None)
+    ds = open_store(reflectance_path, chunks=None, get_credentials=get_credentials, region=s3_region)
     try:
         chunks = enumerate_chunks_from_dataset(ds, chunk_size)
         total_y, total_x = ds.sizes["northing"], ds.sizes["easting"]

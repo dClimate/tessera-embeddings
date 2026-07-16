@@ -738,7 +738,6 @@ def export_zone_roi(
     z.attrs["transform"] = transform
     z.attrs["resolution"] = PIXEL_M
     z.attrs["bbox_wgs84"] = list(_live_tile_bbox_wgs84(spec, tile_live))
-    z.attrs["coverage_sha256"] = coverage_sha  # ties the ROI to the coverage delivery it was built from
     z.attrs["_manifest"] = RoiManifest(resolution=PIXEL_M, chunk_size=INGEST_CHUNK_SIZE, crs=spec.crs).to_dict()
 
     # Upsample tile-liveness onto pixels one chunk-aligned block at a time (each
@@ -753,6 +752,12 @@ def export_zone_roi(
             pixels = np.repeat(np.repeat(block, SHARD_PX, axis=0), SHARD_PX, axis=1)
             y0, x0 = ty0 * SHARD_PX, tx0 * SHARD_PX
             z[y0 : y0 + pixels.shape[0], x0 : x0 + pixels.shape[1]] = pixels
+
+    # Stamp the coverage sha LAST — it is the idempotency discriminator
+    # (_roi_is_current keys off it), so it must land only after every pixel is
+    # written. A crash mid-upsample then leaves an ROI without this attr, forcing
+    # the retry to rebuild rather than trusting a partially-written array.
+    z.attrs["coverage_sha256"] = coverage_sha  # ties the ROI to the coverage delivery it was built from
 
     logger.info(
         "Exported zone %s ROI: %d live tiles -> %s (%dx%d px)", zone, int(tile_live.sum()), dest_path, height, width

@@ -49,10 +49,19 @@ store per zone: isolates windows, avoids out-of-order multi-year time-axis
 appends, and makes deletion + idempotency per-cell.
 
 **Idempotency / crash-repair** rests on a per-store **completion marker** (root
-attr `ingest_window`): a matching marker on every required store short-circuits;
-a crash mid-ingest is repaired by a plain re-run because the ROI flows dedupe
-already-present dates (incremental append) and the marker is written **only after
-coverage is verified**. No deletion is needed for repair.
+attr `ingest_marker`, a fingerprint of window + `min_valid_coverage` + requested
+`s1_orbit` + coverage-delivery sha): a matching marker on every required store
+short-circuits, and the marker is written **only after coverage is verified**, so
+it can never bless an incomplete mosaic. The probe runs over the **maximal**
+candidate set (reflectance + both SAR orbits) keyed on physical existence, not
+just the resolved-orbit set — so a half-written prior attempt (one store written,
+crashed before any marker, or a SAR crash the orbit-resolver can't see) is
+**cleared and rebuilt** rather than appended onto, which would dedupe against
+stale dates and then stamp the new fingerprint over mixed inputs. A changed input
+(rebuilt coverage, new threshold, ascending-only → both) changes the fingerprint
+and likewise forces a clean rebuild. The clearing delete is `strict` so a failed
+delete aborts rather than ingesting onto stale data. An unreadable store (transient
+/ auth `IcechunkError`) re-raises rather than being mistaken for "absent".
 
 **Mosaics are transient** (`cleanup_mosaics`, default on): they are re-derivable
 inputs at ~5–15 TB per zone-year, so retention across 120 zones × 9 years is
@@ -66,6 +75,18 @@ fails on a partial mosaic **before provisioning Ray** (the write-once zone-year
 tag would otherwise make partial embeddings permanent); the **ingest** verifies
 the same before marking done. `allow_partial_window` relaxes both to "non-empty"
 for the rare arctic-only edge zone; an empty store always fails.
+
+**Grid gate** (fill, pre-Ray): reflectance **and every active SAR store** are
+validated against the seeded zone grid (shape / CRS / coordinate endpoints).
+SAR is read by positional slice with no coords of its own, so a stale child SAR
+store or a hand-provided `mosaic_base` on a different grid than reflectance would
+otherwise be mixed in and silently misgeoreference the fill.
+
+**Model gate** (fill, pre-Ray): the store root's seeded `geoemb:model` (encoder
+version) must match the running build's, else the fill refuses — a mid-campaign
+model upgrade would otherwise write new-encoder embeddings under a store still
+advertising the old one and tag them permanently. `allow_model_mismatch` is the
+deliberate-override escape hatch.
 
 **Zone identity = UTM common name** (`"33N"`, `"07S"`) everywhere — group names,
 mosaic paths, tags, flow params — with EPSG retained only as the CRS

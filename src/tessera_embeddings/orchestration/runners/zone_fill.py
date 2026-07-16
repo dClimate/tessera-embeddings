@@ -62,8 +62,14 @@ import zarr
 
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import InferenceConfig
-from tessera_embeddings.inference.assembly import ZarrWriter, read_spatial_coords
+from tessera_embeddings.inference.assembly import (
+    SpatialCoords,
+    ZarrWriter,
+    read_spatial_coords,
+    read_store_spatial_coords,
+)
 from tessera_embeddings.inference.chunk_spec import enumerate_chunks
+from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
@@ -149,6 +155,7 @@ def fill_zone_year(
     run_id: str | None = None,
     gate: CommitGate | None = None,
     n_assembly_workers: int | None = None,
+    s3_concurrency: int | None = None,
     cleanup_staging: bool = True,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
@@ -173,6 +180,8 @@ def fill_zone_year(
         gate: Optional in-process commit gate shared across concurrent fills.
         n_assembly_workers: Assembly worker-process count; defaults to
             ``AssemblyConfig`` sizing from the live-tile count.
+        s3_concurrency: This fill's slice of the fleet S3-PUT budget, forwarded to
+            ``assemble_global``; ``None`` uses the full aggregate target (a lone fill).
         cleanup_staging: Delete staged tiles after a successful fill.
         get_credentials: Optional icechunk credential callback (actors + store).
         s3_region: Optional S3 region override for the global store.
@@ -319,26 +328,17 @@ def fill_zone_year(
         log.info("Zone %s year %d has no land under the mask — marked complete empty (%s)", zone, year, result["tag"])
         return result
 
-    # Live tiles will be inferred, so the ingest mosaic must be on the zone grid
-    # EXACTLY (campaign contract) — not just dimensionally. Every zone in a
-    # hemisphere shares the same pixel extent, so a same-shaped mosaic for the
+    # Live tiles will be inferred, so EVERY active mosaic store must sit on the
+    # zone grid EXACTLY (campaign contract) — not just dimensionally. Every zone
+    # in a hemisphere shares the same pixel extent, so a same-shaped store for the
     # WRONG zone (or a shifted/reversed grid) would pass a shape check and be
-    # written positionally, silently misgeoreferencing the fill. Compare CRS and
-    # coordinate endpoints against the seeded group, the grid authority. (Read
-    # only now — an all-ocean cell already returned above without touching the
-    # mosaic, which may not even exist.)
-    spatial = read_spatial_coords(mosaic_base, get_credentials=get_credentials, s3_region=s3_region)
-    total_y, total_x = len(spatial.northing), len(spatial.easting)
-    if (total_y, total_x) != (ny, nx):
-        raise ValueError(
-            f"Mosaic grid ({total_y} x {total_x}) at {mosaic_base} does not match "
-            f"zone {zone}'s grid ({ny} x {nx}) — the campaign ingest must cover the zone extent exactly."
-        )
-    if spatial.crs != zone_crs:
-        raise ValueError(
-            f"Mosaic CRS {spatial.crs!r} at {mosaic_base} does not match zone {zone}'s CRS "
-            f"{zone_crs!r} — a wrong-zone mosaic would be written positionally and misgeoreferenced."
-        )
+    # written positionally, silently misgeoreferencing the fill. The SAR stores
+    # are read by positional slice (_load_sar_orbit) with no coords of their own,
+    # so a stale child SAR store or a hand-provided `mosaic_base` on a different
+    # grid than reflectance would otherwise slip through unchecked. Validate the
+    # reflectance store AND each active SAR orbit against the seeded group, the
+    # grid authority. (Read only now — an all-ocean cell already returned above
+    # without touching the mosaic, which may not even exist.)
     z_north = cast(zarr.Array, node["northing"])
     z_east = cast(zarr.Array, node["easting"])
     # Absolute half-pixel tolerance, NOT np.isclose's default relative one: at a
@@ -346,17 +346,43 @@ def fill_zone_year(
     # A real shift is >=1 px (10 m); half a pixel (5 m) sits safely above float32
     # coordinate roundtrip (~1 m at this magnitude) yet below one pixel.
     atol = PIXEL_M / 2
-    endpoints_match = (
-        np.isclose(spatial.northing[0], z_north[0], rtol=0.0, atol=atol)
-        and np.isclose(spatial.northing[-1], z_north[-1], rtol=0.0, atol=atol)
-        and np.isclose(spatial.easting[0], z_east[0], rtol=0.0, atol=atol)
-        and np.isclose(spatial.easting[-1], z_east[-1], rtol=0.0, atol=atol)
+
+    def _assert_on_zone_grid(label: str, store_path: str, coords: SpatialCoords) -> None:
+        total_y, total_x = len(coords.northing), len(coords.easting)
+        if (total_y, total_x) != (ny, nx):
+            raise ValueError(
+                f"{label} grid ({total_y} x {total_x}) at {store_path} does not match "
+                f"zone {zone}'s grid ({ny} x {nx}) — the campaign ingest must cover the zone extent exactly."
+            )
+        if coords.crs != zone_crs:
+            raise ValueError(
+                f"{label} CRS {coords.crs!r} at {store_path} does not match zone {zone}'s CRS "
+                f"{zone_crs!r} — a wrong-zone mosaic would be written positionally and misgeoreferenced."
+            )
+        endpoints_match = (
+            np.isclose(coords.northing[0], z_north[0], rtol=0.0, atol=atol)
+            and np.isclose(coords.northing[-1], z_north[-1], rtol=0.0, atol=atol)
+            and np.isclose(coords.easting[0], z_east[0], rtol=0.0, atol=atol)
+            and np.isclose(coords.easting[-1], z_east[-1], rtol=0.0, atol=atol)
+        )
+        if not endpoints_match:
+            raise ValueError(
+                f"{label} coordinates at {store_path} (northing {coords.northing[0]}..{coords.northing[-1]}, "
+                f"easting {coords.easting[0]}..{coords.easting[-1]}) do not lie on zone {zone}'s grid — "
+                "shifted or reversed axes would silently misgeoreference the fill."
+            )
+
+    _assert_on_zone_grid(
+        "Mosaic reflectance",
+        f"{mosaic_base}/reflectance.zarr",
+        read_spatial_coords(mosaic_base, get_credentials=get_credentials, s3_region=s3_region),
     )
-    if not endpoints_match:
-        raise ValueError(
-            f"Mosaic coordinates at {mosaic_base} (northing {spatial.northing[0]}..{spatial.northing[-1]}, "
-            f"easting {spatial.easting[0]}..{spatial.easting[-1]}) do not lie on zone {zone}'s grid — "
-            "shifted or reversed axes would silently misgeoreference the fill."
+    for orbit in _active_orbits(config.s1_orbit):
+        sar_path = f"{mosaic_base}/sar_{orbit}.zarr"
+        _assert_on_zone_grid(
+            f"Mosaic SAR {orbit}",
+            sar_path,
+            read_store_spatial_coords(sar_path, get_credentials=get_credentials, s3_region=s3_region),
         )
 
     results = run_inference(
@@ -404,6 +430,7 @@ def fill_zone_year(
         n_workers=n_workers,
         gate=gate,
         staged_labels=staged_labels,
+        s3_concurrency=s3_concurrency,
         get_credentials=get_credentials,
         s3_region=s3_region,
         log=log,

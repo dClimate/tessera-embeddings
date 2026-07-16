@@ -70,8 +70,8 @@ def test_matching_markers_skip_ingest(wired, monkeypatch):
         "s1_orbit": "ascending",
         "coverage_sha256": "cov-sha-1",
     }
-    # Every resolved store already carries the exact fingerprint.
-    monkeypatch.setattr(mod, "_read_ingest_marker", lambda store, **kw: fp)
+    # Every candidate store exists and carries the exact fingerprint.
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (True, fp))
     result = _run(s1_orbit="ascending")
     assert result["status"] == "already_ingested"
     assert result["fingerprint"] == fp
@@ -80,7 +80,7 @@ def test_matching_markers_skip_ingest(wired, monkeypatch):
 
 def test_dispatches_and_marks_on_success(wired, monkeypatch):
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    monkeypatch.setattr(mod, "_read_ingest_marker", lambda store, **kw: None)  # nothing ingested yet
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))  # nothing ingested yet
     result = _run(s1_orbit="ascending", min_valid_coverage=0.2)
 
     assert result["status"] == "ingested"
@@ -115,7 +115,7 @@ def test_stale_marker_triggers_reingest(wired, monkeypatch):
         "s1_orbit": "ascending",
         "coverage_sha256": "OLD-sha",  # != current "cov-sha-1"
     }
-    monkeypatch.setattr(mod, "_read_ingest_marker", lambda store, **kw: stale)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (True, stale))
     result = _run(s1_orbit="ascending")
     assert result["status"] == "ingested"  # re-ingested despite a present (stale) marker
     assert wired["arun"]
@@ -123,9 +123,37 @@ def test_stale_marker_triggers_reingest(wired, monkeypatch):
     assert wired.get("deletes") == ["s3://in/mosaics/33N/2025"]
 
 
+def test_markerless_partial_mosaic_is_cleared(wired, monkeypatch):
+    """A prior attempt that wrote reflectance then crashed before any SAR store or
+    marker landed must be cleared, not appended onto: the resolved-orbit probe
+    can't see it (no SAR -> resolve raises), so existence over the maximal
+    candidate set is what triggers the clean rebuild.
+    """
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    # Reflectance exists (markerless half-write); the SAR stores never landed.
+    monkeypatch.setattr(
+        mod, "_probe_marker", lambda store, **kw: (True, None) if store.endswith("reflectance.zarr") else (False, None)
+    )
+    # No SAR store yet -> the FIRST orbit resolution (the probe) raises; the
+    # SECOND (post-ingest verification) succeeds once the ingesters have written.
+    calls = {"n": 0}
+
+    def flaky_resolve(mosaic_base, orbit, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise InsufficientCoverageError("no SAR store yet")
+        return orbit
+
+    monkeypatch.setattr(mod, "resolve_s1_orbit", flaky_resolve)
+    result = _run(s1_orbit="ascending")
+    assert result["status"] == "ingested"
+    # The markerless partial was cleared before the rebuild.
+    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025"]
+
+
 def test_coverage_failure_leaves_no_marker(wired, monkeypatch):
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    monkeypatch.setattr(mod, "_read_ingest_marker", lambda store, **kw: None)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
 
     def _raise(*a, **k):
         raise InsufficientCoverageError("reflectance store starts at 2025-03, but window requires 2025-01")

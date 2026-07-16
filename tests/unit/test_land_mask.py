@@ -251,6 +251,7 @@ def _make_coverage(tmp_path, zone: str, live_tiles: list[tuple[int, int]]) -> st
     for r, c in live_tiles:
         tl[r, c] = True
     node.create_array("tile_live_2048", data=tl, chunks=(nty, ntx), dimension_names=("tile_row", "tile_col"))
+    node.attrs["registry_sha256"] = "test-coverage-sha"  # real deliveries carry this; the ROI ties to it
     session.commit("seed coverage")
     return path
 
@@ -317,6 +318,24 @@ def test_export_zone_roi_idempotent(tmp_path) -> None:
     assert first == second == dest
     z = zarr.open(dest, mode="r")
     assert bool(np.asarray(z[10 * SHARD_PX : 11 * SHARD_PX, 5 * SHARD_PX : 6 * SHARD_PX]).all())
+
+
+def test_export_zone_roi_rebuilds_after_partial_write(tmp_path) -> None:
+    """The coverage-sha discriminator is stamped LAST, so an ROI missing it (a
+    crash before the final attr write) is rebuilt rather than trusted: idempotency
+    must never skip a partially-written array.
+    """
+    zone = "31N"
+    cov = _make_coverage(tmp_path, zone, [(10, 5)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    # Simulate a crash that landed shape/CRS/transform but not the final sha.
+    z = zarr.open(dest, mode="a")
+    del z.attrs["coverage_sha256"]
+    assert "coverage_sha256" not in zarr.open(dest, mode="r").attrs
+    # The retry must NOT short-circuit — it rebuilds and re-stamps the sha.
+    assert land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest) == dest
+    assert zarr.open(dest, mode="r").attrs.get("coverage_sha256") is not None
 
 
 def test_export_zone_roi_bbox_handles_antimeridian(tmp_path) -> None:

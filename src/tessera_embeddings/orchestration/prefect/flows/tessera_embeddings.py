@@ -217,7 +217,9 @@ def tessera_embeddings(
             )
             chunk_size = detected
 
-    chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, chunk_size or INFERENCE_CHUNK_SIZE, log)
+    chunks, total_y, total_x = enumerate_mosaic_chunks(
+        mosaic_base, chunk_size or INFERENCE_CHUNK_SIZE, log, get_credentials=iam_icechunk_credentials
+    )
 
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_zarr_path)
     log.info(
@@ -228,7 +230,11 @@ def tessera_embeddings(
     )
 
     check_time_window_coverage(
-        mosaic_base, time_window, s1_orbit=config.s1_orbit, skip_coverage_check=dev_params.skip_coverage_check
+        mosaic_base,
+        time_window,
+        s1_orbit=config.s1_orbit,
+        skip_coverage_check=dev_params.skip_coverage_check,
+        get_credentials=iam_icechunk_credentials,
     )
 
     # Lazily import the AWS Ray provider so the embeddings flow file
@@ -254,6 +260,10 @@ def tessera_embeddings(
         "time_window": time_window,
         "cleanup_staging": dev_params.cleanup_staging,
         "output_name_suffix": dev_params.output_name_suffix,
+        # Same credential callback the orbit probe uses — so the assembly task's
+        # manifest read + writer.assemble open the stores with it, not the default
+        # Icechunk chain (callback-only / non-default-region deployments).
+        "get_credentials": iam_icechunk_credentials,
     }
 
     if dev_params.assembly_only:

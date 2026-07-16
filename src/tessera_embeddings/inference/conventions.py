@@ -98,6 +98,18 @@ DEFAULT_SOURCE_DATA: tuple[str, ...] = (
 QUANTIZED_DTYPE = "int8"
 
 
+def expected_model_url(model_url: str | None = None) -> str:
+    """The ``geoemb:model`` URL this build stamps for the current encoder version.
+
+    A seeded store records this once at its root; the fill re-derives it to verify
+    the running code embeds with the SAME encoder the store was seeded for — a
+    mismatch means a model upgrade slipped in between seeding and filling. Passing
+    *model_url* mirrors the seed-time override so a store seeded with a custom URL
+    round-trips.
+    """
+    return model_url or _MODEL_URL_TEMPLATE.format(version=ENCODER_VERSION)
+
+
 def tile_id_to_epsg(tile_id: str) -> str | None:
     """Derive EPSG code from a Sentinel-2 MGRS tile ID.
 
@@ -246,7 +258,7 @@ def _geoemb_fields(
     attrs: dict = {
         "geoemb:type": "pixel",  # per-pixel embeddings (not chip)
         "geoemb:dimensions": embedding_dim,
-        "geoemb:model": model_url or _MODEL_URL_TEMPLATE.format(version=ENCODER_VERSION),
+        "geoemb:model": expected_model_url(model_url),
         "geoemb:source_data": list(source_data),
         "geoemb:data_type": data_type,
         # build_version is the SOFTWARE build (this package) per the convention.

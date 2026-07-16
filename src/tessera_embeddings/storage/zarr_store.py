@@ -743,14 +743,23 @@ def _write_region(
 # =============================================================================
 
 
-def open_store(store_path: str, chunks: "ChunksArg" = _CHUNKS_UNSET, group: str | None = None) -> xr.Dataset:
+def open_store(
+    store_path: str,
+    chunks: "ChunksArg" = _CHUNKS_UNSET,
+    group: str | None = None,
+    *,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    region: str | None = None,
+) -> xr.Dataset:
     """Open an Icechunk store for reading as an xarray Dataset.
 
     Pass ``chunks=None`` for large (e.g. CONUS-scale) stores to skip the dask
     task graph and slice lazily on metadata alone — see :func:`_open_readonly`.
     ``group`` selects one Zarr group (the global store's per-zone layout).
+    ``get_credentials``/``region`` thread a credential callback / region to the
+    repo open, for callback-only or non-default-region deployments.
     """
-    return _open_readonly(store_path, chunks=chunks, group=group)
+    return _open_readonly(store_path, get_credentials=get_credentials, region=region, chunks=chunks, group=group)
 
 
 def open_store_as_zarr_group(

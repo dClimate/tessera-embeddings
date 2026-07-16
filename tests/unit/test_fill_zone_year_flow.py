@@ -15,6 +15,7 @@ import pytest
 import tessera_embeddings.orchestration.prefect.flows.fill_zone_year as mod
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.errors import InsufficientCoverageError
+from tessera_embeddings.inference.conventions import expected_model_url
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
@@ -38,6 +39,8 @@ def test_coverage_gate_fails_before_ray(monkeypatch, allow_partial):
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
     monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
     monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(time_window="W"))
+    # Model guard also runs pre-Ray; stub it so this test isolates the coverage gate.
+    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
 
     captured: dict = {}
 
@@ -60,6 +63,35 @@ def test_coverage_gate_fails_before_ray(monkeypatch, allow_partial):
     assert captured["mosaic_base"] == "s3://in/mosaics/33N/2025"  # per-year, canonicalized zone
     assert captured["skip"] is allow_partial  # allow_partial_window threaded through
     assert captured["creds"] is not None  # credential callback threaded through
+
+
+def test_model_guard_rejects_encoder_mismatch(monkeypatch):
+    """A store seeded for a different encoder than this build is rejected — a
+    mid-campaign model upgrade would otherwise mix encoders under one store.
+    """
+    monkeypatch.setattr(
+        mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"geoemb:model": "https://x/OLD"})
+    )
+    with pytest.raises(ValueError, match="was seeded for encoder"):
+        mod._assert_seeded_model_matches("s3://in/store", allow_model_mismatch=False, get_credentials=None)
+
+
+def test_model_guard_allows_match_override_and_missing(monkeypatch):
+    """The guard passes when the encoder matches, when the override flag is set,
+    and when the store advertises no model at all (legacy/unseeded root).
+    """
+    monkeypatch.setattr(
+        mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"geoemb:model": expected_model_url()})
+    )
+    mod._assert_seeded_model_matches("s3://in/store", allow_model_mismatch=False, get_credentials=None)  # matches
+
+    monkeypatch.setattr(
+        mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"geoemb:model": "https://x/OLD"})
+    )
+    mod._assert_seeded_model_matches("s3://in/store", allow_model_mismatch=True, get_credentials=None)  # override
+
+    monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={}))
+    mod._assert_seeded_model_matches("s3://in/store", allow_model_mismatch=False, get_credentials=None)  # no attr
 
 
 def test_staging_base_scoped_to_zone_year(monkeypatch):

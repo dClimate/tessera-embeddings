@@ -25,10 +25,11 @@ from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
 
 from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_year_on_axis
-from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete
+from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zone
@@ -62,6 +63,7 @@ async def run_global_campaign(
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
     batch_days: int = 30,
     allow_partial_window: bool = False,
+    sweep_orphan_mosaics: bool = False,
 ) -> dict[str, Any]:
     """Fill every pending (zone, year), year-serial with bounded zone parallelism.
 
@@ -102,6 +104,12 @@ async def run_global_campaign(
         batch_days: S1 CMR batch window forwarded to ingest.
         allow_partial_window: Relax the coverage gate (ingest + fill) to
             "non-empty" for legitimately partial edge zones.
+        sweep_orphan_mosaics: Before the run, delete mosaics for cells that are
+            already complete+tagged in scope — recovering orphans left by a
+            per-cell cleanup that failed after tagging (that cell is no longer in
+            `work`, so it is never retried otherwise). Off by default; the zero-cost
+            backstop for transient mosaics is an S3 lifecycle rule on the mosaics
+            prefix, which this complements for immediate reclamation.
 
     Returns:
         Summary: pending count at start, dispatched run ids per year, totals.
@@ -149,6 +157,22 @@ async def run_global_campaign(
     # and INCLUDES complete-but-untagged cells (crash between fill and tag → the
     # runner's idempotent retag path runs). See its docstring for the two use cases.
     work = campaign_work_list(status, existing_tags, expected_zones=expected_zones, years=campaign_years)
+
+    # Orphan-mosaic recovery: a per-cell cleanup that failed after tagging leaves
+    # the mosaic behind, and that cell is no longer in `work`, so it is never
+    # retried. Sweep complete-and-tagged cells in scope (best-effort) before the
+    # run. Opt-in — the recommended zero-cost backstop is an S3 lifecycle rule.
+    if sweep_orphan_mosaics and ingest and cleanup_mosaics:
+        work_set = set(work)
+        sweep_zones = expected_zones if expected_zones is not None else sorted(status.zones)
+        swept = 0
+        for y in set(campaign_years):
+            for z in sweep_zones:
+                if (z, y) not in work_set and status.has(z, y) and zone_year_tag(z, y) in existing_tags:
+                    delete_prefix(f"{paths.inputs.rstrip('/')}/mosaics/{z}/{y}", log=log)
+                    swept += 1
+        log.info("Orphan-mosaic sweep: reclaimed %d completed-cell mosaic prefix(es)", swept)
+
     log.info(
         "Campaign: %d (zone, year) cell(s) need work across %d year(s); <=%d concurrent fills/year, commit limit %r",
         len(work),
@@ -169,6 +193,10 @@ async def run_global_campaign(
             "s1_orbit": s1_orbit,
             "commit_limit_name": commit_limit_name,
             "allow_partial_window": allow_partial_window,
+            # Divide the fleet S3-PUT budget across concurrent fills so K shard-write
+            # phases don't burst K times the target PUTs (the ~800-req SlowDown). D6
+            # gates committers; this bounds the ungated upload phase.
+            "s3_concurrency": max(1, TARGET_AGGREGATE_S3_CONCURRENCY // max_parallel_zones),
             "ssm_prefix": ssm_prefix,
             "cloudwatch_log_group": cloudwatch_log_group,
             "code_bucket": code_bucket,

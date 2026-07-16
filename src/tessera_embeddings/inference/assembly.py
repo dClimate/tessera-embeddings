@@ -144,6 +144,37 @@ target (``AssemblyConfig`` caps them far lower).
 """
 
 
+def read_store_spatial_coords(
+    store_path: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> SpatialCoords:
+    """Read projected x/y coordinates and CRS from any mosaic child store.
+
+    Reads via the raw-zarr opener — the 1-D coord arrays and root attrs off
+    metadata, never an xarray/dask graph over the store's data chunks.
+    ``get_credentials``/``s3_region`` are threaded to the opener so an S3 store
+    that authenticates only through the campaign's credential callback (or lives
+    outside the default region) is readable.
+
+    Args:
+        store_path: Full path to a single mosaic store (reflectance or SAR).
+        get_credentials: Optional icechunk credential callback for the store.
+        s3_region: Optional S3 region override.
+
+    Returns:
+        SpatialCoords with projected northing and easting arrays.
+    """
+    logger.info("Reading projected coordinates from %s", store_path)
+    root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
+    return SpatialCoords(
+        northing=np.asarray(cast(zarr.Array, root["northing"])),
+        easting=np.asarray(cast(zarr.Array, root["easting"])),
+        crs=cast("str | None", root.attrs.get("crs")),
+    )
+
+
 def read_spatial_coords(
     mosaic_base: str,
     *,
@@ -152,11 +183,9 @@ def read_spatial_coords(
 ) -> SpatialCoords:
     """Read projected x/y coordinates and CRS from the reflectance store.
 
-    Reads via the raw-zarr opener — the 1-D coord arrays and root attrs off
-    metadata, never an xarray/dask graph over the store's data chunks (this runs
-    once per zone-year fill). ``get_credentials``/``s3_region`` are threaded to
-    the opener so an S3 mosaic that authenticates only through the campaign's
-    credential callback (or lives outside the default region) is readable.
+    Thin wrapper over :func:`read_store_spatial_coords` for the reflectance store
+    under ``mosaic_base`` — the fill's canonical grid reference (runs once per
+    zone-year fill).
 
     Args:
         mosaic_base: Base path for the mosaic stores (e.g., "s3://bucket/mosaics/roi").
@@ -166,13 +195,8 @@ def read_spatial_coords(
     Returns:
         SpatialCoords with projected northing and easting arrays.
     """
-    reflectance_path = f"{mosaic_base}/reflectance.zarr"
-    logger.info("Reading projected coordinates from %s", reflectance_path)
-    root = open_store_as_zarr_group(reflectance_path, get_credentials=get_credentials, region=s3_region)
-    return SpatialCoords(
-        northing=np.asarray(cast(zarr.Array, root["northing"])),
-        easting=np.asarray(cast(zarr.Array, root["easting"])),
-        crs=cast("str | None", root.attrs.get("crs")),
+    return read_store_spatial_coords(
+        f"{mosaic_base}/reflectance.zarr", get_credentials=get_credentials, s3_region=s3_region
     )
 
 
@@ -1266,6 +1290,7 @@ class ZarrWriter:
         n_workers: int = 8,
         gate: CommitGate | None = None,
         staged_labels: Iterable[str] | None = None,
+        s3_concurrency: int | None = None,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
@@ -1310,6 +1335,9 @@ class ZarrWriter:
                 process drives (fleet-wide gating is the orchestrator's job).
             staged_labels: Pre-listed staged tile labels (e.g. the return of
                 :meth:`verify_staged_completeness`); ``None`` lists the prefix.
+            s3_concurrency: This fill's slice of the fleet S3-PUT budget (divided
+                across ``n_workers`` for the per-fork cap); ``None`` uses the full
+                ``TARGET_AGGREGATE_S3_CONCURRENCY`` (a lone fill).
             get_credentials: Optional icechunk credential callback.
             s3_region: Optional S3 region override.
             log: Optional logger.
@@ -1324,7 +1352,13 @@ class ZarrWriter:
             raise IncompleteStageError(f"Run {run_id!r} has no staged chunks under {self.staging_base}")
         shards = tuple(sorted(parse_chunk_label(label) for label in labels))
 
-        per_worker_cap = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // max(1, n_workers))
+        # S3 budget: divide the FLEET target across concurrent fills, not just this
+        # fill's forks. TARGET_AGGREGATE_S3_CONCURRENCY // n_workers alone bounds one
+        # fill to ~target, so K concurrent fills burst K times the target PUTs (the
+        # 800-req SlowDown). The campaign passes `s3_concurrency = target //
+        # max_parallel_zones` so the fleet stays near target; None = full target.
+        budget = s3_concurrency if s3_concurrency is not None else TARGET_AGGREGATE_S3_CONCURRENCY
+        per_worker_cap = max(1, budget // max(1, n_workers))
         repo = open_global_repo(
             store_path,
             get_credentials=get_credentials,

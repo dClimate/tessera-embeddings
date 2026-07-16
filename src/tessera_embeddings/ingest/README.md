@@ -148,13 +148,13 @@ run_global_campaign  (per pending (zone, year), zone-parallel within a year)
    │
    ├─ ingest-zone-year ──► export_zone_roi(zone)         {inputs}/rois/zarrs/zone_33N.zarr
    │      │                  (ZoneSpec grid + tile_live mask; ocean-tile skip)
-   │      ├─ marker probe (root attr ingest_window per store) ──► skip if current
+   │      ├─ marker probe (ingest_marker fingerprint; stale/partial ⇒ clear+rebuild)
    │      ├─ ingest_s1_roi_sar × orbit ┐  concurrent, onto
    │      ├─ ingest_s2_roi_reflectance ┘  {inputs}/mosaics/33N/2025/
    │      ├─ check_time_window_coverage (strict span; allow_partial_window escape)
-   │      └─ write ingest_window marker  (last — crash before this ⇒ incremental re-run)
+   │      └─ write ingest_marker  (last — crash before this ⇒ clean rebuild on re-run)
    │
-   ├─ fill-zone-year  ──► coverage gate (pre-Ray) ──► inference ──► assemble ──► tag
+   ├─ fill-zone-year  ──► coverage + SAR-grid + model gates (pre-Ray) ──► inference ──► assemble ──► tag
    │
    └─ delete mosaics/33N/2025  (s5cmd --all-versions; transient input)
 ```
