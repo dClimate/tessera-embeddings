@@ -55,9 +55,8 @@ PHASE_PARSER = r'''
 import glob, re
 from datetime import datetime
 PAT = {
+ "pref": re.compile(r"^(\S+ \S+) \S+ INFO Using prefetched prologue for (\S+)"),
  "tkept": re.compile(r"^(\S+ \S+) \S+ INFO Chunk (\S+): T_kept=(\d+) -> strip_h=(\d+) -> (\d+) strip"),
- "load": re.compile(r"^(\S+ \S+) \S+ INFO Loading chunk (\S+) from"),
- "bands": re.compile(r"^(\S+ \S+) \S+ INFO Loaded S2 bands shape \((\d+),"),
  "ds": re.compile(r"^(\S+ \S+) \S+ INFO MosaicChunkInferenceDataset: (\d+) valid pixels"
                   r" out of \d+ total \(([\d.]+)%\) in (\d+) buckets"),
  "start": re.compile(r"^(\S+ \S+) \S+ INFO Starting v1.1 inference"),
@@ -72,14 +71,20 @@ for f in glob.glob("/tmp/ray/session_latest/logs/worker-*.err"):
             m = pat.match(line.strip())
             if m: events.append((ts(m.group(1)), kind, m.groups()[1:]))
 events.sort(key=lambda e: e[0])
-rows, cur, prev_done = [], None, None
+# With cross-chunk prefetch (Phase 1) a chunk's band/SAR loads log during the
+# PREVIOUS chunk's window, so per-phase load attribution is meaningless there.
+# prologue_s = chunk start -> inference start is the honest GPU-idle-prologue
+# metric in both modes; pref=Y marks chunks that consumed a prefetched stash.
+rows, cur, prev_done, pending_pref = [], None, None, set()
 for t, kind, g in events:
-    if kind == "tkept":
+    if kind == "pref":
+        pending_pref.add(g[0])
+    elif kind == "tkept":
         gap = (t - prev_done).total_seconds() if prev_done else None
-        cur = {"label": g[0], "tkept": g[1], "strips": g[3], "gap_s": gap}
+        cur = {"label": g[0], "tkept": g[1], "strips": g[3], "gap_s": gap, "t_mask": t,
+               "pref": "Y" if g[0] in pending_pref else "N"}
+        pending_pref.discard(g[0])
     elif cur is None: continue
-    elif kind == "load" and "t_load" not in cur: cur["t_load"] = t
-    elif kind == "bands" and "t_bands" not in cur: cur["t_bands"] = t
     elif kind == "ds" and "t_ds" not in cur:
         cur["t_ds"], cur["px"], cur["valid_pct"], cur["buckets"] = t, g[0], g[1], g[2]
     elif kind == "start" and "t_start" not in cur: cur["t_start"] = t
@@ -87,14 +92,13 @@ for t, kind, g in events:
         cur["t_idone"], cur["infer_s"], cur["pxs"] = t, g[0], g[1]
     elif kind == "cdone":
         cur["t_cdone"], cur["total_s"] = t, g[2]; rows.append(cur); prev_done = t; cur = None
-print("label\tTkept\tstrips\tbuckets\tvalid_px\tvalid%\tgap+mask_s\tband_s\tsar+build_s\tinfer_s\twrite_s\ttotal_s\tpx/s")
+print("label\tTkept\tstrips\tpref\tbuckets\tvalid_px\tvalid%\tgap_s\tprologue_s\tinfer_s\twrite_s\ttotal_s\tpx/s")
 for r in rows:
     try:
-        band = (r["t_bands"] - r["t_load"]).total_seconds()
-        sarbuild = (r["t_start"] - r["t_bands"]).total_seconds()
+        prologue = (r["t_start"] - r["t_mask"]).total_seconds()
         write = (r["t_cdone"] - r["t_idone"]).total_seconds()
         gap = r["gap_s"] if r["gap_s"] is not None else -1
-        print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r.get('buckets','?')}\t{r.get('px','?')}\t{r.get('valid_pct','?')}\t{gap:.1f}\t{band:.1f}\t{sarbuild:.1f}\t{r.get('infer_s','?')}\t{write:.1f}\t{r['total_s']}\t{r.get('pxs','?')}")
+        print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r['pref']}\t{r.get('buckets','?')}\t{r.get('px','?')}\t{r.get('valid_pct','?')}\t{gap:.1f}\t{prologue:.1f}\t{r.get('infer_s','?')}\t{write:.1f}\t{r['total_s']}\t{r.get('pxs','?')}")
     except KeyError as e:
         print(f"{r['label']}\tINCOMPLETE({e})")
 '''
