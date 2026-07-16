@@ -313,6 +313,9 @@ def campaign_work_list(
 
     ``expected_zones`` is the zone filter for a subset / repair run (default: all 120).
     """
-    zone_names = tuple(expected_zones) if expected_zones is not None else tuple(ZONES)
-    yrs = tuple(years) if years is not None else status.years
+    # Dedupe (order-preserving): duplicate zones/years from a caller would emit the
+    # same (zone, year) twice, and the driver would dispatch two concurrent fills of
+    # one cell — their years_complete/runs attr commits conflict (RebaseFailedError).
+    zone_names = tuple(dict.fromkeys(expected_zones)) if expected_zones is not None else tuple(ZONES)
+    yrs = tuple(dict.fromkeys(years)) if years is not None else status.years
     return [(z, y) for y in yrs for z in zone_names if not status.has(z, y) or zone_year_tag(z, y) not in existing_tags]

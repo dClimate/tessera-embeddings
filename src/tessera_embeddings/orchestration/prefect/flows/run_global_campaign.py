@@ -134,6 +134,14 @@ async def run_global_campaign(
     # Normalize the requested zones to canonical common names ("33N", "07S") so a
     # bad id fails loudly here and matches the store's group names exactly.
     expected_zones = [canonicalize_zone(z) for z in zones] if zones is not None else None
+    # An explicit zones subset must be seeded: a typo that canonicalizes to a valid
+    # but unseeded zone would otherwise be treated as pending and ingest+fill it
+    # only for the fill to reject an unseeded group. (The default None spans all 120;
+    # a not-fully-seeded store surfaces at the fill, as before.)
+    if expected_zones is not None:
+        unseeded = [z for z in expected_zones if z not in status.zones]
+        if unseeded:
+            raise ValueError(f"Requested zone(s) {unseeded} are not seeded in {store_path} — run the seed flow first.")
 
     # Work list = cells still needing a fill, restricted to `zones` (default: all
     # 120). campaign_work_list is tag-aware: it skips landed-and-tagged cells (so a

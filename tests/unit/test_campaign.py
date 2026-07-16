@@ -281,3 +281,11 @@ def test_mark_zone_year_empty_off_axis_year_raises(tmp_path):
         campaign.mark_zone_year_empty(repo, "01N", 1999)
     status = campaign.campaign_status(repo, years=_YEARS)
     assert not status.has("01N", 1999)
+
+
+def test_work_list_dedupes_duplicate_inputs(tmp_path):
+    """Duplicate zones/years collapse to one cell (else two concurrent same-cell fills)."""
+    _, repo = _seed(tmp_path)
+    status = campaign.campaign_status(repo, years=_YEARS)
+    work = campaign.campaign_work_list(status, set(), expected_zones=("01N", "01N"), years=(2023, 2023))
+    assert work == [("01N", 2023)]

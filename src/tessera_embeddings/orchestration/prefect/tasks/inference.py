@@ -150,7 +150,11 @@ def assemble_embeddings_task(
     writer = ZarrWriter(staging_base)
 
     model_version = checkpoint_to_version(config.checkpoint_path)
-    upstream_manifests = read_upstream_manifests(mosaic_base, config.s1_orbit) if mosaic_base else {}
+    upstream_manifests = (
+        read_upstream_manifests(mosaic_base, config.s1_orbit, get_credentials=get_credentials, s3_region=s3_region)
+        if mosaic_base
+        else {}
+    )
     embedding_manifest = EmbeddingManifest.from_upstream_stores(
         model_checkpoint=model_version,
         num_obs_checkpoints=config.num_obs_checkpoints,

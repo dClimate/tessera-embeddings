@@ -2,6 +2,7 @@
 
 from unittest.mock import patch
 
+import icechunk
 import numpy as np
 import pandas as pd
 import pytest
@@ -523,3 +524,29 @@ class TestSharedStoreOpener:
             "s3://b/m/sar_ascending.zarr",
             "s3://b/m/sar_descending.zarr",
         ]
+
+
+class TestResolveS1OrbitErrors:
+    """resolve_s1_orbit must not swallow transient/auth errors as 'orbit absent'."""
+
+    def test_missing_repo_excludes_orbit(self):
+        def _open(path, **kwargs):
+            raise icechunk.IcechunkError("the repository doesn't exist")
+
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open),
+            pytest.raises(InsufficientCoverageError, match="no SAR stores found"),
+        ):
+            resolve_s1_orbit("s3://b/m", "both")
+
+    def test_transient_error_reraises_not_downgrades(self):
+        def _open(path, **kwargs):
+            if "ascending" in path:
+                return object()  # ascending opens fine
+            raise icechunk.IcechunkError("connection timed out")  # descending errors transiently
+
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open),
+            pytest.raises(icechunk.IcechunkError, match="timed out"),
+        ):
+            resolve_s1_orbit("s3://b/m", "both")  # must NOT silently downgrade to ascending

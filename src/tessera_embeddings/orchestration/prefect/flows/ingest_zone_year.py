@@ -42,6 +42,7 @@ from tessera_embeddings.inference.data_loading import _active_orbits, check_time
 from tessera_embeddings.ingest.land_mask import export_zone_roi
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles
+from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 from tessera_embeddings.utils import utcnow_iso
@@ -153,11 +154,14 @@ async def ingest_zone_year(
     window = parse_time_window(time_window_end or f"December {year}")
     start_date, end_date = window.to_date_range()
     # Fingerprint the ingest INPUTS, not just the window: rebuilding the coverage
-    # (new registry_sha256), changing min_valid_coverage, or the window all change
-    # the mosaic that should be produced, so a stale marker must not short-circuit.
+    # (new registry_sha256), changing min_valid_coverage, the window, or the
+    # REQUESTED orbit set all change the mosaic that should be produced. Including
+    # s1_orbit is what makes an ascending-only run's marker mismatch a later "both"
+    # request (so the missing orbit is actually ingested, not skipped).
     fingerprint = {
         "window": [start_date, end_date],
         "min_valid_coverage": min_valid_coverage,
+        "s1_orbit": s1_orbit,
         "coverage_sha256": _coverage_sha(
             land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=None
         ),
@@ -179,12 +183,20 @@ async def ingest_zone_year(
     # (2) Completion-marker probe: every store present for the resolved orbit set
     #     carries this exact fingerprint? A crash-resumed run then no-ops.
     probe_stores = _resolved_stores()
-    if probe_stores is not None and all(
-        _read_ingest_marker(s, get_credentials=iam_icechunk_credentials, s3_region=None) == fingerprint
-        for s in probe_stores
-    ):
+    existing = (
+        [_read_ingest_marker(s, get_credentials=iam_icechunk_credentials, s3_region=None) for s in probe_stores]
+        if probe_stores is not None
+        else []
+    )
+    if existing and all(m == fingerprint for m in existing):
         log.info("Zone %s year %d already ingested for %s — skipping", zone, year, fingerprint["window"])
         return {"zone": zone, "year": year, "status": "already_ingested", "fingerprint": fingerprint}
+    if any(m is not None for m in existing):
+        # A present-but-mismatched marker (changed inputs, or an ascending-only prior
+        # run now asked for both): the mosaic was built under different inputs, so a
+        # plain re-ingest would append onto stale data. Clear it for a clean rebuild.
+        log.info("Zone %s year %d has a stale ingest marker — clearing %s for a clean rebuild", zone, year, mosaic_base)
+        delete_prefix(mosaic_base, log=log)
 
     # (3) Ensure the zone ROI zarr (idempotent; regenerates if coverage changed).
     export_zone_roi(zone, land_mask_path=land_mask_path, dest_path=roi_path, get_credentials=iam_icechunk_credentials)

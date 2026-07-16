@@ -242,6 +242,13 @@ class TestCheckTimeWindowCoverage:
         with pytest.raises(InsufficientCoverageError, match="no time entries"):
             check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending")
 
+    def test_skip_coverage_check_requires_in_window_data(self, _mock_open_store):
+        """Partial-window mode still rejects a store with only out-of-window dates."""
+        _mock_open_store("2023-01-01", "2023-12-31")  # entirely before the July 2025 window
+        tw = parse_time_window("July 2025")
+        with pytest.raises(InsufficientCoverageError, match="no timestamps within the window"):
+            check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending", skip_coverage_check=True)
+
     def test_skip_coverage_check_bypasses_range_check(self, _mock_open_store):
         """skip_coverage_check=True bypasses the range check even when out of range."""
         # Store ends well before the window — would normally raise.

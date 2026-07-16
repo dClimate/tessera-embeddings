@@ -90,3 +90,10 @@ def test_retag_only_cell_skips_ingest(wired, monkeypatch):
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["fill-zone-year/fill-zone-year"]  # fill (retag) only, no ingest
     assert wired["deletes"] == []
+
+
+def test_unseeded_explicit_zone_rejected(wired):
+    """An explicit zones= entry that isn't seeded fails before dispatch."""
+    with pytest.raises(ValueError, match="not seeded"):
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", zones=["02N"]))
+    assert wired["arun"] == []

@@ -641,7 +641,18 @@ def _live_tile_bbox_wgs84(spec: ZoneSpec, tile_live: np.ndarray) -> tuple[float,
     lon, lat = _to_wgs84(int(spec.epsg)).transform(perim_e, perim_n)
     lon = np.asarray(lon, dtype="float64")
     lat = np.asarray(lat, dtype="float64")
-    return float(lon.min()), float(lat.min()), float(lon.max()), float(lat.max())
+    lat_min, lat_max = float(lat.min()), float(lat.max())
+
+    # Antimeridian: zones 01* / 60* snap slightly past ±180, so inverse projection
+    # wraps some perimeter points to the far side. Plain min/max would then span
+    # nearly the whole globe. A span > 180° signals the wrap; represent the crossing
+    # per the GeoJSON/STAC convention (west > east) — west is the eastern (>0)
+    # cluster's min, east the western (<0) cluster's max — keeping the box narrow.
+    if float(lon.max() - lon.min()) > 180.0:
+        west = float(lon[lon > 0.0].min())
+        east = float(lon[lon < 0.0].max())
+        return west, lat_min, east, lat_max
+    return float(lon.min()), lat_min, float(lon.max()), lat_max
 
 
 def _roi_is_current(

@@ -10,20 +10,30 @@ from __future__ import annotations
 
 import gc
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from tessera_embeddings.config.inference import InferenceConfig, TimeWindow
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks_from_dataset
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.storage.manifest import extract_manifest
-from tessera_embeddings.storage.zarr_store import open_store
+from tessera_embeddings.storage.zarr_store import open_store, open_store_as_zarr_group
 
 
 def read_upstream_manifests(
     mosaic_base: str,
     s1_orbit: str,
+    *,
+    get_credentials: Callable[[], Any] | None = None,
+    s3_region: str | None = None,
 ) -> dict[str, dict[str, Any] | None]:
-    """Read ``_manifest`` attrs from all active ingest stores under ``mosaic_base``."""
+    """Read ``_manifest`` attrs from all active ingest stores under ``mosaic_base``.
+
+    Opens via the raw-zarr metadata reader with the caller's credential callback /
+    region (the same ones the assemble write uses), so a callback-only or
+    non-default-region deployment doesn't fall back to the default Icechunk chain
+    and fail this manifest read on the flow runner before ``writer.assemble()``.
+    """
     store_names = ["reflectance"]
     for orbit in _active_orbits(s1_orbit):
         store_names.append(f"sar_{orbit}")
@@ -31,14 +41,10 @@ def read_upstream_manifests(
     manifests: dict[str, dict[str, Any] | None] = {}
     for name in store_names:
         path = f"{mosaic_base}/{name}.zarr"
-        # chunks=None: read only the root attrs off metadata. Default chunking
-        # would build a Dask task per stored chunk of a full-zone mosaic on the
-        # flow runner just to read one attr dict — pure overhead.
-        ds = open_store(path, chunks=None)
-        try:
-            manifests[name] = extract_manifest(ds.attrs)
-        finally:
-            ds.close()
+        # Raw-zarr open reads only the root attrs off metadata — no Dask graph over
+        # a full-zone mosaic's chunks just to read one attr dict.
+        root = open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
+        manifests[name] = extract_manifest(dict(root.attrs))
     return manifests
 
 

@@ -13,15 +13,17 @@ authority and creates nothing.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import icechunk
+import zarr
 from prefect import flow, get_run_logger
 
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.storage.campaign import campaign_status
 from tessera_embeddings.storage.global_store import create_global_repo, open_global_repo, seed_zone_groups
-from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES
+from tessera_embeddings.storage.zarr_store import read_time_values
+from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES, year_of
 
 
 @flow(name="seed-global-store")
@@ -55,6 +57,19 @@ def seed_global_store(
         log.info("Creating global store %s", store_path)
         repo = create_global_repo(store_path)
         seeded = set()
+
+    # A retry after a partial seed must use the SAME year axis as the groups already
+    # landed — the axis is fixed at seeding (ADR-008 D1), so seeding the remainder
+    # with a different `years` would silently leave the store with mixed axes.
+    if seeded:
+        root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
+        probe = cast("zarr.Group", root[sorted(seeded)[0]])
+        existing_years = tuple(year_of(t) for t in read_time_values(probe))
+        if existing_years != tuple(years):
+            raise ValueError(
+                f"years {tuple(years)} differ from the store's existing axis {existing_years} "
+                f"({len(seeded)} zone(s) already seeded) — reseeding with a different axis would corrupt the store."
+            )
 
     todo = [spec for zone_name, spec in ZONES.items() if zone_name not in seeded]
     if not todo:

@@ -43,6 +43,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "export_zone_roi", lambda z, **kw: rec["roi_exported"].append((z, kw)))
     monkeypatch.setattr(mod, "check_time_window_coverage", lambda *a, **k: rec["coverage_checked"].append((a, k)))
     monkeypatch.setattr(mod, "_write_ingest_marker", lambda store, fp, **kw: rec["markers_written"].append(store))
+    monkeypatch.setattr(mod, "delete_prefix", lambda uri, **kw: rec.setdefault("deletes", []).append(uri))
     # Fingerprint inputs: coverage sha + orbit resolution ("ascending" resolves to
     # itself without probing, so _resolved_stores is deterministic in tests).
     monkeypatch.setattr(mod, "_coverage_sha", lambda *a, **k: "cov-sha-1")
@@ -63,13 +64,18 @@ def test_ocean_zone_skips_everything(wired, monkeypatch):
 
 def test_matching_markers_skip_ingest(wired, monkeypatch):
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    fp = {"window": ["2025-01-01", "2025-12-31"], "min_valid_coverage": 0.1, "coverage_sha256": "cov-sha-1"}
+    fp = {
+        "window": ["2025-01-01", "2025-12-31"],
+        "min_valid_coverage": 0.1,
+        "s1_orbit": "ascending",
+        "coverage_sha256": "cov-sha-1",
+    }
     # Every resolved store already carries the exact fingerprint.
     monkeypatch.setattr(mod, "_read_ingest_marker", lambda store, **kw: fp)
     result = _run(s1_orbit="ascending")
     assert result["status"] == "already_ingested"
     assert result["fingerprint"] == fp
-    assert wired["arun"] == [] and wired["roi_exported"] == []
+    assert wired["arun"] == [] and wired["roi_exported"] == [] and wired.get("deletes", []) == []
 
 
 def test_dispatches_and_marks_on_success(wired, monkeypatch):
@@ -103,11 +109,18 @@ def test_stale_marker_triggers_reingest(wired, monkeypatch):
     NOT short-circuit — the mosaic is re-ingested under the new inputs.
     """
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    stale = {"window": ["2025-01-01", "2025-12-31"], "min_valid_coverage": 0.1, "coverage_sha256": "OLD-sha"}
-    monkeypatch.setattr(mod, "_read_ingest_marker", lambda store, **kw: stale)  # sha != current "cov-sha-1"
+    stale = {
+        "window": ["2025-01-01", "2025-12-31"],
+        "min_valid_coverage": 0.1,
+        "s1_orbit": "ascending",
+        "coverage_sha256": "OLD-sha",  # != current "cov-sha-1"
+    }
+    monkeypatch.setattr(mod, "_read_ingest_marker", lambda store, **kw: stale)
     result = _run(s1_orbit="ascending")
     assert result["status"] == "ingested"  # re-ingested despite a present (stale) marker
     assert wired["arun"]
+    # Stale mosaic cleared before the rebuild so re-ingest doesn't append onto old data.
+    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025"]
 
 
 def test_coverage_failure_leaves_no_marker(wired, monkeypatch):

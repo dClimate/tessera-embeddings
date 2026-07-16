@@ -317,3 +317,22 @@ def test_export_zone_roi_idempotent(tmp_path) -> None:
     assert first == second == dest
     z = zarr.open(dest, mode="r")
     assert bool(np.asarray(z[10 * SHARD_PX : 11 * SHARD_PX, 5 * SHARD_PX : 6 * SHARD_PX]).all())
+
+
+def test_export_zone_roi_bbox_handles_antimeridian(tmp_path) -> None:
+    """A live-tile strip spanning zone 01N's ±180 edge yields a NARROW bbox, not
+    the near-global box naive min/max would give (which would span ~360°).
+    """
+    zone = "01N"
+    spec = zone_grid.zone(zone)
+    row = spec.height // SHARD_PX // 2  # a mid-latitude tile row
+    # A west→east strip that crosses the -180 boundary (west cols wrap to +179,
+    # east cols stay near -176).
+    cov = _make_coverage(tmp_path, zone, [(row, c) for c in range(8)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    minx, miny, maxx, maxy = zarr.open(dest, mode="r").attrs["bbox_wgs84"]
+    # Crossing → GeoJSON west>east; else a normal box. Either way the effective
+    # longitude span is a single 6° zone's width, never ~360°.
+    span = (180.0 - minx) + (maxx + 180.0) if minx > maxx else maxx - minx
+    assert span < 30.0

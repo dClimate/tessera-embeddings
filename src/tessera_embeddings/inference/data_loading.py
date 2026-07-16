@@ -228,6 +228,15 @@ def _active_orbits(s1_orbit: str) -> tuple[str, ...]:
     raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
 
 
+def _is_missing_repo(exc: icechunk.IcechunkError) -> bool:
+    """Whether an IcechunkError means the repo is genuinely absent (vs a transient
+    timeout / auth failure / corruption). Icechunk reports a missing repo as
+    "the repository doesn't exist".
+    """
+    msg = str(exc).lower()
+    return "doesn't exist" in msg or "does not exist" in msg
+
+
 def resolve_s1_orbit(
     mosaic_base: str,
     s1_orbit: str,
@@ -260,7 +269,15 @@ def resolve_s1_orbit(
         try:
             open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
             present.append(orbit)
-        except (FileNotFoundError, icechunk.IcechunkError):
+        except FileNotFoundError:
+            logger.info("SAR %s store not present at %s — will be excluded", orbit, path)
+        except icechunk.IcechunkError as exc:
+            # ONLY a genuinely-absent repo means "exclude this orbit". A timeout,
+            # auth failure, or corruption must not silently downgrade `both` to a
+            # single orbit and permanently drop the other's data — re-raise so the
+            # caller fails loudly instead.
+            if not _is_missing_repo(exc):
+                raise
             logger.info("SAR %s store not present at %s — will be excluded", orbit, path)
 
     if not present:
@@ -306,7 +323,21 @@ def check_time_window_coverage(
             msg = f"{label} store at {path} has no time entries"
             raise InsufficientCoverageError(msg)
 
+        years = times.astype("datetime64[Y]").astype(int) + 1970
+        months = times.astype("datetime64[M]").astype(int) % 12 + 1
+        present_months = set(zip(years.tolist(), months.tolist(), strict=True))
+
         if skip_coverage_check:
+            # Partial-window mode still requires at least one timestamp INSIDE the
+            # window — a store with only out-of-window (e.g. prior-year) dates is
+            # non-empty but useless, and must not pass the preflight / be marked
+            # ingested only for the fill to later find zero in-window observations.
+            if not (present_months & required_months):
+                msg = (
+                    f"{label} store at {path} has no timestamps within the window "
+                    f"{earliest[0]}-{earliest[1]:02d}..{latest[0]}-{latest[1]:02d}"
+                )
+                raise InsufficientCoverageError(msg)
             continue
 
         # Require EVERY month of the window to be present, not just that the
@@ -314,9 +345,6 @@ def check_time_window_coverage(
         # dates bracketing the year) would otherwise pass despite missing every
         # intervening month, and the write-once tag would make that partial year
         # permanent. Month granularity matches the campaign's calendar-year window.
-        years = times.astype("datetime64[Y]").astype(int) + 1970
-        months = times.astype("datetime64[M]").astype(int) % 12 + 1
-        present_months = set(zip(years.tolist(), months.tolist(), strict=True))
         missing = sorted(required_months - present_months)
         if missing:
             preview = ", ".join(f"{y}-{m:02d}" for y, m in missing[:6])
