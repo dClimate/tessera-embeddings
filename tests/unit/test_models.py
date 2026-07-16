@@ -250,61 +250,8 @@ class TestLoadCheckpoint:
         torch.testing.assert_close(cleaned["layer.weight"], weight)
 
 
-class TestRestructuredGRUEquivalence:
-    """The fused-GEMM GRU schedule matches the original per-gate loop.
-
-    The original CustomGRU forward ran 6 separate Linears per timestep; the
-    restructured one batches input-side projections and fuses the recurrent
-    r/z GEMM. Same formula, regrouped reductions → validated-equivalence
-    class (ADR 012): assert_close at float32 tolerances, not bit-equality.
-    """
-
-    @staticmethod
-    def _reference_forward(gru: CustomGRU, x: torch.Tensor, h_0: torch.Tensor | None = None):
-        batch_size, seq_len, _ = x.shape
-        h_t = h_0.squeeze(0) if h_0 is not None else torch.zeros(
-            batch_size, gru.hidden_size, device=x.device, dtype=x.dtype
-        )
-        outputs = torch.empty(batch_size, seq_len, gru.hidden_size, device=x.device, dtype=x.dtype)
-        for t in range(seq_len):
-            h_t = gru.gru_cell(x[:, t, :], h_t)
-            outputs[:, t, :] = h_t
-        return outputs, h_t.unsqueeze(0)
-
-    def test_matches_reference_loop(self):
-        torch.manual_seed(3)
-        gru = CustomGRU(input_size=24, hidden_size=16)
-        x = torch.randn(5, 12, 24)
-        with torch.no_grad():
-            out_new, h_new = gru(x)
-            out_ref, h_ref = self._reference_forward(gru, x)
-        torch.testing.assert_close(out_new, out_ref)
-        torch.testing.assert_close(h_new, h_ref)
-
-    def test_matches_reference_with_initial_hidden(self):
-        torch.manual_seed(4)
-        gru = CustomGRU(input_size=8, hidden_size=8)
-        x = torch.randn(3, 7, 8)
-        h_0 = torch.randn(1, 3, 8)
-        with torch.no_grad():
-            out_new, h_new = gru(x, h_0)
-            out_ref, h_ref = self._reference_forward(gru, x, h_0)
-        torch.testing.assert_close(out_new, out_ref)
-        torch.testing.assert_close(h_new, h_ref)
-
-    def test_fused_cache_rebuilds_on_dtype_change(self):
-        gru = CustomGRU(input_size=8, hidden_size=8)
-        x = torch.randn(2, 3, 8)
-        with torch.no_grad():
-            gru(x)
-            assert gru._fused is not None and gru._fused[0].dtype == torch.float32
-            gru.bfloat16()
-            gru(x.bfloat16())
-            assert gru._fused[0].dtype == torch.bfloat16
-
-
 class TestPositionalEncoderBitIdentity:
-    """stack+reshape interleaving is pure data movement — bit-identical."""
+    """empty + strided sin/cos fill is bit-identical to the historical zeros fill."""
 
     @staticmethod
     def _reference_forward(enc: TemporalPositionalEncoder, doy: torch.Tensor) -> torch.Tensor:

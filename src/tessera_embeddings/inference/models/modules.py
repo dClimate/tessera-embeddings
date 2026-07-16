@@ -66,44 +66,19 @@ class CustomGRU(nn.Module):
     """GRU built from ``CustomGRUCell``, matching ``nn.GRU(batch_first=True)`` contract.
 
     Used to match the tessera beta QAT checkpoint which stores per-gate linear weights
-    instead of the fused weight matrices used by ``nn.GRU``. The checkpoint layout is
-    untouched: parameters stay on the cell; ``forward`` fuses them into larger GEMMs
-    at run time (cached per dtype/device) for a much shorter GPU dependency chain.
+    instead of the fused weight matrices used by ``nn.GRU``.
 
-    Schedule (same formula as the cell, regrouped — validated-equivalence class,
-    see ADR 012):
-
-    - All input-side projections for every timestep run as ONE ``(B·T, in) @
-      (in, 3H)`` GEMM before the loop (they don't depend on the hidden state),
-      with the gate biases pre-added once.
-    - Per step, the recurrent r/z projections fuse into one ``(B, H) @ (H, 2H)``
-      GEMM; only ``W_hh`` stays separate (it consumes ``r * h``). The loop body
-      drops from 6 small GEMMs + ~12 pointwise kernels to 2 GEMMs + ~8.
-
-    The sequential loop over T remains — this GRU variant has a true recurrence —
-    but each step is fewer, larger kernels, which is what the launch-bound
-    profile needs (T sequential steps of tiny kernels dominated small-bucket
-    forwards).
+    This is a *reference* implementation of the checkpoint's exact recurrence. In the
+    production inference graph it does not run: ``builder._fuse_custom_gru`` replaces
+    every instance with a cuDNN ``nn.GRU`` (one fused kernel vs. this per-step loop)
+    before the model is used. Keep this simple and checkpoint-faithful; the GPU-fast
+    path is the fused ``nn.GRU``, not this module.
     """
 
     def __init__(self, input_size: int, hidden_size: int) -> None:
         super().__init__()
         self.gru_cell = CustomGRUCell(input_size, hidden_size)
         self.hidden_size = hidden_size
-        # Fused-weight cache: plain tensors (never registered, never saved).
-        # Rebuilt whenever the parameters' dtype/device changes (e.g. the
-        # one-time .bfloat16() cast in _prepare_gpu).
-        self._fused: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-
-    def _fused_weights(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        cell = self.gru_cell
-        ref = cell.W_ir.weight
-        if self._fused is None or self._fused[0].dtype != ref.dtype or self._fused[0].device != ref.device:
-            w_input = torch.cat([cell.W_ir.weight, cell.W_iz.weight, cell.W_ih.weight], dim=0)  # (3H, in)
-            w_hidden_rz = torch.cat([cell.W_hr.weight, cell.W_hz.weight], dim=0)  # (2H, H)
-            bias = torch.cat([cell.b_r, cell.b_z, cell.b_h])  # (3H,)
-            self._fused = (w_input, w_hidden_rz, bias)
-        return self._fused
 
     def forward(self, x: torch.Tensor, h_0: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the GRU over a batch-first sequence.
@@ -117,29 +92,18 @@ class CustomGRU(nn.Module):
             h_t has shape (1, B, hidden_size).
         """
         batch_size, seq_len, _ = x.shape
-        h = self.hidden_size
-        cell = self.gru_cell
-        w_input, w_hidden_rz, bias = self._fused_weights()
-
-        # One GEMM for every timestep's input-side gate projections, biases
-        # pre-added (they don't depend on h_t either).
-        x_proj = x.matmul(w_input.t()) + bias  # (B, T, 3H)
 
         if h_0 is not None:
             h_t = h_0.squeeze(0)
         else:
-            h_t = torch.zeros(batch_size, h, device=x.device, dtype=x.dtype)
+            h_t = torch.zeros(batch_size, self.hidden_size, device=x.device, dtype=x.dtype)
 
-        steps: list[torch.Tensor] = []
+        outputs = torch.empty(batch_size, seq_len, self.hidden_size, device=x.device, dtype=x.dtype)
         for t in range(seq_len):
-            xp = x_proj[:, t]
-            rz = torch.sigmoid(xp[:, : 2 * h] + h_t.matmul(w_hidden_rz.t()))
-            r, z = rz[:, :h], rz[:, h:]
-            n = torch.tanh(xp[:, 2 * h :] + cell.W_hh(r * h_t))
-            h_t = (1 - z) * h_t + z * n
-            steps.append(h_t)
+            h_t = self.gru_cell(x[:, t, :], h_t)
+            outputs[:, t, :] = h_t
 
-        return torch.stack(steps, dim=1), h_t.unsqueeze(0)
+        return outputs, h_t.unsqueeze(0)
 
 
 class TemporalAwarePooling(nn.Module):
@@ -266,14 +230,17 @@ class TemporalPositionalEncoder(nn.Module):
         # and GRU to run in FP32 — 7 TFLOPS instead of 20-30 TFLOPS on T4 tensor cores.
         # See ai/debug/inference_throughput_profiling_2026-02-23.md for full analysis.
         #
-        # Interleave sin/cos via stack+reshape instead of materialising an FP32
-        # zeros buffer and scatter-writing the two strided halves: at production
-        # shapes the zeros alone were a multi-GB write per forward. Values are
-        # bit-identical (same FP32 trig inputs; the rest is pure data movement).
+        # Fill an UNINITIALISED (B, T, d_model) buffer by strided sin/cos writes.
+        # vs. the historical torch.zeros: skips the multi-GB zero-fill (every
+        # element is written — 0::2 and 1::2 partition the even d_model). vs. a
+        # stack+reshape: never holds sin and cos live alongside a separate
+        # interleaved output. Values are bit-identical to the zeros version.
         position = doy.unsqueeze(-1).float()
         angles = position * self.div_term.float()  # (B, T, d_model/2)
-        pe = torch.stack((torch.sin(angles), torch.cos(angles)), dim=-1)
-        return pe.reshape(doy.shape[0], doy.shape[1], self.d_model).to(doy.dtype)
+        pe = torch.empty(doy.shape[0], doy.shape[1], self.d_model, device=doy.device)
+        pe[:, :, 0::2] = torch.sin(angles)
+        pe[:, :, 1::2] = torch.cos(angles)
+        return pe.to(doy.dtype)
 
 
 class TransformerEncoder(nn.Module):

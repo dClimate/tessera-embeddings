@@ -6,14 +6,19 @@
 
 The GPU-saturation optimization campaign (branch `perf/inference-rethink`)
 includes changes that make the forward pass faster by *regrouping* its
-floating-point work: batching the GRU's per-timestep input projections into
-one GEMM, fusing per-gate matmuls, padding partial sub-batches to fixed
-shapes for CUDA-graph capture. None of these change the mathematical
-formula — but all of them change the *order* in which floating-point sums
-are reduced, and floating-point addition is not associative:
-`(a+b)+c ≠ a+(b+c)` at the last bit. In BF16 (8 mantissa bits) that last
-bit is ~0.4% relative, and the model propagates such wiggles through four
-transformer layers and a recurrent GRU.
+floating-point work: fusing per-gate matmuls, padding partial sub-batches to
+fixed shapes for CUDA-graph capture, and similar regroupings we may adopt.
+None of these change the mathematical formula — but all of them change the
+*order* in which floating-point sums are reduced, and floating-point addition
+is not associative: `(a+b)+c ≠ a+(b+c)` at the last bit. In BF16 (8 mantissa
+bits) that last bit is ~0.4% relative, and the model propagates such wiggles
+through four transformer layers and a recurrent GRU.
+
+(As it landed, this campaign shipped no reduction-reordering change: the
+inference-loop and pipelining work is bit-identical, the positional-encoder
+rewrite is bit-identical, and the GRU already runs as a cuDNN `nn.GRU` fused
+in the builder. This ADR governs the reordering changes we expect to make
+next — it is the policy, not a description of the current diff.)
 
 The question this ADR answers: **must optimized code produce bit-identical
 embeddings, or is a validated tolerance acceptable?**

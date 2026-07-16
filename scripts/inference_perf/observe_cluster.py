@@ -28,8 +28,13 @@ import time
 
 import boto3
 
+# Kill any prior pollers before starting new ones. Match the actual long-lived
+# processes (the `nvidia-smi --query-gpu ... -l` and `dcgmi dmon` command lines),
+# not just the redirect-filename wrapper — otherwise re-running --start-pollers
+# leaves the old samplers writing concurrently to the same files and corrupts the
+# measurements.
 POLLER_COMMANDS = [
-    "pkill -f 'gpu_poll' 2>/dev/null; true",
+    "pkill -f 'nvidia-smi --query-gpu' 2>/dev/null; pkill -f 'dcgmi dmon' 2>/dev/null; true",
     (
         "setsid nohup bash -c 'nvidia-smi --query-gpu=timestamp,utilization.gpu,"
         "utilization.memory,power.draw,clocks.sm,memory.used --format=csv,noheader -l 1 "
@@ -71,10 +76,16 @@ for f in glob.glob("/tmp/ray/session_latest/logs/worker-*.err"):
             m = pat.match(line.strip())
             if m: events.append((ts(m.group(1)), kind, m.groups()[1:]))
 events.sort(key=lambda e: e[0])
-# With cross-chunk prefetch (Phase 1) a chunk's band/SAR loads log during the
-# PREVIOUS chunk's window, so per-phase load attribution is meaningless there.
-# prologue_s = chunk start -> inference start is the honest GPU-idle-prologue
-# metric in both modes; pref=Y marks chunks that consumed a prefetched stash.
+# Overhead accounting: overhead_s = total_s - infer_s - write_s is the honest
+# per-chunk non-inference cost in BOTH modes — it's derived from the wall-clock
+# total (measured from the top of _process_chunk, before any prologue work) minus
+# the two GPU-adjacent phases, so it captures cold load regardless of where the
+# load lines fall. prologue_s (T_kept-log -> inference-start) is main-thread-only
+# and UNDERSTATES cold chunks: the "Chunk T_kept" line is emitted after the
+# prologue's SCL/band read, and with cross-chunk prefetch (Phase 1) the band/SAR
+# loads log during the PREVIOUS chunk's window entirely. Read overhead_s for the
+# real figure; prologue_s only isolates main-thread build. pref=Y marks chunks
+# that consumed a prefetched stash (expect their overhead_s ~= write_s).
 rows, cur, prev_done, pending_pref = [], None, None, set()
 for t, kind, g in events:
     if kind == "pref":
@@ -92,13 +103,13 @@ for t, kind, g in events:
         cur["t_idone"], cur["infer_s"], cur["pxs"] = t, g[0], g[1]
     elif kind == "cdone":
         cur["t_cdone"], cur["total_s"] = t, g[2]; rows.append(cur); prev_done = t; cur = None
-print("label\tTkept\tstrips\tpref\tbuckets\tvalid_px\tvalid%\tgap_s\tprologue_s\tinfer_s\twrite_s\ttotal_s\tpx/s")
+print("label\tTkept\tstrips\tpref\tbuckets\tvalid_px\tvalid%\tprologue_s\tinfer_s\twrite_s\toverhead_s\ttotal_s\tpx/s")
 for r in rows:
     try:
         prologue = (r["t_start"] - r["t_mask"]).total_seconds()
         write = (r["t_cdone"] - r["t_idone"]).total_seconds()
-        gap = r["gap_s"] if r["gap_s"] is not None else -1
-        print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r['pref']}\t{r.get('buckets','?')}\t{r.get('px','?')}\t{r.get('valid_pct','?')}\t{gap:.1f}\t{prologue:.1f}\t{r.get('infer_s','?')}\t{write:.1f}\t{r['total_s']}\t{r.get('pxs','?')}")
+        overhead = float(r["total_s"]) - float(r["infer_s"]) - write
+        print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r['pref']}\t{r.get('buckets','?')}\t{r.get('px','?')}\t{r.get('valid_pct','?')}\t{prologue:.1f}\t{r.get('infer_s','?')}\t{write:.1f}\t{overhead:.1f}\t{r['total_s']}\t{r.get('pxs','?')}")
     except KeyError as e:
         print(f"{r['label']}\tINCOMPLETE({e})")
 '''
@@ -143,27 +154,37 @@ def find_workers(session: boto3.session.Session, name_prefix: str) -> list[str]:
     return [iid for iid in running if iid in registered]
 
 
+# SSM SendCommand caps InstanceIds at 50; the GPU fleet can reach the 80-actor
+# cap (config.dask.NUM_ACTORS_CAP), so send in batches of 50.
+_SSM_MAX_INSTANCES = 50
+
+
 def run_on_workers(session: boto3.session.Session, instance_ids: list[str], commands: list[str]) -> dict[str, str]:
     """Run shell commands on all workers via SSM; return {instance_id: stdout}."""
     ssm = session.client("ssm")
-    cmd_id = ssm.send_command(
-        InstanceIds=instance_ids,
-        DocumentName="AWS-RunShellScript",
-        Parameters={"commands": commands},
-    )["Command"]["CommandId"]
+    cmd_ids: dict[str, list[str]] = {}  # cmd_id -> its instance ids
+    for i in range(0, len(instance_ids), _SSM_MAX_INSTANCES):
+        batch = instance_ids[i : i + _SSM_MAX_INSTANCES]
+        cmd_id = ssm.send_command(
+            InstanceIds=batch,
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": commands},
+        )["Command"]["CommandId"]
+        cmd_ids[cmd_id] = batch
 
     outputs: dict[str, str] = {}
-    for iid in instance_ids:
-        for _ in range(30):
-            time.sleep(2)
-            inv = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
-            if inv["Status"] in ("Success", "Failed", "TimedOut", "Cancelled"):
-                outputs[iid] = inv["StandardOutputContent"] + (
-                    f"\n[stderr] {inv['StandardErrorContent']}" if inv["StandardErrorContent"].strip() else ""
-                )
-                break
-        else:
-            outputs[iid] = "[timed out waiting for SSM invocation]"
+    for cmd_id, batch in cmd_ids.items():
+        for iid in batch:
+            for _ in range(30):
+                time.sleep(2)
+                inv = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
+                if inv["Status"] in ("Success", "Failed", "TimedOut", "Cancelled"):
+                    outputs[iid] = inv["StandardOutputContent"] + (
+                        f"\n[stderr] {inv['StandardErrorContent']}" if inv["StandardErrorContent"].strip() else ""
+                    )
+                    break
+            else:
+                outputs[iid] = "[timed out waiting for SSM invocation]"
     return outputs
 
 

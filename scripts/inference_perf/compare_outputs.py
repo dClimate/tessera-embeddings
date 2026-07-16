@@ -170,14 +170,22 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
     )
 
 
-def _staged_labels(run_dir: str) -> set[str]:
-    """List chunk labels staged under a run directory (``<label>.zarr`` entries)."""
+def _staged_labels(run_dir: str) -> tuple[set[str], set[str]]:
+    """Return (zarr labels, skip-marker labels) staged under a run directory.
+
+    Skip markers (``<label>.skipped``) are returned separately so a chunk that
+    produced embeddings in one run but was skip-marked in the other counts as a
+    label-set difference, not a silent omission.
+    """
     fs, _, (path,) = fsspec.get_fs_token_paths(run_dir)
-    return {
-        entry.rstrip("/").rsplit("/", 1)[-1].removesuffix(".zarr")
-        for entry in fs.ls(path)
-        if entry.rstrip("/").endswith(".zarr")
-    }
+    zarr_labels, skip_labels = set(), set()
+    for entry in fs.ls(path):
+        name = entry.rstrip("/").rsplit("/", 1)[-1]
+        if name.endswith(".zarr"):
+            zarr_labels.add(name.removesuffix(".zarr"))
+        elif name.endswith(".skipped"):
+            skip_labels.add(name.removesuffix(".skipped"))
+    return zarr_labels, skip_labels
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -185,7 +193,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("ref", help="Reference run dir or single staged chunk .zarr")
     parser.add_argument("test", help="Test run dir or single staged chunk .zarr")
-    parser.add_argument("--labels", help="Comma-separated chunk labels (default: all common)")
+    parser.add_argument(
+        "--labels", help="Comma-separated chunk labels — an explicit, intentional subset (skips the label-set check)"
+    )
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="In directory mode, compare the common labels even if the two runs' label sets "
+        "differ (default: a label-set mismatch is a failure, so an incompletely-staged run "
+        "cannot be reported as passing).",
+    )
     parser.add_argument(
         "--cross-config",
         action="store_true",
@@ -204,7 +221,28 @@ def main(argv: list[str] | None = None) -> int:
         if args.labels:
             labels = sorted(args.labels.split(","))
         else:
-            labels = sorted(_staged_labels(ref_dir) & _staged_labels(test_dir))
+            ref_zarr, ref_skip = _staged_labels(ref_dir)
+            test_zarr, test_skip = _staged_labels(test_dir)
+            # A run is only a valid equivalence reference if it staged the same
+            # chunks with the same skip decisions; otherwise a run that dropped
+            # or skip-marked chunks could "pass" on whatever remained in common.
+            if not args.allow_partial and (ref_zarr != test_zarr or ref_skip != test_skip):
+                only_ref = sorted((ref_zarr | ref_skip) - (test_zarr | test_skip))
+                only_test = sorted((test_zarr | test_skip) - (ref_zarr | ref_skip))
+                flipped = sorted((ref_zarr & test_skip) | (test_zarr & ref_skip))
+                print(
+                    "Label sets differ between the two runs (use --labels for an intentional subset, "
+                    "or --allow-partial to compare the common set anyway):",
+                    file=sys.stderr,
+                )
+                if only_ref:
+                    print(f"  only in ref:  {', '.join(only_ref)}", file=sys.stderr)
+                if only_test:
+                    print(f"  only in test: {', '.join(only_test)}", file=sys.stderr)
+                if flipped:
+                    print(f"  staged in one, skip-marked in the other: {', '.join(flipped)}", file=sys.stderr)
+                return 1
+            labels = sorted(ref_zarr & test_zarr)
             if not labels:
                 print("No common staged chunk labels between the two runs", file=sys.stderr)
                 return 1
