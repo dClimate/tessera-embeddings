@@ -284,8 +284,26 @@ target is reached. Over-sampled pixels are uniformly sub-sampled.
 
 - **Bucket loop** — `iter_buckets(largest_first=True)` yields buckets from largest to
   smallest; the largest bucket sets the "hot" GPU allocation so smaller buckets reuse it.
-- **Prefetch thread** — a `ThreadPoolExecutor(max_workers=1)` pipelines CPU batch
-  preparation (data loading + normalization) while the GPU runs the previous forward pass.
+- **Prefetch pool** — two prep workers keep `PREFETCH_DEPTH = 2` batches staged. The
+  resamplers (`sampling.py`) are vectorised: per-pixel resample indices depend only on
+  `(valid_count, target)` and are memoised, so a sub-batch costs a handful of `np.unique`
+  lookups plus large gathers instead of `2 × batch_size` Python iterations (~5× faster;
+  bit-identical to the loop, enforced by golden reference tests).
+- **Two-deep GPU pipeline** (CUDA; `TESSERA_SERIAL_GPU_LOOP=1` reverts to the sync loop) —
+  inputs stage through pinned double-buffers (async H2D), outputs copy back asynchronously
+  with a CUDA event per batch, and the host drains one batch behind. Batch *i+1*'s work is
+  enqueued while *i* executes, so the GPU never idles on Python bookkeeping, transfers, or
+  the scatter-back. Same op order on the same stream as the serial loop → bit-identical.
+  Finiteness is validated on host-side scales after D2H (`raise_on_nonfinite_scales`) —
+  the old on-device `isfinite` check forced a full sync per sub-batch.
+
+```
+ serial loop:     [H2D][═ fwd i ═][D2H][scatter][H2D][═ fwd i+1 ═][D2H][scatter]
+                                   GPU idle ↑↑↑ between every sub-batch
+
+ pipelined loop:  [H2D][═ fwd i ═][D2H][H2D][═ fwd i+1 ═][D2H][═ fwd i+2 ═] …
+    host thread:        …enqueue i+1… …drain i… …enqueue i+2… …drain i+1…
+```
 - **BF16** — the model is cast to BF16 on CUDA (`_prepare_gpu`); FP16 is a best-effort
   fallback for pre-Ampere GPUs only (overflow risk above 65504).
 - **`torch.compile` is disabled** — in a historical experiment on a g5-class worker

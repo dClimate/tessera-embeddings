@@ -12,10 +12,12 @@ from v1.0 is now a no-op and the ``embeddings_std`` field is always ``None``.
 from __future__ import annotations
 
 import logging
+import os
 import time
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -32,12 +34,22 @@ from tessera_embeddings.inference.profiling import (
     log_profiled_batch_summary,
     transformer_flops,
 )
-from tessera_embeddings.inference.quantization import quantize_rows_torch
+from tessera_embeddings.inference.quantization import quantize_rows_torch, raise_on_nonfinite_scales
 
 logger = logging.getLogger(__name__)
 
 PROFILE_BATCH_IDX = 10
 """Batch index for the one-time deep profile (per-layer timing + dtype checks)."""
+
+PREFETCH_DEPTH = 2
+"""CPU batch-prep pipeline depth. Depth 1 starved the GPU whenever a forward ran
+shorter than one prep (~partial sub-batches, short sequences); depth 2 with two
+prep workers keeps a batch ready across consecutive short forwards."""
+
+_SERIAL_LOOP_ENV = "TESSERA_SERIAL_GPU_LOOP"
+"""Set to any non-empty value to force the synchronous per-batch GPU loop
+(pageable transfers, host sync per sub-batch) instead of the pipelined one.
+Escape hatch for debugging the async pipeline in production."""
 
 
 @dataclass
@@ -223,6 +235,10 @@ def _transfer_and_forward(
     q, scales = quantize_rows_torch(z[:, :save_dim])
     q_host = q.cpu().numpy()
     scales_host = scales.cpu().numpy()
+    # Finiteness is validated on the host-side scales (equivalent to checking
+    # the embeddings — see raise_on_nonfinite_scales) so the GPU pipeline never
+    # pays a device-wide sync for the check.
+    raise_on_nonfinite_scales(scales_host)
     return q_host, scales_host, global_idxs, tb2 - tb1, tb3 - tb2
 
 
@@ -241,6 +257,256 @@ def _write_quantized_rows(
     """
     flat_q[global_idxs] = q_host
     flat_scales[global_idxs] = scales_host
+
+
+_BatchIter = Iterator[tuple[int, tuple[int, int], int, int, dict[str, np.ndarray], float]]
+"""Yields (i, bucket_key, start, end, prepared_batch, get_batch_secs)."""
+
+
+@dataclass
+class _LoopProgress:
+    """Per-sub-batch accounting + periodic logging shared by both GPU loops."""
+
+    config: InferenceConfig
+    d_model: int
+    total_sub_batches: int
+    t0: float
+    on_batch: Callable[[int, int], None] | None
+    t_total: _BatchTimings = field(default_factory=lambda: _BatchTimings(0.0, 0.0, 0.0, 0.0))
+    pixels: int = 0
+    tokens: int = 0
+    flops: int = 0
+    sub_batch_idx: int = 0
+
+    def record(self, bucket_key: tuple[int, int], n_px: int, timings: _BatchTimings) -> None:
+        self.t_total += timings
+        self.pixels += n_px
+        self.tokens += n_px * (bucket_key[0] + bucket_key[1])
+        self.flops += transformer_flops(
+            n_px,
+            bucket_key[0],
+            bucket_key[1],
+            d_model=self.d_model,
+            dim_feedforward=self.config.dim_feedforward,
+            num_layers=self.config.num_encoder_layers,
+        )
+        self.sub_batch_idx += 1
+
+        if self.on_batch and (self.sub_batch_idx % 50 == 0 or self.sub_batch_idx == self.total_sub_batches):
+            self.on_batch(self.sub_batch_idx, self.total_sub_batches)
+
+        if self.sub_batch_idx % 200 == 0 or self.sub_batch_idx == self.total_sub_batches:
+            elapsed = time.monotonic() - self.t0
+            logger.info(
+                "Sub-batch %d/%d — %d px — %.0f px/sec — %.0f tok/sec — %.2f eff TFLOPS — %.1fs elapsed",
+                self.sub_batch_idx,
+                self.total_sub_batches,
+                self.pixels,
+                self.pixels / elapsed if elapsed > 0 else 0,
+                self.tokens / elapsed if elapsed > 0 else 0,
+                self.flops / elapsed / 1e12 if elapsed > 0 else 0,
+                elapsed,
+            )
+            avg = self.t_total.avg_ms(self.sub_batch_idx)
+            logger.debug(
+                "  TIMING avg ms/sub-batch (n=%d): "
+                "get_batch=%.1f  transfer=%.1f  forward=%.1f  postprocess=%.1f  total=%.1f",
+                self.sub_batch_idx,
+                avg.get_batch,
+                avg.transfer,
+                avg.forward,
+                avg.postprocess,
+                avg.total,
+            )
+
+
+def _serial_loop(
+    model: MultimodalBTInferenceModel,
+    batches: _BatchIter,
+    config: InferenceConfig,
+    device: torch.device,
+    reduced_precision_dtype: torch.dtype | None,
+    save_dim: int,
+    flat_q: np.ndarray,
+    flat_scales: np.ndarray,
+    progress: _LoopProgress,
+) -> None:
+    """Synchronous per-batch loop: transfer → forward → sync D2H → scatter.
+
+    The CPU path, and the CUDA escape hatch (``TESSERA_SERIAL_GPU_LOOP``).
+    """
+    for i, bucket_key, start, end, batch, get_batch_secs in batches:
+        tb0 = time.monotonic()
+        q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
+            model,
+            batch,
+            bucket_key,
+            device,
+            reduced_precision_dtype,
+            save_dim,
+            profile=(i == PROFILE_BATCH_IDX),
+            config=config,
+        )
+        _write_quantized_rows(q_host, scales_host, global_idxs, flat_q, flat_scales)
+        progress.record(
+            bucket_key,
+            end - start,
+            _BatchTimings(
+                get_batch=get_batch_secs,
+                transfer=transfer_secs,
+                forward=forward_secs,
+                postprocess=time.monotonic() - tb0 - transfer_secs - forward_secs,
+            ),
+        )
+
+
+class _PinnedSlot:
+    """Reusable pinned staging buffers for one in-flight sub-batch.
+
+    Inputs are staged as flat float32 buffers sized to the chunk's largest
+    (batch, seq-len) so any sub-batch shape carves a contiguous view — a
+    contiguous pinned view is what makes ``.to(device, non_blocking=True)`` a
+    single async DMA instead of a hidden staging copy.
+    """
+
+    def __init__(self, batch_size: int, t_s2_max: int, t_s1_max: int, save_dim: int) -> None:
+        self.s2 = torch.empty(batch_size * t_s2_max * 11, dtype=torch.float32, pin_memory=True)
+        self.s1 = torch.empty(batch_size * t_s1_max * 3, dtype=torch.float32, pin_memory=True)
+        self.q = torch.empty((batch_size, save_dim), dtype=torch.int8, pin_memory=True)
+        self.scales = torch.empty(batch_size, dtype=torch.float32, pin_memory=True)
+        self.done = torch.cuda.Event()
+
+
+@dataclass
+class _InFlight:
+    """Bookkeeping for a sub-batch whose GPU work is enqueued but not drained.
+
+    Holds the device-side ``q``/``scales`` refs until the D2H completes so the
+    caching allocator cannot hand their blocks to a later batch while the
+    async copy still reads them (belt-and-braces; the copy is stream-ordered).
+    """
+
+    slot: _PinnedSlot
+    global_idxs: np.ndarray
+    n: int
+    bucket_key: tuple[int, int]
+    q_dev: torch.Tensor
+    scales_dev: torch.Tensor
+    get_batch: float
+    transfer: float
+    forward: float
+
+
+def _pipelined_gpu_loop(
+    model: MultimodalBTInferenceModel,
+    batches: _BatchIter,
+    config: InferenceConfig,
+    device: torch.device,
+    reduced_precision_dtype: torch.dtype | None,
+    save_dim: int,
+    flat_q: np.ndarray,
+    flat_scales: np.ndarray,
+    sub_batches: list[tuple[tuple[int, int], int, int]],
+    progress: _LoopProgress,
+) -> None:
+    """Two-deep asynchronous GPU loop: batch i+1 is enqueued while i executes.
+
+    Everything runs on the current CUDA stream in the same op order as the
+    serial loop (bit-identical results); the difference is purely *when* the
+    host waits. Inputs are staged in pinned buffers (async H2D), outputs copy
+    back asynchronously with a CUDA event per batch, and the host only blocks
+    on the event of the batch one behind — so the GPU always has the next
+    sub-batch's work queued and never idles on Python bookkeeping, H2D, or the
+    scatter-back. Per-phase TIMING numbers here are *enqueue-side* costs
+    (postprocess = drain wait); wall-clock px/s and tok/s are unaffected.
+
+    The one-shot deep profile still runs through the synchronous path: the
+    pipeline is drained first, so its per-layer timings stay accurate.
+    """
+    if not sub_batches:
+        return
+    t_s2_max = max(key[0] for key, _, _ in sub_batches)
+    t_s1_max = max(key[1] for key, _, _ in sub_batches)
+    slots = [_PinnedSlot(config.batch_size, t_s2_max, t_s1_max, save_dim) for _ in range(2)]
+    inflight: deque[_InFlight] = deque()
+
+    def _drain_oldest() -> None:
+        rec = inflight.popleft()
+        t_wait = time.monotonic()
+        rec.slot.done.synchronize()
+        scales_host = rec.slot.scales[: rec.n].numpy()
+        raise_on_nonfinite_scales(scales_host)
+        flat_q[rec.global_idxs] = rec.slot.q[: rec.n].numpy()
+        flat_scales[rec.global_idxs] = scales_host
+        progress.record(
+            rec.bucket_key,
+            rec.n,
+            _BatchTimings(rec.get_batch, rec.transfer, rec.forward, time.monotonic() - t_wait),
+        )
+
+    for i, bucket_key, start, end, batch, get_batch_secs in batches:
+        if i == PROFILE_BATCH_IDX:
+            while inflight:
+                _drain_oldest()
+            tb0 = time.monotonic()
+            q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
+                model, batch, bucket_key, device, reduced_precision_dtype, save_dim, profile=True, config=config
+            )
+            _write_quantized_rows(q_host, scales_host, global_idxs, flat_q, flat_scales)
+            progress.record(
+                bucket_key,
+                end - start,
+                _BatchTimings(
+                    get_batch=get_batch_secs,
+                    transfer=transfer_secs,
+                    forward=forward_secs,
+                    postprocess=time.monotonic() - tb0 - transfer_secs - forward_secs,
+                ),
+            )
+            continue
+
+        slot = slots[i % 2]  # slot of batch i-2 was drained during iteration i-1
+        global_idxs = batch["global_idxs"]
+        n = len(global_idxs)
+
+        tb1 = time.monotonic()
+        s2_np, s1_np = batch["s2"], batch["s1"]
+        s2_pin = slot.s2[: s2_np.size].view(s2_np.shape)
+        s1_pin = slot.s1[: s1_np.size].view(s1_np.shape)
+        s2_pin.copy_(torch.from_numpy(s2_np))
+        s1_pin.copy_(torch.from_numpy(s1_np))
+        s2_dev = s2_pin.to(device, non_blocking=True)
+        s1_dev = s1_pin.to(device, non_blocking=True)
+        if reduced_precision_dtype is not None:
+            s2_dev = s2_dev.to(reduced_precision_dtype)
+            s1_dev = s1_dev.to(reduced_precision_dtype)
+        tb2 = time.monotonic()
+
+        z = model(s2_dev, s1_dev)
+        q, scales = quantize_rows_torch(z[:, :save_dim])
+        slot.q[:n].copy_(q, non_blocking=True)
+        slot.scales[:n].copy_(scales, non_blocking=True)
+        slot.done.record()
+        tb3 = time.monotonic()
+
+        inflight.append(
+            _InFlight(
+                slot=slot,
+                global_idxs=global_idxs,
+                n=n,
+                bucket_key=bucket_key,
+                q_dev=q,
+                scales_dev=scales,
+                get_batch=get_batch_secs,
+                transfer=tb2 - tb1,
+                forward=tb3 - tb2,
+            )
+        )
+        if len(inflight) == 2:
+            _drain_oldest()
+
+    while inflight:
+        _drain_oldest()
 
 
 def run_inference(
@@ -304,15 +570,11 @@ def run_inference(
     )
     reduced_precision_dtype = _prepare_gpu(model, device)
 
-    t_total = _BatchTimings(0.0, 0.0, 0.0, 0.0)
-    pixels_processed = 0
     # px/s conflates sequence length across chunks (a sparse chunk's pixel is
-    # ~10x cheaper than a dense one's), so also track tokens (= pixels x
-    # (T_s2 + T_s1)) and transformer FLOPs for density-neutral throughput.
-    tokens_processed = 0
-    flops_processed = 0
+    # ~10x cheaper than a dense one's), so _LoopProgress also tracks tokens
+    # (= pixels x (T_s2 + T_s1)) and transformer FLOPs for density-neutral
+    # throughput reporting.
     d_model = config.latent_dim * 4
-    sub_batch_idx = 0
     t0 = time.monotonic()
 
     # Flatten (bucket_key, start, end) triples so the prefetch thread can
@@ -330,83 +592,60 @@ def run_inference(
             end = min(start + batch_size, n_in_bucket)
             sub_batches.append((bucket_key, start, end))
 
-    # One prefetch worker pipelines CPU batch prep for i+1 while the GPU runs i.
-    # CPU prep (~165ms) < forward, so the GPU consumes faster than the prefetcher
-    # produces and a deeper queue would just sit full. Quantization is no longer a
-    # CPU stage — it runs on-device inside _transfer_and_forward — so the write is
-    # a cheap inline scatter with no second pool (that pool gated low-observation
-    # chunks, whose tiny forwards couldn't hide the thread handoff).
-    with torch.no_grad(), ThreadPoolExecutor(max_workers=1, thread_name_prefix="prefetch") as pool:
-        next_future = pool.submit(_prepare_batch, dataset, *sub_batches[0]) if sub_batches else None
+    progress = _LoopProgress(
+        config=config,
+        d_model=d_model,
+        total_sub_batches=total_sub_batches,
+        t0=t0,
+        on_batch=on_batch,
+    )
 
-        for i, (bucket_key, start, end) in enumerate(sub_batches):
-            assert next_future is not None
-            batch, get_batch_secs = next_future.result()
+    # Two prep workers keep PREFETCH_DEPTH batches staged: depth 1 starved the
+    # GPU whenever a forward ran shorter than one CPU prep (partial sub-batches,
+    # short sequences). Quantization is not a CPU stage — it runs on-device —
+    # so the scatter-back is a cheap memcpy either way.
+    use_pipelined = device.type == "cuda" and not os.environ.get(_SERIAL_LOOP_ENV)
+    with torch.no_grad(), ThreadPoolExecutor(max_workers=PREFETCH_DEPTH, thread_name_prefix="prefetch") as pool:
+        prefetched: deque[Future[tuple[dict[str, np.ndarray], float]]] = deque()
+        for j in range(min(PREFETCH_DEPTH, len(sub_batches))):
+            prefetched.append(pool.submit(_prepare_batch, dataset, *sub_batches[j]))
 
-            # Kick off prefetch of i+1 before the GPU work on i starts.
-            next_future = (
-                pool.submit(_prepare_batch, dataset, *sub_batches[i + 1]) if i + 1 < len(sub_batches) else None
-            )
+        def _batches() -> _BatchIter:
+            for i, (bucket_key, start, end) in enumerate(sub_batches):
+                batch, get_batch_secs = prefetched.popleft().result()
+                nxt = i + PREFETCH_DEPTH
+                if nxt < len(sub_batches):
+                    prefetched.append(pool.submit(_prepare_batch, dataset, *sub_batches[nxt]))
+                yield i, bucket_key, start, end, batch, get_batch_secs
 
-            tb0 = time.monotonic()
-            q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
+        if use_pipelined:
+            _pipelined_gpu_loop(
                 model,
-                batch,
-                bucket_key,
+                _batches(),
+                config,
                 device,
                 reduced_precision_dtype,
                 save_dim,
-                profile=(sub_batch_idx == PROFILE_BATCH_IDX),
-                config=config,
+                flat_q,
+                flat_scales,
+                sub_batches,
+                progress,
             )
-            _write_quantized_rows(q_host, scales_host, global_idxs, flat_q, flat_scales)
-
-            t_total += _BatchTimings(
-                get_batch=get_batch_secs,
-                transfer=transfer_secs,
-                forward=forward_secs,
-                postprocess=time.monotonic() - tb0 - transfer_secs - forward_secs,
+        else:
+            _serial_loop(
+                model,
+                _batches(),
+                config,
+                device,
+                reduced_precision_dtype,
+                save_dim,
+                flat_q,
+                flat_scales,
+                progress,
             )
-            n_px = end - start
-            pixels_processed += n_px
-            tokens_processed += n_px * (bucket_key[0] + bucket_key[1])
-            flops_processed += transformer_flops(
-                n_px,
-                bucket_key[0],
-                bucket_key[1],
-                d_model=d_model,
-                dim_feedforward=config.dim_feedforward,
-                num_layers=config.num_encoder_layers,
-            )
-            sub_batch_idx += 1
-
-            if on_batch and (sub_batch_idx % 50 == 0 or sub_batch_idx == total_sub_batches):
-                on_batch(sub_batch_idx, total_sub_batches)
-
-            if sub_batch_idx % 200 == 0 or sub_batch_idx == total_sub_batches:
-                elapsed = time.monotonic() - t0
-                rate = pixels_processed / elapsed if elapsed > 0 else 0
-                logger.info(
-                    "Sub-batch %d/%d — %d px — %.0f px/sec — %.0f tok/sec — %.2f eff TFLOPS — %.1fs elapsed",
-                    sub_batch_idx,
-                    total_sub_batches,
-                    pixels_processed,
-                    rate,
-                    tokens_processed / elapsed if elapsed > 0 else 0,
-                    flops_processed / elapsed / 1e12 if elapsed > 0 else 0,
-                    elapsed,
-                )
-                avg = t_total.avg_ms(sub_batch_idx)
-                logger.debug(
-                    "  TIMING avg ms/sub-batch (n=%d): "
-                    "get_batch=%.1f  transfer=%.1f  forward=%.1f  postprocess=%.1f  total=%.1f",
-                    sub_batch_idx,
-                    avg.get_batch,
-                    avg.transfer,
-                    avg.forward,
-                    avg.postprocess,
-                    avg.total,
-                )
+    pixels_processed = progress.pixels
+    tokens_processed = progress.tokens
+    flops_processed = progress.flops
 
     # Rows were already quantized per bucket on arrival; just reshape to (H,W,*).
     out = flat_q.reshape(h, w, save_dim)

@@ -18,6 +18,7 @@ from tessera_embeddings.inference.quantization import (
     quantize_embeddings,
     quantize_rows,
     quantize_rows_torch,
+    raise_on_nonfinite_scales,
 )
 
 
@@ -158,11 +159,25 @@ def test_torch_quantize_matches_numpy_from_reduced_precision() -> None:
     np.testing.assert_array_equal(s_t.numpy(), s_np)
 
 
-def test_torch_quantize_nonfinite_raises() -> None:
-    bad = torch.zeros((2, 128))
-    bad[1, 3] = float("inf")
-    with pytest.raises(ValueError, match="non-finite"):
-        quantize_rows_torch(bad)
+def test_torch_quantize_nonfinite_surfaces_in_scales() -> None:
+    """Non-finite embeddings always yield non-finite scales, and the host-side
+    scale check rejects them.
+
+    quantize_rows_torch deliberately skips on-device validation (it would force
+    a host sync per sub-batch); the contract is that any NaN/Inf row propagates
+    to its scale, where raise_on_nonfinite_scales catches it after the D2H.
+    """
+    for bad_value in (float("inf"), float("nan"), float("-inf")):
+        bad = torch.zeros((2, 128))
+        bad[1, 3] = bad_value
+        _, scales = quantize_rows_torch(bad)
+        assert not np.isfinite(scales.numpy()).all()
+        with pytest.raises(ValueError, match="non-finite"):
+            raise_on_nonfinite_scales(scales.numpy())
+
+
+def test_raise_on_nonfinite_scales_accepts_finite() -> None:
+    raise_on_nonfinite_scales(np.array([1.0, 2.5, 1e-8], dtype=np.float32))
 
 
 def test_round_trip_recovers_within_scale() -> None:

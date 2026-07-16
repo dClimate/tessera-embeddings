@@ -94,12 +94,19 @@ class MultimodalBTInferenceModel(nn.Module):
             torch.cuda.synchronize()
             ts1_end = time.monotonic()
         elif self._s2_stream is not None and self._s1_stream is not None:
+            # The backbone streams must first wait on the caller's stream:
+            # inputs may still be in flight there (async H2D from pinned
+            # memory + dtype cast). Historically the caller's pageable-memory
+            # copies were synchronous, which masked this missing edge.
+            current = torch.cuda.current_stream()
+            self._s2_stream.wait_stream(current)
+            self._s1_stream.wait_stream(current)
             with torch.cuda.stream(self._s2_stream):
                 s2_repr = self.s2_backbone(s2_x)
             with torch.cuda.stream(self._s1_stream):
                 s1_repr = self.s1_backbone(s1_x)
-            torch.cuda.current_stream().wait_stream(self._s2_stream)
-            torch.cuda.current_stream().wait_stream(self._s1_stream)
+            current.wait_stream(self._s2_stream)
+            current.wait_stream(self._s1_stream)
         else:
             s2_repr = self.s2_backbone(s2_x)
             s1_repr = self.s1_backbone(s1_x)

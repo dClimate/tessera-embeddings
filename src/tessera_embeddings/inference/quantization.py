@@ -32,18 +32,34 @@ def quantize_rows_torch(rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     [-127, 127]), so the int8 output is bit-identical to the CPU path on the same
     float32 input. ``rows`` is cast to float32 first because the forward emits
     bf16/fp16; this matches the CPU path, which quantizes the ``.float()`` output.
+
+    Unlike the CPU path, this does NOT validate finiteness on-device: an
+    ``isfinite().all()`` here forces a host sync + an extra full pass over the
+    activations on every sub-batch, stalling the GPU pipeline. Any non-finite
+    row necessarily produces a non-finite scale (NaN/Inf propagates through
+    ``amax``/``clamp``), so callers validate the scales on the host after the
+    D2H copy instead — see :func:`raise_on_nonfinite_scales`.
     """
     import torch
 
     rows = rows.float()
-    if not torch.isfinite(rows).all():
-        raise ValueError("embeddings contain non-finite values (NaN or Inf); cannot quantize")
-
     abs_max = rows.abs().amax(dim=-1)  # (N,)
     scales = torch.clamp(abs_max / 127.0, min=1e-8)  # (N,) float32, avoid div-by-zero
     # torch.round is round-half-to-even, matching numpy's np.round in quantize_rows.
     quantized = torch.clamp(torch.round(rows / scales[:, None]), -127, 127).to(torch.int8)
     return quantized, scales
+
+
+def raise_on_nonfinite_scales(scales_host: np.ndarray) -> None:
+    """Reject a batch whose per-row scales carry NaN/Inf (host-side, post-D2H).
+
+    The GPU quantizer skips on-device finiteness validation (see
+    :func:`quantize_rows_torch`); a non-finite embedding row always surfaces as
+    a non-finite scale, so this cheap ``(N,)`` check on the already-copied host
+    array is equivalent to the full on-device check without the pipeline stall.
+    """
+    if not np.isfinite(scales_host).all():
+        raise ValueError("embeddings contain non-finite values (NaN or Inf); cannot quantize")
 
 
 def quantize_rows(rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
