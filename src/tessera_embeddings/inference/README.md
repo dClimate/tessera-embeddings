@@ -26,7 +26,7 @@ Input stores (Icechunk/Zarr on S3):
             │
             ▼
   ┌─────────────────────────────────────────────┐
-  │  Ray Cluster  (EC2, g5.xlarge × N)          │
+  │  Ray Cluster  (EC2, g6e.xlarge × N)         │
   │  ┌─────────────────────────────────────┐    │
   │  │ InferenceActor (1 GPU each)         │    │
   │  │  per northing strip (bounds RAM):    │    │
@@ -91,7 +91,7 @@ The cluster is managed in a context manager so it automatically tears down after
 
 **Cluster topology:**
 - Head: m5.2xlarge — GCS + autoscaler, no inference work
-- Workers: g5.xlarge (1× A10G 24 GB VRAM, 16 GB RAM) — on-demand, single AZ
+- Workers: g6e.xlarge (1× L40S 48 GB VRAM, 4 vCPU, 32 GB RAM) — on-demand, single AZ
 - Workers use a Packer-built AMI with all dependencies pre-installed; boot ready in ~1 minute
 
 ### 3. Inference Actors
@@ -165,9 +165,10 @@ bands/DOYs, and per-pixel observation counts (`s2_obs_count`, `s1_asc_obs_count`
 The SCL pre-filter above caps peak RAM for *typical* chunks, but it does not bound it: the
 resident S2 band array is `T_valid × H × W × 10 × 2` bytes, which scales with the timestep
 count. On dense ROIs `T_valid` can reach ~120, so a 2000×2000 chunk's `s2_bands` alone is
-~9.6 GB in a single `np.empty` — and on a 16 GB `g5.xlarge` worker that OOMs the loader
-*before* inference runs. `T` is not a free variable (v1.1 uses every valid observation), so
-the only lever is the spatial working set.
+~9.6 GB in a single `np.empty` — on the earlier 16 GB g5-class workers that OOMed the loader
+*before* inference runs, and even on today's 32 GB g6e.xlarge it must share the box with the
+SAR stack, output buffers, and model. `T` is not a free variable (v1.1 uses every valid
+observation), so the only lever is the spatial working set.
 
 `process_chunk` therefore loads each chunk as a sequence of **northing strips** (full easting
 width) rather than all at once. `load_chunk(..., y_sub=<slice>)` reads only a chunk-relative
@@ -251,9 +252,9 @@ target is reached. Over-sampled pixels are uniformly sub-sampled.
   preparation (data loading + normalization) while the GPU runs the previous forward pass.
 - **BF16** — the model is cast to BF16 on CUDA (`_prepare_gpu`); FP16 is a best-effort
   fallback for pre-Ampere GPUs only (overflow risk above 65504).
-- **`torch.compile` is disabled** — on g5.xlarge (15.4 GB VRAM), CUDA graph capture
-  consumed 11.6 GB and slowed forward passes (3,770 ms vs. 1,944 ms) due to GRU
-  recompilation per unique sequence length.
+- **`torch.compile` is disabled** — in a historical experiment on a g5-class worker
+  (15.4 GB VRAM), CUDA graph capture consumed 11.6 GB and slowed forward passes
+  (3,770 ms vs. 1,944 ms) due to GRU recompilation per unique sequence length.
 - **cuDNN benchmark mode is disabled** — with variable bucket shapes the autotuner
   re-searches constantly and inflates host RAM (see `_prepare_gpu`).
 - **Throughput:** ~10–12K px/sec per worker (measured 2026-07, Iowa ROI, L40S). px/sec

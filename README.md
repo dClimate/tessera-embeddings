@@ -212,7 +212,7 @@ Dask graph small (¼ the spatial tasks), while inference reads
 peak GPU-node RAM in check. Zarr's `oindex` reads the 2000 sub-tile out
 of a 4000 chunk without any alignment requirement. Go smaller on the
 read size and the Dask scheduler hangs on graph construction; larger and
-you OOM on a g5.2xlarge. If you change either, profile.
+you OOM on a g6e.xlarge. If you change either, profile.
 
 ### Using these architecture checks in your own repo
 

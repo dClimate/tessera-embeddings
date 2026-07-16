@@ -37,7 +37,7 @@ The AWS implementation owns five concerns:
 ## The cluster YAML template
 
 `providers/aws/cluster.yaml.template` ships a working default for an
-A10G GPU pool on `g5.xlarge`. Account-bound IDs are absent; comments
+L40S GPU pool on `g6e.xlarge`. Account-bound IDs are absent; comments
 flag every injection point with `# INJECT: <what>`.
 
 **Why runtime injection from SSM?** Account-bound IDs (security

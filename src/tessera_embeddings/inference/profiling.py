@@ -200,11 +200,10 @@ def log_effective_tflops(
     """Estimate effective TFLOPS from forward-pass timing and known model structure.
 
     Compares against GPU theoretical peaks to determine hardware utilization.
-    Reference hardware: A10G (g5) and L40S (g6e) worker GPUs.
-      - A10G: BF16 tensor ~35 TFLOPS realistic ceiling (GA10x runs FP32-accumulate
-        at half the advertised 70 dense); memory bandwidth 600 GB/s.
-      - L40S: BF16 tensor 181 TFLOPS dense (datasheet); memory bandwidth 864 GB/s.
-    Historical: T4 BF16=65 peak, L4 BF16=121 peak.
+    Reference hardware: L40S (g6e.xlarge production workers) — BF16 tensor
+    181 TFLOPS dense, memory bandwidth 864 GB/s.
+    Historical: A10G BF16 ~35 realistic (GA10x runs FP32-accumulate at half the
+    advertised 70 dense), T4 BF16=65 peak, L4 BF16=121 peak.
 
     Only counts transformer layer FLOPs (attention + FFN) via
     :func:`transformer_flops`. ``seq_len`` is the S2 backbone's sequence length;
@@ -228,7 +227,7 @@ def log_effective_tflops(
     logger.debug(
         "EFFECTIVE TFLOPS: %.2f TFLOPS (transformer layers only) | "
         "forward=%.1fms | effective_batch=%d | "
-        "ceilings: A10G BF16~35 (fp32-acc half-rate), L40S BF16~181 dense | "
+        "ceiling: L40S BF16~181 TFLOPS dense, 864 GB/s | "
         "verdict=%s",
         effective_tflops,
         forward_ms,

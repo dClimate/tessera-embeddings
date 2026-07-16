@@ -54,7 +54,7 @@ bubbles, and the launch-bound CustomGRU loop (Phase 2–3 targets). px/s is
 density-dependent; completion logs now report tok/sec and effective TFLOPS
 (`profiling.transformer_flops`) for cross-chunk comparison.
 
-Note: production workers are g6e.xlarge (L40S 48 GB, **4 vCPU**, 32 GB RAM) —
-not g5.2xlarge/A10G as older docs suggest. The L40S raises the compute
-ceiling ~5× over A10G while halving host cores, which amplifies every
-CPU-side/pipeline bottleneck above.
+Note: production workers are g6e.xlarge (L40S 48 GB, **4 vCPU**, 32 GB RAM).
+The L40S's tensor ceiling (~181 TFLOPS BF16 dense) is enormous relative to the
+observed TENSO ≤0.26, and only 4 host vCPUs feed it — which is why the
+CPU-side/pipeline bottlenecks above dominate.

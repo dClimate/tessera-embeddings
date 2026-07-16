@@ -212,7 +212,8 @@ class InferenceConfig:
     # Deterministic sampling under v1.1 — no repeat variance; forced False in __post_init__.
     compute_std: bool = False
 
-    # Ray actor resource reservation. num_gpus=1 is production default (one A10G per actor);
+    # Ray actor resource reservation. num_gpus=1 is production default (one GPU per
+    # actor — L40S on g6e.xlarge workers);
     # set to 0 for CPU-only runs (local smoke tests, plain runner on a non-GPU host).
     num_gpus: float = 1.0
 
