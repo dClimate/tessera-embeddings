@@ -35,11 +35,23 @@ import fsspec
 import numpy as np
 import xarray as xr
 
-# ADR-012 thresholds.
+# ADR-012 thresholds for SAME-CONFIG comparisons (the code gate).
 MIN_EXACT_FRAC = 0.995
 MAX_ABS_DELTA = 1
 MAX_SCALE_REL_DRIFT = 1e-3
 MIN_COSINE = 0.9999
+
+# Cross-config thresholds (--cross-config): runs differing in batch size or
+# library stack are not bit-comparable — cuBLAS kernel selection alone moves
+# outputs. Measured 2026-07-16 (main@3584 vs Phase-1@7168, 3 chunks x 512M
+# values): exact 95.4-98.3%, max|d|=2 at ~0.002% rate, scale drift <= 0.78%
+# (2 BF16 ULPs), cosine >= 0.99990, zero NaN-mask mismatches. These bounds
+# sit just outside that envelope; anything worse indicates a real defect,
+# not config shimmer.
+XCFG_MIN_WITHIN_ONE_FRAC = 0.9999
+XCFG_MAX_ABS_DELTA = 3
+XCFG_MAX_SCALE_REL_DRIFT = 1.6e-2  # 4 BF16 ULPs
+XCFG_MIN_COSINE = 0.9999
 
 ROW_BLOCK = 500  # stream comparison in row slabs to bound memory
 
@@ -58,9 +70,19 @@ class ChunkComparison:
     cosine_min: float
     cosine_mean: float
 
+    cross_config: bool = False
+
     @property
     def passed(self) -> bool:
-        """Whether every ADR-012 threshold is met."""
+        """Whether every threshold for the selected comparison class is met."""
+        if self.cross_config:
+            return (
+                self.within_one_frac >= XCFG_MIN_WITHIN_ONE_FRAC
+                and self.max_abs_delta <= XCFG_MAX_ABS_DELTA
+                and self.scale_max_rel_drift <= XCFG_MAX_SCALE_REL_DRIFT
+                and self.nan_mask_mismatches == 0
+                and self.cosine_min >= XCFG_MIN_COSINE
+            )
         return (
             self.exact_frac >= MIN_EXACT_FRAC
             and self.max_abs_delta <= MAX_ABS_DELTA
@@ -71,7 +93,7 @@ class ChunkComparison:
 
     def report(self) -> str:
         """One-line PASS/FAIL summary with all metrics."""
-        status = "PASS" if self.passed else "FAIL"
+        status = ("PASS" if self.passed else "FAIL") + (" (cross-config)" if self.cross_config else "")
         return (
             f"{self.label}: {status} | exact={self.exact_frac:.6%} "
             f"max|d|={self.max_abs_delta} within1={self.within_one_frac:.6%} "
@@ -82,7 +104,7 @@ class ChunkComparison:
         )
 
 
-def compare_chunk(ref_path: str, test_path: str, label: str) -> ChunkComparison:
+def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bool = False) -> ChunkComparison:
     """Stream-compare one staged chunk zarr pair in row slabs."""
     ref = xr.open_zarr(ref_path)
     test = xr.open_zarr(test_path)
@@ -144,6 +166,7 @@ def compare_chunk(ref_path: str, test_path: str, label: str) -> ChunkComparison:
         nan_mask_mismatches=nan_mask_mismatches,
         cosine_min=cosine_min if cosine_count else 1.0,
         cosine_mean=cosine_sum / cosine_count if cosine_count else 1.0,
+        cross_config=cross_config,
     )
 
 
@@ -163,6 +186,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("ref", help="Reference run dir or single staged chunk .zarr")
     parser.add_argument("test", help="Test run dir or single staged chunk .zarr")
     parser.add_argument("--labels", help="Comma-separated chunk labels (default: all common)")
+    parser.add_argument(
+        "--cross-config",
+        action="store_true",
+        help="Runs differ in batch size / library stack: judge against the relaxed "
+        "cross-config envelope (within-1 >= 99.99%%, max|d| <= 3, scale <= 1.6%%, "
+        "cosine >= 0.9999) instead of the same-config bit-drift gate.",
+    )
     args = parser.parse_args(argv)
 
     if args.ref.rstrip("/").endswith(".zarr"):
@@ -182,11 +212,12 @@ def main(argv: list[str] | None = None) -> int:
 
     failures = 0
     for ref_path, test_path, label in pairs:
-        cmp_result = compare_chunk(ref_path, test_path, label)
+        cmp_result = compare_chunk(ref_path, test_path, label, cross_config=args.cross_config)
         print(cmp_result.report())
         failures += 0 if cmp_result.passed else 1
 
-    print(f"\n{len(pairs) - failures}/{len(pairs)} chunks pass ADR-012 thresholds")
+    kind = "cross-config" if args.cross_config else "ADR-012 same-config"
+    print(f"\n{len(pairs) - failures}/{len(pairs)} chunks pass {kind} thresholds")
     return 1 if failures else 0
 
 
