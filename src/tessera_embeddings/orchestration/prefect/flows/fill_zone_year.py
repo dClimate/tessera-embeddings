@@ -64,6 +64,13 @@ class _PrefectCommitGate(AbstractContextManager):
     fleet-wide (across separate flow runs / machines) without limiting inference.
     A fresh :func:`concurrency` context is opened per entry so the gate is
     reusable across the (few) commits a single fill performs.
+
+    ``strict=True``: this gate is LOAD-BEARING for fleet-wide commit contention, so
+    an absent or misspelled limit must fail closed. Prefect's ``concurrency``
+    defaults ``strict=False``, which would only log a warning and let the commit
+    proceed UNGATED — silently reintroducing the rebase/commit storm the gate
+    exists to prevent. Strict mode raises instead, so the limit must be
+    provisioned explicitly (see the campaign runbook).
     """
 
     def __init__(self, name: str, occupy: int = 1) -> None:
@@ -72,7 +79,7 @@ class _PrefectCommitGate(AbstractContextManager):
         self._cm: AbstractContextManager[Any] | None = None
 
     def __enter__(self) -> None:
-        self._cm = concurrency(self._name, occupy=self._occupy)
+        self._cm = concurrency(self._name, occupy=self._occupy, strict=True)
         self._cm.__enter__()
 
     def __exit__(

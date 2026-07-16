@@ -71,6 +71,15 @@ def _make_full_roi_mask(tmp_path, total_y: int, total_x: int) -> str:
     return path
 
 
+def _make_partial_roi_mask(tmp_path, total_y: int, total_x: int, x_true_stop: int) -> str:
+    """An ROI mask True only over columns ``[0, x_true_stop)`` — a shrunken ROI."""
+    path = str(tmp_path / "roi_partial.zarr")
+    arr = zarr.open(path, mode="w", shape=(total_y, total_x), chunks=(total_y, total_x), dtype="bool")
+    arr[:] = False
+    arr[:, :x_true_stop] = True
+    return path
+
+
 def _quantized_embeddings(
     rng: np.random.Generator, h: int, w: int, dim: int = EMBEDDING_DIM
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -454,6 +463,57 @@ class TestAssembly:
         np.testing.assert_array_equal(result[:, :5, :], emb2)
         assert np.all(result[:, 5:, :] == 0), "run1's data must not survive under run2's skip marker"
         assert np.all(np.isnan(ds["scales"].values[0, :, 5:])), "scales must reset to NaN fill too"
+
+    def test_same_date_overwrite_with_shrunken_roi_clears_outside(self, tmp_path):
+        """A same-date overwrite under a SMALLER ROI clears chunks that were live in
+        the prior (larger) ROI but fall outside the new one — otherwise run 1's
+        embeddings there stay published (stale) under run 2's narrower footprint.
+        """
+        staging = str(tmp_path / "staging")
+        output = str(tmp_path / "output.zarr")
+        writer = ZarrWriter(staging)
+        rng = np.random.default_rng(42)
+        chunks = [
+            ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5),
+            ChunkSpec(row=0, col=1, y_start=0, y_stop=5, x_start=5, x_stop=10),
+        ]
+        day = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
+
+        # Run 1: FULL ROI — both chunks carry real data.
+        for chunk in chunks:
+            emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
+            writer.write_chunk(chunk, emb, "run1", scales=scales)
+        writer.assemble(
+            chunks,
+            total_y=5,
+            total_x=10,
+            run_id="run1",
+            output_path=output,
+            roi_zarr_path=_make_full_roi_mask(tmp_path, 5, 10),
+            run_started_at=day,
+            n_workers=1,
+        )
+
+        # Run 2, same date: SHRUNKEN ROI (only cols 0-5). Only chunk_0_0 is staged;
+        # chunk_0_1 is now OUTSIDE the ROI (not merely skip-marked).
+        emb2, scales2 = _quantized_embeddings(rng, 5, 5)
+        writer.write_chunk(chunks[0], emb2, "run2", scales=scales2)
+        writer.assemble(
+            chunks,
+            total_y=5,
+            total_x=10,
+            run_id="run2",
+            output_path=output,
+            roi_zarr_path=_make_partial_roi_mask(tmp_path, 5, 10, x_true_stop=5),
+            run_started_at=day,
+            n_workers=1,
+        )
+
+        ds = open_store(output)
+        assert ds.sizes["time"] == 1
+        result = ds["embeddings"].values[0, ...]
+        np.testing.assert_array_equal(result[:, :5, :], emb2)
+        assert np.all(result[:, 5:, :] == 0), "run1's data outside the shrunken ROI must be cleared"
 
     def test_assemble_multiband_parallel_matches_serial(self, tmp_path):
         """n_workers>1 partitions into y-bands across processes; result matches serial.

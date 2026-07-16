@@ -181,9 +181,27 @@ def seed_zone_groups(
     specs = list(specs)
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
-    # geoemb: provenance is stated once on the root (utm_zones layout); idempotent
-    # across incremental seeds since every call carries the same values.
-    root.attrs.update(_root_attrs(layout, model_version))
+    # geoemb: provenance is stated once on the root (utm_zones layout). It is
+    # WRITE-ONCE: a later fill's model gate (fill_zone_year) trusts it to decide
+    # which encoder may write, so an incremental seed must NOT silently re-stamp it
+    # with a different encoder — that would let already-seeded/filled zones (encoder
+    # A) be mixed with a new one (encoder B) under a root now advertising B. The
+    # first seed stamps it; a matching reseed is a no-op; a changed identity is
+    # rejected. (Software build_version may drift and is not part of the identity.)
+    new_root = _root_attrs(layout, model_version)
+    if "geoemb:model" not in root.attrs:
+        root.attrs.update(new_root)
+    else:
+        identity = ("geoemb:model", "geoemb:dimensions", "geoemb:data_type", "checkpoint_id")
+        mismatched = {
+            k: (root.attrs.get(k), new_root.get(k)) for k in identity if root.attrs.get(k) != new_root.get(k)
+        }
+        if mismatched:
+            raise ValueError(
+                f"Refusing to reseed: the store root's encoder provenance is write-once, but this seed "
+                f"would change {mismatched}. Seed a fresh store for a new encoder (mixing encoders under "
+                "one store would corrupt already-published zones)."
+            )
     times = calendar_year_times(years)
     nt = len(times)
     band = _layout_band(layout)

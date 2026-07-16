@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tessera_embeddings.config.inference import EMBEDDING_DIM
 from tessera_embeddings.storage import global_store, zarr_store
 from tessera_embeddings.storage.zone_grid import ZoneSpec
@@ -97,6 +99,22 @@ def test_second_seed_adds_groups_without_clobbering_first(tmp_path):
     global_store.seed_zone_groups(repo, [_ZB], years=(2025,))
     root = zarr_store.open_store_as_zarr_group(store)
     assert set(root.group_keys()) >= {"01N", "01S"}
+
+
+def test_reseed_with_different_model_rejected(tmp_path):
+    """Root encoder provenance is write-once: a matching reseed is a no-op, but a
+    partial reseed carrying a DIFFERENT encoder is rejected — otherwise the root
+    would advertise the new model and the fill-time model gate would permit mixing
+    it with already-seeded zones.
+    """
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v1")
+    # Same model on a later incremental seed: fine (adds the group, provenance no-op).
+    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v1")
+    # A different model is rejected before any group work.
+    with pytest.raises(ValueError, match="write-once"):
+        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2")
 
 
 def test_global_store_config_has_time_split_and_preload():

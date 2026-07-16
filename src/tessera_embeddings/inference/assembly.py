@@ -290,10 +290,10 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     zarr assignment. Partial output chunks at tile x-boundaries are
     read-modify-written sequentially within this fork (icechunk sessions are
     read-your-writes), so the merged result is exact. ``payload["clear"]``
-    tiles (skip-marked on a same-date overwrite — see :meth:`ZarrWriter.assemble`)
-    get the fill value written over their footprint so a prior run's data
-    can't survive under a rerun's skip marker. Returns the fork for the
-    coordinator to merge.
+    tiles (every chunk this run does not write, on a same-date overwrite — see
+    :meth:`ZarrWriter.assemble`) get the fill value written over their footprint
+    so a prior run's data — under a rerun's skip marker OR outside a changed ROI —
+    can't survive. Returns the fork for the coordinator to merge.
     """
     fork = payload["fork"]
     t = int(payload["time_index"])
@@ -1212,9 +1212,16 @@ class ZarrWriter:
             for unit in range(c.y_start // granularity, -(-c.y_stop // granularity)):
                 unit_weights[unit] += 1
         bands = _partition_bands(total_y, granularity, n_workers, weights=unit_weights)
-        # On a same-date overwrite, ROI-live chunks that this run skip-marked
-        # must be reset to fill — a prior run may have written real data there.
-        clear_chunks = [c for c in roi_live_chunks if c.label in skipped_labels] if overwrite else []
+        # On a same-date overwrite, clear EVERY destination chunk this run does not
+        # write, not just the ROI-live chunks it skip-marked: a prior run under a
+        # LARGER or shifted ROI may have written real data into chunks that fall
+        # outside THIS run's ROI, and those would otherwise survive as stale
+        # published embeddings. Clearing the full non-live footprint (scalar fill,
+        # elided for already-empty ocean chunks) makes the overwritten timestep
+        # exactly this run's ROI regardless of how the ROI changed between runs.
+        clear_chunks = (
+            [c for c in chunks if c.label not in {lc.label for lc in live_chunks}] if overwrite else []
+        )
         payloads: list[dict[str, Any]] = []
         for band in bands:
             y0b, y1b = band
