@@ -17,7 +17,9 @@ context_docs/
 │   ├── 004-duck-typed-providers.md
 │   ├── 005-multi-lock-file-strategy.md
 │   ├── 006-adapter-policy.md
-│   └── 007-native-cmr-granule-query.md
+│   ├── 007-icechunk-chunk-cache-disabled.md
+│   ├── 007-native-cmr-granule-query.md
+│   └── 012-validated-equivalence-for-inference-outputs.md
 └── design/           Long-form framing docs (ported from planning)
     ├── open_sourcing_conceptual_background.md
     └── orchestration_infra_leakage_audit.md
