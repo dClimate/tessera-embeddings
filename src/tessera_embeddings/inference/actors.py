@@ -15,7 +15,8 @@ import contextlib
 import logging
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -38,8 +39,29 @@ if TYPE_CHECKING:
     import icechunk
     import torch
 
-    from tessera_embeddings.inference.data_loading import ChunkData, S2MaskBundle
+    from tessera_embeddings.inference.data_loading import ChunkData, S2MaskBundle, StoreOpener
+    from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
     from tessera_embeddings.inference.models.ssl_model import MultimodalBTInferenceModel
+
+
+@dataclass
+class _PrefetchedChunk:
+    """A chunk prologue loaded ahead of its ``process_chunk`` call.
+
+    Produced by the actor's chunk-prefetch thread while the GPU works on the
+    *previous* chunk: everything ``_process_chunk`` needs before its first
+    forward pass — repo handles, the full-chunk SCL mask, strip tiling, and
+    the first strip's bands + bucketed dataset. Consuming it turns the
+    per-chunk GPU-idle prologue (mask read + strip-0 read + dataset build,
+    ~45-60 s on production chunks) into work hidden behind the prior chunk's
+    inference.
+    """
+
+    store_opener: StoreOpener
+    mask_bundle: S2MaskBundle
+    strip_h: int
+    strips: list[slice]
+    first_strip: tuple[ChunkData, MosaicChunkInferenceDataset]
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +333,95 @@ class InferenceActor:
         self._resource_monitor.start()
         logger.info("InferenceActor ready on instance %s", self.instance_id)
 
+    # ------------------------------------------------------------------
+    # Cross-chunk prologue prefetch
+    # ------------------------------------------------------------------
+    # One persistent single-slot thread loads the NEXT chunk's prologue while
+    # the GPU runs the current chunk (triggered at the final strip, where only
+    # one band strip is resident, so the pair stays within the strip budget).
+    # The stash survives across process_chunk calls; the next call consumes it
+    # by label. Lazily initialised so test harnesses that build bare actors via
+    # object.__new__ keep working without touching __init__.
+
+    def _prefetch_state(self) -> tuple[ThreadPoolExecutor, dict[str, Future[_PrefetchedChunk]]]:
+        pool = getattr(self, "_chunk_prefetch_pool", None)
+        if pool is None:
+            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="chunk-prefetch")
+            self._chunk_prefetch_pool = pool
+            self._prefetched: dict[str, Future[_PrefetchedChunk]] = {}
+        return self._chunk_prefetch_pool, self._prefetched
+
+    def _load_chunk_prologue(self, chunk: ChunkSpec, mosaic_base: str) -> _PrefetchedChunk:
+        """Load everything _process_chunk needs before its first forward pass.
+
+        Runs either inline (cold start, prefetch miss) or on the chunk-prefetch
+        thread. Store opens normally land inside the calling process_chunk's
+        scoped credential provider; a prefetch that outlives its originating
+        call may open through icechunk's default chain instead — if that fails,
+        the consumer falls back to an inline (in-scope) reload, so a
+        credential-window miss degrades to the unprefetched behaviour.
+        """
+        from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
+
+        store_opener = make_store_opener()
+        mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, self.config.time_window, store_opener=store_opener)
+        t_kept = int(mask_bundle.mask.shape[0])
+        strip_h = _strip_height_for_density(t_kept, chunk.width, chunk.height)
+        strips = _strip_slices(chunk.height, strip_h)
+        chunk_data = load_chunk(
+            chunk,
+            mosaic_base,
+            time_window=self.config.time_window,
+            s1_orbit=self.config.s1_orbit,
+            y_sub=strips[0],
+            store_opener=store_opener,
+            mask_bundle=mask_bundle,
+        )
+        dataset = MosaicChunkInferenceDataset(
+            chunk_data,
+            num_obs_checkpoints=self.config.num_obs_checkpoints,
+            s1_orbit=self.config.s1_orbit,
+        )
+        return _PrefetchedChunk(
+            store_opener=store_opener,
+            mask_bundle=mask_bundle,
+            strip_h=strip_h,
+            strips=strips,
+            first_strip=(chunk_data, dataset),
+        )
+
+    def _start_chunk_prefetch(self, chunk: ChunkSpec, mosaic_base: str) -> None:
+        """Kick off the next chunk's prologue load on the prefetch thread."""
+        pool, stash = self._prefetch_state()
+        if chunk.label in stash:
+            return
+        logger.info("Prefetching next chunk %s prologue in background", chunk.label)
+        stash[chunk.label] = pool.submit(self._load_chunk_prologue, chunk, mosaic_base)
+
+    def _take_prefetched(self, label: str) -> _PrefetchedChunk | None:
+        """Consume the stashed prologue for ``label``; evict any stale entries.
+
+        Blocks on an in-flight matching prefetch (partial overlap still wins).
+        Returns None — falling back to the inline prologue — when there is no
+        matching stash or the prefetch failed.
+        """
+        _, stash = self._prefetch_state()
+        for stale in [k for k in stash if k != label]:
+            # Reassignment changed our next chunk; drop the stale future and
+            # let its (possibly still-loading) result be garbage collected.
+            logger.info("Discarding stale prefetched prologue for %s", stale)
+            stash.pop(stale).add_done_callback(lambda f: f.exception())
+        future = stash.pop(label, None)
+        if future is None:
+            return None
+        try:
+            prefetched = future.result()
+        except Exception as exc:
+            logger.warning("Prefetched prologue for %s failed (%s); reloading inline", label, exc)
+            return None
+        logger.info("Using prefetched prologue for %s", label)
+        return prefetched
+
     def ping(self) -> bool:
         """No-op health check used to wait for actor initialization.
 
@@ -330,6 +441,7 @@ class InferenceActor:
         staging_base: str,
         run_id: str,
         tracker: ray.actor.ActorHandle | None = None,
+        prefetch_hint: ChunkSpec | None = None,
     ) -> dict[str, str | int | float]:
         """Process a single spatial chunk: load data, run inference, write output.
 
@@ -351,6 +463,11 @@ class InferenceActor:
             staging_base: Base path for staging output.
             run_id: Unique run identifier.
             tracker: Optional ProgressTracker actor handle for batch-level progress.
+            prefetch_hint: The chunk the scheduler has reserved as this actor's
+                next assignment. Its prologue (mask + strip-0 + dataset) is
+                loaded on the chunk-prefetch thread while this chunk's final
+                strip runs inference, so the next ``process_chunk`` call starts
+                with the GPU-idle prologue already in hand.
 
         Returns:
             Result dict with chunk label, status, pixel count, and timing.
@@ -361,7 +478,7 @@ class InferenceActor:
             else contextlib.nullcontext()
         )
         with cred_scope:
-            return self._process_chunk(chunk, mosaic_base, staging_base, run_id, tracker)
+            return self._process_chunk(chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint)
 
     def _process_chunk(
         self,
@@ -370,6 +487,7 @@ class InferenceActor:
         staging_base: str,
         run_id: str,
         tracker: ray.actor.ActorHandle | None = None,
+        prefetch_hint: ChunkSpec | None = None,
     ) -> dict[str, str | int | float]:
         """Run the load → inference → write pipeline for one chunk.
 
@@ -386,33 +504,29 @@ class InferenceActor:
             tracker.report.remote(chunk.label, 0, 0, "loading")  # type: ignore[union-attr]
 
         try:
-            # Share one set of repo handles across every strip so a split chunk
-            # re-paying the icechunk repo open + manifest load per strip is
-            # avoided (see make_store_opener). Chunk *data* re-reads are not
-            # cached — a dense strip's working set dwarfs the chunk cache.
-            store_opener = make_store_opener()
-
-            # Load the full-chunk S2 SCL mask once: it (a) gives this chunk's
-            # true post-prune valid-timestep count T_kept, used to size the
-            # strip height to the chunk's actual density, and (b) is sliced per
-            # strip so SCL is decompressed once instead of once per strip. SCL is
-            # 1 byte/px vs reflectance's 20, so this is a cheap up-front read.
-            mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, self.config.time_window, store_opener=store_opener)
-            t_kept = int(mask_bundle.mask.shape[0])
-
-            # Size strips from the chunk's real density rather than a fixed
-            # height: sparse chunks (the majority) fit in one full-height strip
-            # and pay 1x reflectance reads; only dense chunks split. A strip's
-            # resident S2 bands are bounded by _S2_STRIP_BYTE_BUDGET.
-            strip_h = _strip_height_for_density(t_kept, chunk.width, chunk.height)
-            strips = _strip_slices(chunk.height, strip_h)
+            # The prologue — repo handles, full-chunk SCL mask (which sizes the
+            # density-based strips), and the first strip's bands + dataset — is
+            # either consumed from the chunk-prefetch stash (loaded while the
+            # PREVIOUS chunk's final strip ran inference) or loaded inline on a
+            # cold start / prefetch miss. See _load_chunk_prologue for what it
+            # holds and _PrefetchedChunk for why.
+            prefetched = self._take_prefetched(chunk.label)
+            if prefetched is None:
+                prefetched = self._load_chunk_prologue(chunk, mosaic_base)
+            store_opener = prefetched.store_opener
+            mask_bundle = prefetched.mask_bundle
+            strips = prefetched.strips
+            # (chunk_data, dataset) for strips[0]; handed to iteration 0 of the
+            # strip loop below, then dropped so at most two strips stay resident.
+            first_strip: tuple[ChunkData, MosaicChunkInferenceDataset] | None = prefetched.first_strip
             logger.info(
                 "Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s)",
                 chunk.label,
-                t_kept,
-                strip_h,
+                int(mask_bundle.mask.shape[0]),
+                prefetched.strip_h,
                 len(strips),
             )
+            del prefetched
 
             # Whole-chunk output buffers, allocated once and held for the chunk.
             # We sub-tile INPUTS only; the output and write path are untouched.
@@ -427,8 +541,11 @@ class InferenceActor:
             # mask_bundle is passed as an explicit submit() arg rather than
             # captured, so the loop can `del` the only strong reference once the
             # last strip has loaded (a closure capture can't be deleted).
-            def _load_strip(y_sub: slice, bundle: S2MaskBundle) -> ChunkData:
-                return load_chunk(
+            # Returns (chunk_data, dataset): bucketing runs on the prefetch
+            # thread too, so it overlaps the prior strip's GPU work instead of
+            # sitting on the critical path between load and inference.
+            def _load_strip(y_sub: slice, bundle: S2MaskBundle) -> tuple[ChunkData, MosaicChunkInferenceDataset]:
+                data = load_chunk(
                     chunk,
                     mosaic_base,
                     time_window=self.config.time_window,
@@ -436,6 +553,11 @@ class InferenceActor:
                     y_sub=y_sub,
                     store_opener=store_opener,
                     mask_bundle=bundle,
+                )
+                return data, MosaicChunkInferenceDataset(
+                    data,
+                    num_obs_checkpoints=self.config.num_obs_checkpoints,
+                    s1_orbit=self.config.s1_orbit,
                 )
 
             on_batch = (
@@ -451,17 +573,17 @@ class InferenceActor:
             }
 
             total_valid = 0
-            # 1-deep prefetch pipeline: strip i+1 loads while strip i runs
-            # inference (same shape as inference.run_inference's prefetcher).
+            # 1-deep prefetch pipeline: strip i+1 loads (and buckets) while
+            # strip i runs inference (same shape as inference.run_inference's
+            # prefetcher). Strip 0 arrived already loaded with the prologue.
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="strip-prefetch") as pool:
-                next_future = pool.submit(_load_strip, strips[0], mask_bundle) if strips else None
+                next_future: Future[tuple[ChunkData, MosaicChunkInferenceDataset]] | None = None
 
                 # Bound to None so the first iteration's `del` has a target; each
                 # iteration rebinds both before use.
                 chunk_data: ChunkData | None = None
                 dataset: MosaicChunkInferenceDataset | None = None
                 for i, strip in enumerate(strips):
-                    assert next_future is not None
                     # The previous strip reported "inference"; flip back to
                     # "loading" before blocking on this strip's read so a slow
                     # multi-strip load isn't misclassified as an inference stall
@@ -477,21 +599,28 @@ class InferenceActor:
                     # three strips, though the strip budget is sized for two.
                     del chunk_data, dataset
 
-                    chunk_data = next_future.result()
+                    if i == 0:
+                        assert first_strip is not None
+                        chunk_data, dataset = first_strip
+                        first_strip = None
+                    else:
+                        assert next_future is not None
+                        chunk_data, dataset = next_future.result()
 
                     # Kick off the next strip's load before running inference on this one.
                     next_future = pool.submit(_load_strip, strips[i + 1], mask_bundle) if i + 1 < len(strips) else None
+
+                    if i + 1 == len(strips) and prefetch_hint is not None:
+                        # Final strip: only one band strip is resident from here
+                        # on, so the next chunk's strip-0 fits the resident pair
+                        # budget. Load its prologue while this strip infers (and
+                        # through the staging write below).
+                        self._start_chunk_prefetch(prefetch_hint, mosaic_base)
 
                     for var in OBS_COUNT_VARS:
                         arr = getattr(chunk_data, var)
                         if arr is not None:
                             obs_buffers[var][strip] = arr
-
-                    dataset = MosaicChunkInferenceDataset(
-                        chunk_data,
-                        num_obs_checkpoints=self.config.num_obs_checkpoints,
-                        s1_orbit=self.config.s1_orbit,
-                    )
 
                     if len(dataset) == 0:
                         # Empty strip: leave its output rows at the initialised

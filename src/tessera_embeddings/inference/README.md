@@ -191,6 +191,42 @@ Two reads are decoupled. **SCL** (1 byte/px) is loaded once for the whole chunk
 the `T_kept` source for sizing. **Reflectance bands** (20 bytes/px) are still read per strip on
 the chunks that split; that per-strip read is exactly the working set the byte budget bounds.
 
+#### 4a″. Cross-chunk prologue prefetch
+
+Baseline profiling (2026-07, `scripts/inference_perf/`) showed each chunk paying ~50–60 s of
+GPU-idle "prologue" — SCL mask read, strip-0 band read, dataset build — plus a ~7 s GPU-idle
+staging write, with **no overlap across chunk boundaries** (~22–25% of chunk wall-clock dead).
+Two mechanisms remove it:
+
+- **Bucketing rides the prefetch thread.** `_load_strip` returns `(ChunkData, dataset)` — the
+  `MosaicChunkInferenceDataset` build (valid-pixel filtering + bucketing, ~10 s on production
+  chunks) happens on the strip-prefetch thread, overlapping the prior strip's GPU work instead
+  of sitting between load and inference on the main thread.
+- **The scheduler reserves each busy actor's next chunk** (`ActorPool.reserved`, 1-deep) and
+  passes it to `process_chunk` as `prefetch_hint`. When the actor reaches its **final strip**
+  (where only one band strip is resident, so the pair budget holds), a persistent
+  chunk-prefetch thread loads the hinted chunk's entire prologue — repo handles, SCL mask,
+  strip tiling, strip-0 bands + dataset (`_PrefetchedChunk`) — while the final strip infers
+  and the staging write runs. The next `process_chunk` call consumes the stash by label and
+  starts inference almost immediately.
+
+```
+ actor timeline, chunk N → N+1 (single-strip chunks)
+
+ without prefetch:  [mask][bands][build][═══ inference N ═══][write][mask][bands][build][═══ N+1 ═══]
+                     GPU:  idle   idle    busy                 idle   idle  idle   idle    busy
+
+ with prefetch:     [mask][bands][build][═══ inference N ═══][write][═══ inference N+1 ═══]
+                                          └─ prefetch thread: [mask][bands][build] N+1 ──┘
+                     GPU:  idle   idle    busy                 ~idle  busy
+```
+
+Reservations are safety-first: they stop when the queue is shallower than the live pool (a
+tail-of-run reservation would pin work to a busy actor while others idle), a failed actor's
+reservation returns to the queue front, a reassigned actor evicts its stale stash, and a
+failed prefetch falls back to the inline (unprefetched) prologue. Chunk results are
+bit-identical either way — the prefetch only moves *when* loading happens.
+
 #### 4b. Valid Pixel Filtering + Bucketing (`dataset.py`)
 
 `MosaicChunkInferenceDataset` identifies pixels eligible for inference and groups them

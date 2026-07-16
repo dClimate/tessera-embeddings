@@ -259,3 +259,66 @@ class TestProcessChunkStriping:
         assert result["valid_pixels"] == 0
         assert _CapturingWriter.last_skip == _CHUNK.label
         assert _CapturingWriter.last_write is None
+
+
+# ---------------------------------------------------------------------------
+# Cross-chunk prologue prefetch (Phase 1 pipelining)
+# ---------------------------------------------------------------------------
+
+_CHUNK_B = ChunkSpec(row=1, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
+_CHUNK_C = ChunkSpec(row=2, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
+
+
+class TestChunkProloguePrefetch:
+    """The prefetch-hint path must be invisible in outputs and self-cleaning."""
+
+    def test_prefetched_prologue_bit_identical_to_cold(self, inference_config, test_model):
+        """Chunk B processed via a prefetch hint == chunk B processed cold."""
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+
+        # Cold baseline for chunk B.
+        actor_cold = _make_actor(inference_config, test_model)
+        _CapturingWriter.last_write = None
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
+            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+        ):
+            res_cold = actor_cold.process_chunk(_CHUNK_B, "s3://b/m", "/tmp/staging", "run-1")
+            write_cold = _CapturingWriter.last_write
+
+        # Chunk A with a hint for B, then B consuming the prefetched prologue.
+        # Both calls stay inside the patch scope because the prefetch thread
+        # opens stores in the background.
+        actor = _make_actor(inference_config, test_model)
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
+            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+        ):
+            res_a = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1", prefetch_hint=_CHUNK_B)
+            assert _CHUNK_B.label in actor._prefetched
+            _CapturingWriter.last_write = None
+            res_b = actor.process_chunk(_CHUNK_B, "s3://b/m", "/tmp/staging", "run-1")
+            write_b = _CapturingWriter.last_write
+
+        assert res_a["status"] == "success"
+        assert res_b["status"] == "success" == res_cold["status"]
+        assert actor._prefetched == {}  # stash consumed
+        np.testing.assert_array_equal(write_cold["embeddings"], write_b["embeddings"])
+        np.testing.assert_allclose(write_cold["scales"], write_b["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
+
+    def test_stale_prefetch_evicted_on_reassignment(self, inference_config, test_model):
+        """A hint for B followed by an assignment of C drops the stale stash."""
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+        actor = _make_actor(inference_config, test_model)
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
+            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+        ):
+            actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1", prefetch_hint=_CHUNK_B)
+            assert _CHUNK_B.label in actor._prefetched
+            res_c = actor.process_chunk(_CHUNK_C, "s3://b/m", "/tmp/staging", "run-1")
+
+        assert res_c["status"] == "success"
+        assert actor._prefetched == {}  # stale B entry evicted, C never stashed
