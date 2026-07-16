@@ -138,10 +138,27 @@ because forks travel by pickle rather than re-opening the repo from its URI.
 icechunk writes chunk objects to a flat ``chunks/<random-id>`` keyspace, so the
 keys spread across S3 partitions well — but partition splitting is adaptive and a
 hard burst overruns the per-prefix rate before (and even after) S3 adapts, which
-is exactly the SlowDown observed at 800 concurrent PUTs. Since ``per_worker_cap``
-floors at 1, aggregate is >= n_workers — keep worker counts at or under this
-target (``AssemblyConfig`` caps them far lower).
+is exactly the SlowDown observed at 800 concurrent PUTs. Because
+``per_worker_cap`` floors at 1, :func:`_s3_budget_split` also caps the worker
+count at the budget so the ``n_workers * per_worker_cap`` product can never
+exceed it (``AssemblyConfig`` caps workers far lower in the common case).
 """
+
+
+def _s3_budget_split(s3_concurrency: int | None, n_workers: int) -> tuple[int, int]:
+    """``(effective_workers, per_worker_cap)`` honoring the fleet S3-PUT budget.
+
+    Each fork worker opens its own repo capped at ``per_worker_cap``, so a fill
+    issues up to ``effective_workers * per_worker_cap`` concurrent requests. When
+    the budget is smaller than the requested worker count, flooring the cap at 1
+    would let ``n_workers`` alone exceed it (e.g. budget 5, 8 workers → 8 > 5), so
+    the worker count is capped at the budget too — fewer concurrent forks, but the
+    fleet target holds. ``s3_concurrency=None`` uses the full aggregate target (a
+    lone fill). Both returned values are ``>= 1``, and their product ``<= budget``.
+    """
+    budget = s3_concurrency if s3_concurrency is not None else TARGET_AGGREGATE_S3_CONCURRENCY
+    workers = min(n_workers, max(1, budget))
+    return workers, max(1, budget // workers)
 
 
 def read_store_spatial_coords(
@@ -1357,8 +1374,7 @@ class ZarrWriter:
         # fill to ~target, so K concurrent fills burst K times the target PUTs (the
         # 800-req SlowDown). The campaign passes `s3_concurrency = target //
         # max_parallel_zones` so the fleet stays near target; None = full target.
-        budget = s3_concurrency if s3_concurrency is not None else TARGET_AGGREGATE_S3_CONCURRENCY
-        per_worker_cap = max(1, budget // max(1, n_workers))
+        n_workers, per_worker_cap = _s3_budget_split(s3_concurrency, n_workers)
         repo = open_global_repo(
             store_path,
             get_credentials=get_credentials,

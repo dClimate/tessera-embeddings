@@ -68,6 +68,7 @@ def test_matching_markers_skip_ingest(wired, monkeypatch):
         "window": ["2025-01-01", "2025-12-31"],
         "min_valid_coverage": 0.1,
         "s1_orbit": "ascending",
+        "allow_partial_window": False,
         "coverage_sha256": "cov-sha-1",
     }
     # Every candidate store exists and carries the exact fingerprint.
@@ -149,6 +150,27 @@ def test_markerless_partial_mosaic_is_cleared(wired, monkeypatch):
     assert result["status"] == "ingested"
     # The markerless partial was cleared before the rebuild.
     assert wired.get("deletes") == ["s3://in/mosaics/33N/2025"]
+
+
+def test_partial_window_marker_does_not_satisfy_strict_run(wired, monkeypatch):
+    """A mosaic accepted under allow_partial_window=True must NOT short-circuit a
+    later strict run — the policy is in the fingerprint, so the strict run clears
+    and re-ingests (re-running the strict coverage gate) instead of reusing a
+    partial mosaic whose fill would fail strict preflight forever.
+    """
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    partial = {
+        "window": ["2025-01-01", "2025-12-31"],
+        "min_valid_coverage": 0.1,
+        "s1_orbit": "ascending",
+        "allow_partial_window": True,  # accepted under the relaxed policy
+        "coverage_sha256": "cov-sha-1",
+    }
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (True, partial))
+    # Default run is strict (allow_partial_window=False): fingerprint differs → re-ingest.
+    result = _run(s1_orbit="ascending")
+    assert result["status"] == "ingested"
+    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025"]  # policy-mismatch mosaic cleared
 
 
 def test_coverage_failure_leaves_no_marker(wired, monkeypatch):

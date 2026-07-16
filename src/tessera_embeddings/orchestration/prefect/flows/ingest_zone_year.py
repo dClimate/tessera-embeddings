@@ -170,15 +170,21 @@ async def ingest_zone_year(
 
     window = parse_time_window(time_window_end or f"December {year}")
     start_date, end_date = window.to_date_range()
-    # Fingerprint the ingest INPUTS, not just the window: rebuilding the coverage
-    # (new registry_sha256), changing min_valid_coverage, the window, or the
-    # REQUESTED orbit set all change the mosaic that should be produced. Including
-    # s1_orbit is what makes an ascending-only run's marker mismatch a later "both"
-    # request (so the missing orbit is actually ingested, not skipped).
+    # Fingerprint the ingest INPUTS and the acceptance POLICY, not just the window:
+    # rebuilding the coverage (new registry_sha256), changing min_valid_coverage, the
+    # window, or the REQUESTED orbit set all change the mosaic that should be produced.
+    # Including s1_orbit is what makes an ascending-only run's marker mismatch a later
+    # "both" request (so the missing orbit is actually ingested, not skipped).
+    # allow_partial_window is in the fingerprint because the marker short-circuits
+    # BEFORE coverage validation: a mosaic accepted under the relaxed policy must NOT
+    # satisfy a later strict run (its fill would then fail strict preflight forever) —
+    # a strict run's differing fingerprint forces a re-ingest that re-runs the strict
+    # coverage gate rather than silently reusing a partial mosaic.
     fingerprint = {
         "window": [start_date, end_date],
         "min_valid_coverage": min_valid_coverage,
         "s1_orbit": s1_orbit,
+        "allow_partial_window": allow_partial_window,
         "coverage_sha256": _coverage_sha(
             land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=None
         ),

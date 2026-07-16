@@ -25,9 +25,11 @@ from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     OBS_COUNT_VARS,
     STAGED_READ_CONFIG_KWARGS,
+    TARGET_AGGREGATE_S3_CONCURRENCY,
     IncompleteStageError,
     ZarrWriter,
     _partition_bands,
+    _s3_budget_split,
     _staged_storage_options,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -35,6 +37,22 @@ from tessera_embeddings.inference.conventions import ENCODER_VERSION
 from tessera_embeddings.inference.quantization import quantize_embeddings
 from tessera_embeddings.storage.global_store import create_global_repo, open_global_repo
 from tessera_embeddings.storage.zarr_store import TIME_ENCODING, open_or_create_repo, open_store
+
+
+@pytest.mark.parametrize(
+    ("s3_concurrency", "n_workers"),
+    [(100, 8), (5, 8), (3, 8), (1, 8), (None, 8), (50, 4), (100, 200)],
+)
+def test_s3_budget_split_never_exceeds_target(s3_concurrency, n_workers):
+    """Workers times the per-fork cap must never exceed the budget (else K fills burst
+    past TARGET_AGGREGATE_S3_CONCURRENCY, the ~800-req SlowDown) — even when the
+    per-fill budget is below the requested worker count (the per-fork floor of 1).
+    """
+    budget = s3_concurrency if s3_concurrency is not None else TARGET_AGGREGATE_S3_CONCURRENCY
+    workers, cap = _s3_budget_split(s3_concurrency, n_workers)
+    assert workers >= 1 and cap >= 1
+    assert workers <= n_workers  # never MORE forks than requested
+    assert workers * cap <= budget  # the fleet request ceiling holds
 
 
 def _dummy_scales(h: int, w: int) -> np.ndarray:

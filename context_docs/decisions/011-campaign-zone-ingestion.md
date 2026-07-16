@@ -50,7 +50,7 @@ appends, and makes deletion + idempotency per-cell.
 
 **Idempotency / crash-repair** rests on a per-store **completion marker** (root
 attr `ingest_marker`, a fingerprint of window + `min_valid_coverage` + requested
-`s1_orbit` + coverage-delivery sha): a matching marker on every required store
+`s1_orbit` + `allow_partial_window` + coverage-delivery sha): a matching marker on every required store
 short-circuits, and the marker is written **only after coverage is verified**, so
 it can never bless an incomplete mosaic. The probe runs over the **maximal**
 candidate set (reflectance + both SAR orbits) keyed on physical existence, not
@@ -74,7 +74,11 @@ latitudes, so a whole-month gap is an ingest-failure signal. The **fill** hard-
 fails on a partial mosaic **before provisioning Ray** (the write-once zone-year
 tag would otherwise make partial embeddings permanent); the **ingest** verifies
 the same before marking done. `allow_partial_window` relaxes both to "non-empty"
-for the rare arctic-only edge zone; an empty store always fails.
+for the rare arctic-only edge zone; an empty store always fails. Because the
+marker short-circuits before coverage validation, `allow_partial_window` is part
+of the fingerprint — a mosaic accepted under the relaxed policy never satisfies a
+later strict run (which would otherwise reuse it and then fail its fill's strict
+preflight forever); the differing fingerprint forces a re-ingest instead.
 
 **Grid gate** (fill, pre-Ray): reflectance **and every active SAR store** are
 validated against the seeded zone grid (shape / CRS / coordinate endpoints).
