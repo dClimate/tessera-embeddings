@@ -110,7 +110,12 @@ REPORT_COMMANDS = [
 
 
 def find_workers(session: boto3.session.Session, name_prefix: str) -> list[str]:
-    """Return instance IDs of running GPU workers whose Name tag matches the prefix."""
+    """Return running, SSM-registered GPU workers whose Name tag matches the prefix.
+
+    Freshly-launched autoscaler workers take a minute to register with SSM, and
+    one unregistered instance in a ``send_command`` batch fails the whole call —
+    so intersect the EC2 listing with SSM's registered set and report the rest.
+    """
     ec2 = session.client("ec2")
     resp = ec2.describe_instances(
         Filters=[
@@ -118,7 +123,20 @@ def find_workers(session: boto3.session.Session, name_prefix: str) -> list[str]:
             {"Name": "tag:Name", "Values": [f"{name_prefix}*worker*"]},
         ]
     )
-    return [inst["InstanceId"] for res in resp["Reservations"] for inst in res["Instances"]]
+    running = [inst["InstanceId"] for res in resp["Reservations"] for inst in res["Instances"]]
+    if not running:
+        return []
+
+    ssm = session.client("ssm")
+    registered: set[str] = set()
+    paginator = ssm.get_paginator("describe_instance_information")
+    for page in paginator.paginate(Filters=[{"Key": "InstanceIds", "Values": running}]):
+        registered.update(info["InstanceId"] for info in page["InstanceInformationList"])
+
+    skipped = sorted(set(running) - registered)
+    if skipped:
+        print(f"Skipping {len(skipped)} worker(s) not yet SSM-registered: {', '.join(skipped)}")
+    return [iid for iid in running if iid in registered]
 
 
 def run_on_workers(session: boto3.session.Session, instance_ids: list[str], commands: list[str]) -> dict[str, str]:
