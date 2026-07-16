@@ -128,11 +128,17 @@ class TestParseTimeWindowErrors:
 
 
 def _make_time_group(start: str, end: str):
-    """Build an in-memory zarr group with a ``time`` array spanning [start, end]."""
+    """Build an in-memory zarr group with a MONTHLY ``time`` array over [start, end].
+
+    Monthly (first of each month) rather than just the two endpoints, so a store
+    that "spans" the window actually contains every month the per-month coverage
+    check now requires.
+    """
     store = zarr.storage.MemoryStore()
     root = zarr.group(store)
 
-    times = np.array([np.datetime64(start), np.datetime64(end)], dtype="datetime64[ns]").astype("int64")
+    months = np.arange(np.datetime64(start, "M"), np.datetime64(end, "M") + 1)
+    times = months.astype("datetime64[ns]").astype("int64")
 
     t_arr = root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
     t_arr[:] = times
@@ -172,17 +178,17 @@ class TestCheckTimeWindowCoverage:
         check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending")
 
     @pytest.mark.parametrize(
-        ("store_start", "store_end", "match"),
+        ("store_start", "store_end"),
         [
-            ("2024-10-01", "2025-12-31", "store starts at"),
-            ("2024-01-01", "2025-06-15", "store ends at"),
+            ("2024-10-01", "2025-12-31"),  # missing the window's Aug/Sep 2024 months
+            ("2024-01-01", "2025-06-15"),  # missing the window's July 2025 month
         ],
         ids=["too-late-start", "too-early-end"],
     )
-    def test_coverage_fails(self, _mock_open_store, store_start, store_end, match):
+    def test_coverage_fails(self, _mock_open_store, store_start, store_end):
         _mock_open_store(store_start, store_end)
         tw = parse_time_window("July 2025")
-        with pytest.raises(InsufficientCoverageError, match=match):
+        with pytest.raises(InsufficientCoverageError, match="missing"):
             check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending")
 
     def test_ascending_orbit_checks_two_stores(self, monkeypatch):

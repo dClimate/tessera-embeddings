@@ -34,7 +34,10 @@ def wired(monkeypatch):
     rec: dict = {"arun": [], "deletes": []}
     monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-campaign"))
     monkeypatch.setattr(mod, "open_global_repo", lambda *a, **k: SimpleNamespace(list_tags=lambda: set()))
-    monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: object())
+    # A seeded, unfilled status: one zone group, nothing complete (so no retag skip).
+    status = SimpleNamespace(zones={"33N": ()}, has=lambda z, y: False)
+    monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+    monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)  # requested years are on-axis
     monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("33N", 2025)])
     monkeypatch.setattr(mod, "tag_year_complete", _defer_milestone)
 
@@ -69,3 +72,21 @@ def test_ingest_disabled_skips_ingest_and_cleanup(wired):
 def test_rejects_zero_parallel_ingest(wired):
     with pytest.raises(ValueError, match="max_parallel_ingest"):
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_ingest=0))
+
+
+def test_off_axis_year_rejected(wired, monkeypatch):
+    """An off-axis year fails up front, before any ingest/fill is dispatched."""
+    monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: False)
+    with pytest.raises(ValueError, match="not on the store's pre-allocated axis"):
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", years=(2026,)))
+    assert wired["arun"] == []  # nothing dispatched
+
+
+def test_retag_only_cell_skips_ingest(wired, monkeypatch):
+    """A complete-but-untagged cell only needs a retag — no ingest, no cleanup."""
+    status = SimpleNamespace(zones={"33N": (2025,)}, has=lambda z, y: True)  # already complete
+    monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    deps = [d for d, _ in wired["arun"]]
+    assert deps == ["fill-zone-year/fill-zone-year"]  # fill (retag) only, no ingest
+    assert wired["deletes"] == []

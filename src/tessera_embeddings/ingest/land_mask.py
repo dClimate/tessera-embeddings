@@ -644,11 +644,15 @@ def _live_tile_bbox_wgs84(spec: ZoneSpec, tile_live: np.ndarray) -> tuple[float,
     return float(lon.min()), float(lat.min()), float(lon.max()), float(lat.max())
 
 
-def _roi_is_current(dest_path: str, height: int, width: int, crs: str, transform: list[float]) -> bool:
-    """Whether an ROI zarr already exists at ``dest_path`` on the exact zone grid.
+def _roi_is_current(
+    dest_path: str, height: int, width: int, crs: str, transform: list[float], coverage_sha: str | None
+) -> bool:
+    """Whether an ROI zarr already exists at ``dest_path`` for the current coverage.
 
-    Idempotency probe: a matching shape/CRS/transform means the mask is already
-    correct (the zone grid is fixed), so the export is a no-op. Any open failure
+    Idempotency probe. Shape/CRS/transform are invariant across registry
+    deliveries, so they alone can't detect changed coverage — the coverage
+    group's ``registry_sha256`` is the discriminator: a new delivery (different
+    ``tile_live_2048``) changes the sha and forces a rebuild. Any open failure
     (missing store) means "rebuild".
     """
     try:
@@ -661,6 +665,7 @@ def _roi_is_current(dest_path: str, height: int, width: int, crs: str, transform
         tuple(existing.shape) == (height, width)
         and existing.attrs.get("crs") == crs
         and list(cast("list[float]", existing.attrs.get("transform", []))) == transform
+        and existing.attrs.get("coverage_sha256") == coverage_sha
     )
 
 
@@ -700,6 +705,7 @@ def export_zone_roi(
     spec = zone_grid.zone(zone)
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
     tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
+    coverage_sha = cast("str | None", cov.attrs.get("registry_sha256"))
     if not tile_live.any():
         logger.info("Zone %s is all-ocean — no ROI to export", zone)
         return None
@@ -709,7 +715,7 @@ def export_zone_roi(
     # north-up top-left origin read_roi_metadata reconstructs into a GeoBox.
     transform = [PIXEL_M, 0.0, spec.easting[0], 0.0, -PIXEL_M, spec.northing[1]]
 
-    if _roi_is_current(dest_path, height, width, spec.crs, transform):
+    if _roi_is_current(dest_path, height, width, spec.crs, transform, coverage_sha):
         logger.info("Zone %s ROI already current at %s — skipping", zone, dest_path)
         return dest_path
 
@@ -721,6 +727,7 @@ def export_zone_roi(
     z.attrs["transform"] = transform
     z.attrs["resolution"] = PIXEL_M
     z.attrs["bbox_wgs84"] = list(_live_tile_bbox_wgs84(spec, tile_live))
+    z.attrs["coverage_sha256"] = coverage_sha  # ties the ROI to the coverage delivery it was built from
     z.attrs["_manifest"] = RoiManifest(resolution=PIXEL_M, chunk_size=INGEST_CHUNK_SIZE, crs=spec.crs).to_dict()
 
     # Upsample tile-liveness onto pixels one chunk-aligned block at a time (each

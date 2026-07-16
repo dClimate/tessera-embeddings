@@ -298,6 +298,7 @@ def check_time_window_coverage(
     for orbit in _active_orbits(s1_orbit):
         stores.append((f"sar_{orbit}", f"{mosaic_base}/sar_{orbit}.zarr"))
 
+    required_months = set(window.months)
     for label, path in stores:
         root = open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
         times = root["time"][:].astype("datetime64[ns]")
@@ -308,32 +309,26 @@ def check_time_window_coverage(
         if skip_coverage_check:
             continue
 
-        store_min = times.min()
-        store_max = times.max()
-        store_min_ym = (
-            int(store_min.astype("datetime64[Y]").astype(int)) + 1970,
-            int(store_min.astype("datetime64[M]").astype(int)) % 12 + 1,
-        )
-        store_max_ym = (
-            int(store_max.astype("datetime64[Y]").astype(int)) + 1970,
-            int(store_max.astype("datetime64[M]").astype(int)) % 12 + 1,
-        )
-
-        if store_min_ym > earliest:
+        # Require EVERY month of the window to be present, not just that the
+        # min/max span it: a mosaic with only January + December (or out-of-window
+        # dates bracketing the year) would otherwise pass despite missing every
+        # intervening month, and the write-once tag would make that partial year
+        # permanent. Month granularity matches the campaign's calendar-year window.
+        years = times.astype("datetime64[Y]").astype(int) + 1970
+        months = times.astype("datetime64[M]").astype(int) % 12 + 1
+        present_months = set(zip(years.tolist(), months.tolist(), strict=True))
+        missing = sorted(required_months - present_months)
+        if missing:
+            preview = ", ".join(f"{y}-{m:02d}" for y, m in missing[:6])
             msg = (
-                f"{label} store starts at {store_min_ym[0]}-{store_min_ym[1]:02d}, "
-                f"but window requires data from {earliest[0]}-{earliest[1]:02d}"
-            )
-            raise InsufficientCoverageError(msg)
-        if store_max_ym < latest:
-            msg = (
-                f"{label} store ends at {store_max_ym[0]}-{store_max_ym[1]:02d}, "
-                f"but window requires data through {latest[0]}-{latest[1]:02d}"
+                f"{label} store at {path} is missing {len(missing)} of the window's "
+                f"{len(required_months)} month(s) (e.g. {preview}) — "
+                f"window {earliest[0]}-{earliest[1]:02d}..{latest[0]}-{latest[1]:02d}"
             )
             raise InsufficientCoverageError(msg)
 
     logger.info(
-        "Time window coverage verified: %d-%02d through %d-%02d",
+        "Time window coverage verified (every month present): %d-%02d through %d-%02d",
         earliest[0],
         earliest[1],
         latest[0],

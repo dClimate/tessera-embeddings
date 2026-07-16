@@ -27,6 +27,7 @@ from prefect.deployments import arun_deployment
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
+from tessera_embeddings.orchestration.runners.zone_fill import zone_year_on_axis
 from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
@@ -112,9 +113,23 @@ async def run_global_campaign(
         raise ValueError(f"max_parallel_ingest must be >= 1, got {max_parallel_ingest} (Semaphore(0) blocks forever)")
     campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS
 
-    repo = open_global_repo(paths.global_store(store_name))
+    store_path = paths.global_store(store_name)
+    repo = open_global_repo(store_path)
     status = campaign_status(repo, years=campaign_years)
     existing_tags = set(repo.list_tags())
+
+    # Reject off-axis years up front, before dispatching any ingest/fill: the time
+    # axis is fixed at seeding (ADR-008 D1), so e.g. `years=(2026,)` against a
+    # 2017-2025 store would otherwise ingest + provision Ray for every zone only
+    # for the fill to reject each one. Validate against a seeded zone's axis.
+    seeded_zones = sorted(status.zones)
+    if seeded_zones:
+        off_axis = [y for y in campaign_years if not zone_year_on_axis(store_path, seeded_zones[0], y)]
+        if off_axis:
+            raise ValueError(
+                f"Year(s) {off_axis} are not on the store's pre-allocated axis "
+                f"(fixed at seeding, ADR-008 D1) — reseed the store or drop them from `years`."
+            )
 
     # Normalize the requested zones to canonical common names ("33N", "07S") so a
     # bad id fails loudly here and matches the store's group names exactly.
@@ -173,14 +188,22 @@ async def run_global_campaign(
         # Ingest (if enabled) → fill → drop the transient mosaic. Ingest and fill
         # have separate concurrency caps; the mosaic is deleted only after the
         # fill is tagged complete.
-        if ingest:
+        #
+        # A complete-but-untagged cell (in years_complete, missing its tag) is in
+        # the work list only so the fill re-creates the tag — no inference, no
+        # mosaic. Skip ingest and cleanup for it entirely.
+        retag_only = status.has(zone, year)
+        did_ingest = ingest and not retag_only
+        if did_ingest:
             async with ingest_sem:  # each ingest provisions its own Dask cluster
                 irun = await arun_deployment(ingest_deployment, parameters=_ingest_params(zone, year))
                 _check_completed(irun, f"ingest {zone}-{year}")
         async with fill_sem:  # bound concurrent fills (hence Ray clusters) within a year
             frun = await arun_deployment(fill_deployment, parameters=_fill_params(zone, year))
             _check_completed(frun, f"fill {zone}-{year}")
-        if cleanup_mosaics:
+        # Only delete a mosaic THIS campaign produced: with ingest=False the mosaic
+        # is an upstream input we must not remove.
+        if did_ingest and cleanup_mosaics:
             delete_prefix(f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}", log=log)
         return str(frun.id)
 

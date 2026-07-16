@@ -342,6 +342,10 @@ class StagedShardSource:
     shard_px: int
     dtypes: tuple[tuple[str, str], ...] = ()  # (var, dtype) expectations from the probe
     embedding_dim: int = 0  # band width for 4-D vars; 0 = skip the band check
+    # Optional vars present in the DESTINATION. A tile carrying one that is NOT in
+    # `variables` (the assembled set) is a heterogeneous stage whose var would be
+    # silently dropped — checked per tile in load(), so EVERY tile is validated.
+    optional_present: tuple[str, ...] = ()
 
     def live_shards(self) -> list[tuple[int, int]]:
         """The staged ``(row, col)`` tile positions — shard indices, 1:1."""
@@ -383,6 +387,16 @@ class StagedShardSource:
                     f"{self.embedding_dim} — a singleton band would broadcast over the output."
                 )
             blocks[var] = block
+        # Detect a heterogeneous stage on EVERY tile (not just a first/last sample):
+        # an optional var present in the destination but absent from the assembled
+        # `variables` (because the probe tile lacked it) would be silently dropped
+        # from this — and every — shard write, then the year tagged complete.
+        extras = [v for v in self.optional_present if v not in self.variables and v in group]
+        if extras:
+            raise ValueError(
+                f"Staged tile {path} carries optional var(s) {extras} absent from the assembled set "
+                f"{list(self.variables)} — heterogeneous staged run; re-stage with one config before assembling."
+            )
         return blocks
 
 
@@ -787,33 +801,33 @@ class ZarrWriter:
         return valid
 
     def _staged_vars_present(self, run_id: str, chunks: list[ChunkSpec], var_names: tuple[str, ...]) -> set[str]:
-        """Check which of *var_names* exist in the staged Zarrs.
+        """Which of *var_names* exist in the staged Zarrs — checked across EVERY tile.
 
-        Probes the two LARGEST chunks (edge chunks may lack interior geometry)
-        and requires them to agree: inferring the variable set from a single
-        tile lets a heterogeneous or resumed stage — old tiles staged without
-        obs counts mixed with newer tiles that have them — silently drop the
-        extra variable from every write. A disagreement is a hard stop instead.
-        Callers must pass only chunks that have staged files.
+        A sampled probe (even first+last) can miss a tile that alone carries an
+        obs-count variable, silently dropping it from the whole output. So every
+        staged chunk is opened and required to agree on the optional-variable set;
+        any disagreement is a hard stop. Callers must pass only chunks that have
+        staged files. (One metadata open per tile; the band fill re-opens them for
+        data — acceptable for the single-ROI path.)
         """
-        ranked = sorted(chunks, key=lambda c: c.height * c.width, reverse=True)
         present: set[str] | None = None
-        for probe in ranked[:2]:
-            path = self._staging_path(run_id, probe)
+        first_label: str | None = None
+        for chunk in chunks:
+            path = self._staging_path(run_id, chunk)
             try:
                 group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
             except FileNotFoundError as exc:  # GroupNotFoundError subclasses this
                 # A silent empty set here would quietly drop every obs-count
-                # variable from the output; a probe that should exist but can't be
+                # variable from the output; a chunk that should exist but can't be
                 # opened is a corrupt/partial stage and must be loud.
-                raise IncompleteStageError(f"Cannot open staged probe chunk {path}: {exc}") from exc
+                raise IncompleteStageError(f"Cannot open staged chunk {path}: {exc}") from exc
             found = {v for v in var_names if v in group}
             if present is None:
-                present = found
+                present, first_label = found, chunk.label
             elif found != present:
                 raise IncompleteStageError(
-                    f"Heterogeneous staged run {run_id}: staged tiles disagree on optional vars "
-                    f"({sorted(present)} vs {sorted(found)}) — re-stage with a single inference config."
+                    f"Heterogeneous staged run {run_id}: chunk {first_label} has optional vars {sorted(present)} "
+                    f"but chunk {chunk.label} has {sorted(found)} — re-stage with a single inference config."
                 )
         return present or set()
 
@@ -949,9 +963,16 @@ class ZarrWriter:
         skipped_labels = set(self._list_skip_marker_labels(run_id))
         live_chunks = [c for c in roi_live_chunks if c.label not in skipped_labels]
         if not live_chunks:
-            raise IncompleteStageError(
-                f"Run {run_id!r} has no staged chunks to assemble under {self.staging_base} "
-                f"({len(roi_live_chunks)} ROI chunks, all skipped or unstaged)."
+            # Every ROI-intersecting chunk was skipped (no valid pixels). Publish
+            # an all-fill timestep anyway rather than aborting: a create/append
+            # writes fill, and a same-date overwrite clears the prior data (its
+            # skip-marked footprints are reset in Phase 2). This matches the old
+            # engine, which could still publish an all-fill output / clear a retry.
+            _log.info(
+                "Run %r: all %d ROI chunk(s) skipped — publishing an all-fill timestep to %s",
+                run_id,
+                len(roi_live_chunks),
+                output_path,
             )
         _log.info(
             "Assembling %d chunks (%d live with staged zarr, %d skipped, %d fill) into %s",
@@ -1174,7 +1195,11 @@ class ZarrWriter:
             granularity,
             min(len(payloads), n_workers),
         )
-        run_forked(session, _fill_band_worker, payloads)
+        # No payloads = an all-skipped run with nothing to write or clear (a fresh
+        # or appended all-fill timestep); the schema/timestep from Phase 1 already
+        # stands. run_forked would spawn a zero-worker pool, so skip it.
+        if payloads:
+            run_forked(session, _fill_band_worker, payloads)
 
         # --- Phase 3: root attrs + one data commit ----------------------------
         node = zarr.open_group(session.store, mode="a")
@@ -1355,26 +1380,11 @@ class ZarrWriter:
         variables = tuple(
             v for v in ("embeddings", "scales", "embedding_std", *OBS_COUNT_VARS) if v in staged_group and v in node
         )
-
-        # The probe (labels[0]) alone fixes the variable set, so a heterogeneous
-        # or resumed stage — old tiles staged without obs counts mixed with newer
-        # tiles that have them — would silently drop the extra variable from EVERY
-        # shard write. Cross-check the last tile's optional-variable set against
-        # the probe; StagedShardSource.load then enforces the set per tile as it
-        # reads (a tile MISSING an expected var is already loud), turning a silent
-        # drop into a hard stop.
-        optional = ("embedding_std", *OBS_COUNT_VARS)
-        if len(labels) > 1:
-            tail_path = f"{self.staging_base}/{run_id}/{labels[-1]}.zarr"
-            tail_group = zarr.open_group(tail_path, mode="r", storage_options=_staged_storage_options(tail_path))
-            probe_opt = {v for v in optional if v in staged_group and v in node}
-            tail_opt = {v for v in optional if v in tail_group and v in node}
-            if probe_opt != tail_opt:
-                raise IncompleteStageError(
-                    f"Heterogeneous staged run {run_id}: probe tile {labels[0]} carries optional vars "
-                    f"{sorted(probe_opt)} but tile {labels[-1]} carries {sorted(tail_opt)} — re-stage "
-                    "with a single inference config before assembling."
-                )
+        # Optional vars the destination CAN hold. StagedShardSource.load checks
+        # every tile for one of these that's absent from `variables` (i.e. present
+        # only in some tiles, so silently dropped) — full-coverage homogeneity, not
+        # a first/last sample.
+        dest_optional = tuple(v for v in ("embedding_std", *OBS_COUNT_VARS) if v in node)
 
         # Validate each staged variable's dtype against its DESTINATION array, not
         # just embeddings/scales (asserted int8/float32 above): a raw-zarr shard
@@ -1412,6 +1422,7 @@ class ZarrWriter:
             shard_px=shard_px,
             dtypes=probe_dtypes,
             embedding_dim=dest_band,
+            optional_present=dest_optional,
         )
         snapshot = write_year_shards(
             repo,

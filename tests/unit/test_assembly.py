@@ -743,6 +743,35 @@ class TestAssembly:
         assert skipped_region.shape == (skipped_chunk.height, skipped_chunk.width, EMBEDDING_DIM)
         assert np.all(skipped_region == 0)
 
+    def test_assemble_all_skipped_publishes_all_fill(self, tmp_path):
+        """Every ROI chunk skip-marked (no valid pixels) → publish an all-fill
+        timestep, not abort (the old engine could publish an all-fill output).
+        """
+        staging = str(tmp_path / "staging")
+        output = str(tmp_path / "output.zarr")
+        writer = ZarrWriter(staging)
+        run_id = "all_skipped"
+        chunks = [
+            ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5),
+            ChunkSpec(row=0, col=1, y_start=0, y_stop=5, x_start=5, x_stop=10),
+        ]
+        for chunk in chunks:
+            writer.write_skip_marker(chunk, run_id)
+
+        writer.assemble(
+            chunks,
+            total_y=5,
+            total_x=10,
+            run_id=run_id,
+            output_path=output,
+            roi_zarr_path=_make_full_roi_mask(tmp_path, 5, 10),
+            n_workers=1,
+        )
+
+        ds = open_store(output)
+        assert ds["embeddings"].shape == (1, 5, 10, EMBEDDING_DIM)
+        assert bool(np.all(ds["embeddings"].values[0] == 0))  # all-fill timestep published
+
     def test_assemble_sparse_roi_non_live_chunks_are_zero_filled(self, tmp_path):
         """Chunks outside the ROI mask are zero-filled without requiring staged data."""
         staging = str(tmp_path / "staging")
@@ -1495,8 +1524,9 @@ class TestAssembleGlobal:
     def test_heterogeneous_staged_optional_vars_raises(self, tmp_path):
         """Tiles disagreeing on optional vars abort rather than silently dropping.
 
-        Inferring the variable set from a single probe tile would drop an obs
-        count present only in later tiles; the probe/tail cross-check catches it.
+        StagedShardSource.load checks EVERY tile: whichever tile is the probe, the
+        other one trips either the missing-variable check (probe has the obs count)
+        or the extras check (probe lacks it) — both name s2_obs_count and abort.
         """
         dim = 8
         ny, nx = 2 * self.TILE, self.TILE  # 2x1 tile grid
@@ -1511,7 +1541,7 @@ class TestAssembleGlobal:
         )
         self._stage_raw_tile(tmp_path, "runH", "chunk_1_0", dim)
         writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
-        with pytest.raises(IncompleteStageError, match="Heterogeneous staged run"):
+        with pytest.raises(ValueError, match="s2_obs_count"):
             writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runH", n_workers=1)
 
 
