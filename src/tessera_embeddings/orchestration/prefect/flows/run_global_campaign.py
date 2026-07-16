@@ -168,6 +168,18 @@ async def run_global_campaign(
     # runner's idempotent retag path runs). See its docstring for the two use cases.
     work = campaign_work_list(status, existing_tags, expected_zones=expected_zones, years=campaign_years)
 
+    # Every work cell must be seeded before we dispatch. The explicit-zones guard
+    # above covers a requested subset, but the default `zones=None` expands to all
+    # 120 in campaign_work_list — so a partially-seeded store would otherwise ingest
+    # each unseeded cell (expensive) only for the fill to reject the missing group.
+    # Validate the actual work zones here to catch that before any ingestion.
+    unseeded_work = sorted({z for z, _ in work if z not in status.zones})
+    if unseeded_work:
+        raise ValueError(
+            f"Zone(s) {unseeded_work} in the work list are not seeded in {store_path} — run the seed flow "
+            "first (a partially-seeded store would ingest each cell only for the fill to reject it)."
+        )
+
     # Orphan-mosaic recovery: a per-cell cleanup that failed after tagging leaves
     # the mosaic behind, and that cell is no longer in `work`, so it is never
     # retried. Sweep complete-and-tagged cells in scope (best-effort) before the
@@ -196,6 +208,12 @@ async def run_global_campaign(
             "zone": zone,
             "year": year,
             "paths": paths.model_dump(),
+            # Deterministic, cell-unique run_id: a retry of a failed/cancelled fill
+            # then RESUMES the same staging prefix (and that prefix is findable for
+            # cleanup) instead of the runner minting a fresh uuid every attempt and
+            # orphaning terabytes of un-resumable staged shards. Cell-unique (zone AND
+            # year) so it can never collide with another cell's staged labels.
+            "run_id": f"{zone}-{year}",
             "ami_ssm_name": ami_ssm_name,
             "store_name": store_name,
             "mask_name": mask_name,

@@ -747,13 +747,20 @@ class ZarrWriter:
             ``None`` if valid, or a string describing the problem.
         """
         path = self._staging_path(run_id, chunk)
-        expected_shape = (chunk.height, chunk.width, self.embedding_dim)
         try:
             group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
             for var in required_vars:
                 if var not in group:
                     return f"missing variable '{var}'"
                 arr: zarr.Array = group[var]  # type: ignore[assignment]
+                # scales is a 2-D per-pixel factor (H, W); embeddings/embedding_std
+                # carry the band dim (H, W, band). Validating scales against the 3-D
+                # shape would false-reject every valid tile.
+                expected_shape = (
+                    (chunk.height, chunk.width)
+                    if var == "scales"
+                    else (chunk.height, chunk.width, self.embedding_dim)
+                )
                 if arr.shape != expected_shape:
                     return f"'{var}' shape {arr.shape} != expected {expected_shape}"
                 expected_dtype = np.int8 if var == "embeddings" else np.float32
@@ -800,7 +807,12 @@ class ZarrWriter:
         )
 
         chunk_by_label = {c.label: c for c in chunks}
-        required_vars = ["embeddings"] + (["embedding_std"] if compute_std else [])
+        # `scales` is mandatory (dequantization needs it) and staged Zarr writes are
+        # NOT atomic across arrays, so a crash mid-write_chunk can leave an
+        # embeddings-only tile. Requiring scales here rejects that partial artifact
+        # up front — otherwise the resume scan counts it valid, run_inference skips
+        # it, and the fill only fails (permanently, on every retry) at assembly.
+        required_vars = ["embeddings", "scales"] + (["embedding_std"] if compute_std else [])
         valid: set[str] = set()
         invalid_paths: list[tuple[str, str]] = []
 

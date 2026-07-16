@@ -79,6 +79,25 @@ def test_driver_reads_are_credentialed(wired, monkeypatch):
     assert onaxis.get("get_credentials") is not None
 
 
+def test_fill_gets_stable_per_cell_run_id(wired):
+    """The fill dispatch carries a deterministic run_id per (zone, year) so a retry
+    resumes the same staging prefix instead of orphaning un-resumable shards.
+    """
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    fill_params = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
+    assert fill_params["run_id"] == "33N-2025"
+
+
+def test_default_run_rejects_unseeded_work_zone(wired, monkeypatch):
+    """A partially-seeded store (default zones=None) fails BEFORE any ingest when the
+    work list includes an unseeded zone — not after an expensive per-cell ingest.
+    """
+    monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("02N", 2025)])  # 02N not in status.zones
+    with pytest.raises(ValueError, match="not seeded"):
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    assert wired["arun"] == []  # nothing dispatched
+
+
 def test_ingest_disabled_skips_ingest_and_cleanup(wired):
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False))
     deps = [d for d, _ in wired["arun"]]

@@ -1288,6 +1288,21 @@ class TestScanExistingStagedChunks:
         result = writer.scan_existing_staged_chunks("run1", self.CHUNKS)
         assert result == {self.CHUNKS[0].label}
 
+    def test_missing_scales_rejected(self, tmp_path):
+        """A crash mid-write_chunk can leave an embeddings-only tile (staged Zarr
+        writes are not atomic across arrays). It must be rejected, not counted valid
+        and skipped — otherwise run_inference skips it and the fill fails
+        permanently at assembly (missing scales) on every retry.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = self.CHUNKS[0]
+        self._stage_chunk(writer, chunk, "run1")
+        # Simulate the partial write: keep embeddings, drop scales.
+        group = zarr.open_group(writer._staging_path("run1", chunk), mode="a")
+        del group["scales"]
+        with pytest.raises(RuntimeError, match="missing variable 'scales'"):
+            writer.scan_existing_staged_chunks("run1", self.CHUNKS)
+
     def test_invalid_shape_raises(self, tmp_path):
         """Staged chunk with wrong shape raises RuntimeError listing the bad path."""
         writer = ZarrWriter(str(tmp_path / "staging"))
