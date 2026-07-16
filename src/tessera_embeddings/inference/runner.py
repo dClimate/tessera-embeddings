@@ -43,6 +43,7 @@ def run_inference(
     *,
     on_actor_retire: Callable[[str], None] | None = None,
     get_credentials: Callable[[], Any] | None = None,
+    s3_region: str | None = None,
 ) -> list[dict]:
     """Create Ray actors, run work-stealing inference, return per-chunk results.
 
@@ -71,6 +72,9 @@ def run_inference(
             every actor so store opens refresh credentials. The AWS provider
             passes ``iam_icechunk_credentials``; the local provider passes
             ``None`` (icechunk's default chain). See :class:`InferenceActor`.
+        s3_region: Optional S3 region for the mosaic repos, injected into every
+            actor so its reads open the store in the same region the caller's
+            preflight/assembly opens use. ``None`` uses icechunk's default region.
 
     Returns:
         Per-chunk result dicts (status, valid pixel count, timing, etc.),
@@ -121,7 +125,7 @@ def run_inference(
 
     def actor_factory(n: int) -> list[ray.actor.ActorHandle]:
         """Request ``n`` new inference actors (one .remote() each)."""
-        return [actor_cls.remote(config, config.checkpoint_path, get_credentials) for _ in range(n)]
+        return [actor_cls.remote(config, config.checkpoint_path, get_credentials, s3_region) for _ in range(n)]
 
     # Request the first batch up front; the work-stealing scheduler requests
     # the rest as instances are placed (see scheduling._maybe_request_next_batch).

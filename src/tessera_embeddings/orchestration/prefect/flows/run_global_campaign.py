@@ -121,8 +121,14 @@ async def run_global_campaign(
         raise ValueError(f"max_parallel_ingest must be >= 1, got {max_parallel_ingest} (Semaphore(0) blocks forever)")
     campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS
 
+    # Lazy AWS import so the flow file imports on non-AWS machines (arch tests).
+    # The driver reads the global store directly (status, tags, on-axis probe)
+    # BEFORE any child flow is dispatched, so a deployment whose store authenticates
+    # only through the callback needs it here too — not just in the children.
+    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+
     store_path = paths.global_store(store_name)
-    repo = open_global_repo(store_path)
+    repo = open_global_repo(store_path, get_credentials=iam_icechunk_credentials)
     status = campaign_status(repo, years=campaign_years)
     existing_tags = set(repo.list_tags())
 
@@ -132,7 +138,11 @@ async def run_global_campaign(
     # for the fill to reject each one. Validate against a seeded zone's axis.
     seeded_zones = sorted(status.zones)
     if seeded_zones:
-        off_axis = [y for y in campaign_years if not zone_year_on_axis(store_path, seeded_zones[0], y)]
+        off_axis = [
+            y
+            for y in campaign_years
+            if not zone_year_on_axis(store_path, seeded_zones[0], y, get_credentials=iam_icechunk_credentials)
+        ]
         if off_axis:
             raise ValueError(
                 f"Year(s) {off_axis} are not on the store's pre-allocated axis "

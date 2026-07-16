@@ -152,6 +152,7 @@ def _make_actor(inference_config, test_model):
     actor.model = test_model
     actor.instance_id = "test-instance"
     actor._get_credentials = None  # no scoped provider; opens use the default chain
+    actor._s3_region = None  # default region
     return actor
 
 
@@ -161,7 +162,7 @@ def _open_store_side_effect():
     sar_asc = _make_sar_zarr_group(5, h, w, seed=20)
     sar_desc = _make_sar_zarr_group(5, h, w, seed=30)
 
-    def _open_store(path):
+    def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
         if "reflectance" in path:
             return s2_root
         if "ascending" in path:
@@ -244,7 +245,7 @@ class TestProcessChunkStriping:
         t_arr[:] = times
         sar = _make_sar_zarr_group(3, h, w)
 
-        def _open_store(path):
+        def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
             return s2_root if "reflectance" in path else sar
 
         _CapturingWriter.last_write = None

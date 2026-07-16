@@ -85,7 +85,7 @@ benchmarks.
 | `--run-id` | groups all artifacts of one run (required) |
 | `--backend` | `local` (default) or `s3` |
 | `--scale` | `tiny` (default, laptop) or `bench` (real numbers) |
-| `--bucket` | S3 bucket, required with `--backend s3`. Accepts a bare name, `bucket/prefix`, or `s3://bucket/prefix`; a prefix becomes the default `--store-root`, and the bare bucket name is used for T7 + the results mirror. |
+| `--bucket` | S3 bucket, required with `--backend s3`. Accepts a bare name, `bucket/prefix`, or `s3://bucket/prefix`; a prefix becomes the default `--store-root`, and both the stores and the S3 results mirror are scoped under it (T7 uses the bare bucket name). |
 | `--variant` | restrict to one variant (T1) |
 | `--phase` | run a single phase by name |
 | `--results-dir` / `--store-root` | override output/store locations |
@@ -110,7 +110,9 @@ also builds its own stores so any single `tN` is independently runnable.
 ## When results land
 
 1. `report.py` writes `scale_test_results/<run-id>/report.md` (the decision
-   matrix with measured values).
+   matrix with measured values). On S3 runs each test's local results are
+   best-effort mirrored to `<bucket>/[<prefix>/]results/<run-id>/` — under the
+   same `--bucket` prefix as the stores, so a prefix-scoped bucket stays writable.
 2. Update the status of each affected decision in ADR-008 (`PENDING → FIRM`, or
    supersede with a new ADR — the decisions file is append-only for reversals).
 3. Archive the report alongside ADR-008.

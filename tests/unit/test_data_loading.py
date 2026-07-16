@@ -194,7 +194,7 @@ class TestLoadChunkOrchestration:
         sar_asc = _make_sar_zarr_group(n_t_sar, h, w, seed=20)
         sar_desc = _make_sar_zarr_group(n_t_sar, h, w, seed=30)
 
-        def _open_store(path):
+        def _open_store(path, region=None):
             if "reflectance" in path:
                 return s2_root
             if "ascending" in path:
@@ -283,7 +283,7 @@ class TestStripReassembly:
         sar_asc = _make_sar_zarr_group(n_t_sar, h, w, seed=20)
         sar_desc = _make_sar_zarr_group(n_t_sar, h, w, seed=30)
 
-        def _open_store(path):
+        def _open_store(path, region=None):
             if "reflectance" in path:
                 return s2_root
             if "ascending" in path:
@@ -362,7 +362,7 @@ class TestSharedMaskBundle:
         sar_asc = _make_sar_zarr_group(n_t_sar, h, w, seed=20)
         sar_desc = _make_sar_zarr_group(n_t_sar, h, w, seed=30)
 
-        def _open_store(path):
+        def _open_store(path, region=None):
             if "reflectance" in path:
                 return s2_root
             if "ascending" in path:
@@ -478,7 +478,7 @@ class TestSharedStoreOpener:
         sar_asc = _make_sar_zarr_group(5, h, w, seed=20)
         sar_desc = _make_sar_zarr_group(5, h, w, seed=30)
 
-        def _open_store(path):
+        def _open_store(path, region=None):
             if "reflectance" in path:
                 return s2_root
             if "ascending" in path:
@@ -488,6 +488,13 @@ class TestSharedStoreOpener:
             raise ValueError(f"Unexpected store path: {path}")
 
         return _open_store
+
+    def test_opener_forwards_region(self):
+        """A non-default region is threaded to every store open (actor read path)."""
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()) as mock_open:
+            opener = make_store_opener(region="eu-west-1")
+            opener("s3://b/m/reflectance.zarr")
+        assert mock_open.call_args.kwargs["region"] == "eu-west-1"
 
     def test_opener_caches_each_path(self):
         """make_store_opener opens each distinct path once and returns the same group."""

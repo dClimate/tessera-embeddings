@@ -77,6 +77,7 @@ class RunConfig:
     backend: str  # "local" | "s3"
     scale: str  # "tiny" | "bench"
     bucket: str | None
+    bucket_prefix: str | None  # prefix from --bucket, honored by the results mirror
     results_dir: Path
     store_root: str  # local dir path or "s3://bucket/prefix"
     real_sample: Path | None
@@ -87,6 +88,19 @@ class RunConfig:
     def is_s3(self) -> bool:
         """True when writing to S3 rather than the local filesystem."""
         return self.backend == _S3
+
+    @property
+    def s3_results_root(self) -> str:
+        """Scheme-less S3 key prefix for this run's mirrored results.
+
+        Honors any ``--bucket`` prefix so results land UNDER the same prefix as the
+        stores (``bucket/prefix/results/<run-id>``), not at the bucket root — a
+        prefix-scoped bucket only grants write access under its prefix. Mirrors the
+        store layout (a sibling ``results/`` dir), so teardown of the stores leaves
+        results intact.
+        """
+        prefix = f"{self.bucket_prefix}/" if self.bucket_prefix else ""
+        return f"{self.bucket}/{prefix}results/{self.run_id}"
 
     @property
     def is_tiny(self) -> bool:
@@ -184,6 +198,7 @@ def config_from_args(args: argparse.Namespace) -> RunConfig:
         backend=args.backend,
         scale=args.scale,
         bucket=bucket,
+        bucket_prefix=bucket_prefix,
         results_dir=results_dir,
         store_root=store_root,
         real_sample=Path(args.real_sample) if args.real_sample else None,
@@ -401,7 +416,7 @@ def _mirror_to_s3(cfg: RunConfig, test: str) -> None:
     try:
         fs = fsspec.filesystem("s3")
         local = cfg.results_dir / test
-        dest = f"{cfg.bucket}/results/{cfg.run_id}/{test}"
+        dest = f"{cfg.s3_results_root}/{test}"
         for f in local.glob("*"):
             fs.put_file(str(f), f"{dest}/{f.name}")
     except Exception as exc:

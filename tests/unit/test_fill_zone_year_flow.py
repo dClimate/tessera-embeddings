@@ -8,6 +8,7 @@ mosaic fails BEFORE a cluster is provisioned.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -92,6 +93,42 @@ def test_model_guard_allows_match_override_and_missing(monkeypatch):
 
     monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={}))
     mod._assert_seeded_model_matches("s3://in/store", allow_model_mismatch=False, get_credentials=None)  # no attr
+
+
+def test_ray_path_wires_actor_terminator(monkeypatch):
+    """The Ray branch wires make_instance_terminator into on_actor_retire, so idle
+    GPU nodes are terminated mid-fill instead of held until the cluster teardown.
+    """
+    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-fill"))
+    monkeypatch.setattr(
+        "tessera_embeddings.providers.aws.credentials.iam_icechunk_credentials", object(), raising=False
+    )
+    # needs_cluster = on_axis and not complete and has_live -> True
+    monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: False)
+    monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
+    monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(time_window="W"))
+    # Pre-Ray gates pass so we reach the terminator wiring + Ray branch.
+    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "check_time_window_coverage", lambda *a, **k: None)
+
+    sentinel = object()
+    monkeypatch.setattr(
+        "tessera_embeddings.providers.aws.ray.make_instance_terminator", lambda **k: sentinel, raising=False
+    )
+
+    @contextmanager
+    def fake_ray_cluster(*a, **k):
+        yield None  # no resolved yaml → the cluster-name probe is skipped
+
+    monkeypatch.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", fake_ray_cluster, raising=False)
+
+    captured: dict = {}
+    monkeypatch.setattr(mod, "fill_zone_year", lambda **kw: captured.update(kw) or {"tag": "t"})
+
+    mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami")
+    assert captured["on_actor_retire"] is sentinel
 
 
 def test_staging_base_scoped_to_zone_year(monkeypatch):

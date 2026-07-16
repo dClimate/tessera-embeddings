@@ -62,6 +62,23 @@ def test_ingest_then_fill_then_cleanup(wired):
     assert result["dispatched"] == 1
 
 
+def test_driver_reads_are_credentialed(wired, monkeypatch):
+    """The driver's own store reads (open_global_repo + the on-axis probe) carry the
+    IAM callback — a callback-only store must authenticate on the driver too, before
+    any child flow is dispatched, not just inside the children.
+    """
+    captured: dict = {}
+    monkeypatch.setattr(
+        mod, "open_global_repo", lambda *a, **k: captured.update(open_kw=k) or SimpleNamespace(list_tags=lambda: set())
+    )
+    onaxis: dict = {}
+    monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: onaxis.update(k) or True)
+
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    assert captured["open_kw"].get("get_credentials") is not None
+    assert onaxis.get("get_credentials") is not None
+
+
 def test_ingest_disabled_skips_ingest_and_cleanup(wired):
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False))
     deps = [d for d, _ in wired["arun"]]

@@ -396,6 +396,7 @@ def fill_zone_year(
         log,
         on_actor_retire=on_actor_retire,
         get_credentials=get_credentials,
+        s3_region=s3_region,
     )
     failed = [r for r in results if r["status"] == "failed"]
     if failed:

@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 StoreOpener = Callable[[str], zarr.Group]
 
 
-def make_store_opener() -> StoreOpener:
+def make_store_opener(region: str | None = None) -> StoreOpener:
     """Return a store opener that opens each distinct path once and reuses it.
 
     Intended to live for the duration of one chunk's strip loop: each strip of
@@ -48,13 +48,18 @@ def make_store_opener() -> StoreOpener:
     *data* re-reads: a dense strip's working set far exceeds icechunk's chunk
     cache, so cross-strip reuse does not hit — see
     ``zarr_store._default_repo_config``.)
+
+    ``region`` is the S3 region for the mosaic repos (credentials are injected
+    separately, via the actor's :func:`credentials_provider` context); a
+    non-default-region fill must thread it so the actor's reads open the store in
+    the same region the preflight/assembly paths use.
     """
     cache: dict[str, zarr.Group] = {}
 
     def _open(store_path: str) -> zarr.Group:
         group = cache.get(store_path)
         if group is None:
-            group = open_store_as_zarr_group(store_path)
+            group = open_store_as_zarr_group(store_path, region=region)
             cache[store_path] = group
         return group
 

@@ -193,7 +193,7 @@ def fill_zone_year_flow(
     # Lazily import the AWS providers so the flow file imports on machines
     # without ray/boto installed (arch tests, local inspection).
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
-    from tessera_embeddings.providers.aws.ray import ray_cluster
+    from tessera_embeddings.providers.aws.ray import make_instance_terminator, ray_cluster
 
     zone = canonicalize_zone(zone)
     store_path = paths.global_store(store_name)
@@ -297,6 +297,14 @@ def fill_zone_year_flow(
             reason = "no live tiles (all-ocean)"
         log.info("Zone %s year %d %s — no Ray cluster", zone, year, reason)
         return fill_zone_year(**fill_kwargs)
+
+    # Ray path only: terminate the EC2 instance behind each retired idle actor
+    # immediately (the runner's on_actor_retire hook), instead of holding idle
+    # GPU nodes for the rest of a multi-hour fill and relying on the autoscaler's
+    # unreliable-after-ray.kill() idle timeout (providers/aws/gotchas.md). The
+    # callback runs driver-side, so its boto3 client never ships to a Ray worker.
+    # Region matches ray_cluster's default (this flow provisions there).
+    fill_kwargs["on_actor_retire"] = make_instance_terminator(log=log)
 
     global _active_resolved_yaml, _active_cluster_name
     with ray_cluster(

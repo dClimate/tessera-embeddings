@@ -70,7 +70,9 @@ def main() -> int:
             fsspec.filesystem("file").rm(str(cfg.results_dir), recursive=True)
             logger.info("results: removed local %s", cfg.results_dir)
         if cfg.is_s3 and cfg.bucket:
-            s3_results = f"s3://{cfg.bucket}/results/{cfg.run_id}"
+            # Same prefix-aware root the mirror writes to (RunConfig.s3_results_root),
+            # so a prefix-scoped run's mirrored results are actually reclaimed.
+            s3_results = f"s3://{cfg.s3_results_root}"
             b, a = _rm_prefix(s3_results)
             logger.info("results: removed %d S3 objects under %s", b - a, s3_results)
     else:

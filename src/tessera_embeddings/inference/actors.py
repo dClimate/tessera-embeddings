@@ -271,6 +271,7 @@ class InferenceActor:
         config: InferenceConfig,
         checkpoint_path: str,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+        s3_region: str | None = None,
     ) -> None:
         """Initialize actor: download checkpoint (if S3) and load model onto GPU.
 
@@ -281,6 +282,10 @@ class InferenceActor:
                 (via :func:`credentials_provider`) for the duration of every
                 :meth:`process_chunk` call. Injected by the cloud-aware caller;
                 ``None`` uses icechunk's default credential chain.
+            s3_region: Optional S3 region for the mosaic repos, applied to every
+                store open. ``None`` uses icechunk's default region — a fill in a
+                non-default region must thread it so the actor's reads match the
+                region the preflight/assembly paths use.
         """
         import torch as _torch
 
@@ -290,6 +295,7 @@ class InferenceActor:
 
         self.config = config
         self._get_credentials = get_credentials
+        self._s3_region = s3_region
         self.instance_id = _fetch_ec2_instance_id()
         self.device = _torch.device("cpu") if self.config.num_gpus == 0 else _select_device(_torch, self.instance_id)
 
@@ -386,7 +392,7 @@ class InferenceActor:
             # re-paying the icechunk repo open + manifest load per strip is
             # avoided (see make_store_opener). Chunk *data* re-reads are not
             # cached — a dense strip's working set dwarfs the chunk cache.
-            store_opener = make_store_opener()
+            store_opener = make_store_opener(region=self._s3_region)
 
             # Load the full-chunk S2 SCL mask once: it (a) gives this chunk's
             # true post-prune valid-timestep count T_kept, used to size the
