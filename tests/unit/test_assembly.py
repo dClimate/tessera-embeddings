@@ -11,7 +11,7 @@ from __future__ import annotations
 import datetime
 import itertools
 from importlib.metadata import version as _dist_version
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -840,86 +840,27 @@ class TestAssembly:
         assert not np.any(np.isnan(live_scales)), "Live chunk scales must not be NaN"
 
 
-class TestCleanupStagingDispatch:
-    """cleanup_staging routes S3 to s5cmd with an fsspec fallback.
+class TestCleanupStaging:
+    """cleanup_staging delegates to the shared prefix-delete helper.
 
-    Diverges from the reference repo's TestCleanupStaging, which asserted
-    s5cmd errors propagate. This repo's cleanup_staging falls back to fsspec
-    instead, so the routing decision is what we pin here. Both _s5cmd_rm and
-    the fsspec filesystem are mocked — the routing decision is the unit under
-    test, not subprocess argv or S3 DELETE semantics.
+    The delete internals (s5cmd --all-versions, fsspec fallback) are
+    object_store.delete_prefix's concern (see test_object_store); here we only
+    pin that the staging dir for the given run is what gets removed.
     """
 
-    def test_s3_uses_s5cmd_and_skips_fsspec(self):
-        """S3 target delegates to _s5cmd_rm with the right URL; fsspec untouched."""
+    def test_delegates_to_delete_prefix_with_run_target(self):
         writer = ZarrWriter("s3://bucket/staging")
-        with (
-            patch.object(_assembly_mod, "_s5cmd_rm") as s5cmd,
-            patch.object(_assembly_mod, "_fs_for") as fs_for,
-        ):
+        with patch.object(_assembly_mod, "delete_prefix") as delete_prefix:
             writer.cleanup_staging("run123")
+        delete_prefix.assert_called_once()
+        assert delete_prefix.call_args.args[0] == "s3://bucket/staging/run123"
 
-        s5cmd.assert_called_once()
-        assert s5cmd.call_args.args[0] == "s3://bucket/staging/run123"
-        # s5cmd succeeded — fsspec must not be touched (no double-delete).
-        fs_for.assert_not_called()
-
-    def test_cleanup_preserves_other_runs(self):
-        """Only the target run_id appears in the S3 URL passed to s5cmd."""
+    def test_only_the_target_run_is_deleted(self):
         writer = ZarrWriter("s3://bucket/staging")
-        with patch.object(_assembly_mod, "_s5cmd_rm") as s5cmd:
+        with patch.object(_assembly_mod, "delete_prefix") as delete_prefix:
             writer.cleanup_staging("delete_me")
-
-        assert s5cmd.call_count == 1
-        assert "delete_me" in s5cmd.call_args.args[0]
-        assert "keep_me" not in s5cmd.call_args.args[0]
-
-    @pytest.mark.parametrize(
-        "exc",
-        [
-            FileNotFoundError("s5cmd binary not found"),
-            RuntimeError("s5cmd failed (rc=1): boom"),
-        ],
-    )
-    def test_s3_falls_back_to_fsspec_when_s5cmd_fails(self, exc):
-        """Both error modes _s5cmd_rm declares fall through to fsspec rm."""
-        writer = ZarrWriter("s3://bucket/staging")
-        fs = MagicMock()
-        fs.exists.return_value = True
-        with (
-            patch.object(_assembly_mod, "_s5cmd_rm", side_effect=exc) as s5cmd,
-            patch.object(_assembly_mod, "_fs_for", return_value=fs) as fs_for,
-        ):
-            writer.cleanup_staging("run123")
-
-        s5cmd.assert_called_once()
-        fs_for.assert_called_once_with("s3://bucket/staging/run123")
-        fs.rm.assert_called_once_with("s3://bucket/staging/run123", recursive=True)
-
-    def test_local_path_skips_s5cmd(self):
-        """Non-S3 target goes straight to fsspec without invoking s5cmd."""
-        writer = ZarrWriter("/tmp/staging")
-        fs = MagicMock()
-        fs.exists.return_value = True
-        with (
-            patch.object(_assembly_mod, "_s5cmd_rm") as s5cmd,
-            patch.object(_assembly_mod, "_fs_for", return_value=fs) as fs_for,
-        ):
-            writer.cleanup_staging("run123")
-
-        s5cmd.assert_not_called()
-        fs_for.assert_called_once_with("/tmp/staging/run123")
-        fs.rm.assert_called_once_with("/tmp/staging/run123", recursive=True)
-
-    def test_local_path_missing_dir_is_noop(self):
-        """The fsspec rm is skipped when the staging dir doesn't exist."""
-        writer = ZarrWriter("/tmp/staging")
-        fs = MagicMock()
-        fs.exists.return_value = False
-        with patch.object(_assembly_mod, "_fs_for", return_value=fs):
-            writer.cleanup_staging("run123")
-
-        fs.rm.assert_not_called()
+        target = delete_prefix.call_args.args[0]
+        assert "delete_me" in target and "keep_me" not in target
 
 
 class TestDetectStagedChunkSize:

@@ -25,9 +25,11 @@ from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
 
 from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete
 from tessera_embeddings.storage.global_store import open_global_repo
+from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zone
 
 
@@ -48,6 +50,17 @@ async def run_global_campaign(
     cloudwatch_log_group: str = "/ec2/tessera/ray",
     code_bucket: str | None = None,
     code_suffix: str = "",
+    # Campaign-triggered per-zone ingestion
+    ingest: bool = True,
+    ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
+    mask_name: str = "global",
+    max_parallel_ingest: int = 2,
+    cleanup_mosaics: bool = True,
+    ingest_min_workers: int = 1,
+    ingest_max_workers: int = 50,
+    min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
+    batch_days: int = 30,
+    allow_partial_window: bool = False,
 ) -> dict[str, Any]:
     """Fill every pending (zone, year), year-serial with bounded zone parallelism.
 
@@ -62,19 +75,32 @@ async def run_global_campaign(
             (default) drives all 120. Either way only cells still needing work are
             dispatched, so a default re-run of a partially-complete year skips the
             finished zones and fills only the unfinished ones (see
-            :func:`campaign_work_list`). Ingestion (the per-zone mosaics this reads)
-            is a separate upstream step.
+            :func:`campaign_work_list`).
         max_parallel_zones: Max concurrent fill runs *within a year* (bounds
             simultaneous Ray clusters — a cost knob, distinct from the commit
             gate).
         commit_limit_name: Prefect global concurrency limit bounding fleet-wide
             simultaneous committers (D6); forwarded to every fill.
         num_actors: GPU actor count, forwarded to each fill.
-        s1_orbit: S1 orbit selection, forwarded to each fill.
+        s1_orbit: S1 orbit selection, forwarded to both ingest and fill.
         ssm_prefix: SSM prefix for Ray resources, forwarded to each fill.
         cloudwatch_log_group: CloudWatch log group, forwarded to each fill.
         code_bucket: Source-tarball bucket, forwarded to each fill.
         code_suffix: Source-tarball suffix, forwarded to each fill.
+        ingest: Trigger per-zone ingestion (``ingest_zone_year``) before each
+            fill (default). Set False when the mosaics already exist upstream.
+        ingest_deployment: ``flow-name/deployment-name`` of the ingest deployment.
+        mask_name: Coverage-store basename, forwarded to ingest.
+        max_parallel_ingest: Max concurrent ingests (each provisions its own Dask
+            cluster) — a separate, smaller knob than the fill cap.
+        cleanup_mosaics: Delete ``mosaics/{zone}/{year}`` (all versions) after the
+            fill lands (default; the mosaic is a transient input). Keep for dev.
+        ingest_min_workers: Lower Dask worker bound for ingest.
+        ingest_max_workers: Upper Dask worker bound for ingest.
+        min_valid_coverage: S2 per-solar-day keep threshold forwarded to ingest.
+        batch_days: S1 CMR batch window forwarded to ingest.
+        allow_partial_window: Relax the coverage gate (ingest + fill) to
+            "non-empty" for legitimately partial edge zones.
 
     Returns:
         Summary: pending count at start, dispatched run ids per year, totals.
@@ -82,6 +108,8 @@ async def run_global_campaign(
     log = get_run_logger()
     if max_parallel_zones < 1:
         raise ValueError(f"max_parallel_zones must be >= 1, got {max_parallel_zones} (Semaphore(0) blocks forever)")
+    if max_parallel_ingest < 1:
+        raise ValueError(f"max_parallel_ingest must be >= 1, got {max_parallel_ingest} (Semaphore(0) blocks forever)")
     campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS
 
     repo = open_global_repo(paths.global_store(store_name))
@@ -106,29 +134,55 @@ async def run_global_campaign(
         commit_limit_name,
     )
 
-    def _params(zone: str, year: int) -> dict[str, Any]:
+    def _fill_params(zone: str, year: int) -> dict[str, Any]:
         return {
             "zone": zone,
             "year": year,
             "paths": paths.model_dump(),
             "ami_ssm_name": ami_ssm_name,
             "store_name": store_name,
+            "mask_name": mask_name,
             "num_actors": num_actors,
             "s1_orbit": s1_orbit,
             "commit_limit_name": commit_limit_name,
+            "allow_partial_window": allow_partial_window,
             "ssm_prefix": ssm_prefix,
             "cloudwatch_log_group": cloudwatch_log_group,
             "code_bucket": code_bucket,
             "code_suffix": code_suffix,
         }
 
-    sem = asyncio.Semaphore(max_parallel_zones)
+    def _ingest_params(zone: str, year: int) -> dict[str, Any]:
+        return {
+            "zone": zone,
+            "year": year,
+            "paths": paths.model_dump(),
+            "mask_name": mask_name,
+            "s1_orbit": s1_orbit,
+            "min_workers": ingest_min_workers,
+            "max_workers": ingest_max_workers,
+            "min_valid_coverage": min_valid_coverage,
+            "batch_days": batch_days,
+            "allow_partial_window": allow_partial_window,
+        }
 
-    async def _fill(zone: str, year: int) -> str:
-        async with sem:  # bound concurrent fills (hence Ray clusters) within a year
-            run = await arun_deployment(fill_deployment, parameters=_params(zone, year))
-            _check_completed(run, f"fill {zone}-{year}")
-            return str(run.id)
+    fill_sem = asyncio.Semaphore(max_parallel_zones)
+    ingest_sem = asyncio.Semaphore(max_parallel_ingest)
+
+    async def _process(zone: str, year: int) -> str:
+        # Ingest (if enabled) → fill → drop the transient mosaic. Ingest and fill
+        # have separate concurrency caps; the mosaic is deleted only after the
+        # fill is tagged complete.
+        if ingest:
+            async with ingest_sem:  # each ingest provisions its own Dask cluster
+                irun = await arun_deployment(ingest_deployment, parameters=_ingest_params(zone, year))
+                _check_completed(irun, f"ingest {zone}-{year}")
+        async with fill_sem:  # bound concurrent fills (hence Ray clusters) within a year
+            frun = await arun_deployment(fill_deployment, parameters=_fill_params(zone, year))
+            _check_completed(frun, f"fill {zone}-{year}")
+        if cleanup_mosaics:
+            delete_prefix(f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}", log=log)
+        return str(frun.id)
 
     # Descending: the campaign fills the current year first, then backwards
     # (ADR-008) — deliver the most-recent year soonest. Override via `years`.
@@ -142,7 +196,7 @@ async def run_global_campaign(
             # return_exceptions=True so a single zone's failure doesn't abandon its
             # siblings mid-flight (default gather() would leave them running orphaned);
             # we let the whole year settle, then fail loudly with every failure.
-            results = await asyncio.gather(*(_fill(z, year) for z in year_zones), return_exceptions=True)
+            results = await asyncio.gather(*(_process(z, year) for z in year_zones), return_exceptions=True)
             failures = [(z, r) for z, r in zip(year_zones, results, strict=True) if isinstance(r, BaseException)]
             if failures:
                 raise RuntimeError(

@@ -34,7 +34,6 @@ import dataclasses
 import datetime
 import itertools
 import logging
-import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, cast
 
@@ -51,6 +50,7 @@ from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
+from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.shard_writer import (
     CommitGate,
     commit_with_rebase,
@@ -142,32 +142,6 @@ is exactly the SlowDown observed at 800 concurrent PUTs. Since ``per_worker_cap`
 floors at 1, aggregate is >= n_workers — keep worker counts at or under this
 target (``AssemblyConfig`` caps them far lower).
 """
-
-
-def _s5cmd_rm(s3_url: str, log: logging.Logger | logging.LoggerAdapter[logging.Logger]) -> None:
-    """Delete all S3 objects under *s3_url* using s5cmd.
-
-    Raises:
-        FileNotFoundError: If the s5cmd binary is not on PATH.
-        RuntimeError: If s5cmd exits with a non-zero status.
-    """
-    cmd = ["s5cmd", "rm", f"{s3_url.rstrip('/')}/*"]
-    log.info("Running: %s", " ".join(cmd))
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    except FileNotFoundError:
-        msg = "s5cmd binary not found — install it or add it to PATH"
-        raise FileNotFoundError(msg) from None
-
-    if result.returncode != 0:
-        msg = f"s5cmd failed (rc={result.returncode}): {result.stderr.strip()}"
-        raise RuntimeError(msg)
-
-    if result.stdout.strip():
-        lines = result.stdout.strip().splitlines()
-        log.info("s5cmd deleted %d objects from %s", len(lines), s3_url)
-    else:
-        log.info("s5cmd: no objects found under %s", s3_url)
 
 
 def read_spatial_coords(
@@ -1469,21 +1443,7 @@ class ZarrWriter:
         """
         _log = log or logger
         target = f"{self.staging_base}/{run_id}"
-
         _log.info("Cleaning up staging: %s", target)
-
-        # For S3, prefer s5cmd: it deletes far faster than fsspec's per-key
-        # serial DELETEs. Fall back to fsspec if s5cmd is unavailable or errors.
-        if fsspec.utils.get_protocol(target) == "s3":
-            try:
-                _s5cmd_rm(target, _log)
-                return
-            except (FileNotFoundError, RuntimeError) as exc:
-                _log.warning("s5cmd cleanup of %s failed (%s) — falling back to fsspec", target, exc)
-
-        try:
-            fs = _fs_for(target)
-            if fs.exists(target):
-                fs.rm(target, recursive=True)
-        except Exception:
-            _log.warning("Failed to clean up staging directory %s", target, exc_info=True)
+        # Shared prefix delete: s5cmd --all-versions (so a versioned bucket doesn't
+        # keep the staged tiles as non-current versions), fsspec fallback.
+        delete_prefix(target, log=_log)
