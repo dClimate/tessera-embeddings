@@ -10,6 +10,7 @@ from rasterio.transform import from_bounds
 
 from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
 from tessera_embeddings.ingest import land_mask
+from tessera_embeddings.ingest.roi import read_roi_metadata
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store_as_zarr_group
 
@@ -233,3 +234,85 @@ def test_spot_check_delivery_rejects_shifted_right_edge(tmp_path) -> None:
     _write_tile(str(tmp_path / n), lon, lat, value=1, east_shift_m=100.0)
     with pytest.raises(ValueError, match="bounds"):
         land_mask.spot_check_delivery([n], delivery_uri=str(tmp_path), n=10)
+
+
+# --------------------------------------------------------------------------- #
+# Zone ROI synthesis (export_zone_roi)
+# --------------------------------------------------------------------------- #
+def _make_coverage(tmp_path, zone: str, live_tiles: list[tuple[int, int]]) -> str:
+    """A minimal coverage repo with a controlled ``tile_live_2048`` for ``zone``."""
+    spec = zone_grid.zone(zone)
+    nty, ntx = spec.height // SHARD_PX, spec.width // SHARD_PX
+    path = str(tmp_path / "coverage.icechunk")
+    repo, _ = open_or_create_repo(path)
+    session = repo.writable_session("main")
+    node = zarr.open_group(session.store, mode="a").require_group(zone)
+    tl = np.zeros((nty, ntx), dtype=bool)
+    for r, c in live_tiles:
+        tl[r, c] = True
+    node.create_array("tile_live_2048", data=tl, chunks=(nty, ntx), dimension_names=("tile_row", "tile_col"))
+    session.commit("seed coverage")
+    return path
+
+
+def test_export_zone_roi_ocean_returns_none(tmp_path) -> None:
+    cov = _make_coverage(tmp_path, "01N", [])
+    assert land_mask.export_zone_roi("01N", land_mask_path=cov, dest_path=str(tmp_path / "roi.zarr")) is None
+
+
+def test_export_zone_roi_roundtrip_matches_zone_grid(tmp_path) -> None:
+    """The synthesized ROI reconstructs to the EXACT zone grid via the real
+    consumer (read_roi_metadata) — the acceptance test the fill relies on."""
+    zone = "31N"
+    spec = zone_grid.zone(zone)
+    cov = _make_coverage(tmp_path, zone, [(10, 5), (11, 5)])
+    dest = str(tmp_path / "zone_31N.zarr")
+    assert land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest) == dest
+
+    meta = read_roi_metadata(dest)  # the real ingest consumer
+    assert meta.native_crs == spec.crs
+    assert (meta.height, meta.width) == (spec.height, spec.width)
+    # The stored transform reconstructs the zone's pixel-center coordinates.
+    a, _, c, _, e, f = zarr.open(dest, mode="r").attrs["transform"]
+    east = c + (np.arange(spec.width) + 0.5) * a
+    north = f + (np.arange(spec.height) + 0.5) * e
+    np.testing.assert_allclose([east[0], east[-1]], zone_grid.easting_coords(spec)[[0, -1]])
+    np.testing.assert_allclose([north[0], north[-1]], zone_grid.northing_coords(spec)[[0, -1]])
+
+
+def test_export_zone_roi_mask_upsamples_live_tiles(tmp_path) -> None:
+    zone = "31N"
+    cov = _make_coverage(tmp_path, zone, [(10, 5)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    z = zarr.open(dest, mode="r")
+    live = z[10 * SHARD_PX : 11 * SHARD_PX, 5 * SHARD_PX : 6 * SHARD_PX]
+    dead = z[10 * SHARD_PX : 11 * SHARD_PX, 6 * SHARD_PX : 7 * SHARD_PX]
+    assert bool(np.asarray(live).all())  # live tile upsampled to all-True pixels
+    assert not bool(np.asarray(dead).any())  # neighbouring dead tile stays fill
+
+
+def test_export_zone_roi_bbox_contains_live_tiles(tmp_path) -> None:
+    zone = "31N"
+    spec = zone_grid.zone(zone)
+    cov = _make_coverage(tmp_path, zone, [(10, 5), (11, 5)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    minx, miny, maxx, maxy = zarr.open(dest, mode="r").attrs["bbox_wgs84"]
+    # The centre of live tile (10, 5) projected to WGS84 must lie inside the bbox.
+    e = spec.easting[0] + (5 * SHARD_PX + SHARD_PX / 2) * land_mask.PIXEL_M
+    n = spec.northing[1] - (10 * SHARD_PX + SHARD_PX / 2) * land_mask.PIXEL_M
+    lon, lat = land_mask._to_wgs84(int(spec.epsg)).transform(e, n)
+    assert minx <= lon <= maxx
+    assert miny <= lat <= maxy
+
+
+def test_export_zone_roi_idempotent(tmp_path) -> None:
+    zone = "31N"
+    cov = _make_coverage(tmp_path, zone, [(10, 5)])
+    dest = str(tmp_path / "roi.zarr")
+    first = land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    second = land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)  # matching grid -> skip
+    assert first == second == dest
+    z = zarr.open(dest, mode="r")
+    assert bool(np.asarray(z[10 * SHARD_PX : 11 * SHARD_PX, 5 * SHARD_PX : 6 * SHARD_PX]).all())

@@ -43,9 +43,10 @@ import hashlib
 import logging
 import math
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import fsspec
 import numpy as np
@@ -53,11 +54,16 @@ import rasterio
 import zarr
 from pyproj import Transformer
 
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
 from tessera_embeddings.storage import zone_grid
+from tessera_embeddings.storage.manifest import RoiManifest
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import PIXEL_M, ZONE_SCHEME, ZONES, ZoneSpec
 from tessera_embeddings.utils import utcnow_iso
+
+if TYPE_CHECKING:
+    import icechunk
 
 logger = logging.getLogger(__name__)
 
@@ -596,3 +602,141 @@ def reconcile_with_bucket(
 def _join(base: str, name: str) -> str:
     """Join a prefix and a name with exactly one separator."""
     return f"{base.rstrip('/')}/{name}"
+
+
+# =============================================================================
+# Zone ROI synthesis — turn a zone's coverage bitmap into the ingest ROI mask.
+# =============================================================================
+
+
+@cache
+def _to_wgs84(epsg: int) -> Transformer:
+    """Zone-CRS → WGS84 transformer, cached per zone (inverse of :func:`_transformer`)."""
+    return Transformer.from_crs(epsg, 4326, always_xy=True)
+
+
+def _live_tile_bbox_wgs84(spec: ZoneSpec, tile_live: np.ndarray) -> tuple[float, float, float, float]:
+    """WGS84 ``(minx, miny, maxx, maxy)`` bounding the zone's LIVE tiles.
+
+    Tight to the live-tile envelope (not the full zone extent) so the STAC/CMR
+    query never scans ocean-only latitudes. The projected rectangle's perimeter
+    is densified before projecting to WGS84 so meridian curvature can't clip the
+    extremes (which may fall mid-edge, not at a corner).
+    """
+    rows = np.where(tile_live.any(axis=1))[0]
+    cols = np.where(tile_live.any(axis=0))[0]
+    r0, r1 = int(rows.min()), int(rows.max()) + 1  # half-open tile indices
+    c0, c1 = int(cols.min()), int(cols.max()) + 1
+    tile_m = SHARD_PX * PIXEL_M
+    e_lo = spec.easting[0] + c0 * tile_m
+    e_hi = spec.easting[0] + c1 * tile_m
+    n_hi = spec.northing[1] - r0 * tile_m  # top (max northing)
+    n_lo = spec.northing[1] - r1 * tile_m  # bottom (min northing)
+
+    n = 16  # samples per edge
+    es = np.linspace(e_lo, e_hi, n)
+    ns = np.linspace(n_lo, n_hi, n)
+    perim_e = np.concatenate([es, np.full(n, e_hi), es[::-1], np.full(n, e_lo)])
+    perim_n = np.concatenate([np.full(n, n_hi), ns[::-1], np.full(n, n_lo), ns])
+    lon, lat = _to_wgs84(int(spec.epsg)).transform(perim_e, perim_n)
+    lon = np.asarray(lon, dtype="float64")
+    lat = np.asarray(lat, dtype="float64")
+    return float(lon.min()), float(lat.min()), float(lon.max()), float(lat.max())
+
+
+def _roi_is_current(dest_path: str, height: int, width: int, crs: str, transform: list[float]) -> bool:
+    """Whether an ROI zarr already exists at ``dest_path`` on the exact zone grid.
+
+    Idempotency probe: a matching shape/CRS/transform means the mask is already
+    correct (the zone grid is fixed), so the export is a no-op. Any open failure
+    (missing store) means "rebuild".
+    """
+    try:
+        existing = zarr.open(dest_path, mode="r")
+    except FileNotFoundError:
+        return False
+    if not isinstance(existing, zarr.Array):
+        return False
+    return (
+        tuple(existing.shape) == (height, width)
+        and existing.attrs.get("crs") == crs
+        and list(cast("list[float]", existing.attrs.get("transform", []))) == transform
+    )
+
+
+def export_zone_roi(
+    zone: str,
+    *,
+    land_mask_path: str,
+    dest_path: str,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> str | None:
+    """Synthesize the ingest ROI mask for one zone from its coverage bitmap.
+
+    Reads the zone's ``tile_live_2048`` bitmap from the coverage repo (ADR-010),
+    upsamples it by :data:`SHARD_PX` onto the zone pixel grid, and writes the
+    exact ROI-mask artifact the ROI ingest flows consume
+    (:func:`tessera_embeddings.ingest.roi.read_roi_metadata`): a chunked boolean
+    zarr on the FIXED zone grid — origin/shape from :class:`ZoneSpec`, never
+    ``compute_grid``'s bbox-fit — with a tight WGS84 bbox drawn from the live
+    tiles. The fill embeds whole live 2048-px tiles, so the mask is tile-granular
+    (a live coastal tile's ocean pixels are included by design); masked ocean is
+    zeroed at ingest and its all-fill chunks are elided.
+
+    Args:
+        zone: UTM common name (e.g. ``"33N"``).
+        land_mask_path: Coverage Icechunk repo (``BucketPaths.land_mask_store``).
+        dest_path: Output ROI zarr URI (e.g. ``{inputs}/rois/zarrs/zone_33N.zarr``).
+        get_credentials: Icechunk credential callback for reading the coverage
+            repo (the ROI zarr itself is written with the ambient chain, matching
+            :func:`~tessera_embeddings.ingest.roi.rasterize_roi_zarr`).
+        s3_region: Region for the coverage-repo read, if not the default.
+
+    Returns:
+        ``dest_path`` on success, or ``None`` for an all-ocean zone (no ROI, so
+        the caller skips ingestion entirely).
+    """
+    spec = zone_grid.zone(zone)
+    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
+    tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
+    if not tile_live.any():
+        logger.info("Zone %s is all-ocean — no ROI to export", zone)
+        return None
+
+    height, width = spec.height, spec.width
+    # 6-coeff affine: [pixel_w, 0, easting_min, 0, -pixel_h, northing_max] — the
+    # north-up top-left origin read_roi_metadata reconstructs into a GeoBox.
+    transform = [PIXEL_M, 0.0, spec.easting[0], 0.0, -PIXEL_M, spec.northing[1]]
+
+    if _roi_is_current(dest_path, height, width, spec.crs, transform):
+        logger.info("Zone %s ROI already current at %s — skipping", zone, dest_path)
+        return dest_path
+
+    z = zarr.open(
+        dest_path, mode="w", shape=(height, width), chunks=(INGEST_CHUNK_SIZE, INGEST_CHUNK_SIZE), dtype="bool"
+    )
+    assert isinstance(z, zarr.Array)
+    z.attrs["crs"] = spec.crs
+    z.attrs["transform"] = transform
+    z.attrs["resolution"] = PIXEL_M
+    z.attrs["bbox_wgs84"] = list(_live_tile_bbox_wgs84(spec, tile_live))
+    z.attrs["_manifest"] = RoiManifest(resolution=PIXEL_M, chunk_size=INGEST_CHUNK_SIZE, crs=spec.crs).to_dict()
+
+    # Upsample tile-liveness onto pixels one chunk-aligned block at a time (each
+    # INGEST_CHUNK_SIZE block = tiles_per_chunk² tiles). Whole-store upsampling
+    # would be tens of GB; empty blocks are skipped so ocean stays fill (elided).
+    tiles_per_chunk = INGEST_CHUNK_SIZE // SHARD_PX
+    for ty0 in range(0, tile_live.shape[0], tiles_per_chunk):
+        for tx0 in range(0, tile_live.shape[1], tiles_per_chunk):
+            block = tile_live[ty0 : ty0 + tiles_per_chunk, tx0 : tx0 + tiles_per_chunk]
+            if not block.any():
+                continue
+            pixels = np.repeat(np.repeat(block, SHARD_PX, axis=0), SHARD_PX, axis=1)
+            y0, x0 = ty0 * SHARD_PX, tx0 * SHARD_PX
+            z[y0 : y0 + pixels.shape[0], x0 : x0 + pixels.shape[1]] = pixels
+
+    logger.info(
+        "Exported zone %s ROI: %d live tiles -> %s (%dx%d px)", zone, int(tile_live.sum()), dest_path, height, width
+    )
+    return dest_path
