@@ -28,7 +28,7 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete
 from tessera_embeddings.storage.global_store import open_global_repo
-from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, utm_zone_to_group
+from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zone
 
 
 @flow(name="run-global-campaign")
@@ -88,9 +88,9 @@ async def run_global_campaign(
     status = campaign_status(repo, years=campaign_years)
     existing_tags = set(repo.list_tags())
 
-    # Callers name zones ergonomically ("33N", "15S"); the store keys groups by EPSG
-    # code ("32633", "32715"). Convert up front so a bad id fails loudly here.
-    expected_zones = [utm_zone_to_group(z) for z in zones] if zones is not None else None
+    # Normalize the requested zones to canonical common names ("33N", "07S") so a
+    # bad id fails loudly here and matches the store's group names exactly.
+    expected_zones = [canonicalize_zone(z) for z in zones] if zones is not None else None
 
     # Work list = cells still needing a fill, restricted to `zones` (default: all
     # 120). campaign_work_list is tag-aware: it skips landed-and-tagged cells (so a

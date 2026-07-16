@@ -21,13 +21,13 @@ def _seed(tmp_path):
 def test_sibling_groups_seeded_without_clobber(tmp_path):
     store = _seed(tmp_path)
     root = zarr_store.open_store_as_zarr_group(store)
-    assert set(root.group_keys()) >= {"32601", "32701"}
+    assert set(root.group_keys()) >= {"01N", "01S"}
 
 
 def test_data_vars_are_metadata_only(tmp_path):
     # embeddings/scales must be all-fill (no chunk objects) — cost-free seeding.
     store = _seed(tmp_path)
-    g = zarr_store.open_store_as_zarr_group(store, group="32601")
+    g = zarr_store.open_store_as_zarr_group(store, group="01N")
     assert g["embeddings"].nchunks_initialized == 0
     assert g["scales"].nchunks_initialized == 0
     assert g["embeddings"].shape == (3, 4096, 2048, EMBEDDING_DIM)
@@ -35,7 +35,7 @@ def test_data_vars_are_metadata_only(tmp_path):
 
 def test_embeddings_is_sharded(tmp_path):
     store = _seed(tmp_path)
-    g = zarr_store.open_store_as_zarr_group(store, group="32601")
+    g = zarr_store.open_store_as_zarr_group(store, group="01N")
     emb = g["embeddings"]
     assert emb.shards == (1, 2048, 2048, EMBEDDING_DIM)
     assert emb.chunks == (1, 256, 256, EMBEDDING_DIM)
@@ -44,7 +44,7 @@ def test_embeddings_is_sharded(tmp_path):
 
 def test_coords_and_attrs(tmp_path):
     store = _seed(tmp_path)
-    g = zarr_store.open_store_as_zarr_group(store, group="32601")
+    g = zarr_store.open_store_as_zarr_group(store, group="01N")
     assert g["easting"].shape == (2048,)
     assert g["northing"].shape == (4096,)
     assert g["time"].shape == (3,)
@@ -81,7 +81,7 @@ def test_root_carries_geoemb_convention(tmp_path):
 
 def test_group_aware_open_store_reads_one_zone(tmp_path):
     store = _seed(tmp_path)
-    ds = zarr_store.open_store(store, chunks=None, group="32701")
+    ds = zarr_store.open_store(store, chunks=None, group="01S")
     assert "embeddings" in ds.data_vars
     assert ds.sizes["time"] == 3
     # time axis decodes to calendar years
@@ -96,7 +96,7 @@ def test_second_seed_adds_groups_without_clobbering_first(tmp_path):
     global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
     global_store.seed_zone_groups(repo, [_ZB], years=(2025,))
     root = zarr_store.open_store_as_zarr_group(store)
-    assert set(root.group_keys()) >= {"32601", "32701"}
+    assert set(root.group_keys()) >= {"01N", "01S"}
 
 
 def test_global_store_config_has_time_split_and_preload():

@@ -1388,7 +1388,7 @@ class TestAssembleGlobal:
 
     TILE = 64  # miniature shard pitch so a unit test never touches 2048² arrays
     INNER = 32
-    ZONE = "32601"
+    ZONE = "01N"
     YEARS = (2024, 2025)
 
     def _seed_zone_repo(self, tmp_path, ny: int, nx: int, dim: int, *, obs_vars: tuple[str, ...] = ()):
@@ -1494,7 +1494,7 @@ class TestAssembleGlobal:
         emb = np.ones((self.TILE, self.TILE, dim), dtype=np.int8)
         writer.write_chunk(chunk, emb, "runG", scales=np.ones((self.TILE, self.TILE), dtype=np.float32))
 
-        with pytest.raises(ValueError, match="not on 32601's pre-allocated time axis"):
+        with pytest.raises(ValueError, match="not on 01N's pre-allocated time axis"):
             writer.assemble_global(store_path, self.ZONE, year=1999, run_id="runG", n_workers=1)
 
     def test_tile_shard_mismatch_raises(self, tmp_path):
@@ -1548,7 +1548,7 @@ class TestAssembleGlobal:
             extra={"s2_obs_count": np.ones((self.TILE, self.TILE), dtype="int64")},
         )
         writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
-        with pytest.raises(IncompleteStageError, match="s2_obs_count dtype int64 but 32601/s2_obs_count is seeded"):
+        with pytest.raises(IncompleteStageError, match="s2_obs_count dtype int64 but 01N/s2_obs_count is seeded"):
             writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runD", n_workers=1)
 
     def test_heterogeneous_staged_optional_vars_raises(self, tmp_path):

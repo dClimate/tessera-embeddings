@@ -9,35 +9,35 @@ from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage import zone_grid as zg
 
 
-def test_120_zones_named_by_epsg():
+def test_120_zones_named_by_common_name():
     assert len(zg.ZONES) == 120
     for utm in range(1, 61):
-        assert f"326{utm:02d}" in zg.ZONES
-        assert f"327{utm:02d}" in zg.ZONES
-    n = zg.ZONES["32601"]
-    assert n.hemisphere == "N" and n.utm_zone == 1
-    assert zg.ZONES["32760"].hemisphere == "S" and zg.ZONES["32760"].utm_zone == 60
-    assert n.group_name == "32601" and n.crs == "EPSG:32601"
+        assert f"{utm:02d}N" in zg.ZONES
+        assert f"{utm:02d}S" in zg.ZONES
+    n = zg.ZONES["01N"]
+    assert n.hemisphere == "N" and n.utm_zone == 1 and n.epsg == "32601"
+    assert zg.ZONES["60S"].hemisphere == "S" and zg.ZONES["60S"].utm_zone == 60 and zg.ZONES["60S"].epsg == "32760"
+    assert n.group_name == "01N" and n.crs == "EPSG:32601"
 
 
-@pytest.mark.parametrize("epsg", list(zg.ZONES))
-def test_extents_pinned_to_pyproj(epsg):
+@pytest.mark.parametrize("name", list(zg.ZONES))
+def test_extents_pinned_to_pyproj(name):
     # The static table must match a fresh pyproj derivation, so an EPSG-database
     # change fails here instead of silently moving the grid.
-    spec = zg.ZONES[epsg]
-    easting, northing = zg.derive_extent(int(epsg))
+    spec = zg.ZONES[name]
+    easting, northing = zg.derive_extent(int(spec.epsg))
     assert (easting, northing) == (spec.easting, spec.northing)
 
 
-@pytest.mark.parametrize("epsg", ["32601", "32630", "32660", "32701", "32731", "32760"])
-def test_shard_aligned(epsg):
-    spec = zg.ZONES[epsg]
+@pytest.mark.parametrize("name", ["01N", "30N", "60N", "01S", "31S", "60S"])
+def test_shard_aligned(name):
+    spec = zg.ZONES[name]
     assert spec.width % SHARD_PX == 0
     assert spec.height % SHARD_PX == 0
 
 
 def test_coords_monotonic_and_sized():
-    spec = zg.ZONES["32601"]
+    spec = zg.ZONES["01N"]
     east = zg.easting_coords(spec)
     north = zg.northing_coords(spec)
     assert east.shape == (spec.width,)
@@ -56,31 +56,31 @@ def test_calendar_year_times():
 
 
 def test_northern_vs_southern_extents_differ_only_in_northing():
-    n = zg.ZONES["32610"]
-    s = zg.ZONES["32710"]
+    n = zg.ZONES["10N"]
+    s = zg.ZONES["10S"]
     assert n.easting == s.easting
     assert n.northing != s.northing  # N starts at 0; S is shifted for the false-northing offset
 
 
 @pytest.mark.parametrize(
-    "utm_zone, expected",
+    "raw, expected",
     [
-        ("33N", "32633"),
-        ("15S", "32715"),
-        ("1N", "32601"),
-        ("01N", "32601"),
-        ("60S", "32760"),
-        ("33n", "32633"),  # case-insensitive hemisphere
-        (" 7s ", "32707"),  # surrounding whitespace tolerated
+        ("33N", "33N"),
+        ("15S", "15S"),
+        ("1N", "01N"),  # zero-padded
+        ("01N", "01N"),
+        ("60S", "60S"),
+        ("33n", "33N"),  # case-insensitive hemisphere
+        (" 7s ", "07S"),  # surrounding whitespace + zero-pad
     ],
 )
-def test_utm_zone_to_group(utm_zone, expected):
-    group = zg.utm_zone_to_group(utm_zone)
-    assert group == expected
-    assert group in zg.ZONES  # every parse maps to a real seeded zone
+def test_canonicalize_zone(raw, expected):
+    name = zg.canonicalize_zone(raw)
+    assert name == expected
+    assert name in zg.ZONES  # every parse maps to a real seeded zone
 
 
 @pytest.mark.parametrize("bad", ["", "33", "N33", "0N", "61N", "33X", "33NN", "abc", "-5N"])
-def test_utm_zone_to_group_rejects_malformed(bad):
+def test_canonicalize_zone_rejects_malformed(bad):
     with pytest.raises(ValueError, match="UTM zone"):
-        zg.utm_zone_to_group(bad)
+        zg.canonicalize_zone(bad)

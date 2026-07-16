@@ -46,17 +46,17 @@ def test_parse_cell_name_rejects_invalid_coords(bad: str) -> None:
 
 def test_zone_for_cell_matches_delivery_samples() -> None:
     # Verified against the partner sample TIFFs' embedded CRS.
-    assert land_mask.zone_for_cell(-0.05, 10.05) == "32630"
-    assert land_mask.zone_for_cell(-0.05, -16.05) == "32730"
+    assert land_mask.zone_for_cell(-0.05, 10.05) == "30N"
+    assert land_mask.zone_for_cell(-0.05, -16.05) == "30S"
     # Band extremes and the equator sign split.
-    assert land_mask.zone_for_cell(-179.95, 0.05) == "32601"
-    assert land_mask.zone_for_cell(179.95, 0.05) == "32660"
-    assert land_mask.zone_for_cell(0.05, 0.05) == "32631"
-    assert land_mask.zone_for_cell(0.05, -0.05) == "32731"
+    assert land_mask.zone_for_cell(-179.95, 0.05) == "01N"
+    assert land_mask.zone_for_cell(179.95, 0.05) == "60N"
+    assert land_mask.zone_for_cell(0.05, 0.05) == "31N"
+    assert land_mask.zone_for_cell(0.05, -0.05) == "31S"
 
 
 def test_project_cells_to_pixel_boxes_is_on_grid() -> None:
-    spec = zone_grid.zone("32631")
+    spec = zone_grid.zone("31N")
     # A cell near the central meridian, mid-latitude.
     r0, r1, c0, c1 = land_mask.project_cells_to_pixel_boxes(np.array([2.35]), np.array([48.85]), spec)
     assert 0 <= r0[0] < r1[0] <= spec.height
@@ -71,10 +71,10 @@ def test_project_cells_to_pixel_boxes_is_on_grid() -> None:
 # Bitmap build
 # --------------------------------------------------------------------------- #
 def test_build_zone_coverage_consistency_and_or() -> None:
-    spec = zone_grid.zone("32631")
+    spec = zone_grid.zone("31N")
     lons = np.array([2.35, 2.45])
     lats = np.array([48.85, 48.85])
-    cov = land_mask.build_zone_coverage("32631", lons, lats)
+    cov = land_mask.build_zone_coverage("31N", lons, lats)
 
     assert cov.tile_live.shape == (spec.height // SHARD_PX, spec.width // SHARD_PX)
     assert cov.chunk_live.shape == (spec.height // INNER_PX, spec.width // INNER_PX)
@@ -86,7 +86,7 @@ def test_build_zone_coverage_consistency_and_or() -> None:
 
 
 def test_build_zone_coverage_empty_zone_is_all_false() -> None:
-    cov = land_mask.build_zone_coverage("32601", np.empty(0), np.empty(0))
+    cov = land_mask.build_zone_coverage("01N", np.empty(0), np.empty(0))
     assert cov.n_cells == 0
     assert not cov.tile_live.any()
     assert not cov.chunk_live.any()
@@ -153,7 +153,7 @@ def test_build_all_rebuild_is_a_new_commit(tmp_path) -> None:
 
 
 def test_validate_rejects_inconsistent_bitmaps(tmp_path) -> None:
-    z = "32601"
+    z = "01N"
     spec = zone_grid.zone(z)
     dest = str(tmp_path / "cov.icechunk")
     repo, _ = open_or_create_repo(dest)

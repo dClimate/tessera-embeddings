@@ -2,7 +2,11 @@
 
 The world is one Icechunk repo of 120 Zarr groups — 60 UTM zones x 2
 hemispheres — each in its own CRS (EPSG:326xx north, EPSG:327xx south) and
-named by its EPSG code string (``"32601"`` … ``"32760"``).
+named by its UTM **common name** (``"01N"`` … ``"60S"``: zero-padded zone
+number + hemisphere). The EPSG code is retained as the CRS only
+(:attr:`ZoneSpec.epsg` / :attr:`ZoneSpec.crs`). This is a deliberate deviation
+from the geoembeddings ``utm_zones`` spec, whose ``utm{NN}`` group name cannot
+express the hemisphere.
 
 **Boundary policy — pure nominal 6° longitude bands.** Zone extents are the
 *nominal* 6°-wide UTM bands; coverage is disjoint and every pixel-center belongs
@@ -60,8 +64,8 @@ class ZoneSpec:
 
     @property
     def group_name(self) -> str:
-        """Zarr group name for this zone (its EPSG code string)."""
-        return self.epsg
+        """Zarr group name for this zone: its UTM common name, e.g. ``"01N"``/``"60S"``."""
+        return f"{self.utm_zone:02d}{self.hemisphere}"
 
     @property
     def crs(self) -> str:
@@ -117,42 +121,45 @@ _SOUTH_NORTHING: Extent = (1_105_920.0, 10_014_720.0)
 
 
 def _build_zones() -> dict[str, ZoneSpec]:
-    """Build the 120-zone registry from the pinned per-hemisphere templates."""
+    """Build the 120-zone registry, keyed by UTM common name (``"01N"``…``"60S"``)."""
     zones: dict[str, ZoneSpec] = {}
     for utm in range(1, 61):
-        n_epsg = f"326{utm:02d}"
-        s_epsg = f"327{utm:02d}"
-        zones[n_epsg] = ZoneSpec(n_epsg, "N", utm, _NORTH_EASTING, _NORTH_NORTHING)
-        zones[s_epsg] = ZoneSpec(s_epsg, "S", utm, _SOUTH_EASTING, _SOUTH_NORTHING)
+        north = ZoneSpec(f"326{utm:02d}", "N", utm, _NORTH_EASTING, _NORTH_NORTHING)
+        south = ZoneSpec(f"327{utm:02d}", "S", utm, _SOUTH_EASTING, _SOUTH_NORTHING)
+        zones[north.group_name] = north
+        zones[south.group_name] = south
     return zones
 
 
-#: The 120 zones, keyed by EPSG code string.
+#: The 120 zones, keyed by UTM common name (``"01N"``…``"60S"``).
 ZONES: dict[str, ZoneSpec] = _build_zones()
 
 
-def zone(epsg: str) -> ZoneSpec:
-    """Look up a zone by EPSG code string (e.g. ``"32601"``)."""
-    return ZONES[epsg]
+def zone(name: str) -> ZoneSpec:
+    """Look up a zone by its UTM common name (e.g. ``"01N"``, ``"60S"``)."""
+    return ZONES[name]
 
 
-def utm_zone_to_group(utm_zone: str) -> str:
-    """Map an ergonomic UTM-zone id (``"33N"``, ``"15S"``, ``"3N"``) to its group name.
+def canonicalize_zone(zone: str) -> str:
+    """Normalize a UTM-zone id to the canonical zero-padded common name.
 
-    The store keys zone groups by EPSG code string (``"32633"`` = UTM 33 North,
-    ``"32715"`` = UTM 15 South); callers prefer the compact ``"<zone><N|S>"`` form.
-    Zone number is 1-60, hemisphere ``N``/``S`` (case-insensitive), optional leading
-    zero. Raises ``ValueError`` on a malformed or out-of-range id.
+    Accepts ``"33N"``, ``"15s"``, ``" 7S "``, ``"07S"`` → ``"33N"`` / ``"15S"`` /
+    ``"07S"``. Zone number is 1-60, hemisphere ``N``/``S`` (case-insensitive),
+    optional leading zero and surrounding whitespace. Raises ``ValueError`` on a
+    malformed or out-of-range id.
+
+    This is the single parser for the zone identifier used across group names,
+    mosaic paths, tags, and flow params; the EPSG code stays available via
+    ``ZONES[name].epsg`` / ``.crs``.
     """
-    text = utm_zone.strip().upper()
+    text = zone.strip().upper()
     m = re.fullmatch(r"(\d{1,2})([NS])", text)
     if not m:
-        raise ValueError(f"UTM zone {utm_zone!r} is malformed — expected '<1-60><N|S>', e.g. '33N' or '15S'.")
+        raise ValueError(f"UTM zone {zone!r} is malformed — expected '<1-60><N|S>', e.g. '33N' or '15S'.")
     number = int(m.group(1))
     if not 1 <= number <= 60:
-        raise ValueError(f"UTM zone number {number} out of range (1-60) in {utm_zone!r}.")
-    prefix = "326" if m.group(2) == "N" else "327"
-    return f"{prefix}{number:02d}"
+        raise ValueError(f"UTM zone number {number} out of range (1-60) in {zone!r}.")
+    return f"{number:02d}{m.group(2)}"
 
 
 def easting_coords(spec: ZoneSpec) -> np.ndarray:

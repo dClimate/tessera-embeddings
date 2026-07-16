@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 def zone_year_tag(zone: str, year: int) -> str:
-    """Tag name for a landed ``(zone, year)`` fill, e.g. ``"zone-32601-2023"``."""
+    """Tag name for a landed ``(zone, year)`` fill, e.g. ``"zone-01N-2023"``."""
     return f"zone-{zone}-{year}"
 
 

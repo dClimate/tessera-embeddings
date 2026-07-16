@@ -117,7 +117,7 @@ def fill_zone_year_flow(
     """Fill one ``(zone, year)`` cell of the global store on a Ray cluster.
 
     Args:
-        zone: Zone group name (EPSG code string, e.g. ``"32630"``).
+        zone: Zone group name — UTM common name, e.g. ``"30N"``/``"19S"``.
         year: Campaign calendar year to fill (must be on the seeded axis).
         paths: Deployment storage contract (global store, land mask, mosaics).
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.

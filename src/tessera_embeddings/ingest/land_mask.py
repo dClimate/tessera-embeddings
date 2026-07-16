@@ -154,7 +154,7 @@ def _transformer(epsg: int) -> Transformer:
 
 
 def zone_for_cell(lon: float, lat: float) -> str:
-    """Cell centre → EPSG code string of its zone (e.g. ``"32630"``).
+    """Cell centre → the UTM common name of its zone (e.g. ``"30N"``, ``"19S"``).
 
     Uses the NOMINAL 6° UTM band (``utm_6deg_nominal``, ADR-008) — filename
     math only, never the MGRS exceptions in :func:`ingest.roi.determine_utm_zone`.
@@ -164,8 +164,7 @@ def zone_for_cell(lon: float, lat: float) -> str:
     """
     band = math.floor((lon + 180.0) / 6.0) + 1
     band = min(max(band, 1), 60)
-    prefix = "326" if lat >= 0 else "327"
-    return f"{prefix}{band:02d}"
+    return f"{band:02d}{'N' if lat >= 0 else 'S'}"
 
 
 def project_cells_to_pixel_boxes(

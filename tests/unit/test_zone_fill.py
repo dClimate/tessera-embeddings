@@ -24,7 +24,7 @@ _BAND = 8
 _TILE = 64  # miniature shard pitch (== inference tile size, D3)
 _INNER = 32
 _NY = _NX = 2 * _TILE  # 2x2 tile grid
-_ZONE = "32601"
+_ZONE = "01N"
 _YEARS = (2024, 2025)
 
 _EMB = ArrayLayout(DIMS_4D, (1, _INNER, _INNER, _BAND), "int8", 0, "zstd", shards=(1, _TILE, _TILE, _BAND))
@@ -32,7 +32,7 @@ _SCL = ArrayLayout(DIMS_3D, (1, _INNER, _INNER), "float32", float("nan"), "pcode
 SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL})
 
 # 10 m pixels -> metre extents for a _NY x _NX pixel zone.
-_SPEC = ZoneSpec(_ZONE, "N", 1, (0.0, _NX * 10.0), (0.0, _NY * 10.0))
+_SPEC = ZoneSpec("32601", "N", 1, (0.0, _NX * 10.0), (0.0, _NY * 10.0))
 
 _WINDOW = TimeWindow(
     window_start=(2024, 7),
@@ -151,10 +151,10 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
     assert summary["live_tiles"] == 3
     assert summary["total_tiles"] == 4
     assert summary["succeeded"] == 3
-    assert summary["tag"] == "zone-32601-2025"
+    assert summary["tag"] == "zone-01N-2025"
 
     repo = global_store.open_global_repo(store)
-    assert repo.lookup_tag("zone-32601-2025") == summary["snapshot_id"]
+    assert repo.lookup_tag("zone-01N-2025") == summary["snapshot_id"]
     node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
     assert node.attrs["years_complete"] == [2025]
     assert node.attrs["runs"]["2025"]["run_id"] == "runZ"
@@ -199,7 +199,7 @@ def test_all_ocean_cell_marked_complete_without_inference(tmp_path, monkeypatch)
     node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
     assert node.attrs["years_complete"] == [2024]
     assert node.attrs["runs"]["2024"] == {**node.attrs["runs"]["2024"], "run_id": "runE", "empty": True}
-    assert repo.lookup_tag("zone-32601-2024") == summary["snapshot_id"]
+    assert repo.lookup_tag("zone-01N-2024") == summary["snapshot_id"]
 
 
 def test_unseeded_zone_raises(tmp_path):
@@ -207,7 +207,7 @@ def test_unseeded_zone_raises(tmp_path):
     with pytest.raises(ValueError, match="not seeded"):
         zone_fill.fill_zone_year(
             store_path=store,
-            zone="32660",
+            zone="60N",
             year=2025,
             land_mask_path=str(tmp_path / "mask.zarr"),
             mosaic_base=str(tmp_path / "mosaics"),
@@ -279,7 +279,7 @@ def test_inference_failure_aborts_before_assembly(tmp_path, monkeypatch):
     repo = global_store.open_global_repo(store)
     node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
     assert node.attrs["years_complete"] == []
-    assert "zone-32601-2025" not in repo.list_tags()
+    assert "zone-01N-2025" not in repo.list_tags()
 
 
 def test_completed_and_tagged_cell_short_circuits(tmp_path, monkeypatch):
@@ -359,13 +359,13 @@ def test_all_tiles_skipped_marks_complete_empty(tmp_path, monkeypatch):
     node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
     assert node.attrs["years_complete"] == [2025]
     assert node.attrs["runs"]["2025"]["empty"] is True
-    assert repo.lookup_tag("zone-32601-2025") == summary["snapshot_id"]
+    assert repo.lookup_tag("zone-01N-2025") == summary["snapshot_id"]
 
 
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"zone_attr": "32602"}, "read positionally"),
+        ({"zone_attr": "02N"}, "read positionally"),
         ({"crs": "EPSG:99999"}, "read positionally"),
         ({"grid_shape": [_NY // 2, _NX // 2]}, "read positionally"),
     ],
@@ -448,7 +448,7 @@ def test_zone_year_complete_reflects_years_complete(tmp_path, monkeypatch):
     """
     store = _seed_global(tmp_path)
     assert zone_fill.zone_year_complete(store, _ZONE, 2025) is False
-    assert zone_fill.zone_year_complete(store, "32660", 2025) is False  # not seeded in this store
+    assert zone_fill.zone_year_complete(store, "60N", 2025) is False  # not seeded in this store
 
     monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
     zone_fill.fill_zone_year(
@@ -475,7 +475,7 @@ def test_zone_year_on_axis(tmp_path):
     assert zone_fill.zone_year_on_axis(store, _ZONE, 2025) is True
     assert zone_fill.zone_year_on_axis(store, _ZONE, 2024) is True
     assert zone_fill.zone_year_on_axis(store, _ZONE, 2026) is False  # off the seeded axis
-    assert zone_fill.zone_year_on_axis(store, "32660", 2025) is False  # not seeded in this store
+    assert zone_fill.zone_year_on_axis(store, "60N", 2025) is False  # not seeded in this store
 
 
 def test_zone_has_live_tiles_true(tmp_path):
@@ -504,7 +504,7 @@ def test_off_axis_year_fails_before_inference(tmp_path, monkeypatch):
         months=tuple((2015, m) for m in range(1, 13)),
         window_end_label="2015-12-01",
     )
-    with pytest.raises(ValueError, match="not on 32601's pre-allocated time axis"):
+    with pytest.raises(ValueError, match="not on 01N's pre-allocated time axis"):
         zone_fill.fill_zone_year(
             store_path=store,
             zone=_ZONE,
@@ -565,7 +565,7 @@ def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatc
     )
     writer.assemble_global(store, _ZONE, year=2025, run_id="run1", n_workers=1)
     repo = global_store.open_global_repo(store)
-    assert "zone-32601-2025" not in repo.list_tags()
+    assert "zone-01N-2025" not in repo.list_tags()
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("a landed cell must not re-run inference just to re-tag")
@@ -584,4 +584,4 @@ def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatc
         run_id="run2",
     )
     assert retry["already_complete"] is True
-    assert repo.lookup_tag("zone-32601-2025") == retry["snapshot_id"]
+    assert repo.lookup_tag("zone-01N-2025") == retry["snapshot_id"]

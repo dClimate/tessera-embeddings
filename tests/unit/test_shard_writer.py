@@ -57,9 +57,9 @@ def _seed(tmp_path, zones=(_ZONE,)):
 
 def test_writes_one_shard_land_masked(tmp_path):
     store, repo = _seed(tmp_path)
-    write_year_shards(repo, "32601", year_index=2, source=_OneInnerChunkSource(seed=1), n_workers=1, shard_px=_SHARD)
+    write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(seed=1), n_workers=1, shard_px=_SHARD)
 
-    g = zarr_store.open_store_as_zarr_group(store, group="32601")
+    g = zarr_store.open_store_as_zarr_group(store, group="01N")
     expected = np.random.default_rng(1).integers(-127, 128, size=(_CHUNK, _CHUNK, _BAND), dtype="int8")
     assert np.array_equal(g["embeddings"][2, 0:_CHUNK, 0:_CHUNK, :], expected)
     # ocean within the written shard is elided -> reads as fill
@@ -75,15 +75,15 @@ def test_writes_one_shard_land_masked(tmp_path):
 
 def test_years_complete_updated_in_commit(tmp_path):
     store, repo = _seed(tmp_path)
-    write_year_shards(repo, "32601", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
-    g = zarr_store.open_store_as_zarr_group(store, group="32601")
+    write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
+    g = zarr_store.open_store_as_zarr_group(store, group="01N")
     assert g.attrs["years_complete"] == [2025]
 
 
 def test_other_years_stay_empty(tmp_path):
     store, repo = _seed(tmp_path)
-    write_year_shards(repo, "32601", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
-    g = zarr_store.open_store_as_zarr_group(store, group="32601")
+    write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
+    g = zarr_store.open_store_as_zarr_group(store, group="01N")
     assert (g["embeddings"][0, 0:_CHUNK, 0:_CHUNK, :] == 0).all()  # 2023 untouched
 
 
@@ -92,8 +92,8 @@ def test_commit_with_rebase_resolves_concurrent_disjoint_commits(tmp_path):
     # Two sessions from the same tip write disjoint groups; both must commit.
     s1 = repo.writable_session("main")
     s2 = repo.writable_session("main")
-    zarr.open_group(s1.store, mode="a")["32601"]["embeddings"][2, 0:_CHUNK, 0:_CHUNK, :] = 1
-    zarr.open_group(s2.store, mode="a")["32701"]["embeddings"][2, 0:_CHUNK, 0:_CHUNK, :] = 2
+    zarr.open_group(s1.store, mode="a")["01N"]["embeddings"][2, 0:_CHUNK, 0:_CHUNK, :] = 1
+    zarr.open_group(s2.store, mode="a")["01S"]["embeddings"][2, 0:_CHUNK, 0:_CHUNK, :] = 2
     id1 = commit_with_rebase(s1, "write zone A")
     id2 = commit_with_rebase(s2, "write zone B")  # tip moved -> auto-rebase
     assert id1 and id2 and id1 != id2
@@ -103,6 +103,6 @@ def test_write_year_shards_behind_gate(tmp_path):
     store, repo = _seed(tmp_path)
     gate = threading.Semaphore(2)
     sid = write_year_shards(
-        repo, "32601", year_index=2, source=_OneInnerChunkSource(), n_workers=1, gate=gate, shard_px=_SHARD
+        repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, gate=gate, shard_px=_SHARD
     )
     assert isinstance(sid, str) and sid

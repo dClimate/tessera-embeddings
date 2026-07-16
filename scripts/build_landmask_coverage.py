@@ -19,7 +19,8 @@ Subcommands::
     ./scripts/build_landmask_coverage.py validate --dest s3://.../masks/global.icechunk
 
 Credentials use the ambient AWS chain (env / instance profile). ``--zones`` (a
-comma-separated EPSG list) restricts build/validate for a quick local run.
+comma-separated list of UTM common names, e.g. ``33N,15S``) restricts
+build/validate for a quick local run.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from tessera_embeddings.ingest.land_mask import (
     spot_check_delivery,
     validate_coverage,
 )
+from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 log = logging.getLogger("build_landmask_coverage")
 
@@ -46,7 +48,7 @@ def _registry_uri(args: argparse.Namespace) -> str:
 
 
 def _zones(args: argparse.Namespace) -> list[str] | None:
-    return [z.strip() for z in args.zones.split(",") if z.strip()] if args.zones else None
+    return [canonicalize_zone(z) for z in args.zones.split(",") if z.strip()] if args.zones else None
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -92,12 +94,16 @@ def main(argv: list[str] | None = None) -> int:
 
     p_build = sub.add_parser("build", help="Build per-zone coverage bitmaps into --dest.")
     p_build.add_argument("--dest", required=True, help="Coverage Icechunk repo URI.")
-    p_build.add_argument("--zones", default=None, help="Comma-separated EPSG list (default: all 120).")
+    p_build.add_argument(
+        "--zones", default=None, help="Comma-separated UTM common names, e.g. 33N,15S (default: all 120)."
+    )
     p_build.set_defaults(func=cmd_build)
 
     p_validate = sub.add_parser("validate", help="Self-check a built coverage store.")
     p_validate.add_argument("--dest", required=True, help="Coverage Icechunk repo URI.")
-    p_validate.add_argument("--zones", default=None, help="Comma-separated EPSG list (default: all 120).")
+    p_validate.add_argument(
+        "--zones", default=None, help="Comma-separated UTM common names, e.g. 33N,15S (default: all 120)."
+    )
     p_validate.set_defaults(func=cmd_validate)
 
     args = parser.parse_args(argv)
