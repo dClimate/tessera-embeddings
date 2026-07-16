@@ -9,7 +9,7 @@ stay attributable after clusters tear down. All runs: Iowa ROI
 |---|---|---|---|---|---|
 | `a85be572e2fb` | 2026-07-16 21:14→ | `main` | 3584 | 404 (complete) | **Baseline.** Phase-0 measurements: ~50–60 s GPU-idle overhead/chunk, TENSO 0.12–0.26, 9.6–13.3K px/s. Full run incl. assembly. |
 | `526db07f32be` | 2026-07-16 22:35→ | branch @ `3be909f` (Phase 1 only) | 7168 | ~25 (cancelled early, no assembly) | **Phase-1 gate.** Prologue hidden (pref=Y rows: gap 0.0 s, overhead ≈ write only ~7 s); TENSO 0.42–0.47; CPU prep (get_batch 600–650 ms) gates inference — the Phase-2 target. Cancelled deliberately after verification. |
-| _(fill when known)_ | 2026-07-16 ~23:55→ | branch @ `c816866` (Phases 1+2+3) | 7168 | — | **Phase-2+3 gate** (cluster `c884a457`, flow run `5d7cbc67`). Tarball fingerprint-verified (PREFETCH_DEPTH, `_pipelined_gpu_loop`, `_fused_weights`, `_local_resample_matrix`). |
+| `b826a6b3a44a` | 2026-07-16 ~23:55→ | branch @ `c816866` (Phases 1+2+3) | 7168 | — | **Phase-2+3 gate** (cluster `c884a457`, flow run `5d7cbc67`). Tarball fingerprint-verified (PREFETCH_DEPTH, `_pipelined_gpu_loop`, `_fused_weights`, `_local_resample_matrix`). Gate comparison: vs `526db07f32be`, same-config thresholds. |
 | _(fill when known)_ | 2026-07-17 ~00:1x→ | `main` | 3584 | — | **Baseline re-run WITH assembly** (flow run `1e00dc16`, prod task def). The first baseline completed inference but was torn down before assembly — no final zarr; its staging (`a85be572e2fb`) survives. This re-run may resume from that staging or mint a new run-id — confirm on first stage write. |
 
 Measured 2026-07-16, batch-size-only delta (baseline 3584 vs P1-gate 7168, 3 chunks,
