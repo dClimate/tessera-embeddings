@@ -19,6 +19,7 @@ import icechunk
 import zarr
 from prefect import flow, get_run_logger
 
+from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.storage.campaign import campaign_status
 from tessera_embeddings.storage.global_store import create_global_repo, open_global_repo, seed_zone_groups
@@ -40,13 +41,21 @@ def seed_global_store(
         paths: Deployment storage contract; the repo is ``paths.global_store(name)``.
         name: Global-store repo basename (default ``"tessera"``).
         years: Campaign year axis to pre-allocate on each group (fixed at seeding).
-        model_version: Optional model-version attr stamped on each group.
+        model_version: Model-identity attr stamped as ``checkpoint_id`` on the root.
+            Defaults to :func:`checkpoint_filename` so the fill's model gate can
+            distinguish the concrete checkpoint (the ``aws``/``mpc`` v1.1 checkpoints
+            share one ``geoemb:model`` URL); without it the checkpoint gate is a
+            no-op. Override to record a custom identity.
 
     Returns:
         Summary: store path, zones seeded this run, zones already present, total.
     """
     log = get_run_logger()
     store_path = paths.global_store(name)
+    # Default the recorded checkpoint identity to the build's checkpoint filename so
+    # the fill's checkpoint gate is effective by default (it only compares when the
+    # store carries a checkpoint_id). geoemb:model alone can't tell aws from mpc.
+    model_version = model_version or checkpoint_filename()
 
     # Open-or-create with the global config (manifest split + preload). A missing
     # repo raises on open; create_global_repo persists the config via save_config.

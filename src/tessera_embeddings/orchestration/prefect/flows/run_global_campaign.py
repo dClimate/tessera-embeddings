@@ -221,15 +221,46 @@ async def run_global_campaign(
         except Exception as exc:  # best-effort — degrade to a config-only fingerprint
             log.warning("Could not read coverage delivery sha for the staging fingerprint (%s) — config-only", exc)
 
+    def _mosaic_identity(zone: str, year: int) -> str | None:
+        # What identifies the MOSAIC the fill will read, for the staging fingerprint:
+        #  - ingest=True: the coverage delivery sha — ingest_zone_year rebuilds the
+        #    mosaic deterministically from the coverage + config, so the sha (plus the
+        #    config in the key) pins it.
+        #  - ingest=False: the mosaic is an EXTERNAL input we didn't produce, so the
+        #    coverage sha says nothing about it. Fingerprint its own identity
+        #    (reflectance `last_appended`) so replacing the prebuilt mosaic and
+        #    rerunning with the same config starts a fresh staging prefix instead of
+        #    resuming tiles computed from the old mosaic. Best-effort per-cell read.
+        if ingest:
+            return coverage_sha
+        try:
+            refl = open_store_as_zarr_group(
+                f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}/reflectance.zarr",
+                get_credentials=iam_icechunk_credentials,
+            )
+            return cast("str | None", refl.attrs.get("last_appended"))
+        except Exception as exc:
+            log.warning(
+                "Could not read prebuilt mosaic identity for %s-%d (%s) — config-only fingerprint", zone, year, exc
+            )
+            return None
+
     def _staging_run_id(zone: str, year: int) -> str:
         # Fingerprint the staging run_id with the inputs that determine the embeddings
         # so a retry after a failed fill RESUMES stale staging only when the inputs are
-        # unchanged. A changed threshold / orbit / window / checkpoint, or a new
-        # coverage delivery (which ingest_zone_year rebuilds the mosaic for), yields a
-        # different fingerprint → a fresh staging prefix → no old tiles resumed under
-        # new inputs. Still cell-unique (zone, year) so retries with identical inputs
-        # resume the same prefix (and it stays findable for cleanup).
-        key = (year, min_valid_coverage, s1_orbit, allow_partial_window, checkpoint_filename(), coverage_sha)
+        # unchanged. A changed threshold / orbit / window / checkpoint, a new coverage
+        # delivery, or (ingest=False) a replaced prebuilt mosaic yields a different
+        # fingerprint → a fresh staging prefix → no old tiles resumed under new inputs.
+        # Still cell-unique (zone, year) so retries with identical inputs resume the
+        # same prefix (and it stays findable for cleanup).
+        key = (
+            year,
+            min_valid_coverage,
+            s1_orbit,
+            allow_partial_window,
+            checkpoint_filename(),
+            _mosaic_identity(zone, year),
+        )
         return f"{zone}-{year}-{hashlib.sha256(repr(key).encode()).hexdigest()[:8]}"
 
     def _fill_params(zone: str, year: int) -> dict[str, Any]:
@@ -304,9 +335,11 @@ async def run_global_campaign(
                 frun = await arun_deployment(fill_deployment, parameters=_fill_params(zone, year))
                 _check_completed(frun, f"fill {zone}-{year}")
             # Only delete a mosaic THIS campaign produced: with ingest=False the mosaic
-            # is an upstream input we must not remove.
+            # is an upstream input we must not remove. Offload the blocking s5cmd/fsspec
+            # delete to a thread so a multi-TB mosaic teardown doesn't stall the event
+            # loop (freezing every other zone's deployment waits) while it runs.
             if did_ingest and cleanup_mosaics:
-                delete_prefix(f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}", log=log)
+                await asyncio.to_thread(delete_prefix, f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}", log=log)
             return str(frun.id)
 
     # Descending: the campaign fills the current year first, then backwards

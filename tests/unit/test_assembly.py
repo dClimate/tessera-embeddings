@@ -1303,11 +1303,12 @@ class TestScanExistingStagedChunks:
         with pytest.raises(RuntimeError, match="missing variable 'scales'"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
 
-    def test_missing_completion_marker_rejected(self, tmp_path):
-        """A tile with all required arrays present + correct shape/dtype but NO
-        completion marker is a partial write (to_zarr can create array metadata
-        before all chunk objects) — it must be rejected, not resumed with silent
-        fill-value holes.
+    def test_missing_completion_marker_triggers_reinference(self, tmp_path):
+        """A markerless tile (crash before the completion marker) is EXCLUDED from
+        the valid set — so run_inference regenerates it (write_chunk's mode="w"
+        overwrites the partial) — rather than raising, which, with the stable
+        input-fingerprinted run_id, would re-fire on the same artifact every retry
+        and wedge the cell until manual deletion.
         """
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = self.CHUNKS[0]
@@ -1315,16 +1316,18 @@ class TestScanExistingStagedChunks:
         # Strip only the completion marker — the arrays still look complete.
         group = zarr.open_group(writer._staging_path("run1", chunk), mode="a")
         del group.attrs["staged_complete"]
-        with pytest.raises(RuntimeError, match="no staged_complete marker"):
-            writer.scan_existing_staged_chunks("run1", self.CHUNKS)
+        # Does NOT raise; the markerless tile is simply not counted valid.
+        result = writer.scan_existing_staged_chunks("run1", self.CHUNKS)
+        assert chunk.label not in result
 
     def test_invalid_shape_raises(self, tmp_path):
-        """Staged chunk with wrong shape raises RuntimeError listing the bad path."""
+        """A COMPLETE staged chunk (marker present) with wrong shape raises."""
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = self.CHUNKS[0]
         # Write valid chunk first
         self._stage_chunk(writer, chunk, "run1")
-        # Overwrite with wrong shape
+        # Overwrite with wrong shape, then re-stamp the completion marker so it is a
+        # COMPLETE-but-structurally-wrong tile (a markerless one would just re-infer).
         bad = np.zeros((5, 5, EMBEDDING_DIM), dtype=np.float32)
         path = writer._staging_path("run1", chunk)
         ds = xr.Dataset(
@@ -1332,6 +1335,7 @@ class TestScanExistingStagedChunks:
             coords={"northing": np.arange(5), "easting": np.arange(5), "band": np.arange(EMBEDDING_DIM)},
         )
         ds.to_zarr(path, mode="w")
+        zarr.open_group(path, mode="a").attrs["staged_complete"] = True
 
         with pytest.raises(RuntimeError, match="invalid staged chunk"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
@@ -1347,6 +1351,7 @@ class TestScanExistingStagedChunks:
             coords={"northing": np.arange(10), "easting": np.arange(10), "band": np.arange(EMBEDDING_DIM)},
         )
         ds.to_zarr(path, mode="w")
+        zarr.open_group(path, mode="a").attrs["staged_complete"] = True  # a COMPLETE-but-invalid tile
 
         with pytest.raises(RuntimeError, match="missing variable 'embeddings'"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
@@ -1382,6 +1387,7 @@ class TestScanExistingStagedChunks:
                 coords={"northing": np.arange(5), "easting": np.arange(5), "band": np.arange(EMBEDDING_DIM)},
             )
             ds.to_zarr(path, mode="w")
+            zarr.open_group(path, mode="a").attrs["staged_complete"] = True  # COMPLETE but wrong shape
 
         with pytest.raises(RuntimeError, match="2 invalid staged chunk") as exc_info:
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)

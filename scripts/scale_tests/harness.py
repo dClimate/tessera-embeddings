@@ -398,8 +398,22 @@ def _marker(cfg: RunConfig, test: str, phase: str) -> Path:
 
 
 def phase_done(cfg: RunConfig, test: str, phase: str) -> bool:
-    """True if this (test, phase) already completed in a prior run."""
-    return _marker(cfg, test, phase).exists()
+    """True if this (test, phase) already completed in a prior run.
+
+    Checks the local marker first, then — for an S3 run — the mirrored marker under
+    ``s3_results_root``. A bench run resumed on a fresh EC2 host has an empty local
+    results dir, but ``mark_phase_done`` mirrored the marker to S3; without the S3
+    check the phase would rerun and clobber the same stores (the cost the marker
+    exists to avoid).
+    """
+    if _marker(cfg, test, phase).exists():
+        return True
+    if cfg.is_s3:
+        try:
+            return bool(fsspec.filesystem("s3").exists(f"{cfg.s3_results_root}/{test}/{phase}.done"))
+        except Exception as exc:
+            logger.warning("Could not check S3 phase marker for %s/%s: %s", test, phase, exc)
+    return False
 
 
 def mark_phase_done(cfg: RunConfig, test: str, phase: str) -> None:

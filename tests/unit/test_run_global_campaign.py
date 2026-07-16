@@ -101,6 +101,27 @@ def test_fill_run_id_is_stable_and_input_fingerprinted(wired):
     assert changed.startswith("33N-2025-") and changed != base  # input change → new prefix
 
 
+def test_ingest_false_run_id_tracks_prebuilt_mosaic_identity(wired, monkeypatch):
+    """With ingest=False the staging fingerprint tracks the prebuilt mosaic's own
+    identity (reflectance last_appended), so replacing the mosaic and rerunning with
+    the same config yields a FRESH staging prefix (no stale-tile resume).
+    """
+
+    def _run_with_mosaic_ts(ts: str) -> str:
+        monkeypatch.setattr(
+            mod,
+            "open_store_as_zarr_group",
+            lambda *a, **k: SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": ts}),
+        )
+        wired["arun"].clear()
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False))
+        return next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
+
+    rid1 = _run_with_mosaic_ts("2026-01-01T00:00:00Z")
+    rid2 = _run_with_mosaic_ts("2026-06-01T00:00:00Z")  # mosaic replaced → new last_appended
+    assert rid1.startswith("33N-2025-") and rid1 != rid2
+
+
 def test_default_run_rejects_unseeded_work_zone(wired, monkeypatch):
     """A partially-seeded store (default zones=None) fails BEFORE any ingest when the
     work list includes an unseeded zone — not after an expensive per-cell ingest.

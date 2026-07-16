@@ -748,38 +748,45 @@ class ZarrWriter:
         run_id: str,
         chunk: ChunkSpec,
         required_vars: list[str],
-    ) -> str | None:
+    ) -> tuple[str, str] | None:
         """Validate a single staged chunk Zarr.
 
-        Returns:
-            ``None`` if valid, or a string describing the problem.
+        Returns ``None`` if the tile is complete and valid, else ``(kind, reason)``:
+
+        - ``("incomplete", ...)`` — a crash artifact: unopenable, or missing the
+          ``staged_complete`` marker (to_zarr can create array metadata before all
+          chunk objects, so a crash leaves gaps read as fill). The caller RE-INFERS
+          it (``write_chunk``'s ``mode="w"`` overwrites) rather than raising — with
+          the stable, input-fingerprinted run_id a raise would wedge every retry on
+          the same partial artifact.
+        - ``("invalid", ...)`` — a COMPLETE tile (marker present) that is
+          structurally wrong (missing var / shape / dtype). The caller raises: this
+          is a real anomaly (e.g. a stale wrong-grid store), not a resumable crash.
         """
         path = self._staging_path(run_id, chunk)
         try:
             group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
-            for var in required_vars:
-                if var not in group:
-                    return f"missing variable '{var}'"
-                arr: zarr.Array = group[var]  # type: ignore[assignment]
-                # scales is a 2-D per-pixel factor (H, W); embeddings/embedding_std
-                # carry the band dim (H, W, band). Validating scales against the 3-D
-                # shape would false-reject every valid tile.
-                expected_shape = (
-                    (chunk.height, chunk.width) if var == "scales" else (chunk.height, chunk.width, self.embedding_dim)
-                )
-                if arr.shape != expected_shape:
-                    return f"'{var}' shape {arr.shape} != expected {expected_shape}"
-                expected_dtype = np.int8 if var == "embeddings" else np.float32
-                if arr.dtype != expected_dtype:
-                    return f"'{var}' dtype {arr.dtype} != expected {expected_dtype}"
-            # Presence/shape/dtype pass, but to_zarr can write array metadata before
-            # all chunk objects — so a crash can leave gaps that read as fill. The
-            # completion marker (written last by write_chunk) is the only signal that
-            # every chunk landed; without it the tile is a partial write, not valid.
-            if not group.attrs.get("staged_complete"):
-                return "incomplete write (no staged_complete marker) — a crash mid-write_chunk left partial chunks"
-        except Exception as exc:
-            return f"failed to open: {exc}"
+        except Exception as exc:  # an unopenable staged zarr is a partial write; re-infer it
+            return ("incomplete", f"could not open (partial write?): {exc}")
+        # The completion marker (written last by write_chunk) is the authority on
+        # whether every chunk landed. Absent → a crashed write → re-infer.
+        if not group.attrs.get("staged_complete"):
+            return ("incomplete", "no staged_complete marker — a crash mid-write_chunk left partial chunks")
+        for var in required_vars:
+            if var not in group:
+                return ("invalid", f"missing variable '{var}'")
+            arr: zarr.Array = group[var]  # type: ignore[assignment]
+            # scales is a 2-D per-pixel factor (H, W); embeddings/embedding_std carry
+            # the band dim (H, W, band). Validating scales against the 3-D shape
+            # would false-reject every valid tile.
+            expected_shape = (
+                (chunk.height, chunk.width) if var == "scales" else (chunk.height, chunk.width, self.embedding_dim)
+            )
+            if arr.shape != expected_shape:
+                return ("invalid", f"'{var}' shape {arr.shape} != expected {expected_shape}")
+            expected_dtype = np.int8 if var == "embeddings" else np.float32
+            if arr.dtype != expected_dtype:
+                return ("invalid", f"'{var}' dtype {arr.dtype} != expected {expected_dtype}")
         return None
 
     def scan_existing_staged_chunks(
@@ -833,11 +840,18 @@ class ZarrWriter:
             if chunk is None:
                 invalid_paths.append((f"{label}.zarr", "no matching ChunkSpec (stale chunk from a different grid?)"))
                 continue
-            reason = self._validate_staged_chunk(run_id, chunk, required_vars)
-            if reason:
-                invalid_paths.append((f"{label}.zarr", reason))
-            else:
+            result = self._validate_staged_chunk(run_id, chunk, required_vars)
+            if result is None:
                 valid.add(label)
+            elif result[0] == "incomplete":
+                # A crash artifact (no completion marker / unopenable): EXCLUDE it so
+                # run_inference regenerates it (write_chunk's mode="w" overwrites the
+                # partial). Do NOT raise — with the stable, input-fingerprinted run_id
+                # a raise would re-fire on the same artifact every retry, wedging the
+                # cell until manual deletion.
+                _log.warning("Staged tile %s is incomplete (%s) — will re-infer (overwrite)", label, result[1])
+            else:  # "invalid" — a COMPLETE tile that is structurally wrong: needs attention.
+                invalid_paths.append((f"{label}.zarr", result[1]))
 
         for label in skip_marker_labels:
             if label not in chunk_by_label:
