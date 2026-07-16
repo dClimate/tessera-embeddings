@@ -166,11 +166,15 @@ def _configure_actor_logging() -> None:
     )
     for noisy in ("zarr", "zarr.group", "icechunk", "botocore", "s3transfer", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # Derive from this module's package so the names survive renames — these
+    # were once hardcoded to a stale "src.inference.*" prefix, which silently
+    # disabled every DEBUG diagnostic (TIMING, EFFECTIVE TFLOPS, autocast probe).
+    pkg = __name__.rsplit(".", 1)[0]  # tessera_embeddings.inference
     for name in (
-        "src.inference.inference",
-        "src.inference.profiling",
-        "src.inference.models.modules",
-        "src.inference.models.ssl_model",
+        f"{pkg}.inference",
+        f"{pkg}.profiling",
+        f"{pkg}.models.modules",
+        f"{pkg}.models.ssl_model",
     ):
         logging.getLogger(name).setLevel(logging.DEBUG)
 
