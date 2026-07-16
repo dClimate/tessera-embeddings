@@ -257,6 +257,32 @@ class TestQueryCmrGranules:
         _, kwargs2 = mock_get.call_args_list[1]
         assert kwargs2["headers"]["CMR-Search-After"] == "token123"
 
+    def test_normal_bbox_queries_once(self):
+        """A west<east bbox issues a single CMR query (no antimeridian split)."""
+        with patch(
+            "tessera_embeddings.ingest.opera_query._query_cmr_granules_one", return_value=[]
+        ) as one:
+            _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "ascending")
+        one.assert_called_once()
+
+    def test_antimeridian_bbox_splits_and_dedupes(self):
+        """A west>east (antimeridian) bbox is split at ±180 into two CMR-valid
+        boxes and their granules merged with dedup — CMR reads bounding_box as
+        lower-left/upper-right, so a single west>east query would match nothing.
+        """
+        calls: list[tuple] = []
+
+        def fake_one(bbox, start, end, orbit):
+            calls.append(bbox)
+            # West half returns g1; east half returns g1 (shared burst) + g2.
+            return [MagicMock(id="g1")] if bbox[0] >= 170.0 else [MagicMock(id="g1"), MagicMock(id="g2")]
+
+        with patch("tessera_embeddings.ingest.opera_query._query_cmr_granules_one", side_effect=fake_one):
+            items = _query_cmr_granules((170.0, -10.0, -170.0, 10.0), "2024-01-01", "2024-01-15", "ascending")
+
+        assert calls == [(170.0, -10.0, 180.0, 10.0), (-180.0, -10.0, -170.0, 10.0)]
+        assert {i.id for i in items} == {"g1", "g2"}  # shared granule deduped across halves
+
     def test_empty_response(self):
         patcher, _ = _patch_cmr_session(return_value=_cmr_response([]))
         with patcher:

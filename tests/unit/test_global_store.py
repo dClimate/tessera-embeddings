@@ -117,6 +117,19 @@ def test_reseed_with_different_model_rejected(tmp_path):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,), model_version="v2")
 
 
+def test_reseed_with_different_axis_rejected(tmp_path):
+    """The time axis is fixed + uniform across groups (ADR-008 D1): a direct
+    incremental seed with a different `years` than already-seeded groups is
+    rejected at the helper (not only in the seed_global_store flow).
+    """
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2024, 2025))
+    global_store.seed_zone_groups(repo, [_ZB], years=(2024, 2025))  # same axis: fine
+    with pytest.raises(ValueError, match="existing axis"):
+        global_store.seed_zone_groups(repo, [_ZB], years=(2025,))
+
+
 def test_global_store_config_has_time_split_and_preload():
     cfg = zarr_store.global_store_config()
     assert cfg.manifest is not None

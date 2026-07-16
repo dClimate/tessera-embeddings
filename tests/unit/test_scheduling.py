@@ -54,6 +54,24 @@ def _do_replace(pool: ActorPool, actor_idx: int = 0) -> None:
         pool.replace(actor_idx, "i-dead")
 
 
+def test_replace_carries_credentials_and_region_to_new_actor():
+    """A replacement actor (after a chunk failure/OOM) must inherit the pool's
+    credentials AND s3_region, else a non-default-region retry opens the mosaic in
+    the default region and re-fails the remaining chunks.
+    """
+    creds = object()
+    pool = _make_pool(get_credentials=creds, s3_region="eu-west-1")
+    mock_actor = MagicMock()
+    mock_actor.get_instance_id.remote.return_value = MagicMock()
+    with patch.object(_sched_mod, "InferenceActor") as cls:
+        cls.options.return_value.remote.return_value = mock_actor
+        pool.replace(0, "i-dead")
+    # .remote(config, checkpoint_path, get_credentials, s3_region)
+    args = cls.options.return_value.remote.call_args.args
+    assert args[2] is creds
+    assert args[3] == "eu-west-1"
+
+
 # ===========================================================================
 # _poll_tracker
 # ===========================================================================

@@ -233,19 +233,51 @@ def _query_cmr_granules(
 ) -> list[Item]:
     """Query the CMR Granule Search API for OPERA items in a bbox/date/orbit.
 
-    Pages cleanly at ``_CMR_PAGE_SIZE`` against ``cmr.earthdata.nasa.gov``,
-    using the ``CMR-Search-After`` header for pagination and ``attribute[]``
-    for server-side orbit-direction filtering. Returns fully-built pystac
-    ``Item`` objects so callers never touch CMR-STAC search.
+    CMR's ``bounding_box`` is lower-left/upper-right (west,south,east,north) and
+    does NOT read a west>east box as antimeridian-crossing — it would match
+    nothing. An ROI whose live-tile envelope crosses ±180° (zones 01*/60*) is
+    stored with a GeoJSON-style west>east bbox (see ``land_mask.export_zone_roi``),
+    so here we split it at the antimeridian into two CMR-valid boxes and merge
+    (dedup by granule id). A normal box queries once.
 
     Args:
-        bbox: (west, south, east, north) in WGS84 degrees.
+        bbox: (west, south, east, north) in WGS84 degrees; west>east = crosses ±180°.
         start_date: Start date (YYYY-MM-DD).
         end_date: End date (YYYY-MM-DD).
         orbit_direction: "ascending" or "descending".
 
     Returns:
         List of pystac ``Item`` objects matching the orbit direction.
+    """
+    west, south, east, north = bbox
+    if west > east:
+        left = _query_cmr_granules_one((west, south, 180.0, north), start_date, end_date, orbit_direction)
+        right = _query_cmr_granules_one((-180.0, south, east, north), start_date, end_date, orbit_direction)
+        merged: list[Item] = []
+        seen: set[str] = set()
+        for item in (*left, *right):
+            if item.id not in seen:
+                seen.add(item.id)
+                merged.append(item)
+        logger.info(
+            f"CMR granule query ({orbit_direction}): antimeridian bbox split into 2 → "
+            f"{len(merged)} unique items ({len(left)}+{len(right)} pre-dedup)"
+        )
+        return merged
+    return _query_cmr_granules_one(bbox, start_date, end_date, orbit_direction)
+
+
+def _query_cmr_granules_one(
+    bbox: tuple[float, float, float, float],
+    start_date: str,
+    end_date: str,
+    orbit_direction: str,
+) -> list[Item]:
+    """Query CMR for OPERA items in ONE (west<=east) bbox, paging all results.
+
+    Pages cleanly at ``_CMR_PAGE_SIZE`` against ``cmr.earthdata.nasa.gov``,
+    using the ``CMR-Search-After`` header for pagination and ``attribute[]``
+    for server-side orbit-direction filtering.
     """
     params: dict[str, str | int] = {
         "short_name": _CMR_OPERA_SHORT_NAME,

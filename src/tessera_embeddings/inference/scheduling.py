@@ -43,6 +43,7 @@ class ActorPool:
         idle_grace_sec: int = 120,
         on_retire: Callable[[str], None] | None = None,
         get_credentials: Callable[[], Any] | None = None,
+        s3_region: str | None = None,
     ) -> None:
         """Initialise the pool from already-ready actor handles.
 
@@ -58,6 +59,10 @@ class ActorPool:
             get_credentials: Optional icechunk S3 credential provider injected
                 into every actor (including replacements) so store opens refresh
                 credentials. See :class:`InferenceActor`.
+            s3_region: Optional S3 region injected into every actor (including
+                replacements) so a non-default-region fill's reads — and the
+                retries after a chunk failure/OOM — open the mosaic in the right
+                region. See :class:`InferenceActor`.
         """
         self.actors = actors
         self.actor_instance_ids = actor_instance_ids
@@ -66,6 +71,7 @@ class ActorPool:
         self.idle_grace_sec = idle_grace_sec
         self._on_retire = on_retire
         self._get_credentials = get_credentials
+        self._s3_region = s3_region
 
         self.actor_deaths: int = 0
 
@@ -325,7 +331,7 @@ class ActorPool:
             ray.kill(self.actors[actor_idx])
 
         new_actor = InferenceActor.options(num_gpus=self.config.num_gpus).remote(  # type: ignore[attr-defined]
-            self.config, self.config.checkpoint_path, self._get_credentials
+            self.config, self.config.checkpoint_path, self._get_credentials, self._s3_region
         )
         self.actors[actor_idx] = new_actor
         self.mark_initializing(actor_idx, placeholder_iid=f"pending-replacement-of-{instance_id}")
@@ -548,6 +554,7 @@ def _process_chunks_work_stealing(
     still_initializing: set[int] | None = None,
     on_actor_retire: Callable[[str], None] | None = None,
     get_credentials: Callable[[], Any] | None = None,
+    s3_region: str | None = None,
     actor_factory: Callable[[int], list[ray.actor.ActorHandle]] | None = None,
     total_actors_target: int | None = None,
     placement_timeout_sec: float = 300.0,
@@ -585,6 +592,8 @@ def _process_chunks_work_stealing(
             Used to consistently and swiftly terminate EC2 instances and save compute costs
         get_credentials: Optional icechunk S3 credential provider injected into
             every actor (seeded and replacement) so store opens refresh creds.
+        s3_region: Optional S3 region injected into every actor (seeded and
+            replacement) so reads open the mosaic in the caller's region.
         actor_factory: Optional callable ``(n) -> [handles]`` that requests ``n``
             new actors. When provided (with ``total_actors_target``), the loop
             requests actors in batches: the caller supplies the first batch, and
@@ -606,7 +615,13 @@ def _process_chunks_work_stealing(
     chunk_by_label = {c.label: c for c in chunks}
 
     pool = ActorPool(
-        actors, actor_instance_ids, config, log, on_retire=on_actor_retire, get_credentials=get_credentials
+        actors,
+        actor_instance_ids,
+        config,
+        log,
+        on_retire=on_actor_retire,
+        get_credentials=get_credentials,
+        s3_region=s3_region,
     )
 
     # Mark actors that haven't finished __init__ yet. seed() skips them —

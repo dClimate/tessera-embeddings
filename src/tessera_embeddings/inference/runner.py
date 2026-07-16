@@ -181,6 +181,7 @@ def run_inference(
             still_initializing=still_initializing,
             on_actor_retire=on_actor_retire,
             get_credentials=get_credentials,
+            s3_region=s3_region,
             actor_factory=actor_factory,
             total_actors_target=num_actors,
             placement_timeout_sec=config.actor_batch_placement_timeout_sec,

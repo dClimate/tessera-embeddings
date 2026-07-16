@@ -22,6 +22,7 @@ their CRS and grid differ by zone.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from typing import cast
 
 import icechunk
 import numpy as np
@@ -30,7 +31,7 @@ import zarr
 from tessera_embeddings.config.store_layout import GLOBAL, StoreLayout
 from tessera_embeddings.inference.conventions import build_convention_attrs, build_geoemb_root_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
-from tessera_embeddings.storage.zarr_store import _create_storage, global_store_config
+from tessera_embeddings.storage.zarr_store import _create_storage, global_store_config, read_time_values
 from tessera_embeddings.storage.zone_grid import (
     CAMPAIGN_YEARS,
     PIXEL_M,
@@ -40,6 +41,7 @@ from tessera_embeddings.storage.zone_grid import (
     calendar_year_times,
     easting_coords,
     northing_coords,
+    year_of,
 )
 
 
@@ -202,6 +204,23 @@ def seed_zone_groups(
                 f"would change {mismatched}. Seed a fresh store for a new encoder (mixing encoders under "
                 "one store would corrupt already-published zones)."
             )
+    # The time axis is fixed and UNIFORM across all zone groups (ADR-008 D1):
+    # campaign status/fill code assumes every group shares one axis. A direct
+    # incremental seed passing a different `years` than the groups already present
+    # would silently leave a mixed-axis store, so validate against any seeded group
+    # here — not only in the seed_global_store flow's retry guard, which a
+    # lower-level caller bypasses.
+    for gname in root.group_keys():
+        grp = cast("zarr.Group", root[gname])
+        if "time" not in grp:
+            continue
+        existing_years = tuple(year_of(t) for t in read_time_values(grp))
+        if existing_years != tuple(years):
+            raise ValueError(
+                f"years {tuple(years)} differ from the store's existing axis {existing_years} — the time axis "
+                "is fixed at seeding (ADR-008 D1); seeding more groups with a different axis would corrupt it."
+            )
+        break  # all groups share one axis (invariant) — one check suffices
     times = calendar_year_times(years)
     nt = len(times)
     band = _layout_band(layout)
