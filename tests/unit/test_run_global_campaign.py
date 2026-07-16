@@ -127,6 +127,24 @@ def test_ingest_false_run_id_tracks_prebuilt_mosaic_identity(wired, monkeypatch)
     assert rid1.startswith("33N-2025-") and rid1 != rid2
 
 
+def test_retag_only_uses_stable_run_id_without_mosaic(wired, monkeypatch):
+    """A retag-only cell (already complete) gets a stable '-retag' run id and does NOT
+    fingerprint the mosaic — which may be cleaned up, so inspecting it would raise
+    before the fill's documented tag repair.
+    """
+    monkeypatch.setattr(
+        mod, "campaign_status", lambda *a, **k: SimpleNamespace(zones={"33N": (2025,)}, has=lambda z, y: True)
+    )
+
+    def _boom(*a, **k):
+        raise AssertionError("retag-only must NOT read the mosaic for a staging fingerprint")
+
+    monkeypatch.setattr(mod, "open_store_as_zarr_group", _boom)
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    fill = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
+    assert fill["run_id"] == "33N-2025-retag"
+
+
 def test_ingest_false_fails_closed_without_mosaic_identity(wired, monkeypatch):
     """ingest=False fails closed when a prebuilt mosaic store carries no identity
     attr — better than fingerprinting a partial view and risking a stale resume.

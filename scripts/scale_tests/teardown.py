@@ -18,16 +18,24 @@ import logging
 import fsspec
 
 from scale_tests import harness
+from tessera_embeddings.storage.object_store import delete_prefix
 
 logger = logging.getLogger("scale_tests.teardown")
 
 
 def _rm_prefix(uri: str) -> tuple[int, int]:
-    """Delete everything under ``uri``; return (objects_before, objects_after)."""
+    """Delete everything under ``uri`` (all versions on S3); return (before, after)."""
     before, _ = harness.object_stats(uri)
     fs, path = harness.fs_and_path(uri)
     if fs.exists(path):
-        fs.rm(path, recursive=True)
+        if uri.startswith("s3://"):
+            # All-version delete: on a versioned bucket `fs.rm(recursive=True)` only
+            # writes delete markers, leaving the (still-billed) object versions behind
+            # even though object_stats then reports the prefix empty. delete_prefix
+            # uses `s5cmd rm --all-versions` (fsspec fallback) so it truly empties.
+            delete_prefix(uri, log=logger, all_versions=True)
+        else:
+            fs.rm(path, recursive=True)
     after, _ = harness.object_stats(uri)
     return before, after
 

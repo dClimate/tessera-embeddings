@@ -96,6 +96,7 @@ def _assert_seeded_model_matches(
     build_checkpoint: str,
     allow_model_mismatch: bool,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None = None,
 ) -> None:
     """Refuse to fill a store seeded for a different encoder/checkpoint than this build.
 
@@ -116,7 +117,7 @@ def _assert_seeded_model_matches(
     gated. Seed with ``model_version=checkpoint_filename()`` to enable checkpoint-level
     gating.
     """
-    root = open_store_as_zarr_group(store_path, get_credentials=get_credentials)
+    root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
     seeded = cast("str | None", root.attrs.get("geoemb:model"))
     expected = expected_model_url()
     if seeded is not None and seeded != expected and not allow_model_mismatch:
@@ -168,6 +169,7 @@ def fill_zone_year_flow(
     code_suffix: str = "",
     num_actors: int = 20,
     s1_orbit: str = "both",
+    s3_region: str | None = None,
     commit_limit_name: str | None = None,
     cleanup_staging: bool = True,
     allow_partial_window: bool = False,
@@ -195,6 +197,8 @@ def fill_zone_year_flow(
         code_suffix: Source-tarball filename suffix (lets branches coexist).
         num_actors: GPU actor count for inference.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
+        s3_region: Optional S3 region for the global store + mosaics, threaded through
+            the preflight reads and the zone-fill runner (default region if None).
         commit_limit_name: Prefect global concurrency limit that bounds the
             fleet's simultaneous committers (D6). ``None`` = ungated (a single
             isolated run has no commit contention).
@@ -242,21 +246,27 @@ def fill_zone_year_flow(
     #    it here (a global-store read) BEFORE standing up a cluster we'd tear
     #    straight back down.
     #  - all-ocean cell (no live tiles): may have no mosaic to probe; fill empty.
-    already_complete = zone_year_complete(store_path, zone, year, get_credentials=iam_icechunk_credentials)
-    on_axis = already_complete or zone_year_on_axis(store_path, zone, year, get_credentials=iam_icechunk_credentials)
+    already_complete = zone_year_complete(
+        store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+    )
+    on_axis = already_complete or zone_year_on_axis(
+        store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+    )
     # Only touch the mask once completion + axis are cleared: an unavailable mask
     # must not block retag-only recovery, and an off-axis year needs no mask.
     has_live = (
-        zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials)
+        zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
         if (on_axis and not already_complete)
         else False
     )
     needs_cluster = on_axis and not already_complete and has_live
 
-    # resolve_s1_orbit probes the mosaics (with the same credential callback the
-    # rest of the fill uses), so only do it when we'll actually infer.
+    # resolve_s1_orbit probes the mosaics (with the same credential callback / region
+    # the rest of the fill uses), so only do it when we'll actually infer.
     resolved_s1 = (
-        resolve_s1_orbit(mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials) if needs_cluster else s1_orbit
+        resolve_s1_orbit(mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
+        if needs_cluster
+        else s1_orbit
     )
     # Default to the strict Jan-Dec calendar-year window for `year` (our global
     # convention: `December {year}` yields a 12-month window spanning Jan-Dec).
@@ -281,6 +291,7 @@ def fill_zone_year_flow(
             build_checkpoint=checkpoint_filename(),
             allow_model_mismatch=allow_model_mismatch,
             get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
         )
         # Fail loudly on a partial/absent mosaic BEFORE provisioning Ray: a
         # zone-wide mosaic missing months is an ingest failure, and the write-once
@@ -294,6 +305,7 @@ def fill_zone_year_flow(
             s1_orbit=resolved_s1,
             skip_coverage_check=allow_partial_window,
             get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
         )
 
     gate = _PrefectCommitGate(commit_limit_name) if commit_limit_name else None
@@ -316,6 +328,7 @@ def fill_zone_year_flow(
         "cleanup_staging": cleanup_staging,
         "s3_concurrency": s3_concurrency,
         "get_credentials": iam_icechunk_credentials,
+        "s3_region": s3_region,
     }
 
     if not needs_cluster:

@@ -311,6 +311,14 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     for tile, path in payload["tiles"]:
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
         staged = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
+        # Require the completion marker here too (the single-ROI assemble path): a
+        # crash-partial tile has array metadata but missing chunks that read as fill,
+        # and the listing-based verification can't see that. The open already happens.
+        if not staged.attrs.get("staged_complete"):
+            raise IncompleteStageError(
+                f"Staged tile {path} lacks the staged_complete marker — a crashed write_chunk left partial "
+                "chunks (read as fill). Assembling it would publish silent holes; re-infer the tile first."
+            )
         for var, arr in arrays.items():
             staged_arr = cast(zarr.Array, staged[var])
             # Validate dtype before assigning: zarr would silently CAST a float
@@ -919,6 +927,13 @@ class ZarrWriter:
                 # variable from the output; a chunk that should exist but can't be
                 # opened is a corrupt/partial stage and must be loud.
                 raise IncompleteStageError(f"Cannot open staged chunk {path}: {exc}") from exc
+            # Reject a crash-partial tile up front (same marker the data read requires):
+            # array metadata can exist before all chunks, so a markerless tile would
+            # otherwise pass this probe and be assembled with fill-value holes.
+            if not group.attrs.get("staged_complete"):
+                raise IncompleteStageError(
+                    f"Staged chunk {path} lacks the staged_complete marker — re-infer it before assembly."
+                )
             found = {v for v in var_names if v in group}
             if present is None:
                 present, first_label = found, chunk.label

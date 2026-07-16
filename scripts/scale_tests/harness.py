@@ -410,7 +410,13 @@ def phase_done(cfg: RunConfig, test: str, phase: str) -> bool:
         return True
     if cfg.is_s3:
         try:
-            return bool(fsspec.filesystem("s3").exists(f"{cfg.s3_results_root}/{test}/{phase}.done"))
+            if fsspec.filesystem("s3").exists(f"{cfg.s3_results_root}/{test}/{phase}.done"):
+                # The marker is only in S3 (fresh-host resume). Pull the mirrored
+                # result files (the phase's JSONL metrics) down so report.py — which
+                # reads ONLY the local results_dir — doesn't show this completed phase
+                # as missing/no-data.
+                _sync_results_from_s3(cfg, test)
+                return True
         except Exception as exc:
             logger.warning("Could not check S3 phase marker for %s/%s: %s", test, phase, exc)
     return False
@@ -435,6 +441,27 @@ def _mirror_to_s3(cfg: RunConfig, test: str) -> None:
             fs.put_file(str(f), f"{dest}/{f.name}")
     except Exception as exc:
         logger.warning("S3 results mirror failed for %s: %s", test, exc)
+
+
+def _sync_results_from_s3(cfg: RunConfig, test: str) -> None:
+    """Best-effort download of a test's mirrored result files to the local results dir.
+
+    The inverse of :func:`_mirror_to_s3`: used on a fresh-host resume so metrics for a
+    phase skipped on the strength of its S3 marker are present locally for report.py.
+    """
+    if not cfg.bucket:
+        return
+    try:
+        fs = fsspec.filesystem("s3")
+        src = f"{cfg.s3_results_root}/{test}"
+        if not fs.exists(src):
+            return
+        local = cfg.results_dir / test
+        local.mkdir(parents=True, exist_ok=True)
+        for key in fs.ls(src, detail=False):
+            fs.get_file(key, str(local / key.rstrip("/").rsplit("/", 1)[-1]))
+    except Exception as exc:
+        logger.warning("S3 results sync-down failed for %s: %s", test, exc)
 
 
 def run_phase(

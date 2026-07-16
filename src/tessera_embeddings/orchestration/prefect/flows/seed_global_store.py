@@ -34,6 +34,7 @@ def seed_global_store(
     name: str = "tessera",
     years: tuple[int, ...] = CAMPAIGN_YEARS,
     model_version: str | None = None,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Create the global-store repo (if absent) and seed every unseeded zone group.
 
@@ -46,11 +47,21 @@ def seed_global_store(
             distinguish the concrete checkpoint (the ``aws``/``mpc`` v1.1 checkpoints
             share one ``geoemb:model`` URL); without it the checkpoint gate is a
             no-op. Override to record a custom identity.
+        s3_region: Optional S3 region for the global store, forwarded to
+            open/create — like the campaign and fill paths, so a non-default-region
+            deployment can seed at all.
 
     Returns:
         Summary: store path, zones seeded this run, zones already present, total.
     """
     log = get_run_logger()
+
+    # Lazy AWS import so the flow file imports on non-AWS machines (arch tests). This
+    # mandatory FIRST step opens/creates the repo, so a callback-only or non-default-
+    # region deployment needs the credential callback + region here too — not just in
+    # the campaign and fill flows.
+    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+
     store_path = paths.global_store(name)
     # Default the recorded checkpoint identity to the build's checkpoint filename so
     # the fill's checkpoint gate is effective by default (it only compares when the
@@ -60,11 +71,11 @@ def seed_global_store(
     # Open-or-create with the global config (manifest split + preload). A missing
     # repo raises on open; create_global_repo persists the config via save_config.
     try:
-        repo = open_global_repo(store_path)
+        repo = open_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
         seeded = set(campaign_status(repo, years=years).zones)
     except (FileNotFoundError, icechunk.IcechunkError):
         log.info("Creating global store %s", store_path)
-        repo = create_global_repo(store_path)
+        repo = create_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
         seeded = set()
 
     # A retry after a partial seed must use the SAME year axis as the groups already

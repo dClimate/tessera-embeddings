@@ -45,7 +45,7 @@ def test_coverage_gate_fails_before_ray(monkeypatch, allow_partial):
 
     captured: dict = {}
 
-    def _coverage(mosaic_base, window, *, s1_orbit, skip_coverage_check, get_credentials):
+    def _coverage(mosaic_base, window, *, s1_orbit, skip_coverage_check, get_credentials, s3_region=None):
         captured.update(mosaic_base=mosaic_base, skip=skip_coverage_check, creds=get_credentials)
         raise InsufficientCoverageError("reflectance store missing months")
 

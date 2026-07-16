@@ -143,7 +143,7 @@ fixed, shard-snapped `zone_grid.ZoneSpec` extent the fill validates against — 
 `land_mask.export_zone_roi` writes the ROI mask directly from `ZoneSpec` (mask = the zone's
 `tile_live_2048` coverage bitmap upsampled ×2048; WGS84 bbox tight to the live tiles).
 
-```
+```text
 run_global_campaign  (per pending (zone, year), zone-parallel within a year)
    │
    ├─ ingest-zone-year ──► export_zone_roi(zone)         {inputs}/rois/zarrs/zone_33N.zarr

@@ -10,12 +10,15 @@ deployments write onto it. Only orchestration lives here (``arun_deployment``);
 each ingest deployment provisions its own Dask cluster.
 
 **Idempotent + crash-safe.** A per-store completion marker (root attr
-``ingest_marker``, fingerprinting window + min_valid_coverage + coverage sha)
-gates the work: a matching marker on every required store short-circuits, and a
-crash mid-ingest is repaired by a plain re-run — the ROI flows dedupe
-already-present dates (incremental append) and the marker is written only after
-coverage is verified. A changed input (rebuilt coverage, new threshold) changes
-the fingerprint, forcing a re-ingest.
+``ingest_marker``, fingerprinting window + min_valid_coverage + s1_orbit +
+allow_partial_window + coverage sha) gates the work: a matching marker on every
+required store short-circuits, and the marker is written only after coverage is
+verified. Recovery is by re-run, but NOT an incremental append: the probe keys on
+physical existence over the maximal candidate set, so a stale, markerless, or
+half-written mosaic is CLEARED (``delete_prefix``, strict) and rebuilt cleanly
+rather than appended onto. A changed input (rebuilt coverage, new threshold,
+different orbit or window, or a flipped ``allow_partial_window``) changes the
+fingerprint and likewise forces a clean rebuild.
 
 **Coverage gate (ADR-011).** After ingestion, :func:`check_time_window_coverage`
 requires the mosaics' months to span the window; ``allow_partial_window`` relaxes
@@ -249,10 +252,24 @@ async def ingest_zone_year(
     s2_coro = arun_deployment(
         deployments.ingest_s2_roi_reflectance, parameters={**common, "min_valid_coverage": min_valid_coverage}
     )
-    *s1_runs, s2_run = await asyncio.gather(*s1_coros, s2_coro)
-    for orbit, s1_run in zip(orbits, s1_runs, strict=True):
-        _check_completed(s1_run, f"ingest_s1_roi_sar ({orbit})")
-    _check_completed(s2_run, "ingest_s2_roi_reflectance")
+    # return_exceptions=True so we WAIT for every deployment to settle before raising:
+    # a plain gather() surfaces the first failure while the sibling S1/S2 jobs keep
+    # writing to mosaic_base, and a retry could then clear the prefix mid-write. Join
+    # them all, then report every failure at once.
+    *s1_runs, s2_run = await asyncio.gather(*s1_coros, s2_coro, return_exceptions=True)
+    labelled = [*((f"ingest_s1_roi_sar ({o})", r) for o, r in zip(orbits, s1_runs, strict=True)),
+                ("ingest_s2_roi_reflectance", s2_run)]
+    errors: list[str] = []
+    for label, run in labelled:
+        if isinstance(run, BaseException):
+            errors.append(f"{label}: {run!r}")
+            continue
+        try:
+            _check_completed(run, label)
+        except Exception as exc:  # a returned-but-not-COMPLETED terminal state
+            errors.append(str(exc))
+    if errors:
+        raise RuntimeError(f"ingest deployment(s) failed for zone {zone} year {year}: " + "; ".join(errors))
 
     # (5) Resolve the orbit set from what actually ingested, then verify + mark
     #     only those stores. `s1_orbit="both"` with one empty orbit downgrades

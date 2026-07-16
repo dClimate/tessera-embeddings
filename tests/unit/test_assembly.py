@@ -1033,6 +1033,7 @@ def _write_monolithic_staged_zarr(path: str, embeddings: np.ndarray, y_start: in
         },
     }
     ds.to_zarr(path, mode="w", encoding=encoding)
+    zarr.open_group(path, mode="a").attrs["staged_complete"] = True  # assembly requires the marker
 
 
 class TestStagedLayout:
@@ -1094,6 +1095,27 @@ class TestStagedLayout:
         result = ds["embeddings"].values[0, ...]
         np.testing.assert_array_equal(result, expected)
         assert ds["embeddings"].shape == (1, 14, 16, EMBEDDING_DIM)
+
+    def test_assemble_rejects_markerless_staged_tile(self, tmp_path):
+        """Single-ROI assembly rejects a crash-partial (markerless) staged tile rather
+        than reading its missing chunks as fill and committing silent holes.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=8, x_start=0, x_stop=8)
+        emb, _ = _quantized_embeddings(np.random.default_rng(1), 8, 8)
+        path = writer._staging_path("run1", chunk)
+        _write_monolithic_staged_zarr(path, emb, 0, 0)
+        del zarr.open_group(path, mode="a").attrs["staged_complete"]  # crash before the marker
+        with pytest.raises(IncompleteStageError, match="staged_complete"):
+            writer.assemble(
+                [chunk],
+                total_y=8,
+                total_x=8,
+                run_id="run1",
+                output_path=str(tmp_path / "output.zarr"),
+                roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 8),
+                n_workers=1,
+            )
 
 
 class TestPartitionBands:

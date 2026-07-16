@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from typing import Any, cast
+from typing import Any
 
 import icechunk
 from prefect import flow, get_run_logger
@@ -53,6 +53,7 @@ async def run_global_campaign(
     commit_limit_name: str = "tessera-global-commits",
     num_actors: int = 20,
     s1_orbit: str = "both",
+    s3_region: str | None = None,
     ssm_prefix: str = "/tessera/ray/",
     cloudwatch_log_group: str = "/ec2/tessera/ray",
     code_bucket: str | None = None,
@@ -91,6 +92,8 @@ async def run_global_campaign(
             simultaneous committers (D6); forwarded to every fill.
         num_actors: GPU actor count, forwarded to each fill.
         s1_orbit: S1 orbit selection, forwarded to both ingest and fill.
+        s3_region: Optional S3 region for the global store, forwarded to the driver's
+            own reads and to each fill so a non-default-region deployment works.
         ssm_prefix: SSM prefix for Ray resources, forwarded to each fill.
         cloudwatch_log_group: CloudWatch log group, forwarded to each fill.
         code_bucket: Source-tarball bucket, forwarded to each fill.
@@ -133,7 +136,7 @@ async def run_global_campaign(
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 
     store_path = paths.global_store(store_name)
-    repo = open_global_repo(store_path, get_credentials=iam_icechunk_credentials)
+    repo = open_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
     status = campaign_status(repo, years=campaign_years)
     existing_tags = set(repo.list_tags())
 
@@ -146,7 +149,9 @@ async def run_global_campaign(
         off_axis = [
             y
             for y in campaign_years
-            if not zone_year_on_axis(store_path, seeded_zones[0], y, get_credentials=iam_icechunk_credentials)
+            if not zone_year_on_axis(
+                store_path, seeded_zones[0], y, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+            )
         ]
         if off_axis:
             raise ValueError(
@@ -208,90 +213,83 @@ async def run_global_campaign(
         commit_limit_name,
     )
 
-    # Coverage delivery sha for the staging fingerprint below. It is global per
-    # delivery (identical across zone groups), so read it once from any seeded zone;
-    # best-effort — a config-only fingerprint is used if the mask isn't readable.
-    coverage_sha: str | None = None
-    if status.zones:
-        try:
-            cov = open_store_as_zarr_group(
-                paths.land_mask_store(mask_name),
-                group=sorted(status.zones)[0],
-                get_credentials=iam_icechunk_credentials,
-            )
-            coverage_sha = cast("str | None", cov.attrs.get("registry_sha256"))
-        except Exception as exc:  # best-effort — degrade to a config-only fingerprint
-            log.warning("Could not read coverage delivery sha for the staging fingerprint (%s) — config-only", exc)
-
-    def _mosaic_identity(zone: str, year: int) -> str | None:
-        # What identifies the MOSAIC the fill will read, for the staging fingerprint:
-        #  - ingest=True: the coverage delivery sha — ingest_zone_year rebuilds the
-        #    mosaic deterministically from the coverage + config, so the sha (plus the
-        #    config in the key) pins it.
-        #  - ingest=False: the mosaic is an EXTERNAL input we didn't produce, so the
-        #    coverage sha says nothing about it. Fingerprint the identity of EVERY
-        #    active child store — reflectance AND each SAR orbit (embeddings depend on
-        #    all of them; replacing only a SAR store must still start a fresh staging
-        #    prefix). FAIL CLOSED if a present store lacks an identity attr rather
-        #    than risk resuming stale tiles against a changed mosaic.
-        if ingest:
-            return coverage_sha
+    def _mosaic_identity(zone: str, year: int) -> str:
+        # Identity of the mosaic the fill will read, per ACTIVE child store. Called
+        # AFTER ingest (for ingest=True), so each store carries its `ingest_marker`
+        # (window + coverage-delivery sha + min_valid_coverage + orbit +
+        # allow_partial_window — the exact per-(zone,year) fingerprint that produced
+        # it); a prebuilt (ingest=False) mosaic falls back to `last_appended`/
+        # `created_at`. This is deliberately per-(zone,year) and post-ingest, NOT one
+        # global coverage sha read once up front: a partial `build_all(zones=...)` can
+        # leave zones on different coverage revisions, and coverage can change after an
+        # early read — either would let stale staged tiles resume against a rebuilt
+        # mosaic. Reflectance AND each PRESENT SAR orbit are fingerprinted (embeddings
+        # depend on all). Genuinely-absent stores (missing repo / not found) are
+        # skipped; a PRESENT store with no identity FAILS CLOSED — never degrade to a
+        # config-only fingerprint.
         base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}"
         ids: list[str] = []
         for store in ("reflectance", "sar_ascending", "sar_descending"):
             path = f"{base}/{store}.zarr"
             try:
-                grp = open_store_as_zarr_group(path, get_credentials=iam_icechunk_credentials)
+                grp = open_store_as_zarr_group(path, get_credentials=iam_icechunk_credentials, region=s3_region)
+            except FileNotFoundError:
+                continue  # absent store (single-orbit mosaic / unproduced orbit) — not active
             except icechunk.IcechunkError as exc:
                 if _is_missing_repo(exc):
-                    continue  # store absent (e.g. a single-orbit mosaic) — not an active input
-                raise  # a transient/auth error: fail closed rather than fingerprint a partial view
-            identity = grp.attrs.get("last_appended") or grp.attrs.get("created_at")
+                    continue
+                raise  # transient/auth: fail closed rather than fingerprint a partial view
+            marker = grp.attrs.get("ingest_marker")
+            identity = (
+                repr(marker)
+                if isinstance(marker, dict)
+                else (grp.attrs.get("last_appended") or grp.attrs.get("created_at"))
+            )
             if identity is None:
                 raise ValueError(
-                    f"Prebuilt mosaic store {path} (ingest=False) has no last_appended/created_at identity attr — "
-                    "cannot safely fingerprint it for staging resume. Clear staging, add the attr, or run ingest=True."
+                    f"Mosaic store {path} has no ingest_marker/last_appended/created_at identity attr — cannot "
+                    "safely fingerprint it for staging resume. Failing closed (clear staging or fix the mosaic)."
                 )
             ids.append(f"{store}={identity}")
         if not ids:
-            raise ValueError(f"No mosaic stores found under {base} (ingest=False) — nothing to fill.")
+            raise ValueError(f"No mosaic stores found under {base} — nothing to fingerprint or fill.")
         return "|".join(ids)
 
     def _staging_run_id(zone: str, year: int) -> str:
-        # Fingerprint the staging run_id with the inputs that determine the embeddings
-        # so a retry after a failed fill RESUMES stale staging only when the inputs are
-        # unchanged. A changed threshold / orbit / window / checkpoint, a new coverage
-        # delivery, or (ingest=False) a replaced prebuilt mosaic yields a different
-        # fingerprint → a fresh staging prefix → no old tiles resumed under new inputs.
-        # Still cell-unique (zone, year) so retries with identical inputs resume the
-        # same prefix (and it stays findable for cleanup).
+        # Deterministic staging run_id fingerprinting everything that determines the
+        # embeddings: the config (threshold/orbit/window/checkpoint), the CODE revision
+        # (`code_suffix` — a new source tarball with the same checkpoint still changes
+        # the output), and the per-(zone,year) mosaic identity (`_mosaic_identity`). A
+        # retry with identical inputs resumes the same prefix (findable for cleanup);
+        # ANY change starts a fresh prefix, so old tiles are never resumed under new
+        # inputs. Called AFTER ingest so ingest=True reads the freshly-written marker.
         key = (
             year,
             min_valid_coverage,
             s1_orbit,
             allow_partial_window,
             checkpoint_filename(),
+            code_suffix,
             _mosaic_identity(zone, year),
         )
         return f"{zone}-{year}-{hashlib.sha256(repr(key).encode()).hexdigest()[:8]}"
 
-    def _fill_params(zone: str, year: int) -> dict[str, Any]:
+    def _fill_params(zone: str, year: int, run_id: str) -> dict[str, Any]:
         return {
             "zone": zone,
             "year": year,
             "paths": paths.model_dump(),
-            # Deterministic, input-fingerprinted run_id: a retry of a failed/cancelled
-            # fill RESUMES the same staging prefix (findable for cleanup) instead of
-            # the runner minting a fresh uuid every attempt and orphaning terabytes of
-            # un-resumable shards — but ONLY when the inputs are unchanged (see
-            # _staging_run_id), so a changed threshold/orbit/window/checkpoint or a new
-            # coverage delivery starts a fresh prefix rather than resuming stale tiles.
-            "run_id": _staging_run_id(zone, year),
+            # run_id is computed by the caller (post-ingest): an input-fingerprinted id
+            # for a real fill (so a retry resumes staging only on identical inputs), or
+            # a stable "-retag" id for an already-complete cell (which does no
+            # inference/staging and must not inspect a possibly-cleaned-up mosaic).
+            "run_id": run_id,
             "ami_ssm_name": ami_ssm_name,
             "store_name": store_name,
             "mask_name": mask_name,
             "num_actors": num_actors,
             "s1_orbit": s1_orbit,
+            "s3_region": s3_region,
             "commit_limit_name": commit_limit_name,
             "allow_partial_window": allow_partial_window,
             # Divide the fleet S3-PUT budget across concurrent fills so K shard-write
@@ -343,8 +341,13 @@ async def run_global_campaign(
                 async with ingest_sem:  # each ingest provisions its own Dask cluster
                     irun = await arun_deployment(ingest_deployment, parameters=_ingest_params(zone, year))
                     _check_completed(irun, f"ingest {zone}-{year}")
+            # Compute the staging run_id AFTER ingest so ingest=True fingerprints the
+            # freshly-written mosaic marker. A retag-only cell does no inference/staging
+            # and its mosaic may already be cleaned up — give it a stable id that does
+            # NOT inspect the mosaic (fingerprinting would raise before the tag repair).
+            run_id = f"{zone}-{year}-retag" if retag_only else _staging_run_id(zone, year)
             async with fill_sem:  # bound concurrent fills (hence Ray clusters) within a year
-                frun = await arun_deployment(fill_deployment, parameters=_fill_params(zone, year))
+                frun = await arun_deployment(fill_deployment, parameters=_fill_params(zone, year, run_id))
                 _check_completed(frun, f"fill {zone}-{year}")
             # Only delete a mosaic THIS campaign produced: with ingest=False the mosaic
             # is an upstream input we must not remove. Offload the blocking s5cmd/fsspec
