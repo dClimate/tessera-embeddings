@@ -60,3 +60,21 @@ def test_coverage_gate_fails_before_ray(monkeypatch, allow_partial):
     assert captured["mosaic_base"] == "s3://in/mosaics/33N/2025"  # per-year, canonicalized zone
     assert captured["skip"] is allow_partial  # allow_partial_window threaded through
     assert captured["creds"] is not None  # credential callback threaded through
+
+
+def test_staging_base_scoped_to_zone_year(monkeypatch):
+    """The runner is handed a (zone, year)-scoped staging_base so a reused run_id
+    can't cross-contaminate another cell's staged tiles.
+    """
+    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-fill"))
+    monkeypatch.setattr(
+        "tessera_embeddings.providers.aws.credentials.iam_icechunk_credentials", object(), raising=False
+    )
+    monkeypatch.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: True)  # retag-only → no cluster, no gate
+    monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(time_window="W"))
+    captured: dict = {}
+    monkeypatch.setattr(mod, "fill_zone_year", lambda **kw: captured.update(kw) or {"tag": "t"})
+
+    mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami")
+    assert captured["staging_base"] == "s3://out/staging/33N/2025"

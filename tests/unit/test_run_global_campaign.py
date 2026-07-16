@@ -97,3 +97,9 @@ def test_unseeded_explicit_zone_rejected(wired):
     with pytest.raises(ValueError, match="not seeded"):
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", zones=["02N"]))
     assert wired["arun"] == []
+
+
+def test_duplicate_years_dispatch_once(wired):
+    """The dispatch loop dedupes years — years=(2025, 2025) runs the cell once."""
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", years=(2025, 2025)))
+    assert len(wired["arun"]) == 2  # one ingest + one fill, not two of each

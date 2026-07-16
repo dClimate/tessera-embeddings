@@ -6,6 +6,8 @@ import logging
 import subprocess
 from types import SimpleNamespace
 
+import pytest
+
 from tessera_embeddings.storage import object_store
 
 
@@ -43,3 +45,24 @@ def test_delete_prefix_s3_defaults_to_all_versions(monkeypatch):
     monkeypatch.setattr(object_store, "_s5cmd_rm", fake_s5)
     object_store.delete_prefix("s3://bucket/mosaics/33N/2025")
     assert seen == {"uri": "s3://bucket/mosaics/33N/2025", "all_versions": True}
+
+
+def test_delete_prefix_strict_raises_when_delete_fails(monkeypatch):
+    """strict=True propagates a failed delete (else the caller ingests onto stale data)."""
+
+    def _s5_fail(*a, **k):
+        raise RuntimeError("s5cmd rc=1")
+
+    class _FS:
+        def exists(self, p):
+            return True
+
+        def rm(self, p, recursive):
+            raise OSError("access denied")
+
+    monkeypatch.setattr(object_store, "_s5cmd_rm", _s5_fail)
+    monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
+
+    object_store.delete_prefix("s3://b/p")  # best-effort: swallows
+    with pytest.raises(OSError, match="access denied"):
+        object_store.delete_prefix("s3://b/p", strict=True)

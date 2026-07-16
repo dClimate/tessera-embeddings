@@ -229,7 +229,10 @@ def fill_zone_year_flow(
         "year": year,
         "land_mask_path": land_mask_path,
         "mosaic_base": mosaic_base,
-        "staging_base": f"{paths.outputs.rstrip('/')}/staging",
+        # Staging is scoped by (zone, year), not just run_id: a reused/retained
+        # run_id can't then match another cell's staged labels+shapes and trick
+        # resume detection into skipping inference for the wrong year.
+        "staging_base": f"{paths.outputs.rstrip('/')}/staging/{zone}/{year}",
         "config": config,
         "num_actors": num_actors,
         "log": log,

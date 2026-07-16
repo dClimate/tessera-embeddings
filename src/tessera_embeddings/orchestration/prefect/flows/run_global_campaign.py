@@ -217,8 +217,10 @@ async def run_global_campaign(
 
     # Descending: the campaign fills the current year first, then backwards
     # (ADR-008) — deliver the most-recent year soonest. Override via `years`.
+    # Dedupe (campaign_work_list already dedupes years, so a duplicate here would
+    # re-dispatch the same static work entries against a non-refreshed status).
     runs_by_year: dict[int, list[str]] = {}
-    for year in sorted(campaign_years, reverse=True):
+    for year in sorted(set(campaign_years), reverse=True):
         year_zones = [z for z, y in work if y == year]
         if year_zones:
             log.info("Year %d: dispatching %d zone fill(s)", year, len(year_zones))

@@ -194,9 +194,11 @@ async def ingest_zone_year(
     if any(m is not None for m in existing):
         # A present-but-mismatched marker (changed inputs, or an ascending-only prior
         # run now asked for both): the mosaic was built under different inputs, so a
-        # plain re-ingest would append onto stale data. Clear it for a clean rebuild.
+        # plain re-ingest would append onto stale data. Clear it for a clean rebuild
+        # — strict=True so a FAILED delete aborts rather than silently ingesting onto
+        # (deduplicated) stale dates and marking the result complete.
         log.info("Zone %s year %d has a stale ingest marker — clearing %s for a clean rebuild", zone, year, mosaic_base)
-        delete_prefix(mosaic_base, log=log)
+        delete_prefix(mosaic_base, log=log, strict=True)
 
     # (3) Ensure the zone ROI zarr (idempotent; regenerates if coverage changed).
     export_zone_roi(zone, land_mask_path=land_mask_path, dest_path=roi_path, get_credentials=iam_icechunk_credentials)

@@ -47,12 +47,11 @@ def _s5cmd_rm(uri: str, log: _Log, *, all_versions: bool) -> None:
     log.info("s5cmd deleted %d object(s) from %s", n, uri)
 
 
-def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = True) -> None:
+def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = True, strict: bool = False) -> None:
     """Delete every object under *uri* (a directory-like prefix).
 
     S3 uses ``s5cmd`` (all versions by default) with an fsspec fallback; other
-    schemes use fsspec directly. Never raises — a cleanup failure is logged, not
-    propagated (the primary work has already succeeded by the time we clean up).
+    schemes use fsspec directly.
 
     Args:
         uri: Prefix to remove (e.g. ``s3://bucket/mosaics/33N/2025``).
@@ -60,6 +59,10 @@ def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = Tru
         all_versions: Pass ``--all-versions`` to s5cmd so a versioned bucket does
             not accumulate non-current versions (the default; the reason this
             helper exists).
+        strict: When True, RAISE if the delete does not succeed. Best-effort
+            (default) is right for post-success cleanup (staging, tagged mosaics);
+            strict is for callers that must not proceed onto un-cleared data (e.g.
+            rebuilding a stale mosaic before re-ingest).
     """
     log = log or logger
     log.info("Deleting prefix: %s", uri)
@@ -77,4 +80,6 @@ def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = Tru
         if fs.exists(uri):
             fs.rm(uri, recursive=True)
     except Exception:
+        if strict:
+            raise
         log.warning("Failed to delete prefix %s", uri, exc_info=True)
