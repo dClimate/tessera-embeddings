@@ -34,7 +34,7 @@ from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.data_loading import resolve_s1_orbit
+from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
 from tessera_embeddings.orchestration.runners.zone_fill import (
     fill_zone_year,
@@ -43,6 +43,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_on_axis,
 )
 from tessera_embeddings.providers.aws.ray import cleanup_ray_tempfiles, terminate_ray_instances_by_tag
+from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 # Module-level state for the cancellation hook (set on entry, cleared on exit).
 _active_resolved_yaml: str | None = None
@@ -112,6 +113,8 @@ def fill_zone_year_flow(
     s1_orbit: str = "both",
     commit_limit_name: str | None = None,
     cleanup_staging: bool = True,
+    allow_partial_window: bool = False,
+    mosaic_base: str | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
     """Fill one ``(zone, year)`` cell of the global store on a Ray cluster.
@@ -137,6 +140,10 @@ def fill_zone_year_flow(
             fleet's simultaneous committers (D6). ``None`` = ungated (a single
             isolated run has no commit contention).
         cleanup_staging: Delete staged tiles after a successful fill.
+        allow_partial_window: Relax the pre-Ray temporal-coverage gate to
+            "non-empty" (default requires the mosaic's months to span the window).
+        mosaic_base: Override for the input mosaic prefix (default
+            ``{inputs}/mosaics/{zone}/{year}`` — the campaign's per-year layout).
         run_id: Reuse a prior run's id to resume it (staged tiles are skipped).
 
     Returns:
@@ -150,9 +157,12 @@ def fill_zone_year_flow(
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
     from tessera_embeddings.providers.aws.ray import ray_cluster
 
+    zone = canonicalize_zone(zone)
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
-    mosaic_base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}"
+    # Campaign mosaics live per (zone, year); `mosaic_base` overrides for a
+    # hand-provided mosaic (e.g. a shared multi-year store).
+    mosaic_base = mosaic_base or f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}"
 
     # Preflight in ascending cost order — cheapest global-store metadata reads
     # first, then the mask, then (only if we will truly infer) the mosaic probe
@@ -195,6 +205,22 @@ def fill_zone_year_flow(
         output_bucket=paths.outputs,
         chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
     )
+
+    if needs_cluster:
+        # Fail loudly on a partial/absent mosaic BEFORE provisioning Ray: a
+        # zone-wide mosaic missing months is an ingest failure, and the write-once
+        # zone-year tag would otherwise make partial embeddings permanent (the
+        # zone-fill chain has no other temporal-coverage gate). `allow_partial_window`
+        # relaxes the month-span check to "non-empty" for a legitimately partial
+        # edge zone; an empty store still fails.
+        check_time_window_coverage(
+            mosaic_base,
+            config.time_window,
+            s1_orbit=resolved_s1,
+            skip_coverage_check=allow_partial_window,
+            get_credentials=iam_icechunk_credentials,
+        )
+
     gate = _PrefectCommitGate(commit_limit_name) if commit_limit_name else None
 
     fill_kwargs: dict[str, Any] = {
