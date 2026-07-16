@@ -281,7 +281,8 @@ depend only on items listed there.
 
 Beyond single-ROI stores, the library ships the storage layout and write
 path for a **global 10 m campaign**: one Icechunk repo holding 120 Zarr
-groups — one per UTM zone (EPSG:32601–60 north, 32701–60 south) — each
+groups — one per UTM zone, named by its **common name** (`01N`–`60N`,
+`01S`–`60S`; the EPSG:326xx/327xx code is retained only as the CRS) — each
 pre-allocated with a 2017–2025 annual time axis and filled one
 (zone, year) at a time. The architecture is settled in
 [ADR-008](context_docs/decisions/008-global-store-architecture.md); the
@@ -290,13 +291,18 @@ build plan is
 
 ```
 one Icechunk repo (BucketPaths.global_store())
-├── 32601/   embeddings (time, northing, easting, band)  int8
-│            (1, 256, 256, 128) inner chunks in (1, 2048, 2048, 128) shards
-│            scales / obs counts sharded on the same 2048² spatial grid
-├── 32602/   … one group per UTM zone, seeded metadata-only up front …
+├── 01N/    embeddings (time, northing, easting, band)  int8
+│           (1, 256, 256, 128) inner chunks in (1, 2048, 2048, 128) shards
+│           scales / obs counts sharded on the same 2048² spatial grid
+├── 02N/    … one group per UTM zone, seeded metadata-only up front …
 ⋮
-└── 32760/   attrs: crs, zone_scheme, years_complete, runs, conventions
+└── 60S/    attrs: crs, zone_scheme, years_complete, runs, conventions
 ```
+
+Zone groups, mosaic paths, and tags all use the UTM **common name**
+(`canonicalize_zone` parses `"33n"`/`" 7s "` → `"33N"`/`"07S"`) — a
+deliberate deviation from the geoembeddings `utm_zones` spec, whose
+`utm{NN}` group name can't express the hemisphere.
 
 Four write paths, all committing atomically (`storage/zarr_store.py` has
 the first three; `inference/assembly.py` + `storage/shard_writer.py` the
@@ -379,6 +385,16 @@ Campaign operations — per-cell tags, snapshot expiry + GC, and a
 zone×year progress reader — live in `storage/campaign.py`; the
 end-to-end (zone, year) fill callable is
 `orchestration/runners/zone_fill.py`.
+
+`run_global_campaign` drives the whole thing year-serial with bounded
+zone parallelism, and **triggers its own ingestion** (ADR-011): per
+pending cell it dispatches `ingest-zone-year` (synthesize a zone-shaped
+ROI from the coverage bitmap → run the S1/S2 ROI ingest flows onto
+`mosaics/{zone}/{year}`) → `fill-zone-year` (a pre-Ray coverage gate,
+then inference → shard-assemble → tag) → delete the transient mosaic
+(`s5cmd --all-versions`). A `zones=["33N", "15S"]` filter restricts the
+run; the default (all 120) skips already-finished cells, and `ingest=False`
+bypasses ingestion when mosaics already exist upstream.
 
 ## The test that proves decoupling
 

@@ -262,7 +262,8 @@ def test_export_zone_roi_ocean_returns_none(tmp_path) -> None:
 
 def test_export_zone_roi_roundtrip_matches_zone_grid(tmp_path) -> None:
     """The synthesized ROI reconstructs to the EXACT zone grid via the real
-    consumer (read_roi_metadata) — the acceptance test the fill relies on."""
+    consumer (read_roi_metadata) — the acceptance test the fill relies on.
+    """
     zone = "31N"
     spec = zone_grid.zone(zone)
     cov = _make_coverage(tmp_path, zone, [(10, 5), (11, 5)])

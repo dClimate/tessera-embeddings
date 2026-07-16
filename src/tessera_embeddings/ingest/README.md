@@ -134,6 +134,37 @@ pixel counts are computed eagerly — band arrays remain lazy until the Zarr wri
 `identify_low_coverage_ds` is the lazy alternative: instead of dropping dates it attaches a
 `valid_coverage` boolean coordinate that downstream tasks can check without reading band data.
 
+### Zone ingestion (the global campaign) — ADR-011
+
+The global campaign reuses this exact ROI engine to produce its per-zone mosaics: it
+**synthesizes a zone-shaped ROI** instead of rasterizing a GeoJSON, then dispatches the same
+S1/S2 ingest flows. `generate_roi`'s `compute_grid` bbox-fits geometry and cannot reproduce the
+fixed, shard-snapped `zone_grid.ZoneSpec` extent the fill validates against — so
+`land_mask.export_zone_roi` writes the ROI mask directly from `ZoneSpec` (mask = the zone's
+`tile_live_2048` coverage bitmap upsampled ×2048; WGS84 bbox tight to the live tiles).
+
+```
+run_global_campaign  (per pending (zone, year), zone-parallel within a year)
+   │
+   ├─ ingest-zone-year ──► export_zone_roi(zone)         {inputs}/rois/zarrs/zone_33N.zarr
+   │      │                  (ZoneSpec grid + tile_live mask; ocean-tile skip)
+   │      ├─ marker probe (root attr ingest_window per store) ──► skip if current
+   │      ├─ ingest_s1_roi_sar × orbit ┐  concurrent, onto
+   │      ├─ ingest_s2_roi_reflectance ┘  {inputs}/mosaics/33N/2025/
+   │      ├─ check_time_window_coverage (strict span; allow_partial_window escape)
+   │      └─ write ingest_window marker  (last — crash before this ⇒ incremental re-run)
+   │
+   ├─ fill-zone-year  ──► coverage gate (pre-Ray) ──► inference ──► assemble ──► tag
+   │
+   └─ delete mosaics/33N/2025  (s5cmd --all-versions; transient input)
+```
+
+The S2 `min_valid_coverage` bar is lowered far below the ROI default (5 % → ~0.1 %): a single
+solar-day's swath covers only a sliver of a whole 6° zone, so a high bar would drop nearly
+every date. Mosaics are per `(zone, year)` and deleted after the fill is tagged — they are
+re-derivable inputs at ~TB scale (ADR-011). Zones are named by UTM common name (`33N`/`07S`),
+not EPSG (see `storage/zone_grid.canonicalize_zone`).
+
 ---
 
 ## Data Transformations

@@ -47,6 +47,7 @@ from tessera_embeddings.storage.zarr_store import (
     compute_doy,
     get_existing_dates,
     open_store,
+    open_store_as_zarr_group,
     resolve_region,
     rollback_commits,
     set_s3_config,
@@ -1064,3 +1065,36 @@ class TestDefaultRepoConfig:
         assert config.storage is not None
         assert config.storage.timeouts.read_timeout_ms == _DEFAULT_READ_TIMEOUT_MS
         assert config.storage.retries.max_tries == _DEFAULT_STORAGE_MAX_TRIES
+
+
+class TestEmptyChunkElision:
+    """The zone mosaics stay cheap only if all-fill (ocean/nodata) chunks are
+    not materialized as objects. This pins that write_dataset's icechunk write
+    elides them (ADR-011's cost assumption), rather than taking it on faith.
+    """
+
+    def test_all_fill_chunks_are_not_materialized(self, local_zarr_path):
+        store_path = str(local_zarr_path / "elision" / "reflectance.zarr")
+        data = xr.Dataset(
+            {"red": (("time", "northing", "easting"), np.zeros((1, 8, 8), dtype="uint16"))},
+            coords={
+                "time": np.array(["2025-06-01"], dtype="datetime64[ns]"),
+                "northing": np.arange(8, dtype="float64"),
+                "easting": np.arange(8, dtype="float64"),
+            },
+        )
+        data["red"].values[0, 0:4, 0:4] = 1  # only the top-left 4x4 chunk carries data
+
+        write_dataset(
+            store_path,
+            data,
+            tile_id="t",
+            baselines={},
+            chunks={"time": 1, "northing": 4, "easting": 4},
+            crs="EPSG:32601",
+        )
+
+        red = open_store_as_zarr_group(store_path)["red"]
+        assert red.shape == (1, 8, 8)
+        # 2x2 spatial chunks; the three all-zero (fill) chunks are elided.
+        assert red.nchunks_initialized == 1

@@ -150,7 +150,7 @@ def _mock_open_store(monkeypatch):
 
     store_times: dict[str, tuple[str, str]] = {}
 
-    def _open_store(path):
+    def _open_store(path, **kwargs):  # accept get_credentials/region
         start, end = store_times.get("default", ("2024-01-01", "2025-12-31"))
         return _make_time_group(start, end)
 
@@ -191,7 +191,7 @@ class TestCheckTimeWindowCoverage:
 
         checked_paths: list[str] = []
 
-        def _open_store(path):
+        def _open_store(path, **kwargs):  # accept get_credentials/region
             checked_paths.append(path)
             return _make_time_group("2024-01-01", "2025-12-31")
 
@@ -209,7 +209,7 @@ class TestCheckTimeWindowCoverage:
 
         checked_paths: list[str] = []
 
-        def _open_store(path):
+        def _open_store(path, **kwargs):  # accept get_credentials/region
             checked_paths.append(path)
             return _make_time_group("2024-01-01", "2025-12-31")
 
@@ -225,7 +225,7 @@ class TestCheckTimeWindowCoverage:
         """A store with zero time entries raises InsufficientCoverageError."""
         import tessera_embeddings.inference.data_loading as dl
 
-        def _open_store(path):
+        def _open_store(path, **kwargs):  # accept get_credentials/region
             store = zarr.storage.MemoryStore()
             root = zarr.group(store)
             root.create_array("time", shape=(0,), dtype=np.int64, chunks=(1,))
@@ -248,7 +248,7 @@ class TestCheckTimeWindowCoverage:
         """skip_coverage_check does not bypass the empty-store guard (it runs first)."""
         import tessera_embeddings.inference.data_loading as dl
 
-        def _open_store(path):
+        def _open_store(path, **kwargs):  # accept get_credentials/region
             store = zarr.storage.MemoryStore()
             root = zarr.group(store)
             root.create_array("time", shape=(0,), dtype=np.int64, chunks=(1,))
