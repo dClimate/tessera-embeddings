@@ -69,6 +69,11 @@ class ChunkComparison:
     nan_mask_mismatches: int
     cosine_min: float
     cosine_mean: float
+    # Obs-count layers (s2/s1_asc/s1_desc) are deterministic per-pixel counts,
+    # independent of batch size or inference — they must match EXACTLY in both
+    # comparison classes. Guards the sparse-read fidelity machinery (full-width
+    # SAR reads + bundle-sourced S2 obs under the easting-bbox crop).
+    obs_count_mismatches: int = 0
 
     cross_config: bool = False
 
@@ -81,6 +86,7 @@ class ChunkComparison:
                 and self.max_abs_delta <= XCFG_MAX_ABS_DELTA
                 and self.scale_max_rel_drift <= XCFG_MAX_SCALE_REL_DRIFT
                 and self.nan_mask_mismatches == 0
+                and self.obs_count_mismatches == 0
                 and self.cosine_min >= XCFG_MIN_COSINE
             )
         return (
@@ -88,6 +94,7 @@ class ChunkComparison:
             and self.max_abs_delta <= MAX_ABS_DELTA
             and self.scale_max_rel_drift <= MAX_SCALE_REL_DRIFT
             and self.nan_mask_mismatches == 0
+            and self.obs_count_mismatches == 0
             and self.cosine_min >= MIN_COSINE
         )
 
@@ -98,7 +105,7 @@ class ChunkComparison:
             f"{self.label}: {status} | exact={self.exact_frac:.6%} "
             f"max|d|={self.max_abs_delta} within1={self.within_one_frac:.6%} "
             f"scale_drift_max={self.scale_max_rel_drift:.2e} "
-            f"nan_mismatch={self.nan_mask_mismatches} "
+            f"nan_mismatch={self.nan_mask_mismatches} obs_mismatch={self.obs_count_mismatches} "
             f"cos_min={self.cosine_min:.6f} cos_mean={self.cosine_mean:.6f} "
             f"(n={self.n_values:,})"
         )
@@ -156,6 +163,20 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
                 cosine_sum += float(cos.sum())
                 cosine_count += int(nz.sum())
 
+    # Obs-count layers: deterministic counts, must be EXACT in both classes.
+    # (H, W) uint16 — small enough to compare whole. A layer present in one
+    # store but not the other is a FAILURE, not a silent skip: a test run that
+    # dropped an obs layer the reference has must not pass the gate. (Its whole
+    # size is charged as mismatches so obs_count_mismatches goes non-zero.)
+    obs_count_mismatches = 0
+    for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
+        in_ref, in_test = var in ref.data_vars, var in test.data_vars
+        if in_ref and in_test:
+            obs_count_mismatches += int((ref[var].values != test[var].values).sum())
+        elif in_ref != in_test:
+            present = ref[var] if in_ref else test[var]
+            obs_count_mismatches += int(present.size)
+
     return ChunkComparison(
         label=label,
         n_values=n_values,
@@ -166,6 +187,7 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
         nan_mask_mismatches=nan_mask_mismatches,
         cosine_min=cosine_min if cosine_count else 1.0,
         cosine_mean=cosine_sum / cosine_count if cosine_count else 1.0,
+        obs_count_mismatches=obs_count_mismatches,
         cross_config=cross_config,
     )
 

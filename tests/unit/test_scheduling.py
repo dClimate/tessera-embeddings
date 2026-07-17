@@ -49,7 +49,17 @@ def _poll(progress: dict, *, stall_threshold: float = 300.0, max_stalls: int = 3
 def _do_replace(pool: ActorPool, actor_idx: int = 0) -> None:
     mock_actor = MagicMock()
     mock_actor.get_instance_id.remote.return_value = MagicMock()
-    with patch.object(_sched_mod, "InferenceActor") as cls:
+    with (
+        patch.object(_sched_mod, "InferenceActor") as cls,
+        # ray.kill MUST be patched: Ray wraps it in an auto-init hook, so an
+        # unpatched call from a test silently boots a REAL local Ray cluster —
+        # ray.init() then hashes/uploads the entire working directory (multi-GB
+        # with scale-test stores present) and reserves an object store. The
+        # suppress(Exception) around the kill in replace() does not help; the
+        # auto-init runs before kill raises. (2026-07-17: three concurrent
+        # pytest runs of this file ate ~60 GB RAM this way.)
+        patch.object(_sched_mod.ray, "kill"),
+    ):
         cls.options.return_value.remote.return_value = mock_actor
         pool.replace(actor_idx, "i-dead")
 
@@ -187,6 +197,65 @@ class TestSubmit:
             assert pool.chunk_attempts["c0"] == 1
             pool.submit(0, chunk, "s3://mosaic", "s3://stage", "run1", tracker=None)
             assert pool.chunk_attempts["c0"] == 2
+
+
+class TestReservations:
+    """1-deep next-chunk reservations feeding the cross-chunk starter prefetch."""
+
+    def test_deep_queue_reserves_head_and_passes_hint(self) -> None:
+        pool = _make_pool(2)
+        pool.actors[0].process_chunk.remote.return_value = MagicMock()
+        queue: deque = deque([_fake_chunk(f"c{i}") for i in range(5)])
+        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
+            pool.submit(0, _fake_chunk("current"), "m", "s", "r", None, queue)
+        assert pool.reserved[0].label == "c0"
+        assert len(queue) == 4
+        kwargs = pool.actors[0].process_chunk.remote.call_args.kwargs
+        assert kwargs["prefetch_hint"].label == "c0"
+
+    def test_shallow_queue_does_not_reserve(self) -> None:
+        # len(queue) <= live_count: a tail reservation would pin work to a
+        # busy actor while others idle.
+        pool = _make_pool(3)
+        pool.actors[0].process_chunk.remote.return_value = MagicMock()
+        queue: deque = deque([_fake_chunk("c0"), _fake_chunk("c1")])
+        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
+            pool.submit(0, _fake_chunk("current"), "m", "s", "r", None, queue)
+        assert pool.reserved == {}
+        assert len(queue) == 2
+        kwargs = pool.actors[0].process_chunk.remote.call_args.kwargs
+        assert kwargs["prefetch_hint"] is None
+
+    def test_no_queue_means_no_reservation(self) -> None:
+        pool = _make_pool(2)
+        pool.actors[0].process_chunk.remote.return_value = MagicMock()
+        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
+            pool.submit(0, _fake_chunk("current"), "m", "s", "r", None)
+        assert pool.reserved == {}
+        assert pool.actors[0].process_chunk.remote.call_args.kwargs["prefetch_hint"] is None
+
+    def test_take_reserved_pops(self) -> None:
+        pool = _make_pool(2)
+        chunk = _fake_chunk("c0")
+        pool.reserved[1] = chunk
+        assert pool.take_reserved(1) is chunk
+        assert pool.take_reserved(1) is None
+
+    def test_stale_reservation_requeued_not_stranded(self) -> None:
+        # Defensive path: an actor re-dispatched while still holding a
+        # reservation must not lose that chunk.
+        pool = _make_pool(2)
+        pool.actors[0].process_chunk.remote.return_value = MagicMock()
+        stale = _fake_chunk("stale")
+        pool.reserved[0] = stale
+        queue: deque = deque([_fake_chunk(f"c{i}") for i in range(4)])
+        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
+            pool.submit(0, _fake_chunk("current"), "m", "s", "r", None, queue)
+        # The stale chunk went to the queue front, so it became the new
+        # reservation — conserved either way: nothing dropped.
+        all_labels = {c.label for c in queue} | {c.label for c in pool.reserved.values()}
+        assert "stale" in all_labels
+        assert len(queue) + len(pool.reserved) == 5
 
 
 class TestSeed:
@@ -1017,3 +1086,206 @@ class TestWorkStealingBatching:
                 log=logging.getLogger("test"),
             )
         assert len(results) == 1
+
+
+# ===========================================================================
+# _process_chunks_work_stealing — deferred staging writes
+# ===========================================================================
+
+
+class TestDeferredWrites:
+    """Chain-confirmation protocol: deferred chunks complete only on write confirm."""
+
+    @staticmethod
+    def _run(actor, chunks, **kwargs):
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=kwargs.pop("fake_wait")),
+            patch.object(_sched_mod.ray, "get", side_effect=kwargs.pop("fake_get")),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod, "InferenceActor") as cls,
+            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
+            patch.object(_sched_mod.time, "sleep"),
+        ):
+            replacement = MagicMock(name="replacement")
+            replacement.get_instance_id.remote.return_value = MagicMock()
+            cls.options.return_value.remote.return_value = replacement
+            return _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=chunks,
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+                **kwargs,
+            )
+
+    def test_deferred_chunks_confirm_via_next_result_and_flush(self) -> None:
+        """c0 confirms via c1's prior_write; c1 confirms via flush_writes."""
+        actor = MagicMock(name="actor_0")
+        chunks = [_fake_chunk("c0"), _fake_chunk("c1")]
+        refs = [MagicMock(name="ref0"), MagicMock(name="ref1")]
+        flush_ref = MagicMock(name="flush_ref")
+        actor.process_chunk.remote.side_effect = refs
+        actor.flush_writes.remote.return_value = flush_ref
+        done: list = []
+
+        def fake_wait(pending_refs, **kw):
+            if kw.get("timeout", 60) == 0:
+                return (list(pending_refs), [])
+            for r in refs:
+                if r in pending_refs and r not in done:
+                    done.append(r)
+                    return ([r], [x for x in pending_refs if x is not r])
+            return ([], list(pending_refs))
+
+        def fake_get(ref, *args, **kwargs):
+            if ref is refs[0]:
+                return {"chunk": "c0", "status": "success", "write_deferred": True, "prior_write": None}
+            if ref is refs[1]:
+                return {
+                    "chunk": "c1",
+                    "status": "success",
+                    "write_deferred": True,
+                    "prior_write": {"label": "c0", "ok": True, "error": None},
+                }
+            if ref is flush_ref:
+                return {"label": "c1", "ok": True, "error": None}
+            return MagicMock()
+
+        results = self._run(actor, chunks, fake_wait=fake_wait, fake_get=fake_get)
+
+        assert sorted(r["chunk"] for r in results) == ["c0", "c1"]
+        assert all(r.get("write_confirmed") for r in results)
+        actor.flush_writes.remote.assert_called()  # c1 had no next result to ride
+
+    def test_failed_write_requeues_without_killing_actor(self) -> None:
+        """A write failure reported via prior_write requeues that chunk on a
+        healthy actor (no kill), and the retry succeeds.
+        """
+        actor = MagicMock(name="actor_0")
+        chunks = [_fake_chunk("c0"), _fake_chunk("c1")]
+        refs = [MagicMock(name=f"ref{i}") for i in range(3)]  # c0, c1, c0-retry
+        flush_refs = [MagicMock(name="fl0"), MagicMock(name="fl1")]
+        actor.process_chunk.remote.side_effect = refs
+        actor.flush_writes.remote.side_effect = flush_refs
+        done: list = []
+
+        def fake_wait(pending_refs, **kw):
+            if kw.get("timeout", 60) == 0:
+                return (list(pending_refs), [])
+            for r in refs:
+                if r in pending_refs and r not in done:
+                    done.append(r)
+                    return ([r], [x for x in pending_refs if x is not r])
+            return ([], list(pending_refs))
+
+        def fake_get(ref, *args, **kwargs):
+            if ref is refs[0]:
+                return {"chunk": "c0", "status": "success", "write_deferred": True, "prior_write": None}
+            if ref is refs[1]:
+                # c1's result reports c0's write FAILED -> c0 requeues.
+                return {
+                    "chunk": "c1",
+                    "status": "success",
+                    "write_deferred": True,
+                    "prior_write": {"label": "c0", "ok": False, "error": "S3 500"},
+                }
+            if ref is refs[2]:
+                # c0 retry: carries c1's (successful) write confirmation.
+                return {
+                    "chunk": "c0",
+                    "status": "success",
+                    "write_deferred": True,
+                    "prior_write": {"label": "c1", "ok": True, "error": None},
+                }
+            if ref is flush_refs[0]:
+                return {"label": "c0", "ok": True, "error": None}
+            return MagicMock()
+
+        results = self._run(actor, chunks, fake_wait=fake_wait, fake_get=fake_get)
+
+        assert sorted(r["chunk"] for r in results) == ["c0", "c1"]
+        # The actor was never replaced: all three process_chunk calls hit it.
+        assert actor.process_chunk.remote.call_count == 3
+
+    def test_actor_death_requeues_deferred_chunk(self) -> None:
+        """An actor dying mid-c1 also requeues c0, whose write it still held."""
+        actor = MagicMock(name="actor_0")
+        chunks = [_fake_chunk("c0"), _fake_chunk("c1")]
+        ref0, ref1 = MagicMock(name="ref0"), MagicMock(name="ref1")
+        retry0, retry1 = MagicMock(name="retry0"), MagicMock(name="retry1")
+        flush_a, flush_b = MagicMock(name="fla"), MagicMock(name="flb")
+
+        replacement = MagicMock(name="replacement_actor")
+        replacement.process_chunk.remote.side_effect = [retry0, retry1]
+        replacement.flush_writes.remote.side_effect = [flush_a, flush_b]
+        iid_ref = MagicMock(name="iid_ref")
+        iid_ref._iid = "i-replacement"
+        replacement.get_instance_id.remote.return_value = iid_ref
+
+        actor.process_chunk.remote.side_effect = [ref0, ref1]
+        done: list = []
+        order = [ref0, ref1, retry0, retry1]
+
+        def fake_wait(pending_refs, **kw):
+            if kw.get("timeout", 60) == 0:
+                return (list(pending_refs), [])
+            for r in order:
+                if r in pending_refs and r not in done:
+                    done.append(r)
+                    return ([r], [x for x in pending_refs if x is not r])
+            return ([], list(pending_refs))
+
+        def fake_get(ref, *args, **kwargs):
+            # NOTE: match by identity — getattr(ref, "_iid", ...) auto-creates a
+            # truthy Mock attribute and would swallow every ref.
+            if ref is iid_ref:
+                return "i-replacement"
+            if ref is ref0:
+                return {"chunk": "c0", "status": "success", "write_deferred": True, "prior_write": None}
+            if ref is ref1:
+                raise RuntimeError("actor died")  # c1 dies; c0's write orphaned
+            if ref is retry0:
+                return {"chunk": "c0", "status": "success", "write_deferred": True, "prior_write": None}
+            if ref is retry1:
+                return {
+                    "chunk": "c1",
+                    "status": "success",
+                    "write_deferred": True,
+                    "prior_write": {"label": "c0", "ok": True, "error": None},
+                }
+            if ref is flush_a:
+                return {"label": "c1", "ok": True, "error": None}
+            return MagicMock()
+
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
+            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod, "InferenceActor") as cls,
+            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
+            patch.object(_sched_mod.time, "sleep"),
+        ):
+            cls.options.return_value.remote.return_value = replacement
+            results = _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=chunks,
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+            )
+
+        # Both chunks completed (on the replacement) despite the death, and c0
+        # was re-run because its deferred write died with the first actor.
+        assert sorted(r["chunk"] for r in results) == ["c0", "c1"]

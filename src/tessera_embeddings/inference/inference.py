@@ -277,11 +277,24 @@ class _LoopProgress:
     tokens: int = 0
     flops: int = 0
     sub_batch_idx: int = 0
+    # Worst single-batch CPU prep this call — averages hide the spikes that
+    # actually starve the GPU (feed-fix telemetry; see actors' reserve_cpus).
+    get_batch_max: float = 0.0
+    # Per-bucket (pixels, sub-batches) — the workload-side input to the
+    # adaptive token-budget gate (temp/token-budget-batching-findings.md §Step 0):
+    # the expected gain is bucket occupancy weighted by the per-shape speedup
+    # curve, and occupancy varies by region, so it's logged on every run.
+    # Counts only — per-bucket forward times are NOT recorded because the
+    # pipelined loop's timings are enqueue-side and would mislead.
+    bucket_px: dict[tuple[int, int], tuple[int, int]] = field(default_factory=dict)
 
     def record(self, bucket_key: tuple[int, int], n_px: int, timings: _BatchTimings) -> None:
         self.t_total += timings
+        self.get_batch_max = max(self.get_batch_max, timings.get_batch)
         self.pixels += n_px
         self.tokens += n_px * (bucket_key[0] + bucket_key[1])
+        px, nb = self.bucket_px.get(bucket_key, (0, 0))
+        self.bucket_px[bucket_key] = (px + n_px, nb + 1)
         self.flops += transformer_flops(
             n_px,
             bucket_key[0],
@@ -310,9 +323,10 @@ class _LoopProgress:
             avg = self.t_total.avg_ms(self.sub_batch_idx)
             logger.debug(
                 "  TIMING avg ms/sub-batch (n=%d): "
-                "get_batch=%.1f  transfer=%.1f  forward=%.1f  postprocess=%.1f  total=%.1f",
+                "get_batch=%.1f (max %.0f)  transfer=%.1f  forward=%.1f  postprocess=%.1f  total=%.1f",
                 self.sub_batch_idx,
                 avg.get_batch,
+                self.get_batch_max * 1000,
                 avg.transfer,
                 avg.forward,
                 avg.postprocess,
@@ -664,5 +678,12 @@ def run_inference(
         tokens_processed / elapsed if elapsed > 0 else 0,
         flops_processed / elapsed / 1e12 if elapsed > 0 else 0,
     )
+    if progress.bucket_px:
+        logger.info(
+            "Bucket occupancy: %s",
+            " ".join(
+                f"({k[0]},{k[1]}):{px}px/{nb}sb" for k, (px, nb) in sorted(progress.bucket_px.items())
+            ),
+        )
 
     return InferenceResult(embeddings=out, embeddings_std=None, scales=scales)

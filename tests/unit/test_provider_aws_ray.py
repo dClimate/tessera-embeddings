@@ -11,20 +11,28 @@ concern.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import boto3
 import pytest
 import yaml
+from botocore.exceptions import ClientError
 from moto import mock_aws
 
+from tessera_embeddings.providers.aws import ray as ray_mod
 from tessera_embeddings.providers.aws.ray import (
     DEFAULT_CLUSTER_TEMPLATE,
     PROJECT_TAG_VALUE,
+    _launch_ray_with_failover,
     _pick_least_loaded_subnet,
+    _rank_launch_subnets,
     _resolve_ray_config,
     cleanup_ray_tempfiles,
 )
+
+_LOG = logging.getLogger("test")
 
 REGION = "us-west-2"
 SSM_PREFIX = "/test/tessera/ray/"
@@ -202,6 +210,168 @@ def test_pick_least_loaded_subnet_returns_least_loaded() -> None:
     subnets = [subnet_a, subnet_b]
     chosen = _pick_least_loaded_subnet(subnets, "test-cluster", ec2)
     assert chosen["SubnetId"] == subnet_b["SubnetId"]
+
+
+# ---------------------------------------------------------------------------
+# Capacity-aware AZ ranking + launch failover
+# ---------------------------------------------------------------------------
+
+
+def _subnet(subnet_id: str, az_letter: str, az_id: str) -> dict[str, str]:
+    """Minimal subnet dict as returned by describe_subnets."""
+    return {"SubnetId": subnet_id, "AvailabilityZone": f"{REGION}{az_letter}", "AvailabilityZoneId": az_id}
+
+
+def _mock_ec2(
+    *,
+    instances: list[str] | None = None,
+    sps: list[dict] | None = None,
+    sps_error: Exception | None = None,
+) -> MagicMock:
+    """Build a fake EC2 client for ranking tests.
+
+    ``instances`` is a list of SubnetIds hosting a tagged Ray instance (load
+    signal). ``sps`` is the SpotPlacementScores payload; ``sps_error`` makes
+    get_spot_placement_scores raise (moto does not implement the API).
+    """
+    client = MagicMock()
+    reservations = [{"Instances": [{"SubnetId": sid} for sid in instances]}] if instances else []
+    client.describe_instances.return_value = {"Reservations": reservations}
+    if sps_error is not None:
+        client.get_spot_placement_scores.side_effect = sps_error
+    else:
+        client.get_spot_placement_scores.return_value = {"SpotPlacementScores": sps or []}
+    return client
+
+
+def test_rank_launch_subnets_orders_by_score() -> None:
+    """Highest spot placement score ranks first; unscored AZs sort last but stay included."""
+    subnets = [
+        _subnet("subnet-a", "a", "usw2-az1"),
+        _subnet("subnet-b", "b", "usw2-az2"),
+        _subnet("subnet-c", "c", "usw2-az3"),  # no score returned
+    ]
+    ec2 = _mock_ec2(
+        sps=[
+            {"Region": REGION, "AvailabilityZoneId": "usw2-az1", "Score": 3},
+            {"Region": REGION, "AvailabilityZoneId": "usw2-az2", "Score": 8},
+        ]
+    )
+
+    ranked = _rank_launch_subnets(subnets, "g6e.xlarge", 20, "tessera-inference", ec2, REGION, _LOG)
+
+    assert [s["SubnetId"] for s in ranked] == ["subnet-b", "subnet-a", "subnet-c"]
+    kwargs = ec2.get_spot_placement_scores.call_args.kwargs
+    assert kwargs["InstanceTypes"] == ["g6e.xlarge"]
+    assert kwargs["TargetCapacity"] == 20
+    assert kwargs["SingleAvailabilityZone"] is True
+    assert kwargs["RegionNames"] == [REGION]
+
+
+def test_rank_launch_subnets_clamps_target_capacity() -> None:
+    """TargetCapacity is clamped to the account-safe 1..100 range."""
+    subnets = [_subnet("subnet-a", "a", "usw2-az1")]
+    ec2 = _mock_ec2(sps=[{"Region": REGION, "AvailabilityZoneId": "usw2-az1", "Score": 5}])
+
+    _rank_launch_subnets(subnets, "g6e.xlarge", 500, "tessera-inference", ec2, REGION, _LOG)
+
+    assert ec2.get_spot_placement_scores.call_args.kwargs["TargetCapacity"] == 100
+
+
+def test_rank_launch_subnets_falls_back_on_access_denied() -> None:
+    """AccessDenied from SPS degrades to least-loaded ranking without raising."""
+    subnets = [_subnet("subnet-a", "a", "usw2-az1"), _subnet("subnet-b", "b", "usw2-az2")]
+    err = ClientError({"Error": {"Code": "AccessDenied", "Message": "no perms"}}, "GetSpotPlacementScores")
+    ec2 = _mock_ec2(instances=["subnet-a", "subnet-a"], sps_error=err)
+
+    ranked = _rank_launch_subnets(subnets, "g6e.xlarge", 20, "tessera-inference", ec2, REGION, _LOG)
+
+    # subnet-a carries 2 Ray instances → least-loaded subnet-b ranks first.
+    assert [s["SubnetId"] for s in ranked] == ["subnet-b", "subnet-a"]
+
+
+def test_rank_launch_subnets_falls_back_on_empty_sps() -> None:
+    """An empty SpotPlacementScores response degrades to least-loaded ranking."""
+    subnets = [_subnet("subnet-a", "a", "usw2-az1"), _subnet("subnet-b", "b", "usw2-az2")]
+    ec2 = _mock_ec2(instances=["subnet-a", "subnet-a"], sps=[])
+
+    ranked = _rank_launch_subnets(subnets, "g6e.xlarge", 20, "tessera-inference", ec2, REGION, _LOG)
+
+    assert [s["SubnetId"] for s in ranked] == ["subnet-b", "subnet-a"]
+
+
+@mock_aws
+def test_resolve_ray_config_uses_chosen_subnet() -> None:
+    """A pre-chosen subnet is used directly; the least-loaded picker is not called."""
+    ami_param, subnet_ids, _ = _seed_ssm_and_vpc()
+    ec2 = boto3.client("ec2", region_name=REGION)
+    subnets = ec2.describe_subnets(SubnetIds=subnet_ids)["Subnets"]
+    chosen = next(s for s in subnets if s["AvailabilityZone"] == f"{REGION}b")
+
+    with patch.object(ray_mod, "_pick_least_loaded_subnet") as picker:
+        resolved = _resolve_ray_config(
+            DEFAULT_CLUSTER_TEMPLATE,
+            region=REGION,
+            ami_ssm_name=ami_param,
+            ssm_prefix=SSM_PREFIX,
+            cluster_name="test-cluster",
+            chosen_subnet=chosen,
+        )
+
+    try:
+        picker.assert_not_called()
+        config = yaml.safe_load(Path(resolved).read_text())
+        assert config["provider"]["availability_zone"] == f"{REGION}b"
+        for node in config["available_node_types"].values():
+            assert node["node_config"]["SubnetIds"] == [chosen["SubnetId"]]
+    finally:
+        cleanup_ray_tempfiles(resolved)
+
+
+def test_launch_with_failover_retries_next_az(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ray-up failure in the top AZ tears the attempt down and launches in the next AZ."""
+    subnets = [_subnet("subnet-a", "a", "usw2-az1"), _subnet("subnet-b", "b", "usw2-az2")]
+
+    resolve_calls: list[str] = []
+
+    def resolve_config(subnet: dict) -> str:
+        resolve_calls.append(subnet["SubnetId"])
+        return f"/tmp/resolved-{subnet['SubnetId']}.yaml"
+
+    def fake_start(resolved_yaml: str, _log: object) -> str:
+        if "subnet-a" in resolved_yaml:
+            raise RuntimeError("ray up failed (InsufficientInstanceCapacity)")
+        return "10.0.0.5"
+
+    stopped: list[str] = []
+    cleaned: list[str] = []
+    monkeypatch.setattr(ray_mod, "_start_ray_cluster", fake_start)
+    monkeypatch.setattr(ray_mod, "_stop_ray_cluster", lambda y, _log: stopped.append(y))
+    monkeypatch.setattr(ray_mod, "cleanup_ray_tempfiles", lambda y: cleaned.append(y))
+
+    resolved_yaml, head_ip = _launch_ray_with_failover(subnets, resolve_config, _LOG)
+
+    assert head_ip == "10.0.0.5"
+    assert resolved_yaml == "/tmp/resolved-subnet-b.yaml"
+    assert resolve_calls == ["subnet-a", "subnet-b"]
+    # The failed first attempt was torn down; the successful one was not.
+    assert stopped == ["/tmp/resolved-subnet-a.yaml"]
+    assert cleaned == ["/tmp/resolved-subnet-a.yaml"]
+
+
+def test_launch_with_failover_raises_when_all_azs_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When ray up fails in every AZ, a RuntimeError names the AZs tried."""
+    subnets = [_subnet("subnet-a", "a", "usw2-az1"), _subnet("subnet-b", "b", "usw2-az2")]
+
+    def fake_start(_resolved_yaml: str, _log: object) -> str:
+        raise RuntimeError("ray up failed")
+
+    monkeypatch.setattr(ray_mod, "_start_ray_cluster", fake_start)
+    monkeypatch.setattr(ray_mod, "_stop_ray_cluster", lambda _y, _log: None)
+    monkeypatch.setattr(ray_mod, "cleanup_ray_tempfiles", lambda _y: None)
+
+    with pytest.raises(RuntimeError, match="all candidate AZs"):
+        _launch_ray_with_failover(subnets, lambda s: f"/tmp/{s['SubnetId']}.yaml", _LOG)
 
 
 def test_cleanup_ray_tempfiles_handles_missing_path() -> None:

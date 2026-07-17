@@ -102,8 +102,11 @@ events.sort(key=lambda e: e[0])
 # A split chunk calls run_inference once per strip, so ds/start/idone lines
 # repeat within one chunk. Accumulate: t_start = FIRST strip's inference start,
 # infer_s = SUM of every strip's reported inference seconds, t_idone = LAST
-# strip's completion, valid_px = SUM across strips. Empty strips emit no
-# start/idone (dataset is empty), so summing what exists is correct.
+# strip's completion. valid_px comes from the actor's chunk-total "complete: N
+# valid pixels" (cdone) line — NOT the per-strip ds sum, which under-counts
+# multi-strip chunks (a strip with no valid pixels emits no ds line, and the ds
+# count is per-strip-within-crop); px/s is the honest END-TO-END rate
+# valid_px / total_s. ds lines are still summed as a fallback if cdone is absent.
 rows, cur, prev_done, pending_pref = [], None, None, set()
 for t, kind, g in events:
     if kind == "pref":
@@ -123,16 +126,19 @@ for t, kind, g in events:
         cur["t_idone"] = t  # last strip wins
         cur["infer_s"] += float(g[0])
     elif kind == "cdone":
-        cur["t_cdone"], cur["total_s"] = t, g[2]; rows.append(cur); prev_done = t; cur = None
+        cur["t_cdone"], cur["cdone_px"], cur["total_s"] = t, int(g[1]), g[2]
+        rows.append(cur); prev_done = t; cur = None
 print("label\tTkept\tstrips\tpref\tbuckets\tvalid_px\tprologue_s\tinfer_s\twrite_s\toverhead_s\ttotal_s\tpx/s")
 for r in rows:
     try:
         prologue = (r["t_start"] - r["t_mask"]).total_seconds()
         write = (r["t_cdone"] - r["t_idone"]).total_seconds()
         infer = r["infer_s"]
-        overhead = float(r["total_s"]) - infer - write
-        pxs = (r["px"] / infer) if infer > 0 else 0  # chunk-level, summed over strips
-        print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r['pref']}\t{r.get('buckets','?')}\t{r['px']}\t{prologue:.1f}\t{infer:.1f}\t{write:.1f}\t{overhead:.1f}\t{r['total_s']}\t{pxs:.0f}")
+        total = float(r["total_s"])
+        overhead = total - infer - write
+        vpx = r.get("cdone_px", r["px"])  # authoritative chunk-total; ds-sum fallback
+        pxs = (vpx / total) if total > 0 else 0  # honest END-TO-END px/s
+        print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r['pref']}\t{r.get('buckets','?')}\t{vpx}\t{prologue:.1f}\t{infer:.1f}\t{write:.1f}\t{overhead:.1f}\t{r['total_s']}\t{pxs:.0f}")
     except KeyError as e:
         print(f"{r['label']}\tINCOMPLETE({e})")
 """

@@ -32,6 +32,7 @@ from typing import Any
 
 import yaml
 from prefect import flow, get_run_logger
+from prefect.runtime import flow_run as flow_run_ctx
 from pydantic import BaseModel
 
 from tessera_embeddings.config.dask import AssemblyConfig
@@ -52,6 +53,7 @@ from tessera_embeddings.orchestration.prefect.tasks.inference import (
     run_inference_task,
 )
 from tessera_embeddings.providers.aws.ray import (
+    DEFAULT_CLUSTER_TEMPLATE,
     cleanup_ray_tempfiles,
     terminate_ray_instances_by_tag,
 )
@@ -83,31 +85,57 @@ class EmbeddingsDevParams(BaseModel):
     sync_source_path: str | None = None
 
 
-def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
-    """Emergency teardown when the flow is cancelled via the Prefect UI.
+def _cluster_name_for_flow_run(flow_run_id: object) -> str:
+    """Derive the deterministic Ray cluster name for a flow run.
 
-    Reads the resolved YAML path from module state and runs ``ray down``.
-    Falls back to terminating instances by EC2 tag when the resolved
-    YAML is unavailable (e.g. cancelled before ``ray up`` completed).
+    The name must be recomputable from nothing but the flow-run id:
+    Prefect executes cancellation/crash hooks in a freshly imported copy
+    of this module after the flow's child process has been killed, so any
+    state the hook needs has to be derivable, not stored. The base name
+    comes from the shipped cluster template so the two stay in sync.
+    """
+    with DEFAULT_CLUSTER_TEMPLATE.open() as f:
+        base = yaml.safe_load(f).get("cluster_name", "tessera-inference")
+    return f"{base}-{str(flow_run_id).replace('-', '')[:8]}"
+
+
+def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
+    """Emergency teardown when the flow is cancelled or crashes.
+
+    Prefect runs these hooks in a FRESH import of this module after the
+    flow's child process has been killed, so the module globals set by
+    the flow body are normally ``None`` here and ``ray down`` (which
+    needs the dead process's resolved YAML tempfile) is normally
+    impossible. The authoritative path is therefore tag-based: re-derive
+    the cluster name from the flow-run id and terminate every instance
+    carrying its ``ray-cluster-name`` tag. The YAML fast path is kept for
+    the rare same-process case; both paths are idempotent.
     """
     log = logging.getLogger(__name__)
-    log.warning("Flow cancelled — tearing down Ray cluster")
+    log.warning("Flow cancelled/crashed — tearing down Ray cluster")
 
     if _active_resolved_yaml and Path(_active_resolved_yaml).exists():
         log.info("Running ray down with %s", _active_resolved_yaml)
         subprocess.run(["ray", "down", _active_resolved_yaml, "-y"], check=False)
         cleanup_ray_tempfiles(_active_resolved_yaml)
-    elif _active_cluster_name:
-        log.warning("No resolved YAML — terminating instances for cluster '%s'", _active_cluster_name)
-        terminate_ray_instances_by_tag(cluster_name=_active_cluster_name, log=log)
+
+    run_id = getattr(flow_run, "id", None)
+    cluster_name = _active_cluster_name or (_cluster_name_for_flow_run(run_id) if run_id else None)
+    if cluster_name:
+        log.warning("Terminating instances for cluster '%s'", cluster_name)
+        terminate_ray_instances_by_tag(cluster_name=cluster_name, log=log)
     else:
         log.warning(
-            "Cancellation fired before cluster was provisioned — "
-            "no YAML or cluster name available. Check the AWS console manually."
+            "No flow-run id or cluster name available — cannot derive the "
+            "cluster tag. Check the AWS console manually."
         )
 
 
-@flow(name="tessera_embeddings", on_cancellation=[_ray_cleanup_on_cancellation])
+@flow(
+    name="tessera_embeddings",
+    on_cancellation=[_ray_cleanup_on_cancellation],
+    on_crashed=[_ray_cleanup_on_cancellation],
+)
 def tessera_embeddings(
     *,
     roi_name: str,
@@ -260,14 +288,20 @@ def tessera_embeddings(
         return _run_assembly(log=log, result_stats=None, **assemble_kwargs)
 
     global _active_resolved_yaml, _active_cluster_name
+    # Deterministic, flow-run-derived cluster name so the cancellation/crash
+    # hook can re-derive it in a fresh process (see _cluster_name_for_flow_run).
+    # Outside a Prefect run (unit tests) the id is None and ray_cluster falls
+    # back to its own random suffix.
     with ray_cluster(
         log,
         ami_ssm_name=ami_ssm_name,
+        cluster_name=_cluster_name_for_flow_run(flow_run_ctx.id) if flow_run_ctx.id else None,
         ssm_prefix=ssm_prefix,
         cloudwatch_log_group=cloudwatch_log_group,
         code_bucket=code_bucket,
         code_suffix=code_suffix,
         sync_source_path=Path(dev_params.sync_source_path) if dev_params.sync_source_path else None,
+        target_workers=num_actors,
     ) as resolved_yaml:
         _active_resolved_yaml = resolved_yaml
         if resolved_yaml and Path(resolved_yaml).exists():
