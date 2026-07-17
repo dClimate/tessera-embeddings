@@ -9,24 +9,37 @@ Phase-0 measurement tool for the GPU-saturation campaign. Against a running
    util, avg power, busy fraction) plus a per-chunk phase-split table parsed
    from the actor logs (gap+mask / band read / SAR+build / inference / write),
    the wall-clock anatomy that shows how much GPU time each phase wastes.
+3. ``--ram-report`` — per-worker peak host RAM + GPU-util distribution pulled
+   from the workers' ``ResourceMonitor`` ``RESOURCES`` lines in CloudWatch.
+   Unlike ``--report`` (which SSHes live workers), this works AFTER a run has
+   torn down, so it answers "how close to the RAM ceiling did we get?" and
+   "how much GPU idle is left to recover?" post hoc. Scope with --since/--until.
 
 Usage::
 
     python scripts/inference_perf/observe_cluster.py --profile yield --start-pollers
     # ...let the run process a few chunks...
     python scripts/inference_perf/observe_cluster.py --profile yield --report
+    # after a run (cluster gone): peak RAM + fleet util from CloudWatch
+    python .../observe_cluster.py --profile yield --ram-report \
+        --since 2026-07-16T22:50 --until 2026-07-17T03:00
 
-Requires workers reachable via SSM (the production AMI runs the agent) and an
-AWS profile with ec2:DescribeInstances + ssm:SendCommand.
+--report/--start-pollers require workers reachable via SSM (the production AMI
+runs the agent). --ram-report only needs CloudWatch Logs read access. All modes
+use an AWS profile with the relevant permissions.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import sys
 import time
 
 import boto3
+
+# CloudWatch log group the workers' ResourceMonitor lines ship to (yield deploy).
+DEFAULT_RAM_LOG_GROUP = "/ec2/yield-embeddings/ray"
 
 # Kill any prior pollers before starting new ones. Match the actual long-lived
 # processes (the `nvidia-smi --query-gpu ... -l` and `dcgmi dmon` command lines),
@@ -205,6 +218,90 @@ def run_on_workers(session: boto3.session.Session, instance_ids: list[str], comm
     return outputs
 
 
+def _parse_ts(s: str) -> int:
+    """Parse an ISO8601 UTC timestamp (or 'YYYY-MM-DDTHH:MM') to epoch seconds."""
+    dt = datetime.datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.UTC)
+    return int(dt.timestamp())
+
+
+def ram_util_report(
+    session: boto3.session.Session, log_group: str, start_epoch: int, end_epoch: int
+) -> int:
+    """Per-worker peak host RAM + GPU-util distribution from CloudWatch.
+
+    Sources the ``ResourceMonitor`` ``RESOURCES`` lines (30 s cadence) that the
+    workers ship to ``log_group``, so it works AFTER a run's cluster has torn
+    down — unlike the SSM ``--report`` path, which needs live workers.
+
+    Reports, per log stream (≈ per worker): peak host RAM (GB and % of node),
+    mean/min GPU utilization, and sample count; plus fleet rollups. Peak RAM is
+    the 30 s-polled peak — it can miss an instantaneous OOM spike (the OOM
+    killer catches those; see the flow-runner memory-monitor diagnostics).
+
+    NOTE: the log group is shared across runs, so scope the window tightly to
+    the run of interest; streams from an overlapping run share the same group.
+    """
+    logs = session.client("logs")
+    query = (
+        "fields @logStream, @message "
+        "| filter @message like /RESOURCES/ "
+        '| parse @message "RAM=*/* GB (*%)" as ram_gb, ram_total, ram_pct '
+        '| parse @message "GPU=*%" as gpu_pct '
+        "| stats max(ram_gb) as peak_ram_gb, max(ram_pct) as peak_ram_pct, "
+        "max(ram_total) as node_gb, avg(gpu_pct) as avg_gpu, min(gpu_pct) as min_gpu, "
+        "count(*) as samples by @logStream "
+        "| sort peak_ram_pct desc"
+    )
+    qid = logs.start_query(
+        logGroupName=log_group, startTime=start_epoch, endTime=end_epoch, queryString=query, limit=10000
+    )["queryId"]
+    while True:
+        res = logs.get_query_results(queryId=qid)
+        if res["status"] in ("Complete", "Failed", "Cancelled", "Timeout"):
+            break
+        time.sleep(2)
+    if res["status"] != "Complete":
+        print(f"CloudWatch query {res['status']}", file=sys.stderr)
+        return 1
+
+    rows = [{c["field"]: c["value"] for c in row} for row in res["results"]]
+    if not rows:
+        print("No RESOURCES lines in the window (check --log-group / --since / --until).", file=sys.stderr)
+        return 1
+
+    win = f"{datetime.datetime.fromtimestamp(start_epoch, datetime.UTC):%Y-%m-%d %H:%M}"
+    win += f" → {datetime.datetime.fromtimestamp(end_epoch, datetime.UTC):%Y-%m-%d %H:%M} UTC"
+    print(f"RAM + GPU-util from {log_group}  [{win}]  ({len(rows)} worker streams)\n")
+    print("stream\tpeak_ram_gb\tpeak_ram_%\tavg_gpu_%\tmin_gpu_%\tsamples")
+    peak_gb = peak_pct = 0.0
+    gpu_avgs, weighted_gpu, total_n, node_gb = [], 0.0, 0, 0.0
+    for r in rows:
+        pg, pp = float(r["peak_ram_gb"]), float(r["peak_ram_pct"])
+        ag, n = float(r["avg_gpu"]), int(float(r["samples"]))
+        node_gb = max(node_gb, float(r.get("node_gb", 0) or 0))
+        peak_gb, peak_pct = max(peak_gb, pg), max(peak_pct, pp)
+        gpu_avgs.append(ag)
+        weighted_gpu += ag * n
+        total_n += n
+        stream = r["@logStream"].rsplit("/", 1)[-1][:32]
+        print(f"{stream}\t{pg:.1f}\t{pp:.0f}\t{ag:.1f}\t{float(r['min_gpu']):.0f}\t{n}")
+
+    fleet_gpu = weighted_gpu / total_n if total_n else 0.0
+    print(
+        f"\nFLEET: peak host RAM = {peak_gb:.1f} GB ({peak_pct:.0f}% of ~{node_gb:.1f} GB node) | "
+        f"sample-weighted avg GPU util = {fleet_gpu:.1f}% across {len(rows)} workers | "
+        f"idle-recovery ceiling if all → 100% ≈ {100 - fleet_gpu:.0f}%"
+    )
+    print(
+        "(peak RAM is the 30s-polled peak; instantaneous OOM spikes show only in the "
+        "flow-runner memory-monitor diagnostics. GPU util is nvidia-smi 'busy-or-not', "
+        "an upper bound on useful-work fraction — not all the sub-100% gap is CPU-feed.)"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point; returns process exit code."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -212,13 +309,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--region", default="us-west-2")
     parser.add_argument("--name-prefix", default="ray-tessera-inference")
     parser.add_argument("--start-pollers", action="store_true", help="Start 1s GPU pollers on all workers")
-    parser.add_argument("--report", action="store_true", help="Fetch GPU summaries + per-chunk phase splits")
+    parser.add_argument(
+        "--report", action="store_true", help="Fetch GPU summaries + per-chunk phase splits (live workers)"
+    )
+    parser.add_argument(
+        "--ram-report",
+        action="store_true",
+        help="Per-worker peak host RAM + GPU-util distribution from CloudWatch RESOURCES lines "
+        "(works post-run, no live cluster needed). Scope with --since/--until.",
+    )
+    parser.add_argument("--log-group", default=DEFAULT_RAM_LOG_GROUP, help="CloudWatch log group for --ram-report")
+    parser.add_argument("--since", help="--ram-report window start, ISO8601 UTC (e.g. 2026-07-16T22:50)")
+    parser.add_argument("--until", help="--ram-report window end, ISO8601 UTC")
+    parser.add_argument(
+        "--hours", type=float, default=6.0, help="--ram-report lookback when --since omitted (default 6h)"
+    )
     args = parser.parse_args(argv)
 
-    if not (args.start_pollers or args.report):
-        parser.error("nothing to do: pass --start-pollers and/or --report")
+    if not (args.start_pollers or args.report or args.ram_report):
+        parser.error("nothing to do: pass --start-pollers, --report, and/or --ram-report")
 
     session = boto3.session.Session(profile_name=args.profile, region_name=args.region)
+
+    if args.ram_report:
+        end = _parse_ts(args.until) if args.until else int(time.time())
+        start = _parse_ts(args.since) if args.since else end - int(args.hours * 3600)
+        rc = ram_util_report(session, args.log_group, start, end)
+        if not (args.start_pollers or args.report):
+            return rc
+
     workers = find_workers(session, args.name_prefix)
     if not workers:
         print(f"No running workers matching {args.name_prefix}*worker*", file=sys.stderr)

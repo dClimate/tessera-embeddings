@@ -31,6 +31,15 @@ Performance, same chunks, wall-clock incl. load+write: baseline ~204–341 s/chu
 → P2+3 89–140 s (**2.5–3.5×/worker**); inference px/s 9.6–13.3K → 13.4–27.3K;
 GPU 100% util / busy 1.00 / ~338 W on saturated workers; get_batch 651 → 103 ms.
 
+Host RAM + fleet GPU util (`observe_cluster.py --ram-report`, P2+3 window,
+101 worker streams): peak host RAM **28.4 GB / 30.9 GB (92%)** in the 30s-polled
+RESOURCES lines; the true instantaneous peak was **29.38 GB (95.1%)** — the
+chunk_5_9 OOM-kill (this gate ran on `c816866`, PRE the strip-budget fix
+`ab3b319`; a post-fix run should peak ~23 GB / ~75%). Fleet sample-weighted avg
+GPU util **79.4%** → total idle-recovery ceiling ~21% (incl. structural
+write/cold-start idle); CPU-feed-specific slice ~7–15% GPU-hours (see
+`temp/token-budget-batching-findings.md` for the g6e.2xlarge vs software tradeoff).
+
 Sparse/edge coverage 2026-07-17 (P2+3 vs baseline, `--cross-config`):
 chunk_0_22 (3.5% valid): exact 99.85%, max|Δ|=2, cosine ≥ 0.99992, 0 NaN
 mismatches; chunk_3_0: exact 98.06%, same envelope — PASS 2/2. Zero NaN-mask
