@@ -481,6 +481,21 @@ def _load_s2(
         s2_doys = mask_bundle.doys
         abs_kept = mask_bundle.abs_indices
         y_slice = _resolve_y_slice(chunk, y_sub)
+
+        if not s2_masks.any():
+            # No valid S2 pixel anywhere in this strip: bucketing would select
+            # zero pixels, so the (expensive, 20 B/px) band read is pure waste.
+            # Return a T=0 band stack — the dataset sees no candidates and the
+            # strip short-circuits — while obs counts keep full fidelity from
+            # the bundle. Common on sparse/edge chunks whose valid sliver lies
+            # in other strips; the timestep prune can't help them because it is
+            # chunk-global (one sliver anywhere keeps the timestep).
+            h = y_slice.stop - y_slice.start
+            w = x_slice.stop - x_slice.start
+            logger.info("Strip rows %s have no valid S2 pixels — skipping band read", rows)
+            empty = np.empty((0, h, w, len(S2_BAND_ORDER)), dtype=root[S2_BAND_ORDER[0]].dtype)
+            return empty, s2_masks[:0], s2_doys[:0], s2_obs_count
+
         s2_bands = _load_s2_bands(
             root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice, reserve_cpus=reserve_cpus
         )

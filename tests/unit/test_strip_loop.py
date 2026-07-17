@@ -331,3 +331,76 @@ class TestDeferredStagingWrites:
     def test_flush_with_nothing_pending_returns_none(self, inference_config, test_model):
         actor = _make_actor(inference_config, test_model)
         assert actor.flush_writes() is None
+
+
+# ---------------------------------------------------------------------------
+# Empty-strip S2 band-read skip
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyStripBandReadSkip:
+    """Strips with zero valid pixels must not pay the S2 band read."""
+
+    def _make_half_empty_stores(self):
+        """Synthetic stores where rows 0-5 are all-invalid SCL, rows 6-11 valid-ish."""
+        h, w = _CHUNK.height, _CHUNK.width
+        rng = np.random.default_rng(99)
+        s2_root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+        for band in S2_BAND_ORDER:
+            vals = rng.integers(100, 5000, size=(6, h, w)).astype(np.uint16)
+            arr = s2_root.create_array(band, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
+            arr[:] = vals
+        scl_vals = np.full((6, h, w), 8, dtype=np.uint8)  # invalid everywhere...
+        scl_vals[:, 6:, :] = rng.choice([4, 5, 8], size=(6, h - 6, w)).astype(np.uint8)  # ...except lower rows
+        scl = s2_root.create_array("scl", shape=scl_vals.shape, dtype=scl_vals.dtype, chunks=scl_vals.shape)
+        scl[:] = scl_vals
+        times = pd.date_range("2024-12-01", periods=6, freq="3D").values.astype("datetime64[ns]").astype("int64")
+        t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
+        t_arr[:] = times
+        sar_asc = _make_sar_zarr_group(4, h, w, seed=201)
+        sar_desc = _make_sar_zarr_group(4, h, w, seed=202)
+
+        def _open_store(path):
+            if "reflectance" in path:
+                return s2_root
+            if "ascending" in path:
+                return sar_asc
+            return sar_desc
+
+        return _open_store
+
+    def _run(self, inference_config, test_model, strip_h):
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+        actor = _make_actor(inference_config, test_model)
+        _CapturingWriter.last_write = None
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._make_half_empty_stores()),
+            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+            patch.object(_actors_mod, "_strip_height_for_density", lambda *a, **k: strip_h),
+            patch.object(_dl_mod, "_load_s2_bands", wraps=_dl_mod._load_s2_bands) as band_spy,
+        ):
+            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+            flushed = actor.flush_writes()
+            assert flushed is None or flushed["ok"]
+        return result, _CapturingWriter.last_write, band_spy
+
+    def test_empty_strip_skips_band_read(self, inference_config, test_model):
+        # strip_h=6 → strip 0 (rows 0-5) is all-invalid, strip 1 (rows 6-11) valid.
+        result, write, band_spy = self._run(inference_config, test_model, strip_h=6)
+        assert result["status"] == "success"
+        # Only the valid strip paid a band read.
+        assert band_spy.call_count == 1
+        (_, kwargs) = band_spy.call_args
+        assert kwargs["y_slice"] == slice(6, 12)
+
+    def test_outputs_identical_with_and_without_skip(self, inference_config, test_model):
+        # Single full-height strip (no skip possible) vs split (top strip skipped):
+        # outputs must be bit-identical.
+        res_one, write_one, _ = self._run(inference_config, test_model, strip_h=10**6)
+        res_two, write_two, _ = self._run(inference_config, test_model, strip_h=6)
+        assert res_one["valid_pixels"] == res_two["valid_pixels"] > 0
+        np.testing.assert_array_equal(write_one["embeddings"], write_two["embeddings"])
+        np.testing.assert_allclose(write_one["scales"], write_two["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
+        for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
+            np.testing.assert_array_equal(write_one["obs_counts"][var], write_two["obs_counts"][var], err_msg=var)
