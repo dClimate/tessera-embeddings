@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from tessera_embeddings.inference.data_loading import ChunkData
@@ -280,3 +281,39 @@ class TestThroughputAccounting:
         summary = next(r.message for r in caplog.records if r.message.startswith("Inference complete"))
         assert "tok/sec avg" in summary
         assert "eff TFLOPS avg" in summary
+
+
+class TestPipelinedGpuLoop:
+    """The async two-deep CUDA loop must match the synchronous serial loop.
+
+    Both loops run the same ops in the same order on the same stream, so results
+    are bit-identical; the pipeline only changes when the host waits. This is the
+    only coverage of the pinned-buffer / CUDA-event / two-deep-drain / backbone-
+    stream-ordering path — the CPU tests exercise `_serial_loop` only. Skips when
+    no GPU is present (CI), runs on GPU boxes.
+    """
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for the pipelined GPU loop")
+    def test_pipelined_matches_serial(self, sample_chunk_data, inference_config, test_model, monkeypatch):
+        import os
+
+        from tessera_embeddings.inference.inference import _SERIAL_LOOP_ENV
+
+        chunk = sample_chunk_data(height=16, width=16, t_s2=12, t_s1a=6, t_s1d=6)
+        device = torch.device("cuda")
+        model = test_model.to(device)
+
+        # Serial reference (escape-hatch env forces _serial_loop even on CUDA).
+        monkeypatch.setenv(_SERIAL_LOOP_ENV, "1")
+        ds_serial = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
+        serial = run_inference(model, ds_serial, inference_config, device)
+
+        # Default path → _pipelined_gpu_loop.
+        monkeypatch.delenv(_SERIAL_LOOP_ENV, raising=False)
+        assert not os.environ.get(_SERIAL_LOOP_ENV)
+        ds_pipe = MosaicChunkInferenceDataset(chunk, num_obs_checkpoints=inference_config.num_obs_checkpoints)
+        pipelined = run_inference(model, ds_pipe, inference_config, device)
+
+        # Same ops, same order, same stream → bit-identical int8 and scales.
+        np.testing.assert_array_equal(pipelined.embeddings, serial.embeddings)
+        np.testing.assert_array_equal(pipelined.scales, serial.scales)
