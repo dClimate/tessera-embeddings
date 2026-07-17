@@ -275,13 +275,21 @@ class TestVectorisedS1MatchesLoop:
         rng = np.random.default_rng(7)
         s1a_mean, s1a_std, s1d_mean, s1d_std = self._stats()
         for ta, td, target in [(6, 5, 8), (10, 10, 16), (3, 0, 8), (0, 4, 8), (12, 9, 8)]:
-            asc, asc_doys = self._random_orbit(rng, 48, ta) if ta else (
-                np.empty((48, 0, 2), dtype=np.uint16),
-                np.empty((48, 0), dtype=np.int32),
+            asc, asc_doys = (
+                self._random_orbit(rng, 48, ta)
+                if ta
+                else (
+                    np.empty((48, 0, 2), dtype=np.uint16),
+                    np.empty((48, 0), dtype=np.int32),
+                )
             )
-            desc, desc_doys = self._random_orbit(rng, 48, td) if td else (
-                np.empty((48, 0, 2), dtype=np.uint16),
-                np.empty((48, 0), dtype=np.int32),
+            desc, desc_doys = (
+                self._random_orbit(rng, 48, td)
+                if td
+                else (
+                    np.empty((48, 0, 2), dtype=np.uint16),
+                    np.empty((48, 0), dtype=np.int32),
+                )
             )
             got = resample_s1_bucket(asc, asc_doys, desc, desc_doys, target, s1a_mean, s1a_std, s1d_mean, s1d_std)
             want = _reference_resample_s1_bucket(

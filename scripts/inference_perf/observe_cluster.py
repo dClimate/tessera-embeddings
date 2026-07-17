@@ -50,13 +50,13 @@ POLLER_COMMANDS = [
 
 GPU_SUMMARY_CMD = (
     "awk -F', ' '{gsub(/ %| W| MiB| MHz/,\"\"); n++; u+=$2; if($2>mu)mu=$2; p+=$4; "
-    "if($2>5)busy++} END {if(n>0) printf \"samples=%d avg_util=%.1f%% max_util=%d%% "
+    'if($2>5)busy++} END {if(n>0) printf "samples=%d avg_util=%.1f%% max_util=%d%% '
     "avg_power=%.0fW busy_frac(>5%%)=%.2f\\n\", n,u/n,mu,p/n,busy/n}' /tmp/gpu_poll.csv"
 )
 
 # Runs on the worker: parse actor .err logs into per-chunk phase rows. The
 # format string targets _configure_actor_logging's basicConfig layout.
-PHASE_PARSER = r'''
+PHASE_PARSER = r"""
 import glob, re
 from datetime import datetime
 PAT = {
@@ -122,7 +122,7 @@ for r in rows:
         print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r['pref']}\t{r.get('buckets','?')}\t{r['px']}\t{prologue:.1f}\t{infer:.1f}\t{write:.1f}\t{overhead:.1f}\t{r['total_s']}\t{pxs:.0f}")
     except KeyError as e:
         print(f"{r['label']}\tINCOMPLETE({e})")
-'''
+"""
 
 REPORT_COMMANDS = [
     "echo '=== GPU POLL SUMMARY ==='",

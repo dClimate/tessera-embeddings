@@ -203,12 +203,8 @@ def resample_s1_bucket(
     # combined with np.where. Per-element arithmetic matches the per-pixel loop
     # this replaced (normalise-then-gather == gather-then-normalise
     # elementwise) — see the golden reference test in test_sampling_v11.py.
-    valid_a = (
-        np.any(s1_asc_bands != 0, axis=-1) if s1_asc_bands.shape[1] > 0 else np.zeros((b, 0), dtype=bool)
-    )
-    valid_d = (
-        np.any(s1_desc_bands != 0, axis=-1) if s1_desc_bands.shape[1] > 0 else np.zeros((b, 0), dtype=bool)
-    )
+    valid_a = np.any(s1_asc_bands != 0, axis=-1) if s1_asc_bands.shape[1] > 0 else np.zeros((b, 0), dtype=bool)
+    valid_d = np.any(s1_desc_bands != 0, axis=-1) if s1_desc_bands.shape[1] > 0 else np.zeros((b, 0), dtype=bool)
     ca = valid_a.sum(axis=1).astype(np.int64)
     cd = valid_d.sum(axis=1).astype(np.int64)
     total = ca + cd

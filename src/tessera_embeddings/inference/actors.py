@@ -63,6 +63,7 @@ class _PrefetchedChunk:
     strips: list[slice]
     first_strip: tuple[ChunkData, MosaicChunkInferenceDataset]
 
+
 logger = logging.getLogger(__name__)
 
 # Host-RAM budget (bytes) for the resident S2 *input* working set of a single

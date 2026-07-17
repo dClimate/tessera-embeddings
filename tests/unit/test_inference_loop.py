@@ -262,9 +262,7 @@ class TestProcessSubBatch:
 class TestThroughputAccounting:
     """Tests for the tokens/s + effective-TFLOPS accounting in run_inference."""
 
-    def test_final_log_reports_tokens_and_tflops(
-        self, sample_chunk_data, inference_config, test_model, caplog
-    ):
+    def test_final_log_reports_tokens_and_tflops(self, sample_chunk_data, inference_config, test_model, caplog):
         """The completion log carries density-neutral throughput units.
 
         px/s conflates sequence length across chunks, so the summary must also
