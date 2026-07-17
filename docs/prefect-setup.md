@@ -204,11 +204,16 @@ the top of each flow file states this explicitly.
 
 ## Cancellation
 
-Each long-running flow registers an `on_cancellation` hook. For
-`tessera_embeddings.py`, that hook tears down the Ray cluster (via
-`ray down` if the resolved YAML is available, falling back to
-EC2-tag-based termination). Don't disable it — orphaned GPU
-instances are expensive.
+Each long-running flow registers `on_cancellation` (and `on_crashed`)
+hooks. For `tessera_embeddings.py`, the hook terminates the Ray
+cluster's EC2 instances by tag: the cluster name is derived
+deterministically from the Prefect flow-run id, so the hook can
+recompute it even though Prefect runs hooks in a freshly imported copy
+of the flow module (the flow child process — and any module state it
+set — is already dead by then; `ray down` via the resolved YAML is
+attempted only as an opportunistic fast path). Don't disable it —
+orphaned GPU instances are expensive, and the autoscaler idle timeout
+never terminates the head node.
 
 The hook is a Prefect-specific concern, so it lives **inside** the
 flow file, not in the AWS provider. The provider exposes the

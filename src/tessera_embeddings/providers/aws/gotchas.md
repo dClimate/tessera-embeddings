@@ -166,15 +166,25 @@ three lines of defence:
    `make_instance_terminator` so the underlying EC2 instance is
    terminated immediately rather than waiting for the autoscaler.
 2. **`ray down`** at context-manager exit. Terminates everything
-   `ray up` provisioned.
-3. **Autoscaler idle timeout** (default 2 min in the YAML template).
-   Final safety net if `ray down` fails — idle workers self-retire.
+   `ray up` provisioned. The resolved YAML is bound *before* `ray up`
+   runs, so even a launch that fails partway tears down whatever it
+   provisioned (a failed launch used to run `ray down` against the
+   unresolved template, whose un-suffixed `cluster_name` matches
+   nothing — that leaked a head on 2026-07-16).
+3. **Autoscaler idle timeout** (2 min in the YAML template). Damage
+   limitation, NOT a safety net: it only drains workers *above* each
+   node type's `min_workers` floor (keep GPU floors at 0 — a leaked
+   cluster holds any positive floor forever) and it never terminates
+   the head node.
 
-For Prefect cancellation specifically, register
-`terminate_ray_instances_by_tag` and `cleanup_ray_tempfiles` on the
-flow's `on_cancellation` hook. They handle the case where the flow
-was cancelled before `ray up` returned (no resolved YAML to feed to
-`ray down`).
+Because layer 3 cannot finish the job, orphan handling falls to the
+orchestrator. `tessera_embeddings.py` derives the cluster name
+deterministically from the Prefect flow-run id and registers an
+`on_cancellation` + `on_crashed` hook that re-derives the name and
+calls `terminate_ray_instances_by_tag`. Prefect runs these hooks in a
+fresh process after killing the flow's child process, so the hook must
+not rely on state the flow body stored — only on what it can recompute
+from the hook's `flow_run` argument.
 
 ---
 
