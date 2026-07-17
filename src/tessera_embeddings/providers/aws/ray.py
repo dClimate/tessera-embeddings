@@ -274,8 +274,7 @@ def _rank_launch_subnets(
     log.info(
         "Ranked launch AZs (best first, single-AZ pin preserved): %s",
         ", ".join(
-            f"{s['AvailabilityZone']}(spot_score={scores.get(_az_id(s), 'n/a')}, "
-            f"ray_load={load_counts[s['SubnetId']]})"
+            f"{s['AvailabilityZone']}(spot_score={scores.get(_az_id(s), 'n/a')}, ray_load={load_counts[s['SubnetId']]})"
             for s in ranked
         ),
     )

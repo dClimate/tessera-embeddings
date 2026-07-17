@@ -232,9 +232,7 @@ def _parse_ts(s: str) -> int:
     return int(dt.timestamp())
 
 
-def ram_util_report(
-    session: boto3.session.Session, log_group: str, start_epoch: int, end_epoch: int
-) -> int:
+def ram_util_report(session: boto3.session.Session, log_group: str, start_epoch: int, end_epoch: int) -> int:
     """Per-worker peak host RAM + GPU-util distribution from CloudWatch.
 
     Sources the ``ResourceMonitor`` ``RESOURCES`` lines (30 s cadence) that the

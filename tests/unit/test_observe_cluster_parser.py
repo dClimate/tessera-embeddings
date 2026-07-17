@@ -47,9 +47,7 @@ def test_phase_parser_valid_px_from_cdone(tmp_path: Path) -> None:
     logdir.mkdir()
     (logdir / "worker-abc.err").write_text(_FAKE_LOG)
 
-    parser = mod.PHASE_PARSER.replace(
-        "/tmp/ray/session_latest/logs/worker-*.err", str(logdir / "worker-*.err")
-    )
+    parser = mod.PHASE_PARSER.replace("/tmp/ray/session_latest/logs/worker-*.err", str(logdir / "worker-*.err"))
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         exec(compile(parser, "<phase_parser>", "exec"), {})

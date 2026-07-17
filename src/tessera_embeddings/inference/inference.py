@@ -681,9 +681,7 @@ def run_inference(
     if progress.bucket_px:
         logger.info(
             "Bucket occupancy: %s",
-            " ".join(
-                f"({k[0]},{k[1]}):{px}px/{nb}sb" for k, (px, nb) in sorted(progress.bucket_px.items())
-            ),
+            " ".join(f"({k[0]},{k[1]}):{px}px/{nb}sb" for k, (px, nb) in sorted(progress.bucket_px.items())),
         )
 
     return InferenceResult(embeddings=out, embeddings_std=None, scales=scales)

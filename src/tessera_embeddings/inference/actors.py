@@ -282,9 +282,7 @@ class _StripPlan:
     strip_h: int
 
 
-def _strip_plan(
-    t_kept: int, height: int, width: int, valid_px: int, mask_width: int | None = None
-) -> _StripPlan:
+def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width: int | None = None) -> _StripPlan:
     """Choose a strip tiling + prefetch strategy for a chunk.
 
     ``width`` is the (possibly easting-cropped) S2 band width; ``mask_width`` is
@@ -434,9 +432,7 @@ def _xchunk_rung(chunk: ChunkSpec, t_kept: int, x_sub: slice | None, valid_px: i
 
     effective_width = chunk.width if x_sub is None else (x_sub.stop - x_sub.start)
     mask_bytes = t_kept * chunk.height * chunk.width
-    starter_bytes = (
-        t_kept * _STARTER_STRIP_H * effective_width * _S2_BYTES_PER_OBS_PX + _XCHUNK_SAR_STARTER_EST_BYTES
-    )
+    starter_bytes = t_kept * _STARTER_STRIP_H * effective_width * _S2_BYTES_PER_OBS_PX + _XCHUNK_SAR_STARTER_EST_BYTES
     if mask_bytes + starter_bytes > _XCHUNK_PREFETCH_CAP_BYTES:
         return "mask-only"
     return "starter"
@@ -1070,11 +1066,7 @@ class InferenceActor:
                     # strip's inference. Pair-budget plans (see
                     # _XCHUNK_UNSAFE_STRATEGIES) hold a near-2x set here — no room
                     # for the stash — so they skip it and take a serial prologue.
-                    if (
-                        i + 1 == len(strips)
-                        and prefetch_hint is not None
-                        and strategy not in _XCHUNK_UNSAFE_STRATEGIES
-                    ):
+                    if i + 1 == len(strips) and prefetch_hint is not None and strategy not in _XCHUNK_UNSAFE_STRATEGIES:
                         self._start_chunk_prefetch(prefetch_hint, mosaic_base)
 
                     if x_sub is None:

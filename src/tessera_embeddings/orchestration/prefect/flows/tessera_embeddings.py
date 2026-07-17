@@ -126,8 +126,7 @@ def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) 
         terminate_ray_instances_by_tag(cluster_name=cluster_name, log=log)
     else:
         log.warning(
-            "No flow-run id or cluster name available — cannot derive the "
-            "cluster tag. Check the AWS console manually."
+            "No flow-run id or cluster name available — cannot derive the cluster tag. Check the AWS console manually."
         )
 
 

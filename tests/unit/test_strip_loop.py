@@ -277,9 +277,7 @@ def _force_strip_plan(strip_h: int, prefetch: bool, strategy: str = "test"):
     """
 
     def _plan(_t_kept, height, _width, _valid_px, mask_width=None):
-        return _StripPlan(
-            strips=_strip_slices(height, strip_h), prefetch=prefetch, strategy=strategy, strip_h=strip_h
-        )
+        return _StripPlan(strips=_strip_slices(height, strip_h), prefetch=prefetch, strategy=strategy, strip_h=strip_h)
 
     return _plan
 
@@ -621,9 +619,7 @@ class TestXChunkPrefetch:
     """Rung rules + end-to-end bit-identity for the cross-chunk prefetch."""
 
     def _plan(self, strategy, prefetch=True):
-        return _StripPlan(
-            strips=[slice(0, 256), slice(256, 2000)], prefetch=prefetch, strategy=strategy, strip_h=1744
-        )
+        return _StripPlan(strips=[slice(0, 256), slice(256, 2000)], prefetch=prefetch, strategy=strategy, strip_h=1744)
 
     def test_rung_rules(self):
         big = ChunkSpec(row=0, col=0, y_start=0, y_stop=2000, x_start=0, x_stop=2000)
@@ -646,9 +642,7 @@ class TestXChunkPrefetch:
         # The tiny test chunk plans single-strip below the starter height, so
         # the natural rung is mask-only: the stash supplies mask + plan and the
         # first strip loads inline. Output must match a serial run exactly.
-        chained, actor = _run_chunk_chain(
-            inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)]
-        )
+        chained, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)])
         serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_B, None)])
         _assert_writes_identical(chained[1], serial[0])
         assert actor._xchunk_prefetched == {}  # stash consumed
@@ -661,9 +655,7 @@ class TestXChunkPrefetch:
             patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)),
             patch.object(_actors_mod, "_xchunk_rung", lambda *a, **k: "starter"),
         )
-        chained, actor = _run_chunk_chain(
-            inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)], patches
-        )
+        chained, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)], patches)
         serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_B, None)], patches)
         _assert_writes_identical(chained[1], serial[0])
         assert actor._xchunk_prefetched == {}
@@ -671,9 +663,7 @@ class TestXChunkPrefetch:
     def test_stale_stash_evicted_on_reassignment(self, inference_config, test_model):
         # Prefetched B but got C (steal/requeue): C runs serially and the
         # stale B stash is discarded — never consumed for the wrong chunk.
-        chained, actor = _run_chunk_chain(
-            inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_C, None)]
-        )
+        chained, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_C, None)])
         serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_C, None)])
         _assert_writes_identical(chained[1], serial[0])
         assert actor._xchunk_prefetched == {}

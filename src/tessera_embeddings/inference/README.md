@@ -12,11 +12,10 @@ domain functions on `ray_cluster(num_gpus=0)` for laptop/CI runs.
 
 **Performance.** On g6e.xlarge (L40S) workers the pipeline sustains **~80–87% GPU utilization**
 and **~21–24K pixels/sec per worker** on mid-density chunks (~10–18K on dense), with **peak host
-RAM ~45–47%** of the 30.9 GB node (budgeted to stay under 60% at UTM-zone scale) — roughly
-**2–2.8×** the throughput of the unoptimised pipeline. Outputs stay within the ADR-012
-validated-equivalence envelope. The mechanisms — vectorised prep, an async GPU loop,
-valid-pixel-aware striping, and a RAM-bounded cross-chunk starter prefetch — are described
-phase-by-phase below; the full profiling record, hard-number attribution, and gotchas are in
+RAM ~45–47%** of the 30.9 GB node (budgeted to stay under 60% at UTM-zone scale). Outputs stay
+within the ADR-012 validated-equivalence envelope. The mechanisms — vectorised prep, an async GPU
+loop, valid-pixel-aware striping, and a RAM-bounded cross-chunk starter prefetch — are described
+phase-by-phase below; full profiling and gotchas are in
 [`context_docs/design/inference_gpu_saturation_profile_2026_07.md`](../../../context_docs/design/inference_gpu_saturation_profile_2026_07.md).
 
 ---
@@ -210,9 +209,8 @@ while strip *i* infers, so **two** band sets co-reside, each ≤ `_S2_STRIP_BYTE
 → pair ≤ ~11.5 GiB. With prefetch **off** the prior set is released before the next loads, so only
 **one** set is resident and it may use the full pair budget — the same ceiling either way. That
 holds peak host RAM at the 60% line of a 30.9 GB g6e.xlarge across UTM-zone-scale density variance
-(measured **45–47% peak** at the shipped 5.75 GiB budget — counter-intuitively *below* the 51% seen
-at 4.75 GiB, because the larger budget makes more chunks single-strip, so fewer hit the two-strip
-co-residency that sets the peak; see the budget constant's comment for the arithmetic).
+(measured **45–47% peak** at the 5.75 GiB budget; most chunks fit in a single strip, so few hit
+the two-strip co-residency that sets the peak — see the budget constant's comment for the arithmetic).
 The bounded cross-chunk starter prefetch (§4a″) adds ≤~2 GiB of stash, but only during the current
 chunk's last strip — the RAM trough — so it raises the trough, not the peak.
 Turning prefetch off on non-hideable chunks matters because a background load only helps if there
