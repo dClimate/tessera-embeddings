@@ -175,18 +175,37 @@ width) rather than all at once. `load_chunk(..., y_sub=<slice>)` reads only a ch
 horizontal band; each strip is a self-contained `ChunkData` that is bucketed, run through
 inference, and written into whole-chunk output buffers by row-slice. Only the *inputs* are
 sub-tiled — the int8 output buffer (`H × W × 128`, ~0.5 GB) is held whole, so the write path,
-obs-count maps, and `assembly.py` are untouched (a single `write_chunk` at the end). Strips
-are loaded through a 1-deep prefetch pipeline (strip *i+1* loads while strip *i* runs the
-GPU), the same pattern as the sub-batch prefetcher in `inference.py`.
+obs-count maps, and `assembly.py` are untouched (a single `write_chunk` at the end). On dense
+chunks strips are loaded through a 1-deep prefetch pipeline (strip *i+1* loads while strip *i*
+runs the GPU), the same pattern as the sub-batch prefetcher in `inference.py`; on sparse chunks
+that pipeline is turned off (see the strip plan below).
 
-The strip height is derived per chunk from its **true post-prune timestep count** `T_kept`,
-read from a full-chunk SCL mask loaded once up front (see below). The strip loop runs a 1-deep
-prefetch (strip *i+1* loads while strip *i* runs the GPU), so once a chunk splits **two strips
-are resident at once**. Every resident band set (strip bands + a full mask charge) must fit
-`_S2_STRIP_BYTE_BUDGET` (4.75 GiB), so the pair stays ≤ ~9.5 GiB — sized to hold peak host RAM
-in the ~50–60% band of a 30.9 GB g6e.xlarge across UTM-zone-scale density variance (see the
-budget constant's comment for the full arithmetic). A chunk that fits in one budget loads
-whole — byte-for-byte the unstriped path.
+The tiling is chosen per chunk by `_strip_plan`, from the full-chunk SCL mask loaded once up
+front: its **true post-prune timestep count** `T_kept` sets the byte cost, and its valid-pixel
+count estimates how long inference will run. Read bytes scale with `T_kept × H × W` (independent
+of how many pixels are valid); inference time scales with valid pixels — so the two can diverge,
+and the plan picks the strategy that fits:
+
+```
+ per_set = T_kept·H·W·(20 bands + 1 mask)          budget = _S2_STRIP_BYTE_BUDGET (5.75 GiB)
+
+ per_set ≤ budget ─────────────────────────────▶ SINGLE strip           (most chunks)
+ else, inference hides the loads (dense) ───────▶ balanced strips ≤ budget, PREFETCH on
+        └─ tall body? ─────────────────────────▶   + small "starter" strip so the GPU starts early
+ else (wide bytes, few valid px → not hideable) ▶ strips ≤ PAIR budget, PREFETCH OFF
+                                                    (only ONE set resident, so it may use 2× budget)
+```
+
+Peak host RAM is bounded the same way in every branch: with prefetch **on**, strip *i+1* loads
+while strip *i* infers, so **two** band sets co-reside, each ≤ `_S2_STRIP_BYTE_BUDGET` (5.75 GiB)
+→ pair ≤ ~11.5 GiB. With prefetch **off** the prior set is released before the next loads, so only
+**one** set is resident and it may use the full pair budget — the same ceiling either way. That
+holds peak host RAM at the 60% line of a 30.9 GB g6e.xlarge across UTM-zone-scale density variance
+(measured 34% avg / 51% peak at 4.75 GiB; see the budget constant's comment for the arithmetic).
+Turning prefetch off on non-hideable chunks matters because a background load only helps if there
+is inference to hide it behind — on a wide-but-sparse chunk the load would otherwise sit naked on
+the critical path *and* force a second co-resident set for nothing. A chunk that fits one budget
+loads whole — byte-for-byte the unstriped path.
 
 Two reads are decoupled. **SCL** (1 byte/px) is loaded once for the whole chunk
 (`load_s2_mask_bundle`) and sliced per strip — it is never re-decompressed, and it doubles as

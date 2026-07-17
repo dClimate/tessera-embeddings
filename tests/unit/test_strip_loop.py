@@ -25,7 +25,9 @@ from tessera_embeddings.inference.actors import (
     _S2_STRIP_BYTE_BUDGET,
     InferenceActor,
     _strip_height_for_density,
+    _strip_plan,
     _strip_slices,
+    _StripPlan,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 
@@ -97,6 +99,59 @@ class TestStripHeightForDensity:
         # A pathologically dense chunk bottoms out at the floor (breaching the
         # byte budget, logged) rather than degenerating into tiny reads.
         assert _strip_height_for_density(10**9, 4000, 4000) == _MIN_STRIP_H
+
+
+class TestStripPlan:
+    """The strip-plan chooses a tiling + prefetch mode; RAM stays bounded."""
+
+    def _peak_resident_bytes(self, plan: _StripPlan, t_kept: int, width: int, height: int) -> int:
+        # Largest single resident S2 set (a strip's bands + the full mask). With
+        # prefetch two sets co-reside; without, only one does. We check the
+        # per-set bound and let the caller compare against 1x or 2x budget.
+        mask_bytes = t_kept * height * width
+        tallest = max(s.stop - s.start for s in plan.strips)
+        return t_kept * tallest * width * len(S2_BAND_ORDER) * 2 + mask_bytes
+
+    def test_fits_one_budget_is_single_strip_no_prefetch(self):
+        # T=60 @ 2000^2: bands+mask fit one budget -> one strip, nothing to prefetch.
+        plan = _strip_plan(t_kept=60, height=2000, width=2000, valid_px=3_800_000)
+        assert plan.strips == [slice(0, 2000)]
+        assert plan.prefetch is False
+        assert plan.strategy == "single"
+
+    def test_dense_hideable_prefetches_and_stays_under_one_budget(self):
+        # T=120 @ 2000^2, nearly full -> must split; long inference hides the
+        # loads -> prefetch on, each resident set within ONE budget (pair <= 2x).
+        plan = _strip_plan(t_kept=120, height=2000, width=2000, valid_px=3_800_000)
+        assert plan.prefetch is True
+        assert len(plan.strips) >= 2
+        assert "dense/prefetch" in plan.strategy
+        assert self._peak_resident_bytes(plan, 120, 2000, 2000) <= _S2_STRIP_BYTE_BUDGET
+
+    def test_dense_hideable_applies_starter_strip(self):
+        # A tall-body dense chunk gets a small starter first strip so the GPU
+        # starts early; the body hides behind it.
+        plan = _strip_plan(t_kept=120, height=2000, width=2000, valid_px=5_000_000)
+        assert plan.strips[0] == slice(0, 256)
+        assert plan.prefetch is True
+        assert "starter" in plan.strategy
+
+    def test_wide_but_few_valid_px_disables_prefetch(self):
+        # T=200 @ 2000^2 but almost no valid pixels: inference too short to hide
+        # loads -> prefetch OFF, strips sized to the pair budget so only ONE set
+        # is resident (peak still bounded by the dense pair = 2x budget).
+        plan = _strip_plan(t_kept=200, height=2000, width=2000, valid_px=50_000)
+        assert plan.prefetch is False
+        assert plan.strategy in ("no-prefetch", "single/wide-budget")
+        assert self._peak_resident_bytes(plan, 200, 2000, 2000) <= 2 * _S2_STRIP_BYTE_BUDGET
+
+    def test_wide_few_valid_px_fitting_pair_is_single_strip(self):
+        # T=100 needs >1 budget but <= the pair; non-hideable -> single strip at
+        # the wider budget, prefetch off.
+        plan = _strip_plan(t_kept=100, height=2000, width=2000, valid_px=30_000)
+        assert plan.strips == [slice(0, 2000)]
+        assert plan.prefetch is False
+        assert plan.strategy == "single/wide-budget"
 
 
 # ---------------------------------------------------------------------------
@@ -210,34 +265,53 @@ def _run_process_chunk(inference_config, test_model):
     return result, _CapturingWriter.last_write
 
 
+def _force_strip_plan(strip_h: int, prefetch: bool):
+    """Patch target for ``_strip_plan`` that forces a fixed tiling + prefetch mode.
+
+    Lets a test control the strip count and the prefetch-on/off branch
+    regardless of the synthetic chunk's density estimates.
+    """
+
+    def _plan(_t_kept, height, _width, _valid_px):
+        return _StripPlan(
+            strips=_strip_slices(height, strip_h), prefetch=prefetch, strategy="test", strip_h=strip_h
+        )
+
+    return _plan
+
+
 class TestProcessChunkStriping:
     """1-strip vs N-strip equality and skip-marker behavior."""
 
     def test_single_vs_multi_strip_identical(self, inference_config, test_model):
-        # Force strip height by overriding the density-based sizer, so the test
-        # controls the tiling regardless of the synthetic chunk's T_kept.
-        # Height above the chunk height -> one strip (== unstriped path).
-        with patch.object(_actors_mod, "_strip_height_for_density", lambda *a, **k: 10**6):
+        # Force the tiling via _strip_plan so the test controls both the strip
+        # count and the prefetch branch, regardless of the synthetic chunk's
+        # density. strip_h > height -> one strip (== unstriped path).
+        with patch.object(_actors_mod, "_strip_plan", _force_strip_plan(10**6, prefetch=False)):
             res_one, write_one = _run_process_chunk(inference_config, test_model)
-        # A small strip height forces a multi-strip split of this tiny chunk.
-        with patch.object(_actors_mod, "_strip_height_for_density", lambda *a, **k: 4):
-            res_many, write_many = _run_process_chunk(inference_config, test_model)
+        # A small strip height forces a multi-strip split of this tiny chunk,
+        # exercised on BOTH the prefetch-on (dense) and prefetch-off (sparse)
+        # paths — all three tilings must yield bit-identical output.
+        with patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)):
+            res_pf, write_pf = _run_process_chunk(inference_config, test_model)
+        with patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=False)):
+            res_nopf, write_nopf = _run_process_chunk(inference_config, test_model)
 
-        assert res_one["status"] == "success"
-        assert res_many["status"] == "success"
-        assert res_one["valid_pixels"] == res_many["valid_pixels"]
+        assert res_one["status"] == res_pf["status"] == res_nopf["status"] == "success"
+        assert res_one["valid_pixels"] == res_pf["valid_pixels"] == res_nopf["valid_pixels"]
 
-        # int8 embeddings must be bit-identical regardless of input tiling.
-        np.testing.assert_array_equal(write_one["embeddings"], write_many["embeddings"])
-        # Per-pixel scales are float32 and identical to ~1e-7 rel: the same
-        # pixels go through the model, but float accumulation order differs
-        # slightly across batch groupings. The drift is well below the int8
-        # quantization step, so dequantized values are indistinguishable.
-        # equal_nan: ungenerated pixels carry a NaN scale in both tilings, and
-        # the same pixels are ungenerated regardless of how the input is striped.
-        np.testing.assert_allclose(write_one["scales"], write_many["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
-        for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
-            np.testing.assert_array_equal(write_one["obs_counts"][var], write_many["obs_counts"][var], err_msg=var)
+        for other in (write_pf, write_nopf):
+            # int8 embeddings must be bit-identical regardless of input tiling
+            # or prefetch mode.
+            np.testing.assert_array_equal(write_one["embeddings"], other["embeddings"])
+            # Per-pixel scales are float32 and identical to ~1e-7 rel: the same
+            # pixels go through the model, but float accumulation order differs
+            # slightly across batch groupings. The drift is well below the int8
+            # quantization step, so dequantized values are indistinguishable.
+            # equal_nan: ungenerated pixels carry a NaN scale in every tiling.
+            np.testing.assert_allclose(write_one["scales"], other["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
+            for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
+                np.testing.assert_array_equal(write_one["obs_counts"][var], other["obs_counts"][var], err_msg=var)
 
     def test_multi_strip_actually_splits(self):
         # The strip height used in the equality test genuinely splits this chunk.
@@ -377,7 +451,7 @@ class TestEmptyStripBandReadSkip:
         with (
             patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._make_half_empty_stores()),
             patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-            patch.object(_actors_mod, "_strip_height_for_density", lambda *a, **k: strip_h),
+            patch.object(_actors_mod, "_strip_plan", _force_strip_plan(strip_h, prefetch=True)),
             patch.object(_dl_mod, "_load_s2_bands", wraps=_dl_mod._load_s2_bands) as band_spy,
         ):
             result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")

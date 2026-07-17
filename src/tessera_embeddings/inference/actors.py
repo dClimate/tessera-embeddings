@@ -57,6 +57,10 @@ class _ChunkPrologue:
     mask_bundle: S2MaskBundle
     strip_h: int
     strips: list[slice]
+    # Whether to run the intra-chunk 1-deep strip prefetch (dense/hideable) or
+    # load strips serially (sparse/non-hideable — never two sets co-resident).
+    prefetch: bool
+    strategy: str
     first_strip: tuple[ChunkData, MosaicChunkInferenceDataset]
     # Chunk-relative easting window of the S2 valid-pixel bounding box, or None
     # for full width. Sparse/edge chunks read (and infer) only these columns;
@@ -68,17 +72,24 @@ logger = logging.getLogger(__name__)
 
 # Host-RAM budget (bytes) for one resident S2 band set (a strip's bands + its
 # full-chunk SCL mask). The intra-chunk 1-deep strip prefetch keeps TWO such
-# sets resident at once, so the steady-state S2 ceiling is the pair:
-# 4.75 GiB/set => ~9.5 GiB. Sized for UTM-zone-scale runs, where chunk-density
-# variance produces RAM spikes and the operating target is peak host RAM in
-# the ~50-60% band of the 30.9 GB usable on a g6e.xlarge:
-#   pair ~9.5 + SAR ~1.5 (unmodelled; spikes on dense-S1 chunks) + whole-chunk
-#   int8 output buffers ~0.6 + model/torch/misc baseline ~5 => ~16-17 GB ~ 54%.
+# sets resident at once (dense/prefetch path), so the steady-state S2 ceiling
+# is the pair: 5.75 GiB/set => ~11.5 GiB. Sized for UTM-zone-scale runs, where
+# chunk-density variance produces RAM spikes; the operating target is peak host
+# RAM at the 60% ceiling of the 30.9 GB usable on a g6e.xlarge:
+#   pair ~11.5 GiB (~12.35 GB) + SAR ~1.5 (unmodelled; spikes on dense-S1
+#   chunks) + whole-chunk int8 output buffers ~0.6 + model/torch/misc baseline
+#   ~3.3 => ~17.7 GB ~ 57% — ~0.9 GB under the 60% line for sub-30s spikes the
+#   RESOURCES poll misses. Validated on the 2026-07-17 run at 4.75 GiB: 34% avg
+#   / 51% peak; the bump to 5.75 lets the whole T<=71 full-width band run as a
+#   SINGLE strip (dropping a wasted ~13s fixed read/chunk) while dense T=114
+#   still splits. The non-hideable strip strategy (see _strip_plan) may size a
+#   strip up to the PAIR budget, but only with prefetch OFF, so at most ONE such
+#   set is resident — peak stays bounded by the same pair ceiling either way.
 # History: 7.0 GiB/set held ~68-75% peak once cross-chunk prologue prefetch was
 # removed (and ~92-95% with it — the chunk_5_9 OOM). Cross-chunk interleaving
 # is deliberately gone (see _load_chunk_prologue); do not raise this budget
 # without re-deriving the arithmetic above against the RAM target.
-_S2_STRIP_BYTE_BUDGET = int(4.75 * 1024**3)
+_S2_STRIP_BYTE_BUDGET = int(5.75 * 1024**3)
 
 # Per-(timestep, pixel) byte cost of resident S2 bands: 10 bands x uint16.
 _S2_BYTES_PER_OBS_PX = len(S2_BAND_ORDER) * 2
@@ -104,9 +115,27 @@ _X_CROP_MIN_SAVING = 0.10
 # budget (logged) — rather than degenerating into hundreds of tiny reads.
 _MIN_STRIP_H = 256
 
+# Strategy-only estimator constants, calibrated from the 2026-07-17 run logs
+# (chunk_0_9's two strips: 4.85 GB in 19.4s and 0.19 GB in 14.5s => BW ~950 MB/s,
+# fixed ~14s/read from re-decompressing the shared 4000^2 storage chunks + zarr
+# open + bucketing; inference px/s ~constant at ~16K, GPU-bound). These pick a
+# strip STRATEGY only — never a correctness value and never a RAM bound. A wrong
+# estimate's worst case is the previous always-prefetch behavior, because both
+# strategies respect the same resident-pair ceiling (see _strip_plan).
+_EST_PX_PER_SEC = 16_000.0
+_EST_READ_BYTES_PER_SEC = 900e6
+_EST_FIXED_READ_S = 13.0
+# P2 starter strip: a deliberately small first strip so the GPU starts inferring
+# after only the ~fixed read cost instead of a full budget-sized load, with the
+# remainder hiding behind it. Bounded upside (~bytes-of-one-budget / BW ~= 7s);
+# applied only when inference comfortably hides the extra read it introduces.
+_STARTER_STRIP_H = 256
 
-def _strip_height_for_density(t_kept: int, width: int, height: int) -> int:
-    """Largest northing strip height (rows) whose resident S2 working set fits budget.
+
+def _strip_height_for_density(
+    t_kept: int, width: int, height: int, budget: int = _S2_STRIP_BYTE_BUDGET
+) -> int:
+    """Largest northing strip height (rows) whose resident S2 working set fits ``budget``.
 
     Budget model: the intra-chunk 1-deep strip prefetch keeps at most two S2
     band sets co-resident (strip *i* inferring while strip *i+1* loads), and
@@ -131,9 +160,9 @@ def _strip_height_for_density(t_kept: int, width: int, height: int) -> int:
     # in full per band set (conservative; see docstring).
     mask_bytes = t * height * width
     # Fast path: the whole chunk (bands + mask) fits one budget — single strip.
-    if t * height * width * _S2_BYTES_PER_OBS_PX + mask_bytes <= _S2_STRIP_BYTE_BUDGET:
+    if t * height * width * _S2_BYTES_PER_OBS_PX + mask_bytes <= budget:
         return height
-    band_budget = _S2_STRIP_BYTE_BUDGET - mask_bytes
+    band_budget = budget - mask_bytes
     per_row = t * width * _S2_BYTES_PER_OBS_PX
     budget_h = max(0, band_budget) // per_row
     if budget_h < _MIN_STRIP_H:
@@ -152,7 +181,7 @@ def _strip_height_for_density(t_kept: int, width: int, height: int) -> int:
             _MIN_STRIP_H,
             _MIN_STRIP_H,
             pair_gib,
-            _S2_STRIP_BYTE_BUDGET / 1024**3,
+            budget / 1024**3,
         )
         return _MIN_STRIP_H
     return budget_h
@@ -165,6 +194,93 @@ def _strip_slices(height: int, strip_h: int) -> list[slice]:
     ``strip_h >= height`` yields a single full-height strip.
     """
     return [slice(start, min(start + strip_h, height)) for start in range(0, height, strip_h)]
+
+
+@dataclass
+class _StripPlan:
+    """How to tile a chunk into northing strips, and whether to prefetch them.
+
+    ``prefetch`` gates the intra-chunk 1-deep load pipeline. It is True only
+    when inference is estimated to run long enough to hide a background strip
+    load behind it; otherwise loads are serial anyway, so we turn prefetch off
+    (never two strips co-resident) and size strips to the larger PAIR budget to
+    minimise the number of expensive fixed-cost reads. ``strip_h`` is the body
+    strip height, kept for logging only.
+    """
+
+    strips: list[slice]
+    prefetch: bool
+    strategy: str
+    strip_h: int
+
+
+def _strip_plan(t_kept: int, height: int, width: int, valid_px: int) -> _StripPlan:
+    """Choose a strip tiling + prefetch strategy for a chunk.
+
+    RAM safety does not depend on the estimates below: every branch keeps the
+    resident working set within the same pair ceiling (``2 x budget``). The
+    estimates only choose which safe strategy is fastest, so a mis-estimate
+    degrades at worst to the previous always-prefetch behaviour.
+
+    Four regimes (bytes scale with ``t_kept x height x width``, independent of
+    valid-pixel count; inference time scales with valid pixels):
+
+    * **Fits one budget** — single strip, no prefetch needed. The common case.
+    * **Split + hideable** (dense: many valid px) — balanced strips at one
+      budget with prefetch on; the loads hide behind inference. Optionally a
+      small starter strip (P2) so the GPU starts sooner.
+    * **Split + not hideable** (wide but few valid px, e.g. a cloudy high-T
+      sliver) — few valid pixels mean inference is too short to hide the loads,
+      so prefetch off and strips sized to the PAIR budget: only one set is ever
+      resident, so peak RAM matches the dense pair, but we pay the fewest
+      fixed-cost reads. A single strip when the whole chunk fits the pair.
+    """
+    budget = _S2_STRIP_BYTE_BUDGET
+    mask_bytes = t_kept * height * width
+    bytes_total = t_kept * height * width * _S2_BYTES_PER_OBS_PX
+    per_set_1x = bytes_total + mask_bytes
+
+    # Regime 1: the whole chunk fits one budget — one strip, nothing to prefetch.
+    if per_set_1x <= budget:
+        return _StripPlan([slice(0, height)], prefetch=False, strategy="single", strip_h=height)
+
+    # Split needed. Will inference hide the loads? Compare estimated total
+    # inference time against estimated total load time (fixed per-read cost x
+    # number of 1x-budget strips, plus bytes / bandwidth).
+    n_dense = (per_set_1x + budget - 1) // budget
+    t_infer = valid_px / _EST_PX_PER_SEC
+    t_load = n_dense * _EST_FIXED_READ_S + bytes_total / _EST_READ_BYTES_PER_SEC
+
+    if t_infer >= t_load:
+        # Regime 2: hideable (dense). Balanced strips at one budget, prefetch on.
+        strip_h = _strip_height_for_density(t_kept, width, height, budget)
+        strips = _strip_slices(height, strip_h)
+        strategy = "dense/prefetch"
+        # P2 starter strip: only when there is a real body to hide behind and
+        # inference comfortably absorbs the one extra fixed read it introduces.
+        if len(strips) >= 2 and strip_h > _STARTER_STRIP_H and t_infer >= t_load + _EST_FIXED_READ_S:
+            body = _strip_slices_from(_STARTER_STRIP_H, height, strip_h)
+            strips = [slice(0, _STARTER_STRIP_H), *body]
+            strategy = "dense/prefetch+starter"
+        return _StripPlan(strips, prefetch=True, strategy=strategy, strip_h=strip_h)
+
+    # Regime 3: not hideable. Prefetch off => only one set resident, so a strip
+    # may use the full PAIR budget (peak still bounded by the dense pair).
+    pair = 2 * budget
+    if per_set_1x <= pair:
+        return _StripPlan([slice(0, height)], prefetch=False, strategy="single/wide-budget", strip_h=height)
+    strip_h = _strip_height_for_density(t_kept, width, height, pair)
+    strips = _strip_slices(height, strip_h)
+    return _StripPlan(strips, prefetch=False, strategy="no-prefetch", strip_h=strip_h)
+
+
+def _strip_slices_from(start: int, height: int, strip_h: int) -> list[slice]:
+    """Tile ``[start, height)`` into chunk-relative strips of ``strip_h`` rows.
+
+    Like :func:`_strip_slices` but beginning at ``start`` — used to tile the
+    body that follows a P2 starter strip. Returns ``[]`` when ``start >= height``.
+    """
+    return [slice(s, min(s + strip_h, height)) for s in range(start, height, strip_h)]
 
 
 def _fetch_ec2_instance_id() -> str:
@@ -362,6 +478,11 @@ class InferenceActor:
         store_opener = make_store_opener()
         mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, self.config.time_window, store_opener=store_opener)
         t_kept = int(mask_bundle.mask.shape[0])
+        # (H, W): pixels with >=1 valid S2 observation. Drives both the easting
+        # crop bbox and the strip-plan's inference-time estimate below.
+        # asarray: mask is 3-D so any(axis=0) is always 2-D, but the numpy stub
+        # types it bool | ndarray — narrow it so the crop/valid-px indexing types.
+        valid_any = np.asarray(mask_bundle.mask.any(axis=0))
 
         # S2 valid-pixel bounding box in easting. On sparse/edge chunks (a
         # coastline sliver, a UTM-zone boundary) the valid columns can be a
@@ -372,7 +493,7 @@ class InferenceActor:
         # load_chunk's x_sub docs). Near-full boxes skip the crop so interior
         # chunks stay on the byte-identical uncropped path.
         x_sub: slice | None = None
-        valid_cols = np.flatnonzero(mask_bundle.mask.any(axis=(0, 1)))
+        valid_cols = np.flatnonzero(valid_any.any(axis=0))
         if valid_cols.size:
             box = slice(int(valid_cols[0]), int(valid_cols[-1]) + 1)
             if (box.stop - box.start) <= (1 - _X_CROP_MIN_SAVING) * chunk.width:
@@ -386,8 +507,9 @@ class InferenceActor:
                 )
 
         effective_width = chunk.width if x_sub is None else (x_sub.stop - x_sub.start)
-        strip_h = _strip_height_for_density(t_kept, effective_width, chunk.height)
-        strips = _strip_slices(chunk.height, strip_h)
+        valid_px = int(valid_any[:, x_sub].sum()) if x_sub is not None else int(valid_any.sum())
+        plan = _strip_plan(t_kept, chunk.height, effective_width, valid_px)
+        strips = plan.strips
         chunk_data = load_chunk(
             chunk,
             mosaic_base,
@@ -406,8 +528,10 @@ class InferenceActor:
         return _ChunkPrologue(
             store_opener=store_opener,
             mask_bundle=mask_bundle,
-            strip_h=strip_h,
+            strip_h=plan.strip_h,
             strips=strips,
+            prefetch=plan.prefetch,
+            strategy=plan.strategy,
             first_strip=(chunk_data, dataset),
             x_sub=x_sub,
         )
@@ -551,6 +675,9 @@ class InferenceActor:
             store_opener = prologue.store_opener
             mask_bundle = prologue.mask_bundle
             strips = prologue.strips
+            # Whether to run the 1-deep strip prefetch (dense/hideable) or load
+            # strips serially with no two sets co-resident (sparse; see _strip_plan).
+            prefetch = prologue.prefetch
             x_sub = prologue.x_sub
             # Column window the cropped grids map to in the whole-chunk output
             # buffers (full width when uncropped).
@@ -559,11 +686,13 @@ class InferenceActor:
             # strip loop below, then dropped so at most two strips stay resident.
             first_strip: tuple[ChunkData, MosaicChunkInferenceDataset] | None = prologue.first_strip
             logger.info(
-                "Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s)",
+                "Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s) [%s, prefetch=%s]",
                 chunk.label,
                 int(mask_bundle.mask.shape[0]),
                 prologue.strip_h,
                 len(strips),
+                prologue.strategy,
+                prefetch,
             )
             del prologue
 
@@ -583,12 +712,14 @@ class InferenceActor:
             # Returns (chunk_data, dataset): bucketing runs on the prefetch
             # thread too, so it overlaps the prior strip's GPU work instead of
             # sitting on the critical path between load and inference.
-            def _load_strip(y_sub: slice, bundle: S2MaskBundle) -> tuple[ChunkData, MosaicChunkInferenceDataset]:
-                # Background load (runs while the GPU infers the prior strip):
-                # reserve cores for the batch-prep workers feeding the GPU, so
-                # band decompression can't starve inference. The prologue's
-                # strip-0 load (_load_chunk_prologue) reserves nothing — it is
-                # serial and the GPU is idle, so it wants every core.
+            def _load_strip(
+                y_sub: slice, bundle: S2MaskBundle, reserve_cpus: int
+            ) -> tuple[ChunkData, MosaicChunkInferenceDataset]:
+                # A BACKGROUND load (prefetch on, runs while the GPU infers the
+                # prior strip) reserves cores for the batch-prep workers feeding
+                # the GPU, so band decompression can't starve inference. A SERIAL
+                # load (prefetch off, or the prologue's strip 0) reserves nothing
+                # — the GPU is idle and wants every core.
                 data = load_chunk(
                     chunk,
                     mosaic_base,
@@ -597,7 +728,7 @@ class InferenceActor:
                     y_sub=y_sub,
                     store_opener=store_opener,
                     mask_bundle=bundle,
-                    reserve_cpus=_BACKGROUND_LOAD_RESERVED_CPUS,
+                    reserve_cpus=reserve_cpus,
                     x_sub=x_sub,
                 )
                 return data, MosaicChunkInferenceDataset(
@@ -619,9 +750,13 @@ class InferenceActor:
             }
 
             total_valid = 0
-            # 1-deep prefetch pipeline: strip i+1 loads (and buckets) while
-            # strip i runs inference (same shape as inference.run_inference's
-            # prefetcher). Strip 0 arrived already loaded with the prologue.
+            # Strip pipeline. When prefetch is on (dense/hideable), strip i+1
+            # loads (and buckets) on the background thread while strip i runs
+            # inference, so at most two S2 sets are co-resident. When it is off
+            # (sparse/non-hideable), each strip is loaded serially in the loop
+            # body — the prior set is dropped first, so only ONE is ever resident
+            # and a strip may safely use the larger pair budget. Strip 0 arrived
+            # already loaded with the prologue in both modes.
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="strip-prefetch") as pool:
                 next_future: Future[tuple[ChunkData, MosaicChunkInferenceDataset]] | None = None
 
@@ -649,12 +784,21 @@ class InferenceActor:
                         assert first_strip is not None
                         chunk_data, dataset = first_strip
                         first_strip = None
-                    else:
+                    elif prefetch:
                         assert next_future is not None
                         chunk_data, dataset = next_future.result()
+                    else:
+                        # Serial: GPU idle, take all cores, one set resident.
+                        chunk_data, dataset = _load_strip(strip, mask_bundle, 0)
 
-                    # Kick off the next strip's load before running inference on this one.
-                    next_future = pool.submit(_load_strip, strips[i + 1], mask_bundle) if i + 1 < len(strips) else None
+                    # With prefetch on, kick off the next strip's BACKGROUND load
+                    # (reserving prep cores) before inferring this one.
+                    if prefetch:
+                        next_future = (
+                            pool.submit(_load_strip, strips[i + 1], mask_bundle, _BACKGROUND_LOAD_RESERVED_CPUS)
+                            if i + 1 < len(strips)
+                            else None
+                        )
 
                     if x_sub is None:
                         for var in OBS_COUNT_VARS:
