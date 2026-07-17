@@ -21,6 +21,7 @@ context_docs/
 │   ├── 007-native-cmr-granule-query.md
 │   └── 012-validated-equivalence-for-inference-outputs.md
 └── design/           Long-form framing docs (ported from planning)
+    └── inference_gpu_saturation_profile_2026_07.md
     ├── open_sourcing_conceptual_background.md
     └── orchestration_infra_leakage_audit.md
 ```
