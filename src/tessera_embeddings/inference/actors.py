@@ -186,11 +186,23 @@ _XCHUNK_T_ALL_EST = 230
 # for obs-layer fidelity; see load_chunk's x_sub docs).
 _XCHUNK_SAR_STARTER_EST_BYTES = int(0.4 * 1024**3)
 
+# Strip strategies whose single resident set can reach the PAIR budget (~2x)
+# rather than one budget. During their last strip the node is NOT at a RAM
+# trough, so starting the cross-chunk prefetch on top could breach the ceiling
+# — skip it for these (accept the next chunk's serial prologue). The trough
+# invariant the prefetch relies on holds only for <=1x-budget plans.
+_XCHUNK_UNSAFE_STRATEGIES = frozenset({"single/wide-budget", "no-prefetch"})
+
 
 def _strip_height_for_density(
-    t_kept: int, width: int, height: int, budget: int = _S2_STRIP_BYTE_BUDGET
+    t_kept: int, width: int, height: int, budget: int = _S2_STRIP_BYTE_BUDGET, mask_width: int | None = None
 ) -> int:
     """Largest northing strip height (rows) whose resident S2 working set fits ``budget``.
+
+    ``width`` sizes the (possibly easting-cropped) S2 band read; ``mask_width``
+    sizes the SCL mask, which stays full-chunk-width even when bands are cropped
+    (defaults to ``width`` for the uncropped case). Charging the mask at its true
+    full width keeps the budget honest on cropped chunks.
 
     Budget model: the intra-chunk 1-deep strip prefetch keeps at most two S2
     band sets co-resident (strip *i* inferring while strip *i+1* loads), and
@@ -212,8 +224,9 @@ def _strip_height_for_density(
     """
     t = max(1, t_kept)
     # Full-chunk SCL mask (bool, 1 byte/px), resident the whole loop; charged
-    # in full per band set (conservative; see docstring).
-    mask_bytes = t * height * width
+    # in full per band set (conservative; see docstring). The mask is
+    # full-chunk-width even when the bands are easting-cropped.
+    mask_bytes = t * height * (mask_width if mask_width is not None else width)
     # Fast path: the whole chunk (bands + mask) fits one budget — single strip.
     if t * height * width * _S2_BYTES_PER_OBS_PX + mask_bytes <= budget:
         return height
@@ -269,8 +282,15 @@ class _StripPlan:
     strip_h: int
 
 
-def _strip_plan(t_kept: int, height: int, width: int, valid_px: int) -> _StripPlan:
+def _strip_plan(
+    t_kept: int, height: int, width: int, valid_px: int, mask_width: int | None = None
+) -> _StripPlan:
     """Choose a strip tiling + prefetch strategy for a chunk.
+
+    ``width`` is the (possibly easting-cropped) S2 band width; ``mask_width`` is
+    the SCL mask width, which stays full-chunk-width even when the bands are
+    cropped (defaults to ``width``). Charging the mask at its true width keeps
+    the budget honest on cropped sparse/edge chunks.
 
     RAM safety does not depend on the estimates below: every branch keeps the
     resident working set within the same pair ceiling (``2 x budget``). The
@@ -291,7 +311,8 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int) -> _StripPl
       fixed-cost reads. A single strip when the whole chunk fits the pair.
     """
     budget = _S2_STRIP_BYTE_BUDGET
-    mask_bytes = t_kept * height * width
+    mw = mask_width if mask_width is not None else width
+    mask_bytes = t_kept * height * mw
     bytes_total = t_kept * height * width * _S2_BYTES_PER_OBS_PX
     per_set_1x = bytes_total + mask_bytes
 
@@ -308,7 +329,7 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int) -> _StripPl
 
     if t_infer >= t_load:
         # Regime 2: hideable (dense). Balanced strips at one budget, prefetch on.
-        strip_h = _strip_height_for_density(t_kept, width, height, budget)
+        strip_h = _strip_height_for_density(t_kept, width, height, budget, mask_width=mw)
         strips = _strip_slices(height, strip_h)
         strategy = "dense/prefetch"
         # P2 starter strip: only when there is a real body to hide behind and
@@ -324,7 +345,7 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int) -> _StripPl
     pair = 2 * budget
     if per_set_1x <= pair:
         return _StripPlan([slice(0, height)], prefetch=False, strategy="single/wide-budget", strip_h=height)
-    strip_h = _strip_height_for_density(t_kept, width, height, pair)
+    strip_h = _strip_height_for_density(t_kept, width, height, pair, mask_width=mw)
     strips = _strip_slices(height, strip_h)
     return _StripPlan(strips, prefetch=False, strategy="no-prefetch", strip_h=strip_h)
 
@@ -376,7 +397,9 @@ def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice
 
     effective_width = chunk.width if x_sub is None else (x_sub.stop - x_sub.start)
     valid_px = int(valid_any[:, x_sub].sum()) if x_sub is not None else int(valid_any.sum())
-    plan = _strip_plan(t_kept, chunk.height, effective_width, valid_px)
+    # Bands read at effective_width (possibly cropped); the SCL mask stays
+    # full chunk width, so charge it at chunk.width in the budget.
+    plan = _strip_plan(t_kept, chunk.height, effective_width, valid_px, mask_width=chunk.width)
     return x_sub, valid_px, plan
 
 
@@ -918,6 +941,7 @@ class InferenceActor:
             # Whether to run the 1-deep strip prefetch (dense/hideable) or load
             # strips serially with no two sets co-resident (sparse; see _strip_plan).
             prefetch = prologue.prefetch
+            strategy = prologue.strategy
             x_sub = prologue.x_sub
             # Column window the cropped grids map to in the whole-chunk output
             # buffers (full width when uncropped).
@@ -1041,9 +1065,16 @@ class InferenceActor:
                         )
 
                     # Last strip: its load is complete (bound above) and no body
-                    # loads remain — the RAM trough. Prefetch the NEXT chunk's
-                    # capped starter payload behind this strip's inference.
-                    if i + 1 == len(strips) and prefetch_hint is not None:
+                    # loads remain. For <=1x-budget plans this is the RAM trough,
+                    # so prefetch the NEXT chunk's capped starter behind this
+                    # strip's inference. Pair-budget plans (see
+                    # _XCHUNK_UNSAFE_STRATEGIES) hold a near-2x set here — no room
+                    # for the stash — so they skip it and take a serial prologue.
+                    if (
+                        i + 1 == len(strips)
+                        and prefetch_hint is not None
+                        and strategy not in _XCHUNK_UNSAFE_STRATEGIES
+                    ):
                         self._start_chunk_prefetch(prefetch_hint, mosaic_base)
 
                     if x_sub is None:

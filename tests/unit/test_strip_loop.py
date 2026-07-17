@@ -268,16 +268,17 @@ def _run_process_chunk(inference_config, test_model):
     return result, _CapturingWriter.last_write
 
 
-def _force_strip_plan(strip_h: int, prefetch: bool):
+def _force_strip_plan(strip_h: int, prefetch: bool, strategy: str = "test"):
     """Patch target for ``_strip_plan`` that forces a fixed tiling + prefetch mode.
 
-    Lets a test control the strip count and the prefetch-on/off branch
-    regardless of the synthetic chunk's density estimates.
+    Lets a test control the strip count, the prefetch-on/off branch, and the
+    strategy label (which gates the cross-chunk prefetch) regardless of the
+    synthetic chunk's density estimates.
     """
 
-    def _plan(_t_kept, height, _width, _valid_px):
+    def _plan(_t_kept, height, _width, _valid_px, mask_width=None):
         return _StripPlan(
-            strips=_strip_slices(height, strip_h), prefetch=prefetch, strategy="test", strip_h=strip_h
+            strips=_strip_slices(height, strip_h), prefetch=prefetch, strategy=strategy, strip_h=strip_h
         )
 
     return _plan
@@ -681,4 +682,14 @@ class TestXChunkPrefetch:
         monkeypatch.setenv(_XCHUNK_DISABLE_ENV, "1")
         _, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B)])
         # Never started: the lazily-created stash is empty (or never created).
+        assert getattr(actor, "_xchunk_prefetched", {}) == {}
+
+    def test_pair_budget_plan_skips_prefetch(self, inference_config, test_model):
+        # A pair-budget strategy (single/wide-budget, no-prefetch) holds a
+        # near-2x-budget set on its last strip — NOT a RAM trough — so the
+        # cross-chunk prefetch must be skipped or it could breach the ceiling.
+        patches = (
+            patch.object(_actors_mod, "_strip_plan", _force_strip_plan(10**6, prefetch=False, strategy="no-prefetch")),
+        )
+        _, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B)], patches)
         assert getattr(actor, "_xchunk_prefetched", {}) == {}
