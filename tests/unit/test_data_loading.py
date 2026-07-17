@@ -543,3 +543,26 @@ class TestSharedStoreOpener:
             "s3://b/m/sar_ascending.zarr",
             "s3://b/m/sar_descending.zarr",
         ]
+
+
+class TestBandReadWorkerReservation:
+    """Background loads reserve cores for the GPU's batch-prep workers."""
+
+    def _workers(self, cores: int, reserve: int) -> int:
+        with patch.object(_dl_mod.os, "sched_getaffinity", create=True, return_value=set(range(cores))):
+            return _dl_mod._band_read_workers(reserve)
+
+    def test_foreground_uses_all_allocated_cores(self):
+        assert self._workers(cores=4, reserve=0) == 4
+
+    def test_background_reserves_cores_for_batch_prep(self):
+        # g6e.xlarge case: 4 vCPUs, reserve 2 for prep → 2 decompression threads.
+        assert self._workers(cores=4, reserve=2) == 2
+
+    def test_never_below_one_worker(self):
+        assert self._workers(cores=2, reserve=2) == 1
+        assert self._workers(cores=1, reserve=4) == 1
+
+    def test_capped_at_band_count(self):
+        assert self._workers(cores=64, reserve=0) == len(S2_BAND_ORDER)
+        assert self._workers(cores=64, reserve=2) == len(S2_BAND_ORDER) - 2

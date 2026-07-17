@@ -79,6 +79,14 @@ _S2_STRIP_BYTE_BUDGET = int(4.75 * 1024**3)
 # Per-(timestep, pixel) byte cost of resident S2 bands: 10 bands x uint16.
 _S2_BYTES_PER_OBS_PX = len(S2_BAND_ORDER) * 2
 
+# Cores left free for the inference loop's batch-prep workers while a
+# BACKGROUND strip load decompresses bands (intra-chunk strip prefetch). The
+# prep pool runs 2 workers (inference.PREFETCH_DEPTH); without this reservation
+# four decompression threads contend with them on the 4-vCPU g6e.xlarge and
+# get_batch spikes to ~500 ms, starving the GPU mid-inference. Foreground
+# (prologue) loads reserve nothing — the GPU is idle and wants the fastest load.
+_BACKGROUND_LOAD_RESERVED_CPUS = 2
+
 # Floor on derived strip height. Below this a strip reads so few northing rows
 # that per-strip fixed overhead (zarr open, SCL slice, dataset bucketing)
 # dominates and read amplification climbs without meaningfully lowering peak RAM.
@@ -481,6 +489,11 @@ class InferenceActor:
             # thread too, so it overlaps the prior strip's GPU work instead of
             # sitting on the critical path between load and inference.
             def _load_strip(y_sub: slice, bundle: S2MaskBundle) -> tuple[ChunkData, MosaicChunkInferenceDataset]:
+                # Background load (runs while the GPU infers the prior strip):
+                # reserve cores for the batch-prep workers feeding the GPU, so
+                # band decompression can't starve inference. The prologue's
+                # strip-0 load (_load_chunk_prologue) reserves nothing — it is
+                # serial and the GPU is idle, so it wants every core.
                 data = load_chunk(
                     chunk,
                     mosaic_base,
@@ -489,6 +502,7 @@ class InferenceActor:
                     y_sub=y_sub,
                     store_opener=store_opener,
                     mask_bundle=bundle,
+                    reserve_cpus=_BACKGROUND_LOAD_RESERVED_CPUS,
                 )
                 return data, MosaicChunkInferenceDataset(
                     data,

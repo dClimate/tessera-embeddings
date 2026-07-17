@@ -45,12 +45,21 @@ logger = logging.getLogger(__name__)
 # count) to keep decompression cores busy without oversubscribing. Uses
 # ``sched_getaffinity`` where available (Linux inference actors) so a
 # cgroup/affinity-pinned worker sees its real allocation, not the host's.
-def _band_read_workers() -> int:
+def _band_read_workers(reserve_cpus: int = 0) -> int:
+    """Decompression pool size for the concurrent S2 band read.
+
+    ``reserve_cpus`` leaves that many cores free for concurrent CPU work.
+    Callers loading in the background while the GPU runs (the intra-chunk
+    strip prefetch) reserve cores for the batch-prep workers that feed the
+    GPU — on the 4-vCPU g6e.xlarge, four decompression threads competing with
+    batch prep produced ~500 ms get_batch spikes that starved the GPU.
+    Foreground loads (the serial chunk prologue, GPU idle) reserve nothing.
+    """
     try:
         allocated = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
     except AttributeError:  # macOS/Windows: no affinity API
         allocated = os.cpu_count() or 4
-    return max(1, min(len(S2_BAND_ORDER), allocated))
+    return max(1, min(len(S2_BAND_ORDER), allocated) - reserve_cpus)
 
 
 # A function that maps a store path to an open zarr group. The default is
@@ -186,6 +195,7 @@ def _load_s2_bands(
     time_indices: np.ndarray,
     y_slice: slice,
     x_slice: slice,
+    reserve_cpus: int = 0,
 ) -> np.ndarray:
     """Stack S2 bands in canonical order, reading directly from zarr.
 
@@ -208,7 +218,7 @@ def _load_s2_bands(
     def _read_band(i: int, band: str) -> None:
         result[:, :, :, i] = root[band].oindex[time_indices, y_slice, x_slice]
 
-    with ThreadPoolExecutor(max_workers=_band_read_workers()) as pool:
+    with ThreadPoolExecutor(max_workers=_band_read_workers(reserve_cpus)) as pool:
         # Drain the map so any read exception propagates instead of being
         # swallowed with a partially-filled ``result``.
         list(pool.map(lambda ib: _read_band(*ib), enumerate(S2_BAND_ORDER)))
@@ -435,6 +445,7 @@ def _load_s2(
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
     mask_bundle: S2MaskBundle | None = None,
+    reserve_cpus: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load all S2 timesteps in the window that have any valid pixel in the (sub-)chunk.
 
@@ -470,7 +481,9 @@ def _load_s2(
         s2_doys = mask_bundle.doys
         abs_kept = mask_bundle.abs_indices
         y_slice = _resolve_y_slice(chunk, y_sub)
-        s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice)
+        s2_bands = _load_s2_bands(
+            root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice, reserve_cpus=reserve_cpus
+        )
         logger.info("Loaded S2 bands shape %s (sliced shared mask)", s2_bands.shape)
         return s2_bands, s2_masks, s2_doys, s2_obs_count
 
@@ -500,7 +513,7 @@ def _load_s2(
 
     s2_doys = s2_doys_full[kept]
 
-    s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice)
+    s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice, reserve_cpus=reserve_cpus)
     logger.info("Loaded S2 bands shape %s", s2_bands.shape)
 
     # Keep the mask bool (1 byte/elem) rather than widening to int32 — it stays
@@ -543,6 +556,7 @@ def load_chunk(
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
     mask_bundle: S2MaskBundle | None = None,
+    reserve_cpus: int = 0,
 ) -> ChunkData:
     """Load all data for one spatial chunk (or a northing strip of it) for v1.1 inference.
 
@@ -569,6 +583,10 @@ def load_chunk(
             it per strip instead of re-read, and timestep pruning uses the
             chunk-level decision baked into the bundle. The strip loop loads the
             bundle once and passes it to every strip; ``None`` loads SCL inline.
+        reserve_cpus: Cores to leave free during the S2 band decompression —
+            background loads running alongside GPU inference reserve cores for
+            the batch-prep workers (see :func:`_band_read_workers`); foreground
+            loads use the default 0.
 
     Returns:
         ChunkData with all S2 timesteps that have any valid pixel in the
@@ -587,7 +605,13 @@ def load_chunk(
     )
 
     s2_bands, s2_masks, s2_doys, s2_obs_count = _load_s2(
-        mosaic_base, chunk, time_window, y_sub=y_sub, store_opener=store_opener, mask_bundle=mask_bundle
+        mosaic_base,
+        chunk,
+        time_window,
+        y_sub=y_sub,
+        store_opener=store_opener,
+        mask_bundle=mask_bundle,
+        reserve_cpus=reserve_cpus,
     )
 
     s1_asc_bands, s1_asc_doys = (
