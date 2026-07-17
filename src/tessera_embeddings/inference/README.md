@@ -10,13 +10,14 @@ The orchestrator-free equivalent is
 [`orchestration/runners/plain.py`](../orchestration/runners/plain.py), which calls the same
 domain functions on `ray_cluster(num_gpus=0)` for laptop/CI runs.
 
-**Performance.** The July 2026 saturation campaign took per-worker throughput to **~2–2.8×**
-of the `main` baseline at **~80–87% GPU utilization** (was 48–72%), while holding **peak host
-RAM at ~45–47%** (the pre-campaign pipeline OOM-killed at 92–95%). Outputs stay within the
-ADR-012 validated-equivalence envelope of `main`. The mechanisms — vectorised prep, an async
-GPU loop, valid-pixel-aware striping, and a RAM-bounded cross-chunk starter prefetch — are
-described phase-by-phase below; the full profiling record, hard-number attribution, and gotchas
-are in [`context_docs/design/inference_gpu_saturation_profile_2026_07.md`](../../../context_docs/design/inference_gpu_saturation_profile_2026_07.md).
+**Performance.** On g6e.xlarge (L40S) workers the pipeline sustains **~80–87% GPU utilization**
+and **~21–24K pixels/sec per worker** on mid-density chunks (~10–18K on dense), with **peak host
+RAM ~45–47%** of the 30.9 GB node (budgeted to stay under 60% at UTM-zone scale) — roughly
+**2–2.8×** the throughput of the unoptimised pipeline. Outputs stay within the ADR-012
+validated-equivalence envelope. The mechanisms — vectorised prep, an async GPU loop,
+valid-pixel-aware striping, and a RAM-bounded cross-chunk starter prefetch — are described
+phase-by-phase below; the full profiling record, hard-number attribution, and gotchas are in
+[`context_docs/design/inference_gpu_saturation_profile_2026_07.md`](../../../context_docs/design/inference_gpu_saturation_profile_2026_07.md).
 
 ---
 
@@ -227,15 +228,11 @@ the chunks that split; that per-strip read is exactly the working set the byte b
 #### 4a″. Chunk prologue: serial by default, with a bounded cross-chunk starter prefetch
 
 Each chunk pays a serial, GPU-idle "prologue" — SCL mask read, first band read, dataset
-build (~24–38 s post-P2/P3) — before its first forward pass. A FULL cross-chunk prologue
-prefetch (hiding the entire next working set behind the prior chunk's inference) shipped
-briefly in 2026-07 and delivered ~1.25–1.3× on dense chunks — but co-residing two chunks'
-whole input working sets (5–7+ GiB each, density-dependent) pushed peak host RAM to
-~92–95% of the node (one observed Ray OOM-kill). It was removed the same week; the
-historical measurements live in `context_docs/design/inference_gpu_saturation_profile_2026_07.md`.
-
-What ships instead is a **bounded starter prefetch** — the same idea with two orders of
-magnitude less co-resident memory and hard caps instead of hope:
+build (~24–38 s) — before its first forward pass. A **bounded cross-chunk starter prefetch**
+hides most of it: the next chunk's mask + a small starter strip (hard-capped ~2 GiB) are
+preloaded during the current chunk's last strip. It deliberately does NOT prefetch the whole
+next working set — that co-resides two full chunks and OOMs the node at UTM-zone-scale density
+variance (the RAM-safety rationale and history are in the concept doc).
 
 ```
  actor timeline, chunk N → N+1 (starter-prefetch hit)
