@@ -19,11 +19,13 @@ i.e. FAIL vs same-config thresholds (as expected), PASS vs `--cross-config`.
 
 Measured 2026-07-17, P2+3 gate (`b826a6b3a44a`) vs P1 gate (`526db07f32be`), same
 batch, chunks 0_0/0_2/0_8 (1.5B values): **100.000000% bit-identical** — exact
-match, max|Δ|=0, zero scale drift, zero NaN mismatches. Phase 2 is bit-identical
-by construction; Phase 3's GRU regrouping perturbs FP32 accumulations below the
-BF16 rounding grid and collapses to bitwise equality on real data. PASSES the
-strict ADR-012 gate outright. (Coverage caveat: dense chunks; extend to sparse
-labels when the gate run reaches them or via the full-run comparison.)
+match, max|Δ|=0, zero scale drift, zero NaN mismatches. Expected: Phase 2 is
+bit-identical by construction, the PE change is bit-identical, and both builds run
+the same pre-existing cuDNN `nn.GRU` fusion (the Phase-3 `CustomGRU` restructure
+never reached production and was reverted — see PR discussion / commit 833c3be), so
+there is no forward-math delta between the two. PASSES the strict ADR-012 gate.
+(Coverage caveat: dense chunks; extend to sparse labels via the cross-config
+baseline comparison below.)
 
 Performance, same chunks, wall-clock incl. load+write: baseline ~204–341 s/chunk
 → P2+3 89–140 s (**2.5–3.5×/worker**); inference px/s 9.6–13.3K → 13.4–27.3K;
@@ -43,9 +45,9 @@ Reference dataset (assembled from baseline staging):
 - `526db07f32be` vs `a85be572e2fb`: batch size differs (7168 vs 3584) → NOT
   bit-comparable; cosine-class thresholds only. Doubles as the empirical
   measurement of how far a batch-size change alone moves int8 outputs.
-- P2+3 gate vs `526db07f32be`: same batch size. Phase 2 is bit-identical by
-  construction; every observed delta is attributable to Phase 3's GRU
-  regrouping and must sit inside the ADR-012 thresholds.
+- P2+3 gate vs `526db07f32be`: same batch size, same GRU (cuDNN nn.GRU in both),
+  Phase 2 bit-identical by construction, PE change bit-identical → expect exact
+  bitwise equality under the strict same-config thresholds (confirmed above).
 
 Compare with:
 
