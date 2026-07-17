@@ -277,9 +277,13 @@ class _LoopProgress:
     tokens: int = 0
     flops: int = 0
     sub_batch_idx: int = 0
+    # Worst single-batch CPU prep this call — averages hide the spikes that
+    # actually starve the GPU (feed-fix telemetry; see actors' reserve_cpus).
+    get_batch_max: float = 0.0
 
     def record(self, bucket_key: tuple[int, int], n_px: int, timings: _BatchTimings) -> None:
         self.t_total += timings
+        self.get_batch_max = max(self.get_batch_max, timings.get_batch)
         self.pixels += n_px
         self.tokens += n_px * (bucket_key[0] + bucket_key[1])
         self.flops += transformer_flops(
@@ -310,9 +314,10 @@ class _LoopProgress:
             avg = self.t_total.avg_ms(self.sub_batch_idx)
             logger.debug(
                 "  TIMING avg ms/sub-batch (n=%d): "
-                "get_batch=%.1f  transfer=%.1f  forward=%.1f  postprocess=%.1f  total=%.1f",
+                "get_batch=%.1f (max %.0f)  transfer=%.1f  forward=%.1f  postprocess=%.1f  total=%.1f",
                 self.sub_batch_idx,
                 avg.get_batch,
+                self.get_batch_max * 1000,
                 avg.transfer,
                 avg.forward,
                 avg.postprocess,

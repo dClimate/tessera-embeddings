@@ -445,11 +445,20 @@ class InferenceActor:
             return None
         label, future = pending
         self._pending_write = None
+        wait_start = time.monotonic()
         try:
             future.result()
         except Exception as exc:
             logger.warning("Deferred staging write for %s FAILED: %s", label, exc)
             return {"label": label, "ok": False, "error": str(exc)}
+        blocked = time.monotonic() - wait_start
+        if blocked > 0.5:
+            # The upload did NOT fully hide under the next chunk's prologue —
+            # the collection had to wait. Persistent blocking here means S3
+            # write throughput, not GPU work, is pacing the actor.
+            logger.info(
+                "Deferred write for %s blocked collection for %.1fs (upload slower than prologue)", label, blocked
+            )
         return {"label": label, "ok": True, "error": None}
 
     def flush_writes(self) -> dict[str, Any] | None:
@@ -718,18 +727,26 @@ class InferenceActor:
             # GPU-idle time. This chunk is only counted complete once the
             # write's outcome is confirmed (see class comment above).
             self._writer_pool_handle()
-            self._pending_write = (
-                chunk.label,
-                self._writer_pool.submit(
-                    writer.write_chunk,
+
+            def _timed_write() -> str:
+                t_w = time.monotonic()
+                path = writer.write_chunk(
                     chunk,
                     embeddings,
                     run_id,
                     embeddings_std=None,
                     scales=scales,
                     obs_counts=obs_buffers,
-                ),
-            )
+                )
+                # One line per chunk: how long the backgrounded upload took
+                # (the phase table's write_s is ~0 by design — this is the
+                # off-critical-path cost, for post-run upload health checks).
+                logger.info(
+                    "Staging write for %s completed in %.1fs (backgrounded)", chunk.label, time.monotonic() - t_w
+                )
+                return path
+
+            self._pending_write = (chunk.label, self._writer_pool.submit(_timed_write))
 
             elapsed = time.monotonic() - t0
             logger.info(
