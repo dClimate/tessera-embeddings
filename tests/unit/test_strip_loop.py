@@ -203,6 +203,10 @@ def _run_process_chunk(inference_config, test_model):
         patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
     ):
         result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+        # The staging write is deferred to the actor's writer thread; drain it
+        # so last_write reflects this chunk before we read it.
+        flushed = actor.flush_writes()
+        assert flushed is None or flushed["ok"], f"deferred write failed: {flushed}"
     return result, _CapturingWriter.last_write
 
 
@@ -274,3 +278,56 @@ class TestProcessChunkStriping:
         assert result["valid_pixels"] == 0
         assert _CapturingWriter.last_skip == _CHUNK.label
         assert _CapturingWriter.last_write is None
+
+
+# ---------------------------------------------------------------------------
+# Deferred staging writes (actor side)
+# ---------------------------------------------------------------------------
+
+_CHUNK_B2 = ChunkSpec(row=1, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
+
+
+class TestDeferredStagingWrites:
+    """process_chunk defers the write; outcomes ride the next result / flush."""
+
+    def _run_two_chunks(self, inference_config, test_model, writer_cls):
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+        actor = _make_actor(inference_config, test_model)
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
+            patch.object(_actors_mod, "ZarrWriter", writer_cls),
+        ):
+            r1 = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+            r2 = actor.process_chunk(_CHUNK_B2, "s3://b/m", "/tmp/staging", "run-1")
+            flushed = actor.flush_writes()
+        return r1, r2, flushed
+
+    def test_writes_defer_and_confirm_in_chain(self, inference_config, test_model):
+        r1, r2, flushed = self._run_two_chunks(inference_config, test_model, _CapturingWriter)
+
+        assert r1["status"] == "success" and r1["write_deferred"] is True
+        assert r1["prior_write"] is None  # nothing pending on a fresh actor
+        # Chunk 2's result carries chunk 1's (successful) write outcome.
+        assert r2["prior_write"] == {"label": _CHUNK.label, "ok": True, "error": None}
+        # Chunk 2's own write drains via flush.
+        assert flushed is not None and flushed["label"] == _CHUNK_B2.label and flushed["ok"] is True
+        # And the write actually happened (the capturing writer recorded it).
+        assert _CapturingWriter.last_write is not None
+
+    def test_failed_write_surfaces_on_next_call(self, inference_config, test_model):
+        class _FailingWriter(_CapturingWriter):
+            def write_chunk(self, chunk, embeddings, run_id, scales, embeddings_std=None, obs_counts=None):
+                raise OSError("S3 500")
+
+        r1, r2, flushed = self._run_two_chunks(inference_config, test_model, _FailingWriter)
+
+        assert r1["write_deferred"] is True and r1["prior_write"] is None
+        prior = r2["prior_write"]
+        assert prior["label"] == _CHUNK.label and prior["ok"] is False
+        assert "S3 500" in prior["error"]
+        assert flushed["label"] == _CHUNK_B2.label and flushed["ok"] is False
+
+    def test_flush_with_nothing_pending_returns_none(self, inference_config, test_model):
+        actor = _make_actor(inference_config, test_model)
+        assert actor.flush_writes() is None

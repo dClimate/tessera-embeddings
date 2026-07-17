@@ -18,7 +18,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import fsspec
 import numpy as np
@@ -376,6 +376,52 @@ class InferenceActor:
             first_strip=(chunk_data, dataset),
         )
 
+    # ------------------------------------------------------------------
+    # Deferred staging writes
+    # ------------------------------------------------------------------
+    # A chunk's staging upload (~seconds of pure I/O) runs on a single-slot
+    # writer thread so it overlaps the NEXT chunk's serial prologue load
+    # instead of adding GPU-idle time. Durability protocol: the deferring
+    # result carries ``write_deferred=True`` and is NOT counted complete by
+    # the scheduler until the write's outcome arrives — piggybacked as
+    # ``prior_write`` on this actor's next result, or via ``flush_writes()``
+    # when the actor idles. RAM cost: one chunk's output buffers (~0.6 GB)
+    # held until the upload lands. Lazily initialised for bare-actor tests.
+
+    def _writer_pool_handle(self) -> ThreadPoolExecutor:
+        pool = getattr(self, "_writer_pool", None)
+        if pool is None:
+            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="staging-write")
+            self._writer_pool = pool
+            self._pending_write: tuple[str, Future[str]] | None = None
+        return pool
+
+    def _collect_prior_write(self) -> dict[str, Any] | None:
+        """Resolve the outstanding deferred write, if any.
+
+        Blocks until the upload finishes — by construction it started at least
+        one chunk ago, so it is almost always already done. Returns
+        ``{"label", "ok", "error"}`` or ``None`` when nothing was pending.
+        """
+        self._writer_pool_handle()
+        pending = self._pending_write
+        if pending is None:
+            return None
+        label, future = pending
+        self._pending_write = None
+        try:
+            future.result()
+        except Exception as exc:
+            logger.warning("Deferred staging write for %s FAILED: %s", label, exc)
+            return {"label": label, "ok": False, "error": str(exc)}
+        return {"label": label, "ok": True, "error": None}
+
+    def flush_writes(self) -> dict[str, Any] | None:
+        """Drain the outstanding deferred write (scheduler calls this when the
+        actor idles or at end-of-run, when no further result can carry it).
+        """
+        return self._collect_prior_write()
+
     def ping(self) -> bool:
         """No-op health check used to wait for actor initialization.
 
@@ -395,7 +441,7 @@ class InferenceActor:
         staging_base: str,
         run_id: str,
         tracker: ray.actor.ActorHandle | None = None,
-    ) -> dict[str, str | int | float]:
+    ) -> dict[str, Any]:
         """Process a single spatial chunk: load data, run inference, write output.
 
         When a ``get_credentials`` provider was injected at construction, reads
@@ -435,7 +481,7 @@ class InferenceActor:
         staging_base: str,
         run_id: str,
         tracker: ray.actor.ActorHandle | None = None,
-    ) -> dict[str, str | int | float]:
+    ) -> dict[str, Any]:
         """Run the load → inference → write pipeline for one chunk.
 
         Always invoked through :meth:`process_chunk`, which establishes the
@@ -595,27 +641,37 @@ class InferenceActor:
                 # distinguish a legitimate skip from a silently-failed chunk
                 # (Ray worker crash, etc.).
                 logger.info("Chunk %s has no valid pixels, skipping (assembly will fill)", chunk.label)
-                writer.write_skip_marker(chunk, run_id)
+                writer.write_skip_marker(chunk, run_id)  # zero-byte marker: keep synchronous
                 return {
                     "chunk": chunk.label,
                     "status": "skipped",
                     "valid_pixels": 0,
                     "elapsed_sec": time.monotonic() - t0,
                     "instance_id": self.instance_id,
+                    "prior_write": self._collect_prior_write(),
                 }
 
-            # Report writing phase before S3 write
-            if tracker:
-                tracker.report.remote(chunk.label, 0, 0, "writing")  # type: ignore[union-attr]
+            # Resolve the PREVIOUS chunk's deferred write first (it queued a
+            # full chunk ago on the single-slot writer — normally long done),
+            # so its outcome rides this result back to the scheduler.
+            prior_write = self._collect_prior_write()
 
-            # Single whole-chunk write — assembly / skip-marker logic untouched.
-            writer.write_chunk(
-                chunk,
-                embeddings,
-                run_id,
-                embeddings_std=None,
-                scales=scales,
-                obs_counts=obs_buffers,
+            # Defer the whole-chunk staging write to the writer thread: it
+            # overlaps the next chunk's serial prologue load instead of adding
+            # GPU-idle time. This chunk is only counted complete once the
+            # write's outcome is confirmed (see class comment above).
+            self._writer_pool_handle()
+            self._pending_write = (
+                chunk.label,
+                self._writer_pool.submit(
+                    writer.write_chunk,
+                    chunk,
+                    embeddings,
+                    run_id,
+                    embeddings_std=None,
+                    scales=scales,
+                    obs_counts=obs_buffers,
+                ),
             )
 
             elapsed = time.monotonic() - t0
@@ -632,6 +688,8 @@ class InferenceActor:
                 "valid_pixels": total_valid,
                 "elapsed_sec": elapsed,
                 "instance_id": self.instance_id,
+                "write_deferred": True,
+                "prior_write": prior_write,
             }
 
         except Exception as e:

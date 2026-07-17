@@ -703,6 +703,13 @@ def _process_chunks_work_stealing(
         """
         if tracker:
             tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
+        # The actor is killed below, taking its writer thread with it — any
+        # deferred write it still held is of unknown state, so requeue that
+        # chunk too. Safe: staged writes are idempotent (run-scoped keys,
+        # mode="w"; resume-scan tolerates rewrites).
+        orphaned = pending_write.pop(actor_idx, None)
+        if orphaned is not None:
+            _requeue_unconfirmed(orphaned, f"actor {actor_idx} failed with the write in flight")
         pool.resolve_iid(actor_idx)
         instance_id = pool.actor_instance_ids[actor_idx]
         attempts = pool.chunk_attempts.get(chunk_label, 1)
@@ -746,10 +753,69 @@ def _process_chunks_work_stealing(
         # the background). The kill is a no-op if the actor process already died.
         pool.replace(actor_idx, instance_id)
 
+    # --- Deferred staging writes ---
+    # Actors return with write_deferred=True while their staging upload runs
+    # on a background thread (overlapping the next chunk's serial prologue).
+    # Such results are held here — NOT counted complete — until the write's
+    # outcome arrives: piggybacked as prior_write on the actor's next result,
+    # or pulled via flush_writes() once the actor idles. On failure or actor
+    # death the chunk requeues (staged writes are idempotent).
+    pending_write: dict[int, dict] = {}  # actor_idx -> deferred result dict
+
+    def _requeue_unconfirmed(deferred: dict, reason: str) -> None:
+        """Requeue a deferred chunk whose write failed or is of unknown state."""
+        label = str(deferred["chunk"])
+        attempts = pool.chunk_attempts.get(label, 1)
+        if attempts <= max_chunk_retries:
+            log.warning(
+                "Chunk %s staging write unconfirmed (%s, attempt %d/%d) — re-queuing",
+                label,
+                reason,
+                attempts,
+                max_chunk_retries,
+            )
+            chunk_queue.append(chunk_by_label[label])
+        else:
+            log.error("Chunk %s PERMANENTLY FAILED: staging write unconfirmed (%s)", label, reason)
+            results.append(
+                {"chunk": label, "status": "failed", "error": f"staging write: {reason}", "attempts": attempts}
+            )
+
+    def _finalize_prior_write(actor_idx: int, prior: dict) -> None:
+        """Resolve a deferred chunk using the write outcome its actor reported."""
+        deferred = pending_write.pop(actor_idx, None)
+        if deferred is None:
+            log.warning("Actor %d reported a write outcome for %s but none was pending", actor_idx, prior.get("label"))
+            return
+        if prior.get("ok"):
+            deferred["write_confirmed"] = True
+            results.append(deferred)
+        else:
+            # The actor itself is healthy (it just inferred a whole chunk) —
+            # requeue without the kill-and-replace used for inference failures.
+            _requeue_unconfirmed(deferred, str(prior.get("error", "unknown write error")))
+
+    def _flush_idle_writes() -> None:
+        """Drain deferred writes on actors with no in-flight call to carry them."""
+        busy = pool.busy_actors
+        for actor_idx in [a for a in pending_write if a not in busy]:
+            try:
+                prior = cast(
+                    "dict | None",
+                    ray.get(pool.actors[actor_idx].flush_writes.remote(), timeout=600),  # type: ignore[union-attr]
+                )
+            except Exception as exc:
+                _requeue_unconfirmed(pending_write.pop(actor_idx), f"flush failed: {exc}")
+                continue
+            if prior is None:
+                _requeue_unconfirmed(pending_write.pop(actor_idx), "actor had no pending write to flush")
+            else:
+                _finalize_prior_write(actor_idx, prior)
+
     # --- Main work-stealing loop ---
-    # Runs while there is in-flight work OR queued chunks waiting for
-    # initializing actors to come online.
-    while pool.pending or (chunk_queue and pool._initializing):
+    # Runs while there is in-flight work, deferred writes awaiting
+    # confirmation, OR queued chunks waiting for initializing actors.
+    while pool.pending or pending_write or (chunk_queue and pool._initializing):
         if pool.pending:
             # Block up to 60s for any one chunk to finish.
             ready_refs, _ = ray.wait(list(pool.pending.keys()), num_returns=1, timeout=60)
@@ -793,7 +859,19 @@ def _process_chunks_work_stealing(
                 if result.get("status") == "failed":
                     _handle_failure(chunk_label, actor_idx, str(result.get("error", "unknown")))
                 else:
-                    results.append(result)
+                    # Resolve the PREVIOUS deferred write this result carries
+                    # before recording this chunk's own deferral.
+                    prior = result.pop("prior_write", None)
+                    if prior is not None:
+                        _finalize_prior_write(actor_idx, prior)
+                    if result.get("write_deferred"):
+                        # Inference is done and the upload is in flight; hold
+                        # the result until the write outcome confirms it. The
+                        # tracker entry is removed now — the actor has moved on,
+                        # so stall detection has nothing left to watch here.
+                        pending_write[actor_idx] = result
+                    else:
+                        results.append(result)
                     if tracker:
                         tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
                     pool._initializing.discard(actor_idx)
@@ -814,7 +892,10 @@ def _process_chunks_work_stealing(
         _maybe_request_next_batch()
         pool.resolve_initializing()
         pool.dispatch_idle(chunk_queue, mosaic_base, staging_base, run_id, tracker)
+        # Actors left idle after dispatch have no next call to carry their
+        # deferred-write confirmation — pull it via flush_writes() (tail of
+        # run, and always before such an actor could be retired).
+        _flush_idle_writes()
         pool.retire_idle(len(pool.pending) + len(chunk_queue))
-
 
     return results
