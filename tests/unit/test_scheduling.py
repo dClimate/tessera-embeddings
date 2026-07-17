@@ -200,9 +200,7 @@ class TestSeed:
         with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
             pool.seed(queue, "m", "s", "r", None)
         assert len(pool.pending) == 3
-        # Every un-dispatched chunk is either still queued or reserved as some
-        # busy actor's prefetch hint — none lost, none double-assigned.
-        assert len(queue) + len(pool.reserved) == 2
+        assert len(queue) == 2
 
     def test_handles_fewer_chunks_than_actors(self) -> None:
         pool = _make_pool(4)
@@ -213,113 +211,6 @@ class TestSeed:
             pool.seed(queue, "m", "s", "r", None)
         assert len(pool.pending) == 2
         assert len(queue) == 0
-
-
-class TestReservations:
-    """Tests for the 1-deep next-chunk reservation / prefetch-hint plumbing."""
-
-    def test_submit_reserves_and_passes_hint_when_queue_deep(self) -> None:
-        pool = _make_pool(2)
-        pool.actors[0].process_chunk.remote.return_value = MagicMock()
-        chunks = [_fake_chunk(f"c{i}") for i in range(4)]
-        queue: deque = deque(chunks[1:])  # 3 queued > live_count 2
-        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
-            pool.submit(0, chunks[0], "m", "s", "r", None, queue)
-        assert pool.reserved[0] is chunks[1]
-        assert list(queue) == chunks[2:]
-        kwargs = pool.actors[0].process_chunk.remote.call_args.kwargs
-        assert kwargs["prefetch_hint"] is chunks[1]
-
-    def test_submit_skips_reservation_when_queue_shallow(self) -> None:
-        # At the run tail (queue <= live actors) a reservation would pin work
-        # to a busy actor while others idle; the hint must be withheld.
-        pool = _make_pool(2)
-        pool.actors[0].process_chunk.remote.return_value = MagicMock()
-        queue: deque = deque([_fake_chunk("c1"), _fake_chunk("c2")])  # 2 <= live 2
-        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
-            pool.submit(0, _fake_chunk("c0"), "m", "s", "r", None, queue)
-        assert pool.reserved == {}
-        assert len(queue) == 2
-        assert pool.actors[0].process_chunk.remote.call_args.kwargs["prefetch_hint"] is None
-
-    def test_submit_without_queue_never_reserves(self) -> None:
-        pool = _make_pool(1)
-        pool.actors[0].process_chunk.remote.return_value = MagicMock()
-        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
-            pool.submit(0, _fake_chunk("c0"), "m", "s", "r", None)
-        assert pool.reserved == {}
-
-    def test_take_reserved_pops_once(self) -> None:
-        pool = _make_pool(1)
-        chunk = _fake_chunk("c1")
-        pool.reserved[0] = chunk
-        assert pool.take_reserved(0) is chunk
-        assert pool.take_reserved(0) is None
-
-    def test_completion_consumes_reservation_in_order(self) -> None:
-        """The reserved (already-prefetched) chunk is the actor's next dispatch.
-
-        One actor, three chunks: seed dispatches c0 and reserves c1; on c0's
-        completion the actor must receive c1 (the hint it prefetched), then c2
-        from the queue — never a different order, which would waste the
-        prefetched prologue.
-        """
-        actor = MagicMock(name="actor_0")
-        config = MagicMock()
-        config.checkpoint_path = "s3://bucket/ckpt.pt"
-        chunks = [_fake_chunk(f"c{i}") for i in range(3)]
-
-        refs = [MagicMock(name=f"ref{i}") for i in range(3)]
-        actor.process_chunk.remote.side_effect = refs
-        done: list = []
-
-        def fake_wait(pending_refs, **kw):
-            if kw.get("timeout", 60) == 0:
-                return (list(pending_refs), [])
-            for r in refs:
-                if r in pending_refs and r not in done:
-                    done.append(r)
-                    return ([r], [x for x in pending_refs if x is not r])
-            return ([], list(pending_refs))
-
-        def fake_get(ref, *args, **kwargs):
-            return {"chunk": f"c{refs.index(ref)}", "status": "success"}
-
-        with (
-            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
-            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
-            patch.object(_sched_mod.time, "sleep"),
-        ):
-            results = _process_chunks_work_stealing(
-                actors=[actor],
-                actor_instance_ids=["i-0000"],
-                chunks=chunks,
-                mosaic_base="m",
-                staging_base="s",
-                run_id="r",
-                config=config,
-                t0=time.monotonic(),
-                log=logging.getLogger("test"),
-            )
-
-        assert len(results) == 3
-        dispatched = [c.args[0] for c in actor.process_chunk.remote.call_args_list]
-        assert dispatched == chunks
-        hints = [c.kwargs["prefetch_hint"] for c in actor.process_chunk.remote.call_args_list]
-        # c0 rode with hint c1 (queue was 2 > live 1); afterwards the queue is
-        # too shallow to reserve again.
-        assert hints == [chunks[1], None, None]
-
-    def test_failure_returns_reservation_to_queue_front(self) -> None:
-        pool = _make_pool(1)
-        reserved_chunk = _fake_chunk("c-reserved")
-        pool.reserved[0] = reserved_chunk
-        # Simulate _handle_failure's reservation release without the full loop.
-        queue: deque = deque([_fake_chunk("c-tail")])
-        released = pool.take_reserved(0)
-        assert released is reserved_chunk
-        queue.appendleft(released)
-        assert queue[0] is reserved_chunk
 
 
 class TestDispatchIdle:
@@ -1023,12 +914,9 @@ class TestWorkStealingBatching:
     """Verify the loop requests later actor batches as the pool drains work."""
 
     def test_second_batch_requested_after_first_placed(self) -> None:
-        """Starting with one actor and a batch size of 2, the loop requests more
-        actors via the factory (placement always satisfied here) and processes
-        every chunk. The batch is right-sized to *unassigned* work: reserved
-        chunks are bound to their busy owner and excluded from the demand count,
-        so the request never over-provisions past the queue + in-flight work and
-        never exceeds the target.
+        """Starting with one actor and a batch size of 2, the loop requests the
+        remaining batch via the factory (placement always satisfied here) and
+        grows the pool until the target is reached.
         """
         config = MagicMock()
         config.checkpoint_path = "s3://bucket/ckpt.pt"
@@ -1091,10 +979,8 @@ class TestWorkStealingBatching:
                 placement_timeout_sec=300.0,
             )
 
-        # The factory was invoked (batching fired), never over-provisioning past
-        # the target (started with 1, target 3 → at most 2 more requested).
-        assert factory_calls
-        assert 0 < sum(factory_calls) <= 2
+        # The factory was invoked for the remaining 2 actors (target 3, started with 1).
+        assert factory_calls == [2]
         # Every chunk was processed.
         assert len(results) == 4
 

@@ -48,11 +48,11 @@ class TestStripHeightForDensity:
     """The density-based strip sizer keeps a strip's S2 working set under budget."""
 
     def test_resident_bytes_stay_under_budget(self):
-        # 10 bands x uint16 = 20 bytes per (obs, px). Each resident band set is
-        # charged its own full mask (the cross-chunk pairing carries two distinct
-        # masks), so every single set — bands(strip_h) + full mask — must fit ONE
-        # budget; two then fit 2 x budget in either the intra- or cross-chunk
-        # pairing. Checked for every case that sizes above the floor.
+        # 10 bands x uint16 = 20 bytes per (obs, px). Every resident band set —
+        # bands(strip_h) + a full mask charge — must fit ONE budget, so the
+        # intra-chunk strip-prefetch pair fits 2 x budget with margin (the mask
+        # is actually shared; charging it per set is deliberate conservatism).
+        # Checked for every case that sizes above the floor.
         for t_kept, width, height in [(50, 2000, 2000), (200, 2000, 2000), (1, 4000, 4000), (180, 1000, 1000)]:
             h = _strip_height_for_density(t_kept, width, height)
             assert h >= 1
@@ -70,26 +70,24 @@ class TestStripHeightForDensity:
 
     def test_single_strip_when_full_height_fits_one_budget(self):
         # A chunk whose full-height bands + mask fit ONE budget runs as a single
-        # strip. Single strips are held to one budget (not the pair budget):
-        # cross-chunk prologue prefetch can co-load the next chunk's strip-0
-        # alongside this chunk, so every resident band set must individually
-        # fit one budget for the co-resident pair to fit two.
+        # strip; anything larger splits so the intra-chunk strip-prefetch pair
+        # stays bounded by 2 x budget.
         h = _strip_height_for_density(60, 2000, 2000)
         assert h == 2000
         full = 60 * 2000 * 2000 * len(S2_BAND_ORDER) * 2 + 60 * 2000 * 2000
         assert full <= _S2_STRIP_BYTE_BUDGET
 
-    def test_dense_single_chunk_splits_so_cross_chunk_pair_fits(self):
-        # Regression for the 2026-07-17 OOM (chunk_5_9, T_kept=122): under the
-        # old pair-budget fast path a T=122 chunk ran as ONE ~10 GB strip, and
-        # the cross-chunk prefetch put two of those on a 31 GB node at once.
-        # Now every resident band set must individually fit one budget.
+    def test_dense_single_chunk_splits_to_respect_budget(self):
+        # Regression rooted in the 2026-07-17 OOM (chunk_5_9, T_kept=122): a
+        # pair-budget fast path once let a T=122 chunk run as ONE ~10 GB strip
+        # and co-residency killed the node at 95% RAM. Every resident band set
+        # must individually fit one budget.
         for t_kept in (90, 122, 160, 250):
             h = _strip_height_for_density(t_kept, 2000, 2000)
             mask_bytes = t_kept * 2000 * 2000
             per_row = t_kept * 2000 * len(S2_BAND_ORDER) * 2
-            # Whether single or split, each resident band set + its own full mask
-            # fits one budget (so the cross-chunk pair fits two).
+            # Whether single or split, each resident band set + full mask charge
+            # fits one budget (so any resident pair fits two).
             if h > _MIN_STRIP_H:
                 assert per_row * h + mask_bytes <= _S2_STRIP_BYTE_BUDGET
         # The OOM case specifically must split.
@@ -276,66 +274,3 @@ class TestProcessChunkStriping:
         assert result["valid_pixels"] == 0
         assert _CapturingWriter.last_skip == _CHUNK.label
         assert _CapturingWriter.last_write is None
-
-
-# ---------------------------------------------------------------------------
-# Cross-chunk prologue prefetch (Phase 1 pipelining)
-# ---------------------------------------------------------------------------
-
-_CHUNK_B = ChunkSpec(row=1, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
-_CHUNK_C = ChunkSpec(row=2, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
-
-
-class TestChunkProloguePrefetch:
-    """The prefetch-hint path must be invisible in outputs and self-cleaning."""
-
-    def test_prefetched_prologue_bit_identical_to_cold(self, inference_config, test_model):
-        """Chunk B processed via a prefetch hint == chunk B processed cold."""
-        inference_config.s1_orbit = "both"
-        inference_config.time_window = parse_time_window("December 2024")
-
-        # Cold baseline for chunk B.
-        actor_cold = _make_actor(inference_config, test_model)
-        _CapturingWriter.last_write = None
-        with (
-            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
-            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-        ):
-            res_cold = actor_cold.process_chunk(_CHUNK_B, "s3://b/m", "/tmp/staging", "run-1")
-            write_cold = _CapturingWriter.last_write
-
-        # Chunk A with a hint for B, then B consuming the prefetched prologue.
-        # Both calls stay inside the patch scope because the prefetch thread
-        # opens stores in the background.
-        actor = _make_actor(inference_config, test_model)
-        with (
-            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
-            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-        ):
-            res_a = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1", prefetch_hint=_CHUNK_B)
-            assert _CHUNK_B.label in actor._prefetched
-            _CapturingWriter.last_write = None
-            res_b = actor.process_chunk(_CHUNK_B, "s3://b/m", "/tmp/staging", "run-1")
-            write_b = _CapturingWriter.last_write
-
-        assert res_a["status"] == "success"
-        assert res_b["status"] == "success" == res_cold["status"]
-        assert actor._prefetched == {}  # stash consumed
-        np.testing.assert_array_equal(write_cold["embeddings"], write_b["embeddings"])
-        np.testing.assert_allclose(write_cold["scales"], write_b["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
-
-    def test_stale_prefetch_evicted_on_reassignment(self, inference_config, test_model):
-        """A hint for B followed by an assignment of C drops the stale stash."""
-        inference_config.s1_orbit = "both"
-        inference_config.time_window = parse_time_window("December 2024")
-        actor = _make_actor(inference_config, test_model)
-        with (
-            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
-            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
-        ):
-            actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1", prefetch_hint=_CHUNK_B)
-            assert _CHUNK_B.label in actor._prefetched
-            res_c = actor.process_chunk(_CHUNK_C, "s3://b/m", "/tmp/staging", "run-1")
-
-        assert res_c["status"] == "success"
-        assert actor._prefetched == {}  # stale B entry evicted, C never stashed

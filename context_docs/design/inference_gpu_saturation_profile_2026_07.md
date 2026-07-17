@@ -89,3 +89,17 @@ CPU-feed-bound straggler tail worth **~7–15% of GPU-hours** (get_batch spikes 
 FP16 fast-accumulate) are analysed in `temp/token-budget-batching-findings.md`
 and the PR #85 discussion; numerics policy in
 [ADR 012](../decisions/012-validated-equivalence-for-inference-outputs.md).
+
+## Addendum (2026-07-17): cross-chunk interleaving removed for UTM-zone-scale RAM headroom
+
+The cross-chunk prologue prefetch measured above was subsequently **removed** by
+decision: co-residing two chunks' input working sets held peak host RAM at
+~92–95% of the node, and at UTM-zone-scale runs chunk-density variance makes
+that an OOM guarantee. The operating target is now peak host RAM ≤60%
+(ideally ~50%), achieved by (a) dropping the cross-chunk prefetch (scheduler
+reservations + actor prologue stash) and (b) shrinking `_S2_STRIP_BYTE_BUDGET`
+7 → 4.75 GiB (expected peak ≈ 16–17 GB ≈ 54%). The dense-chunk interleaving
+factor (~1.25–1.3×) is deliberately given back as the price of that headroom;
+all other campaign gains (vectorised resampler, async GPU pipeline, batch
+7168, within-chunk overlap) are retained. The numbers in this doc describe the
+measured campaign builds and remain the historical record.

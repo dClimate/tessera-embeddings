@@ -182,50 +182,43 @@ GPU), the same pattern as the sub-batch prefetcher in `inference.py`.
 The strip height is derived per chunk from its **true post-prune timestep count** `T_kept`,
 read from a full-chunk SCL mask loaded once up front (see below). The strip loop runs a 1-deep
 prefetch (strip *i+1* loads while strip *i* runs the GPU), so once a chunk splits **two strips
-are resident at once**; the byte budget is the bound on a single strip, sized so the pair holds
-under ~90% of the default 16 GB worker box. A chunk that fits in one strip loads whole (no
-prefetched neighbour) — byte-for-byte the unstriped path.
+are resident at once**. Every resident band set (strip bands + a full mask charge) must fit
+`_S2_STRIP_BYTE_BUDGET` (4.75 GiB), so the pair stays ≤ ~9.5 GiB — sized to hold peak host RAM
+in the ~50–60% band of a 30.9 GB g6e.xlarge across UTM-zone-scale density variance (see the
+budget constant's comment for the full arithmetic). A chunk that fits in one budget loads
+whole — byte-for-byte the unstriped path.
 
 Two reads are decoupled. **SCL** (1 byte/px) is loaded once for the whole chunk
 (`load_s2_mask_bundle`) and sliced per strip — it is never re-decompressed, and it doubles as
 the `T_kept` source for sizing. **Reflectance bands** (20 bytes/px) are still read per strip on
 the chunks that split; that per-strip read is exactly the working set the byte budget bounds.
 
-#### 4a″. Cross-chunk prologue prefetch
+#### 4a″. Chunk prologue: serial by design (cross-chunk prefetch removed)
 
-Baseline profiling (2026-07, `scripts/inference_perf/`) showed each chunk paying ~50–60 s of
-GPU-idle "prologue" — SCL mask read, strip-0 band read, dataset build — plus a ~7 s GPU-idle
-staging write, with **no overlap across chunk boundaries** (~22–25% of chunk wall-clock dead).
-Two mechanisms remove it:
-
-- **Bucketing rides the prefetch thread.** `_load_strip` returns `(ChunkData, dataset)` — the
-  `MosaicChunkInferenceDataset` build (valid-pixel filtering + bucketing, ~10 s on production
-  chunks) happens on the strip-prefetch thread, overlapping the prior strip's GPU work instead
-  of sitting between load and inference on the main thread.
-- **The scheduler reserves each busy actor's next chunk** (`ActorPool.reserved`, 1-deep) and
-  passes it to `process_chunk` as `prefetch_hint`. When the actor reaches its **final strip**
-  (where only one band strip is resident, so the pair budget holds), a persistent
-  chunk-prefetch thread loads the hinted chunk's entire prologue — repo handles, SCL mask,
-  strip tiling, strip-0 bands + dataset (`_PrefetchedChunk`) — while the final strip infers
-  and the staging write runs. The next `process_chunk` call consumes the stash by label and
-  starts inference almost immediately.
+Each chunk pays a serial, GPU-idle "prologue" — SCL mask read, strip-0 band read, dataset
+build (~35–55 s on production chunks) — before its first forward pass, plus a ~7 s GPU-idle
+staging write after. There is deliberately **no overlap across chunk boundaries**:
 
 ```
  actor timeline, chunk N → N+1 (single-strip chunks)
 
- without prefetch:  [mask][bands][build][═══ inference N ═══][write][mask][bands][build][═══ N+1 ═══]
-                     GPU:  idle   idle    busy                 idle   idle  idle   idle    busy
-
- with prefetch:     [mask][bands][build][═══ inference N ═══][write][═══ inference N+1 ═══]
-                                          └─ prefetch thread: [mask][bands][build] N+1 ──┘
-                     GPU:  idle   idle    busy                 ~idle  busy
+ [mask][bands][build][═══ inference N ═══][write][mask][bands][build][═══ N+1 ═══]
+  GPU:  idle   idle    busy                 idle   idle  idle   idle    busy
 ```
 
-Reservations are safety-first: they stop when the queue is shallower than the live pool (a
-tail-of-run reservation would pin work to a busy actor while others idle), a failed actor's
-reservation returns to the queue front, a reassigned actor evicts its stale stash, and a
-failed prefetch falls back to the inline (unprefetched) prologue. Chunk results are
-bit-identical either way — the prefetch only moves *when* loading happens.
+A cross-chunk prologue prefetch (scheduler-reserved next chunk + a prefetch thread hiding
+the prologue behind the prior chunk's inference) shipped briefly in 2026-07 and delivered
+~1.25–1.3× on dense chunks — but co-residing two chunks' input working sets pushed peak
+host RAM to ~92–95% of the node (one observed Ray OOM-kill), and at UTM-zone-scale runs
+chunk-density variance makes that envelope untenable. It was removed the same week to hold
+peak host RAM in the ~50–60% band (see `_S2_STRIP_BYTE_BUDGET` for the arithmetic); the
+serial-prologue GPU idle is the accepted cost of that headroom. The historical measurements
+live in `context_docs/design/inference_gpu_saturation_profile_2026_07.md`.
+
+Within a chunk, overlap remains: **bucketing rides the strip-prefetch thread** —
+`_load_strip` returns `(ChunkData, dataset)`, so the `MosaicChunkInferenceDataset` build
+(valid-pixel filtering + bucketing, ~10 s) overlaps the prior strip's GPU work on split
+chunks instead of sitting between load and inference.
 
 #### 4b. Valid Pixel Filtering + Bucketing (`dataset.py`)
 

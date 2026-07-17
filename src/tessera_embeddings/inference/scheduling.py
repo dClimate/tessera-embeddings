@@ -73,14 +73,6 @@ class ActorPool:
         self.pending: dict[ray.ObjectRef, tuple[str, int]] = {}
         self.chunk_attempts: dict[str, int] = {}
 
-        # actor_idx → the chunk reserved as that actor's next assignment. A
-        # reservation is created at submit time (and passed to the actor as
-        # ``prefetch_hint`` so it preloads the chunk's prologue during the
-        # current chunk's inference), consumed when the actor completes, and
-        # returned to the queue front if the actor fails. Only busy actors
-        # hold reservations.
-        self.reserved: dict[int, ChunkSpec] = {}
-
         self._pending_iid_refs: dict[int, ray.ObjectRef] = {}
         self._initializing: set[int] = set()
         self._retired: set[int] = set()
@@ -172,17 +164,8 @@ class ActorPool:
         staging_base: str,
         run_id: str,
         tracker: ray.actor.ActorHandle | None,
-        chunk_queue: deque[ChunkSpec] | None = None,
     ) -> None:
         """Submit a single chunk to an actor and record the pending future.
-
-        When ``chunk_queue`` is supplied and still deep, the queue head is also
-        popped and RESERVED as this actor's next assignment, riding along as
-        ``prefetch_hint`` so the actor preloads its prologue during this
-        chunk's inference. Reservations stop when the queue is shallower than
-        the live pool (``len(queue) <= live_count``): at the tail of a run a
-        reserved chunk would pin work to a busy actor while other actors sit
-        idle, which costs more than the prologue overlap saves.
 
         Args:
             actor_idx: Index into self.actors.
@@ -191,32 +174,13 @@ class ActorPool:
             staging_base: Base path for staged output.
             run_id: Run identifier.
             tracker: Optional ProgressTracker actor handle.
-            chunk_queue: Remaining-work queue; the reservation source. ``None``
-                disables reservation (used by tests and direct callers).
         """
         self.resolve_iid(actor_idx)  # best-effort resolve before dispatch
-        if actor_idx in self.reserved:
-            # Defensive: a reservation should have been consumed or returned
-            # before this actor is re-dispatched; don't strand the chunk.
-            stranded = self.reserved.pop(actor_idx)
-            self.log.warning("Actor %d re-dispatched holding reservation %s — requeuing it", actor_idx, stranded.label)
-            if chunk_queue is not None:
-                chunk_queue.appendleft(stranded)
-
-        hint: ChunkSpec | None = None
-        if chunk_queue is not None and len(chunk_queue) > self.live_count:
-            hint = chunk_queue.popleft()
-            self.reserved[actor_idx] = hint
-
         ref: ray.ObjectRef = self.actors[actor_idx].process_chunk.remote(  # type: ignore[union-attr]
-            chunk, mosaic_base, staging_base, run_id, tracker=tracker, prefetch_hint=hint
+            chunk, mosaic_base, staging_base, run_id, tracker=tracker
         )
         self.pending[ref] = (chunk.label, actor_idx)
         self.chunk_attempts[chunk.label] = self.chunk_attempts.get(chunk.label, 0) + 1
-
-    def take_reserved(self, actor_idx: int) -> ChunkSpec | None:
-        """Pop and return the chunk reserved for this actor, if any."""
-        return self.reserved.pop(actor_idx, None)
 
     def seed(
         self,
@@ -240,7 +204,7 @@ class ActorPool:
                 break
             if actor_idx in self._initializing:
                 continue
-            self.submit(actor_idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker, chunk_queue)
+            self.submit(actor_idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker)
         self.log.info("Seeded %d actors with initial chunks (%d queued)", len(self.pending), len(chunk_queue))
 
     def dispatch_idle(
@@ -273,7 +237,7 @@ class ActorPool:
             if not idle_ready:
                 break
             idx = idle_ready[0]
-            self.submit(idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker, chunk_queue)
+            self.submit(idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker)
             busy.add(idx)
 
     # ------------------------------------------------------------------
@@ -692,11 +656,6 @@ def _process_chunks_work_stealing(
             return
         assert actor_factory is not None and total_actors_target is not None  # narrowed by batching_enabled
         alive_gpu_nodes = sum(1 for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) > 0)
-        # Reserved chunks are excluded: each is bound to a specific busy actor
-        # (consumed by that actor when it finishes its current chunk, never
-        # returned to the queue except on failure), so it comes with its own
-        # actor and must not inflate demand for NEW actors — counting it would
-        # let the autoscaler provision workers that can't pick it up.
         n, timed_out = _batch_actors_to_request(
             requested=len(pool.actors),
             target=total_actors_target,
@@ -740,17 +699,6 @@ def _process_chunks_work_stealing(
         """
         if tracker:
             tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
-        # A failed actor is killed below, so its reserved next chunk (whose
-        # prologue only that actor may have prefetched) goes back to the queue
-        # front for a healthy actor to pick up promptly.
-        reserved = pool.take_reserved(actor_idx)
-        if reserved is not None:
-            chunk_queue.appendleft(reserved)
-            log.info(
-                "Returned reserved chunk %s from failed actor %d to the queue front",
-                reserved.label,
-                actor_idx,
-            )
         pool.resolve_iid(actor_idx)
         instance_id = pool.actor_instance_ids[actor_idx]
         attempts = pool.chunk_attempts.get(chunk_label, 1)
@@ -842,15 +790,9 @@ def _process_chunks_work_stealing(
             # freshly-spawned replacement still initializing (30-120s). A failed
             # actor was killed and replaced by _handle_failure, so it's now
             # initializing and skipped here — its retried chunk goes to a
-            # different, healthy actor via dispatch_idle below. The actor's
-            # reserved chunk (already prefetched on its end) takes precedence
-            # over the queue so the prefetched prologue is actually consumed.
-            if actor_idx not in pool._initializing:
-                next_chunk = pool.take_reserved(actor_idx)
-                if next_chunk is None and chunk_queue:
-                    next_chunk = chunk_queue.popleft()
-                if next_chunk is not None:
-                    pool.submit(actor_idx, next_chunk, mosaic_base, staging_base, run_id, tracker, chunk_queue)
+            # different, healthy actor via dispatch_idle below.
+            if chunk_queue and actor_idx not in pool._initializing:
+                pool.submit(actor_idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker)
 
         # Request the next actor batch if the prior batch has been placed (or
         # placement timed out), then check if any initializing actors have
