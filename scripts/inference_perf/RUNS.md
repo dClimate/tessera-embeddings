@@ -37,8 +37,15 @@ mismatches; chunk_3_0: exact 98.06%, same envelope — PASS 2/2. Zero NaN-mask
 mismatches on sparse chunks confirms validity/skip semantics are unchanged
 under the prefetched-prologue path.
 
-Reference dataset (assembled from baseline staging):
-`s3://arbol-tessera-embeddings-dev/embeddings/iowa_epsg5070-reference.zarr/`.
+Assembled full-ROI deliverables (icechunk stores, from Dask assembly):
+- reference (main / 3584): `.../embeddings/iowa_epsg5070-reference.zarr/`
+- P2+3 (branch / 7168): `.../embeddings/iowa_epsg5070-inference-speedup-phases-2-and-3.zarr/`
+
+End-to-end check 2026-07-17 (3 interior 512x512 windows, cross-config; full ROI
+is 1.87B px so sampled, not streamed whole): all PASS — exact int8 94.9-95.2%,
+within-1 >= 99.9931%, max|Δ|=2, scale drift <= 0.78%, cosine >= 0.99991, and
+**footprint_mismatch = 0** (identical valid/NaN masks → assembly placed every
+chunk correctly, dropped nothing under the pipelined/prefetch path).
 
 ## Comparison semantics (ADR 012)
 
