@@ -114,18 +114,17 @@ def _build_cloudwatch_setup_command(
     )
 
 
-def _pick_least_loaded_subnet(
+def _count_ray_instances_per_subnet(
     subnets: list[dict[str, Any]],
     cluster_tag_prefix: str,
     ec2_client: Any,  # noqa: ANN401 — boto3 EC2 client has no public type
-) -> dict[str, Any]:
-    """Pick the subnet with the fewest running Ray instances.
+) -> dict[str, int]:
+    """Count running/pending Ray instances in each subnet.
 
-    Counts running/pending instances whose ``ray-cluster-name`` tag starts
-    with ``cluster_tag_prefix`` and returns the subnet with the lowest
-    count (deterministic tie-break by subnet ID). This spreads concurrent
-    clusters across AZs while still pinning each cluster to a single AZ
-    to avoid cross-AZ data transfer charges.
+    Returns a ``{SubnetId: count}`` map (every input subnet is a key, even
+    with a zero count). Counts instances whose ``ray-cluster-name`` tag
+    starts with ``cluster_tag_prefix`` — the "load" signal shared by
+    :func:`_pick_least_loaded_subnet` and :func:`_rank_launch_subnets`.
     """
     subnet_ids = [s["SubnetId"] for s in subnets]
     counts: dict[str, int] = dict.fromkeys(subnet_ids, 0)
@@ -141,9 +140,146 @@ def _pick_least_loaded_subnet(
             sid = inst.get("SubnetId")
             if sid in counts:
                 counts[sid] += 1
+    return counts
 
+
+def _pick_least_loaded_subnet(
+    subnets: list[dict[str, Any]],
+    cluster_tag_prefix: str,
+    ec2_client: Any,  # noqa: ANN401 — boto3 EC2 client has no public type
+) -> dict[str, Any]:
+    """Pick the subnet with the fewest running Ray instances.
+
+    Counts running/pending instances whose ``ray-cluster-name`` tag starts
+    with ``cluster_tag_prefix`` and returns the subnet with the lowest
+    count (deterministic tie-break by subnet ID). This spreads concurrent
+    clusters across AZs while still pinning each cluster to a single AZ
+    to avoid cross-AZ data transfer charges.
+
+    This is the **capacity-blind fallback**: it optimises for spreading
+    load, not for which AZ actually has spare instance capacity. When a
+    capacity signal is available, :func:`_rank_launch_subnets` (which uses
+    GetSpotPlacementScores) is preferred; this function is what that ranker
+    degrades to when the signal is unavailable, and it also remains the
+    picker for :func:`_resolve_ray_config` when no subnet is pre-chosen.
+    The single-AZ pin is identical in both paths — only the AZ *choice*
+    differs.
+    """
+    counts = _count_ray_instances_per_subnet(subnets, cluster_tag_prefix, ec2_client)
     sorted_subnets = sorted(subnets, key=lambda s: (counts[s["SubnetId"]], s["SubnetId"]))
     return sorted_subnets[0]
+
+
+def _spot_placement_scores(
+    instance_type: str,
+    target_capacity: int,
+    region: str,
+    ec2_client: Any,  # noqa: ANN401 — boto3 EC2 client has no public type
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+) -> dict[str, int]:
+    """Fetch EC2 spot placement scores keyed by AvailabilityZoneId.
+
+    Sizes the query to the whole worker fleet (``TargetCapacity`` clamped
+    to ``1..100`` to respect account limits) with ``SingleAvailabilityZone``,
+    so a high score means "this single AZ is scored likely to hold the
+    entire fleet". Spot and on-demand draw from the same physical pools, so
+    a high spot score is a reliable *positive* signal that on-demand can
+    launch there (low scores are ambiguous, hence launch-time failover).
+
+    Never raises. Returns an empty dict — the "signal unavailable" sentinel
+    — on AccessDenied (the runner role may lack ``ec2:GetSpotPlacementScores``),
+    throttling, an empty response, or entries missing an AZ id. Callers fall
+    back to load-based ranking when this is empty.
+    """
+    capped = max(1, min(int(target_capacity), 100))
+    try:
+        resp = ec2_client.get_spot_placement_scores(
+            InstanceTypes=[instance_type],
+            TargetCapacity=capped,
+            TargetCapacityUnitType="units",
+            SingleAvailabilityZone=True,
+            RegionNames=[region],
+        )
+        entries = resp.get("SpotPlacementScores") or []
+        scores = {
+            e["AvailabilityZoneId"]: e["Score"]
+            for e in entries
+            if e.get("AvailabilityZoneId") is not None and e.get("Score") is not None
+        }
+    except Exception as exc:  # SPS is advisory; must never break launch
+        log.warning("SPS unavailable (%s); falling back to least-loaded AZ selection", exc)
+        return {}
+    if not scores:
+        log.warning("SPS unavailable (empty response); falling back to least-loaded AZ selection")
+        return {}
+    log.info("Spot placement scores by AZ id (target_capacity=%d): %s", capped, scores)
+    return scores
+
+
+def _az_id(subnet: dict[str, Any]) -> str:
+    """AvailabilityZoneId of a ``describe_subnets`` entry ("" when absent).
+
+    Keeps the spot-score lookups typed as ``str`` keys and tolerates test
+    subnet dicts that omit the field.
+    """
+    return subnet.get("AvailabilityZoneId") or ""
+
+
+def _rank_launch_subnets(
+    subnets: list[dict[str, Any]],
+    worker_instance_type: str,
+    target_capacity: int,
+    cluster_tag_prefix: str,
+    ec2_client: Any,  # noqa: ANN401 — boto3 EC2 client has no public type
+    region: str,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+) -> list[dict[str, Any]]:
+    """Rank candidate subnets best-first for a capacity-aware single-AZ launch.
+
+    Every node still lands in ONE AZ (cross-AZ data-transfer cost is a hard
+    constraint) — this only decides *which* AZ, sized to the whole worker
+    fleet, to mitigate the failure mode where an AZ lacks capacity for the
+    full fleet at launch time.
+
+    Ranking:
+
+    * With spot placement scores (see :func:`_spot_placement_scores`), sort
+      by ``(-score, load_count, SubnetId)`` — highest-capacity AZ first,
+      load as tie-break. Subnets whose AZ returned no score are still
+      *included* (they sort last) so launch-time failover can still try
+      them.
+    * Without scores (SPS unavailable/degraded), sort by
+      ``(load_count, SubnetId)`` only — identical to
+      :func:`_pick_least_loaded_subnet`'s order.
+
+    Never raises: a failed instance count degrades to zero load, and SPS
+    failures degrade to load-based ranking. The worst case is the same
+    least-loaded pick the fallback would have made.
+    """
+    try:
+        load_counts = _count_ray_instances_per_subnet(subnets, cluster_tag_prefix, ec2_client)
+    except Exception as exc:  # ranking must never break launch
+        log.warning("Could not count Ray instances per subnet (%s); assuming zero load", exc)
+        load_counts = {s["SubnetId"]: 0 for s in subnets}
+
+    scores = _spot_placement_scores(worker_instance_type, target_capacity, region, ec2_client, log)
+    if scores:
+        ranked = sorted(
+            subnets,
+            key=lambda s: (-scores.get(_az_id(s), 0), load_counts[s["SubnetId"]], s["SubnetId"]),
+        )
+    else:
+        ranked = sorted(subnets, key=lambda s: (load_counts[s["SubnetId"]], s["SubnetId"]))
+
+    log.info(
+        "Ranked launch AZs (best first, single-AZ pin preserved): %s",
+        ", ".join(
+            f"{s['AvailabilityZone']}(spot_score={scores.get(_az_id(s), 'n/a')}, "
+            f"ray_load={load_counts[s['SubnetId']]})"
+            for s in ranked
+        ),
+    )
+    return ranked
 
 
 def _resolve_ray_config(
@@ -158,14 +294,16 @@ def _resolve_ray_config(
     code_suffix: str = "",
     cloudwatch_log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
+    chosen_subnet: dict[str, Any] | None = None,
 ) -> str:
     """Inject AWS resource IDs from SSM into a Ray cluster YAML template.
 
     Reads SSM parameters under ``ssm_prefix``, looks up the AMI ID from
-    ``ami_ssm_name``, picks the least-loaded private subnet, materialises
-    the SSH key from SSM into a tempfile, injects the CloudWatch agent
-    setup command, substitutes ``{CODE_BUCKET}`` and ``{CODE_SUFFIX}`` in
-    setup_commands, and writes the resolved config to a tempfile.
+    ``ami_ssm_name``, picks the private subnet (see ``chosen_subnet``),
+    materialises the SSH key from SSM into a tempfile, injects the
+    CloudWatch agent setup command, substitutes ``{CODE_BUCKET}`` and
+    ``{CODE_SUFFIX}`` in setup_commands, and writes the resolved config to
+    a tempfile.
 
     Args:
         cluster_yaml: Path to the cluster YAML template. Use
@@ -190,6 +328,13 @@ def _resolve_ray_config(
             production tarballs; ``"-mybranch"`` for dev branches.
         cloudwatch_log_group: CloudWatch log group for Ray agent logs.
         cloudwatch_template: Path to the CloudWatch agent JSON template.
+        chosen_subnet: When provided, pin the cluster to this subnet's
+            ``SubnetId``/``AvailabilityZone`` directly (the caller has
+            already ranked and chosen an AZ, e.g. via
+            :func:`_rank_launch_subnets`). When ``None`` (the default),
+            behaviour is unchanged: describe the SSM subnets and pick the
+            least-loaded one via :func:`_pick_least_loaded_subnet`. Either
+            way the whole cluster is pinned to a single AZ.
 
     Returns:
         Path to the resolved YAML tempfile.
@@ -235,15 +380,16 @@ def _resolve_ray_config(
     tag_specs: list[dict[str, Any]] = [{"ResourceType": "instance", "Tags": merged_tags}]
 
     # Pin all nodes to a single AZ to avoid cross-AZ data transfer costs.
-    # Pick the subnet with the fewest running Ray instances to spread
-    # concurrent clusters across AZs.
-    ec2 = boto3.client("ec2", region_name=region)
-    subnet_resp = ec2.describe_subnets(SubnetIds=all_subnet_ids)
-    if not subnet_resp.get("Subnets"):
-        msg = f"No subnets found for IDs: {all_subnet_ids}"
-        raise RuntimeError(msg)
-
-    chosen_subnet = _pick_least_loaded_subnet(subnet_resp["Subnets"], base_cluster_name, ec2)
+    # When the caller pre-selected a subnet (capacity-aware ranking in
+    # ray_cluster) use it directly; otherwise fall back to picking the
+    # least-loaded subnet here.
+    if chosen_subnet is None:
+        ec2 = boto3.client("ec2", region_name=region)
+        subnet_resp = ec2.describe_subnets(SubnetIds=all_subnet_ids)
+        if not subnet_resp.get("Subnets"):
+            msg = f"No subnets found for IDs: {all_subnet_ids}"
+            raise RuntimeError(msg)
+        chosen_subnet = _pick_least_loaded_subnet(subnet_resp["Subnets"], base_cluster_name, ec2)
     chosen_az = chosen_subnet["AvailabilityZone"]
     chosen_subnet_id = chosen_subnet["SubnetId"]
     config["provider"]["availability_zone"] = chosen_az
@@ -394,6 +540,58 @@ def _start_ray_cluster(
     log.info("Ray head node IP: %s", head_ip)
 
     return head_ip
+
+
+def _launch_ray_with_failover(
+    ranked_subnets: list[dict[str, Any]],
+    resolve_config: Callable[[dict[str, Any]], str],
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+) -> tuple[str, str]:
+    """Launch the cluster in ranked-AZ order, failing over on ``ray up`` failure.
+
+    Iterates ``ranked_subnets`` (best-first from :func:`_rank_launch_subnets`).
+    For each candidate it resolves a fresh YAML pinned to that single AZ
+    (via ``resolve_config``) and calls :func:`_start_ray_cluster`. On a
+    ``ray up`` failure (``RuntimeError`` — e.g. ``InsufficientInstanceCapacity``)
+    it logs a warning naming the AZ, tears the partial attempt down
+    (:func:`_stop_ray_cluster` + :func:`cleanup_ray_tempfiles`) so a
+    partially-provisioned head does not leak, then tries the next AZ.
+
+    This covers *launch-time* capacity failures only — the single-AZ pin is
+    preserved for every attempt (never spread across AZs). It does NOT
+    migrate a running cluster if its AZ dries up mid-run; that would require
+    a teardown + relaunch and is deliberately not implemented (the
+    autoscaler retries in-place instead).
+
+    Returns:
+        ``(resolved_yaml, head_ip)`` for the first AZ that launched. Only
+        this surviving ``resolved_yaml`` should reach the caller's teardown
+        block — failed attempts are already torn down here.
+
+    Raises:
+        RuntimeError: If ``ray up`` failed in every candidate AZ.
+    """
+    tried_azs: list[str] = []
+    for subnet in ranked_subnets:
+        az = subnet["AvailabilityZone"]
+        tried_azs.append(az)
+        resolved_yaml = resolve_config(subnet)
+        try:
+            head_ip = _start_ray_cluster(resolved_yaml, log)
+        except RuntimeError:
+            log.warning(
+                "ray up failed in AZ %s — tearing down the partial attempt and failing over to the next AZ",
+                az,
+                exc_info=True,
+            )
+            _stop_ray_cluster(resolved_yaml, log)
+            cleanup_ray_tempfiles(resolved_yaml)
+            continue
+        log.info("Ray cluster launched in AZ %s", az)
+        return resolved_yaml, head_ip
+
+    msg = f"ray up failed in all candidate AZs: {tried_azs}"
+    raise RuntimeError(msg)
 
 
 def _log_ray_dashboard_ssm_command(
@@ -552,6 +750,7 @@ def ray_cluster(
     code_suffix: str = "",
     cloudwatch_log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
+    target_workers: int = 2,
 ) -> Iterator[str | None]:
     """Provision an AWS-backed Ray cluster; tear it down on exit.
 
@@ -587,6 +786,11 @@ def ray_cluster(
         code_suffix: Filename suffix for the tarball.
         cloudwatch_log_group: CloudWatch log group for Ray agent logs.
         cloudwatch_template: CloudWatch agent JSON template path.
+        target_workers: Size of the GPU worker fleet this run expects to
+            reach. Used as the ``TargetCapacity`` for the spot-placement
+            capacity signal so the chosen single AZ is scored likely to
+            hold the *whole* fleet, not just one node. Ignored in the
+            ``ray_address`` (attach) path.
 
     Yields:
         Path to the resolved cluster YAML tempfile when this context
@@ -603,11 +807,12 @@ def ray_cluster(
             ray.init(address=ray_address, ignore_reinit_error=True)
         else:
             manages_cluster = True
+            with cluster_yaml.open() as f:
+                template_cfg = yaml.safe_load(f)
+            base_cluster_name = template_cfg.get("cluster_name", "tessera-inference")
             if cluster_name is None:
-                with cluster_yaml.open() as f:
-                    base_name = yaml.safe_load(f).get("cluster_name", "tessera-inference")
                 suffix = uuid.uuid4().hex[:8]
-                cluster_name = f"{base_name}-{suffix}"
+                cluster_name = f"{base_cluster_name}-{suffix}"
             log.info("Using cluster name: %s", cluster_name)
 
             if sync_source_path is not None:
@@ -617,25 +822,61 @@ def ray_cluster(
                 log.info("Syncing %s → s3://%s/%s", sync_source_path, code_bucket, s3_key)
                 _sync_code_to_s3(sync_source_path, code_bucket, s3_key)
 
-            # Resolve BEFORE launching so `resolved_yaml` is bound when a
-            # failed `ray up` unwinds to the finally-block: a partial launch
-            # can leave a provisioned head behind, and `ray down` against the
-            # unresolved template (whose cluster_name lacks the uuid suffix)
-            # matches nothing — that exact path leaked a head on 2026-07-16.
-            log.info("Resolving Ray cluster config from SSM (cluster_name=%s)", cluster_name)
-            resolved_yaml = _resolve_ray_config(
-                cluster_yaml,
-                region=region,
-                ami_ssm_name=ami_ssm_name,
-                ssm_prefix=ssm_prefix,
-                cluster_name=cluster_name,
-                instance_tags=instance_tags,
-                code_bucket=code_bucket,
-                code_suffix=code_suffix,
-                cloudwatch_log_group=cloudwatch_log_group,
-                cloudwatch_template=cloudwatch_template,
+            # Capacity-aware single-AZ selection. The whole cluster is still
+            # pinned to ONE AZ (cross-AZ data-transfer cost is non-negotiable);
+            # spot placement scores only rank WHICH AZ — sized to the full
+            # worker fleet — so we start in an AZ scored to hold everyone,
+            # mitigating the mid-run capacity dry-up seen on 2026-07-16.
+            worker_instance_type = template_cfg["available_node_types"]["gpu-workers-ondemand"]["node_config"][
+                "InstanceType"
+            ]
+            ec2 = boto3.client("ec2", region_name=region)
+            ssm = boto3.client("ssm", region_name=region)
+            subnet_param = ssm.get_parameter(Name=f"{ssm_prefix.rstrip('/')}/private-subnet-ids")
+            all_subnet_ids = [s.strip() for s in subnet_param["Parameter"]["Value"].split(",")]
+            subnet_resp = ec2.describe_subnets(SubnetIds=all_subnet_ids)
+            subnets = subnet_resp.get("Subnets", [])
+            if not subnets:
+                msg = f"No subnets found for IDs: {all_subnet_ids}"
+                raise RuntimeError(msg)
+
+            ranked_subnets = _rank_launch_subnets(
+                subnets,
+                worker_instance_type,
+                target_workers,
+                base_cluster_name,
+                ec2,
+                region,
+                log,
             )
-            head_ip = _start_ray_cluster(resolved_yaml, log)
+
+            def _resolve_for_subnet(chosen_subnet: dict[str, Any]) -> str:
+                # Resolve BEFORE launching so `resolved_yaml` is bound when a
+                # failed `ray up` unwinds: a partial launch can leave a
+                # provisioned head behind, and `ray down` against the
+                # unresolved template (whose cluster_name lacks the uuid
+                # suffix) matches nothing — that path leaked a head on
+                # 2026-07-16.
+                return _resolve_ray_config(
+                    cluster_yaml,
+                    region=region,
+                    ami_ssm_name=ami_ssm_name,
+                    ssm_prefix=ssm_prefix,
+                    cluster_name=cluster_name,
+                    instance_tags=instance_tags,
+                    code_bucket=code_bucket,
+                    code_suffix=code_suffix,
+                    cloudwatch_log_group=cloudwatch_log_group,
+                    cloudwatch_template=cloudwatch_template,
+                    chosen_subnet=chosen_subnet,
+                )
+
+            # Launch in ranked-AZ order, failing over on ray-up failure. Failed
+            # attempts are torn down inside the helper, so only the SUCCESSFUL
+            # resolved_yaml survives to the finally-block (no double teardown).
+            log.info("Launching Ray cluster (cluster_name=%s) with capacity-aware AZ failover", cluster_name)
+            resolved_yaml, head_ip = _launch_ray_with_failover(ranked_subnets, _resolve_for_subnet, log)
+
             head_address = f"ray://{head_ip}:10001"
             log.info("Connecting to Ray at %s", head_address)
             ray.init(address=head_address, ignore_reinit_error=True)

@@ -64,6 +64,78 @@ The AMI ID lives in a separate SSM parameter, named via the
 
 ---
 
+## Single-AZ pinning and capacity-aware AZ selection
+
+Every node in a cluster is pinned to **one** availability zone. This is
+a hard, non-negotiable constraint: head↔worker traffic within an AZ is
+free, but cross-AZ data transfer is billed per GB and dominates cost at
+inference scale. The provider never spreads a cluster across AZs.
+
+That leaves one degree of freedom — *which* single AZ. On 2026-07-16 a
+run pinned to `us-west-2a` hit `InsufficientInstanceCapacity` for
+`g6e.xlarge` and stalled at 2 workers while 2b/2c/2d had capacity. The
+old picker (`_pick_least_loaded_subnet`) chose the AZ with the fewest
+running Ray instances — a capacity-*blind* signal whose deterministic
+tie-break happened to favour 2a.
+
+`ray_cluster` now ranks candidate AZs by a **capacity signal** before
+launching:
+
+```
+                     ┌─────────────────────────────────────────┐
+   describe_subnets  │  _rank_launch_subnets                    │
+   (private subnets) │    load count per subnet (Ray instances) │
+          │          │    + GetSpotPlacementScores(             │
+          └─────────▶│        InstanceType = gpu worker type,   │
+                     │        TargetCapacity = target_workers,  │  ← sized to the
+                     │        SingleAvailabilityZone = True)     │    WHOLE fleet
+                     │    rank by (-score, load, SubnetId)      │
+                     └───────────────────┬──────────────────────┘
+                                         │ ranked best-first
+                                         ▼
+                     ┌─────────────────────────────────────────┐
+                     │  _launch_ray_with_failover               │
+                     │    for AZ in ranked:                     │
+                     │      resolve YAML pinned to that ONE AZ  │
+                     │      ray up ── success ─▶ done           │
+                     │            └─ RuntimeError ─▶ tear down  │
+                     │                              partial,    │
+                     │                              try next AZ │
+                     └─────────────────────────────────────────┘
+```
+
+Key properties:
+
+- **Spot score as an on-demand proxy.** Spot and on-demand draw from the
+  same physical capacity pools, so a *high* `GetSpotPlacementScores`
+  result is a reliable positive signal that on-demand can launch there.
+  Low scores are ambiguous (not a guarantee of failure), which is why
+  failover exists.
+- **Sized to the fleet.** `TargetCapacity` is the run's worker count
+  (`target_workers`, threaded from the flow's `num_actors`), clamped to
+  `1..100`. A high score therefore means "this single AZ is scored likely
+  to hold the *whole* fleet", which is what mitigates the mid-run dry-up:
+  we start where there's room for everyone, not just for the first node.
+- **Graceful fallback — never raises.** The runner IAM role likely lacks
+  `ec2:GetSpotPlacementScores` today, so the call may raise `AccessDenied`.
+  That (and throttling, empty responses, missing AZ ids, or a failed
+  instance-count) degrades to the old least-loaded ranking with a WARNING;
+  it never breaks a launch. To actually benefit, grant the runner role
+  **`ec2:GetSpotPlacementScores`** (a no-resource, region-scoped action).
+- **Launch-time failover.** If `ray up` fails in the top AZ (capacity or
+  otherwise), the partial attempt is torn down (`ray down` +
+  tempfile cleanup, so no head leaks) and the next-best AZ is tried. If
+  every AZ fails, a `RuntimeError` names the AZs tried.
+
+**What this does NOT do:** it does not migrate a *running* cluster if its
+AZ dries up mid-run. A true mid-run migration would require tearing the
+cluster down and relaunching in another AZ; that is deliberately not
+implemented. Once launched, capacity shortfalls fall to the Ray
+autoscaler, which retries the pending node request in-place (same AZ).
+The mitigation is entirely at *selection + launch* time.
+
+---
+
 ## AMI baking pattern
 
 Strongly recommended for production. The default `cluster.yaml.template`
@@ -170,7 +242,11 @@ three lines of defence:
    runs, so even a launch that fails partway tears down whatever it
    provisioned (a failed launch used to run `ray down` against the
    unresolved template, whose un-suffixed `cluster_name` matches
-   nothing — that leaked a head on 2026-07-16).
+   nothing — that leaked a head on 2026-07-16). AZ failover
+   (`_launch_ray_with_failover`) tears down each *failed* attempt as it
+   moves on, so only the successful cluster's YAML survives to the
+   context manager's `finally` — the failing attempts are already gone,
+   and nothing is double-torn-down.
 3. **Autoscaler idle timeout** (2 min in the YAML template). Damage
    limitation, NOT a safety net: it only drains workers *above* each
    node type's `min_workers` floor (keep GPU floors at 0 — a leaked

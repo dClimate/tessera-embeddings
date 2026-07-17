@@ -301,6 +301,7 @@ def tessera_embeddings(
         code_bucket=code_bucket,
         code_suffix=code_suffix,
         sync_source_path=Path(dev_params.sync_source_path) if dev_params.sync_source_path else None,
+        target_workers=num_actors,
     ) as resolved_yaml:
         _active_resolved_yaml = resolved_yaml
         if resolved_yaml and Path(resolved_yaml).exists():
