@@ -393,6 +393,7 @@ def _poll_tracker(
     stall_threshold_sec: float,
     max_simultaneous_stalls: int,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    elapsed_min: float | None = None,
 ) -> None:
     """Poll ProgressTracker; log stalls; raise RuntimeError on systemic stall.
 
@@ -408,6 +409,8 @@ def _poll_tracker(
         max_simultaneous_stalls: Number of simultaneous stalls that triggers a
             systemic abort (RuntimeError).
         log: Logger.
+        elapsed_min: Minutes since run start, folded into the single progress
+            line (this is the ONLY progress log line — keep it that way).
 
     Raises:
         RuntimeError: When ``>= max_simultaneous_stalls`` chunks are stalled.
@@ -447,13 +450,15 @@ def _poll_tracker(
             for _, (_, _, _, phase) in progress.items():
                 phases[phase] = phases.get(phase, 0) + 1
             phase_summary = ", ".join(f"{v} {k}" for k, v in sorted(phases.items()))
+            elapsed = f" — {elapsed_min:.1f} min elapsed" if elapsed_min is not None else ""
             log.info(
-                "Progress: %d/%d done, %d active (%s), %d stalled",
+                "Progress: %d/%d done, %d active (%s), %d stalled%s",
                 n_done,
                 n_total,
                 n_active,
                 phase_summary,
                 len(stalled_chunks),
+                elapsed,
             )
     except Exception as exc:
         # Tracker is a monitoring aid — never a single point of failure.
@@ -620,7 +625,6 @@ def _process_chunks_work_stealing(
     pool.seed(chunk_queue, mosaic_base, staging_base, run_id, tracker)
 
     results: list[dict] = []
-    last_log_count = 0
     stall_threshold_sec = 300.0
 
     # Stall threshold scales with the eventual fleet size, not just the first
@@ -758,7 +762,15 @@ def _process_chunks_work_stealing(
         # Poll tracker on every iteration (including timeouts with no completions)
         # so stall detection stays responsive.
         if tracker:
-            _poll_tracker(tracker, len(results), n_total, stall_threshold_sec, _stall_threshold(), log)
+            _poll_tracker(
+                tracker,
+                len(results),
+                n_total,
+                stall_threshold_sec,
+                _stall_threshold(),
+                log,
+                elapsed_min=(time.monotonic() - t0) / 60,
+            )
 
         # --- Handle completed (or failed) chunks ---
         for ref in ready_refs:
@@ -804,14 +816,5 @@ def _process_chunks_work_stealing(
         pool.dispatch_idle(chunk_queue, mosaic_base, staging_base, run_id, tracker)
         pool.retire_idle(len(pool.pending) + len(chunk_queue))
 
-        if len(results) > last_log_count:
-            elapsed_min = (time.monotonic() - t0) / 60
-            log.info(
-                "Progress: %d / %d chunks complete (%.1f min elapsed)",
-                len(results),
-                n_total,
-                elapsed_min,
-            )
-            last_log_count = len(results)
 
     return results
