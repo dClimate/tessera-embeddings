@@ -194,7 +194,7 @@ count estimates how long inference will run. Read bytes scale with `T_kept × H 
 of how many pixels are valid); inference time scales with valid pixels — so the two can diverge,
 and the plan picks the strategy that fits:
 
-```
+```text
  per_set = T_kept·H·W·(20 bands + 1 mask)          budget = _S2_STRIP_BYTE_BUDGET (5.75 GiB)
 
  per_set ≤ budget ─────────────────────────────▶ SINGLE strip           (most chunks)
@@ -232,7 +232,7 @@ preloaded during the current chunk's last strip. It deliberately does NOT prefet
 next working set — that co-resides two full chunks and OOMs the node at UTM-zone-scale density
 variance (the RAM-safety rationale and history are in the concept doc).
 
-```
+```text
  actor timeline, chunk N → N+1 (starter-prefetch hit)
 
  [═════════ inference N ═══════════][═ N+1 starter ═][═══ N+1 body ═══]

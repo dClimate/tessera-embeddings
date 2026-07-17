@@ -561,6 +561,8 @@ def _launch_ray_with_failover(
     ranked_subnets: list[dict[str, Any]],
     resolve_config: Callable[[dict[str, Any]], str],
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    cluster_name: str,
+    region: str,
 ) -> tuple[str, str]:
     """Launch the cluster in ranked-AZ order, failing over on ``ray up`` failure.
 
@@ -602,7 +604,11 @@ def _launch_ray_with_failover(
                 az,
                 exc_info=True,
             )
-            _stop_ray_cluster(resolved_yaml, log)
+            # If `ray down` can't reach/tear down the partially-provisioned head,
+            # fall back to terminating by ray-cluster-name tag so it can't leak
+            # while we move to the next AZ.
+            if not _stop_ray_cluster(resolved_yaml, log):
+                terminate_ray_instances_by_tag(cluster_name=cluster_name, region=region, log=log)
             cleanup_ray_tempfiles(resolved_yaml)
             continue
         log.info("Ray cluster launched in AZ %s", az)
@@ -697,7 +703,7 @@ def terminate_ray_instances_by_tag(
     cluster_name: str,
     *,
     region: str = "us-west-2",
-    log: logging.Logger | None = None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     prefix_match: bool = False,
 ) -> None:
     """Terminate all running/pending EC2 instances belonging to a Ray cluster.
@@ -737,19 +743,25 @@ def terminate_ray_instances_by_tag(
 def _stop_ray_cluster(
     cluster_yaml: str,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
-) -> None:
-    """Tear down the Ray cluster. Best-effort — does not raise on failure."""
+) -> bool:
+    """Tear down the Ray cluster via ``ray down``. Best-effort — does not raise.
+
+    Returns True if ``ray down`` exited 0, False otherwise (caller may then fall
+    back to tag-based termination so a head that ``ray down`` couldn't reach
+    doesn't leak).
+    """
     log.info("Tearing down Ray cluster")
     result = subprocess.run(["ray", "down", cluster_yaml, "-y"], check=False)
     if result.returncode == 0:
         log.info("Ray cluster stopped")
-    else:
-        log.warning(
-            "ray down exited with code %d — cluster may still be running; idle workers "
-            "self-drain after the idle timeout, but the head node does NOT self-terminate. "
-            "Terminate by ray-cluster-name tag if this persists.",
-            result.returncode,
-        )
+        return True
+    log.warning(
+        "ray down exited with code %d — cluster may still be running; idle workers "
+        "self-drain after the idle timeout, but the head node does NOT self-terminate. "
+        "Terminate by ray-cluster-name tag if this persists.",
+        result.returncode,
+    )
+    return False
 
 
 @contextlib.contextmanager
@@ -891,7 +903,9 @@ def ray_cluster(
             # attempts are torn down inside the helper, so only the SUCCESSFUL
             # resolved_yaml survives to the finally-block (no double teardown).
             log.info("Launching Ray cluster (cluster_name=%s) with capacity-aware AZ failover", cluster_name)
-            resolved_yaml, head_ip = _launch_ray_with_failover(ranked_subnets, _resolve_for_subnet, log)
+            resolved_yaml, head_ip = _launch_ray_with_failover(
+                ranked_subnets, _resolve_for_subnet, log, cluster_name, region
+            )
 
             head_address = f"ray://{head_ip}:10001"
             log.info("Connecting to Ray at %s", head_address)

@@ -23,7 +23,7 @@ Hardware: g6e.xlarge — 1× L40S (181 TFLOPS BF16 dense, 46 GB VRAM, 864 GB/s),
 | inference px/s per worker | 9.6–13.3K | **21–24K** mid-density / 10–18K dense (end-to-end) |
 | GPU-idle overhead per chunk | ~50–60 s (22–25% of wall) | **~24–34 s** serial prologue → **~5–8 s** on prefetch-hit chunks |
 | CPU batch-prep per sub-batch | 165 ms @3584 (651 ms @7168 unvectorised) | **103–160 ms** |
-| peak host RAM | up to **92–95%** (one OOM-kill) | **45–47%** |
+| peak host RAM | ~**50%** (estimated; not directly instrumented) | **45–47%** |
 
 The campaign originally measured ~2.5–3.5× at 100% GPU util **with** a full
 cross-chunk prologue prefetch — but that co-resided two chunks' whole working
@@ -117,7 +117,10 @@ failover).
   background write) → ~5–8 s on prefetch-hit chunks. The interleaving factor
   (~1.25–1.3×, overhead-only, measured as prologue 55→7.5 s) was removed then
   largely re-earned by the bounded prefetch.
-- **RAM (B):** budget + single-strip conversion: 92–95% (OOM) → 45–47% peak.
+- **RAM (B):** the shipped striping + budget design holds **45–47%** peak (`main`
+  itself ran ~50%). The 92–95% OOM was a *removed* full-interleaving iteration of
+  this branch — it's the design constraint that motivated striping, not a
+  main→shipped delta.
 - **Sparse chunks (C):** load cost → bbox-proportional (biggest on sparse-heavy
   ROIs; small on Iowa where mixing already hid it).
 - **Cost (E):** eliminated overnight instance leaks; capacity stalls mitigated at

@@ -777,10 +777,15 @@ class InferenceActor:
         """
         _, stash = self._prefetch_state()
         for stale in [k for k in stash if k != label]:
-            # Reassignment (steal/requeue) changed our next chunk; drop the
-            # stale future and let its result be garbage collected.
-            logger.info("xchunk prefetch: discarding stale stash for %s", stale)
-            stash.pop(stale).add_done_callback(lambda f: f.exception())
+            # A steal/requeue changed our next chunk. The stale prefetch's load
+            # may still be running on the prefetch thread; DRAIN it (wait, then
+            # drop the result) so its capped stash frees before we load the
+            # reassigned chunk — otherwise the stale set and the new load would
+            # briefly co-reside. Rare (only on reassignment); a failed stale
+            # prefetch drains to a no-op.
+            logger.info("xchunk prefetch: draining stale stash for %s", stale)
+            with contextlib.suppress(Exception):
+                stash.pop(stale).result()
         future = stash.pop(label, None)
         if future is None:
             return None

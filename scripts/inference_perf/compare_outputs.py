@@ -137,17 +137,23 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
         s_ref = ref["scales"].isel(northing=rows).values
         s_test = test["scales"].isel(northing=rows).values
 
-        delta = np.abs(e_ref - e_test)
-        n_values += delta.size
-        n_exact += int((delta == 0).sum())
-        n_within_one += int((delta <= 1).sum())
-        max_abs_delta = max(max_abs_delta, int(delta.max(initial=0)))
-
-        ref_nan = np.isnan(s_ref)
-        test_nan = np.isnan(s_test)
-        nan_mask_mismatches += int((ref_nan != test_nan).sum())
-        valid = ~ref_nan & ~test_nan
+        # "Generated" = a real embedding was written: a finite, POSITIVE scale.
+        # Invalid pixels are zero-filled with a NaN scale. Counting them would
+        # (a) dilute int8 exactness toward 100% on sparse chunks (most values
+        # are guaranteed-equal zeros) and (b) admit malformed scales — a zero,
+        # negative, or infinite scale would slip past a bare `~isnan` and make
+        # drift/cosine NaN. So compute EVERY metric over generated pixels only.
+        gen_ref = np.isfinite(s_ref) & (s_ref > 0)
+        gen_test = np.isfinite(s_test) & (s_test > 0)
+        nan_mask_mismatches += int((gen_ref != gen_test).sum())
+        valid = gen_ref & gen_test
         if valid.any():
+            delta = np.abs(e_ref[valid] - e_test[valid])  # (n_valid, D)
+            n_values += delta.size
+            n_exact += int((delta == 0).sum())
+            n_within_one += int((delta <= 1).sum())
+            max_abs_delta = max(max_abs_delta, int(delta.max(initial=0)))
+
             drift = np.abs(s_ref[valid] - s_test[valid]) / np.abs(s_ref[valid])
             scale_max_rel_drift = max(scale_max_rel_drift, float(drift.max()))
 

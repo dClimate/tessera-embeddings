@@ -73,7 +73,7 @@ PHASE_PARSER = r"""
 import glob, re
 from datetime import datetime
 PAT = {
- "pref": re.compile(r"^(\S+ \S+) \S+ INFO Using prefetched prologue for (\S+)"),
+ "pref": re.compile(r"^(\S+ \S+) \S+ INFO xchunk prefetch: hit \([^)]+\) for (\S+)"),
  "tkept": re.compile(r"^(\S+ \S+) \S+ INFO Chunk (\S+): T_kept=(\d+) -> strip_h=(\d+) -> (\d+) strip"),
  "ds": re.compile(r"^(\S+ \S+) \S+ INFO MosaicChunkInferenceDataset: (\d+) valid pixels"
                   r" out of \d+ total \(([\d.]+)%\) in (\d+) buckets"),
@@ -213,7 +213,13 @@ def run_on_workers(session: boto3.session.Session, instance_ids: list[str], comm
                 break
             time.sleep(2)
             for iid in list(pending):
-                inv = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
+                try:
+                    inv = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
+                except ssm.exceptions.InvocationDoesNotExist:
+                    # SSM Run Command is eventually consistent — the invocation
+                    # can be briefly invisible right after send_command. Leave the
+                    # instance pending and retry on the next poll.
+                    continue
                 if inv["Status"] in ("Success", "Failed", "TimedOut", "Cancelled"):
                     outputs[iid] = inv["StandardOutputContent"] + (
                         f"\n[stderr] {inv['StandardErrorContent']}" if inv["StandardErrorContent"].strip() else ""
@@ -261,11 +267,17 @@ def ram_util_report(session: boto3.session.Session, log_group: str, start_epoch:
     qid = logs.start_query(
         logGroupName=log_group, startTime=start_epoch, endTime=end_epoch, queryString=query, limit=10000
     )["queryId"]
-    while True:
-        res = logs.get_query_results(queryId=qid)
-        if res["status"] in ("Complete", "Failed", "Cancelled", "Timeout"):
-            break
+    # Bound the poll: Insights statuses are Scheduled/Running/Complete/Failed/
+    # Cancelled/Timeout/Unknown. Break on any terminal state (incl. Unknown) and
+    # cap total wait so a query stuck Scheduled/Running/Unknown can't spin forever.
+    deadline = time.monotonic() + 180
+    res = logs.get_query_results(queryId=qid)
+    while res["status"] not in ("Complete", "Failed", "Cancelled", "Timeout", "Unknown"):
+        if time.monotonic() > deadline:
+            print("CloudWatch query did not finish within 180s", file=sys.stderr)
+            return 1
         time.sleep(2)
+        res = logs.get_query_results(queryId=qid)
     if res["status"] != "Complete":
         print(f"CloudWatch query {res['status']}", file=sys.stderr)
         return 1

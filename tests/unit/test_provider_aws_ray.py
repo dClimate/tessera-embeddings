@@ -345,11 +345,16 @@ def test_launch_with_failover_retries_next_az(monkeypatch: pytest.MonkeyPatch) -
 
     stopped: list[str] = []
     cleaned: list[str] = []
+    terminated: list[dict] = []
     monkeypatch.setattr(ray_mod, "_start_ray_cluster", fake_start)
-    monkeypatch.setattr(ray_mod, "_stop_ray_cluster", lambda y, _log: stopped.append(y))
+    # ray down succeeds (returns True) → no tag-termination fallback.
+    monkeypatch.setattr(ray_mod, "_stop_ray_cluster", lambda y, _log: (stopped.append(y), True)[1])
     monkeypatch.setattr(ray_mod, "cleanup_ray_tempfiles", lambda y: cleaned.append(y))
+    monkeypatch.setattr(ray_mod, "terminate_ray_instances_by_tag", lambda **k: terminated.append(k))
 
-    resolved_yaml, head_ip = _launch_ray_with_failover(subnets, resolve_config, _LOG)
+    resolved_yaml, head_ip = _launch_ray_with_failover(
+        subnets, resolve_config, _LOG, "tessera-inference-x", "us-west-2"
+    )
 
     assert head_ip == "10.0.0.5"
     assert resolved_yaml == "/tmp/resolved-subnet-b.yaml"
@@ -357,6 +362,27 @@ def test_launch_with_failover_retries_next_az(monkeypatch: pytest.MonkeyPatch) -
     # The failed first attempt was torn down; the successful one was not.
     assert stopped == ["/tmp/resolved-subnet-a.yaml"]
     assert cleaned == ["/tmp/resolved-subnet-a.yaml"]
+    assert terminated == []  # ray down succeeded, so no tag fallback
+
+
+def test_launch_with_failover_tag_terminates_when_ray_down_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed `ray down` on a partial attempt falls back to tag termination."""
+    subnets = [_subnet("subnet-a", "a", "usw2-az1"), _subnet("subnet-b", "b", "usw2-az2")]
+
+    def fake_start(resolved_yaml: str, _log: object) -> str:
+        if "subnet-a" in resolved_yaml:
+            raise RuntimeError("ray up failed")
+        return "10.0.0.5"
+
+    terminated: list[dict] = []
+    monkeypatch.setattr(ray_mod, "_start_ray_cluster", fake_start)
+    monkeypatch.setattr(ray_mod, "_stop_ray_cluster", lambda _y, _log: False)  # ray down FAILED
+    monkeypatch.setattr(ray_mod, "cleanup_ray_tempfiles", lambda _y: None)
+    monkeypatch.setattr(ray_mod, "terminate_ray_instances_by_tag", lambda **k: terminated.append(k))
+
+    _launch_ray_with_failover(subnets, lambda s: f"/tmp/{s['SubnetId']}.yaml", _LOG, "tessera-inference-x", "us-west-2")
+
+    assert terminated == [{"cluster_name": "tessera-inference-x", "region": "us-west-2", "log": _LOG}]
 
 
 def test_launch_with_failover_raises_when_all_azs_fail(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -367,11 +393,14 @@ def test_launch_with_failover_raises_when_all_azs_fail(monkeypatch: pytest.Monke
         raise RuntimeError("ray up failed")
 
     monkeypatch.setattr(ray_mod, "_start_ray_cluster", fake_start)
-    monkeypatch.setattr(ray_mod, "_stop_ray_cluster", lambda _y, _log: None)
+    monkeypatch.setattr(ray_mod, "_stop_ray_cluster", lambda _y, _log: True)
     monkeypatch.setattr(ray_mod, "cleanup_ray_tempfiles", lambda _y: None)
+    monkeypatch.setattr(ray_mod, "terminate_ray_instances_by_tag", lambda **k: None)
 
     with pytest.raises(RuntimeError, match="all candidate AZs"):
-        _launch_ray_with_failover(subnets, lambda s: f"/tmp/{s['SubnetId']}.yaml", _LOG)
+        _launch_ray_with_failover(
+            subnets, lambda s: f"/tmp/{s['SubnetId']}.yaml", _LOG, "tessera-inference-x", "us-west-2"
+        )
 
 
 def test_cleanup_ray_tempfiles_handles_missing_path() -> None:

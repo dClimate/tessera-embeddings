@@ -34,8 +34,10 @@ GPU 100% util / busy 1.00 / ~338 W on saturated workers; get_batch 651 → 103 m
 Host RAM + fleet GPU util (`observe_cluster.py --ram-report`, P2+3 window,
 101 worker streams): peak host RAM **28.4 GB / 30.9 GB (92%)** in the 30s-polled
 RESOURCES lines; the true instantaneous peak was **29.38 GB (95.1%)** — the
-chunk_5_9 OOM-kill (this gate ran on `c816866`, PRE the strip-budget fix
-`ab3b319`; a post-fix run should peak ~23 GB / ~75%). Fleet sample-weighted avg
+chunk_5_9 OOM-kill. This gate ran on `c816866`, an early PRE-strip-budget build
+WITH full cross-chunk interleaving; that 95% is the removed interleaving design's
+footprint, NOT `main` (which ran ~50%) nor the shipped pipeline. The shipped
+striping run measured **45–47% peak** (Phase 4 entry below). Fleet sample-weighted avg
 GPU util **79.4%** → total idle-recovery ceiling ~21% (incl. structural
 write/cold-start idle); CPU-feed-specific slice ~7–15% GPU-hours (see
 `temp/token-budget-batching-findings.md` for the g6e.2xlarge vs software tradeoff).
@@ -47,14 +49,15 @@ mismatches on sparse chunks confirms validity/skip semantics are unchanged
 under the prefetched-prologue path.
 
 Assembled full-ROI deliverables (icechunk stores, from Dask assembly):
-- reference (main / 3584): `.../embeddings/iowa_epsg5070-reference.zarr/`
-- P2+3 (branch / 7168): `.../embeddings/iowa_epsg5070-inference-speedup-phases-2-and-3.zarr/`
+- reference (main / 3584): `s3://arbol-tessera-embeddings-dev/embeddings/iowa_epsg5070-reference.zarr/`
+- P2+3 (branch / 7168): `s3://arbol-tessera-embeddings-dev/embeddings/iowa_epsg5070-inference-speedup-phases-2-and-3.zarr/`
+- phase 4 (striping / 7168): `s3://arbol-tessera-embeddings-dev/embeddings/iowa_epsg5070-inference-speedup-phase4.zarr/`
 
 End-to-end check 2026-07-17 (3 interior 512x512 windows, cross-config; full ROI
 is 1.87B px so sampled, not streamed whole): all PASS — exact int8 94.9-95.2%,
 within-1 >= 99.9931%, max|Δ|=2, scale drift <= 0.78%, cosine >= 0.99991, and
-**footprint_mismatch = 0** (identical valid/NaN masks → assembly placed every
-chunk correctly, dropped nothing under the pipelined/prefetch path).
+**footprint_mismatch = 0** on the sampled windows. This is a spot-check, not
+full-ROI proof; the Phase 4 entry below extends it to 25 windows / 2.23M px.
 
 ## Comparison semantics (ADR 012)
 
