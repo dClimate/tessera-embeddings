@@ -92,48 +92,50 @@ _MIN_STRIP_H = 256
 def _strip_height_for_density(t_kept: int, width: int, height: int) -> int:
     """Largest northing strip height (rows) whose resident S2 working set fits budget.
 
-    Two terms are resident across the strip loop: the full-chunk SCL mask (loaded
-    once, sliced per strip — ``t_kept * height * width`` bytes, bool) and the
-    per-strip reflectance bands (``t_kept * strip_h * width *
-    _S2_BYTES_PER_OBS_PX``). The 1-deep prefetch keeps *two* band strips resident
-    while the single mask is shared, so we solve for the tallest ``strip_h`` with
-    ``2 * bands(strip_h) + mask <= 2 * _S2_STRIP_BYTE_BUDGET`` — i.e. each strip's
-    bands must fit the budget minus half the resident mask.
+    Budget model: at most two S2 band sets are ever co-resident, and each is
+    paired with a full-chunk SCL mask (``t_kept * height * width`` bytes, bool).
+    The pairing arises two ways, and the sizing must bound the worse of them:
 
-    When a single full-height strip fits ONE budget (bands + its whole mask),
-    we return ``height`` outright. A single strip is deliberately NOT allowed
-    the pair budget: with cross-chunk prologue prefetch there is always a
-    potential sibling — the NEXT chunk's strip-0, loaded (with its own mask and
-    SAR stack) while this chunk's final strip infers — so every resident band
-    set must individually fit one budget for the cross-chunk pair to fit two.
-    The old pair-budget fast path assumed no sibling and OOM-killed workers on
-    dense chunk sequences: two T_kept~120 single-strip chunks co-resident put
-    ~27 GB on a 31 GB node (observed 2026-07-17, chunk_5_9, Ray memory monitor
-    kill at 95%).
+    - *Intra-chunk* (a split chunk's 1-deep strip prefetch): two strips of the
+      SAME chunk share ONE mask.
+    - *Cross-chunk* (Phase-1 prologue prefetch): this chunk's final strip and
+      the NEXT chunk's strip-0 each carry their OWN mask (plus the next chunk's
+      SAR, charged to headroom).
 
-    ``t_kept`` is this chunk's true post-prune valid-timestep count, so sparse
-    chunks get tall strips (often the whole chunk in one piece) and only dense
-    chunks split. A chunk dense enough to drive the height below ``_MIN_STRIP_H``
+    So we require every resident ``bands(strip_h) + full mask <= budget``; two
+    such sets then fit ``2 * budget`` in either pairing. This is slightly
+    conservative for the intra-chunk case (its mask is shared, not doubled) but
+    masks are 1/20th the size of bands, so the over-charge is negligible — and
+    charging only half a mask is exactly what OOM-killed a worker: two dense
+    (T_kept~120) chunks co-resident under cross-chunk prefetch put ~27 GB on a
+    31 GB node (2026-07-17, chunk_5_9, Ray memory monitor kill at 95%).
+
+    A single full-height strip that already fits one budget returns ``height``
+    outright. ``t_kept`` is the chunk's true post-prune valid-timestep count, so
+    sparse chunks get tall strips (often the whole chunk) and only dense chunks
+    split. A chunk dense enough to drive the height below ``_MIN_STRIP_H``
     bottoms out there and breaches the budget (logged) rather than degenerating
     into tiny high-overhead reads.
     """
     t = max(1, t_kept)
-    # Full-chunk SCL mask (bool, 1 byte/px) stays resident the whole loop; one
-    # copy is shared by the prefetched pair, so charge half of it to each strip.
+    # Full-chunk SCL mask (bool, 1 byte/px), resident the whole loop. Charged in
+    # FULL per band set: the cross-chunk pair carries two distinct masks.
     mask_bytes = t * height * width
-    # Fast path: the whole chunk fits one budget — single strip. Held to ONE
-    # budget (not the pair) because the cross-chunk prefetch may co-load the
-    # next chunk's strip-0 alongside it; see docstring.
+    # Fast path: the whole chunk (bands + its mask) fits one budget — single
+    # strip. Held to ONE budget so a cross-chunk co-load of the next chunk's
+    # strip-0 (its own bands + mask) still fits the pair budget.
     if t * height * width * _S2_BYTES_PER_OBS_PX + mask_bytes <= _S2_STRIP_BYTE_BUDGET:
         return height
-    band_budget = _S2_STRIP_BYTE_BUDGET - mask_bytes // 2
+    band_budget = _S2_STRIP_BYTE_BUDGET - mask_bytes
     per_row = t * width * _S2_BYTES_PER_OBS_PX
     budget_h = max(0, band_budget) // per_row
     if budget_h < _MIN_STRIP_H:
-        pair_gib = (2 * _MIN_STRIP_H * per_row + mask_bytes) / 1024**3
+        # Worst-case resident pair: two floor-height band sets, each with a full
+        # mask (the cross-chunk pairing).
+        pair_gib = 2 * (_MIN_STRIP_H * per_row + mask_bytes) / 1024**3
         logger.warning(
             "S2 density (T_kept=%d, W=%d, H=%d) drives strip_h=%d below floor "
-            "%d; using %d. Resident bands pair + mask ~%.1f GiB exceeds the "
+            "%d; using %d. Resident bands+mask pair ~%.1f GiB exceeds the "
             "budget (2 x %.1f GiB) — raise _S2_STRIP_BYTE_BUDGET or expect high "
             "host RAM.",
             t_kept,

@@ -48,17 +48,19 @@ class TestStripHeightForDensity:
     """The density-based strip sizer keeps a strip's S2 working set under budget."""
 
     def test_resident_bytes_stay_under_budget(self):
-        # 10 bands x uint16 = 20 bytes per (obs, px). The resident pair is two
-        # band strips plus the single shared full-chunk mask; it must fit twice
-        # the per-strip budget, for every case that sizes above the floor.
+        # 10 bands x uint16 = 20 bytes per (obs, px). Each resident band set is
+        # charged its own full mask (the cross-chunk pairing carries two distinct
+        # masks), so every single set — bands(strip_h) + full mask — must fit ONE
+        # budget; two then fit 2 x budget in either the intra- or cross-chunk
+        # pairing. Checked for every case that sizes above the floor.
         for t_kept, width, height in [(50, 2000, 2000), (200, 2000, 2000), (1, 4000, 4000), (180, 1000, 1000)]:
             h = _strip_height_for_density(t_kept, width, height)
             assert h >= 1
             if h <= _MIN_STRIP_H:
                 continue  # floored case may breach the budget by design
             mask_bytes = t_kept * height * width
-            pair = 2 * t_kept * h * width * len(S2_BAND_ORDER) * 2 + mask_bytes
-            assert pair <= 2 * _S2_STRIP_BYTE_BUDGET
+            resident_set = t_kept * h * width * len(S2_BAND_ORDER) * 2 + mask_bytes
+            assert resident_set <= _S2_STRIP_BYTE_BUDGET
 
     def test_sparser_chunks_get_taller_strips(self):
         # Fewer timesteps -> a taller strip fits the same byte budget.
@@ -86,10 +88,10 @@ class TestStripHeightForDensity:
             h = _strip_height_for_density(t_kept, 2000, 2000)
             mask_bytes = t_kept * 2000 * 2000
             per_row = t_kept * 2000 * len(S2_BAND_ORDER) * 2
-            if h == 2000:  # single strip: whole chunk fits one budget
-                assert per_row * 2000 + mask_bytes <= _S2_STRIP_BYTE_BUDGET
-            elif h > _MIN_STRIP_H:  # split: each strip fits budget minus its mask share
-                assert per_row * h <= _S2_STRIP_BYTE_BUDGET - mask_bytes // 2
+            # Whether single or split, each resident band set + its own full mask
+            # fits one budget (so the cross-chunk pair fits two).
+            if h > _MIN_STRIP_H:
+                assert per_row * h + mask_bytes <= _S2_STRIP_BYTE_BUDGET
         # The OOM case specifically must split.
         assert _strip_height_for_density(122, 2000, 2000) < 2000
 

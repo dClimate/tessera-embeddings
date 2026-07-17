@@ -692,10 +692,15 @@ def _process_chunks_work_stealing(
             return
         assert actor_factory is not None and total_actors_target is not None  # narrowed by batching_enabled
         alive_gpu_nodes = sum(1 for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) > 0)
+        # Reserved chunks are excluded: each is bound to a specific busy actor
+        # (consumed by that actor when it finishes its current chunk, never
+        # returned to the queue except on failure), so it comes with its own
+        # actor and must not inflate demand for NEW actors — counting it would
+        # let the autoscaler provision workers that can't pick it up.
         n, timed_out = _batch_actors_to_request(
             requested=len(pool.actors),
             target=total_actors_target,
-            outstanding=len(pool.pending) + len(pool.reserved) + len(chunk_queue),
+            outstanding=len(pool.pending) + len(chunk_queue),
             alive_gpu_nodes=alive_gpu_nodes,
             nodes_at_last_batch=nodes_at_last_batch,
             last_batch_size=last_batch_size,

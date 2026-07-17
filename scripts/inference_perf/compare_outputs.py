@@ -178,8 +178,10 @@ def _staged_labels(run_dir: str) -> tuple[set[str], set[str]]:
     label-set difference, not a silent omission.
     """
     fs, _, (path,) = fsspec.get_fs_token_paths(run_dir)
+    # detail=False so s3fs returns path strings, not entry dicts (its default);
+    # refresh so a listing cached from before the run staged isn't reused.
     zarr_labels, skip_labels = set(), set()
-    for entry in fs.ls(path):
+    for entry in fs.ls(path, detail=False, refresh=True):
         name = entry.rstrip("/").rsplit("/", 1)[-1]
         if name.endswith(".zarr"):
             zarr_labels.add(name.removesuffix(".zarr"))

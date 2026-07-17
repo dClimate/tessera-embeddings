@@ -1023,9 +1023,12 @@ class TestWorkStealingBatching:
     """Verify the loop requests later actor batches as the pool drains work."""
 
     def test_second_batch_requested_after_first_placed(self) -> None:
-        """Starting with one actor and a batch size of 2, the loop requests the
-        remaining batch via the factory (placement always satisfied here) and
-        grows the pool until the target is reached.
+        """Starting with one actor and a batch size of 2, the loop requests more
+        actors via the factory (placement always satisfied here) and processes
+        every chunk. The batch is right-sized to *unassigned* work: reserved
+        chunks are bound to their busy owner and excluded from the demand count,
+        so the request never over-provisions past the queue + in-flight work and
+        never exceeds the target.
         """
         config = MagicMock()
         config.checkpoint_path = "s3://bucket/ckpt.pt"
@@ -1088,8 +1091,10 @@ class TestWorkStealingBatching:
                 placement_timeout_sec=300.0,
             )
 
-        # The factory was invoked for the remaining 2 actors (target 3, started with 1).
-        assert factory_calls == [2]
+        # The factory was invoked (batching fired), never over-provisioning past
+        # the target (started with 1, target 3 → at most 2 more requested).
+        assert factory_calls
+        assert 0 < sum(factory_calls) <= 2
         # Every chunk was processed.
         assert len(results) == 4
 

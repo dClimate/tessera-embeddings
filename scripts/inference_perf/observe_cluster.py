@@ -86,6 +86,11 @@ events.sort(key=lambda e: e[0])
 # loads log during the PREVIOUS chunk's window entirely. Read overhead_s for the
 # real figure; prologue_s only isolates main-thread build. pref=Y marks chunks
 # that consumed a prefetched stash (expect their overhead_s ~= write_s).
+# A split chunk calls run_inference once per strip, so ds/start/idone lines
+# repeat within one chunk. Accumulate: t_start = FIRST strip's inference start,
+# infer_s = SUM of every strip's reported inference seconds, t_idone = LAST
+# strip's completion, valid_px = SUM across strips. Empty strips emit no
+# start/idone (dataset is empty), so summing what exists is correct.
 rows, cur, prev_done, pending_pref = [], None, None, set()
 for t, kind, g in events:
     if kind == "pref":
@@ -93,23 +98,28 @@ for t, kind, g in events:
     elif kind == "tkept":
         gap = (t - prev_done).total_seconds() if prev_done else None
         cur = {"label": g[0], "tkept": g[1], "strips": g[3], "gap_s": gap, "t_mask": t,
-               "pref": "Y" if g[0] in pending_pref else "N"}
+               "pref": "Y" if g[0] in pending_pref else "N", "infer_s": 0.0, "px": 0}
         pending_pref.discard(g[0])
     elif cur is None: continue
-    elif kind == "ds" and "t_ds" not in cur:
-        cur["t_ds"], cur["px"], cur["valid_pct"], cur["buckets"] = t, g[0], g[1], g[2]
-    elif kind == "start" and "t_start" not in cur: cur["t_start"] = t
-    elif kind == "idone" and "t_idone" not in cur:
-        cur["t_idone"], cur["infer_s"], cur["pxs"] = t, g[0], g[1]
+    elif kind == "ds":
+        if "buckets" not in cur: cur["buckets"] = g[2]  # first strip's bucket count
+        cur["px"] += int(g[0])
+    elif kind == "start":
+        if "t_start" not in cur: cur["t_start"] = t
+    elif kind == "idone":
+        cur["t_idone"] = t  # last strip wins
+        cur["infer_s"] += float(g[0])
     elif kind == "cdone":
         cur["t_cdone"], cur["total_s"] = t, g[2]; rows.append(cur); prev_done = t; cur = None
-print("label\tTkept\tstrips\tpref\tbuckets\tvalid_px\tvalid%\tprologue_s\tinfer_s\twrite_s\toverhead_s\ttotal_s\tpx/s")
+print("label\tTkept\tstrips\tpref\tbuckets\tvalid_px\tprologue_s\tinfer_s\twrite_s\toverhead_s\ttotal_s\tpx/s")
 for r in rows:
     try:
         prologue = (r["t_start"] - r["t_mask"]).total_seconds()
         write = (r["t_cdone"] - r["t_idone"]).total_seconds()
-        overhead = float(r["total_s"]) - float(r["infer_s"]) - write
-        print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r['pref']}\t{r.get('buckets','?')}\t{r.get('px','?')}\t{r.get('valid_pct','?')}\t{prologue:.1f}\t{r.get('infer_s','?')}\t{write:.1f}\t{overhead:.1f}\t{r['total_s']}\t{r.get('pxs','?')}")
+        infer = r["infer_s"]
+        overhead = float(r["total_s"]) - infer - write
+        pxs = (r["px"] / infer) if infer > 0 else 0  # chunk-level, summed over strips
+        print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r['pref']}\t{r.get('buckets','?')}\t{r['px']}\t{prologue:.1f}\t{infer:.1f}\t{write:.1f}\t{overhead:.1f}\t{r['total_s']}\t{pxs:.0f}")
     except KeyError as e:
         print(f"{r['label']}\tINCOMPLETE({e})")
 '''
@@ -174,17 +184,24 @@ def run_on_workers(session: boto3.session.Session, instance_ids: list[str], comm
 
     outputs: dict[str, str] = {}
     for cmd_id, batch in cmd_ids.items():
-        for iid in batch:
-            for _ in range(30):
-                time.sleep(2)
+        # Round-robin across the batch's instances so the ~60s wait is shared,
+        # not serialized: a single slow/unresponsive instance mustn't delay
+        # collecting results from the rest (sequential per-instance waits would
+        # be up to 60s x len(batch) in the worst case).
+        pending = set(batch)
+        for _ in range(30):
+            if not pending:
+                break
+            time.sleep(2)
+            for iid in list(pending):
                 inv = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
                 if inv["Status"] in ("Success", "Failed", "TimedOut", "Cancelled"):
                     outputs[iid] = inv["StandardOutputContent"] + (
                         f"\n[stderr] {inv['StandardErrorContent']}" if inv["StandardErrorContent"].strip() else ""
                     )
-                    break
-            else:
-                outputs[iid] = "[timed out waiting for SSM invocation]"
+                    pending.remove(iid)
+        for iid in pending:
+            outputs[iid] = "[timed out waiting for SSM invocation]"
     return outputs
 
 
