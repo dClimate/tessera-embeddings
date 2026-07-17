@@ -1,105 +1,197 @@
-# Inference GPU saturation profile — July 2026 campaign
+# Inference GPU saturation campaign — July 2026
 
-Headline numbers and conclusions from the profiling campaign behind PR #85
-(branch `perf/inference-rethink`). This is the empirical basis for why the
-inference pipeline looks the way it does — cross-chunk prologue prefetch,
-vectorised resampling, the async two-deep GPU loop, and the strip byte-budget.
+Authoritative record of the inference optimization campaign behind PR #85
+(branch `perf/inference-rethink`): what was changed, how much each change bought,
+how correctness was preserved, and the gotchas future work must respect. This is
+the empirical basis for why the pipeline looks the way it does.
 
-**Complete per-run data, comparison tables, and staging run-id mapping:
-[`scripts/inference_perf/RUNS.md`](../../scripts/inference_perf/RUNS.md).**
-Raw telemetry (TIMING / RESOURCES / EFFECTIVE-TFLOPS lines) survives in
-CloudWatch (`/ec2/yield-embeddings/ray`); reproduce fleet stats with
+**Complete per-run data + staging run-id mapping:
+[`scripts/inference_perf/RUNS.md`](../../scripts/inference_perf/RUNS.md).** Raw
+telemetry (TIMING / RESOURCES / EFFECTIVE-TFLOPS lines) survives in CloudWatch
+(`/ec2/yield-embeddings/ray`); reproduce fleet stats with
 `scripts/inference_perf/observe_cluster.py` (`--report`, `--ram-report`).
 
-## Headline numbers
+Hardware: g6e.xlarge — 1× L40S (181 TFLOPS BF16 dense, 46 GB VRAM, 864 GB/s),
+4 vCPU, 30.9 GB usable RAM, 250 GB NVMe. Iowa ROI, 2000×2000 chunks.
 
-Hardware: g6e.xlarge workers — 1× L40S (181 TFLOPS BF16 dense, 46 GB VRAM),
-4 vCPU, 30.9 GB usable RAM. Iowa ROI, 2000×2000 chunks.
+## Headline numbers (final shipped state)
 
-| metric | baseline (`main`, batch 3584) | after (branch, batch 7168) |
+| metric | `main` baseline (batch 3584) | shipped (branch, batch 7168) |
 |---|---|---|
-| wall-clock per dense chunk | 204–341 s | **89–140 s** (2.5–3.5×/worker) |
-| inference px/s per worker | 9.6–13.3K | **13.4–27.3K** (~1.2–1.5M tok/s) |
-| GPU util (saturated workers) | 48–72% avg | **100%, busy-frac 1.00, ~338/350 W** |
-| DCGM SMACT / TENSO during inference | 0.31–0.68 / 0.12–0.26 | **0.99 / 0.42–0.47** |
-| data loading per chunk (mask + bands + SAR + build, serial & GPU-idle) | 35–53 s = **15–21% of wall** (sparse chunks: up to ~86–99%) | **~0 s** (prefetched behind the prior chunk) |
-| total GPU-idle overhead per chunk (loading + write) | ~50–60 s (22–25% of wall) | **~7.5 s** (the staging write) |
-| CPU batch prep per sub-batch | 165 ms @3584 (651 ms @7168 unvectorised) | **103–160 ms @7168** |
-| peak host RAM | — | 28.4 GB polled / **29.38 GB (95%) at the one OOM** (pre-strip-fix build; post-fix projection ~23 GB) |
+| per-worker throughput | 1× | **~2–2.8×** |
+| GPU utilization (fleet) | 48–72% avg; SMACT 0.31–0.68; TENSO 0.12–0.26 | **~80–87%; SMACT ≈0.99; TENSO 0.42–0.47** |
+| inference px/s per worker | 9.6–13.3K | **21–24K** mid-density / 10–18K dense (end-to-end) |
+| GPU-idle overhead per chunk | ~50–60 s (22–25% of wall) | **~24–34 s** serial prologue → **~5–8 s** on prefetch-hit chunks |
+| CPU batch-prep per sub-batch | 165 ms @3584 (651 ms @7168 unvectorised) | **103–160 ms** |
+| peak host RAM | up to **92–95%** (one OOM-kill) | **45–47%** |
+
+The campaign originally measured ~2.5–3.5× at 100% GPU util **with** a full
+cross-chunk prologue prefetch — but that co-resided two chunks' whole working
+sets and OOM-killed a worker at 92–95% RAM. It was **removed** for UTM-zone-scale
+safety (target peak RAM ≤60%, ideally ~50%) and replaced by the RAM-bounded
+striping + starter-prefetch design below; the ~1.25–1.3× interleaving factor was
+deliberately traded for headroom, then partially recovered by the bounded
+prefetch. The numbers above are the current, RAM-safe config.
 
 ```
- per-chunk wall anatomy      baseline:  [mask][bands][build][═══ inference ═══][write]
-                                         GPU:  ~50-60 s idle        busy        idle
-                             after:     [═══ inference ═══][write]      (prologue prefetched
-                                         GPU: busy           ~7.5 s      behind prior chunk)
+ per-chunk wall anatomy (single-strip chunk), GPU busy = ▓, idle = ░
+
+ main:        [mask][bands][build][▓▓▓▓ inference ▓▓▓▓][write]
+              ░░░░░░░░░░░░░░░░░░░░  ~50-60 s idle       ~7.5 s idle
+
+ striping:    [mask][b][build][▓▓▓▓ inference ▓▓▓▓]     write runs in background,
+              ░░ ~24-34 s ░░                            overlapping next prologue
+
+ +prefetch:   [▓▓▓▓ inference N ▓▓▓▓][▓ N+1 starter ▓][▓▓ N+1 body ▓▓]
+              next chunk's mask+starter preloaded during N's last strip
+              (RAM trough) → GPU idle between chunks ~5-8 s on a hit
 ```
 
-Correctness (ADR 012 harness): same-config gate **100.000000% bit-identical**
-(1.5B values); batch-size change alone shimmer = exact 95–98%, max |Δ|=2,
-cosine ≥ 0.9999; assembled end-to-end windows pass with **zero valid/NaN
-footprint mismatches** (assembly integrity under the new pipeline).
+## The optimizations and what each bought
 
-## What the profile taught us (the load-bearing findings)
+### A. Keep the GPU fed inside the forward loop — RETAINED, bit-identical
+1. **Vectorised temporal resampling** (`sampling.py`/`dataset.py`). The per-pixel
+   Python resample loop cost 600–650 ms/sub-batch at batch 7168 vs ~450 ms of GPU
+   work — prep gated the GPU. Memoised (valid_count, target) index matrices +
+   one vectorised gather brought it to **103–160 ms** (~1.3–1.4× on the inference
+   component; bit-identical — same indices, same arithmetic).
+2. **Async two-deep GPU pipeline** (`inference.py`). Pinned double-buffers + copy
+   stream submit forward *i+1* before syncing *i*'s D2H; per-batch `isfinite`
+   device sync moved to a host check on scales. ~1.1–1.15× (removes the
+   per-sub-batch bubble). `TESSERA_SERIAL_GPU_LOOP=1` is the escape hatch.
+3. **Batch 3584 → 7168.** TENSO 0.12–0.26 → 0.42–0.47 (~1.1–1.3×), previously
+   masked by the prep bottleneck. The ONLY non-bit-identical change (cuBLAS
+   kernel selection shifts with batch shape → ±1–2 int8-level shimmer).
 
-1. **The starvation was structural, not compute.** Baseline tensor pipes ran
-   12–26% active even mid-forward; the GPU was idle 22–25% of wall at chunk
-   boundaries and starved between sub-batches. All recovered gains came from
-   scheduling (prefetch/pipelining), none from changing the math.
-   **Attribution of the 2.5–3.5× (dense chunks):**
-   ~1.25–1.3× data interleaving (cross-chunk prologue prefetch) × ~1.3–1.4×
-   resampler vectorisation (prep 650→103–160 ms —
-   flipped the loop from prep-gated to GPU-bound) × ~1.1–1.3× batch-7168 GEMM
-   efficiency (TENSO 0.12–0.26 → 0.42–0.47; present earlier but fully masked
-   until the sampler stopped gating it) × ~1.1–1.15× async two-deep GPU
-   pipeline (per-batch serialisation residue). Roughly: a third of the seconds
-   saved from hiding the loading, two thirds from faster inference.
-   *How isolated:* no factor comes from a single-variable experiment — the
-   Phase-1 gate also carried batch-7168 / on-device quantize / parallel band
-   reads. The split is COMPONENT accounting: overhead (prologue+write wall) and
-   inference wall are measured separately per chunk, and interleaving's factor
-   is the overhead component alone (55→7.5 s; pref=Y rows show the prologue
-   hidden, not shortened). The bundled changes act on the inference component
-   (and measurably washed out, ±20%, in the P1 gate). One caveat: the bundled
-   parallel band reads also shrink the prologue, but on dense chunks hiding is
-   total either way (any prologue ≪ inference fits under it), so the dense
-   overhead credit belongs to interleaving; on SPARSE chunks (short inference,
-   little to hide under) faster loading and interleaving genuinely share the
-   win and are not split. Phase-2's internal split is likewise
-   TIMING-component arithmetic, not separately gated.
-2. **CPU prep gates the GPU when unvectorised.** At batch 7168 the per-pixel
-   resample loop cost 600–650 ms vs ~450 ms of GPU work — the vectorised
-   resampler (memoised index matrices, bit-identical) brought it to 103–160 ms.
-3. **The GRU was never the production bottleneck** — the builder already fuses
-   `CustomGRU` → cuDNN `nn.GRU`; a restructure attempt was reverted as dead code.
-4. **Host RAM is the binding co-residency constraint.** Cross-chunk prefetch
-   pairs two chunks' working sets; the strip byte-budget must hold every
-   resident band set + its own mask to ONE budget (the chunk_5_9 OOM at 95%
-   taught this; fixed in `_strip_height_for_density`).
-5. **px/s is density-misleading** — completion logs now report tok/s and
-   effective TFLOPS (53.9–67.6 sustained per chunk vs ~181 dense peak).
+### B. Hide the per-chunk prologue idle without OOM — the RAM-safety pivot
+The prologue (mask read → first band read → dataset build) is GPU-idle. Full
+cross-chunk interleaving hid it but OOM'd (§Headline). Replaced with:
+1. **Valid-pixel-aware striping** (`_strip_plan` in `actors.py`). Read bytes scale
+   with `T_kept × H × W` (independent of valid pixels); inference time scales with
+   valid pixels — they diverge, so a single "strip height" is wrong. Four regimes:
+   fits-one-budget → single strip; split+hideable (dense) → balanced strips with
+   1-deep prefetch; split+not-hideable (wide but few valid px) → prefetch OFF,
+   strips at the PAIR budget (only one set resident). RAM safety does **not**
+   depend on the (log-calibrated) hideability estimate — every branch respects
+   the pair ceiling; a wrong estimate degrades to the old always-prefetch behavior.
+2. **Budget 4.75 → 5.75 GiB (P3).** Lets the whole `T≤71` full-width band load as a
+   single strip instead of two, dropping a ~13 s fixed read/chunk (source stores
+   use 4000² chunks → every read re-decompresses whole storage chunks; measured
+   fixed read ≈13 s regardless of strip size). Counter-intuitively **lowered** peak
+   RAM (51% → 45–47%): more single-strip chunks → fewer two-strip co-residency pairs.
+3. **Starter strip (P2).** A small first strip so the GPU starts ~one fixed-read
+   sooner; the body hides behind it. Trimmed steady-state overhead 30–44 s → 24–34 s.
+4. **Bounded cross-chunk starter prefetch (§ actors `_XCHUNK_*`).** The next
+   chunk's mask + 256-row starter (hard-capped ~2 GiB, NOT a whole working set)
+   preloaded during the current chunk's LAST strip — the RAM trough, temporally
+   separated from the mid-chunk two-strip peak. Skips pair-budget plans (their
+   last strip holds ~2× a budget, not a trough). Every miss (cap, work-stealing
+   reassignment, load error, `TESSERA_DISABLE_XCHUNK_PREFETCH=1`) reverts to the
+   serial prologue. Recovers most of the prologue idle (→ ~5–8 s on a hit).
 
-## Remaining headroom (measured, not speculative)
+### C. Cheaper sparse/edge chunks — bit-identical
+Empty strips skip the S2 band read; chunks whose valid pixels span a narrow
+easting window read only that window (SAR read full-width so the saved
+observation-count layers keep full extent). Sparse-chunk load dropped toward
+bbox-proportional cost.
 
-Fleet sample-weighted GPU util over the final gate window: **79.4%** across 101
-worker streams → total idle-recovery ceiling ~21%, of which: the ~7.5 s/chunk
-synchronous staging write + cold first-chunk prologues (structural), and a
-CPU-feed-bound straggler tail worth **~7–15% of GPU-hours** (get_batch spikes to
-~507 ms on dense chunks under 4-vCPU contention). Options and trade-offs
-(software feed fixes vs g6e.2xlarge's 8 vCPU, token-budget batching, deferred
-FP16 fast-accumulate) are analysed in `temp/token-budget-batching-findings.md`
-and the PR #85 discussion; numerics policy in
+### D. Background staging write — bit-identical
+Whole-chunk upload runs on a single-slot writer thread overlapping the next
+prologue; chain-confirmation holds a chunk out of the completed set until its
+write lands (failed writes requeue without killing the actor; staged writes are
+idempotent). Removed ~7.5 s GPU-idle/chunk from the critical path.
+
+### E. Cost & reliability — no output impact
+Leak-proof teardown (flow-run-id-derived cluster tag survives Prefect's
+fresh-process hook; `min_workers: 0` so no idle GPU floor; `resolved_yaml` bound
+before `ray up` so failed launches tear down); capacity-aware single-AZ selection
+(spot-placement scores sized to the fleet, least-loaded fallback, launch-time
+failover).
+
+## Attribution — which change bought which improvement
+
+- **Inference component (retained core, A):** ~1.3–1.4× resampler × ~1.1–1.3×
+  batch-7168 GEMM × ~1.1–1.15× async pipeline ≈ ~1.7–2× on the compute itself.
+  Isolated by TIMING-component arithmetic, not single-variable gates.
+- **Overhead component (B+D):** GPU-idle overhead 50–60 s → 24–34 s (striping +
+  background write) → ~5–8 s on prefetch-hit chunks. The interleaving factor
+  (~1.25–1.3×, overhead-only, measured as prologue 55→7.5 s) was removed then
+  largely re-earned by the bounded prefetch.
+- **RAM (B):** budget + single-strip conversion: 92–95% (OOM) → 45–47% peak.
+- **Sparse chunks (C):** load cost → bbox-proportional (biggest on sparse-heavy
+  ROIs; small on Iowa where mixing already hid it).
+- **Cost (E):** eliminated overnight instance leaks; capacity stalls mitigated at
+  AZ-selection time.
+
+Roughly: a third of the seconds saved came from hiding the loading, two thirds
+from faster inference.
+
+## Correctness
+
+Everything except the batch-size increase is **bit-identical** (scheduling /
+IO-shape only), enforced by golden tests (single-vs-multi-strip, prefetch
+on/off/serial, cropped-vs-uncropped — all identical embeddings/scales/obs
+layers). Numerics policy:
 [ADR 012](../decisions/012-validated-equivalence-for-inference-outputs.md).
+Same-config gate: **100.000000% bit-identical** (1.5B values). Assembled Iowa
+output vs the `main` reference store (25 windows, 2.23M valid px, cross-config):
+**0** footprint mismatches, **0** obs-layer mismatches, within-1 **99.99%**,
+max |Δ| **2**, scale drift **≤1.2%**, cosine **≥0.999913** — inside the ADR-012
+cross-config envelope.
 
-## Addendum (2026-07-17): cross-chunk interleaving removed for UTM-zone-scale RAM headroom
+## Dead-end / shelved levers (measured, do not re-litigate)
 
-The cross-chunk prologue prefetch measured above was subsequently **removed** by
-decision: co-residing two chunks' input working sets held peak host RAM at
-~92–95% of the node, and at UTM-zone-scale runs chunk-density variance makes
-that an OOM guarantee. The operating target is now peak host RAM ≤60%
-(ideally ~50%), achieved by (a) dropping the cross-chunk prefetch (scheduler
-reservations + actor prologue stash) and (b) shrinking `_S2_STRIP_BYTE_BUDGET`
-7 → 4.75 GiB (expected peak ≈ 16–17 GB ≈ 54%). The dense-chunk interleaving
-factor (~1.25–1.3×) is deliberately given back as the price of that headroom;
-all other campaign gains (vectorised resampler, async GPU pipeline, batch
-7168, within-chunk overlap) are retained. The numbers in this doc describe the
-measured campaign builds and remain the historical record.
+- **FP16 fast-accumulate:** L40S GEMM microbench — BF16 already at the full dense
+  ceiling (189 vs 181 datasheet TFLOPS); FP16 buys nothing (the GA10x half-rate
+  penalty is A10G-specific). BF16 stays.
+- **Adaptive token-budget batching:** real-model forward sweep — B=7168 is
+  throughput-optimal at EVERY sequence length (even T=8 at 84/88 TFLOPS); larger
+  B is neutral-to-worse. Shelved (`temp/token-budget-batching-findings.md`).
+- **Eager bucketing (P4):** opens `dataset.py`; post-striping payoff is a sliver;
+  rejected.
+- **GRU restructure:** builder already fuses `CustomGRU` → cuDNN `nn.GRU`; reverted
+  as dead code.
+- **g6e.2xlarge (8 vCPU):** ~30% premium for ~7–15% feed-recoverable — software
+  route preferred.
+
+## Gotchas / bugs to be wary of
+
+- **RAM budget is load-bearing.** Do NOT raise `_S2_STRIP_BYTE_BUDGET` or
+  reintroduce whole-chunk cross-chunk prefetch without re-deriving the arithmetic
+  at the constant. The pair ceiling (2× budget) plus the ~2 GiB prefetch stash is
+  what keeps peak <60%. The prefetch MUST skip pair-budget plans
+  (`_XCHUNK_UNSAFE_STRATEGIES`) — their last strip is not a RAM trough.
+- **The strip-plan estimator is strategy-only.** `_EST_*` constants pick which
+  safe strategy is fastest; they are NEVER a RAM bound. Every branch is RAM-safe
+  regardless of estimate accuracy.
+- **Output is NOT bit-exact vs `main`** — the batch-size change shimmers int8 by
+  ±1–2 levels (cuBLAS). Compare with `compare_outputs.py --cross-config`, never an
+  exact re-diff. Bit-exactness holds only at the same batch/config.
+- **Shared CloudWatch log group across runs.** `--ram-report` / log greps must be
+  scoped tightly with `--since/--until`; a broad window mixes concurrent runs.
+  On-worker 1 s GPU poll files (`/tmp/gpu_poll.csv`) die with the workers — capture
+  `--report` BEFORE a run's cluster tears down.
+- **SPS is a spot proxy for on-demand.** Scores can come back UNIFORM (all 1 at
+  target_capacity=30 was observed) → no discrimination → falls to the subnet-id
+  tiebreak (deterministically us-west-2a). It needs the runner role granted
+  `ec2:GetSpotPlacementScores` or it silently falls back to least-loaded. And with
+  `min_workers: 0`, `ray up` launches only the head, so launch-time failover
+  CANNOT catch g6e worker-capacity shortfalls (they surface later at the
+  autoscaler) — AZ *selection*, not failover, is the mitigation.
+- **Testing: never boot a real Ray cluster in pytest.** `ray.kill` is wrapped in
+  Ray's auto-init hook — an unpatched call in a unit test silently starts a local
+  Ray cluster whose init hashes the whole working dir (multi-GB with scale-test
+  stores present); three concurrent runs ate ~60 GB RAM once. Patch `ray.kill` in
+  any test that reaches `ActorPool.replace`. Run ONE targeted pytest at a time.
+- **A cropped chunk's SCL mask stays full-width** even when bands are cropped —
+  strip sizing charges the mask at `chunk.width` (`mask_width`), and SAR is read
+  full-width so obs-count layers keep full extent.
+
+## Remaining headroom
+
+Fleet GPU util ~80–87%; the residual gap is the serial prologue on prefetch-miss
+chunks and cold first-chunk-per-actor prologues. The next structural lever is
+source-store chunk geometry: the 4000² storage chunking drives the ~13 s
+fixed read amplification — an inference-aligned geometry chosen before the global
+UTM-zone ingestion would cut it for every future run (a config choice then, a
+re-ingest later).

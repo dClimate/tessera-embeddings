@@ -73,3 +73,33 @@ AWS_PROFILE=yield python scripts/inference_perf/compare_outputs.py \
   s3://arbol-tessera-embeddings-dev/staging/<test_run_id> \
   [--labels chunk_0_0,chunk_0_2,...]
 ```
+
+## Phase 4 (striping) run — 2026-07-17
+
+Flow-run `76f3137b`, cluster `tessera-inference-76f3137b`, 22 g6e.xlarge / L40S.
+Full campaign + interleaving removal + striping P0–P3 (valid-pixel-aware
+`_strip_plan`, budget 5.75 GiB, starter strip). Assembled output:
+`.../embeddings/iowa_epsg5070-inference-speedup-phase4.zarr/` (dims
+34964×53383×128).
+
+Fleet: peak host RAM **45–47%** (vs 51% at the 4.75 GiB pre-striping budget —
+lower despite the bigger budget, because more chunks run single-strip);
+GPU util **~80.8%** (30 s poll) / ~87% (1 s DCGM); mid-density chunks
+**21–24K px/s** end-to-end (was 16–22K pre-striping), dense 10–18K; `T≤71`
+full-width chunks confirmed **single strip** (were 2); `write_s ≈ 0`
+(background write); steady-state `overhead_s` **24–34 s**.
+
+Correctness vs the `main` reference (`iowa_epsg5070-reference.zarr`), 25 sampled
+384² windows / 2.23M valid px (cross-config, batch 3584→7168): **footprint
+mismatch = 0**, **obs-layer mismatch = 0**, int8 exact 95.33%, within-1
+**99.9947%**, max|Δ| **2**, scale drift **1.19%**, cosine min **0.999913** —
+inside the ADR-012 cross-config envelope.
+
+## Phase 5 (bounded cross-chunk starter prefetch) run — 2026-07-17
+
+Flow-run `a60550ae`, cluster `tessera-inference-a60550ae`, 22 workers, us-west-2a
+(SPS returned uniform score=1 across AZs → tiebreak → 2a; 2a had capacity).
+Early read: prefetch engaging (hits + mask-only, no misses/skips in sample),
+peak RAM ~47%, util ~81%. Full gate validation (prefetch hit-rate, overhead_s on
+hit chunks, bit-identity vs phase 4) tracked by the run watcher; see
+`temp/phase5-validation-a60550ae.md`.

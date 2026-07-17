@@ -10,6 +10,14 @@ The orchestrator-free equivalent is
 [`orchestration/runners/plain.py`](../orchestration/runners/plain.py), which calls the same
 domain functions on `ray_cluster(num_gpus=0)` for laptop/CI runs.
 
+**Performance.** The July 2026 saturation campaign took per-worker throughput to **~2–2.8×**
+of the `main` baseline at **~80–87% GPU utilization** (was 48–72%), while holding **peak host
+RAM at ~45–47%** (the pre-campaign pipeline OOM-killed at 92–95%). Outputs stay within the
+ADR-012 validated-equivalence envelope of `main`. The mechanisms — vectorised prep, an async
+GPU loop, valid-pixel-aware striping, and a RAM-bounded cross-chunk starter prefetch — are
+described phase-by-phase below; the full profiling record, hard-number attribution, and gotchas
+are in [`context_docs/design/inference_gpu_saturation_profile_2026_07.md`](../../../context_docs/design/inference_gpu_saturation_profile_2026_07.md).
+
 ---
 
 ## Architecture at a Glance
@@ -33,7 +41,7 @@ Input stores (Icechunk/Zarr on S3):
   │  │   1. load_chunk(y_sub=…)  ← selective│    │
   │  │   2. Dataset valid-px filter         │    │
   │  │   3. sample_s2/s1_batch()            │    │
-  │  │   4. model forward  (FP16, B=7168)   │    │
+  │  │   4. model forward  (BF16, B=7168)   │    │
   │  │  5. writer.write_chunk() → staging   │    │
   │  └─────────────────────────────────────┘    │
   │  Work-stealing: actors pull from queue      │
@@ -201,7 +209,11 @@ while strip *i* infers, so **two** band sets co-reside, each ≤ `_S2_STRIP_BYTE
 → pair ≤ ~11.5 GiB. With prefetch **off** the prior set is released before the next loads, so only
 **one** set is resident and it may use the full pair budget — the same ceiling either way. That
 holds peak host RAM at the 60% line of a 30.9 GB g6e.xlarge across UTM-zone-scale density variance
-(measured 34% avg / 51% peak at 4.75 GiB; see the budget constant's comment for the arithmetic).
+(measured **45–47% peak** at the shipped 5.75 GiB budget — counter-intuitively *below* the 51% seen
+at 4.75 GiB, because the larger budget makes more chunks single-strip, so fewer hit the two-strip
+co-residency that sets the peak; see the budget constant's comment for the arithmetic).
+The bounded cross-chunk starter prefetch (§4a″) adds ≤~2 GiB of stash, but only during the current
+chunk's last strip — the RAM trough — so it raises the trough, not the peak.
 Turning prefetch off on non-hideable chunks matters because a background load only helps if there
 is inference to hide it behind — on a wide-but-sparse chunk the load would otherwise sit naked on
 the critical path *and* force a second co-resident set for nothing. A chunk that fits one budget
