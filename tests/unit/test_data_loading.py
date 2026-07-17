@@ -565,4 +565,12 @@ class TestBandReadWorkerReservation:
 
     def test_capped_at_band_count(self):
         assert self._workers(cores=64, reserve=0) == len(S2_BAND_ORDER)
-        assert self._workers(cores=64, reserve=2) == len(S2_BAND_ORDER) - 2
+        # Reservation is applied BEFORE the band-count cap, so when cores far
+        # exceed the band count the reserve is moot (64-2=62, capped at 10 —
+        # 10 readers still leave 54 cores free). The full reader set runs.
+        assert self._workers(cores=64, reserve=2) == len(S2_BAND_ORDER)
+
+    def test_reservation_does_not_drop_readers_when_cores_exceed_bands(self):
+        # Regression for the reserve-after-cap bug: 12 cores, reserve 2 →
+        # min(10, 12-2)=10 readers (2 free for prep), NOT min(10,12)-2=8.
+        assert self._workers(cores=12, reserve=2) == len(S2_BAND_ORDER)

@@ -59,7 +59,11 @@ def _band_read_workers(reserve_cpus: int = 0) -> int:
         allocated = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
     except AttributeError:  # macOS/Windows: no affinity API
         allocated = os.cpu_count() or 4
-    return max(1, min(len(S2_BAND_ORDER), allocated) - reserve_cpus)
+    # Reserve cores from the ALLOCATION first, then cap at the band count, so a
+    # host with more CPUs than bands still runs the full reader set (reserving
+    # after the cap would needlessly drop readers, e.g. 12 CPUs, 2 reserved ->
+    # min(10,12)-2=8 instead of min(10,10)=10). On the 4-vCPU worker both give 2.
+    return max(1, min(len(S2_BAND_ORDER), allocated - reserve_cpus))
 
 
 # A function that maps a store path to an open zarr group. The default is

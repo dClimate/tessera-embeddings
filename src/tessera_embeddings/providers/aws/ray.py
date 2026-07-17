@@ -542,6 +542,22 @@ def _start_ray_cluster(
     return head_ip
 
 
+def _worker_instance_type(template_cfg: dict[str, Any]) -> str:
+    """The GPU worker instance type, tolerant of a renamed node type.
+
+    Prefers the shipped ``gpu-workers-ondemand`` node type but, for a custom
+    ``cluster_yaml`` that renames it, falls back to any node type declaring a
+    GPU resource so the spot-placement query still sizes to the real worker.
+    """
+    node_types = template_cfg.get("available_node_types", {})
+    nt = node_types.get("gpu-workers-ondemand") or next(
+        (v for v in node_types.values() if v.get("resources", {}).get("GPU", 0) > 0), None
+    )
+    if nt is None:
+        raise KeyError("no GPU worker node type found in cluster template (need a resources.GPU > 0 entry)")
+    return str(nt["node_config"]["InstanceType"])
+
+
 def _launch_ray_with_failover(
     ranked_subnets: list[dict[str, Any]],
     resolve_config: Callable[[dict[str, Any]], str],
@@ -578,7 +594,10 @@ def _launch_ray_with_failover(
         resolved_yaml = resolve_config(subnet)
         try:
             head_ip = _start_ray_cluster(resolved_yaml, log)
-        except RuntimeError:
+        except (RuntimeError, subprocess.CalledProcessError):
+            # RuntimeError = `ray up` non-zero exit; CalledProcessError =
+            # `ray get-head-ip` failing AFTER `ray up` already provisioned the
+            # head. Both must tear down (the head can be live) before failover.
             log.warning(
                 "ray up failed in AZ %s — tearing down the partial attempt and failing over to the next AZ",
                 az,
@@ -827,9 +846,7 @@ def ray_cluster(
             # spot placement scores only rank WHICH AZ — sized to the full
             # worker fleet — so we start in an AZ scored to hold everyone,
             # mitigating the mid-run capacity dry-up seen on 2026-07-16.
-            worker_instance_type = template_cfg["available_node_types"]["gpu-workers-ondemand"]["node_config"][
-                "InstanceType"
-            ]
+            worker_instance_type = _worker_instance_type(template_cfg)
             ec2 = boto3.client("ec2", region_name=region)
             ssm = boto3.client("ssm", region_name=region)
             subnet_param = ssm.get_parameter(Name=f"{ssm_prefix.rstrip('/')}/private-subnet-ids")

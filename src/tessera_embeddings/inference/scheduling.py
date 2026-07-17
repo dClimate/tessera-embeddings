@@ -871,7 +871,13 @@ def _process_chunks_work_stealing(
     # actor) so the progress line can report fleet GPU-hours consumed so far.
     gpu_seconds = 0.0
     last_tick = time.monotonic()
-    while pool.pending or pending_write or (chunk_queue and pool._initializing):
+    # Stay alive while any work remains: in-flight chunks, deferred writes
+    # awaiting confirmation, OR queued chunks with a live actor to run them.
+    # The queue clause must NOT be gated on _initializing alone — a failed tail
+    # flush (_flush_idle_writes, which runs after dispatch) requeues its chunk
+    # when no actor is initializing, and gating on _initializing would drop that
+    # retry. `live_count > 0` prevents a busy-spin when every actor has died.
+    while pool.pending or pending_write or (chunk_queue and pool.live_count > 0):
         if pool.pending:
             # Block up to 60s for any one chunk to finish.
             ready_refs, _ = ray.wait(list(pool.pending.keys()), num_returns=1, timeout=60)
