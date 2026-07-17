@@ -212,27 +212,41 @@ Two reads are decoupled. **SCL** (1 byte/px) is loaded once for the whole chunk
 the `T_kept` source for sizing. **Reflectance bands** (20 bytes/px) are still read per strip on
 the chunks that split; that per-strip read is exactly the working set the byte budget bounds.
 
-#### 4a″. Chunk prologue: serial by design (cross-chunk prefetch removed)
+#### 4a″. Chunk prologue: serial by default, with a bounded cross-chunk starter prefetch
 
-Each chunk pays a serial, GPU-idle "prologue" — SCL mask read, strip-0 band read, dataset
-build (~35–55 s on production chunks) — before its first forward pass, plus a ~7 s GPU-idle
-staging write after. There is deliberately **no overlap across chunk boundaries**:
+Each chunk pays a serial, GPU-idle "prologue" — SCL mask read, first band read, dataset
+build (~24–38 s post-P2/P3) — before its first forward pass. A FULL cross-chunk prologue
+prefetch (hiding the entire next working set behind the prior chunk's inference) shipped
+briefly in 2026-07 and delivered ~1.25–1.3× on dense chunks — but co-residing two chunks'
+whole input working sets (5–7+ GiB each, density-dependent) pushed peak host RAM to
+~92–95% of the node (one observed Ray OOM-kill). It was removed the same week; the
+historical measurements live in `context_docs/design/inference_gpu_saturation_profile_2026_07.md`.
+
+What ships instead is a **bounded starter prefetch** — the same idea with two orders of
+magnitude less co-resident memory and hard caps instead of hope:
 
 ```
- actor timeline, chunk N → N+1 (single-strip chunks)
+ actor timeline, chunk N → N+1 (starter-prefetch hit)
 
- [mask][bands][build][═══ inference N ═══][write][mask][bands][build][═══ N+1 ═══]
-  GPU:  idle   idle    busy                 idle   idle  idle   idle    busy
+ [═════════ inference N ═══════════][═ N+1 starter ═][═══ N+1 body ═══]
+              [mask N+1][starter N+1]      [body N+1 loads]
+  GPU:  busy ─────────────────────── busy ── busy ─────── busy
+        └ prefetch runs during N's LAST strip (RAM trough) ┘
 ```
 
-A cross-chunk prologue prefetch (scheduler-reserved next chunk + a prefetch thread hiding
-the prologue behind the prior chunk's inference) shipped briefly in 2026-07 and delivered
-~1.25–1.3× on dense chunks — but co-residing two chunks' input working sets pushed peak
-host RAM to ~92–95% of the node (one observed Ray OOM-kill), and at UTM-zone-scale runs
-chunk-density variance makes that envelope untenable. It was removed the same week to hold
-peak host RAM in the ~50–60% band (see `_S2_STRIP_BYTE_BUDGET` for the arithmetic); the
-serial-prologue GPU idle is the accepted cost of that headroom. The historical measurements
-live in `context_docs/design/inference_gpu_saturation_profile_2026_07.md`.
+The scheduler reserves each actor's next chunk (1-deep, `ActorPool.reserved`, passed as
+`prefetch_hint`; reservations stop when the queue is shallower than the live pool and are
+requeued to the front on actor death). During the CURRENT chunk's last strip — its final
+load is done, so the two-strip co-residency has decayed to the RAM trough — the actor
+prefetches a **capped** payload for the hinted chunk: its SCL mask bundle + read plan, and,
+when the rung allows, its 256-row starter strip. Rungs (`_xchunk_rung`): P2-tiled dense
+chunks prefetch their (already small) starter free; single-budget chunks convert to
+starter+body only when a net-gain check says the extra fixed read will hide; everything
+else (budget-sized first strips, non-hideable sparse plans, anything over the
+`_XCHUNK_PREFETCH_CAP_BYTES` ~2 GiB cap) gets the mask only. Every miss — cap, steal
+(label mismatch evicts the stash), credential-window expiry, load failure, or the
+`TESSERA_DISABLE_XCHUNK_PREFETCH=1` hatch — degrades to the serial prologue: slower,
+never bigger. Peak host RAM keeps the same pair ceiling (see `_S2_STRIP_BYTE_BUDGET`).
 
 Within a chunk, overlap remains: **bucketing rides the strip-prefetch thread** —
 `_load_strip` returns `(ChunkData, dataset)`, so the `MosaicChunkInferenceDataset` build

@@ -9,6 +9,7 @@ result must not depend on how the input is tiled.
 
 from __future__ import annotations
 
+import contextlib
 from unittest.mock import patch
 
 import numpy as np
@@ -23,11 +24,13 @@ from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.actors import (
     _MIN_STRIP_H,
     _S2_STRIP_BYTE_BUDGET,
+    _XCHUNK_DISABLE_ENV,
     InferenceActor,
     _strip_height_for_density,
     _strip_plan,
     _strip_slices,
     _StripPlan,
+    _xchunk_rung,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 
@@ -570,3 +573,112 @@ class TestEastingBboxCrop:
         np.testing.assert_allclose(write_off["scales"], write_on["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
         for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
             np.testing.assert_array_equal(write_off["obs_counts"][var], write_on["obs_counts"][var], err_msg=var)
+
+
+# ---------------------------------------------------------------------------
+# Bounded cross-chunk starter prefetch
+# ---------------------------------------------------------------------------
+
+_CHUNK_B = ChunkSpec(row=1, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
+_CHUNK_C = ChunkSpec(row=2, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
+
+
+def _run_chunk_chain(inference_config, test_model, chain, extra_patches=()):
+    """Process (chunk, prefetch_hint) pairs in order on ONE actor.
+
+    Returns (writes, actor): each chunk's captured whole-chunk write, in
+    order, plus the actor for stash inspection. Writes are flushed between
+    chunks so ``last_write`` is unambiguous.
+    """
+    inference_config.s1_orbit = "both"
+    inference_config.time_window = parse_time_window("December 2024")
+    actor = _make_actor(inference_config, test_model)
+    writes = []
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()))
+        stack.enter_context(patch.object(_actors_mod, "ZarrWriter", _CapturingWriter))
+        for extra in extra_patches:
+            stack.enter_context(extra)
+        for chunk, hint in chain:
+            _CapturingWriter.last_write = None
+            result = actor.process_chunk(chunk, "s3://b/m", "/tmp/staging", "run-1", prefetch_hint=hint)
+            assert result["status"] == "success"
+            flushed = actor.flush_writes()
+            assert flushed is None or flushed["ok"], f"deferred write failed: {flushed}"
+            writes.append(_CapturingWriter.last_write)
+    return writes, actor
+
+
+def _assert_writes_identical(a, b):
+    np.testing.assert_array_equal(a["embeddings"], b["embeddings"])
+    np.testing.assert_allclose(a["scales"], b["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
+    for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
+        np.testing.assert_array_equal(a["obs_counts"][var], b["obs_counts"][var], err_msg=var)
+
+
+class TestXChunkPrefetch:
+    """Rung rules + end-to-end bit-identity for the cross-chunk prefetch."""
+
+    def _plan(self, strategy, prefetch=True):
+        return _StripPlan(
+            strips=[slice(0, 256), slice(256, 2000)], prefetch=prefetch, strategy=strategy, strip_h=1744
+        )
+
+    def test_rung_rules(self):
+        big = ChunkSpec(row=0, col=0, y_start=0, y_stop=2000, x_start=0, x_stop=2000)
+        dense_starter = self._plan("dense/prefetch+starter")
+        # P2-tiled chunks prefetch their (already small) starter.
+        assert _xchunk_rung(big, 60, None, 4_000_000, dense_starter) == "starter"
+        # Plain dense/prefetch: strips[0] is a budget-sized set — never prefetched.
+        assert _xchunk_rung(big, 60, None, 4_000_000, self._plan("dense/prefetch")) == "mask-only"
+        # Non-hideable strategies get the mask.
+        assert _xchunk_rung(big, 60, None, 50_000, self._plan("no-prefetch", prefetch=False)) == "mask-only"
+        single = _StripPlan([slice(0, 2000)], prefetch=False, strategy="single", strip_h=2000)
+        # Dense single-strip: converting to starter+body nets positive.
+        assert _xchunk_rung(big, 60, None, 4_000_000, single) == "starter"
+        # Sparse single-strip: the extra fixed read could never hide.
+        assert _xchunk_rung(big, 60, None, 100_000, single) == "mask-only"
+        # Byte cap: very dense chunks fall back to the mask rung.
+        assert _xchunk_rung(big, 400, None, 4_000_000, dense_starter) == "mask-only"
+
+    def test_chain_bit_identical_mask_only_rung(self, inference_config, test_model):
+        # The tiny test chunk plans single-strip below the starter height, so
+        # the natural rung is mask-only: the stash supplies mask + plan and the
+        # first strip loads inline. Output must match a serial run exactly.
+        chained, actor = _run_chunk_chain(
+            inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)]
+        )
+        serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_B, None)])
+        _assert_writes_identical(chained[1], serial[0])
+        assert actor._xchunk_prefetched == {}  # stash consumed
+
+    def test_chain_bit_identical_starter_rung(self, inference_config, test_model):
+        # Force a multi-strip plan and the starter rung so the stash carries a
+        # loaded first strip; the consuming prologue must produce identical
+        # output to a serial run under the same tiling.
+        patches = (
+            patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)),
+            patch.object(_actors_mod, "_xchunk_rung", lambda *a, **k: "starter"),
+        )
+        chained, actor = _run_chunk_chain(
+            inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_B, None)], patches
+        )
+        serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_B, None)], patches)
+        _assert_writes_identical(chained[1], serial[0])
+        assert actor._xchunk_prefetched == {}
+
+    def test_stale_stash_evicted_on_reassignment(self, inference_config, test_model):
+        # Prefetched B but got C (steal/requeue): C runs serially and the
+        # stale B stash is discarded — never consumed for the wrong chunk.
+        chained, actor = _run_chunk_chain(
+            inference_config, test_model, [(_CHUNK, _CHUNK_B), (_CHUNK_C, None)]
+        )
+        serial, _ = _run_chunk_chain(inference_config, test_model, [(_CHUNK_C, None)])
+        _assert_writes_identical(chained[1], serial[0])
+        assert actor._xchunk_prefetched == {}
+
+    def test_env_hatch_disables_prefetch(self, inference_config, test_model, monkeypatch):
+        monkeypatch.setenv(_XCHUNK_DISABLE_ENV, "1")
+        _, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B)])
+        # Never started: the lazily-created stash is empty (or never created).
+        assert getattr(actor, "_xchunk_prefetched", {}) == {}

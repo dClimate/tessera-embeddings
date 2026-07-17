@@ -49,7 +49,17 @@ def _poll(progress: dict, *, stall_threshold: float = 300.0, max_stalls: int = 3
 def _do_replace(pool: ActorPool, actor_idx: int = 0) -> None:
     mock_actor = MagicMock()
     mock_actor.get_instance_id.remote.return_value = MagicMock()
-    with patch.object(_sched_mod, "InferenceActor") as cls:
+    with (
+        patch.object(_sched_mod, "InferenceActor") as cls,
+        # ray.kill MUST be patched: Ray wraps it in an auto-init hook, so an
+        # unpatched call from a test silently boots a REAL local Ray cluster —
+        # ray.init() then hashes/uploads the entire working directory (multi-GB
+        # with scale-test stores present) and reserves an object store. The
+        # suppress(Exception) around the kill in replace() does not help; the
+        # auto-init runs before kill raises. (2026-07-17: three concurrent
+        # pytest runs of this file ate ~60 GB RAM this way.)
+        patch.object(_sched_mod.ray, "kill"),
+    ):
         cls.options.return_value.remote.return_value = mock_actor
         pool.replace(actor_idx, "i-dead")
 
@@ -187,6 +197,65 @@ class TestSubmit:
             assert pool.chunk_attempts["c0"] == 1
             pool.submit(0, chunk, "s3://mosaic", "s3://stage", "run1", tracker=None)
             assert pool.chunk_attempts["c0"] == 2
+
+
+class TestReservations:
+    """1-deep next-chunk reservations feeding the cross-chunk starter prefetch."""
+
+    def test_deep_queue_reserves_head_and_passes_hint(self) -> None:
+        pool = _make_pool(2)
+        pool.actors[0].process_chunk.remote.return_value = MagicMock()
+        queue: deque = deque([_fake_chunk(f"c{i}") for i in range(5)])
+        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
+            pool.submit(0, _fake_chunk("current"), "m", "s", "r", None, queue)
+        assert pool.reserved[0].label == "c0"
+        assert len(queue) == 4
+        kwargs = pool.actors[0].process_chunk.remote.call_args.kwargs
+        assert kwargs["prefetch_hint"].label == "c0"
+
+    def test_shallow_queue_does_not_reserve(self) -> None:
+        # len(queue) <= live_count: a tail reservation would pin work to a
+        # busy actor while others idle.
+        pool = _make_pool(3)
+        pool.actors[0].process_chunk.remote.return_value = MagicMock()
+        queue: deque = deque([_fake_chunk("c0"), _fake_chunk("c1")])
+        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
+            pool.submit(0, _fake_chunk("current"), "m", "s", "r", None, queue)
+        assert pool.reserved == {}
+        assert len(queue) == 2
+        kwargs = pool.actors[0].process_chunk.remote.call_args.kwargs
+        assert kwargs["prefetch_hint"] is None
+
+    def test_no_queue_means_no_reservation(self) -> None:
+        pool = _make_pool(2)
+        pool.actors[0].process_chunk.remote.return_value = MagicMock()
+        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
+            pool.submit(0, _fake_chunk("current"), "m", "s", "r", None)
+        assert pool.reserved == {}
+        assert pool.actors[0].process_chunk.remote.call_args.kwargs["prefetch_hint"] is None
+
+    def test_take_reserved_pops(self) -> None:
+        pool = _make_pool(2)
+        chunk = _fake_chunk("c0")
+        pool.reserved[1] = chunk
+        assert pool.take_reserved(1) is chunk
+        assert pool.take_reserved(1) is None
+
+    def test_stale_reservation_requeued_not_stranded(self) -> None:
+        # Defensive path: an actor re-dispatched while still holding a
+        # reservation must not lose that chunk.
+        pool = _make_pool(2)
+        pool.actors[0].process_chunk.remote.return_value = MagicMock()
+        stale = _fake_chunk("stale")
+        pool.reserved[0] = stale
+        queue: deque = deque([_fake_chunk(f"c{i}") for i in range(4)])
+        with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
+            pool.submit(0, _fake_chunk("current"), "m", "s", "r", None, queue)
+        # The stale chunk went to the queue front, so it became the new
+        # reservation — conserved either way: nothing dropped.
+        all_labels = {c.label for c in queue} | {c.label for c in pool.reserved.values()}
+        assert "stale" in all_labels
+        assert len(queue) + len(pool.reserved) == 5
 
 
 class TestSeed:

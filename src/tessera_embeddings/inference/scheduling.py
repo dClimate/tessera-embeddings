@@ -73,6 +73,16 @@ class ActorPool:
         self.pending: dict[ray.ObjectRef, tuple[str, int]] = {}
         self.chunk_attempts: dict[str, int] = {}
 
+        # actor_idx → the chunk reserved as that actor's next assignment. A
+        # reservation is created at submit time and passed to the actor as
+        # ``prefetch_hint`` so it can prefetch a BOUNDED starter payload (mask
+        # + 256-row starter strip, hard-capped ~2 GiB — see actors.py
+        # ``_XCHUNK_PREFETCH_CAP_BYTES``, NOT the full-prologue payload the
+        # removed Phase-1 interleaving co-resided) during the current chunk's
+        # tail inference. Reservations stop when the queue is shallower than
+        # the live pool; a failed actor's reservation is requeued to the front.
+        self.reserved: dict[int, ChunkSpec] = {}
+
         self._pending_iid_refs: dict[int, ray.ObjectRef] = {}
         self._initializing: set[int] = set()
         self._retired: set[int] = set()
@@ -164,8 +174,18 @@ class ActorPool:
         staging_base: str,
         run_id: str,
         tracker: ray.actor.ActorHandle | None,
+        chunk_queue: deque[ChunkSpec] | None = None,
     ) -> None:
         """Submit a single chunk to an actor and record the pending future.
+
+        When ``chunk_queue`` is supplied and still deep, the queue head is also
+        popped and RESERVED as this actor's next assignment, riding along as
+        ``prefetch_hint`` so the actor can prefetch that chunk's capped starter
+        payload during this chunk's tail inference (see actors.py). Reservations
+        stop when the queue is shallower than the live pool
+        (``len(queue) <= live_count``): at the tail of a run a reserved chunk
+        would pin work to a busy actor while other actors sit idle, which costs
+        more than the prologue overlap saves.
 
         Args:
             actor_idx: Index into self.actors.
@@ -174,13 +194,32 @@ class ActorPool:
             staging_base: Base path for staged output.
             run_id: Run identifier.
             tracker: Optional ProgressTracker actor handle.
+            chunk_queue: Remaining-work queue; the reservation source. ``None``
+                disables reservation (tests and direct callers).
         """
         self.resolve_iid(actor_idx)  # best-effort resolve before dispatch
+        if actor_idx in self.reserved:
+            # Defensive: a reservation should have been consumed or returned
+            # before this actor is re-dispatched; don't strand the chunk.
+            stranded = self.reserved.pop(actor_idx)
+            self.log.warning("Actor %d re-dispatched holding reservation %s — requeuing it", actor_idx, stranded.label)
+            if chunk_queue is not None:
+                chunk_queue.appendleft(stranded)
+
+        hint: ChunkSpec | None = None
+        if chunk_queue is not None and len(chunk_queue) > self.live_count:
+            hint = chunk_queue.popleft()
+            self.reserved[actor_idx] = hint
+
         ref: ray.ObjectRef = self.actors[actor_idx].process_chunk.remote(  # type: ignore[union-attr]
-            chunk, mosaic_base, staging_base, run_id, tracker=tracker
+            chunk, mosaic_base, staging_base, run_id, tracker=tracker, prefetch_hint=hint
         )
         self.pending[ref] = (chunk.label, actor_idx)
         self.chunk_attempts[chunk.label] = self.chunk_attempts.get(chunk.label, 0) + 1
+
+    def take_reserved(self, actor_idx: int) -> ChunkSpec | None:
+        """Pop and return the chunk reserved for this actor, if any."""
+        return self.reserved.pop(actor_idx, None)
 
     def seed(
         self,
@@ -394,6 +433,7 @@ def _poll_tracker(
     max_simultaneous_stalls: int,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     elapsed_min: float | None = None,
+    gpu_hours: float | None = None,
 ) -> None:
     """Poll ProgressTracker; log stalls; raise RuntimeError on systemic stall.
 
@@ -411,6 +451,8 @@ def _poll_tracker(
         log: Logger.
         elapsed_min: Minutes since run start, folded into the single progress
             line (this is the ONLY progress log line — keep it that way).
+        gpu_hours: Fleet GPU-hours consumed so far (live-actor-count integrated
+            over wall time; one GPU per actor), folded into the same line.
 
     Raises:
         RuntimeError: When ``>= max_simultaneous_stalls`` chunks are stalled.
@@ -451,14 +493,16 @@ def _poll_tracker(
                 phases[phase] = phases.get(phase, 0) + 1
             phase_summary = ", ".join(f"{v} {k}" for k, v in sorted(phases.items()))
             elapsed = f" — {elapsed_min:.1f} min elapsed" if elapsed_min is not None else ""
+            gpu = f", {gpu_hours:.1f} GPU-hrs" if gpu_hours is not None else ""
             log.info(
-                "Progress: %d/%d done, %d active (%s), %d stalled%s",
+                "Progress: %d/%d done, %d active (%s), %d stalled%s%s",
                 n_done,
                 n_total,
                 n_active,
                 phase_summary,
                 len(stalled_chunks),
                 elapsed,
+                gpu,
             )
     except Exception as exc:
         # Tracker is a monitoring aid — never a single point of failure.
@@ -663,7 +707,9 @@ def _process_chunks_work_stealing(
         n, timed_out = _batch_actors_to_request(
             requested=len(pool.actors),
             target=total_actors_target,
-            outstanding=len(pool.pending) + len(chunk_queue),
+            # Reserved next-chunks are real outstanding work too — they live in
+            # neither pending nor the queue while an actor holds them.
+            outstanding=len(pool.pending) + len(chunk_queue) + len(pool.reserved),
             alive_gpu_nodes=alive_gpu_nodes,
             nodes_at_last_batch=nodes_at_last_batch,
             last_batch_size=last_batch_size,
@@ -710,6 +756,12 @@ def _process_chunks_work_stealing(
         orphaned = pending_write.pop(actor_idx, None)
         if orphaned is not None:
             _requeue_unconfirmed(orphaned, f"actor {actor_idx} failed with the write in flight")
+        # Its reserved next chunk (whose starter payload only this actor may
+        # have prefetched) goes back to the queue FRONT for a healthy actor.
+        reserved = pool.take_reserved(actor_idx)
+        if reserved is not None:
+            chunk_queue.appendleft(reserved)
+            log.info("Returned reserved chunk %s from failed actor %d to the queue front", reserved.label, actor_idx)
         pool.resolve_iid(actor_idx)
         instance_id = pool.actor_instance_ids[actor_idx]
         attempts = pool.chunk_attempts.get(chunk_label, 1)
@@ -815,6 +867,10 @@ def _process_chunks_work_stealing(
     # --- Main work-stealing loop ---
     # Runs while there is in-flight work, deferred writes awaiting
     # confirmation, OR queued chunks waiting for initializing actors.
+    # gpu_seconds integrates live-actor-count over wall time (one GPU per
+    # actor) so the progress line can report fleet GPU-hours consumed so far.
+    gpu_seconds = 0.0
+    last_tick = time.monotonic()
     while pool.pending or pending_write or (chunk_queue and pool._initializing):
         if pool.pending:
             # Block up to 60s for any one chunk to finish.
@@ -824,6 +880,9 @@ def _process_chunks_work_stealing(
             # Sleep briefly then check if any actors are ready.
             time.sleep(5)
             ready_refs = []
+        now = time.monotonic()
+        gpu_seconds += pool.live_count * (now - last_tick)
+        last_tick = now
 
         # Poll tracker on every iteration (including timeouts with no completions)
         # so stall detection stays responsive.
@@ -836,6 +895,7 @@ def _process_chunks_work_stealing(
                 _stall_threshold(),
                 log,
                 elapsed_min=(time.monotonic() - t0) / 60,
+                gpu_hours=gpu_seconds / 3600,
             )
 
         # --- Handle completed (or failed) chunks ---
@@ -880,9 +940,15 @@ def _process_chunks_work_stealing(
             # freshly-spawned replacement still initializing (30-120s). A failed
             # actor was killed and replaced by _handle_failure, so it's now
             # initializing and skipped here — its retried chunk goes to a
-            # different, healthy actor via dispatch_idle below.
-            if chunk_queue and actor_idx not in pool._initializing:
-                pool.submit(actor_idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker)
+            # different, healthy actor via dispatch_idle below. The actor's
+            # reserved chunk (whose starter payload it may have prefetched)
+            # takes precedence over the queue so the prefetch is consumed.
+            if actor_idx not in pool._initializing:
+                next_chunk = pool.take_reserved(actor_idx)
+                if next_chunk is None and chunk_queue:
+                    next_chunk = chunk_queue.popleft()
+                if next_chunk is not None:
+                    pool.submit(actor_idx, next_chunk, mosaic_base, staging_base, run_id, tracker, chunk_queue)
 
         # Request the next actor batch if the prior batch has been placed (or
         # placement timed out), then check if any initializing actors have
@@ -896,6 +962,6 @@ def _process_chunks_work_stealing(
         # deferred-write confirmation — pull it via flush_writes() (tail of
         # run, and always before such an actor could be retired).
         _flush_idle_writes()
-        pool.retire_idle(len(pool.pending) + len(chunk_queue))
+        pool.retire_idle(len(pool.pending) + len(chunk_queue) + len(pool.reserved))
 
     return results
