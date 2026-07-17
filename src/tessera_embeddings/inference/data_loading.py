@@ -661,19 +661,22 @@ def load_chunk(
         x_sub=x_sub,
     )
 
+    # Skipped orbits get FULL-width placeholders: every SAR array must be
+    # full-width here because the x_sub block below crops them all uniformly
+    # (after capturing the full-width obs-count side channel).
     s1_asc_bands, s1_asc_doys = (
         _load_sar_orbit(
             mosaic_base, chunk, "ascending", time_window=time_window, y_sub=y_sub, store_opener=store_opener
         )
         if "ascending" in active
-        else _empty_sar_arrays(height, width)
+        else _empty_sar_arrays(height, chunk.width)
     )
     s1_desc_bands, s1_desc_doys = (
         _load_sar_orbit(
             mosaic_base, chunk, "descending", time_window=time_window, y_sub=y_sub, store_opener=store_opener
         )
         if "descending" in active
-        else _empty_sar_arrays(height, width)
+        else _empty_sar_arrays(height, chunk.width)
     )
 
     s1_asc_obs_count = np.any(s1_asc_bands != 0, axis=-1).sum(axis=0).astype(np.uint16)

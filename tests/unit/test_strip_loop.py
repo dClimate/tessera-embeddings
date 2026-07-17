@@ -442,8 +442,8 @@ class TestEastingBboxCrop:
 
         return _open_store
 
-    def _run(self, inference_config, test_model, crop_threshold):
-        inference_config.s1_orbit = "both"
+    def _run(self, inference_config, test_model, crop_threshold, s1_orbit="both"):
+        inference_config.s1_orbit = s1_orbit
         inference_config.time_window = parse_time_window("December 2024")
         actor = _make_actor(inference_config, test_model)
         _CapturingWriter.last_write = None
@@ -478,5 +478,21 @@ class TestEastingBboxCrop:
         np.testing.assert_array_equal(write_off["embeddings"], write_on["embeddings"])
         np.testing.assert_allclose(write_off["scales"], write_on["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
         # Obs layers keep full-extent fidelity, including SAR outside the box.
+        for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
+            np.testing.assert_array_equal(write_off["obs_counts"][var], write_on["obs_counts"][var], err_msg=var)
+
+    def test_single_orbit_crop(self, inference_config, test_model):
+        # Regression (2026-07-17 run, chunk_0_0): with one orbit active, the
+        # skipped orbit's empty placeholder must be FULL width going into the
+        # x_sub block — a cropped-width placeholder got double-cropped, breaking
+        # the dataset build and corrupting s1_*_obs_count_full.
+        res_off, write_off, _ = self._run(inference_config, test_model, crop_threshold=1.1, s1_orbit="ascending")
+        res_on, write_on, _ = self._run(inference_config, test_model, crop_threshold=0.10, s1_orbit="ascending")
+
+        assert res_off["status"] == res_on["status"] == "success"
+        assert write_on["obs_counts"]["s1_desc_obs_count"].shape == (_CHUNK.height, _CHUNK.width)
+        assert not write_on["obs_counts"]["s1_desc_obs_count"].any()
+        np.testing.assert_array_equal(write_off["embeddings"], write_on["embeddings"])
+        np.testing.assert_allclose(write_off["scales"], write_on["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
         for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
             np.testing.assert_array_equal(write_off["obs_counts"][var], write_on["obs_counts"][var], err_msg=var)
