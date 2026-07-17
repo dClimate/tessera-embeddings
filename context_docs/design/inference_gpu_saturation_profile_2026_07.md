@@ -46,16 +46,26 @@ footprint mismatches** (assembly integrity under the new pipeline).
    boundaries and starved between sub-batches. All recovered gains came from
    scheduling (prefetch/pipelining), none from changing the math.
    **Attribution of the 2.5–3.5× (dense chunks):**
-   ~1.25–1.3× data interleaving (cross-chunk prologue prefetch; gated in
-   isolation) × ~1.3–1.4× resampler vectorisation (prep 650→103–160 ms —
+   ~1.25–1.3× data interleaving (cross-chunk prologue prefetch) × ~1.3–1.4×
+   resampler vectorisation (prep 650→103–160 ms —
    flipped the loop from prep-gated to GPU-bound) × ~1.1–1.3× batch-7168 GEMM
    efficiency (TENSO 0.12–0.26 → 0.42–0.47; present earlier but fully masked
    until the sampler stopped gating it) × ~1.1–1.15× async two-deep GPU
    pipeline (per-batch serialisation residue). Roughly: a third of the seconds
-   saved from hiding the loading, two thirds from faster inference. Phase-2
-   pieces shipped in one gate, so the within-gate split is TIMING-component
-   arithmetic, not separately gated. On sparse chunks the attribution inverts:
-   interleaving is essentially the entire win (loading was 86–99% of their wall).
+   saved from hiding the loading, two thirds from faster inference.
+   *How isolated:* no factor comes from a single-variable experiment — the
+   Phase-1 gate also carried batch-7168 / on-device quantize / parallel band
+   reads. The split is COMPONENT accounting: overhead (prologue+write wall) and
+   inference wall are measured separately per chunk, and interleaving's factor
+   is the overhead component alone (55→7.5 s; pref=Y rows show the prologue
+   hidden, not shortened). The bundled changes act on the inference component
+   (and measurably washed out, ±20%, in the P1 gate). One caveat: the bundled
+   parallel band reads also shrink the prologue, but on dense chunks hiding is
+   total either way (any prologue ≪ inference fits under it), so the dense
+   overhead credit belongs to interleaving; on SPARSE chunks (short inference,
+   little to hide under) faster loading and interleaving genuinely share the
+   win and are not split. Phase-2's internal split is likewise
+   TIMING-component arithmetic, not separately gated.
 2. **CPU prep gates the GPU when unvectorised.** At batch 7168 the per-pixel
    resample loop cost 600–650 ms vs ~450 ms of GPU work — the vectorised
    resampler (memoised index matrices, bit-identical) brought it to 103–160 ms.
