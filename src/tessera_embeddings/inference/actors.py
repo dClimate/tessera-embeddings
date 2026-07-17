@@ -58,6 +58,10 @@ class _ChunkPrologue:
     strip_h: int
     strips: list[slice]
     first_strip: tuple[ChunkData, MosaicChunkInferenceDataset]
+    # Chunk-relative easting window of the S2 valid-pixel bounding box, or None
+    # for full width. Sparse/edge chunks read (and infer) only these columns;
+    # outputs are placed at this offset in the whole-chunk buffers.
+    x_sub: slice | None
 
 
 logger = logging.getLogger(__name__)
@@ -86,6 +90,12 @@ _S2_BYTES_PER_OBS_PX = len(S2_BAND_ORDER) * 2
 # get_batch spikes to ~500 ms, starving the GPU mid-inference. Foreground
 # (prologue) loads reserve nothing — the GPU is idle and wants the fastest load.
 _BACKGROUND_LOAD_RESERVED_CPUS = 2
+
+# Apply the S2 easting-bbox crop only when it removes at least this fraction
+# of the chunk's width. Near-full boxes (interior chunks) skip the crop
+# entirely, keeping the mainline path byte-for-byte identical to the uncropped
+# code and avoiding pointless SAR column-copies for a few saved columns.
+_X_CROP_MIN_SAVING = 0.10
 
 # Floor on derived strip height. Below this a strip reads so few northing rows
 # that per-strip fixed overhead (zarr open, SCL slice, dataset bucketing)
@@ -352,7 +362,31 @@ class InferenceActor:
         store_opener = make_store_opener()
         mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, self.config.time_window, store_opener=store_opener)
         t_kept = int(mask_bundle.mask.shape[0])
-        strip_h = _strip_height_for_density(t_kept, chunk.width, chunk.height)
+
+        # S2 valid-pixel bounding box in easting. On sparse/edge chunks (a
+        # coastline sliver, a UTM-zone boundary) the valid columns can be a
+        # small fraction of the width — the S2 band read (20 B/px) shrinks to
+        # the box. Columns outside it have zero valid S2 observations, so they
+        # could never be inferred; the saved obs layers keep full-extent
+        # fidelity via the bundle (S2) and full-width SAR reads (see
+        # load_chunk's x_sub docs). Near-full boxes skip the crop so interior
+        # chunks stay on the byte-identical uncropped path.
+        x_sub: slice | None = None
+        valid_cols = np.flatnonzero(mask_bundle.mask.any(axis=(0, 1)))
+        if valid_cols.size:
+            box = slice(int(valid_cols[0]), int(valid_cols[-1]) + 1)
+            if (box.stop - box.start) <= (1 - _X_CROP_MIN_SAVING) * chunk.width:
+                x_sub = box
+                logger.info(
+                    "Chunk %s: S2 valid bbox covers columns %d-%d (%.0f%% of width) — cropping reads",
+                    chunk.label,
+                    box.start,
+                    box.stop,
+                    100.0 * (box.stop - box.start) / chunk.width,
+                )
+
+        effective_width = chunk.width if x_sub is None else (x_sub.stop - x_sub.start)
+        strip_h = _strip_height_for_density(t_kept, effective_width, chunk.height)
         strips = _strip_slices(chunk.height, strip_h)
         chunk_data = load_chunk(
             chunk,
@@ -362,6 +396,7 @@ class InferenceActor:
             y_sub=strips[0],
             store_opener=store_opener,
             mask_bundle=mask_bundle,
+            x_sub=x_sub,
         )
         dataset = MosaicChunkInferenceDataset(
             chunk_data,
@@ -374,6 +409,7 @@ class InferenceActor:
             strip_h=strip_h,
             strips=strips,
             first_strip=(chunk_data, dataset),
+            x_sub=x_sub,
         )
 
     # ------------------------------------------------------------------
@@ -506,6 +542,10 @@ class InferenceActor:
             store_opener = prologue.store_opener
             mask_bundle = prologue.mask_bundle
             strips = prologue.strips
+            x_sub = prologue.x_sub
+            # Column window the cropped grids map to in the whole-chunk output
+            # buffers (full width when uncropped).
+            cols = x_sub if x_sub is not None else slice(0, chunk.width)
             # (chunk_data, dataset) for strips[0]; handed to iteration 0 of the
             # strip loop below, then dropped so at most two strips stay resident.
             first_strip: tuple[ChunkData, MosaicChunkInferenceDataset] | None = prologue.first_strip
@@ -549,6 +589,7 @@ class InferenceActor:
                     store_opener=store_opener,
                     mask_bundle=bundle,
                     reserve_cpus=_BACKGROUND_LOAD_RESERVED_CPUS,
+                    x_sub=x_sub,
                 )
                 return data, MosaicChunkInferenceDataset(
                     data,
@@ -606,10 +647,23 @@ class InferenceActor:
                     # Kick off the next strip's load before running inference on this one.
                     next_future = pool.submit(_load_strip, strips[i + 1], mask_bundle) if i + 1 < len(strips) else None
 
-                    for var in OBS_COUNT_VARS:
-                        arr = getattr(chunk_data, var)
-                        if arr is not None:
-                            obs_buffers[var][strip] = arr
+                    if x_sub is None:
+                        for var in OBS_COUNT_VARS:
+                            arr = getattr(chunk_data, var)
+                            if arr is not None:
+                                obs_buffers[var][strip] = arr
+                    else:
+                        # Cropped grid: the saved obs layers keep full-extent
+                        # fidelity — S2 counts come from the (full-width) mask
+                        # bundle, SAR counts from the full-width side channel
+                        # (SAR is read full-width regardless; see load_chunk).
+                        obs_buffers["s2_obs_count"][strip] = mask_bundle.obs_count[strip, :]
+                        for var, full in (
+                            ("s1_asc_obs_count", chunk_data.s1_asc_obs_count_full),
+                            ("s1_desc_obs_count", chunk_data.s1_desc_obs_count_full),
+                        ):
+                            if full is not None:
+                                obs_buffers[var][strip] = full
 
                     if len(dataset) == 0:
                         # Empty strip: leave its output rows at the initialised
@@ -621,8 +675,11 @@ class InferenceActor:
                         continue
 
                     result = run_inference(self.model, dataset, self.config, self.device, on_batch=on_batch)
-                    embeddings[strip] = result.embeddings
-                    scales[strip] = result.scales
+                    # Cropped grids land at their column offset; outside the
+                    # box the buffers keep their initial zero/NaN fill — the
+                    # exact values those never-valid pixels get today.
+                    embeddings[strip, cols] = result.embeddings
+                    scales[strip, cols] = result.scales
                     total_valid += len(dataset)
 
             # All strips done: the last strip's inputs and the full-chunk SCL

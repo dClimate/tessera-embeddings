@@ -404,3 +404,79 @@ class TestEmptyStripBandReadSkip:
         np.testing.assert_allclose(write_one["scales"], write_two["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
         for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
             np.testing.assert_array_equal(write_one["obs_counts"][var], write_two["obs_counts"][var], err_msg=var)
+
+
+# ---------------------------------------------------------------------------
+# S2 easting-bbox crop for sparse chunks
+# ---------------------------------------------------------------------------
+
+
+class TestEastingBboxCrop:
+    """Sliver chunks read only the valid-column window; outputs are unchanged."""
+
+    def _make_sliver_stores(self):
+        """Valid pixels confined to columns 2-4; SCL invalid everywhere else."""
+        h, w = _CHUNK.height, _CHUNK.width
+        rng = np.random.default_rng(7)
+        s2_root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+        for band in S2_BAND_ORDER:
+            vals = rng.integers(100, 5000, size=(6, h, w)).astype(np.uint16)
+            arr = s2_root.create_array(band, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
+            arr[:] = vals
+        scl_vals = np.full((6, h, w), 8, dtype=np.uint8)
+        scl_vals[:, :, 2:5] = rng.choice([4, 5, 8], size=(6, h, 3)).astype(np.uint8)
+        scl = s2_root.create_array("scl", shape=scl_vals.shape, dtype=scl_vals.dtype, chunks=scl_vals.shape)
+        scl[:] = scl_vals
+        times = pd.date_range("2024-12-01", periods=6, freq="3D").values.astype("datetime64[ns]").astype("int64")
+        t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
+        t_arr[:] = times
+        sar_asc = _make_sar_zarr_group(4, h, w, seed=301)
+        sar_desc = _make_sar_zarr_group(4, h, w, seed=302)
+
+        def _open_store(path):
+            if "reflectance" in path:
+                return s2_root
+            if "ascending" in path:
+                return sar_asc
+            return sar_desc
+
+        return _open_store
+
+    def _run(self, inference_config, test_model, crop_threshold):
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+        actor = _make_actor(inference_config, test_model)
+        _CapturingWriter.last_write = None
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._make_sliver_stores()),
+            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+            patch.object(_actors_mod, "_X_CROP_MIN_SAVING", crop_threshold),
+            patch.object(_dl_mod, "_load_s2_bands", wraps=_dl_mod._load_s2_bands) as band_spy,
+        ):
+            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+            flushed = actor.flush_writes()
+            assert flushed is None or flushed["ok"]
+        return result, _CapturingWriter.last_write, band_spy
+
+    def test_crop_reads_only_valid_columns(self, inference_config, test_model):
+        result, _, band_spy = self._run(inference_config, test_model, crop_threshold=0.10)
+        assert result["status"] == "success"
+        # The band read was cropped to columns 2..5 (absolute: x_start + [2, 5)).
+        (_, kwargs) = band_spy.call_args
+        assert kwargs["x_slice"] == slice(_CHUNK.x_start + 2, _CHUNK.x_start + 5)
+
+    def test_cropped_outputs_bit_identical_to_uncropped(self, inference_config, test_model):
+        # crop_threshold > 1 makes the box never "save enough" → crop disabled.
+        res_off, write_off, spy_off = self._run(inference_config, test_model, crop_threshold=1.1)
+        res_on, write_on, spy_on = self._run(inference_config, test_model, crop_threshold=0.10)
+
+        # The uncropped run read the full width; the cropped run did not.
+        assert spy_off.call_args.kwargs["x_slice"] == slice(_CHUNK.x_start, _CHUNK.x_stop)
+        assert spy_on.call_args.kwargs["x_slice"] != slice(_CHUNK.x_start, _CHUNK.x_stop)
+
+        assert res_off["valid_pixels"] == res_on["valid_pixels"] > 0
+        np.testing.assert_array_equal(write_off["embeddings"], write_on["embeddings"])
+        np.testing.assert_allclose(write_off["scales"], write_on["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
+        # Obs layers keep full-extent fidelity, including SAR outside the box.
+        for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
+            np.testing.assert_array_equal(write_off["obs_counts"][var], write_on["obs_counts"][var], err_msg=var)

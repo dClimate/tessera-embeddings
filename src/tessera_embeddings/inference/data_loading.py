@@ -159,6 +159,12 @@ class ChunkData:
     s2_obs_count: np.ndarray | None = None  # (H, W), uint16
     s1_asc_obs_count: np.ndarray | None = None  # (H, W), uint16
     s1_desc_obs_count: np.ndarray | None = None  # (H, W), uint16
+    # Full-chunk-width SAR obs counts, populated ONLY for x-cropped loads
+    # (x_sub): the saved obs-count layers must keep full-extent fidelity, but
+    # the cropped grid above can't carry it. SAR is read full-width regardless
+    # (it is ~10x smaller than S2); these hold the pre-crop counts.
+    s1_asc_obs_count_full: np.ndarray | None = None  # (H, full W), uint16
+    s1_desc_obs_count_full: np.ndarray | None = None  # (H, full W), uint16
 
 
 def _load_sar_bands_from_zarr(
@@ -392,6 +398,17 @@ def _resolve_y_slice(chunk: ChunkSpec, y_sub: slice | None) -> slice:
     return slice(chunk.y_start + y_sub.start, chunk.y_start + y_sub.stop)
 
 
+def _resolve_x_slice(chunk: ChunkSpec, x_sub: slice | None) -> slice:
+    """Resolve the absolute store-level easting slice for a (sub-)chunk read.
+
+    ``x_sub`` is chunk-relative, mirroring ``_resolve_y_slice``. ``None`` reads
+    the full chunk width.
+    """
+    if x_sub is None:
+        return slice(chunk.x_start, chunk.x_stop)
+    return slice(chunk.x_start + x_sub.start, chunk.x_start + x_sub.stop)
+
+
 def load_s2_mask_bundle(
     mosaic_base: str,
     chunk: ChunkSpec,
@@ -446,6 +463,7 @@ def _load_s2(
     store_opener: StoreOpener | None = None,
     mask_bundle: S2MaskBundle | None = None,
     reserve_cpus: int = 0,
+    x_sub: slice | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load all S2 timesteps in the window that have any valid pixel in the (sub-)chunk.
 
@@ -470,14 +488,16 @@ def _load_s2(
         store_opener = open_store_as_zarr_group
     store_path = f"{mosaic_base}/reflectance.zarr"
     root = store_opener(store_path)
-    x_slice = slice(chunk.x_start, chunk.x_stop)
+    x_slice = _resolve_x_slice(chunk, x_sub)
 
     if mask_bundle is not None:
-        # Slice the shared full-chunk mask to this strip's rows; the chunk-level
-        # prune already chose the kept timesteps, so band reads match the bundle.
+        # Slice the shared full-chunk mask to this strip's rows (and, when
+        # x-cropped, to the valid-bbox columns); the chunk-level prune already
+        # chose the kept timesteps, so band reads match the bundle.
         rows = y_sub if y_sub is not None else slice(0, chunk.height)
-        s2_masks = mask_bundle.mask[:, rows, :]
-        s2_obs_count = mask_bundle.obs_count[rows, :]
+        cols = x_sub if x_sub is not None else slice(0, chunk.width)
+        s2_masks = mask_bundle.mask[:, rows, cols]
+        s2_obs_count = mask_bundle.obs_count[rows, cols]
         s2_doys = mask_bundle.doys
         abs_kept = mask_bundle.abs_indices
         y_slice = _resolve_y_slice(chunk, y_sub)
@@ -572,6 +592,7 @@ def load_chunk(
     store_opener: StoreOpener | None = None,
     mask_bundle: S2MaskBundle | None = None,
     reserve_cpus: int = 0,
+    x_sub: slice | None = None,
 ) -> ChunkData:
     """Load all data for one spatial chunk (or a northing strip of it) for v1.1 inference.
 
@@ -602,6 +623,16 @@ def load_chunk(
             background loads running alongside GPU inference reserve cores for
             the batch-prep workers (see :func:`_band_read_workers`); foreground
             loads use the default 0.
+        x_sub: Optional chunk-relative EASTING window (the S2 valid-pixel
+            bounding box on sparse/edge chunks). S2 bands — the 20 B/px cost —
+            are read only for these columns and the returned grid is cropped
+            to them (``width`` shrinks, mirroring how ``y_sub`` crops rows).
+            SAR is still READ full-width so the saved obs-count layers keep
+            full-extent fidelity: the pre-crop counts are returned in
+            ``s1_*_obs_count_full`` while the grid-shaped ``s1_*_obs_count``
+            are cropped like everything else. Pixels outside the box have zero
+            valid S2 observations, so they could never be inferred — cropping
+            them changes which bytes are read, not any output.
 
     Returns:
         ChunkData with all S2 timesteps that have any valid pixel in the
@@ -609,7 +640,7 @@ def load_chunk(
     """
     active = set(_active_orbits(s1_orbit))
     height = chunk.height if y_sub is None else (y_sub.stop - y_sub.start)
-    width = chunk.width
+    width = chunk.width if x_sub is None else (x_sub.stop - x_sub.start)
     logger.info(
         "Loading chunk %s from %s (s1_orbit=%s, time_window=%s, y_sub=%s)",
         chunk.label,
@@ -627,6 +658,7 @@ def load_chunk(
         store_opener=store_opener,
         mask_bundle=mask_bundle,
         reserve_cpus=reserve_cpus,
+        x_sub=x_sub,
     )
 
     s1_asc_bands, s1_asc_doys = (
@@ -646,6 +678,19 @@ def load_chunk(
 
     s1_asc_obs_count = np.any(s1_asc_bands != 0, axis=-1).sum(axis=0).astype(np.uint16)
     s1_desc_obs_count = np.any(s1_desc_bands != 0, axis=-1).sum(axis=0).astype(np.uint16)
+
+    s1_asc_obs_count_full: np.ndarray | None = None
+    s1_desc_obs_count_full: np.ndarray | None = None
+    if x_sub is not None:
+        # SAR was read full-width (see the x_sub docstring): keep the full-width
+        # counts for the saved obs layers, then crop the grid-shaped arrays to
+        # match the S2 grid. ascontiguousarray drops the full-width parents.
+        s1_asc_obs_count_full = s1_asc_obs_count
+        s1_desc_obs_count_full = s1_desc_obs_count
+        s1_asc_obs_count = np.ascontiguousarray(s1_asc_obs_count[:, x_sub])
+        s1_desc_obs_count = np.ascontiguousarray(s1_desc_obs_count[:, x_sub])
+        s1_asc_bands = np.ascontiguousarray(s1_asc_bands[:, :, x_sub, :])
+        s1_desc_bands = np.ascontiguousarray(s1_desc_bands[:, :, x_sub, :])
 
     logger.info(
         "Loaded %s: S2 %s, SAR asc %s (%d dates), SAR desc %s (%d dates)",
@@ -670,4 +715,6 @@ def load_chunk(
         s2_obs_count=s2_obs_count,
         s1_asc_obs_count=s1_asc_obs_count,
         s1_desc_obs_count=s1_desc_obs_count,
+        s1_asc_obs_count_full=s1_asc_obs_count_full,
+        s1_desc_obs_count_full=s1_desc_obs_count_full,
     )

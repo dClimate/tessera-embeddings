@@ -218,7 +218,26 @@ live in `context_docs/design/inference_gpu_saturation_profile_2026_07.md`.
 Within a chunk, overlap remains: **bucketing rides the strip-prefetch thread** —
 `_load_strip` returns `(ChunkData, dataset)`, so the `MosaicChunkInferenceDataset` build
 (valid-pixel filtering + bucketing, ~10 s) overlaps the prior strip's GPU work on split
-chunks instead of sitting between load and inference.
+chunks instead of sitting between load and inference. Background strip loads also
+**reserve 2 cores** for the batch-prep workers feeding the GPU (`reserve_cpus` in
+`load_chunk`), so band decompression can't starve inference on the 4-vCPU box.
+
+**The staging write is deferred** to a single-slot writer thread, overlapping the next
+chunk's prologue load (both are I/O; the GPU is idle either way). Durability: the result
+returns `write_deferred=True` and the scheduler holds the chunk out of the completed set
+until the write outcome arrives — piggybacked as `prior_write` on the actor's next
+result, or drained via `flush_writes()` when the actor idles. Failed writes requeue the
+chunk (no actor kill); an actor death with a write in flight requeues too — safe because
+staged writes are idempotent. A chunk's "done" can therefore trail its inference by up
+to one chunk in the progress logs.
+
+**Sparse chunks read less**: strips whose SCL-mask slice has zero valid pixels skip the
+S2 band read entirely, and chunks whose valid pixels span a narrow easting window read
+S2 only for that bounding box (`x_sub`; applied when it saves ≥10% of the width). SAR is
+still read full-width and S2 obs come from the mask bundle, so the saved obs-count
+layers keep full-extent fidelity — outputs are bit-identical, only the bytes read
+change. A chunk_7_0-class sliver (1.5K valid px, T_kept=82) drops from ~39 s of loading
+to roughly bbox-proportional cost.
 
 #### 4b. Valid Pixel Filtering + Bucketing (`dataset.py`)
 
