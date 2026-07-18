@@ -506,7 +506,10 @@ def _load_s2(
         abs_kept = mask_bundle.abs_indices
         y_slice = _resolve_y_slice(chunk, y_sub)
 
-        if not s2_masks.any():
+        # obs_count > 0 ⟺ the pruned mask has a valid entry (pruning drops only
+        # all-False planes), and the (H, W) scan avoids walking the strided
+        # (T_kept, H, W) mask view (~100 ms/chunk on dense multi-strip chunks).
+        if not s2_obs_count.any():
             # No valid S2 pixel anywhere in this strip: bucketing would select
             # zero pixels, so the (expensive, 20 B/px) band read is pure waste.
             # Return a T=0 band stack — the dataset sees no candidates and the

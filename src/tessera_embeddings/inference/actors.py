@@ -610,6 +610,16 @@ class InferenceActor:
         prologue = self._take_prefetched(chunk.label)
         if prologue is not None:
             logger.info("xchunk prefetch: hit (%s) for %s", prologue.rung, chunk.label)
+            # The stash's opener was created on the prefetch thread; if that
+            # thread's store opens outlived the PRIOR chunk's credential scope
+            # (the icechunk provider is a process-wide global, not thread-local)
+            # its repo handles are bound to the default AWS chain, which can
+            # fail to refresh on long-lived workers. The prefetched mask/strip
+            # are already-materialised numpy and safe to keep — but rebuild the
+            # LIVE opener inside THIS call's credential scope so the body-strip
+            # reads never inherit stale credentials (worst case: one repo
+            # re-open, matching the serial path's per-chunk opener).
+            prologue.store_opener = make_store_opener()
         else:
             store_opener, mask_bundle, x_sub, _valid_px, plan = self._open_and_plan(chunk, mosaic_base)
             prologue = _ChunkPrologue(store_opener, mask_bundle, plan, x_sub, first_strip=None)
