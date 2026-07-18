@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM, InferenceConfig
+from tessera_embeddings.config.inference import EMBEDDING_DIM, PREFETCH_DEPTH, InferenceConfig
 from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 from tessera_embeddings.inference.models.ssl_model import MultimodalBTInferenceModel
 from tessera_embeddings.inference.profiling import (
@@ -40,11 +40,6 @@ logger = logging.getLogger(__name__)
 
 PROFILE_BATCH_IDX = 10
 """Batch index for the one-time deep profile (per-layer timing + dtype checks)."""
-
-PREFETCH_DEPTH = 2
-"""CPU batch-prep pipeline depth. Depth 1 starved the GPU whenever a forward ran
-shorter than one prep (~partial sub-batches, short sequences); depth 2 with two
-prep workers keeps a batch ready across consecutive short forwards."""
 
 _SERIAL_LOOP_ENV = "TESSERA_SERIAL_GPU_LOOP"
 """Set to any non-empty value to force the synchronous per-batch GPU loop
@@ -350,28 +345,59 @@ def _serial_loop(
     The CPU path, and the CUDA escape hatch (``TESSERA_SERIAL_GPU_LOOP``).
     """
     for i, bucket_key, start, end, batch, get_batch_secs in batches:
-        tb0 = time.monotonic()
-        q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
+        _run_sync_batch(
             model,
             batch,
             bucket_key,
+            end - start,
+            get_batch_secs,
+            config,
             device,
             reduced_precision_dtype,
             save_dim,
+            flat_q,
+            flat_scales,
+            progress,
             profile=(i == PROFILE_BATCH_IDX),
-            config=config,
         )
-        _write_quantized_rows(q_host, scales_host, global_idxs, flat_q, flat_scales)
-        progress.record(
-            bucket_key,
-            end - start,
-            _BatchTimings(
-                get_batch=get_batch_secs,
-                transfer=transfer_secs,
-                forward=forward_secs,
-                postprocess=time.monotonic() - tb0 - transfer_secs - forward_secs,
-            ),
-        )
+
+
+def _run_sync_batch(
+    model: MultimodalBTInferenceModel,
+    batch: dict,
+    bucket_key: tuple[int, int],
+    n_px: int,
+    get_batch_secs: float,
+    config: InferenceConfig,
+    device: torch.device,
+    reduced_precision_dtype: torch.dtype | None,
+    save_dim: int,
+    flat_q: np.ndarray,
+    flat_scales: np.ndarray,
+    progress: _LoopProgress,
+    *,
+    profile: bool,
+) -> None:
+    """One synchronous transfer → forward → scatter batch, with timing record.
+
+    Shared by ``_serial_loop`` and the pipelined loop's profile batch so the
+    postprocess-timing arithmetic lives once.
+    """
+    tb0 = time.monotonic()
+    q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
+        model, batch, bucket_key, device, reduced_precision_dtype, save_dim, profile=profile, config=config
+    )
+    _write_quantized_rows(q_host, scales_host, global_idxs, flat_q, flat_scales)
+    progress.record(
+        bucket_key,
+        n_px,
+        _BatchTimings(
+            get_batch=get_batch_secs,
+            transfer=transfer_secs,
+            forward=forward_secs,
+            postprocess=time.monotonic() - tb0 - transfer_secs - forward_secs,
+        ),
+    )
 
 
 class _PinnedSlot:
@@ -402,7 +428,6 @@ class _InFlight:
 
     slot: _PinnedSlot
     global_idxs: np.ndarray
-    n: int
     bucket_key: tuple[int, int]
     q_dev: torch.Tensor
     scales_dev: torch.Tensor
@@ -446,36 +471,38 @@ def _pipelined_gpu_loop(
 
     def _drain_oldest() -> None:
         rec = inflight.popleft()
+        n = len(rec.global_idxs)
         t_wait = time.monotonic()
         rec.slot.done.synchronize()
-        scales_host = rec.slot.scales[: rec.n].numpy()
+        scales_host = rec.slot.scales[:n].numpy()
         raise_on_nonfinite_scales(scales_host)
-        flat_q[rec.global_idxs] = rec.slot.q[: rec.n].numpy()
+        flat_q[rec.global_idxs] = rec.slot.q[:n].numpy()
         flat_scales[rec.global_idxs] = scales_host
         progress.record(
             rec.bucket_key,
-            rec.n,
+            n,
             _BatchTimings(rec.get_batch, rec.transfer, rec.forward, time.monotonic() - t_wait),
         )
 
     for i, bucket_key, start, end, batch, get_batch_secs in batches:
         if i == PROFILE_BATCH_IDX:
+            # The deep profile needs a quiet device: drain, then run serially.
             while inflight:
                 _drain_oldest()
-            tb0 = time.monotonic()
-            q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
-                model, batch, bucket_key, device, reduced_precision_dtype, save_dim, profile=True, config=config
-            )
-            _write_quantized_rows(q_host, scales_host, global_idxs, flat_q, flat_scales)
-            progress.record(
+            _run_sync_batch(
+                model,
+                batch,
                 bucket_key,
                 end - start,
-                _BatchTimings(
-                    get_batch=get_batch_secs,
-                    transfer=transfer_secs,
-                    forward=forward_secs,
-                    postprocess=time.monotonic() - tb0 - transfer_secs - forward_secs,
-                ),
+                get_batch_secs,
+                config,
+                device,
+                reduced_precision_dtype,
+                save_dim,
+                flat_q,
+                flat_scales,
+                progress,
+                profile=True,
             )
             continue
 
@@ -507,7 +534,6 @@ def _pipelined_gpu_loop(
             _InFlight(
                 slot=slot,
                 global_idxs=global_idxs,
-                n=n,
                 bucket_key=bucket_key,
                 q_dev=q,
                 scales_dev=scales,

@@ -139,6 +139,14 @@ REPRESENTATION_DIM = 192
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.
 DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
+# CPU batch-prep pipeline depth for the inference loop (also the number of prep
+# workers). Depth 1 starved the GPU whenever a forward ran shorter than one prep;
+# depth 2 keeps a batch ready across consecutive short forwards. Lives here
+# (torch-free) because actors.py sizes its background-load CPU reservation to
+# match — one reserved core per prep worker — and cannot import inference.py at
+# module scope (the Fargate flow runner has no torch).
+PREFETCH_DEPTH = 2
+
 # Spatial read-tile size for inference. The read/ChunkSpec grid stays 2000x2000;
 # the *resident input working set* is bounded separately via density-sized
 # northing strips (see actors._strip_height_for_density), so a 2000x2000 chunk's

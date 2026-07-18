@@ -268,16 +268,22 @@ def _run_process_chunk(inference_config, test_model):
     return result, _CapturingWriter.last_write
 
 
-def _force_strip_plan(strip_h: int, prefetch: bool, strategy: str = "test"):
+def _force_strip_plan(strip_h: int, prefetch: bool, pair_budget: bool = False):
     """Patch target for ``_strip_plan`` that forces a fixed tiling + prefetch mode.
 
     Lets a test control the strip count, the prefetch-on/off branch, and the
-    strategy label (which gates the cross-chunk prefetch) regardless of the
-    synthetic chunk's density estimates.
+    ``pair_budget`` flag (which gates the cross-chunk prefetch) regardless of
+    the synthetic chunk's density estimates.
     """
 
     def _plan(_t_kept, height, _width, _valid_px, mask_width=None):
-        return _StripPlan(strips=_strip_slices(height, strip_h), prefetch=prefetch, strategy=strategy, strip_h=strip_h)
+        return _StripPlan(
+            strips=_strip_slices(height, strip_h),
+            prefetch=prefetch,
+            strategy="test",
+            strip_h=strip_h,
+            pair_budget=pair_budget,
+        )
 
     return _plan
 
@@ -618,18 +624,25 @@ def _assert_writes_identical(a, b):
 class TestXChunkPrefetch:
     """Rung rules + end-to-end bit-identity for the cross-chunk prefetch."""
 
-    def _plan(self, strategy, prefetch=True):
-        return _StripPlan(strips=[slice(0, 256), slice(256, 2000)], prefetch=prefetch, strategy=strategy, strip_h=1744)
+    def _plan(self, prefetch=True, pair_budget=False, starter_first=False):
+        return _StripPlan(
+            strips=[slice(0, 256), slice(256, 2000)],
+            prefetch=prefetch,
+            strategy="test",
+            strip_h=1744,
+            pair_budget=pair_budget,
+            starter_first=starter_first,
+        )
 
     def test_rung_rules(self):
         big = ChunkSpec(row=0, col=0, y_start=0, y_stop=2000, x_start=0, x_stop=2000)
-        dense_starter = self._plan("dense/prefetch+starter")
-        # P2-tiled chunks prefetch their (already small) starter.
+        dense_starter = self._plan(starter_first=True)
+        # Starter-first plans prefetch their (already small) starter.
         assert _xchunk_rung(big, 60, None, 4_000_000, dense_starter) == "starter"
-        # Plain dense/prefetch: strips[0] is a budget-sized set — never prefetched.
-        assert _xchunk_rung(big, 60, None, 4_000_000, self._plan("dense/prefetch")) == "mask-only"
-        # Non-hideable strategies get the mask.
-        assert _xchunk_rung(big, 60, None, 50_000, self._plan("no-prefetch", prefetch=False)) == "mask-only"
+        # Plain dense split: strips[0] is a budget-sized set — never prefetched.
+        assert _xchunk_rung(big, 60, None, 4_000_000, self._plan()) == "mask-only"
+        # Pair-budget (non-hideable) plans get the mask.
+        assert _xchunk_rung(big, 60, None, 50_000, self._plan(prefetch=False, pair_budget=True)) == "mask-only"
         single = _StripPlan([slice(0, 2000)], prefetch=False, strategy="single", strip_h=2000)
         # Dense single-strip: converting to starter+body nets positive.
         assert _xchunk_rung(big, 60, None, 4_000_000, single) == "starter"
@@ -675,11 +688,11 @@ class TestXChunkPrefetch:
         assert getattr(actor, "_xchunk_prefetched", {}) == {}
 
     def test_pair_budget_plan_skips_prefetch(self, inference_config, test_model):
-        # A pair-budget strategy (single/wide-budget, no-prefetch) holds a
-        # near-2x-budget set on its last strip — NOT a RAM trough — so the
-        # cross-chunk prefetch must be skipped or it could breach the ceiling.
+        # A pair-budget plan holds a near-2x-budget set on its last strip —
+        # NOT a RAM trough — so the cross-chunk prefetch must be skipped or it
+        # could breach the ceiling.
         patches = (
-            patch.object(_actors_mod, "_strip_plan", _force_strip_plan(10**6, prefetch=False, strategy="no-prefetch")),
+            patch.object(_actors_mod, "_strip_plan", _force_strip_plan(10**6, prefetch=False, pair_budget=True)),
         )
         _, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B)], patches)
         assert getattr(actor, "_xchunk_prefetched", {}) == {}

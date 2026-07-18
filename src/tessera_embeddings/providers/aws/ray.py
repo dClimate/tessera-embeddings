@@ -157,11 +157,11 @@ def _pick_least_loaded_subnet(
     to avoid cross-AZ data transfer charges.
 
     This is the **capacity-blind fallback**: it optimises for spreading
-    load, not for which AZ actually has spare instance capacity. When a
-    capacity signal is available, :func:`_rank_launch_subnets` (which uses
-    GetSpotPlacementScores) is preferred; this function is what that ranker
-    degrades to when the signal is unavailable, and it also remains the
-    picker for :func:`_resolve_ray_config` when no subnet is pre-chosen.
+    load, not for which AZ actually has spare instance capacity. The
+    production launch path uses :func:`_rank_launch_subnets` (capacity-aware,
+    same load-count + tiebreak ordering when scores are unavailable); this
+    picker remains for :func:`_resolve_ray_config` called without a
+    pre-chosen subnet (tests, direct callers).
     The single-AZ pin is identical in both paths — only the AZ *choice*
     differs.
     """

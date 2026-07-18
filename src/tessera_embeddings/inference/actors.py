@@ -26,7 +26,7 @@ import numpy as np
 import ray
 import requests
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM, S2_BAND_ORDER, InferenceConfig
+from tessera_embeddings.config.inference import EMBEDDING_DIM, PREFETCH_DEPTH, S2_BAND_ORDER, InferenceConfig
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
@@ -49,47 +49,23 @@ if TYPE_CHECKING:
 class _ChunkPrologue:
     """Everything ``_process_chunk`` needs before its first forward pass.
 
-    Repo handles, the full-chunk SCL mask, strip tiling, and the first strip's
-    bands + bucketed dataset — loaded serially (GPU idle) at the top of every
-    chunk by :meth:`InferenceActor._load_chunk_prologue`.
+    Built serially (GPU idle) by :meth:`InferenceActor._load_chunk_prologue`,
+    or ahead of time by the bounded cross-chunk prefetch (see the ``_XCHUNK_*``
+    constants) — in which case ``first_strip`` may still be None (mask-only
+    rung) and the consumer loads it serially.
     """
 
     store_opener: StoreOpener
     mask_bundle: S2MaskBundle
-    strip_h: int
-    strips: list[slice]
-    # Whether to run the intra-chunk 1-deep strip prefetch (dense/hideable) or
-    # load strips serially (sparse/non-hideable — never two sets co-resident).
-    prefetch: bool
-    strategy: str
-    first_strip: tuple[ChunkData, MosaicChunkInferenceDataset]
+    plan: _StripPlan
     # Chunk-relative easting window of the S2 valid-pixel bounding box, or None
     # for full width. Sparse/edge chunks read (and infer) only these columns;
     # outputs are placed at this offset in the whole-chunk buffers.
     x_sub: slice | None
-
-
-@dataclass
-class _PrefetchedStarter:
-    """Capped cross-chunk prefetch payload for the actor's NEXT chunk.
-
-    Produced on the actor's prefetch thread during the current chunk's last
-    strip (the RAM trough): the next chunk's SCL mask bundle, its read plan,
-    and — on the "starter" rung — its small first strip, ready for
-    :meth:`InferenceActor._load_chunk_prologue` to consume. Deliberately NOT
-    the full prologue the removed Phase-1 interleaving stashed: the resident
-    payload is bounded by ``_XCHUNK_PREFETCH_CAP_BYTES`` regardless of chunk
-    density, and every miss path falls back to the serial prologue.
-    """
-
-    store_opener: StoreOpener
-    mask_bundle: S2MaskBundle
-    x_sub: slice | None
-    valid_px: int
-    plan: _StripPlan
-    rung: str  # "starter" | "mask-only"
-    # (ChunkData, dataset) for plan.strips[0]; None on the mask-only rung.
+    # (ChunkData, dataset) for plan.strips[0]; None until loaded.
     first_strip: tuple[ChunkData, MosaicChunkInferenceDataset] | None
+    # Prefetch rung ("starter" | "mask-only") for the hit log; None = serial.
+    rung: str | None = None
 
 
 logger = logging.getLogger(__name__)
@@ -123,12 +99,12 @@ _S2_STRIP_BYTE_BUDGET = int(5.75 * 1024**3)
 _S2_BYTES_PER_OBS_PX = len(S2_BAND_ORDER) * 2
 
 # Cores left free for the inference loop's batch-prep workers while a
-# BACKGROUND strip load decompresses bands (intra-chunk strip prefetch). The
-# prep pool runs 2 workers (inference.PREFETCH_DEPTH); without this reservation
-# four decompression threads contend with them on the 4-vCPU g6e.xlarge and
-# get_batch spikes to ~500 ms, starving the GPU mid-inference. Foreground
-# (prologue) loads reserve nothing — the GPU is idle and wants the fastest load.
-_BACKGROUND_LOAD_RESERVED_CPUS = 2
+# BACKGROUND strip load decompresses bands: one per prep worker, BY DEFINITION
+# tied to the prep pool size so a PREFETCH_DEPTH change can't silently
+# re-introduce the ~500 ms get_batch starvation this reservation prevents on
+# the 4-vCPU g6e.xlarge. Foreground (prologue) loads reserve nothing — the GPU
+# is idle and wants the fastest load.
+_BACKGROUND_LOAD_RESERVED_CPUS = PREFETCH_DEPTH
 
 # Apply the S2 easting-bbox crop only when it removes at least this fraction
 # of the chunk's width. Near-full boxes (interior chunks) skip the crop
@@ -186,50 +162,21 @@ _XCHUNK_T_ALL_EST = 230
 # for obs-layer fidelity; see load_chunk's x_sub docs).
 _XCHUNK_SAR_STARTER_EST_BYTES = int(0.4 * 1024**3)
 
-# Strip strategies whose single resident set can reach the PAIR budget (~2x)
-# rather than one budget. During their last strip the node is NOT at a RAM
-# trough, so starting the cross-chunk prefetch on top could breach the ceiling
-# — skip it for these (accept the next chunk's serial prologue). The trough
-# invariant the prefetch relies on holds only for <=1x-budget plans.
-_XCHUNK_UNSAFE_STRATEGIES = frozenset({"single/wide-budget", "no-prefetch"})
-
-
 def _strip_height_for_density(
     t_kept: int, width: int, height: int, budget: int = _S2_STRIP_BYTE_BUDGET, mask_width: int | None = None
 ) -> int:
     """Largest northing strip height (rows) whose resident S2 working set fits ``budget``.
 
-    ``width`` sizes the (possibly easting-cropped) S2 band read; ``mask_width``
-    sizes the SCL mask, which stays full-chunk-width even when bands are cropped
-    (defaults to ``width`` for the uncropped case). Charging the mask at its true
-    full width keeps the budget honest on cropped chunks.
-
-    Budget model: the intra-chunk 1-deep strip prefetch keeps at most two S2
-    band sets co-resident (strip *i* inferring while strip *i+1* loads), and
-    the full-chunk SCL mask stays resident throughout. We require every
-    resident ``bands(strip_h) + full mask <= budget``, so the steady-state
-    pair fits ``2 * budget``. Charging the (shared) mask in full to each set
-    is slightly conservative — masks are ~1/20th the size of bands — and buys
-    margin against what the budget deliberately does NOT model: the SAR stack
-    (which can spike on dense-S1 chunks) and UTM-zone-scale chunk-density
-    variance. There is no cross-chunk co-residency to model: cross-chunk
-    prologue prefetch was removed (see ``_load_chunk_prologue``).
-
-    A single full-height strip that already fits one budget returns ``height``
-    outright. ``t_kept`` is the chunk's true post-prune valid-timestep count, so
-    sparse chunks get tall strips (often the whole chunk) and only dense chunks
-    split. A chunk dense enough to drive the height below ``_MIN_STRIP_H``
-    bottoms out there and breaches the budget (logged) rather than degenerating
-    into tiny high-overhead reads.
+    Every resident set is charged ``bands(strip_h) + a full SCL mask`` — the
+    RAM model and its arithmetic live at :data:`_S2_STRIP_BYTE_BUDGET`.
+    ``width`` sizes the (possibly easting-cropped) band read; ``mask_width``
+    sizes the mask, which stays full-chunk-width even when bands are cropped
+    (defaults to ``width`` for the uncropped case). A chunk dense enough to
+    drive the height below ``_MIN_STRIP_H`` bottoms out there and breaches the
+    budget (logged) rather than degenerating into tiny high-overhead reads.
     """
     t = max(1, t_kept)
-    # Full-chunk SCL mask (bool, 1 byte/px), resident the whole loop; charged
-    # in full per band set (conservative; see docstring). The mask is
-    # full-chunk-width even when the bands are easting-cropped.
     mask_bytes = t * height * (mask_width if mask_width is not None else width)
-    # Fast path: the whole chunk (bands + mask) fits one budget — single strip.
-    if t * height * width * _S2_BYTES_PER_OBS_PX + mask_bytes <= budget:
-        return height
     band_budget = budget - mask_bytes
     per_row = t * width * _S2_BYTES_PER_OBS_PX
     budget_h = max(0, band_budget) // per_row
@@ -252,61 +199,56 @@ def _strip_height_for_density(
             budget / 1024**3,
         )
         return _MIN_STRIP_H
-    return budget_h
+    return min(height, budget_h)
 
 
-def _strip_slices(height: int, strip_h: int) -> list[slice]:
-    """Tile ``[0, height)`` into chunk-relative northing strips of ``strip_h`` rows.
+def _strip_slices(height: int, strip_h: int, start: int = 0) -> list[slice]:
+    """Tile ``[start, height)`` into chunk-relative northing strips of ``strip_h`` rows.
 
-    The final strip is shorter when ``height`` is not a multiple of ``strip_h``.
-    ``strip_h >= height`` yields a single full-height strip.
+    The final strip is shorter when the span is not a multiple of ``strip_h``.
+    ``strip_h >= height - start`` yields a single strip; ``start >= height``
+    yields ``[]``. A non-zero ``start`` tiles the body after a starter strip.
     """
-    return [slice(start, min(start + strip_h, height)) for start in range(0, height, strip_h)]
+    return [slice(s, min(s + strip_h, height)) for s in range(start, height, strip_h)]
 
 
 @dataclass
 class _StripPlan:
     """How to tile a chunk into northing strips, and whether to prefetch them.
 
-    ``prefetch`` gates the intra-chunk 1-deep load pipeline. It is True only
-    when inference is estimated to run long enough to hide a background strip
-    load behind it; otherwise loads are serial anyway, so we turn prefetch off
-    (never two strips co-resident) and size strips to the larger PAIR budget to
-    minimise the number of expensive fixed-cost reads. ``strip_h`` is the body
-    strip height, kept for logging only.
+    ``prefetch`` gates the intra-chunk 1-deep load pipeline: True only when
+    inference is estimated long enough to hide a background strip load;
+    otherwise loads run serially (never two strips co-resident) and strips may
+    use the PAIR budget. The two booleans carry the plan's load-bearing
+    properties; ``strategy`` is a log label and ``strip_h`` the logged body
+    height — neither drives behavior.
     """
 
     strips: list[slice]
     prefetch: bool
     strategy: str
     strip_h: int
+    # True when a strip was sized to the PAIR budget (~2x): the last strip then
+    # holds a near-2x set, NOT a RAM trough, so the cross-chunk prefetch must
+    # be skipped for this chunk.
+    pair_budget: bool = False
+    # True when strips[0] is already the small starter strip.
+    starter_first: bool = False
 
 
 def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width: int | None = None) -> _StripPlan:
     """Choose a strip tiling + prefetch strategy for a chunk.
 
-    ``width`` is the (possibly easting-cropped) S2 band width; ``mask_width`` is
-    the SCL mask width, which stays full-chunk-width even when the bands are
-    cropped (defaults to ``width``). Charging the mask at its true width keeps
-    the budget honest on cropped sparse/edge chunks.
-
-    RAM safety does not depend on the estimates below: every branch keeps the
-    resident working set within the same pair ceiling (``2 x budget``). The
-    estimates only choose which safe strategy is fastest, so a mis-estimate
-    degrades at worst to the previous always-prefetch behaviour.
-
-    Four regimes (bytes scale with ``t_kept x height x width``, independent of
-    valid-pixel count; inference time scales with valid pixels):
-
-    * **Fits one budget** — single strip, no prefetch needed. The common case.
-    * **Split + hideable** (dense: many valid px) — balanced strips at one
-      budget with prefetch on; the loads hide behind inference. Optionally a
-      small starter strip (P2) so the GPU starts sooner.
-    * **Split + not hideable** (wide but few valid px, e.g. a cloudy high-T
-      sliver) — few valid pixels mean inference is too short to hide the loads,
-      so prefetch off and strips sized to the PAIR budget: only one set is ever
-      resident, so peak RAM matches the dense pair, but we pay the fewest
-      fixed-cost reads. A single strip when the whole chunk fits the pair.
+    Bytes scale with ``t_kept x height x width``; inference time scales with
+    valid pixels — they diverge, so the plan picks per chunk: fits-one-budget →
+    single strip; split + hideable (dense) → balanced strips + prefetch, with a
+    small starter strip when inference absorbs the extra fixed read; split +
+    not hideable (wide but few valid px) → prefetch OFF at the PAIR budget
+    (only one set ever resident). RAM safety does NOT depend on the estimates —
+    every branch respects the pair ceiling (arithmetic at
+    :data:`_S2_STRIP_BYTE_BUDGET`); a mis-estimate only costs speed.
+    ``mask_width`` is the full-chunk mask width when bands are easting-cropped
+    (defaults to ``width`` for the uncropped case).
     """
     budget = _S2_STRIP_BYTE_BUDGET
     mw = mask_width if mask_width is not None else width
@@ -329,32 +271,30 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width:
         # Regime 2: hideable (dense). Balanced strips at one budget, prefetch on.
         strip_h = _strip_height_for_density(t_kept, width, height, budget, mask_width=mw)
         strips = _strip_slices(height, strip_h)
-        strategy = "dense/prefetch"
         # P2 starter strip: only when there is a real body to hide behind and
         # inference comfortably absorbs the one extra fixed read it introduces.
-        if len(strips) >= 2 and strip_h > _STARTER_STRIP_H and t_infer >= t_load + _EST_FIXED_READ_S:
-            body = _strip_slices_from(_STARTER_STRIP_H, height, strip_h)
-            strips = [slice(0, _STARTER_STRIP_H), *body]
-            strategy = "dense/prefetch+starter"
-        return _StripPlan(strips, prefetch=True, strategy=strategy, strip_h=strip_h)
+        starter = len(strips) >= 2 and strip_h > _STARTER_STRIP_H and t_infer >= t_load + _EST_FIXED_READ_S
+        if starter:
+            strips = [slice(0, _STARTER_STRIP_H), *_strip_slices(height, strip_h, start=_STARTER_STRIP_H)]
+        return _StripPlan(
+            strips,
+            prefetch=True,
+            strategy="dense/prefetch+starter" if starter else "dense/prefetch",
+            strip_h=strip_h,
+            starter_first=starter,
+        )
 
     # Regime 3: not hideable. Prefetch off => only one set resident, so a strip
     # may use the full PAIR budget (peak still bounded by the dense pair).
     pair = 2 * budget
     if per_set_1x <= pair:
-        return _StripPlan([slice(0, height)], prefetch=False, strategy="single/wide-budget", strip_h=height)
+        return _StripPlan(
+            [slice(0, height)], prefetch=False, strategy="single/wide-budget", strip_h=height, pair_budget=True
+        )
     strip_h = _strip_height_for_density(t_kept, width, height, pair, mask_width=mw)
-    strips = _strip_slices(height, strip_h)
-    return _StripPlan(strips, prefetch=False, strategy="no-prefetch", strip_h=strip_h)
-
-
-def _strip_slices_from(start: int, height: int, strip_h: int) -> list[slice]:
-    """Tile ``[start, height)`` into chunk-relative strips of ``strip_h`` rows.
-
-    Like :func:`_strip_slices` but beginning at ``start`` — used to tile the
-    body that follows a P2 starter strip. Returns ``[]`` when ``start >= height``.
-    """
-    return [slice(s, min(s + strip_h, height)) for s in range(start, height, strip_h)]
+    return _StripPlan(
+        _strip_slices(height, strip_h), prefetch=False, strategy="no-prefetch", strip_h=strip_h, pair_budget=True
+    )
 
 
 def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice | None, int, _StripPlan]:
@@ -366,10 +306,11 @@ def _chunk_read_plan(chunk: ChunkSpec, mask_bundle: S2MaskBundle) -> tuple[slice
     """
     t_kept = int(mask_bundle.mask.shape[0])
     # (H, W): pixels with >=1 valid S2 observation. Drives both the easting
-    # crop bbox and the strip-plan's inference-time estimate below.
-    # asarray: mask is 3-D so any(axis=0) is always 2-D, but the numpy stub
-    # types it bool | ndarray — narrow it so the crop/valid-px indexing types.
-    valid_any = np.asarray(mask_bundle.mask.any(axis=0))
+    # crop bbox and the strip-plan's inference-time estimate below. Equivalent
+    # to mask.any(axis=0) — obs_count sums the pre-prune mask and pruning drops
+    # only all-False timestep planes — but reads (H, W) instead of scanning the
+    # full (T_kept, H, W) mask (up to ~1 GB) once per chunk.
+    valid_any = mask_bundle.obs_count > 0
 
     # S2 valid-pixel bounding box in easting. On sparse/edge chunks (a
     # coastline sliver, a UTM-zone boundary) the valid columns can be a
@@ -405,24 +346,18 @@ def _xchunk_rung(chunk: ChunkSpec, t_kept: int, x_sub: slice | None, valid_px: i
     """Choose the prefetch rung for a hinted next chunk: "starter" or "mask-only".
 
     The starter rung requires ``plan.strips[0]`` to be the SMALL 256-row
-    starter, which only two plan shapes guarantee:
-
-    * ``dense/prefetch+starter`` — the P2 tiling already starts small, so
-      prefetching strips[0] adds no extra read;
-    * ``single`` — convertible to starter+body (both fit one budget, so their
-      co-residency sits far below the pair ceiling), but the conversion PAYS
-      one extra fixed read: worth it only when the starter's own inference is
-      long enough to hide a meaningful slice of the body read (net-gain check).
-
-    Everything else gets the mask: plain ``dense/prefetch`` (strips[0] is a
-    budget-sized ~5.75 GiB set — over the cap by construction) and the
-    non-hideable strategies (few valid pixels; a starter's ~zero inference
-    could never hide the extra read it introduces). Finally the byte cap: the
+    starter: either the plan already starts small (``starter_first`` — no
+    extra read), or it's a one-budget single strip convertible to
+    starter+body — which PAYS one extra fixed read, so it's worth it only
+    when the starter's own inference can hide a meaningful slice of the body
+    read (net-gain check). Everything else gets the mask: budget-sized first
+    strips are over the cap by construction, and pair-budget plans have too
+    few valid pixels to hide the extra read. Finally the byte cap: the
     resident mask + starter estimate must fit ``_XCHUNK_PREFETCH_CAP_BYTES``.
     """
-    if plan.strategy == "dense/prefetch+starter":
+    if plan.starter_first:
         candidate = True
-    elif plan.strategy == "single" and chunk.height > _STARTER_STRIP_H:
+    elif len(plan.strips) == 1 and not plan.pair_budget and chunk.height > _STARTER_STRIP_H:
         starter_infer_s = (_STARTER_STRIP_H / chunk.height) * (valid_px / _EST_PX_PER_SEC)
         candidate = starter_infer_s >= _EST_FIXED_READ_S
     else:
@@ -617,60 +552,77 @@ class InferenceActor:
         self._resource_monitor.start()
         logger.info("InferenceActor ready on instance %s", self.instance_id)
 
+    def _open_and_plan(
+        self, chunk: ChunkSpec, mosaic_base: str
+    ) -> tuple[StoreOpener, S2MaskBundle, slice | None, int, _StripPlan]:
+        """Open stores, load the SCL bundle, and derive the chunk read plan."""
+        store_opener = make_store_opener()
+        mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, self.config.time_window, store_opener=store_opener)
+        x_sub, valid_px, plan = _chunk_read_plan(chunk, mask_bundle)
+        return store_opener, mask_bundle, x_sub, valid_px, plan
+
+    def _load_strip_dataset(
+        self,
+        chunk: ChunkSpec,
+        mosaic_base: str,
+        *,
+        y_sub: slice,
+        store_opener: StoreOpener,
+        mask_bundle: S2MaskBundle,
+        x_sub: slice | None,
+        reserve_cpus: int = 0,
+    ) -> tuple[ChunkData, MosaicChunkInferenceDataset]:
+        """Load one strip's bands and build its bucketed dataset.
+
+        The single loader shared by the serial prologue, the cross-chunk
+        prefetch, and the strip loop — the load/dataset kwargs must stay
+        identical across all three for bit-identity.
+        """
+        from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
+
+        data = load_chunk(
+            chunk,
+            mosaic_base,
+            time_window=self.config.time_window,
+            s1_orbit=self.config.s1_orbit,
+            y_sub=y_sub,
+            store_opener=store_opener,
+            mask_bundle=mask_bundle,
+            reserve_cpus=reserve_cpus,
+            x_sub=x_sub,
+        )
+        dataset = MosaicChunkInferenceDataset(
+            data,
+            num_obs_checkpoints=self.config.num_obs_checkpoints,
+            s1_orbit=self.config.s1_orbit,
+        )
+        return data, dataset
+
     def _load_chunk_prologue(self, chunk: ChunkSpec, mosaic_base: str) -> _ChunkPrologue:
         """Load everything _process_chunk needs before its first forward pass.
 
         Runs inline (serially, GPU idle) at the top of every chunk, UNLESS the
         bounded cross-chunk prefetch staged some of it during the previous
         chunk's tail (see the ``_XCHUNK_*`` constants): a label-matching stash
-        supplies the mask bundle + read plan (mask-only rung) and possibly the
-        first strip too (starter rung); whatever is missing loads serially
-        here. Full-prologue cross-chunk prefetch (Phase 1) remains removed —
-        co-residing two chunks' whole working sets peaked at ~92-95% host RAM.
+        supplies the mask bundle + read plan and possibly the first strip;
+        whatever is missing loads serially here.
         """
-        from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
-
-        prefetched = self._take_prefetched(chunk.label)
-        if prefetched is not None:
-            logger.info("xchunk prefetch: hit (%s) for %s", prefetched.rung, chunk.label)
-            store_opener = prefetched.store_opener
-            mask_bundle = prefetched.mask_bundle
-            x_sub = prefetched.x_sub
-            plan = prefetched.plan
-            first_strip = prefetched.first_strip
+        prologue = self._take_prefetched(chunk.label)
+        if prologue is not None:
+            logger.info("xchunk prefetch: hit (%s) for %s", prologue.rung, chunk.label)
         else:
-            store_opener = make_store_opener()
-            mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, self.config.time_window, store_opener=store_opener)
-            x_sub, _valid_px, plan = _chunk_read_plan(chunk, mask_bundle)
-            first_strip = None
-
-        if first_strip is None:
-            chunk_data = load_chunk(
+            store_opener, mask_bundle, x_sub, _valid_px, plan = self._open_and_plan(chunk, mosaic_base)
+            prologue = _ChunkPrologue(store_opener, mask_bundle, plan, x_sub, first_strip=None)
+        if prologue.first_strip is None:
+            prologue.first_strip = self._load_strip_dataset(
                 chunk,
                 mosaic_base,
-                time_window=self.config.time_window,
-                s1_orbit=self.config.s1_orbit,
-                y_sub=plan.strips[0],
-                store_opener=store_opener,
-                mask_bundle=mask_bundle,
-                x_sub=x_sub,
+                y_sub=prologue.plan.strips[0],
+                store_opener=prologue.store_opener,
+                mask_bundle=prologue.mask_bundle,
+                x_sub=prologue.x_sub,
             )
-            dataset = MosaicChunkInferenceDataset(
-                chunk_data,
-                num_obs_checkpoints=self.config.num_obs_checkpoints,
-                s1_orbit=self.config.s1_orbit,
-            )
-            first_strip = (chunk_data, dataset)
-        return _ChunkPrologue(
-            store_opener=store_opener,
-            mask_bundle=mask_bundle,
-            strip_h=plan.strip_h,
-            strips=plan.strips,
-            prefetch=plan.prefetch,
-            strategy=plan.strategy,
-            first_strip=first_strip,
-            x_sub=x_sub,
-        )
+        return prologue
 
     # ------------------------------------------------------------------
     # Bounded cross-chunk starter prefetch
@@ -678,15 +630,15 @@ class InferenceActor:
     # Stash keyed by chunk label; lazily initialised so test harnesses that
     # build bare actors via object.__new__ keep working without __init__.
 
-    def _prefetch_state(self) -> tuple[ThreadPoolExecutor, dict[str, Future[_PrefetchedStarter]]]:
+    def _prefetch_state(self) -> tuple[ThreadPoolExecutor, dict[str, Future[_ChunkPrologue]]]:
         pool = getattr(self, "_xchunk_prefetch_pool", None)
         if pool is None:
             pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xchunk-prefetch")
             self._xchunk_prefetch_pool = pool
-            self._xchunk_prefetched: dict[str, Future[_PrefetchedStarter]] = {}
+            self._xchunk_prefetched: dict[str, Future[_ChunkPrologue]] = {}
         return self._xchunk_prefetch_pool, self._xchunk_prefetched
 
-    def _load_prefetched_starter(self, chunk: ChunkSpec, mosaic_base: str) -> _PrefetchedStarter:
+    def _load_prefetched_starter(self, chunk: ChunkSpec, mosaic_base: str) -> _ChunkPrologue:
         """Load the capped prefetch payload for ``chunk`` (prefetch thread).
 
         Store opens normally land inside the calling process_chunk's scoped
@@ -695,56 +647,33 @@ class InferenceActor:
         consumer falls back to an inline (in-scope) reload, so a
         credential-window miss degrades to the unprefetched behaviour.
         """
-        from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
+        store_opener, mask_bundle, x_sub, valid_px, plan = self._open_and_plan(chunk, mosaic_base)
+        rung = _xchunk_rung(chunk, int(mask_bundle.mask.shape[0]), x_sub, valid_px, plan)
 
-        store_opener = make_store_opener()
-        mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, self.config.time_window, store_opener=store_opener)
-        t_kept = int(mask_bundle.mask.shape[0])
-        x_sub, valid_px, plan = _chunk_read_plan(chunk, mask_bundle)
-        rung = _xchunk_rung(chunk, t_kept, x_sub, valid_px, plan)
-
-        first_strip: tuple[ChunkData, MosaicChunkInferenceDataset] | None = None
+        first_strip = None
         if rung == "starter":
-            if plan.strategy == "single":
-                # Convert the one-read plan to starter+body so the prefetched
-                # starter is small; the body (<= one budget, since the whole
-                # chunk fit one) loads behind the starter's inference via the
-                # normal 1-deep strip pipeline. The rung's net-gain check
-                # already priced the extra fixed read this conversion costs.
+            if not plan.starter_first:
+                # One-budget single-strip plan: convert to starter+body (both
+                # <= one budget) so the prefetched piece is small; the body
+                # loads behind the starter's inference via the normal strip
+                # pipeline. The rung's net-gain check priced the extra read.
                 plan = _StripPlan(
                     strips=[slice(0, _STARTER_STRIP_H), slice(_STARTER_STRIP_H, chunk.height)],
                     prefetch=True,
                     strategy="single+xstarter",
                     strip_h=chunk.height - _STARTER_STRIP_H,
+                    starter_first=True,
                 )
-            data = load_chunk(
+            first_strip = self._load_strip_dataset(
                 chunk,
                 mosaic_base,
-                time_window=self.config.time_window,
-                s1_orbit=self.config.s1_orbit,
                 y_sub=plan.strips[0],
                 store_opener=store_opener,
                 mask_bundle=mask_bundle,
-                reserve_cpus=_BACKGROUND_LOAD_RESERVED_CPUS,
                 x_sub=x_sub,
+                reserve_cpus=_BACKGROUND_LOAD_RESERVED_CPUS,
             )
-            first_strip = (
-                data,
-                MosaicChunkInferenceDataset(
-                    data,
-                    num_obs_checkpoints=self.config.num_obs_checkpoints,
-                    s1_orbit=self.config.s1_orbit,
-                ),
-            )
-        return _PrefetchedStarter(
-            store_opener=store_opener,
-            mask_bundle=mask_bundle,
-            x_sub=x_sub,
-            valid_px=valid_px,
-            plan=plan,
-            rung=rung,
-            first_strip=first_strip,
-        )
+        return _ChunkPrologue(store_opener, mask_bundle, plan, x_sub, first_strip, rung=rung)
 
     def _start_chunk_prefetch(self, chunk: ChunkSpec, mosaic_base: str) -> None:
         """Kick off the next chunk's capped prefetch on the prefetch thread.
@@ -768,7 +697,7 @@ class InferenceActor:
         logger.info("xchunk prefetch: starting for %s", chunk.label)
         stash[chunk.label] = pool.submit(self._load_prefetched_starter, chunk, mosaic_base)
 
-    def _take_prefetched(self, label: str) -> _PrefetchedStarter | None:
+    def _take_prefetched(self, label: str) -> _ChunkPrologue | None:
         """Consume the stash for ``label``; evict stale entries.
 
         Blocks on an in-flight matching prefetch (partial overlap still wins).
@@ -920,7 +849,6 @@ class InferenceActor:
         Always invoked through :meth:`process_chunk`, which establishes the
         scoped icechunk credential provider this body's S3 opens depend on.
         """
-        from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
         from tessera_embeddings.inference.inference import run_inference
 
         t0 = time.monotonic()
@@ -938,11 +866,8 @@ class InferenceActor:
             prologue = self._load_chunk_prologue(chunk, mosaic_base)
             store_opener = prologue.store_opener
             mask_bundle = prologue.mask_bundle
-            strips = prologue.strips
-            # Whether to run the 1-deep strip prefetch (dense/hideable) or load
-            # strips serially with no two sets co-resident (sparse; see _strip_plan).
-            prefetch = prologue.prefetch
-            strategy = prologue.strategy
+            plan = prologue.plan
+            strips = plan.strips
             x_sub = prologue.x_sub
             # Column window the cropped grids map to in the whole-chunk output
             # buffers (full width when uncropped).
@@ -954,10 +879,10 @@ class InferenceActor:
                 "Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s) [%s, prefetch=%s]",
                 chunk.label,
                 int(mask_bundle.mask.shape[0]),
-                prologue.strip_h,
+                plan.strip_h,
                 len(strips),
-                prologue.strategy,
-                prefetch,
+                plan.strategy,
+                plan.prefetch,
             )
             del prologue
 
@@ -974,32 +899,20 @@ class InferenceActor:
             # mask_bundle is passed as an explicit submit() arg rather than
             # captured, so the loop can `del` the only strong reference once the
             # last strip has loaded (a closure capture can't be deleted).
-            # Returns (chunk_data, dataset): bucketing runs on the prefetch
-            # thread too, so it overlaps the prior strip's GPU work instead of
-            # sitting on the critical path between load and inference.
+            # BACKGROUND loads (prefetch on) reserve cores for the batch-prep
+            # workers feeding the GPU; SERIAL loads (prefetch off, prologue)
+            # reserve nothing — the GPU is idle and wants every core.
             def _load_strip(
                 y_sub: slice, bundle: S2MaskBundle, reserve_cpus: int
             ) -> tuple[ChunkData, MosaicChunkInferenceDataset]:
-                # A BACKGROUND load (prefetch on, runs while the GPU infers the
-                # prior strip) reserves cores for the batch-prep workers feeding
-                # the GPU, so band decompression can't starve inference. A SERIAL
-                # load (prefetch off, or the prologue's strip 0) reserves nothing
-                # — the GPU is idle and wants every core.
-                data = load_chunk(
+                return self._load_strip_dataset(
                     chunk,
                     mosaic_base,
-                    time_window=self.config.time_window,
-                    s1_orbit=self.config.s1_orbit,
                     y_sub=y_sub,
                     store_opener=store_opener,
                     mask_bundle=bundle,
-                    reserve_cpus=reserve_cpus,
                     x_sub=x_sub,
-                )
-                return data, MosaicChunkInferenceDataset(
-                    data,
-                    num_obs_checkpoints=self.config.num_obs_checkpoints,
-                    s1_orbit=self.config.s1_orbit,
+                    reserve_cpus=reserve_cpus,
                 )
 
             on_batch = (
@@ -1049,7 +962,7 @@ class InferenceActor:
                         assert first_strip is not None
                         chunk_data, dataset = first_strip
                         first_strip = None
-                    elif prefetch:
+                    elif plan.prefetch:
                         assert next_future is not None
                         chunk_data, dataset = next_future.result()
                     else:
@@ -1058,7 +971,7 @@ class InferenceActor:
 
                     # With prefetch on, kick off the next strip's BACKGROUND load
                     # (reserving prep cores) before inferring this one.
-                    if prefetch:
+                    if plan.prefetch:
                         next_future = (
                             pool.submit(_load_strip, strips[i + 1], mask_bundle, _BACKGROUND_LOAD_RESERVED_CPUS)
                             if i + 1 < len(strips)
@@ -1068,10 +981,10 @@ class InferenceActor:
                     # Last strip: its load is complete (bound above) and no body
                     # loads remain. For <=1x-budget plans this is the RAM trough,
                     # so prefetch the NEXT chunk's capped starter behind this
-                    # strip's inference. Pair-budget plans (see
-                    # _XCHUNK_UNSAFE_STRATEGIES) hold a near-2x set here — no room
-                    # for the stash — so they skip it and take a serial prologue.
-                    if i + 1 == len(strips) and prefetch_hint is not None and strategy not in _XCHUNK_UNSAFE_STRATEGIES:
+                    # strip's inference. Pair-budget plans hold a near-2x set
+                    # here — no room for the stash — so they take a serial
+                    # prologue instead.
+                    if i + 1 == len(strips) and prefetch_hint is not None and not plan.pair_budget:
                         self._start_chunk_prefetch(prefetch_hint, mosaic_base)
 
                     if x_sub is None:

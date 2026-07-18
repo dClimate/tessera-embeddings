@@ -102,6 +102,18 @@ class ActorPool:
         """Number of non-retired actor slots."""
         return len(self.actors) - len(self._retired)
 
+    def outstanding_work(self, queued: int) -> int:
+        """In-flight + queued + reserved chunks — the true remaining-work count.
+
+        Reserved next-chunks live in neither ``pending`` nor the queue while a
+        busy actor holds them; excluding them would make remaining work look
+        smaller, under-provisioning actor batches and over-retiring idle actors
+        mid-run. The tail over-provision this can cause is bounded (the
+        ``requested >= outstanding`` and ``target - requested`` caps) and
+        self-corrects via idle retirement.
+        """
+        return len(self.pending) + queued + len(self.reserved)
+
     @property
     def max_actor_deaths(self) -> int:
         """Death count that signals a systemic failure.
@@ -707,16 +719,7 @@ def _process_chunks_work_stealing(
         n, timed_out = _batch_actors_to_request(
             requested=len(pool.actors),
             target=total_actors_target,
-            # Count reserved next-chunks as outstanding work. A reservation POPS
-            # its chunk from chunk_queue and holds it on a busy actor, so
-            # excluding it makes remaining work look smaller and UNDER-provisions
-            # mid-run (fewer actors than the target for genuinely pending work).
-            # The opposite edge — a tail where reserved work can't be taken by a
-            # new actor — is bounded: the requested>=outstanding and
-            # target-requested caps limit it, and any transiently-idle extra
-            # actor is retired by the idle timeout. We favour not starving
-            # mid-run throughput over a small, self-correcting tail over-provision.
-            outstanding=len(pool.pending) + len(chunk_queue) + len(pool.reserved),
+            outstanding=pool.outstanding_work(len(chunk_queue)),
             alive_gpu_nodes=alive_gpu_nodes,
             nodes_at_last_batch=nodes_at_last_batch,
             last_batch_size=last_batch_size,
@@ -872,8 +875,6 @@ def _process_chunks_work_stealing(
                 _finalize_prior_write(actor_idx, prior)
 
     # --- Main work-stealing loop ---
-    # Runs while there is in-flight work, deferred writes awaiting
-    # confirmation, OR queued chunks waiting for initializing actors.
     # gpu_seconds integrates live-actor-count over wall time (one GPU per
     # actor) so the progress line can report fleet GPU-hours consumed so far.
     gpu_seconds = 0.0
@@ -975,9 +976,6 @@ def _process_chunks_work_stealing(
         # deferred-write confirmation — pull it via flush_writes() (tail of
         # run, and always before such an actor could be retired).
         _flush_idle_writes()
-        # Include reserved chunks (see the batch-sizing note): they're genuine
-        # remaining work held out of the queue, so counting them keeps enough
-        # actors alive rather than over-retiring mid-run.
-        pool.retire_idle(len(pool.pending) + len(chunk_queue) + len(pool.reserved))
+        pool.retire_idle(pool.outstanding_work(len(chunk_queue)))
 
     return results

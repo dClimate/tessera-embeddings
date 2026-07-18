@@ -148,18 +148,22 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
         nan_mask_mismatches += int((gen_ref != gen_test).sum())
         valid = gen_ref & gen_test
         if valid.any():
-            delta = np.abs(e_ref[valid] - e_test[valid])  # (n_valid, D)
+            # Gather each masked array once per slab — the boolean-mask gathers
+            # (especially the (n_valid, D) embeddings) allocate copies.
+            er, et = e_ref[valid], e_test[valid]
+            sr, st = s_ref[valid], s_test[valid]
+            delta = np.abs(er - et)  # (n_valid, D)
             n_values += delta.size
             n_exact += int((delta == 0).sum())
             n_within_one += int((delta <= 1).sum())
             max_abs_delta = max(max_abs_delta, int(delta.max(initial=0)))
 
-            drift = np.abs(s_ref[valid] - s_test[valid]) / np.abs(s_ref[valid])
+            drift = np.abs(sr - st) / np.abs(sr)
             scale_max_rel_drift = max(scale_max_rel_drift, float(drift.max()))
 
             # Cosine over dequantized embeddings for valid pixels in this slab.
-            deq_ref = e_ref[valid].astype(np.float32) * s_ref[valid][:, None]
-            deq_test = e_test[valid].astype(np.float32) * s_test[valid][:, None]
+            deq_ref = er.astype(np.float32) * sr[:, None]
+            deq_test = et.astype(np.float32) * st[:, None]
             num = (deq_ref * deq_test).sum(axis=1)
             den = np.linalg.norm(deq_ref, axis=1) * np.linalg.norm(deq_test, axis=1)
             nz = den > 0
