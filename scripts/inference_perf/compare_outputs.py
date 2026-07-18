@@ -75,6 +75,13 @@ class ChunkComparison:
     # SAR reads + bundle-sourced S2 obs under the easting-bbox crop).
     obs_count_mismatches: int = 0
 
+    # Scales that are neither NaN (invalid-pixel fill) nor finite-positive
+    # (generated): zero, negative, or infinite. These indicate a corrupt
+    # artifact in EITHER store and must be zero — without this counter a
+    # malformed scale is lumped with "not generated" and skipped (e.g.
+    # ref=NaN, test=0.0 would sail through every metric).
+    malformed_scales: int = 0
+
     cross_config: bool = False
 
     @property
@@ -87,6 +94,7 @@ class ChunkComparison:
                 and self.scale_max_rel_drift <= XCFG_MAX_SCALE_REL_DRIFT
                 and self.nan_mask_mismatches == 0
                 and self.obs_count_mismatches == 0
+                and self.malformed_scales == 0
                 and self.cosine_min >= XCFG_MIN_COSINE
             )
         return (
@@ -95,6 +103,7 @@ class ChunkComparison:
             and self.scale_max_rel_drift <= MAX_SCALE_REL_DRIFT
             and self.nan_mask_mismatches == 0
             and self.obs_count_mismatches == 0
+            and self.malformed_scales == 0
             and self.cosine_min >= MIN_COSINE
         )
 
@@ -106,6 +115,7 @@ class ChunkComparison:
             f"max|d|={self.max_abs_delta} within1={self.within_one_frac:.6%} "
             f"scale_drift_max={self.scale_max_rel_drift:.2e} "
             f"nan_mismatch={self.nan_mask_mismatches} obs_mismatch={self.obs_count_mismatches} "
+            f"malformed_scales={self.malformed_scales} "
             f"cos_min={self.cosine_min:.6f} cos_mean={self.cosine_mean:.6f} "
             f"(n={self.n_values:,})"
         )
@@ -126,6 +136,7 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
     max_abs_delta = 0
     scale_max_rel_drift = 0.0
     nan_mask_mismatches = 0
+    malformed_scales = 0
     cosine_min = 1.0
     cosine_sum = 0.0
     cosine_count = 0
@@ -146,6 +157,13 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
         gen_ref = np.isfinite(s_ref) & (s_ref > 0)
         gen_test = np.isfinite(s_test) & (s_test > 0)
         nan_mask_mismatches += int((gen_ref != gen_test).sum())
+        # A scale must be exactly one of: NaN (invalid pixel) or generated
+        # (finite positive). Zero / negative / infinite means a corrupt store;
+        # count it explicitly — the "generated pixels only" masking below
+        # would otherwise silently skip it (e.g. ref=NaN vs test=0.0 agrees
+        # on the mask and touches no metric).
+        malformed_scales += int((~np.isnan(s_ref) & ~gen_ref).sum())
+        malformed_scales += int((~np.isnan(s_test) & ~gen_test).sum())
         valid = gen_ref & gen_test
         if valid.any():
             # Gather each masked array once per slab — the boolean-mask gathers
@@ -198,6 +216,7 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
         cosine_min=cosine_min if cosine_count else 1.0,
         cosine_mean=cosine_sum / cosine_count if cosine_count else 1.0,
         obs_count_mismatches=obs_count_mismatches,
+        malformed_scales=malformed_scales,
         cross_config=cross_config,
     )
 

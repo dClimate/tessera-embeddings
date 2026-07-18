@@ -215,6 +215,11 @@ attempted only as an opportunistic fast path). Don't disable it —
 orphaned GPU instances are expensive, and the autoscaler idle timeout
 never terminates the head node.
 
+Normally-completed runs are covered separately: the provider's
+`ray_cluster` finalizer falls back to the same tag-based termination
+when its `ray down` exits nonzero, so a run that finishes but can't
+reach the head doesn't leave the fleet billing either.
+
 The hook is a Prefect-specific concern, so it lives **inside** the
 flow file, not in the AWS provider. The provider exposes the
 helpers; the flow wires them into Prefect's lifecycle.

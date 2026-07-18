@@ -45,9 +45,11 @@ DEFAULT_RAM_LOG_GROUP = "/ec2/yield-embeddings/ray"
 # processes (the `nvidia-smi --query-gpu ... -l` and `dcgmi dmon` command lines),
 # not just the redirect-filename wrapper — otherwise re-running --start-pollers
 # leaves the old samplers writing concurrently to the same files and corrupts the
-# measurements.
+# measurements. The `[n]`/`[d]` bracket idiom keeps the pattern from matching any
+# shell whose own command line contains it (e.g. an SSM wrapper), which pkill -f
+# would otherwise kill before the poller-start commands run.
 POLLER_COMMANDS = [
-    "pkill -f 'nvidia-smi --query-gpu' 2>/dev/null; pkill -f 'dcgmi dmon' 2>/dev/null; true",
+    "pkill -f '[n]vidia-smi --query-gpu' 2>/dev/null; pkill -f '[d]cgmi dmon' 2>/dev/null; true",
     (
         "setsid nohup bash -c 'nvidia-smi --query-gpu=timestamp,utilization.gpu,"
         "utilization.memory,power.draw,clocks.sm,memory.used --format=csv,noheader -l 1 "

@@ -269,7 +269,10 @@ class TestSeed:
         with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
             pool.seed(queue, "m", "s", "r", None)
         assert len(pool.pending) == 3
-        assert len(queue) == 2
+        # While the queue is deeper than the live pool, seeding also reserves
+        # next chunks (prefetch hints) — nothing is dropped either way.
+        assert len(queue) + len(pool.reserved) == 2
+        assert pool.reserved  # at least the first seeded actor got a hint
 
     def test_handles_fewer_chunks_than_actors(self) -> None:
         pool = _make_pool(4)
@@ -1289,3 +1292,78 @@ class TestDeferredWrites:
         # Both chunks completed (on the replacement) despite the death, and c0
         # was re-run because its deferred write died with the first actor.
         assert sorted(r["chunk"] for r in results) == ["c0", "c1"]
+
+    def test_flush_failure_replaces_actor_and_retries_on_replacement(self) -> None:
+        """A failed/timed-out tail flush kills + replaces the actor.
+
+        The flush RPC may have left the (serial) actor wedged inside
+        flush_writes(); without the replacement the requeued chunk would be
+        dispatched right back to it and sit behind the stuck call forever,
+        invisible to stall detection (a chunk that never starts has no
+        tracker entry).
+        """
+        actor = MagicMock(name="actor_0")
+        chunks = [_fake_chunk("c0")]
+        ref0, retry0 = MagicMock(name="ref0"), MagicMock(name="retry0")
+        flush_stuck, flush_ok = MagicMock(name="flush_stuck"), MagicMock(name="flush_ok")
+
+        replacement = MagicMock(name="replacement_actor")
+        replacement.process_chunk.remote.return_value = retry0
+        replacement.flush_writes.remote.return_value = flush_ok
+        iid_ref = MagicMock(name="iid_ref")
+        replacement.get_instance_id.remote.return_value = iid_ref
+
+        actor.process_chunk.remote.return_value = ref0
+        actor.flush_writes.remote.return_value = flush_stuck
+        done: list = []
+        order = [ref0, retry0]
+
+        def fake_wait(pending_refs, **kw):
+            if kw.get("timeout", 60) == 0:
+                return (list(pending_refs), [])
+            for r in order:
+                if r in pending_refs and r not in done:
+                    done.append(r)
+                    return ([r], [x for x in pending_refs if x is not r])
+            return ([], list(pending_refs))
+
+        def fake_get(ref, *args, **kwargs):
+            if ref is iid_ref:
+                return "i-replacement"
+            if ref is flush_stuck:
+                raise RuntimeError("flush timed out")  # stand-in for GetTimeoutError
+            if ref is ref0 or ref is retry0:
+                return {"chunk": "c0", "status": "success", "write_deferred": True, "prior_write": None}
+            if ref is flush_ok:
+                return {"label": "c0", "ok": True, "error": None}
+            return MagicMock()
+
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
+            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
+            patch.object(_sched_mod.ray, "kill") as kill,
+            patch.object(_sched_mod, "InferenceActor") as cls,
+            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
+            patch.object(_sched_mod.time, "sleep"),
+        ):
+            cls.options.return_value.remote.return_value = replacement
+            results = _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=chunks,
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+            )
+
+        # c0 completed (write-confirmed) on the replacement, not the wedged actor.
+        assert [r["chunk"] for r in results] == ["c0"]
+        assert results[0].get("write_confirmed")
+        kill.assert_called_once_with(actor)
+        assert actor.process_chunk.remote.call_count == 1
+        assert replacement.process_chunk.remote.call_count == 1

@@ -243,6 +243,10 @@ class ActorPool:
     ) -> None:
         """Submit one chunk to each actor to prime the work-stealing loop.
 
+        The queue rides along to ``submit()`` so each seeded actor also gets a
+        next-chunk reservation (prefetch hint) while the queue is deep — its
+        FIRST chunk can already overlap the second chunk's prologue.
+
         Args:
             chunk_queue: Queue of remaining chunks (popleft in-place).
             mosaic_base: Base path for mosaic stores.
@@ -255,7 +259,7 @@ class ActorPool:
                 break
             if actor_idx in self._initializing:
                 continue
-            self.submit(actor_idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker)
+            self.submit(actor_idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker, chunk_queue)
         self.log.info("Seeded %d actors with initial chunks (%d queued)", len(self.pending), len(chunk_queue))
 
     def dispatch_idle(
@@ -269,7 +273,10 @@ class ActorPool:
         """Dispatch queued chunks to any idle, non-initializing actors.
 
         Covers cases where a replacement actor was skipped in the main loop —
-        other idle actors can pick up the work immediately.
+        other idle actors can pick up the work immediately. The queue rides
+        along to ``submit()`` so late-joining actors get the same next-chunk
+        reservation (prefetch hint) as main-loop dispatches while the queue
+        is deep.
 
         Args:
             chunk_queue: Queue of remaining chunks (popleft in-place).
@@ -288,7 +295,7 @@ class ActorPool:
             if not idle_ready:
                 break
             idx = idle_ready[0]
-            self.submit(idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker)
+            self.submit(idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker, chunk_queue)
             busy.add(idx)
 
     # ------------------------------------------------------------------
@@ -868,6 +875,14 @@ def _process_chunks_work_stealing(
                 )
             except Exception as exc:
                 _requeue_unconfirmed(pending_write.pop(actor_idx), f"flush failed: {exc}")
+                # A failed or timed-out flush RPC may leave the (serial) actor
+                # still wedged inside flush_writes(); a retry dispatched to it
+                # would sit behind that stuck call forever — and invisibly, as
+                # a chunk that never starts has no tracker entry for stall
+                # detection. Kill + replace the slot so the requeued chunk
+                # lands on a healthy actor. Safe: staged writes are idempotent.
+                pool.resolve_iid(actor_idx)
+                pool.replace(actor_idx, pool.actor_instance_ids[actor_idx])
                 continue
             if prior is None:
                 _requeue_unconfirmed(pending_write.pop(actor_idx), "actor had no pending write to flush")

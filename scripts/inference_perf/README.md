@@ -13,7 +13,9 @@ for the numerics policy it gates).
 - **`compare_outputs.py`** — ADR-012 equivalence gate. Compares staged
   embeddings (int8 + scales) between a reference and a test run; exits nonzero
   if any chunk violates the thresholds (int8 ≥99.5% exact, max |Δ| ≤ 1 level,
-  scale drift ≤ 0.1%, cosine ≥ 0.9999).
+  scale drift ≤ 0.1%, cosine ≥ 0.9999) or the structural checks (generated-mask
+  agreement, exact obs-count layers, zero malformed scales — a scale must be
+  NaN or finite-positive, never zero/negative/inf).
 
 ```
                     ┌─ per-chunk wall-clock anatomy (from --report) ─┐

@@ -4,9 +4,10 @@ These tests stay offline by mocking SSM and EC2 with ``moto``. They
 exercise ``_resolve_ray_config`` (the most complex pure helper),
 ``_pick_least_loaded_subnet``, and ``cleanup_ray_tempfiles``.
 
-The full ``ray_cluster`` context manager is NOT tested here because it
-shells out to ``ray up`` / ``ray down``; that path is an integration
-concern.
+The full ``ray_cluster`` context manager is NOT tested end-to-end here
+because it shells out to ``ray up`` / ``ray down``; that path is an
+integration concern. Its finalizer's tag-termination fallback IS pinned
+below with the launch/teardown helpers stubbed out.
 """
 
 from __future__ import annotations
@@ -383,6 +384,46 @@ def test_launch_with_failover_tag_terminates_when_ray_down_fails(monkeypatch: py
     _launch_ray_with_failover(subnets, lambda s: f"/tmp/{s['SubnetId']}.yaml", _LOG, "tessera-inference-x", "us-west-2")
 
     assert terminated == [{"cluster_name": "tessera-inference-x", "region": "us-west-2", "log": _LOG}]
+
+
+def test_ray_cluster_finalizer_tag_terminates_when_ray_down_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed `ray down` in the NORMAL exit path falls back to tag termination.
+
+    The cancellation/crash hook only covers cancelled or crashed flows — a
+    normally-completed run whose `ray down` fails must not leave the fleet
+    billing.
+    """
+    template = tmp_path / "cluster.yaml"
+    template.write_text("cluster_name: tessera-inference\n")
+
+    fake_ssm = MagicMock()
+    fake_ssm.get_parameter.return_value = {"Parameter": {"Value": "subnet-a"}}
+    fake_ec2 = MagicMock()
+    fake_ec2.describe_subnets.return_value = {"Subnets": [_subnet("subnet-a", "a", "usw2-az1")]}
+    monkeypatch.setattr(
+        ray_mod.boto3, "client", lambda service, region_name=None: {"ssm": fake_ssm, "ec2": fake_ec2}[service]
+    )
+    monkeypatch.setattr(ray_mod, "_worker_instance_type", lambda _cfg: "g6e.xlarge")
+    monkeypatch.setattr(ray_mod, "_rank_launch_subnets", lambda *a, **k: [_subnet("subnet-a", "a", "usw2-az1")])
+    monkeypatch.setattr(ray_mod, "_launch_ray_with_failover", lambda *a, **k: ("/tmp/resolved.yaml", "10.0.0.5"))
+    monkeypatch.setattr(ray_mod, "_log_ray_dashboard_ssm_command", lambda *a, **k: None)
+    monkeypatch.setattr(ray_mod.ray, "init", lambda *a, **k: None)
+    monkeypatch.setattr(ray_mod.ray, "shutdown", lambda: None)
+    monkeypatch.setattr(ray_mod, "_stop_ray_cluster", lambda _y, _log: False)  # ray down FAILED
+    cleaned: list[str] = []
+    terminated: list[dict] = []
+    monkeypatch.setattr(ray_mod, "cleanup_ray_tempfiles", lambda y: cleaned.append(y))
+    monkeypatch.setattr(ray_mod, "terminate_ray_instances_by_tag", lambda **k: terminated.append(k))
+
+    with ray_mod.ray_cluster(
+        _LOG, ami_ssm_name="/x/ami", cluster_yaml=template, cluster_name="tessera-inference-x"
+    ) as resolved:
+        assert resolved == "/tmp/resolved.yaml"
+
+    assert terminated == [{"cluster_name": "tessera-inference-x", "region": "us-west-2", "log": _LOG}]
+    assert cleaned == ["/tmp/resolved.yaml"]  # tempfile cleanup still runs after the fallback
 
 
 def test_launch_with_failover_raises_when_all_azs_fail(monkeypatch: pytest.MonkeyPatch) -> None:

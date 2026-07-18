@@ -917,5 +917,11 @@ def ray_cluster(
     finally:
         ray.shutdown()
         if manages_cluster:
-            _stop_ray_cluster(resolved_yaml or str(cluster_yaml), log)
+            if not _stop_ray_cluster(resolved_yaml or str(cluster_yaml), log) and cluster_name:
+                # Same fallback as the AZ-failover path: when `ray down` can't
+                # tear the cluster down (unreachable head, stale YAML), fall
+                # back to exact-tag termination so a normally-completed run
+                # can't leave the fleet billing. The cancellation/crash hook
+                # only covers cancelled/crashed flows, not this path.
+                terminate_ray_instances_by_tag(cluster_name=cluster_name, region=region, log=log)
             cleanup_ray_tempfiles(resolved_yaml)
