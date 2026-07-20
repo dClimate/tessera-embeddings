@@ -271,6 +271,15 @@ chunk (no actor kill); an actor death with a write in flight requeues too — sa
 staged writes are idempotent. A chunk's "done" can therefore trail its inference by up
 to one chunk in the progress logs.
 
+Every in-actor wait on a background I/O future — the prior chunk's deferred write, and
+the strip / cross-chunk-starter prefetch loads — is bounded by `_BACKGROUND_IO_TIMEOUT_S`
+(600 s, matching the scheduler's `flush_writes()` RPC timeout). A wedged S3/zarr client
+with no socket timeout would otherwise hang `process_chunk` itself, where the scheduler's
+tail-flush recovery can never reach it (Ray serialises actor calls, and a 1–2-actor run
+never hits the ≥3-stall abort). On timeout a deferred write reports failure (requeue), a
+prefetch falls back to a serial load, and a background strip raises so the scheduler
+replaces the actor and requeues.
+
 **Sparse chunks read less**: strips whose SCL-mask slice has zero valid pixels skip the
 S2 band read entirely, and chunks whose valid pixels span a narrow easting window read
 S2 only for that bounding box (`x_sub`; applied when it saves ≥10% of the width). SAR is

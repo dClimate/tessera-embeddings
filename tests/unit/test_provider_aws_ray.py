@@ -426,6 +426,52 @@ def test_ray_cluster_finalizer_tag_terminates_when_ray_down_fails(
     assert cleaned == ["/tmp/resolved.yaml"]  # tempfile cleanup still runs after the fallback
 
 
+def test_ray_cluster_finalizer_skips_ray_down_when_launch_fails_before_resolve(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When every AZ launch fails before a YAML resolves, the finalizer must NOT
+    run `ray down` on the unresolved template.
+
+    That template's base cluster_name lacks the flow-specific uuid suffix, so a
+    `ray down` against it could tear down an unrelated `tessera-inference`
+    cluster. The finalizer terminates by exact tag instead.
+    """
+    template = tmp_path / "cluster.yaml"
+    template.write_text("cluster_name: tessera-inference\n")
+
+    fake_ssm = MagicMock()
+    fake_ssm.get_parameter.return_value = {"Parameter": {"Value": "subnet-a"}}
+    fake_ec2 = MagicMock()
+    fake_ec2.describe_subnets.return_value = {"Subnets": [_subnet("subnet-a", "a", "usw2-az1")]}
+    monkeypatch.setattr(
+        ray_mod.boto3, "client", lambda service, region_name=None: {"ssm": fake_ssm, "ec2": fake_ec2}[service]
+    )
+    monkeypatch.setattr(ray_mod, "_worker_instance_type", lambda _cfg: "g6e.xlarge")
+    monkeypatch.setattr(ray_mod, "_rank_launch_subnets", lambda *a, **k: [_subnet("subnet-a", "a", "usw2-az1")])
+
+    def _all_azs_fail(*_a: object, **_k: object) -> tuple[str, str]:
+        raise RuntimeError("ray up failed in all candidate AZs: ['usw2-az1']")
+
+    monkeypatch.setattr(ray_mod, "_launch_ray_with_failover", _all_azs_fail)
+    monkeypatch.setattr(ray_mod.ray, "shutdown", lambda: None)
+    stop_calls: list[str] = []
+    monkeypatch.setattr(ray_mod, "_stop_ray_cluster", lambda y, _log: stop_calls.append(y) or True)
+    cleaned: list[str | None] = []
+    terminated: list[dict] = []
+    monkeypatch.setattr(ray_mod, "cleanup_ray_tempfiles", lambda y: cleaned.append(y))
+    monkeypatch.setattr(ray_mod, "terminate_ray_instances_by_tag", lambda **k: terminated.append(k))
+
+    with (
+        pytest.raises(RuntimeError, match="all candidate AZs"),
+        ray_mod.ray_cluster(_LOG, ami_ssm_name="/x/ami", cluster_yaml=template, cluster_name="tessera-inference-x"),
+    ):
+        pass
+
+    assert stop_calls == []  # NO `ray down` on the unresolved template
+    assert terminated == [{"cluster_name": "tessera-inference-x", "region": "us-west-2", "log": _LOG}]
+    assert cleaned == [None]  # cleanup called with None (no resolved YAML) — a safe no-op
+
+
 def test_launch_with_failover_raises_when_all_azs_fail(monkeypatch: pytest.MonkeyPatch) -> None:
     """When ray up fails in every AZ, a RuntimeError names the AZs tried."""
     subnets = [_subnet("subnet-a", "a", "usw2-az1"), _subnet("subnet-b", "b", "usw2-az2")]

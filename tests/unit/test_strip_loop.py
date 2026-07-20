@@ -10,6 +10,7 @@ result must not depend on how the input is tiled.
 from __future__ import annotations
 
 import contextlib
+import threading
 from unittest.mock import patch
 
 import numpy as np
@@ -413,6 +414,25 @@ class TestDeferredStagingWrites:
     def test_flush_with_nothing_pending_returns_none(self, inference_config, test_model):
         actor = _make_actor(inference_config, test_model)
         assert actor.flush_writes() is None
+
+    def test_hung_write_times_out_and_surfaces_failure(self, inference_config, test_model, monkeypatch):
+        # A wedged staging upload must not block the actor forever: the bounded
+        # wait returns ok=False so the scheduler can requeue the chunk on a
+        # healthy actor (rather than the actor hanging inside process_chunk,
+        # where the tail flush_writes() timeout can never reach it).
+        actor = _make_actor(inference_config, test_model)
+        pool = actor._writer_pool_handle()
+        release = threading.Event()
+        actor._pending_write = ("chunk_hung", pool.submit(release.wait))
+        monkeypatch.setattr(_actors_mod, "_BACKGROUND_IO_TIMEOUT_S", 0.2)
+        try:
+            outcome = actor.flush_writes()
+        finally:
+            release.set()  # let the leaked writer task finish so the pool closes
+        assert outcome is not None
+        assert outcome["label"] == "chunk_hung"
+        assert outcome["ok"] is False
+        assert "did not complete" in outcome["error"]
 
 
 # ---------------------------------------------------------------------------

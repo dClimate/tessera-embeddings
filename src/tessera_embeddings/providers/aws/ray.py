@@ -917,7 +917,16 @@ def ray_cluster(
     finally:
         ray.shutdown()
         if manages_cluster:
-            if not _stop_ray_cluster(resolved_yaml or str(cluster_yaml), log) and cluster_name:
+            if resolved_yaml is None:
+                # Every AZ launch failed before any config resolved. `ray down`
+                # on the UNRESOLVED template would target its base cluster_name
+                # (no flow-specific uuid suffix) and could tear down an
+                # unrelated `tessera-inference` cluster. Failed attempts were
+                # already torn down inside _launch_ray_with_failover; belt-and-
+                # braces, terminate anything tagged with our exact cluster_name.
+                if cluster_name:
+                    terminate_ray_instances_by_tag(cluster_name=cluster_name, region=region, log=log)
+            elif not _stop_ray_cluster(resolved_yaml, log) and cluster_name:
                 # Same fallback as the AZ-failover path: when `ray down` can't
                 # tear the cluster down (unreachable head, stale YAML), fall
                 # back to exact-tag termination so a normally-completed run

@@ -15,7 +15,11 @@ for the numerics policy it gates).
   if any chunk violates the thresholds (int8 ≥99.5% exact, max |Δ| ≤ 1 level,
   scale drift ≤ 0.1%, cosine ≥ 0.9999) or the structural checks (generated-mask
   agreement, exact obs-count layers, zero malformed scales — a scale must be
-  NaN or finite-positive, never zero/negative/inf).
+  NaN or finite-positive, never zero/negative/inf; and at least one generated
+  pixel, since an all-empty `.zarr` should have been a `.skipped` marker). In
+  directory mode it also rejects invalid staging up front: a chunk present as
+  both a `.zarr` and a `.skipped` marker within one run fails before any
+  comparison (assembly's `verify_staged_completeness` would refuse it).
 
 ```
                     ┌─ per-chunk wall-clock anatomy (from --report) ─┐

@@ -101,6 +101,15 @@ class MultimodalBTInferenceModel(nn.Module):
             current = torch.cuda.current_stream()
             self._s2_stream.wait_stream(current)
             self._s1_stream.wait_stream(current)
+            # wait_stream orders EXECUTION, but the caching allocator tracks a
+            # tensor's liveness only on its allocation stream (`current`). It
+            # can't see that the side streams still read s2_x/s1_x, so a later
+            # `current`-stream allocation (the next pipeline iteration's H2D)
+            # could reuse that storage while a backbone is mid-read — silent,
+            # intermittent corruption. record_stream marks the inputs in use on
+            # the streams that consume them.
+            s2_x.record_stream(self._s2_stream)
+            s1_x.record_stream(self._s1_stream)
             with torch.cuda.stream(self._s2_stream):
                 s2_repr = self.s2_backbone(s2_x)
             with torch.cuda.stream(self._s1_stream):

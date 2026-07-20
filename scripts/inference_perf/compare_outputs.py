@@ -87,6 +87,12 @@ class ChunkComparison:
     @property
     def passed(self) -> bool:
         """Whether every threshold for the selected comparison class is met."""
+        # Zero generated pixels (no finite-positive scale in either store) is an
+        # invalid artifact — a no-valid-pixel chunk must be a .skipped marker,
+        # not an embeddings zarr. Without this guard n_values == 0 defaults every
+        # fraction to 1.0, so an empty/corrupt staged pair would "pass".
+        if self.n_values == 0:
+            return False
         if self.cross_config:
             return (
                 self.within_one_frac >= XCFG_MIN_WITHIN_ONE_FRAC
@@ -276,6 +282,20 @@ def main(argv: list[str] | None = None) -> int:
         else:
             ref_zarr, ref_skip = _staged_labels(ref_dir)
             test_zarr, test_skip = _staged_labels(test_dir)
+            # A label present as BOTH a .zarr and a .skipped marker within one
+            # run is an invalid artifact state that assembly's
+            # verify_staged_completeness rejects — comparing the .zarr could
+            # otherwise report PASS for a run assembly will refuse. Fail
+            # regardless of --allow-partial (this is corruption, not partial
+            # staging).
+            both_staged = (ref_zarr & ref_skip) | (test_zarr & test_skip)
+            if both_staged:
+                print(
+                    "Invalid staging — chunk(s) present as both .zarr and .skipped in a run: "
+                    f"{', '.join(sorted(both_staged))}",
+                    file=sys.stderr,
+                )
+                return 1
             # A run is only a valid equivalence reference if it staged the same
             # chunks with the same skip decisions; otherwise a run that dropped
             # or skip-marked chunks could "pass" on whatever remained in common.

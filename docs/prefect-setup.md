@@ -218,7 +218,11 @@ never terminates the head node.
 Normally-completed runs are covered separately: the provider's
 `ray_cluster` finalizer falls back to the same tag-based termination
 when its `ray down` exits nonzero, so a run that finishes but can't
-reach the head doesn't leave the fleet billing either.
+reach the head doesn't leave the fleet billing either. If a launch
+fails in every AZ before any config resolves, the finalizer skips
+`ray down` altogether (running it against the unresolved template
+could match the base cluster name and tear down an unrelated cluster)
+and goes straight to exact-tag termination for the generated name.
 
 The hook is a Prefect-specific concern, so it lives **inside** the
 flow file, not in the AWS provider. The provider exposes the

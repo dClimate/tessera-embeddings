@@ -106,6 +106,18 @@ _S2_BYTES_PER_OBS_PX = len(S2_BAND_ORDER) * 2
 # is idle and wants the fastest load.
 _BACKGROUND_LOAD_RESERVED_CPUS = PREFETCH_DEPTH
 
+# Hard ceiling on any in-actor wait for a background I/O future — a strip /
+# starter prefetch load, or the prior chunk's deferred staging write. These are
+# seconds of S3/zarr I/O in the normal case (a full strip is ~6.5 s at measured
+# BW); a wait this long means the underlying client is wedged with no socket
+# timeout. Bounding the wait lets process_chunk fail out (or fall back to a
+# serial load) so Ray surfaces the error and the scheduler kills+replaces the
+# actor and requeues — recovery the tail flush_writes() timeout provides for an
+# IDLE actor but which a wedge INSIDE process_chunk never reaches (Ray
+# serialises actor calls; a 1-2 actor run never hits the >=3-stall abort).
+# Matches the scheduler's flush_writes() RPC timeout for consistency.
+_BACKGROUND_IO_TIMEOUT_S = 600.0
+
 # Apply the S2 easting-bbox crop only when it removes at least this fraction
 # of the chunk's width. Near-full boxes (interior chunks) skip the crop
 # entirely, keeping the mainline path byte-for-byte identical to the uncropped
@@ -161,6 +173,7 @@ _XCHUNK_T_ALL_EST = 230
 # Flat allowance for the starter strip's full-width SAR stack (read full-width
 # for obs-layer fidelity; see load_chunk's x_sub docs).
 _XCHUNK_SAR_STARTER_EST_BYTES = int(0.4 * 1024**3)
+
 
 def _strip_height_for_density(
     t_kept: int, width: int, height: int, budget: int = _S2_STRIP_BYTE_BUDGET, mask_width: int | None = None
@@ -723,13 +736,19 @@ class InferenceActor:
             # briefly co-reside. Rare (only on reassignment); a failed stale
             # prefetch drains to a no-op.
             logger.info("xchunk prefetch: draining stale stash for %s", stale)
-            with contextlib.suppress(Exception):
-                stash.pop(stale).result()
+            try:
+                # Bounded: a wedged stale load must not block the reassigned
+                # chunk forever. On timeout the thread leaks (a ThreadPoolExecutor
+                # task can't be cancelled) but the actor proceeds — the stale
+                # payload was going to be dropped anyway.
+                stash.pop(stale).result(timeout=_BACKGROUND_IO_TIMEOUT_S)
+            except Exception as exc:
+                logger.warning("xchunk prefetch: stale drain for %s did not complete (%s)", stale, exc)
         future = stash.pop(label, None)
         if future is None:
             return None
         try:
-            return future.result()
+            return future.result(timeout=_BACKGROUND_IO_TIMEOUT_S)
         except Exception as exc:
             logger.warning("xchunk prefetch for %s failed (%s); loading inline", label, exc)
             return None
@@ -769,7 +788,17 @@ class InferenceActor:
         self._pending_write = None
         wait_start = time.monotonic()
         try:
-            future.result()
+            # Bounded: an unbounded wait on a wedged upload would hang
+            # process_chunk, so the scheduler never reaches its flush_writes()
+            # recovery. On timeout (or any error) return ok=False so the
+            # scheduler requeues the deferred chunk on a healthy actor.
+            future.result(timeout=_BACKGROUND_IO_TIMEOUT_S)
+        except TimeoutError:
+            # A bare TimeoutError stringifies to "" — give the scheduler's
+            # requeue log a legible reason.
+            err = f"staging upload did not complete within {_BACKGROUND_IO_TIMEOUT_S:.0f}s"
+            logger.warning("Deferred staging write for %s FAILED: %s", label, err)
+            return {"label": label, "ok": False, "error": err}
         except Exception as exc:
             logger.warning("Deferred staging write for %s FAILED: %s", label, exc)
             return {"label": label, "ok": False, "error": str(exc)}
@@ -974,7 +1003,17 @@ class InferenceActor:
                         first_strip = None
                     elif plan.prefetch:
                         assert next_future is not None
-                        chunk_data, dataset = next_future.result()
+                        # Bounded: a wedged background strip read would hang the
+                        # actor inside process_chunk with no scheduler recourse.
+                        # On timeout raise (with strip context) so the chunk
+                        # fails out and the scheduler replaces the actor + requeues.
+                        try:
+                            chunk_data, dataset = next_future.result(timeout=_BACKGROUND_IO_TIMEOUT_S)
+                        except TimeoutError as exc:
+                            msg = (
+                                f"Background strip {i} load for {chunk.label} exceeded {_BACKGROUND_IO_TIMEOUT_S:.0f}s"
+                            )
+                            raise RuntimeError(msg) from exc
                     else:
                         # Serial: GPU idle, take all cores, one set resident.
                         chunk_data, dataset = _load_strip(strip, mask_bundle, 0)
