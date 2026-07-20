@@ -240,6 +240,11 @@ class TemporalPositionalEncoder(nn.Module):
         pe = torch.empty(doy.shape[0], doy.shape[1], self.d_model, device=doy.device)
         pe[:, :, 0::2] = torch.sin(angles)
         pe[:, :, 1::2] = torch.cos(angles)
+        # Drop angles before the dtype cast: it's ~2.6 GiB at the max
+        # (B=7168, T=256) bucket and unused past this point, so holding it live
+        # through pe.to() needlessly co-resides it with the fp32 pe and the bf16
+        # output — peak VRAM the concurrent s2/s1 backbones can't spare.
+        del angles
         return pe.to(doy.dtype)
 
 
