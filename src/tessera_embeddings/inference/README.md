@@ -216,7 +216,8 @@ When every pixel in a live (ROI-intersecting) chunk fails the validity filter, t
 takes the `"skipped"` path. The actor writes a zero-byte `{chunk.label}.skipped` marker
 and returns. Assembly fills the footprint with constant-zero/NaN fill tasks. The marker
 distinguishes a legitimate skip from a silently-failed chunk; `verify_staged_completeness`
-requires every live chunk to have either a staged zarr or a skip marker.
+requires every live chunk to have either a **completed** staged zarr (its `.done` marker —
+see §5) or a skip marker.
 
 #### 4c. Temporal Sampling (`sampling.py`)
 
@@ -309,6 +310,16 @@ Alongside embeddings, each staged chunk includes three **observation count** lay
 (`s2_obs_count`, `s1_asc_obs_count`, `s1_desc_obs_count`) — uint16 (H, W) arrays recording
 how many valid timesteps contributed to each pixel. These are carried through assembly into the
 final store as 2D spatial variables (dims: `time, northing, easting`).
+
+**Completion marker (crash safety).** A staged `.zarr` is many S3 objects written with no
+atomic multi-object commit, so a hard crash mid-upload can leave a `.zarr` with valid
+metadata but missing data chunks — which Zarr reads back as *fill values*, not an error.
+To prevent a partial store from being silently assembled, `write_chunk` writes a zero-byte
+`{chunk_label}.done` marker **last**, and `_list_staged_labels` keys on that marker: a `.zarr`
+without its `.done` is an interrupted write, so `verify_staged_completeness` treats it as
+missing (fails loudly) and `scan_existing_staged_chunks` re-runs it on resume rather than
+trusting it. (This guards the *staging* layer; the final store is Icechunk, whose
+transactional commit already rolls back cleanly on a crash during assembly.)
 
 ### 6. Dask Assembly
 

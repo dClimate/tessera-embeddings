@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pickle
 from importlib.metadata import version as _dist_version
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -117,6 +118,19 @@ class TestWriteChunk:
         result = ds["embeddings"].values
         np.testing.assert_array_almost_equal(result, embeddings, decimal=5)
         assert result.shape == (10, 10, EMBEDDING_DIM)
+
+    def test_write_chunk_writes_done_marker(self, tmp_path):
+        """write_chunk writes the .done completion marker, and _list_staged_labels
+        keys on it — the signal that the (many-object) staged write finished.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=10)
+        embeddings = np.random.default_rng(0).random((10, 10, EMBEDDING_DIM)).astype(np.float32)
+
+        writer.write_chunk(chunk, embeddings, run_id="run1", scales=_dummy_scales(10, 10))
+
+        assert Path(writer._done_marker_path("run1", chunk)).exists()
+        assert writer._list_staged_labels("run1") == [chunk.label]
 
     def test_write_chunk_wrong_shape_raises(self, tmp_path):
         staging = str(tmp_path / "staging")
@@ -1132,6 +1146,18 @@ class TestScanExistingStagedChunks:
         result = writer.scan_existing_staged_chunks("run1", self.CHUNKS)
         assert result == {self.CHUNKS[0].label}
 
+    def test_zarr_without_done_marker_is_not_resumed(self, tmp_path):
+        """A .zarr left without its .done marker (crash mid-upload) is NOT treated
+        as done, so resume re-runs it instead of trusting its partial contents.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = self.CHUNKS[0]
+        self._stage_chunk(writer, chunk, "run1")
+        Path(writer._done_marker_path("run1", chunk)).unlink()  # simulate crash before marker
+
+        # The .zarr still exists, but without the marker it doesn't count.
+        assert writer.scan_existing_staged_chunks("run1", self.CHUNKS) == set()
+
     def test_invalid_shape_raises(self, tmp_path):
         """Staged chunk with wrong shape raises RuntimeError listing the bad path."""
         writer = ZarrWriter(str(tmp_path / "staging"))
@@ -1155,12 +1181,14 @@ class TestScanExistingStagedChunks:
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = self.CHUNKS[0]
         path = writer._staging_path("run1", chunk)
-        # Write a Zarr with wrong variable name
+        # Write a Zarr with wrong variable name — a COMPLETED write (mark it
+        # done) whose content is bad, so scan lists it and validation catches it.
         ds = xr.Dataset(
             {"wrong_name": (["northing", "easting", "band"], np.zeros((10, 10, EMBEDDING_DIM), dtype=np.float32))},
             coords={"northing": np.arange(10), "easting": np.arange(10), "band": np.arange(EMBEDDING_DIM)},
         )
         ds.to_zarr(path, mode="w")
+        Path(writer._done_marker_path("run1", chunk)).touch()
 
         with pytest.raises(RuntimeError, match="missing variable 'embeddings'"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
@@ -1187,7 +1215,8 @@ class TestScanExistingStagedChunks:
     def test_reports_all_invalid(self, tmp_path):
         """Error message includes ALL invalid chunks, not just the first."""
         writer = ZarrWriter(str(tmp_path / "staging"))
-        # Write two chunks with wrong shapes
+        # Write two chunks with wrong shapes — completed writes (marked done)
+        # with bad content, so both are listed and reported invalid.
         for chunk in self.CHUNKS[:2]:
             bad = np.zeros((5, 5, EMBEDDING_DIM), dtype=np.float32)
             path = writer._staging_path("run1", chunk)
@@ -1196,6 +1225,7 @@ class TestScanExistingStagedChunks:
                 coords={"northing": np.arange(5), "easting": np.arange(5), "band": np.arange(EMBEDDING_DIM)},
             )
             ds.to_zarr(path, mode="w")
+            Path(writer._done_marker_path("run1", chunk)).touch()
 
         with pytest.raises(RuntimeError, match="2 invalid staged chunk") as exc_info:
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
@@ -1235,6 +1265,20 @@ class TestVerifyStagedCompleteness:
         with pytest.raises(IncompleteStageError, match="2 missing") as exc_info:
             writer.verify_staged_completeness("run1", list(self.CHUNKS))
         assert "Expected 3 chunks, found 1 staged + 0 skipped" in str(exc_info.value)
+
+    def test_markerless_zarr_counts_as_missing(self, tmp_path):
+        """A staged .zarr missing its .done marker (interrupted upload) is
+        unresolved: verification fails rather than letting assembly read its
+        partial contents as fill values.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        for chunk in self.CHUNKS:
+            self._stage_chunk(writer, chunk, "run1")
+        # One chunk's upload was interrupted just before its marker landed.
+        Path(writer._done_marker_path("run1", self.CHUNKS[1])).unlink()
+
+        with pytest.raises(IncompleteStageError, match="1 missing"):
+            writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
     def test_skip_marker_counts_as_resolved(self, tmp_path):
         """A chunk with a skip marker instead of a staged zarr passes verification."""

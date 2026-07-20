@@ -262,6 +262,20 @@ class ZarrWriter:
         """
         return f"{self.staging_base}/{run_id}/{chunk.label}.skipped"
 
+    def _done_marker_path(self, run_id: str, chunk: ChunkSpec) -> str:
+        """Get the completion-marker path for a staged chunk.
+
+        A zero-byte object written by :meth:`write_chunk` **after** the staged
+        Zarr is fully uploaded. Because a staged ``.zarr`` is many S3 objects
+        (metadata + one per data chunk) written with no atomic multi-object
+        commit, a hard crash mid-upload can leave a ``.zarr`` with valid
+        metadata but missing data chunks — which would read back as fill
+        values, not error. The marker is the completeness signal: a ``.zarr``
+        WITHOUT its ``.done`` marker is an interrupted write, ignored by
+        :meth:`_list_staged_labels` (so resume re-runs it) rather than trusted.
+        """
+        return f"{self.staging_base}/{run_id}/{chunk.label}.done"
+
     def write_skip_marker(self, chunk: ChunkSpec, run_id: str) -> str:
         """Write a zero-byte skip marker for a chunk.
 
@@ -288,7 +302,10 @@ class ZarrWriter:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
         Creates an xarray Dataset with an 'embedding' variable (mean) and
-        optionally 'embedding_std' and 'scale' variables.
+        optionally 'embedding_std' and 'scale' variables. Writes a zero-byte
+        ``.done`` completion marker (see :meth:`_done_marker_path`) **after** the
+        store is fully written, so an interrupted upload leaves a markerless
+        ``.zarr`` that resume re-runs rather than trusting.
 
         Args:
             chunk: Chunk specification.
@@ -364,6 +381,13 @@ class ZarrWriter:
         )
 
         ds.to_zarr(path, mode="w", encoding=encoding)
+        # Completion marker LAST — its presence is what makes the chunk count as
+        # staged (see _done_marker_path / _list_staged_labels). A crash between
+        # to_zarr and here leaves a markerless (interrupted) .zarr that resume
+        # will re-run rather than trust.
+        done_path = self._done_marker_path(run_id, chunk)
+        with _fs_for(done_path).open(done_path, "wb") as f:
+            f.write(b"")
         logger.info("Wrote %s to %s", chunk.label, path)
         return path
 
@@ -405,14 +429,16 @@ class ZarrWriter:
         expected_chunks: list[ChunkSpec],
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     ) -> None:
-        """Verify all expected chunks have either a staged zarr or a skip marker.
+        """Verify all expected chunks have either a completed staged zarr or a skip marker.
 
         A live (ROI-intersecting) chunk can resolve in two ways: inference
-        produced embeddings (staged zarr), or every pixel failed the validity
-        filter (skip marker). Any live chunk with neither indicates a silent
-        failure — Ray worker died mid-chunk, a bug in the actor, etc. — and
-        assembly must fail loudly rather than produce a zero-filled output
-        that looks identical to a legitimate skip.
+        produced embeddings (a staged zarr whose ``.done`` marker confirms the
+        upload finished — see :meth:`_done_marker_path`), or every pixel failed
+        the validity filter (skip marker). Any live chunk with neither — including
+        one left as a markerless, partially-uploaded ``.zarr`` by a crash —
+        indicates a silent failure and must fail loudly here rather than let
+        assembly produce a zero-filled output that looks identical to a
+        legitimate skip.
 
         Args:
             run_id: Run identifier (locates the staging directory).
@@ -465,13 +491,19 @@ class ZarrWriter:
         )
 
     def _list_staged_labels(self, run_id: str) -> list[str]:
-        """List chunk labels that have staged Zarrs in the run directory.
+        """List chunk labels whose staged write COMPLETED in the run directory.
+
+        Keyed on the ``.done`` completion marker, not the ``.zarr`` directory:
+        a ``.zarr`` present without its marker is an interrupted write (hard
+        crash mid-upload) and is deliberately excluded so resume re-runs it
+        rather than assembling its partial (fill-valued) contents. See
+        :meth:`_done_marker_path`.
 
         Returns:
             List of chunk label strings (e.g. ``["chunk_0_0", "chunk_0_1"]``).
             Empty list if the staging directory doesn't exist.
         """
-        return self._list_labels_by_suffix(run_id, ".zarr")
+        return self._list_labels_by_suffix(run_id, ".done")
 
     def _list_skip_marker_labels(self, run_id: str) -> list[str]:
         """List chunk labels that have skip markers in the run directory."""
