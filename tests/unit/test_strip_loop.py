@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 import zarr
 
@@ -327,6 +328,41 @@ class TestProcessChunkStriping:
         assert _CHUNK.height > 4
         assert len(_strip_slices(_CHUNK.height, 4)) >= 2
 
+    def test_hung_background_strip_fails_chunk_instead_of_wedging(self, inference_config, test_model, monkeypatch):
+        # A background strip load that hangs must make process_chunk FAIL FAST
+        # (returning status="failed" so the scheduler replaces the actor), NOT
+        # block forever. The strip pool is managed explicitly precisely so the
+        # timeout's raise escapes to the failure handler instead of being
+        # swallowed by ThreadPoolExecutor.__exit__'s wait=True shutdown
+        # re-joining the same wedged worker. If this regressed the test would
+        # HANG rather than fail — the watchdog around the suite bounds that.
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+        actor = _make_actor(inference_config, test_model)
+        real_load = _actors_mod.load_chunk
+        release = threading.Event()
+        calls = {"n": 0}
+
+        def _blocking_load(*a, **k):
+            calls["n"] += 1
+            if calls["n"] >= 2:  # strip 0 (prologue) loads; strip 1 (background) hangs
+                release.wait()
+            return real_load(*a, **k)
+
+        monkeypatch.setattr(_actors_mod, "_BACKGROUND_IO_TIMEOUT_S", 0.3)
+        try:
+            with (
+                patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
+                patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+                patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=True)),
+                patch.object(_actors_mod, "load_chunk", side_effect=_blocking_load),
+            ):
+                result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+        finally:
+            release.set()  # unblock the leaked worker so the pool can drain
+        assert result["status"] == "failed"
+        assert "Background strip" in result["error"]
+
     def test_all_empty_chunk_writes_skip_marker(self, inference_config, test_model):
         """A chunk with zero valid pixels across all strips writes a skip marker."""
         inference_config.s1_orbit = "both"
@@ -432,7 +468,23 @@ class TestDeferredStagingWrites:
         assert outcome is not None
         assert outcome["label"] == "chunk_hung"
         assert outcome["ok"] is False
+        assert outcome["timed_out"] is True  # flags the wedged-writer case to the scheduler
         assert "did not complete" in outcome["error"]
+
+    def test_checked_collect_raises_on_wedged_writer(self, inference_config, test_model, monkeypatch):
+        # On the hot path a wedged writer must fail the whole chunk (raise) so
+        # the scheduler kills+replaces the actor — rather than deferring another
+        # write behind the stuck one. flush_writes (idle path) stays non-raising.
+        actor = _make_actor(inference_config, test_model)
+        pool = actor._writer_pool_handle()
+        release = threading.Event()
+        actor._pending_write = ("chunk_hung", pool.submit(release.wait))
+        monkeypatch.setattr(_actors_mod, "_BACKGROUND_IO_TIMEOUT_S", 0.2)
+        try:
+            with pytest.raises(RuntimeError, match="writer pool wedged"):
+                actor._collect_prior_write_checked()
+        finally:
+            release.set()
 
 
 # ---------------------------------------------------------------------------
@@ -716,3 +768,19 @@ class TestXChunkPrefetch:
         )
         _, actor = _run_chunk_chain(inference_config, test_model, [(_CHUNK, _CHUNK_B)], patches)
         assert getattr(actor, "_xchunk_prefetched", {}) == {}
+
+    def test_wedged_prefetch_pool_raises(self, inference_config, test_model, monkeypatch):
+        # The prefetch pool is a single PERSISTENT worker: a hung task never
+        # frees and would make every later prefetch time out (600s each). A
+        # prefetch timeout must therefore fail the chunk (raise) so the actor +
+        # its pool are replaced — not fall back inline like a mere load error.
+        actor = _make_actor(inference_config, test_model)
+        pool, stash = actor._prefetch_state()
+        release = threading.Event()
+        stash["chunk_x"] = pool.submit(release.wait)
+        monkeypatch.setattr(_actors_mod, "_BACKGROUND_IO_TIMEOUT_S", 0.2)
+        try:
+            with pytest.raises(RuntimeError, match="prefetch pool wedged"):
+                actor._take_prefetched("chunk_x")
+        finally:
+            release.set()

@@ -724,8 +724,11 @@ class InferenceActor:
         """Consume the stash for ``label``; evict stale entries.
 
         Blocks on an in-flight matching prefetch (partial overlap still wins).
-        Returns None — the serial prologue — when there is no matching stash
-        or the prefetch failed.
+        Returns None — the serial prologue — when there is no matching stash or
+        the prefetch ERRORED (worker free, degrade gracefully). RAISES if a
+        prefetch TIMED OUT: the prefetch pool is a single persistent worker, so
+        a wedged task never frees and would poison every later prefetch with a
+        600 s wait — failing the chunk gets the actor (and its pool) replaced.
         """
         _, stash = self._prefetch_state()
         for stale in [k for k in stash if k != label]:
@@ -737,11 +740,9 @@ class InferenceActor:
             # prefetch drains to a no-op.
             logger.info("xchunk prefetch: draining stale stash for %s", stale)
             try:
-                # Bounded: a wedged stale load must not block the reassigned
-                # chunk forever. On timeout the thread leaks (a ThreadPoolExecutor
-                # task can't be cancelled) but the actor proceeds — the stale
-                # payload was going to be dropped anyway.
                 stash.pop(stale).result(timeout=_BACKGROUND_IO_TIMEOUT_S)
+            except TimeoutError as exc:
+                raise RuntimeError(f"xchunk prefetch pool wedged draining stale {stale}") from exc
             except Exception as exc:
                 logger.warning("xchunk prefetch: stale drain for %s did not complete (%s)", stale, exc)
         future = stash.pop(label, None)
@@ -749,7 +750,11 @@ class InferenceActor:
             return None
         try:
             return future.result(timeout=_BACKGROUND_IO_TIMEOUT_S)
+        except TimeoutError as exc:
+            raise RuntimeError(f"xchunk prefetch pool wedged loading {label}") from exc
         except Exception as exc:
+            # The load errored (worker is free) — fall back to the in-scope
+            # serial prologue; slower, never wedged.
             logger.warning("xchunk prefetch for %s failed (%s); loading inline", label, exc)
             return None
 
@@ -795,10 +800,13 @@ class InferenceActor:
             future.result(timeout=_BACKGROUND_IO_TIMEOUT_S)
         except TimeoutError:
             # A bare TimeoutError stringifies to "" — give the scheduler's
-            # requeue log a legible reason.
+            # requeue log a legible reason. timed_out=True flags that the
+            # upload is still WEDGED in the single-slot writer pool (not merely
+            # failed): the actor must be replaced, not reused, or later writes
+            # queue behind it and time out too.
             err = f"staging upload did not complete within {_BACKGROUND_IO_TIMEOUT_S:.0f}s"
             logger.warning("Deferred staging write for %s FAILED: %s", label, err)
-            return {"label": label, "ok": False, "error": err}
+            return {"label": label, "ok": False, "error": err, "timed_out": True}
         except Exception as exc:
             logger.warning("Deferred staging write for %s FAILED: %s", label, exc)
             return {"label": label, "ok": False, "error": str(exc)}
@@ -811,6 +819,25 @@ class InferenceActor:
                 "Deferred write for %s blocked collection for %.1fs (upload slower than prologue)", label, blocked
             )
         return {"label": label, "ok": True, "error": None}
+
+    def _collect_prior_write_checked(self) -> dict[str, Any] | None:
+        """`_collect_prior_write`, but RAISE if the prior upload timed out.
+
+        A timeout means the single-slot writer pool is wedged on a hung upload;
+        deferring this chunk's write behind it would just queue another doomed
+        task. Raising fails the whole chunk so the scheduler kills + replaces
+        this actor (reaping the wedged writer thread) and requeues both this
+        chunk and the orphaned prior write via the standard failure path. A
+        normal write error (`ok=False` without `timed_out`) leaves the healthy
+        actor in rotation and just requeues the one chunk. Used on the hot
+        path; `flush_writes` (idle path) keeps the non-raising variant so the
+        scheduler's flush handler can replace the slot itself.
+        """
+        outcome = self._collect_prior_write()
+        if outcome is not None and outcome.get("timed_out"):
+            msg = f"prior staging write for {outcome['label']} timed out; writer pool wedged"
+            raise RuntimeError(msg)
+        return outcome
 
     def flush_writes(self) -> dict[str, Any] | None:
         """Drain the outstanding deferred write (scheduler calls this when the
@@ -974,7 +1001,16 @@ class InferenceActor:
             # body — the prior set is dropped first, so only ONE is ever resident
             # and a strip may safely use the larger pair budget. Strip 0 arrived
             # already loaded with the prologue in both modes.
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="strip-prefetch") as pool:
+            # Managed explicitly (NOT `with`): a timed-out strip load raises
+            # below, and `ThreadPoolExecutor.__exit__` would call
+            # shutdown(wait=True), re-joining the SAME hung worker and swallowing
+            # the escape. The finally shuts down non-blocking (wait=False,
+            # cancel_futures) so the raise reaches the scheduler; the wedged
+            # worker leaks but dies with the actor the scheduler then replaces.
+            # On the normal path nothing is outstanding at loop exit, so this is
+            # an immediate no-op.
+            pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strip-prefetch")
+            try:
                 next_future: Future[tuple[ChunkData, MosaicChunkInferenceDataset]] | None = None
 
                 # Bound to None so the first iteration's `del` has a target; each
@@ -1070,6 +1106,8 @@ class InferenceActor:
                     embeddings[strip, cols] = result.embeddings
                     scales[strip, cols] = result.scales
                     total_valid += len(dataset)
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
 
             # All strips done: the last strip's inputs and the full-chunk SCL
             # mask are no longer needed (obs counts and embeddings already live
@@ -1094,13 +1132,13 @@ class InferenceActor:
                     "valid_pixels": 0,
                     "elapsed_sec": time.monotonic() - t0,
                     "instance_id": self.instance_id,
-                    "prior_write": self._collect_prior_write(),
+                    "prior_write": self._collect_prior_write_checked(),
                 }
 
             # Resolve the PREVIOUS chunk's deferred write first (it queued a
             # full chunk ago on the single-slot writer — normally long done),
             # so its outcome rides this result back to the scheduler.
-            prior_write = self._collect_prior_write()
+            prior_write = self._collect_prior_write_checked()
 
             # Defer the whole-chunk staging write to the writer thread: it
             # overlaps the next chunk's serial prologue load instead of adding

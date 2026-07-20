@@ -276,9 +276,13 @@ the strip / cross-chunk-starter prefetch loads — is bounded by `_BACKGROUND_IO
 (600 s, matching the scheduler's `flush_writes()` RPC timeout). A wedged S3/zarr client
 with no socket timeout would otherwise hang `process_chunk` itself, where the scheduler's
 tail-flush recovery can never reach it (Ray serialises actor calls, and a 1–2-actor run
-never hits the ≥3-stall abort). On timeout a deferred write reports failure (requeue), a
-prefetch falls back to a serial load, and a background strip raises so the scheduler
-replaces the actor and requeues.
+never hits the ≥3-stall abort). A **timeout** always fails the chunk so the scheduler
+replaces the actor (reaping the wedged worker) and requeues — critically because the
+writer and prefetch pools are single, *persistent* workers, so a stuck task would poison
+every later write/prefetch. Only a background strip's pool is per-chunk and managed
+explicitly (not `with`), so its timeout `raise` escapes instead of being re-swallowed by
+`ThreadPoolExecutor.__exit__`'s blocking `shutdown(wait=True)`. A prefetch that merely
+*errors* (worker free) still degrades gracefully to the serial prologue.
 
 **Sparse chunks read less**: strips whose SCL-mask slice has zero valid pixels skip the
 S2 band read entirely, and chunks whose valid pixels span a narrow easting window read

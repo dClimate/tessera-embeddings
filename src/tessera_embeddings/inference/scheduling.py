@@ -860,9 +860,20 @@ def _process_chunks_work_stealing(
             deferred["write_confirmed"] = True
             results.append(deferred)
         else:
-            # The actor itself is healthy (it just inferred a whole chunk) —
-            # requeue without the kill-and-replace used for inference failures.
+            # A plain write error leaves the actor healthy (it just inferred a
+            # whole chunk) — requeue without the kill-and-replace used for
+            # inference failures.
             _requeue_unconfirmed(deferred, str(prior.get("error", "unknown write error")))
+            if prior.get("timed_out"):
+                # ...but a TIMEOUT means the upload is still wedged in the
+                # actor's single-slot writer pool; keep dispatching to it and
+                # later writes queue behind the stuck task and time out too.
+                # Replace the slot (reaping the writer). Only reached via the
+                # idle-flush path — the hot path raises in process_chunk, so
+                # this actor is idle and has no chunk mid-assignment.
+                log.warning("Actor %d writer pool wedged (write timeout); replacing", actor_idx)
+                pool.resolve_iid(actor_idx)
+                pool.replace(actor_idx, pool.actor_instance_ids[actor_idx])
 
     def _flush_idle_writes() -> None:
         """Drain deferred writes on actors with no in-flight call to carry them."""
