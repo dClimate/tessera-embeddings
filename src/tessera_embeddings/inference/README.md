@@ -14,9 +14,10 @@ domain functions on `ray_cluster(num_gpus=0)` for laptop/CI runs.
 and **~21–24K pixels/sec per worker** on mid-density chunks (~10–18K on dense), with **peak host
 RAM ~45–47%** of the 30.9 GB node (budgeted to stay under 60% at UTM-zone scale). Outputs stay
 within the ADR-012 validated-equivalence envelope. The mechanisms — vectorised prep, an async GPU
-loop, valid-pixel-aware striping, and a RAM-bounded cross-chunk starter prefetch — are mapped in
-[**How the Optimizations Fit Together**](#how-the-optimizations-fit-together) (a decision tree
-with relative impact) and then detailed phase-by-phase below; full profiling and gotchas are in
+loop, valid-pixel-aware striping, and a RAM-bounded cross-chunk starter prefetch — are detailed
+phase-by-phase below, then synthesized into a decision tree with relative impact in
+[**How Our Performance Optimizations Fit Together**](#how-our-performance-optimizations-fit-together); full profiling and
+gotchas are in
 [`context_docs/design/inference_gpu_saturation_profile_2026_07.md`](../../../context_docs/design/inference_gpu_saturation_profile_2026_07.md).
 
 ---
@@ -64,133 +65,6 @@ Input stores (Icechunk/Zarr on S3):
            embedding dims: (time, northing, easting, 128)
            obs count dims:  (time, northing, easting)  — s2/s1_asc/s1_desc
 ```
-
----
-
-## How the Optimizations Fit Together
-
-The GPU on each worker is fast enough; the original pipeline left it **idle ~50% of
-the time** — not waiting on compute, but on *loading data*, *preparing batches*, and
-*writing results*, plus a serial "cold start" at the top of every chunk. Every
-optimization below removes one source of that idle time. None of them changes what the
-model computes: all are **bit-identical** to the original outputs except the batch-size
-bump (which shifts int8 values by ≤1–2 levels, inside the ADR-012 tolerance).
-
-They come in two families:
-
-- **Always-on core loop** — keep the GPU fed *during* the forward pass. These run on
-  every chunk, unconditionally.
-- **Per-chunk adaptive** — how a chunk is loaded and pipelined depends on *how much
-  valid data it actually holds*. A cloudy coastal sliver and a dense interior tile take
-  very different paths. The decision is made per chunk from its Sentinel-2 SCL mask.
-
-**Impact legend** (qualitative — see the profiling doc for hard numbers):
-**● large** · **◐ medium** · **○ small**. "Large" means it removed a dominant chunk of
-GPU-idle time in the profiles; "small" means a real but minor trim.
-
-### The always-on core loop (every chunk)
-
-```
-Runs on every chunk, regardless of density — keeps the GPU busy mid-forward:
-
-  ● vectorised temporal resampling   batch prep 600–650 ms → ~130 ms/sub-batch
-                                      (was SLOWER than the GPU forward → prep
-                                       gated the GPU; now it doesn't)          [§4c]
-  ◐ async two-deep GPU pipeline      pinned double-buffers + copy stream;
-                                      forward i+1 is submitted before i's
-                                      result is copied back → no per-batch bubble [§4d]
-  ◐ batch size 7168 (BF16)           bigger GEMMs use the tensor cores more
-                                      fully (the one non-bit-identical change)  [§4d]
-  ○ background staging write         the ~7.5 s S3 upload runs on a writer
-                                      thread, overlapping the NEXT chunk's load [§5]
-```
-
-### The per-chunk decision tree
-
-Each chunk takes **one path** through this tree, chosen from its valid-pixel count and
-their spatial spread. Read top to bottom:
-
-```
-A chunk arrives → load its SCL mask → count valid pixels, find their bbox
-│
-├─ Q1. Do the valid pixels sit in a narrow easting window?
-│      (cropping saves ≥ 10% of the width)
-│        ├─ yes → ◐ crop the S2 read to the bbox — edge/coast slivers   [§4a]
-│        │        read a fraction of the bytes
-│        └─ no  → read full width (interior tiles stay byte-identical)
-│
-├─ (always) ○ prune S2 timesteps that are empty everywhere — cloudy    [§4a]
-│           dates would never be read by any pixel
-│
-├─ Q2. Does bands + full mask fit ONE RAM budget?
-│        ├─ yes → single strip — no split, no prefetch (common interior)
-│        │
-│        └─ no  → SPLIT into northing strips  ● bounds peak host RAM    [§4a′]
-│                 │
-│                 └─ Q3. Enough valid data for the GPU to hide the strip
-│                        loads behind inference?
-│                          ├─ yes (dense) →
-│                          │     ◐ intra-chunk strip prefetch: strip     [§4a′]
-│                          │       i+1 loads while strip i runs the GPU
-│                          │     ○ starter strip: small first slice, GPU [§4a″]
-│                          │       starts one read sooner
-│                          └─ no (wide but few valid px) →
-│                                prefetch OFF, strips at the PAIR budget [§4a′]
-│                                (one set resident → bigger budget safe;
-│                                fewer, larger reads)
-│
-├─ Q4. On the LAST strip, is this a RAM trough (≤ 1× budget)?
-│        ├─ yes, and a next chunk is reserved →
-│        │     ● cross-chunk starter prefetch: preload the next chunk's [§4a″]
-│        │       mask + 256-row starter NOW, so its GPU work starts
-│        │       0–8 s later instead of 24–34 s
-│        └─ no (pair budget) → skip it; the next chunk takes the serial
-│              prologue (slower, but never over the RAM ceiling)
-│
-└─ (per strip, throughout) ◐ empty-strip skip: a strip whose mask slice [§4a]
-                           has zero valid pixels skips the S2 band read
-```
-
-**Reading the tree in words.** A dense interior tile crops nothing, prunes little,
-splits into strips, pipelines those strip loads, and hands its neighbour a warm start —
-the striping + prefetch machinery (§4a′–4a″) is what recovered most of its per-chunk
-idle. A cloudy coastal sliver instead crops hard to its bbox, prunes empty dates, skips
-empty strips, and often fits a single strip — its win comes almost entirely from
-*reading less* (§4a), because a single-strip chunk is serial and has nothing to overlap.
-Same code, opposite paths.
-
-### Summary
-
-| Optimization | Family | Kicks in when… | Impact | Output |
-|---|---|---|---|---|
-| Vectorised temporal resampling (§4c) | core loop | always | ● large | identical |
-| Async two-deep GPU pipeline (§4d) | core loop | always (CUDA) | ◐ medium | identical |
-| Batch size 3584 → 7168 (§4d) | core loop | always | ◐ medium | ≤1–2 int8 levels¹ |
-| Background staging write (§5) | core loop | always | ○ small | identical |
-| Valid-pixel-aware northing striping (§4a′) | adaptive | chunk exceeds one RAM budget | ● large² | identical |
-| Intra-chunk strip prefetch (§4a′) | adaptive | dense/hideable split | ◐ medium | identical |
-| Starter strip (§4a″) | adaptive | dense split with a real body | ○ small | identical |
-| Cross-chunk starter prefetch (§4a″) | adaptive | last strip is a RAM trough + next chunk reserved | ● large | identical |
-| Timestep pruning (§4a) | adaptive | cloudy chunk (empty dates) | ○ small–◐ | identical |
-| Empty-strip skip (§4a) | adaptive | a strip has zero valid pixels | ◐ medium | identical |
-| Easting bbox crop (§4a) | adaptive | valid pixels span a narrow window (≥10% saved) | ◐ medium³ | identical |
-
-¹ The only non-bit-identical change; judged against the relaxed ADR-012 cross-config
-envelope. ² Foundational — it bounds peak RAM, which is what makes every other adaptive
-choice safe; it also drops a ~13 s fixed read per dense chunk. ³ Large on edge/coast
-slivers (a 1.5K-valid-pixel chunk dropped from ~39 s of loading to roughly
-bbox-proportional), negligible on interior tiles (which skip it).
-
-### What we deliberately did *not* do
-
-Profiling ruled these out, so they're absent by design, not oversight:
-
-- **GRU restructuring** — the model builder already fuses the recurrent stack to cuDNN;
-  a hand-restructure was written, measured as no faster, and reverted as dead code.
-- **FP16 fast-accumulate** — an L40S GEMM microbench showed BF16 already runs at the
-  full dense tensor-core ceiling, so FP16 buys nothing here. BF16 stays.
-- **Adaptive token-budget batching** — measured; B=7168 is already throughput-optimal
-  across sequence lengths, so a dynamic budget added complexity for no gain.
 
 ---
 
@@ -262,9 +136,10 @@ Each chunk goes through four sub-steps:
 
 #### 4a. Data Loading (`data_loading.py`)
 
-Two-phase loading lowers peak worker RAM by dropping empty dates before the band read. This
-caps RAM for typical chunks but does not *bound* it — peak still scales with `T_valid`, which
-is what northing striping (4a′) addresses for dense chunks:
+Two-phase loading exploits **temporal sparsity** — it drops empty dates before the band read
+(timestep pruning). This caps RAM for typical chunks but does not *bound* it — peak still
+scales with the post-prune `T_valid`, which is what northing striping (4a′) bounds for
+high-valid-pixel-count chunks:
 
 ```text
 All timesteps in the ROI time axis
@@ -313,8 +188,8 @@ inference, and written into whole-chunk output buffers by row-slice. Only the *i
 sub-tiled — the int8 output buffer (`H × W × 128`, ~0.5 GB) is held whole, so the write path,
 obs-count maps, and `assembly.py` are untouched (a single `write_chunk` at the end). On dense
 chunks strips are loaded through a 1-deep prefetch pipeline (strip *i+1* loads while strip *i*
-runs the GPU), the same pattern as the sub-batch prefetcher in `inference.py`; on sparse chunks
-that pipeline is turned off (see the strip plan below).
+runs the GPU), the same pattern as the sub-batch prefetcher in `inference.py`; on chunks with
+few valid pixels that pipeline is turned off (see the strip plan below).
 
 The tiling is chosen per chunk by `_strip_plan`, from the full-chunk SCL mask loaded once up
 front: its **true post-prune timestep count** `T_kept` sets the byte cost, and its valid-pixel
@@ -342,7 +217,7 @@ the two-strip co-residency that sets the peak — see the budget constant's comm
 The bounded cross-chunk starter prefetch (§4a″) adds ≤~2 GiB of stash, but only during the current
 chunk's last strip — the RAM trough — so it raises the trough, not the peak.
 Turning prefetch off on non-hideable chunks matters because a background load only helps if there
-is inference to hide it behind — on a wide-but-sparse chunk the load would otherwise sit naked on
+is inference to hide it behind — on a wide but few-valid-pixel chunk the load would otherwise sit naked on
 the critical path *and* force a second co-resident set for nothing. A chunk that fits one budget
 loads whole — byte-for-byte the unstriped path.
 
@@ -377,7 +252,7 @@ prefetches a **capped** payload for the hinted chunk: its SCL mask bundle + read
 when the rung allows, its 256-row starter strip. Rungs (`_xchunk_rung`): P2-tiled dense
 chunks prefetch their (already small) starter free; single-budget chunks convert to
 starter+body only when a net-gain check says the extra fixed read will hide; everything
-else (budget-sized first strips, non-hideable sparse plans, anything over the
+else (budget-sized first strips, non-hideable few-valid-pixel plans, anything over the
 `_XCHUNK_PREFETCH_CAP_BYTES` ~2 GiB cap) gets the mask only. Every miss — cap, steal
 (label mismatch evicts the stash), credential-window expiry, load failure, or the
 `TESSERA_DISABLE_XCHUNK_PREFETCH=1` hatch — degrades to the serial prologue: slower,
@@ -412,9 +287,10 @@ explicitly (not `with`), so its timeout `raise` escapes instead of being re-swal
 `ThreadPoolExecutor.__exit__`'s blocking `shutdown(wait=True)`. A prefetch that merely
 *errors* (worker free) still degrades gracefully to the serial prologue.
 
-**Sparse chunks read less**: strips whose SCL-mask slice has zero valid pixels skip the
-S2 band read entirely, and chunks whose valid pixels span a narrow easting window read
-S2 only for that bounding box (`x_sub`; applied when it saves ≥10% of the width). SAR is
+**Spatial sparsity — read less**: strips whose SCL-mask slice has zero valid pixels skip
+the S2 band read entirely (empty-strip skip), and chunks whose valid pixels span a narrow
+easting window read S2 only for that column bounding box (`x_sub`; applied when it saves
+≥10% of the width). SAR is
 still read full-width and S2 obs come from the mask bundle, so the saved obs-count
 layers keep full-extent fidelity — outputs are bit-identical, only the bytes read
 change. A chunk_7_0-class sliver (1.5K valid px, T_kept=82) drops from ~39 s of loading
@@ -692,6 +568,205 @@ sub-chunks the band axis alone is 32 chunks (128/4), so the graph is
 `chunks=None` opens the store zarr-lazy with no dask graph: slicing is pure
 metadata and chunks load only when `.values` is pulled. This is unrelated to
 manifest splitting — the split bounds commit/manifest cost, not the dask graph.
+
+---
+
+## How Our Performance Optimizations Fit Together
+
+The phases above describe *what the pipeline does*. This section steps back and maps the
+performance work layered across them — *what* each optimization targets, *when* it acts,
+and *how much* it buys — so the design is legible without reading every phase in depth.
+
+The GPU on each worker is fast enough; a naive pipeline leaves it **idle ~50% of the
+time** — not waiting on compute, but on *loading data*, *preparing batches*, and
+*writing results*, plus a serial "cold start" at the top of every chunk. Every
+optimization here removes one source of that idle time. None changes what the model
+computes: all are **bit-identical** — they change scheduling and I/O, not the math —
+except the batch-size bump, which shifts int8 values by ≤1–2 levels (inside the ADR-012
+tolerance).
+
+They come in two families:
+
+- **Always-on core loop** — keep the GPU fed *during* the forward pass. These run on
+  every chunk, unconditionally.
+- **Per-chunk adaptive** — how a chunk is loaded and pipelined depends on *how much
+  valid data it actually holds*. A cloudy coastal sliver and a dense interior tile take
+  very different paths. The decision is made per chunk from its Sentinel-2 SCL mask.
+
+### A few concepts first
+
+**Terms.**
+
+- **GEMM** — a general matrix–matrix multiply, the dominant arithmetic inside the
+  transformer. GPUs run GEMMs on dedicated **tensor cores**, which are most efficient
+  when the matrices are *large*; a bigger **batch** (more pixels multiplied in one go)
+  makes each GEMM larger, so the tensor cores idle less.
+- **batch / sub-batch** — pixels are inferred in groups, not one at a time. A chunk's
+  pixels are split into fixed-size **sub-batches**, each of which is one GPU forward pass.
+- **the transfer "bubble" / copy stream / double-buffering** — a batch must be copied
+  from CPU to GPU ("host→device") before the GPU can compute it; done naively the copy
+  and the compute alternate, so the GPU stalls during every copy — a **bubble**. Staging
+  batches in **pinned** (page-locked) host memory and issuing the copy on a separate CUDA
+  **copy stream** lets the *next* batch transfer while the current one computes; holding
+  two batches in flight at once (**double-buffering**, "two-deep") hides the copy behind
+  compute. (**D2H** = device→host, copying results back.)
+- **SCL mask** — Sentinel-2's per-pixel Scene Classification Layer; here, the
+  cloud/validity mask that records which pixels and which dates hold usable data. Every
+  per-chunk decision below starts from it.
+
+**Where the GPU idles — three windows.** A chunk runs through three windows in order;
+each optimization reclaims idle from one of them (the summary table tags which):
+
+```
+   COLD START (idle) ──▶ FORWARD PASS (busy) ──▶ WRITE (idle) ──▶ next chunk
+
+  1. COLD START — GPU idle: load SCL mask, read the 1st strip, build the dataset.
+       reclaimed by:  crop · prune · empty-strip skip · starter strip ·
+                      cross-chunk prefetch (next chunk's cold start already done)
+
+  2. FORWARD PASS — GPU busy (the real work): sub-batch → sub-batch, across strips.
+       keep it fed, no gaps:  vectorised resampling · async two-deep pipeline ·
+                              batch 7168 · intra-chunk strip prefetch
+
+  3. WRITE — GPU idle: staging upload.
+       reclaimed by:  background write, overlapping the next chunk's cold start
+```
+
+**Two kinds of "sparsity."** The read-reduction optimizations exploit emptiness along
+different axes of a chunk's `time × rows × columns` data cube; naming the axis makes
+"sparse" unambiguous (both *what* is targeted and *why* the fix works):
+
+- **Temporal sparsity** — whole dates are cloud/nodata → *timestep pruning* drops them
+  (shrinks *time*); the resampler never reads an all-empty date.
+- **Spatial sparsity** — valid pixels occupy only part of the tile's footprint →
+  *easting crop* (shrinks *columns*) + *empty-strip skip* (drops empty *rows*); pixels
+  outside the valid footprint produce no embedding, so their bytes are never read.
+- Both are distinct from a chunk's **valid-pixel count** — the *volume* of inference
+  work left after them — which drives the strip/prefetch plan (Q2–Q4 below), not how
+  much gets read. A tile can be spatially compact but temporally deep, or vice versa.
+
+**Impact legend** (qualitative — see the profiling doc for hard numbers):
+**● large** · **◐ medium** · **○ small**. "Large" means it removed a dominant chunk of
+GPU-idle time in the profiles; "small" means a real but minor trim.
+
+### The always-on core loop (every chunk)
+
+```
+Runs on every chunk, regardless of density. The first three keep the GPU busy
+MID-FORWARD; the write hides the POST-FORWARD idle (see the three windows above):
+
+  ● vectorised temporal resampling   batch prep 600–650 ms → ~130 ms/sub-batch
+                                      (was SLOWER than the GPU forward → prep
+                                       gated the GPU; now it doesn't)          [§4c]
+  ◐ async two-deep GPU pipeline      pinned double-buffers + copy stream so the
+                                      next batch transfers while this one runs
+                                      → no per-batch bubble                    [§4d]
+  ◐ batch size 7168 (BF16)           bigger GEMMs use the tensor cores more
+                                      fully (the one non-bit-identical change) [§4d]
+  ○ background staging write         the ~7.5 s S3 upload runs on a writer
+                                      thread, overlapping the NEXT chunk's load [§5]
+```
+
+### The per-chunk decision tree
+
+Two chunks make the tree concrete before you read it. A **dense interior tile** has
+little sparsity of either kind to exploit — it crops nothing and prunes little; its win
+comes from the striping + prefetch pipeline (§4a′–4a″), because its high valid-pixel
+count keeps the GPU busy enough to hide the strip loads. A **cloudy coastal sliver** is
+the opposite: high *temporal* sparsity (prune empty dates) and high *spatial* sparsity
+(crop to the bbox, skip empty row bands), so its win comes almost entirely from *reading
+less* (§4a) — and since its low valid-pixel count makes it a single serial strip,
+reading less is the only lever it has. Same code, opposite paths.
+
+Each chunk takes **one path** through the tree below, chosen from its valid-pixel count
+and where the valid data sits. Read top to bottom:
+
+```
+A chunk arrives → load its SCL mask → count valid pixels, find their bbox
+│
+├─ Q1. SPATIAL sparsity: do the valid pixels sit in a narrow easting window?
+│      (cropping saves ≥ 10% of the width)
+│        ├─ yes → ◐ crop the S2 read to that column bbox — edge/coast   [§4a]
+│        │        slivers read a fraction of the bytes
+│        └─ no  → read full width (interior tiles stay byte-identical)
+│
+├─ TEMPORAL sparsity (always): ○ prune S2 timesteps empty everywhere    [§4a]
+│           — cloudy dates the resampler would never read
+│
+├─ Q2. Does bands + full mask fit ONE RAM budget?
+│        ├─ yes → single strip — no split, no prefetch (common interior)
+│        │
+│        └─ no  → SPLIT into northing strips  ● bounds peak host RAM    [§4a′]
+│                 │
+│                 └─ Q3. Enough valid data for the GPU to hide the strip
+│                        loads behind inference?
+│                          ├─ yes (dense) →
+│                          │     ◐ intra-chunk strip prefetch: strip     [§4a′]
+│                          │       i+1 loads while strip i runs the GPU
+│                          │     ○ starter strip: small first slice, GPU [§4a″]
+│                          │       starts one read sooner
+│                          └─ no (wide but few valid px) →
+│                                prefetch OFF, strips at the PAIR budget [§4a′]
+│                                (one set resident → bigger budget safe;
+│                                fewer, larger reads)
+│
+├─ Q4. On the LAST strip, is this a RAM trough (≤ 1× budget)?
+│        ├─ yes, and a next chunk is reserved →
+│        │     ● cross-chunk starter prefetch: preload the next chunk's [§4a″]
+│        │       mask + 256-row starter NOW, so its GPU work starts
+│        │       0–8 s later instead of 24–34 s
+│        └─ no (pair budget) → skip it; the next chunk takes the serial
+│              prologue (slower, but never over the RAM ceiling)
+│
+└─ SPATIAL sparsity (per strip): ◐ empty-strip skip — a strip whose    [§4a]
+                           mask slice has zero valid pixels skips the S2 band read
+```
+
+### Summary
+
+Every output is **bit-identical** with an unoptimized approach except the batch-size change (¹) — the rest alter
+scheduling and I/O, not the math. *Window* is which GPU-idle window each reclaims (see
+the three-windows diagram above).
+
+| Optimization | Family | Window | Triggers on… | Impact |
+|---|---|---|---|---|
+| Vectorised temporal resampling (§4c) | core loop | mid-forward | always | ● large |
+| Async two-deep GPU pipeline (§4d) | core loop | mid-forward | always (CUDA) | ◐ medium |
+| Batch size 3584 → 7168 (§4d) | core loop | mid-forward | always | ◐ medium¹ |
+| Background staging write (§5) | core loop | write (post) | always | ○ small |
+| Valid-pixel-aware northing striping (§4a′) | adaptive | *enabling* | chunk exceeds one RAM budget | ● large² |
+| Intra-chunk strip prefetch (§4a′) | adaptive | mid-forward | dense/hideable split | ◐ medium |
+| Starter strip (§4a″) | adaptive | cold-start | dense split with a real body | ○ small |
+| Cross-chunk starter prefetch (§4a″) | adaptive | cold-start (next chunk) | last strip is a RAM trough + next chunk reserved | ● large |
+| Timestep pruning (§4a) | adaptive | cold-start | **temporal** sparsity (cloudy/empty dates) | ○ small–◐ |
+| Empty-strip skip (§4a) | adaptive | cold-start (per strip) | **spatial** sparsity (a row band with no valid px) | ◐ medium |
+| Easting bbox crop (§4a) | adaptive | cold-start | **spatial** sparsity (valid px in a narrow column window) | ◐ medium³ |
+
+¹ The only non-bit-identical change; judged against the relaxed ADR-012 cross-config
+envelope (≤1–2 int8 levels).
+
+² Foundational — it bounds peak RAM, which is what makes every other adaptive choice
+safe; it also drops a ~13 s fixed read per dense chunk.
+
+³ Large on edge/coast slivers (a 1.5K-valid-pixel chunk dropped from ~39 s of loading to
+roughly bbox-proportional), negligible on interior tiles (which skip it).
+
+### What we deliberately did *not* do
+
+Profiling ruled these out, so they're absent by design, not oversight:
+
+- **Greedily prefetching to fill RAM.** We deliberately **leave host RAM on the table.**
+  Prefetching the whole next chunk to use the spare RAM co-resides two full working sets
+  and spikes peak host RAM to ~92–95% — which OOM-killed a worker. The strip budget plus
+  the bounded (~2 GiB) cross-chunk prefetch instead hold peak at ~45–52%, well under the
+  60% ceiling, so chunk-density spikes at UTM-zone scale can't OOM the node. The unused
+  headroom is intentional insurance, not waste.
+- **GRU restructuring** — the model builder already fuses the recurrent stack to cuDNN;
+  a hand-restructure was written, measured as no faster, and reverted as dead code.
+- **FP16 fast-accumulate** — an L40S GEMM microbench showed BF16 already runs at the
+  full dense tensor-core ceiling, so FP16 buys nothing here. BF16 stays.
+- **Adaptive token-budget batching** — measured; B=7168 is already throughput-optimal
+  across sequence lengths, so a dynamic budget added complexity for no gain.
 
 ---
 
