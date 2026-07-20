@@ -104,9 +104,8 @@ idempotent). Removed ~7.5 s GPU-idle/chunk from the critical path.
 ### E. Cost & reliability — no output impact
 Leak-proof teardown (flow-run-id-derived cluster tag survives Prefect's
 fresh-process hook; `min_workers: 0` so no idle GPU floor; `resolved_yaml` bound
-before `ray up` so failed launches tear down); capacity-aware single-AZ selection
-(spot-placement scores sized to the fleet, least-loaded fallback, launch-time
-failover).
+before `ray up` so failed launches tear down). The cluster is pinned to one AZ
+(cross-AZ transfer is billed), chosen as the least-loaded subnet.
 
 ## Attribution — which change bought which improvement
 
@@ -174,13 +173,10 @@ cross-config envelope.
   scoped tightly with `--since/--until`; a broad window mixes concurrent runs.
   On-worker 1 s GPU poll files (`/tmp/gpu_poll.csv`) die with the workers — capture
   `--report` BEFORE a run's cluster tears down.
-- **SPS is a spot proxy for on-demand.** Scores can come back UNIFORM (all 1 at
-  target_capacity=30 was observed) → no discrimination → falls to the subnet-id
-  tiebreak (deterministically us-west-2a). It needs the runner role granted
-  `ec2:GetSpotPlacementScores` or it silently falls back to least-loaded. And with
-  `min_workers: 0`, `ray up` launches only the head, so launch-time failover
-  CANNOT catch g6e worker-capacity shortfalls (they surface later at the
-  autoscaler) — AZ *selection*, not failover, is the mitigation.
+- **`min_workers: 0` defers worker capacity to the autoscaler.** `ray up`
+  launches only the head, so a g6e worker-capacity shortfall surfaces later at
+  autoscale time, not at launch. The single-AZ pin is chosen by least-loaded
+  subnet (spread across concurrent clusters); it does not model spot capacity.
 - **Testing: never boot a real Ray cluster in pytest.** `ray.kill` is wrapped in
   Ray's auto-init hook — an unpatched call in a unit test silently starts a local
   Ray cluster whose init hashes the whole working dir (multi-GB with scale-test
