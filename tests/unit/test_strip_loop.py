@@ -25,6 +25,7 @@ from tessera_embeddings.config.inference import S2_BAND_ORDER
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.actors import (
     _MIN_STRIP_H,
+    _S2_FOREGROUND_DECODE_READERS,
     _S2_STRIP_BYTE_BUDGET,
     _XCHUNK_DISABLE_ENV,
     InferenceActor,
@@ -105,6 +106,28 @@ class TestStripHeightForDensity:
         # byte budget, logged) rather than degenerating into tiny reads.
         assert _strip_height_for_density(10**9, 4000, 4000) == _MIN_STRIP_H
 
+    def test_pair_budget_strip_charges_decode_transient(self):
+        # A pair-budget strip is read in the FOREGROUND, so its momentary peak is
+        # the resident stacked result PLUS the concurrent per-band decode
+        # temporaries. Sized with decode_readers, that momentary peak — not just
+        # the resident set — must fit the pair budget (else a high-T foreground
+        # read overshoots the RAM ceiling mid-decode).
+        pair = 2 * _S2_STRIP_BYTE_BUDGET
+        readers = _S2_FOREGROUND_DECODE_READERS
+        for t_kept, width, height in [(120, 2000, 2000), (200, 2000, 2000), (90, 4000, 4000)]:
+            h = _strip_height_for_density(t_kept, width, height, pair, decode_readers=readers)
+            if h <= _MIN_STRIP_H:
+                continue  # floored case may breach the budget by design
+            mask_bytes = t_kept * height * width
+            resident = t_kept * h * width * len(S2_BAND_ORDER) * 2
+            transient = readers * t_kept * h * width * 2
+            assert resident + transient + mask_bytes <= pair
+        # Sanity: charging the transient yields a strictly shorter strip than
+        # sizing the resident set alone (the pre-fix behaviour).
+        naive = _strip_height_for_density(200, 2000, 2000, pair)
+        charged = _strip_height_for_density(200, 2000, 2000, pair, decode_readers=readers)
+        assert charged < naive
+
 
 class TestStripPlan:
     """The strip-plan chooses a tiling + prefetch mode; RAM stays bounded."""
@@ -151,12 +174,31 @@ class TestStripPlan:
         assert self._peak_resident_bytes(plan, 200, 2000, 2000) <= 2 * _S2_STRIP_BYTE_BUDGET
 
     def test_wide_few_valid_px_fitting_pair_is_single_strip(self):
-        # T=100 needs >1 budget but <= the pair; non-hideable -> single strip at
-        # the wider budget, prefetch off.
+        # T=100 needs >1 budget but <= the pair EVEN once its foreground decode
+        # temporaries are counted; non-hideable -> single strip at the wider
+        # budget, prefetch off.
         plan = _strip_plan(t_kept=100, height=2000, width=2000, valid_px=30_000)
         assert plan.strips == [slice(0, 2000)]
         assert plan.prefetch is False
         assert plan.strategy == "single/wide-budget"
+
+    def test_pair_budget_plan_fits_foreground_decode_transient(self):
+        # A wider/higher-T non-hideable chunk that would fit the pair budget as
+        # one RESIDENT set but NOT once its foreground per-band decode temporaries
+        # are counted must SPLIT — so no strip's momentary read peak overshoots
+        # the pair ceiling (pre-fix this single-stripped and could OOM mid-read).
+        plan = _strip_plan(t_kept=120, height=2000, width=2000, valid_px=1000)
+        assert plan.pair_budget is True
+        assert plan.prefetch is False
+        assert len(plan.strips) >= 2  # would have been a single strip pre-fix
+        pair = 2 * _S2_STRIP_BYTE_BUDGET
+        readers = _S2_FOREGROUND_DECODE_READERS
+        mask_bytes = 120 * 2000 * 2000
+        for s in plan.strips:
+            sh = s.stop - s.start
+            resident = 120 * sh * 2000 * len(S2_BAND_ORDER) * 2
+            transient = readers * 120 * sh * 2000 * 2
+            assert resident + transient + mask_bytes <= pair
 
 
 # ---------------------------------------------------------------------------

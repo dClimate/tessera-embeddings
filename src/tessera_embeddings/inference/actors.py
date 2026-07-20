@@ -98,6 +98,17 @@ _S2_STRIP_BYTE_BUDGET = int(5.75 * 1024**3)
 # Per-(timestep, pixel) byte cost of resident S2 bands: 10 bands x uint16.
 _S2_BYTES_PER_OBS_PX = len(S2_BAND_ORDER) * 2
 
+# The foreground S2 band read fans out one decompression thread per core (capped
+# at the 10-band count) — 4 on the 4-vCPU g6e.xlarge. Each concurrent thread
+# holds a transient single-band (T, strip_h, W) uint16 array ON TOP of the
+# resident stacked result, so a read's momentary peak is (10 + readers) bands'
+# worth, not 10. The dense path reads strips in the BACKGROUND (2 reserved-core
+# readers) and its measured peak already includes that transient; only the
+# pair-budget FOREGROUND read (few-valid-px, prefetch off, a single set sized to
+# the full pair budget) must charge it so its momentary peak stays within the
+# pair ceiling. See _strip_plan regime 3.
+_S2_FOREGROUND_DECODE_READERS = min(len(S2_BAND_ORDER), 4)
+
 # Cores left free for the inference loop's batch-prep workers while a
 # BACKGROUND strip load decompresses bands: one per prep worker, BY DEFINITION
 # tied to the prep pool size so a PREFETCH_DEPTH change can't silently
@@ -176,7 +187,12 @@ _XCHUNK_SAR_STARTER_EST_BYTES = int(0.4 * 1024**3)
 
 
 def _strip_height_for_density(
-    t_kept: int, width: int, height: int, budget: int = _S2_STRIP_BYTE_BUDGET, mask_width: int | None = None
+    t_kept: int,
+    width: int,
+    height: int,
+    budget: int = _S2_STRIP_BYTE_BUDGET,
+    mask_width: int | None = None,
+    decode_readers: int = 0,
 ) -> int:
     """Largest northing strip height (rows) whose resident S2 working set fits ``budget``.
 
@@ -184,14 +200,20 @@ def _strip_height_for_density(
     RAM model and its arithmetic live at :data:`_S2_STRIP_BYTE_BUDGET`.
     ``width`` sizes the (possibly easting-cropped) band read; ``mask_width``
     sizes the mask, which stays full-chunk-width even when bands are cropped
-    (defaults to ``width`` for the uncropped case). A chunk dense enough to
-    drive the height below ``_MIN_STRIP_H`` bottoms out there and breaches the
-    budget (logged) rather than degenerating into tiny high-overhead reads.
+    (defaults to ``width`` for the uncropped case). ``decode_readers`` (>0)
+    additionally charges the concurrent per-band decode transient (see
+    :data:`_S2_FOREGROUND_DECODE_READERS`), so the strip's momentary read peak —
+    not just its resident set — fits ``budget``; the default 0 leaves sizing
+    unchanged for the background-read dense path (already measured-safe). A chunk
+    dense enough to drive the height below ``_MIN_STRIP_H`` bottoms out there and
+    breaches the budget (logged) rather than degenerating into tiny reads.
     """
     t = max(1, t_kept)
     mask_bytes = t * height * (mask_width if mask_width is not None else width)
     band_budget = budget - mask_bytes
-    per_row = t * width * _S2_BYTES_PER_OBS_PX
+    # Resident stacked result (_S2_BYTES_PER_OBS_PX) plus decode_readers transient
+    # single-band arrays (2 B/px each) held concurrently during the read.
+    per_row = t * width * (_S2_BYTES_PER_OBS_PX + 2 * decode_readers)
     budget_h = max(0, band_budget) // per_row
     if budget_h < _MIN_STRIP_H:
         # Worst-case resident pair: two floor-height band sets, each charged a
@@ -297,14 +319,19 @@ def _strip_plan(t_kept: int, height: int, width: int, valid_px: int, mask_width:
             starter_first=starter,
         )
 
-    # Regime 3: not hideable. Prefetch off => only one set resident, so a strip
-    # may use the full PAIR budget (peak still bounded by the dense pair).
+    # Regime 3: not hideable. Prefetch off => only one set resident, read in the
+    # FOREGROUND (GPU idle), so the momentary peak is that set's bands + its
+    # concurrent decode transient + mask. We size so THAT fits the pair budget —
+    # the same ceiling the dense resident pair sits at (measured-safe) — rather
+    # than sizing the resident set alone to the pair and overshooting mid-read.
     pair = 2 * budget
-    if per_set_1x <= pair:
+    readers = _S2_FOREGROUND_DECODE_READERS
+    decode_transient = bytes_total * 2 * readers // _S2_BYTES_PER_OBS_PX
+    if bytes_total + decode_transient + mask_bytes <= pair:
         return _StripPlan(
             [slice(0, height)], prefetch=False, strategy="single/wide-budget", strip_h=height, pair_budget=True
         )
-    strip_h = _strip_height_for_density(t_kept, width, height, pair, mask_width=mw)
+    strip_h = _strip_height_for_density(t_kept, width, height, pair, mask_width=mw, decode_readers=readers)
     return _StripPlan(
         _strip_slices(height, strip_h), prefetch=False, strategy="no-prefetch", strip_h=strip_h, pair_budget=True
     )

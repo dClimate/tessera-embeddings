@@ -197,11 +197,13 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
                 cosine_sum += float(cos.sum())
                 cosine_count += int(nz.sum())
 
-    # Obs-count layers: deterministic counts, must be EXACT in both classes.
-    # (H, W) uint16 — small enough to compare whole. A layer present in one
-    # store but not the other is a FAILURE, not a silent skip: a test run that
-    # dropped an obs layer the reference has must not pass the gate. (Its whole
-    # size is charged as mismatches so obs_count_mismatches goes non-zero.)
+    # Obs-count layers: deterministic counts, must be EXACT in both classes and
+    # PRESENT in both. (H, W) uint16 — small enough to compare whole. A required
+    # layer missing from one store (or from BOTH) is a FAILURE, not a silent
+    # skip: a run that dropped an obs layer must not pass the gate. A one-sided
+    # absence charges the present layer's whole size as mismatches; a two-sided
+    # absence (neither run wrote it) charges 1 so obs_count_mismatches still goes
+    # non-zero rather than validating nothing.
     obs_count_mismatches = 0
     for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
         in_ref, in_test = var in ref.data_vars, var in test.data_vars
@@ -210,6 +212,8 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
         elif in_ref != in_test:
             present = ref[var] if in_ref else test[var]
             obs_count_mismatches += int(present.size)
+        else:
+            obs_count_mismatches += 1  # required layer absent from BOTH stores
 
     return ChunkComparison(
         label=label,
