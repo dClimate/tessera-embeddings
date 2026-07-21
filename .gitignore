@@ -102,3 +102,8 @@ ai/
 !examples/**/*.zarr
 !tests/fixtures/**/*.geojson
 !tests/fixtures/**/*.zarr
+
+# Local scale-test artifacts (multi-GB icechunk stores) — never commit
+scripts/scale_test_stores/
+scripts/scale_test_results/
+scripts/scale_tests/

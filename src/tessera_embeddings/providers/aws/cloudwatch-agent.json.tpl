@@ -40,9 +40,16 @@
             "timezone": "UTC"
           },
           {
+            "file_path": "/tmp/ray/session_latest/logs/ram_poll.log",
+            "log_group_name": "__LOG_GROUP__",
+            "log_stream_name": "__INSTANCE_ID__/ram_poll",
+            "timezone": "UTC"
+          },
+          {
             "file_path": "/tmp/ray/session_latest/logs/**/*.log",
             "log_group_name": "__LOG_GROUP__",
             "log_stream_name": "__INSTANCE_ID__/other",
+            "blacklist": "ram_poll.log",
             "timezone": "UTC"
           }
         ]

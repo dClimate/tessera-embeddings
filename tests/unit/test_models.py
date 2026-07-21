@@ -248,3 +248,25 @@ class TestLoadCheckpoint:
         path = self._save(tmp_path, {"model_state": {"_orig_mod.layer.weight": weight}})
         cleaned = load_checkpoint(path, torch.device("cpu"))
         torch.testing.assert_close(cleaned["layer.weight"], weight)
+
+
+class TestPositionalEncoderBitIdentity:
+    """empty + strided sin/cos fill is bit-identical to the historical zeros fill."""
+
+    @staticmethod
+    def _reference_forward(enc: TemporalPositionalEncoder, doy: torch.Tensor) -> torch.Tensor:
+        position = doy.unsqueeze(-1).float()
+        pe = torch.zeros(doy.shape[0], doy.shape[1], enc.d_model, device=doy.device)
+        pe[:, :, 0::2] = torch.sin(position * enc.div_term.float())
+        pe[:, :, 1::2] = torch.cos(position * enc.div_term.float())
+        return pe.to(doy.dtype)
+
+    def test_bit_identical_float32(self):
+        enc = TemporalPositionalEncoder(d_model=32)
+        doy = torch.randint(1, 366, (4, 20)).float()
+        torch.testing.assert_close(enc(doy), self._reference_forward(enc, doy), atol=0.0, rtol=0.0)
+
+    def test_bit_identical_bfloat16_cast_path(self):
+        enc = TemporalPositionalEncoder(d_model=64).bfloat16()
+        doy = torch.randint(1, 366, (2, 9)).bfloat16()
+        torch.testing.assert_close(enc(doy), self._reference_forward(enc, doy), atol=0.0, rtol=0.0)

@@ -15,6 +15,8 @@ S1 stream.
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 
 
@@ -39,6 +41,39 @@ def build_resample_indices(valid_len: int, target_size: int) -> np.ndarray:
     anchors = np.linspace(0, valid_len - 1, num=extra + 2, dtype=np.float64)[1:-1]
     extras = np.clip(np.rint(anchors).astype(np.int64), 0, valid_len - 1)
     return np.concatenate([np.arange(valid_len, dtype=np.int64), extras], axis=0)
+
+
+# build_resample_indices depends only on (valid_len, target), both small ints
+# (valid_len <= T of the chunk, target one of ~32 checkpoints), so the index
+# vectors are memoised. Callers must treat the returned arrays as READ-ONLY —
+# they are shared across every pixel with the same (valid_len, target).
+_resample_indices_cached = functools.lru_cache(maxsize=None)(build_resample_indices)
+
+
+def _local_resample_matrix(counts: np.ndarray, target: int) -> np.ndarray:
+    """Stack per-pixel local resample indices into a ``(B, target)`` matrix.
+
+    ``counts[i]`` is pixel *i*'s valid-observation count; row *i* of the result
+    is ``build_resample_indices(counts[i], target)``. Rows with ``counts == 0``
+    are left as zeros — callers must exclude them from any gather.
+
+    The Python-level work is one cache lookup per *unique* count (a handful per
+    bucket) instead of per pixel, which is what makes the bucket resamplers
+    vectorised rather than 2 x batch_size Python iterations per sub-batch.
+    """
+    local = np.zeros((len(counts), target), dtype=np.int64)
+    for count in np.unique(counts):
+        if count == 0:
+            continue
+        local[counts == count] = _resample_indices_cached(int(count), target)
+    return local
+
+
+def _row_starts(counts: np.ndarray) -> np.ndarray:
+    """Offsets of each row's first entry in a row-major ``np.nonzero`` output."""
+    starts = np.zeros(len(counts) + 1, dtype=np.int64)
+    np.cumsum(counts, out=starts[1:])
+    return starts[:-1]
 
 
 def bucket_for_count(n: int, ckps: tuple[int, ...]) -> int:
@@ -104,17 +139,24 @@ def resample_s2_bucket(
     if t == 0 or target == 0:
         return out
 
-    for i in range(b):
-        mask = s2_masks[i]
-        valid = np.nonzero(mask)[0]
-        if len(valid) == 0:
-            continue
-        local = build_resample_indices(len(valid), target)
-        real = valid[local]
-        sub_b = s2_bands[i, real].astype(np.float32, copy=False)
-        sub_b = (sub_b - s2_mean) / (s2_std + 1e-9)
-        out[i, :, :c] = sub_b
-        out[i, :, c] = s2_doys[i, real]
+    # Vectorised across pixels: np.nonzero on the (B, T) mask yields each
+    # row's valid time indices contiguously in row-major order; _row_starts
+    # locates each row's slice, and the memoised local-index matrix maps every
+    # pixel straight to its absolute gather indices. Bit-identical to the
+    # per-pixel loop it replaced (same indices, same per-element arithmetic) —
+    # see the golden reference test in test_sampling_v11.py.
+    counts = s2_masks.sum(axis=1).astype(np.int64)
+    rows = np.nonzero(counts > 0)[0]
+    if rows.size == 0:
+        return out
+    _, nz_cols = np.nonzero(s2_masks)
+    starts = _row_starts(counts)
+    local = _local_resample_matrix(counts, target)
+
+    real = nz_cols[starts[rows, None] + local[rows]]  # (Bv, target) absolute time idx
+    gathered = s2_bands[rows[:, None], real].astype(np.float32, copy=False)
+    out[rows, :, :c] = (gathered - s2_mean) / (s2_std + 1e-9)
+    out[rows, :, c] = s2_doys[rows[:, None], real]
     return out
 
 
@@ -154,32 +196,53 @@ def resample_s1_bucket(
     if target == 0 or b == 0:
         return out
 
-    for i in range(b):
-        parts_b: list[np.ndarray] = []
-        parts_d: list[np.ndarray] = []
+    # Vectorised over pixels. Each pixel's merged stream is its valid ascending
+    # rows followed by its valid descending rows; a merged local index below
+    # ``ca`` (the pixel's asc count) resolves into the ascending arrays and the
+    # rest into descending, so the two sides are gathered separately and
+    # combined with np.where. Per-element arithmetic matches the per-pixel loop
+    # this replaced (normalise-then-gather == gather-then-normalise
+    # elementwise) — see the golden reference test in test_sampling_v11.py.
+    valid_a = np.any(s1_asc_bands != 0, axis=-1) if s1_asc_bands.shape[1] > 0 else np.zeros((b, 0), dtype=bool)
+    valid_d = np.any(s1_desc_bands != 0, axis=-1) if s1_desc_bands.shape[1] > 0 else np.zeros((b, 0), dtype=bool)
+    ca = valid_a.sum(axis=1).astype(np.int64)
+    cd = valid_d.sum(axis=1).astype(np.int64)
+    total = ca + cd
+    rows = np.nonzero(total > 0)[0]
+    if rows.size == 0:
+        return out
 
-        if s1_asc_bands.shape[1] > 0:
-            stream = s1_asc_bands[i]
-            valid = np.nonzero(np.any(stream != 0, axis=-1))[0]
-            if len(valid) > 0:
-                norm = (stream[valid].astype(np.float32, copy=False) - s1a_mean) / (s1a_std + 1e-9)
-                parts_b.append(norm)
-                parts_d.append(s1_asc_doys[i, valid].astype(np.float32, copy=False))
+    local = _local_resample_matrix(total, target)[rows]  # (Bv, target) merged idx
+    ca_v = ca[rows, None]
+    from_asc = local < ca_v
 
-        if s1_desc_bands.shape[1] > 0:
-            stream = s1_desc_bands[i]
-            valid = np.nonzero(np.any(stream != 0, axis=-1))[0]
-            if len(valid) > 0:
-                norm = (stream[valid].astype(np.float32, copy=False) - s1d_mean) / (s1d_std + 1e-9)
-                parts_b.append(norm)
-                parts_d.append(s1_desc_doys[i, valid].astype(np.float32, copy=False))
+    # Masked-out lanes get a guarded index of 0 BEFORE the gather so every
+    # index is in-bounds; their gathered values are discarded by np.where.
+    def _gather_side(
+        valid: np.ndarray,
+        bands: np.ndarray,
+        doys: np.ndarray,
+        side_local: np.ndarray,
+        lanes: np.ndarray,
+        mean: np.ndarray,
+        std: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        _, nz_cols = np.nonzero(valid)
+        if nz_cols.size == 0:
+            return (
+                np.zeros((rows.size, target, 2), dtype=np.float32),
+                np.zeros((rows.size, target), dtype=np.float32),
+            )
+        counts = valid.sum(axis=1).astype(np.int64)
+        idx = np.where(lanes, _row_starts(counts)[rows, None] + side_local, 0)
+        t_idx = nz_cols[idx]  # (Bv, target) absolute time idx; garbage where ~lanes
+        vals = bands[rows[:, None], t_idx].astype(np.float32, copy=False)
+        norm = (vals - mean) / (std + 1e-9)
+        return norm, doys[rows[:, None], t_idx].astype(np.float32, copy=False)
 
-        if not parts_b:
-            continue
+    a_norm, a_doys = _gather_side(valid_a, s1_asc_bands, s1_asc_doys, local, from_asc, s1a_mean, s1a_std)
+    d_norm, d_doys = _gather_side(valid_d, s1_desc_bands, s1_desc_doys, local - ca_v, ~from_asc, s1d_mean, s1d_std)
 
-        all_b = np.concatenate(parts_b, axis=0)
-        all_d = np.concatenate(parts_d, axis=0)
-        local = build_resample_indices(len(all_b), target)
-        out[i, :, :2] = all_b[local]
-        out[i, :, 2] = all_d[local]
+    out[rows, :, :2] = np.where(from_asc[..., None], a_norm, d_norm)
+    out[rows, :, 2] = np.where(from_asc, a_doys, d_doys)
     return out

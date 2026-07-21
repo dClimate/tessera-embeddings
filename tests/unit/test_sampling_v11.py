@@ -167,3 +167,140 @@ def test_resample_s1_bucket_single_orbit_empty_desc() -> None:
         s1d_std=std2,
     )
     assert out.shape == (b, 8, 3)
+
+
+# ── golden reference: vectorised resamplers == the original per-pixel loops ──
+#
+# The vectorised implementations must be BIT-IDENTICAL to the per-pixel loops
+# they replaced (ADR 012: these are kept in the bit-exact class). The loops are
+# frozen here as reference implementations.
+
+
+def _reference_resample_s2_bucket(s2_bands, s2_masks, s2_doys, target, s2_mean, s2_std):
+    b, t, c = s2_bands.shape
+    out = np.zeros((b, target, c + 1), dtype=np.float32)
+    if t == 0 or target == 0:
+        return out
+    for i in range(b):
+        valid = np.nonzero(s2_masks[i])[0]
+        if len(valid) == 0:
+            continue
+        real = valid[build_resample_indices(len(valid), target)]
+        sub_b = s2_bands[i, real].astype(np.float32, copy=False)
+        out[i, :, :c] = (sub_b - s2_mean) / (s2_std + 1e-9)
+        out[i, :, c] = s2_doys[i, real]
+    return out
+
+
+def _reference_resample_s1_bucket(
+    s1_asc_bands, s1_asc_doys, s1_desc_bands, s1_desc_doys, target, s1a_mean, s1a_std, s1d_mean, s1d_std
+):
+    b = s1_asc_bands.shape[0] if s1_asc_bands.shape[0] > 0 else s1_desc_bands.shape[0]
+    out = np.zeros((b, target, 3), dtype=np.float32)
+    if target == 0 or b == 0:
+        return out
+    for i in range(b):
+        parts_b, parts_d = [], []
+        for bands, doys, mean, std in (
+            (s1_asc_bands, s1_asc_doys, s1a_mean, s1a_std),
+            (s1_desc_bands, s1_desc_doys, s1d_mean, s1d_std),
+        ):
+            if bands.shape[1] > 0:
+                stream = bands[i]
+                valid = np.nonzero(np.any(stream != 0, axis=-1))[0]
+                if len(valid) > 0:
+                    parts_b.append((stream[valid].astype(np.float32, copy=False) - mean) / (std + 1e-9))
+                    parts_d.append(doys[i, valid].astype(np.float32, copy=False))
+        if not parts_b:
+            continue
+        all_b = np.concatenate(parts_b, axis=0)
+        all_d = np.concatenate(parts_d, axis=0)
+        local = build_resample_indices(len(all_b), target)
+        out[i, :, :2] = all_b[local]
+        out[i, :, 2] = all_d[local]
+    return out
+
+
+def _random_s2_case(rng, b, t, invalid_frac=0.3, dead_pixel_frac=0.2):
+    bands = rng.integers(0, 6000, size=(b, t, 10)).astype(np.uint16)
+    masks = rng.random((b, t)) > invalid_frac
+    dead = rng.random(b) < dead_pixel_frac
+    masks[dead] = False  # some pixels have zero valid observations
+    doys = np.broadcast_to(rng.integers(1, 366, size=t).astype(np.int32)[None, :], (b, t))
+    return bands, masks, doys
+
+
+class TestVectorisedS2MatchesLoop:
+    """Vectorised S2 resampler is bit-identical to the frozen per-pixel loop."""
+
+    def test_bit_identical_across_targets(self) -> None:
+        rng = np.random.default_rng(42)
+        mean = np.array(np.arange(10) * 100.0, dtype=np.float32)
+        std = np.array(np.arange(10) + 50.0, dtype=np.float32)
+        for t, target in [(20, 8), (20, 20), (5, 16), (33, 24), (1, 8)]:
+            bands, masks, doys = _random_s2_case(rng, b=64, t=t)
+            got = resample_s2_bucket(bands, masks, doys, target, mean, std)
+            want = _reference_resample_s2_bucket(bands, masks, doys, target, mean, std)
+            np.testing.assert_array_equal(got, want, err_msg=f"t={t} target={target}")
+
+    def test_all_pixels_dead(self) -> None:
+        bands = np.zeros((4, 6, 10), dtype=np.uint16)
+        masks = np.zeros((4, 6), dtype=bool)
+        doys = np.zeros((4, 6), dtype=np.int32)
+        mean = np.zeros(10, dtype=np.float32)
+        std = np.ones(10, dtype=np.float32)
+        got = resample_s2_bucket(bands, masks, doys, 8, mean, std)
+        np.testing.assert_array_equal(got, np.zeros((4, 8, 11), dtype=np.float32))
+
+
+class TestVectorisedS1MatchesLoop:
+    """Vectorised merged-S1 resampler is bit-identical to the frozen loop."""
+
+    def _stats(self):
+        return (
+            np.array([5000.0, 3000.0], dtype=np.float32),
+            np.array([1700.0, 1600.0], dtype=np.float32),
+            np.array([5100.0, 2900.0], dtype=np.float32),
+            np.array([1650.0, 1700.0], dtype=np.float32),
+        )
+
+    def _random_orbit(self, rng, b, t, zero_frac=0.4):
+        bands = rng.integers(1, 8000, size=(b, t, 2)).astype(np.uint16)
+        zero = rng.random((b, t)) < zero_frac
+        bands[zero] = 0  # zeroed timesteps = invalid for that pixel
+        doys = np.broadcast_to(rng.integers(1, 366, size=t).astype(np.int32)[None, :], (b, t))
+        return bands, doys
+
+    def test_bit_identical_both_orbits(self) -> None:
+        rng = np.random.default_rng(7)
+        s1a_mean, s1a_std, s1d_mean, s1d_std = self._stats()
+        for ta, td, target in [(6, 5, 8), (10, 10, 16), (3, 0, 8), (0, 4, 8), (12, 9, 8)]:
+            asc, asc_doys = (
+                self._random_orbit(rng, 48, ta)
+                if ta
+                else (
+                    np.empty((48, 0, 2), dtype=np.uint16),
+                    np.empty((48, 0), dtype=np.int32),
+                )
+            )
+            desc, desc_doys = (
+                self._random_orbit(rng, 48, td)
+                if td
+                else (
+                    np.empty((48, 0, 2), dtype=np.uint16),
+                    np.empty((48, 0), dtype=np.int32),
+                )
+            )
+            got = resample_s1_bucket(asc, asc_doys, desc, desc_doys, target, s1a_mean, s1a_std, s1d_mean, s1d_std)
+            want = _reference_resample_s1_bucket(
+                asc, asc_doys, desc, desc_doys, target, s1a_mean, s1a_std, s1d_mean, s1d_std
+            )
+            np.testing.assert_array_equal(got, want, err_msg=f"ta={ta} td={td} target={target}")
+
+    def test_pixels_with_all_zero_sar_stay_zero(self) -> None:
+        s1a_mean, s1a_std, s1d_mean, s1d_std = self._stats()
+        asc = np.zeros((3, 4, 2), dtype=np.uint16)
+        desc = np.zeros((3, 4, 2), dtype=np.uint16)
+        doys = np.zeros((3, 4), dtype=np.int32)
+        got = resample_s1_bucket(asc, doys, desc, doys, 8, s1a_mean, s1a_std, s1d_mean, s1d_std)
+        np.testing.assert_array_equal(got, np.zeros((3, 8, 3), dtype=np.float32))

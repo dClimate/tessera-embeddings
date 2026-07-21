@@ -67,6 +67,12 @@ class CustomGRU(nn.Module):
 
     Used to match the tessera beta QAT checkpoint which stores per-gate linear weights
     instead of the fused weight matrices used by ``nn.GRU``.
+
+    This is a *reference* implementation of the checkpoint's exact recurrence. In the
+    production inference graph it does not run: ``builder._fuse_custom_gru`` replaces
+    every instance with a cuDNN ``nn.GRU`` (one fused kernel vs. this per-step loop)
+    before the model is used. Keep this simple and checkpoint-faithful; the GPU-fast
+    path is the fused ``nn.GRU``, not this module.
     """
 
     def __init__(self, input_size: int, hidden_size: int) -> None:
@@ -217,17 +223,28 @@ class TemporalPositionalEncoder(nn.Module):
         Returns:
             Positional encoding of shape (B, T, d_model).
         """
-        # CHANGED: Compute in FP32 for numerical precision, then cast output to match
+        # Compute in FP32 for numerical precision, then cast output to match
         # the caller's dtype (BF16 when model.bfloat16() is active). Without this cast,
         # the FP32 positional encoding contaminates all downstream ops via PyTorch's
         # automatic dtype promotion (BF16 + FP32 = FP32), causing the entire transformer
         # and GRU to run in FP32 — 7 TFLOPS instead of 20-30 TFLOPS on T4 tensor cores.
         # See ai/debug/inference_throughput_profiling_2026-02-23.md for full analysis.
+        #
+        # Fill an UNINITIALISED (B, T, d_model) buffer by strided sin/cos writes.
+        # vs. the historical torch.zeros: skips the multi-GB zero-fill (every
+        # element is written — 0::2 and 1::2 partition the even d_model). vs. a
+        # stack+reshape: never holds sin and cos live alongside a separate
+        # interleaved output. Values are bit-identical to the zeros version.
         position = doy.unsqueeze(-1).float()
-
-        pe = torch.zeros(doy.shape[0], doy.shape[1], self.d_model, device=doy.device)
-        pe[:, :, 0::2] = torch.sin(position * self.div_term.float())
-        pe[:, :, 1::2] = torch.cos(position * self.div_term.float())
+        angles = position * self.div_term.float()  # (B, T, d_model/2)
+        pe = torch.empty(doy.shape[0], doy.shape[1], self.d_model, device=doy.device)
+        pe[:, :, 0::2] = torch.sin(angles)
+        pe[:, :, 1::2] = torch.cos(angles)
+        # Drop angles before the dtype cast: it's ~2.6 GiB at the max
+        # (B=7168, T=256) bucket and unused past this point, so holding it live
+        # through pe.to() needlessly co-resides it with the fp32 pe and the bf16
+        # output — peak VRAM the concurrent s2/s1 backbones can't spare.
+        del angles
         return pe.to(doy.dtype)
 
 
