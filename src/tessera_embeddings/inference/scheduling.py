@@ -1040,9 +1040,12 @@ def _process_chunks_work_stealing(
     while pool.pending or pending_write or ((chunk_queue or source_active) and pool.live_count > 0):
         # Top up from the work source BEFORE waiting so freshly-ready zones
         # dispatch this iteration. Polled only when the queue is at or below
-        # the live actor count — the exhaustion trigger — so zones stay
-        # near-sequential: at most the current zone's tail overlaps the next
-        # zone's head.
+        # the live actor count — the exhaustion trigger. For zones at least as
+        # large as the fleet this keeps them near-sequential (one zone's tail
+        # overlaps the next zone's head); a zone smaller than the fleet can't
+        # fill it alone, so successive small zones are pulled to pack it — the
+        # source hands over one zone per poll and the caller bounds how many
+        # coexist.
         if source_active and len(chunk_queue) <= pool.live_count:
             fetched = more_work()  # type: ignore[misc]  # source_active implies more_work is not None
             if fetched is None:

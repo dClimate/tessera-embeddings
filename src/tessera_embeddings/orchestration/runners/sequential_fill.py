@@ -21,9 +21,12 @@ the flow and README point here):
   near-sequential: at most one zone's tail overlaps the next zone's head.
 - **Ingest look-ahead** (``inputs``): the next cells' mosaics are ingested
   *while earlier cells infer*, bounded so in-flight mosaics stay within
-  ADR-011's "peak input storage bounded by in-flight cells" (a semaphore of
-  ``look_ahead + 2`` un-finalized zones, plus the ingest adapter's own
-  concurrent-run bound).
+  ADR-011's "peak input storage bounded by in-flight cells". A semaphore
+  admits at most ``look_ahead + 2`` *un-finalized* zones (a zone holds its
+  slot from prepare until its assembly lands); the feeder also runs ingests
+  up to ``look_ahead`` cells ahead of the admission point, so peak mosaics on
+  disk is roughly ``2 * look_ahead + 2`` — for big zones (multi-TB mosaics)
+  keep ``look_ahead`` small.
 - **Trailing assembly**: a completed zone's shard assembly (~10-15% of its
   inference wall time) runs on a background thread while later zones' tiles
   keep the GPUs busy. Assemblies serialize on one thread; a zone's mosaic is
@@ -40,6 +43,18 @@ A zone whose mosaic resolves a DIFFERENT s1 orbit than the shared session's
 config cannot join the stream (actor configs are fixed at creation); such
 cells are deferred and filled per-cell after the session ends, via the
 caller-supplied ``infer_single`` fallback.
+
+KNOWN LIMITATION — small-zone fleet fill. The ``look_ahead + 2`` admission
+bound doubles as the fleet-fill parallelism: only that many zones' tiles can
+be in flight at once. When a zone is at least as large as the fleet this is
+irrelevant (one zone fills every actor), but a shard of zones each far
+smaller than the fleet (e.g. an all-island Pacific shard) can leave actors
+idle — at most ``(look_ahead + 2) * tiles_per_zone`` tiles are ever
+dispatchable. Largest-first zone ordering pushes these to the low-cost tail,
+so the wasted GPU time is bounded; a shard known to be all-small should be
+run with a larger ``look_ahead`` (its mosaics are small, so the storage bound
+above is slack). Decoupling admission (a storage-bytes budget) from
+fleet-fill parallelism is a possible future refinement — measure first.
 
 Contracts: Prefect-free (the deployment-backed ingest adapter, the
 input-fingerprinted run_id, the per-cell config/plan, and the session itself
