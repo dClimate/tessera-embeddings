@@ -131,6 +131,7 @@ async def ingest_zone_year(
     batch_days: int = 30,
     time_window_end: str | None = None,
     allow_partial_window: bool = False,
+    s3_region: str | None = None,
     use_local: bool = False,
 ) -> dict[str, Any]:
     """Ingest the S1/S2 mosaics for one ``(zone, year)`` onto the zone grid.
@@ -150,6 +151,14 @@ async def ingest_zone_year(
         time_window_end: ``"Month Year"`` override; defaults to ``"December {year}"``.
         allow_partial_window: Relax the coverage gate to "non-empty" (escape
             hatch for a legitimately partial edge zone).
+        s3_region: Optional S3 region for this flow's Icechunk metadata opens
+            (mask liveness, coverage sha, marker probe/write, coverage gate) and
+            the zone-ROI synthesis — mirrors the campaign/fill region threading so
+            a non-default-region deployment reads the same stores the fill will.
+            The child S1/S2 ROI ingest deployments that write the mosaic go through
+            the ROI engine's own storage path, which is us-west-2-only today (a
+            pre-existing limitation independent of this flow; all campaign data
+            lives in us-west-2 by the RTC-archive constraint).
         use_local: Run ingestion on a local Dask cluster (dev).
 
     Returns:
@@ -167,7 +176,7 @@ async def ingest_zone_year(
     roi_path = f"{paths.inputs.rstrip('/')}/rois/zarrs/zone_{zone}.zarr"
 
     # (1) All-ocean zone: no ROI, no ingest — the fill marks it empty.
-    if not zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials):
+    if not zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region):
         log.info("Zone %s has no live tiles (all-ocean) — skipping ingest", zone)
         return {"zone": zone, "year": year, "status": "skipped_ocean"}
 
@@ -189,7 +198,7 @@ async def ingest_zone_year(
         "s1_orbit": s1_orbit,
         "allow_partial_window": allow_partial_window,
         "coverage_sha256": _coverage_sha(
-            land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=None
+            land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region
         ),
     }
 
@@ -201,7 +210,9 @@ async def ingest_zone_year(
         resolve_s1_orbit — so we never require a SAR store that will never exist.
         """
         try:
-            effective = resolve_s1_orbit(mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials)
+            effective = resolve_s1_orbit(
+                mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+            )
         except InsufficientCoverageError:
             return None
         return _mosaic_stores(mosaic_base, effective)
@@ -213,7 +224,7 @@ async def ingest_zone_year(
     #     None), and appending onto it would dedupe against stale dates then stamp
     #     the new fingerprint over mixed inputs. Physical existence is the signal.
     candidates = _mosaic_stores(mosaic_base, "both")
-    probed = {s: _probe_marker(s, get_credentials=iam_icechunk_credentials, s3_region=None) for s in candidates}
+    probed = {s: _probe_marker(s, get_credentials=iam_icechunk_credentials, s3_region=s3_region) for s in candidates}
     resolved = _resolved_stores()
     if resolved is not None and all(probed[s][1] == fingerprint for s in resolved):
         log.info("Zone %s year %d already ingested for %s — skipping", zone, year, fingerprint["window"])
@@ -232,7 +243,13 @@ async def ingest_zone_year(
         delete_prefix(mosaic_base, log=log, strict=True)
 
     # (3) Ensure the zone ROI zarr (idempotent; regenerates if coverage changed).
-    export_zone_roi(zone, land_mask_path=land_mask_path, dest_path=roi_path, get_credentials=iam_icechunk_credentials)
+    export_zone_roi(
+        zone,
+        land_mask_path=land_mask_path,
+        dest_path=roi_path,
+        get_credentials=iam_icechunk_credentials,
+        s3_region=s3_region,
+    )
 
     # (4) Dispatch S1 (per REQUESTED orbit) + S2 ingestion concurrently onto the ROI.
     common: dict[str, Any] = {
@@ -287,11 +304,12 @@ async def ingest_zone_year(
         s1_orbit=effective_orbit,
         skip_coverage_check=allow_partial_window,
         get_credentials=iam_icechunk_credentials,
+        s3_region=s3_region,
     )
 
     # (6) Marker last: a crash before this point re-runs incrementally.
     for store in stores:
-        _write_ingest_marker(store, fingerprint, get_credentials=iam_icechunk_credentials, s3_region=None)
+        _write_ingest_marker(store, fingerprint, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
 
     log.info("Zone %s year %d ingested (orbit=%s, %s)", zone, year, effective_orbit, fingerprint["window"])
     return {"zone": zone, "year": year, "status": "ingested", "fingerprint": fingerprint, "stores": stores}

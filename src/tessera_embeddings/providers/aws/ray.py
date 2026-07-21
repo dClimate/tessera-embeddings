@@ -79,6 +79,42 @@ _REQUIRED_SSM_KEYS = frozenset(
 )
 
 
+def resolve_code_artifact_identity(
+    ami_ssm_name: str,
+    code_bucket: str | None = None,
+    code_suffix: str = "",
+    region: str = "us-west-2",
+) -> str:
+    """Immutable identity of the code a Ray fill will run, for the staging fingerprint.
+
+    Returns ``ami=<ami-id>`` and, when a source tarball overlays the AMI, appends
+    ``|tarball=<etag>`` — the same two artifacts :func:`provision_ray_cluster` boots
+    from (the AMI behind ``ami_ssm_name`` and ``s3://{code_bucket}/code/src{suffix}.tar.gz``).
+
+    The global campaign folds this into each cell's staging ``run_id`` because
+    ``code_suffix`` alone is NOT immutable: it is empty for a baked production AMI and
+    only a filename/branch stem for a tarball, so re-baking the AMI under the same SSM
+    name, or overwriting the tarball, leaves it unchanged. A retry would then resume
+    tiles staged by the OLD code while remaining tiles run the NEW code, permanently
+    publishing a mixed-version year. Resolving the real AMI ID and tarball ETag makes
+    any code change flip the fingerprint, so a fresh staging prefix is used.
+
+    Args:
+        ami_ssm_name: SSM parameter holding the worker AMI ID.
+        code_bucket: S3 bucket of the source tarball; ``None`` for a pure-AMI deploy.
+        code_suffix: Tarball filename suffix (``code/src{code_suffix}.tar.gz``).
+        region: AWS region for the SSM/S3 clients (the store's region; us-west-2 default).
+    """
+    ssm = boto3.client("ssm", region_name=region)
+    ami_id = ssm.get_parameter(Name=ami_ssm_name)["Parameter"]["Value"]
+    parts = [f"ami={ami_id}"]
+    if code_bucket:
+        s3 = boto3.client("s3", region_name=region)
+        etag = s3.head_object(Bucket=code_bucket, Key=f"code/src{code_suffix}.tar.gz")["ETag"].strip('"')
+        parts.append(f"tarball={etag}")
+    return "|".join(parts)
+
+
 def _build_cloudwatch_setup_command(
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
     log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,

@@ -1,8 +1,9 @@
 """Unit tests for the AWS Ray provider's pure helpers.
 
-These tests stay offline by mocking SSM and EC2 with ``moto``. They
+These tests stay offline by mocking SSM, EC2, and S3 with ``moto``. They
 exercise ``_resolve_ray_config`` (the most complex pure helper),
-``_pick_least_loaded_subnet``, and ``cleanup_ray_tempfiles``.
+``_pick_least_loaded_subnet``, ``cleanup_ray_tempfiles``, and
+``resolve_code_artifact_identity`` (the staging-fingerprint code identity).
 
 The full ``ray_cluster`` context manager is NOT tested end-to-end here
 because it shells out to ``ray up`` / ``ray down``; that path is an
@@ -27,6 +28,7 @@ from tessera_embeddings.providers.aws.ray import (
     _pick_least_loaded_subnet,
     _resolve_ray_config,
     cleanup_ray_tempfiles,
+    resolve_code_artifact_identity,
 )
 
 _LOG = logging.getLogger("test")
@@ -207,6 +209,45 @@ def test_pick_least_loaded_subnet_returns_least_loaded() -> None:
     subnets = [subnet_a, subnet_b]
     chosen = _pick_least_loaded_subnet(subnets, "test-cluster", ec2)
     assert chosen["SubnetId"] == subnet_b["SubnetId"]
+
+
+# ---------------------------------------------------------------------------
+# resolve_code_artifact_identity (staging-fingerprint code identity)
+# ---------------------------------------------------------------------------
+
+
+@mock_aws
+def test_resolve_code_artifact_identity_ami_only() -> None:
+    """Pure-AMI deploy (no tarball): the identity is the resolved AMI ID."""
+    ssm = boto3.client("ssm", region_name=REGION)
+    ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-0123456789abcdef0", Type="String")
+    assert resolve_code_artifact_identity("/tessera/ray/ami-id", region=REGION) == "ami=ami-0123456789abcdef0"
+
+
+@mock_aws
+def test_resolve_code_artifact_identity_tracks_tarball_overwrite() -> None:
+    """With a code tarball, the identity folds in its ETag — so re-baking the AMI
+    (new AMI value) OR overwriting the tarball (new ETag) both flip the fingerprint,
+    while identical content resolves to the same identity (safe resume).
+    """
+    ssm = boto3.client("ssm", region_name=REGION)
+    s3 = boto3.client("s3", region_name=REGION)
+    ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-aaa", Type="String")
+    s3.create_bucket(Bucket="code-bkt", CreateBucketConfiguration={"LocationConstraint": REGION})
+    s3.put_object(Bucket="code-bkt", Key="code/src.tar.gz", Body=b"v1")
+
+    id_v1 = resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION)
+    assert id_v1.startswith("ami=ami-aaa|tarball=")
+    assert resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION) == id_v1
+
+    # Overwrite the tarball with different content → different ETag → different identity.
+    s3.put_object(Bucket="code-bkt", Key="code/src.tar.gz", Body=b"v2-different")
+    id_v2 = resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION)
+    assert id_v2 != id_v1
+
+    # Re-bake the AMI (new value behind the same SSM name) → different identity.
+    ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-bbb", Type="String", Overwrite=True)
+    assert resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION) != id_v2
 
 
 # ---------------------------------------------------------------------------

@@ -105,6 +105,20 @@ def test_dispatches_and_marks_on_success(wired, monkeypatch):
     ]
 
 
+def test_s3_region_threaded_through_metadata_opens(wired, monkeypatch):
+    """The flow's s3_region reaches its Icechunk metadata opens — the mask liveness
+    probe, ROI synthesis, and the coverage gate — so a non-default-region deployment
+    reads the same stores the fill will (the campaign now forwards this region).
+    """
+    live_kw: dict = {}
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: live_kw.update(k) or True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+    _run(s1_orbit="ascending", s3_region="eu-west-1")
+    assert live_kw.get("s3_region") == "eu-west-1"  # mask liveness probe
+    assert wired["roi_exported"][0][1].get("s3_region") == "eu-west-1"  # ROI synthesis
+    assert wired["coverage_checked"][0][1].get("s3_region") == "eu-west-1"  # coverage gate
+
+
 def test_stale_marker_triggers_reingest(wired, monkeypatch):
     """A present marker with a different fingerprint (e.g. rebuilt coverage) does
     NOT short-circuit — the mosaic is re-ingested under the new inputs.

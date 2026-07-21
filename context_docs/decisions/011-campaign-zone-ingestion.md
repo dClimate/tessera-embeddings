@@ -103,6 +103,23 @@ geoembeddings `utm_zones` spec**, whose `utm{NN}` group name cannot express the
 hemisphere (33N vs 33S). A hemisphere amendment is a candidate to propose
 upstream. `canonicalize_zone` is the single parser.
 
+**Staging `run_id`** (fill, per cell): the campaign derives each cell's staging
+`run_id` as `{zone}-{year}-{hash}` over the acceptance config (threshold / orbit /
+window / checkpoint), the **immutable code artifact** the fill will run, and the
+per-`(zone, year)` mosaic identity (post-ingest `ingest_marker`). A retry with
+identical inputs resumes the same staging prefix; any change starts a fresh one, so
+tiles staged by old inputs are never resumed under new ones. The code artifact is the
+**resolved AMI ID plus (when a source tarball overlays it) that object's ETag**, not
+the mutable `code_suffix` label — re-baking the AMI under the same SSM name or
+overwriting `code/src{suffix}.tar.gz` would otherwise leave the fingerprint unchanged
+and let a retry publish a permanently-tagged mixed-code year. An **all-ocean cell**
+(no live tiles) produces no mosaic and the fill marks it empty with no staging, so it
+takes a stable `-empty` `run_id` and skips both mosaic fingerprinting (which would
+raise) and cleanup. The campaign's `s3_region` is threaded through ingest's Icechunk
+metadata opens as well as the fill's, so a non-default-region store is read
+consistently (the ROI-engine mosaic write remains us-west-2-only, a pre-existing
+limitation moot while all campaign data lives there).
+
 ## Alternatives considered
 
 - **A zone-native (non-Dask) ingest engine** — rejected: it would duplicate the

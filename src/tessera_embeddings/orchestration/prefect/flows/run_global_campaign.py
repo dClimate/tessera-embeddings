@@ -32,12 +32,24 @@ from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENC
 from tessera_embeddings.inference.data_loading import _is_missing_repo
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
-from tessera_embeddings.orchestration.runners.zone_fill import zone_year_on_axis
+from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles, zone_year_on_axis
 from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zone
+
+
+def _resolve_code_identity(ami_ssm_name: str, code_bucket: str | None, code_suffix: str, region: str | None) -> str:
+    """Lazy-import wrapper over the AWS provider's code-artifact resolver.
+
+    Kept module-level (and thin) so this flow file still imports on non-AWS machines
+    (arch tests) — boto3 lives only under ``providers/aws`` — and tests can stub it.
+    See :func:`tessera_embeddings.providers.aws.ray.resolve_code_artifact_identity`.
+    """
+    from tessera_embeddings.providers.aws.ray import resolve_code_artifact_identity
+
+    return resolve_code_artifact_identity(ami_ssm_name, code_bucket, code_suffix, region or "us-west-2")
 
 
 @flow(name="run-global-campaign")
@@ -136,6 +148,7 @@ async def run_global_campaign(
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 
     store_path = paths.global_store(store_name)
+    land_mask_path = paths.land_mask_store(mask_name)
     repo = open_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
     status = campaign_status(repo, years=campaign_years)
     existing_tags = set(repo.list_tags())
@@ -255,21 +268,33 @@ async def run_global_campaign(
             raise ValueError(f"No mosaic stores found under {base} — nothing to fingerprint or fill.")
         return "|".join(ids)
 
+    code_identity_cache: list[str] = []
+
+    def _code_identity() -> str:
+        # Resolve the immutable code artifact (AMI ID + optional tarball ETag) once and
+        # reuse it for every cell — the AMI/tarball are campaign-wide constants, so a
+        # single SSM/S3 lookup suffices. Lazy so a retag-only or all-ocean campaign (no
+        # real fingerprint computed) makes no AWS call.
+        if not code_identity_cache:
+            code_identity_cache.append(_resolve_code_identity(ami_ssm_name, code_bucket, code_suffix, s3_region))
+        return code_identity_cache[0]
+
     def _staging_run_id(zone: str, year: int) -> str:
         # Deterministic staging run_id fingerprinting everything that determines the
-        # embeddings: the config (threshold/orbit/window/checkpoint), the CODE revision
-        # (`code_suffix` — a new source tarball with the same checkpoint still changes
-        # the output), and the per-(zone,year) mosaic identity (`_mosaic_identity`). A
-        # retry with identical inputs resumes the same prefix (findable for cleanup);
-        # ANY change starts a fresh prefix, so old tiles are never resumed under new
-        # inputs. Called AFTER ingest so ingest=True reads the freshly-written marker.
+        # embeddings: the config (threshold/orbit/window/checkpoint), the CODE the fill
+        # runs (`_code_identity` — the resolved AMI ID + tarball ETag, NOT the mutable
+        # `code_suffix`, so a re-baked AMI or overwritten tarball starts a fresh prefix),
+        # and the per-(zone,year) mosaic identity (`_mosaic_identity`). A retry with
+        # identical inputs resumes the same prefix (findable for cleanup); ANY change
+        # starts a fresh prefix, so old tiles are never resumed under new inputs. Called
+        # AFTER ingest so ingest=True reads the freshly-written marker.
         key = (
             year,
             min_valid_coverage,
             s1_orbit,
             allow_partial_window,
             checkpoint_filename(),
-            code_suffix,
+            _code_identity(),
             _mosaic_identity(zone, year),
         )
         return f"{zone}-{year}-{hashlib.sha256(repr(key).encode()).hexdigest()[:8]}"
@@ -314,6 +339,10 @@ async def run_global_campaign(
             "min_valid_coverage": min_valid_coverage,
             "batch_days": batch_days,
             "allow_partial_window": allow_partial_window,
+            # Same region the fill uses, so ingest's metadata opens (mask liveness,
+            # coverage sha, marker, coverage gate) hit the same stores rather than
+            # defaulting to us-west-2 on a non-default-region deployment.
+            "s3_region": s3_region,
         }
 
     fill_sem = asyncio.Semaphore(max_parallel_zones)
@@ -341,19 +370,35 @@ async def run_global_campaign(
                 async with ingest_sem:  # each ingest provisions its own Dask cluster
                     irun = await arun_deployment(ingest_deployment, parameters=_ingest_params(zone, year))
                     _check_completed(irun, f"ingest {zone}-{year}")
+            # An all-ocean cell (no live tiles) produces no mosaic: ingest returns
+            # skipped_ocean, and the fill marks it empty + tags with no staging/inference
+            # (the same signal the fill preflights on). There is nothing to fingerprint —
+            # _staging_run_id would raise "No mosaic stores found" and strand the whole
+            # year — and nothing to clean up. Give it a stable, mosaic-free id. Checked
+            # for every non-retag cell (one cheap bitmap GET); a live cell falls through
+            # to the input-fingerprinted id. Covers ingest=False empty cells too.
+            empty_cell = not retag_only and not zone_has_live_tiles(
+                land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+            )
             # Compute the staging run_id AFTER ingest so ingest=True fingerprints the
             # freshly-written mosaic marker. A retag-only cell does no inference/staging
             # and its mosaic may already be cleaned up — give it a stable id that does
             # NOT inspect the mosaic (fingerprinting would raise before the tag repair).
-            run_id = f"{zone}-{year}-retag" if retag_only else _staging_run_id(zone, year)
+            if retag_only:
+                run_id = f"{zone}-{year}-retag"
+            elif empty_cell:
+                run_id = f"{zone}-{year}-empty"
+            else:
+                run_id = _staging_run_id(zone, year)
             async with fill_sem:  # bound concurrent fills (hence Ray clusters) within a year
                 frun = await arun_deployment(fill_deployment, parameters=_fill_params(zone, year, run_id))
                 _check_completed(frun, f"fill {zone}-{year}")
             # Only delete a mosaic THIS campaign produced: with ingest=False the mosaic
-            # is an upstream input we must not remove. Offload the blocking s5cmd/fsspec
-            # delete to a thread so a multi-TB mosaic teardown doesn't stall the event
-            # loop (freezing every other zone's deployment waits) while it runs.
-            if did_ingest and cleanup_mosaics:
+            # is an upstream input we must not remove; an empty cell produced none.
+            # Offload the blocking s5cmd/fsspec delete to a thread so a multi-TB mosaic
+            # teardown doesn't stall the event loop (freezing every other zone's
+            # deployment waits) while it runs.
+            if did_ingest and not empty_cell and cleanup_mosaics:
                 await asyncio.to_thread(delete_prefix, f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}", log=log)
             return str(frun.id)
 
