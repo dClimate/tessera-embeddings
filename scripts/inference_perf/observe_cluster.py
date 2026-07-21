@@ -9,9 +9,9 @@ reachable via ``--cluster``/``--cluster-prefix`` regardless of naming scheme.
 1. ``--start-pollers`` — start 1 s pollers on every GPU worker via SSM:
    ``nvidia-smi``, DCGM (``dcgmi dmon``: GRACT/SMACT/TENSO/DRAMA/PCIe), and a
    host-RAM sampler (used/avail/pct + top-3 process RSS each second). The RAM
-   sampler writes into the Ray session log dir, which the CloudWatch agent
-   already ships — so 1 s RAM data SURVIVES cluster teardown (the GPU/DCGM
-   CSVs stay in /tmp and die with the worker; summarize them live).
+   sampler writes where the CloudWatch agent's dedicated ``ram_poll`` entry
+   ships it — so 1 s RAM data SURVIVES cluster teardown (the GPU/DCGM CSVs
+   stay in /tmp and die with the worker; summarize them live).
 2. ``--report`` — fetch a fleet report from live workers: per-worker GPU-poll
    summary (avg/max util, avg power, busy fraction), a 1 s RAM summary (peak,
    time ≥55%/60%, top spikes), OOM forensics (kernel OOM-killer + Ray memory
@@ -56,10 +56,16 @@ import boto3
 DEFAULT_RAM_LOG_GROUP = "/ec2/yield-embeddings/ray"
 
 # 1 s host-RAM sampler, uploaded to each worker and run with nohup. Writes to
-# the Ray session log dir when it exists: the CloudWatch agent's catch-all
-# ``logs/**/*.log`` entry ships that file (stream ``<instance>/other``), so the
-# 1 s samples survive teardown and feed --ram-report's spike analysis. /tmp is
-# the fallback when no Ray session exists yet (data then stays worker-local).
+# the Ray session log dir when it exists: the CloudWatch agent ships that exact
+# path via a DEDICATED collect_list entry (stream ``<instance>/ram_poll``; see
+# providers/aws/cloudwatch-agent.json.tpl), so the 1 s samples survive teardown
+# and feed --ram-report's spike analysis. A dedicated entry is required — the
+# agent tails only the NEWEST file matching a wildcard entry, so relying on the
+# ``**/*.log`` catch-all would both drop samples and let this once-a-second
+# file displace every other log behind that glob (it is blacklisted there for
+# the same reason). Clusters launched from AMIs/templates predating the entry
+# keep the data worker-local — the --report path still summarizes it live.
+# /tmp is the fallback when no Ray session exists yet (worker-local only).
 # Reads /proc directly (no psutil dependency on the host python).
 RAM_POLLER_PY = r"""
 import os, time

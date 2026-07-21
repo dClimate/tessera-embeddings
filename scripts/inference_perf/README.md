@@ -23,9 +23,12 @@ python scripts/inference_perf/observe_cluster.py \
 
 1. `--start-pollers` early in the run — starts 1 s GPU pollers **and a 1 s
    host-RAM sampler** (used/avail/% + top-3 process RSS every second). The RAM
-   sampler writes into the Ray session log dir, which the CloudWatch agent
-   already ships (`<instance>/other` stream) — so the 1 s data **survives
-   teardown**.
+   sampler writes to an exact path the CloudWatch agent ships via a dedicated
+   entry (`<instance>/ram_poll` stream) — so the 1 s data **survives
+   teardown**. (Dedicated because the agent tails only the *newest* file per
+   wildcard entry; a catch-all glob would drop samples and displace other
+   logs. Clusters launched before the template gained the entry keep the data
+   worker-local — `--report` still summarizes it live.)
 2. `--report` while live: per-worker RAM summary (peak, seconds ≥55%/≥60%,
    top spike samples), OOM forensics (kernel OOM-killer + Ray memory-monitor
    events), GPU summaries, and the per-chunk phase table.

@@ -55,9 +55,26 @@ ROW_BLOCK = 384
 # store but absent in the other is caught rather than silently skipped.
 OBS_VARS = ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count")
 
-# Root attrs that legitimately differ between two runs of the same ROI — these
-# are provenance, not data, so a mismatch here is reported but not a failure.
+# The coarsened-store format contract: these variables must be present in BOTH
+# stores — two identically-malformed stores (e.g. both missing `embeddings`)
+# must fail, not vacuously pass. `scales` must be ABSENT: its presence means a
+# full-resolution int8 store (compare those with compare_outputs.py), not a
+# pre-dequantized coarsened one.
+REQUIRED_VARS = ("embeddings", *OBS_VARS)
+FORBIDDEN_VARS = ("scales",)
+
+# Root attrs that legitimately differ between two runs of the same ROI — pure
+# run provenance, not data or format. `run_id` plus anything run-scoped
+# (``run_*``, e.g. run_started_at/run_completed_at timestamps) is reported but
+# never fails the gate; every other attr difference (format, version, grid)
+# still does.
 BENIGN_ATTR_DIFFS = frozenset({"run_id"})
+
+
+def _is_benign_attr(key: str) -> bool:
+    """Whether an attr key is run-scoped provenance (reported, never a failure)."""
+    return key in BENIGN_ATTR_DIFFS or key.startswith("run_")
+
 
 # Abs-diff thresholds reported for float embeddings when NOT bit-identical, so
 # a near-miss (quantization shimmer) is distinguishable from a real divergence.
@@ -84,14 +101,17 @@ class VarComparison:
 
     @property
     def bit_identical(self) -> bool:
+        """Every compared element matched byte-for-byte (and none were compared vacuously)."""
         return self.n > 0 and self.n_bit_equal == self.n
 
     @property
     def mean_abs_diff(self) -> float:
+        """Mean |Δ| over finite pairs (0.0 when nothing was comparable)."""
         return self.sum_abs_diff / self.n_finite_pairs if self.n_finite_pairs else 0.0
 
     @property
     def cosine_mean(self) -> float:
+        """Mean per-pixel cosine (1.0 when no pixel had a computable cosine)."""
         return self.cosine_sum / self.cosine_count if self.cosine_count else 1.0
 
     def report(self) -> str:
@@ -161,8 +181,29 @@ def compare_attrs(ref: xr.Dataset, test: xr.Dataset) -> tuple[list[str], list[st
         if np.all(rv == tv):
             continue
         msg = f"{key}: {rv!r} vs {tv!r}"
-        (benign if key in BENIGN_ATTR_DIFFS else meaningful).append(msg)
+        (benign if _is_benign_attr(key) else meaningful).append(msg)
     return benign, meaningful
+
+
+def compare_var_structure(ref: xr.Dataset, test: xr.Dataset) -> list[str]:
+    """Per-variable dims/shape/dtype mismatches between the two stores.
+
+    Must run before any bit comparison: ``_bit_equal`` views each side through
+    an unsigned integer of *its own* width, so a dtype change that preserves
+    small values (uint16 vs uint32 counts, or all-zero float32 vs float64)
+    would otherwise compare "equal" and falsely certify non-identical stores;
+    a shape/dims change would crash mid-read instead of reporting cleanly.
+    """
+    problems: list[str] = []
+    for v in sorted(set(ref.data_vars) & set(test.data_vars)):
+        a, b = ref[v], test[v]
+        if a.dims != b.dims:
+            problems.append(f"var '{v}' dims {a.dims} vs {b.dims}")
+        elif a.shape != b.shape:
+            problems.append(f"var '{v}' shape {a.shape} vs {b.shape}")
+        elif a.dtype != b.dtype:
+            problems.append(f"var '{v}' dtype {a.dtype} vs {b.dtype}")
+    return problems
 
 
 def _accumulate_float(cmp: VarComparison, a: np.ndarray, b: np.ndarray) -> None:
@@ -203,15 +244,23 @@ def _accumulate_int(cmp: VarComparison, a: np.ndarray, b: np.ndarray) -> None:
 
 
 def compare_variable(
-    ref: xr.Dataset, test: xr.Dataset, name: str, rows: list[slice]
+    ref: xr.Dataset, test: xr.Dataset, name: str, rows: list[tuple[slice, list[int] | None]]
 ) -> VarComparison:
-    """Stream-compare one data variable across the given northing row slabs."""
+    """Stream-compare one data variable across the given northing row slabs.
+
+    Each entry is ``(slab, selection)``: the slab is read whole (one backing
+    zarr chunk's worth of rows), then ``selection`` — when sampling — picks
+    the sampled rows out of it in memory. ``None`` compares the whole slab.
+    """
     da_ref, da_test = ref[name], test[name]
     cmp = VarComparison(name=name, dtype=str(da_ref.dtype))
     is_float = da_ref.dtype.kind == "f"
-    for rows_slice in rows:
+    for rows_slice, sel in rows:
         a = da_ref.isel(northing=rows_slice).values
         b = da_test.isel(northing=rows_slice).values
+        if sel is not None:
+            # northing is axis 1 for every variable: (time, northing, easting[, band])
+            a, b = a[:, sel], b[:, sel]
         cmp.n += a.size
         cmp.n_bit_equal += _bit_equal(a, b)
         if is_float:
@@ -221,14 +270,26 @@ def compare_variable(
     return cmp
 
 
-def _row_slabs(height: int, sample_rows: int | None) -> list[slice]:
-    """Row slabs covering [0, height), or an evenly-strided sampled subset."""
+def _row_slabs(height: int, sample_rows: int | None) -> list[tuple[slice, list[int] | None]]:
+    """Row slabs covering [0, height), or a chunk-aligned sampled subset.
+
+    Sampling groups the sampled row indices by their containing
+    ``ROW_BLOCK``-aligned slab (= the stores' northing chunk), so each backing
+    zarr chunk downloads and decompresses ONCE; the sampled rows are then
+    selected from the slab in memory. Per-row slices would re-read the whole
+    containing chunk for every sampled row — far slower than a full scan once
+    several samples land in one chunk.
+    """
     if sample_rows and sample_rows < height:
         idx = np.linspace(0, height - 1, sample_rows, dtype=int)
-        # Group the sampled indices into contiguous-ish slabs is overkill for a
-        # sample; one 1-row slab per sampled index reads only what's needed.
-        return [slice(int(i), int(i) + 1) for i in idx]
-    return [slice(r0, min(r0 + ROW_BLOCK, height)) for r0 in range(0, height, ROW_BLOCK)]
+        by_block: dict[int, set[int]] = {}
+        for i in idx:
+            by_block.setdefault(int(i) // ROW_BLOCK, set()).add(int(i) % ROW_BLOCK)
+        return [
+            (slice(blk * ROW_BLOCK, min((blk + 1) * ROW_BLOCK, height)), sorted(rows))
+            for blk, rows in sorted(by_block.items())
+        ]
+    return [(slice(r0, min(r0 + ROW_BLOCK, height)), None) for r0 in range(0, height, ROW_BLOCK)]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -268,8 +329,33 @@ def main(argv: list[str] | None = None) -> int:
 
     ref_vars, test_vars = set(ref.data_vars), set(test.data_vars)
     if ref_vars != test_vars:
-        print(f"\nVERDICT: NOT bit-identical — variable sets differ: "
-              f"only-ref={ref_vars - test_vars} only-test={test_vars - ref_vars}")
+        print(
+            f"\nVERDICT: NOT bit-identical — variable sets differ: "
+            f"only-ref={ref_vars - test_vars} only-test={test_vars - ref_vars}"
+        )
+        return 1
+
+    # Format contract: both stores must carry the coarsened layout. Without
+    # this, two identically-malformed stores (both missing `embeddings`, say)
+    # would vacuously "pass" on whatever variables remain in common.
+    missing = [v for v in REQUIRED_VARS if v not in ref_vars]
+    if missing:
+        print(f"\nVERDICT: INVALID coarsened store(s) — required variable(s) absent from both: {missing}")
+        return 1
+    forbidden = [v for v in FORBIDDEN_VARS if v in ref_vars]
+    if forbidden:
+        print(
+            f"\nVERDICT: NOT a coarsened store — {forbidden} present (full-resolution int8 "
+            "format; compare those runs with compare_outputs.py instead)."
+        )
+        return 1
+
+    var_problems = compare_var_structure(ref, test)
+    if var_problems:
+        print("\nDATA-VARIABLE STRUCTURE — NOT identical:")
+        for p in var_problems:
+            print(f"  - {p}")
+        print("\nVERDICT: NOT bit-identical (variable structure mismatch; skipping value comparison).")
         return 1
 
     height = int(ref.sizes["northing"])
