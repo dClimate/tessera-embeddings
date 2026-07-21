@@ -85,7 +85,7 @@ INGEST_MIN_WORKERS_FLOOR = 3
 """Minimum viable ingest cluster size (smaller fights startup overhead)."""
 
 NUM_ACTORS_CAP = 80
-"""GPU actor count ceiling — typical AWS A10G quota for a single account."""
+"""GPU actor count ceiling — typical AWS G-family GPU quota for a single account."""
 
 
 def compute_pipeline_cluster_sizing(

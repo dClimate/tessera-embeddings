@@ -117,3 +117,37 @@ def test_download_checkpoint_concurrent_callers_get_intact_file(tmp_path: Path) 
 
     assert all(Path(r).read_bytes() == payload for r in results)
     assert sorted(p.name for p in cache.iterdir()) == [src.name]
+
+
+def test_configure_actor_logging_enables_debug_on_real_module_loggers() -> None:
+    """The DEBUG allowlist must name the loggers the modules actually use.
+
+    These names were once hardcoded with a stale ``src.inference.`` prefix, so
+    every DEBUG diagnostic (TIMING breakdowns, EFFECTIVE TFLOPS, autocast
+    probe) was silently suppressed in production. Resolving through the
+    imported modules' ``__name__`` keeps this test rename-proof.
+    """
+    import logging
+
+    from tessera_embeddings.inference import inference as inference_mod
+    from tessera_embeddings.inference import profiling as profiling_mod
+    from tessera_embeddings.inference.actors import _configure_actor_logging
+    from tessera_embeddings.inference.models import modules as modules_mod
+    from tessera_embeddings.inference.models import ssl_model as ssl_model_mod
+
+    mods = (inference_mod, profiling_mod, modules_mod, ssl_model_mod)
+    root = logging.getLogger()
+    saved_root = (root.level, root.handlers[:])
+    saved_levels = {m.__name__: logging.getLogger(m.__name__).level for m in mods}
+    try:
+        _configure_actor_logging()
+        for m in mods:
+            assert logging.getLogger(m.__name__).getEffectiveLevel() == logging.DEBUG, (
+                f"{m.__name__} not at DEBUG after _configure_actor_logging()"
+            )
+    finally:
+        # basicConfig(force=True) replaced root handlers; restore for other tests.
+        root.setLevel(saved_root[0])
+        root.handlers[:] = saved_root[1]
+        for name, level in saved_levels.items():
+            logging.getLogger(name).setLevel(level)
