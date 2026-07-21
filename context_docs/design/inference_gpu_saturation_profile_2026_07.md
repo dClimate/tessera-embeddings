@@ -16,14 +16,19 @@ Hardware: g6e.xlarge — 1× L40S (181 TFLOPS BF16 dense, 46 GB VRAM, 864 GB/s),
 
 ## Headline numbers (final shipped state)
 
+Numbers below are the **final shipped state**: the phase-5 run `a60550ae`
+(bounded cross-chunk starter prefetch — the last optimization on the branch).
+`main` is the batch-3584 baseline `a85be572e2fb`. Both single runs; see
+[RUNS.md](../../scripts/inference_perf/RUNS.md) for the per-phase progression.
+
 | metric | `main` baseline (batch 3584) | shipped (branch, batch 7168) |
 |---|---|---|
 | per-worker throughput | 1× | **~2–2.8×** |
-| GPU utilization (fleet) | 48–72% avg; SMACT 0.31–0.68; TENSO 0.12–0.26 | **~80–87%; SMACT ≈0.99; TENSO 0.42–0.47** |
-| inference px/s per worker | 9.6–13.3K | **21–24K** mid-density / 10–18K dense (end-to-end) |
-| GPU-idle overhead per chunk | ~50–60 s (22–25% of wall) | **~24–34 s** serial prologue → **~5–8 s** on prefetch-hit chunks |
+| GPU utilization (fleet) | 48–72% avg; SMACT 0.31–0.68; TENSO 0.12–0.26 | **~89–93%; SMACT ≈0.99; TENSO 0.42–0.47** |
+| inference px/s per worker | 9.6–13.3K | **21–24K** mid-density / 10–18K dense (inference-phase rate; bit-identical forwards, so unchanged since striping) |
+| GPU-idle overhead per chunk | ~50–60 s (22–25% of wall) | **~6 s** median on prefetch-hit chunks; ~36 s on the unavoidable first-per-worker cold start |
 | CPU batch-prep per sub-batch | 165 ms @3584 (651 ms @7168 unvectorised) | **103–160 ms** |
-| peak host RAM | ~**50%** (estimated; not directly instrumented) | **45–47%** |
+| peak host RAM | ~**50%** (estimated; not directly instrumented) | **~52%** (16.1 GB / 30.9 GB) |
 
 The campaign originally measured ~2.5–3.5× at 100% GPU util **with** a full
 cross-chunk prologue prefetch — but that co-resided two chunks' whole working
@@ -44,7 +49,7 @@ prefetch. The numbers above are the current, RAM-safe config.
 
  +prefetch:   [▓▓▓▓ inference N ▓▓▓▓][▓ N+1 starter ▓][▓▓ N+1 body ▓▓]
               next chunk's mask+starter preloaded during N's last strip
-              (RAM trough) → GPU idle between chunks ~5-8 s on a hit
+              (RAM trough) → GPU idle between chunks ~6 s on a hit
 ```
 
 ## The optimizations and what each bought
@@ -87,7 +92,11 @@ cross-chunk interleaving hid it but OOM'd (§Headline). Replaced with:
    separated from the mid-chunk two-strip peak. Skips pair-budget plans (their
    last strip holds ~2× a budget, not a trough). Every miss (cap, work-stealing
    reassignment, load error, `TESSERA_DISABLE_XCHUNK_PREFETCH=1`) reverts to the
-   serial prologue. Recovers most of the prologue idle (→ ~5–8 s on a hit).
+   serial prologue. On run `a60550ae` this hit on 100% of prefetches and cut
+   hit-chunk overhead to **~6 s median** (from striping's 24–34 s); the residual
+   idle is the first-per-worker cold start (~36 s, no predecessor to prefetch).
+   The co-resident stash raises steady peak RAM to **~52%** (from striping's
+   45–47%) — the ~6-pt cost of the recovery, still well under the 60% target.
 
 ### C. Cheaper sparse/edge chunks — bit-identical
 Empty strips skip the S2 band read; chunks whose valid pixels span a narrow
@@ -113,13 +122,14 @@ before `ray up` so failed launches tear down). The cluster is pinned to one AZ
   batch-7168 GEMM × ~1.1–1.15× async pipeline ≈ ~1.7–2× on the compute itself.
   Isolated by TIMING-component arithmetic, not single-variable gates.
 - **Overhead component (B+D):** GPU-idle overhead 50–60 s → 24–34 s (striping +
-  background write) → ~5–8 s on prefetch-hit chunks. The interleaving factor
-  (~1.25–1.3×, overhead-only, measured as prologue 55→7.5 s) was removed then
-  largely re-earned by the bounded prefetch.
-- **RAM (B):** the shipped striping + budget design holds **45–47%** peak (`main`
-  itself ran ~50%). The 92–95% OOM was a *removed* full-interleaving iteration of
-  this branch — it's the design constraint that motivated striping, not a
-  main→shipped delta.
+  background write) → **~6 s median on prefetch-hit chunks** (run `a60550ae`,
+  100% hit-rate; ~36 s remains on cold first-per-worker chunks). The interleaving
+  factor (~1.25–1.3×, overhead-only, measured as prologue 55→7.5 s) was removed
+  then largely re-earned by the bounded prefetch.
+- **RAM (B):** striping + the 5.75 GiB budget hold **45–47%** peak; the bounded
+  prefetch stash adds ~6 pts → **~52%** final (`main` itself ran ~50%). The
+  92–95% OOM was a *removed* full-interleaving iteration of this branch — the
+  design constraint that motivated striping, not a main→shipped delta.
 - **Sparse chunks (C):** load cost → bbox-proportional (biggest on sparse-heavy
   ROIs; small on Iowa where mixing already hid it).
 - **Cost (E):** eliminated overnight instance leaks; capacity stalls mitigated at
@@ -135,11 +145,19 @@ IO-shape only), enforced by golden tests (single-vs-multi-strip, prefetch
 on/off/serial, cropped-vs-uncropped — all identical embeddings/scales/obs
 layers). Numerics policy:
 [ADR 012](../decisions/012-validated-equivalence-for-inference-outputs.md).
-Same-config gate: **100.000000% bit-identical** (1.5B values). Assembled Iowa
-output vs the `main` reference store (25 windows, 2.23M valid px, cross-config):
-**0** footprint mismatches, **0** obs-layer mismatches, within-1 **99.99%**,
-max |Δ| **2**, scale drift **≤1.2%**, cosine **≥0.999913** — inside the ADR-012
-cross-config envelope.
+**Same-config gate** (branch phases held to bit-identity — e.g. P2+3 vs P1,
+and phase 5 vs phase 4): **100.000000% bit-identical** (1.5B values), max |Δ| 0.
+
+**Cross-config comparison vs `main`** (assembled Iowa output vs the batch-3584
+reference store, 25 windows / 2.23M valid px): int8 exactly-equal **95.33%**,
+within-1 **99.9947%**, max |Δ| **2**, scale drift **1.19%**, cosine min
+**0.999913**, **0** footprint mismatches, **0** obs-layer mismatches. This is a
+batch-size (3584→7168) diff, so it is judged against the **cross-config
+envelope** (ADR-012 — within-1 ≥ 99.99%, max ≤ 3, drift ≤ 1.6%, cosine ≥ 0.9999,
+footprint/obs exact), which it passes; it is **not** expected to meet the
+same-config table (exactly-equal ~95% ≪ 99.5% is the cuBLAS batch shimmer of
+fact 2, not a regression). Phase 5 is bit-identical to phase 4, so this
+comparison carries over to the shipped state unchanged.
 
 ## Dead-end / shelved levers (measured, do not re-litigate)
 
@@ -188,8 +206,10 @@ cross-config envelope.
 
 ## Remaining headroom
 
-Fleet GPU util ~80–87%; the residual gap is the serial prologue on prefetch-miss
-chunks and cold first-chunk-per-actor prologues. The next structural lever is
+Fleet GPU util ~89–93%; the residual gap is almost entirely the cold
+first-chunk-per-worker prologue (~36 s, ~85 chunks on `a60550ae` as the fleet
+autoscaled 22→30) — a chunk with no predecessor to prefetch from, which the
+cross-chunk prefetch structurally cannot reach. The next structural lever is
 source-store chunk geometry: the 4000² storage chunking drives the ~13 s
 fixed read amplification — an inference-aligned geometry chosen before the global
 UTM-zone ingestion would cut it for every future run (a config choice then, a

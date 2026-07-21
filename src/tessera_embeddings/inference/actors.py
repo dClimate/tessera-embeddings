@@ -86,9 +86,9 @@ logger = logging.getLogger(__name__)
 #   strip up to the PAIR budget, but only with prefetch OFF, so at most ONE such
 #   set is resident — peak stays bounded by the same pair ceiling either way.
 #   The cross-chunk starter prefetch adds <= _XCHUNK_PREFETCH_CAP_BYTES
-#   (~2 GiB) of stash, but only during the current chunk's LAST strip — after
-#   the two-strip co-residency has decayed — so it raises the trough, not the
-#   peak (measured trough ~40%; +2 GiB => ~47%, still under the peak line).
+#   (~2 GiB) of stash during the current chunk's LAST strip; measured on the
+#   phase-5 run a60550ae it lifted peak ~6 pts (striping 45-47% -> ~52%, the
+#   stash partly co-resident with the peak), still comfortably under the 60% line.
 # History: 7.0 GiB/set held ~68-75% peak once cross-chunk prologue prefetch was
 # removed (and ~92-95% with it — the chunk_5_9 OOM). Cross-chunk interleaving
 # is deliberately gone (see _load_chunk_prologue); do not raise this budget

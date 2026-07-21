@@ -100,9 +100,23 @@ inside the ADR-012 cross-config envelope.
 
 ## Phase 5 (bounded cross-chunk starter prefetch) run — 2026-07-17
 
-Flow-run `a60550ae`, cluster `tessera-inference-a60550ae`, 22 workers, us-west-2a
-(SPS returned uniform score=1 across AZs → tiebreak → 2a; 2a had capacity).
-Early read: prefetch engaging (hits + mask-only, no misses/skips in sample),
-peak RAM ~47%, util ~81%. Full gate validation (prefetch hit-rate, overhead_s on
-hit chunks, bit-identity vs phase 4) tracked by the run watcher; see
-`temp/phase5-validation-a60550ae.md`.
+Flow-run `a60550ae`, cluster `tessera-inference-a60550ae`, autoscaled 22→30
+g6e.xlarge / L40S, us-west-2a. 404 chunks in ~73 min (~34 GPU-hrs), 0 skipped,
+0 failed, 0 stalled. **This is the final shipped state of the branch — use these
+numbers for headline/current claims.**
+
+Fleet: **prefetch hit-rate 100%** (630 starter prefetches → 630 hits; 0
+mask-only / miss / cap-skip); per-chunk `overhead_s` **~6 s median on
+prefetch-hit chunks** (n=251, 5.9 s median / 7.3 s mean) vs ~36 s on the
+unavoidable first-per-worker cold starts (n=85, no predecessor to prefetch
+from); GPU util **~89–93%** (CloudWatch: 89.1% whole-run incl. ramp/drain,
+93.3% mid-run steady; 96.4% on 1 s DCGM — reads high); peak host RAM
+**~52%** (16.1 GB / 30.9 GB — ~6 pts above phase 4 because the prefetch stash
+is co-resident, still well under the 60% target); `write_s ≈ 0`. Inference-phase
+px/s unchanged from phase 4 (bit-identical forwards).
+
+Correctness: **bit-identical to phase 4** (output-preserving — the prefetch
+changes *when* the prologue loads, not the tensors), spot-checked across 8
+chunks / ~1.2B px (exact 100%, max|Δ|=0, obs-mismatch 0, cosine 1.0). So the
+phase-4 cross-config comparison vs `main` above carries over unchanged. Full
+detail: `temp/phase5-validation-a60550ae.md`.

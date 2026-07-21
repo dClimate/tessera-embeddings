@@ -72,6 +72,37 @@ A change that cannot pass does not ship. Changes that can be kept
 bit-identical (pipelining, memory movement, resampler vectorization) are
 kept bit-identical and tested as such.
 
+### Cross-config comparison envelope
+
+The table above gates a **same-config** change — optimized code vs the
+reference at the *identical* batch size and software stack. Comparing two
+runs that differ in **config** (e.g. the `main` reference at batch 3584 vs
+the shipped branch at 7168) is a different question: per fact 2, cuBLAS
+selects different kernels for different batch shapes, so int8 values
+shimmer by more than one level with no change to the model or code. Judged
+against the same-config table, a config change would read as a regression;
+it is not one. Cross-run diffs of this kind are therefore held to a looser,
+empirically-derived envelope (implemented as `compare_outputs.py
+--cross-config`):
+
+| Metric | Same-config gate | Cross-config envelope |
+|---|---|---|
+| int8 within ±1 level | (max deviation ≤ 1) | ≥ 99.99% |
+| max int8 deviation | ≤ 1 level | ≤ 3 levels |
+| per-pixel scale relative drift | ≤ 0.1% | ≤ 1.6% (≈4 BF16 ULPs) |
+| cosine similarity of dequantized embeddings | ≥ 0.9999 | ≥ 0.9999 |
+| footprint / obs-count layers | exact | exact |
+
+The bounds sit just outside the measured shimmer (2026-07-16, `main`@3584
+vs branch@7168, ~512M values/chunk: exact 95–98%, within-1 ≥ 99.99%,
+max |Δ| = 2, scale drift ≤ 0.78%), so anything worse signals a real defect,
+not config drift. Note this envelope does **not** gate *exactly-equal* — that
+metric legitimately falls to ~95% across a batch-size change — but footprint
+and observation-count layers are deterministic and stay **exact** in both
+classes. This envelope is for diffing across configs; it is **not** a
+relaxation of the same-config gate, which every shippable forward-pass
+reorder must still meet.
+
 **Precision stays BF16.** FP16 with reduced-precision accumulation would
 roughly double the matmul ceiling on GA10x-class GPUs (FP32-accumulate
 runs at half rate there), but FP16's range tops out at 65504 and

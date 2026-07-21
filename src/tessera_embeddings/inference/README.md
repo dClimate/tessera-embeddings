@@ -10,10 +10,11 @@ The orchestrator-free equivalent is
 [`orchestration/runners/plain.py`](../orchestration/runners/plain.py), which calls the same
 domain functions on `ray_cluster(num_gpus=0)` for laptop/CI runs.
 
-**Performance.** On g6e.xlarge (L40S) workers the pipeline sustains **~80–87% GPU utilization**
+**Performance.** On g6e.xlarge (L40S) workers the pipeline sustains **~89–93% GPU utilization**
 and **~21–24K pixels/sec per worker** on mid-density chunks (~10–18K on dense), with **peak host
-RAM ~45–47%** of the 30.9 GB node (budgeted to stay under 60% at UTM-zone scale). Outputs stay
-within the ADR-012 validated-equivalence envelope. The mechanisms — vectorised prep, an async GPU
+RAM ~52%** of the 30.9 GB node (budgeted to stay under 60% at UTM-zone scale). Versus the naive
+baseline that's **~2–2.8× per-worker throughput**. Outputs match the `main` reference within the
+ADR-012 cross-config equivalence envelope (a batch-size difference, not a regression). The mechanisms — vectorised prep, an async GPU
 loop, valid-pixel-aware striping, and a RAM-bounded cross-chunk starter prefetch — are detailed
 phase-by-phase below, then synthesized into a decision tree with relative impact in
 [**How Our Performance Optimizations Fit Together**](#how-our-performance-optimizations-fit-together); full profiling and
@@ -211,11 +212,12 @@ Peak host RAM is bounded the same way in every branch: with prefetch **on**, str
 while strip *i* infers, so **two** band sets co-reside, each ≤ `_S2_STRIP_BYTE_BUDGET` (5.75 GiB)
 → pair ≤ ~11.5 GiB. With prefetch **off** the prior set is released before the next loads, so only
 **one** set is resident and it may use the full pair budget — the same ceiling either way. That
-holds peak host RAM at the 60% line of a 30.9 GB g6e.xlarge across UTM-zone-scale density variance
-(measured **45–47% peak** at the 5.75 GiB budget; most chunks fit in a single strip, so few hit
-the two-strip co-residency that sets the peak — see the budget constant's comment for the arithmetic).
-The bounded cross-chunk starter prefetch (§4a″) adds ≤~2 GiB of stash, but only during the current
-chunk's last strip — the RAM trough — so it raises the trough, not the peak.
+holds peak host RAM under the 60% line of a 30.9 GB g6e.xlarge across UTM-zone-scale density variance
+(striping alone measured **45–47% peak** at the 5.75 GiB budget; most chunks fit in a single strip,
+so few hit the two-strip co-residency that sets that peak — see the budget constant's comment for the
+arithmetic). The bounded cross-chunk starter prefetch (§4a″) adds ≤~2 GiB of stash during the current
+chunk's last strip; on the shipped pipeline this lifts measured peak to **~52%** (run `a60550ae`) —
+the stash is partly co-resident with the peak — still comfortably under the 60% ceiling.
 Turning prefetch off on non-hideable chunks matters because a background load only helps if there
 is inference to hide it behind — on a wide but few-valid-pixel chunk the load would otherwise sit naked on
 the critical path *and* force a second co-resident set for nothing. A chunk that fits one budget
@@ -583,7 +585,7 @@ time** — not waiting on compute, but on *loading data*, *preparing batches*, a
 optimization here removes one source of that idle time. None changes what the model
 computes: all are **bit-identical** — they change scheduling and I/O, not the math —
 except the batch-size bump, which shifts int8 values by ≤1–2 levels (inside the ADR-012
-tolerance).
+cross-config envelope, well within same-code quantization noise).
 
 They come in two families:
 
@@ -742,8 +744,10 @@ the three-windows diagram above).
 | Empty-strip skip (§4a) | adaptive | cold-start (per strip) | **spatial** sparsity (a row band with no valid px) | ◐ medium |
 | Easting bbox crop (§4a) | adaptive | cold-start | **spatial** sparsity (valid px in a narrow column window) | ◐ medium³ |
 
-¹ The only non-bit-identical change; judged against the relaxed ADR-012 cross-config
-envelope (≤1–2 int8 levels).
+¹ The only non-bit-identical change. It shifts a small fraction of int8 values by ±1–2
+levels (cuBLAS picks different kernels for different batch shapes), so a `main`-vs-branch
+diff is judged against the ADR-012 **cross-config** envelope (int8 within ±1 on ≥99.99% of
+values, max ≤3; observed max ±2) — not the same-config bit-identity gate the other rows meet.
 
 ² Foundational — it bounds peak RAM, which is what makes every other adaptive choice
 safe; it also drops a ~13 s fixed read per dense chunk.
