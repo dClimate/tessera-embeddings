@@ -593,9 +593,12 @@ The GPU on each worker is fast enough; a naive pipeline leaves it **idle ~50% of
 time** — not waiting on compute, but on *loading data*, *preparing batches*, and
 *writing results*, plus a serial "cold start" at the top of every chunk. Every
 optimization here removes one source of that idle time. None changes what the model
-computes: all are **bit-identical** — they change scheduling and I/O, not the math —
-except the batch-size bump, which shifts int8 values by ≤1–2 levels (inside the ADR-012
-cross-config envelope, well within same-code quantization noise).
+computes: all are **bit-identical to `main`'s outputs** — they change scheduling and I/O,
+not the math — except the batch-size bump, which shifts int8 values by ≤1–2 levels (inside
+the ADR-012 cross-config envelope, well within same-code quantization noise). (One math
+caveat that is *not* part of this work: the model builder's cuDNN-GRU fusion involves a
+small reset-gate approximation (§4d), but it predates this campaign and runs identically
+on `main`, so it cancels out of any before/after comparison here.)
 
 They come in two families:
 
@@ -725,8 +728,9 @@ A chunk arrives → load its SCL mask → count valid pixels, find their bbox
 ├─ Q4. On the LAST strip, is this a RAM trough (≤ 1× budget)?
 │        ├─ yes, and a next chunk is reserved →
 │        │     ● cross-chunk starter prefetch: preload the next chunk's [§4a″]
-│        │       mask + 256-row starter NOW, so its GPU work starts
-│        │       ~6 s later instead of ~24–36 s
+│        │       mask + 256-row starter NOW (mask-only when the rung says
+│        │       the starter wouldn't pay for its extra read), so its GPU
+│        │       work starts ~6 s later instead of ~24–36 s
 │        └─ no (pair budget) → skip it; the next chunk takes the serial
 │              prologue (slower, but never over the RAM ceiling)
 │
@@ -736,9 +740,10 @@ A chunk arrives → load its SCL mask → count valid pixels, find their bbox
 
 ### Summary
 
-Every output is **bit-identical** with an unoptimized approach except the batch-size change (¹) — the rest alter
-scheduling and I/O, not the math. *Window* is which GPU-idle window each reclaims (see
-the three-windows diagram above).
+Every optimization here leaves outputs **bit-identical to `main`'s** except the batch-size
+change (¹) — the rest alter scheduling and I/O, not the math. (The builder's cuDNN-GRU
+reset-gate approximation (§4d) predates this work and is identical on `main`.) *Window* is
+which GPU-idle window each reclaims (see the three-windows diagram above).
 
 | Optimization | Family | Window | Triggers on… | Impact |
 |---|---|---|---|---|
