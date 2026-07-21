@@ -52,6 +52,7 @@ from tessera_embeddings.orchestration.prefect.tasks.inference import (
 )
 from tessera_embeddings.providers.aws.ray import (
     DEFAULT_CLUSTER_TEMPLATE,
+    RAY_DOWN_TIMEOUT_S,
     cleanup_ray_tempfiles,
     terminate_ray_instances_by_tag,
 )
@@ -114,8 +115,14 @@ def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) 
 
     if _active_resolved_yaml and Path(_active_resolved_yaml).exists():
         log.info("Running ray down with %s", _active_resolved_yaml)
-        subprocess.run(["ray", "down", _active_resolved_yaml, "-y"], check=False)
-        cleanup_ray_tempfiles(_active_resolved_yaml)
+        # Bound the call: a hung `ray down` must not block the tag-based
+        # termination below, which is the authoritative teardown here anyway.
+        try:
+            subprocess.run(["ray", "down", _active_resolved_yaml, "-y"], check=False, timeout=RAY_DOWN_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            log.warning("`ray down` exceeded %ds — falling through to tag-based termination", RAY_DOWN_TIMEOUT_S)
+        finally:
+            cleanup_ray_tempfiles(_active_resolved_yaml)
 
     run_id = getattr(flow_run, "id", None)
     cluster_name = _active_cluster_name or (_cluster_name_for_flow_run(run_id) if run_id else None)
@@ -145,6 +152,7 @@ def tessera_embeddings(
     code_suffix: str = "",
     num_actors: int = 20,
     s1_orbit: str = "both",
+    s3_region: str | None = None,
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
 ) -> dict[str, Any]:
     """Generate Tessera embeddings for a mosaicked ROI.
@@ -180,6 +188,10 @@ def tessera_embeddings(
             Empty for production tarballs.
         num_actors: Number of GPU actors to create.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
+        s3_region: Optional S3 region for the mosaic/store opens — threaded, like the
+            IAM credential callback, through orbit resolution, chunk enumeration, the
+            coverage gate, and the assembly task. ``None`` uses the default Icechunk
+            region; set it for a store outside the default region.
         dev_params: See :class:`EmbeddingsDevParams`.
 
     Returns:
@@ -215,11 +227,13 @@ def tessera_embeddings(
     mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
     log.info("Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s", roi_name, mosaic_base, run_id)
 
-    # Probe the SAR stores with the same credential callback the assemble step
-    # uses, so orbit resolution doesn't fall back to the default Icechunk chain.
+    # Probe the SAR stores with the same credential callback + region the assemble
+    # step uses, so orbit resolution doesn't fall back to the default Icechunk chain.
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 
-    resolved_s1_orbit = resolve_s1_orbit(mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials)
+    resolved_s1_orbit = resolve_s1_orbit(
+        mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+    )
     if resolved_s1_orbit != s1_orbit:
         log.info("s1_orbit resolved: %s → %s", s1_orbit, resolved_s1_orbit)
 
@@ -245,7 +259,11 @@ def tessera_embeddings(
             chunk_size = detected
 
     chunks, total_y, total_x = enumerate_mosaic_chunks(
-        mosaic_base, chunk_size or INFERENCE_CHUNK_SIZE, log, get_credentials=iam_icechunk_credentials
+        mosaic_base,
+        chunk_size or INFERENCE_CHUNK_SIZE,
+        log,
+        get_credentials=iam_icechunk_credentials,
+        s3_region=s3_region,
     )
 
     live_chunks = filter_chunks_by_roi_mask(chunks, roi_zarr_path)
@@ -262,6 +280,7 @@ def tessera_embeddings(
         s1_orbit=config.s1_orbit,
         skip_coverage_check=dev_params.skip_coverage_check,
         get_credentials=iam_icechunk_credentials,
+        s3_region=s3_region,
     )
 
     # Lazily import the AWS Ray provider so the embeddings flow file
@@ -287,10 +306,11 @@ def tessera_embeddings(
         "time_window": time_window,
         "cleanup_staging": dev_params.cleanup_staging,
         "output_name_suffix": dev_params.output_name_suffix,
-        # Same credential callback the orbit probe uses — so the assembly task's
-        # manifest read + writer.assemble open the stores with it, not the default
-        # Icechunk chain (callback-only / non-default-region deployments).
+        # Same credential callback + region the orbit probe uses — so the assembly
+        # task's manifest read + writer.assemble open the stores with them, not the
+        # default Icechunk chain (callback-only / non-default-region deployments).
         "get_credentials": iam_icechunk_credentials,
+        "s3_region": s3_region,
     }
 
     if dev_params.assembly_only:

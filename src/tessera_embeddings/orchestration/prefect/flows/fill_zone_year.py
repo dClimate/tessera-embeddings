@@ -44,7 +44,11 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_complete,
     zone_year_on_axis,
 )
-from tessera_embeddings.providers.aws.ray import cleanup_ray_tempfiles, terminate_ray_instances_by_tag
+from tessera_embeddings.providers.aws.ray import (
+    RAY_DOWN_TIMEOUT_S,
+    cleanup_ray_tempfiles,
+    terminate_ray_instances_by_tag,
+)
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
@@ -140,9 +144,18 @@ def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) 
     log = logging.getLogger(__name__)
     log.warning("Flow cancelled — tearing down Ray cluster")
     if _active_resolved_yaml and Path(_active_resolved_yaml).exists():
-        rc = subprocess.run(["ray", "down", _active_resolved_yaml, "-y"], check=False).returncode
+        # Bound the call: a hung `ray down` (unreachable head, wedged CLI) must not
+        # block the tag-based termination fallback and leak billed EC2 workers. A
+        # timeout is treated as a failure so the fallback fires.
+        try:
+            rc = subprocess.run(
+                ["ray", "down", _active_resolved_yaml, "-y"], check=False, timeout=RAY_DOWN_TIMEOUT_S
+            ).returncode
+        except subprocess.TimeoutExpired:
+            log.warning("`ray down` exceeded %ds — terminating instances by tag", RAY_DOWN_TIMEOUT_S)
+            rc = -1
         cleanup_ray_tempfiles(_active_resolved_yaml)
-        # A non-zero `ray down` leaves EC2 instances running; fall back to
+        # A non-zero/timed-out `ray down` leaves EC2 instances running; fall back to
         # terminating them by cluster tag rather than silently leaking them.
         if rc != 0 and _active_cluster_name:
             log.warning("`ray down` exited %d — terminating instances for cluster %r by tag", rc, _active_cluster_name)

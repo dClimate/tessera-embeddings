@@ -63,6 +63,15 @@ you've stored the EC2 resource IDs your Ray nodes need.
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/ec2/tessera/ray"
 """Default CloudWatch log group for Ray agent logs."""
 
+RAY_DOWN_TIMEOUT_S = 300
+"""Upper bound (seconds) on a cancellation-time ``ray down``.
+
+``ray down`` SSHes into the head to tear the cluster down; if the head is
+unreachable or the CLI wedges it can block forever. A cancellation hook that
+hangs here never reaches the tag-based EC2 termination fallback, leaving GPU
+workers running and billed — so the call is bounded and a timeout falls through
+to tag termination. Generous enough for a normal teardown (~1-2 min)."""
+
 PROJECT_TAG_VALUE = "tessera-embeddings"
 """Value of the ``Project`` EC2 tag stamped on every Ray node.
 

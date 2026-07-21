@@ -8,6 +8,8 @@ argument. These tests pin that contract.
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -47,4 +49,31 @@ def test_hook_prefers_same_process_cluster_name() -> None:
         patch.object(flows_mod, "terminate_ray_instances_by_tag") as terminate,
     ):
         _ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
+    assert terminate.call_args.kwargs["cluster_name"] == "tessera-inference-stored99"
+
+
+def test_hook_bounds_ray_down_and_falls_through_on_hang(tmp_path: Path) -> None:
+    """A hung `ray down` (same-process YAML fast path) must not block the
+    authoritative tag-based termination: the call is time-bounded, and a timeout
+    still cleans up the tempfile and terminates the cluster by tag.
+    """
+    yaml_file = tmp_path / "resolved.yaml"
+    yaml_file.write_text("cluster_name: x\n")
+    with (
+        patch.object(flows_mod, "_active_resolved_yaml", str(yaml_file)),
+        patch.object(flows_mod, "_active_cluster_name", "tessera-inference-stored99"),
+        patch.object(flows_mod, "terminate_ray_instances_by_tag") as terminate,
+        patch.object(flows_mod, "cleanup_ray_tempfiles") as cleanup,
+        patch.object(
+            flows_mod.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(cmd="ray down", timeout=flows_mod.RAY_DOWN_TIMEOUT_S),
+        ) as ray_down,
+    ):
+        _ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
+    # `ray down` was invoked with a finite timeout, and the hang did not prevent
+    # tempfile cleanup or the authoritative tag-based termination.
+    assert ray_down.call_args.kwargs["timeout"] == flows_mod.RAY_DOWN_TIMEOUT_S
+    cleanup.assert_called_once()
+    terminate.assert_called_once()
     assert terminate.call_args.kwargs["cluster_name"] == "tessera-inference-stored99"
