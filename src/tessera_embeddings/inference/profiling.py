@@ -163,6 +163,31 @@ def log_profiled_batch_summary(
     )
 
 
+def transformer_flops(
+    batch_size: int,
+    s2_seq_len: int,
+    s1_seq_len: int,
+    d_model: int,
+    dim_feedforward: int,
+    num_layers: int,
+) -> int:
+    """Transformer-layer FLOPs for one dual-backbone forward pass.
+
+    Same accounting as :func:`log_effective_tflops` (attention projections,
+    score/context matmuls, FFN — each matmul (M,K)x(K,N) = 2MKN FLOPs), but with
+    each backbone charged at its own sequence length instead of assuming both
+    run at the S2 length. GRU, embedding MLP, positional encoding, and the
+    dim_reducer are excluded (< ~15% of total); treat results as a consistent
+    lower bound for cross-run comparison, not an exact FLOP count.
+    """
+    total = 0
+    for seq_len in (s2_seq_len, s1_seq_len):
+        attn = 8 * batch_size * seq_len * d_model**2 + 4 * batch_size * seq_len**2 * d_model
+        ffn = 4 * batch_size * seq_len * d_model * dim_feedforward
+        total += (attn + ffn) * num_layers
+    return total
+
+
 def log_effective_tflops(
     forward_ms: float,
     batch_size: int,
@@ -170,39 +195,39 @@ def log_effective_tflops(
     d_model: int = 512,
     dim_feedforward: int = 4096,
     num_layers: int = 8,
-    num_backbones: int = 2,
+    s1_seq_len: int | None = None,
 ) -> None:
     """Estimate effective TFLOPS from forward-pass timing and known model structure.
 
     Compares against GPU theoretical peaks to determine hardware utilization.
-    Reference hardware: A10G (current production GPU).
-      - A10G BF16: 125 TFLOPS (peak), ~40-60 TFLOPS (realistic with overhead)
-      - A10G memory bandwidth: 600 GB/s
-    Historical: T4 BF16=65 peak, L4 BF16=121 peak.
+    Reference hardware: L40S (g6e.xlarge production workers) — BF16 tensor
+    181 TFLOPS dense, memory bandwidth 864 GB/s.
+    Historical: A10G BF16 ~35 realistic (GA10x runs FP32-accumulate at half the
+    advertised 70 dense), T4 BF16=65 peak, L4 BF16=121 peak.
 
-    Only counts transformer layer FLOPs (attention + FFN), which dominate the model.
-    GRU, embedding MLP, and positional encoding are excluded (< 5% of total FLOPs).
+    Only counts transformer layer FLOPs (attention + FFN) via
+    :func:`transformer_flops`. ``seq_len`` is the S2 backbone's sequence length;
+    ``s1_seq_len`` defaults to the same value when not supplied.
     """
     if forward_ms <= 0:
         return
 
     effective_batch = batch_size
-
-    # Per-layer FLOPs (standard transformer accounting -- each matmul (M,K)x(K,N) = 2MKN FLOPs):
-    # Self-attention: 8*B*S*D^2 (4 projections, 2 FLOPs each) + 4*B*S^2*D (scores + context)
-    attn_flops = 8 * effective_batch * seq_len * d_model**2 + 4 * effective_batch * seq_len**2 * d_model
-    # FFN: 4*B*S*D*FF (2 linear layers, 2 FLOPs each)
-    ffn_flops = 4 * effective_batch * seq_len * d_model * dim_feedforward
-
-    per_layer_flops = attn_flops + ffn_flops
-    total_flops = per_layer_flops * num_layers * num_backbones
+    total_flops = transformer_flops(
+        effective_batch,
+        seq_len,
+        s1_seq_len if s1_seq_len is not None else seq_len,
+        d_model=d_model,
+        dim_feedforward=dim_feedforward,
+        num_layers=num_layers,
+    )
 
     effective_tflops = total_flops / (forward_ms / 1000) / 1e12
 
     logger.debug(
         "EFFECTIVE TFLOPS: %.2f TFLOPS (transformer layers only) | "
         "forward=%.1fms | effective_batch=%d | "
-        "A10G BF16=125 TFLOPS (peak) ~40-60 (real) | mem_bw=600 GB/s | "
+        "ceiling: L40S BF16~181 TFLOPS dense, 864 GB/s | "
         "verdict=%s",
         effective_tflops,
         forward_ms,

@@ -48,6 +48,43 @@ class TestLoadS2Bands:
         for i, band in enumerate(S2_BAND_ORDER):
             np.testing.assert_array_equal(result[:, :, :, i], expected[band])
 
+    def test_concurrent_band_read_matches_serial_on_real_icechunk(self, local_zarr_path, sample_reflectance_data):
+        """The parallel band read is correct against a real icechunk store.
+
+        The other tests use an in-memory zarr group; the concurrency concern is
+        specific to icechunk's readonly session store, whose reads run through a
+        different (async, Rust) backend. Build a real local store shaped like
+        reflectance.zarr (time chunked at 1, sub-extent spatial chunks so the
+        read spans multiple chunks) and assert the threaded ``_load_s2_bands``
+        equals a per-band serial read.
+        """
+        from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, write_dataset
+
+        dates = [f"2024-06-{d:02d}" for d in range(1, 9)]  # 8 timesteps
+        data = sample_reflectance_data(dates, height=128, width=128)
+        store_path = str(local_zarr_path / "conc_tile" / "reflectance.zarr")
+        write_dataset(
+            store_path,
+            data,
+            tile_id="33UUP",
+            baselines=dict.fromkeys(dates, 400),
+            chunks={"time": 1, "northing": 64, "easting": 64},
+            crs="EPSG:32615",
+        )
+
+        root = open_store_as_zarr_group(store_path)
+        ti, ys, xs = np.arange(len(dates)), slice(0, 128), slice(0, 128)
+
+        serial = np.empty((len(dates), 128, 128, len(S2_BAND_ORDER)), dtype=np.uint16)
+        for i, band in enumerate(S2_BAND_ORDER):
+            serial[:, :, :, i] = root[band].oindex[ti, ys, xs]
+
+        # Run several times so a data race (rather than a deterministic bug)
+        # has a chance to surface.
+        for _ in range(10):
+            result = _load_s2_bands(root, time_indices=ti, y_slice=ys, x_slice=xs)
+            np.testing.assert_array_equal(result, serial)
+
 
 class TestLoadSclMask:
     """Tests for SCL-based validity masking."""
@@ -557,3 +594,34 @@ class TestResolveS1OrbitErrors:
             pytest.raises(icechunk.IcechunkError, match="timed out"),
         ):
             resolve_s1_orbit("s3://b/m", "both")  # must NOT silently downgrade to ascending
+
+
+class TestBandReadWorkerReservation:
+    """Background loads reserve cores for the GPU's batch-prep workers."""
+
+    def _workers(self, cores: int, reserve: int) -> int:
+        with patch.object(_dl_mod.os, "sched_getaffinity", create=True, return_value=set(range(cores))):
+            return _dl_mod._band_read_workers(reserve)
+
+    def test_foreground_uses_all_allocated_cores(self):
+        assert self._workers(cores=4, reserve=0) == 4
+
+    def test_background_reserves_cores_for_batch_prep(self):
+        # g6e.xlarge case: 4 vCPUs, reserve 2 for prep → 2 decompression threads.
+        assert self._workers(cores=4, reserve=2) == 2
+
+    def test_never_below_one_worker(self):
+        assert self._workers(cores=2, reserve=2) == 1
+        assert self._workers(cores=1, reserve=4) == 1
+
+    def test_capped_at_band_count(self):
+        assert self._workers(cores=64, reserve=0) == len(S2_BAND_ORDER)
+        # Reservation is applied BEFORE the band-count cap, so when cores far
+        # exceed the band count the reserve is moot (64-2=62, capped at 10 —
+        # 10 readers still leave 54 cores free). The full reader set runs.
+        assert self._workers(cores=64, reserve=2) == len(S2_BAND_ORDER)
+
+    def test_reservation_does_not_drop_readers_when_cores_exceed_bands(self):
+        # Regression for the reserve-after-cap bug: 12 cores, reserve 2 →
+        # min(10, 12-2)=10 readers (2 free for prep), NOT min(10,12)-2=8.
+        assert self._workers(cores=12, reserve=2) == len(S2_BAND_ORDER)

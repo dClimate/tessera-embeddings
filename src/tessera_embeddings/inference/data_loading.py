@@ -15,7 +15,9 @@ loaded eagerly.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 
@@ -30,6 +32,39 @@ from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.storage.zarr_store import compute_doy, open_store_as_zarr_group
 
 logger = logging.getLogger(__name__)
+
+
+# Worker cap for the concurrent S2 band read (see ``_load_s2_bands``). The 10
+# bands are independent zarr arrays, so their reads fan out across a thread
+# pool. Unlike the latency-bound ROI probe (``chunk_spec._ROI_PROBE_WORKERS``,
+# oversubscribed x4), this read is decompression-bound: with time chunked at 1,
+# each band's ``oindex`` already issues its per-timestep S3 GETs concurrently,
+# so the serial cost we remove is the 10 decompression waves, not GET latency.
+# Decompression runs in Rust with the GIL released, so it scales to cores — but
+# only to cores, so we cap at the allocated CPU count (never above the band
+# count) to keep decompression cores busy without oversubscribing. Uses
+# ``sched_getaffinity`` where available (Linux inference actors) so a
+# cgroup/affinity-pinned worker sees its real allocation, not the host's.
+def _band_read_workers(reserve_cpus: int = 0) -> int:
+    """Decompression pool size for the concurrent S2 band read.
+
+    ``reserve_cpus`` leaves that many cores free for concurrent CPU work.
+    Callers loading in the background while the GPU runs (the intra-chunk
+    strip prefetch) reserve cores for the batch-prep workers that feed the
+    GPU — on the 4-vCPU g6e.xlarge, four decompression threads competing with
+    batch prep produced ~500 ms get_batch spikes that starved the GPU.
+    Foreground loads (the serial chunk prologue, GPU idle) reserve nothing.
+    """
+    try:
+        allocated = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except AttributeError:  # macOS/Windows: no affinity API
+        allocated = os.cpu_count() or 4
+    # Reserve cores from the ALLOCATION first, then cap at the band count, so a
+    # host with more CPUs than bands still runs the full reader set (reserving
+    # after the cap would needlessly drop readers, e.g. 12 CPUs, 2 reserved ->
+    # min(10,12)-2=8 instead of min(10,10)=10). On the 4-vCPU worker both give 2.
+    return max(1, min(len(S2_BAND_ORDER), allocated - reserve_cpus))
+
 
 # A function that maps a store path to an open zarr group. The default is
 # ``open_store_as_zarr_group`` (a fresh repo open per call). The strip loop
@@ -133,6 +168,12 @@ class ChunkData:
     s2_obs_count: np.ndarray | None = None  # (H, W), uint16
     s1_asc_obs_count: np.ndarray | None = None  # (H, W), uint16
     s1_desc_obs_count: np.ndarray | None = None  # (H, W), uint16
+    # Full-chunk-width SAR obs counts, populated ONLY for x-cropped loads
+    # (x_sub): the saved obs-count layers must keep full-extent fidelity, but
+    # the cropped grid above can't carry it. SAR is read full-width regardless
+    # (it is ~10x smaller than S2); these hold the pre-crop counts.
+    s1_asc_obs_count_full: np.ndarray | None = None  # (H, full W), uint16
+    s1_desc_obs_count_full: np.ndarray | None = None  # (H, full W), uint16
 
 
 def _load_sar_bands_from_zarr(
@@ -169,6 +210,7 @@ def _load_s2_bands(
     time_indices: np.ndarray,
     y_slice: slice,
     x_slice: slice,
+    reserve_cpus: int = 0,
 ) -> np.ndarray:
     """Stack S2 bands in canonical order, reading directly from zarr.
 
@@ -180,8 +222,21 @@ def _load_s2_bands(
     h = y_slice.stop - y_slice.start
     w = x_slice.stop - x_slice.start
     result = np.empty((t, h, w, len(S2_BAND_ORDER)), dtype=ref.dtype)
-    for i, band in enumerate(S2_BAND_ORDER):
+
+    # The 10 bands are independent zarr arrays and each thread writes a distinct
+    # ``result[..., i]`` column, so the reads have no shared mutable state and
+    # run concurrently. Reading one band per iteration is serial across 10
+    # decompression waves; fanning them out collapses those to one wave bounded
+    # by the allocated cores (see ``_band_read_workers``). Concurrent reads on
+    # one readonly icechunk session store (an immutable snapshot view) are safe
+    # — only concurrent *commits* are not; verified against a real store.
+    def _read_band(i: int, band: str) -> None:
         result[:, :, :, i] = root[band].oindex[time_indices, y_slice, x_slice]
+
+    with ThreadPoolExecutor(max_workers=_band_read_workers(reserve_cpus)) as pool:
+        # Drain the map so any read exception propagates instead of being
+        # swallowed with a partially-filled ``result``.
+        list(pool.map(lambda ib: _read_band(*ib), enumerate(S2_BAND_ORDER)))
     return result
 
 
@@ -394,6 +449,17 @@ def _resolve_y_slice(chunk: ChunkSpec, y_sub: slice | None) -> slice:
     return slice(chunk.y_start + y_sub.start, chunk.y_start + y_sub.stop)
 
 
+def _resolve_x_slice(chunk: ChunkSpec, x_sub: slice | None) -> slice:
+    """Resolve the absolute store-level easting slice for a (sub-)chunk read.
+
+    ``x_sub`` is chunk-relative, mirroring ``_resolve_y_slice``. ``None`` reads
+    the full chunk width.
+    """
+    if x_sub is None:
+        return slice(chunk.x_start, chunk.x_stop)
+    return slice(chunk.x_start + x_sub.start, chunk.x_start + x_sub.stop)
+
+
 def load_s2_mask_bundle(
     mosaic_base: str,
     chunk: ChunkSpec,
@@ -447,6 +513,8 @@ def _load_s2(
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
     mask_bundle: S2MaskBundle | None = None,
+    reserve_cpus: int = 0,
+    x_sub: slice | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load all S2 timesteps in the window that have any valid pixel in the (sub-)chunk.
 
@@ -471,18 +539,40 @@ def _load_s2(
         store_opener = open_store_as_zarr_group
     store_path = f"{mosaic_base}/reflectance.zarr"
     root = store_opener(store_path)
-    x_slice = slice(chunk.x_start, chunk.x_stop)
+    x_slice = _resolve_x_slice(chunk, x_sub)
 
     if mask_bundle is not None:
-        # Slice the shared full-chunk mask to this strip's rows; the chunk-level
-        # prune already chose the kept timesteps, so band reads match the bundle.
+        # Slice the shared full-chunk mask to this strip's rows (and, when
+        # x-cropped, to the valid-bbox columns); the chunk-level prune already
+        # chose the kept timesteps, so band reads match the bundle.
         rows = y_sub if y_sub is not None else slice(0, chunk.height)
-        s2_masks = mask_bundle.mask[:, rows, :]
-        s2_obs_count = mask_bundle.obs_count[rows, :]
+        cols = x_sub if x_sub is not None else slice(0, chunk.width)
+        s2_masks = mask_bundle.mask[:, rows, cols]
+        s2_obs_count = mask_bundle.obs_count[rows, cols]
         s2_doys = mask_bundle.doys
         abs_kept = mask_bundle.abs_indices
         y_slice = _resolve_y_slice(chunk, y_sub)
-        s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice)
+
+        # obs_count > 0 ⟺ the pruned mask has a valid entry (pruning drops only
+        # all-False planes), and the (H, W) scan avoids walking the strided
+        # (T_kept, H, W) mask view (~100 ms/chunk on dense multi-strip chunks).
+        if not s2_obs_count.any():
+            # No valid S2 pixel anywhere in this strip: bucketing would select
+            # zero pixels, so the (expensive, 20 B/px) band read is pure waste.
+            # Return a T=0 band stack — the dataset sees no candidates and the
+            # strip short-circuits — while obs counts keep full fidelity from
+            # the bundle. Common on sparse/edge chunks whose valid sliver lies
+            # in other strips; the timestep prune can't help them because it is
+            # chunk-global (one sliver anywhere keeps the timestep).
+            h = y_slice.stop - y_slice.start
+            w = x_slice.stop - x_slice.start
+            logger.info("Strip rows %s have no valid S2 pixels — skipping band read", rows)
+            empty = np.empty((0, h, w, len(S2_BAND_ORDER)), dtype=root[S2_BAND_ORDER[0]].dtype)
+            return empty, s2_masks[:0], s2_doys[:0], s2_obs_count
+
+        s2_bands = _load_s2_bands(
+            root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice, reserve_cpus=reserve_cpus
+        )
         logger.info("Loaded S2 bands shape %s (sliced shared mask)", s2_bands.shape)
         return s2_bands, s2_masks, s2_doys, s2_obs_count
 
@@ -512,7 +602,7 @@ def _load_s2(
 
     s2_doys = s2_doys_full[kept]
 
-    s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice)
+    s2_bands = _load_s2_bands(root, time_indices=abs_kept, y_slice=y_slice, x_slice=x_slice, reserve_cpus=reserve_cpus)
     logger.info("Loaded S2 bands shape %s", s2_bands.shape)
 
     # Keep the mask bool (1 byte/elem) rather than widening to int32 — it stays
@@ -555,6 +645,8 @@ def load_chunk(
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
     mask_bundle: S2MaskBundle | None = None,
+    reserve_cpus: int = 0,
+    x_sub: slice | None = None,
 ) -> ChunkData:
     """Load all data for one spatial chunk (or a northing strip of it) for v1.1 inference.
 
@@ -581,6 +673,20 @@ def load_chunk(
             it per strip instead of re-read, and timestep pruning uses the
             chunk-level decision baked into the bundle. The strip loop loads the
             bundle once and passes it to every strip; ``None`` loads SCL inline.
+        reserve_cpus: Cores to leave free during the S2 band decompression —
+            background loads running alongside GPU inference reserve cores for
+            the batch-prep workers (see :func:`_band_read_workers`); foreground
+            loads use the default 0.
+        x_sub: Optional chunk-relative EASTING window (the S2 valid-pixel
+            bounding box on sparse/edge chunks). S2 bands — the 20 B/px cost —
+            are read only for these columns and the returned grid is cropped
+            to them (``width`` shrinks, mirroring how ``y_sub`` crops rows).
+            SAR is still READ full-width so the saved obs-count layers keep
+            full-extent fidelity: the pre-crop counts are returned in
+            ``s1_*_obs_count_full`` while the grid-shaped ``s1_*_obs_count``
+            are cropped like everything else. Pixels outside the box have zero
+            valid S2 observations, so they could never be inferred — cropping
+            them changes which bytes are read, not any output.
 
     Returns:
         ChunkData with all S2 timesteps that have any valid pixel in the
@@ -588,7 +694,7 @@ def load_chunk(
     """
     active = set(_active_orbits(s1_orbit))
     height = chunk.height if y_sub is None else (y_sub.stop - y_sub.start)
-    width = chunk.width
+    width = chunk.width if x_sub is None else (x_sub.stop - x_sub.start)
     logger.info(
         "Loading chunk %s from %s (s1_orbit=%s, time_window=%s, y_sub=%s)",
         chunk.label,
@@ -599,26 +705,49 @@ def load_chunk(
     )
 
     s2_bands, s2_masks, s2_doys, s2_obs_count = _load_s2(
-        mosaic_base, chunk, time_window, y_sub=y_sub, store_opener=store_opener, mask_bundle=mask_bundle
+        mosaic_base,
+        chunk,
+        time_window,
+        y_sub=y_sub,
+        store_opener=store_opener,
+        mask_bundle=mask_bundle,
+        reserve_cpus=reserve_cpus,
+        x_sub=x_sub,
     )
 
+    # Skipped orbits get FULL-width placeholders: every SAR array must be
+    # full-width here because the x_sub block below crops them all uniformly
+    # (after capturing the full-width obs-count side channel).
     s1_asc_bands, s1_asc_doys = (
         _load_sar_orbit(
             mosaic_base, chunk, "ascending", time_window=time_window, y_sub=y_sub, store_opener=store_opener
         )
         if "ascending" in active
-        else _empty_sar_arrays(height, width)
+        else _empty_sar_arrays(height, chunk.width)
     )
     s1_desc_bands, s1_desc_doys = (
         _load_sar_orbit(
             mosaic_base, chunk, "descending", time_window=time_window, y_sub=y_sub, store_opener=store_opener
         )
         if "descending" in active
-        else _empty_sar_arrays(height, width)
+        else _empty_sar_arrays(height, chunk.width)
     )
 
     s1_asc_obs_count = np.any(s1_asc_bands != 0, axis=-1).sum(axis=0).astype(np.uint16)
     s1_desc_obs_count = np.any(s1_desc_bands != 0, axis=-1).sum(axis=0).astype(np.uint16)
+
+    s1_asc_obs_count_full: np.ndarray | None = None
+    s1_desc_obs_count_full: np.ndarray | None = None
+    if x_sub is not None:
+        # SAR was read full-width (see the x_sub docstring): keep the full-width
+        # counts for the saved obs layers, then crop the grid-shaped arrays to
+        # match the S2 grid. ascontiguousarray drops the full-width parents.
+        s1_asc_obs_count_full = s1_asc_obs_count
+        s1_desc_obs_count_full = s1_desc_obs_count
+        s1_asc_obs_count = np.ascontiguousarray(s1_asc_obs_count[:, x_sub])
+        s1_desc_obs_count = np.ascontiguousarray(s1_desc_obs_count[:, x_sub])
+        s1_asc_bands = np.ascontiguousarray(s1_asc_bands[:, :, x_sub, :])
+        s1_desc_bands = np.ascontiguousarray(s1_desc_bands[:, :, x_sub, :])
 
     logger.info(
         "Loaded %s: S2 %s, SAR asc %s (%d dates), SAR desc %s (%d dates)",
@@ -643,4 +772,6 @@ def load_chunk(
         s2_obs_count=s2_obs_count,
         s1_asc_obs_count=s1_asc_obs_count,
         s1_desc_obs_count=s1_desc_obs_count,
+        s1_asc_obs_count_full=s1_asc_obs_count_full,
+        s1_desc_obs_count_full=s1_desc_obs_count_full,
     )

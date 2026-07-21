@@ -20,11 +20,12 @@ differences for the open-source release:
   ``/ec2/yield/ray``.
 
 # NOTE — cancellation hook dependency:
-# :func:`cleanup_ray_tempfiles` is intended to be wired into the orchestrator's
-# on-cancellation hook. If this module fails to import (unlikely — only boto3,
-# ray + stdlib deps), the hook will raise at cancellation time. That's
-# acceptable: the hook is best-effort, and the autoscaler idle timeout still
-# cleans up after wall-clock timeout.
+# :func:`terminate_ray_instances_by_tag` and :func:`cleanup_ray_tempfiles` are
+# intended to be wired into the orchestrator's on-cancellation/on-crashed
+# hooks. Those hooks are the real last line of defence: the autoscaler idle
+# timeout only drains workers above a node type's ``min_workers`` floor and
+# NEVER terminates the head node, so an untorn-down cluster runs until
+# someone terminates it by tag. See gotchas.md ("Teardown").
 """
 
 from __future__ import annotations
@@ -161,10 +162,11 @@ def _resolve_ray_config(
     """Inject AWS resource IDs from SSM into a Ray cluster YAML template.
 
     Reads SSM parameters under ``ssm_prefix``, looks up the AMI ID from
-    ``ami_ssm_name``, picks the least-loaded private subnet, materialises
-    the SSH key from SSM into a tempfile, injects the CloudWatch agent
-    setup command, substitutes ``{CODE_BUCKET}`` and ``{CODE_SUFFIX}`` in
-    setup_commands, and writes the resolved config to a tempfile.
+    ``ami_ssm_name``, pins all nodes to the least-loaded private subnet
+    (single AZ), materialises the SSH key from SSM into a tempfile, injects the
+    CloudWatch agent setup command, substitutes ``{CODE_BUCKET}`` and
+    ``{CODE_SUFFIX}`` in setup_commands, and writes the resolved config to
+    a tempfile.
 
     Args:
         cluster_yaml: Path to the cluster YAML template. Use
@@ -233,15 +235,13 @@ def _resolve_ray_config(
     merged_tags.extend(instance_tags or [])
     tag_specs: list[dict[str, Any]] = [{"ResourceType": "instance", "Tags": merged_tags}]
 
-    # Pin all nodes to a single AZ to avoid cross-AZ data transfer costs.
-    # Pick the subnet with the fewest running Ray instances to spread
-    # concurrent clusters across AZs.
+    # Pin all nodes to a single AZ (cross-AZ data transfer is billed): describe
+    # the SSM subnets and pick the least-loaded one.
     ec2 = boto3.client("ec2", region_name=region)
     subnet_resp = ec2.describe_subnets(SubnetIds=all_subnet_ids)
     if not subnet_resp.get("Subnets"):
         msg = f"No subnets found for IDs: {all_subnet_ids}"
         raise RuntimeError(msg)
-
     chosen_subnet = _pick_least_loaded_subnet(subnet_resp["Subnets"], base_cluster_name, ec2)
     chosen_az = chosen_subnet["AvailabilityZone"]
     chosen_subnet_id = chosen_subnet["SubnetId"]
@@ -355,37 +355,16 @@ def _sync_code_to_s3(
 
 
 def _start_ray_cluster(
-    cluster_yaml: str | Path,
+    resolved_yaml: str,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
-    *,
-    region: str,
-    ami_ssm_name: str,
-    ssm_prefix: str,
-    cluster_name: str | None,
-    instance_tags: list[dict[str, str]] | None,
-    code_bucket: str | None,
-    code_suffix: str,
-    cloudwatch_log_group: str,
-    cloudwatch_template: Path,
-) -> tuple[str, str]:
-    """Resolve config from SSM and launch a Ray cluster via ``ray up``.
+) -> str:
+    """Launch a Ray cluster via ``ray up`` on a resolved YAML; return the head IP.
 
-    Returns the resolved YAML tempfile path and the head node's internal
-    IP address.
+    Config resolution happens in the caller (:func:`ray_cluster`) so the
+    resolved path is already bound when a failed launch unwinds to the
+    teardown block — ``ray down`` must target the real (uuid-suffixed)
+    cluster, not the unresolved template.
     """
-    log.info("Resolving Ray cluster config from SSM (cluster_name=%s)", cluster_name)
-    resolved_yaml = _resolve_ray_config(
-        cluster_yaml,
-        region=region,
-        ami_ssm_name=ami_ssm_name,
-        ssm_prefix=ssm_prefix,
-        cluster_name=cluster_name,
-        instance_tags=instance_tags,
-        code_bucket=code_bucket,
-        code_suffix=code_suffix,
-        cloudwatch_log_group=cloudwatch_log_group,
-        cloudwatch_template=cloudwatch_template,
-    )
     log.info("Starting Ray cluster from %s", resolved_yaml)
     ray_up = subprocess.run(
         ["ray", "up", resolved_yaml, "-y", "--no-config-cache"],
@@ -413,7 +392,7 @@ def _start_ray_cluster(
     head_ip = lines[-1].strip()
     log.info("Ray head node IP: %s", head_ip)
 
-    return resolved_yaml, head_ip
+    return head_ip
 
 
 def _log_ray_dashboard_ssm_command(
@@ -501,7 +480,7 @@ def terminate_ray_instances_by_tag(
     cluster_name: str,
     *,
     region: str = "us-west-2",
-    log: logging.Logger | None = None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     prefix_match: bool = False,
 ) -> None:
     """Terminate all running/pending EC2 instances belonging to a Ray cluster.
@@ -541,17 +520,25 @@ def terminate_ray_instances_by_tag(
 def _stop_ray_cluster(
     cluster_yaml: str,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
-) -> None:
-    """Tear down the Ray cluster. Best-effort — does not raise on failure."""
+) -> bool:
+    """Tear down the Ray cluster via ``ray down``. Best-effort — does not raise.
+
+    Returns True if ``ray down`` exited 0, False otherwise (caller may then fall
+    back to tag-based termination so a head that ``ray down`` couldn't reach
+    doesn't leak).
+    """
     log.info("Tearing down Ray cluster")
     result = subprocess.run(["ray", "down", cluster_yaml, "-y"], check=False)
     if result.returncode == 0:
         log.info("Ray cluster stopped")
-    else:
-        log.warning(
-            "ray down exited with code %d — cluster may still be running (idle timeout will clean up)",
-            result.returncode,
-        )
+        return True
+    log.warning(
+        "ray down exited with code %d — cluster may still be running; idle workers "
+        "self-drain after the idle timeout, but the head node does NOT self-terminate. "
+        "Terminate by ray-cluster-name tag if this persists.",
+        result.returncode,
+    )
+    return False
 
 
 @contextlib.contextmanager
@@ -635,9 +622,15 @@ def ray_cluster(
                 log.info("Syncing %s → s3://%s/%s", sync_source_path, code_bucket, s3_key)
                 _sync_code_to_s3(sync_source_path, code_bucket, s3_key)
 
-            resolved_yaml, head_ip = _start_ray_cluster(
+            # Resolve BEFORE launching so `resolved_yaml` is bound when a
+            # failed `ray up` unwinds to the finally-block: a partial launch
+            # can leave a provisioned head behind, and `ray down` against the
+            # unresolved template (whose cluster_name lacks the uuid suffix)
+            # matches nothing — that exact path leaked a head on 2026-07-16.
+            # _resolve_ray_config pins the cluster to a single least-loaded AZ.
+            log.info("Resolving Ray cluster config from SSM (cluster_name=%s)", cluster_name)
+            resolved_yaml = _resolve_ray_config(
                 cluster_yaml,
-                log,
                 region=region,
                 ami_ssm_name=ami_ssm_name,
                 ssm_prefix=ssm_prefix,
@@ -648,6 +641,7 @@ def ray_cluster(
                 cloudwatch_log_group=cloudwatch_log_group,
                 cloudwatch_template=cloudwatch_template,
             )
+            head_ip = _start_ray_cluster(resolved_yaml, log)
             head_address = f"ray://{head_ip}:10001"
             log.info("Connecting to Ray at %s", head_address)
             ray.init(address=head_address, ignore_reinit_error=True)
@@ -658,5 +652,19 @@ def ray_cluster(
     finally:
         ray.shutdown()
         if manages_cluster:
-            _stop_ray_cluster(resolved_yaml or str(cluster_yaml), log)
+            if resolved_yaml is None:
+                # Config resolution failed before launch, so no resolved YAML
+                # exists. `ray down` on the UNRESOLVED template would target its
+                # base cluster_name (no flow-specific uuid suffix) and could tear
+                # down an unrelated `tessera-inference` cluster — skip it and
+                # terminate anything tagged with our exact cluster_name instead.
+                if cluster_name:
+                    terminate_ray_instances_by_tag(cluster_name=cluster_name, region=region, log=log)
+            elif not _stop_ray_cluster(resolved_yaml, log) and cluster_name:
+                # When `ray down` can't tear the cluster down (unreachable head,
+                # stale YAML), fall back to exact-tag termination so a normally-
+                # completed run can't leave the fleet billing. The
+                # cancellation/crash hook only covers cancelled/crashed flows,
+                # not this path.
+                terminate_ray_instances_by_tag(cluster_name=cluster_name, region=region, log=log)
             cleanup_ray_tempfiles(resolved_yaml)

@@ -79,6 +79,16 @@ class ActorPool:
         self.pending: dict[ray.ObjectRef, tuple[str, int]] = {}
         self.chunk_attempts: dict[str, int] = {}
 
+        # actor_idx → the chunk reserved as that actor's next assignment. A
+        # reservation is created at submit time and passed to the actor as
+        # ``prefetch_hint`` so it can prefetch a BOUNDED starter payload (mask
+        # + 256-row starter strip, hard-capped ~2 GiB — see actors.py
+        # ``_XCHUNK_PREFETCH_CAP_BYTES``, NOT the full-prologue payload the
+        # removed Phase-1 interleaving co-resided) during the current chunk's
+        # tail inference. Reservations stop when the queue is shallower than
+        # the live pool; a failed actor's reservation is requeued to the front.
+        self.reserved: dict[int, ChunkSpec] = {}
+
         self._pending_iid_refs: dict[int, ray.ObjectRef] = {}
         self._initializing: set[int] = set()
         self._retired: set[int] = set()
@@ -97,6 +107,18 @@ class ActorPool:
     def live_count(self) -> int:
         """Number of non-retired actor slots."""
         return len(self.actors) - len(self._retired)
+
+    def outstanding_work(self, queued: int) -> int:
+        """In-flight + queued + reserved chunks — the true remaining-work count.
+
+        Reserved next-chunks live in neither ``pending`` nor the queue while a
+        busy actor holds them; excluding them would make remaining work look
+        smaller, under-provisioning actor batches and over-retiring idle actors
+        mid-run. The tail over-provision this can cause is bounded (the
+        ``requested >= outstanding`` and ``target - requested`` caps) and
+        self-corrects via idle retirement.
+        """
+        return len(self.pending) + queued + len(self.reserved)
 
     @property
     def max_actor_deaths(self) -> int:
@@ -170,8 +192,18 @@ class ActorPool:
         staging_base: str,
         run_id: str,
         tracker: ray.actor.ActorHandle | None,
+        chunk_queue: deque[ChunkSpec] | None = None,
     ) -> None:
         """Submit a single chunk to an actor and record the pending future.
+
+        When ``chunk_queue`` is supplied and still deep, the queue head is also
+        popped and RESERVED as this actor's next assignment, riding along as
+        ``prefetch_hint`` so the actor can prefetch that chunk's capped starter
+        payload during this chunk's tail inference (see actors.py). Reservations
+        stop when the queue is shallower than the live pool
+        (``len(queue) <= live_count``): at the tail of a run a reserved chunk
+        would pin work to a busy actor while other actors sit idle, which costs
+        more than the prologue overlap saves.
 
         Args:
             actor_idx: Index into self.actors.
@@ -180,13 +212,32 @@ class ActorPool:
             staging_base: Base path for staged output.
             run_id: Run identifier.
             tracker: Optional ProgressTracker actor handle.
+            chunk_queue: Remaining-work queue; the reservation source. ``None``
+                disables reservation (tests and direct callers).
         """
         self.resolve_iid(actor_idx)  # best-effort resolve before dispatch
+        if actor_idx in self.reserved:
+            # Defensive: a reservation should have been consumed or returned
+            # before this actor is re-dispatched; don't strand the chunk.
+            stranded = self.reserved.pop(actor_idx)
+            self.log.warning("Actor %d re-dispatched holding reservation %s — requeuing it", actor_idx, stranded.label)
+            if chunk_queue is not None:
+                chunk_queue.appendleft(stranded)
+
+        hint: ChunkSpec | None = None
+        if chunk_queue is not None and len(chunk_queue) > self.live_count:
+            hint = chunk_queue.popleft()
+            self.reserved[actor_idx] = hint
+
         ref: ray.ObjectRef = self.actors[actor_idx].process_chunk.remote(  # type: ignore[union-attr]
-            chunk, mosaic_base, staging_base, run_id, tracker=tracker
+            chunk, mosaic_base, staging_base, run_id, tracker=tracker, prefetch_hint=hint
         )
         self.pending[ref] = (chunk.label, actor_idx)
         self.chunk_attempts[chunk.label] = self.chunk_attempts.get(chunk.label, 0) + 1
+
+    def take_reserved(self, actor_idx: int) -> ChunkSpec | None:
+        """Pop and return the chunk reserved for this actor, if any."""
+        return self.reserved.pop(actor_idx, None)
 
     def seed(
         self,
@@ -197,6 +248,10 @@ class ActorPool:
         tracker: ray.actor.ActorHandle | None,
     ) -> None:
         """Submit one chunk to each actor to prime the work-stealing loop.
+
+        The queue rides along to ``submit()`` so each seeded actor also gets a
+        next-chunk reservation (prefetch hint) while the queue is deep — its
+        FIRST chunk can already overlap the second chunk's prologue.
 
         Args:
             chunk_queue: Queue of remaining chunks (popleft in-place).
@@ -210,7 +265,7 @@ class ActorPool:
                 break
             if actor_idx in self._initializing:
                 continue
-            self.submit(actor_idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker)
+            self.submit(actor_idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker, chunk_queue)
         self.log.info("Seeded %d actors with initial chunks (%d queued)", len(self.pending), len(chunk_queue))
 
     def dispatch_idle(
@@ -224,7 +279,10 @@ class ActorPool:
         """Dispatch queued chunks to any idle, non-initializing actors.
 
         Covers cases where a replacement actor was skipped in the main loop —
-        other idle actors can pick up the work immediately.
+        other idle actors can pick up the work immediately. The queue rides
+        along to ``submit()`` so late-joining actors get the same next-chunk
+        reservation (prefetch hint) as main-loop dispatches while the queue
+        is deep.
 
         Args:
             chunk_queue: Queue of remaining chunks (popleft in-place).
@@ -243,7 +301,7 @@ class ActorPool:
             if not idle_ready:
                 break
             idx = idle_ready[0]
-            self.submit(idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker)
+            self.submit(idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker, chunk_queue)
             busy.add(idx)
 
     # ------------------------------------------------------------------
@@ -399,6 +457,8 @@ def _poll_tracker(
     stall_threshold_sec: float,
     max_simultaneous_stalls: int,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    elapsed_min: float | None = None,
+    gpu_hours: float | None = None,
 ) -> None:
     """Poll ProgressTracker; log stalls; raise RuntimeError on systemic stall.
 
@@ -414,6 +474,10 @@ def _poll_tracker(
         max_simultaneous_stalls: Number of simultaneous stalls that triggers a
             systemic abort (RuntimeError).
         log: Logger.
+        elapsed_min: Minutes since run start, folded into the single progress
+            line (this is the ONLY progress log line — keep it that way).
+        gpu_hours: Fleet GPU-hours consumed so far (live-actor-count integrated
+            over wall time; one GPU per actor), folded into the same line.
 
     Raises:
         RuntimeError: When ``>= max_simultaneous_stalls`` chunks are stalled.
@@ -453,13 +517,17 @@ def _poll_tracker(
             for _, (_, _, _, phase) in progress.items():
                 phases[phase] = phases.get(phase, 0) + 1
             phase_summary = ", ".join(f"{v} {k}" for k, v in sorted(phases.items()))
+            elapsed = f" — {elapsed_min:.1f} min elapsed" if elapsed_min is not None else ""
+            gpu = f", {gpu_hours:.1f} GPU-hrs" if gpu_hours is not None else ""
             log.info(
-                "Progress: %d/%d done, %d active (%s), %d stalled",
+                "Progress: %d/%d done, %d active (%s), %d stalled%s%s",
                 n_done,
                 n_total,
                 n_active,
                 phase_summary,
                 len(stalled_chunks),
+                elapsed,
+                gpu,
             )
     except Exception as exc:
         # Tracker is a monitoring aid — never a single point of failure.
@@ -635,7 +703,6 @@ def _process_chunks_work_stealing(
     pool.seed(chunk_queue, mosaic_base, staging_base, run_id, tracker)
 
     results: list[dict] = []
-    last_log_count = 0
     stall_threshold_sec = 300.0
 
     # Stall threshold scales with the eventual fleet size, not just the first
@@ -674,7 +741,7 @@ def _process_chunks_work_stealing(
         n, timed_out = _batch_actors_to_request(
             requested=len(pool.actors),
             target=total_actors_target,
-            outstanding=len(pool.pending) + len(chunk_queue),
+            outstanding=pool.outstanding_work(len(chunk_queue)),
             alive_gpu_nodes=alive_gpu_nodes,
             nodes_at_last_batch=nodes_at_last_batch,
             last_batch_size=last_batch_size,
@@ -714,6 +781,19 @@ def _process_chunks_work_stealing(
         """
         if tracker:
             tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
+        # The actor is killed below, taking its writer thread with it — any
+        # deferred write it still held is of unknown state, so requeue that
+        # chunk too. Safe: staged writes are idempotent (run-scoped keys,
+        # mode="w"; resume-scan tolerates rewrites).
+        orphaned = pending_write.pop(actor_idx, None)
+        if orphaned is not None:
+            _requeue_unconfirmed(orphaned, f"actor {actor_idx} failed with the write in flight")
+        # Its reserved next chunk (whose starter payload only this actor may
+        # have prefetched) goes back to the queue FRONT for a healthy actor.
+        reserved = pool.take_reserved(actor_idx)
+        if reserved is not None:
+            chunk_queue.appendleft(reserved)
+            log.info("Returned reserved chunk %s from failed actor %d to the queue front", reserved.label, actor_idx)
         pool.resolve_iid(actor_idx)
         instance_id = pool.actor_instance_ids[actor_idx]
         attempts = pool.chunk_attempts.get(chunk_label, 1)
@@ -757,10 +837,96 @@ def _process_chunks_work_stealing(
         # the background). The kill is a no-op if the actor process already died.
         pool.replace(actor_idx, instance_id)
 
+    # --- Deferred staging writes ---
+    # Actors return with write_deferred=True while their staging upload runs
+    # on a background thread (overlapping the next chunk's serial prologue).
+    # Such results are held here — NOT counted complete — until the write's
+    # outcome arrives: piggybacked as prior_write on the actor's next result,
+    # or pulled via flush_writes() once the actor idles. On failure or actor
+    # death the chunk requeues (staged writes are idempotent).
+    pending_write: dict[int, dict] = {}  # actor_idx -> deferred result dict
+
+    def _requeue_unconfirmed(deferred: dict, reason: str) -> None:
+        """Requeue a deferred chunk whose write failed or is of unknown state."""
+        label = str(deferred["chunk"])
+        attempts = pool.chunk_attempts.get(label, 1)
+        if attempts <= max_chunk_retries:
+            log.warning(
+                "Chunk %s staging write unconfirmed (%s, attempt %d/%d) — re-queuing",
+                label,
+                reason,
+                attempts,
+                max_chunk_retries,
+            )
+            chunk_queue.append(chunk_by_label[label])
+        else:
+            log.error("Chunk %s PERMANENTLY FAILED: staging write unconfirmed (%s)", label, reason)
+            results.append(
+                {"chunk": label, "status": "failed", "error": f"staging write: {reason}", "attempts": attempts}
+            )
+
+    def _finalize_prior_write(actor_idx: int, prior: dict) -> None:
+        """Resolve a deferred chunk using the write outcome its actor reported."""
+        deferred = pending_write.pop(actor_idx, None)
+        if deferred is None:
+            log.warning("Actor %d reported a write outcome for %s but none was pending", actor_idx, prior.get("label"))
+            return
+        if prior.get("ok"):
+            deferred["write_confirmed"] = True
+            results.append(deferred)
+        else:
+            # A plain write error leaves the actor healthy (it just inferred a
+            # whole chunk) — requeue without the kill-and-replace used for
+            # inference failures.
+            _requeue_unconfirmed(deferred, str(prior.get("error", "unknown write error")))
+            if prior.get("timed_out"):
+                # ...but a TIMEOUT means the upload is still wedged in the
+                # actor's single-slot writer pool; keep dispatching to it and
+                # later writes queue behind the stuck task and time out too.
+                # Replace the slot (reaping the writer). Only reached via the
+                # idle-flush path — the hot path raises in process_chunk, so
+                # this actor is idle and has no chunk mid-assignment.
+                log.warning("Actor %d writer pool wedged (write timeout); replacing", actor_idx)
+                pool.resolve_iid(actor_idx)
+                pool.replace(actor_idx, pool.actor_instance_ids[actor_idx])
+
+    def _flush_idle_writes() -> None:
+        """Drain deferred writes on actors with no in-flight call to carry them."""
+        busy = pool.busy_actors
+        for actor_idx in [a for a in pending_write if a not in busy]:
+            try:
+                prior = cast(
+                    "dict | None",
+                    ray.get(pool.actors[actor_idx].flush_writes.remote(), timeout=600),  # type: ignore[union-attr]
+                )
+            except Exception as exc:
+                _requeue_unconfirmed(pending_write.pop(actor_idx), f"flush failed: {exc}")
+                # A failed or timed-out flush RPC may leave the (serial) actor
+                # still wedged inside flush_writes(); a retry dispatched to it
+                # would sit behind that stuck call forever — and invisibly, as
+                # a chunk that never starts has no tracker entry for stall
+                # detection. Kill + replace the slot so the requeued chunk
+                # lands on a healthy actor. Safe: staged writes are idempotent.
+                pool.resolve_iid(actor_idx)
+                pool.replace(actor_idx, pool.actor_instance_ids[actor_idx])
+                continue
+            if prior is None:
+                _requeue_unconfirmed(pending_write.pop(actor_idx), "actor had no pending write to flush")
+            else:
+                _finalize_prior_write(actor_idx, prior)
+
     # --- Main work-stealing loop ---
-    # Runs while there is in-flight work OR queued chunks waiting for
-    # initializing actors to come online.
-    while pool.pending or (chunk_queue and pool._initializing):
+    # gpu_seconds integrates live-actor-count over wall time (one GPU per
+    # actor) so the progress line can report fleet GPU-hours consumed so far.
+    gpu_seconds = 0.0
+    last_tick = time.monotonic()
+    # Stay alive while any work remains: in-flight chunks, deferred writes
+    # awaiting confirmation, OR queued chunks with a live actor to run them.
+    # The queue clause must NOT be gated on _initializing alone — a failed tail
+    # flush (_flush_idle_writes, which runs after dispatch) requeues its chunk
+    # when no actor is initializing, and gating on _initializing would drop that
+    # retry. `live_count > 0` prevents a busy-spin when every actor has died.
+    while pool.pending or pending_write or (chunk_queue and pool.live_count > 0):
         if pool.pending:
             # Block up to 60s for any one chunk to finish.
             ready_refs, _ = ray.wait(list(pool.pending.keys()), num_returns=1, timeout=60)
@@ -769,11 +935,23 @@ def _process_chunks_work_stealing(
             # Sleep briefly then check if any actors are ready.
             time.sleep(5)
             ready_refs = []
+        now = time.monotonic()
+        gpu_seconds += pool.live_count * (now - last_tick)
+        last_tick = now
 
         # Poll tracker on every iteration (including timeouts with no completions)
         # so stall detection stays responsive.
         if tracker:
-            _poll_tracker(tracker, len(results), n_total, stall_threshold_sec, _stall_threshold(), log)
+            _poll_tracker(
+                tracker,
+                len(results),
+                n_total,
+                stall_threshold_sec,
+                _stall_threshold(),
+                log,
+                elapsed_min=(time.monotonic() - t0) / 60,
+                gpu_hours=gpu_seconds / 3600,
+            )
 
         # --- Handle completed (or failed) chunks ---
         for ref in ready_refs:
@@ -796,7 +974,19 @@ def _process_chunks_work_stealing(
                 if result.get("status") == "failed":
                     _handle_failure(chunk_label, actor_idx, str(result.get("error", "unknown")))
                 else:
-                    results.append(result)
+                    # Resolve the PREVIOUS deferred write this result carries
+                    # before recording this chunk's own deferral.
+                    prior = result.pop("prior_write", None)
+                    if prior is not None:
+                        _finalize_prior_write(actor_idx, prior)
+                    if result.get("write_deferred"):
+                        # Inference is done and the upload is in flight; hold
+                        # the result until the write outcome confirms it. The
+                        # tracker entry is removed now — the actor has moved on,
+                        # so stall detection has nothing left to watch here.
+                        pending_write[actor_idx] = result
+                    else:
+                        results.append(result)
                     if tracker:
                         tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
                     pool._initializing.discard(actor_idx)
@@ -805,9 +995,15 @@ def _process_chunks_work_stealing(
             # freshly-spawned replacement still initializing (30-120s). A failed
             # actor was killed and replaced by _handle_failure, so it's now
             # initializing and skipped here — its retried chunk goes to a
-            # different, healthy actor via dispatch_idle below.
-            if chunk_queue and actor_idx not in pool._initializing:
-                pool.submit(actor_idx, chunk_queue.popleft(), mosaic_base, staging_base, run_id, tracker)
+            # different, healthy actor via dispatch_idle below. The actor's
+            # reserved chunk (whose starter payload it may have prefetched)
+            # takes precedence over the queue so the prefetch is consumed.
+            if actor_idx not in pool._initializing:
+                next_chunk = pool.take_reserved(actor_idx)
+                if next_chunk is None and chunk_queue:
+                    next_chunk = chunk_queue.popleft()
+                if next_chunk is not None:
+                    pool.submit(actor_idx, next_chunk, mosaic_base, staging_base, run_id, tracker, chunk_queue)
 
         # Request the next actor batch if the prior batch has been placed (or
         # placement timed out), then check if any initializing actors have
@@ -817,16 +1013,10 @@ def _process_chunks_work_stealing(
         _maybe_request_next_batch()
         pool.resolve_initializing()
         pool.dispatch_idle(chunk_queue, mosaic_base, staging_base, run_id, tracker)
-        pool.retire_idle(len(pool.pending) + len(chunk_queue))
-
-        if len(results) > last_log_count:
-            elapsed_min = (time.monotonic() - t0) / 60
-            log.info(
-                "Progress: %d / %d chunks complete (%.1f min elapsed)",
-                len(results),
-                n_total,
-                elapsed_min,
-            )
-            last_log_count = len(results)
+        # Actors left idle after dispatch have no next call to carry their
+        # deferred-write confirmation — pull it via flush_writes() (tail of
+        # run, and always before such an actor could be retired).
+        _flush_idle_writes()
+        pool.retire_idle(pool.outstanding_work(len(chunk_queue)))
 
     return results

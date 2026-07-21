@@ -257,8 +257,10 @@ async def ingest_zone_year(
     # writing to mosaic_base, and a retry could then clear the prefix mid-write. Join
     # them all, then report every failure at once.
     *s1_runs, s2_run = await asyncio.gather(*s1_coros, s2_coro, return_exceptions=True)
-    labelled = [*((f"ingest_s1_roi_sar ({o})", r) for o, r in zip(orbits, s1_runs, strict=True)),
-                ("ingest_s2_roi_reflectance", s2_run)]
+    labelled = [
+        *((f"ingest_s1_roi_sar ({o})", r) for o, r in zip(orbits, s1_runs, strict=True)),
+        ("ingest_s2_roi_reflectance", s2_run),
+    ]
     errors: list[str] = []
     for label, run in labelled:
         if isinstance(run, BaseException):

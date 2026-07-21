@@ -4,13 +4,15 @@ These tests stay offline by mocking SSM and EC2 with ``moto``. They
 exercise ``_resolve_ray_config`` (the most complex pure helper),
 ``_pick_least_loaded_subnet``, and ``cleanup_ray_tempfiles``.
 
-The full ``ray_cluster`` context manager is NOT tested here because it
-shells out to ``ray up`` / ``ray down``; that path is an integration
-concern.
+The full ``ray_cluster`` context manager is NOT tested end-to-end here
+because it shells out to ``ray up`` / ``ray down``; that path is an
+integration concern. Its finalizer's tag-termination fallback IS pinned
+below with the launch/teardown helpers stubbed out.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import boto3
@@ -18,6 +20,7 @@ import pytest
 import yaml
 from moto import mock_aws
 
+from tessera_embeddings.providers.aws import ray as ray_mod
 from tessera_embeddings.providers.aws.ray import (
     DEFAULT_CLUSTER_TEMPLATE,
     PROJECT_TAG_VALUE,
@@ -25,6 +28,8 @@ from tessera_embeddings.providers.aws.ray import (
     _resolve_ray_config,
     cleanup_ray_tempfiles,
 )
+
+_LOG = logging.getLogger("test")
 
 REGION = "us-west-2"
 SSM_PREFIX = "/test/tessera/ray/"
@@ -202,6 +207,79 @@ def test_pick_least_loaded_subnet_returns_least_loaded() -> None:
     subnets = [subnet_a, subnet_b]
     chosen = _pick_least_loaded_subnet(subnets, "test-cluster", ec2)
     assert chosen["SubnetId"] == subnet_b["SubnetId"]
+
+
+# ---------------------------------------------------------------------------
+# ray_cluster lifecycle / teardown
+# ---------------------------------------------------------------------------
+
+
+def test_ray_cluster_finalizer_tag_terminates_when_ray_down_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed `ray down` in the NORMAL exit path falls back to tag termination.
+
+    The cancellation/crash hook only covers cancelled or crashed flows — a
+    normally-completed run whose `ray down` fails must not leave the fleet
+    billing.
+    """
+    template = tmp_path / "cluster.yaml"
+    template.write_text("cluster_name: tessera-inference\n")
+
+    monkeypatch.setattr(ray_mod, "_resolve_ray_config", lambda *a, **k: "/tmp/resolved.yaml")
+    monkeypatch.setattr(ray_mod, "_start_ray_cluster", lambda *a, **k: "10.0.0.5")
+    monkeypatch.setattr(ray_mod, "_log_ray_dashboard_ssm_command", lambda *a, **k: None)
+    monkeypatch.setattr(ray_mod.ray, "init", lambda *a, **k: None)
+    monkeypatch.setattr(ray_mod.ray, "shutdown", lambda: None)
+    monkeypatch.setattr(ray_mod, "_stop_ray_cluster", lambda _y, _log: False)  # ray down FAILED
+    cleaned: list[str] = []
+    terminated: list[dict] = []
+    monkeypatch.setattr(ray_mod, "cleanup_ray_tempfiles", lambda y: cleaned.append(y))
+    monkeypatch.setattr(ray_mod, "terminate_ray_instances_by_tag", lambda **k: terminated.append(k))
+
+    with ray_mod.ray_cluster(
+        _LOG, ami_ssm_name="/x/ami", cluster_yaml=template, cluster_name="tessera-inference-x"
+    ) as resolved:
+        assert resolved == "/tmp/resolved.yaml"
+
+    assert terminated == [{"cluster_name": "tessera-inference-x", "region": "us-west-2", "log": _LOG}]
+    assert cleaned == ["/tmp/resolved.yaml"]  # tempfile cleanup still runs after the fallback
+
+
+def test_ray_cluster_finalizer_skips_ray_down_when_resolve_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When config resolution fails before launch (no resolved YAML), the
+    finalizer must NOT run `ray down` on the unresolved template.
+
+    That template's base cluster_name lacks the flow-specific uuid suffix, so a
+    `ray down` against it could tear down an unrelated `tessera-inference`
+    cluster. The finalizer terminates by exact tag instead.
+    """
+    template = tmp_path / "cluster.yaml"
+    template.write_text("cluster_name: tessera-inference\n")
+
+    def _resolve_fails(*_a: object, **_k: object) -> str:
+        raise RuntimeError("SSM resolution failed")
+
+    monkeypatch.setattr(ray_mod, "_resolve_ray_config", _resolve_fails)
+    monkeypatch.setattr(ray_mod.ray, "shutdown", lambda: None)
+    stop_calls: list[str] = []
+    monkeypatch.setattr(ray_mod, "_stop_ray_cluster", lambda y, _log: stop_calls.append(y) or True)
+    cleaned: list[str | None] = []
+    terminated: list[dict] = []
+    monkeypatch.setattr(ray_mod, "cleanup_ray_tempfiles", lambda y: cleaned.append(y))
+    monkeypatch.setattr(ray_mod, "terminate_ray_instances_by_tag", lambda **k: terminated.append(k))
+
+    with (
+        pytest.raises(RuntimeError, match="SSM resolution failed"),
+        ray_mod.ray_cluster(_LOG, ami_ssm_name="/x/ami", cluster_yaml=template, cluster_name="tessera-inference-x"),
+    ):
+        pass
+
+    assert stop_calls == []  # NO `ray down` on the unresolved template
+    assert terminated == [{"cluster_name": "tessera-inference-x", "region": "us-west-2", "log": _LOG}]
+    assert cleaned == [None]  # cleanup called with None (no resolved YAML) — a safe no-op
 
 
 def test_cleanup_ray_tempfiles_handles_missing_path() -> None:
