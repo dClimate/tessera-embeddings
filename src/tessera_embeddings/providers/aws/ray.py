@@ -157,6 +157,7 @@ def _resolve_ray_config(
     code_suffix: str = "",
     cloudwatch_log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
+    idle_timeout_minutes: int | None = None,
 ) -> str:
     """Inject AWS resource IDs from SSM into a Ray cluster YAML template.
 
@@ -189,6 +190,12 @@ def _resolve_ray_config(
             production tarballs; ``"-mybranch"`` for dev branches.
         cloudwatch_log_group: CloudWatch log group for Ray agent logs.
         cloudwatch_template: Path to the CloudWatch agent JSON template.
+        idle_timeout_minutes: Override the template's autoscaler idle-down
+            delay. The template default (2 min) suits single-ROI runs, where
+            any idle worker is surplus; a multi-zone sequential fill holds one
+            cluster across zones and must survive the inter-zone gap
+            (staged-completeness verify + next zone's dispatch), so it passes
+            a larger value. ``None`` keeps the template's value.
 
     Returns:
         Path to the resolved YAML tempfile.
@@ -204,6 +211,8 @@ def _resolve_ray_config(
     base_cluster_name = config.get("cluster_name", "tessera-inference")
     if cluster_name:
         config["cluster_name"] = cluster_name
+    if idle_timeout_minutes is not None:
+        config["idle_timeout_minutes"] = idle_timeout_minutes
 
     ssm = boto3.client("ssm", region_name=region)
 
@@ -367,6 +376,7 @@ def _start_ray_cluster(
     code_suffix: str,
     cloudwatch_log_group: str,
     cloudwatch_template: Path,
+    idle_timeout_minutes: int | None = None,
 ) -> tuple[str, str]:
     """Resolve config from SSM and launch a Ray cluster via ``ray up``.
 
@@ -385,6 +395,7 @@ def _start_ray_cluster(
         code_suffix=code_suffix,
         cloudwatch_log_group=cloudwatch_log_group,
         cloudwatch_template=cloudwatch_template,
+        idle_timeout_minutes=idle_timeout_minutes,
     )
     log.info("Starting Ray cluster from %s", resolved_yaml)
     ray_up = subprocess.run(
@@ -570,6 +581,7 @@ def ray_cluster(
     code_suffix: str = "",
     cloudwatch_log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
+    idle_timeout_minutes: int | None = None,
 ) -> Iterator[str | None]:
     """Provision an AWS-backed Ray cluster; tear it down on exit.
 
@@ -605,6 +617,11 @@ def ray_cluster(
         code_suffix: Filename suffix for the tarball.
         cloudwatch_log_group: CloudWatch log group for Ray agent logs.
         cloudwatch_template: CloudWatch agent JSON template path.
+        idle_timeout_minutes: Optional override of the template's autoscaler
+            idle-down delay (see :func:`_resolve_ray_config`). Multi-zone
+            sequential fills hold one cluster across zones and pass a value
+            large enough to survive the inter-zone gap; ``None`` (default)
+            keeps the template's single-ROI-tuned value.
 
     Yields:
         Path to the resolved cluster YAML tempfile when this context
@@ -647,6 +664,7 @@ def ray_cluster(
                 code_suffix=code_suffix,
                 cloudwatch_log_group=cloudwatch_log_group,
                 cloudwatch_template=cloudwatch_template,
+                idle_timeout_minutes=idle_timeout_minutes,
             )
             head_address = f"ray://{head_ip}:10001"
             log.info("Connecting to Ray at %s", head_address)

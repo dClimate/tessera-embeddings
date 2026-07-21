@@ -44,6 +44,7 @@ def run_inference(
     on_actor_retire: Callable[[str], None] | None = None,
     get_credentials: Callable[[], Any] | None = None,
     s3_region: str | None = None,
+    retire_idle_actors: bool = True,
 ) -> list[dict]:
     """Create Ray actors, run work-stealing inference, return per-chunk results.
 
@@ -75,6 +76,11 @@ def run_inference(
         s3_region: Optional S3 region for the mosaic repos, injected into every
             actor so its reads open the store in the same region the caller's
             preflight/assembly opens use. ``None`` uses icechunk's default region.
+        retire_idle_actors: Kill actors idle past the grace period at the run
+            tail (default). A multi-zone sequential fill passes False for all
+            but its final zone so the shared cluster's warm instances survive
+            to serve the next zone instead of idle-draining at every zone tail
+            (see ``scheduling._process_chunks_work_stealing``).
 
     Returns:
         Per-chunk result dicts (status, valid pixel count, timing, etc.),
@@ -185,6 +191,7 @@ def run_inference(
             actor_factory=actor_factory,
             total_actors_target=num_actors,
             placement_timeout_sec=config.actor_batch_placement_timeout_sec,
+            retire_idle_actors=retire_idle_actors,
         )
     finally:
         log.info("Killing %d actors to release resource reservations", len(actors))

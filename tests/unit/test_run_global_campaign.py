@@ -205,3 +205,32 @@ def test_duplicate_years_dispatch_once(wired):
     """The dispatch loop dedupes years — years=(2025, 2025) runs the cell once."""
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", years=(2025, 2025)))
     assert len(wired["arun"]) == 2  # one ingest + one fill, not two of each
+
+
+def test_sequential_strategy_dispatches_one_run_per_year(wired):
+    """fill_strategy="sequential" replaces the per-cell chain with ONE
+    fill-zones-sequential run per year: no driver-side ingest (the child's
+    look-ahead owns it), no driver-side mosaic cleanup, zones passed as a list.
+    """
+    result = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="sequential"))
+    deps = [d for d, _ in wired["arun"]]
+    assert deps == ["fill-zones-sequential/fill-zones-sequential"]
+    params = wired["arun"][0][1]
+    assert params["zones"] == ["33N"] and params["year"] == 2025
+    # The child's ingest look-ahead inherits the driver's ingest bound + params.
+    assert params["ingest"] is True and params["look_ahead"] == 2
+    assert params["ingest_deployment"] == "ingest-zone-year/ingest-zone-year"
+    # Mosaic lifecycle belongs to the child in this mode.
+    assert wired["deletes"] == []
+    assert result["dispatched"] == 1
+
+
+def test_sequential_strategy_forwards_ingest_false(wired):
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="sequential", ingest=False))
+    assert wired["arun"][0][1]["ingest"] is False
+
+
+def test_invalid_fill_strategy_rejected(wired):
+    with pytest.raises(ValueError, match="fill_strategy"):
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="both"))
+    assert wired["arun"] == []

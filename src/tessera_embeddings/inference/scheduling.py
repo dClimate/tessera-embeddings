@@ -558,6 +558,7 @@ def _process_chunks_work_stealing(
     actor_factory: Callable[[int], list[ray.actor.ActorHandle]] | None = None,
     total_actors_target: int | None = None,
     placement_timeout_sec: float = 300.0,
+    retire_idle_actors: bool = True,
 ) -> list[dict]:
     """Process chunks with dynamic work-stealing across actors.
 
@@ -606,6 +607,14 @@ def _process_chunks_work_stealing(
         placement_timeout_sec: Max seconds to wait for a batch's instances to be
             placed before requesting the next batch anyway (capacity-shortfall
             escape hatch).
+        retire_idle_actors: Kill actors idle past the grace period as the run's
+            tail drains (the default, right for a standalone run where an idle
+            worker is surplus forever). A multi-zone sequential fill passes
+            False for every zone but its last: the "surplus" workers are the
+            NEXT zone's fleet, and retiring them at each zone's tail would
+            drain the shared cluster's instances (idle nodes hit the
+            autoscaler's idle timeout) only to re-pay their multi-minute
+            bringup at the next zone.
 
     Returns:
         List of result dicts (status, chunk label, timing, etc.).
@@ -817,7 +826,8 @@ def _process_chunks_work_stealing(
         _maybe_request_next_batch()
         pool.resolve_initializing()
         pool.dispatch_idle(chunk_queue, mosaic_base, staging_base, run_id, tracker)
-        pool.retire_idle(len(pool.pending) + len(chunk_queue))
+        if retire_idle_actors:
+            pool.retire_idle(len(pool.pending) + len(chunk_queue))
 
         if len(results) > last_log_count:
             elapsed_min = (time.monotonic() - t0) / 60

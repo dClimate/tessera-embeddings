@@ -1035,3 +1035,60 @@ class TestWorkStealingBatching:
                 log=logging.getLogger("test"),
             )
         assert len(results) == 1
+
+
+# ===========================================================================
+# _process_chunks_work_stealing — retire_idle_actors gate
+# ===========================================================================
+
+
+class TestRetireIdleGate:
+    """retire_idle_actors=False must keep the loop from ever retiring idle
+    actors — the sequential multi-zone fill passes it for every zone but its
+    last so a zone's tail doesn't drain the shared cluster's instances.
+    """
+
+    def _run_one_chunk(self, retire_idle_actors: bool) -> MagicMock:
+        actor = MagicMock(name="actor_0")
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        chunk = _fake_chunk("c0")
+        seed_ref = MagicMock(name="seed_ref")
+        iid_ref = MagicMock(name="iid_ref")
+        actor.process_chunk.remote.return_value = seed_ref
+        actor.get_instance_id.remote.return_value = iid_ref
+
+        def fake_get(ref, *args, **kwargs):
+            if ref is seed_ref:
+                return {"chunk": "c0", "status": "ok"}
+            if ref is iid_ref:
+                return "i-0000"
+            return MagicMock()
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
+            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.time, "sleep"),
+            patch.object(_sched_mod.ActorPool, "retire_idle") as retire_mock,
+        ):
+            results = _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=[chunk],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+                retire_idle_actors=retire_idle_actors,
+            )
+        assert len(results) == 1 and results[0]["status"] == "ok"
+        return retire_mock
+
+    def test_default_retires_idle_actors(self) -> None:
+        assert self._run_one_chunk(retire_idle_actors=True).called
+
+    def test_gate_disables_retirement(self) -> None:
+        assert not self._run_one_chunk(retire_idle_actors=False).called

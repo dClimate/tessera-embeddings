@@ -31,20 +31,41 @@ from the single-ROI path above:
 
 ```text
 build_land_mask   →   seed_global_store   →   run_global_campaign
-(coverage bitmaps)    (metadata-only)          └─ per pending (zone, year): fill_zone_year (Ray)
+(coverage bitmaps)    (metadata-only)          ├─ parallel:   per pending (zone, year): fill_zone_year (Ray cluster each)
+                                               └─ sequential: per year: fill_zones_sequential (ONE shared Ray cluster)
 ```
 
 `run_global_campaign` reads live progress via `storage.campaign.campaign_status`
-and dispatches a `fill-zone-year` deployment run per pending cell, **year by
-year** (outer serial loop) with **bounded zone parallelism** within each year.
-This is safe because inference is independent across zones and only *same-zone*
-fills conflict (shared group attrs → `RebaseFailedError`) — the year-serial loop
-guarantees a zone never fills two years at once. The fleet-wide **committer
+and dispatches fills for every pending cell, **year by year** (outer serial
+loop), under one of two strategies:
+
+- **`fill_strategy="parallel"`** (default): a `fill-zone-year` run per cell,
+  with **bounded zone parallelism** within each year (`max_parallel_zones`
+  simultaneous Ray clusters). Best wall-clock; each cell pays its own cluster.
+- **`fill_strategy="sequential"`**: ONE `fill-zones-sequential` run per year —
+  a single shared Ray cluster fills the year's zones strictly one at a time,
+  largest-first, amortizing `ray up` (~5-10 min), per-worker EC2 bringup
+  (minutes of billed GPU idle each), the per-worker model-load cold start, and
+  the EC2 capacity roll across the whole year instead of per zone. The shared
+  fleet is kept busy at the seams by **ingest look-ahead** (the next cells'
+  mosaics ingest while the current cell infers, bounded so in-flight mosaics
+  stay within ADR-011's storage budget) and **trailing assembly** (a cell's
+  shard write runs on a background thread — assembly is ~10-15% of a cell's
+  inference wall — while the next cell's inference keeps the GPUs busy).
+  Retag-only and all-ocean cells settle before the cluster exists, and
+  all-ocean cells are never ingested at all. Trades wall-clock (zones no
+  longer overlap) for GPU-hours + capacity risk.
+
+Zone-parallelism (either flavor) is safe because inference is independent
+across zones and only *same-zone* fills conflict (shared group attrs →
+`RebaseFailedError`) — the year-serial loop guarantees a zone never fills two
+years at once, and within a sequential run the depth-1 trailing assembly can
+never overlap a commit for the same zone group. The fleet-wide **committer
 bound is a Prefect global concurrency limit** (`commit_limit_name`, ADR-008 D6),
 passed to every fill so commits stay under the storm threshold while GPU
 inference runs unbounded. `build_land_mask` and `seed_global_store` are
 cluster-less (they run on the flow runner like `generate_roi`); only
-`fill_zone_year` provisions Ray.
+`fill_zone_year` / `fill_zones_sequential` provision Ray.
 
 ## Master pipeline
 
@@ -75,7 +96,8 @@ override.
 | `build_land_mask.py` | Global campaign: build per-zone coverage bitmaps from the partner delivery registry (ADR-010). Optional pre-build delivery verification + post-build validation. No cluster. |
 | `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
 | `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commit gate = a Prefect global concurrency limit. |
-| `run_global_campaign.py` | Global campaign driver: dispatch a `fill-zone-year` run per pending `(zone, year)`, year-serial with bounded zone parallelism. |
+| `fill_zones_sequential.py` | Global campaign: fill one year's zones sequentially on a SINGLE shared Ray cluster (largest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Pre-cluster triage settles retag/all-ocean cells. |
+| `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="parallel"`), or one `fill-zones-sequential` run per year (`"sequential"`). |
 
 > **Why so many flow files?** The two-flow pattern below explains the inner/outer
 > split per file. The flows themselves are kept thin — task-graph discipline

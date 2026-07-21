@@ -54,6 +54,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, cast
 
 import icechunk
@@ -68,7 +69,7 @@ from tessera_embeddings.inference.assembly import (
     read_spatial_coords,
     read_store_spatial_coords,
 )
-from tessera_embeddings.inference.chunk_spec import enumerate_chunks
+from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
@@ -76,6 +77,27 @@ from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.shard_writer import CommitGate, read_years_complete, shard_pitch
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, time_index_of
 from tessera_embeddings.storage.zone_grid import PIXEL_M, year_timestamp
+
+
+def zone_live_tile_count(
+    land_mask_path: str,
+    zone: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> int:
+    """Number of 2048-px tiles the coverage bitmap marks live for ``zone``.
+
+    The same one-GET read as :func:`zone_has_live_tiles`, kept separate because
+    the multi-zone sequential fill uses the COUNT twice at preflight: ordering
+    its zones largest-first (so a shared cluster's fleet only ever shrinks) and
+    clamping per-zone actor requests. This only reads the liveness bitmap;
+    :func:`fill_zone_year` re-reads and attr-validates the coverage group as
+    the authority, so a wrong-zone mask still fails loudly there rather than
+    being trusted here.
+    """
+    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
+    return int(np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool).sum())
 
 
 def zone_has_live_tiles(
@@ -89,12 +111,10 @@ def zone_has_live_tiles(
 
     A cheap one-GET preflight: an all-ocean cell (no live tiles) can be filled
     empty with no GPU work, so a caller can skip provisioning a Ray cluster for
-    it. This only reads the liveness bitmap; :func:`fill_zone_year` re-reads and
-    attr-validates the coverage group as the authority, so a wrong-zone mask
-    still fails loudly there rather than being trusted here.
+    it. See :func:`zone_live_tile_count` for the underlying read and its
+    trust boundary.
     """
-    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
-    return bool(np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool).any())
+    return zone_live_tile_count(land_mask_path, zone, get_credentials=get_credentials, s3_region=s3_region) > 0
 
 
 def zone_year_complete(
@@ -141,6 +161,32 @@ def zone_year_on_axis(
     return time_index_of(cast(zarr.Group, root[zone]), year_timestamp(year)) is not None
 
 
+@dataclass
+class ZoneFillHandoff:
+    """State handed from :func:`infer_zone_year` to :func:`assemble_zone_year`.
+
+    Plain data only (labels, counts, per-tile result dicts) — no repo handles
+    or zarr groups — so the assembly phase can run on a different thread than
+    the inference phase (the sequential multi-zone runner trails a cell's
+    assembly behind the NEXT cell's inference) and re-open its own store
+    connections there.
+    """
+
+    zone: str
+    year: int
+    run_id: str
+    t0: float
+    # zone/year/run_id/tile-count fields shared by every result dict.
+    summary: dict[str, Any]
+    # Live tiles that went to inference — verify_staged_completeness and
+    # assembly worker sizing both need the list, not just its length.
+    live: list[ChunkSpec]
+    results: list[dict[str, Any]]
+    # Terminal result produced by the inference phase (already-complete cell,
+    # or all-ocean empty fill). When set, assembly is a pass-through no-op.
+    done: dict[str, Any] | None = None
+
+
 def fill_zone_year(
     *,
     store_path: str,
@@ -162,6 +208,11 @@ def fill_zone_year(
     on_actor_retire: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Fill one (zone, year): mask → inference → shard assembly → tag.
+
+    The composition of :func:`infer_zone_year` and :func:`assemble_zone_year`,
+    run back to back — the right shape for a standalone single-cell fill. The
+    multi-zone sequential runner calls the two phases separately so a cell's
+    assembly can trail behind the next cell's inference on a shared cluster.
 
     Args:
         store_path: URI of the global Icechunk repo (``BucketPaths.global_store()``).
@@ -191,6 +242,71 @@ def fill_zone_year(
     Returns:
         Summary dict: zone, year, run_id, snapshot_id, tag, tile counts,
         inference outcome counts, ``empty`` flag, and elapsed seconds.
+    """
+    handoff = infer_zone_year(
+        store_path=store_path,
+        zone=zone,
+        year=year,
+        land_mask_path=land_mask_path,
+        mosaic_base=mosaic_base,
+        staging_base=staging_base,
+        config=config,
+        num_actors=num_actors,
+        log=log,
+        run_id=run_id,
+        gate=gate,
+        get_credentials=get_credentials,
+        s3_region=s3_region,
+        on_actor_retire=on_actor_retire,
+    )
+    return assemble_zone_year(
+        handoff,
+        store_path=store_path,
+        staging_base=staging_base,
+        log=log,
+        gate=gate,
+        n_assembly_workers=n_assembly_workers,
+        s3_concurrency=s3_concurrency,
+        cleanup_staging=cleanup_staging,
+        get_credentials=get_credentials,
+        s3_region=s3_region,
+    )
+
+
+def infer_zone_year(
+    *,
+    store_path: str,
+    zone: str,
+    year: int,
+    land_mask_path: str,
+    mosaic_base: str,
+    staging_base: str,
+    config: InferenceConfig,
+    num_actors: int,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    run_id: str | None = None,
+    gate: CommitGate | None = None,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+    on_actor_retire: Callable[[str], None] | None = None,
+    retire_idle_actors: bool = True,
+) -> ZoneFillHandoff:
+    """Inference phase of a (zone, year) fill: validate → mask → run_inference.
+
+    Everything :func:`fill_zone_year` does up to (and including) Ray inference:
+    grid/axis/window validation, the coverage-mask read, the mosaic grid
+    asserts, and ``run_inference`` over the live tiles. Terminal cells that
+    need no assembly — already complete (retag only) or all-ocean (marked
+    complete empty, committed and tagged here) — come back with
+    ``ZoneFillHandoff.done`` set.
+
+    ``retire_idle_actors=False`` keeps idle actors alive through this cell's
+    tail — the multi-zone sequential runner passes it for every cell but its
+    last so the shared cluster's instances survive to serve the next zone
+    (see :func:`tessera_embeddings.inference.runner.run_inference`).
+
+    Raises:
+        RuntimeError: If any live tile fails inference.
     """
     t0 = time.monotonic()
     run_id = run_id or uuid.uuid4().hex[:12]
@@ -238,7 +354,7 @@ def fill_zone_year(
             snapshot = repo.lookup_branch("main")
             tag_zone_year(repo, zone, year, snapshot_id=snapshot)
             log.info("Zone %s year %d landed but was untagged (crash before tag) — tagged %s", zone, year, tag)
-        return {
+        result = {
             "zone": zone,
             "year": year,
             "run_id": run_id,
@@ -247,6 +363,7 @@ def fill_zone_year(
             "tag": tag,
             "elapsed_sec": time.monotonic() - t0,
         }
+        return ZoneFillHandoff(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], results=[], done=result)
 
     emb = cast(zarr.Array, node["embeddings"])
     _, ny, nx, _ = emb.shape
@@ -307,26 +424,16 @@ def fill_zone_year(
         "total_tiles": len(chunks),
         "live_tiles": len(live),
     }
-    writer = ZarrWriter(staging_base)
-
-    def _cleanup() -> None:
-        if cleanup_staging:
-            try:
-                writer.cleanup_staging(run_id, log)
-            except Exception:
-                log.warning("Staging cleanup failed for run %s", run_id, exc_info=True)
-
-    def _finish_empty(**extra: float) -> dict[str, Any]:
-        # A no-data cell (all-ocean, or every live tile skipped) still lands:
-        # years_complete + provenance in one commit, then the zone-year tag.
-        snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id, gate=gate)
-        tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
-        return {**summary, "empty": True, "snapshot_id": snapshot, "tag": tag, **extra}
 
     if not live:
-        result = _finish_empty(elapsed_sec=time.monotonic() - t0)
+        # A no-data cell (all-ocean) still lands: years_complete + provenance
+        # in one commit, then the zone-year tag. Terminal here — no staging
+        # exists, so there is nothing for the assembly phase to do.
+        snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id, gate=gate)
+        tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
+        result = {**summary, "empty": True, "snapshot_id": snapshot, "tag": tag, "elapsed_sec": time.monotonic() - t0}
         log.info("Zone %s year %d has no land under the mask — marked complete empty (%s)", zone, year, result["tag"])
-        return result
+        return ZoneFillHandoff(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], results=[], done=result)
 
     # Live tiles will be inferred, so EVERY active mosaic store must sit on the
     # zone grid EXACTLY (campaign contract) — not just dimensionally. Every zone
@@ -397,10 +504,50 @@ def fill_zone_year(
         on_actor_retire=on_actor_retire,
         get_credentials=get_credentials,
         s3_region=s3_region,
+        retire_idle_actors=retire_idle_actors,
     )
     failed = [r for r in results if r["status"] == "failed"]
     if failed:
         raise RuntimeError(f"{len(failed)} tiles failed during inference for zone {zone} year {year} (run {run_id})")
+
+    return ZoneFillHandoff(zone=zone, year=year, run_id=run_id, t0=t0, summary=summary, live=live, results=results)
+
+
+def assemble_zone_year(
+    handoff: ZoneFillHandoff,
+    *,
+    store_path: str,
+    staging_base: str,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    gate: CommitGate | None = None,
+    n_assembly_workers: int | None = None,
+    s3_concurrency: int | None = None,
+    cleanup_staging: bool = True,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> dict[str, Any]:
+    """Assembly phase of a (zone, year) fill: verify staged → assemble → tag.
+
+    Consumes an :class:`infer_zone_year` handoff: verifies staged
+    completeness, assembles the staged tiles into the zone group (or marks
+    the cell complete-empty when every live tile skipped), tags the landed
+    commit, and cleans up staging. Opens its own repo/writer connections so
+    the sequential multi-zone runner can run it on a trailing thread while
+    the caller's thread starts the next cell's inference. A terminal handoff
+    (``done`` set) passes straight through.
+    """
+    if handoff.done is not None:
+        return handoff.done
+    zone, year, run_id, t0 = handoff.zone, handoff.year, handoff.run_id, handoff.t0
+    summary, live, results = handoff.summary, handoff.live, handoff.results
+    writer = ZarrWriter(staging_base)
+
+    def _cleanup() -> None:
+        if cleanup_staging:
+            try:
+                writer.cleanup_staging(run_id, log)
+            except Exception:
+                log.warning("Staging cleanup failed for run %s", run_id, exc_info=True)
 
     staged_labels = writer.verify_staged_completeness(run_id, live, log=log)
     if not staged_labels:
@@ -409,9 +556,17 @@ def fill_zone_year(
         # Mark + tag FIRST, clean up after (matching the data path): a crash
         # after cleanup but before the tag would otherwise force full
         # re-inference just to regenerate zero-byte skip markers.
-        result = _finish_empty(
-            skipped=sum(r["status"] == "skipped" for r in results), elapsed_sec=time.monotonic() - t0
-        )
+        repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
+        snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id, gate=gate)
+        tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
+        result = {
+            **summary,
+            "empty": True,
+            "snapshot_id": snapshot,
+            "tag": tag,
+            "skipped": sum(r["status"] == "skipped" for r in results),
+            "elapsed_sec": time.monotonic() - t0,
+        }
         _cleanup()
         log.info(
             "Zone %s year %d: all %d live tiles skipped — marked complete empty (%s)",
@@ -436,6 +591,7 @@ def fill_zone_year(
         s3_region=s3_region,
         log=log,
     )
+    repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
     _cleanup()
 

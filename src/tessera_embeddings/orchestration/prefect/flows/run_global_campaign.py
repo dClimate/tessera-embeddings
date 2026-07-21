@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Callable
 from typing import Any
 
 import icechunk
@@ -40,6 +41,96 @@ from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zone
 
 
+def _mosaic_identity(
+    zone: str,
+    year: int,
+    *,
+    inputs_bucket: str,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> str:
+    """Identity string of the mosaic a fill will read, per ACTIVE child store.
+
+    Called AFTER ingest (for ingest=True), so each store carries its
+    ``ingest_marker`` (window + coverage-delivery sha + min_valid_coverage +
+    orbit + allow_partial_window — the exact per-(zone,year) fingerprint that
+    produced it); a prebuilt (ingest=False) mosaic falls back to
+    ``last_appended``/``created_at``. This is deliberately per-(zone,year) and
+    post-ingest, NOT one global coverage sha read once up front: a partial
+    ``build_all(zones=...)`` can leave zones on different coverage revisions,
+    and coverage can change after an early read — either would let stale
+    staged tiles resume against a rebuilt mosaic. Reflectance AND each PRESENT
+    SAR orbit are fingerprinted (embeddings depend on all). Genuinely-absent
+    stores (missing repo / not found) are skipped; a PRESENT store with no
+    identity FAILS CLOSED — never degrade to a config-only fingerprint.
+
+    Module-level (not a flow closure) because both campaign drivers need it:
+    the parallel per-cell dispatch here and the sequential shared-cluster
+    fill's ``prepare`` callable (:mod:`.fill_zones_sequential`).
+    """
+    base = f"{inputs_bucket.rstrip('/')}/mosaics/{zone}/{year}"
+    ids: list[str] = []
+    for store in ("reflectance", "sar_ascending", "sar_descending"):
+        path = f"{base}/{store}.zarr"
+        try:
+            grp = open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
+        except FileNotFoundError:
+            continue  # absent store (single-orbit mosaic / unproduced orbit) — not active
+        except icechunk.IcechunkError as exc:
+            if _is_missing_repo(exc):
+                continue
+            raise  # transient/auth: fail closed rather than fingerprint a partial view
+        marker = grp.attrs.get("ingest_marker")
+        identity = (
+            repr(marker)
+            if isinstance(marker, dict)
+            else (grp.attrs.get("last_appended") or grp.attrs.get("created_at"))
+        )
+        if identity is None:
+            raise ValueError(
+                f"Mosaic store {path} has no ingest_marker/last_appended/created_at identity attr — cannot "
+                "safely fingerprint it for staging resume. Failing closed (clear staging or fix the mosaic)."
+            )
+        ids.append(f"{store}={identity}")
+    if not ids:
+        raise ValueError(f"No mosaic stores found under {base} — nothing to fingerprint or fill.")
+    return "|".join(ids)
+
+
+def _staging_run_id(
+    zone: str,
+    year: int,
+    *,
+    inputs_bucket: str,
+    min_valid_coverage: float,
+    s1_orbit: str,
+    allow_partial_window: bool,
+    code_suffix: str,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> str:
+    """Deterministic staging run_id fingerprinting everything that determines the embeddings.
+
+    Covers the config (threshold/orbit/window/checkpoint), the CODE revision
+    (``code_suffix`` — a new source tarball with the same checkpoint still
+    changes the output), and the per-(zone,year) mosaic identity
+    (:func:`_mosaic_identity`). A retry with identical inputs resumes the same
+    prefix (findable for cleanup); ANY change starts a fresh prefix, so old
+    tiles are never resumed under new inputs. Call AFTER ingest so
+    ingest=True reads the freshly-written marker.
+    """
+    key = (
+        year,
+        min_valid_coverage,
+        s1_orbit,
+        allow_partial_window,
+        checkpoint_filename(),
+        code_suffix,
+        _mosaic_identity(zone, year, inputs_bucket=inputs_bucket, get_credentials=get_credentials, s3_region=s3_region),
+    )
+    return f"{zone}-{year}-{hashlib.sha256(repr(key).encode()).hexdigest()[:8]}"
+
+
 @flow(name="run-global-campaign")
 async def run_global_campaign(
     *,
@@ -50,6 +141,8 @@ async def run_global_campaign(
     years: tuple[int, ...] | None = None,
     zones: list[str] | None = None,
     max_parallel_zones: int = 8,
+    fill_strategy: str = "parallel",
+    sequential_fill_deployment: str = "fill-zones-sequential/fill-zones-sequential",
     commit_limit_name: str = "tessera-global-commits",
     num_actors: int = 20,
     s1_orbit: str = "both",
@@ -87,7 +180,20 @@ async def run_global_campaign(
             :func:`campaign_work_list`).
         max_parallel_zones: Max concurrent fill runs *within a year* (bounds
             simultaneous Ray clusters — a cost knob, distinct from the commit
-            gate).
+            gate). Fill-dispatch only in the default ``parallel`` strategy;
+            ignored for fills under ``sequential``.
+        fill_strategy: ``"parallel"`` (default) dispatches one
+            ``fill-zone-year`` run per cell, each with its own Ray cluster, up
+            to ``max_parallel_zones`` at once. ``"sequential"`` dispatches ONE
+            ``fill-zones-sequential`` run per year: a single shared Ray
+            cluster fills that year's zones strictly one at a time (largest
+            first), amortizing `ray up` + per-worker bringup + model-load cold
+            starts across the year instead of paying them per zone — trading
+            wall-clock (zones no longer overlap) for GPU-hours and capacity
+            risk. Ingest look-ahead and trailing assembly keep the shared
+            fleet busy at the seams; see the flow's module docstring.
+        sequential_fill_deployment: ``flow-name/deployment-name`` of the
+            sequential fill deployment (``fill_strategy="sequential"`` only).
         commit_limit_name: Prefect global concurrency limit bounding fleet-wide
             simultaneous committers (D6); forwarded to every fill.
         num_actors: GPU actor count, forwarded to each fill.
@@ -127,6 +233,8 @@ async def run_global_campaign(
         raise ValueError(f"max_parallel_zones must be >= 1, got {max_parallel_zones} (Semaphore(0) blocks forever)")
     if max_parallel_ingest < 1:
         raise ValueError(f"max_parallel_ingest must be >= 1, got {max_parallel_ingest} (Semaphore(0) blocks forever)")
+    if fill_strategy not in ("parallel", "sequential"):
+        raise ValueError(f"fill_strategy must be 'parallel' or 'sequential', got {fill_strategy!r}")
     campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS
 
     # Lazy AWS import so the flow file imports on non-AWS machines (arch tests).
@@ -213,67 +321,6 @@ async def run_global_campaign(
         commit_limit_name,
     )
 
-    def _mosaic_identity(zone: str, year: int) -> str:
-        # Identity of the mosaic the fill will read, per ACTIVE child store. Called
-        # AFTER ingest (for ingest=True), so each store carries its `ingest_marker`
-        # (window + coverage-delivery sha + min_valid_coverage + orbit +
-        # allow_partial_window — the exact per-(zone,year) fingerprint that produced
-        # it); a prebuilt (ingest=False) mosaic falls back to `last_appended`/
-        # `created_at`. This is deliberately per-(zone,year) and post-ingest, NOT one
-        # global coverage sha read once up front: a partial `build_all(zones=...)` can
-        # leave zones on different coverage revisions, and coverage can change after an
-        # early read — either would let stale staged tiles resume against a rebuilt
-        # mosaic. Reflectance AND each PRESENT SAR orbit are fingerprinted (embeddings
-        # depend on all). Genuinely-absent stores (missing repo / not found) are
-        # skipped; a PRESENT store with no identity FAILS CLOSED — never degrade to a
-        # config-only fingerprint.
-        base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}"
-        ids: list[str] = []
-        for store in ("reflectance", "sar_ascending", "sar_descending"):
-            path = f"{base}/{store}.zarr"
-            try:
-                grp = open_store_as_zarr_group(path, get_credentials=iam_icechunk_credentials, region=s3_region)
-            except FileNotFoundError:
-                continue  # absent store (single-orbit mosaic / unproduced orbit) — not active
-            except icechunk.IcechunkError as exc:
-                if _is_missing_repo(exc):
-                    continue
-                raise  # transient/auth: fail closed rather than fingerprint a partial view
-            marker = grp.attrs.get("ingest_marker")
-            identity = (
-                repr(marker)
-                if isinstance(marker, dict)
-                else (grp.attrs.get("last_appended") or grp.attrs.get("created_at"))
-            )
-            if identity is None:
-                raise ValueError(
-                    f"Mosaic store {path} has no ingest_marker/last_appended/created_at identity attr — cannot "
-                    "safely fingerprint it for staging resume. Failing closed (clear staging or fix the mosaic)."
-                )
-            ids.append(f"{store}={identity}")
-        if not ids:
-            raise ValueError(f"No mosaic stores found under {base} — nothing to fingerprint or fill.")
-        return "|".join(ids)
-
-    def _staging_run_id(zone: str, year: int) -> str:
-        # Deterministic staging run_id fingerprinting everything that determines the
-        # embeddings: the config (threshold/orbit/window/checkpoint), the CODE revision
-        # (`code_suffix` — a new source tarball with the same checkpoint still changes
-        # the output), and the per-(zone,year) mosaic identity (`_mosaic_identity`). A
-        # retry with identical inputs resumes the same prefix (findable for cleanup);
-        # ANY change starts a fresh prefix, so old tiles are never resumed under new
-        # inputs. Called AFTER ingest so ingest=True reads the freshly-written marker.
-        key = (
-            year,
-            min_valid_coverage,
-            s1_orbit,
-            allow_partial_window,
-            checkpoint_filename(),
-            code_suffix,
-            _mosaic_identity(zone, year),
-        )
-        return f"{zone}-{year}-{hashlib.sha256(repr(key).encode()).hexdigest()[:8]}"
-
     def _fill_params(zone: str, year: int, run_id: str) -> dict[str, Any]:
         return {
             "zone": zone,
@@ -345,7 +392,21 @@ async def run_global_campaign(
             # freshly-written mosaic marker. A retag-only cell does no inference/staging
             # and its mosaic may already be cleaned up — give it a stable id that does
             # NOT inspect the mosaic (fingerprinting would raise before the tag repair).
-            run_id = f"{zone}-{year}-retag" if retag_only else _staging_run_id(zone, year)
+            run_id = (
+                f"{zone}-{year}-retag"
+                if retag_only
+                else _staging_run_id(
+                    zone,
+                    year,
+                    inputs_bucket=paths.inputs,
+                    min_valid_coverage=min_valid_coverage,
+                    s1_orbit=s1_orbit,
+                    allow_partial_window=allow_partial_window,
+                    code_suffix=code_suffix,
+                    get_credentials=iam_icechunk_credentials,
+                    s3_region=s3_region,
+                )
+            )
             async with fill_sem:  # bound concurrent fills (hence Ray clusters) within a year
                 frun = await arun_deployment(fill_deployment, parameters=_fill_params(zone, year, run_id))
                 _check_completed(frun, f"fill {zone}-{year}")
@@ -364,7 +425,47 @@ async def run_global_campaign(
     runs_by_year: dict[int, list[str]] = {}
     for year in sorted(set(campaign_years), reverse=True):
         year_zones = [z for z, y in work if y == year]
-        if year_zones:
+        if year_zones and fill_strategy == "sequential":
+            # One child run fills the whole year on a single shared Ray
+            # cluster, zones strictly sequential. Ingest, per-cell run_ids,
+            # retag/empty triage, and mosaic cleanup all live inside the child
+            # (its ingest look-ahead is what pipelines mosaics against the
+            # shared cluster), so the per-cell _process chain is bypassed.
+            log.info("Year %d: dispatching one sequential fill for %d zone(s)", year, len(year_zones))
+            frun = await arun_deployment(
+                sequential_fill_deployment,
+                parameters={
+                    "zones": year_zones,
+                    "year": year,
+                    "paths": paths.model_dump(),
+                    "ami_ssm_name": ami_ssm_name,
+                    "store_name": store_name,
+                    "mask_name": mask_name,
+                    "num_actors": num_actors,
+                    "s1_orbit": s1_orbit,
+                    "s3_region": s3_region,
+                    "commit_limit_name": commit_limit_name,
+                    "allow_partial_window": allow_partial_window,
+                    "ssm_prefix": ssm_prefix,
+                    "cloudwatch_log_group": cloudwatch_log_group,
+                    "code_bucket": code_bucket,
+                    "code_suffix": code_suffix,
+                    "ingest": ingest,
+                    "ingest_deployment": ingest_deployment,
+                    # The look-ahead bounds concurrent ingests exactly as
+                    # max_parallel_ingest does for the parallel strategy.
+                    "look_ahead": max_parallel_ingest,
+                    "cleanup_mosaics": cleanup_mosaics,
+                    "ingest_min_workers": ingest_min_workers,
+                    "ingest_max_workers": ingest_max_workers,
+                    "min_valid_coverage": min_valid_coverage,
+                    "batch_days": batch_days,
+                },
+            )
+            _check_completed(frun, f"sequential fill year {year}")
+            runs_by_year[year] = [str(frun.id)]
+            log.info("Year %d: sequential fill landed", year)
+        elif year_zones:
             log.info("Year %d: dispatching %d zone fill(s)", year, len(year_zones))
             # All zones in a year are distinct groups → safe to fill concurrently.
             # The outer loop is serial, so the SAME zone never fills two years at once.
