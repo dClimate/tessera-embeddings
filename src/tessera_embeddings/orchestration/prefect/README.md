@@ -32,7 +32,7 @@ from the single-ROI path above:
 ```text
 build_land_mask   →   seed_global_store   →   run_global_campaign
 (coverage bitmaps)    (metadata-only)          ├─ parallel:   per pending (zone, year): fill_zone_year (Ray cluster each)
-                                               └─ sequential: per year: fill_zones_sequential (ONE shared Ray cluster)
+                                               └─ sequential: per year: K fill_zones_sequential shards (K long-lived Ray clusters)
 ```
 
 `run_global_campaign` reads live progress via `storage.campaign.campaign_status`
@@ -42,11 +42,14 @@ loop), under one of two strategies:
 - **`fill_strategy="parallel"`** (default): a `fill-zone-year` run per cell,
   with **bounded zone parallelism** within each year (`max_parallel_zones`
   simultaneous Ray clusters). Best wall-clock; each cell pays its own cluster.
-- **`fill_strategy="sequential"`**: ONE `fill-zones-sequential` run per year —
-  a single shared Ray cluster fills the year's zones strictly one at a time,
-  largest-first, amortizing `ray up` (~5-10 min), per-worker EC2 bringup
-  (minutes of billed GPU idle each), the per-worker model-load cold start, and
-  the EC2 capacity roll across the whole year instead of per zone. The shared
+- **`fill_strategy="sequential"`**: up to `max_parallel_zones`
+  `fill-zones-sequential` runs per year, each owning ONE long-lived Ray
+  cluster that drains a size-balanced shard of the year's zones strictly one
+  at a time — a cluster takes up its next zone without teardown or actor
+  churn, amortizing `ray up` (~5-10 min), per-worker EC2 bringup (minutes of
+  billed GPU idle each), the per-worker model-load cold start, and the EC2
+  capacity roll across its whole shard instead of per zone
+  (`max_parallel_zones=1` = a single cluster for the whole year). The shared
   fleet is kept busy at the seams by **ingest look-ahead** (the next cells'
   mosaics ingest while the current cell infers, bounded so in-flight mosaics
   stay within ADR-011's storage budget) and **trailing assembly** (a cell's

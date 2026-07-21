@@ -28,12 +28,12 @@ from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
 
 from tessera_embeddings.config.inference import checkpoint_filename
+from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.inference.data_loading import _is_missing_repo
-from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
-from tessera_embeddings.orchestration.runners.zone_fill import zone_year_on_axis
+from tessera_embeddings.orchestration.runners.zone_fill import zone_live_tile_count, zone_year_on_axis
 from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
@@ -131,6 +131,36 @@ def _staging_run_id(
     return f"{zone}-{year}-{hashlib.sha256(repr(key).encode()).hexdigest()[:8]}"
 
 
+def _partition_by_live_tiles(
+    zones: list[str],
+    n_shards: int,
+    *,
+    land_mask_path: str,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> list[list[str]]:
+    """Split ``zones`` into ``n_shards`` lists of ~equal total live-tile count.
+
+    Longest-processing-time greedy: zones descending by coverage-bitmap tile
+    count, each assigned to the currently-lightest shard — so the sequential
+    fill's shared clusters finish their shards at roughly the same time. Tile
+    counts are one ~1 KB GET per zone; ``n_shards == 1`` skips the reads
+    entirely. Empty shards (more shards than zones) are dropped.
+    """
+    if n_shards <= 1:
+        return [zones]
+    weight = {
+        z: zone_live_tile_count(land_mask_path, z, get_credentials=get_credentials, s3_region=s3_region) for z in zones
+    }
+    shards: list[list[str]] = [[] for _ in range(n_shards)]
+    totals = [0] * n_shards
+    for z in sorted(zones, key=lambda z: weight[z], reverse=True):
+        i = totals.index(min(totals))
+        shards[i].append(z)
+        totals[i] += weight[z]
+    return [sh for sh in shards if sh]
+
+
 @flow(name="run-global-campaign")
 async def run_global_campaign(
     *,
@@ -157,10 +187,7 @@ async def run_global_campaign(
     mask_name: str = "global",
     max_parallel_ingest: int = 2,
     cleanup_mosaics: bool = True,
-    ingest_min_workers: int = 1,
-    ingest_max_workers: int = 50,
-    min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
-    batch_days: int = 30,
+    ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     allow_partial_window: bool = False,
     sweep_orphan_mosaics: bool = False,
 ) -> dict[str, Any]:
@@ -183,15 +210,18 @@ async def run_global_campaign(
             gate). Fill-dispatch only in the default ``parallel`` strategy;
             ignored for fills under ``sequential``.
         fill_strategy: ``"parallel"`` (default) dispatches one
-            ``fill-zone-year`` run per cell, each with its own Ray cluster, up
-            to ``max_parallel_zones`` at once. ``"sequential"`` dispatches ONE
-            ``fill-zones-sequential`` run per year: a single shared Ray
-            cluster fills that year's zones strictly one at a time (largest
-            first), amortizing `ray up` + per-worker bringup + model-load cold
-            starts across the year instead of paying them per zone — trading
-            wall-clock (zones no longer overlap) for GPU-hours and capacity
-            risk. Ingest look-ahead and trailing assembly keep the shared
-            fleet busy at the seams; see the flow's module docstring.
+            ``fill-zone-year`` run per cell, each with its own SHORT-LIVED Ray
+            cluster, up to ``max_parallel_zones`` at once. ``"sequential"``
+            dispatches up to ``max_parallel_zones`` ``fill-zones-sequential``
+            runs per year, each owning ONE LONG-LIVED Ray cluster that drains
+            a size-balanced shard of the year's zones strictly one at a time —
+            a cluster takes up its next zone without teardown or actor churn,
+            amortizing `ray up` + per-worker bringup + model-load cold starts
+            across its whole shard. Same zone-parallelism bound, ~1/cluster
+            per shard instead of one per cell; ingest look-ahead and trailing
+            assembly keep each fleet busy at the seams (see the flow's module
+            docstring). ``max_parallel_zones=1`` degenerates to a single
+            cluster for the whole year.
         sequential_fill_deployment: ``flow-name/deployment-name`` of the
             sequential fill deployment (``fill_strategy="sequential"`` only).
         commit_limit_name: Prefect global concurrency limit bounding fleet-wide
@@ -212,10 +242,9 @@ async def run_global_campaign(
             cluster) — a separate, smaller knob than the fill cap.
         cleanup_mosaics: Delete ``mosaics/{zone}/{year}`` (all versions) after the
             fill lands (default; the mosaic is a transient input). Keep for dev.
-        ingest_min_workers: Lower Dask worker bound for ingest.
-        ingest_max_workers: Upper Dask worker bound for ingest.
-        min_valid_coverage: S2 per-solar-day keep threshold forwarded to ingest.
-        batch_days: S1 CMR batch window forwarded to ingest.
+        ingest_settings: Grouped ingest tuning knobs (worker bounds, S2
+            coverage threshold, S1 batch window), forwarded verbatim to every
+            ingest — see :class:`tessera_embeddings.config.ingest.IngestSettings`.
         allow_partial_window: Relax the coverage gate (ingest + fill) to
             "non-empty" for legitimately partial edge zones.
         sweep_orphan_mosaics: Before the run, delete mosaics for cells that are
@@ -356,10 +385,7 @@ async def run_global_campaign(
             "paths": paths.model_dump(),
             "mask_name": mask_name,
             "s1_orbit": s1_orbit,
-            "min_workers": ingest_min_workers,
-            "max_workers": ingest_max_workers,
-            "min_valid_coverage": min_valid_coverage,
-            "batch_days": batch_days,
+            "ingest_settings": ingest_settings.model_dump(),
             "allow_partial_window": allow_partial_window,
         }
 
@@ -399,7 +425,7 @@ async def run_global_campaign(
                     zone,
                     year,
                     inputs_bucket=paths.inputs,
-                    min_valid_coverage=min_valid_coverage,
+                    min_valid_coverage=ingest_settings.min_valid_coverage,
                     s1_orbit=s1_orbit,
                     allow_partial_window=allow_partial_window,
                     code_suffix=code_suffix,
@@ -426,17 +452,35 @@ async def run_global_campaign(
     for year in sorted(set(campaign_years), reverse=True):
         year_zones = [z for z, y in work if y == year]
         if year_zones and fill_strategy == "sequential":
-            # One child run fills the whole year on a single shared Ray
-            # cluster, zones strictly sequential. Ingest, per-cell run_ids,
-            # retag/empty triage, and mosaic cleanup all live inside the child
-            # (its ingest look-ahead is what pipelines mosaics against the
-            # shared cluster), so the per-cell _process chain is bypassed.
-            log.info("Year %d: dispatching one sequential fill for %d zone(s)", year, len(year_zones))
-            frun = await arun_deployment(
-                sequential_fill_deployment,
-                parameters={
-                    "zones": year_zones,
-                    "year": year,
+            # Up to max_parallel_zones child runs fill the year, each owning
+            # ONE shared Ray cluster and draining its own zone shard strictly
+            # sequentially — clusters take up their next zone without actor
+            # churn instead of being torn down per cell. Shards are
+            # size-balanced (LPT over live-tile counts) so they finish
+            # together. Ingest, per-cell run_ids, retag/empty triage, and
+            # mosaic cleanup all live inside the children (their ingest
+            # look-ahead pipelines mosaics against each cluster), so the
+            # per-cell _process chain is bypassed; the global ingest bound is
+            # preserved by dividing max_parallel_ingest across the shards.
+            shards = _partition_by_live_tiles(
+                year_zones,
+                min(max_parallel_zones, len(year_zones)),
+                land_mask_path=paths.land_mask_store(mask_name),
+                get_credentials=iam_icechunk_credentials,
+                s3_region=s3_region,
+            )
+            log.info(
+                "Year %d: dispatching %d sequential fill(s) for %d zone(s): %s",
+                year,
+                len(shards),
+                len(year_zones),
+                [len(sh) for sh in shards],
+            )
+
+            def _sequential_params(shard: list[str], n_shards: int, seq_year: int) -> dict[str, Any]:
+                return {
+                    "zones": shard,
+                    "year": seq_year,
                     "paths": paths.model_dump(),
                     "ami_ssm_name": ami_ssm_name,
                     "store_name": store_name,
@@ -452,19 +496,34 @@ async def run_global_campaign(
                     "code_suffix": code_suffix,
                     "ingest": ingest,
                     "ingest_deployment": ingest_deployment,
-                    # The look-ahead bounds concurrent ingests exactly as
-                    # max_parallel_ingest does for the parallel strategy.
-                    "look_ahead": max_parallel_ingest,
+                    # Split the strategy-level bounds across the shards: the
+                    # look-aheads together match max_parallel_ingest (the same
+                    # global ingest bound the parallel strategy enforces), and
+                    # each child's staging+assembly slice keeps the fleet-wide
+                    # S3-PUT rate at the aggregate target.
+                    "look_ahead": max(1, max_parallel_ingest // n_shards),
+                    "s3_concurrency": max(1, TARGET_AGGREGATE_S3_CONCURRENCY // (2 * n_shards)),
                     "cleanup_mosaics": cleanup_mosaics,
-                    "ingest_min_workers": ingest_min_workers,
-                    "ingest_max_workers": ingest_max_workers,
-                    "min_valid_coverage": min_valid_coverage,
-                    "batch_days": batch_days,
-                },
+                    "ingest_settings": ingest_settings.model_dump(),
+                }
+
+            seq_results = await asyncio.gather(
+                *(
+                    arun_deployment(sequential_fill_deployment, parameters=_sequential_params(sh, len(shards), year))
+                    for sh in shards
+                ),
+                return_exceptions=True,
             )
-            _check_completed(frun, f"sequential fill year {year}")
-            runs_by_year[year] = [str(frun.id)]
-            log.info("Year %d: sequential fill landed", year)
+            seq_failures = [r for r in seq_results if isinstance(r, BaseException)]
+            if seq_failures:
+                raise RuntimeError(
+                    f"year {year}: {len(seq_failures)}/{len(shards)} sequential fill(s) failed (e.g. {seq_failures[0]})"
+                )
+            seq_runs = [r for r in seq_results if not isinstance(r, BaseException)]
+            for frun in seq_runs:
+                _check_completed(frun, f"sequential fill year {year}")
+            runs_by_year[year] = [str(r.id) for r in seq_runs]
+            log.info("Year %d: %d sequential fill(s) landed", year, len(shards))
         elif year_zones:
             log.info("Year %d: dispatching %d zone fill(s)", year, len(year_zones))
             # All zones in a year are distinct groups → safe to fill concurrently.

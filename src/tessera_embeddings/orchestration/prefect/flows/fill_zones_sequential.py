@@ -32,6 +32,7 @@ from prefect import flow, get_run_logger
 from prefect.deployments import run_deployment
 
 from tessera_embeddings.config.inference import checkpoint_filename
+from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
@@ -46,7 +47,6 @@ from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
     _assert_seeded_model_matches,
     _PrefectCommitGate,
 )
-from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import _staging_run_id
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.sequential_fill import (
@@ -155,10 +155,7 @@ def fill_zones_sequential_flow(
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
     look_ahead: int = 2,
     cleanup_mosaics: bool = True,
-    ingest_min_workers: int = 1,
-    ingest_max_workers: int = 50,
-    min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
-    batch_days: int = 30,
+    ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
 ) -> dict[str, Any]:
     """Fill one year's zones sequentially on a single shared Ray cluster.
 
@@ -205,10 +202,10 @@ def fill_zones_sequential_flow(
             concurrent ingest Dask clusters AND in-flight mosaics, ADR-011).
         cleanup_mosaics: Delete each campaign-ingested mosaic after its cell
             lands (transient input). Ignored for ``ingest=False`` mosaics.
-        ingest_min_workers: Lower Dask worker bound per ingest.
-        ingest_max_workers: Upper Dask worker bound per ingest.
-        min_valid_coverage: S2 per-solar-day keep threshold forwarded to ingest.
-        batch_days: S1 CMR batch window forwarded to ingest.
+        ingest_settings: Grouped ingest tuning knobs (worker bounds, S2
+            coverage threshold, S1 batch window), forwarded verbatim to each
+            cell's ingest — see
+            :class:`tessera_embeddings.config.ingest.IngestSettings`.
 
     Returns:
         Summary dict: triage counts (retag / empty / live), the sequential
@@ -329,10 +326,7 @@ def fill_zones_sequential_flow(
             "paths": paths.model_dump(),
             "mask_name": mask_name,
             "s1_orbit": s1_orbit,
-            "min_workers": ingest_min_workers,
-            "max_workers": ingest_max_workers,
-            "min_valid_coverage": min_valid_coverage,
-            "batch_days": batch_days,
+            "ingest_settings": ingest_settings.model_dump(),
             "allow_partial_window": allow_partial_window,
         }
 
@@ -374,7 +368,7 @@ def fill_zones_sequential_flow(
                 cell.zone,
                 cell.year,
                 inputs_bucket=paths.inputs,
-                min_valid_coverage=min_valid_coverage,
+                min_valid_coverage=ingest_settings.min_valid_coverage,
                 s1_orbit=s1_orbit,
                 allow_partial_window=allow_partial_window,
                 code_suffix=code_suffix,

@@ -102,7 +102,7 @@ def test_fill_run_id_is_stable_and_input_fingerprinted(wired):
     base = _fill_run_id(wired)
     assert base.startswith("33N-2025-")  # cell-scoped prefix + fingerprint suffix
     assert _fill_run_id(wired) == base  # deterministic across identical runs
-    changed = _fill_run_id(wired, min_valid_coverage=0.5)
+    changed = _fill_run_id(wired, ingest_settings=mod.IngestSettings(min_valid_coverage=0.5))
     assert changed.startswith("33N-2025-") and changed != base  # input change → new prefix
 
 
@@ -234,3 +234,36 @@ def test_invalid_fill_strategy_rejected(wired):
     with pytest.raises(ValueError, match="fill_strategy"):
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="both"))
     assert wired["arun"] == []
+
+
+def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
+    """max_parallel_zones > 1 in sequential mode = that many chained clusters:
+    zones are LPT-partitioned by live-tile count and each shard's child divides
+    the global ingest look-ahead bound.
+    """
+    status = SimpleNamespace(zones={"33N": (), "34N": (), "35N": ()}, has=lambda z, y: False)
+    monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+    monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("33N", 2025), ("34N", 2025), ("35N", 2025)])
+    counts = {"33N": 500, "34N": 300, "35N": 250}
+    monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: counts[zone])
+
+    asyncio.run(
+        mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="sequential", max_parallel_zones=2)
+    )
+    assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential"] * 2
+    shards = [p["zones"] for _, p in wired["arun"]]
+    # LPT: 500 alone; 300+250 together — balanced totals (500 vs 550).
+    assert sorted(map(sorted, shards)) == [["33N"], ["34N", "35N"]]
+    # The global ingest bound (max_parallel_ingest=2) is divided across shards.
+    assert all(p["look_ahead"] == 1 for _, p in wired["arun"])
+
+
+def test_sequential_single_shard_reads_no_tile_counts(wired, monkeypatch):
+    """One work zone → one shard → the partitioner must not read the mask."""
+
+    def boom(*a, **k):
+        raise AssertionError("tile counts must not be read for a single shard")
+
+    monkeypatch.setattr(mod, "zone_live_tile_count", boom)
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="sequential"))
+    assert len(wired["arun"]) == 1
