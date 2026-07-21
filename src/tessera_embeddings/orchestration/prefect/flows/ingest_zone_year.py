@@ -38,6 +38,7 @@ from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
 from pydantic import BaseModel
 
+from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import InsufficientCoverageError
@@ -55,12 +56,10 @@ from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_stor
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 from tessera_embeddings.utils import utcnow_iso
 
+
 #: Percent-of-ROI valid-pixel threshold for keeping an S2 solar-day. Far below
 #: the ROI default (5.0): a single day's swath covers only a sliver of a whole
 #: 6° zone, so a high bar would drop nearly every date (see ADR-011).
-DEFAULT_MIN_VALID_COVERAGE = 0.1
-
-
 class IngestDeployments(BaseModel):
     """Deployment refs (``flow_name/deployment_name``) the campaign dispatches to."""
 
@@ -125,10 +124,7 @@ async def ingest_zone_year(
     deployments: IngestDeployments = IngestDeployments(),  # noqa: B008
     mask_name: str = "global",
     s1_orbit: str = "both",
-    min_workers: int = 1,
-    max_workers: int = 50,
-    min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
-    batch_days: int = 30,
+    ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     time_window_end: str | None = None,
     allow_partial_window: bool = False,
     use_local: bool = False,
@@ -142,11 +138,10 @@ async def ingest_zone_year(
         deployments: S1/S2 ingest deployment refs.
         mask_name: Coverage-store basename (``paths.land_mask_store``).
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
-        min_workers: Lower Dask worker bound forwarded to each ingest.
-        max_workers: Upper Dask worker bound forwarded to each ingest.
-        min_valid_coverage: S2 per-solar-day keep threshold (percent of the ROI);
-            defaults low for zone-scale ROIs.
-        batch_days: S1 CMR batch window forwarded to the SAR ingest.
+        ingest_settings: Grouped ingest tuning knobs (worker bounds, S2
+            coverage threshold, S1 batch window) fanned out to the base
+            S1/S2 ingest flows. See
+            :class:`tessera_embeddings.config.ingest.IngestSettings`.
         time_window_end: ``"Month Year"`` override; defaults to ``"December {year}"``.
         allow_partial_window: Relax the coverage gate to "non-empty" (escape
             hatch for a legitimately partial edge zone).
@@ -185,7 +180,7 @@ async def ingest_zone_year(
     # coverage gate rather than silently reusing a partial mosaic.
     fingerprint = {
         "window": [start_date, end_date],
-        "min_valid_coverage": min_valid_coverage,
+        "min_valid_coverage": ingest_settings.min_valid_coverage,
         "s1_orbit": s1_orbit,
         "allow_partial_window": allow_partial_window,
         "coverage_sha256": _coverage_sha(
@@ -240,17 +235,21 @@ async def ingest_zone_year(
         "start_date": start_date,
         "end_date": end_date,
         "store_path": mosaic_base,
-        "min_workers": min_workers,
-        "max_workers": max_workers,
+        "min_workers": ingest_settings.min_workers,
+        "max_workers": ingest_settings.max_workers,
         "use_local": use_local,
     }
     orbits = _active_orbits(s1_orbit)
     s1_coros = [
-        arun_deployment(deployments.ingest_s1_roi_sar, parameters={**common, "orbit": orbit, "batch_days": batch_days})
+        arun_deployment(
+            deployments.ingest_s1_roi_sar,
+            parameters={**common, "orbit": orbit, "batch_days": ingest_settings.batch_days},
+        )
         for orbit in orbits
     ]
     s2_coro = arun_deployment(
-        deployments.ingest_s2_roi_reflectance, parameters={**common, "min_valid_coverage": min_valid_coverage}
+        deployments.ingest_s2_roi_reflectance,
+        parameters={**common, "min_valid_coverage": ingest_settings.min_valid_coverage},
     )
     # return_exceptions=True so we WAIT for every deployment to settle before raising:
     # a plain gather() surfaces the first failure while the sibling S1/S2 jobs keep

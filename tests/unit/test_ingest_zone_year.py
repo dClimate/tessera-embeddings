@@ -82,7 +82,7 @@ def test_matching_markers_skip_ingest(wired, monkeypatch):
 def test_dispatches_and_marks_on_success(wired, monkeypatch):
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
     monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))  # nothing ingested yet
-    result = _run(s1_orbit="ascending", min_valid_coverage=0.2)
+    result = _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(min_valid_coverage=0.2))
 
     assert result["status"] == "ingested"
     # ROI synthesized once, onto the campaign's ROI path for this zone.
