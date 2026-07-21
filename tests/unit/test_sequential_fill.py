@@ -1,9 +1,9 @@
 """fill_zones_sequential: ordering, look-ahead, trailing assembly, breaker.
 
-The runner is Prefect/Ray-free by contract, so these tests patch its two
-zone-fill phase imports (``infer_zone_year`` / ``assemble_zone_year``) at the
-runner's own namespace and drive the loop with recording fakes — no cluster,
-no store.
+The runner is pure sequencing over injected callables (Prefect/Ray-free by
+contract), so these tests drive the loop with recording fakes passed straight
+through the ``prepare``/``infer``/``assemble`` parameters — no cluster, no
+store, no monkeypatching.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from typing import Any
 
 import pytest
 
-import tessera_embeddings.orchestration.runners.sequential_fill as mod
 from tessera_embeddings.orchestration.runners.sequential_fill import (
     PreparedCell,
     SequentialCell,
@@ -63,48 +62,40 @@ class RecordingInputs:
         self.events.append(f"cleanup:{zone}")
 
 
-def _wire(monkeypatch, events: list[str], *, infer=None, assemble=None):
-    """Patch the two phases with recorders (overridable per test)."""
+def _run(cells, events: list[str] | None = None, *, infer=None, assemble=None, **kw) -> dict[str, Any]:
+    """Drive the runner with recording default phases (overridable per test)."""
+    events = events if events is not None else []
 
-    def default_infer(**kw):
-        events.append(f"infer:{kw['zone']}")
-        return _handoff(kw["zone"])
+    def default_infer(cell, prep, final):
+        events.append(f"infer:{cell.zone}")
+        return _handoff(cell.zone)
 
-    def default_assemble(handoff, **kw):
+    def default_assemble(handoff, prep):
         events.append(f"assemble:{handoff.zone}")
         return {"zone": handoff.zone, "empty": False}
 
-    monkeypatch.setattr(mod, "infer_zone_year", infer or default_infer)
-    monkeypatch.setattr(mod, "assemble_zone_year", assemble or default_assemble)
-
-
-def _run(cells, *, inputs=None, look_ahead=2, **kw) -> dict[str, Any]:
     return fill_zones_sequential(
         cells=cells,
-        store_path="s3://store",
-        land_mask_path="s3://mask",
         prepare=_prepare,
+        infer=infer or default_infer,
+        assemble=assemble or default_assemble,
         log=LOG,
-        inputs=inputs,
-        look_ahead=look_ahead,
         **kw,
     )
 
 
-def test_cells_processed_in_order_and_all_succeed(monkeypatch):
+def test_cells_processed_in_order_and_all_succeed():
     events: list[str] = []
-    _wire(monkeypatch, events)
-    summary = _run(_cells(3))
+    summary = _run(_cells(3), events)
     assert [e for e in events if e.startswith("infer:")] == ["infer:01N", "infer:02N", "infer:03N"]
     assert summary["succeeded"] == 3 and summary["failed"] == 0
     # Every cell was assembled (none were terminal handoffs).
     assert sorted(e for e in events if e.startswith("assemble:")) == ["assemble:01N", "assemble:02N", "assemble:03N"]
 
 
-def test_lookahead_ingests_run_ahead_of_the_inference_head(monkeypatch):
+def test_lookahead_ingests_run_ahead_of_the_inference_head():
     events: list[str] = []
-    _wire(monkeypatch, events)
-    _run(_cells(4), inputs=RecordingInputs(events), look_ahead=2)
+    _run(_cells(4), events, inputs=RecordingInputs(events), look_ahead=2)
     # Cells 1-3 (current + 2 look-ahead) are started before the first wait...
     first_wait = events.index("wait:01N")
     assert set(events[:first_wait]) >= {"start:01N", "start:02N", "start:03N"}
@@ -117,19 +108,18 @@ def test_lookahead_ingests_run_ahead_of_the_inference_head(monkeypatch):
     assert cleaned == {"cleanup:01N", "cleanup:02N", "cleanup:03N", "cleanup:04N"}
 
 
-def test_retirement_enabled_only_on_the_final_cell(monkeypatch):
+def test_final_cell_flag_set_only_on_the_last_cell():
     flags: list[bool] = []
 
-    def infer(**kw):
-        flags.append(kw["retire_idle_actors"])
-        return _handoff(kw["zone"])
+    def infer(cell, prep, final):
+        flags.append(final)
+        return _handoff(cell.zone)
 
-    _wire(monkeypatch, [], infer=infer)
-    _run(_cells(3))
+    _run(_cells(3), infer=infer)
     assert flags == [False, False, True]
 
 
-def test_trailing_assembly_overlaps_next_inference(monkeypatch):
+def test_trailing_assembly_overlaps_next_inference():
     """Cell 2's inference must start while cell 1's assembly is still running —
     the whole point of the trailing thread. The blocked assembly is released
     only by cell 2's inference starting, so a serialized implementation would
@@ -138,51 +128,47 @@ def test_trailing_assembly_overlaps_next_inference(monkeypatch):
     next_inference_started = threading.Event()
     events: list[str] = []
 
-    def infer(**kw):
-        events.append(f"infer:{kw['zone']}")
-        if kw["zone"] == "02N":
+    def infer(cell, prep, final):
+        events.append(f"infer:{cell.zone}")
+        if cell.zone == "02N":
             next_inference_started.set()
-        return _handoff(kw["zone"])
+        return _handoff(cell.zone)
 
-    def assemble(handoff, **kw):
+    def assemble(handoff, prep):
         if handoff.zone == "01N":
             assert next_inference_started.wait(timeout=10), "assembly 1 finished before inference 2 began"
         events.append(f"assemble:{handoff.zone}")
         return {"zone": handoff.zone}
 
-    _wire(monkeypatch, events, infer=infer, assemble=assemble)
-    summary = _run(_cells(2))
+    summary = _run(_cells(2), events, infer=infer, assemble=assemble)
     assert summary["succeeded"] == 2
     assert events.index("infer:02N") < events.index("assemble:01N")
 
 
-def test_terminal_handoff_skips_assembly(monkeypatch):
+def test_terminal_handoff_skips_assembly():
     events: list[str] = []
 
-    def infer(**kw):
-        events.append(f"infer:{kw['zone']}")
-        return _handoff(kw["zone"], done={"zone": kw["zone"], "already_complete": True})
+    def infer(cell, prep, final):
+        events.append(f"infer:{cell.zone}")
+        return _handoff(cell.zone, done={"zone": cell.zone, "already_complete": True})
 
-    _wire(monkeypatch, events, infer=infer)
-    summary = _run(_cells(1), inputs=RecordingInputs(events))
+    summary = _run(_cells(1), events, infer=infer, inputs=RecordingInputs(events))
     assert summary["succeeded"] == 1
     assert not [e for e in events if e.startswith("assemble:")]
     assert "cleanup:01N" in events  # terminal cells still release their mosaic
 
 
-def test_single_cell_failure_recorded_and_run_continues(monkeypatch):
+def test_single_cell_failure_recorded_and_run_continues():
     events: list[str] = []
 
-    def infer(**kw):
-        events.append(f"infer:{kw['zone']}")
-        if kw["zone"] == "02N":
+    def infer(cell, prep, final):
+        events.append(f"infer:{cell.zone}")
+        if cell.zone == "02N":
             raise RuntimeError("boom")
-        return _handoff(kw["zone"])
+        return _handoff(cell.zone)
 
-    _wire(monkeypatch, events, infer=infer)
-    inputs = RecordingInputs(events)
     with pytest.raises(RuntimeError, match="1/3 cell"):
-        _run(_cells(3), inputs=inputs)
+        _run(_cells(3), events, infer=infer, inputs=RecordingInputs(events))
     # The failure did not stop the later cell, and the failed cell's mosaic
     # was kept (its retry needs it for the fingerprinted run_id + resume).
     assert "infer:03N" in events
@@ -190,53 +176,43 @@ def test_single_cell_failure_recorded_and_run_continues(monkeypatch):
     assert {"cleanup:01N", "cleanup:03N"} <= set(events)
 
 
-def test_consecutive_failures_trip_the_breaker(monkeypatch):
+def test_consecutive_failures_trip_the_breaker():
     calls: list[str] = []
 
-    def infer(**kw):
-        calls.append(kw["zone"])
+    def infer(cell, prep, final):
+        calls.append(cell.zone)
         raise RuntimeError("systemic")
 
-    _wire(monkeypatch, [], infer=infer)
     with pytest.raises(RuntimeError, match="consecutive"):
-        _run(_cells(5), max_consecutive_failures=2)
+        _run(_cells(5), infer=infer, max_consecutive_failures=2)
     assert calls == ["01N", "02N"]  # the 3rd cell is never attempted
 
 
-def test_assembly_failure_keeps_mosaic_and_fails_run(monkeypatch):
+def test_assembly_failure_keeps_mosaic_and_fails_run():
     events: list[str] = []
 
-    def assemble(handoff, **kw):
+    def assemble(handoff, prep):
         raise RuntimeError("commit refused")
 
-    _wire(monkeypatch, events, assemble=assemble)
-    inputs = RecordingInputs(events)
     with pytest.raises(RuntimeError, match="assembly"):
-        _run(_cells(1), inputs=inputs)
+        _run(_cells(1), events, assemble=assemble, inputs=RecordingInputs(events))
     assert "cleanup:01N" not in events
 
 
-def test_prepare_failure_is_a_prepare_phase_failure(monkeypatch):
-    _wire(monkeypatch, [])
-
+def test_prepare_failure_is_a_prepare_phase_failure():
     def prepare(cell):
         raise ValueError("coverage gate")
 
+    def unreachable(*a, **k):
+        raise AssertionError("phases must not run when prepare fails")
+
     with pytest.raises(RuntimeError) as exc_info:
-        fill_zones_sequential(
-            cells=_cells(1),
-            store_path="s3://store",
-            land_mask_path="s3://mask",
-            prepare=prepare,
-            log=LOG,
-            max_consecutive_failures=5,
-        )
+        fill_zones_sequential(cells=_cells(1), prepare=prepare, infer=unreachable, assemble=unreachable, log=LOG)
     assert "'phase': 'prepare'" in str(exc_info.value)
 
 
-def test_no_inputs_adapter_means_no_lifecycle_calls(monkeypatch):
+def test_no_inputs_adapter_means_no_lifecycle_calls():
     events: list[str] = []
-    _wire(monkeypatch, events)
-    summary = _run(_cells(2), inputs=None)
+    summary = _run(_cells(2), events, inputs=None)
     assert summary["succeeded"] == 2
     assert not [e for e in events if e.startswith(("start:", "wait:", "cleanup:"))]

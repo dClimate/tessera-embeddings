@@ -4,7 +4,7 @@ Provisions a Ray GPU cluster, runs the zone-fill runner
 (:func:`tessera_embeddings.orchestration.runners.zone_fill.fill_zone_year` —
 coverage mask → inference → shard assembly → tag), and tears the cluster down.
 Mirrors :mod:`tessera_embeddings`'s single-flow Ray pattern (``ray_cluster``
-context manager + module-state cancellation hook).
+context manager; the cancellation hook is shared via :mod:`._ray_lifecycle`).
 
 **Concurrency model (ADR-008 D6).** Inference is embarrassingly parallel across
 zones — nothing is shared and nothing commits — so many of these flow runs can
@@ -19,15 +19,11 @@ conflict) is the campaign driver's job, not this flow's.
 
 from __future__ import annotations
 
-import logging
-import subprocess
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, cast
 
-import yaml
 from prefect import flow, get_run_logger
 from prefect.concurrency.sync import concurrency
 
@@ -38,22 +34,22 @@ from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.conventions import expected_model_url
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
+from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
+    activate,
+    deactivate,
+    ray_cleanup_on_cancellation,
+)
 from tessera_embeddings.orchestration.runners.zone_fill import (
     fill_zone_year,
     zone_has_live_tiles,
     zone_year_complete,
     zone_year_on_axis,
 )
-from tessera_embeddings.providers.aws.ray import cleanup_ray_tempfiles, terminate_ray_instances_by_tag
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 if TYPE_CHECKING:
     import icechunk
-
-# Module-level state for the cancellation hook (set on entry, cleared on exit).
-_active_resolved_yaml: str | None = None
-_active_cluster_name: str | None = None
 
 
 class _PrefectCommitGate(AbstractContextManager):
@@ -135,25 +131,7 @@ def _assert_seeded_model_matches(
         )
 
 
-def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
-    """Emergency Ray teardown when the flow is cancelled via the Prefect UI."""
-    log = logging.getLogger(__name__)
-    log.warning("Flow cancelled — tearing down Ray cluster")
-    if _active_resolved_yaml and Path(_active_resolved_yaml).exists():
-        rc = subprocess.run(["ray", "down", _active_resolved_yaml, "-y"], check=False).returncode
-        cleanup_ray_tempfiles(_active_resolved_yaml)
-        # A non-zero `ray down` leaves EC2 instances running; fall back to
-        # terminating them by cluster tag rather than silently leaking them.
-        if rc != 0 and _active_cluster_name:
-            log.warning("`ray down` exited %d — terminating instances for cluster %r by tag", rc, _active_cluster_name)
-            terminate_ray_instances_by_tag(cluster_name=_active_cluster_name, log=log)
-    elif _active_cluster_name:
-        terminate_ray_instances_by_tag(cluster_name=_active_cluster_name, log=log)
-    else:
-        log.warning("Cancellation fired before the cluster was provisioned — check the AWS console manually.")
-
-
-@flow(name="fill-zone-year", on_cancellation=[_ray_cleanup_on_cancellation])
+@flow(name="fill-zone-year", on_cancellation=[ray_cleanup_on_cancellation])
 def fill_zone_year_flow(
     *,
     zone: str,
@@ -349,7 +327,6 @@ def fill_zone_year_flow(
     # Region matches ray_cluster's default (this flow provisions there).
     fill_kwargs["on_actor_retire"] = make_instance_terminator(log=log)
 
-    global _active_resolved_yaml, _active_cluster_name
     with ray_cluster(
         log,
         ami_ssm_name=ami_ssm_name,
@@ -358,14 +335,9 @@ def fill_zone_year_flow(
         code_bucket=code_bucket,
         code_suffix=code_suffix,
     ) as resolved_yaml:
-        _active_resolved_yaml = resolved_yaml
-        if resolved_yaml and Path(resolved_yaml).exists():
-            with Path(resolved_yaml).open() as f:
-                _active_cluster_name = yaml.safe_load(f).get("cluster_name")
-
+        activate(resolved_yaml)
         summary = fill_zone_year(**fill_kwargs)
-    _active_resolved_yaml = None
-    _active_cluster_name = None
+    deactivate()
 
     log.info("Zone %s year %d filled: %s", zone, year, summary.get("tag"))
     return summary

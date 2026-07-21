@@ -608,13 +608,11 @@ def _process_chunks_work_stealing(
             placed before requesting the next batch anyway (capacity-shortfall
             escape hatch).
         retire_idle_actors: Kill actors idle past the grace period as the run's
-            tail drains (the default, right for a standalone run where an idle
-            worker is surplus forever). A multi-zone sequential fill passes
-            False for every zone but its last: the "surplus" workers are the
-            NEXT zone's fleet, and retiring them at each zone's tail would
-            drain the shared cluster's instances (idle nodes hit the
-            autoscaler's idle timeout) only to re-pay their multi-minute
-            bringup at the next zone.
+            tail drains (the default). A multi-zone sequential fill passes
+            False for every zone but its last — its "surplus" workers are the
+            NEXT zone's fleet, and retiring them would idle-drain the shared
+            cluster's instances at every zone tail (see
+            ``orchestration.runners.sequential_fill``).
 
     Returns:
         List of result dicts (status, chunk label, timing, etc.).

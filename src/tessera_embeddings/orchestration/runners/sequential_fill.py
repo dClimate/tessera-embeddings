@@ -4,12 +4,13 @@ The per-cell fill chain (:mod:`.zone_fill`) provisions nothing itself — the
 caller owns the Ray context. The parallel campaign exploits that by running
 K fills at once, each in its own flow run with its own cluster; this runner
 exploits it the other way: **one long-lived cluster, cells strictly
-sequential**, so the per-cluster costs — `ray up`, per-worker EC2 bringup
+sequential**, so the per-cluster costs — ``ray up``, per-worker EC2 bringup
 (minutes each), the model-load cold start on every worker — are paid once per
 campaign year instead of once per zone.
 
 Keeping the shared fleet busy between cells is the whole game, and three
-mechanisms cooperate on it:
+mechanisms cooperate on it (this docstring is the canonical statement of the
+rationale — the flow and README point here):
 
 - **Ingest look-ahead** (``inputs``): the next cells' mosaics are ingested
   *while the current cell infers*, bounded by ``look_ahead`` so in-flight
@@ -22,17 +23,17 @@ mechanisms cooperate on it:
   one is submitted. Within one run every cell is a distinct zone group (the
   caller passes one year's zones), so a trailing commit can never hit the
   same-zone attr conflict that forbids concurrent same-zone fills.
-- **Fleet retention**: every cell but the last runs inference with
-  ``retire_idle_actors=False`` so its tail doesn't idle-kill the actors whose
+- **Fleet retention**: every cell but the last runs inference with idle-actor
+  retirement disabled so its tail doesn't idle-kill the actors whose
   instances the next cell needs (an actor-less node hits the autoscaler idle
   timeout and drains); the final cell retires normally so the fleet tapers
   as the run ends. Order ``cells`` largest-first — the fleet then only ever
   shrinks, and small island zones land at the natural taper.
 
-Contracts: Prefect-free (the deployment-backed ingest adapter, the
-input-fingerprinted run_id, and the per-cell config all arrive as callables
-from the flow layer); the caller is already inside a Ray context; cells are
-one year's distinct zones (see the trailing-assembly note above for why).
+The runner is pure sequencing: the zone-fill phases, the deployment-backed
+ingest adapter, the input-fingerprinted run_id, and the per-cell config all
+arrive as callables from the flow layer (which keeps this module Prefect-free
+per the architecture rules). The caller is already inside a Ray context.
 """
 
 from __future__ import annotations
@@ -44,13 +45,9 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-from tessera_embeddings.orchestration.runners.zone_fill import assemble_zone_year, infer_zone_year
-
 if TYPE_CHECKING:
-    import icechunk
-
     from tessera_embeddings.config.inference import InferenceConfig
-    from tessera_embeddings.storage.shard_writer import CommitGate
+    from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff
 
 
 class CellInputs(Protocol):
@@ -107,56 +104,42 @@ class PreparedCell:
 def fill_zones_sequential(
     *,
     cells: list[SequentialCell],
-    store_path: str,
-    land_mask_path: str,
     prepare: Callable[[SequentialCell], PreparedCell],
+    infer: Callable[[SequentialCell, PreparedCell, bool], ZoneFillHandoff],
+    assemble: Callable[[ZoneFillHandoff, PreparedCell], dict[str, Any]],
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     inputs: CellInputs | None = None,
     look_ahead: int = 2,
-    gate: CommitGate | None = None,
-    n_assembly_workers: int | None = None,
-    s3_concurrency: int | None = None,
-    cleanup_staging: bool = True,
-    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
-    s3_region: str | None = None,
-    on_actor_retire: Callable[[str], None] | None = None,
     max_consecutive_failures: int = 3,
 ) -> dict[str, Any]:
     """Fill ``cells`` in order on the caller's Ray cluster, assembly trailing.
 
     Per cell: wait for its inputs (mosaics), top up the ingest look-ahead,
-    ``prepare`` it (orbit/config/run_id/coverage gate — the flow's callable),
-    run the inference phase on the shared cluster, then hand the assembly
-    phase to the trailing thread and move on. A cell that fails (ingest,
-    prepare, inference, or assembly) is recorded and the run continues — the
-    cell stays pending in the campaign ledger for the next pass — unless
-    ``max_consecutive_failures`` cells fail in a row, which indicates a
-    systemic problem (bad checkpoint, broken store) not worth burning the
-    fleet on.
+    ``prepare`` it, run ``infer`` on the shared cluster, then hand ``assemble``
+    to the trailing thread and move on. A cell that fails in any phase is
+    recorded and the run continues — the cell stays pending in the campaign
+    ledger for the next pass — unless ``max_consecutive_failures`` cells fail
+    in a row, which indicates a systemic problem (bad checkpoint, broken
+    store) not worth burning the fleet on.
 
     Args:
         cells: Ordered (zone, year) work items — one year's distinct zones,
             largest-first (see the module docstring for both constraints).
-        store_path: URI of the global Icechunk repo.
-        land_mask_path: Campaign coverage-store URI.
         prepare: Resolves a cell's :class:`PreparedCell` once its inputs are
             ready. Raising here (coverage gate, fingerprint failure) fails the
             cell, not the run.
+        infer: The inference phase, ``(cell, prepared, is_final_cell) →``
+            handoff — a partial application of
+            :func:`~tessera_embeddings.orchestration.runners.zone_fill.infer_zone_year`
+            whose third argument gates idle-actor retirement (True only for
+            the final cell; see "fleet retention" above).
+        assemble: The assembly phase, ``(handoff, prepared) → summary`` — a
+            partial application of
+            :func:`~tessera_embeddings.orchestration.runners.zone_fill.assemble_zone_year`.
         log: Logger.
         inputs: Mosaic lifecycle adapter; ``None`` means the mosaics already
             exist upstream (no starts, no waits, no cleanup).
         look_ahead: Cells beyond the current one to keep in ingest flight.
-        gate: In-process commit gate shared with any concurrent committers.
-        n_assembly_workers: Assembly worker-process count per cell
-            (``None`` = sized from each cell's live-tile count).
-        s3_concurrency: Each assembly's slice of the fleet S3-PUT budget.
-        cleanup_staging: Delete a cell's staged tiles after it lands.
-        get_credentials: Icechunk credential callback for actors + stores.
-        s3_region: S3 region for the global store + mosaics.
-        on_actor_retire: EC2 terminator for retired/replaced actors. Passed to
-            every cell; it only fires from idle retirement (gated off until
-            the final cell) or actor replacement, so intermediate cells keep
-            their fleet while dead instances still get reclaimed promptly.
         max_consecutive_failures: Consecutive-cell-failure circuit breaker.
 
     Returns:
@@ -231,7 +214,6 @@ def fill_zones_sequential(
             inputs.start(cells[0].zone, cells[0].year)
             _start_lookahead(1)
         for i, cell in enumerate(cells):
-            final = i == len(cells) - 1
             try:
                 if inputs is not None:
                     inputs.wait(cell.zone, cell.year)
@@ -241,26 +223,7 @@ def fill_zones_sequential(
                 _fail(cell, "prepare", exc)
                 continue
             try:
-                handoff = infer_zone_year(
-                    store_path=store_path,
-                    zone=cell.zone,
-                    year=cell.year,
-                    land_mask_path=land_mask_path,
-                    mosaic_base=prep.mosaic_base,
-                    staging_base=prep.staging_base,
-                    config=prep.config,
-                    num_actors=cell.num_actors,
-                    log=log,
-                    run_id=prep.run_id,
-                    gate=gate,
-                    get_credentials=get_credentials,
-                    s3_region=s3_region,
-                    on_actor_retire=on_actor_retire,
-                    # Only the final cell's tail may drain the fleet — earlier
-                    # tails would idle-kill the very actors (and, via the
-                    # autoscaler idle timeout, instances) the next cell needs.
-                    retire_idle_actors=final,
-                )
+                handoff = infer(cell, prep, i == len(cells) - 1)
             except Exception as exc:
                 _fail(cell, "inference", exc)
                 continue
@@ -275,22 +238,7 @@ def fill_zones_sequential(
                 # empty) — committed and tagged there; nothing to assemble.
                 _succeed(cell, handoff.done)
                 continue
-            trailing = (
-                cell,
-                executor.submit(
-                    assemble_zone_year,
-                    handoff,
-                    store_path=store_path,
-                    staging_base=prep.staging_base,
-                    log=log,
-                    gate=gate,
-                    n_assembly_workers=n_assembly_workers,
-                    s3_concurrency=s3_concurrency,
-                    cleanup_staging=cleanup_staging,
-                    get_credentials=get_credentials,
-                    s3_region=s3_region,
-                ),
-            )
+            trailing = (cell, executor.submit(assemble, handoff, prep))
         _join_trailing()
     finally:
         # On the breaker path a submitted assembly may still be committing —

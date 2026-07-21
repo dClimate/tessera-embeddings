@@ -618,10 +618,8 @@ def ray_cluster(
         cloudwatch_log_group: CloudWatch log group for Ray agent logs.
         cloudwatch_template: CloudWatch agent JSON template path.
         idle_timeout_minutes: Optional override of the template's autoscaler
-            idle-down delay (see :func:`_resolve_ray_config`). Multi-zone
-            sequential fills hold one cluster across zones and pass a value
-            large enough to survive the inter-zone gap; ``None`` (default)
-            keeps the template's single-ROI-tuned value.
+            idle-down delay; ``None`` keeps the template's value. Rationale at
+            :func:`_resolve_ray_config`.
 
     Yields:
         Path to the resolved cluster YAML tempfile when this context

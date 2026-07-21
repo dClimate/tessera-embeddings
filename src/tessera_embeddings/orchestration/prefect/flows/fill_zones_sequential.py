@@ -5,37 +5,29 @@ The parallel campaign path (:mod:`.run_global_campaign` dispatching
 each one re-paying ``ray up`` (~5-10 min wall), per-worker EC2 bringup
 (minutes of billed GPU idle each), the per-worker model-load cold start, and
 a fresh roll of the EC2 capacity dice. This flow amortizes all of that across
-a whole year's zones: ONE cluster, zones filled **strictly sequentially**
-(the user-facing contract), with the cluster kept busy at the seams by the
-sequential runner's ingest look-ahead and trailing assembly
-(:mod:`tessera_embeddings.orchestration.runners.sequential_fill`).
+a whole year's zones: ONE cluster, zones filled **strictly sequentially**.
+How the shared fleet is kept busy at the seams (ingest look-ahead, trailing
+assembly, fleet retention) is the sequential runner's story — see
+:mod:`tessera_embeddings.orchestration.runners.sequential_fill`; this flow
+supplies the Prefect-facing pieces (deployment-backed ingest, fingerprinted
+run_ids, per-cell config) and the cluster itself, with its autoscaler
+``idle_timeout_minutes`` raised so the short inter-zone seam never sheds
+workers.
 
 Cheap cells never touch the cluster: already-complete cells are retagged and
 all-ocean cells are marked complete-empty *before* Ray is provisioned — and,
 unlike the per-cell path, an all-ocean cell is never ingested at all. Live
-cells are ordered largest-first (by coverage-bitmap live-tile count) so the
-autoscaled fleet only ever shrinks across the run; each cell requests
-``min(num_actors, its live tiles)`` actors, and every cell but the last runs
-with idle-actor retirement disabled so zone tails don't drain the instances
-the next zone needs. The cluster's autoscaler ``idle_timeout_minutes`` is
-raised (template default 2) so the short inter-zone seam never sheds workers.
-
-Mirrors :mod:`.fill_zone_year`'s cancellation-hook pattern (module state +
-tag-based fallback). Same-zone commit-conflict safety holds by construction:
-one year's zones are distinct groups, and the runner's trailing assembly is
-depth-1, so no two commits for the same zone group can ever be in flight.
+cells are ordered largest-first (clamped ``min(num_actors, live tiles)``
+requests) so the autoscaled fleet only ever shrinks across the run.
 """
 
 from __future__ import annotations
 
 import logging
-import subprocess
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import yaml
 from prefect import flow, get_run_logger
 from prefect.deployments import run_deployment
 
@@ -45,6 +37,11 @@ from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
+from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
+    activate,
+    deactivate,
+    ray_cleanup_on_cancellation,
+)
 from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
     _assert_seeded_model_matches,
     _PrefectCommitGate,
@@ -58,21 +55,19 @@ from tessera_embeddings.orchestration.runners.sequential_fill import (
     fill_zones_sequential,
 )
 from tessera_embeddings.orchestration.runners.zone_fill import (
+    assemble_zone_year,
     fill_zone_year,
+    infer_zone_year,
     zone_live_tile_count,
     zone_year_complete,
     zone_year_on_axis,
 )
-from tessera_embeddings.providers.aws.ray import cleanup_ray_tempfiles, terminate_ray_instances_by_tag
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 if TYPE_CHECKING:
     from tessera_embeddings.config.inference import InferenceConfig
-
-# Module-level state for the cancellation hook (set on entry, cleared on exit).
-_active_resolved_yaml: str | None = None
-_active_cluster_name: str | None = None
+    from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff
 
 
 class _DeploymentCellInputs:
@@ -132,25 +127,7 @@ class _DeploymentCellInputs:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
 
-def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
-    """Emergency Ray teardown when the flow is cancelled via the Prefect UI."""
-    log = logging.getLogger(__name__)
-    log.warning("Flow cancelled — tearing down Ray cluster")
-    if _active_resolved_yaml and Path(_active_resolved_yaml).exists():
-        rc = subprocess.run(["ray", "down", _active_resolved_yaml, "-y"], check=False).returncode
-        cleanup_ray_tempfiles(_active_resolved_yaml)
-        # A non-zero `ray down` leaves EC2 instances running; fall back to
-        # terminating them by cluster tag rather than silently leaking them.
-        if rc != 0 and _active_cluster_name:
-            log.warning("`ray down` exited %d — terminating instances for cluster %r by tag", rc, _active_cluster_name)
-            terminate_ray_instances_by_tag(cluster_name=_active_cluster_name, log=log)
-    elif _active_cluster_name:
-        terminate_ray_instances_by_tag(cluster_name=_active_cluster_name, log=log)
-    else:
-        log.warning("Cancellation fired before the cluster was provisioned — check the AWS console manually.")
-
-
-@flow(name="fill-zones-sequential", on_cancellation=[_ray_cleanup_on_cancellation])
+@flow(name="fill-zones-sequential", on_cancellation=[ray_cleanup_on_cancellation])
 def fill_zones_sequential_flow(
     *,
     zones: list[str],
@@ -416,7 +393,42 @@ def fill_zones_sequential_flow(
 
         s3_concurrency = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // 2)
 
-    global _active_resolved_yaml, _active_cluster_name
+    # Fires only on actor replacement (dead instance reclaim) until the final
+    # cell, whose tail retirement drains the fleet early.
+    terminator = make_instance_terminator(log=log)
+
+    def _infer(cell: SequentialCell, prep: PreparedCell, final: bool) -> ZoneFillHandoff:
+        return infer_zone_year(
+            store_path=store_path,
+            zone=cell.zone,
+            year=cell.year,
+            land_mask_path=land_mask_path,
+            mosaic_base=prep.mosaic_base,
+            staging_base=prep.staging_base,
+            config=prep.config,
+            num_actors=cell.num_actors,
+            log=log,
+            run_id=prep.run_id,
+            gate=gate,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+            on_actor_retire=terminator,
+            retire_idle_actors=final,
+        )
+
+    def _assemble(handoff: ZoneFillHandoff, prep: PreparedCell) -> dict[str, Any]:
+        return assemble_zone_year(
+            handoff,
+            store_path=store_path,
+            staging_base=prep.staging_base,
+            log=log,
+            gate=gate,
+            s3_concurrency=s3_concurrency,
+            cleanup_staging=cleanup_staging,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+        )
+
     try:
         with ray_cluster(
             log,
@@ -427,34 +439,21 @@ def fill_zones_sequential_flow(
             code_suffix=code_suffix,
             idle_timeout_minutes=idle_timeout_minutes,
         ) as resolved_yaml:
-            _active_resolved_yaml = resolved_yaml
-            if resolved_yaml and Path(resolved_yaml).exists():
-                with Path(resolved_yaml).open() as f:
-                    _active_cluster_name = yaml.safe_load(f).get("cluster_name")
-
+            activate(resolved_yaml)
             seq = fill_zones_sequential(
                 cells=live,
-                store_path=store_path,
-                land_mask_path=land_mask_path,
                 prepare=_prepare,
+                infer=_infer,
+                assemble=_assemble,
                 log=log,
                 inputs=inputs,
                 look_ahead=look_ahead,
-                gate=gate,
-                s3_concurrency=s3_concurrency,
-                cleanup_staging=cleanup_staging,
-                get_credentials=iam_icechunk_credentials,
-                s3_region=s3_region,
-                # Fires only on actor replacement (dead instance reclaim) until
-                # the final cell, whose tail retirement drains the fleet early.
-                on_actor_retire=make_instance_terminator(log=log),
                 max_consecutive_failures=max_consecutive_failures,
             )
     finally:
         if inputs is not None:
             inputs.shutdown()
-    _active_resolved_yaml = None
-    _active_cluster_name = None
+    deactivate()
 
     log.info(
         "Year %d sequential fill: %d/%d live cells landed (plus %d retagged, %d empty)",
