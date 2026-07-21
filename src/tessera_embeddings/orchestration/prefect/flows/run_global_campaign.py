@@ -253,14 +253,15 @@ async def run_global_campaign(
             provisioning its own short-lived Ray cluster.
             ``"chained-clusters"`` dispatches up to ``max_parallel_zones``
             ``fill-zones-sequential`` runs per year, each owning ONE
-            long-lived Ray cluster that drains a size-balanced shard of the
-            year's zones one at a time — a cluster takes up its next zone
-            without teardown or actor churn, amortizing ``ray up`` +
-            per-worker bringup + model-load cold starts across its whole
-            shard. Ingest look-ahead and trailing assembly keep each fleet
-            busy at the seams (see the flow's module docstring);
-            ``max_parallel_zones=1`` degenerates to a single cluster for the
-            whole year.
+            long-lived Ray cluster whose actors stream through a
+            size-balanced shard of the year's zones — strictly ordered, the
+            next zone's tiles interleaving only at queue exhaustion, so zone
+            tails never idle the fleet and there is no per-zone teardown,
+            actor churn, or model reload. Amortizes ``ray up`` + per-worker
+            bringup + model-load cold starts across the whole shard; ingest
+            look-ahead and trailing assembly cover the remaining seams (see
+            the runner's module docstring). ``max_parallel_zones=1``
+            degenerates to a single cluster for the whole year.
         chained_fill_deployment: ``flow-name/deployment-name`` of the chained
             fill deployment (``fill_strategy="chained-clusters"`` only).
         commit_limit_name: Prefect global concurrency limit bounding fleet-wide

@@ -149,3 +149,14 @@ def test_prepare_fingerprints_after_resolving_orbit(wired):
 def test_duplicate_and_lowercase_zones_are_canonicalized(wired):
     _run(zones=["33n", "33N"])
     assert [c.zone for c in wired["seq_kwargs"]["cells"]] == ["33N"]
+
+
+def test_stream_contract_wired(wired):
+    """The runner receives the stream contract: plan/session/infer_single +
+    the session orbit the feeder gates zone deferral on.
+    """
+    _run(s1_orbit="both")
+    kw = wired["seq_kwargs"]
+    assert kw["session_s1_orbit"] == "both"
+    assert callable(kw["plan"]) and callable(kw["session"]) and callable(kw["infer_single"])
+    assert "infer" not in kw and "max_consecutive_failures" not in kw

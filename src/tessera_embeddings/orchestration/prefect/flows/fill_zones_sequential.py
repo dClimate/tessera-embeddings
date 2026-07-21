@@ -5,14 +5,17 @@ The parallel campaign path (:mod:`.run_global_campaign` dispatching
 each one re-paying ``ray up`` (~5-10 min wall), per-worker EC2 bringup
 (minutes of billed GPU idle each), the per-worker model-load cold start, and
 a fresh roll of the EC2 capacity dice. This flow amortizes all of that across
-a whole year's zones: ONE cluster, zones filled **strictly sequentially**.
-How the shared fleet is kept busy at the seams (ingest look-ahead, trailing
-assembly, fleet retention) is the sequential runner's story — see
+a whole year's zones: ONE cluster, ONE set of actors, zones streamed
+**near-sequentially** — strictly ordered, with the next zone's tiles
+interleaving only once the current zone's queue is exhausted, so zone tails
+never idle the fleet and actors are never re-created between zones. How the
+stream works (interleaving, ingest look-ahead, trailing assembly) is the
+chained runner's story — see
 :mod:`tessera_embeddings.orchestration.runners.sequential_fill`; this flow
 supplies the Prefect-facing pieces (deployment-backed ingest, fingerprinted
-run_ids, per-cell config) and the cluster itself, with its autoscaler
-``idle_timeout_minutes`` raised so the short inter-zone seam never sheds
-workers.
+run_ids, per-cell config, the shared session itself) and the cluster, with
+its autoscaler ``idle_timeout_minutes`` raised so ingest-starved gaps in the
+stream never shed workers.
 
 Cheap cells never touch the cluster: already-complete cells are retagged and
 all-ocean cells are marked complete-empty *before* Ray is provisioned — and,
@@ -24,6 +27,7 @@ requests) so the autoscaled fleet only ever shrinks across the run.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from functools import partial
@@ -39,6 +43,8 @@ from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
+from tessera_embeddings.inference.runner import run_inference
+from tessera_embeddings.inference.scheduling import WorkItem
 from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     activate,
     deactivate,
@@ -59,9 +65,11 @@ from tessera_embeddings.orchestration.runners.sequential_fill import (
     fill_zones_sequential,
 )
 from tessera_embeddings.orchestration.runners.zone_fill import (
+    ZonePlan,
     assemble_zone_year,
     fill_zone_year,
     infer_zone_year,
+    plan_zone_inference,
     zone_live_tile_count,
     zone_year_complete,
     zone_year_on_axis,
@@ -154,7 +162,6 @@ def fill_zones_sequential_flow(
     allow_model_mismatch: bool = False,
     s3_concurrency: int | None = None,
     idle_timeout_minutes: int = 10,
-    max_consecutive_failures: int = 3,
     ingest: bool = True,
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
     look_ahead: int = 2,
@@ -198,7 +205,6 @@ def fill_zones_sequential_flow(
         idle_timeout_minutes: Autoscaler idle-down override for the shared
             cluster (template default 2 min suits per-cell fills; the
             inter-zone seam here needs more slack).
-        max_consecutive_failures: The runner's circuit breaker.
         ingest: Produce each cell's mosaics via the ingest deployment, look-ahead
             pipelined with inference (default). False = mosaics exist upstream.
         ingest_deployment: ``flow-name/deployment-name`` of the ingest deployment.
@@ -216,6 +222,7 @@ def fill_zones_sequential_flow(
         runner's outcome summary, and elapsed seconds.
     """
     log = get_run_logger()
+    t0_flow = time.monotonic()
 
     # Lazily import the AWS providers so the flow file imports on machines
     # without ray/boto installed (arch tests, local inspection).
@@ -389,14 +396,60 @@ def fill_zones_sequential_flow(
 
         s3_concurrency = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // 2)
 
-    # on_actor_retire fires only from idle retirement, which stays gated off
-    # until the final cell — so this terminator is inert mid-run and only
-    # drains the fleet early during the last cell's tail. A dead actor's
-    # abandoned instance is reclaimed by the autoscaler idle timeout instead
-    # (idle_timeout_minutes, below).
+    # on_actor_retire fires only from idle retirement, which the scheduler
+    # suppresses while the zone stream is unexhausted — so this terminator is
+    # inert mid-stream and only drains the fleet early during the true shard
+    # tail. A dead actor's abandoned instance is reclaimed by the autoscaler
+    # idle timeout instead (idle_timeout_minutes, below).
     terminator = make_instance_terminator(log=log)
 
-    def _infer(cell: SequentialCell, prep: PreparedCell, final: bool) -> ZoneFillHandoff:
+    def _plan(cell: SequentialCell, prep: PreparedCell) -> ZonePlan:
+        return plan_zone_inference(
+            store_path=store_path,
+            zone=cell.zone,
+            year=cell.year,
+            land_mask_path=land_mask_path,
+            mosaic_base=prep.mosaic_base,
+            config=prep.config,
+            log=log,
+            run_id=prep.run_id,
+            gate=gate,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+        )
+
+    # The shared stream session: ONE set of actors for every same-orbit zone,
+    # fed via the runner's more_work source. Its config carries the session
+    # orbit; zones resolving a different orbit are deferred by the runner to
+    # _infer_single below. The placeholder path args are never used — the
+    # initial chunk list is empty and every streamed item carries its own
+    # ZoneContext.
+    session_config = _config_for(s1_orbit)
+
+    def _session(
+        more_work: Callable[[], list[WorkItem] | None],
+        on_item_done: Callable[[WorkItem, dict[str, Any]], None],
+    ) -> list[dict[str, Any]]:
+        return run_inference(
+            num_actors,
+            session_config,
+            [],
+            "chained-session",
+            "chained-session",
+            "chained-session",
+            t0_flow,
+            log,
+            on_actor_retire=terminator,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+            retire_idle_actors=True,  # the scheduler holds off until the source is exhausted
+            more_work=more_work,
+            on_item_done=on_item_done,
+        )
+
+    def _infer_single(cell: SequentialCell, prep: PreparedCell, final: bool) -> ZoneFillHandoff:
+        # Orbit-mismatch fallback: a per-cell session with the cell's own
+        # config, after the shared stream ends.
         return infer_zone_year(
             store_path=store_path,
             zone=cell.zone,
@@ -442,12 +495,14 @@ def fill_zones_sequential_flow(
             seq = fill_zones_sequential(
                 cells=live,
                 prepare=_prepare,
-                infer=_infer,
+                plan=_plan,
+                session=_session,
                 assemble=_assemble,
+                infer_single=_infer_single,
+                session_s1_orbit=s1_orbit,
                 log=log,
                 inputs=inputs,
                 look_ahead=look_ahead,
-                max_consecutive_failures=max_consecutive_failures,
             )
     finally:
         if inputs is not None:

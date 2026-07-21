@@ -44,12 +44,16 @@ loop), under one of two strategies:
   simultaneous Ray clusters). Best wall-clock; each cell pays its own cluster.
 - **`fill_strategy="chained-clusters"`**: up to `max_parallel_zones`
   `fill-zones-sequential` runs per year, each owning ONE long-lived Ray
-  cluster that drains a size-balanced shard of the year's zones strictly one
-  at a time — a cluster takes up its next zone without teardown or actor
-  churn, amortizing `ray up` (~5-10 min), per-worker EC2 bringup (minutes of
-  billed GPU idle each), the per-worker model-load cold start, and the EC2
-  capacity roll across its whole shard instead of per zone
-  (`max_parallel_zones=1` = a single cluster for the whole year). The shared
+  cluster whose actors are created once and **stream** through a
+  size-balanced shard of the year's zones — strictly ordered, with the next
+  zone's tiles interleaving only once the current zone's queue is exhausted,
+  so zone tails never idle the fleet and there is no per-zone teardown, actor
+  churn, or model reload. Amortizes `ray up` (~5-10 min), per-worker EC2
+  bringup (minutes of billed GPU idle each), the per-worker model-load cold
+  start, and the EC2 capacity roll across the whole shard instead of per zone
+  (`max_parallel_zones=1` = a single cluster for the whole year). Zones whose
+  mosaics resolve a different S1 orbit than the session run per-cell after
+  the stream. The shared
   fleet is kept busy at the seams by **ingest look-ahead** (the next cells'
   mosaics ingest while the current cell infers, bounded so in-flight mosaics
   stay within ADR-011's storage budget) and **trailing assembly** (a cell's

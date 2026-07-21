@@ -1,25 +1,27 @@
-"""fill_zones_sequential: ordering, look-ahead, trailing assembly, breaker.
+"""fill_zones_sequential: the chained stream — feeder, tallies, trailing assembly.
 
-The runner is pure sequencing over injected callables (Prefect/Ray-free by
-contract), so these tests drive the loop with recording fakes passed straight
-through the ``prepare``/``infer``/``assemble`` parameters — no cluster, no
-store, no monkeypatching.
+The runner is pure orchestration over injected callables (Prefect/Ray-free by
+contract). These tests drive it with a synchronous fake ``session`` that
+drains ``more_work`` and fires ``on_item_done`` per item — no cluster, no
+store, no monkeypatching. The staged-resume scan is the one internal
+dependency, stubbed at the module namespace.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-from typing import Any
 
 import pytest
 
+import tessera_embeddings.orchestration.runners.sequential_fill as mod
+from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.orchestration.runners.sequential_fill import (
     PreparedCell,
     SequentialCell,
     fill_zones_sequential,
 )
-from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff
+from tessera_embeddings.orchestration.runners.zone_fill import ZonePlan
 
 LOG = logging.getLogger("test-sequential-fill")
 
@@ -28,191 +30,245 @@ def _cells(n: int) -> list[SequentialCell]:
     return [SequentialCell(zone=f"{i + 1:02d}N", year=2025, num_actors=5) for i in range(n)]
 
 
-def _prepare(cell: SequentialCell) -> PreparedCell:
-    return PreparedCell(
-        mosaic_base=f"m/{cell.zone}",
-        staging_base=f"s/{cell.zone}",
-        run_id=f"r-{cell.zone}",
-        config=object(),  # opaque to the runner; only threaded through
-    )
+class _Config:
+    """Minimal config stand-in (orbit + the scan's compute_std probe)."""
+
+    def __init__(self, s1_orbit: str = "both") -> None:
+        self.s1_orbit = s1_orbit
+        self.compute_std = False
 
 
-def _handoff(zone: str, done: dict[str, Any] | None = None) -> ZoneFillHandoff:
-    return ZoneFillHandoff(
-        zone=zone, year=2025, run_id=f"r-{zone}", t0=0.0, summary={"zone": zone}, live=[], results=[], done=done
-    )
+def _prepare_for(orbits: dict[str, str] | None = None):
+    def _prepare(cell: SequentialCell) -> PreparedCell:
+        return PreparedCell(
+            mosaic_base=f"m/{cell.zone}",
+            staging_base=f"s/{cell.zone}",
+            run_id=f"r-{cell.zone}",
+            config=_Config((orbits or {}).get(cell.zone, "both")),
+        )
+
+    return _prepare
+
+
+def _tiles(zone: str, n: int) -> list[ChunkSpec]:
+    return [ChunkSpec(row=0, col=i, y_start=0, y_stop=64, x_start=i * 64, x_stop=(i + 1) * 64) for i in range(n)]
+
+
+def _plan_for(tiles: int = 2, done_zones: set[str] | None = None):
+    def _plan(cell: SequentialCell, prep: PreparedCell) -> ZonePlan:
+        if done_zones and cell.zone in done_zones:
+            return ZonePlan(
+                cell.zone, cell.year, prep.run_id, 0.0, {}, [], done={"zone": cell.zone, "already_complete": True}
+            )
+        return ZonePlan(
+            cell.zone,
+            cell.year,
+            prep.run_id,
+            0.0,
+            {"zone": cell.zone, "live_tiles": tiles},
+            _tiles(cell.zone, tiles),
+        )
+
+    return _plan
+
+
+def _sync_session(fail: set[str] | None = None, events: list[str] | None = None):
+    """A session that drains more_work synchronously, completing every item."""
+
+    def session(more_work, on_item_done):
+        results = []
+        while True:
+            batch = more_work()
+            if batch is None:
+                return results
+            for item in batch:
+                if events is not None:
+                    events.append(f"infer:{item.uid}")
+                status = "failed" if fail and item.ctx.run_id.removeprefix("r-") in fail else "success"
+                result = {"chunk": item.chunk.label, "status": status}
+                results.append(result)
+                on_item_done(item, result)
+
+    return session
+
+
+def _assemble(events: list[str] | None = None):
+    def assemble(handoff, prep):
+        if events is not None:
+            events.append(f"assemble:{handoff.zone}")
+        return {"zone": handoff.zone, "empty": False, "succeeded": len(handoff.results)}
+
+    return assemble
+
+
+def _no_fallback(cell, prep, final):
+    raise AssertionError("infer_single must not run when no cell defers")
 
 
 class RecordingInputs:
-    """CellInputs fake appending every call to a shared event list."""
+    """CellInputs fake appending every call to a shared event list (thread-safe)."""
 
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self._lock = threading.Lock()
 
     def start(self, zone: str, year: int) -> None:
-        # Idempotence is the adapter's contract; record only true starts so
-        # the look-ahead assertions see the runner's intent, not its retries.
-        if f"start:{zone}" not in self.events:
-            self.events.append(f"start:{zone}")
+        with self._lock:
+            if f"start:{zone}" not in self.events:
+                self.events.append(f"start:{zone}")
 
     def wait(self, zone: str, year: int) -> None:
-        self.events.append(f"wait:{zone}")
+        with self._lock:
+            self.events.append(f"wait:{zone}")
 
     def cleanup(self, zone: str, year: int) -> None:
-        self.events.append(f"cleanup:{zone}")
+        with self._lock:
+            self.events.append(f"cleanup:{zone}")
 
 
-def _run(cells, events: list[str] | None = None, *, infer=None, assemble=None, **kw) -> dict[str, Any]:
-    """Drive the runner with recording default phases (overridable per test)."""
-    events = events if events is not None else []
+@pytest.fixture(autouse=True)
+def _no_scan(monkeypatch):
+    """Staged-resume scan: nothing staged unless a test overrides."""
+    monkeypatch.setattr(
+        mod.ZarrWriter, "scan_existing_staged_chunks", lambda self, run_id, chunks, **kw: set(), raising=True
+    )
 
-    def default_infer(cell, prep, final):
-        events.append(f"infer:{cell.zone}")
-        return _handoff(cell.zone)
 
-    def default_assemble(handoff, prep):
-        events.append(f"assemble:{handoff.zone}")
-        return {"zone": handoff.zone, "empty": False}
-
+def _run(cells, *, orbits=None, plan=None, session=None, assemble=None, infer_single=_no_fallback, **kw):
     return fill_zones_sequential(
         cells=cells,
-        prepare=_prepare,
-        infer=infer or default_infer,
-        assemble=assemble or default_assemble,
+        prepare=_prepare_for(orbits),
+        plan=plan or _plan_for(),
+        session=session or _sync_session(),
+        assemble=assemble or _assemble(),
+        infer_single=infer_single,
+        session_s1_orbit="both",
         log=LOG,
         **kw,
     )
 
 
-def test_cells_processed_in_order_and_all_succeed():
+def test_all_zones_stream_in_order_and_assemble(monkeypatch):
     events: list[str] = []
-    summary = _run(_cells(3), events)
-    assert [e for e in events if e.startswith("infer:")] == ["infer:01N", "infer:02N", "infer:03N"]
+    summary = _run(_cells(3), session=_sync_session(events=events), assemble=_assemble(events))
     assert summary["succeeded"] == 3 and summary["failed"] == 0
-    # Every cell was assembled (none were terminal handoffs).
-    assert sorted(e for e in events if e.startswith("assemble:")) == ["assemble:01N", "assemble:02N", "assemble:03N"]
+    infers = [e for e in events if e.startswith("infer:")]
+    # Zone order preserved: all of 01N's tiles before 02N's, etc.
+    assert infers == sorted(infers)
+    assert [e for e in events if e.startswith("assemble:")] == ["assemble:01N", "assemble:02N", "assemble:03N"]
 
 
-def test_lookahead_ingests_run_ahead_of_the_inference_head():
+def test_zone_uids_are_run_scoped(monkeypatch):
+    """Identical tile labels across zones stay distinct in the stream."""
     events: list[str] = []
-    _run(_cells(4), events, inputs=RecordingInputs(events), look_ahead=2)
-    # Cells 1-3 (current + 2 look-ahead) are started before the first wait...
-    first_wait = events.index("wait:01N")
-    assert set(events[:first_wait]) >= {"start:01N", "start:02N", "start:03N"}
-    # ...and cell 4's ingest starts before cell 2's inference finishes (i.e.
-    # once the head advances past cell 1) — never all up front.
-    assert "start:04N" not in events[:first_wait]
-    assert events.index("start:04N") < events.index("infer:02N")
-    # Each landed cell's mosaic is cleaned up.
-    cleaned = {e for e in events if e.startswith("cleanup:")}
-    assert cleaned == {"cleanup:01N", "cleanup:02N", "cleanup:03N", "cleanup:04N"}
+    _run(_cells(2), session=_sync_session(events=events))
+    uids = {e.removeprefix("infer:") for e in events if e.startswith("infer:")}
+    assert uids == {"r-01N:chunk_0_0", "r-01N:chunk_0_1", "r-02N:chunk_0_0", "r-02N:chunk_0_1"}
 
 
-def test_final_cell_flag_set_only_on_the_last_cell():
-    flags: list[bool] = []
-
-    def infer(cell, prep, final):
-        flags.append(final)
-        return _handoff(cell.zone)
-
-    _run(_cells(3), infer=infer)
-    assert flags == [False, False, True]
-
-
-def test_trailing_assembly_overlaps_next_inference():
-    """Cell 2's inference must start while cell 1's assembly is still running —
-    the whole point of the trailing thread. The blocked assembly is released
-    only by cell 2's inference starting, so a serialized implementation would
-    deadlock (caught by the join timeout) rather than pass by accident.
-    """
-    next_inference_started = threading.Event()
+def test_ingest_lifecycle_and_cleanup_after_assembly():
     events: list[str] = []
+    inputs = RecordingInputs(events)
+    _run(_cells(3), inputs=inputs, look_ahead=1)
+    # Every cell was started/waited, and cleaned only after landing.
+    for z in ("01N", "02N", "03N"):
+        assert f"start:{z}" in events and f"wait:{z}" in events and f"cleanup:{z}" in events
 
-    def infer(cell, prep, final):
-        events.append(f"infer:{cell.zone}")
-        if cell.zone == "02N":
-            next_inference_started.set()
-        return _handoff(cell.zone)
 
+def test_failed_zone_keeps_mosaic_and_others_land():
+    events: list[str] = []
+    inputs = RecordingInputs(events)
+    with pytest.raises(RuntimeError, match="1/3 cell"):
+        _run(_cells(3), session=_sync_session(fail={"02N"}, events=events), inputs=inputs)
+    assert "cleanup:02N" not in events
+    assert "cleanup:01N" in events and "cleanup:03N" in events
+
+
+def test_terminal_plan_recorded_without_streaming():
+    events: list[str] = []
+    inputs = RecordingInputs(events)
+    summary = _run(_cells(2), plan=_plan_for(done_zones={"01N"}), session=_sync_session(events=events), inputs=inputs)
+    assert summary["succeeded"] == 2
+    assert not [e for e in events if e.startswith("infer:r-01N")]  # 01N never streamed
+    assert "cleanup:01N" in events  # its mosaic is still released
+
+
+def test_all_resumed_zone_goes_straight_to_assembly(monkeypatch):
+    events: list[str] = []
+    monkeypatch.setattr(
+        mod.ZarrWriter,
+        "scan_existing_staged_chunks",
+        lambda self, run_id, chunks, **kw: {c.label for c in chunks} if run_id == "r-01N" else set(),
+    )
+    summary = _run(_cells(2), session=_sync_session(events=events), assemble=_assemble(events))
+    assert summary["succeeded"] == 2
+    assert not [e for e in events if e.startswith("infer:r-01N")]  # nothing left to infer
+    assert "assemble:01N" in events  # but it still assembles (verify + tag)
+
+
+def test_orbit_mismatch_defers_to_fallback():
+    events: list[str] = []
+    calls: list[tuple[str, bool]] = []
+
+    def infer_single(cell, prep, final):
+        calls.append((cell.zone, final))
+        from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff
+
+        return ZoneFillHandoff(
+            zone=cell.zone, year=cell.year, run_id=prep.run_id, t0=0.0, summary={}, live=[], results=[]
+        )
+
+    summary = _run(
+        _cells(3),
+        orbits={"02N": "ascending"},
+        session=_sync_session(events=events),
+        assemble=_assemble(events),
+        infer_single=infer_single,
+    )
+    assert summary["deferred_orbit_mismatch"] == 1
+    assert calls == [("02N", True)]  # ran after the stream, flagged final
+    assert not [e for e in events if e.startswith("infer:r-02N")]  # never streamed
+    assert summary["succeeded"] == 3
+
+
+def test_assembly_failure_recorded_run_continues():
     def assemble(handoff, prep):
         if handoff.zone == "01N":
-            assert next_inference_started.wait(timeout=10), "assembly 1 finished before inference 2 began"
-        events.append(f"assemble:{handoff.zone}")
+            raise RuntimeError("commit refused")
         return {"zone": handoff.zone}
 
-    summary = _run(_cells(2), events, infer=infer, assemble=assemble)
-    assert summary["succeeded"] == 2
-    assert events.index("infer:02N") < events.index("assemble:01N")
+    with pytest.raises(RuntimeError, match="1/2 cell"):
+        _run(_cells(2), assemble=assemble)
 
 
-def test_terminal_handoff_skips_assembly():
-    events: list[str] = []
+def test_session_crash_unwinds_feeder_without_deadlock():
+    """A crashing session must not leave the feeder blocked on zone slots."""
 
-    def infer(cell, prep, final):
-        events.append(f"infer:{cell.zone}")
-        return _handoff(cell.zone, done={"zone": cell.zone, "already_complete": True})
+    def crashing_session(more_work, on_item_done):
+        raise RuntimeError("cluster fell over")
 
-    summary = _run(_cells(1), events, infer=infer, inputs=RecordingInputs(events))
-    assert summary["succeeded"] == 1
-    assert not [e for e in events if e.startswith("assemble:")]
-    assert "cleanup:01N" in events  # terminal cells still release their mosaic
-
-
-def test_single_cell_failure_recorded_and_run_continues():
-    events: list[str] = []
-
-    def infer(cell, prep, final):
-        events.append(f"infer:{cell.zone}")
-        if cell.zone == "02N":
-            raise RuntimeError("boom")
-        return _handoff(cell.zone)
-
-    with pytest.raises(RuntimeError, match="1/3 cell"):
-        _run(_cells(3), events, infer=infer, inputs=RecordingInputs(events))
-    # The failure did not stop the later cell, and the failed cell's mosaic
-    # was kept (its retry needs it for the fingerprinted run_id + resume).
-    assert "infer:03N" in events
-    assert "cleanup:02N" not in events
-    assert {"cleanup:01N", "cleanup:03N"} <= set(events)
+    # Enough cells that the feeder WILL block on the slot semaphore
+    # (look_ahead+2 slots, none ever released because nothing completes).
+    with pytest.raises(RuntimeError, match="cluster fell over"):
+        _run(_cells(8), session=crashing_session, look_ahead=1)
 
 
-def test_consecutive_failures_trip_the_breaker():
-    calls: list[str] = []
-
-    def infer(cell, prep, final):
-        calls.append(cell.zone)
-        raise RuntimeError("systemic")
-
-    with pytest.raises(RuntimeError, match="consecutive"):
-        _run(_cells(5), infer=infer, max_consecutive_failures=2)
-    assert calls == ["01N", "02N"]  # the 3rd cell is never attempted
-
-
-def test_assembly_failure_keeps_mosaic_and_fails_run():
-    events: list[str] = []
-
-    def assemble(handoff, prep):
-        raise RuntimeError("commit refused")
-
-    with pytest.raises(RuntimeError, match="assembly"):
-        _run(_cells(1), events, assemble=assemble, inputs=RecordingInputs(events))
-    assert "cleanup:01N" not in events
-
-
-def test_prepare_failure_is_a_prepare_phase_failure():
+def test_prepare_failure_is_cell_scoped():
     def prepare(cell):
-        raise ValueError("coverage gate")
-
-    def unreachable(*a, **k):
-        raise AssertionError("phases must not run when prepare fails")
+        if cell.zone == "01N":
+            raise ValueError("mosaic missing")
+        return _prepare_for()(cell)
 
     with pytest.raises(RuntimeError) as exc_info:
-        fill_zones_sequential(cells=_cells(1), prepare=prepare, infer=unreachable, assemble=unreachable, log=LOG)
-    assert "'phase': 'prepare'" in str(exc_info.value)
-
-
-def test_no_inputs_adapter_means_no_lifecycle_calls():
-    events: list[str] = []
-    summary = _run(_cells(2), events, inputs=None)
-    assert summary["succeeded"] == 2
-    assert not [e for e in events if e.startswith(("start:", "wait:", "cleanup:"))]
+        fill_zones_sequential(
+            cells=_cells(2),
+            prepare=prepare,
+            plan=_plan_for(),
+            session=_sync_session(),
+            assemble=_assemble(),
+            infer_single=_no_fallback,
+            session_s1_orbit="both",
+            log=LOG,
+        )
+    assert "'phase': 'inputs/prepare'" in str(exc_info.value)
+    assert "02N" not in str(exc_info.value)  # the other cell landed

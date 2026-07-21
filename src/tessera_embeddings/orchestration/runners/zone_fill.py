@@ -273,40 +273,50 @@ def fill_zone_year(
     )
 
 
-def infer_zone_year(
+@dataclass
+class ZonePlan:
+    """Everything a (zone, year) fill knows before any GPU work starts.
+
+    Produced by :func:`plan_zone_inference`; consumed either by
+    :func:`infer_zone_year` (which runs a per-cell ``run_inference`` over
+    ``live``) or by the chained multi-zone runner (which enqueues ``live``
+    into a shared scheduler session and reassembles a
+    :class:`ZoneFillHandoff` from the streamed results).
+    """
+
+    zone: str
+    year: int
+    run_id: str
+    t0: float
+    summary: dict[str, Any]
+    live: list[ChunkSpec]
+    # Terminal result (already-complete cell, or all-ocean empty fill —
+    # committed and tagged during planning). When set, there is nothing to
+    # infer or assemble.
+    done: dict[str, Any] | None = None
+
+
+def plan_zone_inference(
     *,
     store_path: str,
     zone: str,
     year: int,
     land_mask_path: str,
     mosaic_base: str,
-    staging_base: str,
     config: InferenceConfig,
-    num_actors: int,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     run_id: str | None = None,
     gate: CommitGate | None = None,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
-    on_actor_retire: Callable[[str], None] | None = None,
-    retire_idle_actors: bool = True,
-) -> ZoneFillHandoff:
-    """Inference phase of a (zone, year) fill: validate → mask → run_inference.
+) -> ZonePlan:
+    """Validate a (zone, year) cell and enumerate its live tiles — no GPU work.
 
-    Everything :func:`fill_zone_year` does up to (and including) Ray inference:
-    grid/axis/window validation, the coverage-mask read, the mosaic grid
-    asserts, and ``run_inference`` over the live tiles. Terminal cells that
-    need no assembly — already complete (retag only) or all-ocean (marked
-    complete empty, committed and tagged here) — come back with
-    ``ZoneFillHandoff.done`` set.
-
-    ``retire_idle_actors=False`` keeps idle actors alive through this cell's
-    tail — the multi-zone sequential runner passes it for every cell but its
-    last so the shared cluster's instances survive to serve the next zone
-    (see :func:`tessera_embeddings.inference.runner.run_inference`).
-
-    Raises:
-        RuntimeError: If any live tile fails inference.
+    Everything :func:`infer_zone_year` does before ``run_inference``:
+    seeded/axis/window validation, the coverage-mask read (with identity
+    checks), the live-tile enumeration, and the mosaic grid asserts. Terminal
+    cells — already complete (retagged here) or all-ocean (marked complete
+    empty, committed and tagged here) — come back with ``ZonePlan.done`` set.
     """
     t0 = time.monotonic()
     run_id = run_id or uuid.uuid4().hex[:12]
@@ -363,7 +373,7 @@ def infer_zone_year(
             "tag": tag,
             "elapsed_sec": time.monotonic() - t0,
         }
-        return ZoneFillHandoff(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], results=[], done=result)
+        return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], done=result)
 
     emb = cast(zarr.Array, node["embeddings"])
     _, ny, nx, _ = emb.shape
@@ -433,7 +443,7 @@ def infer_zone_year(
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
         result = {**summary, "empty": True, "snapshot_id": snapshot, "tag": tag, "elapsed_sec": time.monotonic() - t0}
         log.info("Zone %s year %d has no land under the mask — marked complete empty (%s)", zone, year, result["tag"])
-        return ZoneFillHandoff(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], results=[], done=result)
+        return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary={}, live=[], done=result)
 
     # Live tiles will be inferred, so EVERY active mosaic store must sit on the
     # zone grid EXACTLY (campaign contract) — not just dimensionally. Every zone
@@ -492,25 +502,138 @@ def infer_zone_year(
             read_store_spatial_coords(sar_path, get_credentials=get_credentials, s3_region=s3_region),
         )
 
+    return ZonePlan(zone=zone, year=year, run_id=run_id, t0=t0, summary=summary, live=live)
+
+
+def infer_zone_year(
+    *,
+    store_path: str,
+    zone: str,
+    year: int,
+    land_mask_path: str,
+    mosaic_base: str,
+    staging_base: str,
+    config: InferenceConfig,
+    num_actors: int,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    run_id: str | None = None,
+    gate: CommitGate | None = None,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+    on_actor_retire: Callable[[str], None] | None = None,
+    retire_idle_actors: bool = True,
+) -> ZoneFillHandoff:
+    """Inference phase of a (zone, year) fill: plan → run_inference.
+
+    :func:`plan_zone_inference` composed with a per-cell ``run_inference``
+    over the plan's live tiles. Terminal cells (already complete / all-ocean)
+    come back with ``ZoneFillHandoff.done`` set.
+
+    ``retire_idle_actors=False`` keeps idle actors alive through this cell's
+    tail — a caller running cells as separate sessions passes it for every
+    cell but its last so the shared cluster's instances survive to serve the
+    next zone (the chained runner instead streams every zone through ONE
+    session; see :mod:`.sequential_fill`).
+
+    Raises:
+        RuntimeError: If any live tile fails inference.
+    """
+    plan = plan_zone_inference(
+        store_path=store_path,
+        zone=zone,
+        year=year,
+        land_mask_path=land_mask_path,
+        mosaic_base=mosaic_base,
+        config=config,
+        log=log,
+        run_id=run_id,
+        gate=gate,
+        get_credentials=get_credentials,
+        s3_region=s3_region,
+    )
+    return (
+        complete_zone_inference(plan, results=None)
+        if plan.done is not None
+        else _infer_planned(
+            plan,
+            mosaic_base=mosaic_base,
+            staging_base=staging_base,
+            config=config,
+            num_actors=num_actors,
+            log=log,
+            on_actor_retire=on_actor_retire,
+            get_credentials=get_credentials,
+            s3_region=s3_region,
+            retire_idle_actors=retire_idle_actors,
+        )
+    )
+
+
+def _infer_planned(
+    plan: ZonePlan,
+    *,
+    mosaic_base: str,
+    staging_base: str,
+    config: InferenceConfig,
+    num_actors: int,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    on_actor_retire: Callable[[str], None] | None,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None,
+    retire_idle_actors: bool,
+) -> ZoneFillHandoff:
+    """Run a per-cell inference session over a plan's live tiles."""
     results = run_inference(
         num_actors,
         config,
-        live,
+        plan.live,
         mosaic_base,
         staging_base,
-        run_id,
-        t0,
+        plan.run_id,
+        plan.t0,
         log,
         on_actor_retire=on_actor_retire,
         get_credentials=get_credentials,
         s3_region=s3_region,
         retire_idle_actors=retire_idle_actors,
     )
+    return complete_zone_inference(plan, results=results)
+
+
+def complete_zone_inference(plan: ZonePlan, *, results: list[dict] | None) -> ZoneFillHandoff:
+    """Fold per-tile results back into the handoff the assembly phase consumes.
+
+    Shared by the per-cell path and the chained runner (which collects a
+    zone's results from the streamed session instead of a dedicated
+    ``run_inference`` call). Raises if any tile failed — the zone must not
+    assemble partial output; its cell stays pending in the campaign ledger.
+    """
+    if plan.done is not None:
+        return ZoneFillHandoff(
+            zone=plan.zone,
+            year=plan.year,
+            run_id=plan.run_id,
+            t0=plan.t0,
+            summary={},
+            live=[],
+            results=[],
+            done=plan.done,
+        )
+    assert results is not None
     failed = [r for r in results if r["status"] == "failed"]
     if failed:
-        raise RuntimeError(f"{len(failed)} tiles failed during inference for zone {zone} year {year} (run {run_id})")
-
-    return ZoneFillHandoff(zone=zone, year=year, run_id=run_id, t0=t0, summary=summary, live=live, results=results)
+        raise RuntimeError(
+            f"{len(failed)} tiles failed during inference for zone {plan.zone} year {plan.year} (run {plan.run_id})"
+        )
+    return ZoneFillHandoff(
+        zone=plan.zone,
+        year=plan.year,
+        run_id=plan.run_id,
+        t0=plan.t0,
+        summary=plan.summary,
+        live=plan.live,
+        results=results,
+    )
 
 
 def assemble_zone_year(

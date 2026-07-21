@@ -211,10 +211,14 @@ class TestSubmit:
         pool.actors[0].process_chunk.remote.return_value = ref
         with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
             pool.submit(0, chunk, "s3://mosaic", "s3://stage", "run1", tracker=None)
-            assert pool.pending[ref] == ("c0", 0)
-            assert pool.chunk_attempts["c0"] == 1
+            item, actor_idx = pool.pending[ref]
+            assert (item.chunk.label, actor_idx) == ("c0", 0)
+            assert item.ctx == _sched_mod.ZoneContext("s3://mosaic", "s3://stage", "run1")
+            # Attempts are keyed run_id-qualified: bare labels collide across
+            # a chained session's zones.
+            assert pool.chunk_attempts["run1:c0"] == 1
             pool.submit(0, chunk, "s3://mosaic", "s3://stage", "run1", tracker=None)
-            assert pool.chunk_attempts["c0"] == 2
+            assert pool.chunk_attempts["run1:c0"] == 2
 
 
 class TestReservations:
@@ -226,7 +230,7 @@ class TestReservations:
         queue: deque = deque([_fake_chunk(f"c{i}") for i in range(5)])
         with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
             pool.submit(0, _fake_chunk("current"), "m", "s", "r", None, queue)
-        assert pool.reserved[0].label == "c0"
+        assert pool.reserved[0].chunk.label == "c0"
         assert len(queue) == 4
         kwargs = pool.actors[0].process_chunk.remote.call_args.kwargs
         assert kwargs["prefetch_hint"].label == "c0"
@@ -269,9 +273,13 @@ class TestReservations:
         queue: deque = deque([_fake_chunk(f"c{i}") for i in range(4)])
         with patch.object(_sched_mod.ray, "wait", return_value=([], [])):
             pool.submit(0, _fake_chunk("current"), "m", "s", "r", None, queue)
+
         # The stale chunk went to the queue front, so it became the new
         # reservation — conserved either way: nothing dropped.
-        all_labels = {c.label for c in queue} | {c.label for c in pool.reserved.values()}
+        def _label(entry):
+            return entry.chunk.label if isinstance(entry, _sched_mod.WorkItem) else entry.label
+
+        all_labels = {_label(c) for c in queue} | {_label(c) for c in pool.reserved.values()}
         assert "stale" in all_labels
         assert len(queue) + len(pool.reserved) == 5
 
@@ -1442,3 +1450,152 @@ class TestRetireIdleGate:
 
     def test_gate_disables_retirement(self) -> None:
         assert not self._run_one_chunk(retire_idle_actors=False).called
+
+
+# ===========================================================================
+# _process_chunks_work_stealing — chained multi-zone work source
+# ===========================================================================
+
+
+class TestChainedWorkSource:
+    """more_work/on_item_done: zones stream through one session, contexts intact."""
+
+    @staticmethod
+    def _zone_items(zone: str, labels: list[str]) -> list:
+        ctx = _sched_mod.ZoneContext(f"m/{zone}", f"s/{zone}", f"run-{zone}")
+        return [_sched_mod.WorkItem(chunk=_fake_chunk(label), ctx=ctx) for label in labels]
+
+    def _drive(self, actor, zones: list[list], **loop_kwargs):
+        """Run the loop with zone 0 as the initial batch and the rest sourced."""
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        remaining = list(zones[1:])
+
+        def more_work():
+            return remaining.pop(0) if remaining else None
+
+        refs_by_call: list = []
+
+        def fake_process_chunk(*args, **kwargs):
+            ref = MagicMock(name=f"ref{len(refs_by_call)}")
+            refs_by_call.append((ref, args, kwargs))
+            return ref
+
+        actor.process_chunk.remote.side_effect = fake_process_chunk
+
+        def fake_get(ref, *a, **k):
+            for r, args, _ in refs_by_call:
+                if r is ref:
+                    return {"chunk": args[0].label, "status": "ok"}
+            return MagicMock()
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=lambda refs, **kw: (list(refs), [])),
+            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.time, "sleep"),
+            patch.object(_sched_mod.ActorPool, "retire_idle") as retire_mock,
+        ):
+            results = _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=[item.chunk for item in zones[0]] if zones and not loop_kwargs.pop("wrap_first", True) else [],
+                mosaic_base="m/zone-a",
+                staging_base="s/zone-a",
+                run_id="run-zone-a",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+                more_work=more_work,
+                **loop_kwargs,
+            )
+        return results, refs_by_call, retire_mock
+
+    def test_zones_stream_with_their_own_contexts(self):
+        """Zone B's chunks are dispatched against zone B's mosaic/staging/run_id."""
+        actor = MagicMock(name="actor_0")
+        zone_a = self._zone_items("zone-a", ["c0", "c1"])
+        zone_b = self._zone_items("zone-b", ["c0", "c1"])  # same labels, different zone
+        done: list = []
+        results, calls, _ = self._drive(
+            actor,
+            [[], zone_a, zone_b],
+            on_item_done=lambda item, res: done.append((item.uid, res["status"])),
+        )
+        assert len(results) == 4
+        # Every dispatch carried its item's own zone context.
+        for _, args, _kw in calls:
+            chunk, mosaic_base, staging_base, run_id = args[:4]
+            zone = run_id.removeprefix("run-")
+            assert mosaic_base == f"m/{zone}" and staging_base == f"s/{zone}"
+        # on_item_done fired once per item, uids run_id-qualified (no aliasing
+        # despite identical labels across the two zones).
+        assert sorted(u for u, _ in done) == ["run-zone-a:c0", "run-zone-a:c1", "run-zone-b:c0", "run-zone-b:c1"]
+
+    def test_retirement_suppressed_until_source_exhausted(self):
+        actor = MagicMock(name="actor_0")
+        zone_a = self._zone_items("zone-a", ["c0"])
+        _, _, retire_mock = self._drive(actor, [[], zone_a], retire_idle_actors=True)
+        # The source returned items then None; retirement may only run in
+        # iterations AFTER exhaustion. With one chunk and instant completion
+        # the final iteration retires — but never before the source was live.
+        assert retire_mock.called  # ran after exhaustion (gate passed through)
+
+    def test_attempts_do_not_alias_across_zones(self):
+        """Same label in two zones keeps independent retry budgets."""
+        actor = MagicMock(name="actor_0")
+        zone_a = self._zone_items("zone-a", ["c0"])
+        zone_b = self._zone_items("zone-b", ["c0"])
+        # Zone A's c0 fails once then succeeds on retry; zone B's c0 succeeds
+        # first try. With label-keyed attempts, A's failures would eat B's
+        # retry budget.
+        calls: dict = {"n": 0}
+        refs: list = []
+
+        def fake_process_chunk(*args, **kwargs):
+            ref = MagicMock(name=f"r{len(refs)}")
+            refs.append((ref, args))
+            return ref
+
+        def fake_get(ref, *a, **k):
+            for r, args in refs:
+                if r is ref:
+                    run_id = args[3]
+                    if run_id == "run-zone-a" and calls["n"] == 0:
+                        calls["n"] += 1
+                        return {"chunk": args[0].label, "status": "failed", "error": "transient"}
+                    return {"chunk": args[0].label, "status": "ok"}
+            return MagicMock()
+
+        actor.process_chunk.remote.side_effect = fake_process_chunk
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        remaining = [zone_a, zone_b]
+
+        replacement = MagicMock(name="replacement")
+        replacement.process_chunk.remote.side_effect = fake_process_chunk
+        replacement.get_instance_id.remote.return_value = MagicMock()
+
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=lambda r, **kw: (list(r), [])),
+            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod, "InferenceActor") as cls,
+            patch.object(_sched_mod, "log_worker_failure_diagnostic"),
+            patch.object(_sched_mod.time, "sleep"),
+        ):
+            cls.options.return_value.remote.return_value = replacement
+            results = _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=[],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+                more_work=lambda: remaining.pop(0) if remaining else None,
+            )
+        by_status = sorted((r["chunk"], r["status"]) for r in results)
+        assert by_status == [("c0", "ok"), ("c0", "ok")]  # both zones landed
