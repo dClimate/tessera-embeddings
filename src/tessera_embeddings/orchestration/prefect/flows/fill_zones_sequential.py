@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from prefect import flow, get_run_logger
@@ -47,7 +48,10 @@ from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
     _assert_seeded_model_matches,
     _PrefectCommitGate,
 )
-from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import _staging_run_id
+from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import (
+    _ingest_dispatch_params,
+    _staging_run_id,
+)
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.sequential_fill import (
     PreparedCell,
@@ -319,16 +323,14 @@ def fill_zones_sequential_flow(
         s3_region=s3_region,
     )
 
-    def _ingest_params(zone: str, cell_year: int) -> dict[str, Any]:
-        return {
-            "zone": zone,
-            "year": cell_year,
-            "paths": paths.model_dump(),
-            "mask_name": mask_name,
-            "s1_orbit": s1_orbit,
-            "ingest_settings": ingest_settings.model_dump(),
-            "allow_partial_window": allow_partial_window,
-        }
+    _ingest_params = partial(
+        _ingest_dispatch_params,
+        paths=paths,
+        mask_name=mask_name,
+        s1_orbit=s1_orbit,
+        ingest_settings=ingest_settings,
+        allow_partial_window=allow_partial_window,
+    )
 
     inputs = (
         _DeploymentCellInputs(
@@ -387,8 +389,11 @@ def fill_zones_sequential_flow(
 
         s3_concurrency = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // 2)
 
-    # Fires only on actor replacement (dead instance reclaim) until the final
-    # cell, whose tail retirement drains the fleet early.
+    # on_actor_retire fires only from idle retirement, which stays gated off
+    # until the final cell — so this terminator is inert mid-run and only
+    # drains the fleet early during the last cell's tail. A dead actor's
+    # abandoned instance is reclaimed by the autoscaler idle timeout instead
+    # (idle_timeout_minutes, below).
     terminator = make_instance_terminator(log=log)
 
     def _infer(cell: SequentialCell, prep: PreparedCell, final: bool) -> ZoneFillHandoff:
@@ -447,7 +452,10 @@ def fill_zones_sequential_flow(
     finally:
         if inputs is not None:
             inputs.shutdown()
-    deactivate()
+        # The context manager has already torn the cluster down (or the hook
+        # will, on cancellation) — clear the hook state even when the runner
+        # raises (its partial-failure RuntimeError is a NORMAL exit path).
+        deactivate()
 
     log.info(
         "Year %d sequential fill: %d/%d live cells landed (plus %d retagged, %d empty)",

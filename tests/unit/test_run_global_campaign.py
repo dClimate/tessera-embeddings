@@ -271,3 +271,22 @@ def test_sequential_single_shard_reads_no_tile_counts(wired, monkeypatch):
     monkeypatch.setattr(mod, "zone_live_tile_count", boom)
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
     assert len(wired["arun"]) == 1
+
+
+def test_partition_zero_weights_known_complete_cells(monkeypatch):
+    """Retag-only cells cost the child no GPU time, so they must not skew the
+    LPT balance — and their mask reads must be skipped entirely.
+    """
+    counts = {"01N": 100, "02N": 90, "03N": 80}
+
+    def count(mask, zone, **k):
+        if zone not in counts:
+            raise AssertionError(f"tile count read for known-complete zone {zone}")
+        return counts[zone]
+
+    monkeypatch.setattr(mod, "zone_live_tile_count", count)
+    shards = mod._partition_by_live_tiles(
+        ["01N", "02N", "03N", "04N"], 2, land_mask_path="mask", known_complete={"04N"}
+    )
+    # LPT over {100, 90, 80}: [01N] vs [02N, 03N]; 04N rides along at zero cost.
+    assert sorted(map(sorted, shards)) == [["01N", "04N"], ["02N", "03N"]]

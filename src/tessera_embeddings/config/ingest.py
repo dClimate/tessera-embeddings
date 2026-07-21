@@ -20,12 +20,13 @@ INGEST_CHUNK_SIZE = 4096
 
 INGEST_CHUNKS = {"time": 1, "northing": INGEST_CHUNK_SIZE, "easting": INGEST_CHUNK_SIZE}
 
-# S2 per-solar-day keep threshold for the GLOBAL CAMPAIGN ingest path: a solar
-# day is kept when at least this FRACTION of the zone's live tiles has valid
-# (cloud-screened) coverage. NOTE the single-ROI path has a same-named,
-# different-scaled constant (ingest/roi_processing.py, 5.0 — a PERCENT of the
-# ROI); the two paths' semantics must be reconciled before one constant can
-# serve both.
+# S2 per-solar-day keep threshold for the GLOBAL CAMPAIGN ingest path, as a
+# PERCENT of ROI pixels that must be valid (cloud-screened) to keep a solar
+# day — the same percent scale as ingest/roi_processing.py's same-named
+# constant, but tuned to 0.1% because a whole-zone ROI is mostly ocean/edge
+# (the single-ROI default of 5% would drop nearly every date). The duplicate
+# constants should eventually be unified under one name with per-path
+# defaults.
 DEFAULT_MIN_VALID_COVERAGE = 0.1
 
 
@@ -41,15 +42,16 @@ class IngestSettings(BaseModel):
 
     Defaults are campaign-scale. The single-ROI path (``tessera-full-pipeline``
     and the base ingest flows) keeps its own flat knobs for now: its worker
-    bounds are ``None``-means-auto-size and its coverage threshold is
-    percent-scaled (see :data:`DEFAULT_MIN_VALID_COVERAGE`), so adopting this
-    model there first requires unifying those semantics.
+    bounds are ``None``-means-auto-size (auto-derived from ROI chunk count)
+    and its coverage default is 5% vs the campaign's 0.1% (see
+    :data:`DEFAULT_MIN_VALID_COVERAGE`), so adopting this model there first
+    requires reconciling those defaults.
     """
 
     # Dask worker bounds for one (zone, year) ingest.
     min_workers: int = 1
     max_workers: int = 50
-    # S2 per-solar-day keep threshold (fraction; see DEFAULT_MIN_VALID_COVERAGE).
+    # S2 per-solar-day keep threshold (percent; see DEFAULT_MIN_VALID_COVERAGE).
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE
     # S1 CMR query batch window, in days.
     batch_days: int = 30

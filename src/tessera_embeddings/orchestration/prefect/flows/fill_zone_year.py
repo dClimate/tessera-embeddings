@@ -327,17 +327,22 @@ def fill_zone_year_flow(
     # Region matches ray_cluster's default (this flow provisions there).
     fill_kwargs["on_actor_retire"] = make_instance_terminator(log=log)
 
-    with ray_cluster(
-        log,
-        ami_ssm_name=ami_ssm_name,
-        ssm_prefix=ssm_prefix,
-        cloudwatch_log_group=cloudwatch_log_group,
-        code_bucket=code_bucket,
-        code_suffix=code_suffix,
-    ) as resolved_yaml:
-        activate(resolved_yaml)
-        summary = fill_zone_year(**fill_kwargs)
-    deactivate()
+    try:
+        with ray_cluster(
+            log,
+            ami_ssm_name=ami_ssm_name,
+            ssm_prefix=ssm_prefix,
+            cloudwatch_log_group=cloudwatch_log_group,
+            code_bucket=code_bucket,
+            code_suffix=code_suffix,
+        ) as resolved_yaml:
+            activate(resolved_yaml)
+            summary = fill_zone_year(**fill_kwargs)
+    finally:
+        # Clear the hook state only AFTER the context manager's teardown has
+        # run (or failed into the hook's remit) — and also on the exception
+        # path, which the old success-only clearing missed.
+        deactivate()
 
     log.info("Zone %s year %d filled: %s", zone, year, summary.get("tag"))
     return summary

@@ -6,7 +6,7 @@ K fills at once, each in its own flow run with its own cluster; this runner
 exploits it the other way: **one long-lived cluster, cells strictly
 sequential**, so the per-cluster costs — ``ray up``, per-worker EC2 bringup
 (minutes each), the model-load cold start on every worker — are paid once per
-campaign year instead of once per zone.
+shard of a campaign year instead of once per zone.
 
 Keeping the shared fleet busy between cells is the whole game, and three
 mechanisms cooperate on it (this docstring is the canonical statement of the
@@ -171,12 +171,24 @@ def fill_zones_sequential(
                 f"All failures so far: {failures}"
             ) from exc
 
-    def _succeed(cell: SequentialCell, result: dict[str, Any]) -> None:
+    def _succeed(result: dict[str, Any]) -> None:
         nonlocal consecutive
         consecutive = 0
         outcomes.append(result)
+
+    def _assemble_and_release(cell: SequentialCell, handoff: ZoneFillHandoff, prep: PreparedCell) -> dict[str, Any]:
+        """Trailing-thread body: assemble, then release the cell's mosaic.
+
+        The mosaic delete (potentially multi-TB) runs here, overlapping the
+        next cell's inference, rather than at the main loop's join point where
+        it would stall the GPUs between cells. An assembly failure skips the
+        delete — the retry needs the mosaic for its fingerprinted run_id and
+        staged-tile resume.
+        """
+        result = assemble(handoff, prep)
         if inputs is not None:
             inputs.cleanup(cell.zone, cell.year)
+        return result
 
     def _join_trailing() -> None:
         """Collect the in-flight assembly's outcome (success resets the breaker)."""
@@ -193,7 +205,7 @@ def fill_zones_sequential(
             # tiles — deleting the mosaic here would orphan both.
             _fail(cell, "assembly", exc)
         else:
-            _succeed(cell, result)
+            _succeed(result)
 
     def _start_lookahead(next_index: int) -> None:
         """Keep the next ``look_ahead`` cells' ingests in flight (idempotent)."""
@@ -214,13 +226,15 @@ def fill_zones_sequential(
             inputs.start(cells[0].zone, cells[0].year)
             _start_lookahead(1)
         for i, cell in enumerate(cells):
+            phase = "inputs"
             try:
                 if inputs is not None:
                     inputs.wait(cell.zone, cell.year)
                     _start_lookahead(i + 1)
+                phase = "prepare"
                 prep = prepare(cell)
             except Exception as exc:
-                _fail(cell, "prepare", exc)
+                _fail(cell, phase, exc)
                 continue
             try:
                 handoff = infer(cell, prep, i == len(cells) - 1)
@@ -235,10 +249,14 @@ def fill_zones_sequential(
             _join_trailing()
             if handoff.done is not None:
                 # Terminal in the inference phase (already complete / all-ocean
-                # empty) — committed and tagged there; nothing to assemble.
-                _succeed(cell, handoff.done)
+                # empty) — committed and tagged there; nothing to assemble, so
+                # release the mosaic inline (usually a no-op: most terminal
+                # cells were never ingested by this run's adapter).
+                _succeed(handoff.done)
+                if inputs is not None:
+                    inputs.cleanup(cell.zone, cell.year)
                 continue
-            trailing = (cell, executor.submit(assemble, handoff, prep))
+            trailing = (cell, executor.submit(_assemble_and_release, cell, handoff, prep))
         _join_trailing()
     finally:
         # On the breaker path a submitted assembly may still be committing —

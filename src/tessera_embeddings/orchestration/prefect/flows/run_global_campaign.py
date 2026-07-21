@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Callable
+from collections.abc import Callable, Collection
+from functools import partial
 from typing import Any
 
 import icechunk
@@ -133,11 +134,40 @@ def _staging_run_id(
     return f"{zone}-{year}-{hashlib.sha256(repr(key).encode()).hexdigest()[:8]}"
 
 
+def _ingest_dispatch_params(
+    zone: str,
+    year: int,
+    *,
+    paths: BucketPaths,
+    mask_name: str,
+    s1_orbit: str,
+    ingest_settings: IngestSettings,
+    allow_partial_window: bool,
+) -> dict[str, Any]:
+    """Parameter dict for one ``ingest-zone-year`` deployment run.
+
+    Shared by both fill strategies' dispatch sites — the cluster-per-zone
+    driver's per-cell chain and the chained fill's look-ahead adapter
+    (:mod:`.fill_zones_sequential`) — so the two cannot drift from the
+    deployment's signature independently.
+    """
+    return {
+        "zone": zone,
+        "year": year,
+        "paths": paths.model_dump(),
+        "mask_name": mask_name,
+        "s1_orbit": s1_orbit,
+        "ingest_settings": ingest_settings.model_dump(),
+        "allow_partial_window": allow_partial_window,
+    }
+
+
 def _partition_by_live_tiles(
     zones: list[str],
     n_shards: int,
     *,
     land_mask_path: str,
+    known_complete: Collection[str] = (),
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
 ) -> list[list[str]]:
@@ -145,14 +175,20 @@ def _partition_by_live_tiles(
 
     Longest-processing-time greedy: zones descending by coverage-bitmap tile
     count, each assigned to the currently-lightest shard — so the sequential
-    fill's shared clusters finish their shards at roughly the same time. Tile
-    counts are one ~1 KB GET per zone; ``n_shards == 1`` skips the reads
-    entirely. Empty shards (more shards than zones) are dropped.
+    fill's shared clusters finish their shards at roughly the same time.
+    ``known_complete`` zones (retag-only crash-recovery cells) weigh zero — the
+    child settles them without GPU work, so their tile counts would only skew
+    the balance (and their mask reads are skipped). Tile counts are one ~1 KB
+    GET per zone; ``n_shards == 1`` skips the reads entirely. Empty shards
+    (more shards than zones) are dropped.
     """
     if n_shards <= 1:
         return [zones]
     weight = {
-        z: zone_live_tile_count(land_mask_path, z, get_credentials=get_credentials, s3_region=s3_region) for z in zones
+        z: 0
+        if z in known_complete
+        else zone_live_tile_count(land_mask_path, z, get_credentials=get_credentials, s3_region=s3_region)
+        for z in zones
     }
     shards: list[list[str]] = [[] for _ in range(n_shards)]
     totals = [0] * n_shards
@@ -207,10 +243,10 @@ async def run_global_campaign(
             dispatched, so a default re-run of a partially-complete year skips the
             finished zones and fills only the unfinished ones (see
             :func:`campaign_work_list`).
-        max_parallel_zones: Max concurrent fill runs *within a year* (bounds
-            simultaneous Ray clusters — a cost knob, distinct from the commit
-            gate). Under ``"cluster-per-zone"`` it also caps concurrent fill
-            runs; under ``"chained-clusters"`` it is the shard/cluster count.
+        max_parallel_zones: Bounds simultaneous Ray clusters within a year (a
+            cost knob, distinct from the commit gate): the concurrent per-cell
+            fill runs under ``"cluster-per-zone"``, or the shard/cluster count
+            under ``"chained-clusters"``.
         fill_strategy: Named for the CLUSTER LIFECYCLE — both strategies run
             up to ``max_parallel_zones`` zones at once. ``"cluster-per-zone"``
             (default) dispatches one ``fill-zone-year`` run per cell, each
@@ -381,16 +417,14 @@ async def run_global_campaign(
             "code_suffix": code_suffix,
         }
 
-    def _ingest_params(zone: str, year: int) -> dict[str, Any]:
-        return {
-            "zone": zone,
-            "year": year,
-            "paths": paths.model_dump(),
-            "mask_name": mask_name,
-            "s1_orbit": s1_orbit,
-            "ingest_settings": ingest_settings.model_dump(),
-            "allow_partial_window": allow_partial_window,
-        }
+    _ingest_params = partial(
+        _ingest_dispatch_params,
+        paths=paths,
+        mask_name=mask_name,
+        s1_orbit=s1_orbit,
+        ingest_settings=ingest_settings,
+        allow_partial_window=allow_partial_window,
+    )
 
     fill_sem = asyncio.Semaphore(max_parallel_zones)
     ingest_sem = asyncio.Semaphore(max_parallel_ingest)
@@ -469,6 +503,7 @@ async def run_global_campaign(
                 year_zones,
                 min(max_parallel_zones, len(year_zones)),
                 land_mask_path=paths.land_mask_store(mask_name),
+                known_complete={z for z in year_zones if status.has(z, year)},
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
             )
