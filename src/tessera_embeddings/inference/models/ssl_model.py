@@ -116,6 +116,16 @@ class MultimodalBTInferenceModel(nn.Module):
                 s1_repr = self.s1_backbone(s1_x)
             current.wait_stream(self._s2_stream)
             current.wait_stream(self._s1_stream)
+            # s2_repr/s1_repr were ALLOCATED on the backbone streams but are
+            # consumed on `current` (the fusion below) after these waits. The
+            # caching allocator tracks a tensor's liveness only on its alloc
+            # stream, so — symmetric to the input record_stream above — mark
+            # these outputs in use on `current`; otherwise a later
+            # `current`-stream allocation (e.g. the next pipeline iteration's
+            # H2D) could reuse their storage before the fusion reads them,
+            # a silent intermittent corruption.
+            s2_repr.record_stream(current)
+            s1_repr.record_stream(current)
         else:
             s2_repr = self.s2_backbone(s2_x)
             s1_repr = self.s1_backbone(s1_x)
