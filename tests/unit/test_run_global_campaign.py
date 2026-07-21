@@ -208,11 +208,11 @@ def test_duplicate_years_dispatch_once(wired):
 
 
 def test_sequential_strategy_dispatches_one_run_per_year(wired):
-    """fill_strategy="sequential" replaces the per-cell chain with ONE
+    """fill_strategy="chained-clusters" replaces the per-cell chain with ONE
     fill-zones-sequential run per year: no driver-side ingest (the child's
     look-ahead owns it), no driver-side mosaic cleanup, zones passed as a list.
     """
-    result = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="sequential"))
+    result = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["fill-zones-sequential/fill-zones-sequential"]
     params = wired["arun"][0][1]
@@ -226,7 +226,9 @@ def test_sequential_strategy_dispatches_one_run_per_year(wired):
 
 
 def test_sequential_strategy_forwards_ingest_false(wired):
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="sequential", ingest=False))
+    asyncio.run(
+        mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", ingest=False)
+    )
     assert wired["arun"][0][1]["ingest"] is False
 
 
@@ -248,7 +250,9 @@ def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
     monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: counts[zone])
 
     asyncio.run(
-        mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="sequential", max_parallel_zones=2)
+        mod.run_global_campaign.fn(
+            paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", max_parallel_zones=2
+        )
     )
     assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential"] * 2
     shards = [p["zones"] for _, p in wired["arun"]]
@@ -265,5 +269,5 @@ def test_sequential_single_shard_reads_no_tile_counts(wired, monkeypatch):
         raise AssertionError("tile counts must not be read for a single shard")
 
     monkeypatch.setattr(mod, "zone_live_tile_count", boom)
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="sequential"))
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
     assert len(wired["arun"]) == 1

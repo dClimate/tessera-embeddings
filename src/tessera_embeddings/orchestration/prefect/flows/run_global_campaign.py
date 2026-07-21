@@ -1,9 +1,11 @@
 """Drive the global embeddings campaign: fill every pending (zone, year).
 
 Reads the live fill progress from the seeded store
-(:func:`~tessera_embeddings.storage.campaign.campaign_status`) and dispatches a
-``fill-zone-year`` deployment run per pending cell via ``arun_deployment``,
-mirroring :mod:`tessera_full_pipeline`'s driver pattern.
+(:func:`~tessera_embeddings.storage.campaign.campaign_status`) and dispatches
+fills for every pending cell via ``arun_deployment`` — a ``fill-zone-year`` run
+per cell (``fill_strategy="cluster-per-zone"``), or size-balanced
+``fill-zones-sequential`` shards on long-lived clusters (``"chained-clusters"``)
+— mirroring :mod:`tessera_full_pipeline`'s driver pattern.
 
 **Scheduling (ADR-008 D6 + the runner contract).** Inference is parallel across
 zones; only commits contend, and only *same-zone* fills conflict (shared
@@ -64,9 +66,9 @@ def _mosaic_identity(
     stores (missing repo / not found) are skipped; a PRESENT store with no
     identity FAILS CLOSED — never degrade to a config-only fingerprint.
 
-    Module-level (not a flow closure) because both campaign drivers need it:
-    the parallel per-cell dispatch here and the sequential shared-cluster
-    fill's ``prepare`` callable (:mod:`.fill_zones_sequential`).
+    Module-level (not a flow closure) because both fill strategies need it:
+    the cluster-per-zone dispatch here and the chained-clusters fill's
+    ``prepare`` callable (:mod:`.fill_zones_sequential`).
     """
     base = f"{inputs_bucket.rstrip('/')}/mosaics/{zone}/{year}"
     ids: list[str] = []
@@ -171,8 +173,8 @@ async def run_global_campaign(
     years: tuple[int, ...] | None = None,
     zones: list[str] | None = None,
     max_parallel_zones: int = 8,
-    fill_strategy: str = "parallel",
-    sequential_fill_deployment: str = "fill-zones-sequential/fill-zones-sequential",
+    fill_strategy: str = "cluster-per-zone",
+    chained_fill_deployment: str = "fill-zones-sequential/fill-zones-sequential",
     commit_limit_name: str = "tessera-global-commits",
     num_actors: int = 20,
     s1_orbit: str = "both",
@@ -207,23 +209,24 @@ async def run_global_campaign(
             :func:`campaign_work_list`).
         max_parallel_zones: Max concurrent fill runs *within a year* (bounds
             simultaneous Ray clusters — a cost knob, distinct from the commit
-            gate). Fill-dispatch only in the default ``parallel`` strategy;
-            ignored for fills under ``sequential``.
-        fill_strategy: ``"parallel"`` (default) dispatches one
-            ``fill-zone-year`` run per cell, each with its own SHORT-LIVED Ray
-            cluster, up to ``max_parallel_zones`` at once. ``"sequential"``
-            dispatches up to ``max_parallel_zones`` ``fill-zones-sequential``
-            runs per year, each owning ONE LONG-LIVED Ray cluster that drains
-            a size-balanced shard of the year's zones strictly one at a time —
-            a cluster takes up its next zone without teardown or actor churn,
-            amortizing `ray up` + per-worker bringup + model-load cold starts
-            across its whole shard. Same zone-parallelism bound, ~1/cluster
-            per shard instead of one per cell; ingest look-ahead and trailing
-            assembly keep each fleet busy at the seams (see the flow's module
-            docstring). ``max_parallel_zones=1`` degenerates to a single
-            cluster for the whole year.
-        sequential_fill_deployment: ``flow-name/deployment-name`` of the
-            sequential fill deployment (``fill_strategy="sequential"`` only).
+            gate). Under ``"cluster-per-zone"`` it also caps concurrent fill
+            runs; under ``"chained-clusters"`` it is the shard/cluster count.
+        fill_strategy: Named for the CLUSTER LIFECYCLE — both strategies run
+            up to ``max_parallel_zones`` zones at once. ``"cluster-per-zone"``
+            (default) dispatches one ``fill-zone-year`` run per cell, each
+            provisioning its own short-lived Ray cluster.
+            ``"chained-clusters"`` dispatches up to ``max_parallel_zones``
+            ``fill-zones-sequential`` runs per year, each owning ONE
+            long-lived Ray cluster that drains a size-balanced shard of the
+            year's zones one at a time — a cluster takes up its next zone
+            without teardown or actor churn, amortizing ``ray up`` +
+            per-worker bringup + model-load cold starts across its whole
+            shard. Ingest look-ahead and trailing assembly keep each fleet
+            busy at the seams (see the flow's module docstring);
+            ``max_parallel_zones=1`` degenerates to a single cluster for the
+            whole year.
+        chained_fill_deployment: ``flow-name/deployment-name`` of the chained
+            fill deployment (``fill_strategy="chained-clusters"`` only).
         commit_limit_name: Prefect global concurrency limit bounding fleet-wide
             simultaneous committers (D6); forwarded to every fill.
         num_actors: GPU actor count, forwarded to each fill.
@@ -262,8 +265,8 @@ async def run_global_campaign(
         raise ValueError(f"max_parallel_zones must be >= 1, got {max_parallel_zones} (Semaphore(0) blocks forever)")
     if max_parallel_ingest < 1:
         raise ValueError(f"max_parallel_ingest must be >= 1, got {max_parallel_ingest} (Semaphore(0) blocks forever)")
-    if fill_strategy not in ("parallel", "sequential"):
-        raise ValueError(f"fill_strategy must be 'parallel' or 'sequential', got {fill_strategy!r}")
+    if fill_strategy not in ("cluster-per-zone", "chained-clusters"):
+        raise ValueError(f"fill_strategy must be 'cluster-per-zone' or 'chained-clusters', got {fill_strategy!r}")
     campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS
 
     # Lazy AWS import so the flow file imports on non-AWS machines (arch tests).
@@ -451,7 +454,7 @@ async def run_global_campaign(
     runs_by_year: dict[int, list[str]] = {}
     for year in sorted(set(campaign_years), reverse=True):
         year_zones = [z for z, y in work if y == year]
-        if year_zones and fill_strategy == "sequential":
+        if year_zones and fill_strategy == "chained-clusters":
             # Up to max_parallel_zones child runs fill the year, each owning
             # ONE shared Ray cluster and draining its own zone shard strictly
             # sequentially — clusters take up their next zone without actor
@@ -470,17 +473,17 @@ async def run_global_campaign(
                 s3_region=s3_region,
             )
             log.info(
-                "Year %d: dispatching %d sequential fill(s) for %d zone(s): %s",
+                "Year %d: dispatching %d chained fill(s) for %d zone(s): %s",
                 year,
                 len(shards),
                 len(year_zones),
                 [len(sh) for sh in shards],
             )
 
-            def _sequential_params(shard: list[str], n_shards: int, seq_year: int) -> dict[str, Any]:
+            def _chained_params(shard: list[str], n_shards: int, chained_year: int) -> dict[str, Any]:
                 return {
                     "zones": shard,
-                    "year": seq_year,
+                    "year": chained_year,
                     "paths": paths.model_dump(),
                     "ami_ssm_name": ami_ssm_name,
                     "store_name": store_name,
@@ -507,23 +510,24 @@ async def run_global_campaign(
                     "ingest_settings": ingest_settings.model_dump(),
                 }
 
-            seq_results = await asyncio.gather(
+            chained_results = await asyncio.gather(
                 *(
-                    arun_deployment(sequential_fill_deployment, parameters=_sequential_params(sh, len(shards), year))
+                    arun_deployment(chained_fill_deployment, parameters=_chained_params(sh, len(shards), year))
                     for sh in shards
                 ),
                 return_exceptions=True,
             )
-            seq_failures = [r for r in seq_results if isinstance(r, BaseException)]
-            if seq_failures:
+            chained_failures = [r for r in chained_results if isinstance(r, BaseException)]
+            if chained_failures:
                 raise RuntimeError(
-                    f"year {year}: {len(seq_failures)}/{len(shards)} sequential fill(s) failed (e.g. {seq_failures[0]})"
+                    f"year {year}: {len(chained_failures)}/{len(shards)} chained fill(s) failed "
+                    f"(e.g. {chained_failures[0]})"
                 )
-            seq_runs = [r for r in seq_results if not isinstance(r, BaseException)]
-            for frun in seq_runs:
-                _check_completed(frun, f"sequential fill year {year}")
-            runs_by_year[year] = [str(r.id) for r in seq_runs]
-            log.info("Year %d: %d sequential fill(s) landed", year, len(shards))
+            chained_runs = [r for r in chained_results if not isinstance(r, BaseException)]
+            for frun in chained_runs:
+                _check_completed(frun, f"chained fill year {year}")
+            runs_by_year[year] = [str(r.id) for r in chained_runs]
+            log.info("Year %d: %d chained fill(s) landed", year, len(shards))
         elif year_zones:
             log.info("Year %d: dispatching %d zone fill(s)", year, len(year_zones))
             # All zones in a year are distinct groups → safe to fill concurrently.

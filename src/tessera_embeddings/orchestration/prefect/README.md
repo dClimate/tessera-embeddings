@@ -31,18 +31,18 @@ from the single-ROI path above:
 
 ```text
 build_land_mask   →   seed_global_store   →   run_global_campaign
-(coverage bitmaps)    (metadata-only)          ├─ parallel:   per pending (zone, year): fill_zone_year (Ray cluster each)
-                                               └─ sequential: per year: K fill_zones_sequential shards (K long-lived Ray clusters)
+(coverage bitmaps)    (metadata-only)          ├─ cluster-per-zone: per pending (zone, year): fill_zone_year (Ray cluster each)
+                                               └─ chained-clusters: per year: K fill_zones_sequential shards (K long-lived Ray clusters)
 ```
 
 `run_global_campaign` reads live progress via `storage.campaign.campaign_status`
 and dispatches fills for every pending cell, **year by year** (outer serial
 loop), under one of two strategies:
 
-- **`fill_strategy="parallel"`** (default): a `fill-zone-year` run per cell,
+- **`fill_strategy="cluster-per-zone"`** (default): a `fill-zone-year` run per cell,
   with **bounded zone parallelism** within each year (`max_parallel_zones`
   simultaneous Ray clusters). Best wall-clock; each cell pays its own cluster.
-- **`fill_strategy="sequential"`**: up to `max_parallel_zones`
+- **`fill_strategy="chained-clusters"`**: up to `max_parallel_zones`
   `fill-zones-sequential` runs per year, each owning ONE long-lived Ray
   cluster that drains a size-balanced shard of the year's zones strictly one
   at a time — a cluster takes up its next zone without teardown or actor
@@ -100,7 +100,7 @@ override.
 | `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
 | `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commit gate = a Prefect global concurrency limit. |
 | `fill_zones_sequential.py` | Global campaign: fill one year's zones sequentially on a SINGLE shared Ray cluster (largest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Pre-cluster triage settles retag/all-ocean cells. |
-| `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="parallel"`), or one `fill-zones-sequential` run per year (`"sequential"`). |
+| `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="cluster-per-zone"`), or size-balanced `fill-zones-sequential` shards on long-lived clusters (`"chained-clusters"`). |
 
 > **Why so many flow files?** The two-flow pattern below explains the inner/outer
 > split per file. The flows themselves are kept thin — task-graph discipline
