@@ -63,6 +63,17 @@ OBS_VARS = ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count")
 REQUIRED_VARS = ("embeddings", *OBS_VARS)
 FORBIDDEN_VARS = ("scales",)
 
+# The format's expected dtypes. Pinning them (not just checking the two stores
+# agree) means two identically-malformed stores — e.g. both with int16
+# embeddings, or uint16 obs counts that would overflow at 50x50 coarsening
+# (up to ~315k obs/px ≫ 65535) — fail rather than certify each other.
+EXPECTED_DTYPES = {
+    "embeddings": "float32",
+    "s2_obs_count": "uint32",
+    "s1_asc_obs_count": "uint32",
+    "s1_desc_obs_count": "uint32",
+}
+
 # Root attrs that legitimately differ between two runs of the same ROI — pure
 # run provenance, not data or format. `run_id` plus anything run-scoped
 # (``run_*``, e.g. run_started_at/run_completed_at timestamps) is reported but
@@ -256,11 +267,18 @@ def compare_variable(
     cmp = VarComparison(name=name, dtype=str(da_ref.dtype))
     is_float = da_ref.dtype.kind == "f"
     for rows_slice, sel in rows:
-        a = da_ref.isel(northing=rows_slice).values
-        b = da_test.isel(northing=rows_slice).values
+        sub_ref = da_ref.isel(northing=rows_slice)
+        sub_test = da_test.isel(northing=rows_slice)
         if sel is not None:
-            # northing is axis 1 for every variable: (time, northing, easting[, band])
-            a, b = a[:, sel], b[:, sel]
+            # Select the sampled rows by DIM NAME, not a positional numpy index:
+            # northing's axis position depends on whether a `time` dim is present
+            # ((time, northing, easting, band) vs (northing, easting, band)), so
+            # positional indexing would silently select easting on a time-less
+            # store. `sel` are slab-relative northing offsets.
+            sub_ref = sub_ref.isel(northing=sel)
+            sub_test = sub_test.isel(northing=sel)
+        a = sub_ref.values
+        b = sub_test.values
         cmp.n += a.size
         cmp.n_bit_equal += _bit_equal(a, b)
         if is_float:
@@ -348,6 +366,21 @@ def main(argv: list[str] | None = None) -> int:
             f"\nVERDICT: NOT a coarsened store — {forbidden} present (full-resolution int8 "
             "format; compare those runs with compare_outputs.py instead)."
         )
+        return 1
+
+    # Pin the required variables to the format's expected dtypes in BOTH stores
+    # (compare_var_structure only checks the two AGREE — two identically-wrong
+    # stores would agree and pass).
+    dtype_problems = [
+        f"{tag} '{v}' is {ds[v].dtype} (expected {EXPECTED_DTYPES[v]})"
+        for v in REQUIRED_VARS
+        for tag, ds in (("ref", ref), ("test", test))
+        if str(ds[v].dtype) != EXPECTED_DTYPES[v]
+    ]
+    if dtype_problems:
+        print("\nVERDICT: INVALID coarsened store — required variable(s) have unexpected dtype:")
+        for p in dtype_problems:
+            print(f"  - {p}")
         return 1
 
     var_problems = compare_var_structure(ref, test)

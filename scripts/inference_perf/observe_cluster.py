@@ -320,8 +320,14 @@ def find_workers(session: boto3.session.Session, cluster: str | None, cluster_pr
     ssm = session.client("ssm")
     registered: set[str] = set()
     paginator = ssm.get_paginator("describe_instance_information")
-    for page in paginator.paginate(Filters=[{"Key": "InstanceIds", "Values": running}]):
-        registered.update(info["InstanceId"] for info in page["InstanceInformationList"])
+    # The InstanceIds filter caps Values at 50; the fleet can exceed that
+    # (cluster.yaml.template allows max_workers=500), so query in batches or a
+    # >50-worker run raises ValidationException here. _SSM_MAX_INSTANCES (=50)
+    # is defined below for the same cap on SendCommand.
+    for i in range(0, len(running), _SSM_MAX_INSTANCES):
+        batch = running[i : i + _SSM_MAX_INSTANCES]
+        for page in paginator.paginate(Filters=[{"Key": "InstanceIds", "Values": batch}]):
+            registered.update(info["InstanceId"] for info in page["InstanceInformationList"])
 
     skipped = sorted(set(running) - registered)
     if skipped:
@@ -410,6 +416,16 @@ def _insights_query(
     return [{c["field"]: c["value"] for c in row} for row in res["results"]]
 
 
+def _worker_label(stream: str) -> str:
+    """Per-worker label from a ``<instance-id>/<suffix>`` CloudWatch stream name.
+
+    The instance id is the discriminating part — the suffix (``actors``,
+    ``ram_poll``, …) is the SAME for every worker, so labelling by the suffix
+    (a trailing ``rsplit('/', 1)[-1]``) collapses all rows to one name.
+    """
+    return stream.split("/", 1)[0][:20]
+
+
 def ram_util_report(session: boto3.session.Session, log_group: str, start_epoch: int, end_epoch: int) -> int:
     """Per-worker peak host RAM + GPU-util distribution from CloudWatch.
 
@@ -436,40 +452,47 @@ def ram_util_report(session: boto3.session.Session, log_group: str, start_epoch:
         "count(*) as samples by @logStream "
         "| sort peak_ram_pct desc"
     )
+    win = f"{datetime.datetime.fromtimestamp(start_epoch, datetime.UTC):%Y-%m-%d %H:%M}"
+    win += f" → {datetime.datetime.fromtimestamp(end_epoch, datetime.UTC):%Y-%m-%d %H:%M} UTC"
+    print(f"RAM + GPU-util from {log_group}  [{win}]")
+
+    # The two sources are INDEPENDENT: a short run (or a worker OOM-killed
+    # before its first 30 s RESOURCES sample) may have only RAMPOLL — the very
+    # 1 s evidence this feature targets — so an empty RESOURCES set must not
+    # short-circuit the RAMPOLL section. `_insights_query` returns None on a
+    # HARD failure (permission/timeout/failed status), [] for "no such lines":
+    # None → return nonzero (never mask a failed query as "no data"); [] →
+    # note it and try the other source; fail only if NEITHER produced data.
+
+    # --- 30 s RESOURCES rollup (always-on monitor) ---
     rows = _insights_query(logs, log_group, resources_q, start_epoch, end_epoch)
     if rows is None:
         return 1
-    if not rows:
-        print("No RESOURCES lines in the window (check --log-group / --since / --until).", file=sys.stderr)
-        return 1
-
-    win = f"{datetime.datetime.fromtimestamp(start_epoch, datetime.UTC):%Y-%m-%d %H:%M}"
-    win += f" → {datetime.datetime.fromtimestamp(end_epoch, datetime.UTC):%Y-%m-%d %H:%M} UTC"
-    print(f"RAM + GPU-util from {log_group}  [{win}]  ({len(rows)} worker streams)\n")
-    print("stream\tpeak_ram_gb\tpeak_ram_%\tavg_gpu_%\tmin_gpu_%\tsamples")
-    peak_gb = peak_pct = 0.0
-    gpu_avgs, weighted_gpu, total_n, node_gb = [], 0.0, 0, 0.0
-    for r in rows:
-        pg, pp = float(r["peak_ram_gb"]), float(r["peak_ram_pct"])
-        ag, n = float(r["avg_gpu"]), int(float(r["samples"]))
-        node_gb = max(node_gb, float(r.get("node_gb", 0) or 0))
-        peak_gb, peak_pct = max(peak_gb, pg), max(peak_pct, pp)
-        gpu_avgs.append(ag)
-        weighted_gpu += ag * n
-        total_n += n
-        stream = r["@logStream"].rsplit("/", 1)[-1][:32]
-        print(f"{stream}\t{pg:.1f}\t{pp:.0f}\t{ag:.1f}\t{float(r['min_gpu']):.0f}\t{n}")
-
-    fleet_gpu = weighted_gpu / total_n if total_n else 0.0
-    print(
-        f"\nFLEET: peak host RAM = {peak_gb:.1f} GB ({peak_pct:.0f}% of ~{node_gb:.1f} GB node) | "
-        f"sample-weighted avg GPU util = {fleet_gpu:.1f}% across {len(rows)} workers | "
-        f"idle-recovery ceiling if all → 100% ≈ {100 - fleet_gpu:.0f}%"
-    )
-    print(
-        "(peak RAM above is the 30s-polled peak — a FLOOR for the true instantaneous peak. "
-        "GPU util is nvidia-smi 'busy-or-not', an upper bound on useful-work fraction.)"
-    )
+    if rows:
+        print(f"\n30s RESOURCES rollup ({len(rows)} worker streams):")
+        print("worker\tpeak_ram_gb\tpeak_ram_%\tavg_gpu_%\tmin_gpu_%\tsamples")
+        peak_gb = peak_pct = 0.0
+        weighted_gpu, total_n, node_gb = 0.0, 0, 0.0
+        for r in rows:
+            pg, pp = float(r["peak_ram_gb"]), float(r["peak_ram_pct"])
+            ag, n = float(r["avg_gpu"]), int(float(r["samples"]))
+            node_gb = max(node_gb, float(r.get("node_gb", 0) or 0))
+            peak_gb, peak_pct = max(peak_gb, pg), max(peak_pct, pp)
+            weighted_gpu += ag * n
+            total_n += n
+            print(f"{_worker_label(r['@logStream'])}\t{pg:.1f}\t{pp:.0f}\t{ag:.1f}\t{float(r['min_gpu']):.0f}\t{n}")
+        fleet_gpu = weighted_gpu / total_n if total_n else 0.0
+        print(
+            f"\nFLEET: peak host RAM = {peak_gb:.1f} GB ({peak_pct:.0f}% of ~{node_gb:.1f} GB node) | "
+            f"sample-weighted avg GPU util = {fleet_gpu:.1f}% across {len(rows)} workers | "
+            f"idle-recovery ceiling if all → 100% ≈ {100 - fleet_gpu:.0f}%"
+        )
+        print(
+            "(peak RAM above is the 30s-polled peak — a FLOOR for the true instantaneous peak. "
+            "GPU util is nvidia-smi 'busy-or-not', an upper bound on useful-work fraction.)"
+        )
+    else:
+        print("\n(no 30s RESOURCES lines in window)")
 
     # --- 1 s RAMPOLL rollup + spike table (present when --start-pollers ran) ---
     poll_q = (
@@ -481,32 +504,40 @@ def ram_util_report(session: boto3.session.Session, log_group: str, start_epoch:
         "| sort peak_pct desc"
     )
     poll_rows = _insights_query(logs, log_group, poll_q, start_epoch, end_epoch)
-    if not poll_rows:
-        print("\n(no 1s RAMPOLL lines in window — --start-pollers not run, or pre-tooling code)")
-        return 0
-    print(f"\n1s RAM POLL rollup ({len(poll_rows)} worker streams):")
-    print("stream\tpeak_gb\tpeak_%\tp99_%\tsamples")
-    for r in poll_rows:
-        stream = r["@logStream"].rsplit("/", 1)[-1][:32]
-        print(
-            f"{stream}\t{float(r['peak_gb']):.1f}\t{float(r['peak_pct']):.0f}"
-            f"\t{float(r['p99_pct']):.0f}\t{int(float(r['samples']))}"
+    if poll_rows is None:
+        return 1
+    if poll_rows:
+        print(f"\n1s RAM POLL rollup ({len(poll_rows)} worker streams):")
+        print("worker\tpeak_gb\tpeak_%\tp99_%\tsamples")
+        for r in poll_rows:
+            print(
+                f"{_worker_label(r['@logStream'])}\t{float(r['peak_gb']):.1f}\t{float(r['peak_pct']):.0f}"
+                f"\t{float(r['p99_pct']):.0f}\t{int(float(r['samples']))}"
+            )
+        spike_q = (
+            "fields @logStream, @message "
+            "| filter @message like /RAMPOLL/ "
+            '| parse @message "pct=* top=*" as pctv, topv '
+            "| sort pctv desc "
+            "| limit 10"
         )
+        spikes = _insights_query(logs, log_group, spike_q, start_epoch, end_epoch)
+        if spikes is None:
+            return 1
+        if spikes:
+            print("\nTop 10 RAM spike samples (1s):")
+            for r in spikes:
+                msg = r.get("@message", "").strip()
+                print(f"{_worker_label(r['@logStream'])}\t{msg[msg.find('RAMPOLL') :][:160]}")
+    else:
+        print("\n(no 1s RAMPOLL lines in window — --start-pollers not run, or pre-tooling code)")
 
-    spike_q = (
-        "fields @logStream, @message "
-        "| filter @message like /RAMPOLL/ "
-        '| parse @message "pct=* top=*" as pctv, topv '
-        "| sort pctv desc "
-        "| limit 10"
-    )
-    spikes = _insights_query(logs, log_group, spike_q, start_epoch, end_epoch)
-    if spikes:
-        print("\nTop 10 RAM spike samples (1s):")
-        for r in spikes:
-            stream = r["@logStream"].rsplit("/", 1)[-1][:32]
-            msg = r.get("@message", "").strip()
-            print(f"{stream}\t{msg[msg.find('RAMPOLL') :][:160]}")
+    if not rows and not poll_rows:
+        print(
+            "No RAM data (RESOURCES or RAMPOLL) in the window (check --log-group / --since / --until).",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

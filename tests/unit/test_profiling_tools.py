@@ -23,14 +23,23 @@ from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OBSERVE_CLUSTER = REPO_ROOT / "scripts" / "inference_perf" / "observe_cluster.py"
+COMPARE_COARSENED = REPO_ROOT / "scripts" / "inference_perf" / "compare_coarsened_stores.py"
+
+
+def _load_script(path: Path, name: str):
+    """Import a scripts/ module by path (scripts/ is not a package)."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    # Register before exec: @dataclass resolves field types via
+    # sys.modules[cls.__module__], which is absent for a bare exec_module.
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _load_phase_parser() -> str:
     """Import observe_cluster.py by path (scripts/ is not a package)."""
-    spec = importlib.util.spec_from_file_location("observe_cluster", OBSERVE_CLUSTER)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.PHASE_PARSER
+    return _load_script(OBSERVE_CLUSTER, "observe_cluster").PHASE_PARSER
 
 
 def _run_parser(logs_dir: Path) -> str:
@@ -160,3 +169,83 @@ class TestPhaseParser:
         fields = row.split("\t")
         assert fields[1] == "50"  # T_kept
         assert fields[5] == "1000"  # valid_px from the cdone line
+
+
+def _make_coarse_ds(emb: object, *, with_time: bool = True):
+    """Minimal coarsened-format xr.Dataset from an (northing, easting, band) array."""
+    import numpy as np
+    import xarray as xr
+
+    n, e, b = emb.shape
+    coords = {"northing": np.arange(n), "easting": np.arange(e), "band": np.arange(b)}
+    dims = ("northing", "easting", "band")
+    obs_dims = ("northing", "easting")
+    data = emb.astype("float32")
+    obs = np.ones((n, e), dtype="uint32")
+    if with_time:
+        coords["time"] = [0]
+        dims, obs_dims = ("time", *dims), ("time", *obs_dims)
+        data, obs = data[None], obs[None]
+    return xr.Dataset(
+        {
+            "embeddings": (dims, data),
+            "s2_obs_count": (obs_dims, obs),
+            "s1_asc_obs_count": (obs_dims, obs.copy()),
+            "s1_desc_obs_count": (obs_dims, obs.copy()),
+        },
+        coords=coords,
+    )
+
+
+class TestCoarsenedCompare:
+    """compare_coarsened_stores: chunk-aligned sampling, dim-aware selection, structure gate."""
+
+    def test_row_slabs_sampling_is_chunk_aligned(self) -> None:
+        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        slabs = mod._row_slabs(1000, sample_rows=10)  # ROW_BLOCK=384 → chunks 0,1,2
+        starts = [s.start for s, _ in slabs]
+        assert starts == sorted(set(starts))  # each backing chunk read at most once
+        assert all(st % mod.ROW_BLOCK == 0 for st in starts)
+        for s, sel in slabs:  # selections are slab-relative offsets within the chunk
+            assert sel is not None
+            assert all(0 <= o < mod.ROW_BLOCK and s.start + o < 1000 for o in sel)
+
+    def test_sampled_compare_selects_northing_rows(self) -> None:
+        import numpy as np
+
+        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        base = np.arange(8 * 4 * 2, dtype="float32").reshape(8, 4, 2)
+        rows = mod._row_slabs(8, sample_rows=3)  # → rows 0, 3, 7 (one slab)
+        ref = _make_coarse_ds(base)
+
+        differ_unsampled = base.copy()
+        differ_unsampled[5] += 1.0  # row 5 is NOT in {0,3,7}
+        assert mod.compare_variable(ref, _make_coarse_ds(differ_unsampled), "embeddings", rows).bit_identical
+
+        differ_sampled = base.copy()
+        differ_sampled[3] += 1.0  # row 3 IS sampled → must be caught
+        assert not mod.compare_variable(ref, _make_coarse_ds(differ_sampled), "embeddings", rows).bit_identical
+
+    def test_sampled_compare_dim_aware_without_time_axis(self) -> None:
+        """A time-less store still selects northing rows (positional indexing would not)."""
+        import numpy as np
+
+        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        base = np.arange(8 * 4 * 2, dtype="float32").reshape(8, 4, 2)
+        rows = mod._row_slabs(8, sample_rows=3)
+        ref = _make_coarse_ds(base, with_time=False)
+        differ = base.copy()
+        differ[3] += 1.0  # sampled northing row
+        assert not mod.compare_variable(ref, _make_coarse_ds(differ, with_time=False), "embeddings", rows).bit_identical
+
+    def test_var_structure_flags_dtype_mismatch(self) -> None:
+        import numpy as np
+
+        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        base = np.zeros((4, 4, 2), dtype="float32")
+        ref = _make_coarse_ds(base)
+        test = _make_coarse_ds(base)
+        # Same values, narrower obs dtype — bit-view compare would miss it.
+        test["s2_obs_count"] = test["s2_obs_count"].astype("uint16")
+        problems = mod.compare_var_structure(ref, test)
+        assert any("s2_obs_count" in p and "dtype" in p for p in problems)
