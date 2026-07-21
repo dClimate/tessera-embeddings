@@ -11,10 +11,19 @@ The orchestrator-free equivalent is
 domain functions on `ray_cluster(num_gpus=0)` for laptop/CI runs.
 
 **Performance.** On g6e.xlarge (L40S) workers the pipeline sustains **~89–93% GPU utilization**
-and **~21–24K pixels/sec per worker** on mid-density chunks (~10–18K on dense), with **peak host
-RAM ~52%** of the 30.9 GB node (budgeted to stay under 60% at UTM-zone scale). Versus the naive
-baseline that's **~2–2.8× per-worker throughput**. Outputs match the `main` reference within the
-ADR-012 cross-config equivalence envelope (a batch-size difference, not a regression). The mechanisms — vectorised prep, an async GPU
+with **peak host RAM ~52%** of the 30.9 GB node (budgeted to stay under 60% at UTM-zone scale).
+Throughput comes in two flavors — keep them distinct:
+
+- **Fleet-overall: ~13–15K px/s per worker** — the whole-run average (total ROI pixels ÷ total
+  GPU-hours: Iowa's 1.87B px in ~34 GPU-hrs), *including* cold starts, the dense/sparse chunk
+  mix, and autoscale ramp. Use this for capacity planning and cost estimates.
+- **Per-chunk-class: ~21–24K px/s** on mid-density chunks, **~10–18K** on dense (more timesteps
+  = more compute per pixel) — the end-to-end rate while a worker processes a chunk of that
+  class. Use this when comparing optimizations.
+
+Versus the naive baseline that's **~2–2.8× per-worker throughput**. Outputs match the `main`
+reference within the ADR-012 cross-config equivalence envelope (a batch-size difference, not a
+regression). The mechanisms — vectorised prep, an async GPU
 loop, valid-pixel-aware striping, and a RAM-bounded cross-chunk starter prefetch — are detailed
 phase-by-phase below, then synthesized into a decision tree with relative impact in
 [**How Our Performance Optimizations Fit Together**](#how-our-performance-optimizations-fit-together); full profiling and
@@ -81,8 +90,8 @@ reads the 2000×2000 sub-tile out of them via `zarr.Array.oindex` with no alignm
 
 `filter_chunks_by_roi_mask` then drops any chunk whose footprint does not intersect the ROI
 zarr mask produced by `generate_roi`. Only the surviving **live chunks** are dispatched to
-GPU actors. This matters for sparse ROIs: a polygon inscribed in a large bounding rectangle
-may leave the majority of chunks empty, and a GPU actor takes tens of seconds just to open
+GPU actors. This matters for ROIs that fill little of their bounding box: a polygon inscribed
+in a large bounding rectangle may leave the majority of chunks empty, and a GPU actor takes tens of seconds just to open
 the zarr store, read SCL, and detect emptiness — pure waste on a GPU-priced node. With
 pre-filtering, only intersecting chunks reach the Ray cluster at all, and the cluster is
 auto-sized from the live-chunk count.
@@ -231,7 +240,7 @@ the chunks that split; that per-strip read is exactly the working set the byte b
 #### 4a″. Chunk prologue: serial by default, with a bounded cross-chunk starter prefetch
 
 Each chunk pays a serial, GPU-idle "prologue" — SCL mask read, first band read, dataset
-build (~24–38 s) — before its first forward pass. A **bounded cross-chunk starter prefetch**
+build (~24–36 s) — before its first forward pass. A **bounded cross-chunk starter prefetch**
 hides most of it: the next chunk's mask + a small starter strip (hard-capped ~2 GiB) are
 preloaded during the current chunk's last strip. It deliberately does NOT prefetch the whole
 next working set — that co-resides two full chunks and OOMs the node at UTM-zone-scale density
@@ -389,8 +398,9 @@ target is reached. Over-sampled pixels are uniformly sub-sampled.
 - **Positional encoding without the zeros buffer** — sin/cos are written straight into an
   uninitialised output buffer instead of scatter-writing into a multi-GB FP32 `zeros`
   allocation per forward. Bit-identical values, lower peak memory.
-- **Throughput:** ~10–12K px/sec per worker (measured 2026-07, Iowa ROI, L40S). px/sec
-  is density-dependent — a sparse pixel costs ~10× less than a dense one — so the
+- **Throughput:** ~21–24K px/sec per worker on mid-density chunks (10–18K on dense; measured
+  2026-07, Iowa ROI, L40S). px/sec is density-dependent — a pixel with few observations costs
+  ~10× less than a densely-observed one — so the
   periodic and end-of-chunk summaries also log **tok/sec** (pixels × (T_s2 + T_s1))
   and **effective TFLOPS** (transformer-layer FLOPs via `profiling.transformer_flops`)
   for density-neutral comparison across chunks and runs.
@@ -716,7 +726,7 @@ A chunk arrives → load its SCL mask → count valid pixels, find their bbox
 │        ├─ yes, and a next chunk is reserved →
 │        │     ● cross-chunk starter prefetch: preload the next chunk's [§4a″]
 │        │       mask + 256-row starter NOW, so its GPU work starts
-│        │       0–8 s later instead of 24–34 s
+│        │       ~6 s later instead of ~24–36 s
 │        └─ no (pair budget) → skip it; the next chunk takes the serial
 │              prologue (slower, but never over the RAM ceiling)
 │
@@ -762,7 +772,7 @@ Profiling ruled these out, so they're absent by design, not oversight:
 - **Greedily prefetching to fill RAM.** We deliberately **leave host RAM on the table.**
   Prefetching the whole next chunk to use the spare RAM co-resides two full working sets
   and spikes peak host RAM to ~92–95% — which OOM-killed a worker. The strip budget plus
-  the bounded (~2 GiB) cross-chunk prefetch instead hold peak at ~45–52%, well under the
+  the bounded (~2 GiB) cross-chunk prefetch instead hold peak at ~52%, well under the
   60% ceiling, so chunk-density spikes at UTM-zone scale can't OOM the node. The unused
   headroom is intentional insurance, not waste.
 - **GRU restructuring** — the model builder already fuses the recurrent stack to cuDNN;

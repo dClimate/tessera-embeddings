@@ -24,7 +24,7 @@ bit-identical by construction, the PE change is bit-identical, and both builds r
 the same pre-existing cuDNN `nn.GRU` fusion (the Phase-3 `CustomGRU` restructure
 never reached production and was reverted — see PR discussion / commit 833c3be), so
 there is no forward-math delta between the two. PASSES the strict ADR-012 gate.
-(Coverage caveat: dense chunks; extend to sparse labels via the cross-config
+(Coverage caveat: dense chunks; extend to few-valid-pixel labels via the cross-config
 baseline comparison below.)
 
 Performance, same chunks, wall-clock incl. load+write: baseline ~204–341 s/chunk
@@ -42,10 +42,10 @@ GPU util **79.4%** → total idle-recovery ceiling ~21% (incl. structural
 write/cold-start idle); CPU-feed-specific slice ~7–15% GPU-hours (see
 `temp/token-budget-batching-findings.md` for the g6e.2xlarge vs software tradeoff).
 
-Sparse/edge coverage 2026-07-17 (P2+3 vs baseline, `--cross-config`):
+Few-valid-pixel / edge coverage 2026-07-17 (P2+3 vs baseline, `--cross-config`):
 chunk_0_22 (3.5% valid): exact 99.85%, max|Δ|=2, cosine ≥ 0.99992, 0 NaN
 mismatches; chunk_3_0: exact 98.06%, same envelope — PASS 2/2. Zero NaN-mask
-mismatches on sparse chunks confirms validity/skip semantics are unchanged
+mismatches on few-valid-pixel chunks confirms validity/skip semantics are unchanged
 under the prefetched-prologue path.
 
 Assembled full-ROI deliverables (icechunk stores, from Dask assembly):
@@ -112,8 +112,10 @@ unavoidable first-per-worker cold starts (n=85, no predecessor to prefetch
 from); GPU util **~89–93%** (CloudWatch: 89.1% whole-run incl. ramp/drain,
 93.3% mid-run steady; 96.4% on 1 s DCGM — reads high); peak host RAM
 **~52%** (16.1 GB / 30.9 GB — ~6 pts above phase 4 because the prefetch stash
-is co-resident, still well under the 60% target); `write_s ≈ 0`. Inference-phase
-px/s unchanged from phase 4 (bit-identical forwards).
+is co-resident, still well under the 60% target); `write_s ≈ 0`. Per-chunk-class
+px/s unchanged from phase 4 (bit-identical forwards); **fleet-overall ≈ 13–15K
+px/s/worker** (1.87B-px ROI ÷ ~34 GPU-hrs — the whole-run average incl. cold
+starts, density mix, and ramp; live-chunk-only basis ~13K).
 
 Correctness: **bit-identical to phase 4** (output-preserving — the prefetch
 changes *when* the prologue loads, not the tensors), spot-checked across 8

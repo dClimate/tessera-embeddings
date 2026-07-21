@@ -25,7 +25,8 @@ Numbers below are the **final shipped state**: the phase-5 run `a60550ae`
 |---|---|---|
 | per-worker throughput | 1× | **~2–2.8×** |
 | GPU utilization (fleet) | 48–72% avg; SMACT 0.31–0.68; TENSO 0.12–0.26 | **~89–93%; SMACT ≈0.99; TENSO 0.42–0.47** |
-| inference px/s per worker | 9.6–13.3K | **21–24K** mid-density / 10–18K dense (inference-phase rate; bit-identical forwards, so unchanged since striping) |
+| px/s per worker, per-chunk-class | 9.6–13.3K | **21–24K** mid-density / 10–18K dense (rate while processing a chunk of that class; bit-identical forwards, so unchanged since striping) |
+| px/s per worker, fleet-overall | — (not separately derived) | **~13–15K** (1.87B-px ROI ÷ ~34 GPU-hrs on `a60550ae`; includes cold starts, density mix, ramp — the capacity-planning number) |
 | GPU-idle overhead per chunk | ~50–60 s (22–25% of wall) | **~6 s** median on prefetch-hit chunks; ~36 s on the unavoidable first-per-worker cold start |
 | CPU batch-prep per sub-batch | 165 ms @3584 (651 ms @7168 unvectorised) | **103–160 ms** |
 | peak host RAM | ~**50%** (estimated; not directly instrumented) | **~52%** (16.1 GB / 30.9 GB) |
@@ -98,11 +99,11 @@ cross-chunk interleaving hid it but OOM'd (§Headline). Replaced with:
    The co-resident stash raises steady peak RAM to **~52%** (from striping's
    45–47%) — the ~6-pt cost of the recovery, still well under the 60% target.
 
-### C. Cheaper sparse/edge chunks — bit-identical
+### C. Cheaper spatially-sparse / edge chunks — bit-identical
 Empty strips skip the S2 band read; chunks whose valid pixels span a narrow
 easting window read only that window (SAR read full-width so the saved
-observation-count layers keep full extent). Sparse-chunk load dropped toward
-bbox-proportional cost.
+observation-count layers keep full extent). Spatially-sparse chunks' load
+dropped toward bbox-proportional cost.
 
 ### D. Background staging write — bit-identical
 Whole-chunk upload runs on a single-slot writer thread overlapping the next
@@ -130,8 +131,8 @@ before `ray up` so failed launches tear down). The cluster is pinned to one AZ
   prefetch stash adds ~6 pts → **~52%** final (`main` itself ran ~50%). The
   92–95% OOM was a *removed* full-interleaving iteration of this branch — the
   design constraint that motivated striping, not a main→shipped delta.
-- **Sparse chunks (C):** load cost → bbox-proportional (biggest on sparse-heavy
-  ROIs; small on Iowa where mixing already hid it).
+- **Spatially-sparse chunks (C):** load cost → bbox-proportional (biggest on
+  ROIs dominated by narrow-footprint chunks; small on Iowa where mixing already hid it).
 - **Cost (E):** eliminated overnight instance leaks; capacity stalls mitigated at
   AZ-selection time.
 
