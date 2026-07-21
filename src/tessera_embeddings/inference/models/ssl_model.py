@@ -94,12 +94,38 @@ class MultimodalBTInferenceModel(nn.Module):
             torch.cuda.synchronize()
             ts1_end = time.monotonic()
         elif self._s2_stream is not None and self._s1_stream is not None:
+            # The backbone streams must first wait on the caller's stream:
+            # inputs may still be in flight there (async H2D from pinned
+            # memory + dtype cast). Historically the caller's pageable-memory
+            # copies were synchronous, which masked this missing edge.
+            current = torch.cuda.current_stream()
+            self._s2_stream.wait_stream(current)
+            self._s1_stream.wait_stream(current)
+            # wait_stream orders EXECUTION, but the caching allocator tracks a
+            # tensor's liveness only on its allocation stream (`current`). It
+            # can't see that the side streams still read s2_x/s1_x, so a later
+            # `current`-stream allocation (the next pipeline iteration's H2D)
+            # could reuse that storage while a backbone is mid-read — silent,
+            # intermittent corruption. record_stream marks the inputs in use on
+            # the streams that consume them.
+            s2_x.record_stream(self._s2_stream)
+            s1_x.record_stream(self._s1_stream)
             with torch.cuda.stream(self._s2_stream):
                 s2_repr = self.s2_backbone(s2_x)
             with torch.cuda.stream(self._s1_stream):
                 s1_repr = self.s1_backbone(s1_x)
-            torch.cuda.current_stream().wait_stream(self._s2_stream)
-            torch.cuda.current_stream().wait_stream(self._s1_stream)
+            current.wait_stream(self._s2_stream)
+            current.wait_stream(self._s1_stream)
+            # s2_repr/s1_repr were ALLOCATED on the backbone streams but are
+            # consumed on `current` (the fusion below) after these waits. The
+            # caching allocator tracks a tensor's liveness only on its alloc
+            # stream, so — symmetric to the input record_stream above — mark
+            # these outputs in use on `current`; otherwise a later
+            # `current`-stream allocation (e.g. the next pipeline iteration's
+            # H2D) could reuse their storage before the fusion reads them,
+            # a silent intermittent corruption.
+            s2_repr.record_stream(current)
+            s1_repr.record_stream(current)
         else:
             s2_repr = self.s2_backbone(s2_x)
             s1_repr = self.s1_backbone(s1_x)

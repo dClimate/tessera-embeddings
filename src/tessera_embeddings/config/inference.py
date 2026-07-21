@@ -139,6 +139,14 @@ REPRESENTATION_DIM = 192
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.
 DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 
+# CPU batch-prep pipeline depth for the inference loop (also the number of prep
+# workers). Depth 1 starved the GPU whenever a forward ran shorter than one prep;
+# depth 2 keeps a batch ready across consecutive short forwards. Lives here
+# (torch-free) because actors.py sizes its background-load CPU reservation to
+# match — one reserved core per prep worker — and cannot import inference.py at
+# module scope (the Fargate flow runner has no torch).
+PREFETCH_DEPTH = 2
+
 # Spatial read-tile size for inference. 2048 aligns the ChunkSpec grid with the
 # global store's shard grid (ADR-008 D3): one inference tile == one 2048-px
 # shard == 2x2 tiles per 4096-px ingest chunk, so assembly writes whole, lean
@@ -207,14 +215,15 @@ class InferenceConfig:
     num_obs_checkpoints: tuple[int, ...] = field(default_factory=lambda: DEFAULT_NUM_OBS_CHECKPOINTS)
 
     # Inference
-    batch_size: int = 3584
+    batch_size: int = 7168
     num_workers: int = 4
     norm_source: Literal["mpc", "aws"] = "aws"
     s1_orbit: Literal["ascending", "descending", "both"] = "both"
     # Deterministic sampling under v1.1 — no repeat variance; forced False in __post_init__.
     compute_std: bool = False
 
-    # Ray actor resource reservation. num_gpus=1 is production default (one A10G per actor);
+    # Ray actor resource reservation. num_gpus=1 is production default (one GPU per
+    # actor — L40S on g6e.xlarge workers);
     # set to 0 for CPU-only runs (local smoke tests, plain runner on a non-GPU host).
     num_gpus: float = 1.0
 

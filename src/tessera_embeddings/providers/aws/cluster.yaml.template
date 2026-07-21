@@ -69,8 +69,11 @@ available_node_types:
         max_workers: 0
 
     # On-demand GPU workers (~$1.86/hr at us-west-2 g6e.xlarge pricing)
-    # min_workers > 0 pre-warms the pool so the first batch of actors does
-    # not pay autoscaler cold-start latency (~30-60s per scale cycle).
+    # min_workers MUST stay 0: the idle timeout only drains nodes ABOVE the
+    # floor, so a positive floor is held forever on a leaked cluster — a
+    # cancelled flow whose teardown never ran kept a head + 2 idle g6e.xlarge
+    # overnight (2026-07-16). The cost of 0 is one ~30-60s autoscaler
+    # cold-start for the first batch of actors.
     gpu-workers-ondemand:
         node_config:
             InstanceType: g6e.xlarge
@@ -84,7 +87,7 @@ available_node_types:
         resources:
             CPU: 4
             GPU: 1
-        min_workers: 2
+        min_workers: 0
         max_workers: 500
 
     # Spot GPU workers (experimental — risk of interruption mid-chunk).

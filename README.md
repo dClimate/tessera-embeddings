@@ -220,7 +220,7 @@ Dask graph small (¼ the spatial tasks), while inference reads
 peak GPU-node RAM in check. Zarr's `oindex` reads the 2048 sub-tile out
 of a 4096 chunk without any alignment requirement. Go smaller on the
 ingest chunk and the satellite-ingest Dask scheduler drowns in tasks;
-go larger on the read tile and you OOM on a g5.2xlarge. And 2048 is
+go larger on the read tile and you OOM on a g6e.xlarge. And 2048 is
 load-bearing for the global store: one inference tile must equal one
 2048-px shard (ADR-008 D3). If you change either, profile.
 

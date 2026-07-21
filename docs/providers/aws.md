@@ -157,16 +157,18 @@ Default node config:
 
 ```
 head:        m5.2xlarge          (8 vCPU, 32 GB)   GCS + autoscaler
-workers:     g5.2xlarge          (8 vCPU, 32 GB,    1 InferenceActor each
-                                  1× A10G 24 GB,
-                                  450 GB NVMe)
+workers:     g6e.xlarge          (4 vCPU, 32 GB,    1 InferenceActor each
+                                  1× L40S 48 GB,
+                                  250 GB NVMe)
 ```
 
-`g5.2xlarge` was chosen for ~$1.21/hr at us-west-2 spot pricing,
-24 GB VRAM (fits the Tessera model + working set), and 450 GB NVMe
-(fast enough for `torch.load` of the checkpoint without EBS stalls).
-Bigger workers don't help — single-A10G throughput is the
-bottleneck.
+`g6e.xlarge` gives 48 GB VRAM (the Tessera model + working set fit
+with lots of headroom), 250 GB NVMe (fast enough for `torch.load` of
+the checkpoint without EBS stalls), and up to 20 Gbps network for the
+S3-heavy load phase. ~$1.86/hr on-demand at us-west-2; spot varies
+(~$0.5–0.9/hr). Scaling is horizontal — one GPU/actor per worker —
+so bigger instances don't help; note the 4 vCPUs make host-side data
+loading the tight resource per worker.
 
 ## Region
 
@@ -190,10 +192,10 @@ Inference, 5 km × 5 km ROI, 1 month of S2 + S1:
 ROI generation                            $0.001    (Fargate, ~5 s)
 S2 ingest    (Fargate, ~10 min × 4 wkrs)  $0.10
 S1 ingest    (Fargate, ~10 min × 4 wkrs)  $0.10
-Inference    (1 g5.2xlarge spot × 30 min) $0.20
+Inference    (1 g6e.xlarge spot × 30 min) $0.35
 Assembly     (Fargate, ~5 min × 20 wkrs)  $0.30
 ─────────────────────────────────────────────────
-Total                                     ~$0.70
+Total                                     ~$0.85
 
 Inference, 100 km × 100 km ROI:
 ─────────────────────────────────────────────────
