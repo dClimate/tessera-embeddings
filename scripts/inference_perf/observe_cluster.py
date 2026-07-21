@@ -1,28 +1,41 @@
-"""Observe GPU utilization + per-chunk phase splits on a live Ray inference cluster.
+"""Observe GPU/RAM utilization + per-chunk phase splits on a Ray inference cluster.
 
-Phase-0 measurement tool for the GPU-saturation campaign. Against a running
-``ray-tessera-inference-*`` cluster it can:
+General-purpose profiling tool for any Tessera Ray inference deployment (built
+during the GPU-saturation campaign; equally aimed at global-tessera runs).
+Workers are discovered by the Ray autoscaler's own tags (``ray-cluster-name``
++ ``ray-node-type=worker``) — the same tags teardown uses — so any cluster is
+reachable via ``--cluster``/``--cluster-prefix`` regardless of naming scheme.
 
-1. ``--start-pollers`` — start 1 s ``nvidia-smi`` and DCGM (``dcgmi dmon``:
-   GRACT/SMACT/TENSO/DRAMA/PCIe) captures on every GPU worker via SSM.
-2. ``--report`` — fetch a fleet report: per-worker GPU-poll summary (avg/max
-   util, avg power, busy fraction) plus a per-chunk phase-split table parsed
-   from the actor logs (gap+mask / band read / SAR+build / inference / write),
-   the wall-clock anatomy that shows how much GPU time each phase wastes.
-3. ``--ram-report`` — per-worker peak host RAM + GPU-util distribution pulled
-   from the workers' ``ResourceMonitor`` ``RESOURCES`` lines in CloudWatch.
-   Unlike ``--report`` (which SSHes live workers), this works AFTER a run has
-   torn down, so it answers "how close to the RAM ceiling did we get?" and
-   "how much GPU idle is left to recover?" post hoc. Scope with --since/--until.
+1. ``--start-pollers`` — start 1 s pollers on every GPU worker via SSM:
+   ``nvidia-smi``, DCGM (``dcgmi dmon``: GRACT/SMACT/TENSO/DRAMA/PCIe), and a
+   host-RAM sampler (used/avail/pct + top-3 process RSS each second). The RAM
+   sampler writes into the Ray session log dir, which the CloudWatch agent
+   already ships — so 1 s RAM data SURVIVES cluster teardown (the GPU/DCGM
+   CSVs stay in /tmp and die with the worker; summarize them live).
+2. ``--report`` — fetch a fleet report from live workers: per-worker GPU-poll
+   summary (avg/max util, avg power, busy fraction), a 1 s RAM summary (peak,
+   time ≥55%/60%, top spikes), OOM forensics (kernel OOM-killer + Ray memory
+   monitor events), and a per-chunk phase-split table. The table prefers the
+   actors' machine-readable ``CHUNK_SUMMARY`` JSON lines and falls back to
+   legacy prose-log regex parsing for runs from older code.
+3. ``--ram-report`` — post-hoc, from CloudWatch (no live cluster needed):
+   per-worker peak host RAM + GPU-util distribution from the 30 s RESOURCES
+   lines, plus — when the 1 s RAM poller ran — a per-worker 1 s rollup
+   (peak/p99) and the top spike samples with timestamps. Scope with
+   --since/--until.
 
 Usage::
 
+    # any deployment: pass the profile/region/log-group for that account
     python scripts/inference_perf/observe_cluster.py --profile yield --start-pollers
     # ...let the run process a few chunks...
     python scripts/inference_perf/observe_cluster.py --profile yield --report
-    # after a run (cluster gone): peak RAM + fleet util from CloudWatch
+    # after a run (cluster gone): peak/spike RAM + fleet util from CloudWatch
     python .../observe_cluster.py --profile yield --ram-report \
+        --log-group /ec2/yield-embeddings/ray \
         --since 2026-07-16T22:50 --until 2026-07-17T03:00
+    # scope to one run's fleet when several clusters share the account
+    python .../observe_cluster.py --profile yield --cluster tessera-inference-a60550ae --report
 
 --report/--start-pollers require workers reachable via SSM (the production AMI
 runs the agent). --ram-report only needs CloudWatch Logs read access. All modes
@@ -38,18 +51,80 @@ import time
 
 import boto3
 
-# CloudWatch log group the workers' ResourceMonitor lines ship to (yield deploy).
+# CloudWatch log group the workers' ResourceMonitor lines ship to (yield deploy
+# default — pass --log-group for other deployments).
 DEFAULT_RAM_LOG_GROUP = "/ec2/yield-embeddings/ray"
 
+# 1 s host-RAM sampler, uploaded to each worker and run with nohup. Writes to
+# the Ray session log dir when it exists: the CloudWatch agent's catch-all
+# ``logs/**/*.log`` entry ships that file (stream ``<instance>/other``), so the
+# 1 s samples survive teardown and feed --ram-report's spike analysis. /tmp is
+# the fallback when no Ray session exists yet (data then stays worker-local).
+# Reads /proc directly (no psutil dependency on the host python).
+RAM_POLLER_PY = r"""
+import os, time
+from datetime import datetime, timezone
+
+def logs_dir():
+    d = "/tmp/ray/session_latest/logs"
+    return d if os.path.isdir(d) else "/tmp"
+
+def meminfo():
+    m = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            m[k.strip()] = int(v.split()[0])  # kB
+    total, avail = m["MemTotal"], m["MemAvailable"]
+    used = total - avail
+    return used / 1048576, avail / 1048576, 100.0 * used / total
+
+def top_rss(n=3):
+    procs = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            comm = rss = None
+            with open(f"/proc/{pid}/status") as f:
+                for line in f:
+                    if line.startswith("Name:"):
+                        comm = line.split(None, 1)[1].strip()
+                    elif line.startswith("VmRSS:"):
+                        rss = int(line.split()[1])
+                        break
+            if rss:
+                procs.append((rss, comm))
+        except OSError:
+            continue
+    procs.sort(reverse=True)
+    return ",".join(f"{c}:{r / 1048576:.1f}" for r, c in procs[:n])
+
+while True:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        used, avail, pct = meminfo()
+        line = f"RAMPOLL ts={ts} used_gb={used:.2f} avail_gb={avail:.2f} pct={pct:.0f} top={top_rss()}"
+        with open(os.path.join(logs_dir(), "ram_poll.log"), "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    time.sleep(1)
+"""
+
 # Kill any prior pollers before starting new ones. Match the actual long-lived
-# processes (the `nvidia-smi --query-gpu ... -l` and `dcgmi dmon` command lines),
-# not just the redirect-filename wrapper — otherwise re-running --start-pollers
-# leaves the old samplers writing concurrently to the same files and corrupts the
-# measurements. The `[n]`/`[d]` bracket idiom keeps the pattern from matching any
-# shell whose own command line contains it (e.g. an SSM wrapper), which pkill -f
-# would otherwise kill before the poller-start commands run.
+# processes (the `nvidia-smi --query-gpu ... -l`, `dcgmi dmon`, and ram_poll.py
+# command lines), not just the redirect-filename wrapper — otherwise re-running
+# --start-pollers leaves the old samplers writing concurrently to the same
+# files and corrupts the measurements. The `[n]`/`[d]`/`[r]` bracket idiom
+# keeps the pattern from matching any shell whose own command line contains it
+# (e.g. an SSM wrapper), which pkill -f would otherwise kill before the
+# poller-start commands run.
 POLLER_COMMANDS = [
-    "pkill -f '[n]vidia-smi --query-gpu' 2>/dev/null; pkill -f '[d]cgmi dmon' 2>/dev/null; true",
+    (
+        "pkill -f '[n]vidia-smi --query-gpu' 2>/dev/null; pkill -f '[d]cgmi dmon' 2>/dev/null; "
+        "pkill -f '[r]am_poll.py' 2>/dev/null; true"
+    ),
     (
         "setsid nohup bash -c 'nvidia-smi --query-gpu=timestamp,utilization.gpu,"
         "utilization.memory,power.draw,clocks.sm,memory.used --format=csv,noheader -l 1 "
@@ -60,7 +135,9 @@ POLLER_COMMANDS = [
         "'dcgmi dmon -e 1001,1002,1004,1005,1009,1010 -d 1000 > /tmp/dcgm_poll.txt 2>&1' "
         "</dev/null >/dev/null 2>&1 & fi"
     ),
-    "sleep 2; pgrep -af 'nvidia-smi --query|dcgmi dmon' | head -4",
+    f"cat > /tmp/ram_poll.py << 'RAMPYEOF'\n{RAM_POLLER_PY}\nRAMPYEOF",
+    "setsid nohup python3 /tmp/ram_poll.py </dev/null >/dev/null 2>&1 &",
+    "sleep 2; pgrep -af 'nvidia-smi --query|dcgmi dmon|ram_poll' | head -6",
 ]
 
 GPU_SUMMARY_CMD = (
@@ -69,80 +146,122 @@ GPU_SUMMARY_CMD = (
     "avg_power=%.0fW busy_frac(>5%%)=%.2f\\n\", n,u/n,mu,p/n,busy/n}' /tmp/gpu_poll.csv"
 )
 
-# Runs on the worker: parse actor .err logs into per-chunk phase rows. The
-# format string targets _configure_actor_logging's basicConfig layout.
+# 1 s RAM poll summary. Field layout of a RAMPOLL line:
+#   RAMPOLL ts=<iso> used_gb=<g> avail_gb=<g> pct=<p> top=<comm:gb,...>
+# ($5 is pct=<p>.) One compound command so $F persists across the pipeline.
+RAM_SUMMARY_CMD = (
+    'F=/tmp/ray/session_latest/logs/ram_poll.log; [ -f "$F" ] || F=/tmp/ram_poll.log; '
+    'awk \'/^RAMPOLL/{n++; split($5,p,"="); v=p[2]+0; s+=v; if(v>mx){mx=v; ts=$2} '
+    "if(v>=55)h55++; if(v>=60)h60++} "
+    'END{if(n>0) printf "samples=%d mean=%.1f%% peak=%.0f%% at %s | sec>=55%%: %d | sec>=60%%: %d\\n", '
+    'n, s/n, mx, ts, h55, h60; else print "no ram_poll data (pollers not started?)"}\' "$F"; '
+    "echo '--- top 5 RAM spike samples ---'; "
+    "grep -h '^RAMPOLL' \"$F\" 2>/dev/null | sort -t= -k5 -rn | head -5; true"
+)
+
+# Runs on the worker: build the per-chunk phase table. Preferred source is the
+# actors' machine-readable CHUNK_SUMMARY JSON lines (see actors.py
+# _chunk_summary_line — stable keys, immune to prose-wording drift). The legacy
+# prose-regex path below remains as a fallback so the tool still works against
+# runs from code that predates the summary lines.
 PHASE_PARSER = r"""
-import glob, re
+import glob, json, os, re
 from datetime import datetime
-PAT = {
- "pref": re.compile(r"^(\S+ \S+) \S+ INFO xchunk prefetch: hit \([^)]+\) for (\S+)"),
- "tkept": re.compile(r"^(\S+ \S+) \S+ INFO Chunk (\S+): T_kept=(\d+) -> strip_h=(\d+) -> (\d+) strip"),
- "ds": re.compile(r"^(\S+ \S+) \S+ INFO MosaicChunkInferenceDataset: (\d+) valid pixels"
-                  r" out of \d+ total \(([\d.]+)%\) in (\d+) buckets"),
- "start": re.compile(r"^(\S+ \S+) \S+ INFO Starting v1.1 inference"),
- "idone": re.compile(r"^(\S+ \S+) \S+ INFO Inference complete: .* ([\d.]+)s total, (\d+) px/sec"),
- "cdone": re.compile(r"^(\S+ \S+) \S+ INFO Chunk (\S+) complete: (\d+) valid pixels, ([\d.]+)s"),
-}
-def ts(s): return datetime.strptime(s, "%Y-%m-%d %H:%M:%S,%f")
-events = []
-for f in glob.glob("/tmp/ray/session_latest/logs/worker-*.err"):
+
+LOGS = os.environ.get("TESSERA_RAY_LOGS", "/tmp/ray/session_latest/logs")
+
+summaries = []
+for f in glob.glob(f"{LOGS}/worker-*.err"):
     for line in open(f, errors="replace"):
-        for kind, pat in PAT.items():
-            m = pat.match(line.strip())
-            if m: events.append((ts(m.group(1)), kind, m.groups()[1:]))
-events.sort(key=lambda e: e[0])
-# Overhead accounting: overhead_s = total_s - infer_s - write_s is the honest
-# per-chunk non-inference cost in BOTH modes — it's derived from the wall-clock
-# total (measured from the top of _process_chunk, before any prologue work) minus
-# the two GPU-adjacent phases, so it captures cold load regardless of where the
-# load lines fall. prologue_s (T_kept-log -> inference-start) is main-thread-only
-# and UNDERSTATES cold chunks: the "Chunk T_kept" line is emitted after the
-# prologue's SCL/band read, and with cross-chunk prefetch (Phase 1) the band/SAR
-# loads log during the PREVIOUS chunk's window entirely. Read overhead_s for the
-# real figure; prologue_s only isolates main-thread build. pref=Y marks chunks
-# that consumed a prefetched stash (expect their overhead_s ~= write_s).
-# A split chunk calls run_inference once per strip, so ds/start/idone lines
-# repeat within one chunk. Accumulate: t_start = FIRST strip's inference start,
-# infer_s = SUM of every strip's reported inference seconds, t_idone = LAST
-# strip's completion. valid_px comes from the actor's chunk-total "complete: N
-# valid pixels" (cdone) line — NOT the per-strip ds sum, which under-counts
-# multi-strip chunks (a strip with no valid pixels emits no ds line, and the ds
-# count is per-strip-within-crop); px/s is the honest END-TO-END rate
-# valid_px / total_s. ds lines are still summed as a fallback if cdone is absent.
-rows, cur, prev_done, pending_pref = [], None, None, set()
-for t, kind, g in events:
-    if kind == "pref":
-        pending_pref.add(g[0])
-    elif kind == "tkept":
-        gap = (t - prev_done).total_seconds() if prev_done else None
-        cur = {"label": g[0], "tkept": g[1], "strips": g[3], "gap_s": gap, "t_mask": t,
-               "pref": "Y" if g[0] in pending_pref else "N", "infer_s": 0.0, "px": 0}
-        pending_pref.discard(g[0])
-    elif cur is None: continue
-    elif kind == "ds":
-        if "buckets" not in cur: cur["buckets"] = g[2]  # first strip's bucket count
-        cur["px"] += int(g[0])
-    elif kind == "start":
-        if "t_start" not in cur: cur["t_start"] = t
-    elif kind == "idone":
-        cur["t_idone"] = t  # last strip wins
-        cur["infer_s"] += float(g[0])
-    elif kind == "cdone":
-        cur["t_cdone"], cur["cdone_px"], cur["total_s"] = t, int(g[1]), g[2]
-        rows.append(cur); prev_done = t; cur = None
-print("label\tTkept\tstrips\tpref\tbuckets\tvalid_px\tprologue_s\tinfer_s\twrite_s\toverhead_s\ttotal_s\tpx/s")
-for r in rows:
-    try:
-        prologue = (r["t_start"] - r["t_mask"]).total_seconds()
-        write = (r["t_cdone"] - r["t_idone"]).total_seconds()
-        infer = r["infer_s"]
-        total = float(r["total_s"])
-        overhead = total - infer - write
-        vpx = r.get("cdone_px", r["px"])  # authoritative chunk-total; ds-sum fallback
-        pxs = (vpx / total) if total > 0 else 0  # honest END-TO-END px/s
-        print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r['pref']}\t{r.get('buckets','?')}\t{vpx}\t{prologue:.1f}\t{infer:.1f}\t{write:.1f}\t{overhead:.1f}\t{r['total_s']}\t{pxs:.0f}")
-    except KeyError as e:
-        print(f"{r['label']}\tINCOMPLETE({e})")
+        i = line.find("CHUNK_SUMMARY: ")
+        if i != -1:
+            try:
+                summaries.append(json.loads(line[i + len("CHUNK_SUMMARY: "):]))
+            except ValueError:
+                pass
+
+if summaries:
+    print("label\tTkept\tstrips\trung\tvalid_px\tprologue_s\tinfer_s\toverhead_s\ttotal_s\tpx/s\tstatus")
+    for s in summaries:
+        total = float(s.get("total_s") or 0)
+        px = int(s.get("valid_px") or 0)
+        pxs = px / total if total > 0 else 0
+        print("\t".join(str(x) for x in (
+            s.get("label"), s.get("t_kept", "?"), s.get("strips", "?"), s.get("rung", "?"),
+            px, s.get("prologue_s", "?"), s.get("infer_s", "?"), s.get("overhead_s", "?"),
+            s.get("total_s", "?"), f"{pxs:.0f}", s.get("status"),
+        )))
+else:
+    # ------- legacy prose-log parsing (pre-CHUNK_SUMMARY code) -------
+    PAT = {
+     "pref": re.compile(r"^(\S+ \S+) \S+ INFO xchunk prefetch: hit \([^)]+\) for (\S+)"),
+     "tkept": re.compile(r"^(\S+ \S+) \S+ INFO Chunk (\S+): T_kept=(\d+) -> strip_h=(\d+) -> (\d+) strip"),
+     "ds": re.compile(r"^(\S+ \S+) \S+ INFO MosaicChunkInferenceDataset: (\d+) valid pixels"
+                      r" out of \d+ total \(([\d.]+)%\) in (\d+) buckets"),
+     "start": re.compile(r"^(\S+ \S+) \S+ INFO Starting v1.1 inference"),
+     "idone": re.compile(r"^(\S+ \S+) \S+ INFO Inference complete: .* ([\d.]+)s total, (\d+) px/sec"),
+     "cdone": re.compile(r"^(\S+ \S+) \S+ INFO Chunk (\S+) complete: (\d+) valid pixels, ([\d.]+)s"),
+    }
+    def ts(s): return datetime.strptime(s, "%Y-%m-%d %H:%M:%S,%f")
+    events = []
+    for f in glob.glob(f"{LOGS}/worker-*.err"):
+        for line in open(f, errors="replace"):
+            for kind, pat in PAT.items():
+                m = pat.match(line.strip())
+                if m: events.append((ts(m.group(1)), kind, m.groups()[1:]))
+    events.sort(key=lambda e: e[0])
+    # Overhead accounting: overhead_s = total_s - infer_s - write_s is the honest
+    # per-chunk non-inference cost in BOTH modes — it's derived from the wall-clock
+    # total (measured from the top of _process_chunk, before any prologue work) minus
+    # the two GPU-adjacent phases, so it captures cold load regardless of where the
+    # load lines fall. prologue_s (T_kept-log -> inference-start) is main-thread-only
+    # and UNDERSTATES cold chunks: the "Chunk T_kept" line is emitted after the
+    # prologue's SCL/band read, and with cross-chunk prefetch (Phase 1) the band/SAR
+    # loads log during the PREVIOUS chunk's window entirely. Read overhead_s for the
+    # real figure; prologue_s only isolates main-thread build. pref=Y marks chunks
+    # that consumed a prefetched stash (expect their overhead_s ~= write_s).
+    # A split chunk calls run_inference once per strip, so ds/start/idone lines
+    # repeat within one chunk. Accumulate: t_start = FIRST strip's inference start,
+    # infer_s = SUM of every strip's reported inference seconds, t_idone = LAST
+    # strip's completion. valid_px comes from the actor's chunk-total "complete: N
+    # valid pixels" (cdone) line — NOT the per-strip ds sum, which under-counts
+    # multi-strip chunks (a strip with no valid pixels emits no ds line, and the ds
+    # count is per-strip-within-crop); px/s is the honest END-TO-END rate
+    # valid_px / total_s. ds lines are still summed as a fallback if cdone is absent.
+    rows, cur, prev_done, pending_pref = [], None, None, set()
+    for t, kind, g in events:
+        if kind == "pref":
+            pending_pref.add(g[0])
+        elif kind == "tkept":
+            gap = (t - prev_done).total_seconds() if prev_done else None
+            cur = {"label": g[0], "tkept": g[1], "strips": g[3], "gap_s": gap, "t_mask": t,
+                   "pref": "Y" if g[0] in pending_pref else "N", "infer_s": 0.0, "px": 0}
+            pending_pref.discard(g[0])
+        elif cur is None: continue
+        elif kind == "ds":
+            if "buckets" not in cur: cur["buckets"] = g[2]  # first strip's bucket count
+            cur["px"] += int(g[0])
+        elif kind == "start":
+            if "t_start" not in cur: cur["t_start"] = t
+        elif kind == "idone":
+            cur["t_idone"] = t  # last strip wins
+            cur["infer_s"] += float(g[0])
+        elif kind == "cdone":
+            cur["t_cdone"], cur["cdone_px"], cur["total_s"] = t, int(g[1]), g[2]
+            rows.append(cur); prev_done = t; cur = None
+    print("label\tTkept\tstrips\tpref\tbuckets\tvalid_px\tprologue_s\tinfer_s\twrite_s\toverhead_s\ttotal_s\tpx/s")
+    for r in rows:
+        try:
+            prologue = (r["t_start"] - r["t_mask"]).total_seconds()
+            write = (r["t_cdone"] - r["t_idone"]).total_seconds()
+            infer = r["infer_s"]
+            total = float(r["total_s"])
+            overhead = total - infer - write
+            vpx = r.get("cdone_px", r["px"])  # authoritative chunk-total; ds-sum fallback
+            pxs = (vpx / total) if total > 0 else 0  # honest END-TO-END px/s
+            print(f"{r['label']}\t{r['tkept']}\t{r['strips']}\t{r['pref']}\t{r.get('buckets','?')}\t{vpx}\t{prologue:.1f}\t{infer:.1f}\t{write:.1f}\t{overhead:.1f}\t{r['total_s']}\t{pxs:.0f}")
+        except KeyError as e:
+            print(f"{r['label']}\tINCOMPLETE({e})")
 """
 
 REPORT_COMMANDS = [
@@ -150,23 +269,42 @@ REPORT_COMMANDS = [
     GPU_SUMMARY_CMD,
     "echo '=== DCGM tail ==='",
     "tail -6 /tmp/dcgm_poll.txt 2>/dev/null || echo no-dcgm",
+    "echo '=== RAM POLL SUMMARY (1s) ==='",
+    RAM_SUMMARY_CMD,
+    "echo '=== OOM / MEMORY EVENTS ==='",
+    (
+        "{ sudo -n dmesg -T 2>/dev/null || dmesg -T 2>/dev/null; } "
+        "| grep -iE 'out of memory|oom[-_]?kill' | tail -5; true"
+    ),
+    (
+        "grep -hiE 'node memory usage|low on memory|killed.*memory' "
+        "/tmp/ray/session_latest/logs/raylet* 2>/dev/null | tail -3; true"
+    ),
     "echo '=== PHASE SPLITS ==='",
     f"python3 - << 'PYEOF'\n{PHASE_PARSER}\nPYEOF",
 ]
 
 
-def find_workers(session: boto3.session.Session, name_prefix: str) -> list[str]:
-    """Return running, SSM-registered GPU workers whose Name tag matches the prefix.
+def find_workers(session: boto3.session.Session, cluster: str | None, cluster_prefix: str) -> list[str]:
+    """Return running, SSM-registered GPU workers of the target cluster(s).
+
+    Discovery keys on the Ray autoscaler's own EC2 tags — ``ray-cluster-name``
+    (the same tag teardown terminates by) and ``ray-node-type=worker`` — so it
+    works for any deployment regardless of instance-naming scheme. ``cluster``
+    scopes to one run's fleet exactly; otherwise ``cluster_prefix`` matches all
+    clusters whose name starts with it.
 
     Freshly-launched autoscaler workers take a minute to register with SSM, and
     one unregistered instance in a ``send_command`` batch fails the whole call —
     so intersect the EC2 listing with SSM's registered set and report the rest.
     """
     ec2 = session.client("ec2")
+    tag_values = [cluster] if cluster else [f"{cluster_prefix}*"]
     resp = ec2.describe_instances(
         Filters=[
             {"Name": "instance-state-name", "Values": ["running"]},
-            {"Name": "tag:Name", "Values": [f"{name_prefix}*worker*"]},
+            {"Name": "tag:ray-node-type", "Values": ["worker"]},
+            {"Name": "tag:ray-cluster-name", "Values": tag_values},
         ]
     )
     running = [inst["InstanceId"] for res in resp["Reservations"] for inst in res["Instances"]]
@@ -240,23 +378,49 @@ def _parse_ts(s: str) -> int:
     return int(dt.timestamp())
 
 
+def _insights_query(
+    logs: object, log_group: str, query: str, start_epoch: int, end_epoch: int
+) -> list[dict[str, str]] | None:
+    """Run one CloudWatch Insights query and return its rows (None on failure).
+
+    Bounded poll: Insights statuses are Scheduled/Running/Complete/Failed/
+    Cancelled/Timeout/Unknown. Break on any terminal state (incl. Unknown) and
+    cap total wait so a query stuck Scheduled/Running/Unknown can't spin forever.
+    """
+    qid = logs.start_query(
+        logGroupName=log_group, startTime=start_epoch, endTime=end_epoch, queryString=query, limit=10000
+    )["queryId"]
+    deadline = time.monotonic() + 180
+    res = logs.get_query_results(queryId=qid)
+    while res["status"] not in ("Complete", "Failed", "Cancelled", "Timeout", "Unknown"):
+        if time.monotonic() > deadline:
+            print("CloudWatch query did not finish within 180s", file=sys.stderr)
+            return None
+        time.sleep(2)
+        res = logs.get_query_results(queryId=qid)
+    if res["status"] != "Complete":
+        print(f"CloudWatch query {res['status']}", file=sys.stderr)
+        return None
+    return [{c["field"]: c["value"] for c in row} for row in res["results"]]
+
+
 def ram_util_report(session: boto3.session.Session, log_group: str, start_epoch: int, end_epoch: int) -> int:
     """Per-worker peak host RAM + GPU-util distribution from CloudWatch.
 
-    Sources the ``ResourceMonitor`` ``RESOURCES`` lines (30 s cadence) that the
-    workers ship to ``log_group``, so it works AFTER a run's cluster has torn
-    down — unlike the SSM ``--report`` path, which needs live workers.
+    Sources two line families the workers ship to ``log_group``, so it works
+    AFTER a run's cluster has torn down — unlike the SSM ``--report`` path:
 
-    Reports, per log stream (≈ per worker): peak host RAM (GB and % of node),
-    mean/min GPU utilization, and sample count; plus fleet rollups. Peak RAM is
-    the 30 s-polled peak — it can miss an instantaneous OOM spike (the OOM
-    killer catches those; see the flow-runner memory-monitor diagnostics).
+    - ``RESOURCES`` (30 s, always on): per-stream peak RAM + GPU-util rollup.
+      30 s cadence MISSES sub-30 s spikes — treat its peak as a floor.
+    - ``RAMPOLL`` (1 s, present when ``--start-pollers`` ran): per-stream 1 s
+      peak/p99 rollup plus the top spike samples with timestamps and the top
+      RSS processes at that instant — the spike-forensics view.
 
     NOTE: the log group is shared across runs, so scope the window tightly to
     the run of interest; streams from an overlapping run share the same group.
     """
     logs = session.client("logs")
-    query = (
+    resources_q = (
         "fields @logStream, @message "
         "| filter @message like /RESOURCES/ "
         '| parse @message "RAM=*/* GB (*%)" as ram_gb, ram_total, ram_pct '
@@ -266,25 +430,9 @@ def ram_util_report(session: boto3.session.Session, log_group: str, start_epoch:
         "count(*) as samples by @logStream "
         "| sort peak_ram_pct desc"
     )
-    qid = logs.start_query(
-        logGroupName=log_group, startTime=start_epoch, endTime=end_epoch, queryString=query, limit=10000
-    )["queryId"]
-    # Bound the poll: Insights statuses are Scheduled/Running/Complete/Failed/
-    # Cancelled/Timeout/Unknown. Break on any terminal state (incl. Unknown) and
-    # cap total wait so a query stuck Scheduled/Running/Unknown can't spin forever.
-    deadline = time.monotonic() + 180
-    res = logs.get_query_results(queryId=qid)
-    while res["status"] not in ("Complete", "Failed", "Cancelled", "Timeout", "Unknown"):
-        if time.monotonic() > deadline:
-            print("CloudWatch query did not finish within 180s", file=sys.stderr)
-            return 1
-        time.sleep(2)
-        res = logs.get_query_results(queryId=qid)
-    if res["status"] != "Complete":
-        print(f"CloudWatch query {res['status']}", file=sys.stderr)
+    rows = _insights_query(logs, log_group, resources_q, start_epoch, end_epoch)
+    if rows is None:
         return 1
-
-    rows = [{c["field"]: c["value"] for c in row} for row in res["results"]]
     if not rows:
         print("No RESOURCES lines in the window (check --log-group / --since / --until).", file=sys.stderr)
         return 1
@@ -313,10 +461,46 @@ def ram_util_report(session: boto3.session.Session, log_group: str, start_epoch:
         f"idle-recovery ceiling if all → 100% ≈ {100 - fleet_gpu:.0f}%"
     )
     print(
-        "(peak RAM is the 30s-polled peak; instantaneous OOM spikes show only in the "
-        "flow-runner memory-monitor diagnostics. GPU util is nvidia-smi 'busy-or-not', "
-        "an upper bound on useful-work fraction — not all the sub-100% gap is CPU-feed.)"
+        "(peak RAM above is the 30s-polled peak — a FLOOR for the true instantaneous peak. "
+        "GPU util is nvidia-smi 'busy-or-not', an upper bound on useful-work fraction.)"
     )
+
+    # --- 1 s RAMPOLL rollup + spike table (present when --start-pollers ran) ---
+    poll_q = (
+        "fields @logStream, @message "
+        "| filter @message like /RAMPOLL/ "
+        '| parse @message "used_gb=* avail_gb=* pct=* top=*" as used_gb, avail_gb, pctv, topv '
+        "| stats max(used_gb) as peak_gb, max(pctv) as peak_pct, pct(pctv, 99) as p99_pct, "
+        "count(*) as samples by @logStream "
+        "| sort peak_pct desc"
+    )
+    poll_rows = _insights_query(logs, log_group, poll_q, start_epoch, end_epoch)
+    if not poll_rows:
+        print("\n(no 1s RAMPOLL lines in window — --start-pollers not run, or pre-tooling code)")
+        return 0
+    print(f"\n1s RAM POLL rollup ({len(poll_rows)} worker streams):")
+    print("stream\tpeak_gb\tpeak_%\tp99_%\tsamples")
+    for r in poll_rows:
+        stream = r["@logStream"].rsplit("/", 1)[-1][:32]
+        print(
+            f"{stream}\t{float(r['peak_gb']):.1f}\t{float(r['peak_pct']):.0f}"
+            f"\t{float(r['p99_pct']):.0f}\t{int(float(r['samples']))}"
+        )
+
+    spike_q = (
+        "fields @logStream, @message "
+        "| filter @message like /RAMPOLL/ "
+        '| parse @message "pct=* top=*" as pctv, topv '
+        "| sort pctv desc "
+        "| limit 10"
+    )
+    spikes = _insights_query(logs, log_group, spike_q, start_epoch, end_epoch)
+    if spikes:
+        print("\nTop 10 RAM spike samples (1s):")
+        for r in spikes:
+            stream = r["@logStream"].rsplit("/", 1)[-1][:32]
+            msg = r.get("@message", "").strip()
+            print(f"{stream}\t{msg[msg.find('RAMPOLL') :][:160]}")
     return 0
 
 
@@ -325,16 +509,26 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--profile", default="yield", help="AWS profile (default: yield)")
     parser.add_argument("--region", default="us-west-2")
-    parser.add_argument("--name-prefix", default="ray-tessera-inference")
-    parser.add_argument("--start-pollers", action="store_true", help="Start 1s GPU pollers on all workers")
+    parser.add_argument("--cluster", help="Exact ray-cluster-name tag — scope to one run's fleet")
     parser.add_argument(
-        "--report", action="store_true", help="Fetch GPU summaries + per-chunk phase splits (live workers)"
+        "--cluster-prefix",
+        "--name-prefix",  # backward-compat alias (previous versions matched the EC2 Name)
+        dest="cluster_prefix",
+        default="tessera-inference",
+        help="ray-cluster-name tag prefix to match when --cluster is not given (default: tessera-inference)",
+    )
+    parser.add_argument("--start-pollers", action="store_true", help="Start 1s GPU + host-RAM pollers on all workers")
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Fetch GPU/RAM summaries, OOM events, and per-chunk phase splits (live workers)",
     )
     parser.add_argument(
         "--ram-report",
         action="store_true",
-        help="Per-worker peak host RAM + GPU-util distribution from CloudWatch RESOURCES lines "
-        "(works post-run, no live cluster needed). Scope with --since/--until.",
+        help="Per-worker peak host RAM + GPU-util distribution from CloudWatch RESOURCES lines, "
+        "plus 1s spike analysis when the RAM poller ran (works post-run, no live cluster "
+        "needed). Scope with --since/--until.",
     )
     parser.add_argument("--log-group", default=DEFAULT_RAM_LOG_GROUP, help="CloudWatch log group for --ram-report")
     parser.add_argument("--since", help="--ram-report window start, ISO8601 UTC (e.g. 2026-07-16T22:50)")
@@ -356,9 +550,13 @@ def main(argv: list[str] | None = None) -> int:
         if not (args.start_pollers or args.report):
             return rc
 
-    workers = find_workers(session, args.name_prefix)
+    # Tolerate the old Name-style prefix (instance Names are "ray-<cluster>-...",
+    # the tag value is the bare cluster name).
+    prefix = args.cluster_prefix.removeprefix("ray-")
+    workers = find_workers(session, args.cluster, prefix)
     if not workers:
-        print(f"No running workers matching {args.name_prefix}*worker*", file=sys.stderr)
+        target = args.cluster or f"{prefix}*"
+        print(f"No running SSM-registered workers with ray-cluster-name={target}", file=sys.stderr)
         return 1
     print(f"Found {len(workers)} worker(s): {', '.join(workers)}\n")
 

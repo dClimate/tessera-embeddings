@@ -12,6 +12,7 @@ torch is only needed on GPU workers at runtime.
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import tempfile
@@ -69,6 +70,18 @@ class _ChunkPrologue:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _chunk_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogeneous JSON payload
+    """One machine-readable per-chunk line for the profiling tools.
+
+    ``scripts/inference_perf/observe_cluster.py --report`` parses these in
+    preference to prose log lines (whose wording drifts across branches and
+    silently breaks regex parsers). Keep the keys stable — or update that
+    parser in the same change.
+    """
+    return "CHUNK_SUMMARY: " + json.dumps(fields, sort_keys=True)
+
 
 # Host-RAM budget (bytes) for one resident S2 band set (a strip's bands + its
 # full-chunk SCL mask). The intra-chunk 1-deep strip prefetch keeps TWO such
@@ -945,6 +958,7 @@ class InferenceActor:
         from tessera_embeddings.inference.inference import run_inference
 
         t0 = time.monotonic()
+        self._resource_monitor.set_context("work", f"{chunk.label}:prologue")
 
         # Report loading phase so stall detection has visibility before batch 50
         if tracker:
@@ -968,10 +982,15 @@ class InferenceActor:
             # (chunk_data, dataset) for strips[0]; handed to iteration 0 of the
             # strip loop below, then dropped so at most two strips stay resident.
             first_strip: tuple[ChunkData, MosaicChunkInferenceDataset] | None = prologue.first_strip
+            # Captured for the CHUNK_SUMMARY line — mask_bundle and prologue are
+            # both deleted before the completion site.
+            t_kept = int(mask_bundle.mask.shape[0])
+            rung = prologue.rung or "serial"
+            prologue_s = time.monotonic() - t0
             logger.info(
                 "Chunk %s: T_kept=%d -> strip_h=%d -> %d strip(s) [%s, prefetch=%s]",
                 chunk.label,
-                int(mask_bundle.mask.shape[0]),
+                t_kept,
                 plan.strip_h,
                 len(strips),
                 plan.strategy,
@@ -1021,6 +1040,7 @@ class InferenceActor:
             }
 
             total_valid = 0
+            infer_s = 0.0  # summed wall-clock of the per-strip inference calls
             # Strip pipeline. When prefetch is on (dense/hideable), strip i+1
             # loads (and buckets) on the background thread while strip i runs
             # inference, so at most two S2 sets are co-resident. When it is off
@@ -1045,6 +1065,7 @@ class InferenceActor:
                 chunk_data: ChunkData | None = None
                 dataset: MosaicChunkInferenceDataset | None = None
                 for i, strip in enumerate(strips):
+                    self._resource_monitor.set_context("work", f"{chunk.label}:s{i + 1}/{len(strips)}")
                     # The previous strip reported "inference"; flip back to
                     # "loading" before blocking on this strip's read so a slow
                     # multi-strip load isn't misclassified as an inference stall
@@ -1126,7 +1147,9 @@ class InferenceActor:
                         logger.info("Chunk %s strip %s: no valid pixels, leaving zero-filled", chunk.label, strip)
                         continue
 
+                    t_inf = time.monotonic()
                     result = run_inference(self.model, dataset, self.config, self.device, on_batch=on_batch)
+                    infer_s += time.monotonic() - t_inf
                     # Cropped grids land at their column offset; outside the
                     # box the buffers keep their initial zero/NaN fill — the
                     # exact values those never-valid pixels get today.
@@ -1153,11 +1176,30 @@ class InferenceActor:
                 # (Ray worker crash, etc.).
                 logger.info("Chunk %s has no valid pixels, skipping (assembly will fill)", chunk.label)
                 writer.write_skip_marker(chunk, run_id)  # zero-byte marker: keep synchronous
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    "%s",
+                    _chunk_summary_line(
+                        label=chunk.label,
+                        status="skipped",
+                        valid_px=0,
+                        total_s=round(elapsed, 1),
+                        prologue_s=round(prologue_s, 1),
+                        infer_s=0.0,
+                        overhead_s=round(elapsed, 1),
+                        strips=len(strips),
+                        strip_h=plan.strip_h,
+                        strategy=plan.strategy,
+                        t_kept=t_kept,
+                        rung=rung,
+                        x_crop_w=(x_sub.stop - x_sub.start) if x_sub is not None else None,
+                    ),
+                )
                 return {
                     "chunk": chunk.label,
                     "status": "skipped",
                     "valid_pixels": 0,
-                    "elapsed_sec": time.monotonic() - t0,
+                    "elapsed_sec": elapsed,
                     "instance_id": self.instance_id,
                     "prior_write": self._collect_prior_write_checked(),
                 }
@@ -1174,22 +1216,29 @@ class InferenceActor:
             self._writer_pool_handle()
 
             def _timed_write() -> str:
-                t_w = time.monotonic()
-                path = writer.write_chunk(
-                    chunk,
-                    embeddings,
-                    run_id,
-                    embeddings_std=None,
-                    scales=scales,
-                    obs_counts=obs_buffers,
-                )
-                # One line per chunk: how long the backgrounded upload took
-                # (the phase table's write_s is ~0 by design — this is the
-                # off-critical-path cost, for post-run upload health checks).
-                logger.info(
-                    "Staging write for %s completed in %.1fs (backgrounded)", chunk.label, time.monotonic() - t_w
-                )
-                return path
+                # "write" is a separate context slot: the upload overlaps the
+                # NEXT chunk's prologue on the main thread, so both phases must
+                # be attributable on the same RESOURCES line.
+                self._resource_monitor.set_context("write", chunk.label)
+                try:
+                    t_w = time.monotonic()
+                    path = writer.write_chunk(
+                        chunk,
+                        embeddings,
+                        run_id,
+                        embeddings_std=None,
+                        scales=scales,
+                        obs_counts=obs_buffers,
+                    )
+                    # One line per chunk: how long the backgrounded upload took
+                    # (the phase table's write_s is ~0 by design — this is the
+                    # off-critical-path cost, for post-run upload health checks).
+                    logger.info(
+                        "Staging write for %s completed in %.1fs (backgrounded)", chunk.label, time.monotonic() - t_w
+                    )
+                    return path
+                finally:
+                    self._resource_monitor.set_context("write", None)
 
             self._pending_write = (chunk.label, self._writer_pool.submit(_timed_write))
 
@@ -1199,6 +1248,26 @@ class InferenceActor:
                 chunk.label,
                 total_valid,
                 elapsed,
+            )
+            logger.info(
+                "%s",
+                _chunk_summary_line(
+                    label=chunk.label,
+                    status="success",
+                    valid_px=total_valid,
+                    total_s=round(elapsed, 1),
+                    prologue_s=round(prologue_s, 1),
+                    infer_s=round(infer_s, 1),
+                    # write is deferred to the background writer, so the honest
+                    # critical-path overhead is everything that isn't inference.
+                    overhead_s=round(elapsed - infer_s, 1),
+                    strips=len(strips),
+                    strip_h=plan.strip_h,
+                    strategy=plan.strategy,
+                    t_kept=t_kept,
+                    rung=rung,
+                    x_crop_w=(x_sub.stop - x_sub.start) if x_sub is not None else None,
+                ),
             )
 
             return {
@@ -1214,6 +1283,12 @@ class InferenceActor:
         except Exception as e:
             elapsed = time.monotonic() - t0
             logger.exception("Chunk %s failed after %.1fs on instance %s", chunk.label, elapsed, self.instance_id)
+            # Minimal summary (prologue may not have completed, so per-plan
+            # fields can be unbound here); parsers key on status.
+            logger.info(
+                "%s",
+                _chunk_summary_line(label=chunk.label, status="failed", total_s=round(elapsed, 1), error=str(e)[:200]),
+            )
             return {
                 "chunk": chunk.label,
                 "status": "failed",
@@ -1221,6 +1296,10 @@ class InferenceActor:
                 "elapsed_sec": elapsed,
                 "instance_id": self.instance_id,
             }
+        finally:
+            # Between chunks the main thread is idle (any live "write" slot is
+            # owned by the background writer and cleared there).
+            self._resource_monitor.set_context("work", "idle")
 
 
 # Schemes that mean "fetch this from somewhere else first". A local filesystem
