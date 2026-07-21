@@ -74,6 +74,18 @@ EXPECTED_DTYPES = {
     "s1_desc_obs_count": "uint32",
 }
 
+# ...and the format's expected dimension layout, again pinned in both stores:
+# a wrong-but-agreeing axis order (e.g. embeddings as (time, northing, band,
+# easting)) would pass a dtype-and-agreement check yet break the northing-slab
+# reader. All required vars carry (northing, easting), optionally led by time;
+# embeddings additionally trails band.
+EXPECTED_DIMS = {
+    "embeddings": ("northing", "easting", "band"),
+    "s2_obs_count": ("northing", "easting"),
+    "s1_asc_obs_count": ("northing", "easting"),
+    "s1_desc_obs_count": ("northing", "easting"),
+}
+
 # Root attrs that legitimately differ between two runs of the same ROI — pure
 # run provenance, not data or format. `run_id` plus anything run-scoped
 # (``run_*``, e.g. run_started_at/run_completed_at timestamps) is reported but
@@ -219,9 +231,16 @@ def compare_var_structure(ref: xr.Dataset, test: xr.Dataset) -> list[str]:
 
 def _accumulate_float(cmp: VarComparison, a: np.ndarray, b: np.ndarray) -> None:
     """Fold one float slab into the running numeric-divergence metrics."""
+    # "not comparable" = either side is non-finite (NaN OR ±inf). The mask must
+    # exclude inf too: inf - inf = NaN would poison max/mean/CDF on a store that
+    # carries infinities. The NaN mask-agreement counter still keys on isnan
+    # (NaN is the invalid-pixel fill); an inf is neither valid data nor the fill,
+    # so a one-sided inf shows up as a non-finite (dropped) element and, if it
+    # differs bitwise, in n_bit_equal — it can't masquerade as agreement.
+    fin_a, fin_b = np.isfinite(a), np.isfinite(b)
     nan_a, nan_b = np.isnan(a), np.isnan(b)
     cmp.nan_mask_mismatches += int((nan_a != nan_b).sum())
-    both = ~nan_a & ~nan_b
+    both = fin_a & fin_b
     if both.any():
         diff = np.abs(a[both] - b[both])
         cmp.n_finite_pairs += int(diff.size)
@@ -266,6 +285,19 @@ def compare_variable(
     da_ref, da_test = ref[name], test[name]
     cmp = VarComparison(name=name, dtype=str(da_ref.dtype))
     is_float = da_ref.dtype.kind == "f"
+
+    # A variable without a `northing` dim (a scalar or non-spatial auxiliary
+    # var an unexpected store might carry) can't be row-slabbed — read it whole
+    # in one shot rather than crashing on isel(northing=...). The known format
+    # vars (embeddings, obs counts) all have northing and take the streaming
+    # path below.
+    if "northing" not in da_ref.dims:
+        a, b = da_ref.values, da_test.values
+        cmp.n += a.size
+        cmp.n_bit_equal += _bit_equal(a, b)
+        (_accumulate_float if is_float else _accumulate_int)(cmp, a, b)
+        return cmp
+
     for rows_slice, sel in rows:
         sub_ref = da_ref.isel(northing=rows_slice)
         sub_test = da_test.isel(northing=rows_slice)
@@ -383,6 +415,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {p}")
         return 1
 
+    # ...and the dims layout (again in both stores): a wrong-but-agreeing axis
+    # order passes the dtype + agreement checks yet breaks the slab reader / the
+    # format's meaning. A leading `time` axis is allowed and ignored.
+    dim_problems = [
+        f"{tag} '{v}' dims {tuple(ds[v].dims)} (expected {EXPECTED_DIMS[v]}, optionally led by time)"
+        for v in REQUIRED_VARS
+        for tag, ds in (("ref", ref), ("test", test))
+        if tuple(d for d in ds[v].dims if d != "time") != EXPECTED_DIMS[v]
+    ]
+    if dim_problems:
+        print("\nVERDICT: INVALID coarsened store — required variable(s) have unexpected dims:")
+        for p in dim_problems:
+            print(f"  - {p}")
+        return 1
+
     var_problems = compare_var_structure(ref, test)
     if var_problems:
         print("\nDATA-VARIABLE STRUCTURE — NOT identical:")
@@ -394,7 +441,8 @@ def main(argv: list[str] | None = None) -> int:
     height = int(ref.sizes["northing"])
     rows = _row_slabs(height, args.sample_rows)
     if args.sample_rows and args.sample_rows < height:
-        print(f"\n(sampling {len(rows)} of {height} northing rows)")
+        sampled = sum(len(sel) for _, sel in rows if sel is not None)
+        print(f"\n(sampling {sampled} of {height} northing rows, across {len(rows)} chunk-aligned slabs)")
 
     # Compare embeddings first, then obs-count layers, in a stable order.
     order = [v for v in ("embeddings", *OBS_VARS) if v in ref_vars]

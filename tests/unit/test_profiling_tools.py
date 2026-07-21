@@ -249,3 +249,32 @@ class TestCoarsenedCompare:
         test["s2_obs_count"] = test["s2_obs_count"].astype("uint16")
         problems = mod.compare_var_structure(ref, test)
         assert any("s2_obs_count" in p and "dtype" in p for p in problems)
+
+    def test_non_spatial_variable_compared_not_crashed(self) -> None:
+        """A var without a northing dim reads whole instead of crashing on isel(northing=…)."""
+        import numpy as np
+
+        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        base = np.zeros((4, 4, 2), dtype="float32")
+        ref = _make_coarse_ds(base)
+        ref["aux"] = 5.0  # scalar (0-d) data var — no northing dim
+        test = _make_coarse_ds(base)
+        test["aux"] = 5.0
+        rows = mod._row_slabs(4, sample_rows=None)
+        cmp = mod.compare_variable(ref, test, "aux", rows)  # must not raise
+        assert cmp.n == 1
+        assert cmp.bit_identical
+
+    def test_finite_mask_excludes_infinities(self) -> None:
+        """inf-inf=NaN must not poison the abs-diff stats when a store has infinities."""
+        import numpy as np
+
+        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        a = np.array([[1.0, np.inf, 3.0]], dtype="float32")
+        b = np.array([[1.0, np.inf, 3.5]], dtype="float32")
+        cmp = mod.VarComparison(name="x", dtype="float32")
+        mod._accumulate_float(cmp, a, b)
+        # The +inf pair is excluded, not folded in as inf-inf=NaN.
+        assert np.isfinite(cmp.max_abs_diff) and abs(cmp.max_abs_diff - 0.5) < 1e-6
+        assert np.isfinite(cmp.mean_abs_diff)
+        assert cmp.n_finite_pairs == 2  # the two finite pairs only

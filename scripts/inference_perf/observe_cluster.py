@@ -106,12 +106,19 @@ def top_rss(n=3):
     procs.sort(reverse=True)
     return ",".join(f"{c}:{r / 1048576:.1f}" for r, c in procs[:n])
 
+# Resolve the target ONCE and truncate it at startup. The GPU/DCGM pollers
+# start with fresh files (`>`); this must too, or re-running --start-pollers on
+# a live worker leaves the prior session's samples appended — a stale spike
+# would then be reported as the current run's peak. Fixing the path here also
+# keeps every append in one file even if the Ray session dir appears later.
+path = os.path.join(logs_dir(), "ram_poll.log")
+open(path, "w").close()
 while True:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         used, avail, pct = meminfo()
         line = f"RAMPOLL ts={ts} used_gb={used:.2f} avail_gb={avail:.2f} pct={pct:.0f} top={top_rss()}"
-        with open(os.path.join(logs_dir(), "ram_poll.log"), "a") as f:
+        with open(path, "a") as f:
             f.write(line + "\n")
     except Exception:
         pass

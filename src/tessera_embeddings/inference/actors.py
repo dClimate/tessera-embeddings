@@ -1065,7 +1065,11 @@ class InferenceActor:
                 chunk_data: ChunkData | None = None
                 dataset: MosaicChunkInferenceDataset | None = None
                 for i, strip in enumerate(strips):
-                    self._resource_monitor.set_context("work", f"{chunk.label}:s{i + 1}/{len(strips)}")
+                    # Split the strip window into :load then :infer (below) so a
+                    # RESOURCES spike is attributable to the band decode vs the
+                    # forward — the band-decode transient and the inference peak
+                    # are different RAM events worth telling apart.
+                    self._resource_monitor.set_context("work", f"{chunk.label}:s{i + 1}/{len(strips)}:load")
                     # The previous strip reported "inference"; flip back to
                     # "loading" before blocking on this strip's read so a slow
                     # multi-strip load isn't misclassified as an inference stall
@@ -1147,6 +1151,7 @@ class InferenceActor:
                         logger.info("Chunk %s strip %s: no valid pixels, leaving zero-filled", chunk.label, strip)
                         continue
 
+                    self._resource_monitor.set_context("work", f"{chunk.label}:s{i + 1}/{len(strips)}:infer")
                     t_inf = time.monotonic()
                     result = run_inference(self.model, dataset, self.config, self.device, on_batch=on_batch)
                     infer_s += time.monotonic() - t_inf
@@ -1176,6 +1181,10 @@ class InferenceActor:
                 # (Ray worker crash, etc.).
                 logger.info("Chunk %s has no valid pixels, skipping (assembly will fill)", chunk.label)
                 writer.write_skip_marker(chunk, run_id)  # zero-byte marker: keep synchronous
+                # Collect the prior deferred write BEFORE snapshotting elapsed —
+                # the wait is actor-occupancy this chunk owns, same as the
+                # success path below (else the phase table under-reports it).
+                prior_write = self._collect_prior_write_checked()
                 elapsed = time.monotonic() - t0
                 logger.info(
                     "%s",
@@ -1201,7 +1210,7 @@ class InferenceActor:
                     "valid_pixels": 0,
                     "elapsed_sec": elapsed,
                     "instance_id": self.instance_id,
-                    "prior_write": self._collect_prior_write_checked(),
+                    "prior_write": prior_write,
                 }
 
             # Resolve the PREVIOUS chunk's deferred write first (it queued a
@@ -1253,7 +1262,14 @@ class InferenceActor:
                 "%s",
                 _chunk_summary_line(
                     label=chunk.label,
+                    # "success" = inference finished and outputs are staged for
+                    # upload. write_confirmed=False flags that the deferred S3
+                    # write is NOT yet durably confirmed (that happens a chunk
+                    # later via prior-write chain-confirmation) — so a phase
+                    # tool should treat a later duplicate label as the retry of
+                    # a failed write, keeping the last, not double-count it.
                     status="success",
+                    write_confirmed=False,
                     valid_px=total_valid,
                     total_s=round(elapsed, 1),
                     prologue_s=round(prologue_s, 1),
