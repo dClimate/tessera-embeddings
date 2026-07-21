@@ -1,15 +1,61 @@
 # Inference performance harness
 
-Phase-0 tooling for the GPU-saturation campaign (see
-`context_docs/decisions/012-validated-equivalence-for-inference-outputs.md`
-for the numerics policy it gates).
+General-purpose profiling tooling for Tessera Ray inference runs — any
+deployment, any scale (built during the GPU-saturation campaign; equally
+aimed at global-tessera UTM-zone runs). Numerics policy the gates enforce:
+`context_docs/decisions/012-validated-equivalence-for-inference-outputs.md`.
+
+## Using it against any deployment
+
+Workers are discovered by the Ray autoscaler's own EC2 tags
+(`ray-cluster-name` + `ray-node-type=worker`), not instance names, so any
+cluster works. Point the tool at a deployment with:
+
+```
+python scripts/inference_perf/observe_cluster.py \
+  --profile <aws-profile> --region <region> \
+  --cluster <exact-ray-cluster-name>        # or --cluster-prefix <base-name>
+  --log-group </ec2/.../ray>                # that deployment's CW log group
+  --start-pollers | --report | --ram-report
+```
+
+**RAM-spike workflow** (the at-scale question these tools now answer):
+
+1. `--start-pollers` early in the run — starts 1 s GPU pollers **and a 1 s
+   host-RAM sampler** (used/avail/% + top-3 process RSS every second). The RAM
+   sampler writes to an exact path the CloudWatch agent ships via a dedicated
+   entry (`<instance>/ram_poll` stream) — so the 1 s data **survives
+   teardown**. (Dedicated because the agent tails only the *newest* file per
+   wildcard entry; a catch-all glob would drop samples and displace other
+   logs. Clusters launched before the template gained the entry keep the data
+   worker-local — `--report` still summarizes it live.)
+2. `--report` while live: per-worker RAM summary (peak, seconds ≥55%/≥60%,
+   top spike samples), OOM forensics (kernel OOM-killer + Ray memory-monitor
+   events), GPU summaries, and the per-chunk phase table.
+3. `--ram-report --since ... --until ...` any time after: 30 s RESOURCES
+   rollup (always available; a *floor* for the true peak) plus, when the 1 s
+   poller ran, per-worker 1 s peak/p99 and the top-10 spike samples with
+   timestamps and the processes holding the memory at that instant.
+4. Attribution: the actors tag every 30 s `RESOURCES` line with what they were
+   doing (`ctx=work:<chunk>:<phase> write:<chunk>`), and emit one
+   machine-readable `CHUNK_SUMMARY` JSON line per chunk — so any spike can be
+   tied to a chunk + phase without prose-log archaeology.
 
 ## Tools
 
-- **`observe_cluster.py`** — against a live `ray-tessera-inference-*` cluster:
-  `--start-pollers` launches 1 s nvidia-smi + DCGM (SMACT/TENSO/DRAMA) captures
-  on every GPU worker via SSM; `--report` fetches per-worker GPU summaries and
-  a per-chunk phase-split table parsed from actor logs.
+- **`observe_cluster.py`** — against a live cluster: `--start-pollers`
+  launches 1 s nvidia-smi + DCGM (SMACT/TENSO/DRAMA) + host-RAM captures on
+  every GPU worker via SSM; `--report` fetches per-worker GPU/RAM summaries,
+  OOM events, and a per-chunk phase-split table (preferring the actors'
+  `CHUNK_SUMMARY` JSON lines; legacy prose-log parsing remains as a fallback
+  for runs from older code); `--ram-report` reconstructs RAM/GPU rollups and
+  1 s spike analysis from CloudWatch after teardown.
+- **`compare_coarsened_stores.py`** — bit-identity check between two
+  *coarsened* (e.g. 500 m) embedding icechunk stores (float32 pre-dequantized
+  `embeddings`, uint32 obs counts — no `scales`). Compares raw bit patterns;
+  when not identical, reports max/mean |Δ|, an abs-diff CDF, per-pixel cosine,
+  and NaN-mask agreement so quantization shimmer is distinguishable from a
+  real defect. `--sample-rows N` for very large stores.
 - **`compare_outputs.py`** — ADR-012 equivalence gate. Compares staged
   embeddings (int8 + scales) between a reference and a test run; exits nonzero
   if any chunk violates the thresholds (int8 ≥99.5% exact, max |Δ| ≤ 1 level,

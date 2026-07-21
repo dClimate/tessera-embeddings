@@ -90,6 +90,26 @@ class ResourceMonitor:
         self._interval = interval_sec
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # Named context slots appended to every RESOURCES line so post-hoc RAM
+        # analysis can attribute a sample to what the process was doing. Slots
+        # (not one string) because two threads legitimately report at once: the
+        # actor's main thread ("work" — chunk/phase) and its background writer
+        # ("write" — a staging upload overlapping the next chunk's prologue).
+        self._contexts: dict[str, str] = {}
+        self._ctx_lock = threading.Lock()
+
+    def set_context(self, slot: str, value: str | None) -> None:
+        """Set (or clear, with ``None``) one named context slot.
+
+        Thread-safe; each caller owns its slot so concurrent phases don't
+        clobber each other. Shows up as ``ctx=slot:value ...`` on the next
+        RESOURCES line.
+        """
+        with self._ctx_lock:
+            if value is None:
+                self._contexts.pop(slot, None)
+            else:
+                self._contexts[slot] = value
 
     def start(self) -> None:
         """Start the monitor thread."""
@@ -107,20 +127,29 @@ class ResourceMonitor:
 
     def _run(self) -> None:
         while not self._stop_event.wait(self._interval):
-            parts = []
+            self._emit_once()
 
-            cpu_mem = _get_cpu_mem_stats()
-            if "load_avg" in cpu_mem:
-                parts.append(f"load={cpu_mem['load_avg']}")
-            if "ram" in cpu_mem:
-                parts.append(f"RAM={cpu_mem['ram']}")
+    def _emit_once(self) -> None:
+        """Sample once and log a RESOURCES line (factored out for testing)."""
+        parts = []
 
-            gpu = _get_gpu_stats()
-            if gpu:
-                parts.append(f"GPU={gpu['gpu_util']}")
-                parts.append(f"VRAM={gpu['mem_used']}/{gpu['mem_total']}")
-                parts.append(f"temp={gpu['temp']}")
-                parts.append(f"power={gpu['power']}")
+        cpu_mem = _get_cpu_mem_stats()
+        if "load_avg" in cpu_mem:
+            parts.append(f"load={cpu_mem['load_avg']}")
+        if "ram" in cpu_mem:
+            parts.append(f"RAM={cpu_mem['ram']}")
 
-            if parts:
-                logger.info("RESOURCES: %s", " | ".join(parts))
+        gpu = _get_gpu_stats()
+        if gpu:
+            parts.append(f"GPU={gpu['gpu_util']}")
+            parts.append(f"VRAM={gpu['mem_used']}/{gpu['mem_total']}")
+            parts.append(f"temp={gpu['temp']}")
+            parts.append(f"power={gpu['power']}")
+
+        with self._ctx_lock:
+            if self._contexts:
+                ctx = " ".join(f"{slot}:{val}" for slot, val in sorted(self._contexts.items()))
+                parts.append(f"ctx={ctx}")
+
+        if parts:
+            logger.info("RESOURCES: %s", " | ".join(parts))
