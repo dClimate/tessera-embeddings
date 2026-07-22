@@ -34,16 +34,22 @@ SMALL = StoreLayout(name="small", arrays={"embeddings": _EMB, "scales": _SCL})
 # 10 m pixels -> metre extents for a _NY x _NX pixel zone.
 _SPEC = ZoneSpec("32601", "N", 1, (0.0, _NX * 10.0), (0.0, _NY * 10.0))
 
-_WINDOW = TimeWindow(
-    window_start=(2024, 7),
-    window_end=(2025, 6),
-    months=tuple([(2024, m) for m in range(7, 13)] + [(2025, m) for m in range(1, 7)]),
-    window_end_label="2025-06-01",
-)
+
+def _window(year: int) -> TimeWindow:
+    """The exact Jan-Dec calendar-year window the global store requires (strict gate)."""
+    return TimeWindow(
+        window_start=(year, 1),
+        window_end=(year, 12),
+        months=tuple((year, m) for m in range(1, 13)),
+        window_end_label=f"{year}-12-01",
+    )
 
 
-def _config() -> InferenceConfig:
-    return InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0)
+_WINDOW = _window(2025)
+
+
+def _config(year: int = 2025) -> InferenceConfig:
+    return InferenceConfig(time_window=_window(year), chunk_size=_TILE, num_gpus=0)
 
 
 def _seed_global(tmp_path) -> str:
@@ -170,16 +176,12 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
     node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
     assert node.attrs["years_complete"] == [2025]
     assert node.attrs["runs"]["2025"]["run_id"] == "runZ"
-    # The ACTUAL window is recorded per slot — here a deliberately non-calendar (rolling
-    # 2024-07..2025-06) window filling the 2025 slot. The `time` point stays the
-    # calendar-year label (2025-01-01) while time_bnds + `runs` carry reality, so the
-    # deviation is legible rather than a silent mislabel (time_convention_strict=False).
-    start, end = _WINDOW.to_date_range()  # ("2024-07-01", "2025-06-30")
-    assert node.attrs["runs"]["2025"]["window"] == [start, end]
+    # Label accuracy under the calendar-year GUARANTEE: the slot's `time` point is
+    # Jan 1 (the window start) and the seeded time_bnds state the slot's true
+    # interval [Jan 1, Dec 31] — exactly the window the strict gate required.
     assert node["time"].attrs["bounds"] == "time_bnds"
     bnds = np.asarray(node["time_bnds"][1]).astype("datetime64[ns]")  # 2025 slot = index 1
-    assert list(bnds.astype("datetime64[D]").astype(str)) == [start, end]
-    # The time POINT itself is unchanged — still the fixed calendar-year label.
+    assert list(bnds.astype("datetime64[D]").astype(str)) == list(_WINDOW.to_date_range())
     assert np.asarray(node["time"][1]).astype("datetime64[ns]").astype("datetime64[D]").astype(str) == "2025-01-01"
     # 2025 is index 1 on the (2024, 2025) axis; staged tiles match, ocean tile is fill.
     result = np.asarray(node["embeddings"][1])
@@ -210,7 +212,7 @@ def test_all_ocean_cell_marked_complete_without_inference(tmp_path, monkeypatch)
         land_mask_path=mask,
         mosaic_base=mosaic_base,
         staging_base=str(tmp_path / "staging"),
-        config=_config(),
+        config=_config(2024),
         num_actors=1,
         log=log,
         run_id="runE",
@@ -415,7 +417,6 @@ def test_all_tiles_skipped_marks_complete_empty(tmp_path, monkeypatch):
     node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
     assert node.attrs["years_complete"] == [2025]
     assert node.attrs["runs"]["2025"]["empty"] is True
-    assert node.attrs["runs"]["2025"]["window"] == list(_config().time_window.to_date_range())  # window recorded too
     assert repo.lookup_tag("zone-01N-2025") == summary["snapshot_id"]
 
 
@@ -490,7 +491,7 @@ def test_all_ocean_cell_skips_missing_mosaic(tmp_path, monkeypatch):
         land_mask_path=mask,
         mosaic_base=str(tmp_path / "does_not_exist"),  # missing mosaic must not be read
         staging_base=str(tmp_path / "staging"),
-        config=_config(),
+        config=_config(2024),
         num_actors=1,
         log=log,
         run_id="runNM",
@@ -576,17 +577,11 @@ def test_off_axis_year_fails_before_inference(tmp_path, monkeypatch):
 
 
 def test_window_year_mismatch_raises(tmp_path):
-    """A time_window that never touches the target year is an operator error."""
+    """A window for a DIFFERENT year than the target slot is an operator error
+    (e.g. a cloned invocation whose year was edited but not its time_window).
+    """
     store = _seed_global(tmp_path)
-    # _WINDOW covers 2024-07..2025-06; year=2024 and 2025 are both fine — but a
-    # cloned invocation editing year to a slot outside the window must die.
-    window = TimeWindow(
-        window_start=(2025, 1),
-        window_end=(2025, 12),
-        months=tuple((2025, m) for m in range(1, 13)),
-        window_end_label="2025-12-01",
-    )
-    with pytest.raises(ValueError, match="must overlap the calendar-year slot"):
+    with pytest.raises(ValueError, match="guarantees calendar-year slots"):
         zone_fill.fill_zone_year(
             store_path=store,
             zone=_ZONE,
@@ -594,7 +589,34 @@ def test_window_year_mismatch_raises(tmp_path):
             land_mask_path=str(tmp_path / "mask.zarr"),
             mosaic_base=str(tmp_path / "mosaics"),
             staging_base=str(tmp_path / "staging"),
-            config=InferenceConfig(time_window=window, chunk_size=_TILE, num_gpus=0),
+            config=_config(2025),  # exact Jan-Dec 2025 window, but year=2024
+            num_actors=1,
+            log=log,
+        )
+
+
+def test_rolling_window_rejected(tmp_path):
+    """The calendar-year gate: a rolling 12-month window that merely OVERLAPS the
+    target year is rejected — the store guarantees calendar-year slots (a rolling
+    window's label would be inaccurate, CF containment), and the error points
+    non-calendar consumers at the single-ROI `12mo_window_end` path.
+    """
+    store = _seed_global(tmp_path)
+    rolling = TimeWindow(
+        window_start=(2024, 7),
+        window_end=(2025, 6),
+        months=tuple([(2024, m) for m in range(7, 13)] + [(2025, m) for m in range(1, 7)]),
+        window_end_label="2025-06-01",
+    )
+    with pytest.raises(ValueError, match="12mo_window_end"):
+        zone_fill.fill_zone_year(
+            store_path=store,
+            zone=_ZONE,
+            year=2025,  # rolling window overlaps 2025 — still rejected
+            land_mask_path=str(tmp_path / "mask.zarr"),
+            mosaic_base=str(tmp_path / "mosaics"),
+            staging_base=str(tmp_path / "staging"),
+            config=InferenceConfig(time_window=rolling, chunk_size=_TILE, num_gpus=0),
             num_actors=1,
             log=log,
         )

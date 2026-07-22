@@ -138,16 +138,15 @@ def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: Sto
         "crs": spec.crs,
         "years_complete": [],
         "zone_scheme": ZONE_SCHEME,
-        # Calendar-year is the DEFAULT labeling of each year slot, not a guarantee:
-        # the `time` point is indexed by calendar year (each slot's coordinate is Jan 1,
-        # fixed and uniform across zones), and the campaign always fills a strict Jan-Dec
-        # window — but a non-campaign consumer MAY write a non-calendar 12-month window
-        # into a slot for non-standard processing. When it does, the run's ACTUAL date
-        # range is written into the `time_bnds` CF-bounds variable (and `runs`
-        # provenance), so the interval matches reality rather than being a silent
-        # mislabel under the calendar-year point. See ADR-011.
+        # Calendar-year slots are a GUARANTEE: each `time` point is Jan 1 of its year
+        # (the START of the exact Jan-Dec window it holds — fixed and uniform across
+        # zones at seeding), and the zone-fill gate rejects any window that is not
+        # exactly that calendar year, so the label always matches the data. The seeded
+        # `time_bnds` CF-bounds variable states each slot's true interval
+        # ([Jan 1, Dec 31]). Non-calendar 12-month windows belong in a store whose
+        # time points ARE the windows (single-ROI `12mo_window_end`, or the ADR-011
+        # windowed-variant design at zone scale) — never in this store.
         "time_convention": "calendar_year",
-        "time_convention_strict": False,
         "layout": layout.name,
     }
     attrs.update(
@@ -236,11 +235,12 @@ def seed_zone_groups(
     times = calendar_year_times(years)
     nt = len(times)
     band = _layout_band(layout)
-    # CF time bounds: each year slot's DEFAULT covered interval is the actual date
-    # range of its calendar year, [Jan 1, Dec 31] (matching TimeWindow.to_date_range
-    # for a Jan-Dec window). A fill overwrites its slot's row with the run's real
-    # window, so the bounds always state the true observation extent — the `time`
-    # point stays the fixed calendar-year label, and time_bnds carries reality.
+    # CF time bounds: each year slot's covered interval is the actual date range of
+    # its calendar year, [Jan 1, Dec 31] (= TimeWindow.to_date_range for the Jan-Dec
+    # window every fill is required to use — the zone-fill gate enforces it). Written
+    # once here and never touched by fills: under the calendar-year guarantee the
+    # seeded bounds ARE each slot's true observation extent, and the `time` point
+    # (Jan 1 = the window start) always lies within them (CF §7.1 containment).
     default_bnds = np.stack(
         [
             np.array([np.datetime64(f"{y}-01-01", "ns") for y in years], dtype="datetime64[ns]"),

@@ -206,7 +206,10 @@ def fill_zone_year_flow(
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
         time_window_end: End month of the inference window as ``"Month Year"``;
             defaults to ``"December {year}"`` (the calendar-year window). The
-            runner requires it to overlap ``year``.
+            runner REQUIRES the exact January-December window for ``year``
+            (the store guarantees calendar-year slots), so any other value fails
+            loudly at the preflight gate — non-calendar 12-month windows belong
+            in the single-ROI ``12mo_window_end`` path, not the global store.
         store_name: Global-store repo basename (``paths.global_store``).
         mask_name: Coverage-store repo basename (``paths.land_mask_store``).
         ssm_prefix: SSM prefix for the Ray cluster resource IDs.
@@ -287,10 +290,10 @@ def fill_zone_year_flow(
         if needs_cluster
         else s1_orbit
     )
-    # Default to the strict Jan-Dec calendar-year window for `year` (our global
-    # convention: `December {year}` yields a 12-month window spanning Jan-Dec).
-    # `time_window_end` overrides for rolling windows — the runner's window check
-    # is deliberately permissive so non-campaign consumers can use them.
+    # The strict Jan-Dec calendar-year window for `year`: `December {year}` yields a
+    # 12-month window spanning exactly Jan-Dec (the store's guaranteed convention).
+    # A `time_window_end` override producing any other window is rejected loudly by
+    # the runner's calendar-year gate — the single enforcement chokepoint.
     config = build_inference_config(
         s1_orbit=resolved_s1,
         time_window=parse_time_window(time_window_end or f"December {year}"),

@@ -208,22 +208,26 @@ def fill_zone_year(
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — the axis is fixed at seeding (ADR-008 D1)."
         )
-    # Require only that the window OVERLAPS `year`. Calendar-year is the store's
-    # DEFAULT convention, not a guarantee (zone group: time_convention="calendar_year",
-    # time_convention_strict=False) — a non-campaign consumer may deliberately drive a
-    # rolling (non-Jan-Dec) 12-month window into a year slot. The slot's `time` point
-    # stays the calendar-year label, but the run's ACTUAL window (its to_date_range())
-    # is written into the group's `time_bnds` CF-bounds variable (and `runs` provenance)
-    # by assemble_global / mark_zone_year_empty, so the interval matches reality rather
-    # than being a silent mislabel under the calendar-year point. The global campaign
-    # always uses a strict Jan-Dec window (fill_zone_year_flow). What IS an error is a
-    # window fully DISJOINT from `year` (e.g. a cloned invocation whose year was edited
-    # but not its time_window) — that would land embeddings under an unrelated slot.
+    # STRICT calendar-year gate: the window must be EXACTLY Jan-Dec of `year`. The
+    # global store's time points are window STARTS (each slot's coordinate is Jan 1
+    # of its year, fixed at seeding), so a window that merely overlaps `year` — e.g.
+    # a rolling Feb-Jan — would sit at a coordinate outside its own real interval
+    # (violating CF §7.1 bounds containment) and be permanently mislabeled under the
+    # write-once zone-year tag; and one slot per year cannot hold two window phases
+    # anyway. Label accuracy is the invariant: `time_convention="calendar_year"` is a
+    # GUARANTEE, and the seeded `time_bnds` ([Jan 1, Dec 31] per slot) states each
+    # slot's true interval. Non-calendar 12-month windows belong in a store whose
+    # time points ARE the windows: today the single-ROI `12mo_window_end` path
+    # (assemble(): time = window-end label, extendable axis); zone-scale, the
+    # windowed-variant design in ADR-011 (slots declared at other start months).
     window_years = {y for y, _ in config.time_window.months}
-    if year not in window_years:
+    if window_years != {year}:
         raise ValueError(
-            f"config.time_window ({config.time_window.window_end_label}) covers {sorted(window_years)} "
-            f"but year={year} — the inference window must overlap the calendar-year slot it fills."
+            f"config.time_window ({config.time_window.window_end_label}) spans {sorted(window_years)} "
+            f"but the global store guarantees calendar-year slots (time_convention='calendar_year'): "
+            f"year={year} requires the exact January-December {year} window. Rolling/offset 12-month "
+            f"windows are not writable to the global store — use the single-ROI `12mo_window_end` "
+            f"path for non-calendar windows (or the ADR-011 windowed-variant design at zone scale)."
         )
 
     # Idempotent retry: a cell that already landed is done — re-running it
@@ -323,9 +327,7 @@ def fill_zone_year(
     def _finish_empty(**extra: float) -> dict[str, Any]:
         # A no-data cell (all-ocean, or every live tile skipped) still lands:
         # years_complete + provenance in one commit, then the zone-year tag.
-        snapshot = mark_zone_year_empty(
-            repo, zone, year, run_id=run_id, gate=gate, window_bounds=config.time_window.to_date_range()
-        )
+        snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id, gate=gate)
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
         return {**summary, "empty": True, "snapshot_id": snapshot, "tag": tag, **extra}
 
@@ -440,7 +442,6 @@ def fill_zone_year(
         s3_concurrency=s3_concurrency,
         get_credentials=get_credentials,
         s3_region=s3_region,
-        window_bounds=config.time_window.to_date_range(),
         log=log,
     )
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)

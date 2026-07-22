@@ -120,28 +120,39 @@ metadata opens as well as the fill's, so a non-default-region store is read
 consistently (the ROI-engine mosaic write remains us-west-2-only, a pre-existing
 limitation moot while all campaign data lives there).
 
-**Time convention — calendar-year DEFAULT, not a guarantee.** Each zone group's time
-axis is indexed by calendar year (`time` point = Jan 1 of the year, fixed and uniform
-across all zones at seeding, D1), and the campaign always fills a strict Jan–Dec window
-— so the group advertises `time_convention="calendar_year"`. But that is the DEFAULT
-labeling, not a hard promise (`time_convention_strict=False`): a non-campaign consumer
-may deliberately drive a non-calendar 12-month window (e.g. a rolling Feb–Jan) into a
-year slot for non-standard processing. The `fill_zone_year` runner therefore requires
-only that the inference window OVERLAP the target year (a fully-disjoint window is still
-rejected as operator error).
+**Time convention — calendar-year slots are a GUARANTEE (decided 2026-07-22).** Each
+zone group's time axis is fixed and uniform at seeding (D1): one `time` point per
+campaign year at Jan 1 — i.e. each point is the **start of the exact Jan–Dec window
+its slot holds** — plus a CF `time_bnds` variable (`(time, 2)`,
+`time.attrs["bounds"]="time_bnds"`) stating each slot's true interval
+`[Jan 1, Dec 31]`. The `fill_zone_year` runner **rejects any window that is not
+exactly the slot's calendar year**; `time_convention="calendar_year"` is therefore a
+guarantee, and every label matches the data it holds.
 
-The `time` point can't itself carry the deviation (it's the fixed cross-zone index that
-slot lookup and campaign status key off), so the **actual window is recorded as CF time
-bounds**: each group carries a `time_bnds` variable of shape `(time, 2)` with
-`time.attrs["bounds"]="time_bnds"`, seeded with each year's default `[Jan-1, Dec-31]` and
-overwritten per fill with the run's real `to_date_range()` (first day of the start month,
-last day of the end month — e.g. `[2024-02-01, 2025-01-31]` for a Feb→Jan window). So the
-`time` point stays the calendar-year label while `time_bnds` states the true observation
-interval — the label matches reality, machine-readably (a CF-aware reader surfaces the
-interval per timestep). The `runs` provenance also records the range as human-readable
-backup. (Considered and rejected: hard-requiring an exact Jan–Dec window — it would break
-the deliberate rolling-window capability; and mutating the `time` point per fill — it
-would break the fixed, uniform cross-zone axis.)
+Two designs for supporting non-calendar 12-month windows in this store were
+**considered and rejected**:
+
+- *Keep the Jan-1 point and record a deviating window in `time_bnds`/provenance*
+  (briefly implemented, then reverted): a Feb→Jan window pinned at `2025-01-01`
+  places the coordinate **outside its own bounds** (`2025-01-01 ∉
+  [2025-02-01, 2026-01-31]`), which CF's cell-bounds model does not tolerate
+  (a coordinate is a representative instant *inside* its cell; checkers flag
+  violations) — the label lies even with honest bounds attached. Worse, one slot
+  per year cannot hold two window phases at all (June–May *and* July–June anchored
+  in the same year collide): a **cardinality** defect no labeling fixes.
+- *Mutating the `time` point per fill*: breaks the fixed, uniform cross-zone axis
+  that slot lookup (`time_index_of(year_timestamp(year))`), campaign status, and
+  D1's no-resize contract all key off.
+
+**The sanctioned non-calendar design** rests on the observation that a 12-month
+window is uniquely identified by its start month, and Jan-1 points already *are*
+window starts: a **windowed store variant** would seed slots at other declared
+start months (a June–May slot's point IS `2025-06-01`, inside its bounds; June–May
+and July–June are distinct slots — no collisions, ever). This is a design note
+only, to be built on real demand; until then, non-calendar 12-month windows use
+the **single-ROI `12mo_window_end` path** (`assemble()`: `time` = window-end
+label, an extendable axis where multiple windows already coexist correctly).
+The single-ROI path is deliberately untouched by all of this.
 
 ## Alternatives considered
 

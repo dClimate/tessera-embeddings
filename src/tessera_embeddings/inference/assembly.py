@@ -1388,7 +1388,6 @@ class ZarrWriter:
         s3_concurrency: int | None = None,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
-        window_bounds: tuple[str, str] | None = None,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
@@ -1436,10 +1435,6 @@ class ZarrWriter:
                 ``TARGET_AGGREGATE_S3_CONCURRENCY`` (a lone fill).
             get_credentials: Optional icechunk credential callback.
             s3_region: Optional S3 region override.
-            window_bounds: The run's actual ``(start, end)`` ISO date range
-                (``TimeWindow.to_date_range()``). Written into the slot's ``time_bnds``
-                CF-bounds row and the ``runs`` provenance, so a non-calendar window is
-                legible under the calendar-year-default ``time`` point. ``None`` omits it.
             log: Optional logger.
 
         Returns:
@@ -1567,7 +1562,6 @@ class ZarrWriter:
             shard_px=shard_px,
             commit_msg=f"Run {run_id}: fill {zone} year {year}",
             run_id=run_id,
-            window_bounds=window_bounds,
         )
         _log.info("Global assembly complete: %s/%s year %d (snapshot %s)", store_path, zone, year, snapshot)
         return snapshot

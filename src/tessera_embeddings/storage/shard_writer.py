@@ -132,44 +132,20 @@ def read_years_complete(node: zarr.Group) -> list[int]:
     return sorted(int(y) for y in raw) if isinstance(raw, list) else []
 
 
-def run_provenance(
-    existing: object, year: int, run_id: str, *, empty: bool = False, window_bounds: tuple[str, str] | None = None
-) -> dict:
+def run_provenance(existing: object, year: int, run_id: str, *, empty: bool = False) -> dict:
     """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
 
     Both fill paths use this — the shard write (:func:`write_year_shards`) and
     the no-data marking (``campaign.mark_zone_year_empty``) — so the provenance
-    record shape can only change in one place.
-
-    ``window_bounds`` is the ``(start, end)`` ISO date range the slot was actually
-    filled from (``TimeWindow.to_date_range()`` — first day of the start month, last
-    day of the end month, e.g. ``("2025-01-01", "2025-12-31")`` for a calendar year).
-    It is recorded here as human-readable provenance; the authoritative machine-readable
-    form is the group's ``time_bnds`` CF-bounds variable (written in the same commit).
-    The store advertises ``time_convention="calendar_year"`` as the DEFAULT, not a
-    guarantee (``time_convention_strict=False``): a fill may write a non-calendar
-    12-month window, so these make the true window legible rather than a silent
-    mislabel under the calendar-year ``time`` point.
+    record shape can only change in one place. The record carries no window: the
+    store GUARANTEES calendar-year slots (the zone-fill gate rejects any window
+    that is not exactly Jan-Dec of the slot's year), and each slot's true interval
+    is stated by the seeded ``time_bnds`` CF-bounds variable.
     """
     record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat()}
-    if window_bounds is not None:
-        record["window"] = list(window_bounds)
     if empty:
         record["empty"] = True
     return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
-
-
-def write_time_bounds(node: zarr.Group, year_index: int, window_bounds: tuple[str, str]) -> None:
-    """Write a slot's real ``[start, end]`` date range into the group's ``time_bnds``.
-
-    No-op when the group has no ``time_bnds`` (e.g. a non-global store). Encodes to the
-    same int64-ns representation as the ``time`` coordinate (:data:`TIME_ENCODING`).
-    """
-    if "time_bnds" not in node:
-        return
-    start_ns = np.datetime64(window_bounds[0], "ns").astype("int64")
-    end_ns = np.datetime64(window_bounds[1], "ns").astype("int64")
-    cast("zarr.Array", node["time_bnds"])[year_index] = [start_ns, end_ns]
 
 
 def _year_label(node: zarr.Group, year_index: int) -> int:
@@ -222,7 +198,6 @@ def write_year_shards(
     shard_px: int = SHARD_PX,
     commit_msg: str | None = None,
     run_id: str | None = None,
-    window_bounds: tuple[str, str] | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
@@ -258,9 +233,7 @@ def write_year_shards(
     done = read_years_complete(node)
     if year_label not in done:
         node.attrs["years_complete"] = sorted([*done, year_label])
-    if window_bounds is not None:
-        write_time_bounds(node, year_index, window_bounds)
     if run_id is not None:
-        node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year_label, run_id, window_bounds=window_bounds)
+        node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year_label, run_id)
 
     return commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}", gate=gate)
