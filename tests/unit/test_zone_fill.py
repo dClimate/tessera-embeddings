@@ -171,9 +171,16 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
     assert node.attrs["years_complete"] == [2025]
     assert node.attrs["runs"]["2025"]["run_id"] == "runZ"
     # The ACTUAL window is recorded per slot — here a deliberately non-calendar (rolling
-    # 2024-07..2025-06) window filling the 2025 slot, legible via `runs` rather than a
-    # silent mislabel under the calendar-year default (time_convention_strict=False).
-    assert node.attrs["runs"]["2025"]["window"] == _WINDOW.window_end_label
+    # 2024-07..2025-06) window filling the 2025 slot. The `time` point stays the
+    # calendar-year label (2025-01-01) while time_bnds + `runs` carry reality, so the
+    # deviation is legible rather than a silent mislabel (time_convention_strict=False).
+    start, end = _WINDOW.to_date_range()  # ("2024-07-01", "2025-06-30")
+    assert node.attrs["runs"]["2025"]["window"] == [start, end]
+    assert node["time"].attrs["bounds"] == "time_bnds"
+    bnds = np.asarray(node["time_bnds"][1]).astype("datetime64[ns]")  # 2025 slot = index 1
+    assert list(bnds.astype("datetime64[D]").astype(str)) == [start, end]
+    # The time POINT itself is unchanged — still the fixed calendar-year label.
+    assert np.asarray(node["time"][1]).astype("datetime64[ns]").astype("datetime64[D]").astype(str) == "2025-01-01"
     # 2025 is index 1 on the (2024, 2025) axis; staged tiles match, ocean tile is fill.
     result = np.asarray(node["embeddings"][1])
     assert np.all(result[_TILE:, :_TILE] == 0), "unmasked tile must stay at fill"
@@ -408,7 +415,7 @@ def test_all_tiles_skipped_marks_complete_empty(tmp_path, monkeypatch):
     node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
     assert node.attrs["years_complete"] == [2025]
     assert node.attrs["runs"]["2025"]["empty"] is True
-    assert node.attrs["runs"]["2025"]["window"] == _config().time_window.window_end_label  # window recorded too
+    assert node.attrs["runs"]["2025"]["window"] == list(_config().time_window.to_date_range())  # window recorded too
     assert repo.lookup_tag("zone-01N-2025") == summary["snapshot_id"]
 
 

@@ -211,13 +211,14 @@ def fill_zone_year(
     # Require only that the window OVERLAPS `year`. Calendar-year is the store's
     # DEFAULT convention, not a guarantee (zone group: time_convention="calendar_year",
     # time_convention_strict=False) — a non-campaign consumer may deliberately drive a
-    # rolling (non-Jan-Dec) 12-month window into a year slot, and the actual window is
-    # recorded per year in the group's `runs` provenance (assemble_global /
-    # mark_zone_year_empty pass window_end_label), so a deviation is legible rather than
-    # a silent mislabel. The global campaign always uses a strict Jan-Dec window
-    # (fill_zone_year_flow). What IS an error is a window fully DISJOINT from `year`
-    # (e.g. a cloned invocation whose year was edited but not its time_window) — that
-    # would land embeddings under an unrelated slot, so we reject it here.
+    # rolling (non-Jan-Dec) 12-month window into a year slot. The slot's `time` point
+    # stays the calendar-year label, but the run's ACTUAL window (its to_date_range())
+    # is written into the group's `time_bnds` CF-bounds variable (and `runs` provenance)
+    # by assemble_global / mark_zone_year_empty, so the interval matches reality rather
+    # than being a silent mislabel under the calendar-year point. The global campaign
+    # always uses a strict Jan-Dec window (fill_zone_year_flow). What IS an error is a
+    # window fully DISJOINT from `year` (e.g. a cloned invocation whose year was edited
+    # but not its time_window) — that would land embeddings under an unrelated slot.
     window_years = {y for y, _ in config.time_window.months}
     if year not in window_years:
         raise ValueError(
@@ -323,7 +324,7 @@ def fill_zone_year(
         # A no-data cell (all-ocean, or every live tile skipped) still lands:
         # years_complete + provenance in one commit, then the zone-year tag.
         snapshot = mark_zone_year_empty(
-            repo, zone, year, run_id=run_id, gate=gate, window=config.time_window.window_end_label
+            repo, zone, year, run_id=run_id, gate=gate, window_bounds=config.time_window.to_date_range()
         )
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
         return {**summary, "empty": True, "snapshot_id": snapshot, "tag": tag, **extra}
@@ -439,7 +440,7 @@ def fill_zone_year(
         s3_concurrency=s3_concurrency,
         get_credentials=get_credentials,
         s3_region=s3_region,
-        window=config.time_window.window_end_label,
+        window_bounds=config.time_window.to_date_range(),
         log=log,
     )
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)

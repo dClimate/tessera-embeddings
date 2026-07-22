@@ -33,6 +33,7 @@ from tessera_embeddings.storage.shard_writer import (
     commit_with_rebase,
     read_years_complete,
     run_provenance,
+    write_time_bounds,
 )
 from tessera_embeddings.storage.zarr_store import time_index_of
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES, year_timestamp
@@ -132,7 +133,7 @@ def mark_zone_year_empty(
     *,
     run_id: str | None = None,
     gate: CommitGate | None = None,
-    window: str | None = None,
+    window_bounds: tuple[str, str] | None = None,
 ) -> str:
     """Mark a ``(zone, year)`` complete with **no data** — an all-ocean cell.
 
@@ -153,7 +154,8 @@ def mark_zone_year_empty(
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
     node = cast(zarr.Group, root[zone])
-    if time_index_of(node, year_timestamp(year)) is None:
+    year_index = time_index_of(node, year_timestamp(year))
+    if year_index is None:
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — refusing to mark an "
             "off-axis year complete (ADR-008 D1: the axis is fixed at seeding)."
@@ -162,8 +164,12 @@ def mark_zone_year_empty(
     if year in done:
         return repo.lookup_branch("main")
     node.attrs["years_complete"] = sorted([*done, year])
+    if window_bounds is not None:
+        write_time_bounds(node, year_index, window_bounds)
     if run_id is not None:
-        node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year, run_id, empty=True, window=window)
+        node.attrs["runs"] = run_provenance(
+            node.attrs.get("runs"), year, run_id, empty=True, window_bounds=window_bounds
+        )
     return commit_with_rebase(session, f"mark {zone} year {year} complete (no land)", gate=gate)
 
 

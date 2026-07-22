@@ -31,7 +31,12 @@ import zarr
 from tessera_embeddings.config.store_layout import GLOBAL, StoreLayout
 from tessera_embeddings.inference.conventions import build_convention_attrs, build_geoemb_root_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
-from tessera_embeddings.storage.zarr_store import _create_storage, global_store_config, read_time_values
+from tessera_embeddings.storage.zarr_store import (
+    TIME_ENCODING,
+    _create_storage,
+    global_store_config,
+    read_time_values,
+)
 from tessera_embeddings.storage.zone_grid import (
     CAMPAIGN_YEARS,
     PIXEL_M,
@@ -134,12 +139,13 @@ def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: Sto
         "years_complete": [],
         "zone_scheme": ZONE_SCHEME,
         # Calendar-year is the DEFAULT labeling of each year slot, not a guarantee:
-        # the time axis is indexed by calendar year (each slot's coordinate is Jan 1),
-        # and the campaign always fills a strict Jan-Dec window — but a non-campaign
-        # consumer MAY write a non-calendar 12-month window into a slot for
-        # non-standard processing. When it does, the actual window (its
-        # `window_end_label`) is recorded per year in the group's `runs` provenance, so
-        # the deviation is legible rather than a silent mislabel under the slot.
+        # the `time` point is indexed by calendar year (each slot's coordinate is Jan 1,
+        # fixed and uniform across zones), and the campaign always fills a strict Jan-Dec
+        # window — but a non-campaign consumer MAY write a non-calendar 12-month window
+        # into a slot for non-standard processing. When it does, the run's ACTUAL date
+        # range is written into the `time_bnds` CF-bounds variable (and `runs`
+        # provenance), so the interval matches reality rather than being a silent
+        # mislabel under the calendar-year point. See ADR-011.
         "time_convention": "calendar_year",
         "time_convention_strict": False,
         "layout": layout.name,
@@ -230,6 +236,18 @@ def seed_zone_groups(
     times = calendar_year_times(years)
     nt = len(times)
     band = _layout_band(layout)
+    # CF time bounds: each year slot's DEFAULT covered interval is the actual date
+    # range of its calendar year, [Jan 1, Dec 31] (matching TimeWindow.to_date_range
+    # for a Jan-Dec window). A fill overwrites its slot's row with the run's real
+    # window, so the bounds always state the true observation extent — the `time`
+    # point stays the fixed calendar-year label, and time_bnds carries reality.
+    default_bnds = np.stack(
+        [
+            np.array([np.datetime64(f"{y}-01-01", "ns") for y in years], dtype="datetime64[ns]"),
+            np.array([np.datetime64(f"{y}-12-31", "ns") for y in years], dtype="datetime64[ns]"),
+        ],
+        axis=1,
+    ).astype("int64")
     for spec in specs:
         node = root.require_group(spec.group_name)
         north = northing_coords(spec)
@@ -237,6 +255,9 @@ def seed_zone_groups(
         sizes = {"time": nt, "northing": spec.height, "easting": spec.width, "band": band}
         create_layout_arrays(node, layout, layout.arrays, sizes)
         _write_coord_arrays(node, {"time": times, "northing": north, "easting": east, "band": np.arange(band)})
+        bnds = node.create_array("time_bnds", data=default_bnds, chunks=(nt, 2), dimension_names=("time", "bnds"))
+        bnds.attrs.update(TIME_ENCODING)  # same int64-ns encoding as `time`
+        node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
         node.attrs.update(_zone_attrs(spec, north, east, layout))
     return session.commit(commit_msg or f"seed {len(specs)} zone group(s)")
 

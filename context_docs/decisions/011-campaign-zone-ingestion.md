@@ -121,19 +121,27 @@ consistently (the ROI-engine mosaic write remains us-west-2-only, a pre-existing
 limitation moot while all campaign data lives there).
 
 **Time convention — calendar-year DEFAULT, not a guarantee.** Each zone group's time
-axis is indexed by calendar year (slot coordinate = Jan 1 of the year, fixed at seeding,
-D1), and the campaign always fills a strict Jan–Dec window — so the group advertises
-`time_convention="calendar_year"`. But that is the DEFAULT labeling, not a hard promise
-(`time_convention_strict=False`): a non-campaign consumer may deliberately drive a
-non-calendar 12-month window (e.g. a rolling Feb–Jan) into a year slot for non-standard
-processing. The `fill_zone_year` runner therefore requires only that the inference window
-OVERLAP the target year (a fully-disjoint window is still rejected as operator error), and
-the **actual window is recorded per year** in the group's `runs` provenance (its
-`window_end_label`, written by `assemble_global` / `mark_zone_year_empty` via
-`run_provenance`). A deviation is thus legible rather than a silent mislabel under the
-calendar-year slot. (Considered and rejected: hard-requiring an exact Jan–Dec window —
-it would break the deliberate rolling-window capability for a marginal guarantee the
-per-slot provenance already provides.)
+axis is indexed by calendar year (`time` point = Jan 1 of the year, fixed and uniform
+across all zones at seeding, D1), and the campaign always fills a strict Jan–Dec window
+— so the group advertises `time_convention="calendar_year"`. But that is the DEFAULT
+labeling, not a hard promise (`time_convention_strict=False`): a non-campaign consumer
+may deliberately drive a non-calendar 12-month window (e.g. a rolling Feb–Jan) into a
+year slot for non-standard processing. The `fill_zone_year` runner therefore requires
+only that the inference window OVERLAP the target year (a fully-disjoint window is still
+rejected as operator error).
+
+The `time` point can't itself carry the deviation (it's the fixed cross-zone index that
+slot lookup and campaign status key off), so the **actual window is recorded as CF time
+bounds**: each group carries a `time_bnds` variable of shape `(time, 2)` with
+`time.attrs["bounds"]="time_bnds"`, seeded with each year's default `[Jan-1, Dec-31]` and
+overwritten per fill with the run's real `to_date_range()` (first day of the start month,
+last day of the end month — e.g. `[2024-02-01, 2025-01-31]` for a Feb→Jan window). So the
+`time` point stays the calendar-year label while `time_bnds` states the true observation
+interval — the label matches reality, machine-readably (a CF-aware reader surfaces the
+interval per timestep). The `runs` provenance also records the range as human-readable
+backup. (Considered and rejected: hard-requiring an exact Jan–Dec window — it would break
+the deliberate rolling-window capability; and mutating the `time` point per fill — it
+would break the fixed, uniform cross-zone axis.)
 
 ## Alternatives considered
 
