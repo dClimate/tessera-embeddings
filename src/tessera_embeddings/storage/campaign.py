@@ -132,6 +132,7 @@ def mark_zone_year_empty(
     *,
     run_id: str | None = None,
     gate: CommitGate | None = None,
+    window: str | None = None,
 ) -> str:
     """Mark a ``(zone, year)`` complete with **no data** — an all-ocean cell.
 
@@ -162,7 +163,7 @@ def mark_zone_year_empty(
         return repo.lookup_branch("main")
     node.attrs["years_complete"] = sorted([*done, year])
     if run_id is not None:
-        node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year, run_id, empty=True)
+        node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year, run_id, empty=True, window=window)
     return commit_with_rebase(session, f"mark {zone} year {year} complete (no land)", gate=gate)
 
 

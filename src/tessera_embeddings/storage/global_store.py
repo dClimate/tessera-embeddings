@@ -133,7 +133,15 @@ def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: Sto
         "crs": spec.crs,
         "years_complete": [],
         "zone_scheme": ZONE_SCHEME,
+        # Calendar-year is the DEFAULT labeling of each year slot, not a guarantee:
+        # the time axis is indexed by calendar year (each slot's coordinate is Jan 1),
+        # and the campaign always fills a strict Jan-Dec window — but a non-campaign
+        # consumer MAY write a non-calendar 12-month window into a slot for
+        # non-standard processing. When it does, the actual window (its
+        # `window_end_label`) is recorded per year in the group's `runs` provenance, so
+        # the deviation is legible rather than a silent mislabel under the slot.
         "time_convention": "calendar_year",
+        "time_convention_strict": False,
         "layout": layout.name,
     }
     attrs.update(

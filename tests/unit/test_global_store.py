@@ -55,7 +55,8 @@ def test_coords_and_attrs(tmp_path):
     assert attrs["crs"] == "EPSG:32601"
     assert attrs["years_complete"] == []
     assert attrs["zone_scheme"] == "utm_6deg_nominal"
-    assert attrs["time_convention"] == "calendar_year"
+    assert attrs["time_convention"] == "calendar_year"  # the DEFAULT slot labeling
+    assert attrs["time_convention_strict"] is False  # ...not a guarantee; deviations recorded in `runs`
     assert attrs["proj:code"] == "EPSG:32601"  # per-zone proj: merged in
     # geoemb: lives once on the root (utm_zones layout), not per zone.
     assert "geoemb:type" not in attrs

@@ -208,13 +208,16 @@ def fill_zone_year(
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — the axis is fixed at seeding (ADR-008 D1)."
         )
-    # Permissive by design: require only that the window OVERLAPS `year`, so
-    # non-campaign consumers can drive rolling (non-Jan-Dec) windows. The global
-    # campaign default is a strict Jan-Dec calendar-year window
-    # (fill_zone_year_flow), which is unambiguous; a window fully DISJOINT from
-    # `year` is the operator error we catch here (e.g. a cloned invocation whose
-    # year was edited but not its time_window), which would otherwise land
-    # mislabeled embeddings and tag them permanently complete.
+    # Require only that the window OVERLAPS `year`. Calendar-year is the store's
+    # DEFAULT convention, not a guarantee (zone group: time_convention="calendar_year",
+    # time_convention_strict=False) — a non-campaign consumer may deliberately drive a
+    # rolling (non-Jan-Dec) 12-month window into a year slot, and the actual window is
+    # recorded per year in the group's `runs` provenance (assemble_global /
+    # mark_zone_year_empty pass window_end_label), so a deviation is legible rather than
+    # a silent mislabel. The global campaign always uses a strict Jan-Dec window
+    # (fill_zone_year_flow). What IS an error is a window fully DISJOINT from `year`
+    # (e.g. a cloned invocation whose year was edited but not its time_window) — that
+    # would land embeddings under an unrelated slot, so we reject it here.
     window_years = {y for y, _ in config.time_window.months}
     if year not in window_years:
         raise ValueError(
@@ -319,7 +322,9 @@ def fill_zone_year(
     def _finish_empty(**extra: float) -> dict[str, Any]:
         # A no-data cell (all-ocean, or every live tile skipped) still lands:
         # years_complete + provenance in one commit, then the zone-year tag.
-        snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id, gate=gate)
+        snapshot = mark_zone_year_empty(
+            repo, zone, year, run_id=run_id, gate=gate, window=config.time_window.window_end_label
+        )
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
         return {**summary, "empty": True, "snapshot_id": snapshot, "tag": tag, **extra}
 
@@ -434,6 +439,7 @@ def fill_zone_year(
         s3_concurrency=s3_concurrency,
         get_credentials=get_credentials,
         s3_region=s3_region,
+        window=config.time_window.window_end_label,
         log=log,
     )
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)

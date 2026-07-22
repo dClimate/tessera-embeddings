@@ -120,6 +120,21 @@ metadata opens as well as the fill's, so a non-default-region store is read
 consistently (the ROI-engine mosaic write remains us-west-2-only, a pre-existing
 limitation moot while all campaign data lives there).
 
+**Time convention — calendar-year DEFAULT, not a guarantee.** Each zone group's time
+axis is indexed by calendar year (slot coordinate = Jan 1 of the year, fixed at seeding,
+D1), and the campaign always fills a strict Jan–Dec window — so the group advertises
+`time_convention="calendar_year"`. But that is the DEFAULT labeling, not a hard promise
+(`time_convention_strict=False`): a non-campaign consumer may deliberately drive a
+non-calendar 12-month window (e.g. a rolling Feb–Jan) into a year slot for non-standard
+processing. The `fill_zone_year` runner therefore requires only that the inference window
+OVERLAP the target year (a fully-disjoint window is still rejected as operator error), and
+the **actual window is recorded per year** in the group's `runs` provenance (its
+`window_end_label`, written by `assemble_global` / `mark_zone_year_empty` via
+`run_provenance`). A deviation is thus legible rather than a silent mislabel under the
+calendar-year slot. (Considered and rejected: hard-requiring an exact Jan–Dec window —
+it would break the deliberate rolling-window capability for a marginal guarantee the
+per-slot provenance already provides.)
+
 ## Alternatives considered
 
 - **A zone-native (non-Dask) ingest engine** — rejected: it would duplicate the

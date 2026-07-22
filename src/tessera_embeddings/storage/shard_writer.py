@@ -132,14 +132,23 @@ def read_years_complete(node: zarr.Group) -> list[int]:
     return sorted(int(y) for y in raw) if isinstance(raw, list) else []
 
 
-def run_provenance(existing: object, year: int, run_id: str, *, empty: bool = False) -> dict:
+def run_provenance(existing: object, year: int, run_id: str, *, empty: bool = False, window: str | None = None) -> dict:
     """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
 
     Both fill paths use this — the shard write (:func:`write_year_shards`) and
     the no-data marking (``campaign.mark_zone_year_empty``) — so the provenance
     record shape can only change in one place.
+
+    ``window`` records the ISO window-end label of the 12-month inference window the
+    slot was actually filled from (e.g. ``"2025-12-01"`` for a calendar-year fill).
+    The store advertises ``time_convention="calendar_year"`` as the DEFAULT but not a
+    guarantee (``time_convention_strict=False``): a fill may write a non-calendar
+    12-month window, so this per-year record is what makes the actual window legible
+    instead of a silent mislabel under the calendar-year slot.
     """
     record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat()}
+    if window is not None:
+        record["window"] = window
     if empty:
         record["empty"] = True
     return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
@@ -195,6 +204,7 @@ def write_year_shards(
     shard_px: int = SHARD_PX,
     commit_msg: str | None = None,
     run_id: str | None = None,
+    window: str | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
@@ -231,6 +241,6 @@ def write_year_shards(
     if year_label not in done:
         node.attrs["years_complete"] = sorted([*done, year_label])
     if run_id is not None:
-        node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year_label, run_id)
+        node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year_label, run_id, window=window)
 
     return commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}", gate=gate)
