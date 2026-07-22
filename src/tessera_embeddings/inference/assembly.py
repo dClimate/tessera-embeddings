@@ -1013,11 +1013,12 @@ class ZarrWriter:
         * existing store, time value already present → its index is overwritten
           in place (idempotent resume: a crashed assembly re-run lands on the
           same index instead of appending a duplicate timestep). Live positions
-          are rewritten and skip-marked chunks' footprints are reset to fill (a
-          prior run's data must not survive under a rerun's skip marker);
-          positions **outside the current ROI mask** are not touched — a
-          same-date re-assembly assumes the same grid and mask, so shrink the
-          ROI only with a fresh date (or a fresh store).
+          are rewritten and **every destination chunk this run does not rewrite
+          as live is cleared to fill** — skip-marked footprints AND positions
+          outside this run's ROI mask (a prior run's data must not survive under
+          a rerun's skip marker, nor be stranded as stale embeddings when the ROI
+          shrinks). A same-date re-assembly with a different mask is therefore
+          safe; the timestep reflects exactly this run's live footprint.
 
         The fill itself is always the second, single data commit, so a crash
         mid-fill leaves only an all-fill timestep that the re-run overwrites —

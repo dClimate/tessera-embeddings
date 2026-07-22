@@ -51,9 +51,9 @@ from tessera_embeddings.orchestration.prefect.tasks.inference import (
     run_inference_task,
 )
 from tessera_embeddings.providers.aws.ray import (
-    DEFAULT_CLUSTER_TEMPLATE,
     RAY_DOWN_TIMEOUT_S,
     cleanup_ray_tempfiles,
+    cluster_name_for_flow_run,
     terminate_ray_instances_by_tag,
 )
 
@@ -84,18 +84,12 @@ class EmbeddingsDevParams(BaseModel):
     sync_source_path: str | None = None
 
 
-def _cluster_name_for_flow_run(flow_run_id: object) -> str:
-    """Derive the deterministic Ray cluster name for a flow run.
-
-    The name must be recomputable from nothing but the flow-run id:
-    Prefect executes cancellation/crash hooks in a freshly imported copy
-    of this module after the flow's child process has been killed, so any
-    state the hook needs has to be derivable, not stored. The base name
-    comes from the shipped cluster template so the two stay in sync.
+def _cluster_name_for_flow_run(flow_run_id: object) -> str | None:
+    """Deterministic Ray cluster name for a flow run — delegates to the shared
+    provider helper so this flow and ``fill-zone-year`` derive it identically. See
+    :func:`tessera_embeddings.providers.aws.ray.cluster_name_for_flow_run`.
     """
-    with DEFAULT_CLUSTER_TEMPLATE.open() as f:
-        base = yaml.safe_load(f).get("cluster_name", "tessera-inference")
-    return f"{base}-{str(flow_run_id).replace('-', '')[:8]}"
+    return cluster_name_for_flow_run(flow_run_id)
 
 
 def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
@@ -119,8 +113,10 @@ def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) 
         # termination below, which is the authoritative teardown here anyway.
         try:
             subprocess.run(["ray", "down", _active_resolved_yaml, "-y"], check=False, timeout=RAY_DOWN_TIMEOUT_S)
-        except subprocess.TimeoutExpired:
-            log.warning("`ray down` exceeded %ds — falling through to tag-based termination", RAY_DOWN_TIMEOUT_S)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            # A hang OR a launch failure (e.g. `ray` not on PATH) before a return code
+            # must fall through to the unconditional tag-based termination below.
+            log.warning("`ray down` did not complete (%s) — falling through to tag-based termination", exc)
         finally:
             cleanup_ray_tempfiles(_active_resolved_yaml)
 
@@ -349,6 +345,7 @@ def tessera_embeddings(
             run_id=run_id,
             t0=t0,
             get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
         )
     _active_resolved_yaml = None
     _active_cluster_name = None

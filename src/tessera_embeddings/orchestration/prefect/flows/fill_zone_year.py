@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, cast
 import yaml
 from prefect import flow, get_run_logger
 from prefect.concurrency.sync import concurrency
+from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
@@ -47,6 +48,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
 from tessera_embeddings.providers.aws.ray import (
     RAY_DOWN_TIMEOUT_S,
     cleanup_ray_tempfiles,
+    cluster_name_for_flow_run,
     terminate_ray_instances_by_tag,
 )
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
@@ -143,25 +145,29 @@ def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) 
     """Emergency Ray teardown when the flow is cancelled via the Prefect UI."""
     log = logging.getLogger(__name__)
     log.warning("Flow cancelled — tearing down Ray cluster")
+    fallback_cluster = _active_cluster_name or cluster_name_for_flow_run(getattr(flow_run, "id", None))
     if _active_resolved_yaml and Path(_active_resolved_yaml).exists():
-        # Bound the call: a hung `ray down` (unreachable head, wedged CLI) must not
-        # block the tag-based termination fallback and leak billed EC2 workers. A
-        # timeout is treated as a failure so the fallback fires.
+        # Bound the call and swallow launch failures: a hung `ray down` (unreachable
+        # head, wedged CLI) OR an OSError before it even produces a return code (e.g.
+        # `ray` not on PATH) must not block the tag-based termination fallback and leak
+        # billed EC2 workers. Both are treated as failure (rc=-1) so the fallback fires,
+        # and tempfile cleanup runs in `finally` regardless of outcome.
+        rc = -1
         try:
             rc = subprocess.run(
                 ["ray", "down", _active_resolved_yaml, "-y"], check=False, timeout=RAY_DOWN_TIMEOUT_S
             ).returncode
-        except subprocess.TimeoutExpired:
-            log.warning("`ray down` exceeded %ds — terminating instances by tag", RAY_DOWN_TIMEOUT_S)
-            rc = -1
-        cleanup_ray_tempfiles(_active_resolved_yaml)
-        # A non-zero/timed-out `ray down` leaves EC2 instances running; fall back to
-        # terminating them by cluster tag rather than silently leaking them.
-        if rc != 0 and _active_cluster_name:
-            log.warning("`ray down` exited %d — terminating instances for cluster %r by tag", rc, _active_cluster_name)
-            terminate_ray_instances_by_tag(cluster_name=_active_cluster_name, log=log)
-    elif _active_cluster_name:
-        terminate_ray_instances_by_tag(cluster_name=_active_cluster_name, log=log)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            log.warning("`ray down` did not complete (%s) — terminating instances by tag", exc)
+        finally:
+            cleanup_ray_tempfiles(_active_resolved_yaml)
+        # A non-zero/timed-out/failed `ray down` leaves EC2 instances running; fall back
+        # to terminating them by cluster tag rather than silently leaking them.
+        if rc != 0 and fallback_cluster:
+            log.warning("`ray down` exited %d — terminating instances for cluster %r by tag", rc, fallback_cluster)
+            terminate_ray_instances_by_tag(cluster_name=fallback_cluster, log=log)
+    elif fallback_cluster:
+        terminate_ray_instances_by_tag(cluster_name=fallback_cluster, log=log)
     else:
         log.warning("Cancellation fired before the cluster was provisioned — check the AWS console manually.")
 
@@ -363,6 +369,10 @@ def fill_zone_year_flow(
     fill_kwargs["on_actor_retire"] = make_instance_terminator(log=log)
 
     global _active_resolved_yaml, _active_cluster_name
+    # Pin a deterministic cluster name from the flow-run id so the cancellation/crash
+    # hook can re-derive it and terminate the fleet by tag even when it runs in a fresh
+    # module import (globals unset) — without this, a cancel before `_active_cluster_name`
+    # is read from the YAML would hit the "no cluster name" path and leak the GPU fleet.
     with ray_cluster(
         log,
         ami_ssm_name=ami_ssm_name,
@@ -370,6 +380,7 @@ def fill_zone_year_flow(
         cloudwatch_log_group=cloudwatch_log_group,
         code_bucket=code_bucket,
         code_suffix=code_suffix,
+        cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
     ) as resolved_yaml:
         _active_resolved_yaml = resolved_yaml
         if resolved_yaml and Path(resolved_yaml).exists():

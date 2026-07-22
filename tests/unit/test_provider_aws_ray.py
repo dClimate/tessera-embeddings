@@ -237,13 +237,17 @@ def test_resolve_code_artifact_identity_tracks_tarball_overwrite() -> None:
     s3.put_object(Bucket="code-bkt", Key="code/src.tar.gz", Body=b"v1")
 
     id_v1 = resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION)
-    assert id_v1.startswith("ami=ami-aaa|tarball=")
+    # Lock the documented format exactly (ami=<id>|tarball=<etag>), not just a prefix,
+    # so a regression from ETag to some other object attribute would be caught.
+    etag_v1 = s3.head_object(Bucket="code-bkt", Key="code/src.tar.gz")["ETag"].strip('"')
+    assert id_v1 == f"ami=ami-aaa|tarball={etag_v1}"
     assert resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION) == id_v1
 
     # Overwrite the tarball with different content → different ETag → different identity.
     s3.put_object(Bucket="code-bkt", Key="code/src.tar.gz", Body=b"v2-different")
     id_v2 = resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION)
-    assert id_v2 != id_v1
+    etag_v2 = s3.head_object(Bucket="code-bkt", Key="code/src.tar.gz")["ETag"].strip('"')
+    assert id_v2 == f"ami=ami-aaa|tarball={etag_v2}" and id_v2 != id_v1
 
     # Re-bake the AMI (new value behind the same SSM name) → different identity.
     ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-bbb", Type="String", Overwrite=True)

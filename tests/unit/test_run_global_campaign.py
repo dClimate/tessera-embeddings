@@ -126,6 +126,40 @@ def test_fill_run_id_tracks_resolved_code_artifact_not_suffix(wired, monkeypatch
     assert changed.startswith("33N-2025-") and changed != base
 
 
+def test_code_identity_resolves_in_ray_region_not_storage_region(wired, monkeypatch):
+    """The code-artifact lookup must use the RAY provisioning region (None → us-west-2,
+    the fill's ray_cluster default), NOT the storage s3_region — the AMI SSM param and
+    tarball live where Ray provisions, which may differ from a non-default-region store.
+    """
+    calls: list = []
+    monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a: calls.append(a) or "ami=ami-test")
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", s3_region="eu-west-1"))
+    # Called once (memoized) with region (4th positional arg) = None, NOT "eu-west-1".
+    assert calls and calls[0][3] is None
+
+
+def test_mosaic_identity_fingerprints_only_active_orbits(wired, monkeypatch):
+    """With a single requested orbit, _mosaic_identity opens reflectance + the active
+    SAR store only — never the opposite orbit, even if a stale one is present (which
+    the fill never reads and which could wrongly raise or perturb the run_id).
+    """
+    opened: list[str] = []
+
+    def _capture(path, **k):
+        opened.append(path)
+        return SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": "2026-01-01T00:00:00Z"})
+
+    monkeypatch.setattr(mod, "open_store_as_zarr_group", _capture)
+    asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False, s1_orbit="ascending"
+        )
+    )
+    assert any("reflectance.zarr" in p for p in opened)
+    assert any("sar_ascending.zarr" in p for p in opened)
+    assert not any("sar_descending.zarr" in p for p in opened)  # inactive orbit never touched
+
+
 def test_all_ocean_cell_uses_empty_run_id_and_skips_cleanup(wired, monkeypatch):
     """An all-ocean cell (no live tiles) gets a stable '-empty' run id and never
     fingerprints a (nonexistent) mosaic — _staging_run_id would raise 'No mosaic stores

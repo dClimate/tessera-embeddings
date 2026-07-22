@@ -29,7 +29,7 @@ from prefect.deployments import arun_deployment
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
-from tessera_embeddings.inference.data_loading import _is_missing_repo
+from tessera_embeddings.inference.data_loading import _active_orbits, _is_missing_repo
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles, zone_year_on_axis
@@ -236,13 +236,20 @@ async def run_global_campaign(
         # global coverage sha read once up front: a partial `build_all(zones=...)` can
         # leave zones on different coverage revisions, and coverage can change after an
         # early read — either would let stale staged tiles resume against a rebuilt
-        # mosaic. Reflectance AND each PRESENT SAR orbit are fingerprinted (embeddings
+        # mosaic. Reflectance AND each ACTIVE SAR orbit are fingerprinted (embeddings
         # depend on all). Genuinely-absent stores (missing repo / not found) are
         # skipped; a PRESENT store with no identity FAILS CLOSED — never degrade to a
-        # config-only fingerprint.
+        # config-only fingerprint. Only the ACTIVE orbit set is fingerprinted
+        # (reflectance + `_active_orbits(s1_orbit)`): the fill reads only those, so an
+        # inactive opposite-orbit store that happens to be present (a stale/markerless
+        # leftover, or a prebuilt `ingest=False` mosaic that shipped both orbits) must
+        # NOT be opened here — it can't affect the embeddings, yet fingerprinting it
+        # could raise (no identity) or perturb the run_id and needlessly restart a valid
+        # single-orbit fill.
         base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}"
+        stores = ["reflectance", *(f"sar_{orbit}" for orbit in _active_orbits(s1_orbit))]
         ids: list[str] = []
-        for store in ("reflectance", "sar_ascending", "sar_descending"):
+        for store in stores:
             path = f"{base}/{store}.zarr"
             try:
                 grp = open_store_as_zarr_group(path, get_credentials=iam_icechunk_credentials, region=s3_region)
@@ -275,8 +282,15 @@ async def run_global_campaign(
         # reuse it for every cell — the AMI/tarball are campaign-wide constants, so a
         # single SSM/S3 lookup suffices. Lazy so a retag-only or all-ocean campaign (no
         # real fingerprint computed) makes no AWS call.
+        #
+        # region=None → us-west-2, the region the fill's ray_cluster PROVISIONS from
+        # (its default; the campaign does not thread a Ray region through). The AMI SSM
+        # parameter and the source tarball live in that region — NOT the storage
+        # `s3_region` (which may differ for a non-default-region store). Resolving here
+        # with s3_region would look up the AMI in the wrong SSM namespace and either
+        # fail or fingerprint an artifact the workers never boot.
         if not code_identity_cache:
-            code_identity_cache.append(_resolve_code_identity(ami_ssm_name, code_bucket, code_suffix, s3_region))
+            code_identity_cache.append(_resolve_code_identity(ami_ssm_name, code_bucket, code_suffix, None))
         return code_identity_cache[0]
 
     def _staging_run_id(zone: str, year: int) -> str:

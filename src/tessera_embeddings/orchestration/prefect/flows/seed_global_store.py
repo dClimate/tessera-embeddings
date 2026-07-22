@@ -21,6 +21,7 @@ from prefect import flow, get_run_logger
 
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.inference.data_loading import _is_missing_repo
 from tessera_embeddings.storage.campaign import campaign_status
 from tessera_embeddings.storage.global_store import create_global_repo, open_global_repo, seed_zone_groups
 from tessera_embeddings.storage.zarr_store import read_time_values
@@ -73,7 +74,17 @@ def seed_global_store(
     try:
         repo = open_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
         seeded = set(campaign_status(repo, years=years).zones)
-    except (FileNotFoundError, icechunk.IcechunkError):
+    except FileNotFoundError:
+        log.info("Creating global store %s", store_path)
+        repo = create_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
+        seeded = set()
+    except icechunk.IcechunkError as exc:
+        # Only a genuinely-missing repo means "create it". Auth/throttle/timeout/
+        # corruption errors must NOT fall into the create path (it would fail against
+        # the live repo if the transient error clears, and buries the real cause) —
+        # re-raise them. Mirrors the ingest/campaign _is_missing_repo handling.
+        if not _is_missing_repo(exc):
+            raise
         log.info("Creating global store %s", store_path)
         repo = create_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
         seeded = set()

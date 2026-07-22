@@ -124,6 +124,24 @@ def resolve_code_artifact_identity(
     return "|".join(parts)
 
 
+def cluster_name_for_flow_run(flow_run_id: object, cluster_yaml: Path = DEFAULT_CLUSTER_TEMPLATE) -> str | None:
+    """Deterministic Ray cluster name for a flow run, or ``None`` if no id is known.
+
+    The name must be recomputable from nothing but the flow-run id: Prefect runs
+    cancellation/crash hooks in a freshly imported module after the flow's child
+    process is killed, so a hook can re-derive the cluster tag (and terminate the
+    fleet) even with the flow's module globals unset. Both the ``tessera_embeddings``
+    and ``fill-zone-year`` flows pass this as ``ray_cluster(cluster_name=...)`` so the
+    provisioned name and the hook's re-derived name always match. The base comes from
+    the shipped cluster template so it stays in sync with what ``ray up`` uses.
+    """
+    if not flow_run_id:
+        return None
+    with cluster_yaml.open() as f:
+        base = yaml.safe_load(f).get("cluster_name", "tessera-inference")
+    return f"{base}-{str(flow_run_id).replace('-', '')[:8]}"
+
+
 def _build_cloudwatch_setup_command(
     cloudwatch_template: Path = DEFAULT_CLOUDWATCH_TEMPLATE,
     log_group: str = DEFAULT_CLOUDWATCH_LOG_GROUP,
