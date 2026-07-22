@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from prefect import flow, get_run_logger
 from prefect.concurrency.sync import concurrency
+from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
@@ -45,6 +46,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_complete,
     zone_year_on_axis,
 )
+from tessera_embeddings.providers.aws.ray import cluster_name_for_flow_run
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
@@ -165,7 +167,10 @@ def fill_zone_year_flow(
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
         time_window_end: End month of the inference window as ``"Month Year"``;
             defaults to ``"December {year}"`` (the calendar-year window). The
-            runner requires it to overlap ``year``.
+            runner REQUIRES the exact January-December window for ``year``
+            (the store guarantees calendar-year slots), so any other value fails
+            loudly at the preflight gate — non-calendar 12-month windows belong
+            in the single-ROI ``12mo_window_end`` path, not the global store.
         store_name: Global-store repo basename (``paths.global_store``).
         mask_name: Coverage-store repo basename (``paths.land_mask_store``).
         ssm_prefix: SSM prefix for the Ray cluster resource IDs.
@@ -246,10 +251,10 @@ def fill_zone_year_flow(
         if needs_cluster
         else s1_orbit
     )
-    # Default to the strict Jan-Dec calendar-year window for `year` (our global
-    # convention: `December {year}` yields a 12-month window spanning Jan-Dec).
-    # `time_window_end` overrides for rolling windows — the runner's window check
-    # is deliberately permissive so non-campaign consumers can use them.
+    # The strict Jan-Dec calendar-year window for `year`: `December {year}` yields a
+    # 12-month window spanning exactly Jan-Dec (the store's guaranteed convention).
+    # A `time_window_end` override producing any other window is rejected loudly by
+    # the runner's calendar-year gate — the single enforcement chokepoint.
     config = build_inference_config(
         s1_orbit=resolved_s1,
         time_window=parse_time_window(time_window_end or f"December {year}"),
@@ -328,6 +333,11 @@ def fill_zone_year_flow(
     fill_kwargs["on_actor_retire"] = make_instance_terminator(log=log)
 
     try:
+        # Pin a deterministic cluster name from the flow-run id so the cancellation
+        # hook can re-derive it and terminate the fleet by tag even when it runs in a
+        # fresh module import (globals unset) — without this, a cancel before
+        # `activate()` records the name would hit the "no cluster name" path and leak
+        # the GPU fleet.
         with ray_cluster(
             log,
             ami_ssm_name=ami_ssm_name,
@@ -335,6 +345,7 @@ def fill_zone_year_flow(
             cloudwatch_log_group=cloudwatch_log_group,
             code_bucket=code_bucket,
             code_suffix=code_suffix,
+            cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
         ) as resolved_yaml:
             activate(resolved_yaml)
             summary = fill_zone_year(**fill_kwargs)

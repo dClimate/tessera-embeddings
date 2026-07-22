@@ -137,7 +137,10 @@ def run_provenance(existing: object, year: int, run_id: str, *, empty: bool = Fa
 
     Both fill paths use this — the shard write (:func:`write_year_shards`) and
     the no-data marking (``campaign.mark_zone_year_empty``) — so the provenance
-    record shape can only change in one place.
+    record shape can only change in one place. The record carries no window: the
+    store GUARANTEES calendar-year slots (the zone-fill gate rejects any window
+    that is not exactly Jan-Dec of the slot's year), and each slot's true interval
+    is stated by the seeded ``time_bnds`` CF-bounds variable.
     """
     record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat()}
     if empty:

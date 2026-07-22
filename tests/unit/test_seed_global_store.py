@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import logging
 
+import icechunk
+import pytest
+
 import tessera_embeddings.orchestration.prefect.flows.seed_global_store as mod
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
@@ -48,3 +51,32 @@ def test_seed_preserves_explicit_model_version(monkeypatch):
     captured = _capture_seed(monkeypatch)
     mod.seed_global_store.fn(paths=_PATHS, model_version="custom-encoder-v2")
     assert captured["model_version"] == "custom-encoder-v2"
+
+
+def test_seed_creates_on_missing_repo_icechunk_error(monkeypatch):
+    """A genuinely-missing repo (IcechunkError "doesn't exist") takes the create path."""
+    captured = _capture_seed(monkeypatch)
+
+    def _raise_missing(*a, **k):
+        raise icechunk.IcechunkError("the repository doesn't exist")
+
+    monkeypatch.setattr(mod, "open_global_repo", _raise_missing)
+    mod.seed_global_store.fn(paths=_PATHS)
+    assert captured["model_version"] == checkpoint_filename()  # seed_zone_groups ran → create path taken
+
+
+def test_seed_reraises_transient_icechunk_error(monkeypatch):
+    """A transient IcechunkError (timeout/auth) must NOT be treated as a missing repo —
+    it re-raises instead of creating a fresh repo against a store that may already exist.
+    """
+    _capture_seed(monkeypatch)
+
+    def _raise_transient(*a, **k):
+        raise icechunk.IcechunkError("connection timed out")
+
+    monkeypatch.setattr(mod, "open_global_repo", _raise_transient)
+    created: list = []
+    monkeypatch.setattr(mod, "create_global_repo", lambda *a, **k: created.append(1) or object())
+    with pytest.raises(icechunk.IcechunkError, match="timed out"):
+        mod.seed_global_store.fn(paths=_PATHS)
+    assert created == []  # never entered the create path

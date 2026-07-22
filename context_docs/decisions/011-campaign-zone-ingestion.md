@@ -103,6 +103,57 @@ geoembeddings `utm_zones` spec**, whose `utm{NN}` group name cannot express the
 hemisphere (33N vs 33S). A hemisphere amendment is a candidate to propose
 upstream. `canonicalize_zone` is the single parser.
 
+**Staging `run_id`** (fill, per cell): the campaign derives each cell's staging
+`run_id` as `{zone}-{year}-{hash}` over the acceptance config (threshold / orbit /
+window / checkpoint), the **immutable code artifact** the fill will run, and the
+per-`(zone, year)` mosaic identity (post-ingest `ingest_marker`). A retry with
+identical inputs resumes the same staging prefix; any change starts a fresh one, so
+tiles staged by old inputs are never resumed under new ones. The code artifact is the
+**resolved AMI ID plus (when a source tarball overlays it) that object's ETag**, not
+the mutable `code_suffix` label — re-baking the AMI under the same SSM name or
+overwriting `code/src{suffix}.tar.gz` would otherwise leave the fingerprint unchanged
+and let a retry publish a permanently-tagged mixed-code year. An **all-ocean cell**
+(no live tiles) produces no mosaic and the fill marks it empty with no staging, so it
+takes a stable `-empty` `run_id` and skips both mosaic fingerprinting (which would
+raise) and cleanup. The campaign's `s3_region` is threaded through ingest's Icechunk
+metadata opens as well as the fill's, so a non-default-region store is read
+consistently (the ROI-engine mosaic write remains us-west-2-only, a pre-existing
+limitation moot while all campaign data lives there).
+
+**Time convention — calendar-year slots are a GUARANTEE (decided 2026-07-22).** Each
+zone group's time axis is fixed and uniform at seeding (D1): one `time` point per
+campaign year at Jan 1 — i.e. each point is the **start of the exact Jan–Dec window
+its slot holds** — plus a CF `time_bnds` variable (`(time, 2)`,
+`time.attrs["bounds"]="time_bnds"`) stating each slot's true interval
+`[Jan 1, Dec 31]`. The `fill_zone_year` runner **rejects any window that is not
+exactly the slot's calendar year**; `time_convention="calendar_year"` is therefore a
+guarantee, and every label matches the data it holds.
+
+Two designs for supporting non-calendar 12-month windows in this store were
+**considered and rejected**:
+
+- *Keep the Jan-1 point and record a deviating window in `time_bnds`/provenance*
+  (briefly implemented, then reverted): a Feb→Jan window pinned at `2025-01-01`
+  places the coordinate **outside its own bounds** (`2025-01-01 ∉
+  [2025-02-01, 2026-01-31]`), which CF's cell-bounds model does not tolerate
+  (a coordinate is a representative instant *inside* its cell; checkers flag
+  violations) — the label lies even with honest bounds attached. Worse, one slot
+  per year cannot hold two window phases at all (June–May *and* July–June anchored
+  in the same year collide): a **cardinality** defect no labeling fixes.
+- *Mutating the `time` point per fill*: breaks the fixed, uniform cross-zone axis
+  that slot lookup (`time_index_of(year_timestamp(year))`), campaign status, and
+  D1's no-resize contract all key off.
+
+**The sanctioned non-calendar design** rests on the observation that a 12-month
+window is uniquely identified by its start month, and Jan-1 points already *are*
+window starts: a **windowed store variant** would seed slots at other declared
+start months (a June–May slot's point IS `2025-06-01`, inside its bounds; June–May
+and July–June are distinct slots — no collisions, ever). This is a design note
+only, to be built on real demand; until then, non-calendar 12-month windows use
+the **single-ROI `12mo_window_end` path** (`assemble()`: `time` = window-end
+label, an extendable axis where multiple windows already coexist correctly).
+The single-ROI path is deliberately untouched by all of this.
+
 ## Alternatives considered
 
 - **A zone-native (non-Dask) ingest engine** — rejected: it would duplicate the

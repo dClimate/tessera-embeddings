@@ -59,6 +59,9 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
     monkeypatch.setattr(mod, "check_time_window_coverage", lambda *a, **k: None)
     monkeypatch.setattr(mod, "_staging_run_id", lambda z, y, **k: f"{z}-{y}-fingerprint")
+    # Immutable code identity (AMI ID + tarball ETag) — mocked so tests make no
+    # SSM/S3 call; resolved once per run and folded into each cell's run_id.
+    monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a: "ami=ami-test")
 
     def fake_sequential(**kwargs):
         rec["seq_kwargs"] = kwargs

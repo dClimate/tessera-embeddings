@@ -396,6 +396,55 @@ then inference → shard-assemble → tag) → delete the transient mosaic
 run; the default (all 120) skips already-finished cells, and `ingest=False`
 bypasses ingestion when mosaics already exist upstream.
 
+### Reading a zone group (xarray)
+
+Open a zone group through an Icechunk readonly session and ask xarray to
+decode CF-linked variables as coordinates:
+
+```python
+import xarray as xr
+from tessera_embeddings.storage.global_store import open_global_repo
+
+repo = open_global_repo("s3://<bucket>/global/tessera.icechunk")
+session = repo.readonly_session(branch="main")
+ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords="all")
+```
+
+```
+<xarray.Dataset>
+Coordinates:
+  * time         (time) datetime64[ns] 2017-01-01 2018-01-01 ... 2025-01-01
+  * northing     (northing) float64 ...
+  * easting      (easting) float64 ...
+  * band         (band) int64 0 1 ... 127
+    time_bnds    (time, bnds) datetime64[ns] ...     ← [Jan 1, Dec 31] per slot
+Data variables:
+    embeddings   (time, northing, easting, band) int8 ...
+    scales       (time, northing, easting) float32 ...
+    s2_obs_count (time, northing, easting) uint16 ...
+```
+
+**Time semantics (guaranteed).** Each `time` point is **January 1 of its
+calendar year — the start of the exact Jan–Dec window that slot holds**
+(`time_convention="calendar_year"`; the fill runner rejects any other
+window, so the label always matches the data). The companion `time_bnds`
+variable (shape `(time, 2)`, linked via `time.attrs["bounds"]` per CF)
+states each slot's covered interval explicitly: `[YYYY-01-01, YYYY-12-31]`.
+
+`decode_coords="all"` is what promotes `time_bnds` from *Data variables*
+to *Coordinates* — xarray sets variables referenced by `bounds` (and
+`grid_mapping`) attributes as coordinates. Without it the dataset is
+identical; `time_bnds` just lists under data variables. Non-calendar
+12-month windows are **not** written to this store — the single-ROI
+output stores (`time_convention="12mo_window_end"`, one time entry per
+window-end label) are the home for rolling windows.
+
+Reference docs:
+[`xarray.open_zarr` / `decode_coords`](https://docs.xarray.dev/en/stable/generated/xarray.open_zarr.html) ·
+[xarray weather & climate (CF) guide](https://docs.xarray.dev/en/stable/user-guide/weather-climate.html) ·
+[CF conventions §7.1 Cell Boundaries](https://cfconventions.org/cf-conventions/cf-conventions.html#cell-boundaries) ·
+[cf-xarray bounds handling](https://cf-xarray.readthedocs.io/en/latest/bounds.html)
+
 ## The test that proves decoupling
 
 [`src/tessera_embeddings/orchestration/runners/plain.py`](src/tessera_embeddings/orchestration/runners/plain.py)

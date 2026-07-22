@@ -3,7 +3,9 @@
 Regression for the 2026-07-17 mis-measurement: a multi-strip chunk's per-strip
 ``ds`` lines under-count valid pixels (a no-valid-pixel strip emits no ds line),
 so the parser must take valid_px + px/s from the actor's chunk-total "complete:
-N valid pixels" line, not the ds sum.
+N valid pixels" line, not the ds sum. This exercises the parser's LEGACY
+prose-log path (the ``_FAKE_LOG`` here carries no ``CHUNK_SUMMARY`` lines);
+current-code runs use the structured path (see test_profiling_tools.py).
 """
 
 from __future__ import annotations
@@ -12,6 +14,8 @@ import contextlib
 import importlib.util
 import io
 from pathlib import Path
+
+import pytest
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "inference_perf" / "observe_cluster.py"
 
@@ -41,16 +45,18 @@ def _load_observe_cluster():
     return mod
 
 
-def test_phase_parser_valid_px_from_cdone(tmp_path: Path) -> None:
+def test_phase_parser_valid_px_from_cdone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     mod = _load_observe_cluster()
     logdir = tmp_path / "logs"
     logdir.mkdir()
     (logdir / "worker-abc.err").write_text(_FAKE_LOG)
 
-    parser = mod.PHASE_PARSER.replace("/tmp/ray/session_latest/logs/worker-*.err", str(logdir / "worker-*.err"))
+    # The parser reads its log dir from TESSERA_RAY_LOGS (default: the on-worker
+    # Ray session path). Point it at the fixture instead of string-patching.
+    monkeypatch.setenv("TESSERA_RAY_LOGS", str(logdir))
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        exec(compile(parser, "<phase_parser>", "exec"), {})
+        exec(compile(mod.PHASE_PARSER, "<phase_parser>", "exec"), {})
     lines = buf.getvalue().splitlines()
 
     header, row = lines[0].split("\t"), lines[1].split("\t")

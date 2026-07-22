@@ -334,18 +334,26 @@ def plan_zone_inference(
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — the axis is fixed at seeding (ADR-008 D1)."
         )
-    # Permissive by design: require only that the window OVERLAPS `year`, so
-    # non-campaign consumers can drive rolling (non-Jan-Dec) windows. The global
-    # campaign default is a strict Jan-Dec calendar-year window
-    # (fill_zone_year_flow), which is unambiguous; a window fully DISJOINT from
-    # `year` is the operator error we catch here (e.g. a cloned invocation whose
-    # year was edited but not its time_window), which would otherwise land
-    # mislabeled embeddings and tag them permanently complete.
+    # STRICT calendar-year gate: the window must be EXACTLY Jan-Dec of `year`. The
+    # global store's time points are window STARTS (each slot's coordinate is Jan 1
+    # of its year, fixed at seeding), so a window that merely overlaps `year` — e.g.
+    # a rolling Feb-Jan — would sit at a coordinate outside its own real interval
+    # (violating CF §7.1 bounds containment) and be permanently mislabeled under the
+    # write-once zone-year tag; and one slot per year cannot hold two window phases
+    # anyway. Label accuracy is the invariant: `time_convention="calendar_year"` is a
+    # GUARANTEE, and the seeded `time_bnds` ([Jan 1, Dec 31] per slot) states each
+    # slot's true interval. Non-calendar 12-month windows belong in a store whose
+    # time points ARE the windows: today the single-ROI `12mo_window_end` path
+    # (assemble(): time = window-end label, extendable axis); zone-scale, the
+    # windowed-variant design in ADR-011 (slots declared at other start months).
     window_years = {y for y, _ in config.time_window.months}
-    if year not in window_years:
+    if window_years != {year}:
         raise ValueError(
-            f"config.time_window ({config.time_window.window_end_label}) covers {sorted(window_years)} "
-            f"but year={year} — the inference window must overlap the calendar-year slot it fills."
+            f"config.time_window ({config.time_window.window_end_label}) spans {sorted(window_years)} "
+            f"but the global store guarantees calendar-year slots (time_convention='calendar_year'): "
+            f"year={year} requires the exact January-December {year} window. Rolling/offset 12-month "
+            f"windows are not writable to the global store — use the single-ROI `12mo_window_end` "
+            f"path for non-calendar windows (or the ADR-011 windowed-variant design at zone scale)."
         )
 
     # Idempotent retry: a cell that already landed is done — re-running it

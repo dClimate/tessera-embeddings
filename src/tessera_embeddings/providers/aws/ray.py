@@ -63,6 +63,15 @@ you've stored the EC2 resource IDs your Ray nodes need.
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/ec2/tessera/ray"
 """Default CloudWatch log group for Ray agent logs."""
 
+RAY_DOWN_TIMEOUT_S = 300
+"""Upper bound (seconds) on a cancellation-time ``ray down``.
+
+``ray down`` SSHes into the head to tear the cluster down; if the head is
+unreachable or the CLI wedges it can block forever. A cancellation hook that
+hangs here never reaches the tag-based EC2 termination fallback, leaving GPU
+workers running and billed — so the call is bounded and a timeout falls through
+to tag termination. Generous enough for a normal teardown (~1-2 min)."""
+
 PROJECT_TAG_VALUE = "tessera-embeddings"
 """Value of the ``Project`` EC2 tag stamped on every Ray node.
 
@@ -77,6 +86,60 @@ this in lockstep with the deployment's IAM condition (yield CDK:
 _REQUIRED_SSM_KEYS = frozenset(
     {"security-group-id", "instance-profile-arn", "private-subnet-ids", "key-pair-name", "key-pair-id"}
 )
+
+
+def resolve_code_artifact_identity(
+    ami_ssm_name: str,
+    code_bucket: str | None = None,
+    code_suffix: str = "",
+    region: str = "us-west-2",
+) -> str:
+    """Immutable identity of the code a Ray fill will run, for the staging fingerprint.
+
+    Returns ``ami=<ami-id>`` and, when a source tarball overlays the AMI, appends
+    ``|tarball=<etag>`` — the same two artifacts :func:`provision_ray_cluster` boots
+    from (the AMI behind ``ami_ssm_name`` and ``s3://{code_bucket}/code/src{suffix}.tar.gz``).
+
+    The global campaign folds this into each cell's staging ``run_id`` because
+    ``code_suffix`` alone is NOT immutable: it is empty for a baked production AMI and
+    only a filename/branch stem for a tarball, so re-baking the AMI under the same SSM
+    name, or overwriting the tarball, leaves it unchanged. A retry would then resume
+    tiles staged by the OLD code while remaining tiles run the NEW code, permanently
+    publishing a mixed-version year. Resolving the real AMI ID and tarball ETag makes
+    any code change flip the fingerprint, so a fresh staging prefix is used.
+
+    Args:
+        ami_ssm_name: SSM parameter holding the worker AMI ID.
+        code_bucket: S3 bucket of the source tarball; ``None`` for a pure-AMI deploy.
+        code_suffix: Tarball filename suffix (``code/src{code_suffix}.tar.gz``).
+        region: AWS region for the SSM/S3 clients (the store's region; us-west-2 default).
+    """
+    ssm = boto3.client("ssm", region_name=region)
+    ami_id = ssm.get_parameter(Name=ami_ssm_name)["Parameter"]["Value"]
+    parts = [f"ami={ami_id}"]
+    if code_bucket:
+        s3 = boto3.client("s3", region_name=region)
+        etag = s3.head_object(Bucket=code_bucket, Key=f"code/src{code_suffix}.tar.gz")["ETag"].strip('"')
+        parts.append(f"tarball={etag}")
+    return "|".join(parts)
+
+
+def cluster_name_for_flow_run(flow_run_id: object, cluster_yaml: Path = DEFAULT_CLUSTER_TEMPLATE) -> str | None:
+    """Deterministic Ray cluster name for a flow run, or ``None`` if no id is known.
+
+    The name must be recomputable from nothing but the flow-run id: Prefect runs
+    cancellation/crash hooks in a freshly imported module after the flow's child
+    process is killed, so a hook can re-derive the cluster tag (and terminate the
+    fleet) even with the flow's module globals unset. Both the ``tessera_embeddings``
+    and ``fill-zone-year`` flows pass this as ``ray_cluster(cluster_name=...)`` so the
+    provisioned name and the hook's re-derived name always match. The base comes from
+    the shipped cluster template so it stays in sync with what ``ray up`` uses.
+    """
+    if not flow_run_id:
+        return None
+    with cluster_yaml.open() as f:
+        base = yaml.safe_load(f).get("cluster_name", "tessera-inference")
+    return f"{base}-{str(flow_run_id).replace('-', '')[:8]}"
 
 
 def _build_cloudwatch_setup_command(

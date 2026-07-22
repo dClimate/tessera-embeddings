@@ -36,6 +36,7 @@ from tessera_embeddings.inference.actors import (
     _xchunk_rung,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 
 
 class TestStripSlices:
@@ -270,6 +271,8 @@ def _make_actor(inference_config, test_model):
     actor.instance_id = "test-instance"
     actor._get_credentials = None  # no scoped provider; opens use the default chain
     actor._s3_region = None  # default region
+    # Unstarted monitor: process_chunk tags phase context on it (no thread runs).
+    actor._resource_monitor = ResourceMonitor()
     return actor
 
 

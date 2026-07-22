@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 from prefect import flow, get_run_logger
 from prefect.deployments import run_deployment
+from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.ingest import IngestSettings
@@ -56,6 +57,7 @@ from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
 )
 from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import (
     _ingest_dispatch_params,
+    _resolve_code_identity,
     _staging_run_id,
 )
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
@@ -227,7 +229,11 @@ def fill_zones_sequential_flow(
     # Lazily import the AWS providers so the flow file imports on machines
     # without ray/boto installed (arch tests, local inspection).
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
-    from tessera_embeddings.providers.aws.ray import make_instance_terminator, ray_cluster
+    from tessera_embeddings.providers.aws.ray import (
+        cluster_name_for_flow_run,
+        make_instance_terminator,
+        ray_cluster,
+    )
 
     # Canonicalize + dedupe, preserving caller order until the size sort.
     zones = list(dict.fromkeys(canonicalize_zone(z) for z in zones))
@@ -352,6 +358,14 @@ def fill_zones_sequential_flow(
         else None
     )
 
+    # Resolve the immutable code artifact (AMI ID + optional tarball ETag) ONCE for
+    # the whole run — it's a run-wide constant every cell's staging run_id folds in.
+    # NOT the mutable `code_suffix` label (a re-baked AMI or overwritten tarball
+    # must start fresh staging prefixes), and resolved in the Ray provisioning
+    # region (None → us-west-2), not the storage `s3_region`. Placed after the
+    # no-live-cells early return so triage-only runs make no AWS call.
+    code_identity = _resolve_code_identity(ami_ssm_name, code_bucket, code_suffix, None)
+
     def _prepare(cell: SequentialCell) -> PreparedCell:
         # Everything here needs the cell's mosaic, so it runs only after the
         # cell's ingest (if any) has landed: orbit resolution probes the
@@ -380,7 +394,7 @@ def fill_zones_sequential_flow(
                 min_valid_coverage=ingest_settings.min_valid_coverage,
                 s1_orbit=s1_orbit,
                 allow_partial_window=allow_partial_window,
-                code_suffix=code_suffix,
+                code_identity=code_identity,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
             ),
@@ -482,6 +496,10 @@ def fill_zones_sequential_flow(
         )
 
     try:
+        # Pin a deterministic cluster name from the flow-run id so the cancellation
+        # hook can re-derive it and terminate the fleet by tag even in a fresh module
+        # import (globals unset) — a cancel before activate() records the name must
+        # not hit the "no cluster name" path and leak the shared GPU fleet.
         with ray_cluster(
             log,
             ami_ssm_name=ami_ssm_name,
@@ -490,6 +508,7 @@ def fill_zones_sequential_flow(
             code_bucket=code_bucket,
             code_suffix=code_suffix,
             idle_timeout_minutes=idle_timeout_minutes,
+            cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
         ) as resolved_yaml:
             activate(resolved_yaml)
             seq = fill_zones_sequential(

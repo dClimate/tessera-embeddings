@@ -31,7 +31,12 @@ import zarr
 from tessera_embeddings.config.store_layout import GLOBAL, StoreLayout
 from tessera_embeddings.inference.conventions import build_convention_attrs, build_geoemb_root_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
-from tessera_embeddings.storage.zarr_store import _create_storage, global_store_config, read_time_values
+from tessera_embeddings.storage.zarr_store import (
+    TIME_ENCODING,
+    _create_storage,
+    global_store_config,
+    read_time_values,
+)
 from tessera_embeddings.storage.zone_grid import (
     CAMPAIGN_YEARS,
     PIXEL_M,
@@ -133,6 +138,14 @@ def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: Sto
         "crs": spec.crs,
         "years_complete": [],
         "zone_scheme": ZONE_SCHEME,
+        # Calendar-year slots are a GUARANTEE: each `time` point is Jan 1 of its year
+        # (the START of the exact Jan-Dec window it holds — fixed and uniform across
+        # zones at seeding), and the zone-fill gate rejects any window that is not
+        # exactly that calendar year, so the label always matches the data. The seeded
+        # `time_bnds` CF-bounds variable states each slot's true interval
+        # ([Jan 1, Dec 31]). Non-calendar 12-month windows belong in a store whose
+        # time points ARE the windows (single-ROI `12mo_window_end`, or the ADR-011
+        # windowed-variant design at zone scale) — never in this store.
         "time_convention": "calendar_year",
         "layout": layout.name,
     }
@@ -222,6 +235,19 @@ def seed_zone_groups(
     times = calendar_year_times(years)
     nt = len(times)
     band = _layout_band(layout)
+    # CF time bounds: each year slot's covered interval is the actual date range of
+    # its calendar year, [Jan 1, Dec 31] (= TimeWindow.to_date_range for the Jan-Dec
+    # window every fill is required to use — the zone-fill gate enforces it). Written
+    # once here and never touched by fills: under the calendar-year guarantee the
+    # seeded bounds ARE each slot's true observation extent, and the `time` point
+    # (Jan 1 = the window start) always lies within them (CF §7.1 containment).
+    default_bnds = np.stack(
+        [
+            np.array([np.datetime64(f"{y}-01-01", "ns") for y in years], dtype="datetime64[ns]"),
+            np.array([np.datetime64(f"{y}-12-31", "ns") for y in years], dtype="datetime64[ns]"),
+        ],
+        axis=1,
+    ).astype("int64")
     for spec in specs:
         node = root.require_group(spec.group_name)
         north = northing_coords(spec)
@@ -229,6 +255,9 @@ def seed_zone_groups(
         sizes = {"time": nt, "northing": spec.height, "easting": spec.width, "band": band}
         create_layout_arrays(node, layout, layout.arrays, sizes)
         _write_coord_arrays(node, {"time": times, "northing": north, "easting": east, "band": np.arange(band)})
+        bnds = node.create_array("time_bnds", data=default_bnds, chunks=(nt, 2), dimension_names=("time", "bnds"))
+        bnds.attrs.update(TIME_ENCODING)  # same int64-ns encoding as `time`
+        node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
         node.attrs.update(_zone_attrs(spec, north, east, layout))
     return session.commit(commit_msg or f"seed {len(specs)} zone group(s)")
 

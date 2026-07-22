@@ -38,8 +38,12 @@ def wired(monkeypatch):
     status = SimpleNamespace(zones={"33N": ()}, has=lambda z, y: False)
     monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)  # requested years are on-axis
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)  # default: a live (non-ocean) cell
     monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("33N", 2025)])
     monkeypatch.setattr(mod, "tag_year_complete", _defer_milestone)
+    # Immutable code identity (AMI ID + optional tarball ETag) — mocked so tests make no
+    # SSM/S3 call; resolved once per campaign and folded into the staging fingerprint.
+    monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a, **k: "ami=ami-test")
     # Store reads for the staging fingerprint: the coverage delivery sha (global per
     # delivery) and, for ingest=False, each mosaic store's `last_appended` identity.
     monkeypatch.setattr(
@@ -104,6 +108,85 @@ def test_fill_run_id_is_stable_and_input_fingerprinted(wired):
     assert _fill_run_id(wired) == base  # deterministic across identical runs
     changed = _fill_run_id(wired, ingest_settings=mod.IngestSettings(min_valid_coverage=0.5))
     assert changed.startswith("33N-2025-") and changed != base  # input change → new prefix
+
+
+def test_fill_run_id_tracks_resolved_code_artifact_not_suffix(wired, monkeypatch):
+    """The staging fingerprint keys on the RESOLVED code artifact (AMI ID + tarball
+    ETag), not the mutable `code_suffix`. So overwriting the tarball / re-baking the AMI
+    (a new resolved identity) yields a fresh prefix, while a `code_suffix` label change
+    that resolves to the same artifact does NOT — closing the mixed-version-year hole.
+    """
+    base = _fill_run_id(wired)
+    # A different code_suffix that resolves to the SAME artifact keeps the prefix stable
+    # (the mock ignores its args) — the fingerprint no longer keys on the raw suffix.
+    assert _fill_run_id(wired, code_suffix="-branchB") == base
+    # A changed resolved artifact (re-baked AMI / overwritten tarball) → fresh prefix.
+    monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a, **k: "ami=ami-REBAKED")
+    changed = _fill_run_id(wired)
+    assert changed.startswith("33N-2025-") and changed != base
+
+
+def test_code_identity_resolves_in_ray_region_not_storage_region(wired, monkeypatch):
+    """The code-artifact lookup must use the RAY provisioning region (None → us-west-2,
+    the fill's ray_cluster default), NOT the storage s3_region — the AMI SSM param and
+    tarball live where Ray provisions, which may differ from a non-default-region store.
+    """
+    calls: list = []
+    monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a: calls.append(a) or "ami=ami-test")
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", s3_region="eu-west-1"))
+    # Called once (memoized) with region (4th positional arg) = None, NOT "eu-west-1".
+    assert calls and calls[0][3] is None
+
+
+def test_mosaic_identity_fingerprints_only_active_orbits(wired, monkeypatch):
+    """With a single requested orbit, _mosaic_identity opens reflectance + the active
+    SAR store only — never the opposite orbit, even if a stale one is present (which
+    the fill never reads and which could wrongly raise or perturb the run_id).
+    """
+    opened: list[str] = []
+
+    def _capture(path, **k):
+        opened.append(path)
+        return SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": "2026-01-01T00:00:00Z"})
+
+    monkeypatch.setattr(mod, "open_store_as_zarr_group", _capture)
+    asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False, s1_orbit="ascending"
+        )
+    )
+    assert any("reflectance.zarr" in p for p in opened)
+    assert any("sar_ascending.zarr" in p for p in opened)
+    assert not any("sar_descending.zarr" in p for p in opened)  # inactive orbit never touched
+
+
+def test_all_ocean_cell_uses_empty_run_id_and_skips_cleanup(wired, monkeypatch):
+    """An all-ocean cell (no live tiles) gets a stable '-empty' run id and never
+    fingerprints a (nonexistent) mosaic — _staging_run_id would raise 'No mosaic stores
+    found' and strand the year — and no mosaic cleanup runs (ingest produced none).
+    """
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: False)
+
+    def _boom(*a, **k):
+        raise AssertionError("an empty cell must NOT read the mosaic for a staging fingerprint")
+
+    monkeypatch.setattr(mod, "open_store_as_zarr_group", _boom)
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    deps = [d for d, _ in wired["arun"]]
+    assert deps == ["ingest-zone-year/ingest-zone-year", "fill-zone-year/fill-zone-year"]  # ingest still probes+skips
+    fill = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
+    assert fill["run_id"] == "33N-2025-empty"
+    assert wired["deletes"] == []  # no mosaic produced → nothing to clean up
+
+
+def test_ingest_params_carry_s3_region(wired):
+    """The campaign's s3_region reaches the ingest deployment (not just the fill), so a
+    non-default-region deployment's ingest metadata opens hit the right bucket.
+    """
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", s3_region="eu-west-1"))
+    ingest = next(p for d, p in wired["arun"] if d == "ingest-zone-year/ingest-zone-year")
+    fill = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
+    assert ingest["s3_region"] == "eu-west-1" and fill["s3_region"] == "eu-west-1"
 
 
 def test_ingest_false_run_id_tracks_prebuilt_mosaic_identity(wired, monkeypatch):

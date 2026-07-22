@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM
@@ -51,11 +52,19 @@ def test_coords_and_attrs(tmp_path):
     assert g["northing"].shape == (4096,)
     assert g["time"].shape == (3,)
     assert g["band"].shape == (EMBEDDING_DIM,)  # band coord present for xarray consumers
+    # CF time bounds: (time, 2), linked via time.attrs["bounds"], seeded to each slot's
+    # DEFAULT calendar-year interval [Jan 1, Dec 31] (a fill overwrites with its real window).
+    assert g["time_bnds"].shape == (3, 2)
+    assert g["time"].attrs["bounds"] == "time_bnds"
+    yrs = np.asarray(g["time"]).astype("datetime64[ns]").astype("datetime64[Y]").astype(int) + 1970
+    bnds = np.asarray(g["time_bnds"]).astype("datetime64[ns]").astype("datetime64[D]").astype(str)
+    for i, y in enumerate(yrs):
+        assert list(bnds[i]) == [f"{y}-01-01", f"{y}-12-31"]
     attrs = dict(g.attrs)
     assert attrs["crs"] == "EPSG:32601"
     assert attrs["years_complete"] == []
     assert attrs["zone_scheme"] == "utm_6deg_nominal"
-    assert attrs["time_convention"] == "calendar_year"
+    assert attrs["time_convention"] == "calendar_year"  # a GUARANTEE (zone-fill gate enforces Jan-Dec)
     assert attrs["proj:code"] == "EPSG:32601"  # per-zone proj: merged in
     # geoemb: lives once on the root (utm_zones layout), not per zone.
     assert "geoemb:type" not in attrs
