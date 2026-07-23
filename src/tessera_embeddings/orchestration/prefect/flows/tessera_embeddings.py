@@ -149,6 +149,7 @@ def tessera_embeddings(
     num_actors: int = 20,
     s1_orbit: str = "both",
     s3_region: str | None = None,
+    allow_s2_only: bool = False,
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
 ) -> dict[str, Any]:
     """Generate Tessera embeddings for a mosaicked ROI.
@@ -188,6 +189,13 @@ def tessera_embeddings(
             IAM credential callback, through orbit resolution, chunk enumeration, the
             coverage gate, and the assembly task. ``None`` uses the default Icechunk
             region; set it for a store outside the default region.
+        allow_s2_only: Embed S2-valid pixels that have ZERO S1 observations
+            (sub-zone SAR coverage gaps) via the upstream v1.1 missing-S1
+            convention (all-zeros normalized S1 input) instead of skipping
+            them. Default False (historical behavior). Affected pixels are
+            identifiable afterwards via ``s1_asc_obs_count +
+            s1_desc_obs_count == 0``; quality is unvalidated — see the
+            optional-S1 ADR.
         dev_params: See :class:`EmbeddingsDevParams`.
 
     Returns:
@@ -239,6 +247,7 @@ def tessera_embeddings(
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
+        allow_s2_only=allow_s2_only,
     )
 
     staging_base = f"{output_bucket.rstrip('/')}/staging"

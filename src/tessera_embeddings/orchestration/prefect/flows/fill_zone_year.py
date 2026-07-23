@@ -207,6 +207,7 @@ def fill_zone_year_flow(
     cleanup_staging: bool = True,
     allow_partial_window: bool = False,
     allow_model_mismatch: bool = False,
+    allow_s2_only: bool = False,
     mosaic_base: str | None = None,
     s3_concurrency: int | None = None,
     run_id: str | None = None,
@@ -244,6 +245,16 @@ def fill_zone_year_flow(
         allow_model_mismatch: Fill even when the seeded store advertises a
             different encoder than this build (default rejects — a mid-campaign
             model upgrade would otherwise mix encoders under one store).
+        allow_s2_only: Embed S2-valid pixels that have ZERO S1 observations
+            (sub-zone SAR coverage gaps) using the upstream v1.1 missing-S1
+            convention (all-zeros normalized S1 input). Default False: such
+            pixels are skipped. Only the PER-PIXEL gate is relaxed — the
+            zone-level gates (SAR store presence, temporal coverage, grid
+            validation) stay strict, so a zone with NO SAR at all still fails
+            loudly (that signals an ingest bug, not geography). Identify the
+            affected pixels afterwards via ``s1_asc_obs_count +
+            s1_desc_obs_count == 0``. Embedding quality for S2-only pixels is
+            unvalidated — see the optional-S1 ADR before production use.
         mosaic_base: Override for the input mosaic prefix (default
             ``{inputs}/mosaics/{zone}/{year}`` — the campaign's per-year layout).
         s3_concurrency: This fill's slice of the fleet S3-PUT budget for the shard
@@ -315,6 +326,7 @@ def fill_zone_year_flow(
         inputs_bucket=paths.inputs,
         output_bucket=paths.outputs,
         chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
+        allow_s2_only=allow_s2_only,
     )
 
     if needs_cluster:

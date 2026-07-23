@@ -830,3 +830,83 @@ class TestXChunkPrefetch:
                 actor._take_prefetched("chunk_x")
         finally:
             release.set()
+
+
+class TestAllowS2Only:
+    """End-to-end through the real model: the optional per-pixel S1 requirement."""
+
+    def _stores_with_sar_gap(self, h: int, w: int, half: int):
+        """S2 valid EVERYWHERE (scl=4); SAR zeroed over columns >= half (a coverage gap)."""
+        rng = np.random.default_rng(11)
+        s2_root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+        for band in S2_BAND_ORDER:
+            vals = rng.integers(100, 5000, size=(6, h, w)).astype(np.uint16)
+            arr = s2_root.create_array(band, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
+            arr[:] = vals
+        scl = s2_root.create_array("scl", shape=(6, h, w), dtype=np.uint8, chunks=(6, h, w))
+        scl[:] = 4  # every pixel S2-valid at every timestep
+        times = pd.date_range("2024-01-01", periods=6, freq="5D").values.astype("datetime64[ns]").astype("int64")
+        t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
+        t_arr[:] = times
+
+        sar_asc = _make_sar_zarr_group(5, h, w, seed=20)
+        sar_desc = _make_sar_zarr_group(5, h, w, seed=30)
+        for grp in (sar_asc, sar_desc):
+            for name in ("0_VV", "0_VH"):
+                data = grp[name][:]
+                data[:, :, half:] = 0  # no SAR observations right of the gap edge
+                grp[name][:] = data
+
+        def _open_store(path, region=None):
+            if "reflectance" in path:
+                return s2_root
+            if "ascending" in path:
+                return sar_asc
+            if "descending" in path:
+                return sar_desc
+            raise ValueError(f"Unexpected store path: {path}")
+
+        return _open_store
+
+    def _run(self, inference_config, test_model, opener, allow_s2_only: bool):
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+        inference_config.allow_s2_only = allow_s2_only
+        actor = _make_actor(inference_config, test_model)
+        _CapturingWriter.last_write = None
+        _CapturingWriter.last_skip = None
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=opener),
+            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+        ):
+            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+        return result, _CapturingWriter.last_write
+
+    def test_sar_gap_pixels_embed_only_with_flag(self, inference_config, test_model):
+        h, w = _CHUNK.height, _CHUNK.width
+        half = w // 2
+        opener = self._stores_with_sar_gap(h, w, half)
+
+        res_off, write_off = self._run(inference_config, test_model, opener, allow_s2_only=False)
+        res_on, write_on = self._run(inference_config, test_model, opener, allow_s2_only=True)
+        assert res_off["status"] == "success" and res_on["status"] == "success"
+
+        # Provenance is identical either way: zero S1 observations in the gap.
+        for write in (write_off, write_on):
+            assert np.all(write["obs_counts"]["s1_asc_obs_count"][:, half:] == 0)
+            assert np.all(write["obs_counts"]["s1_desc_obs_count"][:, half:] == 0)
+            assert np.all(write["obs_counts"]["s2_obs_count"] > 0)
+
+        # Flag OFF (historical gate): gap pixels are never embedded — NaN scale.
+        assert np.all(np.isnan(write_off["scales"][:, half:]))
+        assert np.all(np.isfinite(write_off["scales"][:, :half]))
+
+        # Flag ON: every S2-valid pixel embeds — finite scales and embeddings
+        # everywhere, including the SAR gap (upstream v1.1 zero-input convention).
+        assert np.all(np.isfinite(write_on["scales"]))
+        assert np.all(np.isfinite(write_on["embeddings"]))
+        assert res_on["valid_pixels"] == h * w
+        assert res_off["valid_pixels"] == h * half
+
+        # S1-informed pixels are unaffected by the flag: identical int8 embeddings.
+        np.testing.assert_array_equal(write_on["embeddings"][:, :half], write_off["embeddings"][:, :half])

@@ -81,6 +81,7 @@ async def run_global_campaign(
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
     batch_days: int = 30,
     allow_partial_window: bool = False,
+    allow_s2_only: bool = False,
     sweep_orphan_mosaics: bool = False,
 ) -> dict[str, Any]:
     """Fill every pending (zone, year), year-serial with bounded zone parallelism.
@@ -124,6 +125,14 @@ async def run_global_campaign(
         batch_days: S1 CMR batch window forwarded to ingest.
         allow_partial_window: Relax the coverage gate (ingest + fill) to
             "non-empty" for legitimately partial edge zones.
+        allow_s2_only: Forwarded to every fill: embed S2-valid pixels with ZERO
+            S1 observations (sub-zone SAR coverage gaps) via the upstream v1.1
+            missing-S1 convention instead of skipping them. PER-PIXEL only —
+            zone-level SAR gates stay strict (a zone with no SAR at all still
+            fails loudly; that signals an ingest bug). Folded into the staging
+            run_id so a retry across a flipped flag never resumes mixed tiles.
+            S2-only pixel quality is unvalidated (see the optional-S1 ADR);
+            affected pixels are identifiable via s1_*_obs_count == 0.
         sweep_orphan_mosaics: Before the run, delete mosaics for cells that are
             already complete+tagged in scope — recovering orphans left by a
             per-cell cleanup that failed after tagging (that cell is no longer in
@@ -307,6 +316,10 @@ async def run_global_campaign(
             min_valid_coverage,
             s1_orbit,
             allow_partial_window,
+            # allow_s2_only changes WHICH pixels get embeddings, so a retry across a
+            # flipped flag must start a fresh staging prefix — resuming would mix
+            # S1-gated and S2-only tiles under one run.
+            allow_s2_only,
             checkpoint_filename(),
             _code_identity(),
             _mosaic_identity(zone, year),
@@ -331,6 +344,7 @@ async def run_global_campaign(
             "s3_region": s3_region,
             "commit_limit_name": commit_limit_name,
             "allow_partial_window": allow_partial_window,
+            "allow_s2_only": allow_s2_only,
             # Divide the fleet S3-PUT budget across concurrent fills so K shard-write
             # phases don't burst K times the target PUTs (the ~800-req SlowDown). D6
             # gates committers; this bounds the ungated upload phase.

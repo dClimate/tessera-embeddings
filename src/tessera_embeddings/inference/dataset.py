@@ -46,6 +46,12 @@ class MosaicChunkInferenceDataset:
         num_obs_checkpoints: Sorted bucket sizes. A pixel with ``k`` valid
             observations is mapped to the smallest checkpoint ``>= k``.
         s1_orbit: Which S1 orbit direction(s) are active. Only affects logging.
+        allow_s2_only: Keep S2-valid pixels with ZERO S1 observations (sub-zone
+            SAR coverage gaps). They land in the smallest S1 bucket and receive
+            the upstream v1.1 missing-S1 input: an all-zeros normalized-space S1
+            slice (``resample_s1_bucket`` zero-count rows == ucam-eo/tessera's
+            ``_sample_s1_merged`` zero return). Default False: such pixels are
+            skipped entirely (no embedding — this pipeline's historical gate).
     """
 
     def __init__(
@@ -53,9 +59,11 @@ class MosaicChunkInferenceDataset:
         chunk_data: ChunkData,
         num_obs_checkpoints: tuple[int, ...] = DEFAULT_NUM_OBS_CHECKPOINTS,
         s1_orbit: Literal["ascending", "descending", "both"] = "both",
+        allow_s2_only: bool = False,
     ) -> None:
         self.num_obs_checkpoints = _normalize_obs_checkpoints(num_obs_checkpoints)
         self.s1_orbit = s1_orbit
+        self.allow_s2_only = allow_s2_only
         self.H = chunk_data.height
         self.W = chunk_data.width
 
@@ -103,7 +111,15 @@ class MosaicChunkInferenceDataset:
             s1_desc_valid = np.any(s1_desc != 0, axis=-1).sum(axis=0).astype(np.int32)
         s1_total_valid = s1_asc_valid + s1_desc_valid
 
-        valid_mask = s2_nonzero & (s2_valid_count > 0) & (s1_total_valid > 0)
+        # A pixel needs real S2 to embed at all. The S1 term is the optional part:
+        # by default a pixel with zero S1 observations is skipped (historical gate);
+        # with allow_s2_only it is kept and flows through as the upstream v1.1
+        # missing-S1 convention (all-zeros normalized S1 slice, smallest bucket via
+        # compute_bin_keys' clip). Per-pixel provenance stays exact either way —
+        # s1_asc/desc_obs_count are written as 0 for these pixels.
+        valid_mask = s2_nonzero & (s2_valid_count > 0)
+        if not self.allow_s2_only:
+            valid_mask &= s1_total_valid > 0
         rows, cols = np.where(valid_mask)
 
         self._rows = rows
