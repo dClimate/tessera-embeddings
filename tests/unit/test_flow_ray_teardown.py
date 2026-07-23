@@ -14,6 +14,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import tessera_embeddings.orchestration.prefect.flows._ray_lifecycle as lifecycle_mod
+import tessera_embeddings.orchestration.prefect.flows.fill_zone_year as fill_mod
+import tessera_embeddings.orchestration.prefect.flows.fill_zones_sequential as seq_mod
 import tessera_embeddings.orchestration.prefect.flows.tessera_embeddings as flows_mod
 from tessera_embeddings.orchestration.prefect.flows.tessera_embeddings import (
     _cluster_name_for_flow_run,
@@ -158,3 +160,36 @@ def test_lifecycle_hook_derives_cluster_name_in_fresh_process(tmp_path: Path) ->
         lifecycle_mod.ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
     terminate.assert_called_once()
     assert terminate.call_args.kwargs["cluster_name"] == "tessera-inference-1cb5e1da"
+
+
+# ---------------------------------------------------------------------------
+# Hook REGISTRATION: every GPU (Ray-owning) flow must clean up on BOTH a
+# cancellation AND a crash — a crashed run leaks the head EC2 node forever.
+# ---------------------------------------------------------------------------
+
+
+def test_fill_zone_year_registers_teardown_on_cancel_and_crash() -> None:
+    """The per-cell GPU fill must tear down on cancel AND crash (a crashed run
+    would otherwise leak the whole Ray GPU fleet — the Dask ingest flows self-heal
+    via their scheduler idle-timeout, but a `ray up` head persists until torn down).
+    It uses the SHARED :mod:`._ray_lifecycle` hook (not a per-flow copy).
+    """
+    flow = fill_mod.fill_zone_year_flow
+    assert lifecycle_mod.ray_cleanup_on_cancellation in flow.on_cancellation_hooks
+    assert lifecycle_mod.ray_cleanup_on_cancellation in flow.on_crashed_hooks
+
+
+def test_fill_zones_sequential_registers_teardown_on_cancel_and_crash() -> None:
+    """The shared-cluster GPU fill has the same both-hooks contract via the shared
+    hook — a crashed year-long run must not leak its long-lived Ray cluster.
+    """
+    flow = seq_mod.fill_zones_sequential_flow
+    assert lifecycle_mod.ray_cleanup_on_cancellation in flow.on_cancellation_hooks
+    assert lifecycle_mod.ray_cleanup_on_cancellation in flow.on_crashed_hooks
+
+
+def test_tessera_embeddings_registers_teardown_on_cancel_and_crash() -> None:
+    """The single-ROI GPU sibling has the same both-hooks contract."""
+    flow = flows_mod.tessera_embeddings
+    assert flows_mod._ray_cleanup_on_cancellation in flow.on_cancellation_hooks
+    assert flows_mod._ray_cleanup_on_cancellation in flow.on_crashed_hooks

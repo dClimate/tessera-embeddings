@@ -119,7 +119,8 @@ The cluster is managed in a context manager so it automatically tears down after
 
 **Cluster topology:**
 - Head: m5.2xlarge — GCS + autoscaler, no inference work
-- Workers: g6e.xlarge (1× L40S 48 GB VRAM, 4 vCPU, 32 GB RAM) — on-demand, single AZ
+- Workers: g6e.xlarge (1× L40S 48 GB VRAM, 4 vCPU, 32 GB RAM) — on-demand, multi-AZ
+  (first-listed subnet preferred; Ray fails over across subnets on capacity errors)
 - Workers use a Packer-built AMI with all dependencies pre-installed; boot ready in ~1 minute
 
 ### 3. Inference Actors
@@ -322,9 +323,17 @@ to roughly bbox-proportional cost.
 `MosaicChunkInferenceDataset` identifies pixels eligible for inference and groups them
 into `(s2_bin, s1_bin)` buckets for batched processing:
 
-1. **Valid pixel mask** — at least one non-zero S2 observation AND at least one non-zero
-   S1 observation. S1 floor of 1 prevents the sampler from crashing on all-zero SAR tiles
-   at orbit coverage edges (pixels with zero valid S1 would be OOD for the model anyway).
+1. **Valid pixel mask** — at least one non-zero S2 observation AND (by default) at least
+   one non-zero S1 observation. The S1 term is optional: with
+   `InferenceConfig.allow_s2_only=True` (flow param `allow_s2_only`, default off),
+   S2-valid pixels inside S1 coverage gaps (swath edges/holes) are embedded too, using
+   the upstream v1.1 missing-S1 convention — an all-zeros *normalized-space* S1 slice
+   in the smallest bucket, bit-identical to `ucam-eo/tessera`'s
+   `_sample_s1_merged` zero return (`resample_s1_bucket` already produces it; nothing
+   in the encoder requires ≥1 S1 observation). S1-informed pixels are unaffected by
+   the flag. Detect S2-only pixels downstream via finite `scales` +
+   `s1_asc_obs_count + s1_desc_obs_count == 0`. Quality of S2-only embeddings is
+   unvalidated against S1-informed ones — see ADR-013 before enabling in production.
 
 2. **Bin key assignment** — for each valid pixel, `compute_bin_keys` maps observation
    counts `(s2_obs_count, s1_obs_count)` to the nearest entry in `num_obs_checkpoints`

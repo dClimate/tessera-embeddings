@@ -12,7 +12,7 @@ import logging
 import re
 import time
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -42,9 +42,12 @@ _CMR_PROVIDER = "ASF"
 _CMR_PAGE_SIZE = 2000
 
 # Granule data links carry the per-band COG download URLs. The ``rel`` ends
-# in ``/data#`` and the HTTPS href ends in ``_<BAND>.tif`` (BAND ∈ VV/VH/mask).
+# in ``/data#`` and the HTTPS href ends in ``_<BAND>.tif``. HH/HV are matched
+# for RECOGNITION ONLY (EW-mode polar granules carry them instead of VV/VH) so
+# the skip log can say what a rejected granule actually had — the pipeline
+# still ingests exclusively dual-pol VV+VH (``S1_OPERA_BANDS``).
 _CMR_DATA_REL_SUFFIX = "/data#"
-_BAND_HREF_RE = re.compile(r"_(VV|VH|mask)\.tif$")
+_BAND_HREF_RE = re.compile(r"_(VV|VH|HH|HV|mask)\.tif$")
 
 
 # CMR intermittently times out or returns 5xx under load. urllib3's Retry
@@ -153,7 +156,7 @@ def normalize_opera_timestamps(items: list[Any]) -> list[Any]:
     return items
 
 
-def _granule_to_item(entry: dict[str, Any]) -> Item | None:
+def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = None) -> Item | None:
     """Build a pystac ``Item`` from one CMR granule search entry.
 
     Maps the granule's data download links onto the ``S1_OPERA_BANDS`` asset
@@ -162,14 +165,23 @@ def _granule_to_item(entry: dict[str, Any]) -> Item | None:
     dtype, nodata, and CRS from the COGs themselves (we pass an explicit
     geobox), so only the band hrefs, id, datetime, geometry, and bbox matter.
 
+    Only dual-pol VV+VH granules are accepted — a partial-pol granule would
+    otherwise ingest a fabricated all-nodata band that the encoder reads as a
+    confident physical signal (see the optional-S1 ADR). The skip log names
+    what WAS found (``VV-only``, EW-mode ``HH/HV``, …) so regional data loss
+    is quantifiable; ``skip_counts`` (optional) accumulates the same
+    categories for a per-query summary.
+
     Args:
         entry: One element of ``feed.entry`` from the CMR granule search JSON.
+        skip_counts: Optional counter of skip categories, incremented on skip.
 
     Returns:
-        A pystac ``Item``, or ``None`` if the entry lacks the expected VV/VH
-        data links (e.g. a non-RTC product slipped through the query).
+        A pystac ``Item``, or ``None`` if the entry lacks BOTH VV and VH data
+        links (single-pol granule, EW-mode HH/HV granule, or a non-RTC product
+        that slipped through the query).
     """
-    # Map band suffix (VV/VH) -> datapool HTTPS href from the data links.
+    # Map band suffix (VV/VH/HH/HV) -> datapool HTTPS href from the data links.
     band_hrefs: dict[str, str] = {}
     for link in entry.get("links", []):
         if not link.get("rel", "").endswith(_CMR_DATA_REL_SUFFIX):
@@ -187,7 +199,20 @@ def _granule_to_item(entry: dict[str, Any]) -> Item | None:
             assets[band_key] = Asset(href=href, roles=["data"])
 
     if len(assets) < len(S1_OPERA_BANDS):
-        logger.warning("Skipping granule %s: missing VV/VH data links", entry.get("title", "<unknown>"))
+        pols = sorted(k for k in band_hrefs if k != "mask")
+        if {"HH", "HV"} & set(pols):
+            category = f"{'/'.join(pols)} (EW-mode?)"
+        elif pols:
+            category = f"{'/'.join(pols)}-only"
+        else:
+            category = "no data links"
+        if skip_counts is not None:
+            skip_counts[category] += 1
+        logger.warning(
+            "Skipping granule %s: polarizations found %s — dual-pol VV+VH required",
+            entry.get("title", "<unknown>"),
+            pols or "none",
+        )
         return None
 
     # OPERA polygons are space-separated "lat lon lat lon ..." rings; pystac /
@@ -290,6 +315,7 @@ def _query_cmr_granules_one(
 
     items: list[Item] = []
     headers: dict[str, str] = {}
+    skip_counts: Counter[str] = Counter()
 
     logger.info(f"CMR granule query ({orbit_direction}) starting for {start_date}..{end_date} bbox={bbox}")
     t0 = time.monotonic()
@@ -305,7 +331,7 @@ def _query_cmr_granules_one(
         if not entries:
             break
 
-        items.extend(item for item in (_granule_to_item(e) for e in entries) if item is not None)
+        items.extend(item for item in (_granule_to_item(e, skip_counts) for e in entries) if item is not None)
         logger.info(
             f"CMR granule query ({orbit_direction}): page {page} returned {len(entries)} entries "
             f"({len(items)} items so far, {time.monotonic() - t0:.1f}s)"
@@ -321,6 +347,15 @@ def _query_cmr_granules_one(
         f"CMR granule query ({orbit_direction}): {len(items)} items across {page} page(s) "
         f"in {time.monotonic() - t0:.1f}s"
     )
+    if skip_counts:
+        # One quantifiable line per query so regional dual-pol data loss (e.g.
+        # 2017 VV-only campaigns, EW-mode polar HH/HV) is visible in the logs.
+        logger.warning(
+            "CMR granule query (%s): skipped %d granule(s) without dual-pol VV+VH: %s",
+            orbit_direction,
+            sum(skip_counts.values()),
+            dict(sorted(skip_counts.items())),
+        )
     return items
 
 

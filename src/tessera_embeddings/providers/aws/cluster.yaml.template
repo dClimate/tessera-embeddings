@@ -34,8 +34,10 @@ max_workers: 500  # Global ceiling — Ray defaults to 2 if omitted!
 provider:
     type: aws
     region: us-west-2  # Default matches OPERA RTC archive region (in-region auth required)
-    # INJECT: availability_zone — pinned to the least-loaded private subnet's
-    # AZ to avoid cross-AZ data transfer costs between head and workers.
+    # INJECT: availability_zone — comma-joined AZs of ALL private subnets, in
+    # SSM order. Nodes launch in the first-listed subnet and fail over to the
+    # next on capacity errors. Cross-AZ spread is safe for this workload: bulk
+    # data is actor↔S3 only (never node-to-node); head↔worker is control RPCs.
     use_internal_ips: true  # Workers launch in private subnets (no public IPs)
     cache_stopped_nodes: false  # Terminate (not stop) nodes — flow runner lacks ec2:StopInstances
 

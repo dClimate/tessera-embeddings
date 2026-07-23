@@ -1,11 +1,14 @@
-"""Shared Ray-cluster cancellation hook for cluster-owning campaign flows.
+"""Shared Ray-cluster teardown hook for cluster-owning campaign flows.
 
 ``fill_zone_year`` and ``fill_zones_sequential`` provision a Ray cluster the
-same way and need the same emergency teardown when cancelled from the Prefect
-UI; this module holds the one hook (and the module state it reads) so the
+same way and need the same emergency teardown when the flow is cancelled OR
+crashes; this module holds the one hook (and the module state it reads) so the
 pattern isn't copied per flow. A flow calls :func:`activate` right after
 ``ray_cluster`` yields and :func:`deactivate` on normal exit, and registers
-:func:`ray_cleanup_on_cancellation` as its ``on_cancellation`` hook.
+:func:`ray_cleanup_on_cancellation` as BOTH its ``on_cancellation`` and
+``on_crashed`` hook. A crashed run (OOM, host loss, unhandled error) is exactly
+as leak-prone as a cancelled one — the ``ray up`` head node persists on EC2
+until torn down — so both terminal states must fire it.
 
 Prefect can run the hook in a FRESH import of this module (the flow's child
 process is killed first), where the module globals are unset — so both flows
@@ -52,9 +55,13 @@ def deactivate() -> None:
 
 
 def ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
-    """Emergency Ray teardown when the flow is cancelled via the Prefect UI."""
+    """Emergency Ray teardown when the flow is cancelled OR crashes.
+
+    Registered as both ``on_cancellation`` and ``on_crashed`` — see the module
+    docstring for why a crash is as leak-prone as a cancellation.
+    """
     log = logging.getLogger(__name__)
-    log.warning("Flow cancelled — tearing down Ray cluster")
+    log.warning("Flow cancelled/crashed — tearing down Ray cluster")
     # Fresh-import fallback: the flows pin cluster_name_for_flow_run(flow_run_ctx.id)
     # at provisioning, so the hook can re-derive the same name when the module
     # globals are unset (Prefect killed the flow process before running the hook).

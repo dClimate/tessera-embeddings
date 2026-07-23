@@ -141,7 +141,11 @@ class _DeploymentCellInputs:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
 
-@flow(name="fill-zones-sequential", on_cancellation=[ray_cleanup_on_cancellation])
+@flow(
+    name="fill-zones-sequential",
+    on_cancellation=[ray_cleanup_on_cancellation],
+    on_crashed=[ray_cleanup_on_cancellation],
+)
 def fill_zones_sequential_flow(
     *,
     zones: list[str],
@@ -161,11 +165,13 @@ def fill_zones_sequential_flow(
     commit_limit_name: str | None = None,
     cleanup_staging: bool = True,
     allow_partial_window: bool = False,
+    allow_s2_only: bool = False,
     allow_model_mismatch: bool = False,
     s3_concurrency: int | None = None,
     idle_timeout_minutes: int = 10,
     ingest: bool = True,
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
+    branch: str | None = None,
     look_ahead: int = 2,
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
@@ -199,6 +205,12 @@ def fill_zones_sequential_flow(
         cleanup_staging: Delete each cell's staged tiles after it lands.
         allow_partial_window: Relax each cell's temporal-coverage gate to
             "non-empty".
+        allow_s2_only: Embed S2-valid pixels with ZERO S1 observations (sub-zone
+            SAR coverage gaps) via the upstream v1.1 missing-S1 convention instead
+            of skipping them. PER-PIXEL only — zone-level SAR gates stay strict.
+            Folded into each cell's staging run_id so a retry across a flipped flag
+            never resumes mixed tiles. Quality is unvalidated — see the optional-S1
+            ADR. Default False (historical behaviour).
         allow_model_mismatch: Fill even when the seeded store advertises a
             different encoder/checkpoint than this build (default rejects).
         s3_concurrency: Each trailing assembly's slice of the fleet S3-PUT
@@ -209,7 +221,12 @@ def fill_zones_sequential_flow(
             inter-zone seam here needs more slack).
         ingest: Produce each cell's mosaics via the ingest deployment, look-ahead
             pipelined with inference (default). False = mosaics exist upstream.
-        ingest_deployment: ``flow-name/deployment-name`` of the ingest deployment.
+        ingest_deployment: ``flow-name/deployment-name`` of the ingest deployment
+            (already branch-resolved by the campaign driver, if any).
+        branch: Route the S1/S2 ingest grandchildren dispatched by each cell's
+            ``ingest_zone_year`` to their branch-scoped deployments (see
+            :func:`run_global_campaign._dpl`). ``None`` (default) = unsuffixed prod
+            refs. The direct ``ingest_deployment`` above is resolved by the caller.
         look_ahead: Cells beyond the current one kept in ingest flight (bounds
             concurrent ingest Dask clusters AND in-flight mosaics, ADR-011).
         cleanup_mosaics: Delete each campaign-ingested mosaic after its cell
@@ -251,6 +268,7 @@ def fill_zones_sequential_flow(
             inputs_bucket=paths.inputs,
             output_bucket=paths.outputs,
             chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
+            allow_s2_only=allow_s2_only,
         )
 
     # ------------------------------------------------------------------
@@ -343,6 +361,8 @@ def fill_zones_sequential_flow(
         s1_orbit=s1_orbit,
         ingest_settings=ingest_settings,
         allow_partial_window=allow_partial_window,
+        s3_region=s3_region,
+        branch=branch,
     )
 
     inputs = (
@@ -394,6 +414,7 @@ def fill_zones_sequential_flow(
                 min_valid_coverage=ingest_settings.min_valid_coverage,
                 s1_orbit=s1_orbit,
                 allow_partial_window=allow_partial_window,
+                allow_s2_only=allow_s2_only,
                 code_identity=code_identity,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,

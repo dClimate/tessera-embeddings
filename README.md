@@ -394,7 +394,11 @@ ROI from the coverage bitmap → run the S1/S2 ROI ingest flows onto
 then inference → shard-assemble → tag) → delete the transient mosaic
 (`s5cmd --all-versions`). A `zones=["33N", "15S"]` filter restricts the
 run; the default (all 120) skips already-finished cells, and `ingest=False`
-bypasses ingestion when mosaics already exist upstream.
+bypasses ingestion when mosaics already exist upstream. A `branch` slug routes
+every dispatched deployment — the fill, the ingest, and the S1/S2 grandchildren
+`ingest-zone-year` dispatches — to its `-<branch>` variant, so a downstream that
+registers dev-branch deployments can exercise the whole chain (including
+ingestion) off prod; `branch=None` (default) is the unsuffixed production path.
 
 ### Reading a zone group (xarray)
 
@@ -438,6 +442,17 @@ identical; `time_bnds` just lists under data variables. Non-calendar
 12-month windows are **not** written to this store — the single-ROI
 output stores (`time_convention="12mo_window_end"`, one time entry per
 window-end label) are the home for rolling windows.
+
+**Per-pixel input provenance.** The obs-count layers record how many
+observations fed each pixel's embedding: `s2_obs_count`,
+`s1_asc_obs_count`, `s1_desc_obs_count` (always written; `0` = none).
+By default every embedded pixel has ≥1 S1 observation; when a fill ran
+with `allow_s2_only=True` (opt-in — embeds S2-valid pixels inside S1
+coverage gaps using the upstream v1.1 missing-S1 convention), the
+**S2-only pixels are exactly those with a finite `scales` value and
+`s1_asc_obs_count + s1_desc_obs_count == 0`**. S2-only embedding quality
+is unvalidated against S1-informed embeddings — see
+[ADR-013](context_docs/decisions/013-optional-s1-s2-only-pixels.md).
 
 Reference docs:
 [`xarray.open_zarr` / `decode_coords`](https://docs.xarray.dev/en/stable/generated/xarray.open_zarr.html) ·

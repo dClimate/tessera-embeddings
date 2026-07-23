@@ -127,3 +127,58 @@ def test_bucket_sizes_consistency() -> None:
     sizes = ds.bucket_sizes()
     for key, count in sizes.items():
         assert len(ds._bucket_pixels[key]) == count
+
+
+# ── allow_s2_only: the optional per-pixel S1 requirement ──
+
+
+def test_s2_only_pixels_dropped_by_default() -> None:
+    """Pins the historical gate: S2-valid pixels with ZERO S1 observations are
+    skipped entirely when allow_s2_only is off (the default).
+    """
+    chunk_data = _make_chunk_data(H=4, W=4, n_s2=12, n_s1a=0, n_s1d=0)
+    ds = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS)
+    assert len(ds) == 0
+    assert list(ds.iter_buckets()) == []
+
+
+def test_allow_s2_only_embeds_s1_empty_pixels_with_upstream_convention() -> None:
+    """With allow_s2_only, S2-valid/S1-empty pixels are kept and receive the
+    upstream v1.1 missing-S1 input: the SMALLEST S1 bucket and an all-zeros
+    (normalized-space) S1 slice — exactly ucam-eo/tessera's
+    ``_sample_s1_merged`` zero return.
+    """
+    chunk_data = _make_chunk_data(H=4, W=4, n_s2=12, n_s1a=0, n_s1d=0)
+    ds = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS, allow_s2_only=True)
+    assert len(ds) > 0  # every S2-valid pixel is now embedded
+    for (s2_bin, s1_bin), idxs in ds.iter_buckets():
+        assert s1_bin == CKPS[0]  # zero S1 count clips into the smallest bucket
+        batch = ds.get_bucket_batch((s2_bin, s1_bin), 0, len(idxs))
+        assert batch["s1"].shape[1:] == (CKPS[0], 3)
+        np.testing.assert_array_equal(batch["s1"], 0.0)  # neutral all-zeros slice
+        assert np.all(np.isfinite(batch["s2"]))
+
+
+def test_allow_s2_only_mixed_chunk_adds_exactly_the_s1_gap_pixels() -> None:
+    """A chunk with SAR over only part of its area: the flag adds exactly the
+    S2-valid pixels inside the SAR gap, and keeps every previously-valid pixel
+    (S1-informed pixels are unaffected).
+    """
+    chunk_data = _make_chunk_data(H=4, W=4, n_s2=12, n_s1a=6)
+    # Kill SAR over the right half — an in-zone S1 coverage gap.
+    chunk_data.s1_asc_bands[:, :, 2:, :] = 0.0
+
+    ds_default = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS)
+    ds_flag = MosaicChunkInferenceDataset(chunk_data, num_obs_checkpoints=CKPS, allow_s2_only=True)
+
+    s2_ok = chunk_data.s2_obs_count > 0  # s2_bands are all non-zero in the fixture
+    s1_ok = np.any(np.any(chunk_data.s1_asc_bands != 0, axis=-1), axis=0)
+    assert len(ds_default) == int((s2_ok & s1_ok).sum())
+    assert len(ds_flag) == int(s2_ok.sum())
+
+    # The default set is a strict subset: nothing previously embedded changes.
+    default_idxs = set(ds_default._global_idxs.tolist())
+    flag_idxs = set(ds_flag._global_idxs.tolist())
+    assert default_idxs < flag_idxs
+    gap_rows, gap_cols = np.where(s2_ok & ~s1_ok)
+    assert set((gap_rows * 4 + gap_cols).tolist()) == flag_idxs - default_idxs

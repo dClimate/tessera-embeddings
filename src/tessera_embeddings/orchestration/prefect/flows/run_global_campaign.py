@@ -35,6 +35,7 @@ from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.inference.data_loading import _active_orbits, _is_missing_repo
+from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import IngestDeployments
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_has_live_tiles,
@@ -46,6 +47,23 @@ from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zone
+
+# S1/S2 grandchild ingest refs are derived from this single source (rather than
+# duplicated string literals), so a future rename of the ingest deployments stays
+# in one place — ingest_zone_year.IngestDeployments.
+_INGEST_DEPLOYMENT_DEFAULTS = IngestDeployments()
+
+
+def _dpl(prod_ref: str, branch: str | None) -> str:
+    """Route a child deployment ref to its branch-scoped variant.
+
+    A blank ``branch`` (``None``, empty, or whitespace) returns the ref
+    unchanged — production behaviour. A real branch slug is appended to the
+    *deployment name*: ``"flow/name"`` -> ``"flow/name-<branch>"`` (dev branches
+    register every flow under the suffixed name with their own image + task def).
+    """
+    slug = (branch or "").strip()
+    return f"{prod_ref}-{slug}" if slug else prod_ref
 
 
 def _mosaic_identity(
@@ -120,14 +138,15 @@ def _staging_run_id(
     min_valid_coverage: float,
     s1_orbit: str,
     allow_partial_window: bool,
+    allow_s2_only: bool,
     code_identity: str,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
 ) -> str:
     """Deterministic staging run_id fingerprinting everything that determines the embeddings.
 
-    Covers the config (threshold/orbit/window/checkpoint), the CODE the fill
-    runs (``code_identity`` — the resolved AMI ID + tarball ETag from
+    Covers the config (threshold/orbit/window/checkpoint/S2-only), the CODE the
+    fill runs (``code_identity`` — the resolved AMI ID + tarball ETag from
     :func:`_resolve_code_identity`, NOT the mutable ``code_suffix`` label, so a
     re-baked AMI or overwritten tarball starts a fresh prefix), and the
     per-(zone,year) mosaic identity (:func:`_mosaic_identity`). A retry with
@@ -140,6 +159,10 @@ def _staging_run_id(
         min_valid_coverage,
         s1_orbit,
         allow_partial_window,
+        # allow_s2_only changes WHICH pixels get embeddings, so a retry across a
+        # flipped flag must start a fresh staging prefix — resuming would mix
+        # S1-gated and S2-only tiles under one run.
+        allow_s2_only,
         checkpoint_filename(),
         code_identity,
         _mosaic_identity(
@@ -164,6 +187,7 @@ def _ingest_dispatch_params(
     ingest_settings: IngestSettings,
     allow_partial_window: bool,
     s3_region: str | None = None,
+    branch: str | None = None,
 ) -> dict[str, Any]:
     """Parameter dict for one ``ingest-zone-year`` deployment run.
 
@@ -173,7 +197,10 @@ def _ingest_dispatch_params(
     deployment's signature independently. ``s3_region`` is the same region the
     fill uses, so ingest's metadata opens (mask liveness, coverage sha, marker,
     coverage gate) hit the same stores rather than defaulting to us-west-2 on a
-    non-default-region deployment.
+    non-default-region deployment. ``branch`` routes the S1/S2 grandchildren
+    ``ingest_zone_year`` dispatches to their branch-scoped deployments (see
+    :func:`_dpl`) — without it, a branch campaign 404s one level down on the
+    unsuffixed prod refs.
     """
     return {
         "zone": zone,
@@ -184,6 +211,14 @@ def _ingest_dispatch_params(
         "ingest_settings": ingest_settings.model_dump(),
         "allow_partial_window": allow_partial_window,
         "s3_region": s3_region,
+        # Grandchild routing: the S1/S2 ingest deployments dispatched BY
+        # ingest_zone_year. Without this key its IngestDeployments() defaults
+        # (unsuffixed prod refs) always win. Built from the defaults model so a
+        # rename stays single-sourced.
+        "deployments": {
+            "ingest_s1_roi_sar": _dpl(_INGEST_DEPLOYMENT_DEFAULTS.ingest_s1_roi_sar, branch),
+            "ingest_s2_roi_reflectance": _dpl(_INGEST_DEPLOYMENT_DEFAULTS.ingest_s2_roi_reflectance, branch),
+        },
     }
 
 
@@ -244,13 +279,14 @@ async def run_global_campaign(
     *,
     paths: BucketPaths,
     ami_ssm_name: str,
-    fill_deployment: str = "fill-zone-year/fill-zone-year",
+    branch: str | None = None,
+    fill_deployment: str | None = None,
     store_name: str = "tessera",
     years: tuple[int, ...] | None = None,
     zones: list[str] | None = None,
     max_parallel_zones: int = 8,
     fill_strategy: str = "cluster-per-zone",
-    chained_fill_deployment: str = "fill-zones-sequential/fill-zones-sequential",
+    chained_fill_deployment: str | None = None,
     commit_limit_name: str = "tessera-global-commits",
     num_actors: int = 20,
     s1_orbit: str = "both",
@@ -261,12 +297,13 @@ async def run_global_campaign(
     code_suffix: str = "",
     # Campaign-triggered per-zone ingestion
     ingest: bool = True,
-    ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
+    ingest_deployment: str | None = None,
     mask_name: str = "global",
     max_parallel_ingest: int = 2,
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     allow_partial_window: bool = False,
+    allow_s2_only: bool = False,
     sweep_orphan_mosaics: bool = False,
 ) -> dict[str, Any]:
     """Fill every pending (zone, year), year-serial with bounded zone parallelism.
@@ -274,7 +311,20 @@ async def run_global_campaign(
     Args:
         paths: Deployment storage contract.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI (forwarded to fills).
+        branch: Route child deployments to their branch-scoped variants. ``None``
+            (production) leaves every ref at its unsuffixed default — behaviour is
+            byte-for-byte unchanged. A slug (e.g. ``"global-tessera"``) suffixes
+            every *derived* child deployment name with ``-<slug>``: the fill, the
+            ingest, and — crucially — the S1/S2 grandchildren that
+            ``ingest_zone_year`` dispatches (unreachable otherwise, so a branch
+            campaign with ``ingest=True`` used to 404 one level down). An
+            explicitly-passed ``fill_deployment``/``ingest_deployment`` is used
+            verbatim and never re-suffixed; only the defaults are derived. This is
+            orthogonal to ``code_suffix`` (which scopes the source tarball, not
+            deployment names).
         fill_deployment: ``flow-name/deployment-name`` of the fill deployment.
+            ``None`` (default) derives ``fill-zone-year/fill-zone-year`` routed by
+            ``branch``; an explicit value is used verbatim.
         store_name: Global-store repo basename.
         years: Campaign years to drive (default: all campaign years).
         zones: Restrict the fill chain (inference + assembly) to these UTM zones in
@@ -303,7 +353,9 @@ async def run_global_campaign(
             the runner's module docstring). ``max_parallel_zones=1``
             degenerates to a single cluster for the whole year.
         chained_fill_deployment: ``flow-name/deployment-name`` of the chained
-            fill deployment (``fill_strategy="chained-clusters"`` only).
+            fill deployment (``fill_strategy="chained-clusters"`` only). ``None``
+            (default) derives ``fill-zones-sequential/fill-zones-sequential``
+            routed by ``branch``; an explicit value is used verbatim.
         commit_limit_name: Prefect global concurrency limit bounding fleet-wide
             simultaneous committers (D6); forwarded to every fill.
         num_actors: GPU actor count, forwarded to each fill.
@@ -317,6 +369,9 @@ async def run_global_campaign(
         ingest: Trigger per-zone ingestion (``ingest_zone_year``) before each
             fill (default). Set False when the mosaics already exist upstream.
         ingest_deployment: ``flow-name/deployment-name`` of the ingest deployment.
+            ``None`` (default) derives ``ingest-zone-year/ingest-zone-year`` routed
+            by ``branch``; an explicit value is used verbatim. The S1/S2 refs it
+            dispatches are always branch-derived (see ``branch``).
         mask_name: Coverage-store basename, forwarded to ingest.
         max_parallel_ingest: Max concurrent ingests (each provisions its own Dask
             cluster) — a separate, smaller knob than the fill cap.
@@ -327,6 +382,14 @@ async def run_global_campaign(
             ingest — see :class:`tessera_embeddings.config.ingest.IngestSettings`.
         allow_partial_window: Relax the coverage gate (ingest + fill) to
             "non-empty" for legitimately partial edge zones.
+        allow_s2_only: Forwarded to every fill: embed S2-valid pixels with ZERO
+            S1 observations (sub-zone SAR coverage gaps) via the upstream v1.1
+            missing-S1 convention instead of skipping them. PER-PIXEL only —
+            zone-level SAR gates stay strict (a zone with no SAR at all still
+            fails loudly; that signals an ingest bug). Folded into the staging
+            run_id so a retry across a flipped flag never resumes mixed tiles.
+            S2-only pixel quality is unvalidated (see the optional-S1 ADR);
+            affected pixels are identifiable via s1_*_obs_count == 0.
         sweep_orphan_mosaics: Before the run, delete mosaics for cells that are
             already complete+tagged in scope — recovering orphans left by a
             per-cell cleanup that failed after tagging (that cell is no longer in
@@ -338,6 +401,12 @@ async def run_global_campaign(
         Summary: pending count at start, dispatched run ids per year, totals.
     """
     log = get_run_logger()
+    # Resolve branch-scoped deployment names once. A default (None) child ref is
+    # derived from `branch`; an explicit ref passes through verbatim. The S1/S2
+    # grandchildren are derived from the same `branch` in `_ingest_params`.
+    fill_deployment = fill_deployment or _dpl("fill-zone-year/fill-zone-year", branch)
+    ingest_deployment = ingest_deployment or _dpl("ingest-zone-year/ingest-zone-year", branch)
+    chained_fill_deployment = chained_fill_deployment or _dpl("fill-zones-sequential/fill-zones-sequential", branch)
     if max_parallel_zones < 1:
         raise ValueError(f"max_parallel_zones must be >= 1, got {max_parallel_zones} (Semaphore(0) blocks forever)")
     if max_parallel_ingest < 1:
@@ -467,6 +536,7 @@ async def run_global_campaign(
             "s3_region": s3_region,
             "commit_limit_name": commit_limit_name,
             "allow_partial_window": allow_partial_window,
+            "allow_s2_only": allow_s2_only,
             # Divide the fleet S3-PUT budget across concurrent fills so K shard-write
             # phases don't burst K times the target PUTs (the ~800-req SlowDown). D6
             # gates committers; this bounds the ungated upload phase.
@@ -485,6 +555,7 @@ async def run_global_campaign(
         ingest_settings=ingest_settings,
         allow_partial_window=allow_partial_window,
         s3_region=s3_region,
+        branch=branch,
     )
 
     fill_sem = asyncio.Semaphore(max_parallel_zones)
@@ -538,6 +609,7 @@ async def run_global_campaign(
                     min_valid_coverage=ingest_settings.min_valid_coverage,
                     s1_orbit=s1_orbit,
                     allow_partial_window=allow_partial_window,
+                    allow_s2_only=allow_s2_only,
                     code_identity=_code_identity(),
                     get_credentials=iam_icechunk_credentials,
                     s3_region=s3_region,
@@ -601,12 +673,16 @@ async def run_global_campaign(
                     "s3_region": s3_region,
                     "commit_limit_name": commit_limit_name,
                     "allow_partial_window": allow_partial_window,
+                    "allow_s2_only": allow_s2_only,
                     "ssm_prefix": ssm_prefix,
                     "cloudwatch_log_group": cloudwatch_log_group,
                     "code_bucket": code_bucket,
                     "code_suffix": code_suffix,
                     "ingest": ingest,
                     "ingest_deployment": ingest_deployment,
+                    # Route this shard's S1/S2 ingest grandchildren (see `branch`);
+                    # the direct ingest/fill refs above are already branch-resolved.
+                    "branch": branch,
                     # Split the strategy-level bounds across the shards: the
                     # look-aheads together match max_parallel_ingest (the same
                     # global ingest bound the parallel strategy enforces), and

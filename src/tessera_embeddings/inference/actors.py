@@ -654,6 +654,7 @@ class InferenceActor:
             data,
             num_obs_checkpoints=self.config.num_obs_checkpoints,
             s1_orbit=self.config.s1_orbit,
+            allow_s2_only=self.config.allow_s2_only,
         )
         return data, dataset
 

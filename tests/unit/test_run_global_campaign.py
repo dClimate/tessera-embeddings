@@ -110,6 +110,18 @@ def test_fill_run_id_is_stable_and_input_fingerprinted(wired):
     assert changed.startswith("33N-2025-") and changed != base  # input change → new prefix
 
 
+def test_fill_run_id_changes_with_allow_s2_only(wired):
+    """allow_s2_only changes WHICH pixels get embeddings, so it must flip the
+    staging fingerprint — a retry across a flipped flag never resumes mixed tiles.
+    The flag is also forwarded to the fill deployment.
+    """
+    base = _fill_run_id(wired)
+    flagged = _fill_run_id(wired, allow_s2_only=True)
+    assert flagged.startswith("33N-2025-") and flagged != base
+    fill_params = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
+    assert fill_params["allow_s2_only"] is True
+
+
 def test_fill_run_id_tracks_resolved_code_artifact_not_suffix(wired, monkeypatch):
     """The staging fingerprint keys on the RESOLVED code artifact (AMI ID + tarball
     ETag), not the mutable `code_suffix`. So overwriting the tarball / re-baking the AMI
@@ -373,3 +385,77 @@ def test_partition_zero_weights_known_complete_cells(monkeypatch):
     )
     # LPT over {100, 90, 80}: [01N] vs [02N, 03N]; 04N rides along at zero cost.
     assert sorted(map(sorted, shards)) == [["01N", "04N"], ["02N", "03N"]]
+
+
+# ── branch-scoped deployment routing ──
+
+
+def _dep(rec: dict, needle: str) -> tuple[str, dict]:
+    """The (dep_ref, params) of the dispatched deployment whose ref contains needle."""
+    return next((d, p) for d, p in rec["arun"] if needle in d)
+
+
+def test_dpl_routes_only_when_branch_is_a_real_slug() -> None:
+    """The routing primitive: a blank branch (None/empty/whitespace) is a no-op;
+    a real slug is appended to the deployment name.
+    """
+    assert mod._dpl("flow/name", None) == "flow/name"
+    assert mod._dpl("flow/name", "") == "flow/name"
+    assert mod._dpl("flow/name", "   ") == "flow/name"
+    assert mod._dpl("flow/name", "x") == "flow/name-x"
+
+
+def test_branch_none_keeps_prod_refs_everywhere(wired):
+    """Regression guard: with no branch, every child ref — direct AND grandchild —
+    is the unsuffixed production default (today's behaviour, byte-for-byte).
+    """
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    deps = [d for d, _ in wired["arun"]]
+    assert deps == ["ingest-zone-year/ingest-zone-year", "fill-zone-year/fill-zone-year"]
+    _, ingest_params = _dep(wired, "ingest-zone-year")
+    assert ingest_params["deployments"] == {
+        "ingest_s1_roi_sar": "ingest_s1_roi_sar/ingest-s1-roi-sar",
+        "ingest_s2_roi_reflectance": "ingest_s2_roi_reflectance/ingest-s2-roi-reflectance",
+    }
+
+
+def test_branch_suffixes_all_four_derived_refs(wired):
+    """The fix: a branch slug routes the fill, the ingest, AND the S1/S2
+    grandchildren that ingest_zone_year dispatches (the ones that used to 404).
+    """
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", branch="global-tessera"))
+    fill_dep, _ = _dep(wired, "fill-zone-year")
+    ingest_dep, ingest_params = _dep(wired, "ingest-zone-year")
+    assert fill_dep == "fill-zone-year/fill-zone-year-global-tessera"
+    assert ingest_dep == "ingest-zone-year/ingest-zone-year-global-tessera"
+    assert ingest_params["deployments"] == {
+        "ingest_s1_roi_sar": "ingest_s1_roi_sar/ingest-s1-roi-sar-global-tessera",
+        "ingest_s2_roi_reflectance": "ingest_s2_roi_reflectance/ingest-s2-roi-reflectance-global-tessera",
+    }
+
+
+def test_explicit_direct_ref_is_verbatim_but_grandchildren_still_route(wired):
+    """Precedence: an explicit fill/ingest ref is used verbatim (never re-suffixed),
+    yet the S1/S2 grandchildren still follow `branch` — they have no explicit knob.
+    """
+    asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS,
+            ami_ssm_name="ami",
+            branch="b",
+            fill_deployment="custom/fill",
+            ingest_deployment="custom/ingest",
+        )
+    )
+    fill_dep, _ = _dep(wired, "custom/fill")
+    ingest_dep, ingest_params = _dep(wired, "custom/ingest")
+    assert fill_dep == "custom/fill"  # not custom/fill-b
+    assert ingest_dep == "custom/ingest"
+    assert ingest_params["deployments"]["ingest_s1_roi_sar"].endswith("-b")
+
+
+def test_branch_routes_fill_when_ingest_disabled(wired):
+    """ingest=False: no ingest dispatch, but the fill ref is still branch-routed."""
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, branch="b"))
+    deps = [d for d, _ in wired["arun"]]
+    assert deps == ["fill-zone-year/fill-zone-year-b"]  # fill only, suffixed

@@ -153,6 +153,7 @@ def _run_inference_and_assemble(
     checkpoint_dir: str | None,
     checkpoint_url: str | None,
     num_gpus: int,
+    allow_s2_only: bool = False,
     log: logging.Logger,
 ) -> dict[str, Any]:
     """Run inference under local Ray, then assemble with local worker processes."""
@@ -182,6 +183,7 @@ def _run_inference_and_assemble(
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
         num_gpus=num_gpus,
+        allow_s2_only=allow_s2_only,
     )
 
     chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, config.chunk_size or INFERENCE_CHUNK_SIZE, log)
@@ -275,6 +277,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
               start: "2024-07-01"
               end: "2025-07-01"
             s1_orbit: ascending    # or "descending" or "both"
+            allow_s2_only: false   # embed S2-valid pixels with zero S1 observations
             n_workers: 2
             checkpoint_dir: null    # override model directory; null → {inputs}/models/
             checkpoint_url: null    # full checkpoint URI (s3://, https://, …); overrides checkpoint_dir
@@ -353,6 +356,7 @@ def run_plain(config_path: Path, *, skip_inference: bool = False) -> dict[str, A
         checkpoint_dir=cfg.get("checkpoint_dir"),
         checkpoint_url=cfg.get("checkpoint_url"),
         num_gpus=num_gpus,
+        allow_s2_only=cfg.get("allow_s2_only", False),
         log=log,
     )
     log.info("Pipeline complete: %s", summary)
