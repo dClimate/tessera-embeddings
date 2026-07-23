@@ -61,6 +61,28 @@ changes which pixels get embeddings, so a retry across a flipped flag starts a
 fresh staging prefix rather than resuming mixed tiles. It is NOT part of the
 ingest marker — ingestion is unaffected by it.
 
+**The single-ROI path (`tessera_embeddings`) does not derive its run_id from a
+fingerprint** — a fresh run gets a random uuid and a resume reuses an
+operator-supplied `previous_run_id`. Since `run_inference()` skips already-
+staged `.zarr`/`.skipped` artifacts by run_id alone, flipping `allow_s2_only`
+on a resume would keep old skip markers (the very S2-only pixels the flag now
+embeds) for staged chunks while recomputing the rest under the new gate, and
+assembly would publish a mix. Fix: a fresh S2-only run's run_id carries an
+`s2only-` prefix (`S2_ONLY_RUN_PREFIX`), so the mode that produced a run's
+staged chunks is recorded in the staging namespace itself; a resume whose
+prefix disagrees with the requested flag is refused (`_resolve_run_id`).
+Default-mode runs keep the historical bare-uuid run_id, so the single-ROI path
+is unchanged when the flag is off. Assembly-only resumes are exempt (they
+re-publish staged tiles and never run the per-pixel gate).
+
+**Public-API + reachability wiring.** `InferenceConfig` is a positional
+dataclass documented as public API, so `allow_s2_only` is appended as the
+*last* field — a mid-list insertion would silently rebind downstream
+positional args. The flag is also forwarded by the master
+`tessera_full_pipeline` to the embeddings deployment, so it is reachable from
+the documented end-to-end path, not only the child flow. (Both surfaced in
+review of PR #95.)
+
 **Zone-level gates stay loud.** `ingest_zone_year`'s
 `InsufficientCoverageError` (zero SAR stores produced), `resolve_s1_orbit`
 (no SAR store at fill), the temporal coverage gate, and the SAR grid

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 import pytest
 
 from tessera_embeddings.config.inference import (
@@ -115,3 +117,17 @@ def test_inference_config_empty_num_obs_checkpoints_raises() -> None:
 def test_inference_config_compute_std_forced_false() -> None:
     cfg = _minimal_config(compute_std=True)  # type: ignore[call-arg]
     assert cfg.compute_std is False
+
+
+def test_allow_s2_only_is_the_last_field() -> None:
+    """InferenceConfig is public API (docs/public-api.md) and a positional
+    dataclass. A new field inserted mid-list would silently rebind later
+    positional args in downstream construction (e.g. a positional num_gpus would
+    land in compute_std). New fields must be appended; pin allow_s2_only last.
+    """
+    assert fields(InferenceConfig)[-1].name == "allow_s2_only"
+
+
+def test_allow_s2_only_defaults_off() -> None:
+    assert _minimal_config().allow_s2_only is False
+    assert _minimal_config(allow_s2_only=True).allow_s2_only is True

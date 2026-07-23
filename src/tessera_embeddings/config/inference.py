@@ -219,17 +219,6 @@ class InferenceConfig:
     num_workers: int = 4
     norm_source: Literal["mpc", "aws"] = "aws"
     s1_orbit: Literal["ascending", "descending", "both"] = "both"
-    # Embed S2-valid pixels that have ZERO S1 observations (sub-zone SAR coverage
-    # gaps — swath edges/holes; worst at high latitudes). Such a pixel gets the
-    # upstream v1.1 missing-S1 convention: an all-zeros (normalized-space) S1 slice
-    # at the smallest bucket — exactly ucam-eo/tessera's `_sample_s1_merged` zero
-    # return — so this restores upstream parity rather than inventing an input.
-    # Default False: pixels without S1 are skipped (this pipeline's historical
-    # gate). Per-pixel provenance is free either way: an embedded pixel with
-    # s1_asc_obs_count + s1_desc_obs_count == 0 is an S2-only embedding. NOTE:
-    # S2-only embedding QUALITY is unvalidated for this S1-trained checkpoint —
-    # see the optional-S1 ADR before enabling in production.
-    allow_s2_only: bool = False
     # Deterministic sampling under v1.1 — no repeat variance; forced False in __post_init__.
     compute_std: bool = False
 
@@ -261,6 +250,23 @@ class InferenceConfig:
     # the next batch anyway. Escape hatch so a capacity shortfall (e.g. AWS only
     # provisions 48/50) can't gate every remaining batch forever.
     actor_batch_placement_timeout_sec: float = 300.0
+
+    # Appended last on purpose: InferenceConfig is public API (docs/public-api.md)
+    # and this is a positional dataclass, so a new field in the middle would
+    # silently rebind later positional args in downstream construction. Keep new
+    # fields at the tail.
+    #
+    # Embed S2-valid pixels that have ZERO S1 observations (sub-zone SAR coverage
+    # gaps — swath edges/holes; worst at high latitudes). Such a pixel gets the
+    # upstream v1.1 missing-S1 convention: an all-zeros (normalized-space) S1 slice
+    # at the smallest bucket — exactly ucam-eo/tessera's `_sample_s1_merged` zero
+    # return — so this restores upstream parity rather than inventing an input.
+    # Default False: pixels without S1 are skipped (this pipeline's historical
+    # gate). Per-pixel provenance is free either way: an embedded pixel with
+    # s1_asc_obs_count + s1_desc_obs_count == 0 is an S2-only embedding. NOTE:
+    # S2-only embedding QUALITY is unvalidated for this S1-trained checkpoint —
+    # see the optional-S1 ADR before enabling in production.
+    allow_s2_only: bool = False
 
     def __post_init__(self) -> None:
         """Validate and normalise config fields."""
