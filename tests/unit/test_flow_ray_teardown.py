@@ -139,3 +139,26 @@ def test_fill_hook_derives_cluster_name_in_fresh_process(tmp_path: Path) -> None
         fill_mod._ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
     terminate.assert_called_once()
     assert terminate.call_args.kwargs["cluster_name"] == "tessera-inference-1cb5e1da"
+
+
+# ---------------------------------------------------------------------------
+# Hook REGISTRATION: every GPU (Ray-owning) flow must clean up on BOTH a
+# cancellation AND a crash — a crashed run leaks the head EC2 node forever.
+# ---------------------------------------------------------------------------
+
+
+def test_fill_zone_year_registers_teardown_on_cancel_and_crash() -> None:
+    """The per-cell GPU fill must tear down on cancel AND crash (a crashed run
+    would otherwise leak the whole Ray GPU fleet — the Dask ingest flows self-heal
+    via their scheduler idle-timeout, but a `ray up` head persists until torn down).
+    """
+    flow = fill_mod.fill_zone_year_flow
+    assert fill_mod._ray_cleanup_on_cancellation in flow.on_cancellation_hooks
+    assert fill_mod._ray_cleanup_on_cancellation in flow.on_crashed_hooks
+
+
+def test_tessera_embeddings_registers_teardown_on_cancel_and_crash() -> None:
+    """The single-ROI GPU sibling has the same both-hooks contract."""
+    flow = flows_mod.tessera_embeddings
+    assert flows_mod._ray_cleanup_on_cancellation in flow.on_cancellation_hooks
+    assert flows_mod._ray_cleanup_on_cancellation in flow.on_crashed_hooks

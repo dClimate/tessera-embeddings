@@ -142,9 +142,19 @@ def _assert_seeded_model_matches(
 
 
 def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
-    """Emergency Ray teardown when the flow is cancelled via the Prefect UI."""
+    """Emergency Ray teardown when the flow is CANCELLED or CRASHES.
+
+    Registered as BOTH ``on_cancellation`` and ``on_crashed`` — a crashed run
+    (OOM, host loss, unhandled error) is exactly as leak-prone as a cancelled
+    one: the ``ray up`` head node persists on EC2 until explicitly torn down, so
+    without a crash hook a crashed fill would leak the whole GPU fleet forever
+    (unlike the Dask ingest flows, whose scheduler self-terminates on its idle
+    timeout). Prefect may run this in a FRESH module import (the flow's process
+    is killed first), so it re-derives the cluster name from ``flow_run.id`` via
+    :func:`cluster_name_for_flow_run` when the module globals are unset.
+    """
     log = logging.getLogger(__name__)
-    log.warning("Flow cancelled — tearing down Ray cluster")
+    log.warning("Flow cancelled/crashed — tearing down Ray cluster")
     fallback_cluster = _active_cluster_name or cluster_name_for_flow_run(getattr(flow_run, "id", None))
     if _active_resolved_yaml and Path(_active_resolved_yaml).exists():
         # Bound the call and swallow launch failures: a hung `ray down` (unreachable
@@ -172,7 +182,11 @@ def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) 
         log.warning("Cancellation fired before the cluster was provisioned — check the AWS console manually.")
 
 
-@flow(name="fill-zone-year", on_cancellation=[_ray_cleanup_on_cancellation])
+@flow(
+    name="fill-zone-year",
+    on_cancellation=[_ray_cleanup_on_cancellation],
+    on_crashed=[_ray_cleanup_on_cancellation],
+)
 def fill_zone_year_flow(
     *,
     zone: str,
