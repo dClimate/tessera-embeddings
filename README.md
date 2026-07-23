@@ -394,7 +394,11 @@ ROI from the coverage bitmap → run the S1/S2 ROI ingest flows onto
 then inference → shard-assemble → tag) → delete the transient mosaic
 (`s5cmd --all-versions`). A `zones=["33N", "15S"]` filter restricts the
 run; the default (all 120) skips already-finished cells, and `ingest=False`
-bypasses ingestion when mosaics already exist upstream.
+bypasses ingestion when mosaics already exist upstream. A `branch` slug routes
+every dispatched deployment — the fill, the ingest, and the S1/S2 grandchildren
+`ingest-zone-year` dispatches — to its `-<branch>` variant, so a downstream that
+registers dev-branch deployments can exercise the whole chain (including
+ingestion) off prod; `branch=None` (default) is the unsuffixed production path.
 
 ### Reading a zone group (xarray)
 

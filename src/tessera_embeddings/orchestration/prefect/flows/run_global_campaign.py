@@ -30,7 +30,10 @@ from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.inference.data_loading import _active_orbits, _is_missing_repo
-from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import DEFAULT_MIN_VALID_COVERAGE
+from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import (
+    DEFAULT_MIN_VALID_COVERAGE,
+    IngestDeployments,
+)
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles, zone_year_on_axis
 from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete, zone_year_tag
@@ -38,6 +41,23 @@ from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zone
+
+# S1/S2 grandchild ingest refs are derived from this single source (rather than
+# duplicated string literals), so a future rename of the ingest deployments stays
+# in one place — ingest_zone_year.IngestDeployments.
+_INGEST_DEPLOYMENT_DEFAULTS = IngestDeployments()
+
+
+def _dpl(prod_ref: str, branch: str | None) -> str:
+    """Route a child deployment ref to its branch-scoped variant.
+
+    A blank ``branch`` (``None``, empty, or whitespace) returns the ref
+    unchanged — production behaviour. A real branch slug is appended to the
+    *deployment name*: ``"flow/name"`` -> ``"flow/name-<branch>"`` (dev branches
+    register every flow under the suffixed name with their own image + task def).
+    """
+    slug = (branch or "").strip()
+    return f"{prod_ref}-{slug}" if slug else prod_ref
 
 
 def _resolve_code_identity(ami_ssm_name: str, code_bucket: str | None, code_suffix: str, region: str | None) -> str:
@@ -57,7 +77,8 @@ async def run_global_campaign(
     *,
     paths: BucketPaths,
     ami_ssm_name: str,
-    fill_deployment: str = "fill-zone-year/fill-zone-year",
+    branch: str | None = None,
+    fill_deployment: str | None = None,
     store_name: str = "tessera",
     years: tuple[int, ...] | None = None,
     zones: list[str] | None = None,
@@ -72,7 +93,7 @@ async def run_global_campaign(
     code_suffix: str = "",
     # Campaign-triggered per-zone ingestion
     ingest: bool = True,
-    ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
+    ingest_deployment: str | None = None,
     mask_name: str = "global",
     max_parallel_ingest: int = 2,
     cleanup_mosaics: bool = True,
@@ -89,7 +110,20 @@ async def run_global_campaign(
     Args:
         paths: Deployment storage contract.
         ami_ssm_name: SSM parameter name for the Ray GPU AMI (forwarded to fills).
+        branch: Route child deployments to their branch-scoped variants. ``None``
+            (production) leaves every ref at its unsuffixed default — behaviour is
+            byte-for-byte unchanged. A slug (e.g. ``"global-tessera"``) suffixes
+            every *derived* child deployment name with ``-<slug>``: the fill, the
+            ingest, and — crucially — the S1/S2 grandchildren that
+            ``ingest_zone_year`` dispatches (unreachable otherwise, so a branch
+            campaign with ``ingest=True`` used to 404 one level down). An
+            explicitly-passed ``fill_deployment``/``ingest_deployment`` is used
+            verbatim and never re-suffixed; only the defaults are derived. This is
+            orthogonal to ``code_suffix`` (which scopes the source tarball, not
+            deployment names).
         fill_deployment: ``flow-name/deployment-name`` of the fill deployment.
+            ``None`` (default) derives ``fill-zone-year/fill-zone-year`` routed by
+            ``branch``; an explicit value is used verbatim.
         store_name: Global-store repo basename.
         years: Campaign years to drive (default: all campaign years).
         zones: Restrict the fill chain (inference + assembly) to these UTM zones in
@@ -114,6 +148,9 @@ async def run_global_campaign(
         ingest: Trigger per-zone ingestion (``ingest_zone_year``) before each
             fill (default). Set False when the mosaics already exist upstream.
         ingest_deployment: ``flow-name/deployment-name`` of the ingest deployment.
+            ``None`` (default) derives ``ingest-zone-year/ingest-zone-year`` routed
+            by ``branch``; an explicit value is used verbatim. The S1/S2 refs it
+            dispatches are always branch-derived (see ``branch``).
         mask_name: Coverage-store basename, forwarded to ingest.
         max_parallel_ingest: Max concurrent ingests (each provisions its own Dask
             cluster) — a separate, smaller knob than the fill cap.
@@ -144,6 +181,11 @@ async def run_global_campaign(
         Summary: pending count at start, dispatched run ids per year, totals.
     """
     log = get_run_logger()
+    # Resolve branch-scoped deployment names once. A default (None) child ref is
+    # derived from `branch`; an explicit ref passes through verbatim. The S1/S2
+    # grandchildren are derived from the same `branch` in `_ingest_params`.
+    fill_deployment = fill_deployment or _dpl("fill-zone-year/fill-zone-year", branch)
+    ingest_deployment = ingest_deployment or _dpl("ingest-zone-year/ingest-zone-year", branch)
     if max_parallel_zones < 1:
         raise ValueError(f"max_parallel_zones must be >= 1, got {max_parallel_zones} (Semaphore(0) blocks forever)")
     if max_parallel_ingest < 1:
@@ -371,6 +413,15 @@ async def run_global_campaign(
             # coverage sha, marker, coverage gate) hit the same stores rather than
             # defaulting to us-west-2 on a non-default-region deployment.
             "s3_region": s3_region,
+            # Grandchild routing: the S1/S2 ingest deployments dispatched BY
+            # ingest_zone_year. Without this key its IngestDeployments() defaults
+            # (unsuffixed prod refs) always win, so a branch campaign would 404 one
+            # level down. Derived from the same `branch` as the direct children;
+            # built from the defaults model so a rename stays single-sourced.
+            "deployments": {
+                "ingest_s1_roi_sar": _dpl(_INGEST_DEPLOYMENT_DEFAULTS.ingest_s1_roi_sar, branch),
+                "ingest_s2_roi_reflectance": _dpl(_INGEST_DEPLOYMENT_DEFAULTS.ingest_s2_roi_reflectance, branch),
+            },
         }
 
     fill_sem = asyncio.Semaphore(max_parallel_zones)
