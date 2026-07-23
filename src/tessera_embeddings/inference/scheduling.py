@@ -25,6 +25,7 @@ from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.inference.actors import InferenceActor
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.diagnostics import log_worker_failure_diagnostic
+from tessera_embeddings.inference.progress import chunk_uid
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,7 @@ class WorkItem:
     @property
     def uid(self) -> str:
         """Scheduler-unique key for this item (labels alone collide across zones)."""
-        return f"{self.ctx.run_id}:{self.chunk.label}"
+        return chunk_uid(self.ctx.run_id, self.chunk.label)
 
 
 def _as_item(work: WorkItem | ChunkSpec, ctx: ZoneContext) -> WorkItem:
@@ -877,7 +878,7 @@ def _process_chunks_work_stealing(
         """
         chunk_label = item.chunk.label
         if tracker:
-            tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
+            tracker.remove.remote(item.uid)  # type: ignore[union-attr]  # run-qualified: labels alias across zones
         # The actor is killed below, taking its writer thread with it — any
         # deferred write it still held is of unknown state, so requeue that
         # chunk too. Safe: staged writes are idempotent (run-scoped keys,
@@ -1124,7 +1125,7 @@ def _process_chunks_work_stealing(
                         if on_item_done is not None:
                             on_item_done(item, result)
                     if tracker:
-                        tracker.remove.remote(item.chunk.label)  # type: ignore[union-attr]
+                        tracker.remove.remote(item.uid)  # type: ignore[union-attr]  # run-qualified (see chunk_uid)
                     pool._initializing.discard(actor_idx)
 
             # Immediately re-feed the actor that just freed up, unless it's a

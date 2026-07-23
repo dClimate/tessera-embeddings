@@ -1599,3 +1599,41 @@ class TestChainedWorkSource:
             )
         by_status = sorted((r["chunk"], r["status"]) for r in results)
         assert by_status == [("c0", "ok"), ("c0", "ok")]  # both zones landed
+
+
+# ---------------------------------------------------------------------------
+# Run-qualified progress key (chunk_uid / WorkItem.uid)
+# ---------------------------------------------------------------------------
+
+
+class TestChunkUid:
+    """The progress tracker is keyed by the run-qualified uid, not the bare
+    chunk label, so a shared multi-zone session can't alias two zones' chunks.
+    """
+
+    def test_chunk_uid_is_run_qualified(self) -> None:
+        from tessera_embeddings.inference.progress import chunk_uid
+
+        assert chunk_uid("33N-2025-abc", "5_5") == "33N-2025-abc:5_5"
+
+    def test_workitem_uid_uses_the_shared_helper(self) -> None:
+        from tessera_embeddings.inference.progress import chunk_uid
+
+        item = _sched_mod.WorkItem(
+            chunk=_fake_chunk("5_5"), ctx=_sched_mod.ZoneContext("s3://m", "s3://s", "33N-2025-abc")
+        )
+        assert item.uid == chunk_uid("33N-2025-abc", "5_5")
+
+    def test_same_label_different_zones_do_not_collide(self) -> None:
+        """The regression: two zones both have a ``5_5`` chunk. Before the fix
+        both keyed the tracker as ``"5_5"``, so one zone's completion evicted the
+        other's progress entry and hung the live task. Their uids must differ.
+        """
+        za = _sched_mod.WorkItem(
+            chunk=_fake_chunk("5_5"), ctx=_sched_mod.ZoneContext("s3://m/33N", "s3://s/33N", "33N-2025-a")
+        )
+        zb = _sched_mod.WorkItem(
+            chunk=_fake_chunk("5_5"), ctx=_sched_mod.ZoneContext("s3://m/34N", "s3://s/34N", "34N-2025-b")
+        )
+        assert za.chunk.label == zb.chunk.label  # labels collide across zones...
+        assert za.uid != zb.uid  # ...but the run-qualified uids do not

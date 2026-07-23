@@ -21,29 +21,43 @@ import time
 import ray
 
 
+def chunk_uid(run_id: str, chunk_label: str) -> str:
+    """The run-qualified progress key: ``"{run_id}:{chunk_label}"``.
+
+    Chunk labels are grid-relative positions (e.g. ``"5_5"``) that REPEAT across
+    zones, so a shared multi-zone session (chained fill) can have two zones'
+    identically-labelled chunks in flight at once during tail/head overlap.
+    Qualifying by the per-zone ``run_id`` keeps their tracker entries distinct so
+    one zone's completion can't evict the other's and hang a live GPU task. This
+    is the same key :attr:`WorkItem.uid` uses for retry bookkeeping; both build it
+    here so the actor's ``report`` and the scheduler's ``remove`` cannot drift.
+    """
+    return f"{run_id}:{chunk_label}"
+
+
 @ray.remote(num_cpus=0, memory=10 * 1024 * 1024)  # 10 MB
 class ProgressTracker:
     """Holds per-chunk progress state, updated by GPU actors.
 
-    Each entry is a dict keyed by chunk_label with values:
-    ``(batch_idx, total_batches, staleness_sec, phase)``.
+    Each entry is a dict keyed by the run-qualified chunk uid (:func:`chunk_uid`)
+    with values ``(batch_idx, total_batches, staleness_sec, phase)``.
     """
 
     def __init__(self) -> None:
         self._progress: dict[str, tuple[int, int, float, str]] = {}
 
-    def report(self, chunk_label: str, batch_idx: int, total_batches: int, phase: str = "inference") -> None:
-        """Update progress for a chunk. Called fire-and-forget from GPU actors."""
-        self._progress[chunk_label] = (batch_idx, total_batches, time.monotonic(), phase)
+    def report(self, uid: str, batch_idx: int, total_batches: int, phase: str = "inference") -> None:
+        """Update progress for a chunk (keyed by :func:`chunk_uid`). Fire-and-forget from GPU actors."""
+        self._progress[uid] = (batch_idx, total_batches, time.monotonic(), phase)
 
     def get_all(self) -> dict[str, tuple[int, int, float, str]]:
         """Return progress with staleness computed on the tracker's own clock.
 
-        Returns dict of {chunk_label: (batch_idx, total_batches, staleness_sec, phase)}.
+        Returns dict of {uid: (batch_idx, total_batches, staleness_sec, phase)}.
         """
         now = time.monotonic()
-        return {label: (batch, total, now - ts, phase) for label, (batch, total, ts, phase) in self._progress.items()}
+        return {uid: (batch, total, now - ts, phase) for uid, (batch, total, ts, phase) in self._progress.items()}
 
-    def remove(self, chunk_label: str) -> None:
-        """Remove a completed chunk from tracking."""
-        self._progress.pop(chunk_label, None)
+    def remove(self, uid: str) -> None:
+        """Remove a completed chunk from tracking (keyed by :func:`chunk_uid`)."""
+        self._progress.pop(uid, None)
