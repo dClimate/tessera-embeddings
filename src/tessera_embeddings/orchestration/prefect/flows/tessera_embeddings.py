@@ -62,6 +62,14 @@ from tessera_embeddings.providers.aws.ray import (
 _active_resolved_yaml: str | None = None
 _active_cluster_name: str | None = None
 
+# Fresh runs with allow_s2_only=True carry this run_id prefix. The run_id
+# namespaces the staging directory, so the prefix records the per-pixel S1
+# mode that produced a run's staged chunks — letting a resume detect (and
+# refuse) a mode flip that would otherwise mix S1-gated and S2-only chunks in
+# one assembled output. Default runs keep the historical bare-uuid run_id, so
+# the single-ROI path is byte-for-byte unchanged when the flag is off.
+S2_ONLY_RUN_PREFIX = "s2only-"
+
 
 class EmbeddingsDevParams(BaseModel):
     """Development-mode toggles for the embeddings flow.
@@ -90,6 +98,34 @@ def _cluster_name_for_flow_run(flow_run_id: object) -> str | None:
     :func:`tessera_embeddings.providers.aws.ray.cluster_name_for_flow_run`.
     """
     return cluster_name_for_flow_run(flow_run_id)
+
+
+def _resolve_run_id(previous_run_id: str | None, *, allow_s2_only: bool, assembly_only: bool) -> str:
+    """Derive the staging run_id, encoding the S2-only mode via S2_ONLY_RUN_PREFIX.
+
+    ``run_inference()`` reuses staged ``.zarr``/``.skipped`` artifacts by run_id
+    alone. If a resume flipped ``allow_s2_only``, old skip markers (S2-valid /
+    zero-S1 pixels the flag now embeds) would be kept for already-staged chunks
+    while only the not-yet-staged chunks were recomputed under the new gate, and
+    assembly would publish a mix of S1-gated and S2-only tiles. Encoding the mode
+    in the run_id — which namespaces the staging directory — lets a resume detect
+    and refuse a mode flip. Fresh default-mode runs keep the historical bare-uuid
+    run_id, so the single-ROI path is unchanged when the flag is off.
+
+    Assembly-only resumes are exempt: they re-publish whatever is staged and never
+    run the per-pixel gate, so the requested flag can't change their output.
+    """
+    if previous_run_id:
+        resumed_s2_only = previous_run_id.startswith(S2_ONLY_RUN_PREFIX)
+        if not assembly_only and resumed_s2_only != allow_s2_only:
+            raise ValueError(
+                f"Cannot resume run {previous_run_id!r} (allow_s2_only={resumed_s2_only}) with "
+                f"allow_s2_only={allow_s2_only}: its staged chunks were produced under the other "
+                f"per-pixel S1 mode, so continuing would publish a mix of S1-gated and S2-only "
+                f"tiles. Resume with allow_s2_only={resumed_s2_only}, or start a fresh run."
+            )
+        return previous_run_id
+    return (S2_ONLY_RUN_PREFIX if allow_s2_only else "") + uuid.uuid4().hex[:12]
 
 
 def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
@@ -149,6 +185,7 @@ def tessera_embeddings(
     num_actors: int = 20,
     s1_orbit: str = "both",
     s3_region: str | None = None,
+    allow_s2_only: bool = False,
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
 ) -> dict[str, Any]:
     """Generate Tessera embeddings for a mosaicked ROI.
@@ -188,6 +225,13 @@ def tessera_embeddings(
             IAM credential callback, through orbit resolution, chunk enumeration, the
             coverage gate, and the assembly task. ``None`` uses the default Icechunk
             region; set it for a store outside the default region.
+        allow_s2_only: Embed S2-valid pixels that have ZERO S1 observations
+            (sub-zone SAR coverage gaps) via the upstream v1.1 missing-S1
+            convention (all-zeros normalized S1 input) instead of skipping
+            them. Default False (historical behavior). Affected pixels are
+            identifiable afterwards via ``s1_asc_obs_count +
+            s1_desc_obs_count == 0``; quality is unvalidated — see the
+            optional-S1 ADR.
         dev_params: See :class:`EmbeddingsDevParams`.
 
     Returns:
@@ -204,7 +248,9 @@ def tessera_embeddings(
     if dev_params.assembly_only and not dev_params.previous_run_id:
         raise ValueError("assembly_only=True requires previous_run_id")
 
-    run_id = dev_params.previous_run_id or uuid.uuid4().hex[:12]
+    run_id = _resolve_run_id(
+        dev_params.previous_run_id, allow_s2_only=allow_s2_only, assembly_only=dev_params.assembly_only
+    )
     run_started_at = datetime.datetime.now(datetime.UTC)
     t0 = time.monotonic()
 
@@ -239,6 +285,7 @@ def tessera_embeddings(
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
+        allow_s2_only=allow_s2_only,
     )
 
     staging_base = f"{output_bucket.rstrip('/')}/staging"

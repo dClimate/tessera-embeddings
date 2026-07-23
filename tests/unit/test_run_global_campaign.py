@@ -110,6 +110,18 @@ def test_fill_run_id_is_stable_and_input_fingerprinted(wired):
     assert changed.startswith("33N-2025-") and changed != base  # input change → new prefix
 
 
+def test_fill_run_id_changes_with_allow_s2_only(wired):
+    """allow_s2_only changes WHICH pixels get embeddings, so it must flip the
+    staging fingerprint — a retry across a flipped flag never resumes mixed tiles.
+    The flag is also forwarded to the fill deployment.
+    """
+    base = _fill_run_id(wired)
+    flagged = _fill_run_id(wired, allow_s2_only=True)
+    assert flagged.startswith("33N-2025-") and flagged != base
+    fill_params = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
+    assert fill_params["allow_s2_only"] is True
+
+
 def test_fill_run_id_tracks_resolved_code_artifact_not_suffix(wired, monkeypatch):
     """The staging fingerprint keys on the RESOLVED code artifact (AMI ID + tarball
     ETag), not the mutable `code_suffix`. So overwriting the tarball / re-baking the AMI

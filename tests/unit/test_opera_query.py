@@ -1,5 +1,7 @@
 """Unit tests for opera_query.py - OPERA RTC-S1 query utilities."""
 
+import logging
+from collections import Counter
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
@@ -213,6 +215,24 @@ class TestGranuleToItem:
     def test_missing_band_links_returns_none(self):
         """A granule lacking a VV or VH data link is skipped."""
         assert _granule_to_item(_granule_entry("g1", bands=("VV",))) is None
+
+    def test_skip_reports_polarizations_found(self, caplog):
+        """The skip log + counter name WHAT was found — VV-only (partial dual-pol,
+        e.g. 2017 Tanzania/SW Brazil), EW-mode HH/HV (polar), or nothing — so
+        regional dual-pol data loss is quantifiable instead of one generic warning.
+        Behavior is unchanged: only dual-pol VV+VH granules are accepted.
+        """
+        skip_counts: Counter[str] = Counter()
+        with caplog.at_level(logging.WARNING):
+            assert _granule_to_item(_granule_entry("g-vv", bands=("VV",)), skip_counts) is None
+            assert _granule_to_item(_granule_entry("g-ew", bands=("HH", "HV")), skip_counts) is None
+            assert _granule_to_item(_granule_entry("g-none", bands=()), skip_counts) is None
+            # Dual-pol is accepted and never counted.
+            assert _granule_to_item(_granule_entry("g-ok"), skip_counts) is not None
+        assert skip_counts == {"VV-only": 1, "HH/HV (EW-mode?)": 1, "no data links": 1}
+        assert "polarizations found ['VV']" in caplog.text
+        assert "polarizations found ['HH', 'HV']" in caplog.text
+        assert "polarizations found none" in caplog.text
 
     def test_handles_missing_polygon(self):
         item = _granule_to_item(_granule_entry("g1", with_ring=False))

@@ -439,6 +439,17 @@ identical; `time_bnds` just lists under data variables. Non-calendar
 output stores (`time_convention="12mo_window_end"`, one time entry per
 window-end label) are the home for rolling windows.
 
+**Per-pixel input provenance.** The obs-count layers record how many
+observations fed each pixel's embedding: `s2_obs_count`,
+`s1_asc_obs_count`, `s1_desc_obs_count` (always written; `0` = none).
+By default every embedded pixel has ≥1 S1 observation; when a fill ran
+with `allow_s2_only=True` (opt-in — embeds S2-valid pixels inside S1
+coverage gaps using the upstream v1.1 missing-S1 convention), the
+**S2-only pixels are exactly those with a finite `scales` value and
+`s1_asc_obs_count + s1_desc_obs_count == 0`**. S2-only embedding quality
+is unvalidated against S1-informed embeddings — see
+[ADR-013](context_docs/decisions/013-optional-s1-s2-only-pixels.md).
+
 Reference docs:
 [`xarray.open_zarr` / `decode_coords`](https://docs.xarray.dev/en/stable/generated/xarray.open_zarr.html) ·
 [xarray weather & climate (CF) guide](https://docs.xarray.dev/en/stable/user-guide/weather-climate.html) ·

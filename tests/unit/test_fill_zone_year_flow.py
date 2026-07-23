@@ -66,6 +66,40 @@ def test_coverage_gate_fails_before_ray(monkeypatch, allow_partial):
     assert captured["creds"] is not None  # credential callback threaded through
 
 
+@pytest.mark.parametrize("flag", [False, True])
+def test_allow_s2_only_reaches_inference_config(monkeypatch, flag):
+    """The flow's allow_s2_only lands in build_inference_config — the single
+    chokepoint through which it reaches the dataset's per-pixel gate. The
+    zone-level gates are NOT relaxed by it (coverage gate still raises here).
+    """
+    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-fill"))
+    monkeypatch.setattr(
+        "tessera_embeddings.providers.aws.credentials.iam_icechunk_credentials", object(), raising=False
+    )
+    monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: False)
+    monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
+    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
+
+    captured: dict = {}
+
+    def _config(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(time_window="W")
+
+    monkeypatch.setattr(mod, "build_inference_config", _config)
+
+    def _coverage(*a, **k):
+        raise InsufficientCoverageError("stop before Ray")
+
+    monkeypatch.setattr(mod, "check_time_window_coverage", _coverage)
+
+    with pytest.raises(InsufficientCoverageError):
+        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami", allow_s2_only=flag)
+    assert captured["allow_s2_only"] is flag
+
+
 def test_model_guard_rejects_encoder_mismatch(monkeypatch):
     """A store seeded for a different encoder than this build is rejected — a
     mid-campaign model upgrade would otherwise mix encoders under one store.
