@@ -55,12 +55,58 @@ Required SSM keys under `ssm_prefix` (default `/tessera/ray/`):
 |---|---|---|
 | `security-group-id` | String | Cluster security group |
 | `instance-profile-arn` | String | IAM instance profile ARN |
-| `private-subnet-ids` | StringList (comma-sep) | Private subnets to choose from |
+| `private-subnet-ids` | StringList (comma-sep) | Private subnets, in launch-preference order (see "Subnet / AZ placement") |
 | `key-pair-name` | String | EC2 key pair name (for SSH) |
 | `key-pair-id` | String | EC2 key pair ID (for SSH key lookup) |
 
 The AMI ID lives in a separate SSM parameter, named via the
 `ami_ssm_name` argument to `ray_cluster`.
+
+---
+
+## Subnet / AZ placement — multi-AZ with capacity failover
+
+`_resolve_ray_config` puts **every** subnet from `private-subnet-ids` into
+every node type's `SubnetIds`, preserving the SSM-param order. Ray's AWS
+node provider launches each instance in the **first** listed subnet and
+rotates to the next on a launch `ClientError` (notably
+`InsufficientInstanceCapacity`), trying every subnet before failing — so
+the fleet lands mostly in one AZ, with automatic spillover when that AZ
+runs out of GPU capacity (a 2026-07-17 run stalled at 2 workers under a
+single-AZ pin for exactly this reason). **SSM order = launch preference.**
+
+**Why cross-AZ spread is safe for this workload:** inference's bulk data
+plane is actor↔S3 only — mosaic reads, staging writes, checkpoint
+download. Workers never exchange data with each other, and head↔worker
+traffic is KB/s control RPCs (chunk specs, status dicts, heartbeats), so
+cross-AZ transfer exposure is cents per run. This rests on an INVARIANT:
+**Ray actors must never exchange bulk data node-to-node; all bulk I/O goes
+to S3.** Any future feature that ships tensors/arrays between nodes (e.g.
+peer-to-peer prefetch) breaks the cost model and must revisit AZ pinning.
+The Dask provider (`providers/aws/dask.py`) is different — Dask genuinely
+shuffles between workers — and keeps its single-AZ pin.
+
+**In-region S3 is only free via the S3 gateway endpoint.** A subnet whose
+route table lacks the endpoint route sends S3 traffic through the NAT
+gateway at ~$0.045/GB — ~$45/TB, silently, and inference reads TBs. When
+adding or changing subnets, verify every subnet's route table is attached
+to the S3 gateway endpoint:
+
+```bash
+# The S3 gateway endpoint and the route tables it serves:
+aws ec2 describe-vpc-endpoints \
+  --filters Name=service-name,Values=com.amazonaws.<region>.s3 \
+            Name=vpc-endpoint-type,Values=Gateway \
+  --query 'VpcEndpoints[].{id:VpcEndpointId,rts:RouteTableIds}'
+# Each subnet's route table (falls back to the VPC main table if empty):
+aws ec2 describe-route-tables \
+  --filters Name=association.subnet-id,Values=<subnet-id> \
+  --query 'RouteTables[0].RouteTableId'
+```
+
+Every subnet's route table must appear in the endpoint's `RouteTableIds`.
+Post-change backstop: Cost Explorer's "EC2: Data Transfer — Regional" line
+for a run window should read cents.
 
 ---
 

@@ -177,38 +177,6 @@ def _build_cloudwatch_setup_command(
     )
 
 
-def _pick_least_loaded_subnet(
-    subnets: list[dict[str, Any]],
-    cluster_tag_prefix: str,
-    ec2_client: Any,  # noqa: ANN401 — boto3 EC2 client has no public type
-) -> dict[str, Any]:
-    """Pick the subnet with the fewest running Ray instances.
-
-    Counts running/pending instances whose ``ray-cluster-name`` tag starts
-    with ``cluster_tag_prefix`` and returns the subnet with the lowest
-    count (deterministic tie-break by subnet ID). This spreads concurrent
-    clusters across AZs while still pinning each cluster to a single AZ
-    to avoid cross-AZ data transfer charges.
-    """
-    subnet_ids = [s["SubnetId"] for s in subnets]
-    counts: dict[str, int] = dict.fromkeys(subnet_ids, 0)
-    resp = ec2_client.describe_instances(
-        Filters=[
-            {"Name": "tag:ray-cluster-name", "Values": [f"{cluster_tag_prefix}*"]},
-            {"Name": "instance-state-name", "Values": ["running", "pending"]},
-            {"Name": "subnet-id", "Values": subnet_ids},
-        ],
-    )
-    for reservation in resp.get("Reservations", []):
-        for inst in reservation.get("Instances", []):
-            sid = inst.get("SubnetId")
-            if sid in counts:
-                counts[sid] += 1
-
-    sorted_subnets = sorted(subnets, key=lambda s: (counts[s["SubnetId"]], s["SubnetId"]))
-    return sorted_subnets[0]
-
-
 def _resolve_ray_config(
     cluster_yaml: str | Path,
     *,
@@ -225,8 +193,9 @@ def _resolve_ray_config(
     """Inject AWS resource IDs from SSM into a Ray cluster YAML template.
 
     Reads SSM parameters under ``ssm_prefix``, looks up the AMI ID from
-    ``ami_ssm_name``, pins all nodes to the least-loaded private subnet
-    (single AZ), materialises the SSH key from SSM into a tempfile, injects the
+    ``ami_ssm_name``, lists every private subnet on every node type (multi-AZ
+    with launch-time capacity failover — see the subnet block below),
+    materialises the SSH key from SSM into a tempfile, injects the
     CloudWatch agent setup command, substitutes ``{CODE_BUCKET}`` and
     ``{CODE_SUFFIX}`` in setup_commands, and writes the resolved config to
     a tempfile.
@@ -266,7 +235,6 @@ def _resolve_ray_config(
     with cluster_yaml.open() as f:
         config = yaml.safe_load(f)
 
-    base_cluster_name = config.get("cluster_name", "tessera-inference")
     if cluster_name:
         config["cluster_name"] = cluster_name
 
@@ -298,17 +266,29 @@ def _resolve_ray_config(
     merged_tags.extend(instance_tags or [])
     tag_specs: list[dict[str, Any]] = [{"ResourceType": "instance", "Tags": merged_tags}]
 
-    # Pin all nodes to a single AZ (cross-AZ data transfer is billed): describe
-    # the SSM subnets and pick the least-loaded one.
+    # Every node type gets ALL private subnets, in SSM-param order. Ray's AWS
+    # node provider launches in the FIRST listed subnet and rotates to the
+    # next on a launch ClientError (e.g. InsufficientInstanceCapacity),
+    # trying every subnet before giving up — so the fleet lands mostly in one
+    # AZ with automatic capacity spillover to the others (a 2026-07-17 run
+    # stalled at 2 workers when its pinned AZ ran out of g6e capacity).
+    # Cross-AZ exposure is negligible by construction: inference's bulk data
+    # plane is actor↔S3 only (free in-region via the subnets' S3 gateway
+    # endpoints — verify routes when subnets change, see gotchas.md) and
+    # head↔worker traffic is KB/s control RPCs. INVARIANT that keeps this
+    # cheap: Ray actors must never exchange bulk data node-to-node — all bulk
+    # I/O goes to S3. (The Dask provider keeps its single-AZ pin; Dask
+    # genuinely shuffles between workers.)
     ec2 = boto3.client("ec2", region_name=region)
     subnet_resp = ec2.describe_subnets(SubnetIds=all_subnet_ids)
     if not subnet_resp.get("Subnets"):
         msg = f"No subnets found for IDs: {all_subnet_ids}"
         raise RuntimeError(msg)
-    chosen_subnet = _pick_least_loaded_subnet(subnet_resp["Subnets"], base_cluster_name, ec2)
-    chosen_az = chosen_subnet["AvailabilityZone"]
-    chosen_subnet_id = chosen_subnet["SubnetId"]
-    config["provider"]["availability_zone"] = chosen_az
+    # describe_subnets returns arbitrary order; order the AZ list to match the
+    # SSM subnet order (= launch-preference order), deduping shared AZs.
+    az_by_subnet = {s["SubnetId"]: s["AvailabilityZone"] for s in subnet_resp["Subnets"]}
+    azs = list(dict.fromkeys(az_by_subnet[sid] for sid in all_subnet_ids))
+    config["provider"]["availability_zone"] = ",".join(azs)
 
     ami_param = ssm.get_parameter(Name=ami_ssm_name)
     ami_id = ami_param["Parameter"]["Value"]
@@ -319,7 +299,7 @@ def _resolve_ray_config(
         nc["KeyName"] = key_name
         nc["SecurityGroupIds"] = sg_ids
         nc["IamInstanceProfile"] = iam_profile
-        nc["SubnetIds"] = [chosen_subnet_id]
+        nc["SubnetIds"] = list(all_subnet_ids)
         if tag_specs:
             nc["TagSpecifications"] = tag_specs
 
@@ -690,7 +670,8 @@ def ray_cluster(
             # can leave a provisioned head behind, and `ray down` against the
             # unresolved template (whose cluster_name lacks the uuid suffix)
             # matches nothing — that exact path leaked a head on 2026-07-16.
-            # _resolve_ray_config pins the cluster to a single least-loaded AZ.
+            # _resolve_ray_config lists every private subnet on every node
+            # type (multi-AZ with launch-time capacity failover).
             log.info("Resolving Ray cluster config from SSM (cluster_name=%s)", cluster_name)
             resolved_yaml = _resolve_ray_config(
                 cluster_yaml,

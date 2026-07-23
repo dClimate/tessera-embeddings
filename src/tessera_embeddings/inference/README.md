@@ -119,7 +119,8 @@ The cluster is managed in a context manager so it automatically tears down after
 
 **Cluster topology:**
 - Head: m5.2xlarge — GCS + autoscaler, no inference work
-- Workers: g6e.xlarge (1× L40S 48 GB VRAM, 4 vCPU, 32 GB RAM) — on-demand, single AZ
+- Workers: g6e.xlarge (1× L40S 48 GB VRAM, 4 vCPU, 32 GB RAM) — on-demand, multi-AZ
+  (first-listed subnet preferred; Ray fails over across subnets on capacity errors)
 - Workers use a Packer-built AMI with all dependencies pre-installed; boot ready in ~1 minute
 
 ### 3. Inference Actors
