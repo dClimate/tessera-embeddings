@@ -46,6 +46,13 @@ def chunk_live_grid(tile_live: np.ndarray, height: int, width: int) -> np.ndarra
     A chunk is live if ANY constituent tile is live. Padded to the chunk grid's
     shape first, so a zone whose tile grid is odd-sized keeps its last chunk.
     """
+    # The bitmap must be exactly the zone's tile grid: a wrong-shaped one (a stale
+    # store, a transposed array) would otherwise pad silently and report credible
+    # but wrong counts. NOT the padded chunk-grid shape — every zone's tile grid is
+    # odd-sized, so that stricter-looking check would reject all of them.
+    expected = (math.ceil(height / SHARD_PX), math.ceil(width / SHARD_PX))
+    if tile_live.shape != expected:
+        raise ValueError(f"tile_live shape {tile_live.shape} != zone tile grid {expected}")
     rows, cols = math.ceil(height / INGEST_CHUNK_SIZE), math.ceil(width / INGEST_CHUNK_SIZE)
     padded = np.zeros((rows * TILES_PER_CHUNK, cols * TILES_PER_CHUNK), dtype=bool)
     padded[: tile_live.shape[0], : tile_live.shape[1]] = tile_live
@@ -69,9 +76,15 @@ def strategy_costs(live: np.ndarray) -> dict[str, int]:
     }
 
 
-def measure(land_mask_path: str, zones: list[str], *, s3_region: str | None) -> list[dict]:
-    """Per-zone chunk costs. Zones absent from the coverage repo are skipped."""
+def measure(land_mask_path: str, zones: list[str], *, s3_region: str | None) -> tuple[list[dict], dict]:
+    """Per-zone chunk costs + coverage provenance. Zones absent from the repo are skipped.
+
+    Provenance is the coverage delivery's ``registry_sha256`` — the same identity the
+    campaign fingerprints ingest on — plus the grid constants the counts depend on,
+    so the committed JSON states which mask revision produced it.
+    """
     out: list[dict] = []
+    shas: set[str | None] = set()
     for name in zones:
         spec = ZONES[name]
         try:
@@ -79,10 +92,21 @@ def measure(land_mask_path: str, zones: list[str], *, s3_region: str | None) -> 
         except (FileNotFoundError, KeyError):
             print(f"  {name}: absent from coverage repo — skipped", file=sys.stderr)
             continue
+        shas.add(cov.attrs.get("registry_sha256"))
         tile_live = np.asarray(cov["tile_live_2048"], dtype=bool)
         live = chunk_live_grid(tile_live, spec.height, spec.width)
         out.append({"zone": name, "live_tiles": int(tile_live.sum()), **strategy_costs(live)})
-    return out
+    if len(shas) > 1:
+        # One delivery stamps every zone group; a mix means a partial rebuild and
+        # the totals would straddle two coverage revisions.
+        raise ValueError(f"Coverage repo mixes registry_sha256 values: {sorted(map(str, shas))}")
+    provenance = {
+        "land_mask_path": land_mask_path,
+        "registry_sha256": next(iter(shas), None),
+        "ingest_chunk_px": INGEST_CHUNK_SIZE,
+        "tile_px": SHARD_PX,
+    }
+    return out, provenance
 
 
 def _report(rows: list[dict]) -> str:
@@ -114,14 +138,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json-out", help="write the per-zone rows here")
     args = parser.parse_args(argv)
 
-    rows = measure(args.land_mask_path, args.zone or sorted(ZONES), s3_region=args.s3_region)
+    rows, provenance = measure(args.land_mask_path, args.zone or sorted(ZONES), s3_region=args.s3_region)
     if not rows:
         print("No zones measured — is --land-mask-path right?", file=sys.stderr)
         return 1
     print(_report(rows))
     if args.json_out:
         with Path(args.json_out).open("w") as fh:
-            json.dump(rows, fh, indent=2)
+            json.dump({"provenance": provenance, "zones": rows}, fh, indent=2)
         print(f"\nper-zone rows → {args.json_out}", file=sys.stderr)
     return 0
 
