@@ -45,8 +45,16 @@ _LOGS = {
 
 def _args(**over):
     base = dict(
-        scheduler="sched.json", logs="logs.json", perf_report="s3://b/perf.html",
-        run_id="abc123", zone="32633", year="2025", min_workers="1", max_workers="500", title=None, out=None,
+        scheduler="sched.json",
+        logs="logs.json",
+        perf_report="s3://b/perf.html",
+        run_id="abc123",
+        zone="32633",
+        year="2025",
+        min_workers="1",
+        max_workers="500",
+        title=None,
+        out=None,
     )
     base.update(over)
     return argparse.Namespace(**base)
@@ -78,3 +86,45 @@ def test_dossier_notes_empty_scheduler_series():
     empty = {"log_group": "/ecs/tessera/dask", "profile": {"samples": 0}}
     md = rep.build_dossier(_args(logs=None), empty, None)
     assert "No `scheduler health:` lines" in md
+
+
+class TestTruncationIsNeverSilent:
+    """A capped input must never be presented as a full-run profile.
+
+    The producing tools flag the Insights row cap in their JSON, but the dossier
+    is what an operator actually reads and writes a verdict against — so if it
+    dropped the flag, a series that merely stopped early would be read as "peaked
+    at 98% CPU, never tripped backlog-growth". Both the banner and the
+    per-section markers are pinned here.
+    """
+
+    def test_untruncated_dossier_has_no_partial_warning(self):
+        md = rep.build_dossier(_args(), _SCHED, _LOGS)
+        assert "PARTIAL" not in md
+
+    def test_truncated_scheduler_series_is_flagged(self):
+        md = rep.build_dossier(_args(logs=None), {**_SCHED, "truncated": True}, None)
+        assert "PARTIAL" in md
+        assert "the scheduler health series" in md  # named in the banner
+        # Marked at the figures themselves, not only in the banner.
+        assert md.index("PARTIAL") < md.index("## Interpretation")
+        assert md.count("PARTIAL") >= 2
+
+    def test_truncated_log_query_is_flagged_and_named(self):
+        logs = {
+            **_LOGS,
+            "queries": {
+                "http_retries_by_service": {
+                    **_LOGS["queries"]["http_retries_by_service"],
+                    "truncated": True,
+                },
+                "s3_slowdown": {**_LOGS["queries"]["s3_slowdown"], "truncated": False},
+            },
+        }
+        md = rep.build_dossier(_args(scheduler=None), None, logs)
+        assert "log query `http_retries_by_service`" in md
+        assert "s3_slowdown" in md and "log query `s3_slowdown`" not in md
+
+    def test_missing_truncated_key_is_treated_as_complete(self):
+        """Older JSON (written before the flag existed) must still render."""
+        assert "PARTIAL" not in rep.build_dossier(_args(), _SCHED, _LOGS)

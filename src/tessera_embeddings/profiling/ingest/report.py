@@ -55,6 +55,38 @@ def _md_table(rows: list[dict], limit: int = 25) -> str:
     return head + sep + body
 
 
+#: Marker appended to any section built from a capped (partial) result set. The
+#: producing tools flag truncation in their JSON (``truncated``); the dossier is
+#: what an operator actually reads, so it must carry the flag through rather than
+#: present a capped series as a full run — the peaks and onsets below a cap are
+#: lower bounds, and a saturation onset may be missing entirely.
+_PARTIAL = "**PARTIAL — hit the Insights row cap; figures below are lower bounds.**"
+
+
+def _truncation_banner(sched: dict | None, logs: dict | None) -> list[str]:
+    """A top-of-dossier warning naming every capped input, or [] when all complete.
+
+    Repeated at the top because the per-section markers are easy to skim past,
+    and a reader who misses the cap draws conclusions ("peaked at 98% CPU, never
+    tripped backlog-growth") from a series that simply stopped early.
+    """
+    capped: list[str] = []
+    if sched is not None and sched.get("truncated"):
+        capped.append("the scheduler health series")
+    for name, q in (logs or {}).get("queries", {}).items():
+        if q.get("truncated"):
+            capped.append(f"log query `{name}`")
+    if not capped:
+        return []
+    return [
+        f"> ⚠️ {_PARTIAL}",
+        ">",
+        f"> Capped inputs: {', '.join(capped)}. Re-run those over a narrower window "
+        "(or a tighter `--stream-prefix`) before treating this dossier as a full-run profile.",
+        "",
+    ]
+
+
 def _scheduler_section(sched: dict | None) -> str:
     if sched is None:
         return "### Scheduler\n\n_No scheduler profile supplied (`--scheduler`)._\n"
@@ -73,6 +105,10 @@ def _scheduler_section(sched: dict | None) -> str:
     lines = [
         "### Scheduler",
         "",
+    ]
+    if sched.get("truncated"):
+        lines += [_PARTIAL, ""]
+    lines += [
         f"- Window: {w['start']} → {w['end']} ({profile['samples']} health samples)",
         f"- Peak CPU: **{pk['cpu']:.0f}%** · peak mem: **{mem}** · peak loop-lag: **{pk['lag']:.1f}s**",
         f"- Peak backlog (no-worker): **{pk['no_worker']}**",
@@ -95,6 +131,8 @@ def _logs_section(logs: dict | None) -> str:
         if rows is None:
             out.append("_query failed (permission/timeout) — see stderr from the run_\n")
         else:
+            if q.get("truncated"):
+                out += [_PARTIAL, ""]
             out.append(_md_table(rows))
         out.append("")
     return "\n".join(out)
@@ -130,9 +168,14 @@ def build_dossier(args: argparse.Namespace, sched: dict | None, logs: dict | Non
         "",
     ]
 
+    # Above the Interpretation prompts on purpose: the operator must know a figure
+    # is a lower bound BEFORE writing a verdict against it.
+    banner = _truncation_banner(sched, logs)
+
     return "\n".join(
         [
             "\n".join(meta),
+            *(["\n".join(banner)] if banner else []),
             "\n".join(interpretation),
             _scheduler_section(sched),
             "",

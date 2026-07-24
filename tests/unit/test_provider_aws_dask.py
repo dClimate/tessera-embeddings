@@ -24,6 +24,11 @@ from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_fixe
 pytest.importorskip("dask_cloudprovider", reason="dask-cloudprovider not installed (AWS extras)")
 
 from tessera_embeddings.config.ingest import IngestSettings
+
+# The consumer of the health line, imported here so a format change and its
+# parser are pinned against each other in one test (see
+# test_emitted_line_parses_with_the_profiling_parser).
+from tessera_embeddings.profiling.ingest.watch_scheduler import parse_health_line
 from tessera_embeddings.providers.aws import dask as dask_mod
 from tessera_embeddings.providers.aws.dask import (
     _RETRYABLE_CLUSTER_START_ERRORS,
@@ -182,6 +187,28 @@ class TestSchedulerResourceLogger:
         plugin._proc.cpu_percent(None)
         plugin._mem_limit_bytes = 8 * 1024**3
         return plugin
+
+    def test_emitted_line_parses_with_the_profiling_parser(self, caplog) -> None:
+        """The heartbeat format and the tool that reads it must not drift apart.
+
+        ``watch_scheduler``'s regex mirrors this plugin's format string by hand.
+        On drift the parser matches nothing, ``--report`` finds zero samples, and
+        the dossier reports "was the heartbeat plugin attached?" — a wrong
+        diagnosis, and one otherwise only discoverable during a live at-scale run.
+        So this parses a REAL emitted line rather than a copy of the format.
+        """
+        plugin = self._make_started()
+        sched = _FakeScheduler(workers_processing=[3, 4], tasks=42, unrunnable=7)
+        line = self._emit(plugin, sched, caplog)
+
+        sample = parse_health_line(line)
+        assert sample is not None, f"watch_scheduler's parser did not match an emitted line: {line!r}"
+        # Every field the tool derives its alerts from must survive the round trip.
+        assert sample["workers"] == 2
+        assert sample["tasks"] == 42
+        assert sample["processing"] == 7  # 3 + 4 in flight
+        assert sample["no_worker"] == 7
+        assert sample["mem"] == pytest.approx(100.0 * plugin._proc.memory_info().rss / (8 * 1024**3), abs=1.0)
 
     def test_line_reports_all_signals(self, caplog) -> None:
         """One probe emits CPU, memory, lag, fds/threads and the task/worker
