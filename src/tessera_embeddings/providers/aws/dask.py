@@ -611,6 +611,7 @@ def ecs_cluster(
     extra_scheduler_env: dict[str, str] | None = None,
     ec2_scheduler: bool = False,
     image: str | None = None,
+    resource_tags: dict[str, str] | None = None,
 ) -> Iterator[ECSCluster]:
     """Provision a Dask cluster backed by AWS Fargate (or hybrid EC2 scheduler).
 
@@ -642,6 +643,11 @@ def ecs_cluster(
             for large-graph planning. Workers still run on Fargate.
             Requires ``EC2_SCHEDULER_CAPACITY_PROVIDER`` env var.
         image: Override Docker image URI for scheduler and workers.
+        resource_tags: Extra tags applied to every AWS resource the cluster
+            creates (scheduler + worker ECS tasks included). The flows tag with
+            their flow-run id so an emergency teardown can find this run's
+            tasks from nothing but the flow_run (see
+            :func:`stop_ecs_tasks_by_tag`).
 
     Yields:
         The :class:`ECSCluster`/``FargateCluster``.
@@ -694,6 +700,8 @@ def ecs_cluster(
         cluster_kwargs["scheduler_mem"] = scheduler_mem
     if image is not None:
         cluster_kwargs["image"] = image
+    if resource_tags:
+        cluster_kwargs["tags"] = dict(resource_tags)
 
     worker_extra_args = ["--death-timeout", "300"]
     if worker_nprocs is not None:
@@ -762,3 +770,47 @@ def ecs_cluster(
     finally:
         log.info("Closing cluster...")
         cluster.close()
+
+
+def stop_ecs_tasks_by_tag(
+    tag_key: str,
+    tag_value: str,
+    *,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+    cluster_arn: str | None = None,
+) -> int:
+    """Stop every running ECS task in the ingest cluster carrying ``tag_key=tag_value``.
+
+    The emergency teardown for a Dask ingest cluster whose owning flow was
+    cancelled or crashed: ``ecs_cluster`` tears down in a ``finally``, which a
+    hard cancel skips (the process is killed first), leaving scheduler + workers
+    running in ECS. The flows tag every cluster resource with their flow-run id
+    (``resource_tags``), so this can find the leak from nothing but that id — the
+    same tag-based pattern as ``ray.terminate_ray_instances_by_tag``. Idempotent:
+    already-stopped tasks simply no longer match.
+
+    ``cluster_arn`` defaults to the module's env contract (``ECS_CLUSTER_ARN``).
+    Returns the number of tasks stopped; 0 with a warning when the env var is
+    absent (nothing to sweep against) rather than raising — the hook must never
+    mask the flow's own terminal state.
+    """
+    import boto3
+
+    arn = cluster_arn or os.environ.get("ECS_CLUSTER_ARN", "")
+    if not arn:
+        log.warning("ECS_CLUSTER_ARN unset — cannot sweep tasks for %s=%s", tag_key, tag_value)
+        return 0
+    ecs = boto3.client("ecs")
+    task_arns: list[str] = []
+    paginator = ecs.get_paginator("list_tasks")
+    for page in paginator.paginate(cluster=arn):
+        task_arns.extend(page.get("taskArns", []))
+    stopped = 0
+    for i in range(0, len(task_arns), 100):  # describe_tasks caps at 100 per call
+        desc = ecs.describe_tasks(cluster=arn, tasks=task_arns[i : i + 100], include=["TAGS"])
+        for task in desc.get("tasks", []):
+            if any(t.get("key") == tag_key and t.get("value") == tag_value for t in task.get("tags", [])):
+                ecs.stop_task(cluster=arn, task=task["taskArn"], reason=f"tessera teardown: {tag_key}={tag_value}")
+                stopped += 1
+    log.warning("Stopped %d ECS task(s) tagged %s=%s", stopped, tag_key, tag_value)
+    return stopped

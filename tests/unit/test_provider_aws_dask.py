@@ -589,3 +589,67 @@ class TestMaybePerformanceReport:
             ran.append(True)
         assert ran == [True]
         assert any("failed to upload" in r.getMessage() for r in caplog.records)
+
+
+class TestStopEcsTasksByTag:
+    """The ingest cluster's emergency teardown: sweep this run's tasks by tag.
+
+    A hard-cancelled flow skips ecs_cluster's `finally`, leaving scheduler +
+    workers running in ECS (the 03S leak: 23 workers + a scheduler). The flows
+    tag every cluster resource with their flow-run id, so the hook finds the
+    leak from nothing but the flow_run argument, in a fresh process.
+    """
+
+    class _FakeEcs:
+        def __init__(self, tagged: dict[str, dict[str, str]]) -> None:
+            self.tagged = tagged  # taskArn -> tags
+            self.stopped: list[str] = []
+
+        def get_paginator(self, name):
+            arns = list(self.tagged)
+
+            class _P:
+                def paginate(self, cluster):
+                    # two pages, to prove pagination is honoured
+                    yield {"taskArns": arns[:1]}
+                    yield {"taskArns": arns[1:]}
+
+            return _P()
+
+        def describe_tasks(self, cluster, tasks, include):
+            assert include == ["TAGS"]
+            return {
+                "tasks": [
+                    {"taskArn": a, "tags": [{"key": k, "value": v} for k, v in self.tagged[a].items()]} for a in tasks
+                ]
+            }
+
+        def stop_task(self, cluster, task, reason):
+            self.stopped.append(task)
+
+    def _sweep(self, monkeypatch, tagged, **kw):
+        fake = self._FakeEcs(tagged)
+        monkeypatch.setenv("ECS_CLUSTER_ARN", "arn:cluster/test")
+        import boto3
+
+        monkeypatch.setattr(boto3, "client", lambda name: fake)
+        n = dask_mod.stop_ecs_tasks_by_tag("tessera-flow-run-id", "run-A", log=logging.getLogger("t"), **kw)
+        return n, fake
+
+    def test_stops_only_this_runs_tasks(self, monkeypatch):
+        tagged = {
+            "arn:task/sched-A": {"tessera-flow-run-id": "run-A"},
+            "arn:task/worker-A": {"tessera-flow-run-id": "run-A", "createdBy": "dask-cloudprovider"},
+            "arn:task/worker-B": {"tessera-flow-run-id": "run-B"},  # another run's cluster: untouched
+            "arn:task/untagged": {},
+        }
+        n, fake = self._sweep(monkeypatch, tagged)
+        assert n == 2
+        assert sorted(fake.stopped) == ["arn:task/sched-A", "arn:task/worker-A"]
+
+    def test_missing_cluster_arn_warns_and_returns_zero(self, monkeypatch, caplog):
+        monkeypatch.delenv("ECS_CLUSTER_ARN", raising=False)
+        with caplog.at_level(logging.WARNING):
+            n = dask_mod.stop_ecs_tasks_by_tag("k", "v", log=logging.getLogger("t"))
+        assert n == 0  # the hook must never mask the flow's own terminal state
+        assert any("ECS_CLUSTER_ARN" in r.getMessage() for r in caplog.records)
