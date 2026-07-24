@@ -1532,6 +1532,60 @@ class TestChainedWorkSource:
         # despite identical labels across the two zones).
         assert sorted(u for u, _ in done) == ["run-zone-a:c0", "run-zone-a:c1", "run-zone-b:c0", "run-zone-b:c1"]
 
+    def test_boundary_wait_is_short_while_source_active(self):
+        """At a zone boundary — source still active, queue drained to the poll
+        trigger — the loop caps the ray.wait short (5s) so the next zone
+        dispatches promptly; blocking the full 60s would idle the fleet up to a
+        GPU-minute per boundary. Once the source is exhausted, the wait is 60s.
+        """
+        actor = MagicMock(name="actor_0")
+        zone_a = self._zone_items("zone-a", ["c0"])
+        zone_b = self._zone_items("zone-b", ["c0"])
+        # `[]` = next zone still ingesting (not ready) — the boundary gap.
+        remaining: list = [zone_a, [], [], zone_b, None]
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        refs: list = []
+        timeouts: list = []
+
+        def fake_process_chunk(*args, **kwargs):
+            ref = MagicMock(name=f"r{len(refs)}")
+            refs.append((ref, args))
+            return ref
+
+        def fake_get(ref, *a, **k):
+            for r, args in refs:
+                if r is ref:
+                    return {"chunk": args[0].label, "status": "ok"}
+            return MagicMock()
+
+        def fake_wait(pending, **kw):
+            timeouts.append(kw.get("timeout"))
+            return ([pending[0]], list(pending[1:]))
+
+        actor.process_chunk.remote.side_effect = fake_process_chunk
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
+            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
+            patch.object(_sched_mod.ray, "kill"),
+            patch.object(_sched_mod.time, "sleep"),
+            patch.object(_sched_mod.ActorPool, "retire_idle"),
+        ):
+            _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=[],
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+                more_work=lambda: remaining.pop(0) if remaining else None,
+            )
+        assert 5 in timeouts  # boundary wait while the source was still active
+        assert 60 in timeouts  # long wait after the source was exhausted
+
     def test_retirement_suppressed_until_source_exhausted(self):
         actor = MagicMock(name="actor_0")
         zone_a = self._zone_items("zone-a", ["c0"])

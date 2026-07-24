@@ -1063,8 +1063,15 @@ def _process_chunks_work_stealing(
                     "Work source added %d chunk(s) (queue now %d, total %d)", len(fetched), len(chunk_queue), n_total
                 )
         if pool.pending:
-            # Block up to 60s for any one chunk to finish.
-            ready_refs, _ = ray.wait(list(pool.pending.keys()), num_returns=1, timeout=60)
+            # Block for any one chunk to finish. At a zone boundary — source still
+            # active and the queue drained to the poll trigger — the next zone may
+            # become ready momentarily, so cap the wait short: blocking the full
+            # 60s on a single tail task would idle the rest of the fleet up to a
+            # GPU-minute at every boundary. Otherwise (source exhausted, or a deep
+            # queue keeping actors busy) the long wait is fine.
+            at_boundary = source_active and len(chunk_queue) <= pool.live_count
+            wait_timeout = 5 if at_boundary else 60
+            ready_refs, _ = ray.wait(list(pool.pending.keys()), num_returns=1, timeout=wait_timeout)
         else:
             # Nothing in-flight but chunks are queued for initializing actors.
             # Sleep briefly then check if any actors are ready.

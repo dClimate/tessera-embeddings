@@ -90,6 +90,12 @@ if TYPE_CHECKING:
 # Ingests run tens of minutes, so this granularity is noise there; shutdown
 # doesn't wait on it (pollers wake immediately via the _stopping event).
 _INGEST_POLL_S = 15.0
+# Consecutive read_flow_run errors tolerated before a poller gives up. A
+# transient Prefect API/network blip must not fail the ingest wait (or, worse,
+# deregister a still-running child so shutdown can no longer cancel it); we
+# retry across it. A PERSISTENT failure eventually raises — leaving the id
+# registered so shutdown's sweep can still reach the live child.
+_INGEST_POLL_MAX_ERRORS = 10
 
 
 class _DeploymentCellInputs:
@@ -160,17 +166,42 @@ class _DeploymentCellInputs:
         )
         with self._lock:
             self._inflight[(zone, year)] = run.id
-        try:
-            run = self._poll_until_terminal(run.id, f"{zone}-{year}")
-        finally:
-            with self._lock:
-                self._inflight.pop((zone, year), None)
+        run = self._poll_until_terminal(run.id, f"{zone}-{year}")
+        # Deregister ONLY after a CONFIRMED terminal state. A transient poll
+        # error or a shutdown-abandon raises above WITHOUT reaching here, so the
+        # id stays in _inflight and shutdown's sweep (and the abandon-cancel
+        # below) can still reach a child that is still running server-side.
+        with self._lock:
+            self._inflight.pop((zone, year), None)
         _check_completed(run, f"ingest {zone}-{year}")
 
     def _poll_until_terminal(self, flow_run_id: Any, label: str) -> Any:  # noqa: ANN401 — Prefect FlowRun
+        errors = 0
         with get_client(sync_client=True) as client:
             while not self._stopping.is_set():
-                run = client.read_flow_run(flow_run_id)
+                try:
+                    run = client.read_flow_run(flow_run_id)
+                except Exception:
+                    # Transient API/network blip: retry rather than fail the
+                    # ingest wait — and never deregister here, so the id stays
+                    # visible to shutdown. Give up only after a persistent run.
+                    errors += 1
+                    self._log.warning(
+                        "Error polling ingest %s (%s), attempt %d/%d — retrying",
+                        label,
+                        flow_run_id,
+                        errors,
+                        _INGEST_POLL_MAX_ERRORS,
+                        exc_info=True,
+                    )
+                    if errors >= _INGEST_POLL_MAX_ERRORS:
+                        raise RuntimeError(
+                            f"ingest {label}: gave up after {errors} consecutive poll errors "
+                            f"(run {flow_run_id} may still be live — left for the shutdown sweep)"
+                        ) from None
+                    self._stopping.wait(_INGEST_POLL_S)
+                    continue
+                errors = 0
                 if run.state is not None and run.state.is_final():
                     return run
                 self._stopping.wait(_INGEST_POLL_S)

@@ -291,11 +291,39 @@ def fill_zones_sequential(
     # fallback; cap how many budget slots they may sit on so at least one slot
     # keeps cycling for the stream (all held → feeder deadlock).
     max_deferred_retained = look_ahead + 1
+    # A FAILED cell keeps its mosaic (for the retry's staged resume) but frees
+    # its budget slot — otherwise a systematic failure deadlocks the feeder (no
+    # cell ever succeeds to free a slot). But freeing every failed slot lets a
+    # systematic failure ADMIT and retain every shard's multi-TB mosaic,
+    # bypassing the budget the other way. So retained failures are counted, and
+    # once they reach this cap the feeder stops admitting new cells (the run
+    # then winds down and fails on the recorded failures). Bounded either way.
+    retained_failed: set[tuple[str, int]] = set()
+    max_retained_failures = look_ahead + 2
     finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
 
     def _release_mosaic(cell: SequentialCell) -> None:
         if budget is not None:
             budget.release((cell.zone, cell.year))
+
+    def _retain_failed_mosaic(cell: SequentialCell) -> None:
+        """A failed cell frees its budget slot (no deadlock) but keeps its mosaic
+        (staged resume) — counted so a systematic failure can't accumulate every
+        shard's mosaic off-budget (the feeder stops at ``max_retained_failures``).
+        """
+        if budget is None:
+            return
+        with lock:
+            retained_failed.add((cell.zone, cell.year))
+            n = len(retained_failed)
+        budget.release((cell.zone, cell.year))
+        log.warning(
+            "Cell %s-%d failed — mosaic retained for resume, off-budget (%d/%d retained-failure cap)",
+            cell.zone,
+            cell.year,
+            n,
+            max_retained_failures,
+        )
 
     def _record_failure(cell: SequentialCell, phase: str, exc: BaseException) -> None:
         with lock:
@@ -350,23 +378,35 @@ def fill_zones_sequential(
         except Exception as exc:
             _record_failure(cell, "assembly", exc)
         finally:
-            if not cleaned and budget is not None:
-                # The retained mosaic (kept for the retry's staged resume) now
-                # sits OUTSIDE the budget — a slot held forever would starve the
-                # feeder into deadlock. Say so instead of silently exceeding.
-                log.warning(
-                    "Cell %s-%d failed — its mosaic is retained for resume and no longer counts "
-                    "against the mosaic budget",
-                    cell.zone,
-                    cell.year,
-                )
-            _release_mosaic(cell)
+            # Success → free the slot (clean); failure → retain the mosaic for
+            # resume but free + COUNT the slot (bounded by the retained-failure
+            # cap the feeder checks). Both free the slot exactly once.
+            if cleaned:
+                _release_mosaic(cell)
+            else:
+                _retain_failed_mosaic(cell)
             zone_slots.release()
 
     def _feed() -> None:
         """Walk cells in order: inputs → prepare → plan → scan → enqueue."""
         try:
             for i, cell in enumerate(cells):
+                # Stop admitting once too many failed cells are retaining mosaics
+                # off-budget: a systematic failure would otherwise keep freeing
+                # slots and pile up every shard's multi-TB input. The in-flight
+                # cells finish and the run fails on the recorded failures; the
+                # unattempted cells stay pending for the next campaign pass.
+                with lock:
+                    n_failed = len(retained_failed)
+                if budget is not None and n_failed >= max_retained_failures:
+                    log.error(
+                        "Retained-failure cap reached (%d failed cell(s) holding mosaics off-budget) — "
+                        "stopping the feeder before admitting more ingests; %d cell(s) left unattempted "
+                        "(they stay pending for the next campaign pass). Likely a systematic failure — investigate.",
+                        n_failed,
+                        len(cells) - i,
+                    )
+                    return
                 _start_lookahead(i)
                 # Bounded admission; poll so a crashed session unwinds us.
                 while not zone_slots.acquire(timeout=1.0):
@@ -388,7 +428,7 @@ def fill_zones_sequential(
                         zone_slots.release()
                         return
                     _record_failure(cell, "inputs/prepare", exc)
-                    _release_mosaic(cell)  # mosaic (if any) retained, off-budget
+                    _retain_failed_mosaic(cell)  # mosaic (if any) retained for resume, counted
                     zone_slots.release()
                     continue
                 if prep.config.s1_orbit != session_s1_orbit:
@@ -446,7 +486,7 @@ def fill_zones_sequential(
                     )
                 except Exception as exc:
                     _record_failure(cell, "plan", exc)
-                    _release_mosaic(cell)  # mosaic retained for resume, off-budget
+                    _retain_failed_mosaic(cell)  # mosaic retained for resume, counted
                     zone_slots.release()
                     continue
                 live = [c for c in zplan.live if c.label not in already]

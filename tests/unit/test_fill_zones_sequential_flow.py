@@ -439,3 +439,67 @@ def test_flow_registers_child_ingest_sweep_on_cancel_and_crash():
     flow = mod.fill_zones_sequential_flow
     assert mod._cancel_child_ingests_on_cancellation in flow.on_cancellation_hooks
     assert mod._cancel_child_ingests_on_cancellation in flow.on_crashed_hooks
+
+
+class _FlakyClient(_FakeClient):
+    """read_flow_run raises `errors` times, then returns a terminal run."""
+
+    def __init__(self, errors: int, terminal_state):
+        super().__init__([terminal_state])
+        self._errors_left = errors
+        self.reads = 0
+
+    def read_flow_run(self, fr_id):
+        self.reads += 1
+        if self._errors_left > 0:
+            self._errors_left -= 1
+            raise ConnectionError("transient prefect api blip")
+        return SimpleNamespace(id=fr_id, state=self._states[0])
+
+
+def test_poll_retries_transient_errors_then_completes(monkeypatch):
+    """A transient read error must NOT fail the ingest wait — the poller retries
+    across it and the id stays registered throughout (visible to shutdown).
+    """
+    from prefect.states import StateType
+
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.001)
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-4", state=None)
+    )
+    client = _FlakyClient(errors=3, terminal_state=_state(StateType.COMPLETED, final=True))
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    adapter = _adapter()
+    try:
+        adapter.wait("33N", 2025)  # succeeds despite 3 transient errors
+        assert client.reads == 4  # 3 errors + 1 terminal read
+        assert adapter._inflight == {}  # deregistered only after the terminal read
+    finally:
+        adapter.shutdown()
+
+
+def test_poll_error_keeps_id_registered_for_shutdown(monkeypatch):
+    """A persistent poll failure gives up — but must leave the child id in
+    _inflight so shutdown can still cancel the live server-side run.
+    """
+    from prefect.states import StateType
+
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.001)
+    monkeypatch.setattr(mod, "_INGEST_POLL_MAX_ERRORS", 3)
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-5", state=None)
+    )
+
+    class _AlwaysErrors(_FakeClient):
+        def read_flow_run(self, fr_id):
+            raise ConnectionError("prefect api down")
+
+    client = _AlwaysErrors([_state(StateType.RUNNING, final=False)])
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    adapter = _adapter()
+    adapter.start("33N", 2025)
+    with pytest.raises(RuntimeError, match="gave up after"):
+        adapter._futures[("33N", 2025)].result(timeout=5)
+    assert ("33N", 2025) in adapter._inflight  # NOT deregistered → shutdown can sweep it
+    adapter.shutdown()
+    assert ("fr-5", StateType.CANCELLING) in client.cancelled

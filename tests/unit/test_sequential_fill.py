@@ -427,3 +427,37 @@ def test_lookahead_does_not_deadlock_on_early_deferrals():
     assert result["summary"]["deferred_orbit_mismatch"] == 2
     assert calls == ["01N", "02N"]
     assert inputs.high_water <= 3  # the bound still held throughout
+
+
+def test_systematic_failure_stops_feeder_at_retained_cap():
+    """A run that fails EVERY cell must not free-then-retain every shard's mosaic:
+    once retained failures reach look_ahead + 2, the feeder stops admitting, so
+    peak retained mosaics stays bounded rather than growing to the whole shard.
+    """
+    events: list[str] = []
+    inputs = BudgetProbeInputs(events)
+    with pytest.raises(RuntimeError, match="cell"):
+        # 12 cells, all fail inference; look_ahead=1 → retained-failure cap = 3.
+        _run(_cells(12), session=_sync_session(fail={f"{i + 1:02d}N" for i in range(12)}), inputs=inputs, look_ahead=1)
+    # The feeder stopped admitting once the cap was reached, so it never started
+    # every shard's ingest. Retained-but-uncleaned mosaics DO exceed the active
+    # budget by design (kept for resume) but stay bounded ~ cap + in-flight, NOT
+    # the whole 12-cell shard.
+    started = len([e for e in events if e.startswith("start:")])
+    assert started < 12  # stopped early — the essential guarantee
+    assert started <= 2 * (1 + 2) + 2  # bounded ~ cap + in-flight, not shard size
+    assert inputs.high_water == started  # nothing cleaned — every started mosaic retained
+    assert "cleanup:" not in "".join(events)
+
+
+def test_sporadic_failures_below_cap_do_not_stop_the_run():
+    """A couple of failures under the cap must NOT halt the feeder — every cell
+    is still attempted (only a systematic failure trips the early stop).
+    """
+    events: list[str] = []
+    inputs = BudgetProbeInputs(events)
+    with pytest.raises(RuntimeError, match="2/8 cell"):
+        _run(_cells(8), session=_sync_session(fail={"03N", "06N"}), inputs=inputs, look_ahead=2)
+    # All 8 admitted (2 failed, 6 cleaned) — the run wasn't cut short.
+    assert len([e for e in events if e.startswith("start:")]) == 8
+    assert len([e for e in events if e.startswith("cleanup:")]) == 6
