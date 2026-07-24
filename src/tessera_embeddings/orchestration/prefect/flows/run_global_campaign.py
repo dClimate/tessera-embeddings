@@ -559,7 +559,7 @@ async def run_global_campaign(
             ami_id_cache.append(_resolve_ami_id(ami_ssm_name, None))
         return ami_id_cache[0]
 
-    def _fill_params(zone: str, year: int, run_id: str) -> dict[str, Any]:
+    def _fill_params(zone: str, year: int, run_id: str, *, needs_cluster: bool) -> dict[str, Any]:
         return {
             "zone": zone,
             "year": year,
@@ -572,7 +572,15 @@ async def run_global_campaign(
             "ami_ssm_name": ami_ssm_name,
             # Pin the exact image the staging fingerprint recorded (see _ami_id), so
             # the fill can't re-resolve ami_ssm_name to a re-baked AMI mid-campaign.
-            "ami_id": _ami_id(),
+            #
+            # ONLY for a cell that will actually start Ray. Retag-only and all-ocean
+            # cells never provision, and _code_identity is deliberately lazy for the
+            # same reason: a pure tag-repair or all-ocean campaign should need no SSM
+            # read at all, and resolving here would make one — turning a missing
+            # parameter or an SSM-less role into a failure on precisely the cheap
+            # recovery path that has no use for the answer. None leaves the fill's own
+            # fallback in place, which those cells never reach either.
+            "ami_id": _ami_id() if needs_cluster else None,
             "store_name": store_name,
             "mask_name": mask_name,
             "num_actors": num_actors,
@@ -659,7 +667,10 @@ async def run_global_campaign(
                     s3_region=s3_region,
                 )
             async with fill_sem:  # bound concurrent fills (hence Ray clusters) within a year
-                frun = await arun_deployment(fill_deployment, parameters=_fill_params(zone, year, run_id))
+                frun = await arun_deployment(
+                    fill_deployment,
+                    parameters=_fill_params(zone, year, run_id, needs_cluster=not (retag_only or empty_cell)),
+                )
                 _check_completed(frun, f"fill {zone}-{year}")
             # Only delete a mosaic THIS campaign produced: with ingest=False the mosaic
             # is an upstream input we must not remove; an empty cell produced none.

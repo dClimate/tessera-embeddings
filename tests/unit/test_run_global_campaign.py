@@ -477,3 +477,39 @@ def test_both_strategies_pin_the_resolved_ami_id(wired):
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
     chained = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
     assert chained["ami_id"] == "ami-test-id"
+
+
+class TestAmiIsResolvedOnlyForCellsThatStartRay:
+    """A cell that never provisions Ray must not force an SSM read.
+
+    ``_code_identity`` is deliberately lazy so a pure tag-repair or all-ocean
+    campaign makes no AWS call; pinning the AMI into every dispatch would undo
+    that and turn a missing parameter — or a role without SSM access — into a
+    failure on exactly the cheap recovery path that has no use for the answer.
+    """
+
+    def _no_ssm(self, monkeypatch):
+        def _boom(*a, **k):
+            raise AssertionError("a cell that starts no cluster must not resolve the AMI")
+
+        monkeypatch.setattr(mod, "_resolve_ami_id", _boom)
+
+    def test_retag_only_cell_neither_resolves_nor_pins(self, wired, monkeypatch):
+        self._no_ssm(monkeypatch)
+        monkeypatch.setattr(
+            mod, "campaign_status", lambda *a, **k: SimpleNamespace(zones={"33N": (2025,)}, has=lambda z, y: True)
+        )
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
+        assert fill["run_id"].endswith("-retag")
+        assert fill["ami_id"] is None
+        # The SSM pointer still travels, so the fill's own fallback stays available.
+        assert fill["ami_ssm_name"] == "ami"
+
+    def test_all_ocean_cell_neither_resolves_nor_pins(self, wired, monkeypatch):
+        self._no_ssm(monkeypatch)
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: False)
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
+        assert fill["run_id"].endswith("-empty")
+        assert fill["ami_id"] is None
