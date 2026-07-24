@@ -62,6 +62,8 @@ def wired(monkeypatch):
     # Immutable code identity (AMI ID + tarball ETag) — mocked so tests make no
     # SSM/S3 call; resolved once per run and folded into each cell's run_id.
     monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a: "ami=ami-test")
+    # Same for the AMI pointer, which an unpinned (direct, non-campaign) run resolves.
+    monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a: "ami-resolved")
 
     def fake_sequential(**kwargs):
         rec["seq_kwargs"] = kwargs
@@ -131,6 +133,19 @@ def test_pinned_ami_id_reaches_ray_cluster(wired):
     """
     _run(ami_id="ami-pinned-01")
     assert wired["ray_kwargs"]["ami_id"] == "ami-pinned-01"
+
+
+def test_unpinned_ami_is_resolved_once_and_reused(wired, monkeypatch):
+    """Called direct (no campaign pin), the SSM pointer is read once.
+
+    Resolving separately for the fingerprint and for ray_cluster would let a re-bake
+    between the two boot an image the staging prefix was not fingerprinted against.
+    """
+    calls: list = []
+    monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a: calls.append(a) or "ami-resolved")
+    _run(ami_id=None)
+    assert len(calls) == 1
+    assert wired["ray_kwargs"]["ami_id"] == "ami-resolved"
 
 
 def test_ingest_false_passes_no_inputs_adapter(wired):

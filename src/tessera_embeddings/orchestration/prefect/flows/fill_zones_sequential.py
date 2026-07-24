@@ -60,6 +60,7 @@ from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
 )
 from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import (
     _ingest_dispatch_params,
+    _resolve_ami_id,
     _resolve_code_identity,
     _staging_run_id,
 )
@@ -576,8 +577,12 @@ def fill_zones_sequential_flow(
     # must start fresh staging prefixes), and resolved in the Ray provisioning
     # region (None → us-west-2), not the storage `s3_region`. Placed after the
     # no-live-cells early return so triage-only runs make no AWS call.
-    # Pin the AMI component to the same id the cluster boots (ami_id, below), so this
-    # flow's own staging fingerprint and its provisioned image can't disagree.
+    # Pin the AMI component to the same id the cluster boots, so this flow's own
+    # staging fingerprint and its provisioned image can't disagree. Called direct
+    # (not via run-global-campaign) ami_id is None, and leaving it None would read the
+    # SSM pointer twice — here and again in ray_cluster — so a re-bake landing between
+    # them boots a different image than the prefix was fingerprinted against.
+    ami_id = ami_id or _resolve_ami_id(ami_ssm_name, None)
     code_identity = _resolve_code_identity(ami_ssm_name, code_bucket, code_suffix, None, ami_id)
 
     def _prepare(cell: SequentialCell) -> PreparedCell:
