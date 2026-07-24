@@ -6,10 +6,10 @@ how correctness was preserved, and the gotchas future work must respect. This is
 the empirical basis for why the pipeline looks the way it does.
 
 **Complete per-run data + staging run-id mapping:
-[`scripts/inference_perf/RUNS.md`](../../scripts/inference_perf/RUNS.md).** Raw
+[`scripts/profiling/inference/RUNS.md`](../../scripts/profiling/inference/RUNS.md).** Raw
 telemetry (TIMING / RESOURCES / EFFECTIVE-TFLOPS lines) survives in CloudWatch
 (`/ec2/yield-embeddings/ray`); reproduce fleet stats with
-`scripts/inference_perf/observe_cluster.py` (`--report`, `--ram-report`).
+`scripts/profiling/inference/observe_cluster.py` (`--report`, `--ram-report`).
 
 Hardware: g6e.xlarge — 1× L40S (181 TFLOPS BF16 dense, 46 GB VRAM, 864 GB/s),
 4 vCPU, 30.9 GB usable RAM, 250 GB NVMe. Iowa ROI, 2000×2000 chunks.
@@ -19,7 +19,7 @@ Hardware: g6e.xlarge — 1× L40S (181 TFLOPS BF16 dense, 46 GB VRAM, 864 GB/s),
 Numbers below are the **final shipped state**: the phase-5 run `a60550ae`
 (bounded cross-chunk starter prefetch — the last optimization on the branch).
 `main` is the batch-3584 baseline `a85be572e2fb`. Both single runs; see
-[RUNS.md](../../scripts/inference_perf/RUNS.md) for the per-phase progression.
+[RUNS.md](../../scripts/profiling/inference/RUNS.md) for the per-phase progression.
 
 | metric | `main` baseline (batch 3584) | shipped (branch, batch 7168) |
 |---|---|---|

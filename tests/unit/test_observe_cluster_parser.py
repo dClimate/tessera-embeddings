@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "inference_perf" / "observe_cluster.py"
+_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "profiling" / "inference" / "observe_cluster.py"
 
 # A 2-strip chunk whose per-strip ds sum (100) disagrees with the actor's
 # chunk-total complete line (2500) — the exact multi-strip under-count. Built

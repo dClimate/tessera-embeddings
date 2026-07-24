@@ -22,8 +22,8 @@ from tessera_embeddings.inference.actors import _chunk_summary_line
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-OBSERVE_CLUSTER = REPO_ROOT / "scripts" / "inference_perf" / "observe_cluster.py"
-COMPARE_COARSENED = REPO_ROOT / "scripts" / "inference_perf" / "compare_coarsened_stores.py"
+OBSERVE_CLUSTER = REPO_ROOT / "scripts" / "profiling" / "inference" / "observe_cluster.py"
+COMPARE_COARSENED = REPO_ROOT / "scripts" / "profiling" / "inference" / "compare_coarsened_stores.py"
 
 
 def _load_script(path: Path, name: str):

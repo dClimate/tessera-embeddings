@@ -71,7 +71,7 @@ full-ROI proof; the Phase 4 entry below extends it to 25 windows / 2.23M px.
 Compare with:
 
 ```
-AWS_PROFILE=yield python scripts/inference_perf/compare_outputs.py \
+AWS_PROFILE=yield python scripts/profiling/inference/compare_outputs.py \
   s3://arbol-tessera-embeddings-dev/staging/<ref_run_id> \
   s3://arbol-tessera-embeddings-dev/staging/<test_run_id> \
   [--labels chunk_0_0,chunk_0_2,...]
