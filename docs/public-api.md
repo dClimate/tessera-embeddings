@@ -66,6 +66,13 @@ rather than re-exported from the top-level package:
 - `tessera_embeddings.architecture_tests` — reusable architecture-rule
   checker. Run via
   `python -m tessera_embeddings.architecture_tests --source path/`.
+- `tessera_embeddings.profiling` — operator profiling harnesses for the
+  ingest (Dask scheduler) and inference (Ray GPU) stages. Installed as
+  console scripts: `te-watch-scheduler`, `te-ingest-log-queries`,
+  `te-ingest-report`, `te-observe-cluster`, `te-compare-outputs`,
+  `te-compare-stores`; each also runs as
+  `python -m tessera_embeddings.profiling.<stage>.<tool>`. The AWS-facing
+  ones need the `aws` extra. See `profiling/README.md`.
 - `tessera_embeddings.storage` — Icechunk/Zarr store management:
   `zarr_store` (open / create / append / region-write) and
   `empty_store` (all-fill store seeding — `create_empty_store`,

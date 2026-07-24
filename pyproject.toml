@@ -79,6 +79,10 @@ aws = [
     "prefect-aws",
     # Serves the Dask scheduler dashboard (port-forwarded over SSM).
     "bokeh",
+    # Imported at module scope by providers/aws/dask.py (the scheduler health
+    # plugin). It arrives transitively via distributed, but the import is ours,
+    # so declare it rather than rely on a dependency's dependency.
+    "psutil",
 ]
 all = [
     "tessera_embeddings[inference,prefect,aws]",
@@ -121,6 +125,20 @@ torch = { index = "pytorch-cpu" }
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+# Operator profiling commands (tessera_embeddings.profiling). Each binds to an
+# existing `main(argv) -> int`; every one is equally runnable as
+# `python -m tessera_embeddings.profiling.<stage>.<tool>`, which is what a
+# checkout uses. The te-* prefix keeps them namespaced on a shared PATH.
+# The three AWS-facing ones (watch-scheduler, ingest-log-queries,
+# observe-cluster) need the `aws` extra for boto3.
+[project.scripts]
+te-watch-scheduler = "tessera_embeddings.profiling.ingest.watch_scheduler:main"
+te-ingest-log-queries = "tessera_embeddings.profiling.ingest.ingest_log_queries:main"
+te-ingest-report = "tessera_embeddings.profiling.ingest.report:main"
+te-observe-cluster = "tessera_embeddings.profiling.inference.observe_cluster:main"
+te-compare-outputs = "tessera_embeddings.profiling.inference.compare_outputs:main"
+te-compare-stores = "tessera_embeddings.profiling.inference.compare_coarsened_stores:main"
 
 [build-system]
 requires = ["hatchling"]

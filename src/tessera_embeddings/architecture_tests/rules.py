@@ -85,7 +85,15 @@ DEFAULT_RULES: tuple[Rule, ...] = (
         # boto3 is the AWS SDK; it must stay confined to providers/aws/
         # so closed-source clouds and on-prem deployments don't transitively
         # pull AWS in.
-        allowed_path_prefixes=("providers/aws/",),
+        #
+        # profiling/ is the one other exception: operator CLIs that read
+        # CloudWatch/ECS/EC2 to profile a live run. The invariant this rule
+        # protects still holds — no library code imports profiling/, so the
+        # subpackage is only loaded when someone runs a profiling command, and
+        # boto3 stays in the optional `aws` extra. Confining these tools to
+        # providers/aws/ instead would split each harness across two trees for
+        # no gain in isolation.
+        allowed_path_prefixes=("providers/aws/", "profiling/"),
     ),
     Rule(
         name="no-botocore-outside-aws-provider",

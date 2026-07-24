@@ -17,7 +17,7 @@ Workers are discovered by the Ray autoscaler's own EC2 tags
 cluster works. Point the tool at a deployment with:
 
 ```
-python scripts/profiling/inference/observe_cluster.py \
+te-observe-cluster \
   --profile <aws-profile> --region <region> \
   --cluster <exact-ray-cluster-name>        # or --cluster-prefix <base-name>
   --log-group </ec2/.../ray>                # that deployment's CW log group

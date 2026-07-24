@@ -14,9 +14,9 @@ system of record behind the prose.
 
 Usage::
 
-    python scripts/profiling/ingest/watch_scheduler.py ... --report > sched.json
-    python scripts/profiling/ingest/ingest_log_queries.py ... > logs.json
-    python scripts/profiling/ingest/report.py \
+    te-watch-scheduler ... --report > sched.json
+    te-ingest-log-queries ... > logs.json
+    te-ingest-report \
         --scheduler sched.json --logs logs.json \
         --run-id abc123 --zone 32633 --year 2025 --max-workers 500 \
         --perf-report s3://.../perf.html --out dossier.md

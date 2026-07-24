@@ -11,7 +11,6 @@ work against any run:
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import logging
 import subprocess
@@ -20,26 +19,12 @@ from pathlib import Path
 
 from tessera_embeddings.inference.actors import _chunk_summary_line
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-OBSERVE_CLUSTER = REPO_ROOT / "scripts" / "profiling" / "inference" / "observe_cluster.py"
-COMPARE_COARSENED = REPO_ROOT / "scripts" / "profiling" / "inference" / "compare_coarsened_stores.py"
-
-
-def _load_script(path: Path, name: str):
-    """Import a scripts/ module by path (scripts/ is not a package)."""
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    # Register before exec: @dataclass resolves field types via
-    # sys.modules[cls.__module__], which is absent for a bare exec_module.
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+from tessera_embeddings.profiling.inference import compare_coarsened_stores, observe_cluster
 
 
 def _load_phase_parser() -> str:
-    """Import observe_cluster.py by path (scripts/ is not a package)."""
-    return _load_script(OBSERVE_CLUSTER, "observe_cluster").PHASE_PARSER
+    """The worker-side parser source that observe_cluster ships over SSM."""
+    return observe_cluster.PHASE_PARSER
 
 
 def _run_parser(logs_dir: Path) -> str:
@@ -201,7 +186,7 @@ class TestCoarsenedCompare:
     """compare_coarsened_stores: chunk-aligned sampling, dim-aware selection, structure gate."""
 
     def test_row_slabs_sampling_is_chunk_aligned(self) -> None:
-        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        mod = compare_coarsened_stores
         slabs = mod._row_slabs(1000, sample_rows=10)  # ROW_BLOCK=384 → chunks 0,1,2
         starts = [s.start for s, _ in slabs]
         assert starts == sorted(set(starts))  # each backing chunk read at most once
@@ -213,7 +198,7 @@ class TestCoarsenedCompare:
     def test_sampled_compare_selects_northing_rows(self) -> None:
         import numpy as np
 
-        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        mod = compare_coarsened_stores
         base = np.arange(8 * 4 * 2, dtype="float32").reshape(8, 4, 2)
         rows = mod._row_slabs(8, sample_rows=3)  # → rows 0, 3, 7 (one slab)
         ref = _make_coarse_ds(base)
@@ -230,7 +215,7 @@ class TestCoarsenedCompare:
         """A time-less store still selects northing rows (positional indexing would not)."""
         import numpy as np
 
-        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        mod = compare_coarsened_stores
         base = np.arange(8 * 4 * 2, dtype="float32").reshape(8, 4, 2)
         rows = mod._row_slabs(8, sample_rows=3)
         ref = _make_coarse_ds(base, with_time=False)
@@ -241,7 +226,7 @@ class TestCoarsenedCompare:
     def test_var_structure_flags_dtype_mismatch(self) -> None:
         import numpy as np
 
-        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        mod = compare_coarsened_stores
         base = np.zeros((4, 4, 2), dtype="float32")
         ref = _make_coarse_ds(base)
         test = _make_coarse_ds(base)
@@ -254,7 +239,7 @@ class TestCoarsenedCompare:
         """A var without a northing dim reads whole instead of crashing on isel(northing=…)."""
         import numpy as np
 
-        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        mod = compare_coarsened_stores
         base = np.zeros((4, 4, 2), dtype="float32")
         ref = _make_coarse_ds(base)
         ref["aux"] = 5.0  # scalar (0-d) data var — no northing dim
@@ -269,7 +254,7 @@ class TestCoarsenedCompare:
         """inf-inf=NaN must not poison the abs-diff stats when a store has infinities."""
         import numpy as np
 
-        mod = _load_script(COMPARE_COARSENED, "compare_coarsened_stores")
+        mod = compare_coarsened_stores
         a = np.array([[1.0, np.inf, 3.0]], dtype="float32")
         b = np.array([[1.0, np.inf, 3.5]], dtype="float32")
         cmp = mod.VarComparison(name="x", dtype="float32")

@@ -76,7 +76,7 @@ logger = logging.getLogger(__name__)
 def _chunk_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogeneous JSON payload
     """One machine-readable per-chunk line for the profiling tools.
 
-    ``scripts/profiling/inference/observe_cluster.py --report`` parses these in
+    ``te-observe-cluster --report`` parses these in
     preference to prose log lines (whose wording drifts across branches and
     silently breaks regex parsers). Keep the keys stable — or update that
     parser in the same change.

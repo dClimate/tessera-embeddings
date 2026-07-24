@@ -27,9 +27,9 @@ reachable via ``--cluster``/``--cluster-prefix`` regardless of naming scheme.
 Usage::
 
     # any deployment: pass the profile/region/log-group for that account
-    python scripts/profiling/inference/observe_cluster.py --profile yield --start-pollers
+    te-observe-cluster --profile yield --start-pollers
     # ...let the run process a few chunks...
-    python scripts/profiling/inference/observe_cluster.py --profile yield --report
+    te-observe-cluster --profile yield --report
     # after a run (cluster gone): peak/spike RAM + fleet util from CloudWatch
     python .../observe_cluster.py --profile yield --ram-report \
         --log-group /ec2/yield-embeddings/ray \

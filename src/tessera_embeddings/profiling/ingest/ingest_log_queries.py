@@ -22,10 +22,10 @@ The patterns key off real log markers in the ingest path:
 
 Usage::
 
-    python scripts/profiling/ingest/ingest_log_queries.py --profile global-tessera-dev \
+    te-ingest-log-queries --profile global-tessera-dev \
         --since 2026-07-24T18:00 --until 2026-07-24T20:30            # all queries -> JSON
-    python scripts/profiling/ingest/ingest_log_queries.py ... --query http_retries_by_service
-    python scripts/profiling/ingest/ingest_log_queries.py --list    # names + descriptions
+    te-ingest-log-queries ... --query http_retries_by_service
+    te-ingest-log-queries --list    # names + descriptions
 
 Only needs CloudWatch Logs read access. The log group is shared across ingest
 runs — scope the window tightly to the run of interest.
@@ -128,7 +128,7 @@ def _parse_ts(s: str) -> int:
 def _insights_query(logs: object, log_group: str, query: str, start_epoch: int, end_epoch: int) -> list[dict] | None:
     """Run one CloudWatch Insights query and return its rows (None on failure).
 
-    Bounded poll, mirroring scripts/profiling/inference/observe_cluster.py: break
+    Bounded poll, mirroring src/tessera_embeddings/profiling/inference/observe_cluster.py: break
     on any terminal status and cap total wait so a stuck query can't spin forever.
     """
     qid = logs.start_query(

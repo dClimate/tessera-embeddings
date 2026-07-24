@@ -13,12 +13,36 @@ harnesses are deployment-agnostic; you pass the profile / region / log group).
 ## Which one do I want?
 
 - **"Is the ingest scheduler falling behind at N workers?"** → `ingest/` —
-  `watch_scheduler.py` (live scheduler heartbeat → JSON + alerts),
-  `ingest_log_queries.py` (429/503/retry/worker-exit aggregates across every
-  worker stream), `report.py` (assemble the per-run dossier).
+  `te-watch-scheduler` (live scheduler heartbeat → JSON + alerts),
+  `te-ingest-log-queries` (429/503/retry/worker-exit aggregates across every
+  worker stream), `te-ingest-report` (assemble the per-run dossier).
 - **"Are the GPUs busy? are workers OOMing?"** → `inference/` —
-  `observe_cluster.py` (live GPU/RAM pollers + post-hoc CloudWatch rollups),
-  plus the `compare_*` output-equivalence gates.
+  `te-observe-cluster` (live GPU/RAM pollers + post-hoc CloudWatch rollups),
+  plus the `te-compare-*` output-equivalence gates.
+
+## Invocation
+
+Every tool is installed as a console script, so any project depending on this
+library gets them on `PATH` — no checkout or path juggling:
+
+| Command | Module under `tessera_embeddings.profiling` |
+| --- | --- |
+| `te-watch-scheduler` | `ingest.watch_scheduler` |
+| `te-ingest-log-queries` | `ingest.ingest_log_queries` |
+| `te-ingest-report` | `ingest.report` |
+| `te-observe-cluster` | `inference.observe_cluster` |
+| `te-compare-outputs` | `inference.compare_outputs` |
+| `te-compare-stores` | `inference.compare_coarsened_stores` |
+
+Each is equally runnable from a checkout as
+`python -m tessera_embeddings.profiling.<stage>.<tool>`, which is what to use
+when iterating on the tools themselves.
+
+The three AWS-facing tools read CloudWatch, ECS and EC2, so they need the `aws`
+extra (`pip install tessera_embeddings[aws]`) for boto3; the comparison gates
+need only the base install. Nothing in the library imports this subpackage, so
+an ordinary `import tessera_embeddings` never pulls a cloud SDK in on its
+account — the tools load only when a command runs.
 
 ## Why they are separate
 

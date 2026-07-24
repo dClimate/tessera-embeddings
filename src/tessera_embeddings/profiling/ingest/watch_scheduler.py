@@ -26,9 +26,9 @@ stream lands in the same group (disambiguate with ``--stream-prefix``).
 Usage::
 
     # live, during a run (Ctrl-C to stop)
-    python scripts/profiling/ingest/watch_scheduler.py --profile global-tessera-dev --live
+    te-watch-scheduler --profile global-tessera-dev --live
     # post-hoc profile of a finished run
-    python scripts/profiling/ingest/watch_scheduler.py --profile global-tessera-dev \
+    te-watch-scheduler --profile global-tessera-dev \
         --report --since 2026-07-24T18:00 --until 2026-07-24T20:30 --markdown
 """
 
@@ -269,7 +269,7 @@ def watch_live(
 def _insights_query(logs: object, log_group: str, query: str, start_epoch: int, end_epoch: int) -> list[dict] | None:
     """Run one CloudWatch Insights query and return its rows (None on failure).
 
-    Bounded poll, mirroring scripts/profiling/inference/observe_cluster.py: break on
+    Bounded poll, mirroring src/tessera_embeddings/profiling/inference/observe_cluster.py: break on
     any terminal status and cap total wait so a stuck query can't spin forever.
     """
     qid = logs.start_query(

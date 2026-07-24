@@ -1,34 +1,17 @@
-"""Offline tests for the ingest scheduler watcher (scripts/profiling/ingest).
+"""Offline tests for the ingest scheduler watcher.
 
 The watcher's value at scale rests on two pure functions that never touch AWS:
 ``parse_health_line`` (must track the SchedulerResourceLogger format byte for
 byte) and ``evaluate_alerts`` / ``profile_run`` (the saturation rules). These
 are exercised here without CloudWatch so a format drift or threshold-logic
-regression fails fast in CI, mirroring test_observe_cluster_parser.py's
-load-by-path pattern.
+regression fails fast in CI.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import math
-import sys
-from pathlib import Path
 
-_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "profiling" / "ingest" / "watch_scheduler.py"
-
-
-def _load():
-    spec = importlib.util.spec_from_file_location("watch_scheduler", _SCRIPT)
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    # Register before exec: @dataclass resolves cls.__module__ via sys.modules.
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-ws = _load()
+from tessera_embeddings.profiling.ingest import watch_scheduler as ws
 
 # A real line as SchedulerResourceLogger emits it, with the CloudWatch/logging
 # prefix the parser must tolerate (it uses re.search, not match). Kept in sync

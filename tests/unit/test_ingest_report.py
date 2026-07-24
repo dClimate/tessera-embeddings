@@ -1,4 +1,4 @@
-"""Offline tests for the ingest dossier assembler (scripts/profiling/ingest).
+"""Offline tests for the ingest dossier assembler.
 
 ``build_dossier`` is a pure merge over the profiling JSON; these tests pin that
 it renders each section, tolerates a missing input, and surfaces the operator's
@@ -8,23 +8,8 @@ Interpretation prompts — no AWS involved.
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import sys
-from pathlib import Path
 
-_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "profiling" / "ingest" / "report.py"
-
-
-def _load():
-    spec = importlib.util.spec_from_file_location("ingest_report", _SCRIPT)
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-rep = _load()
+from tessera_embeddings.profiling.ingest import report as rep
 
 _SCHED = {
     "log_group": "/ecs/tessera/dask",

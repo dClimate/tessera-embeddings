@@ -11,13 +11,12 @@ current-code runs use the structured path (see test_profiling_tools.py).
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import io
 from pathlib import Path
 
 import pytest
 
-_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "profiling" / "inference" / "observe_cluster.py"
+from tessera_embeddings.profiling.inference import observe_cluster
 
 # A 2-strip chunk whose per-strip ds sum (100) disagrees with the actor's
 # chunk-total complete line (2500) — the exact multi-strip under-count. Built
@@ -37,16 +36,8 @@ _FAKE_LOG = "\n".join(
 )
 
 
-def _load_observe_cluster():
-    spec = importlib.util.spec_from_file_location("observe_cluster", _SCRIPT)
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def test_phase_parser_valid_px_from_cdone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    mod = _load_observe_cluster()
+    mod = observe_cluster
     logdir = tmp_path / "logs"
     logdir.mkdir()
     (logdir / "worker-abc.err").write_text(_FAKE_LOG)

@@ -67,16 +67,16 @@ campaign (large graphs make the report heavy).
 
 ```
 # 1. while the run is live — machine-readable snapshots + alerts
-python scripts/profiling/ingest/watch_scheduler.py --profile <p> --live | tee live.jsonl
+te-watch-scheduler --profile <p> --live | tee live.jsonl
 
 # 2. after the run — scheduler profile + external-service aggregates
-python scripts/profiling/ingest/watch_scheduler.py --profile <p> \
+te-watch-scheduler --profile <p> \
     --report --since <t0> --until <t1> > sched.json
-python scripts/profiling/ingest/ingest_log_queries.py --profile <p> \
+te-ingest-log-queries --profile <p> \
     --since <t0> --until <t1> > logs.json
 
 # 3. assemble the dossier, then write the interpretation
-python scripts/profiling/ingest/report.py --scheduler sched.json --logs logs.json \
+te-ingest-report --scheduler sched.json --logs logs.json \
     --run-id <id> --zone <z> --year <y> --max-workers <n> --out dossier.md
 ```
 
