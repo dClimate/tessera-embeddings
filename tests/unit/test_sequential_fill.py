@@ -461,3 +461,25 @@ def test_sporadic_failures_below_cap_do_not_stop_the_run():
     # All 8 admitted (2 failed, 6 cleaned) — the run wasn't cut short.
     assert len([e for e in events if e.startswith("start:")]) == 8
     assert len([e for e in events if e.startswith("cleanup:")]) == 6
+
+
+def test_negative_look_ahead_rejected():
+    """look_ahead < 0 would size the budget / zone_slots at <= 0 capacity and
+    deadlock the feeder — the runner rejects it up front.
+    """
+    with pytest.raises(ValueError, match="look_ahead must be >= 0"):
+        _run(_cells(1), look_ahead=-1)
+
+
+def test_feeder_crash_is_surfaced_not_silent_success():
+    """An exception OUTSIDE the per-cell guards (here inputs.start, called by
+    _start_lookahead) must fail the run — not silently kill the daemon feeder
+    and let the drained partial queue look complete.
+    """
+
+    class ExplodingInputs(RecordingInputs):
+        def start(self, zone: str, year: int) -> None:
+            raise RuntimeError("feeder boom")
+
+    with pytest.raises(RuntimeError, match="zone feeder crashed"):
+        _run(_cells(3), inputs=ExplodingInputs([]), look_ahead=1)

@@ -503,3 +503,37 @@ def test_poll_error_keeps_id_registered_for_shutdown(monkeypatch):
     assert ("33N", 2025) in adapter._inflight  # NOT deregistered → shutdown can sweep it
     adapter.shutdown()
     assert ("fr-5", StateType.CANCELLING) in client.cancelled
+
+
+def test_negative_look_ahead_rejected_before_any_side_effect(wired):
+    """look_ahead < 0 is rejected before triage / priming / `ray up` — a
+    deadlock that only manifested after the GPU cluster was provisioned.
+    """
+    with pytest.raises(ValueError, match="look_ahead must be >= 0"):
+        _run(look_ahead=-2)
+    assert wired["ray_kwargs"] is None  # no cluster provisioned
+    assert wired["seq_kwargs"] is None  # runner never entered
+
+
+def test_session_orbit_resolved_from_largest_cell(wired, monkeypatch):
+    """The shared session's orbit comes from the largest live cell's RESOLVED
+    orbit, not the raw request — so a single-orbit shard under the default
+    "both" streams instead of deferring (then failing at the cap) every cell.
+    """
+    monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "ascending")
+    _run(ingest=False, s1_orbit="both", zones=["33N", "34N"])
+    assert wired["seq_kwargs"]["session_s1_orbit"] == "ascending"
+
+
+def test_session_orbit_falls_back_to_request_when_probe_fails(wired, monkeypatch):
+    """If the largest cell's orbit can't be resolved, keep the requested orbit
+    (best-effort) and let the runner's feeder handle that cell per-cell — the
+    resolution must not be fatal.
+    """
+
+    def boom(*a, **k):
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(mod, "resolve_s1_orbit", boom)
+    _run(ingest=False, s1_orbit="both")
+    assert wired["seq_kwargs"]["session_s1_orbit"] == "both"

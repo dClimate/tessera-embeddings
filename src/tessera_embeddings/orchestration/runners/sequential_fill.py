@@ -271,6 +271,10 @@ def fill_zones_sequential(
             failed (completed cells are already committed + tagged and drop
             out of the next campaign pass).
     """
+    if look_ahead < 0:
+        # Would size zone_slots/_MosaicBudget at <= 0 capacity → the feeder
+        # blocks forever on acquire. The flow validates this earlier too.
+        raise ValueError(f"look_ahead must be >= 0, got {look_ahead}")
     t0 = time.monotonic()
     lock = threading.Lock()
     outcomes: list[dict[str, Any]] = []
@@ -279,6 +283,7 @@ def fill_zones_sequential(
     tallies: dict[str, _ZoneTally] = {}  # run_id → tally
     ready: deque[list[WorkItem]] = deque()  # zones awaiting injection, in cell order
     feeder_done = threading.Event()
+    feeder_error: list[BaseException] = []  # an exception outside the per-cell guards
     stop = threading.Event()  # session crashed — unwind the feeder
     # Bounds un-finalized zones (mosaic held from prepare until assembly lands):
     # the current zone + one trailing assembly + the ingest look-ahead.
@@ -510,6 +515,15 @@ def fill_zones_sequential(
                 if not live:
                     # Everything already staged — straight to assembly.
                     finalizer.submit(_finalize, tally)
+        except BaseException as exc:
+            # An exception OUTSIDE the per-cell guards (e.g. in _start_lookahead,
+            # the enqueue, or finalizer.submit) would otherwise just kill this
+            # daemon thread: feeder_done fires, _more_work returns None, the
+            # session drains the partially-fed queue, and the run returns as if
+            # complete with cells silently never enqueued. Capture it so the
+            # caller can re-raise after the session drains.
+            feeder_error.append(exc)
+            log.error("Zone feeder crashed — remaining cells were not enqueued: %s", exc, exc_info=exc)
         finally:
             feeder_done.set()
 
@@ -558,6 +572,15 @@ def fill_zones_sequential(
         if feeder.is_alive():
             log.warning("Zone feeder did not exit within 600s — continuing teardown (daemon thread)")
         finalizer.shutdown(wait=True)
+
+    # A feeder crash (captured above) means the session drained only a partial
+    # queue and would otherwise look complete — surface it. Committed cells stay
+    # tagged; the un-enqueued ones stay pending for the next campaign pass.
+    if feeder_error:
+        raise RuntimeError(
+            "zone feeder crashed before enqueuing all cells — run is incomplete "
+            "(unattempted cells remain pending for the next campaign pass)"
+        ) from feeder_error[0]
 
     # Orbit-mismatch cells: per-cell sessions on the same (still-provisioned)
     # cluster, after the stream so they never contend with it for GPUs.
