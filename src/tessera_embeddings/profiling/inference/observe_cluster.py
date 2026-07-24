@@ -48,6 +48,7 @@ import argparse
 import datetime
 import sys
 import time
+from typing import Any
 
 import boto3
 
@@ -398,7 +399,13 @@ def _parse_ts(s: str) -> int:
 
 
 def _insights_query(
-    logs: object, log_group: str, query: str, start_epoch: int, end_epoch: int
+    # ``logs`` is a boto3 client: boto3 generates its clients at runtime, so there
+    # is no static type to name.
+    logs: Any,  # noqa: ANN401 — boto3 client, no static type exists
+    log_group: str,
+    query: str,
+    start_epoch: int,
+    end_epoch: int,
 ) -> list[dict[str, str]] | None:
     """Run one CloudWatch Insights query and return its rows (None on failure).
 

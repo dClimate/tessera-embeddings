@@ -77,8 +77,16 @@ def test_parse_health_line_rejects_non_health():
 
 def _sample(**over):
     base = {
-        "cpu": 10.0, "rss_gib": 1.0, "mem": 20.0, "lag": 0.0, "fds": 10,
-        "threads": 5, "workers": 100, "tasks": 1000, "processing": 50, "no_worker": 0,
+        "cpu": 10.0,
+        "rss_gib": 1.0,
+        "mem": 20.0,
+        "lag": 0.0,
+        "fds": 10,
+        "threads": 5,
+        "workers": 100,
+        "tasks": 1000,
+        "processing": 50,
+        "no_worker": 0,
     }
     base.update(over)
     return base
@@ -119,9 +127,7 @@ def test_profile_run_peaks_onsets_events():
     # Build a series that ramps CPU into sustained saturation with a rising
     # backlog and a worker join, then compute the profile.
     series = []
-    for i, (cpu, nw, workers) in enumerate(
-        [(20, 0, 100), (95, 1, 100), (96, 2, 150), (97, 3, 150), (98, 4, 150)]
-    ):
+    for i, (cpu, nw, workers) in enumerate([(20, 0, 100), (95, 1, 100), (96, 2, 150), (97, 3, 150), (98, 4, 150)]):
         series.append(ws._snapshot(_sample(cpu=cpu, no_worker=nw, workers=workers), 1000 + i * 30, None, None, []))
     prof = ws.profile_run(series, ws.Thresholds())
     assert prof["samples"] == 5

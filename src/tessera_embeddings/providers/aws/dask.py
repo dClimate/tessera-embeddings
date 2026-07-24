@@ -238,9 +238,7 @@ class SchedulerResourceLogger(SchedulerPlugin):
                 processing,
                 no_worker,
             )
-            if self._stack_sampling and (
-                cpu_pct >= self._stack_trigger_cpu_pct or lag_s >= self._stack_trigger_lag_s
-            ):
+            if self._stack_sampling and (cpu_pct >= self._stack_trigger_cpu_pct or lag_s >= self._stack_trigger_lag_s):
                 self._maybe_sample_stacks(cpu_pct, lag_s)
         except (psutil.Error, AttributeError) as e:
             log.warning("scheduler health probe failed: %s", e)
@@ -319,7 +317,13 @@ class SchedulerResourceLogger(SchedulerPlugin):
 
 
 @contextlib.contextmanager
-def maybe_performance_report(scheduler_address: str, uri: str | None, log: logging.Logger) -> Iterator[None]:
+def maybe_performance_report(
+    scheduler_address: str,
+    uri: str | None,
+    # Both call sites are Prefect flows, whose get_run_logger() returns a
+    # LoggerAdapter, not a Logger. Only .warning/.info are used, which both have.
+    log: logging.Logger | logging.LoggerAdapter[Any],
+) -> Iterator[None]:
     """Optionally capture a Dask ``performance_report`` for the wrapped compute.
 
     No-op when ``uri`` is falsy (the default), so normal runs pay nothing. When

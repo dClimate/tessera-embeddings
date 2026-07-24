@@ -338,10 +338,15 @@ def profile_run(series: list[dict], thresholds: Thresholds) -> dict:
 
     # Worker join/exit events derived from count changes between samples.
     events = []
-    for a, b in itertools.pairwise(series):
-        if b["workers"] != a["workers"]:
+    for before, after in itertools.pairwise(series):
+        if after["workers"] != before["workers"]:
             events.append(
-                {"ts": b["ts"], "from": a["workers"], "to": b["workers"], "delta": b["workers"] - a["workers"]}
+                {
+                    "ts": after["ts"],
+                    "from": before["workers"],
+                    "to": after["workers"],
+                    "delta": after["workers"] - before["workers"],
+                }
             )
 
     return {
@@ -374,8 +379,7 @@ def _markdown(profile: dict, log_group: str, *, truncated: bool = False) -> str:
         f"- Peaks: cpu **{pk['cpu']:.0f}%**, mem **{mem}**, lag **{pk['lag']:.1f}s**, "
         f"no-worker backlog **{pk['no_worker']}**, workers **{pk['workers']}**, tasks **{pk['tasks']}**",
         f"- cpu-high ∧ backlog-rising intervals: **{p['cpu_backlog_cooccurrence']}**",
-        "- Saturation onsets: "
-        + (", ".join(f"{k} @ {v}" for k, v in p["onsets"].items() if v) or "_none tripped_"),
+        "- Saturation onsets: " + (", ".join(f"{k} @ {v}" for k, v in p["onsets"].items() if v) or "_none tripped_"),
         f"- Worker join/exit events: **{len(p['worker_events'])}**",
     ]
     return "\n".join(lines) + "\n"

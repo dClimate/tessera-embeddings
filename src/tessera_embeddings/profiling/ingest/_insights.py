@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sys
 import time
+from typing import Any
 
 #: Insights' own per-query result ceiling.
 INSIGHTS_MAX_RESULTS = 10_000
@@ -34,7 +35,10 @@ _TERMINAL = ("Complete", "Failed", "Cancelled", "Timeout", "Unknown")
 
 
 def insights_query(
-    logs: object,
+    # A boto3 ``logs`` client. boto3 generates its clients at runtime, so there is
+    # no static type to name; the tests pass a stub with just the two methods used
+    # here, which is the point of not pinning a concrete type.
+    logs: Any,  # noqa: ANN401 — boto3 client, no static type exists
     log_group: str,
     query: str,
     start_epoch: int,

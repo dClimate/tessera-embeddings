@@ -4453,6 +4453,7 @@ all = [
     { name = "prefect" },
     { name = "prefect-aws" },
     { name = "prefect-dask" },
+    { name = "psutil" },
     { name = "ray", extra = ["default"] },
     { name = "s3fs" },
     { name = "scikit-learn" },
@@ -4465,6 +4466,7 @@ aws = [
     { name = "botocore" },
     { name = "dask-cloudprovider", extra = ["aws"] },
     { name = "prefect-aws" },
+    { name = "psutil" },
     { name = "s3fs" },
 ]
 inference = [
@@ -4520,6 +4522,7 @@ requires-dist = [
     { name = "prefect", marker = "extra == 'prefect'", specifier = ">=3.0" },
     { name = "prefect-aws", marker = "extra == 'aws'" },
     { name = "prefect-dask", marker = "extra == 'prefect'" },
+    { name = "psutil", marker = "extra == 'aws'" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyproj" },

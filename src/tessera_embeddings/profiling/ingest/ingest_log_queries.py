@@ -66,8 +66,7 @@ QUERIES: dict[str, tuple[str, str]] = {
         r" | sort retries desc",
     ),
     "http_retry_status": (
-        "Catalog HTTP retries broken down by service and status code (429 "
-        "throttle vs 503 SlowDown vs 5xx).",
+        "Catalog HTTP retries broken down by service and status code (429 throttle vs 503 SlowDown vs 5xx).",
         r"fields @message"
         r" | filter @message like /retry:/ and @message like /HTTP/"
         r" | parse @message /(?<service>\S+) retry:.* HTTP (?<status>\d+)/"

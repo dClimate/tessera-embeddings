@@ -178,7 +178,10 @@ def compare_coords(ref: xr.Dataset, test: xr.Dataset) -> list[str]:
     problems: list[str] = []
     if dict(ref.sizes) != dict(test.sizes):
         problems.append(f"dims differ: {dict(ref.sizes)} vs {dict(test.sizes)}")
-    ref_coords, test_coords = set(ref.coords), set(test.coords)
+    # str() because xarray types its keys as Hashable, which is neither sortable
+    # nor usable as a name in the messages below; every key in these stores is a
+    # string.
+    ref_coords, test_coords = {str(c) for c in ref.coords}, {str(c) for c in test.coords}
     if ref_coords != test_coords:
         problems.append(f"coord set differs: only-ref={ref_coords - test_coords} only-test={test_coords - ref_coords}")
     for c in sorted(ref_coords & test_coords):
@@ -218,7 +221,8 @@ def compare_var_structure(ref: xr.Dataset, test: xr.Dataset) -> list[str]:
     a shape/dims change would crash mid-read instead of reporting cleanly.
     """
     problems: list[str] = []
-    for v in sorted(set(ref.data_vars) & set(test.data_vars)):
+    # str(): see compare_coords — xarray keys are typed Hashable, ours are strings.
+    for v in sorted({str(v) for v in ref.data_vars} & {str(v) for v in test.data_vars}):
         a, b = ref[v], test[v]
         if a.dims != b.dims:
             problems.append(f"var '{v}' dims {a.dims} vs {b.dims}")
@@ -377,7 +381,8 @@ def main(argv: list[str] | None = None) -> int:
     if meaningful:
         print("  root attrs differ (UNEXPECTED): " + "; ".join(meaningful))
 
-    ref_vars, test_vars = set(ref.data_vars), set(test.data_vars)
+    # str(): see compare_coords — xarray keys are typed Hashable, ours are strings.
+    ref_vars, test_vars = {str(v) for v in ref.data_vars}, {str(v) for v in test.data_vars}
     if ref_vars != test_vars:
         print(
             f"\nVERDICT: NOT bit-identical — variable sets differ: "
