@@ -39,6 +39,7 @@ from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_expone
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
+from tessera_embeddings.ingest.live_windows import live_windows_for_mask
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE, apply_roi_mask
 from tessera_embeddings.ingest.stac import (
@@ -49,7 +50,7 @@ from tessera_embeddings.ingest.stac import (
     query_stac_items,
 )
 from tessera_embeddings.storage.manifest import IngestManifest
-from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset
+from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset, write_day_windows
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +172,7 @@ def ingest_s2_roi_reflectance(
     collection: str = "sentinel-2-l2a",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     storage_options: dict | None = None,
+    crop_to_live_windows: bool = False,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
 
@@ -195,6 +197,12 @@ def ingest_s2_roi_reflectance(
         log: Optional logger; defaults to ``logging.getLogger(__name__)``.
         storage_options: fsspec storage options for reading the ROI
             mask. ``None`` lets fsspec auto-detect from the URI.
+        crop_to_live_windows: Write only the chunk-aligned windows that
+            intersect the ROI mask (``ingest.live_windows``) instead of the
+            full extent — one commit per date either way. Default False
+            preserves the byte-identical legacy path while the cropped one
+            is validated; the SCL coverage phase is NOT yet cropped (its
+            full-extent reduce still runs — see the design note).
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items
@@ -205,6 +213,14 @@ def ingest_s2_roi_reflectance(
     roi = read_roi_metadata(roi_zarr_path)
 
     ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path)
+
+    # Live windows for the cropped write path, derived once per run from the same
+    # mask this ingest already reads (plain tuples: storage takes no ingest types).
+    live_windows: list[tuple[int, int, int, int]] | None = None
+    if crop_to_live_windows:
+        wins = live_windows_for_mask(roi_zarr_path)
+        live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in wins]
+        log.info("Cropping writes to %d live window(s)", len(wins))
 
     # time=1 matches INGEST_CHUNKS so each date is an independent Dask task:
     # fully parallel across dates with no rechunk at write time.
@@ -274,7 +290,8 @@ def ingest_s2_roi_reflectance(
         day_ds, _ = apply_roi_mask(day_ds, roi_zarr_path, spatial_chunks, roi_mask=roi_mask)
 
         # Tenacity retry on intermittent GDAL errors under high parallelism.
-        # Icechunk writes are atomic, so retry is safe.
+        # Icechunk writes are atomic, so retry is safe — a failed cropped date
+        # commits nothing (batched_region_writes) and the retry starts clean.
         for attempt in Retrying(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, min=2, max=8),
@@ -282,15 +299,28 @@ def ingest_s2_roi_reflectance(
             reraise=True,
         ):
             with attempt:
-                write_dataset(
-                    reflectance_store,
-                    day_ds,
-                    tile_id=roi_zarr_path,
-                    baselines=baselines,
-                    chunks=INGEST_CHUNKS,
-                    manifest=ingest_manifest,
-                    crs=roi.native_crs,
-                )
+                if live_windows is not None:
+                    write_day_windows(
+                        reflectance_store,
+                        day_ds,
+                        live_windows,
+                        roi=roi,
+                        manifest=ingest_manifest,
+                        baselines=baselines,
+                        tile_id=roi_zarr_path,
+                        crs=roi.native_crs,
+                        chunks=INGEST_CHUNKS,
+                    )
+                else:
+                    write_dataset(
+                        reflectance_store,
+                        day_ds,
+                        tile_id=roi_zarr_path,
+                        baselines=baselines,
+                        chunks=INGEST_CHUNKS,
+                        manifest=ingest_manifest,
+                        crs=roi.native_crs,
+                    )
         total_processed += 1
 
     log.info("%d/%d dates passed coverage filter", len(items_by_date) - total_filtered, len(items_by_date))

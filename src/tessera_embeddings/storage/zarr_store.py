@@ -38,7 +38,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import fsspec
 import icechunk
@@ -1018,6 +1018,93 @@ def batched_region_writes(
     session = repo.writable_session("main")
     yield RegionWriteBatch(session)
     session.commit(message)
+
+
+def write_day_windows(
+    store_path: str,
+    day_ds: xr.Dataset,
+    windows: "list[tuple[int, int, int, int]]",
+    *,
+    # Duck-typed like create_empty_store's roi param: needs .geobox/.height/.width.
+    # Typed Any because RoiMetadata lives in ingest/, which imports storage — a
+    # concrete annotation here would be a layering cycle.
+    roi: Any,  # noqa: ANN401 — see comment
+    manifest: IngestManifest | None,
+    baselines: dict[str, int],
+    tile_id: str,
+    crs: str,
+    chunks: dict[str, int],
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+) -> None:
+    """Write ONE date's live windows into a mosaic store, one commit for the date.
+
+    The cropped counterpart of :func:`write_dataset` (same bookkeeping contract,
+    write volume proportional to live area instead of extent). ``day_ds`` is the
+    date's full-extent LAZY dataset (``time`` size 1); each ``(y0, y1, x0, x1)``
+    window — chunk-disjoint, from ``ingest.live_windows`` — is written as a
+    ``to_icechunk`` region on one shared session, so the pixels flow from the Dask
+    workers that computed them (never materialised on the caller — see the design
+    note's dense-zone arithmetic) and the date lands as ONE snapshot.
+
+    First date seeds the store all-fill via :func:`~.empty_store.create_empty_store`
+    (schema-only: cost independent of extent) with the same attr set
+    :func:`write_dataset` creates, then writes windows; later dates append the time
+    slot and merge attrs exactly as the append path does (baselines union / doy
+    concat / ``last_appended`` bump), and the manifest is validated against the
+    store BEFORE anything is written — the per-append structural gate must not be
+    lost to batching.
+    """
+    from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
+
+    if day_ds.sizes["time"] != 1:
+        raise ValueError(f"write_day_windows writes one date per call; got time size {day_ds.sizes['time']}")
+    when = np.asarray(day_ds.time.values, dtype="datetime64[ns]")[0]
+    date_str = str(when)[:10]
+
+    seeded = not get_existing_dates(store_path)
+    if seeded:
+        create_empty_store(
+            store_path,
+            roi=roi,
+            times=np.array([when]),
+            var_dtypes={str(v): day_ds[v].dtype for v in day_ds.data_vars},
+            tile_id=tile_id,
+            crs=crs,
+            chunks=chunks,
+            baselines=baselines,
+            manifest=manifest,
+        )
+
+    with batched_region_writes(
+        store_path,
+        message=f"date {date_str}: {len(windows)} live window(s)",
+        get_credentials=get_credentials,
+        s3_region=s3_region,
+    ) as batch:
+        if manifest:
+            manifest.validate_against(extract_manifest(dict(batch.group.attrs)), store_path)
+        if seeded:
+            t = 0  # the seed put this date on the axis; attrs already carry its doy/baselines
+        else:
+            t = batch.append_time_slot(when)
+            attrs = batch.group.attrs
+            merged = dict(cast("dict", attrs.get("baselines_applied", {})))
+            merged.update(baselines)
+            attrs["baselines_applied"] = merged
+            attrs["doy"] = list(cast("list", attrs.get("doy", []))) + compute_doy(np.array([when])).tolist()
+            attrs["last_appended"] = utcnow_iso()
+        drop = [c for c in ("time", "northing", "easting") if c in day_ds.coords]
+        for y0, y1, x0, x1 in windows:
+            win = day_ds.isel(northing=slice(y0, y1), easting=slice(x0, x1)).drop_vars(drop)
+            to_icechunk(
+                win,
+                batch.session,
+                mode="r+",
+                region={"time": slice(t, t + 1), "northing": slice(y0, y1), "easting": slice(x0, x1)},
+                align_chunks=True,
+                split_every=8,
+            )
 
 
 def compute_doy(timestamps: np.ndarray) -> np.ndarray:
