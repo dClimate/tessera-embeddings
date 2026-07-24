@@ -12,13 +12,22 @@ The patterns key off real log markers in the ingest path:
 - **HTTP catalog retries** — ``tessera_embeddings.ingest._http`` logs every
   retry as ``<service> retry: <method> <url> — HTTP <status>`` (service is
   ``CMR`` or ``STAC``); ``status_forcelist`` is (429, 500, 502, 503, 504), so
-  429 throttling and 503 SlowDown both surface here, attributable to CMR vs
-  earth-search/element84 by service and host.
-- **S1 granule-download retries** — ``ingest/s1_roi.py`` retries ASF downloads
-  via tenacity ``before_sleep_log`` → ``Retrying ... as it raised ...``.
-- **S3 SlowDown** — 503s from the object store (icechunk / botocore).
-- **Worker lifecycle** — distributed/nanny worker exit/restart/removal lines,
-  with reasons, to separate "workers dying" from "scheduler falling behind".
+  429 throttling and 503s from the catalog both surface here, attributable to
+  CMR vs earth-search/element84 by service and host.
+- **Store-write retries** — both ``ingest/s1_roi.py`` and ``ingest/s2_roi.py``
+  wrap ``write_dataset`` in tenacity with ``before_sleep_log``
+  (``Retrying ... as it raised ...``), so this measures icechunk/GDAL write
+  pressure across both sensors.
+- **S3 SlowDown** — 503s from the object store, keyed on the error code and
+  excluding catalog retry lines (which also carry ``HTTP 503``).
+- **Worker lifecycle** — distributed/nanny exit/kill/restart/removal counts by
+  category, to separate "workers dying" from "scheduler falling behind".
+
+Known gap: **ASF granule downloads are not separately instrumented.** Nothing in
+the download path emits a stable retry marker today, so external download
+throttling is not directly observable here — it would show up indirectly as
+worker errors or stalled batches. Adding a marker to the download path is a
+follow-up, not something this query pack can infer.
 
 Usage::
 
@@ -28,7 +37,8 @@ Usage::
     te-ingest-log-queries --list    # names + descriptions
 
 Only needs CloudWatch Logs read access. The log group is shared across ingest
-runs — scope the window tightly to the run of interest.
+runs — scope the window tightly to the run of interest. A query that cannot be
+answered records ``rows: null`` and never aborts the others.
 """
 
 from __future__ import annotations
@@ -36,10 +46,10 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
-import sys
-import time
 
 import boto3
+
+from tessera_embeddings.profiling.ingest._insights import insights_query
 
 DEFAULT_INGEST_LOG_GROUP = "/ecs/tessera/dask"
 
@@ -91,17 +101,28 @@ QUERIES: dict[str, tuple[str, str]] = {
         r" | sort bin(5m) asc",
     ),
     "worker_lifecycle_counts": (
-        "Worker lifecycle event counts by type — separates 'workers dying' "
-        "(exit/restart/removed) from a scheduler that is merely behind.",
-        r"fields @message"
-        r" | filter @message like /(Worker process .* exited|Remove worker|Removing worker"
-        r"|Register worker|Registered worker|Nanny .* (restart|closing)|lost all workers"
-        r"|worker failed|Killed worker|Unexpected worker)/"
-        r" | parse @message /(?<event>Worker process .* exited|Remove worker|Removing worker"
-        r"|Register worker|Registered worker|Nanny.*restart|Nanny.*closing|lost all workers"
-        r"|worker failed|Killed worker|Unexpected worker)/"
-        r" | stats count(*) as n by event"
-        r" | sort n desc",
+        "Worker lifecycle counts by CATEGORY — separates 'workers dying' "
+        "(exit/kill/restart/removal) from a scheduler that is merely behind. "
+        "Returns one row of fixed columns.",
+        # Counted with per-category boolean flags summed into fixed columns rather
+        # than `parse ... | stats by event`: the lifecycle markers embed variable
+        # text (a PID in "Worker process 1234 exited", an address in "Nanny at
+        # 'tcp://...' restarting"), so capturing the match would group by that
+        # text and yield one bucket per worker — turning a restart storm into
+        # thousands of rows of 1 instead of a single visible count.
+        r"fields"
+        r" (@message like /Worker process .* exited/) as f_proc_exited,"
+        r" (@message like /Killed worker/) as f_killed,"
+        r" (@message like /worker failed/) as f_failed,"
+        r" (@message like /Unexpected worker/) as f_unexpected,"
+        r" (@message like /Remov(e|ing) worker/) as f_removed,"
+        r" (@message like /Regist(er|ered) worker/) as f_registered,"
+        r" (@message like /Nanny.*(restart|closing)/) as f_nanny,"
+        r" (@message like /lost all workers/) as f_lost_all"
+        r" | stats sum(f_proc_exited) as worker_process_exited, sum(f_killed) as killed_worker,"
+        r" sum(f_failed) as worker_failed, sum(f_unexpected) as unexpected_worker,"
+        r" sum(f_removed) as worker_removed, sum(f_registered) as worker_registered,"
+        r" sum(f_nanny) as nanny_restart_or_close, sum(f_lost_all) as lost_all_workers",
     ),
     "worker_exit_reasons": (
         "Raw recent worker exit/kill/removal lines with reasons and timestamps "
@@ -130,29 +151,6 @@ def _parse_ts(s: str) -> int:
     return int(dt.timestamp())
 
 
-def _insights_query(logs: object, log_group: str, query: str, start_epoch: int, end_epoch: int) -> list[dict] | None:
-    """Run one CloudWatch Insights query and return its rows (None on failure).
-
-    Bounded poll, mirroring src/tessera_embeddings/profiling/inference/observe_cluster.py: break
-    on any terminal status and cap total wait so a stuck query can't spin forever.
-    """
-    qid = logs.start_query(
-        logGroupName=log_group, startTime=start_epoch, endTime=end_epoch, queryString=query, limit=10000
-    )["queryId"]
-    deadline = time.monotonic() + 180
-    res = logs.get_query_results(queryId=qid)
-    while res["status"] not in ("Complete", "Failed", "Cancelled", "Timeout", "Unknown"):
-        if time.monotonic() > deadline:
-            print("CloudWatch query did not finish within 180s", file=sys.stderr)
-            return None
-        time.sleep(2)
-        res = logs.get_query_results(queryId=qid)
-    if res["status"] != "Complete":
-        print(f"CloudWatch query {res['status']}", file=sys.stderr)
-        return None
-    return [{c["field"]: c["value"] for c in row} for row in res["results"]]
-
-
 def run_queries(
     session: boto3.session.Session,
     log_group: str,
@@ -162,9 +160,12 @@ def run_queries(
 ) -> dict:
     """Run the named queries and return a JSON-able dict keyed by query name.
 
-    A query that fails hard (permission/timeout) records ``rows: null``; a
-    query that simply matched nothing records ``rows: []`` — the caller can
-    tell "couldn't ask" from "asked, nothing there".
+    A query that fails hard (rejected/denied/timed out) records ``rows: null``; a
+    query that simply matched nothing records ``rows: []`` — the caller can tell
+    "couldn't ask" from "asked, nothing there". One failing query never aborts the
+    rest: the whole point is to collect whatever IS available for the dossier, so
+    every query is attempted and reported independently (see ``_insights``).
+    ``truncated`` flags a result that hit the Insights row cap.
     """
     logs = session.client("logs")
     out: dict = {
@@ -174,8 +175,8 @@ def run_queries(
     }
     for name in names:
         description, query = QUERIES[name]
-        rows = _insights_query(logs, log_group, query, start_epoch, end_epoch)
-        out["queries"][name] = {"description": description, "rows": rows}
+        rows, truncated = insights_query(logs, log_group, query, start_epoch, end_epoch)
+        out["queries"][name] = {"description": description, "rows": rows, "truncated": truncated}
     return out
 
 

@@ -46,6 +46,8 @@ from dataclasses import dataclass
 
 import boto3
 
+from tessera_embeddings.profiling.ingest._insights import insights_query
+
 # Ingest Dask log group + scheduler stream prefix. dask-cloudprovider names
 # streams ``<prefix>/<container>/<task-id>``; ``ecs_cluster`` sets prefix "dask"
 # and the scheduler container is "dask-scheduler" (see providers/aws/dask.py),
@@ -60,6 +62,12 @@ HEALTH_MARKER = "scheduler health:"
 # How often --live polls CloudWatch. The heartbeat itself is every 30 s, so a
 # 20 s poll keeps latency under one heartbeat without hammering the API.
 DEFAULT_POLL_INTERVAL_S = 20.0
+
+# How far back --live rewinds its cursor each poll, so a heartbeat that CloudWatch
+# surfaces out of order (common when the prefix spans several scheduler streams)
+# is still picked up instead of being skipped forever. eventId dedupe makes the
+# replay free; two minutes covers ingestion lag at a 30 s heartbeat.
+REPLAY_OVERLAP_MS = 120_000
 
 
 @dataclass(frozen=True)
@@ -220,9 +228,16 @@ def watch_live(
     """Tail scheduler health lines and emit JSON snapshots until interrupted.
 
     Uses ``filter_log_events`` (not Insights) for low-latency incremental
-    tailing, deduping on eventId and advancing the window past each consumed
-    event. stdout = one JSON object per health line; stderr = a human line and
+    tailing. stdout = one JSON object per health line; stderr = a human line and
     ALERT banners.
+
+    The cursor is advanced to ``newest seen - REPLAY_OVERLAP_MS`` rather than
+    past the newest event: when the prefix spans several scheduler streams,
+    CloudWatch can make a line from one stream visible only after a
+    later-timestamped line from another has already been consumed, and a cursor
+    parked past the newest timestamp would skip that heartbeat forever (a missed
+    sample can mean a missed alert). Re-fetching a small overlap each poll is
+    harmless because ``seen`` dedupes on eventId.
     """
     logs = session.client("logs")
     start_ms = int((time.time() - lookback_s) * 1000)
@@ -263,34 +278,11 @@ def watch_live(
                 print(json.dumps(snap), flush=True)
                 print(_human_line(snap), file=sys.stderr, flush=True)
                 prev, prev_epoch = sample, epoch
-                start_ms = max(start_ms, ev["timestamp"] + 1)
+                start_ms = max(start_ms, ev["timestamp"] - REPLAY_OVERLAP_MS)
             time.sleep(poll_interval_s)
     except KeyboardInterrupt:
         print("# stopped", file=sys.stderr)
         return 0
-
-
-def _insights_query(logs: object, log_group: str, query: str, start_epoch: int, end_epoch: int) -> list[dict] | None:
-    """Run one CloudWatch Insights query and return its rows (None on failure).
-
-    Bounded poll, mirroring src/tessera_embeddings/profiling/inference/observe_cluster.py: break on
-    any terminal status and cap total wait so a stuck query can't spin forever.
-    """
-    qid = logs.start_query(
-        logGroupName=log_group, startTime=start_epoch, endTime=end_epoch, queryString=query, limit=10000
-    )["queryId"]
-    deadline = time.monotonic() + 180
-    res = logs.get_query_results(queryId=qid)
-    while res["status"] not in ("Complete", "Failed", "Cancelled", "Timeout", "Unknown"):
-        if time.monotonic() > deadline:
-            print("CloudWatch query did not finish within 180s", file=sys.stderr)
-            return None
-        time.sleep(2)
-        res = logs.get_query_results(queryId=qid)
-    if res["status"] != "Complete":
-        print(f"CloudWatch query {res['status']}", file=sys.stderr)
-        return None
-    return [{c["field"]: c["value"] for c in row} for row in res["results"]]
 
 
 def _series_from_rows(rows: list[dict]) -> list[dict]:
@@ -362,7 +354,7 @@ def profile_run(series: list[dict], thresholds: Thresholds) -> dict:
     }
 
 
-def _markdown(profile: dict, log_group: str) -> str:
+def _markdown(profile: dict, log_group: str, *, truncated: bool = False) -> str:
     if not profile.get("samples"):
         return f"### Scheduler profile\n\n_No `scheduler health:` lines found in {log_group}._\n"
     p, w, pk = profile, profile["window"], profile["peaks"]
@@ -370,6 +362,14 @@ def _markdown(profile: dict, log_group: str) -> str:
     lines = [
         "### Scheduler profile",
         "",
+    ]
+    if truncated:
+        lines += [
+            "> **PARTIAL — the query hit the Insights row cap.** Peaks and onsets "
+            "below are lower bounds; narrow the window or stream prefix.",
+            "",
+        ]
+    lines += [
         f"- Window: {w['start']} → {w['end']} ({p['samples']} samples)",
         f"- Peaks: cpu **{pk['cpu']:.0f}%**, mem **{mem}**, lag **{pk['lag']:.1f}s**, "
         f"no-worker backlog **{pk['no_worker']}**, workers **{pk['workers']}**, tasks **{pk['tasks']}**",
@@ -403,7 +403,7 @@ def report_run(
         f'| filter @message like "{HEALTH_MARKER}" '
         "| sort @timestamp asc"
     )
-    rows = _insights_query(logs, log_group, query, start_epoch, end_epoch)
+    rows, truncated = insights_query(logs, log_group, query, start_epoch, end_epoch)
     if rows is None:
         return 1
     series = _series_from_rows(rows)
@@ -412,12 +412,16 @@ def report_run(
         "log_group": log_group,
         "stream_prefix": stream_prefix,
         "window": {"start": _iso(start_epoch), "end": _iso(end_epoch)},
+        # True when the row cap was hit: the series is PARTIAL, so the peaks and
+        # onsets below are lower bounds, not the full run (insights_query also
+        # warns on stderr). Never present a capped series as a full-run profile.
+        "truncated": truncated,
         "profile": profile,
         "series": series,
     }
     print(json.dumps(out, indent=2))
     if markdown:
-        print(_markdown(profile, log_group), file=sys.stderr)
+        print(_markdown(profile, log_group, truncated=truncated), file=sys.stderr)
     return 0
 
 

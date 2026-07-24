@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 
 from tessera_embeddings.profiling.ingest import watch_scheduler as ws
+from tessera_embeddings.profiling.ingest._insights import insights_query
 
 # A real line as SchedulerResourceLogger emits it, with the CloudWatch/logging
 # prefix the parser must tolerate (it uses re.search, not match). Kept in sync
@@ -136,3 +137,44 @@ def test_profile_run_peaks_onsets_events():
 
 def test_profile_run_empty():
     assert ws.profile_run([], ws.Thresholds()) == {"samples": 0}
+
+
+class TestInsightsRunner:
+    """The shared Insights runner's two contracts: never abort, never hide a cap."""
+
+    def _logs(self, *, rows=0, status="Complete", raise_on_start=None):
+        class _Logs:
+            def start_query(self, **kw):
+                if raise_on_start:
+                    raise raise_on_start
+                return {"queryId": "q1"}
+
+            def get_query_results(self, queryId):
+                return {
+                    "status": status,
+                    "results": [[{"field": "@message", "value": f"m{i}"}] for i in range(rows)],
+                }
+
+        return _Logs()
+
+    def test_rejected_query_returns_none_not_raise(self):
+        """A start_query rejection must not abort the command mid-collection."""
+        boom = RuntimeError("MalformedQueryException")
+        rows, truncated = insights_query(self._logs(raise_on_start=boom), "g", "q", 0, 1)
+        assert rows is None and truncated is False
+
+    def test_failed_status_returns_none(self):
+
+        rows, _ = insights_query(self._logs(status="Failed"), "g", "q", 0, 1)
+        assert rows is None
+
+    def test_empty_result_is_not_none(self):
+        """'asked, nothing matched' must stay distinguishable from 'couldn't ask'."""
+        rows, truncated = insights_query(self._logs(rows=0), "g", "q", 0, 1)
+        assert rows == [] and truncated is False
+
+    def test_hitting_the_cap_sets_truncated(self):
+        """A capped result is flagged, never presented as a full series."""
+        rows, truncated = insights_query(self._logs(rows=5), "g", "q", 0, 1, limit=5)
+        assert len(rows) == 5
+        assert truncated is True

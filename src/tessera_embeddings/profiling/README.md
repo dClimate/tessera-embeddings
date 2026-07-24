@@ -38,11 +38,14 @@ Each is equally runnable from a checkout as
 `python -m tessera_embeddings.profiling.<stage>.<tool>`, which is what to use
 when iterating on the tools themselves.
 
-The three AWS-facing tools read CloudWatch, ECS and EC2, so they need the `aws`
-extra (`pip install tessera_embeddings[aws]`) for boto3; the comparison gates
-need only the base install. Nothing in the library imports this subpackage, so
-an ordinary `import tessera_embeddings` never pulls a cloud SDK in on its
-account — the tools load only when a command runs.
+**Install the `aws` extra** (`pip install "tessera_embeddings[aws]"`) for any of
+these against real infrastructure: the three AWS-facing tools need boto3 for
+CloudWatch/ECS/EC2, and the comparison gates need `s3fs` the moment their inputs
+are `s3://` URIs (they run on the base install only for local paths).
+
+Nothing in the library imports this subpackage, so an ordinary
+`import tessera_embeddings` never pulls a cloud SDK in on its account — the tools
+load only when a command runs.
 
 ## AWS-specific by necessity — and a template for other clouds
 

@@ -10,15 +10,26 @@ feeds is exercised against a stub callable to confirm the wiring.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
+import pickle
+import threading
+
+import cloudpickle
+import psutil
 import pytest
 from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_fixed
 
 pytest.importorskip("dask_cloudprovider", reason="dask-cloudprovider not installed (AWS extras)")
 
+from tessera_embeddings.config.ingest import IngestSettings
+from tessera_embeddings.providers.aws import dask as dask_mod
 from tessera_embeddings.providers.aws.dask import (
     _RETRYABLE_CLUSTER_START_ERRORS,
     SchedulerResourceLogger,
     _is_retryable_cluster_start_error,
+    maybe_performance_report,
 )
 
 
@@ -152,8 +163,6 @@ class TestSchedulerResourceLogger:
 
     def _emit(self, plugin: SchedulerResourceLogger, sched: _FakeScheduler, caplog) -> str:
         """Run one probe with the plugin bound to ``sched`` and return the line."""
-        import logging
-
         plugin._scheduler = sched
         with caplog.at_level(logging.INFO, logger="distributed.scheduler"):
             plugin._log_usage()
@@ -168,7 +177,6 @@ class TestSchedulerResourceLogger:
         # Sampling off: these tests assert the health line only, and a triggered
         # sampler would spawn a thread and add nondeterministic WARNING lines.
         plugin = SchedulerResourceLogger(interval_s=30.0, stack_sampling=False)
-        import psutil
 
         plugin._proc = psutil.Process()
         plugin._proc.cpu_percent(None)
@@ -225,8 +233,6 @@ class TestSchedulerResourceLogger:
         """Defensive: a probe with no primed process (pre-``start``) logs nothing
         rather than raising.
         """
-        import logging
-
         plugin = SchedulerResourceLogger()
         with caplog.at_level(logging.INFO, logger="distributed.scheduler"):
             plugin._log_usage()
@@ -236,8 +242,6 @@ class TestSchedulerResourceLogger:
         """``before_close`` must stop the PeriodicCallback so a torn-down
         scheduler isn't left with a live timer.
         """
-        import asyncio
-
         plugin = SchedulerResourceLogger()
 
         class _FakeCallback:
@@ -264,10 +268,6 @@ class TestSchedulerResourceLogger:
         the failure is SILENT and the run emits no health lines at all. Hence the
         event is created in ``start()``, and this pins that.
         """
-        import pickle
-
-        import cloudpickle
-
         plugin = SchedulerResourceLogger()
         for dumps in (pickle.dumps, cloudpickle.dumps):
             revived = pickle.loads(dumps(plugin))
@@ -276,8 +276,6 @@ class TestSchedulerResourceLogger:
 
     def test_start_creates_the_sampler_event(self) -> None:
         """``start()`` runs in the scheduler process, so the Event is built there."""
-        import asyncio
-
         plugin = SchedulerResourceLogger(interval_s=30.0)
         sched = _FakeScheduler(workers_processing=[0], tasks=0, unrunnable=0)
         asyncio.run(plugin.start(sched))
@@ -291,9 +289,6 @@ class TestSchedulerResourceLogger:
         """The worker logs one collapsed stack tally with the cpu/lag context
         and clears the single-flight flag when done.
         """
-        import logging
-        import threading
-
         plugin = SchedulerResourceLogger(stack_samples=2, stack_sample_gap_s=0.0)
         # start() normally creates this in the scheduler process; stand it up here.
         plugin._sampler_active = threading.Event()
@@ -307,8 +302,6 @@ class TestSchedulerResourceLogger:
 
     def test_stack_sampler_single_flight(self) -> None:
         """A second trigger while a sampler is active is a no-op."""
-        import threading
-
         plugin = SchedulerResourceLogger()
         started: list = []
         plugin._sample_stacks_worker = lambda *a: started.append(a)  # type: ignore[method-assign]
@@ -319,8 +312,6 @@ class TestSchedulerResourceLogger:
 
     def test_stack_sampler_triggers_when_idle(self) -> None:
         """When idle, a trigger spawns the worker off the event loop."""
-        import threading
-
         plugin = SchedulerResourceLogger()
         ran = threading.Event()
 
@@ -353,7 +344,6 @@ class TestSchedulerResourceLoggerOnCluster:
     """
 
     def test_registered_plugin_emits_on_real_scheduler(self, caplog) -> None:
-        import logging
         import time
 
         from distributed import Client, LocalCluster
@@ -377,10 +367,6 @@ class TestSchedulerResourceLoggerOnCluster:
 
 def test_maybe_performance_report_noop_without_uri() -> None:
     """With no URI the helper is a pure pass-through — no client, no Dask calls."""
-    import logging
-
-    from tessera_embeddings.providers.aws.dask import maybe_performance_report
-
     ran = []
     with maybe_performance_report("tcp://unused:8786", None, logging.getLogger("t")):
         ran.append(True)
@@ -389,6 +375,76 @@ def test_maybe_performance_report_noop_without_uri() -> None:
 
 def test_ingest_settings_perf_report_uri_defaults_none() -> None:
     """The perf-report knob is off by default, so normal runs never capture one."""
-    from tessera_embeddings.config.ingest import IngestSettings
-
     assert IngestSettings().perf_report_uri is None
+
+
+def _report_stub(exit_error: Exception | None = None):
+    """A performance_report stand-in, optionally failing on exit (the render step)."""
+
+    @contextlib.contextmanager
+    def _report(filename=None):
+        yield
+        if exit_error is not None:
+            raise exit_error
+
+    return _report
+
+
+class TestMaybePerformanceReport:
+    """A probe-only diagnostics artifact must never affect the ingest it observes."""
+
+    def test_noop_without_uri(self) -> None:
+        """With no URI the helper is a pure pass-through — no client, no Dask calls."""
+        ran = []
+        with maybe_performance_report("tcp://unused:8786", None, logging.getLogger("t")):
+            ran.append(True)
+        assert ran == [True]
+
+    def test_setup_failure_still_runs_the_body(self, monkeypatch, caplog) -> None:
+        """If the diagnostic client can't connect, the ingest runs anyway.
+
+        Otherwise an unreachable scheduler — or a typo'd probe URI — would stop
+        the actual ingest from happening at all.
+        """
+
+        def _boom(*a, **k):
+            raise OSError("cannot connect to scheduler")
+
+        monkeypatch.setattr(dask_mod, "Client", _boom)
+
+        ran = []
+        with (
+            caplog.at_level(logging.WARNING),
+            maybe_performance_report("tcp://x:8786", "s3://b/p.html", logging.getLogger("t")),
+        ):
+            ran.append(True)
+        assert ran == [True], "body must still execute when diagnostics setup fails"
+
+    def test_render_failure_does_not_mask_the_body_exception(self, monkeypatch) -> None:
+        """A report-render failure must not replace the ingest's own exception.
+
+        The render happens in ``performance_report.__exit__``, so unguarded it
+        would surface INSTEAD of the real ingest error and send debugging in
+        entirely the wrong direction.
+        """
+        monkeypatch.setattr(dask_mod, "Client", lambda *a, **k: contextlib.nullcontext())
+        monkeypatch.setattr(dask_mod, "performance_report", _report_stub(RuntimeError("render blew up")))
+
+        with (
+            pytest.raises(ValueError, match="the real ingest failure"),
+            maybe_performance_report("tcp://x:8786", "s3://b/p.html", logging.getLogger("t")),
+        ):
+            raise ValueError("the real ingest failure")
+
+    def test_render_failure_does_not_fail_a_successful_ingest(self, monkeypatch, caplog) -> None:
+        """A render failure after a clean ingest is logged, not raised."""
+        monkeypatch.setattr(dask_mod, "Client", lambda *a, **k: contextlib.nullcontext())
+        monkeypatch.setattr(dask_mod, "performance_report", _report_stub(RuntimeError("render blew up")))
+
+        ran = []
+        with (
+            caplog.at_level(logging.WARNING),
+            maybe_performance_report("tcp://x:8786", "s3://b/p.html", logging.getLogger("t")),
+        ):
+            ran.append(True)
+        assert ran == [True]

@@ -52,9 +52,10 @@ if TYPE_CHECKING:
     from distributed import Scheduler
 
 import dask
+import fsspec
 import psutil
 from dask_cloudprovider.aws import ECSCluster, FargateCluster
-from distributed import Client
+from distributed import Client, performance_report
 from distributed.diagnostics.plugin import SchedulerPlugin
 from tenacity import (
     Retrying,
@@ -266,29 +267,49 @@ class SchedulerResourceLogger(SchedulerPlugin):
     def _sample_stacks_worker(self, cpu_pct: float, lag_s: float) -> None:
         """Snapshot thread stacks a few times and log a collapsed leaf-frame tally.
 
-        Counts the innermost frame (``thread:file:function:line``) across every
-        thread and sample, so the busiest locations during the stall rise to the
-        top — enough to attribute saturation without a process-attach profiler.
+        Reports the **event-loop thread separately** from the rest, because a
+        single global tally is misleading: idle threads park on one unchanging
+        wait frame and so accumulate a high count, while the genuinely busy loop
+        spreads its samples across many frames and can fall off the end of the
+        list — the exact opposite of what we need to attribute a stall. The loop
+        thread is the one that matters here (it is what ``lag`` measures), so its
+        frames are tallied and reported on their own.
+
+        This sampler's own thread is excluded — it is guaranteed to be running
+        (it is doing the sampling) and would otherwise take a slot in every
+        report.
         """
         log = logging.getLogger("distributed.scheduler")
         try:
+            me = threading.current_thread().ident
+            # The scheduler's event loop runs in the thread that started it —
+            # MainThread under dask-cloudprovider's `dask-scheduler` entrypoint.
+            loop_tid = threading.main_thread().ident
             names = {t.ident: t.name for t in threading.enumerate()}
-            counts: collections.Counter[str] = collections.Counter()
+            loop_counts: collections.Counter[str] = collections.Counter()
+            other_counts: collections.Counter[str] = collections.Counter()
             for i in range(self._stack_samples):
                 for tid, frame in sys._current_frames().items():
+                    if tid == me:
+                        continue
                     code = frame.f_code
                     fname = code.co_filename.rsplit("/", 1)[-1]
-                    leaf = f"{names.get(tid, tid)}:{fname}:{code.co_name}:{frame.f_lineno}"
-                    counts[leaf] += 1
+                    if tid == loop_tid:
+                        loop_counts[f"{fname}:{code.co_name}:{frame.f_lineno}"] += 1
+                    else:
+                        other_counts[f"{names.get(tid, tid)}:{fname}:{code.co_name}:{frame.f_lineno}"] += 1
                 if i < self._stack_samples - 1:
                     time.sleep(self._stack_sample_gap_s)
-            top = " | ".join(f"{loc}={n}" for loc, n in counts.most_common(8))
+            loop_top = " | ".join(f"{loc}={n}" for loc, n in loop_counts.most_common(6)) or "(no samples)"
+            other_top = " | ".join(f"{loc}={n}" for loc, n in other_counts.most_common(4)) or "(none)"
             log.warning(
-                "scheduler stack sample (cpu=%.0f%% lag=%.1fs, %d samples): %s",
+                "scheduler stack sample (cpu=%.0f%% lag=%.1fs, %d samples) loop[%s]: %s -- other threads: %s",
                 cpu_pct,
                 lag_s,
                 self._stack_samples,
-                top,
+                names.get(loop_tid, "?"),
+                loop_top,
+                other_top,
             )
         except Exception as e:  # diagnostics thread must never crash the scheduler
             log.warning("scheduler stack sampling failed: %s", e)
@@ -305,33 +326,63 @@ def maybe_performance_report(scheduler_address: str, uri: str | None, log: loggi
     set, it opens a short-lived client on ``scheduler_address`` — needed because
     ``performance_report`` talks to the scheduler through the *current* client,
     and the Prefect task runner owns a separate one — captures the
-    task-stream/profile/bandwidth HTML to a temp file, then uploads it to
-    ``uri`` (any fsspec target). Upload failures are logged, never raised: a
-    diagnostics artifact must not fail the ingest. Intended for probe rungs, not
-    the campaign (large graphs make report assembly heavy).
+    task-stream/profile/bandwidth HTML to a temp file, then uploads it to ``uri``
+    (any fsspec target). Intended for probe rungs, not the campaign (large graphs
+    make report assembly heavy).
+
+    **The diagnostics are fully isolated from the wrapped body**, because this is
+    an optional probe-only artifact that must never affect the ingest it observes.
+    Three failure paths are each contained:
+
+    1. *Setup* (client connect, report start) — logged, then the body runs with no
+       diagnostics at all, rather than an unreachable scheduler dashboard
+       preventing the ingest from running.
+    2. *Rendering* (``performance_report.__exit__``, which builds the HTML and is
+       the expensive part) — logged. Left unguarded it would fail an ingest that
+       had already completed, and on a FAILING ingest it would propagate in place
+       of the body's exception, hiding the real error behind a diagnostics one.
+    3. *Upload* — logged. fsspec backends raise anything (botocore ClientError for
+       a denied PUT or missing bucket, credential errors), none of which subclass
+       OSError.
+
+    The report is shipped whether or not the body succeeded: a failed at-scale
+    run is exactly when its task stream is most worth reading.
     """
     if not uri:
         yield
         return
-    import fsspec
-    from distributed import Client, performance_report
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local = Path(tmpdir) / "dask-performance-report.html"
-        with Client(scheduler_address), performance_report(filename=str(local)):
-            yield
-        # performance_report has flushed `local` on __exit__ above; now ship it.
+        diagnostics = contextlib.ExitStack()
         try:
-            with local.open("rb") as fh, fsspec.open(uri, "wb") as out:
-                out.write(fh.read())
-            log.info("wrote Dask performance report to %s", uri)
+            diagnostics.enter_context(Client(scheduler_address))
+            diagnostics.enter_context(performance_report(filename=str(local)))
         except Exception as e:
-            # Deliberately broad. This runs AFTER the ingest has succeeded, and an
-            # fsspec backend can raise anything (botocore ClientError for a bad
-            # bucket or denied PUT, credential errors) — none of which subclass
-            # OSError. A probe-only diagnostics artifact must never turn a
-            # completed mosaic ingest into a failed flow run.
-            log.warning("failed to upload Dask performance report to %s: %s", uri, e)
+            log.warning("could not start Dask performance report (%s); continuing without it", e)
+            with contextlib.suppress(Exception):
+                diagnostics.close()
+            yield
+            return
+
+        try:
+            yield
+        finally:
+            # Nothing below may raise: that is what keeps a diagnostics artifact
+            # from failing a completed ingest or masking a failing one.
+            rendered = False
+            try:
+                diagnostics.close()  # renders the HTML
+                rendered = True
+            except Exception as e:
+                log.warning("Dask performance report generation failed: %s", e)
+            if rendered:
+                try:
+                    with local.open("rb") as fh, fsspec.open(uri, "wb") as out:
+                        out.write(fh.read())
+                    log.info("wrote Dask performance report to %s", uri)
+                except Exception as e:
+                    log.warning("failed to upload Dask performance report to %s: %s", uri, e)
 
 
 # Substrings of transient cluster-start failures worth retrying. All are ECS
