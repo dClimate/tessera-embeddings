@@ -125,7 +125,8 @@ zone group's time axis is fixed and uniform at seeding (D1): one `time` point pe
 campaign year at Jan 1 — i.e. each point is the **start of the exact Jan–Dec window
 its slot holds** — plus a CF `time_bnds` variable (`(time, 2)`,
 `time.attrs["bounds"]="time_bnds"`) stating each slot's true interval
-`[Jan 1, Dec 31]`. The `fill_zone_year` runner **rejects any window that is not
+`[Jan 1 of y, Jan 1 of y+1)` — half-open, so consecutive years are contiguous
+rather than leaving a one-day hole at each boundary. The `fill_zone_year` runner **rejects any window that is not
 exactly the slot's calendar year**; `time_convention="calendar_year"` is therefore a
 guarantee, and every label matches the data it holds.
 

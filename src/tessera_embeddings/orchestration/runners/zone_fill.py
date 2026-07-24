@@ -341,7 +341,7 @@ def plan_zone_inference(
     # (violating CF §7.1 bounds containment) and be permanently mislabeled under the
     # write-once zone-year tag; and one slot per year cannot hold two window phases
     # anyway. Label accuracy is the invariant: `time_convention="calendar_year"` is a
-    # GUARANTEE, and the seeded `time_bnds` ([Jan 1, Dec 31] per slot) states each
+    # GUARANTEE, and the seeded `time_bnds` ([Jan 1 of y, Jan 1 of y+1) per slot) states each
     # slot's true interval. Non-calendar 12-month windows belong in a store whose
     # time points ARE the windows: today the single-ROI `12mo_window_end` path
     # (assemble(): time = window-end label, extendable axis); zone-scale, the

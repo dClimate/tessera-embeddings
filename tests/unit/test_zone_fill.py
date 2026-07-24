@@ -178,10 +178,10 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
     assert node.attrs["runs"]["2025"]["run_id"] == "runZ"
     # Label accuracy under the calendar-year GUARANTEE: the slot's `time` point is
     # Jan 1 (the window start) and the seeded time_bnds state the slot's true
-    # interval [Jan 1, Dec 31] — exactly the window the strict gate required.
+    # interval, half-open [Jan 1 2025, Jan 1 2026) — the window the strict gate required.
     assert node["time"].attrs["bounds"] == "time_bnds"
     bnds = np.asarray(node["time_bnds"][1]).astype("datetime64[ns]")  # 2025 slot = index 1
-    assert list(bnds.astype("datetime64[D]").astype(str)) == list(_WINDOW.to_date_range())
+    assert list(bnds.astype("datetime64[D]").astype(str)) == ["2025-01-01", "2026-01-01"]
     assert np.asarray(node["time"][1]).astype("datetime64[ns]").astype("datetime64[D]").astype(str) == "2025-01-01"
     # 2025 is index 1 on the (2024, 2025) axis; staged tiles match, ocean tile is fill.
     result = np.asarray(node["embeddings"][1])

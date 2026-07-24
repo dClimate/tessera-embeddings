@@ -142,8 +142,8 @@ def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: Sto
         # (the START of the exact Jan-Dec window it holds — fixed and uniform across
         # zones at seeding), and the zone-fill gate rejects any window that is not
         # exactly that calendar year, so the label always matches the data. The seeded
-        # `time_bnds` CF-bounds variable states each slot's true interval
-        # ([Jan 1, Dec 31]). Non-calendar 12-month windows belong in a store whose
+        # `time_bnds` CF-bounds variable states each slot's true interval, half-open
+        # ([Jan 1 of y, Jan 1 of y+1)). Non-calendar 12-month windows belong in a store whose
         # time points ARE the windows (single-ROI `12mo_window_end`, or the ADR-011
         # windowed-variant design at zone scale) — never in this store.
         "time_convention": "calendar_year",
@@ -235,16 +235,17 @@ def seed_zone_groups(
     times = calendar_year_times(years)
     nt = len(times)
     band = _layout_band(layout)
-    # CF time bounds: each year slot's covered interval is the actual date range of
-    # its calendar year, [Jan 1, Dec 31] (= TimeWindow.to_date_range for the Jan-Dec
-    # window every fill is required to use — the zone-fill gate enforces it). Written
-    # once here and never touched by fills: under the calendar-year guarantee the
-    # seeded bounds ARE each slot's true observation extent, and the `time` point
-    # (Jan 1 = the window start) always lies within them (CF §7.1 containment).
+    # CF time bounds: each year slot covers its whole calendar year, half-open as CF
+    # intends — [Jan 1 00:00 of y, Jan 1 00:00 of y+1). The upper bound is the instant
+    # the year ENDS, not the start of Dec 31: at ns precision the latter would drop
+    # Dec 31 and leave a one-day hole between consecutive slots. So years are
+    # contiguous, each cell is a full 365/366 days, and the `time` point (Jan 1) lies
+    # inside its own cell (CF §7.1 containment). Written once here and never touched
+    # by fills — the calendar-year guarantee makes these each slot's true extent.
     default_bnds = np.stack(
         [
             np.array([np.datetime64(f"{y}-01-01", "ns") for y in years], dtype="datetime64[ns]"),
-            np.array([np.datetime64(f"{y}-12-31", "ns") for y in years], dtype="datetime64[ns]"),
+            np.array([np.datetime64(f"{y + 1}-01-01", "ns") for y in years], dtype="datetime64[ns]"),
         ],
         axis=1,
     ).astype("int64")
