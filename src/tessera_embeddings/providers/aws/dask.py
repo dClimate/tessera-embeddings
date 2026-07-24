@@ -34,21 +34,28 @@ This contract is documented for the open-source release in
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import logging
 import os
 import random
+import sys
+import tempfile
+import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from distributed import Scheduler
 
 import dask
+import fsspec
 import psutil
 from dask_cloudprovider.aws import ECSCluster, FargateCluster
-from distributed import Client
+from distributed import Client, performance_report
 from distributed.diagnostics.plugin import SchedulerPlugin
 from tenacity import (
     Retrying,
@@ -76,6 +83,17 @@ DEFAULT_CLOUDWATCH_LOG_GROUP = "/ecs/tessera/dask"
 # after-the-fact "unresponsive for Ns" warning. A steady heartbeat makes the
 # run-up to that visible.
 DEFAULT_SCHEDULER_PROFILE_INTERVAL_S = 30.0
+
+# Under-duress stack sampling. When the scheduler process crosses either
+# threshold, a short-lived background thread snapshots ``sys._current_frames()``
+# a few times and logs a collapsed tally of the busiest code locations — the
+# py-spy substitute for Fargate, where process-attach (SYS_PTRACE) isn't
+# granted. It attributes a stall to graph construction vs comms vs work-stealing
+# vs GC. Runs OFF the event loop, so it never adds to the lag it measures.
+DEFAULT_STACK_TRIGGER_CPU_PCT = 90.0
+DEFAULT_STACK_TRIGGER_LAG_S = 3.0
+DEFAULT_STACK_SAMPLES = 5
+DEFAULT_STACK_SAMPLE_GAP_S = 0.2
 
 
 class SchedulerResourceLogger(SchedulerPlugin):
@@ -106,19 +124,47 @@ class SchedulerResourceLogger(SchedulerPlugin):
       breakdown of tasks in flight (``processing``) and stuck waiting
       (``no-worker``) — a rising backlog signals the scheduler falling behind.
 
+    When ``cpu`` or ``lag`` crosses the stack-sampling thresholds, a one-shot
+    background thread additionally logs a ``scheduler stack sample`` line: a
+    collapsed tally of the busiest code locations across the process's threads,
+    to attribute the stall (graph build vs comms vs stealing vs GC). It is
+    single-flight and runs off the event loop, so it never worsens the lag it
+    measures; pass ``stack_sampling=False`` to disable it entirely.
+
     Instantiated on the client but pickled to and run inside the scheduler
     process, so ``psutil.Process()`` measures the scheduler, not the client.
     """
 
     name = "scheduler-resource-logger"
 
-    def __init__(self, interval_s: float = DEFAULT_SCHEDULER_PROFILE_INTERVAL_S) -> None:
+    def __init__(
+        self,
+        interval_s: float = DEFAULT_SCHEDULER_PROFILE_INTERVAL_S,
+        *,
+        stack_sampling: bool = True,
+        stack_trigger_cpu_pct: float = DEFAULT_STACK_TRIGGER_CPU_PCT,
+        stack_trigger_lag_s: float = DEFAULT_STACK_TRIGGER_LAG_S,
+        stack_samples: int = DEFAULT_STACK_SAMPLES,
+        stack_sample_gap_s: float = DEFAULT_STACK_SAMPLE_GAP_S,
+    ) -> None:
         self.interval_s = interval_s
         self._proc: psutil.Process | None = None
         self._callback: PeriodicCallback | None = None
         self._scheduler: Any = None
         self._mem_limit_bytes: int | None = None
         self._expected_next_s: float | None = None
+        # Under-duress stack sampling (see class docstring).
+        self._stack_sampling = stack_sampling
+        self._stack_trigger_cpu_pct = stack_trigger_cpu_pct
+        self._stack_trigger_lag_s = stack_trigger_lag_s
+        self._stack_samples = stack_samples
+        self._stack_sample_gap_s = stack_sample_gap_s
+        # Created in start(), NOT here: this object is pickled to the remote
+        # scheduler by Client.register_plugin, and a threading.Event owns a
+        # _thread.lock that neither pickle nor cloudpickle can serialize. Building
+        # it in __init__ makes registration raise — which ecs_cluster swallows as
+        # best-effort, silently leaving the run with no heartbeat at all.
+        self._sampler_active: threading.Event | None = None
 
     async def start(self, scheduler: Scheduler) -> None:
         """Bind to the scheduler and start the periodic probe (called in-process).
@@ -127,6 +173,8 @@ class SchedulerResourceLogger(SchedulerPlugin):
         is non-blocking (no ``await``) — it just wires up the PeriodicCallback.
         """
         self._scheduler = scheduler
+        # Safe here: start() runs in the scheduler process, after unpickling.
+        self._sampler_active = threading.Event()
         self._proc = psutil.Process()
         # Prime cpu_percent so the first real reading is an interval delta
         # rather than the meaningless 0.0 the first call always returns.
@@ -190,8 +238,151 @@ class SchedulerResourceLogger(SchedulerPlugin):
                 processing,
                 no_worker,
             )
+            if self._stack_sampling and (
+                cpu_pct >= self._stack_trigger_cpu_pct or lag_s >= self._stack_trigger_lag_s
+            ):
+                self._maybe_sample_stacks(cpu_pct, lag_s)
         except (psutil.Error, AttributeError) as e:
             log.warning("scheduler health probe failed: %s", e)
+
+    def _maybe_sample_stacks(self, cpu_pct: float, lag_s: float) -> None:
+        """Kick off a one-shot background stack sample unless one is running.
+
+        Single-flight via ``_sampler_active`` so a sustained stall spawns at most
+        one sampler at a time, and threaded so sampling runs off the event loop.
+        """
+        if self._sampler_active is None:
+            # Defensive: a probe driven without start() (tests) still samples.
+            self._sampler_active = threading.Event()
+        if self._sampler_active.is_set():
+            return
+        self._sampler_active.set()
+        threading.Thread(
+            target=self._sample_stacks_worker,
+            args=(cpu_pct, lag_s),
+            name="sched-stack-sampler",
+            daemon=True,
+        ).start()
+
+    def _sample_stacks_worker(self, cpu_pct: float, lag_s: float) -> None:
+        """Snapshot thread stacks a few times and log a collapsed leaf-frame tally.
+
+        Reports the **event-loop thread separately** from the rest, because a
+        single global tally is misleading: idle threads park on one unchanging
+        wait frame and so accumulate a high count, while the genuinely busy loop
+        spreads its samples across many frames and can fall off the end of the
+        list — the exact opposite of what we need to attribute a stall. The loop
+        thread is the one that matters here (it is what ``lag`` measures), so its
+        frames are tallied and reported on their own.
+
+        This sampler's own thread is excluded — it is guaranteed to be running
+        (it is doing the sampling) and would otherwise take a slot in every
+        report.
+        """
+        log = logging.getLogger("distributed.scheduler")
+        try:
+            me = threading.current_thread().ident
+            # The scheduler's event loop runs in the thread that started it —
+            # MainThread under dask-cloudprovider's `dask-scheduler` entrypoint.
+            loop_tid = threading.main_thread().ident
+            names = {t.ident: t.name for t in threading.enumerate()}
+            loop_counts: collections.Counter[str] = collections.Counter()
+            other_counts: collections.Counter[str] = collections.Counter()
+            for i in range(self._stack_samples):
+                for tid, frame in sys._current_frames().items():
+                    if tid == me:
+                        continue
+                    code = frame.f_code
+                    fname = code.co_filename.rsplit("/", 1)[-1]
+                    if tid == loop_tid:
+                        loop_counts[f"{fname}:{code.co_name}:{frame.f_lineno}"] += 1
+                    else:
+                        other_counts[f"{names.get(tid, tid)}:{fname}:{code.co_name}:{frame.f_lineno}"] += 1
+                if i < self._stack_samples - 1:
+                    time.sleep(self._stack_sample_gap_s)
+            loop_top = " | ".join(f"{loc}={n}" for loc, n in loop_counts.most_common(6)) or "(no samples)"
+            other_top = " | ".join(f"{loc}={n}" for loc, n in other_counts.most_common(4)) or "(none)"
+            log.warning(
+                "scheduler stack sample (cpu=%.0f%% lag=%.1fs, %d samples) loop[%s]: %s -- other threads: %s",
+                cpu_pct,
+                lag_s,
+                self._stack_samples,
+                names.get(loop_tid, "?"),
+                loop_top,
+                other_top,
+            )
+        except Exception as e:  # diagnostics thread must never crash the scheduler
+            log.warning("scheduler stack sampling failed: %s", e)
+        finally:
+            if self._sampler_active is not None:
+                self._sampler_active.clear()
+
+
+@contextlib.contextmanager
+def maybe_performance_report(scheduler_address: str, uri: str | None, log: logging.Logger) -> Iterator[None]:
+    """Optionally capture a Dask ``performance_report`` for the wrapped compute.
+
+    No-op when ``uri`` is falsy (the default), so normal runs pay nothing. When
+    set, it opens a short-lived client on ``scheduler_address`` — needed because
+    ``performance_report`` talks to the scheduler through the *current* client,
+    and the Prefect task runner owns a separate one — captures the
+    task-stream/profile/bandwidth HTML to a temp file, then uploads it to ``uri``
+    (any fsspec target). Intended for probe rungs, not the campaign (large graphs
+    make report assembly heavy).
+
+    **The diagnostics are fully isolated from the wrapped body**, because this is
+    an optional probe-only artifact that must never affect the ingest it observes.
+    Three failure paths are each contained:
+
+    1. *Setup* (client connect, report start) — logged, then the body runs with no
+       diagnostics at all, rather than an unreachable scheduler dashboard
+       preventing the ingest from running.
+    2. *Rendering* (``performance_report.__exit__``, which builds the HTML and is
+       the expensive part) — logged. Left unguarded it would fail an ingest that
+       had already completed, and on a FAILING ingest it would propagate in place
+       of the body's exception, hiding the real error behind a diagnostics one.
+    3. *Upload* — logged. fsspec backends raise anything (botocore ClientError for
+       a denied PUT or missing bucket, credential errors), none of which subclass
+       OSError.
+
+    The report is shipped whether or not the body succeeded: a failed at-scale
+    run is exactly when its task stream is most worth reading.
+    """
+    if not uri:
+        yield
+        return
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local = Path(tmpdir) / "dask-performance-report.html"
+        diagnostics = contextlib.ExitStack()
+        try:
+            diagnostics.enter_context(Client(scheduler_address))
+            diagnostics.enter_context(performance_report(filename=str(local)))
+        except Exception as e:
+            log.warning("could not start Dask performance report (%s); continuing without it", e)
+            with contextlib.suppress(Exception):
+                diagnostics.close()
+            yield
+            return
+
+        try:
+            yield
+        finally:
+            # Nothing below may raise: that is what keeps a diagnostics artifact
+            # from failing a completed ingest or masking a failing one.
+            rendered = False
+            try:
+                diagnostics.close()  # renders the HTML
+                rendered = True
+            except Exception as e:
+                log.warning("Dask performance report generation failed: %s", e)
+            if rendered:
+                try:
+                    with local.open("rb") as fh, fsspec.open(uri, "wb") as out:
+                        out.write(fh.read())
+                    log.info("wrote Dask performance report to %s", uri)
+                except Exception as e:
+                    log.warning("failed to upload Dask performance report to %s: %s", uri, e)
 
 
 # Substrings of transient cluster-start failures worth retrying. All are ECS

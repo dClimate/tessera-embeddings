@@ -105,6 +105,35 @@ def test_dispatches_and_marks_on_success(wired, monkeypatch):
     ]
 
 
+def test_perf_report_uri_scoped_by_cell_then_child(wired, monkeypatch):
+    """The base URI is scoped by (zone, year) FIRST, then per child.
+
+    run-global-campaign hands the same IngestSettings to every cell, so a
+    base-only path would have concurrent cells racing on one s2.html and later
+    cells silently overwriting earlier ones.
+    """
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+    _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(perf_report_uri="s3://in/perf/"))
+
+    params = [p for _, p in wired["arun"]]
+    s2 = next(p for p in params if "min_valid_coverage" in p)
+    s1 = next(p for p in params if "orbit" in p)
+    # zone 33N / year 2025 (see _run's defaults) separates the cells.
+    assert s2["perf_report_uri"] == "s3://in/perf/33N-2025/s2.html"
+    assert s1["perf_report_uri"] == "s3://in/perf/33N-2025/s1-ascending.html"
+
+
+def test_perf_report_uri_none_by_default(wired, monkeypatch):
+    """With no perf base set, children receive perf_report_uri=None (off)."""
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+    _run(s1_orbit="ascending")
+
+    params = [p for _, p in wired["arun"]]
+    assert all(p["perf_report_uri"] is None for p in params)
+
+
 def test_s3_region_threaded_through_metadata_opens(wired, monkeypatch):
     """The flow's s3_region reaches its Icechunk metadata opens — the mask liveness
     probe, ROI synthesis, and the coverage gate — so a non-default-region deployment

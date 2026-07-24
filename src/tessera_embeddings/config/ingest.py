@@ -55,3 +55,8 @@ class IngestSettings(BaseModel):
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE
     # S1 CMR query batch window, in days.
     batch_days: int = 30
+    # Optional base URI (an fsspec target, e.g. s3://.../perf/) for capturing a
+    # Dask ``distributed.performance_report`` per child ingest. Default None =
+    # off (normal runs pay nothing); set it only on a probe rung — ingest-zone-year
+    # composes a unique per-child filename (``s2.html``, ``s1-<orbit>.html``) under it.
+    perf_report_uri: str | None = None

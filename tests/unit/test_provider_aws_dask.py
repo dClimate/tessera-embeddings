@@ -10,15 +10,26 @@ feeds is exercised against a stub callable to confirm the wiring.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
+import pickle
+import threading
+
+import cloudpickle
+import psutil
 import pytest
 from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_fixed
 
 pytest.importorskip("dask_cloudprovider", reason="dask-cloudprovider not installed (AWS extras)")
 
+from tessera_embeddings.config.ingest import IngestSettings
+from tessera_embeddings.providers.aws import dask as dask_mod
 from tessera_embeddings.providers.aws.dask import (
     _RETRYABLE_CLUSTER_START_ERRORS,
     SchedulerResourceLogger,
     _is_retryable_cluster_start_error,
+    maybe_performance_report,
 )
 
 
@@ -152,8 +163,6 @@ class TestSchedulerResourceLogger:
 
     def _emit(self, plugin: SchedulerResourceLogger, sched: _FakeScheduler, caplog) -> str:
         """Run one probe with the plugin bound to ``sched`` and return the line."""
-        import logging
-
         plugin._scheduler = sched
         with caplog.at_level(logging.INFO, logger="distributed.scheduler"):
             plugin._log_usage()
@@ -165,8 +174,9 @@ class TestSchedulerResourceLogger:
         """A logger past ``start()`` but with its PeriodicCallback torn down so
         no timer fires during the test.
         """
-        plugin = SchedulerResourceLogger(interval_s=30.0)
-        import psutil
+        # Sampling off: these tests assert the health line only, and a triggered
+        # sampler would spawn a thread and add nondeterministic WARNING lines.
+        plugin = SchedulerResourceLogger(interval_s=30.0, stack_sampling=False)
 
         plugin._proc = psutil.Process()
         plugin._proc.cpu_percent(None)
@@ -223,8 +233,6 @@ class TestSchedulerResourceLogger:
         """Defensive: a probe with no primed process (pre-``start``) logs nothing
         rather than raising.
         """
-        import logging
-
         plugin = SchedulerResourceLogger()
         with caplog.at_level(logging.INFO, logger="distributed.scheduler"):
             plugin._log_usage()
@@ -234,8 +242,6 @@ class TestSchedulerResourceLogger:
         """``before_close`` must stop the PeriodicCallback so a torn-down
         scheduler isn't left with a live timer.
         """
-        import asyncio
-
         plugin = SchedulerResourceLogger()
 
         class _FakeCallback:
@@ -252,6 +258,83 @@ class TestSchedulerResourceLogger:
         assert cb.stopped is True
         assert plugin._callback is None
 
+    def test_plugin_is_picklable_for_register_plugin(self) -> None:
+        """The plugin MUST survive serialization to the remote scheduler.
+
+        ``Client.register_plugin`` pickles the instance to the scheduler process.
+        A ``threading.Event`` built in ``__init__`` owns a ``_thread.lock`` that
+        neither pickle nor cloudpickle can serialize, so registration would raise
+        — and ``ecs_cluster`` catches registration errors as best-effort, meaning
+        the failure is SILENT and the run emits no health lines at all. Hence the
+        event is created in ``start()``, and this pins that.
+        """
+        plugin = SchedulerResourceLogger()
+        for dumps in (pickle.dumps, cloudpickle.dumps):
+            revived = pickle.loads(dumps(plugin))
+            assert revived.name == SchedulerResourceLogger.name
+            assert revived._sampler_active is None  # created in start(), not __init__
+
+    def test_start_creates_the_sampler_event(self) -> None:
+        """``start()`` runs in the scheduler process, so the Event is built there."""
+        plugin = SchedulerResourceLogger(interval_s=30.0)
+        sched = _FakeScheduler(workers_processing=[0], tasks=0, unrunnable=0)
+        asyncio.run(plugin.start(sched))
+        try:
+            assert plugin._sampler_active is not None
+            assert plugin._sampler_active.is_set() is False
+        finally:
+            asyncio.run(plugin.before_close())  # stop the PeriodicCallback
+
+    def test_stack_sampler_logs_and_clears(self, caplog) -> None:
+        """The worker logs one collapsed stack tally with the cpu/lag context
+        and clears the single-flight flag when done.
+        """
+        plugin = SchedulerResourceLogger(stack_samples=2, stack_sample_gap_s=0.0)
+        # start() normally creates this in the scheduler process; stand it up here.
+        plugin._sampler_active = threading.Event()
+        plugin._sampler_active.set()
+        with caplog.at_level(logging.WARNING, logger="distributed.scheduler"):
+            plugin._sample_stacks_worker(95.0, 4.0)
+        lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("scheduler stack sample")]
+        assert len(lines) == 1
+        assert "cpu=95% lag=4.0s, 2 samples" in lines[0]
+        assert plugin._sampler_active.is_set() is False
+
+    def test_stack_sampler_single_flight(self) -> None:
+        """A second trigger while a sampler is active is a no-op."""
+        plugin = SchedulerResourceLogger()
+        started: list = []
+        plugin._sample_stacks_worker = lambda *a: started.append(a)  # type: ignore[method-assign]
+        plugin._sampler_active = threading.Event()
+        plugin._sampler_active.set()  # pretend one is already running
+        plugin._maybe_sample_stacks(99.0, 5.0)
+        assert started == []
+
+    def test_stack_sampler_triggers_when_idle(self) -> None:
+        """When idle, a trigger spawns the worker off the event loop."""
+        plugin = SchedulerResourceLogger()
+        ran = threading.Event()
+
+        def _fake(cpu: float, lag: float) -> None:
+            ran.set()
+            plugin._sampler_active.clear()
+
+        plugin._sample_stacks_worker = _fake  # type: ignore[method-assign]
+        plugin._maybe_sample_stacks(99.0, 5.0)
+        assert ran.wait(timeout=2.0)
+
+    def test_log_usage_calls_sampler_on_high_lag(self, caplog) -> None:
+        """The health probe hands a duress reading (lag>=3s) to the sampler."""
+        plugin = self._make_started()
+        plugin._stack_sampling = True  # helper disables it; re-enable for this test
+        calls: list = []
+        plugin._maybe_sample_stacks = lambda cpu, lag: calls.append((cpu, lag))  # type: ignore[method-assign]
+        self._emit(plugin, _FakeScheduler(workers_processing=[0], tasks=0, unrunnable=0, now=1000.0), caplog)
+        caplog.clear()  # _emit asserts exactly one health line per call
+        self._emit(plugin, _FakeScheduler(workers_processing=[0], tasks=0, unrunnable=0, now=1035.0), caplog)
+        assert calls, "expected the sampler to be triggered by lag>=3s"
+        assert calls[-1][1] == 5.0
+
 
 @pytest.mark.integration
 class TestSchedulerResourceLoggerOnCluster:
@@ -261,7 +344,6 @@ class TestSchedulerResourceLoggerOnCluster:
     """
 
     def test_registered_plugin_emits_on_real_scheduler(self, caplog) -> None:
-        import logging
         import time
 
         from distributed import Client, LocalCluster
@@ -281,3 +363,88 @@ class TestSchedulerResourceLoggerOnCluster:
         health = [r.getMessage() for r in caplog.records if r.getMessage().startswith("scheduler health:")]
         assert health, "expected at least one health line from the running scheduler"
         assert "workers=1" in health[-1]
+
+
+def test_maybe_performance_report_noop_without_uri() -> None:
+    """With no URI the helper is a pure pass-through — no client, no Dask calls."""
+    ran = []
+    with maybe_performance_report("tcp://unused:8786", None, logging.getLogger("t")):
+        ran.append(True)
+    assert ran == [True]
+
+
+def test_ingest_settings_perf_report_uri_defaults_none() -> None:
+    """The perf-report knob is off by default, so normal runs never capture one."""
+    assert IngestSettings().perf_report_uri is None
+
+
+def _report_stub(exit_error: Exception | None = None):
+    """A performance_report stand-in, optionally failing on exit (the render step)."""
+
+    @contextlib.contextmanager
+    def _report(filename=None):
+        yield
+        if exit_error is not None:
+            raise exit_error
+
+    return _report
+
+
+class TestMaybePerformanceReport:
+    """A probe-only diagnostics artifact must never affect the ingest it observes."""
+
+    def test_noop_without_uri(self) -> None:
+        """With no URI the helper is a pure pass-through — no client, no Dask calls."""
+        ran = []
+        with maybe_performance_report("tcp://unused:8786", None, logging.getLogger("t")):
+            ran.append(True)
+        assert ran == [True]
+
+    def test_setup_failure_still_runs_the_body(self, monkeypatch, caplog) -> None:
+        """If the diagnostic client can't connect, the ingest runs anyway.
+
+        Otherwise an unreachable scheduler — or a typo'd probe URI — would stop
+        the actual ingest from happening at all.
+        """
+
+        def _boom(*a, **k):
+            raise OSError("cannot connect to scheduler")
+
+        monkeypatch.setattr(dask_mod, "Client", _boom)
+
+        ran = []
+        with (
+            caplog.at_level(logging.WARNING),
+            maybe_performance_report("tcp://x:8786", "s3://b/p.html", logging.getLogger("t")),
+        ):
+            ran.append(True)
+        assert ran == [True], "body must still execute when diagnostics setup fails"
+
+    def test_render_failure_does_not_mask_the_body_exception(self, monkeypatch) -> None:
+        """A report-render failure must not replace the ingest's own exception.
+
+        The render happens in ``performance_report.__exit__``, so unguarded it
+        would surface INSTEAD of the real ingest error and send debugging in
+        entirely the wrong direction.
+        """
+        monkeypatch.setattr(dask_mod, "Client", lambda *a, **k: contextlib.nullcontext())
+        monkeypatch.setattr(dask_mod, "performance_report", _report_stub(RuntimeError("render blew up")))
+
+        with (
+            pytest.raises(ValueError, match="the real ingest failure"),
+            maybe_performance_report("tcp://x:8786", "s3://b/p.html", logging.getLogger("t")),
+        ):
+            raise ValueError("the real ingest failure")
+
+    def test_render_failure_does_not_fail_a_successful_ingest(self, monkeypatch, caplog) -> None:
+        """A render failure after a clean ingest is logged, not raised."""
+        monkeypatch.setattr(dask_mod, "Client", lambda *a, **k: contextlib.nullcontext())
+        monkeypatch.setattr(dask_mod, "performance_report", _report_stub(RuntimeError("render blew up")))
+
+        ran = []
+        with (
+            caplog.at_level(logging.WARNING),
+            maybe_performance_report("tcp://x:8786", "s3://b/p.html", logging.getLogger("t")),
+        ):
+            ran.append(True)
+        assert ran == [True]

@@ -13,11 +13,11 @@ inference-outputs.md``:
 Usage::
 
     # Compare two staged run directories (all chunk labels present in both):
-    python scripts/inference_perf/compare_outputs.py \
+    te-compare-outputs \
         s3://bucket/staging/<ref_run_id> s3://bucket/staging/<test_run_id>
 
     # Compare two specific staged chunk zarrs:
-    python scripts/inference_perf/compare_outputs.py \
+    te-compare-outputs \
         s3://.../ref/chunk_0_2.zarr s3://.../test/chunk_0_2.zarr
 
 Exit code 0 = all chunks pass, 1 = any failure. Bit-identical changes

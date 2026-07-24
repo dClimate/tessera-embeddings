@@ -1,0 +1,180 @@
+"""Assemble a per-run ingest dossier from the profiling JSON outputs.
+
+The dossier is the deliverable of every at-scale ingest rung: it merges the
+scheduler profile (``watch_scheduler.py --report``), the external-service
+aggregates (``ingest_log_queries.py``), and — when captured — the deep-profile
+``performance_report`` artifact link, into one markdown skeleton. This tool
+does the mechanical merge and leaves a clearly-marked **Interpretation** section
+for the operator (Claude) to fill in with the bottleneck verdict and the
+recommended next rung.
+
+It is pure: it reads JSON files already produced by the other tools and touches
+no AWS, so it is deterministic and unit-testable, and the raw JSON stays the
+system of record behind the prose.
+
+Usage::
+
+    te-watch-scheduler ... --report > sched.json
+    te-ingest-log-queries ... > logs.json
+    te-ingest-report \
+        --scheduler sched.json --logs logs.json \
+        --run-id abc123 --zone 32633 --year 2025 --max-workers 500 \
+        --perf-report s3://.../perf.html --out dossier.md
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+def _load_json(path: str | None) -> dict | None:
+    if not path:
+        return None
+    return json.loads(Path(path).read_text())
+
+
+def _md_table(rows: list[dict], limit: int = 25) -> str:
+    """Render Insights rows (list of {col: val}) as a markdown table."""
+    if not rows:
+        return "_no matching log lines_\n"
+    cols: list[str] = []
+    for r in rows:
+        for k in r:
+            if k not in cols:
+                cols.append(k)
+    head = "| " + " | ".join(cols) + " |\n"
+    sep = "| " + " | ".join("---" for _ in cols) + " |\n"
+    body = ""
+    for r in rows[:limit]:
+        body += "| " + " | ".join(str(r.get(c, "")) for c in cols) + " |\n"
+    if len(rows) > limit:
+        body += f"\n_({len(rows) - limit} more rows in the raw JSON)_\n"
+    return head + sep + body
+
+
+def _scheduler_section(sched: dict | None) -> str:
+    if sched is None:
+        return "### Scheduler\n\n_No scheduler profile supplied (`--scheduler`)._\n"
+    profile = sched.get("profile", {})
+    if not profile.get("samples"):
+        return (
+            "### Scheduler\n\n"
+            f"_No `scheduler health:` lines in {sched.get('log_group', '?')} for the window "
+            "— was the heartbeat plugin attached, and the stream-prefix right?_\n"
+        )
+    pk = profile["peaks"]
+    w = profile["window"]
+    mem = "unknown" if pk["mem"] is None else f"{pk['mem']:.0f}%"
+    tripped = ", ".join(f"`{k}` @ {v}" for k, v in profile["onsets"].items() if v)
+    onsets = tripped or "_none tripped_"
+    lines = [
+        "### Scheduler",
+        "",
+        f"- Window: {w['start']} → {w['end']} ({profile['samples']} health samples)",
+        f"- Peak CPU: **{pk['cpu']:.0f}%** · peak mem: **{mem}** · peak loop-lag: **{pk['lag']:.1f}s**",
+        f"- Peak backlog (no-worker): **{pk['no_worker']}**",
+        f"- Peak workers: **{pk['workers']}** · peak tasks: **{pk['tasks']}**",
+        f"- cpu-high ∧ backlog-rising intervals: **{profile['cpu_backlog_cooccurrence']}**",
+        f"- Saturation onsets: {onsets}",
+        f"- Worker join/exit events: **{len(profile['worker_events'])}**",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _logs_section(logs: dict | None) -> str:
+    if logs is None:
+        return "### External services & workers\n\n_No log-query output supplied (`--logs`)._\n"
+    out = ["### External services & workers", ""]
+    for name, q in logs.get("queries", {}).items():
+        out.append(f"**{name}** — {q['description']}")
+        out.append("")
+        rows = q.get("rows")
+        if rows is None:
+            out.append("_query failed (permission/timeout) — see stderr from the run_\n")
+        else:
+            out.append(_md_table(rows))
+        out.append("")
+    return "\n".join(out)
+
+
+def build_dossier(args: argparse.Namespace, sched: dict | None, logs: dict | None) -> str:
+    """Merge the scheduler + log-query JSON into the dossier markdown skeleton."""
+    title = args.title or f"Ingest run {args.run_id or '(unlabeled)'}"
+    meta = [
+        f"# {title}",
+        "",
+        "| field | value |",
+        "| --- | --- |",
+        f"| run id | {args.run_id or '—'} |",
+        f"| zone / year | {args.zone or '—'} / {args.year or '—'} |",
+        f"| worker bounds | {args.min_workers or '—'} … {args.max_workers or '—'} |",
+    ]
+    win = (sched or {}).get("window") or (logs or {}).get("window")
+    if win:
+        meta.append(f"| window | {win['start']} → {win['end']} |")
+    if args.perf_report:
+        meta.append(f"| deep-profile artifact | [{args.perf_report}]({args.perf_report}) |")
+    meta.append("")
+
+    interpretation = [
+        "## Interpretation",
+        "",
+        "> _Fill in from the sections below. Answer explicitly:_",
+        "> - **Bottleneck verdict** — scheduler-bound, worker/external-bound, or headroom left?",
+        "> - **Limiting factor** — which signal capped this rung (CPU-sustained, backlog growth, "
+        "worker churn, an external 429/503 curve, S3 SlowDown)?",
+        "> - **Next rung** — go higher, hold, or step back; and any config change to try first.",
+        "",
+    ]
+
+    return "\n".join(
+        [
+            "\n".join(meta),
+            "\n".join(interpretation),
+            _scheduler_section(sched),
+            "",
+            _logs_section(logs),
+            "---",
+            "",
+            "_Raw JSON is the system of record: "
+            + ", ".join(
+                p for p in (f"`{args.scheduler}`" if args.scheduler else "", f"`{args.logs}`" if args.logs else "") if p
+            )
+            + "._",
+            "",
+        ]
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse args, load the profiling JSON, and emit the dossier."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--scheduler", help="watch_scheduler.py --report JSON file")
+    parser.add_argument("--logs", help="ingest_log_queries.py JSON file")
+    parser.add_argument("--perf-report", help="S3 URI of the distributed performance_report HTML (if captured)")
+    parser.add_argument("--run-id")
+    parser.add_argument("--zone")
+    parser.add_argument("--year")
+    parser.add_argument("--min-workers")
+    parser.add_argument("--max-workers")
+    parser.add_argument("--title")
+    parser.add_argument("--out", help="write the dossier here (default: stdout)")
+    args = parser.parse_args(argv)
+
+    if not args.scheduler and not args.logs:
+        parser.error("supply at least one of --scheduler / --logs")
+
+    dossier = build_dossier(args, _load_json(args.scheduler), _load_json(args.logs))
+    if args.out:
+        Path(args.out).write_text(dossier)
+        print(f"wrote {args.out}", file=sys.stderr)
+    else:
+        print(dossier)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

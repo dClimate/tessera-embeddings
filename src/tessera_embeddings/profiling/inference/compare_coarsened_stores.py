@@ -22,7 +22,7 @@ defect.
 
 Usage::
 
-    AWS_PROFILE=yield python scripts/inference_perf/compare_coarsened_stores.py \
+    AWS_PROFILE=yield te-compare-stores \
         s3://arbol-tessera-embeddings-dev/embeddings/iowa_epsg5070-reference_500m.zarr \
         s3://arbol-tessera-embeddings-dev/embeddings/iowa_epsg5070-inference-speedup-phase5_500m.zarr
 

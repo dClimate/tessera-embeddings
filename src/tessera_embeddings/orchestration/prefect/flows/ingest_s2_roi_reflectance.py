@@ -63,6 +63,7 @@ def ingest_s2_roi_reflectance(
     ec2_scheduler: bool = False,
     use_local: bool = False,
     storage_options: dict | None = None,
+    perf_report_uri: str | None = None,
 ) -> dict[str, Any]:
     """Ingest S2 L2A reflectance for an ROI using Dask workers.
 
@@ -90,6 +91,9 @@ def ingest_s2_roi_reflectance(
             For tests and dev iteration on a single machine.
         storage_options: fsspec storage options forwarded to the
             domain function.
+        perf_report_uri: Optional fsspec URI; when set, a Dask
+            performance-report HTML for this run is captured and
+            uploaded there (probe-rung profiling; default off).
 
     Returns:
         ``IngestResult`` serialised as a dict (see
@@ -115,18 +119,19 @@ def ingest_s2_roi_reflectance(
                 storage_options=storage_options,
             )
 
-    from tessera_embeddings.providers.aws.dask import ecs_cluster
+    from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
 
     with ecs_cluster(log, min_workers=min_workers, max_workers=max_workers, ec2_scheduler=ec2_scheduler) as cluster:
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
-        return _ingest_s2_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-            roi_zarr_path=roi_zarr_path,
-            start_date=start_date,
-            end_date=end_date,
-            store_path=store_path,
-            min_valid_coverage=min_valid_coverage,
-            provider=provider,
-            collection=collection,
-            storage_options=storage_options,
-        )
+        with maybe_performance_report(cluster.scheduler_address, perf_report_uri, log):
+            return _ingest_s2_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
+                roi_zarr_path=roi_zarr_path,
+                start_date=start_date,
+                end_date=end_date,
+                store_path=store_path,
+                min_valid_coverage=min_valid_coverage,
+                provider=provider,
+                collection=collection,
+                storage_options=storage_options,
+            )

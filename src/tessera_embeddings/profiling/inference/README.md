@@ -1,5 +1,10 @@
 # Inference performance harness
 
+> **Scope: the INFERENCE half of the pipeline** — the Ray / GPU fill stage. For
+> the ingest half (the Dask / Fargate scheduler + workers), see
+> [`../ingest/`](../ingest/README.md). Start at [`../README.md`](../README.md)
+> for which harness to reach for.
+
 General-purpose profiling tooling for Tessera Ray inference runs — any
 deployment, any scale (built during the GPU-saturation campaign; equally
 aimed at global-tessera UTM-zone runs). Numerics policy the gates enforce:
@@ -12,7 +17,7 @@ Workers are discovered by the Ray autoscaler's own EC2 tags
 cluster works. Point the tool at a deployment with:
 
 ```
-python scripts/inference_perf/observe_cluster.py \
+te-observe-cluster \
   --profile <aws-profile> --region <region> \
   --cluster <exact-ray-cluster-name>        # or --cluster-prefix <base-name>
   --log-group </ec2/.../ray>                # that deployment's CW log group
