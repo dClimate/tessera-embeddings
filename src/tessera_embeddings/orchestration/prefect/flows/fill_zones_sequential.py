@@ -27,6 +27,7 @@ requests) so the autoscaled fleet only ever shrinks across the run.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -34,8 +35,10 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from prefect import flow, get_run_logger
+from prefect.client.orchestration import get_client
 from prefect.deployments import run_deployment
 from prefect.runtime import flow_run as flow_run_ctx
+from prefect.states import Cancelling
 
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.ingest import IngestSettings
@@ -83,17 +86,27 @@ if TYPE_CHECKING:
     from tessera_embeddings.config.inference import InferenceConfig
     from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff
 
+# How often a cell-ingest worker polls its child flow run for a terminal state.
+# Ingests run tens of minutes, so this granularity is noise there; shutdown
+# doesn't wait on it (pollers wake immediately via the _stopping event).
+_INGEST_POLL_S = 15.0
+
 
 class _DeploymentCellInputs:
     """Ingest-deployment adapter satisfying the runner's ``CellInputs`` protocol.
 
-    ``start`` submits a worker thread that dispatches the ingest deployment and
-    blocks until that flow run finishes, so a cell's ``wait`` is just a future
-    join; the executor is sized to ``look_ahead`` so concurrent ingest Dask
-    clusters stay bounded exactly like the parallel driver's
-    ``max_parallel_ingest``. ``cleanup`` deletes only mosaics THIS adapter
-    produced (a cell never started here is someone else's input), matching the
-    parallel driver's ``did_ingest and cleanup_mosaics`` rule.
+    ``start`` submits a worker thread that creates the ingest flow run
+    (``run_deployment(timeout=0)``, returning immediately with the run's id)
+    and then POLLS it to a terminal state, so a cell's ``wait`` is a future
+    join and — crucially — the child run's id is known while it executes:
+    ``shutdown`` can request cancellation of every in-flight ingest instead of
+    orphaning children that keep writing after the parent has failed (a quick
+    retry would then race the orphan on the same mosaic prefix). The executor
+    is sized to ``look_ahead`` so concurrent ingest Dask clusters stay bounded
+    exactly like the parallel driver's ``max_parallel_ingest``. ``cleanup``
+    deletes only mosaics THIS adapter produced (a cell never started here is
+    someone else's input), matching the parallel driver's ``did_ingest and
+    cleanup_mosaics`` rule.
 
     Threads don't inherit the flow's Prefect context, so ingest runs dispatch
     without a parent-run link — they are still tracked as ordinary runs of the
@@ -117,19 +130,51 @@ class _DeploymentCellInputs:
         self._log = log
         self._executor = ThreadPoolExecutor(max_workers=max(1, max_parallel), thread_name_prefix="cell-ingest")
         self._futures: dict[tuple[str, int], Future[None]] = {}
+        self._lock = threading.Lock()
+        self._inflight: dict[tuple[str, int], Any] = {}  # (zone, year) → flow-run id
+        self._stopping = threading.Event()
 
     def _run(self, zone: str, year: int) -> None:
         self._log.info("Ingest dispatch: %s-%d via %s", zone, year, self._deployment)
-        run = run_deployment(self._deployment, parameters=self._params_for(zone, year))
+        # timeout=0: return as soon as the run is created so its id is in hand —
+        # a blocking run_deployment() only yields the run AFTER it finishes,
+        # leaving shutdown nothing to cancel.
+        # run_deployment is @sync_compatible (typed as a union with its coroutine
+        # form); in these worker threads it always runs synchronously.
+        run: Any = run_deployment(self._deployment, parameters=self._params_for(zone, year), timeout=0)
+        with self._lock:
+            self._inflight[(zone, year)] = run.id
+        try:
+            run = self._poll_until_terminal(run.id, f"{zone}-{year}")
+        finally:
+            with self._lock:
+                self._inflight.pop((zone, year), None)
         _check_completed(run, f"ingest {zone}-{year}")
+
+    def _poll_until_terminal(self, flow_run_id: Any, label: str) -> Any:  # noqa: ANN401 — Prefect FlowRun
+        with get_client(sync_client=True) as client:
+            while not self._stopping.is_set():
+                run = client.read_flow_run(flow_run_id)
+                if run.state is not None and run.state.is_final():
+                    return run
+                self._stopping.wait(_INGEST_POLL_S)
+        raise RuntimeError(f"ingest {label} abandoned: adapter shutting down")
 
     def start(self, zone: str, year: int) -> None:
         if (zone, year) not in self._futures:
             self._futures[(zone, year)] = self._executor.submit(self._run, zone, year)
 
-    def wait(self, zone: str, year: int) -> None:
+    def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
         self.start(zone, year)
-        self._futures[(zone, year)].result()
+        fut = self._futures[(zone, year)]
+        while True:
+            try:
+                return fut.result(timeout=1.0)
+            except TimeoutError:
+                # Runner unwind (crashed session): return promptly instead of
+                # sitting behind the full remaining ingest duration.
+                if stop is not None and stop.is_set():
+                    raise RuntimeError(f"wait for ingest {zone}-{year} aborted: runner stopping") from None
 
     def cleanup(self, zone: str, year: int) -> None:
         if (zone, year) not in self._futures or not self._cleanup_mosaics:
@@ -137,8 +182,39 @@ class _DeploymentCellInputs:
         delete_prefix(f"{self._inputs_bucket.rstrip('/')}/mosaics/{zone}/{year}", log=self._log)
 
     def shutdown(self) -> None:
-        """Stop dispatching; don't wait on ingests nobody will consume."""
+        """Stop dispatching AND cancel in-flight child ingest runs (best effort).
+
+        Queued futures are cancelled outright; running ones are unblocked by
+        ``_stopping`` at their next poll tick. The child flow runs themselves
+        would otherwise keep executing server-side after this parent dies —
+        request their cancellation so a prompt retry never races an orphaned
+        ingest writing the same mosaic prefix.
+        """
+        # Snapshot BEFORE waking the pollers: a woken worker deregisters its
+        # run id on the way out, and an id that leaves the map un-swept is an
+        # un-cancelled child still running server-side.
+        with self._lock:
+            inflight = dict(self._inflight)
+        self._stopping.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
+        if not inflight:
+            return
+        try:
+            with get_client(sync_client=True) as client:
+                for (zone, year), fr_id in inflight.items():
+                    try:
+                        client.set_flow_run_state(fr_id, state=Cancelling())
+                        self._log.warning("Requested cancellation of in-flight ingest %s-%d (%s)", zone, year, fr_id)
+                    except Exception:
+                        self._log.warning(
+                            "Could not cancel in-flight ingest %s-%d (%s) — it may keep running; check the Prefect UI",
+                            zone,
+                            year,
+                            fr_id,
+                            exc_info=True,
+                        )
+        except Exception:
+            self._log.warning("Ingest cancellation sweep failed — check the Prefect UI for orphans", exc_info=True)
 
 
 @flow(
@@ -461,12 +537,20 @@ def fill_zones_sequential_flow(
     # ZoneContext.
     session_config = _config_for(s1_orbit)
 
+    # Size the shared session by the LARGEST cell's clamped request, not the raw
+    # fleet ceiling: the session provisions its first actor batch before any
+    # streamed work arrives, so a small shard (e.g. a one-tile zone list) would
+    # otherwise request the full default fleet for work that can never use it.
+    # live is sorted num_actors-descending and each cell is already clamped to
+    # min(num_actors, its live tiles), so live[0] IS the run's true ceiling.
+    session_actors = live[0].num_actors
+
     def _session(
         more_work: Callable[[], list[WorkItem] | None],
         on_item_done: Callable[[WorkItem, dict[str, Any]], None],
     ) -> list[dict[str, Any]]:
         return run_inference(
-            num_actors,
+            session_actors,
             session_config,
             [],
             "chained-session",
@@ -515,6 +599,16 @@ def fill_zones_sequential_flow(
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
         )
+
+    # Prime the pipeline: kick off the initial ingest window BEFORE `ray up`, so
+    # the first cell's mosaic materializes during cluster bring-up instead of a
+    # freshly-provisioned GPU fleet idling through a full ingest at the start of
+    # every year. Idempotent — the runner's feeder immediately re-issues these
+    # same starts (and admits them through its mosaic budget); the window is
+    # 1 + look_ahead ≤ the budget's look_ahead + 2, so priming can't overshoot it.
+    if inputs is not None:
+        for cell in live[: 1 + look_ahead]:
+            inputs.start(cell.zone, cell.year)
 
     try:
         # Pin a deterministic cluster name from the flow-run id so the cancellation

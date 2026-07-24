@@ -163,3 +163,162 @@ def test_stream_contract_wired(wired):
     assert kw["session_s1_orbit"] == "both"
     assert callable(kw["plan"]) and callable(kw["session"]) and callable(kw["infer_single"])
     assert "infer" not in kw and "max_consecutive_failures" not in kw
+
+
+# ---------------------------------------------------------------------------
+# Pipeline priming + session sizing
+# ---------------------------------------------------------------------------
+
+
+def test_first_ingest_window_starts_before_ray_up(wired, monkeypatch):
+    """The initial ingest window is kicked off BEFORE `ray up`, so the first
+    mosaic materializes during cluster bring-up instead of the fresh GPU fleet
+    idling through a full ingest at the start of every year.
+    """
+
+    class FakeInputs:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self, zone, year):
+            wired["order"].append(f"start:{zone}")
+
+        def shutdown(self):
+            wired["order"].append("inputs_shutdown")
+
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", FakeInputs)
+    _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
+    # Window = 1 + look_ahead cells, all before the cluster:
+    starts = [e for e in wired["order"] if e.startswith("start:")]
+    assert starts == ["start:01N", "start:02N"]
+    assert wired["order"].index("start:02N") < wired["order"].index("ray_up")
+
+
+def test_ingest_false_skips_priming(wired, monkeypatch):
+    monkeypatch.setattr(
+        mod, "_DeploymentCellInputs", lambda **k: (_ for _ in ()).throw(AssertionError("no adapter expected"))
+    )
+    _run(ingest=False)
+    assert not [e for e in wired["order"] if e.startswith("start:")]
+
+
+def test_session_sized_to_largest_cell_not_fleet_ceiling(wired, monkeypatch):
+    """The shared session's actor request is the LARGEST cell's clamped request:
+    a small shard must not ask AWS for the full default fleet before any
+    streamed work arrives.
+    """
+    counts = {"01N": 3, "02N": 5}
+    monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: counts[zone])
+    captured: dict = {}
+    monkeypatch.setattr(mod, "run_inference", lambda n, *a, **k: captured.update(n=n) or [])
+    _run(zones=["01N", "02N"], num_actors=20)
+    wired["seq_kwargs"]["session"](lambda: None, lambda item, result: None)
+    assert captured["n"] == 5  # max cell request, not 20
+
+
+# ---------------------------------------------------------------------------
+# _DeploymentCellInputs: poll-based child runs + shutdown cancellation
+# ---------------------------------------------------------------------------
+
+
+def _adapter(**over):
+    kwargs = dict(
+        deployment="ingest-zone-year/ingest-zone-year",
+        params_for=lambda z, y: {"zone": z, "year": y},
+        inputs_bucket="s3://in",
+        cleanup_mosaics=True,
+        max_parallel=2,
+        log=logging.getLogger("test-adapter"),
+    )
+    kwargs.update(over)
+    return mod._DeploymentCellInputs(**kwargs)
+
+
+class _FakeClient:
+    """Sync-client stand-in: scripted read_flow_run states + cancel recording."""
+
+    def __init__(self, states):
+        self._states = list(states)
+        self.cancelled: list = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read_flow_run(self, fr_id):
+        state = self._states.pop(0) if len(self._states) > 1 else self._states[0]
+        return SimpleNamespace(id=fr_id, state=state)
+
+    def set_flow_run_state(self, fr_id, state, **kw):
+        self.cancelled.append((fr_id, state.type))
+
+
+def _state(state_type, *, final):
+    return SimpleNamespace(type=state_type, name=state_type.value, is_final=lambda: final)
+
+
+def test_adapter_wait_polls_child_run_to_completion(monkeypatch):
+    from prefect.states import StateType
+
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
+    monkeypatch.setattr(mod, "run_deployment", lambda dep, parameters, timeout: SimpleNamespace(id="fr-1", state=None))
+    client = _FakeClient([_state(StateType.RUNNING, final=False), _state(StateType.COMPLETED, final=True)])
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    adapter = _adapter()
+    try:
+        adapter.wait("33N", 2025)  # returns (no raise) once the child completes
+        assert adapter._inflight == {}  # deregistered after the poll
+    finally:
+        adapter.shutdown()
+    assert client.cancelled == []  # nothing in flight at shutdown
+
+
+def test_adapter_shutdown_cancels_in_flight_child_runs(monkeypatch):
+    """The reviewer's orphan scenario: parent dies while a child ingest runs.
+    shutdown() must request cancellation of the in-flight child flow run —
+    otherwise it keeps writing the mosaic prefix a prompt retry would race.
+    """
+    import time as _time
+
+    from prefect.states import StateType
+
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
+    monkeypatch.setattr(mod, "run_deployment", lambda dep, parameters, timeout: SimpleNamespace(id="fr-9", state=None))
+    client = _FakeClient([_state(StateType.RUNNING, final=False)])  # never terminal
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    adapter = _adapter()
+    adapter.start("33N", 2025)
+    for _ in range(200):  # let the worker register its in-flight run id
+        if adapter._inflight:
+            break
+        _time.sleep(0.01)
+    assert adapter._inflight == {("33N", 2025): "fr-9"}
+    adapter.shutdown()
+    assert client.cancelled == [("fr-9", StateType.CANCELLING)]
+
+
+def test_adapter_wait_honors_the_runner_stop_event(monkeypatch):
+    """A blocked wait() returns promptly (raising) once the runner's stop event
+    is set — the feeder must never sit behind a full ingest during unwind.
+    """
+    import threading as _threading
+    import time as _time
+
+    from prefect.states import StateType
+
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
+    monkeypatch.setattr(mod, "run_deployment", lambda dep, parameters, timeout: SimpleNamespace(id="fr-2", state=None))
+    client = _FakeClient([_state(StateType.RUNNING, final=False)])  # never terminal
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    adapter = _adapter()
+    stop = _threading.Event()
+    t0 = _time.monotonic()
+    _threading.Timer(0.3, stop.set).start()
+    try:
+        with pytest.raises(RuntimeError, match="aborted: runner stopping"):
+            adapter.wait("33N", 2025, stop=stop)
+        assert _time.monotonic() - t0 < 30
+    finally:
+        adapter.shutdown()

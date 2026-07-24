@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 import pytest
 
@@ -117,13 +118,36 @@ class RecordingInputs:
             if f"start:{zone}" not in self.events:
                 self.events.append(f"start:{zone}")
 
-    def wait(self, zone: str, year: int) -> None:
+    def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
         with self._lock:
             self.events.append(f"wait:{zone}")
 
     def cleanup(self, zone: str, year: int) -> None:
         with self._lock:
             self.events.append(f"cleanup:{zone}")
+
+
+class BudgetProbeInputs(RecordingInputs):
+    """RecordingInputs that also tracks the started-not-cleaned high-water mark —
+    the mosaic count the budget is supposed to bound.
+    """
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.alive = 0
+        self.high_water = 0
+
+    def start(self, zone: str, year: int) -> None:
+        with self._lock:
+            if f"start:{zone}" not in self.events:
+                self.events.append(f"start:{zone}")
+                self.alive += 1
+                self.high_water = max(self.high_water, self.alive)
+
+    def cleanup(self, zone: str, year: int) -> None:
+        with self._lock:
+            self.events.append(f"cleanup:{zone}")
+            self.alive -= 1
 
 
 @pytest.fixture(autouse=True)
@@ -272,3 +296,93 @@ def test_prepare_failure_is_cell_scoped():
         )
     assert "'phase': 'inputs/prepare'" in str(exc_info.value)
     assert "02N" not in str(exc_info.value)  # the other cell landed
+
+
+# ---------------------------------------------------------------------------
+# Mosaic budget: ingest starts admitted through the storage bound
+# ---------------------------------------------------------------------------
+
+
+def test_mosaic_budget_bounds_started_not_cleaned_mosaics():
+    """Look-ahead ingest starts go through the mosaic budget, so mosaics alive
+    on storage (started, not yet cleaned) never exceed look_ahead + 2 — they
+    used to escape the bound and peak at ~2*look_ahead + 2.
+    """
+    events: list[str] = []
+    inputs = BudgetProbeInputs(events)
+    _run(_cells(8), inputs=inputs, look_ahead=1)
+    assert inputs.high_water <= 3  # look_ahead + 2
+    # Everything still landed and was cleaned.
+    assert inputs.alive == 0
+    assert len([e for e in events if e.startswith("cleanup:")]) == 8
+
+
+def test_failed_cell_releases_budget_slot_and_keeps_mosaic():
+    """A failed zone retains its mosaic for staged resume but must give back
+    its budget slot — a slot held forever would starve the feeder.
+    """
+    events: list[str] = []
+    inputs = BudgetProbeInputs(events)
+    with pytest.raises(RuntimeError, match="1/8 cell"):
+        _run(_cells(8), session=_sync_session(fail={"01N"}), inputs=inputs, look_ahead=0)
+    assert "cleanup:01N" not in events  # mosaic retained for the retry...
+    # ...but every OTHER cell was still admitted and landed (no starvation).
+    assert len([e for e in events if e.startswith("cleanup:")]) == 7
+
+
+def test_deferred_mosaics_capped_with_loud_failure():
+    """Orbit-mismatch deferrals retain mosaics until the post-session fallback,
+    so they are capped at look_ahead + 1 budget slots; mismatch cells beyond
+    the cap fail loudly (and their mosaics are cleaned) instead of silently
+    stacking multi-TB mosaics for the whole run.
+    """
+    events: list[str] = []
+    inputs = BudgetProbeInputs(events)
+    calls: list[str] = []
+
+    def infer_single(cell, prep, final):
+        calls.append(cell.zone)
+        from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff
+
+        return ZoneFillHandoff(
+            zone=cell.zone, year=cell.year, run_id=prep.run_id, t0=0.0, summary={}, live=[], results=[]
+        )
+
+    # ALL cells mismatch the session orbit; look_ahead=0 → cap = 1 retained.
+    with pytest.raises(RuntimeError) as exc_info:
+        _run(
+            _cells(4),
+            orbits=dict.fromkeys(("01N", "02N", "03N", "04N"), "ascending"),
+            inputs=inputs,
+            infer_single=infer_single,
+            look_ahead=0,
+        )
+    assert "deferred-mosaic-budget" in str(exc_info.value)
+    assert "'02N'" in str(exc_info.value) and "'01N'" not in str(exc_info.value)
+    assert calls == ["01N"]  # the retained deferral still ran via fallback
+    assert inputs.high_water <= 2  # look_ahead + 2
+    # Capped cells' mosaics cleaned immediately; the deferred one after fallback.
+    for z in ("01N", "02N", "03N", "04N"):
+        assert f"cleanup:{z}" in events
+
+
+def test_stop_unblocks_a_running_ingest_wait():
+    """A crashed session must unwind the feeder even while it is blocked inside
+    inputs.wait — the stop event is passed through and honored.
+    """
+
+    class BlockingInputs(RecordingInputs):
+        def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+            assert stop is not None  # the runner must pass its unwind event
+            while not stop.is_set():
+                time.sleep(0.02)
+            raise RuntimeError("aborted: runner stopping")
+
+    def crashing_session(more_work, on_item_done):
+        time.sleep(0.1)  # let the feeder reach the blocking wait first
+        raise RuntimeError("cluster fell over")
+
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="cluster fell over"):
+        _run(_cells(2), session=crashing_session, inputs=BlockingInputs([]), look_ahead=0)
+    assert time.monotonic() - t0 < 30  # no 600s join-timeout hang

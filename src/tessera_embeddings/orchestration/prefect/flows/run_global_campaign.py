@@ -374,7 +374,12 @@ async def run_global_campaign(
             dispatches are always branch-derived (see ``branch``).
         mask_name: Coverage-store basename, forwarded to ingest.
         max_parallel_ingest: Max concurrent ingests (each provisions its own Dask
-            cluster) — a separate, smaller knob than the fill cap.
+            cluster) — a separate, smaller knob than the fill cap. Under
+            ``"chained-clusters"`` it is divided across the shards as their
+            ingest look-aheads with a floor of one per shard, so with more
+            shards than this cap the effective ceiling is the shard count
+            (warned at dispatch); a hard fleet-wide cap needs a concurrency
+            limit on the ingest deployment itself.
         cleanup_mosaics: Delete ``mosaics/{zone}/{year}`` (all versions) after the
             fill lands (default; the mosaic is a transient input). Keep for dev.
         ingest_settings: Grouped ingest tuning knobs (worker bounds, S2
@@ -659,6 +664,21 @@ async def run_global_campaign(
                 len(year_zones),
                 [len(sh) for sh in shards],
             )
+            # No silent caps: each shard needs a look-ahead of >= 1 to make
+            # progress, so with more shards than max_parallel_ingest the true
+            # concurrent-ingest ceiling is len(shards), not the requested cap —
+            # only a cross-run gate (a concurrency limit on the ingest
+            # deployment) can enforce it below one-per-shard.
+            if ingest and len(shards) > max_parallel_ingest:
+                log.warning(
+                    "chained-clusters: %d shards each hold an ingest look-ahead of >= 1, so up to %d "
+                    "ingest Dask clusters may run concurrently — exceeding max_parallel_ingest=%d. "
+                    "Reduce max_parallel_zones, or set a concurrency limit on the ingest deployment "
+                    "for a hard fleet-wide cap.",
+                    len(shards),
+                    len(shards),
+                    max_parallel_ingest,
+                )
 
             def _chained_params(shard: list[str], n_shards: int, chained_year: int) -> dict[str, Any]:
                 return {

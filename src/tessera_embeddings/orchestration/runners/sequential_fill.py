@@ -21,12 +21,19 @@ the flow and README point here):
   near-sequential: at most one zone's tail overlaps the next zone's head.
 - **Ingest look-ahead** (``inputs``): the next cells' mosaics are ingested
   *while earlier cells infer*, bounded so in-flight mosaics stay within
-  ADR-011's "peak input storage bounded by in-flight cells". A semaphore
-  admits at most ``look_ahead + 2`` *un-finalized* zones (a zone holds its
-  slot from prepare until its assembly lands); the feeder also runs ingests
-  up to ``look_ahead`` cells ahead of the admission point, so peak mosaics on
-  disk is roughly ``2 * look_ahead + 2`` — for big zones (multi-TB mosaics)
-  keep ``look_ahead`` small.
+  ADR-011's "peak input storage bounded by in-flight cells". Two gates
+  cooperate: ``zone_slots`` admits at most ``look_ahead + 2`` *un-finalized*
+  zones (a zone holds its slot from prepare until its assembly lands), and a
+  mosaic budget (:class:`_MosaicBudget`, same capacity) admits every ingest
+  *start* — a mosaic occupies a budget slot from the moment its ingest is
+  kicked off until its cleanup, so look-ahead can never materialize more than
+  ``look_ahead + 2`` mosaics at once (it used to escape the bound and peak at
+  ~``2 * look_ahead + 2``). Mosaics deliberately RETAINED past the run —
+  failed cells (kept for staged resume) and orbit-mismatch deferrals awaiting
+  the fallback — are handled explicitly: failures release their budget slot
+  with a warning (storage honesty over a feeder deadlock), and deferrals may
+  hold at most ``look_ahead + 1`` slots before further mismatch cells fail
+  loudly instead of silently stacking multi-TB mosaics.
 - **Trailing assembly**: a completed zone's shard assembly (~10-15% of its
   inference wall time) runs on a background thread while later zones' tiles
   keep the GPUs busy. Assemblies serialize on one thread; a zone's mosaic is
@@ -97,13 +104,56 @@ class CellInputs(Protocol):
         """Begin producing the cell's mosaics without blocking."""
         ...
 
-    def wait(self, zone: str, year: int) -> None:
-        """Block until the cell's mosaics are ready; raise if production failed."""
+    def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+        """Block until the cell's mosaics are ready; raise if production failed.
+
+        When ``stop`` is supplied the implementation must return promptly
+        (by raising) once it is set — the runner passes its unwind event so a
+        crashed session is never stuck behind a running ingest.
+        """
         ...
 
     def cleanup(self, zone: str, year: int) -> None:
         """Delete the cell's mosaics (only if this adapter produced them)."""
         ...
+
+
+class _MosaicBudget:
+    """Bounds mosaics alive on storage: ingest *start* through cleanup.
+
+    ``zone_slots`` alone bounds only *admitted* zones — look-ahead ingest
+    starts happen before admission, so without this gate they escape the
+    storage bound. A slot is acquired (idempotently, keyed by cell) before a
+    cell's ingest is started and released at its mosaic cleanup — or, for
+    mosaics deliberately retained past the run (failed cells kept for staged
+    resume), released explicitly with a warning so a permanently-held slot
+    can never starve the feeder into deadlock.
+    """
+
+    def __init__(self, slots: int) -> None:
+        self._sem = threading.Semaphore(slots)
+        self._held: set[tuple[str, int]] = set()
+        self._lock = threading.Lock()
+
+    def acquire(self, key: tuple[str, int], stop: threading.Event) -> bool:
+        """Admit ``key``'s mosaic; False = ``stop`` was set while waiting."""
+        with self._lock:
+            if key in self._held:
+                return True  # idempotent: look-ahead windows overlap
+        while not self._sem.acquire(timeout=1.0):
+            if stop.is_set():
+                return False
+        with self._lock:
+            self._held.add(key)
+        return True
+
+    def release(self, key: tuple[str, int]) -> None:
+        """Release ``key``'s slot (idempotent no-op for keys never admitted)."""
+        with self._lock:
+            if key not in self._held:
+                return
+            self._held.discard(key)
+        self._sem.release()
 
 
 @dataclass
@@ -199,7 +249,8 @@ def fill_zones_sequential(
         inputs: Mosaic lifecycle adapter; ``None`` means the mosaics already
             exist upstream (no starts, no waits, no cleanup).
         look_ahead: Cells beyond the feed head to keep in ingest flight; also
-            sizes the un-finalized-zone bound (``look_ahead + 2``).
+            sizes the un-finalized-zone bound AND the mosaic storage budget
+            (both ``look_ahead + 2`` — see :class:`_MosaicBudget`).
 
     Returns:
         Summary dict: per-cell outcomes, failure records, deferral count, and
@@ -222,7 +273,19 @@ def fill_zones_sequential(
     # Bounds un-finalized zones (mosaic held from prepare until assembly lands):
     # the current zone + one trailing assembly + the ingest look-ahead.
     zone_slots = threading.Semaphore(look_ahead + 2)
+    # Bounds mosaics alive on storage (ingest START through cleanup) at the same
+    # capacity — look-ahead starts are admitted through it, so they can no longer
+    # escape the storage bound (see _MosaicBudget). No inputs → no mosaics.
+    budget = _MosaicBudget(look_ahead + 2) if inputs is not None else None
+    # Orbit-mismatch deferrals RETAIN their mosaics until the post-session
+    # fallback; cap how many budget slots they may sit on so at least one slot
+    # keeps cycling for the stream (all held → feeder deadlock).
+    max_deferred_retained = look_ahead + 1
     finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
+
+    def _release_mosaic(cell: SequentialCell) -> None:
+        if budget is not None:
+            budget.release((cell.zone, cell.year))
 
     def _record_failure(cell: SequentialCell, phase: str, exc: BaseException) -> None:
         with lock:
@@ -234,10 +297,18 @@ def fill_zones_sequential(
             outcomes.append(result)
 
     def _start_lookahead(feed_index: int) -> None:
-        """Keep ingests running ahead of the feed head (idempotent starts)."""
-        if inputs is None:
+        """Keep ingests running ahead of the feed head (idempotent starts).
+
+        Every start is admitted through the mosaic budget first, so look-ahead
+        can never materialize more mosaics than the bound — this blocks the
+        feeder until a finalizing zone frees a slot, which is the intended
+        backpressure (ingest paced by fill throughput, ADR-011).
+        """
+        if inputs is None or budget is None:
             return
         for cell in cells[feed_index : feed_index + 1 + look_ahead]:
+            if not budget.acquire((cell.zone, cell.year), stop):
+                return  # stop set while waiting — the caller's loop unwinds
             inputs.start(cell.zone, cell.year)
 
     def _finalize(tally: _ZoneTally) -> None:
@@ -249,6 +320,7 @@ def fill_zones_sequential(
         and resumes its staged tiles.
         """
         cell, prep = tally.cell, tally.prep
+        cleaned = False
         try:
             if tally.failed:
                 bad = [r for r in tally.results if r.get("status") == "failed"]
@@ -260,9 +332,21 @@ def fill_zones_sequential(
             _record_outcome(assemble(handoff, prep))
             if inputs is not None:
                 inputs.cleanup(cell.zone, cell.year)
+                cleaned = True
         except Exception as exc:
             _record_failure(cell, "assembly", exc)
         finally:
+            if not cleaned and budget is not None:
+                # The retained mosaic (kept for the retry's staged resume) now
+                # sits OUTSIDE the budget — a slot held forever would starve the
+                # feeder into deadlock. Say so instead of silently exceeding.
+                log.warning(
+                    "Cell %s-%d failed — its mosaic is retained for resume and no longer counts "
+                    "against the mosaic budget",
+                    cell.zone,
+                    cell.year,
+                )
+            _release_mosaic(cell)
             zone_slots.release()
 
     def _feed() -> None:
@@ -279,15 +363,46 @@ def fill_zones_sequential(
                     return
                 try:
                     if inputs is not None:
-                        inputs.wait(cell.zone, cell.year)
+                        # stop-aware: the adapter must return promptly (raising)
+                        # once stop is set, so a crashed session is never stuck
+                        # behind a running ingest for its full duration.
+                        inputs.wait(cell.zone, cell.year, stop=stop)
                     prep = prepare(cell)
                 except Exception as exc:
+                    if stop.is_set():
+                        # Unwinding, not a cell failure — don't record it.
+                        zone_slots.release()
+                        return
                     _record_failure(cell, "inputs/prepare", exc)
+                    _release_mosaic(cell)  # mosaic (if any) retained, off-budget
                     zone_slots.release()
                     continue
                 if prep.config.s1_orbit != session_s1_orbit:
                     # Actor configs are fixed at session creation — this cell
-                    # runs per-cell after the stream (see infer_single).
+                    # runs per-cell after the stream (see infer_single). Its
+                    # mosaic is RETAINED (and keeps its budget slot) until the
+                    # fallback — bounded: past the cap, further mismatch cells
+                    # fail loudly rather than silently stacking multi-TB
+                    # mosaics for the whole run (retry next campaign pass, or
+                    # run those zones with the matching s1_orbit).
+                    with lock:
+                        n_deferred = len(deferred)
+                    if budget is not None and n_deferred >= max_deferred_retained:
+                        _record_failure(
+                            cell,
+                            "deferred-mosaic-budget",
+                            RuntimeError(
+                                f"orbit-mismatch deferral cap reached ({n_deferred} retained mosaics): "
+                                f"cell resolved s1_orbit={prep.config.s1_orbit} != session "
+                                f"{session_s1_orbit} — rerun with s1_orbit={prep.config.s1_orbit} "
+                                f"or a larger look_ahead"
+                            ),
+                        )
+                        if inputs is not None:
+                            inputs.cleanup(cell.zone, cell.year)
+                        _release_mosaic(cell)
+                        zone_slots.release()
+                        continue
                     log.info(
                         "Cell %s-%d resolved s1_orbit=%s != session %s — deferring to the per-cell fallback",
                         cell.zone,
@@ -307,6 +422,7 @@ def fill_zones_sequential(
                         _record_outcome(zplan.done)
                         if inputs is not None:
                             inputs.cleanup(cell.zone, cell.year)
+                        _release_mosaic(cell)
                         zone_slots.release()
                         continue
                     # Per-zone staged-resume scan (the single-zone path does
@@ -316,6 +432,7 @@ def fill_zones_sequential(
                     )
                 except Exception as exc:
                     _record_failure(cell, "plan", exc)
+                    _release_mosaic(cell)  # mosaic retained for resume, off-budget
                     zone_slots.release()
                     continue
                 live = [c for c in zplan.live if c.label not in already]
@@ -400,6 +517,8 @@ def fill_zones_sequential(
                 inputs.cleanup(cell.zone, cell.year)
         except Exception as exc:
             _record_failure(cell, "fallback", exc)
+        finally:
+            _release_mosaic(cell)  # held since its ingest start (deferral retention)
 
     elapsed = time.monotonic() - t0
     summary: dict[str, Any] = {
