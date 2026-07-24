@@ -140,10 +140,21 @@ experiment ran on icechunk 2.0.4 (the venv's pin) while the campaign standard is
 results, but re-run the report's call sequences after the bump before relying on
 them at scale.
 
-This also means the mechanism is **plain sequential `to_icechunk` calls on a
-shared session** — dask parallelises within each write, and under the ingest
-cluster's distributed client the bytes flow from workers to storage exactly as
-`_write_region` does today. No process pool, no session forking of our own.
+**Framing principle (standing, 2026-07-24): avoid Dask where possible.** Direct
+zarr writes under an icechunk commit are cleaner than anything routed through a
+task graph — `write_regions`' removal is the precedent. Dask is genuinely needed
+to *compute* the mosaic (the STAC loads and resampling), so it stays for that;
+it is not needed to *place* the results. So the write path prefers
+`region_merge`'s write style without its process pool: compute a window (or a
+chunk of one) to numpy, assign it positionally into the session's zarr group,
+one commit per date. The time-axis extension is likewise a raw resize plus a
+coord append on the session — metadata, not a graph.
+
+The proven fallback, if per-session write throughput ever binds (one session's
+chunk writes serialise on its store mutex; region-merge measured the plateau), is
+the experiment's other result: sequential `to_icechunk(mode="r+", region=...)`
+calls on the shared session, which fork internally and write from Dask workers.
+Either way: no process pool, no session forking of our own.
 
 **This must not become `write_regions` again** — a single Dask graph spanning every
 region, which was built and removed for being the bottleneck (see the warning
