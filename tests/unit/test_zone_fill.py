@@ -814,7 +814,12 @@ def test_fill_accepts_a_cropped_written_mosaic(tmp_path, monkeypatch):
     roi.geobox, roi.height, roi.width = geobox, _NY, _NX
 
     day_ds = xr.Dataset(
-        {"red": (("time", "northing", "easting"), dask_array.full((1, _NY, _NX), 3, dtype=np.uint16, chunks=(1, _TILE, _TILE)))},
+        {
+            "red": (
+                ("time", "northing", "easting"),
+                dask_array.full((1, _NY, _NX), 3, dtype=np.uint16, chunks=(1, _TILE, _TILE)),
+            )
+        },
         coords={"time": np.array(["2025-06-01"], dtype="datetime64[ns]")},
     )
     base = str(tmp_path / "mosaics")
