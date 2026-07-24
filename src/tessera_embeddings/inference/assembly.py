@@ -30,6 +30,7 @@ Two write-conflict regimes, one engine:
 from __future__ import annotations
 
 import bisect
+import contextlib
 import dataclasses
 import datetime
 import itertools
@@ -110,6 +111,19 @@ def _fs_for(uri: str, storage_options: dict | None = None) -> fsspec.AbstractFil
 
 class IncompleteStageError(RuntimeError):
     """Raised when assembly is attempted before all chunks have been staged."""
+
+
+class AllChunksSkippedError(RuntimeError):
+    """Every chunk of a run resolved to a skip marker, so no staged tile exists.
+
+    Distinct from ``FileNotFoundError`` (nothing there at all): the run IS real, it
+    just has nothing to measure a chunk size from. Callers resuming such a run should
+    fall back to their configured chunk size — ``assemble`` publishes an all-fill
+    timestep for this case.
+    """
+
+    def __init__(self, run_id: str) -> None:
+        super().__init__(f"Every chunk of run '{run_id}' was skipped — no staged tile to size from.")
 
 
 @dataclasses.dataclass
@@ -511,6 +525,14 @@ class ZarrWriter:
         # directory-backed filesystems (write_chunk's to_zarr creates it as a
         # side effect; a bare open() does not). No-op on object stores.
         fs.makedirs(path.rsplit("/", 1)[0], exist_ok=True)
+        # Drop any staged zarr for this chunk first. It can only be a crash artifact
+        # the resume scan excluded — the chunk is skipping, so nothing valid can be
+        # staged for it — and leaving the pair behind makes verify_staged_completeness
+        # raise "BOTH a staged zarr and a skip marker" on every retry under the stable
+        # run_id, wedging the cell until someone deletes it by hand.
+        staged = self._staging_path(run_id, chunk)
+        with contextlib.suppress(FileNotFoundError):
+            fs.rm(staged, recursive=True)
         with fs.open(path, "wb") as f:
             f.write(b"")
         logger.info("Wrote skip marker for %s to %s", chunk.label, path)
@@ -636,10 +658,18 @@ class ZarrWriter:
             The chunk_size (pixels) used during inference.
 
         Raises:
-            FileNotFoundError: If no staged chunks exist for the run.
+            AllChunksSkippedError: If the run exists but every chunk skipped.
+            FileNotFoundError: If the run has no staged chunks and no skip markers.
         """
         labels = self._list_staged_labels(run_id)
         if not labels:
+            if self._list_skip_marker_labels(run_id):
+                # A real run in which every chunk skipped: there is no tile to measure,
+                # but assemble() publishes an all-fill timestep for exactly this case,
+                # so report "unknown" and let the caller use its configured size. Only
+                # reached when markers prove the run exists — a run_id that matches
+                # nothing at all still raises, so a typo can't become a silent re-run.
+                raise AllChunksSkippedError(run_id)
             raise FileNotFoundError(f"No staged chunks found for run '{run_id}' under {self.staging_base}")
         path = f"{self.staging_base}/{run_id}/{labels[0]}.zarr"
         try:

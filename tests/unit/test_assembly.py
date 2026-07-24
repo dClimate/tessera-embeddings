@@ -26,6 +26,7 @@ from tessera_embeddings.inference.assembly import (
     OBS_COUNT_VARS,
     STAGED_READ_CONFIG_KWARGS,
     TARGET_AGGREGATE_S3_CONCURRENCY,
+    AllChunksSkippedError,
     IncompleteStageError,
     ZarrWriter,
     _partition_bands,
@@ -1460,14 +1461,55 @@ class TestVerifyStagedCompleteness:
         writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
     def test_both_staged_and_skipped_raises(self, tmp_path):
-        """A chunk with BOTH a staged zarr and a skip marker is inconsistent."""
+        """A chunk with BOTH a staged zarr and a skip marker is inconsistent.
+
+        The marker is created directly, not via ``write_skip_marker`` — that clears
+        the sibling zarr, so our own writer can no longer produce this state. The
+        guard remains for prefixes we did not author: a half-cleaned directory, two
+        processes on one run_id, manual surgery.
+        """
         writer = ZarrWriter(str(tmp_path / "staging"))
         for chunk in self.CHUNKS:
             self._stage_chunk(writer, chunk, "run1")
-        writer.write_skip_marker(self.CHUNKS[0], "run1")
+        (tmp_path / "staging" / "run1" / f"{self.CHUNKS[0].label}.skipped").write_bytes(b"")
 
         with pytest.raises(IncompleteStageError, match="BOTH a staged zarr and a skip marker"):
             writer.verify_staged_completeness("run1", list(self.CHUNKS))
+
+    def test_detect_chunk_size_separates_all_skipped_from_no_such_run(self, tmp_path):
+        """An all-skipped run must stay resumable; a bogus run_id must not.
+
+        assemble() publishes an all-fill timestep when every chunk skipped, but the
+        resume path sizes the chunk grid first — so that lookup has to distinguish
+        "real run, nothing to measure" from "no such run", or either the branch is
+        unreachable or a mistyped run_id silently becomes a full re-run.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        for chunk in self.CHUNKS:
+            writer.write_skip_marker(chunk, "all-skipped")
+
+        with pytest.raises(AllChunksSkippedError, match="all-skipped"):
+            writer.detect_staged_chunk_size("all-skipped")
+        with pytest.raises(FileNotFoundError):
+            writer.detect_staged_chunk_size("typo-run")
+
+    def test_skip_marker_clears_a_stale_staged_zarr(self, tmp_path):
+        """A skipping chunk must not leave a staged zarr behind.
+
+        The resume scan excludes an incomplete staged zarr rather than raising (a
+        raise would re-fire every retry under the stable run_id). If the chunk then
+        skips, the leftover would trip the BOTH check here instead — wedging the
+        cell in the very way that exclusion exists to avoid.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        for chunk in self.CHUNKS:
+            self._stage_chunk(writer, chunk, "run1")
+        assert (tmp_path / "staging" / "run1" / f"{self.CHUNKS[0].label}.zarr").exists()
+
+        writer.write_skip_marker(self.CHUNKS[0], "run1")
+
+        assert not (tmp_path / "staging" / "run1" / f"{self.CHUNKS[0].label}.zarr").exists()
+        writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
     def test_no_staged_chunks_raises(self, tmp_path):
         """Raises IncompleteStageError when staging dir is empty."""

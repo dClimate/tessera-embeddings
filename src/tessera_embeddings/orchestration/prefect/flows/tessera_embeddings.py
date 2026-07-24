@@ -39,7 +39,7 @@ from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.assembly import ZarrWriter
+from tessera_embeddings.inference.assembly import AllChunksSkippedError, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
@@ -294,12 +294,20 @@ def tessera_embeddings(
     # between a resumed run and the current config.
     chunk_size = config.chunk_size
     if dev_params.previous_run_id:
-        detected = ZarrWriter(staging_base).detect_staged_chunk_size(dev_params.previous_run_id)
-        if detected != chunk_size:
-            log.warning(
-                "Staged chunks use chunk_size=%d (current config: %d) — using staged value", detected, chunk_size
+        try:
+            detected = ZarrWriter(staging_base).detect_staged_chunk_size(dev_params.previous_run_id)
+        except AllChunksSkippedError:
+            # Nothing staged to measure, but the run is real and assemble() publishes
+            # an all-fill timestep for it — keep the configured size and continue.
+            log.info(
+                "Run %s staged no tiles (all chunks skipped) — using configured chunk_size", dev_params.previous_run_id
             )
-            chunk_size = detected
+        else:
+            if detected != chunk_size:
+                log.warning(
+                    "Staged chunks use chunk_size=%d (current config: %d) — using staged value", detected, chunk_size
+                )
+                chunk_size = detected
 
     chunks, total_y, total_x = enumerate_mosaic_chunks(
         mosaic_base,
