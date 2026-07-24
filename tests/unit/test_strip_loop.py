@@ -880,6 +880,11 @@ class TestAllowS2Only:
             patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
         ):
             result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+            # The staging write is deferred to the actor's writer thread; drain it
+            # so last_write reflects this chunk before we read it (mirrors
+            # _run_process_chunk — without this the read races the write thread).
+            flushed = actor.flush_writes()
+            assert flushed is None or flushed["ok"], f"deferred write failed: {flushed}"
         return result, _CapturingWriter.last_write
 
     def test_sar_gap_pixels_embed_only_with_flag(self, inference_config, test_model):
