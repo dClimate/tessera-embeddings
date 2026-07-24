@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import json
 
+from tessera_embeddings.profiling._cloudwatch import insights_query
 from tessera_embeddings.profiling.ingest import watch_scheduler as ws
-from tessera_embeddings.profiling.ingest._insights import insights_query
 
 # A real line as SchedulerResourceLogger emits it, with the CloudWatch/logging
 # prefix the parser must tolerate (it uses re.search, not match). Kept in sync
@@ -146,9 +146,11 @@ def test_profile_run_empty():
 
 
 class TestInsightsRunner:
-    """The shared Insights runner's two contracts: never abort, never hide a cap."""
+    """The shared runner's three contracts: never abort, never hide a cap, never
+    orphan a query it gave up on.
+    """
 
-    def _logs(self, *, rows=0, status="Complete", raise_on_start=None):
+    def _logs(self, *, rows=0, status="Complete", raise_on_start=None, stopped=None):
         class _Logs:
             def start_query(self, **kw):
                 if raise_on_start:
@@ -160,6 +162,10 @@ class TestInsightsRunner:
                     "status": status,
                     "results": [[{"field": "@message", "value": f"m{i}"}] for i in range(rows)],
                 }
+
+            def stop_query(self, queryId):
+                if stopped is not None:
+                    stopped.append(queryId)
 
         return _Logs()
 
@@ -184,3 +190,33 @@ class TestInsightsRunner:
         rows, truncated = insights_query(self._logs(rows=5), "g", "q", 0, 1, limit=5)
         assert len(rows) == 5
         assert truncated is True
+
+    def test_abandoned_query_is_cancelled(self):
+        """Giving up at the deadline must release the concurrency slot.
+
+        An orphaned query keeps holding one of the account's concurrent-query
+        slots, and the bill comes due as an unrelated later query being rejected
+        — i.e. as the never-abort contract firing for no visible reason. A
+        negative deadline puts the give-up branch on the first poll, so this needs
+        no clock patching and no sleeping.
+        """
+        stopped: list[str] = []
+        rows, truncated = insights_query(self._logs(status="Running", stopped=stopped), "g", "q", 0, 1, deadline_s=-1)
+        assert rows is None and truncated is False
+        assert stopped == ["q1"]
+
+    def test_cancel_failure_does_not_mask_the_timeout(self):
+        """A cancel that itself fails (the query just finished) is swallowed."""
+
+        class _Logs:
+            def start_query(self, **kw):
+                return {"queryId": "q1"}
+
+            def get_query_results(self, queryId):
+                return {"status": "Running", "results": []}
+
+            def stop_query(self, queryId):
+                raise RuntimeError("InvalidOperationException: query is not running")
+
+        rows, _ = insights_query(_Logs(), "g", "q", 0, 1, deadline_s=-1)
+        assert rows is None

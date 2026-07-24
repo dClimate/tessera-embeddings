@@ -25,9 +25,11 @@ pytest.importorskip("dask_cloudprovider", reason="dask-cloudprovider not install
 
 from tessera_embeddings.config.ingest import IngestSettings
 
-# The consumer of the health line, imported here so a format change and its
-# parser are pinned against each other in one test (see
-# test_emitted_line_parses_with_the_profiling_parser).
+# The consumers of this provider's log contract, imported here so a change on
+# either side fails in one place: the health-line parser (see
+# test_emitted_line_parses_with_the_profiling_parser) and the log group the
+# profiling CLIs query (see test_profiling_tools_target_the_providers_log_group).
+from tessera_embeddings.profiling.ingest import DEFAULT_INGEST_LOG_GROUP
 from tessera_embeddings.profiling.ingest.watch_scheduler import parse_health_line
 from tessera_embeddings.providers.aws import dask as dask_mod
 from tessera_embeddings.providers.aws.dask import (
@@ -131,6 +133,18 @@ class TestRetryPolicyWiring:
         with pytest.raises(RuntimeError, match="image pull failed"):
             self._run(misconfigured)
         assert calls["n"] == 1  # no retries burned on a permanent failure
+
+
+def test_profiling_tools_target_the_providers_log_group() -> None:
+    """The tools must query the group this provider actually ships to.
+
+    They can't import the provider for it — that would drag dask, distributed and
+    dask-cloudprovider into a CLI that only needs boto3 — so the constant is
+    duplicated by necessity and pinned here instead. Without this, changing the
+    provider's group leaves the tools silently querying an empty one, which reads
+    identically to "the run produced no logs".
+    """
+    assert DEFAULT_INGEST_LOG_GROUP == dask_mod.DEFAULT_CLOUDWATCH_LOG_GROUP
 
 
 class _FakeWorker:

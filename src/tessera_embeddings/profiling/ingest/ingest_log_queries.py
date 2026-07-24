@@ -44,14 +44,12 @@ answered records ``rows: null`` and never aborts the others.
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
 
 import boto3
 
-from tessera_embeddings.profiling.ingest._insights import insights_query
-
-DEFAULT_INGEST_LOG_GROUP = "/ecs/tessera/dask"
+from tessera_embeddings.profiling._cloudwatch import insights_query, iso, parse_ts
+from tessera_embeddings.profiling.ingest import DEFAULT_INGEST_LOG_GROUP
 
 # name -> (description, Insights query string). The run window + log group are
 # passed to start_query separately, so the query strings carry no per-run state.
@@ -142,14 +140,6 @@ QUERIES: dict[str, tuple[str, str]] = {
 }
 
 
-def _parse_ts(s: str) -> int:
-    """Parse an ISO8601 UTC timestamp (or 'YYYY-MM-DDTHH:MM') to epoch seconds."""
-    dt = datetime.datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.UTC)
-    return int(dt.timestamp())
-
-
 def run_queries(
     session: boto3.session.Session,
     log_group: str,
@@ -169,7 +159,7 @@ def run_queries(
     logs = session.client("logs")
     out: dict = {
         "log_group": log_group,
-        "window": {"start": _iso(start_epoch), "end": _iso(end_epoch)},
+        "window": {"start": iso(start_epoch), "end": iso(end_epoch)},
         "queries": {},
     }
     for name in names:
@@ -177,10 +167,6 @@ def run_queries(
         rows, truncated = insights_query(logs, log_group, query, start_epoch, end_epoch)
         out["queries"][name] = {"description": description, "rows": rows, "truncated": truncated}
     return out
-
-
-def _iso(epoch: float) -> str:
-    return f"{datetime.datetime.fromtimestamp(epoch, datetime.UTC):%Y-%m-%dT%H:%M:%SZ}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -205,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
 
     names = args.query or list(QUERIES)
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
-    result = run_queries(session, args.log_group, _parse_ts(args.since), _parse_ts(args.until), names)
+    result = run_queries(session, args.log_group, parse_ts(args.since), parse_ts(args.until), names)
     print(json.dumps(result, indent=2))
     # Nonzero if every requested query failed hard (never mask a broken run as clean).
     if all(q["rows"] is None for q in result["queries"].values()):

@@ -35,7 +35,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import datetime
 import itertools
 import json
 import re
@@ -46,13 +45,13 @@ from dataclasses import dataclass
 
 import boto3
 
-from tessera_embeddings.profiling.ingest._insights import insights_query
+from tessera_embeddings.profiling._cloudwatch import insights_query, iso, parse_ts
+from tessera_embeddings.profiling.ingest import DEFAULT_INGEST_LOG_GROUP
 
-# Ingest Dask log group + scheduler stream prefix. dask-cloudprovider names
-# streams ``<prefix>/<container>/<task-id>``; ``ecs_cluster`` sets prefix "dask"
-# and the scheduler container is "dask-scheduler" (see providers/aws/dask.py),
-# so scheduler health lines land under "dask/dask-scheduler/...".
-DEFAULT_INGEST_LOG_GROUP = "/ecs/tessera/dask"
+# dask-cloudprovider names streams ``<prefix>/<container>/<task-id>``;
+# ``ecs_cluster`` sets prefix "dask" and the scheduler container is
+# "dask-scheduler" (see providers/aws/dask.py), so scheduler health lines land
+# under "dask/dask-scheduler/...".
 DEFAULT_SCHEDULER_STREAM_PREFIX = "dask/dask-scheduler"
 
 # The substring CloudWatch filters on server-side, and the marker the parser
@@ -138,18 +137,6 @@ def parse_health_line(message: str) -> dict | None:
     }
 
 
-def _parse_ts(s: str) -> int:
-    """Parse an ISO8601 UTC timestamp (or 'YYYY-MM-DDTHH:MM') to epoch seconds."""
-    dt = datetime.datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.UTC)
-    return int(dt.timestamp())
-
-
-def _iso(epoch: float) -> str:
-    return f"{datetime.datetime.fromtimestamp(epoch, datetime.UTC):%Y-%m-%dT%H:%M:%SZ}"
-
-
 def _rate(cur: float, prev: float, dt_s: float) -> float | None:
     """Per-second change between two samples, or None if the interval is 0."""
     if dt_s <= 0:
@@ -198,7 +185,7 @@ def evaluate_alerts(window: list[dict], thresholds: Thresholds) -> list[str]:
 
 def _snapshot(sample: dict, epoch: int, prev: dict | None, prev_epoch: int | None, alerts: list[str]) -> dict:
     """Assemble the per-interval JSON snapshot emitted on stdout."""
-    snap: dict = {"ts": _iso(epoch), "epoch": epoch, **sample, "alerts": alerts}
+    snap: dict = {"ts": iso(epoch), "epoch": epoch, **sample, "alerts": alerts}
     if prev is not None and prev_epoch is not None:
         dt = epoch - prev_epoch
         snap["d_tasks_per_s"] = _rate(sample["tasks"], prev["tasks"], dt)
@@ -292,12 +279,15 @@ def _series_from_rows(rows: list[dict]) -> list[dict]:
         sample = parse_health_line(r.get("@message", ""))
         if sample is None:
             continue
-        ts = r.get("@timestamp", "")
+        # Insights renders @timestamp as "YYYY-MM-DD HH:MM:SS.mmm" (space-separated,
+        # no zone); parse_ts reads that and treats the naive value as UTC, which is
+        # what CloudWatch means. Skip a row whose timestamp doesn't parse rather
+        # than lose the whole series to one malformed value.
         try:
-            epoch = int(datetime.datetime.fromisoformat(ts.replace(" ", "T") + "+00:00").timestamp())
+            epoch = parse_ts(r.get("@timestamp", ""))
         except ValueError:
             continue
-        series.append({"epoch": epoch, "ts": _iso(epoch), **sample})
+        series.append({"epoch": epoch, "ts": iso(epoch), **sample})
     series.sort(key=lambda s: s["epoch"])
     return series
 
@@ -415,7 +405,7 @@ def report_run(
     out = {
         "log_group": log_group,
         "stream_prefix": stream_prefix,
-        "window": {"start": _iso(start_epoch), "end": _iso(end_epoch)},
+        "window": {"start": iso(start_epoch), "end": iso(end_epoch)},
         # True when the row cap was hit: the series is PARTIAL, so the peaks and
         # onsets below are lower bounds, not the full run (insights_query also
         # warns on stderr). Never present a capped series as a full-run profile.
@@ -480,8 +470,8 @@ def main(argv: list[str] | None = None) -> int:
         session,
         args.log_group,
         args.stream_prefix,
-        _parse_ts(args.since),
-        _parse_ts(args.until),
+        parse_ts(args.since),
+        parse_ts(args.until),
         thresholds,
         args.markdown,
     )

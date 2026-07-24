@@ -12,3 +12,11 @@ task graph and routes every task — is the saturation risk, not the workers.
 
 See ``README.md`` in this directory for the per-run workflow.
 """
+
+from __future__ import annotations
+
+#: CloudWatch log group the ingest Dask cluster ships to — the single source for
+#: both tools. It mirrors ``providers.aws.dask.DEFAULT_CLOUDWATCH_LOG_GROUP``, and
+#: a test pins the two together: importing the provider from here instead would
+#: drag dask/distributed/dask-cloudprovider into a CLI that only needs boto3.
+DEFAULT_INGEST_LOG_GROUP = "/ecs/tessera/dask"

@@ -52,6 +52,8 @@ from typing import Any
 
 import boto3
 
+from tessera_embeddings.profiling._cloudwatch import insights_query, parse_ts
+
 # CloudWatch log group the workers' ResourceMonitor lines ship to (yield deploy
 # default — pass --log-group for other deployments).
 DEFAULT_RAM_LOG_GROUP = "/ec2/yield-embeddings/ray"
@@ -390,14 +392,6 @@ def run_on_workers(session: boto3.session.Session, instance_ids: list[str], comm
     return outputs
 
 
-def _parse_ts(s: str) -> int:
-    """Parse an ISO8601 UTC timestamp (or 'YYYY-MM-DDTHH:MM') to epoch seconds."""
-    dt = datetime.datetime.fromisoformat(s)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.UTC)
-    return int(dt.timestamp())
-
-
 def _insights_query(
     # ``logs`` is a boto3 client: boto3 generates its clients at runtime, so there
     # is no static type to name.
@@ -407,27 +401,20 @@ def _insights_query(
     start_epoch: int,
     end_epoch: int,
 ) -> list[dict[str, str]] | None:
-    """Run one CloudWatch Insights query and return its rows (None on failure).
+    """Run one Insights query and return its rows, or None on a hard failure.
 
-    Bounded poll: Insights statuses are Scheduled/Running/Complete/Failed/
-    Cancelled/Timeout/Unknown. Break on any terminal state (incl. Unknown) and
-    cap total wait so a query stuck Scheduled/Running/Unknown can't spin forever.
+    A thin adapter over the shared runner in ``profiling/_cloudwatch.py``, which
+    owns the bounded poll, the never-abort contract (rows=None rather than a
+    raised botocore error, so one bad query doesn't discard the rollup already
+    printed) and cancelling a query it gives up on.
+
+    The truncation flag is dropped on purpose: every query below is a per-stream
+    AGGREGATE (``stats … by @logStream`` — one row per worker) or carries its own
+    ``limit``, so the 10k-row cap is unreachable here. The shared runner still
+    warns on stderr if that ever stops being true.
     """
-    qid = logs.start_query(
-        logGroupName=log_group, startTime=start_epoch, endTime=end_epoch, queryString=query, limit=10000
-    )["queryId"]
-    deadline = time.monotonic() + 180
-    res = logs.get_query_results(queryId=qid)
-    while res["status"] not in ("Complete", "Failed", "Cancelled", "Timeout", "Unknown"):
-        if time.monotonic() > deadline:
-            print("CloudWatch query did not finish within 180s", file=sys.stderr)
-            return None
-        time.sleep(2)
-        res = logs.get_query_results(queryId=qid)
-    if res["status"] != "Complete":
-        print(f"CloudWatch query {res['status']}", file=sys.stderr)
-        return None
-    return [{c["field"]: c["value"] for c in row} for row in res["results"]]
+    rows, _truncated = insights_query(logs, log_group, query, start_epoch, end_epoch)
+    return rows
 
 
 def _worker_label(stream: str) -> str:
@@ -595,8 +582,8 @@ def main(argv: list[str] | None = None) -> int:
     session = boto3.session.Session(profile_name=args.profile, region_name=args.region)
 
     if args.ram_report:
-        end = _parse_ts(args.until) if args.until else int(time.time())
-        start = _parse_ts(args.since) if args.since else end - int(args.hours * 3600)
+        end = parse_ts(args.until) if args.until else int(time.time())
+        start = parse_ts(args.since) if args.since else end - int(args.hours * 3600)
         rc = ram_util_report(session, args.log_group, start, end)
         if not (args.start_pollers or args.report):
             return rc
