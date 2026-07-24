@@ -163,6 +163,12 @@ def _staging_run_id(
         # flipped flag must start a fresh staging prefix — resuming would mix
         # S1-gated and S2-only tiles under one run.
         allow_s2_only,
+        # Checkpoint identity is the FILENAME, not the weight bytes — deliberately.
+        # A new model ships under a new filename (norm_source → a distinct name),
+        # which both flips this fingerprint AND is rejected by the seeded model gate
+        # (checkpoint_id / geoemb:model). The checkpoint is fixed for a campaign and
+        # never overwritten mid-run, so a same-filename byte-swap is a non-scenario;
+        # content-hashing it here would buy nothing. (Do not "fix" to an ETag.)
         checkpoint_filename(),
         code_identity,
         _mosaic_identity(
