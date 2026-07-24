@@ -64,6 +64,12 @@ HEALTH_MARKER = "scheduler health:"
 # 20 s poll keeps latency under one heartbeat without hammering the API.
 DEFAULT_POLL_INTERVAL_S = 20.0
 
+# How much already-emitted heartbeat --live replays before tailing. One
+# heartbeat is 30 s, so the default gives ~10 samples of context — enough for
+# the sustained-CPU and backlog-growth rules to have a window to judge from
+# the first snapshot, instead of staying blind for their first few intervals.
+DEFAULT_LOOKBACK_S = 300
+
 # How far back --live rewinds its cursor each poll, so a heartbeat that CloudWatch
 # surfaces out of order (common when the prefix spans several scheduler streams)
 # is still picked up instead of being skipped forever. eventId dedupe makes the
@@ -212,7 +218,7 @@ def watch_live(
     stream_prefix: str,
     poll_interval_s: float,
     thresholds: Thresholds,
-    lookback_s: int = 300,
+    lookback_s: int = DEFAULT_LOOKBACK_S,
 ) -> int:
     """Tail scheduler health lines and emit JSON snapshots until interrupted.
 
@@ -456,6 +462,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL_S, help="live: seconds between polls"
     )
+    parser.add_argument(
+        "--lookback",
+        type=int,
+        default=DEFAULT_LOOKBACK_S,
+        help=(
+            "live: seconds of already-emitted heartbeat to replay before tailing "
+            "(default: %(default)s). Raise it when attaching to a run that is "
+            "already under way, so the ramp-up you missed still lands in the series."
+        ),
+    )
     parser.add_argument("--cpu-threshold", type=float, default=Thresholds.cpu_pct)
     parser.add_argument("--cpu-intervals", type=int, default=Thresholds.cpu_intervals)
     parser.add_argument("--mem-threshold", type=float, default=Thresholds.mem_pct)
@@ -468,7 +484,14 @@ def main(argv: list[str] | None = None) -> int:
     session = boto3.Session(profile_name=args.profile, region_name=args.region)
 
     if args.live:
-        return watch_live(session, args.log_group, args.stream_prefix, args.poll_interval, thresholds)
+        return watch_live(
+            session,
+            args.log_group,
+            args.stream_prefix,
+            args.poll_interval,
+            thresholds,
+            lookback_s=args.lookback,
+        )
 
     if not args.since or not args.until:
         parser.error("--report requires --since and --until")

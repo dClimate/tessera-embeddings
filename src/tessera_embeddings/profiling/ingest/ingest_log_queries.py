@@ -76,8 +76,8 @@ QUERIES: dict[str, tuple[str, str]] = {
         "Catalog retry storms: retries per 5-minute bin (rising bins = an "
         "external API pushing back harder over the run).",
         r"filter @message like /retry:/"
-        r" | stats count(*) as retries by bin(5m)"
-        r" | sort bin(5m) asc",
+        r" | stats count(*) as retries by bin(5m) as period"
+        r" | sort period asc",
     ),
     "store_write_retries": (
         "Mosaic store-write retries per 5-minute bin. BOTH s1_roi.py and "
@@ -85,8 +85,8 @@ QUERIES: dict[str, tuple[str, str]] = {
         "counts icechunk/GDAL write failures under parallelism across both "
         "sensors — write pressure, NOT catalog or granule-download trouble.",
         r"filter @message like /Retrying/ and @message like /as it raised/"
-        r" | stats count(*) as retries by bin(5m)"
-        r" | sort bin(5m) asc",
+        r" | stats count(*) as retries by bin(5m) as period"
+        r" | sort period asc",
     ),
     "s3_slowdown": (
         "S3 503 SlowDown per 5-minute bin (object-store push-back on mosaic/store "
@@ -95,8 +95,8 @@ QUERIES: dict[str, tuple[str, str]] = {
         "would blame the object store when the catalog is at fault (those live in "
         "http_retry_status).",
         r"filter @message like /SlowDown/ and @message not like /retry:/"
-        r" | stats count(*) as slowdowns by bin(5m)"
-        r" | sort bin(5m) asc",
+        r" | stats count(*) as slowdowns by bin(5m) as period"
+        r" | sort period asc",
     ),
     "worker_lifecycle_counts": (
         "Worker lifecycle counts by CATEGORY — separates 'workers dying' "
@@ -135,8 +135,8 @@ QUERIES: dict[str, tuple[str, str]] = {
         "General worker error/exception rate per 5-minute bin — a catch-all so "
         "a novel failure mode still shows up as a rising error curve.",
         r"filter @message like /ERROR/ or @message like /Traceback/ or @message like /Exception/"
-        r" | stats count(*) as errors by bin(5m)"
-        r" | sort bin(5m) asc",
+        r" | stats count(*) as errors by bin(5m) as period"
+        r" | sort period asc",
     ),
 }
 
