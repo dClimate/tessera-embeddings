@@ -113,6 +113,29 @@ def test_fill_run_id_is_stable_and_input_fingerprinted(wired):
     assert changed.startswith("33N-2025-") and changed != base  # input change → new prefix
 
 
+def test_fill_run_id_changes_when_the_mosaic_is_rebuilt(wired, monkeypatch):
+    """A rebuilt mosaic must not resume tiles staged against the previous one.
+
+    The ingest marker is policy only, so re-ingesting the same window under the same
+    settings reproduces it exactly — while the pixels can differ (a reprocessed or
+    late-published granule). Keying on the marker alone would resume the old tiles
+    and publish a zone-year mixing two mosaic revisions.
+    """
+    marker = {"window": ["2025-01-01", "2025-12-31"], "coverage_sha256": "cov"}
+
+    def _mosaic(completed_at):
+        return lambda *a, **k: SimpleNamespace(
+            attrs={"registry_sha256": "cov-sha-test", "ingest_marker": marker, "ingest_completed_at": completed_at}
+        )
+
+    monkeypatch.setattr(mod, "open_store_as_zarr_group", _mosaic("2026-01-01T00:00:00Z"))
+    first = _fill_run_id(wired)
+    assert _fill_run_id(wired) == first  # same build → same prefix, so a retry resumes
+
+    monkeypatch.setattr(mod, "open_store_as_zarr_group", _mosaic("2026-02-02T00:00:00Z"))
+    assert _fill_run_id(wired) != first  # identical marker, new build → fresh prefix
+
+
 def test_fill_run_id_changes_with_allow_s2_only(wired):
     """allow_s2_only changes WHICH pixels get embeddings, so it must flip the
     staging fingerprint — a retry across a flipped flag never resumes mixed tiles.

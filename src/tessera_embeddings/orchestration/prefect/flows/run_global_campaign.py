@@ -80,7 +80,8 @@ def _mosaic_identity(
     Called AFTER ingest (for ingest=True), so each store carries its
     ``ingest_marker`` (window + coverage-delivery sha + min_valid_coverage +
     orbit + allow_partial_window — the exact per-(zone,year) fingerprint that
-    produced it); a prebuilt (ingest=False) mosaic falls back to
+    produced it) plus the ``ingest_completed_at`` that separates two builds
+    sharing one policy; a prebuilt (ingest=False) mosaic falls back to
     ``last_appended``/``created_at``. This is deliberately per-(zone,year) and
     post-ingest, NOT one global coverage sha read once up front: a partial
     ``build_all(zones=...)`` can leave zones on different coverage revisions,
@@ -115,7 +116,11 @@ def _mosaic_identity(
             raise  # transient/auth: fail closed rather than fingerprint a partial view
         marker = grp.attrs.get("ingest_marker")
         identity = (
-            repr(marker)
+            # marker + completed_at, not the marker alone: the marker is policy, so a
+            # rebuild under identical settings reproduces it byte for byte and would
+            # resume tiles staged against the PREVIOUS mosaic. completed_at is stamped
+            # in the same commit and only moves when ingest actually re-ran.
+            f"{marker!r}@{grp.attrs.get('ingest_completed_at')}"
             if isinstance(marker, dict)
             else (grp.attrs.get("last_appended") or grp.attrs.get("created_at"))
         )
