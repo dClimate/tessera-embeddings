@@ -227,3 +227,50 @@ def test_coverage_failure_leaves_no_marker(wired, monkeypatch):
     with pytest.raises(InsufficientCoverageError):
         _run(s1_orbit="ascending")
     assert wired["markers_written"] == []  # not marked complete on a coverage gap
+
+
+class TestChunkScaledWorkers:
+    """Cropped cells size their Dask fleet from live chunks, not zone extent.
+
+    The 03S incident: a 4-tile zone hit the 50-worker ceiling because the fleet
+    was sized for a full-extent mosaic. With writes cropped to live windows the
+    chunk count IS the work measure, so max_workers scales with it — floor keeps
+    a tiny cell from starving, and the settings ceiling stays the quota cap.
+    """
+
+    def _dispatch(self, wired, monkeypatch, *, tile_live, **settings_kwargs):
+        import numpy as np
+
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        monkeypatch.setattr(
+            mod,
+            "open_store_as_zarr_group",
+            lambda *a, **k: {"tile_live_2048": np.asarray(tile_live, dtype=bool)},
+        )
+        _run(ingest_settings=mod.IngestSettings(crop_to_live_windows=True, **settings_kwargs), s1_orbit="ascending")
+        return [p["max_workers"] for _, p in wired["arun"]]
+
+    def test_sparse_zone_gets_the_floor_not_the_ceiling(self, wired, monkeypatch):
+        # 03S in miniature: 4 live tiles in one 4096-chunk -> 1 chunk -> floor(10).
+        tiles = [[True, True], [True, True]]
+        assert self._dispatch(wired, monkeypatch, tile_live=tiles) == [10, 10]  # s1 + s2
+
+    def test_dense_zone_is_capped_by_settings(self, wired, monkeypatch):
+        import numpy as np
+
+        tiles = np.ones((40, 40), dtype=bool)  # 400 live chunks -> 200 > cap
+        assert self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=50) == [50, 50]
+
+    def test_mid_zone_scales_half_worker_per_chunk(self, wired, monkeypatch):
+        import numpy as np
+
+        tiles = np.zeros((20, 20), dtype=bool)
+        tiles[::2, ::2] = True  # every 2x2 tile block live -> all 100 chunks live
+        assert self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=200) == [50, 50]
+
+    def test_crop_off_keeps_the_settings_value(self, wired, monkeypatch):
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        _run(ingest_settings=mod.IngestSettings(max_workers=37), s1_orbit="ascending")
+        assert [p["max_workers"] for _, p in wired["arun"]] == [37, 37]

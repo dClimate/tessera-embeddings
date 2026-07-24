@@ -38,13 +38,14 @@ import dask.distributed
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
+from tessera_embeddings.ingest.live_windows import live_windows_for_mask
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import apply_roi_mask
 from tessera_embeddings.ingest.stac import ingest_tile
 from tessera_embeddings.ingest.transforms import amplitude_to_db
 from tessera_embeddings.storage.manifest import IngestManifest
-from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset
+from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset, write_day_windows
 
 DEFAULT_CRED_REFRESH_INTERVAL_SEC = 30 * 60
 """STS credentials are refreshed at most every 30 minutes (1-hour TTL minus headroom)."""
@@ -90,6 +91,7 @@ def ingest_s1_roi_sar(
     cred_refresh_interval_sec: float = DEFAULT_CRED_REFRESH_INTERVAL_SEC,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     storage_options: dict | None = None,
+    crop_to_live_windows: bool = False,
 ) -> SarIngestResult:
     """Ingest OPERA RTC-S1 SAR for an ROI using batched time windows.
 
@@ -131,6 +133,9 @@ def ingest_s1_roi_sar(
             callback.
         log: Optional logger; defaults to ``logging.getLogger(__name__)``.
         storage_options: fsspec storage options for the ROI mask reads.
+        crop_to_live_windows: Write only the chunk-aligned windows that
+            intersect the ROI mask (``ingest.live_windows``), one commit per
+            date within each batch. Default False = legacy full-extent path.
 
     Returns:
         :class:`SarIngestResult`. ``status="skipped"`` if zero dates
@@ -148,6 +153,17 @@ def ingest_s1_roi_sar(
     last_cred_refresh: float = float("-inf")
 
     orbit_store = f"{store_path}/sar_{orbit}.zarr"
+
+    # Cropped write path: windows derived once from the same mask this ingest
+
+    # reads (see ingest.live_windows; identical mechanics to the S2 path).
+
+    live_windows: list[tuple[int, int, int, int]] | None = None
+
+    if crop_to_live_windows:
+        live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in live_windows_for_mask(roi_zarr_path)]
+
+        log.info("Cropping writes to %d live window(s)", len(live_windows))
     total_processed = 0
     batch_start = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -208,22 +224,46 @@ def ingest_s1_roi_sar(
 
         if data is not None:
             data, _ = apply_roi_mask(data, roi_zarr_path, spatial_chunks, roi_mask=roi_mask)
-            for attempt in Retrying(
-                stop=stop_after_attempt(3),
-                wait=wait_exponential(multiplier=1, min=2, max=8),
-                before_sleep=before_sleep_log(log, logging.WARNING),
-                reraise=True,
-            ):
-                with attempt:
-                    write_dataset(
-                        orbit_store,
-                        data,
-                        tile_id=roi_zarr_path,
-                        baselines=baselines,
-                        chunks=INGEST_CHUNKS,
-                        manifest=ingest_manifest,
-                        crs=roi.native_crs,
-                    )
+
+            def _retrying() -> Retrying:
+                return Retrying(
+                    stop=stop_after_attempt(3),
+                    wait=wait_exponential(multiplier=1, min=2, max=8),
+                    before_sleep=before_sleep_log(log, logging.WARNING),
+                    reraise=True,
+                )
+
+            if live_windows is not None:
+                # A batch holds many NON-contiguous dates, each its own atomic
+                # commit — so the retry scope is PER DATE. One retry around the
+                # whole loop would restart at a date an earlier attempt already
+                # committed and trip the duplicate-date guard.
+                for i in range(data.sizes["time"]):
+                    for attempt in _retrying():
+                        with attempt:
+                            write_day_windows(
+                                orbit_store,
+                                data.isel(time=slice(i, i + 1)),
+                                live_windows,
+                                roi=roi,
+                                manifest=ingest_manifest,
+                                baselines=baselines,
+                                tile_id=roi_zarr_path,
+                                crs=roi.native_crs,
+                                chunks=INGEST_CHUNKS,
+                            )
+            else:
+                for attempt in _retrying():
+                    with attempt:
+                        write_dataset(
+                            orbit_store,
+                            data,
+                            tile_id=roi_zarr_path,
+                            baselines=baselines,
+                            chunks=INGEST_CHUNKS,
+                            manifest=ingest_manifest,
+                            crs=roi.native_crs,
+                        )
             n = data.sizes["time"]
             total_processed += n
             log.info(

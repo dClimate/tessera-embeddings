@@ -26,7 +26,9 @@ This module imports nothing from Prefect or any cloud provider.
 from __future__ import annotations
 
 import logging
+import operator
 from dataclasses import dataclass
+from functools import reduce
 from typing import cast, final
 
 import dask.array as da
@@ -39,6 +41,7 @@ from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_expone
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
+from tessera_embeddings.ingest.live_windows import live_windows_for_mask
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE, apply_roi_mask
 from tessera_embeddings.ingest.stac import (
@@ -49,7 +52,7 @@ from tessera_embeddings.ingest.stac import (
     query_stac_items,
 )
 from tessera_embeddings.storage.manifest import IngestManifest
-from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset
+from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset, write_day_windows
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +110,7 @@ def _compute_scl_phase(
     roi_pixel_count: int,
     min_valid_coverage: float,
     client: dask.distributed.Client,
+    windows: list[tuple[int, int, int, int]] | None = None,
 ) -> tuple[bool, xr.DataArray | None]:
     """Phase 1: load only SCL, compute coverage and per-pixel validity.
 
@@ -125,10 +129,14 @@ def _compute_scl_phase(
         roi_pixel_count: Number of ``True`` pixels in ``roi_mask``.
         min_valid_coverage: Minimum valid coverage percentage.
         client: Connected Dask client used to persist intermediates.
+        windows: Live windows for the cropped path — the coverage reduce runs
+            over these only and ``any_valid`` is returned LAZY (never
+            persisted full-extent). ``None`` = legacy full-extent behaviour.
 
     Returns:
         ``(passes_coverage, any_valid)``. ``any_valid`` is persisted on
-        workers when ``passes_coverage`` is True; ``None`` otherwise.
+        workers when ``passes_coverage`` is True (legacy path); ``None``
+        when the date fails coverage.
     """
     try:
         scl_ds = _load_scl_only(day_items, geobox, load_chunks)
@@ -148,10 +156,20 @@ def _compute_scl_phase(
     # solar_day grouping fuses all same-day tiles into exactly one time slice
     scl_2d = scl_ds["scl"].isel(time=0)
     any_valid = ~scl_2d.isin(invalid_classes)
-    valid_count = (any_valid & roi_mask).sum()
 
-    any_valid, valid_count = client.persist([any_valid, valid_count])
-    valid_count_val = valid_count.compute().item()
+    if windows is not None:
+        # Cropped: reduce only the live windows (dask culls the graph to their
+        # chunks — the mask is False outside every window, so the total is
+        # identical to the full reduce by the windows' coverage-totality property).
+        # any_valid stays LAZY: persisting it would materialise the full extent,
+        # and Phase 2's zeroing pulls only window slices of it anyway.
+        masked = any_valid & roi_mask
+        parts = [masked.isel(northing=slice(y0, y1), easting=slice(x0, x1)).sum() for y0, y1, x0, x1 in windows]
+        valid_count_val = int(reduce(operator.add, parts).compute()) if parts else 0
+    else:
+        valid_count = (any_valid & roi_mask).sum()
+        any_valid, valid_count = client.persist([any_valid, valid_count])
+        valid_count_val = valid_count.compute().item()
 
     passes = float(100.0 * valid_count_val / roi_pixel_count) >= min_valid_coverage
     if not passes:
@@ -171,6 +189,7 @@ def ingest_s2_roi_reflectance(
     collection: str = "sentinel-2-l2a",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     storage_options: dict | None = None,
+    crop_to_live_windows: bool = False,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
 
@@ -195,6 +214,14 @@ def ingest_s2_roi_reflectance(
         log: Optional logger; defaults to ``logging.getLogger(__name__)``.
         storage_options: fsspec storage options for reading the ROI
             mask. ``None`` lets fsspec auto-detect from the URI.
+        crop_to_live_windows: Write only the chunk-aligned windows that
+            intersect the ROI mask (``ingest.live_windows``) instead of the
+            full extent — one commit per date either way. Default False
+            preserves the byte-identical legacy path while the cropped one
+            is validated. The SCL coverage phase is cropped too: its reduce
+            runs over the windows only (identical total — the mask is False
+            outside them) and ``any_valid`` stays lazy, so no full-extent
+            array is ever persisted.
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items
@@ -205,6 +232,14 @@ def ingest_s2_roi_reflectance(
     roi = read_roi_metadata(roi_zarr_path)
 
     ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path)
+
+    # Live windows for the cropped write path, derived once per run from the same
+    # mask this ingest already reads (plain tuples: storage takes no ingest types).
+    live_windows: list[tuple[int, int, int, int]] | None = None
+    if crop_to_live_windows:
+        wins = live_windows_for_mask(roi_zarr_path)
+        live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in wins]
+        log.info("Cropping writes to %d live window(s)", len(wins))
 
     # time=1 matches INGEST_CHUNKS so each date is an independent Dask task:
     # fully parallel across dates with no rechunk at write time.
@@ -243,7 +278,14 @@ def ingest_s2_roi_reflectance(
     for day_items in items_by_date.values():
         # Phase 1: SCL-only coverage check — tiny graph.
         passes, any_valid = _compute_scl_phase(
-            day_items, roi.geobox, INGEST_CHUNKS, roi_mask, roi_pixel_count, min_valid_coverage, client
+            day_items,
+            roi.geobox,
+            INGEST_CHUNKS,
+            roi_mask,
+            roi_pixel_count,
+            min_valid_coverage,
+            client,
+            windows=live_windows,
         )
         if not passes:
             total_filtered += 1
@@ -274,7 +316,8 @@ def ingest_s2_roi_reflectance(
         day_ds, _ = apply_roi_mask(day_ds, roi_zarr_path, spatial_chunks, roi_mask=roi_mask)
 
         # Tenacity retry on intermittent GDAL errors under high parallelism.
-        # Icechunk writes are atomic, so retry is safe.
+        # Icechunk writes are atomic, so retry is safe — a failed cropped date
+        # commits nothing (batched_region_writes) and the retry starts clean.
         for attempt in Retrying(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, min=2, max=8),
@@ -282,15 +325,28 @@ def ingest_s2_roi_reflectance(
             reraise=True,
         ):
             with attempt:
-                write_dataset(
-                    reflectance_store,
-                    day_ds,
-                    tile_id=roi_zarr_path,
-                    baselines=baselines,
-                    chunks=INGEST_CHUNKS,
-                    manifest=ingest_manifest,
-                    crs=roi.native_crs,
-                )
+                if live_windows is not None:
+                    write_day_windows(
+                        reflectance_store,
+                        day_ds,
+                        live_windows,
+                        roi=roi,
+                        manifest=ingest_manifest,
+                        baselines=baselines,
+                        tile_id=roi_zarr_path,
+                        crs=roi.native_crs,
+                        chunks=INGEST_CHUNKS,
+                    )
+                else:
+                    write_dataset(
+                        reflectance_store,
+                        day_ds,
+                        tile_id=roi_zarr_path,
+                        baselines=baselines,
+                        chunks=INGEST_CHUNKS,
+                        manifest=ingest_manifest,
+                        crs=roi.native_crs,
+                    )
         total_processed += 1
 
     log.info("%d/%d dates passed coverage filter", len(items_by_date) - total_filtered, len(items_by_date))

@@ -16,9 +16,14 @@ from collections.abc import Callable
 from typing import Any
 
 from prefect import flow, get_run_logger
+from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.ingest.auth import get_s3_credentials, set_s3_credentials
 from tessera_embeddings.ingest.s1_roi import S1Orbit
+from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
+    dask_cleanup_on_cancellation,
+    dask_resource_tags,
+)
 from tessera_embeddings.orchestration.prefect.flows._dask_runner import get_task_runner_for_cluster
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_sar
 
@@ -36,6 +41,7 @@ def _ingest_s1_roi_impl(
     apply_credentials_fn: Callable[[dict[str, str]], None] | None,
     use_s3_direct: bool,
     storage_options: dict | None,
+    crop_to_live_windows: bool,
 ) -> dict[str, Any]:
     """Inner flow: submits the S1 ingestion task to the configured Dask runner."""
     future = process_roi_sar.submit(
@@ -49,6 +55,7 @@ def _ingest_s1_roi_impl(
         apply_credentials_fn=apply_credentials_fn,
         use_s3_direct=use_s3_direct,
         storage_options=storage_options,
+        crop_to_live_windows=crop_to_live_windows,
     )
     return future.result()
 
@@ -70,7 +77,11 @@ def _default_edl_env() -> dict[str, str]:
     }
 
 
-@flow(name="ingest_s1_roi_sar")
+@flow(
+    name="ingest_s1_roi_sar",
+    on_cancellation=[dask_cleanup_on_cancellation],
+    on_crashed=[dask_cleanup_on_cancellation],
+)
 def ingest_s1_roi_sar(
     *,
     roi_zarr_path: str,
@@ -85,6 +96,7 @@ def ingest_s1_roi_sar(
     use_local: bool = False,
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
+    crop_to_live_windows: bool = False,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
 
@@ -113,6 +125,9 @@ def ingest_s1_roi_sar(
             performance-report HTML for this run is captured and
             uploaded there (probe-rung profiling; default off).
             Ignored on the ``use_local`` path, which warns.
+        crop_to_live_windows: Restrict mosaic writes (and the S2 coverage
+            reduce) to the chunk-aligned windows intersecting the ROI mask —
+            one commit per date. Default False = legacy full-extent path.
 
     Returns:
         ``SarIngestResult`` serialised as a dict.
@@ -156,6 +171,7 @@ def ingest_s1_roi_sar(
                 apply_credentials_fn=apply_credentials_fn,
                 use_s3_direct=use_s3_direct,
                 storage_options=storage_options,
+                crop_to_live_windows=crop_to_live_windows,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -167,6 +183,9 @@ def ingest_s1_roi_sar(
         min_workers=min_workers,
         max_workers=max_workers,
         extra_worker_env=edl_env,
+        # Tag every cluster resource with this run's id so the cancellation/crash
+        # hook can sweep the tasks from a fresh process (see _dask_lifecycle).
+        resource_tags=dask_resource_tags(flow_run_ctx.id),
     ) as cluster:
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
@@ -182,4 +201,5 @@ def ingest_s1_roi_sar(
                 apply_credentials_fn=apply_credentials_fn,
                 use_s3_direct=use_s3_direct,
                 storage_options=storage_options,
+                crop_to_live_windows=crop_to_live_windows,
             )

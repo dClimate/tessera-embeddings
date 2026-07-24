@@ -16,8 +16,13 @@ from __future__ import annotations
 from typing import Any
 
 from prefect import flow, get_run_logger
+from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
+from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
+    dask_cleanup_on_cancellation,
+    dask_resource_tags,
+)
 from tessera_embeddings.orchestration.prefect.flows._dask_runner import get_task_runner_for_cluster
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_reflectance
 
@@ -33,6 +38,7 @@ def _ingest_s2_roi_impl(
     provider: str = "earth-search",
     collection: str = "sentinel-2-l2a",
     storage_options: dict | None = None,
+    crop_to_live_windows: bool = False,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
     future = process_roi_reflectance.submit(
@@ -44,11 +50,16 @@ def _ingest_s2_roi_impl(
         provider=provider,
         collection=collection,
         storage_options=storage_options,
+        crop_to_live_windows=crop_to_live_windows,
     )
     return future.result()
 
 
-@flow(name="ingest_s2_roi_reflectance")
+@flow(
+    name="ingest_s2_roi_reflectance",
+    on_cancellation=[dask_cleanup_on_cancellation],
+    on_crashed=[dask_cleanup_on_cancellation],
+)
 def ingest_s2_roi_reflectance(
     *,
     roi_zarr_path: str,
@@ -64,6 +75,7 @@ def ingest_s2_roi_reflectance(
     use_local: bool = False,
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
+    crop_to_live_windows: bool = False,
 ) -> dict[str, Any]:
     """Ingest S2 L2A reflectance for an ROI using Dask workers.
 
@@ -95,6 +107,9 @@ def ingest_s2_roi_reflectance(
             performance-report HTML for this run is captured and
             uploaded there (probe-rung profiling; default off).
             Ignored on the ``use_local`` path, which warns.
+        crop_to_live_windows: Restrict mosaic writes (and the S2 coverage
+            reduce) to the chunk-aligned windows intersecting the ROI mask —
+            one commit per date. Default False = legacy full-extent path.
 
     Returns:
         ``IngestResult`` serialised as a dict (see
@@ -122,11 +137,20 @@ def ingest_s2_roi_reflectance(
                 provider=provider,
                 collection=collection,
                 storage_options=storage_options,
+                crop_to_live_windows=crop_to_live_windows,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
 
-    with ecs_cluster(log, min_workers=min_workers, max_workers=max_workers, ec2_scheduler=ec2_scheduler) as cluster:
+    with ecs_cluster(
+        log,
+        min_workers=min_workers,
+        max_workers=max_workers,
+        ec2_scheduler=ec2_scheduler,
+        # Tag every cluster resource with this run's id so the cancellation/crash
+        # hook can sweep the tasks from a fresh process (see _dask_lifecycle).
+        resource_tags=dask_resource_tags(flow_run_ctx.id),
+    ) as cluster:
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
         with maybe_performance_report(cluster.scheduler_address, perf_report_uri, log):
@@ -139,4 +163,5 @@ def ingest_s2_roi_reflectance(
                 provider=provider,
                 collection=collection,
                 storage_options=storage_options,
+                crop_to_live_windows=crop_to_live_windows,
             )
