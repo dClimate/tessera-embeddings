@@ -8,15 +8,18 @@ the artifact both ``rasterize_roi_zarr`` and ``export_zone_roi`` write), coarsen
 it to the ingest chunk grid, and emit one window per live chunk-row spanning that
 row's live columns.
 
-Row-band windows are a measured choice, not a guess: across all 112 land zones
-they compute within 1% (median) of the exact live-chunk floor, while a single
-bounding box captures less than half the win (see the design note's measurement
-table). Windows are snapped to the chunk grid by construction, which makes them
+This module is general-purpose: it serves a SINGLE run (any sparse ROI — scattered
+fields, a coastline, any footprint much smaller than its bounding box) and a
+GLOBAL campaign zone identically, because both produce the same mask artifact.
+The strategy choice was measured on the GLOBAL campaign's coverage specifically
+(all 112 land zones; table and per-zone JSON in the design note): row bands
+compute within 1% (median) of the exact live-chunk floor, while a single bounding
+box captures less than half the win. A single ROI sees the same behaviour scaled
+to its own extent-vs-content gap.
+
+Windows are snapped to the chunk grid by construction, which makes them
 chunk-disjoint — the property that lets one session write every window of a date
 and commit once, with no shared-chunk reconciliation.
-
-Serves the single-ROI and campaign paths identically: both produce the same mask
-artifact, so neither caller needs to know which world it is in.
 """
 
 from __future__ import annotations

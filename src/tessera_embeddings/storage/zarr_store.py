@@ -947,7 +947,14 @@ class RegionWriteBatch:
     """
 
     def __init__(self, session: "icechunk.Session") -> None:
-        self._session = session
+        #: The batch's session. Exposed because window PIXEL data at volume should
+        #: be written as ``to_icechunk(win, batch.session, mode="r+", region=...)``
+        #: — placement stays on the Dask workers that computed the pixels instead
+        #: of funnelling the date's live volume through the one worker running the
+        #: caller (dense-zone arithmetic in the design note). Same session, same
+        #: single commit; ``write_window`` below is for volumes that comfortably
+        #: fit on the calling worker.
+        self.session = session
         #: The store's root group, writable. Exposed so callers can read/merge root
         #: attrs (baselines, doy, last_appended) — attr edits land in the same commit.
         self.group: zarr.Group = zarr.open_group(session.store, mode="r+")

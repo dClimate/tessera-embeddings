@@ -144,17 +144,26 @@ them at scale.
 zarr writes under an icechunk commit are cleaner than anything routed through a
 task graph — `write_regions`' removal is the precedent. Dask is genuinely needed
 to *compute* the mosaic (the STAC loads and resampling), so it stays for that;
-it is not needed to *place* the results. So the write path prefers
-`region_merge`'s write style without its process pool: compute a window (or a
-chunk of one) to numpy, assign it positionally into the session's zarr group,
-one commit per date. The time-axis extension is likewise a raw resize plus a
-coord append on the session — metadata, not a graph.
+control flow, metadata, and commits are direct: the time-axis extension is a raw
+resize plus a coord append on the session, attrs are plain zarr writes, one
+commit per date is one `session.commit`.
 
-The proven fallback, if per-session write throughput ever binds (one session's
-chunk writes serialise on its store mutex; region-merge measured the plateau), is
-the experiment's other result: sequential `to_icechunk(mode="r+", region=...)`
-calls on the shared session, which fork internally and write from Dask workers.
-Either way: no process pool, no session forking of our own.
+**For the window PIXELS, volume decides — the same split `region_merge` itself
+implements** (one shard → no pool, "fork once and write inline"; many → the
+pool). The domain function runs on a single Dask worker, so computing windows to
+numpy and assigning them directly funnels the date's live volume through that one
+node. The arithmetic: sparse zones — the ones that motivated this work — are
+trivial (03S: 4 chunks, well under 1 GB/date across all bands); a dense zone is
+not (35N: ~2,400 live chunks ≈ 80 GB per band-date; a single wide row window is
+~570 MB per band). At volume, the mechanism is the experiment's shared-session
+`to_icechunk(mode="r+", region=...)` per window: placement stays on the workers
+that computed the pixels, Dask's memory manager stays in charge, and the commit
+shape is unchanged. That is also the faithful adaptation of region-merge's
+fork/merge to graph-resident bytes — icechunk forks the session and merges
+changesets *inside* `to_icechunk`, with Dask workers playing the role
+region-merge gives its process pool. The pool itself does not transfer: it exists
+because region-merge's bytes are re-readable from a store by child processes
+(only paths and slices pickle across); ours would have to carry the pixels.
 
 **This must not become `write_regions` again** — a single Dask graph spanning every
 region, which was built and removed for being the bottleneck (see the warning
