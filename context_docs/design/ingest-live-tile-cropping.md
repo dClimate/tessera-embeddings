@@ -74,8 +74,10 @@ The shape:
 1. Derive live windows from the ROI mask, coarsened to the ingest chunk grid.
 2. Seed the mosaic full-extent and all-fill — creation cost is independent of
    spatial extent, since data vars are schema-only with zero chunks written.
-3. Per date, extend the time axis, then write each live window with
-   `zarr_store.write_region`. One commit per date, not per window.
+3. Per date, extend the time axis, then write that date's live windows — all of
+   them in **one commit**, via the fork-and-merge mechanism described below.
+   Explicitly NOT per-window `zarr_store.write_region`: that commits once per
+   call, so a loop over 74–220 windows would commit that many times per date.
 
 Snapping windows to the 4096 chunk grid is deliberate: it makes windows
 chunk-disjoint, which removes the shared-boundary-chunk reconciliation that the
