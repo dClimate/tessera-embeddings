@@ -29,17 +29,20 @@ guard; the fill re-checks before provisioning Ray.
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Callable
 from typing import Any, cast
 
 import icechunk
+import numpy as np
 import zarr
 from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
 from pydantic import BaseModel
 
-from tessera_embeddings.config.ingest import IngestSettings
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.data_loading import (
@@ -113,6 +116,32 @@ def _write_ingest_marker(store_path: str, fingerprint: dict, *, get_credentials:
     root.attrs["ingest_marker"] = dict(fingerprint)
     root.attrs["ingest_completed_at"] = utcnow_iso()
     session.commit(f"ingest marker: {fingerprint}")
+
+
+# Chunk-scaled worker sizing for cropped ingests (upstream roi_fanout's pattern:
+# workers proportional to the cell's work measure, clamped). One 4096-px ingest
+# chunk is the unit of work once writes crop to live windows, so a 4-tile zone no
+# longer gets the same fleet as a dense one. The floor keeps a tiny cell from
+# starving on one worker; the caller's max_workers stays the hard cap (quota).
+_WORKERS_PER_LIVE_CHUNK = 0.5
+_WORKERS_FLOOR = 10
+
+
+def _live_chunk_count(land_mask_path: str, zone: str, *, get_credentials: Callable, s3_region: str | None) -> int:
+    """Live 4096-px ingest chunks in the zone, from the coverage bitmap (a KB read)."""
+    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
+    tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
+    t = INGEST_CHUNK_SIZE // SHARD_PX  # tiles per chunk per axis
+    rows, cols = math.ceil(tile_live.shape[0] / t), math.ceil(tile_live.shape[1] / t)
+    padded = np.zeros((rows * t, cols * t), dtype=bool)
+    padded[: tile_live.shape[0], : tile_live.shape[1]] = tile_live
+    return int(padded.reshape(rows, t, cols, t).any(axis=(1, 3)).sum())
+
+
+def _scaled_max_workers(live_chunks: int, settings: IngestSettings) -> int:
+    """Clamp(0.5 x live chunks) into [max(min_workers, floor), max_workers]."""
+    floor = max(settings.min_workers, min(_WORKERS_FLOOR, settings.max_workers))
+    return max(floor, min(settings.max_workers, round(live_chunks * _WORKERS_PER_LIVE_CHUNK)))
 
 
 @flow(name="ingest-zone-year")
@@ -246,14 +275,25 @@ async def ingest_zone_year(
         s3_region=s3_region,
     )
 
-    # (4) Dispatch S1 (per REQUESTED orbit) + S2 ingestion concurrently onto the ROI.
+    # (4) Size the fleet from the cell's live work when cropping: with writes
+    # restricted to live windows the chunk count IS the work measure, and the
+    # 03S incident showed extent-sized fleets are wrong by orders of magnitude.
+    max_workers = ingest_settings.max_workers
+    if ingest_settings.crop_to_live_windows:
+        n_chunks = _live_chunk_count(
+            land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        )
+        max_workers = _scaled_max_workers(n_chunks, ingest_settings)
+        log.info("Zone %s: %d live chunk(s) -> max_workers=%d", zone, n_chunks, max_workers)
+
+    # Dispatch S1 (per REQUESTED orbit) + S2 ingestion concurrently onto the ROI.
     common: dict[str, Any] = {
         "roi_zarr_path": roi_path,
         "start_date": start_date,
         "end_date": end_date,
         "store_path": mosaic_base,
         "min_workers": ingest_settings.min_workers,
-        "max_workers": ingest_settings.max_workers,
+        "max_workers": max_workers,
         "use_local": use_local,
         "crop_to_live_windows": ingest_settings.crop_to_live_windows,
     }

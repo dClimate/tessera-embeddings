@@ -782,3 +782,67 @@ def test_zone_live_tile_count(tmp_path):
     empty_mask = _make_mask(tmp_path / "m2", [])
     assert zone_fill.zone_live_tile_count(empty_mask, _ZONE) == 0
     assert zone_fill.zone_has_live_tiles(empty_mask, _ZONE) is False
+
+
+def test_fill_accepts_a_cropped_written_mosaic(tmp_path, monkeypatch):
+    """The exact-grid validation passes against a write_day_windows mosaic.
+
+    The cropped ingest seeds schema-only from the zone ROI's geobox and writes
+    only live windows; the fill's grid assert reads full-length coords, CRS and
+    endpoints. This pins the load-bearing equivalence: a sparse mosaic's DECLARED
+    grid — geobox-derived coords included — is byte-compatible with the zone grid
+    the fill validates against, so cropping never trips the assert.
+    """
+    import dask.array as dask_array
+    import xarray as xr
+    from affine import Affine
+    from odc.geo.geobox import GeoBox
+
+    from tessera_embeddings.storage.zarr_store import write_day_windows
+
+    store = _seed_global(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0)])
+
+    # The production zone geobox, exactly as export_zone_roi encodes it:
+    # north-up, top-left origin at (easting_min, northing_max).
+    geobox = GeoBox((_NY, _NX), Affine(10.0, 0.0, _SPEC.easting[0], 0.0, -10.0, _SPEC.northing[1]), _SPEC.crs)
+
+    class _Roi:
+        pass
+
+    roi = _Roi()
+    roi.geobox, roi.height, roi.width = geobox, _NY, _NX
+
+    day_ds = xr.Dataset(
+        {"red": (("time", "northing", "easting"), dask_array.full((1, _NY, _NX), 3, dtype=np.uint16, chunks=(1, _TILE, _TILE)))},
+        coords={"time": np.array(["2025-06-01"], dtype="datetime64[ns]")},
+    )
+    base = str(tmp_path / "mosaics")
+    for name in ("reflectance", "sar_ascending", "sar_descending"):
+        write_day_windows(
+            f"{base}/{name}.zarr",
+            day_ds,
+            [(0, _TILE, 0, _TILE)],  # one live window; the rest of the grid is never written
+            roi=roi,
+            manifest=None,
+            baselines={},
+            tile_id="roi.zarr",
+            crs=_SPEC.crs,
+            chunks={"time": 1, "northing": _TILE, "easting": _TILE},
+        )
+
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
+    summary = zone_fill.fill_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2025,
+        land_mask_path=mask,
+        mosaic_base=base,
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="runCropped",
+    )
+    assert summary["empty"] is False and summary["succeeded"] == 1
