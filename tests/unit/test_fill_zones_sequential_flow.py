@@ -515,25 +515,11 @@ def test_negative_look_ahead_rejected_before_any_side_effect(wired):
     assert wired["seq_kwargs"] is None  # runner never entered
 
 
-def test_session_orbit_resolved_from_largest_cell(wired, monkeypatch):
-    """The shared session's orbit comes from the largest live cell's RESOLVED
-    orbit, not the raw request — so a single-orbit shard under the default
-    "both" streams instead of deferring (then failing at the cap) every cell.
+def test_session_orbit_is_the_request(wired):
+    """The session orbit is simply the request — a whole UTM zone always carries
+    both orbits, so resolving it from the cells' data would only matter for a
+    single-orbit whole zone, which does not occur (sub-zone/pixel single-orbit
+    is handled per-pixel, not here).
     """
-    monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "ascending")
-    _run(ingest=False, s1_orbit="both", zones=["33N", "34N"])
-    assert wired["seq_kwargs"]["session_s1_orbit"] == "ascending"
-
-
-def test_session_orbit_falls_back_to_request_when_probe_fails(wired, monkeypatch):
-    """If the largest cell's orbit can't be resolved, keep the requested orbit
-    (best-effort) and let the runner's feeder handle that cell per-cell — the
-    resolution must not be fatal.
-    """
-
-    def boom(*a, **k):
-        raise RuntimeError("probe failed")
-
-    monkeypatch.setattr(mod, "resolve_s1_orbit", boom)
-    _run(ingest=False, s1_orbit="both")
+    _run(s1_orbit="both")
     assert wired["seq_kwargs"]["session_s1_orbit"] == "both"

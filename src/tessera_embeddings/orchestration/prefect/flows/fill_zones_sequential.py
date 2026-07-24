@@ -646,15 +646,15 @@ def fill_zones_sequential_flow(
     # initial chunk list is empty and every streamed item carries its own
     # ZoneContext.
     #
-    # session_orbit/session_config default to the REQUEST but are refined to the
-    # largest live cell's RESOLVED orbit once its mosaic exists (inside the Ray
-    # block, below): with the default "both", a shard whose SAR is single-orbit
-    # resolves every cell to one orbit, and a "both" session would defer — then,
-    # past the deferral cap, FAIL — every one of them, so a valid single-orbit
-    # shard would never fill under chained-clusters. Matching the session to the
-    # shard's actual orbit streams them; genuinely mixed shards still defer the
-    # minority to the fallback.
-    session_orbit = s1_orbit
+    # The session orbit is simply the REQUEST (default "both"). A whole UTM zone
+    # is anticipated to always carry BOTH S1 orbits — single/no-orbit is a
+    # sub-zone and pixel-level reality (handled per-pixel in the mosaic and by
+    # `allow_s2_only`), NOT a whole-zone one — so `resolve_s1_orbit` returns
+    # "both" for every cell and none ever mismatches a "both" session. Resolving
+    # the session orbit from the cells' data would only matter for a
+    # single-orbit whole zone, which does not occur; the orbit-mismatch
+    # deferral + fallback below remains as a safety net for an explicit
+    # single-orbit request (or that non-scenario), bounded by the deferral cap.
     session_config = _config_for(s1_orbit)
 
     # Size the shared session by the LARGEST cell's clamped request, not the raw
@@ -746,31 +746,6 @@ def fill_zones_sequential_flow(
             cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
         ) as resolved_yaml:
             activate(resolved_yaml)
-            # Refine the session orbit from the largest live cell's actual data
-            # now that its mosaic exists (it was primed before `ray up`, so its
-            # ingest overlapped cluster bring-up). Best-effort: if the wait or
-            # probe fails, keep the requested orbit and let the runner's feeder
-            # handle that cell per-cell — do NOT make it fatal here.
-            try:
-                if inputs is not None:
-                    inputs.wait(live[0].zone, live[0].year)
-                session_orbit = resolve_s1_orbit(
-                    f"{paths.inputs.rstrip('/')}/mosaics/{live[0].zone}/{live[0].year}",
-                    s1_orbit,
-                    get_credentials=iam_icechunk_credentials,
-                    s3_region=s3_region,
-                )
-                session_config = _config_for(session_orbit)
-                if session_orbit != s1_orbit:
-                    log.info("Shared session orbit resolved from %s: %s → %s", live[0].zone, s1_orbit, session_orbit)
-            except Exception:
-                log.warning(
-                    "Could not resolve the session orbit from %s — using requested %r; the feeder will "
-                    "handle that cell per-cell",
-                    live[0].zone,
-                    s1_orbit,
-                    exc_info=True,
-                )
             seq = fill_zones_sequential(
                 cells=live,
                 prepare=_prepare,
@@ -778,7 +753,7 @@ def fill_zones_sequential_flow(
                 session=_session,
                 assemble=_assemble,
                 infer_single=_infer_single,
-                session_s1_orbit=session_orbit,
+                session_s1_orbit=s1_orbit,
                 log=log,
                 inputs=inputs,
                 look_ahead=look_ahead,
