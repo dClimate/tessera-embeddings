@@ -204,6 +204,39 @@ def test_ray_path_wires_actor_terminator(monkeypatch):
     assert captured["on_actor_retire"] is sentinel
 
 
+def test_pinned_ami_id_reaches_ray_cluster(monkeypatch):
+    """A campaign-pinned ami_id is threaded into ray_cluster so the fleet boots the
+    exact image the staging fingerprint recorded, not whatever ami_ssm_name resolves
+    to at provisioning time.
+    """
+    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-fill"))
+    monkeypatch.setattr(
+        "tessera_embeddings.providers.aws.credentials.iam_icechunk_credentials", object(), raising=False
+    )
+    monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: False)
+    monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
+    monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(time_window="W"))
+    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "check_time_window_coverage", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "tessera_embeddings.providers.aws.ray.make_instance_terminator", lambda **k: object(), raising=False
+    )
+    monkeypatch.setattr(mod, "fill_zone_year", lambda **kw: {"tag": "t"})
+
+    captured: dict = {}
+
+    @contextmanager
+    def fake_ray_cluster(*a, **k):
+        captured.update(k)
+        yield None
+
+    monkeypatch.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", fake_ray_cluster, raising=False)
+    mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami", ami_id="ami-pinned-01")
+    assert captured["ami_id"] == "ami-pinned-01"
+
+
 def test_staging_base_scoped_to_zone_year(monkeypatch):
     """The runner is handed a (zone, year)-scoped staging_base so a reused run_id
     can't cross-contaminate another cell's staged tiles.

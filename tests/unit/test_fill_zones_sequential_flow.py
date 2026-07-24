@@ -125,6 +125,14 @@ def test_cluster_gets_idle_timeout_and_code_params(wired):
     assert wired["ray_kwargs"]["code_suffix"] == "-branch"
 
 
+def test_pinned_ami_id_reaches_ray_cluster(wired):
+    """A campaign-pinned ami_id is threaded into the shared cluster's ray_cluster,
+    so the fleet boots the exact image this flow's staging fingerprint recorded.
+    """
+    _run(ami_id="ami-pinned-01")
+    assert wired["ray_kwargs"]["ami_id"] == "ami-pinned-01"
+
+
 def test_ingest_false_passes_no_inputs_adapter(wired):
     _run(ingest=False)
     assert wired["seq_kwargs"]["inputs"] is None

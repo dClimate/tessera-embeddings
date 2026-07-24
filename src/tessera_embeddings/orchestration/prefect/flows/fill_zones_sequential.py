@@ -327,6 +327,7 @@ def fill_zones_sequential_flow(
     year: int,
     paths: BucketPaths,
     ami_ssm_name: str,
+    ami_id: str | None = None,
     time_window_end: str | None = None,
     store_name: str = "tessera",
     mask_name: str = "global",
@@ -360,7 +361,12 @@ def fill_zones_sequential_flow(
             which is what makes the runner's trailing assembly conflict-free.
         year: Campaign calendar year to fill (must be on the seeded axis).
         paths: Deployment storage contract (global store, land mask, mosaics).
-        ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
+        ami_ssm_name: SSM parameter name for the Ray GPU AMI ID (used only when
+            ``ami_id`` is not given).
+        ami_id: Pre-resolved AMI ID the campaign pinned. Used for BOTH the shared
+            cluster's image AND this flow's own staging fingerprint, so a
+            mid-campaign re-bake can't split them. ``None`` (direct calls) resolves
+            ``ami_ssm_name`` as before.
         time_window_end: End month of the inference window as ``"Month Year"``;
             defaults to ``"December {year}"`` (the calendar-year window).
         store_name: Global-store repo basename (``paths.global_store``).
@@ -570,7 +576,9 @@ def fill_zones_sequential_flow(
     # must start fresh staging prefixes), and resolved in the Ray provisioning
     # region (None → us-west-2), not the storage `s3_region`. Placed after the
     # no-live-cells early return so triage-only runs make no AWS call.
-    code_identity = _resolve_code_identity(ami_ssm_name, code_bucket, code_suffix, None)
+    # Pin the AMI component to the same id the cluster boots (ami_id, below), so this
+    # flow's own staging fingerprint and its provisioned image can't disagree.
+    code_identity = _resolve_code_identity(ami_ssm_name, code_bucket, code_suffix, None, ami_id)
 
     def _prepare(cell: SequentialCell) -> PreparedCell:
         # Everything here needs the cell's mosaic, so it runs only after the
@@ -738,6 +746,7 @@ def fill_zones_sequential_flow(
         with ray_cluster(
             log,
             ami_ssm_name=ami_ssm_name,
+            ami_id=ami_id,
             ssm_prefix=ssm_prefix,
             cloudwatch_log_group=cloudwatch_log_group,
             code_bucket=code_bucket,

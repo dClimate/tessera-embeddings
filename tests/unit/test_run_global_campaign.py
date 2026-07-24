@@ -44,6 +44,9 @@ def wired(monkeypatch):
     # Immutable code identity (AMI ID + optional tarball ETag) — mocked so tests make no
     # SSM/S3 call; resolved once per campaign and folded into the staging fingerprint.
     monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a, **k: "ami=ami-test")
+    # Pinned AMI id (resolved once, threaded into every fill's provisioning) — mocked
+    # so tests make no SSM call.
+    monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a, **k: "ami-test-id")
     # Store reads for the staging fingerprint: the coverage delivery sha (global per
     # delivery) and, for ingest=False, each mosaic store's `last_appended` identity.
     monkeypatch.setattr(
@@ -459,3 +462,18 @@ def test_branch_routes_fill_when_ingest_disabled(wired):
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, branch="b"))
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["fill-zone-year/fill-zone-year-b"]  # fill only, suffixed
+
+
+def test_both_strategies_pin_the_resolved_ami_id(wired):
+    """The campaign resolves the worker AMI once and pins it into every dispatched
+    fill — cluster-per-zone AND chained — so a fill boots the exact image its
+    staging fingerprint recorded instead of re-reading the SSM pointer.
+    """
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
+    assert fill["ami_id"] == "ami-test-id"
+
+    wired["arun"].clear()
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
+    chained = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
+    assert chained["ami_id"] == "ami-test-id"

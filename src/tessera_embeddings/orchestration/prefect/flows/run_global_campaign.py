@@ -259,19 +259,34 @@ def _partition_by_live_tiles(
     return [sh for sh in shards if sh]
 
 
-def _resolve_code_identity(ami_ssm_name: str, code_bucket: str | None, code_suffix: str, region: str | None) -> str:
+def _resolve_code_identity(
+    ami_ssm_name: str, code_bucket: str | None, code_suffix: str, region: str | None, ami_id: str | None = None
+) -> str:
     """Lazy-import wrapper over the AWS provider's code-artifact resolver.
 
     Kept module-level (and thin) so this flow file still imports on non-AWS machines
     (arch tests) — boto3 lives only under ``providers/aws`` — and tests can stub it.
     Region ``None`` → us-west-2, the region the fills' ``ray_cluster`` PROVISIONS
     from: the AMI SSM parameter and source tarball live there, NOT in the storage
-    ``s3_region`` (which may differ for a non-default-region store).
+    ``s3_region`` (which may differ for a non-default-region store). ``ami_id`` pins
+    the AMI component to a pre-resolved id so the fingerprint matches the image the
+    fill is pinned to boot.
     See :func:`tessera_embeddings.providers.aws.ray.resolve_code_artifact_identity`.
     """
     from tessera_embeddings.providers.aws.ray import resolve_code_artifact_identity
 
-    return resolve_code_artifact_identity(ami_ssm_name, code_bucket, code_suffix, region or "us-west-2")
+    return resolve_code_artifact_identity(ami_ssm_name, code_bucket, code_suffix, region or "us-west-2", ami_id=ami_id)
+
+
+def _resolve_ami_id(ami_ssm_name: str, region: str | None) -> str:
+    """Lazy-import wrapper over the AWS provider's AMI-ID resolver (see
+    :func:`tessera_embeddings.providers.aws.ray.resolve_ami_id`). Region ``None`` →
+    us-west-2, the Ray provisioning region (where the AMI SSM parameter lives), NOT
+    the storage ``s3_region``. Kept thin so the flow imports on non-AWS machines.
+    """
+    from tessera_embeddings.providers.aws.ray import resolve_ami_id
+
+    return resolve_ami_id(ami_ssm_name, region or "us-west-2")
 
 
 @flow(name="run-global-campaign")
@@ -520,8 +535,23 @@ async def run_global_campaign(
         # with s3_region would look up the AMI in the wrong SSM namespace and either
         # fail or fingerprint an artifact the workers never boot.
         if not code_identity_cache:
-            code_identity_cache.append(_resolve_code_identity(ami_ssm_name, code_bucket, code_suffix, None))
+            # Pin the AMI component to the SAME id every fill provisions (below), so
+            # the fingerprint and the booted image can't disagree via two separate
+            # SSM reads at different instants.
+            code_identity_cache.append(_resolve_code_identity(ami_ssm_name, code_bucket, code_suffix, None, _ami_id()))
         return code_identity_cache[0]
+
+    ami_id_cache: list[str] = []
+
+    def _ami_id() -> str:
+        # Resolve the worker AMI ID ONCE per campaign and PIN it into every fill's
+        # provisioning (below), so a mid-campaign re-bake that repoints ami_ssm_name
+        # can't make a fill boot a different image than its staging fingerprint (which
+        # keys on this same resolved id via _code_identity) recorded. Same region
+        # rationale as _code_identity (None → us-west-2, the Ray provisioning region).
+        if not ami_id_cache:
+            ami_id_cache.append(_resolve_ami_id(ami_ssm_name, None))
+        return ami_id_cache[0]
 
     def _fill_params(zone: str, year: int, run_id: str) -> dict[str, Any]:
         return {
@@ -534,6 +564,9 @@ async def run_global_campaign(
             # inference/staging and must not inspect a possibly-cleaned-up mosaic).
             "run_id": run_id,
             "ami_ssm_name": ami_ssm_name,
+            # Pin the exact image the staging fingerprint recorded (see _ami_id), so
+            # the fill can't re-resolve ami_ssm_name to a re-baked AMI mid-campaign.
+            "ami_id": _ami_id(),
             "store_name": store_name,
             "mask_name": mask_name,
             "num_actors": num_actors,
@@ -686,6 +719,7 @@ async def run_global_campaign(
                     "year": chained_year,
                     "paths": paths.model_dump(),
                     "ami_ssm_name": ami_ssm_name,
+                    "ami_id": _ami_id(),  # pin the fingerprinted image (see _ami_id / _fill_params)
                     "store_name": store_name,
                     "mask_name": mask_name,
                     "num_actors": num_actors,

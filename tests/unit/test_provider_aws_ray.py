@@ -27,6 +27,7 @@ from tessera_embeddings.providers.aws.ray import (
     PROJECT_TAG_VALUE,
     _resolve_ray_config,
     cleanup_ray_tempfiles,
+    resolve_ami_id,
     resolve_code_artifact_identity,
 )
 
@@ -231,6 +232,45 @@ def test_resolve_code_artifact_identity_tracks_tarball_overwrite() -> None:
     # Re-bake the AMI (new value behind the same SSM name) → different identity.
     ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-bbb", Type="String", Overwrite=True)
     assert resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION) != id_v2
+
+
+@mock_aws
+def test_resolve_ami_id_reads_the_ssm_pointer() -> None:
+    ssm = boto3.client("ssm", region_name=REGION)
+    ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-pinned-01", Type="String")
+    assert resolve_ami_id("/tessera/ray/ami-id", region=REGION) == "ami-pinned-01"
+
+
+@mock_aws
+def test_resolve_code_artifact_identity_uses_pinned_ami_id() -> None:
+    """A pinned ami_id fingerprints that exact image WITHOUT reading the SSM
+    pointer (no ami param is seeded here), so the campaign's fingerprint matches
+    the image it also pins provisioning to.
+    """
+    identity = resolve_code_artifact_identity("/unread/ami-id", region=REGION, ami_id="ami-pinned-99")
+    assert identity == "ami=ami-pinned-99"
+
+
+@mock_aws
+def test_resolve_ray_config_pins_ami_id_over_ssm(tmp_path: Path) -> None:
+    """When ami_id is given, the cluster boots THAT image, not whatever the SSM
+    pointer currently holds — a mid-campaign re-bake can't change the booted image.
+    """
+    ami_param, _, _ = _seed_ssm_and_vpc()  # SSM ami-id = ami-0123456789abcdef0
+    resolved = _resolve_ray_config(
+        DEFAULT_CLUSTER_TEMPLATE,
+        region=REGION,
+        ami_ssm_name=ami_param,
+        ami_id="ami-pinned-different",  # differs from the SSM value on purpose
+        ssm_prefix=SSM_PREFIX,
+        cluster_name="test-cluster",
+    )
+    try:
+        config = yaml.safe_load(Path(resolved).read_text())
+        for node in config["available_node_types"].values():
+            assert node["node_config"]["ImageId"] == "ami-pinned-different"  # pinned id wins
+    finally:
+        cleanup_ray_tempfiles(resolved)
 
 
 # ---------------------------------------------------------------------------

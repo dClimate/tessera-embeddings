@@ -88,11 +88,23 @@ _REQUIRED_SSM_KEYS = frozenset(
 )
 
 
+def resolve_ami_id(ami_ssm_name: str, region: str = "us-west-2") -> str:
+    """Resolve the worker AMI ID the ``ami_ssm_name`` SSM parameter currently points at.
+
+    The campaign resolves this ONCE up front and pins it into every fill's
+    provisioning (``ray_cluster(ami_id=...)``), so a re-bake that repoints the SSM
+    parameter mid-campaign can't make a fill boot a different image than the one its
+    staging fingerprint recorded — see :func:`resolve_code_artifact_identity`.
+    """
+    return boto3.client("ssm", region_name=region).get_parameter(Name=ami_ssm_name)["Parameter"]["Value"]
+
+
 def resolve_code_artifact_identity(
     ami_ssm_name: str,
     code_bucket: str | None = None,
     code_suffix: str = "",
     region: str = "us-west-2",
+    ami_id: str | None = None,
 ) -> str:
     """Immutable identity of the code a Ray fill will run, for the staging fingerprint.
 
@@ -113,10 +125,13 @@ def resolve_code_artifact_identity(
         code_bucket: S3 bucket of the source tarball; ``None`` for a pure-AMI deploy.
         code_suffix: Tarball filename suffix (``code/src{code_suffix}.tar.gz``).
         region: AWS region for the SSM/S3 clients (the store's region; us-west-2 default).
+        ami_id: A pre-resolved AMI ID to fingerprint instead of reading ``ami_ssm_name``.
+            Pass the SAME id that provisioning is pinned to (``ray_cluster(ami_id=...)``)
+            so the fingerprint and the booted image are guaranteed identical — a caller
+            that pins provisioning must pin the fingerprint too, or the two could resolve
+            the SSM pointer at different instants and disagree.
     """
-    ssm = boto3.client("ssm", region_name=region)
-    ami_id = ssm.get_parameter(Name=ami_ssm_name)["Parameter"]["Value"]
-    parts = [f"ami={ami_id}"]
+    parts = [f"ami={ami_id if ami_id is not None else resolve_ami_id(ami_ssm_name, region)}"]
     if code_bucket:
         s3 = boto3.client("s3", region_name=region)
         etag = s3.head_object(Bucket=code_bucket, Key=f"code/src{code_suffix}.tar.gz")["ETag"].strip('"')
@@ -182,6 +197,7 @@ def _resolve_ray_config(
     *,
     region: str = "us-west-2",
     ami_ssm_name: str,
+    ami_id: str | None = None,
     ssm_prefix: str = DEFAULT_SSM_PREFIX,
     cluster_name: str | None = None,
     instance_tags: list[dict[str, str]] | None = None,
@@ -205,7 +221,12 @@ def _resolve_ray_config(
         cluster_yaml: Path to the cluster YAML template. Use
             :data:`DEFAULT_CLUSTER_TEMPLATE` for the bundled template.
         region: AWS region for SSM and EC2 clients.
-        ami_ssm_name: SSM parameter name holding the worker AMI ID.
+        ami_ssm_name: SSM parameter name holding the worker AMI ID. Used only
+            when ``ami_id`` is not given.
+        ami_id: A pre-resolved worker AMI ID that PINS the image, bypassing the
+            ``ami_ssm_name`` lookup. The campaign resolves the AMI once and threads
+            it here so a mid-campaign re-bake can't repoint the SSM parameter and
+            boot a different image than a fill's staging fingerprint recorded.
         ssm_prefix: Prefix under which Ray resource IDs are stored.
             Required keys: ``security-group-id``, ``instance-profile-arn``,
             ``private-subnet-ids``, ``key-pair-name``, ``key-pair-id``.
@@ -299,12 +320,16 @@ def _resolve_ray_config(
     azs = list(dict.fromkeys(az_by_subnet[sid] for sid in all_subnet_ids))
     config["provider"]["availability_zone"] = ",".join(azs)
 
-    ami_param = ssm.get_parameter(Name=ami_ssm_name)
-    ami_id = ami_param["Parameter"]["Value"]
+    # Prefer a caller-PINNED AMI ID (the campaign resolves it once and threads it
+    # through every fill) over re-reading the SSM pointer here: re-reading would let
+    # a mid-campaign re-bake boot a different image than the fill's staging
+    # fingerprint recorded. Fall back to the SSM lookup when unpinned (direct/dev
+    # invocations), where the pointer is authoritative.
+    resolved_ami_id = ami_id if ami_id is not None else ssm.get_parameter(Name=ami_ssm_name)["Parameter"]["Value"]
 
     for node_type_cfg in config["available_node_types"].values():
         nc = node_type_cfg["node_config"]
-        nc["ImageId"] = ami_id
+        nc["ImageId"] = resolved_ami_id
         nc["KeyName"] = key_name
         nc["SecurityGroupIds"] = sg_ids
         nc["IamInstanceProfile"] = iam_profile
@@ -598,6 +623,7 @@ def ray_cluster(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     *,
     ami_ssm_name: str,
+    ami_id: str | None = None,
     ray_address: str | None = None,
     cluster_yaml: str | Path | None = None,
     cluster_name: str | None = None,
@@ -626,7 +652,12 @@ def ray_cluster(
         log: Logger.
         ami_ssm_name: SSM parameter name holding the worker AMI ID.
             Required even when ``ray_address`` is given (kept as a
-            consistent signature; ignored in that path).
+            consistent signature; ignored in that path). Used only when
+            ``ami_id`` is not given.
+        ami_id: Pre-resolved AMI ID that PINS the worker image (bypasses the
+            ``ami_ssm_name`` lookup). The campaign threads the AMI it resolved
+            once into every fill so a mid-campaign re-bake can't boot a
+            different image than the fill's staging fingerprint recorded.
         ray_address: Connect to an existing cluster instead of launching one.
         cluster_yaml: Path to the cluster YAML template. Defaults to the
             template shipped at :data:`DEFAULT_CLUSTER_TEMPLATE`.
@@ -690,6 +721,7 @@ def ray_cluster(
                 cluster_yaml,
                 region=region,
                 ami_ssm_name=ami_ssm_name,
+                ami_id=ami_id,
                 ssm_prefix=ssm_prefix,
                 cluster_name=cluster_name,
                 instance_tags=instance_tags,

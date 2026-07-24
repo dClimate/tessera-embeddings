@@ -153,6 +153,7 @@ def fill_zone_year_flow(
     year: int,
     paths: BucketPaths,
     ami_ssm_name: str,
+    ami_id: str | None = None,
     time_window_end: str | None = None,
     store_name: str = "tessera",
     mask_name: str = "global",
@@ -178,7 +179,13 @@ def fill_zone_year_flow(
         zone: Zone group name — UTM common name, e.g. ``"30N"``/``"19S"``.
         year: Campaign calendar year to fill (must be on the seeded axis).
         paths: Deployment storage contract (global store, land mask, mosaics).
-        ami_ssm_name: SSM parameter name for the Ray GPU AMI ID.
+        ami_ssm_name: SSM parameter name for the Ray GPU AMI ID (used only when
+            ``ami_id`` is not given).
+        ami_id: Pre-resolved AMI ID the campaign pinned into this fill's staging
+            fingerprint. When set, the cluster boots exactly this image instead of
+            re-reading ``ami_ssm_name`` — so a mid-campaign re-bake can't run new code
+            under a fingerprint that recorded the old image. ``None`` (direct calls)
+            resolves ``ami_ssm_name`` at provisioning as before.
         time_window_end: End month of the inference window as ``"Month Year"``;
             defaults to ``"December {year}"`` (the calendar-year window). The
             runner REQUIRES the exact January-December window for ``year``
@@ -366,6 +373,7 @@ def fill_zone_year_flow(
         with ray_cluster(
             log,
             ami_ssm_name=ami_ssm_name,
+            ami_id=ami_id,
             ssm_prefix=ssm_prefix,
             cloudwatch_log_group=cloudwatch_log_group,
             code_bucket=code_bucket,
