@@ -26,7 +26,9 @@ This module imports nothing from Prefect or any cloud provider.
 from __future__ import annotations
 
 import logging
+import operator
 from dataclasses import dataclass
+from functools import reduce
 from typing import cast, final
 
 import dask.array as da
@@ -108,6 +110,7 @@ def _compute_scl_phase(
     roi_pixel_count: int,
     min_valid_coverage: float,
     client: dask.distributed.Client,
+    windows: list[tuple[int, int, int, int]] | None = None,
 ) -> tuple[bool, xr.DataArray | None]:
     """Phase 1: load only SCL, compute coverage and per-pixel validity.
 
@@ -126,10 +129,14 @@ def _compute_scl_phase(
         roi_pixel_count: Number of ``True`` pixels in ``roi_mask``.
         min_valid_coverage: Minimum valid coverage percentage.
         client: Connected Dask client used to persist intermediates.
+        windows: Live windows for the cropped path — the coverage reduce runs
+            over these only and ``any_valid`` is returned LAZY (never
+            persisted full-extent). ``None`` = legacy full-extent behaviour.
 
     Returns:
         ``(passes_coverage, any_valid)``. ``any_valid`` is persisted on
-        workers when ``passes_coverage`` is True; ``None`` otherwise.
+        workers when ``passes_coverage`` is True (legacy path); ``None``
+        when the date fails coverage.
     """
     try:
         scl_ds = _load_scl_only(day_items, geobox, load_chunks)
@@ -149,10 +156,20 @@ def _compute_scl_phase(
     # solar_day grouping fuses all same-day tiles into exactly one time slice
     scl_2d = scl_ds["scl"].isel(time=0)
     any_valid = ~scl_2d.isin(invalid_classes)
-    valid_count = (any_valid & roi_mask).sum()
 
-    any_valid, valid_count = client.persist([any_valid, valid_count])
-    valid_count_val = valid_count.compute().item()
+    if windows is not None:
+        # Cropped: reduce only the live windows (dask culls the graph to their
+        # chunks — the mask is False outside every window, so the total is
+        # identical to the full reduce by the windows' coverage-totality property).
+        # any_valid stays LAZY: persisting it would materialise the full extent,
+        # and Phase 2's zeroing pulls only window slices of it anyway.
+        masked = any_valid & roi_mask
+        parts = [masked.isel(northing=slice(y0, y1), easting=slice(x0, x1)).sum() for y0, y1, x0, x1 in windows]
+        valid_count_val = int(reduce(operator.add, parts).compute()) if parts else 0
+    else:
+        valid_count = (any_valid & roi_mask).sum()
+        any_valid, valid_count = client.persist([any_valid, valid_count])
+        valid_count_val = valid_count.compute().item()
 
     passes = float(100.0 * valid_count_val / roi_pixel_count) >= min_valid_coverage
     if not passes:
@@ -201,8 +218,10 @@ def ingest_s2_roi_reflectance(
             intersect the ROI mask (``ingest.live_windows``) instead of the
             full extent — one commit per date either way. Default False
             preserves the byte-identical legacy path while the cropped one
-            is validated; the SCL coverage phase is NOT yet cropped (its
-            full-extent reduce still runs — see the design note).
+            is validated. The SCL coverage phase is cropped too: its reduce
+            runs over the windows only (identical total — the mask is False
+            outside them) and ``any_valid`` stays lazy, so no full-extent
+            array is ever persisted.
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items
@@ -259,7 +278,14 @@ def ingest_s2_roi_reflectance(
     for day_items in items_by_date.values():
         # Phase 1: SCL-only coverage check — tiny graph.
         passes, any_valid = _compute_scl_phase(
-            day_items, roi.geobox, INGEST_CHUNKS, roi_mask, roi_pixel_count, min_valid_coverage, client
+            day_items,
+            roi.geobox,
+            INGEST_CHUNKS,
+            roi_mask,
+            roi_pixel_count,
+            min_valid_coverage,
+            client,
+            windows=live_windows,
         )
         if not passes:
             total_filtered += 1

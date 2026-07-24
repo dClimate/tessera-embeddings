@@ -36,6 +36,7 @@ def _ingest_s1_roi_impl(
     apply_credentials_fn: Callable[[dict[str, str]], None] | None,
     use_s3_direct: bool,
     storage_options: dict | None,
+    crop_to_live_windows: bool,
 ) -> dict[str, Any]:
     """Inner flow: submits the S1 ingestion task to the configured Dask runner."""
     future = process_roi_sar.submit(
@@ -49,6 +50,7 @@ def _ingest_s1_roi_impl(
         apply_credentials_fn=apply_credentials_fn,
         use_s3_direct=use_s3_direct,
         storage_options=storage_options,
+        crop_to_live_windows=crop_to_live_windows,
     )
     return future.result()
 
@@ -85,6 +87,7 @@ def ingest_s1_roi_sar(
     use_local: bool = False,
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
+    crop_to_live_windows: bool = False,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
 
@@ -113,6 +116,9 @@ def ingest_s1_roi_sar(
             performance-report HTML for this run is captured and
             uploaded there (probe-rung profiling; default off).
             Ignored on the ``use_local`` path, which warns.
+        crop_to_live_windows: Restrict mosaic writes (and the S2 coverage
+            reduce) to the chunk-aligned windows intersecting the ROI mask —
+            one commit per date. Default False = legacy full-extent path.
 
     Returns:
         ``SarIngestResult`` serialised as a dict.
@@ -156,6 +162,7 @@ def ingest_s1_roi_sar(
                 apply_credentials_fn=apply_credentials_fn,
                 use_s3_direct=use_s3_direct,
                 storage_options=storage_options,
+                crop_to_live_windows=crop_to_live_windows,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -182,4 +189,5 @@ def ingest_s1_roi_sar(
                 apply_credentials_fn=apply_credentials_fn,
                 use_s3_direct=use_s3_direct,
                 storage_options=storage_options,
+                crop_to_live_windows=crop_to_live_windows,
             )

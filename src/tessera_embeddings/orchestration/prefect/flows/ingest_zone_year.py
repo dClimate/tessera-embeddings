@@ -255,6 +255,7 @@ async def ingest_zone_year(
         "min_workers": ingest_settings.min_workers,
         "max_workers": ingest_settings.max_workers,
         "use_local": use_local,
+        "crop_to_live_windows": ingest_settings.crop_to_live_windows,
     }
     orbits = _active_orbits(s1_orbit)
     # Optional perf-report capture: the setting is a base URI. Scope it by CELL
