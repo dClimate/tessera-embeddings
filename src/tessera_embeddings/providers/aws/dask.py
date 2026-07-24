@@ -34,12 +34,18 @@ This contract is documented for the open-source release in
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import logging
 import os
 import random
+import sys
+import tempfile
+import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -77,6 +83,17 @@ DEFAULT_CLOUDWATCH_LOG_GROUP = "/ecs/tessera/dask"
 # run-up to that visible.
 DEFAULT_SCHEDULER_PROFILE_INTERVAL_S = 30.0
 
+# Under-duress stack sampling. When the scheduler process crosses either
+# threshold, a short-lived background thread snapshots ``sys._current_frames()``
+# a few times and logs a collapsed tally of the busiest code locations — the
+# py-spy substitute for Fargate, where process-attach (SYS_PTRACE) isn't
+# granted. It attributes a stall to graph construction vs comms vs work-stealing
+# vs GC. Runs OFF the event loop, so it never adds to the lag it measures.
+DEFAULT_STACK_TRIGGER_CPU_PCT = 90.0
+DEFAULT_STACK_TRIGGER_LAG_S = 3.0
+DEFAULT_STACK_SAMPLES = 5
+DEFAULT_STACK_SAMPLE_GAP_S = 0.2
+
 
 class SchedulerResourceLogger(SchedulerPlugin):
     """Log the scheduler *process's own* health on a fixed interval.
@@ -106,19 +123,42 @@ class SchedulerResourceLogger(SchedulerPlugin):
       breakdown of tasks in flight (``processing``) and stuck waiting
       (``no-worker``) — a rising backlog signals the scheduler falling behind.
 
+    When ``cpu`` or ``lag`` crosses the stack-sampling thresholds, a one-shot
+    background thread additionally logs a ``scheduler stack sample`` line: a
+    collapsed tally of the busiest code locations across the process's threads,
+    to attribute the stall (graph build vs comms vs stealing vs GC). It is
+    single-flight and runs off the event loop, so it never worsens the lag it
+    measures; pass ``stack_sampling=False`` to disable it entirely.
+
     Instantiated on the client but pickled to and run inside the scheduler
     process, so ``psutil.Process()`` measures the scheduler, not the client.
     """
 
     name = "scheduler-resource-logger"
 
-    def __init__(self, interval_s: float = DEFAULT_SCHEDULER_PROFILE_INTERVAL_S) -> None:
+    def __init__(
+        self,
+        interval_s: float = DEFAULT_SCHEDULER_PROFILE_INTERVAL_S,
+        *,
+        stack_sampling: bool = True,
+        stack_trigger_cpu_pct: float = DEFAULT_STACK_TRIGGER_CPU_PCT,
+        stack_trigger_lag_s: float = DEFAULT_STACK_TRIGGER_LAG_S,
+        stack_samples: int = DEFAULT_STACK_SAMPLES,
+        stack_sample_gap_s: float = DEFAULT_STACK_SAMPLE_GAP_S,
+    ) -> None:
         self.interval_s = interval_s
         self._proc: psutil.Process | None = None
         self._callback: PeriodicCallback | None = None
         self._scheduler: Any = None
         self._mem_limit_bytes: int | None = None
         self._expected_next_s: float | None = None
+        # Under-duress stack sampling (see class docstring).
+        self._stack_sampling = stack_sampling
+        self._stack_trigger_cpu_pct = stack_trigger_cpu_pct
+        self._stack_trigger_lag_s = stack_trigger_lag_s
+        self._stack_samples = stack_samples
+        self._stack_sample_gap_s = stack_sample_gap_s
+        self._sampler_active = threading.Event()
 
     async def start(self, scheduler: Scheduler) -> None:
         """Bind to the scheduler and start the periodic probe (called in-process).
@@ -190,8 +230,92 @@ class SchedulerResourceLogger(SchedulerPlugin):
                 processing,
                 no_worker,
             )
+            if self._stack_sampling and (
+                cpu_pct >= self._stack_trigger_cpu_pct or lag_s >= self._stack_trigger_lag_s
+            ):
+                self._maybe_sample_stacks(cpu_pct, lag_s)
         except (psutil.Error, AttributeError) as e:
             log.warning("scheduler health probe failed: %s", e)
+
+    def _maybe_sample_stacks(self, cpu_pct: float, lag_s: float) -> None:
+        """Kick off a one-shot background stack sample unless one is running.
+
+        Single-flight via ``_sampler_active`` so a sustained stall spawns at most
+        one sampler at a time, and threaded so sampling runs off the event loop.
+        """
+        if self._sampler_active.is_set():
+            return
+        self._sampler_active.set()
+        threading.Thread(
+            target=self._sample_stacks_worker,
+            args=(cpu_pct, lag_s),
+            name="sched-stack-sampler",
+            daemon=True,
+        ).start()
+
+    def _sample_stacks_worker(self, cpu_pct: float, lag_s: float) -> None:
+        """Snapshot thread stacks a few times and log a collapsed leaf-frame tally.
+
+        Counts the innermost frame (``thread:file:function:line``) across every
+        thread and sample, so the busiest locations during the stall rise to the
+        top — enough to attribute saturation without a process-attach profiler.
+        """
+        log = logging.getLogger("distributed.scheduler")
+        try:
+            names = {t.ident: t.name for t in threading.enumerate()}
+            counts: collections.Counter[str] = collections.Counter()
+            for i in range(self._stack_samples):
+                for tid, frame in sys._current_frames().items():
+                    code = frame.f_code
+                    fname = code.co_filename.rsplit("/", 1)[-1]
+                    leaf = f"{names.get(tid, tid)}:{fname}:{code.co_name}:{frame.f_lineno}"
+                    counts[leaf] += 1
+                if i < self._stack_samples - 1:
+                    time.sleep(self._stack_sample_gap_s)
+            top = " | ".join(f"{loc}={n}" for loc, n in counts.most_common(8))
+            log.warning(
+                "scheduler stack sample (cpu=%.0f%% lag=%.1fs, %d samples): %s",
+                cpu_pct,
+                lag_s,
+                self._stack_samples,
+                top,
+            )
+        except Exception as e:  # diagnostics thread must never crash the scheduler
+            log.warning("scheduler stack sampling failed: %s", e)
+        finally:
+            self._sampler_active.clear()
+
+
+@contextlib.contextmanager
+def maybe_performance_report(scheduler_address: str, uri: str | None, log: logging.Logger) -> Iterator[None]:
+    """Optionally capture a Dask ``performance_report`` for the wrapped compute.
+
+    No-op when ``uri`` is falsy (the default), so normal runs pay nothing. When
+    set, it opens a short-lived client on ``scheduler_address`` — needed because
+    ``performance_report`` talks to the scheduler through the *current* client,
+    and the Prefect task runner owns a separate one — captures the
+    task-stream/profile/bandwidth HTML to a temp file, then uploads it to
+    ``uri`` (any fsspec target). Upload failures are logged, never raised: a
+    diagnostics artifact must not fail the ingest. Intended for probe rungs, not
+    the campaign (large graphs make report assembly heavy).
+    """
+    if not uri:
+        yield
+        return
+    import fsspec
+    from distributed import Client, performance_report
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local = Path(tmpdir) / "dask-performance-report.html"
+        with Client(scheduler_address), performance_report(filename=str(local)):
+            yield
+        # performance_report has flushed `local` on __exit__ above; now ship it.
+        try:
+            with local.open("rb") as fh, fsspec.open(uri, "wb") as out:
+                out.write(fh.read())
+            log.info("wrote Dask performance report to %s", uri)
+        except (OSError, ValueError) as e:
+            log.warning("failed to upload Dask performance report to %s: %s", uri, e)
 
 
 # Substrings of transient cluster-start failures worth retrying. All are ECS

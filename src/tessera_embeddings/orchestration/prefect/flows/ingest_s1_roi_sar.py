@@ -84,6 +84,7 @@ def ingest_s1_roi_sar(
     use_s3_direct: bool = True,
     use_local: bool = False,
     storage_options: dict | None = None,
+    perf_report_uri: str | None = None,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
 
@@ -108,6 +109,9 @@ def ingest_s1_roi_sar(
         use_local: Use the local Dask provider for testing.
         storage_options: fsspec storage options forwarded to the
             domain function.
+        perf_report_uri: Optional fsspec URI; when set, a Dask
+            performance-report HTML for this run is captured and
+            uploaded there (probe-rung profiling; default off).
 
     Returns:
         ``SarIngestResult`` serialised as a dict.
@@ -149,7 +153,7 @@ def ingest_s1_roi_sar(
                 storage_options=storage_options,
             )
 
-    from tessera_embeddings.providers.aws.dask import ecs_cluster
+    from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
 
     edl_env = _default_edl_env()
 
@@ -161,15 +165,16 @@ def ingest_s1_roi_sar(
     ) as cluster:
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
-        return _ingest_s1_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-            roi_zarr_path=roi_zarr_path,
-            start_date=start_date,
-            end_date=end_date,
-            store_path=store_path,
-            orbit=orbit,
-            batch_days=batch_days,
-            edl_credentials_fn=edl_credentials_fn,
-            apply_credentials_fn=apply_credentials_fn,
-            use_s3_direct=use_s3_direct,
-            storage_options=storage_options,
-        )
+        with maybe_performance_report(cluster.scheduler_address, perf_report_uri, log):
+            return _ingest_s1_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
+                roi_zarr_path=roi_zarr_path,
+                start_date=start_date,
+                end_date=end_date,
+                store_path=store_path,
+                orbit=orbit,
+                batch_days=batch_days,
+                edl_credentials_fn=edl_credentials_fn,
+                apply_credentials_fn=apply_credentials_fn,
+                use_s3_direct=use_s3_direct,
+                storage_options=storage_options,
+            )

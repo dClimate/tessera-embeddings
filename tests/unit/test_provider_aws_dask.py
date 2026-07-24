@@ -165,7 +165,9 @@ class TestSchedulerResourceLogger:
         """A logger past ``start()`` but with its PeriodicCallback torn down so
         no timer fires during the test.
         """
-        plugin = SchedulerResourceLogger(interval_s=30.0)
+        # Sampling off: these tests assert the health line only, and a triggered
+        # sampler would spawn a thread and add nondeterministic WARNING lines.
+        plugin = SchedulerResourceLogger(interval_s=30.0, stack_sampling=False)
         import psutil
 
         plugin._proc = psutil.Process()
@@ -252,6 +254,57 @@ class TestSchedulerResourceLogger:
         assert cb.stopped is True
         assert plugin._callback is None
 
+    def test_stack_sampler_logs_and_clears(self, caplog) -> None:
+        """The worker logs one collapsed stack tally with the cpu/lag context
+        and clears the single-flight flag when done.
+        """
+        import logging
+
+        plugin = SchedulerResourceLogger(stack_samples=2, stack_sample_gap_s=0.0)
+        plugin._sampler_active.set()
+        with caplog.at_level(logging.WARNING, logger="distributed.scheduler"):
+            plugin._sample_stacks_worker(95.0, 4.0)
+        lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("scheduler stack sample")]
+        assert len(lines) == 1
+        assert "cpu=95% lag=4.0s, 2 samples" in lines[0]
+        assert plugin._sampler_active.is_set() is False
+
+    def test_stack_sampler_single_flight(self) -> None:
+        """A second trigger while a sampler is active is a no-op."""
+        plugin = SchedulerResourceLogger()
+        started: list = []
+        plugin._sample_stacks_worker = lambda *a: started.append(a)  # type: ignore[method-assign]
+        plugin._sampler_active.set()  # pretend one is already running
+        plugin._maybe_sample_stacks(99.0, 5.0)
+        assert started == []
+
+    def test_stack_sampler_triggers_when_idle(self) -> None:
+        """When idle, a trigger spawns the worker off the event loop."""
+        import threading
+
+        plugin = SchedulerResourceLogger()
+        ran = threading.Event()
+
+        def _fake(cpu: float, lag: float) -> None:
+            ran.set()
+            plugin._sampler_active.clear()
+
+        plugin._sample_stacks_worker = _fake  # type: ignore[method-assign]
+        plugin._maybe_sample_stacks(99.0, 5.0)
+        assert ran.wait(timeout=2.0)
+
+    def test_log_usage_calls_sampler_on_high_lag(self, caplog) -> None:
+        """The health probe hands a duress reading (lag>=3s) to the sampler."""
+        plugin = self._make_started()
+        plugin._stack_sampling = True  # helper disables it; re-enable for this test
+        calls: list = []
+        plugin._maybe_sample_stacks = lambda cpu, lag: calls.append((cpu, lag))  # type: ignore[method-assign]
+        self._emit(plugin, _FakeScheduler(workers_processing=[0], tasks=0, unrunnable=0, now=1000.0), caplog)
+        caplog.clear()  # _emit asserts exactly one health line per call
+        self._emit(plugin, _FakeScheduler(workers_processing=[0], tasks=0, unrunnable=0, now=1035.0), caplog)
+        assert calls, "expected the sampler to be triggered by lag>=3s"
+        assert calls[-1][1] == 5.0
+
 
 @pytest.mark.integration
 class TestSchedulerResourceLoggerOnCluster:
@@ -281,3 +334,22 @@ class TestSchedulerResourceLoggerOnCluster:
         health = [r.getMessage() for r in caplog.records if r.getMessage().startswith("scheduler health:")]
         assert health, "expected at least one health line from the running scheduler"
         assert "workers=1" in health[-1]
+
+
+def test_maybe_performance_report_noop_without_uri() -> None:
+    """With no URI the helper is a pure pass-through — no client, no Dask calls."""
+    import logging
+
+    from tessera_embeddings.providers.aws.dask import maybe_performance_report
+
+    ran = []
+    with maybe_performance_report("tcp://unused:8786", None, logging.getLogger("t")):
+        ran.append(True)
+    assert ran == [True]
+
+
+def test_ingest_settings_perf_report_uri_defaults_none() -> None:
+    """The perf-report knob is off by default, so normal runs never capture one."""
+    from tessera_embeddings.config.ingest import IngestSettings
+
+    assert IngestSettings().perf_report_uri is None
