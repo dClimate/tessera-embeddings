@@ -140,6 +140,20 @@ Two supported paths:
    [`docs/orchestrator-swap.md`](docs/orchestrator-swap.md) and
    [`docs/providers/adding-your-own.md`](docs/providers/adding-your-own.md).
 
+### Profiling a run
+
+Both compute stages ship a profiling harness — `te-watch-scheduler` and friends
+for the Dask ingest scheduler, `te-observe-cluster` for the Ray GPU fleet. They
+install as console scripts with the AWS extra:
+
+```
+pip install "tessera_embeddings[aws]"   # or: uv sync --extra aws
+```
+
+They are **AWS-specific** (CloudWatch, ECS, EC2, SSM) but are written to be a
+template for other clouds, and PRs generalizing them are welcome. See
+[`src/tessera_embeddings/profiling/README.md`](src/tessera_embeddings/profiling/README.md).
+
 ## Architecture
 
 Three strict layers:

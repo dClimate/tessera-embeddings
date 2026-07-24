@@ -158,7 +158,12 @@ class SchedulerResourceLogger(SchedulerPlugin):
         self._stack_trigger_lag_s = stack_trigger_lag_s
         self._stack_samples = stack_samples
         self._stack_sample_gap_s = stack_sample_gap_s
-        self._sampler_active = threading.Event()
+        # Created in start(), NOT here: this object is pickled to the remote
+        # scheduler by Client.register_plugin, and a threading.Event owns a
+        # _thread.lock that neither pickle nor cloudpickle can serialize. Building
+        # it in __init__ makes registration raise — which ecs_cluster swallows as
+        # best-effort, silently leaving the run with no heartbeat at all.
+        self._sampler_active: threading.Event | None = None
 
     async def start(self, scheduler: Scheduler) -> None:
         """Bind to the scheduler and start the periodic probe (called in-process).
@@ -167,6 +172,8 @@ class SchedulerResourceLogger(SchedulerPlugin):
         is non-blocking (no ``await``) — it just wires up the PeriodicCallback.
         """
         self._scheduler = scheduler
+        # Safe here: start() runs in the scheduler process, after unpickling.
+        self._sampler_active = threading.Event()
         self._proc = psutil.Process()
         # Prime cpu_percent so the first real reading is an interval delta
         # rather than the meaningless 0.0 the first call always returns.
@@ -243,6 +250,9 @@ class SchedulerResourceLogger(SchedulerPlugin):
         Single-flight via ``_sampler_active`` so a sustained stall spawns at most
         one sampler at a time, and threaded so sampling runs off the event loop.
         """
+        if self._sampler_active is None:
+            # Defensive: a probe driven without start() (tests) still samples.
+            self._sampler_active = threading.Event()
         if self._sampler_active.is_set():
             return
         self._sampler_active.set()
@@ -283,7 +293,8 @@ class SchedulerResourceLogger(SchedulerPlugin):
         except Exception as e:  # diagnostics thread must never crash the scheduler
             log.warning("scheduler stack sampling failed: %s", e)
         finally:
-            self._sampler_active.clear()
+            if self._sampler_active is not None:
+                self._sampler_active.clear()
 
 
 @contextlib.contextmanager
@@ -314,7 +325,12 @@ def maybe_performance_report(scheduler_address: str, uri: str | None, log: loggi
             with local.open("rb") as fh, fsspec.open(uri, "wb") as out:
                 out.write(fh.read())
             log.info("wrote Dask performance report to %s", uri)
-        except (OSError, ValueError) as e:
+        except Exception as e:
+            # Deliberately broad. This runs AFTER the ingest has succeeded, and an
+            # fsspec backend can raise anything (botocore ClientError for a bad
+            # bucket or denied PUT, credential errors) — none of which subclass
+            # OSError. A probe-only diagnostics artifact must never turn a
+            # completed mosaic ingest into a failed flow run.
             log.warning("failed to upload Dask performance report to %s: %s", uri, e)
 
 

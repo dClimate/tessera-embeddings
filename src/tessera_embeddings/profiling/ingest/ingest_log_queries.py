@@ -71,17 +71,22 @@ QUERIES: dict[str, tuple[str, str]] = {
         r" | stats count(*) as retries by bin(5m)"
         r" | sort bin(5m) asc",
     ),
-    "s1_download_retries": (
-        "S1 (ASF) granule-download retries per 5-minute bin (tenacity "
-        "before_sleep_log: 'Retrying ... as it raised ...').",
+    "store_write_retries": (
+        "Mosaic store-write retries per 5-minute bin. BOTH s1_roi.py and "
+        "s2_roi.py wrap write_dataset in tenacity with before_sleep_log, so this "
+        "counts icechunk/GDAL write failures under parallelism across both "
+        "sensors — write pressure, NOT catalog or granule-download trouble.",
         r"filter @message like /Retrying/ and @message like /as it raised/"
         r" | stats count(*) as retries by bin(5m)"
         r" | sort bin(5m) asc",
     ),
     "s3_slowdown": (
-        "S3 503 SlowDown occurrences per 5-minute bin (object-store push-back "
-        "on mosaic/store writes).",
-        r"filter @message like /SlowDown/ or @message like /HTTP 503/"
+        "S3 503 SlowDown per 5-minute bin (object-store push-back on mosaic/store "
+        "writes). Keyed on the S3 error code alone, with catalog retry lines "
+        "excluded: CMR/STAC retries also log 'HTTP 503', and counting those here "
+        "would blame the object store when the catalog is at fault (those live in "
+        "http_retry_status).",
+        r"filter @message like /SlowDown/ and @message not like /retry:/"
         r" | stats count(*) as slowdowns by bin(5m)"
         r" | sort bin(5m) asc",
     ),

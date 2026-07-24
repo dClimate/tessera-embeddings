@@ -44,6 +44,28 @@ need only the base install. Nothing in the library imports this subpackage, so
 an ordinary `import tessera_embeddings` never pulls a cloud SDK in on its
 account — the tools load only when a command runs.
 
+## AWS-specific by necessity — and a template for other clouds
+
+These tools are deliberately AWS-coupled: they read CloudWatch Logs (Insights
+and stream tails), ECS task metadata, EC2 tags, and reach workers over SSM.
+There is no vendor-neutral way to ask those questions, so the harnesses live
+under the AWS provider's umbrella rather than pretending to be portable.
+
+That said, **the structure is meant to be a template, not a dead end.** What
+carries over to any cloud is the shape: a periodic in-process health heartbeat
+on the scheduler; a log-derived time series parsed into machine-readable
+snapshots with threshold alerts; a query pack that separates "our scheduler is
+saturated" from "an external service is throttling us"; and a per-run dossier
+that an operator (or an agent) interprets. Swapping CloudWatch for Cloud
+Logging, Log Analytics, or Loki is a matter of replacing the log-read and
+query layers — the parsers, threshold rules, and dossier assembly are
+provider-agnostic already.
+
+**PRs that generalize these are very welcome** — whether that means factoring
+the log backend behind a small interface or contributing a sibling harness for
+another provider. See `docs/providers/adding-your-own.md` for how the rest of
+the codebase handles the same split.
+
 ## Why they are separate
 
 Inference profiling is mature and GPU/RAM-centric: the workers are the

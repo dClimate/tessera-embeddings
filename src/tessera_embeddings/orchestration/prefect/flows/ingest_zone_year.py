@@ -257,9 +257,13 @@ async def ingest_zone_year(
         "use_local": use_local,
     }
     orbits = _active_orbits(s1_orbit)
-    # Optional perf-report capture: the setting is a base URI; give each child a
-    # distinct filename so concurrent S1-orbit + S2 reports don't overwrite.
-    perf_base = ingest_settings.perf_report_uri
+    # Optional perf-report capture: the setting is a base URI. Scope it by CELL
+    # first, then by child. run-global-campaign hands the SAME IngestSettings to
+    # every (zone, year), so a base-only path would have concurrent cells racing
+    # on one s2.html and later cells overwriting earlier ones; the per-child
+    # suffix then separates the S1 orbits from S2 within a cell.
+    perf_cell = ingest_settings.perf_report_uri
+    perf_base = f"{perf_cell.rstrip('/')}/{zone}-{year}" if perf_cell else None
     s1_coros = [
         arun_deployment(
             deployments.ingest_s1_roi_sar,
@@ -267,7 +271,7 @@ async def ingest_zone_year(
                 **common,
                 "orbit": orbit,
                 "batch_days": ingest_settings.batch_days,
-                "perf_report_uri": f"{perf_base.rstrip('/')}/s1-{orbit}.html" if perf_base else None,
+                "perf_report_uri": f"{perf_base}/s1-{orbit}.html" if perf_base else None,
             },
         )
         for orbit in orbits
@@ -277,7 +281,7 @@ async def ingest_zone_year(
         parameters={
             **common,
             "min_valid_coverage": ingest_settings.min_valid_coverage,
-            "perf_report_uri": f"{perf_base.rstrip('/')}/s2.html" if perf_base else None,
+            "perf_report_uri": f"{perf_base}/s2.html" if perf_base else None,
         },
     )
     # return_exceptions=True so we WAIT for every deployment to settle before raising:

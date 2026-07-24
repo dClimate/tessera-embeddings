@@ -9,7 +9,7 @@ regression fails fast in CI.
 
 from __future__ import annotations
 
-import math
+import json
 
 from tessera_embeddings.profiling.ingest import watch_scheduler as ws
 
@@ -39,15 +39,24 @@ def test_parse_health_line_full():
     }
 
 
-def test_parse_health_line_nan_mem():
+def test_parse_health_line_unknown_mem_is_json_safe():
+    """An unknown container limit becomes None (null), never NaN.
+
+    json.dumps renders a float NaN as the bare token ``NaN``, which is invalid
+    JSON — it would break strict consumers of the live JSONL / report output in
+    exactly this case.
+    """
     line = (
         "scheduler health: cpu=100% rss=2.00GiB mem=nan% lag=6.0s "
         "fds=1 threads=1 workers=1 tasks=1 processing=1 no-worker=1"
     )
     s = ws.parse_health_line(line)
     assert s is not None
-    assert math.isnan(s["mem"])
+    assert s["mem"] is None
     assert s["cpu"] == 100.0
+    # The whole snapshot must round-trip through strict JSON.
+    snap = ws._snapshot(s, 1000, None, None, [])
+    assert json.loads(json.dumps(snap))["mem"] is None
 
 
 def test_parse_health_line_negatives():
@@ -87,12 +96,8 @@ def test_alert_cpu_sustained():
 def test_alert_mem_and_lag():
     th = ws.Thresholds()
     assert "mem-high" in ws.evaluate_alerts([_sample(mem=85)], th)
-    assert "mem-high" not in ws.evaluate_alerts([_sample(mem=nanmem())], th)  # nan never trips
+    assert "mem-high" not in ws.evaluate_alerts([_sample(mem=None)], th)  # unknown never trips
     assert "loop-lag" in ws.evaluate_alerts([_sample(lag=6.0)], th)
-
-
-def nanmem():
-    return math.nan
 
 
 def test_alert_backlog_growth():

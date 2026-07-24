@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -68,7 +67,7 @@ def _scheduler_section(sched: dict | None) -> str:
         )
     pk = profile["peaks"]
     w = profile["window"]
-    mem = "nan" if isinstance(pk["mem"], float) and math.isnan(pk["mem"]) else f"{pk['mem']:.0f}%"
+    mem = "unknown" if pk["mem"] is None else f"{pk['mem']:.0f}%"
     tripped = ", ".join(f"`{k}` @ {v}" for k, v in profile["onsets"].items() if v)
     onsets = tripped or "_none tripped_"
     lines = [

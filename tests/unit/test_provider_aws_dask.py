@@ -254,13 +254,49 @@ class TestSchedulerResourceLogger:
         assert cb.stopped is True
         assert plugin._callback is None
 
+    def test_plugin_is_picklable_for_register_plugin(self) -> None:
+        """The plugin MUST survive serialization to the remote scheduler.
+
+        ``Client.register_plugin`` pickles the instance to the scheduler process.
+        A ``threading.Event`` built in ``__init__`` owns a ``_thread.lock`` that
+        neither pickle nor cloudpickle can serialize, so registration would raise
+        — and ``ecs_cluster`` catches registration errors as best-effort, meaning
+        the failure is SILENT and the run emits no health lines at all. Hence the
+        event is created in ``start()``, and this pins that.
+        """
+        import pickle
+
+        import cloudpickle
+
+        plugin = SchedulerResourceLogger()
+        for dumps in (pickle.dumps, cloudpickle.dumps):
+            revived = pickle.loads(dumps(plugin))
+            assert revived.name == SchedulerResourceLogger.name
+            assert revived._sampler_active is None  # created in start(), not __init__
+
+    def test_start_creates_the_sampler_event(self) -> None:
+        """``start()`` runs in the scheduler process, so the Event is built there."""
+        import asyncio
+
+        plugin = SchedulerResourceLogger(interval_s=30.0)
+        sched = _FakeScheduler(workers_processing=[0], tasks=0, unrunnable=0)
+        asyncio.run(plugin.start(sched))
+        try:
+            assert plugin._sampler_active is not None
+            assert plugin._sampler_active.is_set() is False
+        finally:
+            asyncio.run(plugin.before_close())  # stop the PeriodicCallback
+
     def test_stack_sampler_logs_and_clears(self, caplog) -> None:
         """The worker logs one collapsed stack tally with the cpu/lag context
         and clears the single-flight flag when done.
         """
         import logging
+        import threading
 
         plugin = SchedulerResourceLogger(stack_samples=2, stack_sample_gap_s=0.0)
+        # start() normally creates this in the scheduler process; stand it up here.
+        plugin._sampler_active = threading.Event()
         plugin._sampler_active.set()
         with caplog.at_level(logging.WARNING, logger="distributed.scheduler"):
             plugin._sample_stacks_worker(95.0, 4.0)
@@ -271,9 +307,12 @@ class TestSchedulerResourceLogger:
 
     def test_stack_sampler_single_flight(self) -> None:
         """A second trigger while a sampler is active is a no-op."""
+        import threading
+
         plugin = SchedulerResourceLogger()
         started: list = []
         plugin._sample_stacks_worker = lambda *a: started.append(a)  # type: ignore[method-assign]
+        plugin._sampler_active = threading.Event()
         plugin._sampler_active.set()  # pretend one is already running
         plugin._maybe_sample_stacks(99.0, 5.0)
         assert started == []

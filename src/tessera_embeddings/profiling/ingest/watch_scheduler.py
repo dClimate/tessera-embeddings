@@ -38,7 +38,6 @@ import argparse
 import datetime
 import itertools
 import json
-import math
 import re
 import sys
 import time
@@ -105,8 +104,13 @@ def parse_health_line(message: str) -> dict | None:
     """Parse a ``scheduler health:`` log message into a metrics dict, or None.
 
     Returns None for any line that isn't a well-formed health line, so callers
-    can feed raw CloudWatch messages in and drop non-matches silently. ``mem``
-    becomes ``float('nan')`` when the container limit was unknown.
+    can feed raw CloudWatch messages in and drop non-matches silently.
+
+    ``mem`` is ``None`` when the scheduler could not read its container limit (it
+    logs ``mem=nan%``). Deliberately None rather than ``float("nan")``: these
+    dicts go through ``json.dumps``, which renders NaN as the bare token ``NaN``
+    — not valid JSON — so a strict consumer of the advertised JSON/JSONL output
+    would break in exactly the unknown-memory case. ``None`` serializes to null.
     """
     m = _HEALTH_RE.search(message)
     if not m:
@@ -115,7 +119,7 @@ def parse_health_line(message: str) -> dict | None:
     return {
         "cpu": float(g["cpu"]),
         "rss_gib": float(g["rss"]),
-        "mem": math.nan if g["mem"] == "nan" else float(g["mem"]),
+        "mem": None if g["mem"] == "nan" else float(g["mem"]),
         "lag": float(g["lag"]),
         "fds": int(g["fds"]),
         "threads": int(g["threads"]),
@@ -162,8 +166,8 @@ def evaluate_alerts(window: list[dict], thresholds: Thresholds) -> list[str]:
     if len(tail) >= thresholds.cpu_intervals and all(s["cpu"] >= thresholds.cpu_pct for s in tail):
         alerts.append("cpu-sustained")
 
-    # memory: single sample over the limit fraction (nan never trips).
-    if not math.isnan(latest["mem"]) and latest["mem"] >= thresholds.mem_pct:
+    # memory: single sample over the limit fraction (an unknown limit never trips).
+    if latest["mem"] is not None and latest["mem"] >= thresholds.mem_pct:
         alerts.append("mem-high")
 
     # backlog: no-worker strictly rising over the last backlog_intervals steps.
@@ -196,7 +200,7 @@ def _snapshot(sample: dict, epoch: int, prev: dict | None, prev_epoch: int | Non
 
 
 def _human_line(snap: dict) -> str:
-    mem = "nan" if math.isnan(snap["mem"]) else f"{snap['mem']:.0f}"
+    mem = "?" if snap["mem"] is None else f"{snap['mem']:.0f}"
     return (
         f"{snap['ts']}  cpu={snap['cpu']:.0f}% mem={mem}% lag={snap['lag']:.1f}s "
         f"workers={snap['workers']} tasks={snap['tasks']} "
@@ -311,12 +315,14 @@ def profile_run(series: list[dict], thresholds: Thresholds) -> dict:
     if not series:
         return {"samples": 0}
 
-    def _finite(key: str) -> list[float]:
-        return [s[key] for s in series if not (isinstance(s[key], float) and math.isnan(s[key]))]
+    def _known(key: str) -> list[float]:
+        """Values for ``key`` across the series, skipping unknown (None) samples."""
+        return [s[key] for s in series if s[key] is not None]
 
     peaks = {
         "cpu": max(s["cpu"] for s in series),
-        "mem": max(_finite("mem"), default=math.nan),
+        # None (JSON null) when the container limit was unknown for every sample.
+        "mem": max(_known("mem"), default=None),
         "lag": max(s["lag"] for s in series),
         "no_worker": max(s["no_worker"] for s in series),
         "workers": max(s["workers"] for s in series),
@@ -360,7 +366,7 @@ def _markdown(profile: dict, log_group: str) -> str:
     if not profile.get("samples"):
         return f"### Scheduler profile\n\n_No `scheduler health:` lines found in {log_group}._\n"
     p, w, pk = profile, profile["window"], profile["peaks"]
-    mem = "nan" if isinstance(pk["mem"], float) and math.isnan(pk["mem"]) else f"{pk['mem']:.0f}%"
+    mem = "unknown" if pk["mem"] is None else f"{pk['mem']:.0f}%"
     lines = [
         "### Scheduler profile",
         "",
@@ -386,10 +392,15 @@ def report_run(
 ) -> int:
     """Post-hoc profile: pull health lines via Insights, emit JSON (+ optional md)."""
     logs = session.client("logs")
+    # Match on the FULL stream prefix, so --stream-prefix can actually separate
+    # overlapping ingests in the shared log group as documented (truncating to the
+    # last path component would merge two runs' series into one bogus profile).
+    # Insights `like "..."` is a literal substring match — no regex escaping of
+    # the slashes, and no chance of a prefix character being read as a metachar.
     query = (
         "fields @timestamp, @message "
-        f"| filter @logStream like /{stream_prefix.split('/')[-1]}/ "
-        f"| filter @message like /{HEALTH_MARKER}/ "
+        f'| filter @logStream like "{stream_prefix}" '
+        f'| filter @message like "{HEALTH_MARKER}" '
         "| sort @timestamp asc"
     )
     rows = _insights_query(logs, log_group, query, start_epoch, end_epoch)

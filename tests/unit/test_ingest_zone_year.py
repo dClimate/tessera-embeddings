@@ -105,15 +105,21 @@ def test_dispatches_and_marks_on_success(wired, monkeypatch):
     ]
 
 
-def test_perf_report_uri_threaded_per_child(wired, monkeypatch):
-    """A perf_report_uri base fans out to a DISTINCT filename per child ingest."""
+def test_perf_report_uri_scoped_by_cell_then_child(wired, monkeypatch):
+    """The base URI is scoped by (zone, year) FIRST, then per child.
+
+    run-global-campaign hands the same IngestSettings to every cell, so a
+    base-only path would have concurrent cells racing on one s2.html and later
+    cells silently overwriting earlier ones.
+    """
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
     monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-    _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(perf_report_uri="s3://in/perf/33N-2025/"))
+    _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(perf_report_uri="s3://in/perf/"))
 
     params = [p for _, p in wired["arun"]]
     s2 = next(p for p in params if "min_valid_coverage" in p)
     s1 = next(p for p in params if "orbit" in p)
+    # zone 33N / year 2025 (see _run's defaults) separates the cells.
     assert s2["perf_report_uri"] == "s3://in/perf/33N-2025/s2.html"
     assert s1["perf_report_uri"] == "s3://in/perf/33N-2025/s1-ascending.html"
 
