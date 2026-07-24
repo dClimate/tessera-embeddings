@@ -165,6 +165,10 @@ class SchedulerResourceLogger(SchedulerPlugin):
         # it in __init__ makes registration raise — which ecs_cluster swallows as
         # best-effort, silently leaving the run with no heartbeat at all.
         self._sampler_active: threading.Event | None = None
+        # Likewise recorded in start(): the id of the thread the scheduler's event
+        # loop runs on, which is the thread `lag` measures and the one the stack
+        # sampler reports separately (see _sample_stacks_worker).
+        self._loop_tid: int | None = None
 
     async def start(self, scheduler: Scheduler) -> None:
         """Bind to the scheduler and start the periodic probe (called in-process).
@@ -175,6 +179,9 @@ class SchedulerResourceLogger(SchedulerPlugin):
         self._scheduler = scheduler
         # Safe here: start() runs in the scheduler process, after unpickling.
         self._sampler_active = threading.Event()
+        # This coroutine is awaited ON the scheduler's event loop, so the current
+        # thread IS the loop thread. Recording it beats inferring it later.
+        self._loop_tid = threading.get_ident()
         self._proc = psutil.Process()
         # Prime cpu_percent so the first real reading is an interval delta
         # rather than the meaningless 0.0 the first call always returns.
@@ -280,9 +287,12 @@ class SchedulerResourceLogger(SchedulerPlugin):
         log = logging.getLogger("distributed.scheduler")
         try:
             me = threading.current_thread().ident
-            # The scheduler's event loop runs in the thread that started it —
-            # MainThread under dask-cloudprovider's `dask-scheduler` entrypoint.
-            loop_tid = threading.main_thread().ident
+            # Recorded by start() from the loop thread itself. Falling back to
+            # MainThread covers a probe driven without start() (tests) and matches
+            # where dask-cloudprovider's `dask-scheduler` entrypoint runs the loop;
+            # attributing the stall to the wrong thread would only mislabel which
+            # of the two tallies below is which, never crash.
+            loop_tid = self._loop_tid if self._loop_tid is not None else threading.main_thread().ident
             names = {t.ident: t.name for t in threading.enumerate()}
             loop_counts: collections.Counter[str] = collections.Counter()
             other_counts: collections.Counter[str] = collections.Counter()

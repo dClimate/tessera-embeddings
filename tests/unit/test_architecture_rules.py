@@ -65,6 +65,25 @@ def test_forbidden_call_name_flags(tmp_path: Path) -> None:
     assert "no-prefect-context-helpers-outside-prefect-layer" in rules_fired
 
 
+def test_library_code_may_not_import_the_profiling_subpackage(tmp_path: Path) -> None:
+    """Only profiling/ may import profiling/.
+
+    The boto3 exemption for profiling/ is conditional on the subpackage being
+    unreachable from library code — one import from a flow or domain module would
+    pull boto3 into a plain ``import tessera_embeddings``. Both directions are
+    pinned: flagged from outside, allowed within (the tools import each other).
+    """
+    _write(tmp_path / "inference" / "actors.py", "from tessera_embeddings.profiling.ingest import report\n")
+    violations = [v for v in run(tmp_path) if v.rule == "no-profiling-imports-outside-profiling"]
+    assert len(violations) == 1
+    assert violations[0].path.name == "actors.py"
+
+    _write(tmp_path / "profiling" / "ingest" / "report.py", "from tessera_embeddings.profiling import _cloudwatch\n")
+    assert not [
+        v for v in run(tmp_path) if v.rule == "no-profiling-imports-outside-profiling" and v.path.name == "report.py"
+    ]
+
+
 def test_extra_allowed_paths_extend_per_rule(tmp_path: Path) -> None:
     """``extra_allowed_paths`` permits the import in additional subtrees."""
     _write(tmp_path / "yield_modeling" / "iac.py", "import boto3\n")
@@ -113,6 +132,8 @@ def test_default_rules_cover_six_hard_rules() -> None:
     assert "no-dask-distributed-get_client-in-domain" in rule_names
     assert "no-boto3-outside-aws-provider" in rule_names
     assert "no-botocore-outside-aws-provider" in rule_names
+    # Guards the condition the boto3 exemption for profiling/ was granted on.
+    assert "no-profiling-imports-outside-profiling" in rule_names
 
 
 def test_rule_dataclass_is_immutable() -> None:

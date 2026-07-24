@@ -88,6 +88,22 @@ def test_dossier_notes_empty_scheduler_series():
     assert "No `scheduler health:` lines" in md
 
 
+class TestBadInputFiles:
+    """A mistyped path or a stderr-polluted file is a message, not a traceback."""
+
+    def test_missing_file_exits_nonzero_with_a_message(self, tmp_path, capsys):
+        rc = rep.main(["--scheduler", str(tmp_path / "nope.json")])
+        assert rc == 1
+        assert "cannot read" in capsys.readouterr().err
+
+    def test_malformed_json_names_the_likely_cause(self, tmp_path, capsys):
+        bad = tmp_path / "sched.json"
+        bad.write_text("WARNING: query hit the cap\n{}")
+        rc = rep.main(["--scheduler", str(bad)])
+        assert rc == 1
+        assert "not valid JSON" in capsys.readouterr().err
+
+
 class TestTruncationIsNeverSilent:
     """A capped input must never be presented as a full-run profile.
 

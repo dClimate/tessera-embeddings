@@ -31,9 +31,21 @@ from pathlib import Path
 
 
 def _load_json(path: str | None) -> dict | None:
+    """Read one profiling JSON file, or None when the flag wasn't given.
+
+    Raises :class:`ValueError` for an unreadable or malformed file so ``main`` can
+    turn it into a one-line message: an operator assembling a dossier has usually
+    just mistyped a path or piped a tool's stderr over its stdout, and a traceback
+    is a poor way to say so.
+    """
     if not path:
         return None
-    return json.loads(Path(path).read_text())
+    try:
+        return json.loads(Path(path).read_text())
+    except OSError as e:
+        raise ValueError(f"cannot read {path}: {e}") from e
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{path} is not valid JSON ({e}) — is it a profiling tool's stdout?") from e
 
 
 def _md_table(rows: list[dict], limit: int = 25) -> str:
@@ -210,7 +222,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.scheduler and not args.logs:
         parser.error("supply at least one of --scheduler / --logs")
 
-    dossier = build_dossier(args, _load_json(args.scheduler), _load_json(args.logs))
+    try:
+        sched, logs = _load_json(args.scheduler), _load_json(args.logs)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    dossier = build_dossier(args, sched, logs)
     if args.out:
         Path(args.out).write_text(dossier)
         print(f"wrote {args.out}", file=sys.stderr)

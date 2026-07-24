@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import logging
 import pickle
 import threading
+from pathlib import Path
 
 import cloudpickle
 import psutil
@@ -326,6 +328,41 @@ class TestSchedulerResourceLogger:
         finally:
             asyncio.run(plugin.before_close())  # stop the PeriodicCallback
 
+    def test_start_records_the_loop_thread_not_the_main_thread(self) -> None:
+        """The sampler attributes the stall to the thread ``lag`` measures.
+
+        ``start()`` is awaited ON the scheduler's event loop, so it records that
+        thread's id. Driven from a NON-main thread on purpose: under pytest the
+        loop thread and MainThread are the same, so a same-thread assertion would
+        pass even if the id were never recorded at all — which is exactly the bug
+        this replaces (inferring the loop thread as MainThread).
+        """
+        plugin = SchedulerResourceLogger(interval_s=30.0)
+        sched = _FakeScheduler(workers_processing=[0], tasks=0, unrunnable=0)
+        worker_tid: list[int] = []
+
+        def _run_start() -> None:
+            worker_tid.append(threading.get_ident())
+            asyncio.run(plugin.start(sched))
+            asyncio.run(plugin.before_close())
+
+        t = threading.Thread(target=_run_start, name="fake-scheduler-loop")
+        t.start()
+        t.join(timeout=10)
+
+        assert plugin._loop_tid == worker_tid[0]
+        assert plugin._loop_tid != threading.main_thread().ident
+
+    def test_sampler_falls_back_to_main_thread_before_start(self, caplog) -> None:
+        """A probe driven without ``start()`` still samples (tests do this)."""
+        plugin = SchedulerResourceLogger(stack_samples=1, stack_sample_gap_s=0.0)
+        plugin._sampler_active = threading.Event()
+        plugin._sampler_active.set()
+        assert plugin._loop_tid is None
+        with caplog.at_level(logging.WARNING, logger="distributed.scheduler"):
+            plugin._sample_stacks_worker(95.0, 4.0)
+        assert any(r.getMessage().startswith("scheduler stack sample") for r in caplog.records)
+
     def test_stack_sampler_logs_and_clears(self, caplog) -> None:
         """The worker logs one collapsed stack tally with the cpu/lag context
         and clears the single-flight flag when done.
@@ -406,29 +443,59 @@ class TestSchedulerResourceLoggerOnCluster:
         assert "workers=1" in health[-1]
 
 
-def test_maybe_performance_report_noop_without_uri() -> None:
-    """With no URI the helper is a pure pass-through — no client, no Dask calls."""
-    ran = []
-    with maybe_performance_report("tcp://unused:8786", None, logging.getLogger("t")):
-        ran.append(True)
-    assert ran == [True]
-
-
 def test_ingest_settings_perf_report_uri_defaults_none() -> None:
     """The perf-report knob is off by default, so normal runs never capture one."""
     assert IngestSettings().perf_report_uri is None
 
 
 def _report_stub(exit_error: Exception | None = None):
-    """A performance_report stand-in, optionally failing on exit (the render step)."""
+    """A performance_report stand-in, optionally failing on exit (the render step).
+
+    It WRITES the file on a successful exit, because the real one does and the
+    upload step reads it back. A stub that skipped that would make an upload test
+    pass for the wrong reason: the missing-file error and the upload error are
+    caught by the same handler, so the assertion would hold even with the upload
+    never attempted.
+    """
 
     @contextlib.contextmanager
     def _report(filename=None):
         yield
         if exit_error is not None:
             raise exit_error
+        if filename:
+            Path(filename).write_bytes(b"<html>report</html>")
 
     return _report
+
+
+class _FakeFsspec:
+    """Stand-in for the module-level ``fsspec`` in the provider.
+
+    Substituted on the provider module's own attribute rather than on the real
+    fsspec: ``dask.py`` binds the module at import time, so patching the library
+    in place would leak into every other test in the session (the from-import
+    binding trap, documented in the repo's architecture notes).
+    """
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.written: dict[str, bytes] = {}
+
+    def open(self, uri, mode="rb"):
+        if self.error is not None:
+            raise self.error
+        written = self.written
+        sink = io.BytesIO()
+
+        @contextlib.contextmanager
+        def _cm():
+            try:
+                yield sink
+            finally:
+                written[uri] = sink.getvalue()
+
+        return _cm()
 
 
 class TestMaybePerformanceReport:
@@ -489,3 +556,36 @@ class TestMaybePerformanceReport:
         ):
             ran.append(True)
         assert ran == [True]
+
+    def test_rendered_report_is_uploaded_to_the_uri(self, monkeypatch) -> None:
+        """The happy path: the rendered HTML reaches the target URI."""
+        fake = _FakeFsspec()
+        monkeypatch.setattr(dask_mod, "Client", lambda *a, **k: contextlib.nullcontext())
+        monkeypatch.setattr(dask_mod, "performance_report", _report_stub())
+        monkeypatch.setattr(dask_mod, "fsspec", fake)
+
+        with maybe_performance_report("tcp://x:8786", "s3://b/p.html", logging.getLogger("t")):
+            pass
+        assert fake.written == {"s3://b/p.html": b"<html>report</html>"}
+
+    def test_upload_failure_does_not_fail_the_ingest(self, monkeypatch, caplog) -> None:
+        """A denied PUT or missing bucket is logged, never raised.
+
+        fsspec backends raise botocore ClientError / credential errors, none of
+        which subclass OSError — so this is the third of the three containment
+        paths, and the one an operator is most likely to hit first (a typo'd
+        bucket, or a role without write access to the profiling prefix).
+        """
+        fake = _FakeFsspec(error=RuntimeError("AccessDenied on PutObject"))
+        monkeypatch.setattr(dask_mod, "Client", lambda *a, **k: contextlib.nullcontext())
+        monkeypatch.setattr(dask_mod, "performance_report", _report_stub())
+        monkeypatch.setattr(dask_mod, "fsspec", fake)
+
+        ran = []
+        with (
+            caplog.at_level(logging.WARNING),
+            maybe_performance_report("tcp://x:8786", "s3://b/p.html", logging.getLogger("t")),
+        ):
+            ran.append(True)
+        assert ran == [True]
+        assert any("failed to upload" in r.getMessage() for r in caplog.records)

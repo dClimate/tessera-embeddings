@@ -19,17 +19,19 @@ that heartbeat into something a machine can act on:
    events — emitted as one JSON object to stdout (consumed by ``report.py``),
    with ``--markdown`` adding a paste-ready section to stderr.
 
-Both modes only need CloudWatch Logs read access. Scope ``--report`` tightly:
-the log group is shared across ingest runs, so an overlapping run's scheduler
-stream lands in the same group (disambiguate with ``--stream-prefix``).
+Both modes only need CloudWatch Logs read access, resolved from the ambient AWS
+credential chain (``AWS_PROFILE``, instance role, …) unless ``--profile`` names
+one. Scope ``--report`` tightly: the log group is shared across ingest runs, so
+an overlapping run's scheduler stream lands in the same group (disambiguate with
+``--stream-prefix``).
 
 Usage::
 
+    export AWS_PROFILE=...              # or pass --profile on each call
     # live, during a run (Ctrl-C to stop)
-    te-watch-scheduler --profile global-tessera-dev --live
+    te-watch-scheduler --live
     # post-hoc profile of a finished run
-    te-watch-scheduler --profile global-tessera-dev \
-        --report --since 2026-07-24T18:00 --until 2026-07-24T20:30 --markdown
+    te-watch-scheduler --report --since 2026-07-24T18:00 --until 2026-07-24T20:30 --markdown
 """
 
 from __future__ import annotations
@@ -229,10 +231,12 @@ def watch_live(
     logs = session.client("logs")
     start_ms = int((time.time() - lookback_s) * 1000)
     seen: set[str] = set()
+    # Bounded to what the longest sustained rule looks back over, +1 for the
+    # rising-backlog comparison and +1 of slack. The deque length IS the window
+    # every rule sees, so no caller-side slicing is needed.
     window: deque[dict] = deque(maxlen=max(thresholds.cpu_intervals, thresholds.backlog_intervals) + 2)
     prev: dict | None = None
     prev_epoch: int | None = None
-    keep = max(thresholds.cpu_intervals, thresholds.backlog_intervals) + 2
 
     print(f"# watching {log_group} [{stream_prefix}] — Ctrl-C to stop", file=sys.stderr)
     try:
@@ -260,7 +264,7 @@ def watch_live(
                     continue
                 epoch = ev["timestamp"] // 1000
                 window.append(sample)
-                alerts = evaluate_alerts(list(window)[-keep:], thresholds)
+                alerts = evaluate_alerts(list(window), thresholds)
                 snap = _snapshot(sample, epoch, prev, prev_epoch, alerts)
                 print(json.dumps(snap), flush=True)
                 print(_human_line(snap), file=sys.stderr, flush=True)
@@ -433,7 +437,9 @@ def _build_thresholds(args: argparse.Namespace) -> Thresholds:
 def main(argv: list[str] | None = None) -> int:
     """Parse args and run the live or post-hoc scheduler-watch mode."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--profile", default="global-tessera-dev", help="AWS profile (default: %(default)s)")
+    parser.add_argument(
+        "--profile", default=None, help="AWS profile; default uses the ambient credential chain / AWS_PROFILE"
+    )
     parser.add_argument("--region", default="us-west-2")
     parser.add_argument("--log-group", default=DEFAULT_INGEST_LOG_GROUP)
     parser.add_argument(

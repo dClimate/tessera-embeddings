@@ -100,6 +100,18 @@ DEFAULT_RULES: tuple[Rule, ...] = (
         forbidden_import_prefix="botocore",
         allowed_path_prefixes=("providers/aws/",),
     ),
+    Rule(
+        # The boto3 rule above exempts profiling/ on one condition: that the
+        # subpackage stays unreachable from library code, so boto3 is imported
+        # only when an operator runs a profiling command. Nothing enforced that
+        # condition — and the first domain or flow module to import profiling/
+        # would pull boto3 into an ordinary `import tessera_embeddings`
+        # transitively, silently undoing the isolation the exemption was granted
+        # against. This rule keeps the bargain honest.
+        name="no-profiling-imports-outside-profiling",
+        forbidden_import_prefix="tessera_embeddings.profiling",
+        allowed_path_prefixes=("profiling/",),
+    ),
 )
 
 

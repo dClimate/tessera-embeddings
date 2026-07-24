@@ -3,7 +3,8 @@
 The Tessera pipeline has two compute-heavy stages, and they saturate on
 completely different resources. Each has its own profiling harness here — pick
 by **which stage you are watching**, not by which account you are on (both
-harnesses are deployment-agnostic; you pass the profile / region / log group).
+harnesses are deployment-agnostic; you supply the credentials / region / log
+group).
 
 | Stage | What runs it | Saturates on | Harness |
 | --- | --- | --- | --- |
@@ -45,7 +46,14 @@ are `s3://` URIs (they run on the base install only for local paths).
 
 Nothing in the library imports this subpackage, so an ordinary
 `import tessera_embeddings` never pulls a cloud SDK in on its account — the tools
-load only when a command runs.
+load only when a command runs. An architecture rule enforces that, so the
+isolation can't quietly lapse.
+
+**Credentials.** No tool hardcodes an account: they resolve credentials through
+the ambient AWS chain, so `export AWS_PROFILE=<your-profile>` (or an instance
+role) is enough, and `--profile` / `--region` override per call. Only
+`--log-group` carries a deployment-shaped default — `/ecs/tessera/dask` for
+ingest, the yield Ray group for inference — so pass it on other deployments.
 
 ## AWS-specific by necessity — and a template for other clouds
 

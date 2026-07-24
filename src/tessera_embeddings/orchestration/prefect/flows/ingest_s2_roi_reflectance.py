@@ -94,6 +94,7 @@ def ingest_s2_roi_reflectance(
         perf_report_uri: Optional fsspec URI; when set, a Dask
             performance-report HTML for this run is captured and
             uploaded there (probe-rung profiling; default off).
+            Ignored on the ``use_local`` path, which warns.
 
     Returns:
         ``IngestResult`` serialised as a dict (see
@@ -105,6 +106,10 @@ def ingest_s2_roi_reflectance(
     if use_local:
         from tessera_embeddings.providers.local.dask import local_cluster
 
+        if perf_report_uri:
+            # Say so rather than no-op: an operator who set this and finds nothing
+            # at the URI would otherwise suspect the upload or their credentials.
+            log.warning("perf_report_uri is ignored on the local-cluster path (use_local=True)")
         with local_cluster() as cluster:
             log.info("Local Dask cluster ready: scheduler=%s", cluster.scheduler_address)
             task_runner = get_task_runner_for_cluster(cluster.scheduler_address)

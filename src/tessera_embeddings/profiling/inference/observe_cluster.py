@@ -26,20 +26,22 @@ reachable via ``--cluster``/``--cluster-prefix`` regardless of naming scheme.
 
 Usage::
 
-    # any deployment: pass the profile/region/log-group for that account
-    te-observe-cluster --profile yield --start-pollers
+    # any deployment: point at the account's credentials/region/log-group
+    export AWS_PROFILE=...              # or pass --profile on each call
+    te-observe-cluster --start-pollers
     # ...let the run process a few chunks...
-    te-observe-cluster --profile yield --report
+    te-observe-cluster --report
     # after a run (cluster gone): peak/spike RAM + fleet util from CloudWatch
-    python .../observe_cluster.py --profile yield --ram-report \
-        --log-group /ec2/yield-embeddings/ray \
+    te-observe-cluster --ram-report --log-group /ec2/yield-embeddings/ray \
         --since 2026-07-16T22:50 --until 2026-07-17T03:00
     # scope to one run's fleet when several clusters share the account
-    python .../observe_cluster.py --profile yield --cluster tessera-inference-a60550ae --report
+    te-observe-cluster --cluster tessera-inference-a60550ae --report
 
 --report/--start-pollers require workers reachable via SSM (the production AMI
-runs the agent). --ram-report only needs CloudWatch Logs read access. All modes
-use an AWS profile with the relevant permissions.
+runs the agent). --ram-report only needs CloudWatch Logs read access. Credentials
+come from the ambient AWS chain (``AWS_PROFILE``, instance role, …) unless
+``--profile`` names one; note ``--log-group`` still defaults to the yield
+deployment's group, so pass it for any other account.
 """
 
 from __future__ import annotations
@@ -545,7 +547,9 @@ def ram_util_report(session: boto3.session.Session, log_group: str, start_epoch:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point; returns process exit code."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--profile", default="yield", help="AWS profile (default: yield)")
+    parser.add_argument(
+        "--profile", default=None, help="AWS profile; default uses the ambient credential chain / AWS_PROFILE"
+    )
     parser.add_argument("--region", default="us-west-2")
     parser.add_argument("--cluster", help="Exact ray-cluster-name tag — scope to one run's fleet")
     parser.add_argument(

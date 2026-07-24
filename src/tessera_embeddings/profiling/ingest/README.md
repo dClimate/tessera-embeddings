@@ -11,9 +11,11 @@ not the workers. Its stress is otherwise invisible until it stalls (the
 built-in `Event loop was unresponsive for Ns` warning) or the task is
 OOM-killed. This harness makes the run-up traceable and machine-consumable.
 
-Deployment-agnostic: pass `--profile` / `--region` / `--log-group` for the
-account you are watching (defaults target `global-tessera-dev` and
-`/ecs/tessera/dask`). All tools need only CloudWatch Logs read access.
+Deployment-agnostic. Credentials come from the ambient AWS chain, so
+`export AWS_PROFILE=<your-profile>` once and the examples below run as written;
+`--profile` / `--region` override per call. `--log-group` defaults to
+`/ecs/tessera/dask`, which is where this repo's Dask provider ships. All tools
+need only CloudWatch Logs read access.
 
 ## In-process instrumentation (already on the scheduler)
 
@@ -66,14 +68,14 @@ campaign (large graphs make the report heavy).
 ## Per-run workflow
 
 ```
+export AWS_PROFILE=<your-profile>   # or add --profile <p> to each call below
+
 # 1. while the run is live — machine-readable snapshots + alerts
-te-watch-scheduler --profile <p> --live | tee live.jsonl
+te-watch-scheduler --live | tee live.jsonl
 
 # 2. after the run — scheduler profile + external-service aggregates
-te-watch-scheduler --profile <p> \
-    --report --since <t0> --until <t1> > sched.json
-te-ingest-log-queries --profile <p> \
-    --since <t0> --until <t1> > logs.json
+te-watch-scheduler --report --since <t0> --until <t1> > sched.json
+te-ingest-log-queries --since <t0> --until <t1> > logs.json
 
 # 3. assemble the dossier, then write the interpretation
 te-ingest-report --scheduler sched.json --logs logs.json \

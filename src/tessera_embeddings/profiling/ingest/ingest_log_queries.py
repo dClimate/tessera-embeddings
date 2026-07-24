@@ -31,13 +31,14 @@ follow-up, not something this query pack can infer.
 
 Usage::
 
-    te-ingest-log-queries --profile global-tessera-dev \
-        --since 2026-07-24T18:00 --until 2026-07-24T20:30            # all queries -> JSON
+    export AWS_PROFILE=...              # or pass --profile on each call
+    te-ingest-log-queries --since 2026-07-24T18:00 --until 2026-07-24T20:30  # all -> JSON
     te-ingest-log-queries ... --query http_retries_by_service
     te-ingest-log-queries --list    # names + descriptions
 
-Only needs CloudWatch Logs read access. The log group is shared across ingest
-runs — scope the window tightly to the run of interest. A query that cannot be
+Only needs CloudWatch Logs read access, resolved from the ambient AWS credential
+chain unless ``--profile`` names one. The log group is shared across ingest runs
+— scope the window tightly to the run of interest. A query that cannot be
 answered records ``rows: null`` and never aborts the others.
 """
 
@@ -172,7 +173,9 @@ def run_queries(
 def main(argv: list[str] | None = None) -> int:
     """Parse args and run the requested Insights queries (or --list)."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--profile", default="global-tessera-dev", help="AWS profile (default: %(default)s)")
+    parser.add_argument(
+        "--profile", default=None, help="AWS profile; default uses the ambient credential chain / AWS_PROFILE"
+    )
     parser.add_argument("--region", default="us-west-2")
     parser.add_argument("--log-group", default=DEFAULT_INGEST_LOG_GROUP)
     parser.add_argument("--since", help="run start (ISO8601 UTC)")
