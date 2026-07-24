@@ -95,13 +95,85 @@ This also settles an open question from the original write-up: the ingest does n
 need `export_zone_roi` to carry the bitmap forward, because it already opens the
 mask.
 
+## Writing N windows without a commit storm
+
+`zarr_store.write_region` writes **one region per commit**. At a median of 74
+windows and roughly 50 dates that is ~3,700 commits per zone-year, against a store
+whose commit pressure is already a governed constraint (ADR-008 D5/D6 caps
+concurrent committers). So the per-window loop cannot use it as-is.
+
+The same code shows the way out: `_commit_preserving_attrs` calls `to_icechunk`
+and `session.commit` as separate steps, so several writes can share one session and
+one commit. That is what `region_merge` already does properly — fork the session,
+write chunk bytes per fork, merge the changesets, commit once — and it is the
+mechanism this work adopts (below).
+
+**This must not become `write_regions` again** — a single Dask graph spanning every
+region, which was built and removed for being the bottleneck (see the warning
+below). The adopted mechanism is the opposite: raw chunk writes, no graph.
+
 ## What we take from the region-writes / region-merge work, and why
 
 `storage/region_merge.py` and its design note (PR #77), and the ROI fan-out
 foundations (PR #79), solve the tier directly above this one: merging many
-grid-aligned feature stores into one master. We are not merging — we write regions
-into the mosaic directly, so no merge tier is involved — but four of their findings
-transfer, and one is a warning we would otherwise have walked into.
+grid-aligned feature stores into one master. We take code from both, generalised —
+neither PR is merging soon, so the generalised version here becomes the shared one
+and those branches rebase onto it rather than landing a second copy.
+
+Two things are adopted outright:
+
+**The fork-and-merge write mechanism** (#77). Within one icechunk session every
+chunk write serialises on that session's store mutex, so a thread pool plateaus
+regardless of width; the only axis that scales is processes. `region_merge` forks
+the session N ways, each fork writing its shard's bytes directly to storage with its
+own lock and connection pool, and merges the returned changesets into one commit.
+Workers use the **spawn** context so a child never inherits the parent's icechunk
+runtime or credential state. This is measured, non-obvious knowledge, and it gives
+us many windows in one commit with no task graph.
+
+*Generalised:* today the byte source can only be another store. It becomes a
+parameter, so the source is either a source store (the merge case) or in-memory
+arrays (the ingest case). The overlay policy is likewise a parameter — blind assign
+for windows that are disjoint and single-owner, fill-masked overlay
+(`where(src is fill, master, src)`) where windows may share a master chunk.
+
+**Grid-aligned window derivation** (#79). `feature_window` snaps a geometry to a
+window of the master geobox with `GeoBox.enclosing` plus an `overlap_roi` clamp, so
+the window is an exact pixel-subset *by construction* rather than by post-hoc
+validation — region writes place data positionally and are silently wrong otherwise.
+
+*Generalised:* geometry and bitmap are two ways of expressing the same live-cell
+selection, so one helper takes either and returns grid-aligned windows. The
+single-ROI path keeps its geometry entry point; the campaign gets a bitmap one.
+
+**Forward compatibility with real merge workflows.** The store-to-store merge is a
+use case we may want for its own reasons, so generalising must not foreclose it: a
+source store stays a first-class byte source, fill-masked overlay stays expressible
+even though the ingest path does not need it, and the date-union and
+temp-store-cleanup helpers stay usable. The test for "generalised correctly" is that
+`merge_stores` could be rebuilt on top of this without special-casing.
+
+This should be cheap rather than a contortion, because the two cases differ on only
+two axes: **where a block's bytes come from** (a source store's chunk, or a slice of
+an in-memory array) and **how they combine with what is already there** (assign, or
+overlay only non-fill pixels). Everything else — session forking, spawn context,
+tiling to the master chunk grid, changeset merge, one commit, the temporal
+distinct-time-chunk check, the spatial pixel-subset check — is identical and already
+written. And `region_merge` already contains *both* combine behaviours internally as
+an optimisation: an all-real interior block skips the master read and assigns
+directly, while partial-edge blocks read-modify-write. So exposing the choice is
+surfacing an existing branch, not adding one. If that turns out not to hold once the
+code is in front of us, drop the merge generality rather than contort for it — the
+ingest path is the thing on the critical path.
+
+**What we deliberately do not take: the merge *workflow*.** Ingesting each window to
+a temp store and merging it in would write every live byte twice. Empty chunks are
+already elided, so today's write volume is live-only — doubling it doubles S3 PUTs
+against a backend whose push-back is already managed by an aggregate concurrency
+budget. Take the mechanism, not the pipeline.
+
+Four further findings transfer, and one is a warning we would otherwise have walked
+into.
 
 **The warning: do not rebuild a Dask-graph region write.** `write_regions`, a
 `store_dask`-based batch path, was built and then removed. Its
