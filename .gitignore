@@ -107,3 +107,6 @@ ai/
 scripts/scale_test_stores/
 scripts/scale_test_results/
 scripts/scale_tests/
+
+# Local one-off analysis scripts kept out of the repo for now.
+scripts/plot_corn_sample_500m_regions.py
