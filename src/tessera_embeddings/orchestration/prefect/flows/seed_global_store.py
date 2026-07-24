@@ -71,9 +71,9 @@ def seed_global_store(
 
     # Open-or-create with the global config (manifest split + preload). A missing
     # repo raises on open; create_global_repo persists the config via save_config.
+    seeded: set[str]
     try:
         repo = open_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
-        seeded = set(campaign_status(repo, years=years).zones)
     except FileNotFoundError:
         log.info("Creating global store %s", store_path)
         repo = create_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
@@ -88,6 +88,18 @@ def seed_global_store(
         log.info("Creating global store %s", store_path)
         repo = create_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
         seeded = set()
+    else:
+        # The repo exists — but may still be UNSEEDED: a prior run can create the
+        # repo (and persist its config) then crash BEFORE the first seed_zone_groups
+        # commit writes the root group. campaign_status then reads a rootless store
+        # and raises GroupNotFoundError; treat that as "nothing seeded yet" so this
+        # retry seeds the store (the flow's advertised idempotency) instead of
+        # propagating and wedging every retry on the half-created repo.
+        try:
+            seeded = set(campaign_status(repo, years=years).zones)
+        except zarr.errors.GroupNotFoundError:
+            log.info("Store %s exists but has no root group yet — treating as unseeded", store_path)
+            seeded = set()
 
     # A retry after a partial seed must use the SAME year axis as the groups already
     # landed — the axis is fixed at seeding (ADR-008 D1), so seeding the remainder

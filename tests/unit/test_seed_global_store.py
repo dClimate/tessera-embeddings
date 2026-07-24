@@ -10,6 +10,7 @@ import logging
 
 import icechunk
 import pytest
+import zarr.errors
 
 import tessera_embeddings.orchestration.prefect.flows.seed_global_store as mod
 from tessera_embeddings.config.inference import checkpoint_filename
@@ -80,3 +81,21 @@ def test_seed_reraises_transient_icechunk_error(monkeypatch):
     with pytest.raises(icechunk.IcechunkError, match="timed out"):
         mod.seed_global_store.fn(paths=_PATHS)
     assert created == []  # never entered the create path
+
+
+def test_seed_treats_rootless_existing_repo_as_unseeded(monkeypatch):
+    """Idempotency edge: a repo that OPENS fine but has no root group yet (a prior
+    run created + saved config, then crashed before the first seed commit) must be
+    treated as unseeded and seeded, not raise. campaign_status reads a rootless
+    store and raises GroupNotFoundError; the flow swallows that → seeded=set().
+    """
+    captured = _capture_seed(monkeypatch)  # mocks seed_zone_groups + logger + create
+    monkeypatch.setattr(mod, "open_global_repo", lambda *a, **k: object())  # repo EXISTS
+
+    def _rootless(*a, **k):
+        raise zarr.errors.GroupNotFoundError("no group found in store")
+
+    monkeypatch.setattr(mod, "campaign_status", _rootless)
+    mod.seed_global_store.fn(paths=_PATHS)
+    # Reached seeding (seeded=set()) instead of propagating the read error.
+    assert captured["model_version"] == checkpoint_filename()

@@ -346,14 +346,19 @@ def plan_zone_inference(
     # time points ARE the windows: today the single-ROI `12mo_window_end` path
     # (assemble(): time = window-end label, extendable axis); zone-scale, the
     # windowed-variant design in ADR-011 (slots declared at other start months).
-    window_years = {y for y, _ in config.time_window.months}
-    if window_years != {year}:
+    # Compare the WHOLE month set, not just "every month falls in `year`": a
+    # same-year partial (e.g. Jan-Jun 2025) also has window_years == {year} but is
+    # only six months, and would otherwise pass here and tag the slot complete
+    # with a short window while the seeded time_bnds advertise the full Jan-Dec.
+    if set(config.time_window.months) != {(year, m) for m in range(1, 13)}:
+        window_years = sorted({y for y, _ in config.time_window.months})
         raise ValueError(
-            f"config.time_window ({config.time_window.window_end_label}) spans {sorted(window_years)} "
-            f"but the global store guarantees calendar-year slots (time_convention='calendar_year'): "
-            f"year={year} requires the exact January-December {year} window. Rolling/offset 12-month "
-            f"windows are not writable to the global store — use the single-ROI `12mo_window_end` "
-            f"path for non-calendar windows (or the ADR-011 windowed-variant design at zone scale)."
+            f"config.time_window ({config.time_window.window_end_label}, months in year(s) {window_years}) "
+            f"is not the exact January-December {year} window, but the global store guarantees "
+            f"calendar-year slots (time_convention='calendar_year'): year={year} requires all 12 months "
+            f"January-December {year}. Rolling/offset OR same-year partial windows are not writable to "
+            f"the global store — use the single-ROI `12mo_window_end` path for non-calendar windows "
+            f"(or the ADR-011 windowed-variant design at zone scale)."
         )
 
     # Idempotent retry: a cell that already landed is done — re-running it

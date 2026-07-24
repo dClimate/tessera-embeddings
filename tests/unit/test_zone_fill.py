@@ -622,6 +622,33 @@ def test_rolling_window_rejected(tmp_path):
         )
 
 
+def test_same_year_partial_window_rejected(tmp_path):
+    """A same-year PARTIAL window (every month in `year`, but fewer than 12) is
+    rejected too: the slot must hold the full Jan-Dec year the seeded time_bnds
+    advertise, not a short window. The gate compares the whole month set, not just
+    'all months fall in `year`'.
+    """
+    store = _seed_global(tmp_path)
+    partial = TimeWindow(
+        window_start=(2025, 1),
+        window_end=(2025, 6),
+        months=tuple((2025, m) for m in range(1, 7)),  # Jan-Jun 2025 only
+        window_end_label="2025-06-01",
+    )
+    with pytest.raises(ValueError, match="guarantees calendar-year slots"):
+        zone_fill.fill_zone_year(
+            store_path=store,
+            zone=_ZONE,
+            year=2025,
+            land_mask_path=str(tmp_path / "mask.zarr"),
+            mosaic_base=str(tmp_path / "mosaics"),
+            staging_base=str(tmp_path / "staging"),
+            config=InferenceConfig(time_window=partial, chunk_size=_TILE, num_gpus=0),
+            num_actors=1,
+            log=log,
+        )
+
+
 def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatch):
     """A crash between the fill commit and the tag: retry tags the tip, no re-inference.
 
