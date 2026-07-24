@@ -74,7 +74,8 @@ rather than re-exported from the top-level package:
   `python -m tessera_embeddings.profiling.<stage>.<tool>`. The AWS-facing
   ones need the `aws` extra. See `profiling/README.md`.
 - `tessera_embeddings.storage` — Icechunk/Zarr store management:
-  `zarr_store` (open / create / append / region-write) and
+  `zarr_store` (open / create / append / region-write / windowed
+  per-date batch — `write_day_windows`, the cropped-ingest write path) and
   `empty_store` (all-fill store seeding — `create_empty_store`,
   `create_empty_store_from_coords`, `VarSpec`, `daily_times`).
 

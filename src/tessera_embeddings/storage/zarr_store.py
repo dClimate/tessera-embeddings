@@ -5,7 +5,7 @@ that hold preprocessed Sentinel-2 reflectance data and cloud masks.
 
 Uses Icechunk for transactional writes with atomic commit semantics.
 
-Four write paths, all committing atomically:
+Five write paths, all committing atomically:
 
 - **create** (:func:`write_dataset` on a fresh store) — ``to_icechunk`` mode
   ``"w"`` writes the whole array.
@@ -19,6 +19,13 @@ Four write paths, all committing atomically:
   dask blocks and ``mode="r+"`` rejects partial-chunk writes. Use
   :func:`resolve_region` to turn coordinate ranges into the integer slices
   ``write_region`` expects.
+- **windowed per-date batch** (:func:`write_day_windows`, on
+  :func:`batched_region_writes`) — the cropped-ingest counterpart of
+  ``write_dataset``: seed an all-fill store with an EMPTY time axis once, then
+  per date append the time slot atomically WITH that date's chunk-disjoint
+  live-window region writes, all under ONE commit. Same bookkeeping contract
+  as create/append (attr set, baselines/doy merge, per-write manifest
+  validation); write volume scales with live area instead of extent.
 - **shard-assemble** (embeddings only; lives in
   :mod:`tessera_embeddings.inference.assembly` +
   :mod:`tessera_embeddings.storage.shard_writer`) — staged inference tiles
@@ -28,7 +35,9 @@ Four write paths, all committing atomically:
   (one commit per zone-year, ADR-008).
 
 The batch variant of the region-overwrite path (a Dask-graph write of many
-regions at once) was removed as unused.
+regions at once — one graph spanning every region, built on the flow runner)
+was removed as unused; the windowed per-date batch is NOT its return, since it
+builds no graph at all.
 """
 
 import logging

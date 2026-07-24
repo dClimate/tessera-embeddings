@@ -140,6 +140,14 @@ Two supported paths:
    [`docs/orchestrator-swap.md`](docs/orchestrator-swap.md) and
    [`docs/providers/adding-your-own.md`](docs/providers/adding-your-own.md).
 
+Ingest cost scales with the area you actually keep, not your ROI's
+bounding extent: with `crop_to_live_windows` on, the mosaic loads and
+writes are restricted to the chunk-aligned windows that intersect the
+ROI mask (measured campaign-wide: ~4.3× less compute; a sparse island
+zone drops from 3,706 chunks per band-date to 4). Same flag serves a
+single sparse ROI and a global campaign zone. See
+[the ingest README](src/tessera_embeddings/ingest/README.md#cropping-to-live-windows-crop_to_live_windows).
+
 ### Profiling a run
 
 Both compute stages ship a profiling harness — `te-watch-scheduler` and friends

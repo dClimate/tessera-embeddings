@@ -232,6 +232,27 @@ fresh process after killing the flow's child process, so the hook must
 not rely on state the flow body stored — only on what it can recompute
 from the hook's `flow_run` argument.
 
+### The Dask/ECS analogue
+
+The ingest clusters have the same failure mode with a simpler fix.
+`ecs_cluster` tears down at context-manager exit, which a hard cancel
+skips (the flow process is killed first) — a cancelled ingest once left
+23 workers plus a scheduler running in ECS. (NOT the `skip_cleanup`
+flag: that only disables dask-cloudprovider's startup sweep for debris
+from *prior* runs, and turning it off breaks cluster construction under
+AWS SSO.) So the ingest flows tag every cluster resource with their
+flow-run id (`ecs_cluster(resource_tags=...)`) and register
+`_dask_lifecycle.dask_cleanup_on_cancellation` for both cancellation
+and crash, which calls `stop_ecs_tasks_by_tag` — purely tag-based, so
+it needs no module state to survive the fresh-import hook process.
+
+```text
+normal exit    ── ecs_cluster finally ──► cluster.close()
+hard cancel ┐
+crash       ┴─ on_cancellation/on_crashed ──► stop_ecs_tasks_by_tag(
+                                                 "tessera-flow-run-id" = flow_run.id)
+```
+
 ---
 
 ## Connection modes

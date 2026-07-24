@@ -16,6 +16,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
+| `live_windows.py` | Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes — one row-band window per live chunk-row of the ROI mask. Serves single-ROI and campaign runs identically. |
 
 ---
 
@@ -149,6 +150,7 @@ run_global_campaign  (per pending (zone, year), zone-parallel within a year)
    ├─ ingest-zone-year ──► export_zone_roi(zone)         {inputs}/rois/zarrs/zone_33N.zarr
    │      │                  (ZoneSpec grid + tile_live mask; ocean-tile skip)
    │      ├─ marker probe (ingest_marker fingerprint; stale/partial ⇒ clear+rebuild)
+   │      ├─ (crop_to_live_windows: live-chunk count ⇒ max_workers)
    │      ├─ ingest_s1_roi_sar × orbit ┐  concurrent, onto
    │      ├─ ingest_s2_roi_reflectance ┘  {inputs}/mosaics/33N/2025/
    │      ├─ check_time_window_coverage (strict span; allow_partial_window escape)
@@ -247,6 +249,71 @@ This is a fully lazy Dask operation — no data is materialised until the Zarr w
 ---
 
 ## Performance Optimizations
+
+### Cropping to live windows (`crop_to_live_windows`)
+
+Ingest cost scales with the **extent it computes, not the land it keeps**: the mosaic
+loads cover the whole ROI grid even where the mask is entirely ocean/out-of-footprint.
+The first real campaign cell made the gap concrete — zone `03S` has 4 live tiles out of
+14,355, yet its full-extent mosaic built a 119,002-task graph and spilled ~1 TB of worker
+memory before being cancelled. Measured across all 112 land zones, ~78% of campaign
+ingest compute is spent on ocean.
+
+`crop_to_live_windows` (an `IngestSettings` knob for the campaign; a flag on both ingest
+flows and domain functions for single runs) restricts every load and write to the
+chunk-aligned windows that intersect the ROI mask:
+
+```text
+zone / ROI extent (declared grid — UNCHANGED, the fill validates it)
+┌──────────────────────────────────────────────┐
+│ ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  │   · ocean / out-of-footprint:
+│ · · · ┌────────────────────┐ ·  ·  ·  ·  ·   │     never loaded, never computed,
+│ · · · │████████████████████│ ·  ·  ·  ·  ·   │     never written (reads back as
+│ · · · └────────────────────┘ ·  ·  ·  ·  ·   │     fill — Zarr elides all-fill
+│ · · · · · · ┌────────┐ ·  ·  ·  ·  ·  ·  ·   │     chunks anyway)
+│ · · · · · · │████████│ ·  ·  ·  ·  ·  ·  ·   │
+│ · · · · · · └────────┘ ·  ·  ·  ·  ·  ·  ·   │   █ live row-band windows:
+│ ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  │     one per live chunk-row,
+└──────────────────────────────────────────────┘     4096-px chunk-aligned
+```
+
+- **Windows** come from `live_windows.py`: the boolean ROI mask (the same artifact both
+  `rasterize_roi_zarr` and `export_zone_roi` write) is scanned one chunk block at a time
+  (~16 MB peak, no Dask) and coarsened to the ingest chunk grid; each live chunk-row
+  becomes one window spanning its live columns. Row bands are a *measured* choice:
+  campaign-wide they compute within 1% of the exact live-chunk floor, where a single
+  bounding box captures less than half the win (see
+  `context_docs/design/ingest-live-tile-cropping.md` for the full measurement).
+- **Writes** go through `storage.write_day_windows`: a missing store is seeded all-fill
+  with an **empty** time axis (schema only — creation cost independent of extent), then
+  each date appends its time slot atomically WITH its windows in **one commit**:
+
+```text
+per passing date (one writable session ── one commit)
+   ├─ append time slot            (metadata-only resize; duplicate date = loud error)
+   ├─ to_icechunk(region=window₁) ┐  pixels flow from the Dask workers that
+   ├─ to_icechunk(region=window₂) │  computed them — never materialised on
+   ├─ ...                         ┘  the flow runner
+   ├─ merge attrs                 (baselines ∪, doy ++, last_appended)
+   └─ commit                      (crash before here ⇒ nothing visible; retry is clean)
+```
+
+  The empty-axis seed matters: the time axis only ever contains dates whose pixels
+  committed, which is what keeps `get_existing_dates` (the STAC dedupe),
+  `check_time_window_coverage`, and the empty-timestep prunes truthful.
+- **The declared grid stays full-extent**, so the zone fill's exact-grid validation is
+  unaffected — Zarr/Icechunk arrays are sparse and unwritten chunks read back as fill.
+- **The SCL coverage phase is cropped too**: its reduce runs over the windows only
+  (identical total — the mask is False outside them) and the validity mask stays lazy,
+  so no full-extent array is ever persisted.
+- **Worker sizing follows**: with cropping on, `ingest-zone-year` sizes `max_workers`
+  from the cell's live-chunk count (0.5 workers/chunk, clamped) instead of granting a
+  4-tile zone the same fleet as a dense one.
+
+Default **off** at every layer — the legacy full-extent path is byte-identical until the
+cropped path is validated on a live cell. S1 and S2 share the mechanism; the one
+difference is that S1's multi-date batches loop per date (non-contiguous dates cannot
+share a region write), each date keeping its own atomic commit and retry scope.
 
 ### Background: how Dask task graphs consume scheduler RAM
 
