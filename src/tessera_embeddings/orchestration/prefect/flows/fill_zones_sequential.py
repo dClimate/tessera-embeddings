@@ -122,12 +122,19 @@ class _DeploymentCellInputs:
         cleanup_mosaics: bool,
         max_parallel: int,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+        child_tag: str | None = None,
     ) -> None:
         self._deployment = deployment
         self._params_for = params_for
         self._inputs_bucket = inputs_bucket
         self._cleanup_mosaics = cleanup_mosaics
         self._log = log
+        # Deterministic tag stamped on every child run, derived from the PARENT
+        # flow-run id — the cancellation/crash hook re-derives it in a fresh
+        # process and sweeps live children by tag (the in-process shutdown()
+        # never runs when Prefect kills the flow process). Mirrors the Ray
+        # terminate-instances-by-tag pattern.
+        self._child_tag = child_tag
         self._executor = ThreadPoolExecutor(max_workers=max(1, max_parallel), thread_name_prefix="cell-ingest")
         self._futures: dict[tuple[str, int], Future[None]] = {}
         self._lock = threading.Lock()
@@ -135,13 +142,22 @@ class _DeploymentCellInputs:
         self._stopping = threading.Event()
 
     def _run(self, zone: str, year: int) -> None:
+        # Never CREATE a child once shutdown began — a run dispatched after the
+        # cancellation sweep would be the one orphan the sweep can't see.
+        if self._stopping.is_set():
+            raise RuntimeError(f"ingest {zone}-{year} not dispatched: adapter shutting down")
         self._log.info("Ingest dispatch: %s-%d via %s", zone, year, self._deployment)
         # timeout=0: return as soon as the run is created so its id is in hand —
         # a blocking run_deployment() only yields the run AFTER it finishes,
         # leaving shutdown nothing to cancel.
         # run_deployment is @sync_compatible (typed as a union with its coroutine
         # form); in these worker threads it always runs synchronously.
-        run: Any = run_deployment(self._deployment, parameters=self._params_for(zone, year), timeout=0)
+        run: Any = run_deployment(
+            self._deployment,
+            parameters=self._params_for(zone, year),
+            timeout=0,
+            tags=[self._child_tag] if self._child_tag else None,
+        )
         with self._lock:
             self._inflight[(zone, year)] = run.id
         try:
@@ -158,6 +174,15 @@ class _DeploymentCellInputs:
                 if run.state is not None and run.state.is_final():
                     return run
                 self._stopping.wait(_INGEST_POLL_S)
+            # Abandoning: this child may have been created after (or registered
+            # too late for) shutdown's snapshot sweep — cancel it OURSELVES with
+            # the already-open client before raising, so a dispatch racing
+            # shutdown can't leave a server-side ingest running.
+            try:
+                client.set_flow_run_state(flow_run_id, state=Cancelling())
+                self._log.warning("Cancelled abandoned ingest %s (%s)", label, flow_run_id)
+            except Exception:
+                self._log.warning("Could not cancel abandoned ingest %s (%s)", label, flow_run_id, exc_info=True)
         raise RuntimeError(f"ingest {label} abandoned: adapter shutting down")
 
     def start(self, zone: str, year: int) -> None:
@@ -217,10 +242,53 @@ class _DeploymentCellInputs:
             self._log.warning("Ingest cancellation sweep failed — check the Prefect UI for orphans", exc_info=True)
 
 
+def _ingest_child_tag(flow_run_id: object) -> str | None:
+    """Deterministic tag for this run's child ingest deployments.
+
+    Derived from the parent flow-run id alone so the cancellation/crash hook —
+    which Prefect runs in a FRESH process after killing the flow (module state
+    gone, ``finally: inputs.shutdown()`` never ran) — can re-derive it and sweep
+    the children server-side. Same contract as
+    :func:`~tessera_embeddings.providers.aws.ray.cluster_name_for_flow_run`.
+    """
+    return f"chained-ingest:{flow_run_id}" if flow_run_id else None
+
+
+def _cancel_child_ingests_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
+    """Cancel this run's live child ingest deployments on CANCEL or CRASH.
+
+    The in-process ``inputs.shutdown()`` handles normal failure paths, but a
+    cancelled/crashed flow's process is killed before its ``finally`` runs —
+    without this hook, every active child ingest (dispatched from threads, so
+    no parent-run link) keeps writing the mosaic prefix a retry will race.
+    Children are found by the deterministic parent-derived tag.
+    """
+    log = logging.getLogger(__name__)
+    tag = _ingest_child_tag(getattr(flow_run, "id", None))
+    if not tag:
+        log.warning("No flow-run id — cannot sweep child ingest runs by tag. Check the Prefect UI manually.")
+        return
+    try:
+        from prefect.client.schemas.filters import FlowRunFilter, FlowRunFilterTags
+
+        with get_client(sync_client=True) as client:
+            runs = client.read_flow_runs(flow_run_filter=FlowRunFilter(tags=FlowRunFilterTags(all_=[tag])))
+            live = [r for r in runs if r.state is None or not r.state.is_final()]
+            if live:
+                log.warning("Cancelling %d live child ingest run(s) tagged %r", len(live), tag)
+            for r in live:
+                try:
+                    client.set_flow_run_state(r.id, state=Cancelling())
+                except Exception:
+                    log.warning("Could not cancel child ingest %s", r.id, exc_info=True)
+    except Exception:
+        log.warning("Child-ingest sweep failed — check the Prefect UI for tag %r", tag, exc_info=True)
+
+
 @flow(
     name="fill-zones-sequential",
-    on_cancellation=[ray_cleanup_on_cancellation],
-    on_crashed=[ray_cleanup_on_cancellation],
+    on_cancellation=[ray_cleanup_on_cancellation, _cancel_child_ingests_on_cancellation],
+    on_crashed=[ray_cleanup_on_cancellation, _cancel_child_ingests_on_cancellation],
 )
 def fill_zones_sequential_flow(
     *,
@@ -449,6 +517,10 @@ def fill_zones_sequential_flow(
             cleanup_mosaics=cleanup_mosaics,
             max_parallel=look_ahead,
             log=log,
+            # Parent-derived tag so the cancellation/crash hook can sweep live
+            # child ingests from a fresh process (see _ingest_child_tag). None
+            # outside a Prefect run (unit tests) — children just go untagged.
+            child_tag=_ingest_child_tag(flow_run_ctx.id) if flow_run_ctx.id else None,
         )
         if ingest
         else None

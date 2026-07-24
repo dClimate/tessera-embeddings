@@ -386,3 +386,44 @@ def test_stop_unblocks_a_running_ingest_wait():
     with pytest.raises(RuntimeError, match="cluster fell over"):
         _run(_cells(2), session=crashing_session, inputs=BlockingInputs([]), look_ahead=0)
     assert time.monotonic() - t0 < 30  # no 600s join-timeout hang
+
+
+def test_lookahead_does_not_deadlock_on_early_deferrals():
+    """THE deadlock regression (PR #90 review, HIGH): two early orbit-mismatch
+    deferrals retain budget slots and a started look-ahead cell holds the third;
+    the feeder must then block only on the CURRENT cell's slot (whose processing
+    frees slots), never on a future look-ahead slot — blocking there wedged the
+    feeder forever before the fix.
+    """
+    events: list[str] = []
+    inputs = BudgetProbeInputs(events)
+    calls: list[str] = []
+
+    def infer_single(cell, prep, final):
+        calls.append(cell.zone)
+        from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff
+
+        return ZoneFillHandoff(
+            zone=cell.zone, year=cell.year, run_id=prep.run_id, t0=0.0, summary={}, live=[], results=[]
+        )
+
+    result: dict = {}
+
+    def target():
+        result["summary"] = _run(
+            _cells(4),
+            orbits={"01N": "ascending", "02N": "ascending"},  # cap (look_ahead+1=2) NOT exceeded
+            inputs=inputs,
+            infer_single=infer_single,
+            look_ahead=1,
+        )
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout=30)
+    if t.is_alive():
+        pytest.fail("feeder deadlocked: blocked on a future cell's budget slot with deferrals holding the rest")
+    assert result["summary"]["succeeded"] == 4  # 2 streamed + 2 fallback
+    assert result["summary"]["deferred_orbit_mismatch"] == 2
+    assert calls == ["01N", "02N"]
+    assert inputs.high_water <= 3  # the bound still held throughout

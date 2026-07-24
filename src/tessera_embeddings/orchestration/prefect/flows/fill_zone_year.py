@@ -19,6 +19,7 @@ conflict) is the campaign driver's job, not this flow's.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from types import TracebackType
@@ -69,23 +70,31 @@ class _PrefectCommitGate(AbstractContextManager):
     proceed UNGATED — silently reintroducing the rebase/commit storm the gate
     exists to prevent. Strict mode raises instead, so the limit must be
     provisioned explicitly (see the campaign runbook).
+
+    THREAD-SAFE: the active context lives in a per-thread stack, not an instance
+    slot — the chained fill shares ONE gate between its feeder thread (terminal
+    plans commit inside ``plan``) and its trailing-assembly thread, and an
+    instance slot would let a concurrent enter overwrite the other thread's
+    context and release the wrong slot on exit.
     """
 
     def __init__(self, name: str, occupy: int = 1) -> None:
         self._name = name
         self._occupy = occupy
-        self._cm: AbstractContextManager[Any] | None = None
+        self._local = threading.local()
 
     def __enter__(self) -> None:
-        self._cm = concurrency(self._name, occupy=self._occupy, strict=True)
-        self._cm.__enter__()
+        cm = concurrency(self._name, occupy=self._occupy, strict=True)
+        cm.__enter__()
+        stack: list[AbstractContextManager[Any]] = getattr(self._local, "stack", [])
+        stack.append(cm)
+        self._local.stack = stack
 
     def __exit__(
         self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
     ) -> None:
-        assert self._cm is not None
-        self._cm.__exit__(exc_type, exc, tb)
-        self._cm = None
+        cm = self._local.stack.pop()
+        cm.__exit__(exc_type, exc, tb)
 
 
 def _assert_seeded_model_matches(

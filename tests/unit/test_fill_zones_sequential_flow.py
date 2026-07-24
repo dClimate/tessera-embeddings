@@ -263,7 +263,9 @@ def test_adapter_wait_polls_child_run_to_completion(monkeypatch):
     from prefect.states import StateType
 
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
-    monkeypatch.setattr(mod, "run_deployment", lambda dep, parameters, timeout: SimpleNamespace(id="fr-1", state=None))
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-1", state=None)
+    )
     client = _FakeClient([_state(StateType.RUNNING, final=False), _state(StateType.COMPLETED, final=True)])
     monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
     adapter = _adapter()
@@ -285,7 +287,9 @@ def test_adapter_shutdown_cancels_in_flight_child_runs(monkeypatch):
     from prefect.states import StateType
 
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
-    monkeypatch.setattr(mod, "run_deployment", lambda dep, parameters, timeout: SimpleNamespace(id="fr-9", state=None))
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-9", state=None)
+    )
     client = _FakeClient([_state(StateType.RUNNING, final=False)])  # never terminal
     monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
     adapter = _adapter()
@@ -296,7 +300,9 @@ def test_adapter_shutdown_cancels_in_flight_child_runs(monkeypatch):
         _time.sleep(0.01)
     assert adapter._inflight == {("33N", 2025): "fr-9"}
     adapter.shutdown()
-    assert client.cancelled == [("fr-9", StateType.CANCELLING)]
+    # The sweep cancels synchronously; the woken poller may ALSO self-cancel
+    # (belt + suspenders for the late-registration window) — assert the sweep's.
+    assert client.cancelled[0] == ("fr-9", StateType.CANCELLING)
 
 
 def test_adapter_wait_honors_the_runner_stop_event(monkeypatch):
@@ -309,7 +315,9 @@ def test_adapter_wait_honors_the_runner_stop_event(monkeypatch):
     from prefect.states import StateType
 
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
-    monkeypatch.setattr(mod, "run_deployment", lambda dep, parameters, timeout: SimpleNamespace(id="fr-2", state=None))
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-2", state=None)
+    )
     client = _FakeClient([_state(StateType.RUNNING, final=False)])  # never terminal
     monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
     adapter = _adapter()
@@ -322,3 +330,112 @@ def test_adapter_wait_honors_the_runner_stop_event(monkeypatch):
         assert _time.monotonic() - t0 < 30
     finally:
         adapter.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Shutdown-race hardening + the cancellation-hook child sweep
+# ---------------------------------------------------------------------------
+
+
+def test_adapter_refuses_dispatch_after_shutdown(monkeypatch):
+    """A worker that reaches its dispatch AFTER shutdown began must NOT create a
+    child run — a run created after the cancellation sweep is the one orphan the
+    sweep can't see. Exercised on _run directly: this is the race where the
+    worker was submitted before shutdown but starts executing after (a fresh
+    start() would already be rejected by the shut-down executor).
+    """
+    calls: list = []
+    monkeypatch.setattr(mod, "run_deployment", lambda *a, **k: calls.append(1))
+    adapter = _adapter()
+    adapter._stopping.set()  # shutdown has begun; this worker thread is late
+    try:
+        with pytest.raises(RuntimeError, match="not dispatched"):
+            adapter._run("33N", 2025)
+        assert calls == []  # no child was ever created
+    finally:
+        adapter.shutdown()
+
+
+def test_abandoned_poller_cancels_its_own_child(monkeypatch):
+    """A poller woken by shutdown cancels its own child with its open client
+    before raising — closing the late-registration window the snapshot sweep
+    can miss.
+    """
+    from prefect.states import StateType
+
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-7", state=None)
+    )
+    client = _FakeClient([_state(StateType.RUNNING, final=False)])  # never terminal
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    adapter = _adapter()
+    adapter.start("33N", 2025)
+    fut = adapter._futures[("33N", 2025)]
+    import time as _time
+
+    for _ in range(200):  # let the worker register before shutting down
+        if adapter._inflight:
+            break
+        _time.sleep(0.01)
+    adapter.shutdown()
+    with pytest.raises(RuntimeError, match="abandoned"):
+        fut.result(timeout=5)
+    assert ("fr-7", StateType.CANCELLING) in client.cancelled  # self-cancel happened
+
+
+def test_adapter_tags_child_runs_with_parent_derived_tag(monkeypatch):
+    from prefect.states import StateType
+
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
+    captured: dict = {}
+
+    def fake_run_deployment(dep, parameters, timeout, tags=None):
+        captured["tags"] = tags
+        return SimpleNamespace(id="fr-3", state=None)
+
+    monkeypatch.setattr(mod, "run_deployment", fake_run_deployment)
+    client = _FakeClient([_state(StateType.COMPLETED, final=True)])
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    adapter = _adapter(child_tag="chained-ingest:run-xyz")
+    try:
+        adapter.wait("33N", 2025)
+    finally:
+        adapter.shutdown()
+    assert captured["tags"] == ["chained-ingest:run-xyz"]
+
+
+def test_ingest_child_tag_derivation():
+    assert mod._ingest_child_tag("abc-123") == "chained-ingest:abc-123"
+    assert mod._ingest_child_tag(None) is None
+
+
+def test_cancel_child_ingests_hook_sweeps_live_runs_by_tag(monkeypatch):
+    """The hook re-derives the parent tag and cancels only LIVE children — the
+    in-process shutdown() never runs when Prefect kills the flow process.
+    """
+    from prefect.states import StateType
+
+    live = SimpleNamespace(id="fr-live", state=_state(StateType.RUNNING, final=False))
+    done = SimpleNamespace(id="fr-done", state=_state(StateType.COMPLETED, final=True))
+
+    class _SweepClient(_FakeClient):
+        def __init__(self):
+            super().__init__([_state(StateType.RUNNING, final=False)])
+            self.filters: list = []
+
+        def read_flow_runs(self, flow_run_filter=None):
+            self.filters.append(flow_run_filter)
+            return [live, done]
+
+    client = _SweepClient()
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    mod._cancel_child_ingests_on_cancellation(None, SimpleNamespace(id="run-1"), None)
+    assert client.cancelled == [("fr-live", StateType.CANCELLING)]  # final child untouched
+    assert client.filters[0].tags.all_ == ["chained-ingest:run-1"]
+
+
+def test_flow_registers_child_ingest_sweep_on_cancel_and_crash():
+    flow = mod.fill_zones_sequential_flow
+    assert mod._cancel_child_ingests_on_cancellation in flow.on_cancellation_hooks
+    assert mod._cancel_child_ingests_on_cancellation in flow.on_crashed_hooks

@@ -135,14 +135,24 @@ class _MosaicBudget:
         self._held: set[tuple[str, int]] = set()
         self._lock = threading.Lock()
 
-    def acquire(self, key: tuple[str, int], stop: threading.Event) -> bool:
-        """Admit ``key``'s mosaic; False = ``stop`` was set while waiting."""
+    def acquire(self, key: tuple[str, int], stop: threading.Event, *, blocking: bool = True) -> bool:
+        """Admit ``key``'s mosaic; False = no slot (non-blocking) or ``stop`` set.
+
+        ``blocking=False`` is for LOOK-AHEAD admissions: the feeder must only
+        ever block on the CURRENT cell's slot (whose processing is what frees
+        slots) — blocking on a future cell's slot while the current one sits
+        unprocessed is a deadlock when deferred/retained mosaics hold the rest
+        of the budget. A denied look-ahead is retried on a later feed step.
+        """
         with self._lock:
             if key in self._held:
                 return True  # idempotent: look-ahead windows overlap
-        while not self._sem.acquire(timeout=1.0):
-            if stop.is_set():
-                return False
+        if blocking:
+            while not self._sem.acquire(timeout=1.0):
+                if stop.is_set():
+                    return False
+        elif not self._sem.acquire(blocking=False):
+            return False
         with self._lock:
             self._held.add(key)
         return True
@@ -300,15 +310,19 @@ def fill_zones_sequential(
         """Keep ingests running ahead of the feed head (idempotent starts).
 
         Every start is admitted through the mosaic budget first, so look-ahead
-        can never materialize more mosaics than the bound — this blocks the
-        feeder until a finalizing zone frees a slot, which is the intended
-        backpressure (ingest paced by fill throughput, ADR-011).
+        can never materialize more mosaics than the bound. Only the CURRENT
+        cell's admission may block (its processing is what frees slots —
+        blocking on a future cell's slot while the current one sits unprocessed
+        deadlocks once deferred/retained mosaics hold the rest of the budget);
+        look-ahead cells are admitted non-blocking and simply retried on later
+        feed steps when the budget is tight. That degradation IS the intended
+        backpressure: ingest paced by fill throughput (ADR-011).
         """
         if inputs is None or budget is None:
             return
-        for cell in cells[feed_index : feed_index + 1 + look_ahead]:
-            if not budget.acquire((cell.zone, cell.year), stop):
-                return  # stop set while waiting — the caller's loop unwinds
+        for offset, cell in enumerate(cells[feed_index : feed_index + 1 + look_ahead]):
+            if not budget.acquire((cell.zone, cell.year), stop, blocking=offset == 0):
+                return  # stop set (current) or budget tight (look-ahead) — retry next step
             inputs.start(cell.zone, cell.year)
 
     def _finalize(tally: _ZoneTally) -> None:
