@@ -28,7 +28,7 @@ from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.lifecycle import wait_for_actors
 from tessera_embeddings.inference.progress import ProgressTracker
-from tessera_embeddings.inference.scheduling import _process_chunks_work_stealing
+from tessera_embeddings.inference.scheduling import WorkItem, _process_chunks_work_stealing
 
 
 def run_inference(
@@ -44,6 +44,9 @@ def run_inference(
     on_actor_retire: Callable[[str], None] | None = None,
     get_credentials: Callable[[], Any] | None = None,
     s3_region: str | None = None,
+    retire_idle_actors: bool = True,
+    more_work: Callable[[], list[WorkItem] | None] | None = None,
+    on_item_done: Callable[[WorkItem, dict], None] | None = None,
 ) -> list[dict]:
     """Create Ray actors, run work-stealing inference, return per-chunk results.
 
@@ -75,6 +78,17 @@ def run_inference(
         s3_region: Optional S3 region for the mosaic repos, injected into every
             actor so its reads open the store in the same region the caller's
             preflight/assembly opens use. ``None`` uses icechunk's default region.
+        retire_idle_actors: Kill actors idle past the grace period at the run
+            tail (default); see ``scheduling._process_chunks_work_stealing``
+            for when a caller passes False.
+        more_work: Optional chained-session work source (see the scheduler's
+            docstring). With a source, ``chunks`` is typically empty and every
+            item carries its own :class:`~tessera_embeddings.inference.scheduling.ZoneContext`; the
+            single-zone resume scan is skipped (the source's feeder does its
+            own per-zone scan before enqueueing).
+        on_item_done: Optional per-item final-outcome callback (chained
+            sessions use it for per-zone completion accounting). Runs on the
+            scheduler thread — must not block.
 
     Returns:
         Per-chunk result dicts (status, valid pixel count, timing, etc.),
@@ -90,13 +104,18 @@ def run_inference(
         raise ValueError(f"num_actors must be >= 1, got {num_actors}")
 
     # --- Resume check: skip chunks already staged from a prior run ---
-    writer = ZarrWriter(staging_base)
-    already_done = writer.scan_existing_staged_chunks(
-        run_id,
-        chunks,
-        compute_std=config.compute_std,
-        log=log,
-    )
+    # Gated on a non-empty chunk list: a chained session starts empty (work
+    # arrives via more_work, each zone pre-scanned by its feeder), and its
+    # placeholder staging_base must not be listed.
+    already_done: set[str] = set()
+    if chunks:
+        writer = ZarrWriter(staging_base)
+        already_done = writer.scan_existing_staged_chunks(
+            run_id,
+            chunks,
+            compute_std=config.compute_std,
+            log=log,
+        )
     if already_done:
         remaining = len(chunks) - len(already_done)
         log.info(
@@ -152,7 +171,10 @@ def run_inference(
         )
 
         # --- Process chunks with work-stealing ---
-        log.info("Processing %d chunks across %d actors (work-stealing)", len(chunks), len(actors))
+        if more_work is not None:
+            log.info("Processing a chained multi-zone stream across %d actors (work-stealing)", len(actors))
+        else:
+            log.info("Processing %d chunks across %d actors (work-stealing)", len(chunks), len(actors))
 
         # Pin the ProgressTracker to a node with no GPUs (typically the head
         # node in a Ray cluster). Tracker is lightweight; keeping it off
@@ -185,6 +207,9 @@ def run_inference(
             actor_factory=actor_factory,
             total_actors_target=num_actors,
             placement_timeout_sec=config.actor_batch_placement_timeout_sec,
+            retire_idle_actors=retire_idle_actors,
+            more_work=more_work,
+            on_item_done=on_item_done,
         )
     finally:
         log.info("Killing %d actors to release resource reservations", len(actors))

@@ -31,6 +31,7 @@ from tessera_embeddings.config.inference import EMBEDDING_DIM, PREFETCH_DEPTH, S
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
+from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 from tessera_embeddings.storage.zarr_store import credentials_provider
 
@@ -967,9 +968,14 @@ class InferenceActor:
         t0 = time.monotonic()
         self._resource_monitor.set_context("work", f"{chunk.label}:prologue")
 
+        # Progress is tracked by the run-qualified uid, not the bare label: labels
+        # repeat across zones, and a shared multi-zone session (chained fill) can
+        # have two zones' same-labelled chunks in flight at once (see chunk_uid).
+        uid = chunk_uid(run_id, chunk.label)
+
         # Report loading phase so stall detection has visibility before batch 50
         if tracker:
-            tracker.report.remote(chunk.label, 0, 0, "loading")  # type: ignore[union-attr]
+            tracker.report.remote(uid, 0, 0, "loading")  # type: ignore[union-attr]
 
         try:
             # The prologue — repo handles, full-chunk SCL mask (which sizes the
@@ -1035,7 +1041,7 @@ class InferenceActor:
                 )
 
             on_batch = (
-                (lambda b, t: tracker.report.remote(chunk.label, b, t, "inference"))  # type: ignore[union-attr]
+                (lambda b, t: tracker.report.remote(uid, b, t, "inference"))  # type: ignore[union-attr]
                 if tracker
                 else None
             )
@@ -1082,7 +1088,7 @@ class InferenceActor:
                     # multi-strip load isn't misclassified as an inference stall
                     # by _poll_tracker. (Strip 0's "loading" was reported above.)
                     if tracker and i > 0:
-                        tracker.report.remote(chunk.label, 0, 0, "loading")  # type: ignore[union-attr]
+                        tracker.report.remote(uid, 0, 0, "loading")  # type: ignore[union-attr]
 
                     # Release the previous strip's input arrays BEFORE blocking
                     # on this strip's load and submitting the next prefetch. The

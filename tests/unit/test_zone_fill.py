@@ -664,3 +664,94 @@ def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatc
     )
     assert retry["already_complete"] is True
     assert repo.lookup_tag("zone-01N-2025") == retry["snapshot_id"]
+
+
+# ===========================================================================
+# Phase split: infer_zone_year / assemble_zone_year (the sequential runner's API)
+# ===========================================================================
+
+
+def test_phase_split_matches_composed_fill(tmp_path, monkeypatch):
+    """Infer → handoff → assemble lands the same store state and summary shape
+    as the composed fill_zone_year (which is their back-to-back composition).
+    """
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0), (1, 1)])
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
+
+    handoff = zone_fill.infer_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2025,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="runP",
+    )
+    assert handoff.done is None
+    assert len(handoff.live) == 2 and len(handoff.results) == 2
+
+    summary = zone_fill.assemble_zone_year(
+        handoff,
+        store_path=store,
+        staging_base=str(tmp_path / "staging"),
+        log=log,
+    )
+    assert summary["empty"] is False and summary["succeeded"] == 2
+    assert summary["tag"] == zone_fill.zone_year_tag(_ZONE, 2025)
+    # The year is recorded complete — the composed path's end state.
+    assert zone_fill.zone_year_complete(store, _ZONE, 2025)
+
+
+def test_infer_phase_threads_retirement_gate(tmp_path, monkeypatch):
+    """The sequential runner's retire_idle_actors=False must reach run_inference —
+    it is what keeps a zone tail from draining the shared cluster.
+    """
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0)])
+    seen: dict = {}
+    staged: dict[str, np.ndarray] = {}
+    base_stub = _staging_inference_stub(staged)
+
+    def recording_stub(*args, **kwargs):
+        seen.update(kwargs)
+        return base_stub(*args, **kwargs)
+
+    monkeypatch.setattr(zone_fill, "run_inference", recording_stub)
+    zone_fill.infer_zone_year(
+        store_path=store,
+        zone=_ZONE,
+        year=2025,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        staging_base=str(tmp_path / "staging"),
+        config=_config(),
+        num_actors=1,
+        log=log,
+        run_id="runR",
+        retire_idle_actors=False,
+    )
+    assert seen["retire_idle_actors"] is False
+
+
+def test_terminal_handoff_passes_through_assembly(tmp_path):
+    done = {"zone": _ZONE, "year": 2025, "already_complete": True}
+    handoff = zone_fill.ZoneFillHandoff(
+        zone=_ZONE, year=2025, run_id="r", t0=0.0, summary={}, live=[], results=[], done=done
+    )
+    assert zone_fill.assemble_zone_year(handoff, store_path="unused", staging_base="unused", log=log) is done
+
+
+def test_zone_live_tile_count(tmp_path):
+    mask = _make_mask(tmp_path, [(0, 0), (0, 1), (1, 0)])
+    assert zone_fill.zone_live_tile_count(mask, _ZONE) == 3
+    assert zone_fill.zone_has_live_tiles(mask, _ZONE) is True
+    empty_mask = _make_mask(tmp_path / "m2", [])
+    assert zone_fill.zone_live_tile_count(empty_mask, _ZONE) == 0
+    assert zone_fill.zone_has_live_tiles(empty_mask, _ZONE) is False

@@ -4,7 +4,7 @@ Provisions a Ray GPU cluster, runs the zone-fill runner
 (:func:`tessera_embeddings.orchestration.runners.zone_fill.fill_zone_year` —
 coverage mask → inference → shard assembly → tag), and tears the cluster down.
 Mirrors :mod:`tessera_embeddings`'s single-flow Ray pattern (``ray_cluster``
-context manager + module-state cancellation hook).
+context manager; the cancellation hook is shared via :mod:`._ray_lifecycle`).
 
 **Concurrency model (ADR-008 D6).** Inference is embarrassingly parallel across
 zones — nothing is shared and nothing commits — so many of these flow runs can
@@ -19,15 +19,12 @@ conflict) is the campaign driver's job, not this flow's.
 
 from __future__ import annotations
 
-import logging
-import subprocess
+import threading
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, cast
 
-import yaml
 from prefect import flow, get_run_logger
 from prefect.concurrency.sync import concurrency
 from prefect.runtime import flow_run as flow_run_ctx
@@ -39,27 +36,23 @@ from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.conventions import expected_model_url
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
+from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
+    activate,
+    deactivate,
+    ray_cleanup_on_cancellation,
+)
 from tessera_embeddings.orchestration.runners.zone_fill import (
     fill_zone_year,
     zone_has_live_tiles,
     zone_year_complete,
     zone_year_on_axis,
 )
-from tessera_embeddings.providers.aws.ray import (
-    RAY_DOWN_TIMEOUT_S,
-    cleanup_ray_tempfiles,
-    cluster_name_for_flow_run,
-    terminate_ray_instances_by_tag,
-)
+from tessera_embeddings.providers.aws.ray import cluster_name_for_flow_run
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 if TYPE_CHECKING:
     import icechunk
-
-# Module-level state for the cancellation hook (set on entry, cleared on exit).
-_active_resolved_yaml: str | None = None
-_active_cluster_name: str | None = None
 
 
 class _PrefectCommitGate(AbstractContextManager):
@@ -77,23 +70,31 @@ class _PrefectCommitGate(AbstractContextManager):
     proceed UNGATED — silently reintroducing the rebase/commit storm the gate
     exists to prevent. Strict mode raises instead, so the limit must be
     provisioned explicitly (see the campaign runbook).
+
+    THREAD-SAFE: the active context lives in a per-thread stack, not an instance
+    slot — the chained fill shares ONE gate between its feeder thread (terminal
+    plans commit inside ``plan``) and its trailing-assembly thread, and an
+    instance slot would let a concurrent enter overwrite the other thread's
+    context and release the wrong slot on exit.
     """
 
     def __init__(self, name: str, occupy: int = 1) -> None:
         self._name = name
         self._occupy = occupy
-        self._cm: AbstractContextManager[Any] | None = None
+        self._local = threading.local()
 
     def __enter__(self) -> None:
-        self._cm = concurrency(self._name, occupy=self._occupy, strict=True)
-        self._cm.__enter__()
+        cm = concurrency(self._name, occupy=self._occupy, strict=True)
+        cm.__enter__()
+        stack: list[AbstractContextManager[Any]] = getattr(self._local, "stack", [])
+        stack.append(cm)
+        self._local.stack = stack
 
     def __exit__(
         self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
     ) -> None:
-        assert self._cm is not None
-        self._cm.__exit__(exc_type, exc, tb)
-        self._cm = None
+        cm = self._local.stack.pop()
+        cm.__exit__(exc_type, exc, tb)
 
 
 def _assert_seeded_model_matches(
@@ -141,51 +142,10 @@ def _assert_seeded_model_matches(
         )
 
 
-def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
-    """Emergency Ray teardown when the flow is CANCELLED or CRASHES.
-
-    Registered as BOTH ``on_cancellation`` and ``on_crashed`` — a crashed run
-    (OOM, host loss, unhandled error) is exactly as leak-prone as a cancelled
-    one: the ``ray up`` head node persists on EC2 until explicitly torn down, so
-    without a crash hook a crashed fill would leak the whole GPU fleet forever
-    (unlike the Dask ingest flows, whose scheduler self-terminates on its idle
-    timeout). Prefect may run this in a FRESH module import (the flow's process
-    is killed first), so it re-derives the cluster name from ``flow_run.id`` via
-    :func:`cluster_name_for_flow_run` when the module globals are unset.
-    """
-    log = logging.getLogger(__name__)
-    log.warning("Flow cancelled/crashed — tearing down Ray cluster")
-    fallback_cluster = _active_cluster_name or cluster_name_for_flow_run(getattr(flow_run, "id", None))
-    if _active_resolved_yaml and Path(_active_resolved_yaml).exists():
-        # Bound the call and swallow launch failures: a hung `ray down` (unreachable
-        # head, wedged CLI) OR an OSError before it even produces a return code (e.g.
-        # `ray` not on PATH) must not block the tag-based termination fallback and leak
-        # billed EC2 workers. Both are treated as failure (rc=-1) so the fallback fires,
-        # and tempfile cleanup runs in `finally` regardless of outcome.
-        rc = -1
-        try:
-            rc = subprocess.run(
-                ["ray", "down", _active_resolved_yaml, "-y"], check=False, timeout=RAY_DOWN_TIMEOUT_S
-            ).returncode
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            log.warning("`ray down` did not complete (%s) — terminating instances by tag", exc)
-        finally:
-            cleanup_ray_tempfiles(_active_resolved_yaml)
-        # A non-zero/timed-out/failed `ray down` leaves EC2 instances running; fall back
-        # to terminating them by cluster tag rather than silently leaking them.
-        if rc != 0 and fallback_cluster:
-            log.warning("`ray down` exited %d — terminating instances for cluster %r by tag", rc, fallback_cluster)
-            terminate_ray_instances_by_tag(cluster_name=fallback_cluster, log=log)
-    elif fallback_cluster:
-        terminate_ray_instances_by_tag(cluster_name=fallback_cluster, log=log)
-    else:
-        log.warning("Cancellation fired before the cluster was provisioned — check the AWS console manually.")
-
-
 @flow(
     name="fill-zone-year",
-    on_cancellation=[_ray_cleanup_on_cancellation],
-    on_crashed=[_ray_cleanup_on_cancellation],
+    on_cancellation=[ray_cleanup_on_cancellation],
+    on_crashed=[ray_cleanup_on_cancellation],
 )
 def fill_zone_year_flow(
     *,
@@ -397,28 +357,28 @@ def fill_zone_year_flow(
     # Region matches ray_cluster's default (this flow provisions there).
     fill_kwargs["on_actor_retire"] = make_instance_terminator(log=log)
 
-    global _active_resolved_yaml, _active_cluster_name
-    # Pin a deterministic cluster name from the flow-run id so the cancellation/crash
-    # hook can re-derive it and terminate the fleet by tag even when it runs in a fresh
-    # module import (globals unset) — without this, a cancel before `_active_cluster_name`
-    # is read from the YAML would hit the "no cluster name" path and leak the GPU fleet.
-    with ray_cluster(
-        log,
-        ami_ssm_name=ami_ssm_name,
-        ssm_prefix=ssm_prefix,
-        cloudwatch_log_group=cloudwatch_log_group,
-        code_bucket=code_bucket,
-        code_suffix=code_suffix,
-        cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
-    ) as resolved_yaml:
-        _active_resolved_yaml = resolved_yaml
-        if resolved_yaml and Path(resolved_yaml).exists():
-            with Path(resolved_yaml).open() as f:
-                _active_cluster_name = yaml.safe_load(f).get("cluster_name")
-
-        summary = fill_zone_year(**fill_kwargs)
-    _active_resolved_yaml = None
-    _active_cluster_name = None
+    try:
+        # Pin a deterministic cluster name from the flow-run id so the cancellation
+        # hook can re-derive it and terminate the fleet by tag even when it runs in a
+        # fresh module import (globals unset) — without this, a cancel before
+        # `activate()` records the name would hit the "no cluster name" path and leak
+        # the GPU fleet.
+        with ray_cluster(
+            log,
+            ami_ssm_name=ami_ssm_name,
+            ssm_prefix=ssm_prefix,
+            cloudwatch_log_group=cloudwatch_log_group,
+            code_bucket=code_bucket,
+            code_suffix=code_suffix,
+            cluster_name=cluster_name_for_flow_run(flow_run_ctx.id),
+        ) as resolved_yaml:
+            activate(resolved_yaml)
+            summary = fill_zone_year(**fill_kwargs)
+    finally:
+        # Clear the hook state only AFTER the context manager's teardown has
+        # run (or failed into the hook's remit) — and also on the exception
+        # path, which the old success-only clearing missed.
+        deactivate()
 
     log.info("Zone %s year %d filled: %s", zone, year, summary.get("tag"))
     return summary

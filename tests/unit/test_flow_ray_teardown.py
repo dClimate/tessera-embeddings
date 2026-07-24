@@ -13,7 +13,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import tessera_embeddings.orchestration.prefect.flows._ray_lifecycle as lifecycle_mod
 import tessera_embeddings.orchestration.prefect.flows.fill_zone_year as fill_mod
+import tessera_embeddings.orchestration.prefect.flows.fill_zones_sequential as seq_mod
 import tessera_embeddings.orchestration.prefect.flows.tessera_embeddings as flows_mod
 from tessera_embeddings.orchestration.prefect.flows.tessera_embeddings import (
     _cluster_name_for_flow_run,
@@ -99,44 +101,63 @@ def test_hook_falls_through_on_ray_down_launch_error(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# fill-zone-year teardown hook (separate implementation, same guarantees)
+# shared campaign-flow teardown hook (_ray_lifecycle: fill-zone-year +
+# fill-zones-sequential register the same hook; same guarantees as above)
 # ---------------------------------------------------------------------------
 
 
-def test_fill_hook_bounds_ray_down_and_terminates_by_tag(tmp_path: Path) -> None:
-    """The fill flow's teardown hook bounds `ray down`; a hang/launch failure still
-    cleans up the tempfile and terminates the cluster by tag (no leaked GPU fleet).
+def test_lifecycle_hook_bounds_ray_down_and_terminates_by_tag(tmp_path: Path) -> None:
+    """The shared campaign teardown hook bounds `ray down`; a hang/launch failure
+    still cleans up the tempfile and terminates the cluster by tag (no leaked fleet).
     """
     yaml_file = tmp_path / "resolved.yaml"
     yaml_file.write_text("cluster_name: x\n")
     with (
-        patch.object(fill_mod, "_active_resolved_yaml", str(yaml_file)),
-        patch.object(fill_mod, "_active_cluster_name", "tessera-inference-fill01"),
-        patch.object(fill_mod, "terminate_ray_instances_by_tag") as terminate,
-        patch.object(fill_mod, "cleanup_ray_tempfiles") as cleanup,
+        patch.object(lifecycle_mod, "_active_resolved_yaml", str(yaml_file)),
+        patch.object(lifecycle_mod, "_active_cluster_name", "tessera-inference-fill01"),
+        patch.object(lifecycle_mod, "terminate_ray_instances_by_tag") as terminate,
+        patch.object(lifecycle_mod, "cleanup_ray_tempfiles") as cleanup,
         patch.object(
-            fill_mod.subprocess,
+            lifecycle_mod.subprocess,
             "run",
-            side_effect=subprocess.TimeoutExpired(cmd="ray down", timeout=fill_mod.RAY_DOWN_TIMEOUT_S),
+            side_effect=subprocess.TimeoutExpired(cmd="ray down", timeout=lifecycle_mod.RAY_DOWN_TIMEOUT_S),
         ) as ray_down,
     ):
-        fill_mod._ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
-    assert ray_down.call_args.kwargs["timeout"] == fill_mod.RAY_DOWN_TIMEOUT_S
+        lifecycle_mod.ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
+    assert ray_down.call_args.kwargs["timeout"] == lifecycle_mod.RAY_DOWN_TIMEOUT_S
     cleanup.assert_called_once_with(str(yaml_file))
     terminate.assert_called_once_with(cluster_name="tessera-inference-fill01", log=terminate.call_args.kwargs["log"])
 
 
-def test_fill_hook_derives_cluster_name_in_fresh_process(tmp_path: Path) -> None:
-    """In a fresh import (module globals unset) the fill hook re-derives the cluster
-    name from flow_run.id and terminates by tag — the deterministic-name fix so a
-    cancel before the YAML is read cannot leak the fleet.
+def test_lifecycle_hook_swallows_ray_down_launch_error(tmp_path: Path) -> None:
+    """An OSError before `ray down` produces a return code (e.g. `ray` not on PATH)
+    must not escape the hook — cleanup and tag-based termination still run.
+    """
+    yaml_file = tmp_path / "resolved.yaml"
+    yaml_file.write_text("cluster_name: x\n")
+    with (
+        patch.object(lifecycle_mod, "_active_resolved_yaml", str(yaml_file)),
+        patch.object(lifecycle_mod, "_active_cluster_name", "tessera-inference-fill01"),
+        patch.object(lifecycle_mod, "terminate_ray_instances_by_tag") as terminate,
+        patch.object(lifecycle_mod, "cleanup_ray_tempfiles") as cleanup,
+        patch.object(lifecycle_mod.subprocess, "run", side_effect=OSError("ray: command not found")),
+    ):
+        lifecycle_mod.ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
+    cleanup.assert_called_once_with(str(yaml_file))
+    terminate.assert_called_once()
+
+
+def test_lifecycle_hook_derives_cluster_name_in_fresh_process(tmp_path: Path) -> None:
+    """In a fresh import (module globals unset) the shared hook re-derives the
+    cluster name from flow_run.id and terminates by tag — the deterministic-name
+    fix so a cancel before activate() records the name cannot leak the fleet.
     """
     with (
-        patch.object(fill_mod, "_active_resolved_yaml", None),
-        patch.object(fill_mod, "_active_cluster_name", None),
-        patch.object(fill_mod, "terminate_ray_instances_by_tag") as terminate,
+        patch.object(lifecycle_mod, "_active_resolved_yaml", None),
+        patch.object(lifecycle_mod, "_active_cluster_name", None),
+        patch.object(lifecycle_mod, "terminate_ray_instances_by_tag") as terminate,
     ):
-        fill_mod._ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
+        lifecycle_mod.ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
     terminate.assert_called_once()
     assert terminate.call_args.kwargs["cluster_name"] == "tessera-inference-1cb5e1da"
 
@@ -151,10 +172,20 @@ def test_fill_zone_year_registers_teardown_on_cancel_and_crash() -> None:
     """The per-cell GPU fill must tear down on cancel AND crash (a crashed run
     would otherwise leak the whole Ray GPU fleet — the Dask ingest flows self-heal
     via their scheduler idle-timeout, but a `ray up` head persists until torn down).
+    It uses the SHARED :mod:`._ray_lifecycle` hook (not a per-flow copy).
     """
     flow = fill_mod.fill_zone_year_flow
-    assert fill_mod._ray_cleanup_on_cancellation in flow.on_cancellation_hooks
-    assert fill_mod._ray_cleanup_on_cancellation in flow.on_crashed_hooks
+    assert lifecycle_mod.ray_cleanup_on_cancellation in flow.on_cancellation_hooks
+    assert lifecycle_mod.ray_cleanup_on_cancellation in flow.on_crashed_hooks
+
+
+def test_fill_zones_sequential_registers_teardown_on_cancel_and_crash() -> None:
+    """The shared-cluster GPU fill has the same both-hooks contract via the shared
+    hook — a crashed year-long run must not leak its long-lived Ray cluster.
+    """
+    flow = seq_mod.fill_zones_sequential_flow
+    assert lifecycle_mod.ray_cleanup_on_cancellation in flow.on_cancellation_hooks
+    assert lifecycle_mod.ray_cleanup_on_cancellation in flow.on_crashed_hooks
 
 
 def test_tessera_embeddings_registers_teardown_on_cancel_and_crash() -> None:

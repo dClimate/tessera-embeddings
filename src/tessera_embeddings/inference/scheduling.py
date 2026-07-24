@@ -16,6 +16,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, cast
 
 import ray
@@ -24,6 +25,50 @@ from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.inference.actors import InferenceActor
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.diagnostics import log_worker_failure_diagnostic
+from tessera_embeddings.inference.progress import chunk_uid
+
+
+@dataclass(frozen=True)
+class ZoneContext:
+    """Where a chunk's inputs live and where its staging goes.
+
+    One per (zone, year) cell. A single-zone run has exactly one (built from
+    ``_process_chunks_work_stealing``'s scalar args); a chained multi-zone
+    session has one per zone, carried on every :class:`WorkItem` so chunks
+    from consecutive zones can coexist in one scheduler queue. Frozen so
+    equality is value-based — the reservation path uses ``ctx == ctx`` to
+    restrict prefetch hints to same-zone successors (a cross-zone hint would
+    make the actor prefetch from the wrong mosaic).
+    """
+
+    mosaic_base: str
+    staging_base: str
+    run_id: str
+
+
+@dataclass(frozen=True)
+class WorkItem:
+    """One chunk plus the zone context it must be processed under.
+
+    ``uid`` (run_id-qualified label) keys all scheduler bookkeeping: chunk
+    labels repeat across zones (every zone has a ``chunk_0_0``), so bare
+    labels would alias retry counts and requeues between a finishing zone's
+    tail and the next zone's head. Run ids are campaign-unique per cell
+    (input-fingerprinted), so ``run_id:label`` is collision-free.
+    """
+
+    chunk: ChunkSpec
+    ctx: ZoneContext
+
+    @property
+    def uid(self) -> str:
+        """Scheduler-unique key for this item (labels alone collide across zones)."""
+        return chunk_uid(self.ctx.run_id, self.chunk.label)
+
+
+def _as_item(work: WorkItem | ChunkSpec, ctx: ZoneContext) -> WorkItem:
+    """Normalize a bare ChunkSpec (legacy callers/tests) into a WorkItem."""
+    return work if isinstance(work, WorkItem) else WorkItem(chunk=work, ctx=ctx)
 
 
 class ActorPool:
@@ -75,11 +120,15 @@ class ActorPool:
 
         self.actor_deaths: int = 0
 
-        # ref → (chunk_label, actor_idx)
-        self.pending: dict[ray.ObjectRef, tuple[str, int]] = {}
+        # ref → (WorkItem, actor_idx). (Some pool unit tests insert bare
+        # labels in the WorkItem slot; the pool itself only reads the actor
+        # index from entries it did not create.)
+        self.pending: dict[ray.ObjectRef, tuple[Any, int]] = {}
+        # Retry counts keyed by WorkItem.uid (run_id-qualified — bare labels
+        # collide across a chained session's zones).
         self.chunk_attempts: dict[str, int] = {}
 
-        # actor_idx → the chunk reserved as that actor's next assignment. A
+        # actor_idx → the item reserved as that actor's next assignment. A
         # reservation is created at submit time and passed to the actor as
         # ``prefetch_hint`` so it can prefetch a BOUNDED starter payload (mask
         # + 256-row starter strip, hard-capped ~2 GiB — see actors.py
@@ -87,7 +136,10 @@ class ActorPool:
         # removed Phase-1 interleaving co-resided) during the current chunk's
         # tail inference. Reservations stop when the queue is shallower than
         # the live pool; a failed actor's reservation is requeued to the front.
-        self.reserved: dict[int, ChunkSpec] = {}
+        # Only SAME-ZONE successors are reserved — the actor prefetches the
+        # hint from the CURRENT call's mosaic, so a cross-zone hint would read
+        # the wrong store (see submit()).
+        self.reserved: dict[int, WorkItem] = {}
 
         self._pending_iid_refs: dict[int, ray.ObjectRef] = {}
         self._initializing: set[int] = set()
@@ -187,61 +239,83 @@ class ActorPool:
     def submit(
         self,
         actor_idx: int,
-        chunk: ChunkSpec,
-        mosaic_base: str,
-        staging_base: str,
-        run_id: str,
-        tracker: ray.actor.ActorHandle | None,
-        chunk_queue: deque[ChunkSpec] | None = None,
+        work: WorkItem | ChunkSpec,
+        mosaic_base: str | None = None,
+        staging_base: str | None = None,
+        run_id: str | None = None,
+        tracker: ray.actor.ActorHandle | None = None,
+        chunk_queue: deque[WorkItem | ChunkSpec] | None = None,
     ) -> None:
-        """Submit a single chunk to an actor and record the pending future.
+        """Submit a single work item to an actor and record the pending future.
 
-        When ``chunk_queue`` is supplied and still deep, the queue head is also
-        popped and RESERVED as this actor's next assignment, riding along as
-        ``prefetch_hint`` so the actor can prefetch that chunk's capped starter
-        payload during this chunk's tail inference (see actors.py). Reservations
-        stop when the queue is shallower than the live pool
-        (``len(queue) <= live_count``): at the tail of a run a reserved chunk
-        would pin work to a busy actor while other actors sit idle, which costs
-        more than the prologue overlap saves.
+        ``work`` is a :class:`WorkItem`, or (legacy callers/tests) a bare
+        ``ChunkSpec`` wrapped with the scalar path args into a single-zone
+        item. When ``chunk_queue`` is supplied and still deep, the queue head
+        is also popped and RESERVED as this actor's next assignment, riding
+        along as ``prefetch_hint`` so the actor can prefetch that chunk's
+        capped starter payload during this chunk's tail inference (see
+        actors.py). Reservations stop when the queue is shallower than the
+        live pool (``len(queue) <= live_count``): at the tail of a run a
+        reserved chunk would pin work to a busy actor while other actors sit
+        idle, which costs more than the prologue overlap saves. A queue head
+        from a DIFFERENT zone is never reserved: the actor prefetches the hint
+        from the current call's mosaic, so a cross-zone hint would read the
+        wrong store — the next zone's first chunks load serially instead.
 
         Args:
             actor_idx: Index into self.actors.
-            chunk: Chunk to process.
-            mosaic_base: Base path for mosaic stores.
-            staging_base: Base path for staged output.
-            run_id: Run identifier.
+            work: Work item (or bare chunk, wrapped with the path args below).
+            mosaic_base: Base path for mosaic stores (bare-chunk callers only).
+            staging_base: Base path for staged output (bare-chunk callers only).
+            run_id: Run identifier (bare-chunk callers only).
             tracker: Optional ProgressTracker actor handle.
             chunk_queue: Remaining-work queue; the reservation source. ``None``
                 disables reservation (tests and direct callers).
         """
+        if isinstance(work, WorkItem):
+            item = work
+        else:
+            if mosaic_base is None or staging_base is None or run_id is None:
+                raise TypeError("bare-ChunkSpec submit requires mosaic_base, staging_base and run_id")
+            item = WorkItem(chunk=work, ctx=ZoneContext(mosaic_base, staging_base, run_id))
         self.resolve_iid(actor_idx)  # best-effort resolve before dispatch
         if actor_idx in self.reserved:
             # Defensive: a reservation should have been consumed or returned
             # before this actor is re-dispatched; don't strand the chunk.
             stranded = self.reserved.pop(actor_idx)
-            self.log.warning("Actor %d re-dispatched holding reservation %s — requeuing it", actor_idx, stranded.label)
+            self.log.warning(
+                "Actor %d re-dispatched holding reservation %s — requeuing it", actor_idx, stranded.chunk.label
+            )
             if chunk_queue is not None:
                 chunk_queue.appendleft(stranded)
 
-        hint: ChunkSpec | None = None
-        if chunk_queue is not None and len(chunk_queue) > self.live_count:
-            hint = chunk_queue.popleft()
+        hint: WorkItem | None = None
+        if (
+            chunk_queue is not None
+            and len(chunk_queue) > self.live_count
+            and _as_item(chunk_queue[0], item.ctx).ctx == item.ctx
+        ):
+            hint = _as_item(chunk_queue.popleft(), item.ctx)
             self.reserved[actor_idx] = hint
 
         ref: ray.ObjectRef = self.actors[actor_idx].process_chunk.remote(  # type: ignore[union-attr]
-            chunk, mosaic_base, staging_base, run_id, tracker=tracker, prefetch_hint=hint
+            item.chunk,
+            item.ctx.mosaic_base,
+            item.ctx.staging_base,
+            item.ctx.run_id,
+            tracker=tracker,
+            prefetch_hint=hint.chunk if hint is not None else None,
         )
-        self.pending[ref] = (chunk.label, actor_idx)
-        self.chunk_attempts[chunk.label] = self.chunk_attempts.get(chunk.label, 0) + 1
+        self.pending[ref] = (item, actor_idx)
+        self.chunk_attempts[item.uid] = self.chunk_attempts.get(item.uid, 0) + 1
 
-    def take_reserved(self, actor_idx: int) -> ChunkSpec | None:
-        """Pop and return the chunk reserved for this actor, if any."""
+    def take_reserved(self, actor_idx: int) -> WorkItem | None:
+        """Pop and return the item reserved for this actor, if any."""
         return self.reserved.pop(actor_idx, None)
 
     def seed(
         self,
-        chunk_queue: deque[ChunkSpec],
+        chunk_queue: deque[WorkItem | ChunkSpec],
         mosaic_base: str,
         staging_base: str,
         run_id: str,
@@ -270,7 +344,7 @@ class ActorPool:
 
     def dispatch_idle(
         self,
-        chunk_queue: deque[ChunkSpec],
+        chunk_queue: deque[WorkItem | ChunkSpec],
         mosaic_base: str,
         staging_base: str,
         run_id: str,
@@ -626,6 +700,9 @@ def _process_chunks_work_stealing(
     actor_factory: Callable[[int], list[ray.actor.ActorHandle]] | None = None,
     total_actors_target: int | None = None,
     placement_timeout_sec: float = 300.0,
+    retire_idle_actors: bool = True,
+    more_work: Callable[[], list[WorkItem] | None] | None = None,
+    on_item_done: Callable[[WorkItem, dict], None] | None = None,
 ) -> list[dict]:
     """Process chunks with dynamic work-stealing across actors.
 
@@ -674,13 +751,33 @@ def _process_chunks_work_stealing(
         placement_timeout_sec: Max seconds to wait for a batch's instances to be
             placed before requesting the next batch anyway (capacity-shortfall
             escape hatch).
+        retire_idle_actors: Kill actors idle past the grace period as the run's
+            tail drains (the default). A chained multi-zone fill leaves this
+            True and relies on the ``more_work`` gate below; a caller managing
+            zones as separate calls passes False for every zone but its last —
+            the "surplus" workers are the NEXT zone's fleet, and retiring them
+            would idle-drain the shared cluster's instances at every zone tail
+            (see ``orchestration.runners.sequential_fill``).
+        more_work: Optional pull source for a chained multi-zone session.
+            Polled (non-blocking) whenever the queue is at or below the live
+            actor count: a list extends the queue (its items carry their own
+            :class:`ZoneContext`), ``[]`` means nothing ready YET (the loop
+            stays alive and keeps polling), ``None`` means exhausted forever.
+            While the source is unexhausted, idle retirement is suppressed —
+            apparently-idle actors are the next zone's fleet — and the loop
+            does not exit on an empty queue.
+        on_item_done: Optional callback fired exactly once per work item at
+            its FINAL outcome — success (after any deferred write confirms) or
+            permanent failure — with the item and its result dict. A chained
+            session uses it for per-zone completion accounting; it runs on the
+            scheduler thread, so it must not block.
 
     Returns:
         List of result dicts (status, chunk label, timing, etc.).
     """
-    chunk_queue: deque[ChunkSpec] = deque(chunks)
+    default_ctx = ZoneContext(mosaic_base, staging_base, run_id)
+    chunk_queue: deque[WorkItem | ChunkSpec] = deque(_as_item(c, default_ctx) for c in chunks)
     n_total = len(chunk_queue)
-    chunk_by_label = {c.label: c for c in chunks}
 
     pool = ActorPool(
         actors,
@@ -764,7 +861,7 @@ def _process_chunks_work_stealing(
             " — placement timed out, requesting anyway" if timed_out else "",
         )
 
-    def _handle_failure(chunk_label: str, actor_idx: int, error: str) -> None:
+    def _handle_failure(item: WorkItem, actor_idx: int, error: str) -> None:
         """Retry a failed chunk on a different worker and kill the failing actor.
 
         Shared by both failure modes: an actor whose process died (ray.get
@@ -775,12 +872,13 @@ def _process_chunks_work_stealing(
         keep failing on subsequent chunks — is taken out of rotation.
 
         Args:
-            chunk_label: Label of the chunk that failed.
+            item: The work item that failed.
             actor_idx: Slot of the actor that failed it.
             error: Error string (from the exception or the failed result dict).
         """
+        chunk_label = item.chunk.label
         if tracker:
-            tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
+            tracker.remove.remote(item.uid)  # type: ignore[union-attr]  # run-qualified: labels alias across zones
         # The actor is killed below, taking its writer thread with it — any
         # deferred write it still held is of unknown state, so requeue that
         # chunk too. Safe: staged writes are idempotent (run-scoped keys,
@@ -788,15 +886,18 @@ def _process_chunks_work_stealing(
         orphaned = pending_write.pop(actor_idx, None)
         if orphaned is not None:
             _requeue_unconfirmed(orphaned, f"actor {actor_idx} failed with the write in flight")
+
         # Its reserved next chunk (whose starter payload only this actor may
         # have prefetched) goes back to the queue FRONT for a healthy actor.
         reserved = pool.take_reserved(actor_idx)
         if reserved is not None:
             chunk_queue.appendleft(reserved)
-            log.info("Returned reserved chunk %s from failed actor %d to the queue front", reserved.label, actor_idx)
+            log.info(
+                "Returned reserved chunk %s from failed actor %d to the queue front", reserved.chunk.label, actor_idx
+            )
         pool.resolve_iid(actor_idx)
         instance_id = pool.actor_instance_ids[actor_idx]
-        attempts = pool.chunk_attempts.get(chunk_label, 1)
+        attempts = pool.chunk_attempts.get(item.uid, 1)
         # attempts starts at 1 on first submission, so max_chunk_retries=2
         # means first try + 2 re-queues = 3 total attempts.
         if attempts <= max_chunk_retries:
@@ -809,7 +910,7 @@ def _process_chunks_work_stealing(
                 max_chunk_retries,
                 error,
             )
-            chunk_queue.append(chunk_by_label[chunk_label])
+            chunk_queue.append(item)
         else:
             log.error(
                 "Chunk %s PERMANENTLY FAILED on instance %s (actor %d, attempt %d/%d): %s",
@@ -820,15 +921,16 @@ def _process_chunks_work_stealing(
                 max_chunk_retries,
                 error,
             )
-            results.append(
-                {
-                    "chunk": chunk_label,
-                    "status": "failed",
-                    "error": error,
-                    "instance_id": instance_id,
-                    "attempts": attempts,
-                }
-            )
+            failed = {
+                "chunk": chunk_label,
+                "status": "failed",
+                "error": error,
+                "instance_id": instance_id,
+                "attempts": attempts,
+            }
+            results.append(failed)
+            if on_item_done is not None:
+                on_item_done(item, failed)
 
         # Query CloudWatch for resource telemetry leading up to the failure
         log_worker_failure_diagnostic(instance_id, chunk_label, error, log)
@@ -844,12 +946,13 @@ def _process_chunks_work_stealing(
     # outcome arrives: piggybacked as prior_write on the actor's next result,
     # or pulled via flush_writes() once the actor idles. On failure or actor
     # death the chunk requeues (staged writes are idempotent).
-    pending_write: dict[int, dict] = {}  # actor_idx -> deferred result dict
+    pending_write: dict[int, tuple[WorkItem, dict]] = {}  # actor_idx -> (item, deferred result)
 
-    def _requeue_unconfirmed(deferred: dict, reason: str) -> None:
+    def _requeue_unconfirmed(entry: tuple[WorkItem, dict], reason: str) -> None:
         """Requeue a deferred chunk whose write failed or is of unknown state."""
+        item, deferred = entry
         label = str(deferred["chunk"])
-        attempts = pool.chunk_attempts.get(label, 1)
+        attempts = pool.chunk_attempts.get(item.uid, 1)
         if attempts <= max_chunk_retries:
             log.warning(
                 "Chunk %s staging write unconfirmed (%s, attempt %d/%d) — re-queuing",
@@ -858,27 +961,31 @@ def _process_chunks_work_stealing(
                 attempts,
                 max_chunk_retries,
             )
-            chunk_queue.append(chunk_by_label[label])
+            chunk_queue.append(item)
         else:
             log.error("Chunk %s PERMANENTLY FAILED: staging write unconfirmed (%s)", label, reason)
-            results.append(
-                {"chunk": label, "status": "failed", "error": f"staging write: {reason}", "attempts": attempts}
-            )
+            failed = {"chunk": label, "status": "failed", "error": f"staging write: {reason}", "attempts": attempts}
+            results.append(failed)
+            if on_item_done is not None:
+                on_item_done(item, failed)
 
     def _finalize_prior_write(actor_idx: int, prior: dict) -> None:
         """Resolve a deferred chunk using the write outcome its actor reported."""
-        deferred = pending_write.pop(actor_idx, None)
-        if deferred is None:
+        entry = pending_write.pop(actor_idx, None)
+        if entry is None:
             log.warning("Actor %d reported a write outcome for %s but none was pending", actor_idx, prior.get("label"))
             return
+        item, deferred = entry
         if prior.get("ok"):
             deferred["write_confirmed"] = True
             results.append(deferred)
+            if on_item_done is not None:
+                on_item_done(item, deferred)
         else:
             # A plain write error leaves the actor healthy (it just inferred a
             # whole chunk) — requeue without the kill-and-replace used for
             # inference failures.
-            _requeue_unconfirmed(deferred, str(prior.get("error", "unknown write error")))
+            _requeue_unconfirmed(entry, str(prior.get("error", "unknown write error")))
             if prior.get("timed_out"):
                 # ...but a TIMEOUT means the upload is still wedged in the
                 # actor's single-slot writer pool; keep dispatching to it and
@@ -920,16 +1027,51 @@ def _process_chunks_work_stealing(
     # actor) so the progress line can report fleet GPU-hours consumed so far.
     gpu_seconds = 0.0
     last_tick = time.monotonic()
+    # A chained session's work source: while unexhausted, the loop must stay
+    # alive through empty-queue gaps (the next zone may still be ingesting)
+    # and must not retire "idle" actors (they are the next zone's fleet).
+    source_active = more_work is not None
     # Stay alive while any work remains: in-flight chunks, deferred writes
-    # awaiting confirmation, OR queued chunks with a live actor to run them.
+    # awaiting confirmation, queued chunks with a live actor to run them, OR
+    # an unexhausted work source that may still supply more zones.
     # The queue clause must NOT be gated on _initializing alone — a failed tail
     # flush (_flush_idle_writes, which runs after dispatch) requeues its chunk
     # when no actor is initializing, and gating on _initializing would drop that
     # retry. `live_count > 0` prevents a busy-spin when every actor has died.
-    while pool.pending or pending_write or (chunk_queue and pool.live_count > 0):
+    while pool.pending or pending_write or ((chunk_queue or source_active) and pool.live_count > 0):
+        # Top up from the work source BEFORE waiting so freshly-ready zones
+        # dispatch this iteration. Polled only when the queue is at or below
+        # the live actor count — the exhaustion trigger. For zones at least as
+        # large as the fleet this keeps them near-sequential (one zone's tail
+        # overlaps the next zone's head); a zone smaller than the fleet can't
+        # fill it alone, so successive small zones are pulled to pack it — the
+        # source hands over one zone per poll and the caller bounds how many
+        # coexist.
+        if source_active and len(chunk_queue) <= pool.live_count:
+            fetched = more_work()  # type: ignore[misc]  # source_active implies more_work is not None
+            if fetched is None:
+                source_active = False
+                log.info(
+                    "Work source exhausted — %d queued + %d in-flight chunk(s) remain",
+                    len(chunk_queue),
+                    len(pool.pending),
+                )
+            elif fetched:
+                chunk_queue.extend(fetched)
+                n_total += len(fetched)
+                log.info(
+                    "Work source added %d chunk(s) (queue now %d, total %d)", len(fetched), len(chunk_queue), n_total
+                )
         if pool.pending:
-            # Block up to 60s for any one chunk to finish.
-            ready_refs, _ = ray.wait(list(pool.pending.keys()), num_returns=1, timeout=60)
+            # Block for any one chunk to finish. At a zone boundary — source still
+            # active and the queue drained to the poll trigger — the next zone may
+            # become ready momentarily, so cap the wait short: blocking the full
+            # 60s on a single tail task would idle the rest of the fleet up to a
+            # GPU-minute at every boundary. Otherwise (source exhausted, or a deep
+            # queue keeping actors busy) the long wait is fine.
+            at_boundary = source_active and len(chunk_queue) <= pool.live_count
+            wait_timeout = 5 if at_boundary else 60
+            ready_refs, _ = ray.wait(list(pool.pending.keys()), num_returns=1, timeout=wait_timeout)
         else:
             # Nothing in-flight but chunks are queued for initializing actors.
             # Sleep briefly then check if any actors are ready.
@@ -955,7 +1097,7 @@ def _process_chunks_work_stealing(
 
         # --- Handle completed (or failed) chunks ---
         for ref in ready_refs:
-            chunk_label, actor_idx = pool.pending.pop(ref)
+            item, actor_idx = pool.pending.pop(ref)
 
             try:
                 result = ray.get(ref)
@@ -963,7 +1105,7 @@ def _process_chunks_work_stealing(
                 # The actor process died (OOM, segfault, CUDA process abort) so
                 # ray.get raised. Stringify and route through the same handling
                 # as an actor that caught its own error and returned "failed".
-                _handle_failure(chunk_label, actor_idx, str(e))
+                _handle_failure(item, actor_idx, str(e))
             else:
                 # ray.get succeeded, but the actor catches its own exceptions and
                 # returns status="failed" rather than raising (see actors.py). A
@@ -972,7 +1114,7 @@ def _process_chunks_work_stealing(
                 # otherwise the chunk would never retry and the wedged actor, which
                 # tends to keep failing, would be handed the next chunk below.
                 if result.get("status") == "failed":
-                    _handle_failure(chunk_label, actor_idx, str(result.get("error", "unknown")))
+                    _handle_failure(item, actor_idx, str(result.get("error", "unknown")))
                 else:
                     # Resolve the PREVIOUS deferred write this result carries
                     # before recording this chunk's own deferral.
@@ -984,11 +1126,13 @@ def _process_chunks_work_stealing(
                         # the result until the write outcome confirms it. The
                         # tracker entry is removed now — the actor has moved on,
                         # so stall detection has nothing left to watch here.
-                        pending_write[actor_idx] = result
+                        pending_write[actor_idx] = (item, result)
                     else:
                         results.append(result)
+                        if on_item_done is not None:
+                            on_item_done(item, result)
                     if tracker:
-                        tracker.remove.remote(chunk_label)  # type: ignore[union-attr]
+                        tracker.remove.remote(item.uid)  # type: ignore[union-attr]  # run-qualified (see chunk_uid)
                     pool._initializing.discard(actor_idx)
 
             # Immediately re-feed the actor that just freed up, unless it's a
@@ -999,11 +1143,11 @@ def _process_chunks_work_stealing(
             # reserved chunk (whose starter payload it may have prefetched)
             # takes precedence over the queue so the prefetch is consumed.
             if actor_idx not in pool._initializing:
-                next_chunk = pool.take_reserved(actor_idx)
-                if next_chunk is None and chunk_queue:
-                    next_chunk = chunk_queue.popleft()
-                if next_chunk is not None:
-                    pool.submit(actor_idx, next_chunk, mosaic_base, staging_base, run_id, tracker, chunk_queue)
+                next_work = pool.take_reserved(actor_idx)
+                if next_work is None and chunk_queue:
+                    next_work = _as_item(chunk_queue.popleft(), default_ctx)
+                if next_work is not None:
+                    pool.submit(actor_idx, next_work, tracker=tracker, chunk_queue=chunk_queue)
 
         # Request the next actor batch if the prior batch has been placed (or
         # placement timed out), then check if any initializing actors have
@@ -1015,8 +1159,15 @@ def _process_chunks_work_stealing(
         pool.dispatch_idle(chunk_queue, mosaic_base, staging_base, run_id, tracker)
         # Actors left idle after dispatch have no next call to carry their
         # deferred-write confirmation — pull it via flush_writes() (tail of
-        # run, and always before such an actor could be retired).
+        # run, and always before such an actor could be retired). Runs even
+        # when retirement is gated off: a chained multi-zone fill still needs
+        # its zone-tail writes confirmed before the zone's assembly can verify
+        # staged completeness.
         _flush_idle_writes()
-        pool.retire_idle(pool.outstanding_work(len(chunk_queue)))
+        # Retirement additionally waits for source exhaustion: while more
+        # zones may arrive, an idle actor is the next zone's fleet, and
+        # retiring it would idle-drain the shared cluster's instances.
+        if retire_idle_actors and not source_active:
+            pool.retire_idle(pool.outstanding_work(len(chunk_queue)))
 
     return results

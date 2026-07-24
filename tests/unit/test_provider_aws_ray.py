@@ -323,3 +323,30 @@ def test_cleanup_ray_tempfiles_removes_yaml_and_ssh_key(tmp_path: Path) -> None:
 
     assert not yaml_path.exists()
     assert not ssh_key.exists()
+
+
+@mock_aws
+def test_resolve_ray_config_idle_timeout_override(tmp_path: Path) -> None:
+    """idle_timeout_minutes overrides the template value; None keeps it.
+
+    The template's 2-minute default suits per-cell fills; a multi-zone
+    sequential fill holds one cluster across zones and must survive the
+    inter-zone seam, so it passes a larger value through ray_cluster.
+    """
+    ami_param, _, _ = _seed_ssm_and_vpc()
+    template_default = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["idle_timeout_minutes"]
+
+    kept = _resolve_ray_config(DEFAULT_CLUSTER_TEMPLATE, region=REGION, ami_ssm_name=ami_param, ssm_prefix=SSM_PREFIX)
+    overridden = _resolve_ray_config(
+        DEFAULT_CLUSTER_TEMPLATE,
+        region=REGION,
+        ami_ssm_name=ami_param,
+        ssm_prefix=SSM_PREFIX,
+        idle_timeout_minutes=10,
+    )
+    try:
+        assert yaml.safe_load(Path(kept).read_text())["idle_timeout_minutes"] == template_default
+        assert yaml.safe_load(Path(overridden).read_text())["idle_timeout_minutes"] == 10
+    finally:
+        cleanup_ray_tempfiles(kept)
+        cleanup_ray_tempfiles(overridden)
