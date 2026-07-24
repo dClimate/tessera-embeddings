@@ -935,6 +935,84 @@ def write_region(
     )
 
 
+class RegionWriteBatch:
+    """Many positional window writes under ONE icechunk commit.
+
+    Handed out by :func:`batched_region_writes`. Direct zarr assignment on the
+    session's store — no Dask, no task graph (the avoid-Dask principle in the
+    live-tile-cropping design note): the caller computes each window to numpy and
+    this places it. Windows must be mutually chunk-disjoint (the chunk-snapped
+    window derivation guarantees it); two writes straddling one chunk in a session
+    are unsupported.
+    """
+
+    def __init__(self, session: "icechunk.Session") -> None:
+        self._session = session
+        #: The store's root group, writable. Exposed so callers can read/merge root
+        #: attrs (baselines, doy, last_appended) — attr edits land in the same commit.
+        self.group: zarr.Group = zarr.open_group(session.store, mode="r+")
+
+    def append_time_slot(self, when: np.datetime64) -> int:
+        """Grow the time axis by one date and return its index. Metadata only.
+
+        Resizes the time coord and every time-dimensioned array by one slot —
+        icechunk arrays are sparse, so the new slot costs no chunks until written.
+        The session sees its own uncommitted resize, so window writes into the
+        returned index work immediately (verified by experiment; see the design
+        note). A date already on the axis raises: the callers dedupe upstream, so
+        a duplicate here means a retry bug about to double-stamp one date.
+        """
+        when_ns = np.asarray(when, dtype="datetime64[ns]")
+        existing = read_time_values(self.group)
+        if (existing == when_ns).any():
+            raise ValueError(f"date {when_ns} is already on the time axis; refusing a duplicate slot")
+        t_index = len(existing)
+        time_arr = self.group["time"]
+        assert isinstance(time_arr, zarr.Array)
+        time_arr.resize((t_index + 1,))
+        time_arr[t_index] = when_ns.astype("int64")  # int64 ns per TIME_ENCODING
+        for name, arr in self.group.arrays():
+            # zarr v3 metadata carries dimension_names; every engine-written store
+            # is v3, and a v2 array would predate the convention entirely.
+            dims = getattr(arr.metadata, "dimension_names", None)
+            if name != "time" and dims and dims[0] == "time":
+                arr.resize((t_index + 1, *arr.shape[1:]))
+        return t_index
+
+    def write_window(self, t_index: int, y: slice, x: slice, values: dict[str, np.ndarray]) -> None:
+        """Assign one window's pixels for one date, var by var."""
+        for var, data in values.items():
+            arr = self.group[var]
+            assert isinstance(arr, zarr.Array)
+            arr[t_index, y, x] = data
+
+
+@contextmanager
+def batched_region_writes(
+    store_path: str,
+    *,
+    message: str,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+) -> Iterator[RegionWriteBatch]:
+    """One writable session, N window writes (+ optional attr edits), one commit.
+
+    The per-date write unit of the live-window ingest path: everything done through
+    the yielded :class:`RegionWriteBatch` lands atomically in a single snapshot on
+    exit. On an exception nothing commits — the abandoned session is invisible to
+    readers, so a retry starts clean from the last committed state.
+
+    Deliberately NOT the removed Dask-graph batch write (`write_regions`): there is
+    no graph here at all. For a single arbitrary (unaligned) region overwrite, use
+    :func:`write_region`, which pads to chunk boundaries; this path requires
+    chunk-disjoint windows and one commit is the point.
+    """
+    repo = _open_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    session = repo.writable_session("main")
+    yield RegionWriteBatch(session)
+    session.commit(message)
+
+
 def compute_doy(timestamps: np.ndarray) -> np.ndarray:
     """Compute day-of-year from datetime64 timestamps.
 
