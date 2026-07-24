@@ -144,7 +144,13 @@ def _write_coord_arrays(node: zarr.Group, coords: dict[str, np.ndarray]) -> None
     for name, values in coords.items():
         if name == "time":
             time_int = np.asarray(values, dtype="datetime64[ns]").astype("int64")
-            time_arr = node.create_array("time", data=time_int, chunks=(len(time_int),), dimension_names=("time",))
+            # max(len, 1): a zero-length chunk is invalid, and an EMPTY time axis is a
+            # legitimate seed (the cropped ingest appends each date atomically with
+            # its pixels — committing a date before its windows would let a crash
+            # strand an all-fill timestep that later dedupe treats as ingested).
+            time_arr = node.create_array(
+                "time", data=time_int, chunks=(max(len(time_int), 1),), dimension_names=("time",)
+            )
             time_arr.attrs.update(TIME_ENCODING)
         else:
             arr = np.asarray(values)

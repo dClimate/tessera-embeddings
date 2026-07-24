@@ -127,3 +127,36 @@ def test_multi_date_dataset_refused(tmp_path):
             crs="EPSG:32601",
             chunks=CHUNKS,
         )
+
+
+def test_crash_between_seed_and_first_windows_is_retryable(tmp_path):
+    """The seed commits an EMPTY axis, so no date exists before its pixels do.
+
+    Review catch (da-code-reviewer, HIGH): seeding times=[first_date] committed
+    the date before its windows — a crash in between left an all-fill timestep
+    that get_existing_dates reported as ingested, so the retry hit the
+    duplicate-date guard and the STAC dedupe filtered the date forever. Now a
+    crash after the seed leaves a zero-date store, and the retry appends the
+    date atomically with its windows.
+    """
+    from tessera_embeddings.storage.empty_store import create_empty_store
+
+    store = str(tmp_path / "reflectance.zarr")
+    # Simulate the crash: store seeded, no date committed.
+    create_empty_store(
+        store,
+        roi=_Roi(),
+        times=np.array([], dtype="datetime64[ns]"),
+        var_dtypes={"band": np.dtype("uint16"), "scl": np.dtype("uint8")},
+        tile_id="roi.zarr",
+        crs="EPSG:32601",
+        chunks=CHUNKS,
+        manifest=MANIFEST,
+    )
+    assert get_existing_dates(store) == set()  # the dedupe sees nothing ingested
+
+    _write(store, "2024-06-01", 7)  # the retry
+    assert get_existing_dates(store) == {"2024-06-01"}
+    g = open_store_as_zarr_group(store)
+    assert (np.asarray(g["band"])[0, 0:4, :] == 7).all()
+    assert dict(g.attrs)["doy"] == [153]

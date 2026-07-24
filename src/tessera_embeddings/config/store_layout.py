@@ -66,7 +66,10 @@ def clamp_chunks_and_shards(
     implementation of this load-bearing geometry math; both
     :meth:`ArrayLayout.create_kwargs` and the empty-store seeder call it.
     """
-    clamped = tuple(min(c, s) for c, s in zip(chunks, shape, strict=True))
+    # max(..., 1): a zero-extent axis is legal (a mosaic seeded with an EMPTY
+    # time axis, appended per date), but a zero chunk edge is not — keep the
+    # nominal chunk there so the axis grows into its normal chunking.
+    clamped = tuple(max(min(c, s), 1) for c, s in zip(chunks, shape, strict=True))
     if shards is None:
         return clamped, None
     clamped_shards = tuple(max(c, (min(sh, s) // c) * c) for sh, s, c in zip(shards, shape, clamped, strict=True))

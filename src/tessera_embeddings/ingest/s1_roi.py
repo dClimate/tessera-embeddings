@@ -224,17 +224,23 @@ def ingest_s1_roi_sar(
 
         if data is not None:
             data, _ = apply_roi_mask(data, roi_zarr_path, spatial_chunks, roi_mask=roi_mask)
-            for attempt in Retrying(
-                stop=stop_after_attempt(3),
-                wait=wait_exponential(multiplier=1, min=2, max=8),
-                before_sleep=before_sleep_log(log, logging.WARNING),
-                reraise=True,
-            ):
-                with attempt:
-                    if live_windows is not None:
-                        # A batch holds many NON-contiguous dates — one region per
-                        # date, so each date stays its own atomic commit.
-                        for i in range(data.sizes["time"]):
+
+            def _retrying() -> Retrying:
+                return Retrying(
+                    stop=stop_after_attempt(3),
+                    wait=wait_exponential(multiplier=1, min=2, max=8),
+                    before_sleep=before_sleep_log(log, logging.WARNING),
+                    reraise=True,
+                )
+
+            if live_windows is not None:
+                # A batch holds many NON-contiguous dates, each its own atomic
+                # commit — so the retry scope is PER DATE. One retry around the
+                # whole loop would restart at a date an earlier attempt already
+                # committed and trip the duplicate-date guard.
+                for i in range(data.sizes["time"]):
+                    for attempt in _retrying():
+                        with attempt:
                             write_day_windows(
                                 orbit_store,
                                 data.isel(time=slice(i, i + 1)),
@@ -246,7 +252,9 @@ def ingest_s1_roi_sar(
                                 crs=roi.native_crs,
                                 chunks=INGEST_CHUNKS,
                             )
-                    else:
+            else:
+                for attempt in _retrying():
+                    with attempt:
                         write_dataset(
                             orbit_store,
                             data,

@@ -1047,13 +1047,14 @@ def write_day_windows(
     workers that computed them (never materialised on the caller — see the design
     note's dense-zone arithmetic) and the date lands as ONE snapshot.
 
-    First date seeds the store all-fill via :func:`~.empty_store.create_empty_store`
-    (schema-only: cost independent of extent) with the same attr set
-    :func:`write_dataset` creates, then writes windows; later dates append the time
-    slot and merge attrs exactly as the append path does (baselines union / doy
-    concat / ``last_appended`` bump), and the manifest is validated against the
-    store BEFORE anything is written — the per-append structural gate must not be
-    lost to batching.
+    A missing store is seeded all-fill with an EMPTY time axis via
+    :func:`~.empty_store.create_empty_store` (schema-only: cost independent of
+    extent, same attr set :func:`write_dataset` creates); every date — the first
+    included — then appends its time slot atomically WITH its windows and merges
+    attrs exactly as the append path does (baselines union / doy concat /
+    ``last_appended`` bump). The manifest is validated against the store BEFORE
+    anything is written — the per-append structural gate must not be lost to
+    batching.
     """
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
@@ -1062,17 +1063,24 @@ def write_day_windows(
     when = np.asarray(day_ds.time.values, dtype="datetime64[ns]")[0]
     date_str = str(when)[:10]
 
-    seeded = not get_existing_dates(store_path)
-    if seeded:
+    # Seed with an EMPTY time axis, so the first date takes the same atomic
+    # append+windows commit as every other date. Seeding times=[when] would
+    # commit the date BEFORE its pixels: a crash between the two leaves an
+    # all-fill timestep that get_existing_dates then reports as ingested — the
+    # retry hits the duplicate-date guard and the STAC dedupe filters the date
+    # forever. Existence is probed on the repo, not the (possibly empty) axis.
+    try:
+        _open_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    except (FileNotFoundError, icechunk.IcechunkError):
         create_empty_store(
             store_path,
             roi=roi,
-            times=np.array([when]),
+            times=np.array([], dtype="datetime64[ns]"),
             var_dtypes={str(v): day_ds[v].dtype for v in day_ds.data_vars},
             tile_id=tile_id,
             crs=crs,
             chunks=chunks,
-            baselines=baselines,
+            baselines={},  # merged per date below, exactly like the append path
             manifest=manifest,
         )
 
@@ -1084,16 +1092,13 @@ def write_day_windows(
     ) as batch:
         if manifest:
             manifest.validate_against(extract_manifest(dict(batch.group.attrs)), store_path)
-        if seeded:
-            t = 0  # the seed put this date on the axis; attrs already carry its doy/baselines
-        else:
-            t = batch.append_time_slot(when)
-            attrs = batch.group.attrs
-            merged = dict(cast("dict", attrs.get("baselines_applied", {})))
-            merged.update(baselines)
-            attrs["baselines_applied"] = merged
-            attrs["doy"] = list(cast("list", attrs.get("doy", []))) + compute_doy(np.array([when])).tolist()
-            attrs["last_appended"] = utcnow_iso()
+        t = batch.append_time_slot(when)
+        attrs = batch.group.attrs
+        merged = dict(cast("dict", attrs.get("baselines_applied", {})))
+        merged.update(baselines)
+        attrs["baselines_applied"] = merged
+        attrs["doy"] = list(cast("list", attrs.get("doy", []))) + compute_doy(np.array([when])).tolist()
+        attrs["last_appended"] = utcnow_iso()
         drop = [c for c in ("time", "northing", "easting") if c in day_ds.coords]
         for y0, y1, x0, x1 in windows:
             win = day_ds.isel(northing=slice(y0, y1), easting=slice(x0, x1)).drop_vars(drop)

@@ -29,6 +29,7 @@ import math
 import sys
 from pathlib import Path
 
+import icechunk
 import numpy as np
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
@@ -92,6 +93,11 @@ def measure(land_mask_path: str, zones: list[str], *, s3_region: str | None) -> 
         except (FileNotFoundError, KeyError):
             print(f"  {name}: absent from coverage repo — skipped", file=sys.stderr)
             continue
+        except icechunk.IcechunkError as exc:
+            # One repo serves every zone, so an unopenable repo (bad path, auth,
+            # transient) fails identically 120 times — abort with the diagnostic
+            # instead of crashing mid-loop, and never mask auth errors as "absent".
+            raise SystemExit(f"Cannot open coverage repo {land_mask_path}: {exc}") from exc
         shas.add(cov.attrs.get("registry_sha256"))
         tile_live = np.asarray(cov["tile_live_2048"], dtype=bool)
         live = chunk_live_grid(tile_live, spec.height, spec.width)
@@ -120,7 +126,7 @@ def _report(rows: list[dict]) -> str:
     ]
     for k in ("bbox", "rows", "exact"):
         lines.append(f"  {k:<19} {tot[k]:>12,}   {tot['full'] / max(tot[k], 1):>6.1f}x less work")
-    lines += ["", "Worst zones for bbox (scattered land — where a single window buys least):"]
+    lines += ["", "Largest bbox overshoot vs the exact floor (bbox/exact — scattered land):"]
     for r in sorted(land, key=lambda r: -(r["bbox"] / max(r["exact"], 1)))[:5]:
         lines.append(
             f"  {r['zone']}  full {r['full']:>6,}  bbox {r['bbox']:>6,}  rows {r['rows']:>6,}  "

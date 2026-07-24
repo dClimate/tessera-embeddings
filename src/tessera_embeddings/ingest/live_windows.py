@@ -58,20 +58,23 @@ def _open_mask(mask_path: str) -> zarr.Array:
 def live_chunk_grid(mask_path: str, *, chunk_px: int = INGEST_CHUNK_SIZE) -> np.ndarray:
     """Coarsen the ROI mask onto the ingest chunk grid: True where any pixel is live.
 
-    Reads the mask row-band by row-band (one chunk-row of pixels at a time) rather
-    than whole — a zone mask decompresses to tens of GB — or per-chunk — thousands
-    of object reads. Plain zarr, no dask: this is a metadata-scale scan that must
-    not cost a task graph.
+    Reads one chunk-sized block at a time (~16 MB at the 4096 default), reducing
+    each straight into its ``live`` cell — never a whole row band (a full-width
+    band of a wide zone is hundreds of MB, and an arbitrary single-ROI width is
+    unbounded) and never the whole mask (tens of GB decompressed). The block
+    reads hit the same underlying zarr chunk objects a wider read would — zarr
+    fetches per chunk either way — so this bounds memory without extra I/O.
+    Plain zarr, no dask: a metadata-scale scan must not cost a task graph.
     """
     z = _open_mask(mask_path)
     height, width = z.shape
     rows, cols = math.ceil(height / chunk_px), math.ceil(width / chunk_px)
     live = np.zeros((rows, cols), dtype=bool)
     for r in range(rows):
-        band = np.asarray(z[r * chunk_px : min((r + 1) * chunk_px, height), :])
-        padded = np.zeros((band.shape[0], cols * chunk_px), dtype=bool)
-        padded[:, :width] = band
-        live[r] = padded.reshape(band.shape[0], cols, chunk_px).any(axis=(0, 2))
+        y = slice(r * chunk_px, min((r + 1) * chunk_px, height))
+        for c in range(cols):
+            block = z[y, c * chunk_px : min((c + 1) * chunk_px, width)]
+            live[r, c] = bool(np.asarray(block).any())
     return live
 
 
