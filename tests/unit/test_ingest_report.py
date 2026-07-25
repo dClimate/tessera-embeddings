@@ -144,3 +144,40 @@ class TestTruncationIsNeverSilent:
     def test_missing_truncated_key_is_treated_as_complete(self):
         """Older JSON (written before the flag existed) must still render."""
         assert "PARTIAL" not in rep.build_dossier(_args(), _SCHED, _LOGS)
+
+
+class TestFleetMemoryReachesTheDossier:
+    """Worker memory is the SECOND failure mode; the dossier must show it.
+
+    The heartbeat carries fleet memory and watch_scheduler's own --markdown
+    reports it, but the dossier is what an operator reads to write a bottleneck
+    verdict — and the campaign cell that motivated the metric died of worker
+    memory with every scheduler signal nominal. A dossier without it invites
+    exactly the wrong verdict.
+    """
+
+    def _sched(self, **peak_overrides):
+        peaks = {**_SCHED["profile"]["peaks"], **peak_overrides}
+        return {**_SCHED, "profile": {**_SCHED["profile"], "peaks": peaks}}
+
+    def test_spilling_run_reports_the_fleet_peaks(self):
+        sched = self._sched(worker_mem_gib=517.0, worker_spill_gib=468.0, worker_max_gib=31.5)
+        md = rep.build_dossier(_args(logs=None), sched, None)
+        assert "Peak FLEET memory: **517.00 GiB**" in md
+        assert "spilled **468.00 GiB**" in md
+        assert "hottest worker **31.50 GiB**" in md
+        assert "no spill" not in md
+
+    def test_healthy_run_says_the_graph_fit(self):
+        """Zero spill is a measured result, not missing data — say so."""
+        sched = self._sched(worker_mem_gib=40.0, worker_spill_gib=0.0, worker_max_gib=14.0)
+        md = rep.build_dossier(_args(logs=None), sched, None)
+        assert "_(no spill — the graph fit the fleet)_" in md
+        assert "Peak FLEET memory: **40.00 GiB**" in md
+
+    def test_older_profile_without_fleet_keys_renders(self):
+        """A profile from before the heartbeat carried fleet memory must not crash,
+        and must read "not recorded" rather than implying a healthy zero.
+        """
+        md = rep.build_dossier(_args(logs=None), _SCHED, None)  # fixture has no fleet keys
+        assert "Peak FLEET memory: **not recorded**" in md

@@ -18,15 +18,14 @@ the hook re-derives the same name as its fallback, terminating the fleet by
 tag even from nothing but the ``flow_run`` argument.
 (:mod:`.tessera_embeddings` keeps its own variant of the same pattern.)
 
-**This hook MUST stay idempotent, and it is the expensive one.** Cancellation
-hooks were observed running twice for a single ``Cancelling`` transition on the
-Dask side (2026-07-25; see :mod:`._hook_invocation`). If the cause is Prefect's
-invocation model rather than that particular cancel, this hook doubles too — and
-two concurrent ``ray down`` invocations against one cluster is a materially worse
-proposition than two ECS sweeps. Both paths here already tolerate it: ``ray down``
-is bounded and its failure falls through to tag-based termination, and
-``terminate_ray_instances_by_tag`` filters live instances by tag, so a second pass
-finds fewer or none. Keep it that way.
+**This hook MUST stay idempotent, and it is the expensive one.** Cancelling a
+parent run and its child together delivers the transition twice and runs the
+hook twice (diagnosed on the Dask side 2026-07-25; Prefect's invocation model is
+not at fault). Two concurrent ``ray down`` invocations against one cluster is a
+materially worse proposition than two ECS sweeps, so prefer cancelling ONE run.
+Both paths here tolerate it today: ``ray down`` is bounded and its failure falls
+through to tag-based termination, and ``terminate_ray_instances_by_tag`` filters
+live instances by tag, so a second pass finds fewer or none. Keep it that way.
 """
 
 from __future__ import annotations
@@ -37,7 +36,6 @@ from pathlib import Path
 
 import yaml
 
-from tessera_embeddings.orchestration.prefect.flows._hook_invocation import hook_invocation_site
 from tessera_embeddings.providers.aws.ray import (
     RAY_DOWN_TIMEOUT_S,
     cleanup_ray_tempfiles,
@@ -73,9 +71,7 @@ def ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -
     must stay idempotent.
     """
     log = logging.getLogger(__name__)
-    # Site tag: attributes a doubled execution to one process or two (see
-    # _hook_invocation). This hook is the expensive one to double.
-    log.warning("Flow cancelled/crashed — tearing down Ray cluster [%s]", hook_invocation_site())
+    log.warning("Flow cancelled/crashed — tearing down Ray cluster")
     # Fresh-import fallback: the flows pin cluster_name_for_flow_run(flow_run_ctx.id)
     # at provisioning, so the hook can re-derive the same name when the module
     # globals are unset (Prefect killed the flow process before running the hook).

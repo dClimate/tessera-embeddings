@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 
-from tessera_embeddings.orchestration.prefect.flows._hook_invocation import hook_invocation_site
 from tessera_embeddings.providers.aws.dask import stop_ecs_tasks_by_tag
 
 #: Tag key stamped on every ECS resource a flow's Dask cluster creates.
@@ -35,15 +34,12 @@ def dask_resource_tags(flow_run_id: object) -> dict[str, str] | None:
 def dask_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
     """Emergency ECS teardown when an ingest flow is cancelled OR crashes.
 
-    Must remain idempotent — see the module docstring: this has been seen to run
-    twice for one transition.
+    Must remain idempotent — see the module docstring.
     """
     log = logging.getLogger(__name__)
     run_id = getattr(flow_run, "id", None)
     if not run_id:
         log.warning("No flow-run id on the cancellation hook — cannot sweep ECS tasks.")
         return
-    # Site tag: lets a doubled pair be attributed to one process or two without
-    # another investigation round (see _hook_invocation).
-    log.warning("Flow cancelled/crashed — sweeping ECS tasks for run %s [%s]", run_id, hook_invocation_site())
+    log.warning("Flow cancelled/crashed — sweeping ECS tasks for run %s", run_id)
     stop_ecs_tasks_by_tag(DASK_FLOW_RUN_TAG, str(run_id), log=log)

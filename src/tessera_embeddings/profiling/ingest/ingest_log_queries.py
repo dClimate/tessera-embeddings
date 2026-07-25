@@ -23,26 +23,14 @@ The patterns key off real log markers in the ingest path:
 - **Worker lifecycle** — distributed/nanny exit/kill/restart/removal counts by
   category, to separate "workers dying" from "scheduler falling behind".
 
-Counting caveat for runs before 2026-07-25: **some counts below were inflated
-2x.** The package logger carried its own stderr handler while Prefect's console
-handler sat on the root logger, so every record from a ``tessera_embeddings.*``
-logger reached CloudWatch twice (two formats: ``2026-07-25 00:33:35,395 | ...``
-and ``00:33:35.395 | ...``). Fixed in ``config/environment.py`` — the handler is
-now attached only when the root logger is unconfigured.
-
-Which queries this touched, for anyone re-reading old figures:
-
-- ``http_retries_by_service`` / ``http_retry_status`` / ``http_retries_over_time``
-  and ``store_write_retries`` count OUR log lines (``ingest._http``, tenacity's
-  ``before_sleep_log``) — doubled wherever both handlers were attached.
-- ``worker_lifecycle_counts`` / ``worker_exit_reasons`` count ``distributed``'s
-  own lines, never ours — **unaffected**.
-- ``s3_slowdown`` and ``error_rate_over_time`` match on content across all
-  streams, so they are a mix.
-
-The discriminator is content timestamp, not line count: a duplicated record
-appears twice at the same millisecond in two formats. Post-fix runs need no
-correction.
+Counting note: **these counts are sound; do not "correct" them.** Flow-runner
+containers duplicated every log line for a period (two stdout handlers — fixed in
+``config/environment.py``), which invites the inference that line counts here are
+inflated 2x. Measured 2026-07-25, they are not: these queries count lines in the
+Dask **worker** streams, and ``watch_scheduler`` parses the **scheduler** stream —
+both launched by dask-cloudprovider with ``distributed``'s own logging, verified
+single-delivery. Only ``…-flow-runner/…`` streams were affected, and nothing here
+reads those. Halving these figures would corrupt valid measurements.
 
 Known gap: **ASF granule downloads are not separately instrumented.** Nothing in
 the download path emits a stable retry marker today, so external download

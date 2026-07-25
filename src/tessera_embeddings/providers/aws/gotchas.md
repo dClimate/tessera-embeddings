@@ -253,27 +253,25 @@ crash       ┴─ on_cancellation/on_crashed ──► stop_ecs_tasks_by_tag(
                                                  "tessera-flow-run-id" = flow_run.id)
 ```
 
-### Terminal-state hooks can run twice — keep them idempotent
+### Cancel ONE run — terminal-state hooks are not deduplicated
 
-A single `Cancelling` transition was observed executing
-`dask_cleanup_on_cancellation` **twice** (2026-07-25): two entries into the
-sweep 1 ms apart, two completions 72 ms apart. Prefect 3.7 has two sites that
-run these hooks — the flow engine inside the run's own process, and the runner
-that observes the state change — gated to be mutually exclusive by
-`PREFECT__ENABLE_CANCELLATION_AND_CRASHED_HOOKS`. Nothing in `prefect_aws` sets
-that variable, so a child launched by an ECS *worker* may have both fire; that
-is the leading hypothesis, not yet confirmed against a live cancel.
+Cancelling a parent run and its child together delivers the transition twice,
+and the teardown hook runs twice. Diagnosed 2026-07-25 after a doubled
+`dask_cleanup_on_cancellation` was traced to the cancellation *method*, not to
+Prefect: a single `set_flow_run_state(Cancelling)` on one run runs the hook
+exactly once. Registering the same callable on both `on_cancellation` and
+`on_crashed` is fine and is deliberate — a crashed run leaks exactly like a
+cancelled one.
 
-Harmless today because both teardown hooks are idempotent by construction, and
-they must stay that way — the Ray hook especially, since two concurrent
-`ray down` invocations against one cluster is a worse proposition than two ECS
-sweeps. Each hook logs a site tag (`pid=… thread=… engine_owns=…`, see
-`flows/_hook_invocation.py`) so the next cancellation attributes a doubled pair
-to one process or two without another investigation round.
+Survivable because both teardown hooks are idempotent by construction, and they
+must stay that way — the Ray hook especially, since two concurrent `ray down`
+invocations against one cluster is worse than two ECS sweeps. So: **cancel from
+the UI, or set `Cancelling` on one run**, and never add non-idempotent work to
+either hook.
 
-**Validating any change here needs a killed process, not a polite cancel.** In
-the observed run `ecs_cluster`'s `finally` had already removed 9 of 10 tasks
-before the hook fired — a graceful cancel tests the hook against an
+**Validating a change to these hooks needs a killed process, not a polite
+cancel.** In the observed run `ecs_cluster`'s `finally` had already removed 9 of
+10 tasks before the hook fired — a graceful cancel tests the hook against an
 already-empty cluster.
 
 ### Logging: do not add a handler when the root logger is configured
@@ -288,6 +286,14 @@ root logger being unconfigured; the package logger's LEVEL is still set
 unconditionally, which is the part that actually matters. Prefect UI logs are
 unaffected either way — they come from the `APILogHandler` on `prefect.flow_runs`,
 never from our package logger.
+
+Scope, measured rather than assumed: **only the flow-runner streams doubled.**
+The Dask scheduler and worker containers are launched by dask-cloudprovider and
+use `distributed`'s own logging, verified single-delivery (consecutive
+`scheduler health:` heartbeats carry unique timestamps). So the profiling tools
+read single-delivery streams and **their counts need no correction** —
+`ingest_log_queries.py` counts worker-stream lines and `watch_scheduler` parses
+the scheduler stream. Do not "fix" those numbers.
 
 ---
 

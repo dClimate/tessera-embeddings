@@ -75,6 +75,16 @@ def _md_table(rows: list[dict], limit: int = 25) -> str:
 _PARTIAL = "**PARTIAL — hit the Insights row cap; figures below are lower bounds.**"
 
 
+def _gib(value: float | None) -> str:
+    """Render a fleet-memory peak, distinguishing "not measured" from zero.
+
+    Mirrors ``watch_scheduler``'s formatter rather than importing it: that module
+    imports boto3 at module scope, and this assembler is deliberately pure over
+    the JSON — no cloud SDK, so it runs anywhere the files do.
+    """
+    return "not recorded" if value is None else f"{value:.2f} GiB"
+
+
 def _truncation_banner(sched: dict | None, logs: dict | None) -> list[str]:
     """A top-of-dossier warning naming every capped input, or [] when all complete.
 
@@ -125,6 +135,10 @@ def _scheduler_section(sched: dict | None) -> str:
         f"- Peak CPU: **{pk['cpu']:.0f}%** · peak mem: **{mem}** · peak loop-lag: **{pk['lag']:.1f}s**",
         f"- Peak backlog (no-worker): **{pk['no_worker']}**",
         f"- Peak workers: **{pk['workers']}** · peak tasks: **{pk['tasks']}**",
+        f"- Peak FLEET memory: **{_gib(pk.get('worker_mem_gib'))}** · spilled "
+        f"**{_gib(pk.get('worker_spill_gib'))}** · hottest worker "
+        f"**{_gib(pk.get('worker_max_gib'))}**"
+        + ("" if pk.get("worker_spill_gib") else "  _(no spill — the graph fit the fleet)_"),
         f"- cpu-high ∧ backlog-rising intervals: **{profile['cpu_backlog_cooccurrence']}**",
         f"- Saturation onsets: {onsets}",
         f"- Worker join/exit events: **{len(profile['worker_events'])}**",
@@ -175,7 +189,7 @@ def build_dossier(args: argparse.Namespace, sched: dict | None, logs: dict | Non
         "> _Fill in from the sections below. Answer explicitly:_",
         "> - **Bottleneck verdict** — scheduler-bound, worker/external-bound, or headroom left?",
         "> - **Limiting factor** — which signal capped this rung (CPU-sustained, backlog growth, "
-        "worker churn, an external 429/503 curve, S3 SlowDown)?",
+        "worker churn, FLEET memory / spill, an external 429/503 curve, S3 SlowDown)?",
         "> - **Next rung** — go higher, hold, or step back; and any config change to try first.",
         "",
     ]
