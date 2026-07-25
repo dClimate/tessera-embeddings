@@ -21,10 +21,9 @@ from prefect import flow, get_run_logger
 
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.inference.data_loading import _is_missing_repo
 from tessera_embeddings.storage.campaign import campaign_status
 from tessera_embeddings.storage.global_store import create_global_repo, open_global_repo, seed_zone_groups
-from tessera_embeddings.storage.zarr_store import read_time_values
+from tessera_embeddings.storage.zarr_store import is_missing_repo, read_time_values
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES, year_of
 
 
@@ -82,8 +81,8 @@ def seed_global_store(
         # Only a genuinely-missing repo means "create it". Auth/throttle/timeout/
         # corruption errors must NOT fall into the create path (it would fail against
         # the live repo if the transient error clears, and buries the real cause) —
-        # re-raise them. Mirrors the ingest/campaign _is_missing_repo handling.
-        if not _is_missing_repo(exc):
+        # re-raise them. Mirrors the ingest/campaign is_missing_repo handling.
+        if not is_missing_repo(exc):
             raise
         log.info("Creating global store %s", store_path)
         repo = create_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)

@@ -34,7 +34,7 @@ from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
-from tessera_embeddings.inference.data_loading import _active_orbits, _is_missing_repo
+from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import IngestDeployments
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import (
@@ -45,7 +45,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
 from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
-from tessera_embeddings.storage.zarr_store import open_store_group_and_tip
+from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store_group_and_tip
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zone
 
 # S1/S2 grandchild ingest refs are derived from this single source (rather than
@@ -135,7 +135,7 @@ def _mosaic_identity(
         except FileNotFoundError:
             continue  # absent store (single-orbit mosaic / unproduced orbit) — not active
         except icechunk.IcechunkError as exc:
-            if _is_missing_repo(exc):
+            if is_missing_repo(exc):
                 continue
             raise  # transient/auth: fail closed rather than fingerprint a partial view
         marker = grp.attrs.get("ingest_marker")

@@ -29,7 +29,7 @@ from tessera_embeddings.config.inference import S2_BAND_ORDER, SCL_VALID_CLASSES
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.storage.zarr_store import compute_doy, open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import compute_doy, is_missing_repo, open_store_as_zarr_group
 
 logger = logging.getLogger(__name__)
 
@@ -288,15 +288,6 @@ def _active_orbits(s1_orbit: str) -> tuple[str, ...]:
     raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
 
 
-def _is_missing_repo(exc: icechunk.IcechunkError) -> bool:
-    """Whether an IcechunkError means the repo is genuinely absent (vs a transient
-    timeout / auth failure / corruption). Icechunk reports a missing repo as
-    "the repository doesn't exist".
-    """
-    msg = str(exc).lower()
-    return "doesn't exist" in msg or "does not exist" in msg
-
-
 def resolve_s1_orbit(
     mosaic_base: str,
     s1_orbit: str,
@@ -336,7 +327,7 @@ def resolve_s1_orbit(
             # auth failure, or corruption must not silently downgrade `both` to a
             # single orbit and permanently drop the other's data — re-raise so the
             # caller fails loudly instead.
-            if not _is_missing_repo(exc):
+            if not is_missing_repo(exc):
                 raise
             logger.info("SAR %s store not present at %s — will be excluded", orbit, path)
 

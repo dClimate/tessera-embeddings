@@ -448,6 +448,23 @@ def global_store_config(max_concurrent_requests: int | None = None) -> icechunk.
     return config
 
 
+def is_missing_repo(exc: icechunk.IcechunkError) -> bool:
+    """Whether an ``IcechunkError`` means the repo is genuinely ABSENT.
+
+    Icechunk reports a missing repository as "the repository doesn't exist". Every
+    other ``IcechunkError`` — auth, throttling, timeout, real corruption — must be
+    told apart from absence, because the two call for opposite responses: absence
+    means create, and anything else means surface the error. Conflating them sends a
+    transient failure down the create path, where it resurfaces as a dirty-prefix
+    ``CorruptedStoreError`` that names the wrong problem.
+
+    Lives here, not in the inference layer that first needed it: it is a fact about
+    Icechunk repositories, and the storage layer cannot import upward to reach it.
+    """
+    msg = str(exc).lower()
+    return "doesn't exist" in msg or "does not exist" in msg
+
+
 def _open_repo(
     store_path: str,
     max_concurrent_requests: int | None = None,
@@ -1142,6 +1159,7 @@ def write_day_windows(
     # all-fill timestep that get_existing_dates then reports as ingested — the
     # retry hits the duplicate-date guard and the STAC dedupe filters the date
     # forever. Existence is probed on the repo, not the (possibly empty) axis.
+    needs_seed = False
     try:
         # Probe the ROOT GROUP, not just the repo: _create_repo creates the repo
         # before create_empty_store writes and commits the schema, so a crash in
@@ -1150,7 +1168,18 @@ def write_day_windows(
         # wedged forever. (Same failure the global-store seeder hit; see its
         # GroupNotFoundError handling.)
         open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
-    except (FileNotFoundError, KeyError, zarr.errors.GroupNotFoundError, icechunk.IcechunkError):
+    except icechunk.IcechunkError as exc:
+        # ONLY genuine absence means "seed me". Treating every IcechunkError as absence
+        # sends an auth failure, a throttle, a timeout or real corruption into the
+        # create path, where it resurfaces as a dirty-prefix CorruptedStoreError —
+        # masking the real cause and defeating the write retry's ability to report it.
+        if not is_missing_repo(exc):
+            raise
+        needs_seed = True
+    except (FileNotFoundError, KeyError, zarr.errors.GroupNotFoundError):
+        needs_seed = True
+
+    if needs_seed:
         create_empty_store(
             store_path,
             roi=roi,

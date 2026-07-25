@@ -44,7 +44,6 @@ from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.data_loading import (
     _active_orbits,
-    _is_missing_repo,
     check_time_window_coverage,
     resolve_s1_orbit,
 )
@@ -52,7 +51,7 @@ from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_coun
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles
 from tessera_embeddings.storage.object_store import delete_prefix
-from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import is_missing_repo, open_or_create_repo, open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 from tessera_embeddings.utils import utcnow_iso
 
@@ -106,7 +105,7 @@ def _probe_marker(store_path: str, *, get_credentials: _Creds, s3_region: str | 
     except FileNotFoundError:
         return (False, None)
     except icechunk.IcechunkError as exc:
-        if _is_missing_repo(exc):
+        if is_missing_repo(exc):
             return (False, None)
         raise
     raw = root.attrs.get("ingest_marker")

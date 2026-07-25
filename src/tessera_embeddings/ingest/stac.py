@@ -1025,27 +1025,33 @@ def stream_stac_months(
         return result
 
     # max_workers=1 IS the depth-1 buffer: one query in flight, one month in the
-    # caller's hands. cancel_futures on exit so a failure mid-month does not block on
-    # the next month's in-flight HTTP walk.
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="stac-prefetch") as pool:
-        try:
-            pending = pool.submit(run, months[0]) if months else None
-            for i, mr in enumerate(months):
-                items, baselines = pending.result()  # type: ignore[union-attr]
-                if i + 1 < len(months):
-                    pending = pool.submit(run, months[i + 1])
-                owned = [it for it in items if mr.own_start <= str(it.datetime)[:10] <= mr.own_end]
-                dropped = len(items) - len(owned)
-                if not owned:
-                    log.info("Month %s..%s: no new items", mr.own_start, mr.own_end)
-                    continue
-                log.info(
-                    "Month %s..%s: %d item(s)%s",
-                    mr.own_start,
-                    mr.own_end,
-                    len(owned),
-                    f" ({dropped} outside the month)" if dropped else "",
-                )
-                yield mr, owned, baselines
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+    # caller's hands. cancel_futures on shutdown so a failure mid-month does not block
+    # on the next month's in-flight HTTP walk.
+    #
+    # Deliberately NOT a `with` block: ThreadPoolExecutor.__exit__ is an unconditional
+    # shutdown(wait=True) that would run AFTER this finally, so the non-blocking
+    # shutdown would be followed immediately by a blocking one and a failed or
+    # closed-early ingest would still hang until the prefetched query and its retries
+    # finished. Not waiting is the entire point of cancelling here.
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stac-prefetch")
+    try:
+        pending = pool.submit(run, months[0]) if months else None
+        for i, mr in enumerate(months):
+            items, baselines = pending.result()  # type: ignore[union-attr]
+            if i + 1 < len(months):
+                pending = pool.submit(run, months[i + 1])
+            owned = [it for it in items if mr.own_start <= str(it.datetime)[:10] <= mr.own_end]
+            dropped = len(items) - len(owned)
+            if not owned:
+                log.info("Month %s..%s: no new items", mr.own_start, mr.own_end)
+                continue
+            log.info(
+                "Month %s..%s: %d item(s)%s",
+                mr.own_start,
+                mr.own_end,
+                len(owned),
+                f" ({dropped} outside the month)" if dropped else "",
+            )
+            yield mr, owned, baselines
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
