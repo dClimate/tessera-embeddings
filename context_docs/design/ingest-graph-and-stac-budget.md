@@ -359,6 +359,47 @@ Collapsing the two masking passes into one, counted on a real window's optimised
 **1.28× fewer graph tasks**, matching the predicted ~25%. This is the pattern to follow for
 the remaining shaves: the mechanism is measurable exactly, the wall-clock consequence is not.
 
+## 9. Manifest sharding: the axis matters more than the size
+
+Same zone, month and fleet; two dates each, so directly comparable.
+
+| configuration | date 1 | date 2 | manifest objects | manifest bytes |
+|---|---|---|---|---|
+| no split | 179.5 s | 147.8 s | — | ~3.3 MB (fitted) |
+| `{northing:4, easting:4, time:8}` | **245.8 s** | **281.3 s** | **10,195** | 3.85 MB |
+| `{time: 8}` | 179.8 s | 146.8 s | **161** | 1.99 MB |
+
+The spatial split cost **30-50% wall clock** — not from bytes but from object count: ~5,097
+manifest objects rewritten per commit against ~14, and the PUT latency dominates. Time-only
+restores no-split speed while already writing fewer manifest bytes, and it grows LINEARLY with
+dates where unsharded grows as N-squared over 2.
+
+**The rule, generalised:** split the axis along which a single commit is NARROW. Campaign
+ingest commits one date across every live window, so it is narrow in time and wide in space —
+the exact inverse of the region-write merge workload the module default was written for. Both
+regimes are now documented at `storage/zarr_store.py`'s split constants.
+
+Reference for the unsharded cost this removes: ~1.1 MB of chunk references per date, so a
+250-date zone-year rewrites ~35 GB of manifest cumulatively and ~275 MB on its final commits.
+That is ~1-3 s/date, i.e. splitting is mainly an **S3 traffic and cost** win rather than a
+wall-clock one — worth having because it is free, not because it is fast.
+
+## 10. Task-count levers: what is left, and what is ruled out
+
+Current: **4 tasks per (chunk x band)**, ~44 per output chunk, 77.9 per load block.
+
+| lever | expected | LOC | effort | status |
+|---|---|---|---|---|
+| Load blocks 8192 to 16384 | area in blocks divided by 4, so **~2-3x** on load-side terms | ~5 | 30 min | **next** — memory per task x4 (134 to 536 MB per band); raising worker memory is sanctioned if the gain is real |
+| Drop `align_chunks`, rely on windows already landing on load blocks | ~1 of 4 per chunk-band (**~25%**) | ~20 | 2-3 h | **after** — measure, do not assume: dropping it was 11% SLOWER when blocks and chunks matched |
+| Coarsen `INGEST_CHUNKS["time"]` beyond 1 | none per date; fewer commits | ~10 | — | **REJECTED** — breaks the property that a date's time slot lands atomically with its pixels, which is what makes a crashed ingest safely retryable |
+| Fold the ROI mask inside `odc.stac.load` | ~1 more per chunk-band | 80+ | 1-2 d | **REJECTED** — no clean hook; high risk for a second-order gain |
+
+On worker memory for the 16384 experiment: the hottest worker already reached 10.3 GiB of 16
+at 8192 blocks, so 16384 is expected to press it. Raising the worker size is an accepted trade
+if the task-count gain is real — the extra instance cost is small against the fleet time saved
+— but the gain must be demonstrated by task count first, and spill must be zero.
+
 ## Changelog
 
 - **2026-07-25** — Created. Graph anatomy measured (4 tasks per chunk-band); linear cost
