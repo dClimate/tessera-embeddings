@@ -37,7 +37,7 @@ from typing import Literal, final
 import dask.distributed
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
-from tessera_embeddings.config.ingest import INGEST_CHUNKS
+from tessera_embeddings.config.ingest import INGEST_CHUNKS, INGEST_LOAD_CHUNK_SIZE, INGEST_LOAD_CHUNKS
 from tessera_embeddings.ingest.live_windows import live_windows_for_mask
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
@@ -146,9 +146,11 @@ def ingest_s1_roi_sar(
 
     ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path)
 
-    # Load chunks: spatial multiples of INGEST_CHUNKS so rechunk at
-    # write time is a pure split with no cross-chunk shuffling.
-    spatial_chunks = {"northing": INGEST_CHUNKS["northing"], "easting": INGEST_CHUNKS["easting"]}
+    # Load chunks: spatial multiples of INGEST_CHUNKS so rechunk at write time is a
+    # pure split with no cross-chunk shuffling. The multiple is the point — fewer,
+    # larger load blocks mean a smaller graph, which is what limits ingest (see
+    # config.ingest.INGEST_LOAD_CHUNK_SIZE).
+    spatial_chunks = {"northing": INGEST_LOAD_CHUNKS["northing"], "easting": INGEST_LOAD_CHUNKS["easting"]}
 
     last_cred_refresh: float = float("-inf")
 
@@ -159,7 +161,10 @@ def ingest_s1_roi_sar(
     live_windows: list[tuple[int, int, int, int]] | None = None
     if crop_to_live_windows:
         live_windows = [
-            (w.y0, w.y1, w.x0, w.x1) for w in live_windows_for_mask(roi_zarr_path, storage_options=storage_options)
+            (w.y0, w.y1, w.x0, w.x1)
+            for w in live_windows_for_mask(
+                roi_zarr_path, window_px=INGEST_LOAD_CHUNK_SIZE, storage_options=storage_options
+            )
         ]
         log.info("Cropping writes to %d live window(s)", len(live_windows))
 
@@ -215,7 +220,7 @@ def ingest_s1_roi_sar(
             end_date=batch_end_str,
             existing_dates=existing_dates,
             bbox=roi.bbox_wgs84,
-            chunks=INGEST_CHUNKS,
+            chunks=INGEST_LOAD_CHUNKS,
             resampling="bilinear",
             groupby="solar_day",
             item_provider_fn=make_s1_item_provider(

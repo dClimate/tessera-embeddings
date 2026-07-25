@@ -50,10 +50,17 @@ logger = logging.getLogger(__name__)
 #: matches, while a key of different rank (``c/1/2/3``) deliberately does not.
 _CHUNK_KEY_RE = re.compile(r"(?:^|/)c/(\d+)/(\d+)$")
 
-#: Chunk-area cap on one grouped band, bounding the graph a single region write
-#: builds. Costs almost nothing against no cap at all; it exists to keep memory and
-#: scheduler load inside a proven envelope. See :func:`merge_bands`.
-MAX_CHUNKS_PER_WINDOW = 2048
+#: Cap on the graph a single region write may build, in TASKS — the unit that
+#: actually saturates, because the scheduler dispatches tasks and its event loop is
+#: single-threaded. Denominated in tasks rather than chunk area because the tasks a
+#: chunk costs depends on band count and block geometry, so a chunk-denominated cap
+#: silently changes meaning whenever either moves. See :func:`merge_bands`.
+MAX_TASKS_PER_WINDOW = 24_000
+
+#: Graph tasks one window chunk is assumed to cost, for turning the task cap into a
+#: chunk area. Deliberately conservative — the cap should bind slightly early rather
+#: than late — and overridable by callers that have measured their own geometry.
+DEFAULT_TASKS_PER_CHUNK = 200
 
 #: What one window write costs, expressed as the chunk area that costs the same.
 #: Extra computed area is parallel and cheap; a window boundary is a serial,
@@ -237,7 +244,8 @@ def merge_bands(
     windows: list[LiveWindow],
     *,
     chunk_px: int = INGEST_CHUNK_SIZE,
-    max_chunks_per_window: int = MAX_CHUNKS_PER_WINDOW,
+    max_tasks_per_window: int = MAX_TASKS_PER_WINDOW,
+    tasks_per_chunk: int = DEFAULT_TASKS_PER_CHUNK,
     window_cost_in_chunks: int = WINDOW_COST_IN_CHUNKS,
 ) -> list[LiveWindow]:
     """Group vertically-adjacent row bands to minimise total ingest cost.
@@ -258,9 +266,12 @@ def merge_bands(
     express "extra area is nearly free", so it under-merges precisely on the sparse
     ROIs where the absolute waste is trivial.
 
-    ``max_chunks_per_window`` bounds one window's graph, trading a little cost for
-    a memory and scheduler envelope known to be safe. A single row band wider than
-    the cap is still emitted: being one chunk-row, it cannot be split.
+    ``max_tasks_per_window`` bounds one window's GRAPH, converted to a chunk area
+    through ``tasks_per_chunk``. Tasks are the right unit: the scheduler dispatches
+    tasks on a single-threaded event loop, and past its throughput extra area stops
+    being cheap — which is how an unbounded objective over-merges into a saturated
+    scheduler and gets slower. A single row band over the cap is still emitted:
+    being one chunk-row, it cannot be split.
 
     Grouping only unions adjacent chunk-row ranges, so windows stay chunk-aligned
     and mutually chunk-disjoint — the property that lets one session write a whole
@@ -272,6 +283,7 @@ def merge_bands(
     n = len(windows)
     if n == 0:
         return []
+    max_chunks = max(1, max_tasks_per_window // max(1, tasks_per_chunk))
 
     # best[i] = min cost of covering the first i bands; cut[i] = where its last
     # group starts. Costs are in CHUNK-EQUIVALENTS, so no seconds are needed —
@@ -286,7 +298,7 @@ def merge_bands(
         for j in range(i - 1, -1, -1):
             group = _union(windows[j:i])
             area = _chunk_area(group, chunk_px)
-            if area > max_chunks_per_window and i - j > 1:
+            if area > max_chunks and i - j > 1:
                 break
             candidate = best[j] + window_cost_in_chunks + area
             if candidate < best[i]:
@@ -302,10 +314,29 @@ def merge_bands(
     return out
 
 
+def coarsen_live_grid(live: np.ndarray, factor: int) -> np.ndarray:
+    """Coarsen a live-chunk grid by ``factor``: a coarse cell is live if any fine one is.
+
+    Lets windows be derived on a COARSER grid than the mask is chunked at, which is
+    what keeps them aligned to the ingest's load blocks when those are a multiple of
+    the store's chunks. Deriving on the fine grid and snapping outward afterwards
+    would be wrong: two windows on adjacent fine rows can snap into the same coarse
+    block and stop being chunk-disjoint, which the single-session write requires.
+    """
+    if factor == 1:
+        return live
+    rows, cols = live.shape
+    r_pad, c_pad = math.ceil(rows / factor) * factor, math.ceil(cols / factor) * factor
+    padded = np.zeros((r_pad, c_pad), dtype=bool)
+    padded[:rows, :cols] = live
+    return padded.reshape(r_pad // factor, factor, c_pad // factor, factor).any(axis=(1, 3))
+
+
 def live_windows_for_mask(
     mask_path: str,
     *,
     chunk_px: int = INGEST_CHUNK_SIZE,
+    window_px: int | None = None,
     prefer_keys: bool = True,
     merge: bool = True,
     storage_options: dict | None = None,
@@ -319,12 +350,20 @@ def live_windows_for_mask(
     sequential reads. Row bands are then merged into taller bands
     (:func:`merge_bands`), because the per-window write cost is what dominates.
 
+    ``window_px`` snaps the windows to a COARSER grid than the mask's own chunking —
+    set it to the ingest's load-block size so every window lands on whole load
+    blocks. It must be a multiple of ``chunk_px``; ``None`` means the mask's grid.
+    The mask itself stays at ``chunk_px``, so the fast key-listing path is unaffected.
+
     ``prefer_keys=False`` forces the read path and ``merge=False`` the unmerged row
     bands, which is how each is held against the other in tests.
     ``storage_options`` mirrors :func:`ingest.roi.read_roi_mask`, so a deployment
     whose mask needs non-default fsspec/S3 settings derives windows where its
     ingest already reads the mask.
     """
+    window_px = window_px or chunk_px
+    if window_px % chunk_px:
+        raise ValueError(f"window_px {window_px} must be a multiple of chunk_px {chunk_px}")
     mask = _open_mask(mask_path, storage_options)
     height, width = mask.shape
     live = (
@@ -334,5 +373,6 @@ def live_windows_for_mask(
     )
     if live is None:
         live = live_chunk_grid(mask_path, chunk_px=chunk_px, storage_options=storage_options)
-    windows = row_band_windows(live, height=height, width=width, chunk_px=chunk_px)
-    return merge_bands(windows, chunk_px=chunk_px) if merge else windows
+    live = coarsen_live_grid(live, window_px // chunk_px)
+    windows = row_band_windows(live, height=height, width=width, chunk_px=window_px)
+    return merge_bands(windows, chunk_px=window_px) if merge else windows

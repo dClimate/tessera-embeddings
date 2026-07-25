@@ -21,6 +21,30 @@ INGEST_CHUNK_SIZE = 4096
 
 INGEST_CHUNKS = {"time": 1, "northing": INGEST_CHUNK_SIZE, "easting": INGEST_CHUNK_SIZE}
 
+# Dask block size for the LOAD side of ingest — deliberately DECOUPLED from the
+# storage chunk size above, and the reason the two exist separately.
+#
+# Graph task count is what limits ingest, and it scales with the number of blocks
+# the read path builds. Coarsening the load blocks shrinks that count without
+# touching the store's read geometry, which matters because the inference side is
+# tuned around the STORED chunk size: zarr decompresses whole stored chunks to
+# serve any part of one, so a coarser store adds a fixed per-chunk read cost to
+# the GPU path (measured, and the reason the store stays at 4096 — see
+# context_docs/design/ingest-graph-and-stac-budget.md).
+#
+# Must be a positive multiple of INGEST_CHUNK_SIZE: the write rechunks load blocks
+# down to store chunks, and a non-multiple would make that a cross-block shuffle
+# instead of a pure split. Set equal to INGEST_CHUNK_SIZE to disable the decoupling.
+INGEST_LOAD_CHUNK_SIZE = 8192
+
+if INGEST_LOAD_CHUNK_SIZE % INGEST_CHUNK_SIZE:
+    raise ValueError(
+        f"INGEST_LOAD_CHUNK_SIZE ({INGEST_LOAD_CHUNK_SIZE}) must be a multiple of "
+        f"INGEST_CHUNK_SIZE ({INGEST_CHUNK_SIZE}) so the write is a pure split"
+    )
+
+INGEST_LOAD_CHUNKS = {"time": 1, "northing": INGEST_LOAD_CHUNK_SIZE, "easting": INGEST_LOAD_CHUNK_SIZE}
+
 # S2 per-solar-day keep threshold for the GLOBAL CAMPAIGN ingest path, as a
 # PERCENT of ROI pixels that must be valid (cloud-screened) to keep a solar
 # day — the same percent scale as ingest/roi_processing.py's same-named

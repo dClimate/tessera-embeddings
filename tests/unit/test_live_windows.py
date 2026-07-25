@@ -298,7 +298,7 @@ class TestMergeBands:
     def test_chunk_cap_splits_a_tall_band(self):
         """Even a free merge stops at the area cap, so one graph stays bounded."""
         rows = [LiveWindow(y0=r * CHUNK, y1=(r + 1) * CHUNK, x0=0, x1=2 * CHUNK) for r in range(10)]
-        merged = merge_bands(rows, chunk_px=CHUNK, max_chunks_per_window=4)
+        merged = merge_bands(rows, chunk_px=CHUNK, max_tasks_per_window=4, tasks_per_chunk=1)
         assert len(merged) == 5  # 4-chunk cap = 2 rows of 2 chunks per band
         assert all(_area([w]) <= 4 for w in merged)
 
@@ -307,7 +307,7 @@ class TestMergeBands:
         losing it would silently skip land.
         """
         rows = [LiveWindow(y0=0, y1=CHUNK, x0=0, x1=9 * CHUNK)]  # 9 chunks
-        assert merge_bands(rows, chunk_px=CHUNK, max_chunks_per_window=2) == rows
+        assert merge_bands(rows, chunk_px=CHUNK, max_tasks_per_window=2, tasks_per_chunk=1) == rows
 
     def test_matches_brute_force_optimum(self):
         """Optimality, checked exhaustively on small inputs rather than asserted."""
@@ -321,7 +321,9 @@ class TestMergeBands:
                 bands.append(LiveWindow(y0=y, y1=y + CHUNK, x0=x0, x1=x0 + rng.randint(1, 4) * CHUNK))
             cap = rng.choice([4, 8, 64, 10**6])
             price = rng.choice([0, 1, 5, 200])
-            got = merge_bands(bands, chunk_px=CHUNK, max_chunks_per_window=cap, window_cost_in_chunks=price)
+            got = merge_bands(
+                bands, chunk_px=CHUNK, max_tasks_per_window=cap, tasks_per_chunk=1, window_cost_in_chunks=price
+            )
             assert self._cost(got, price) == _brute_force_best(bands, cap, price, CHUNK)
 
     def test_merged_bands_stay_chunk_aligned_and_disjoint(self):
@@ -333,7 +335,7 @@ class TestMergeBands:
             LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=CHUNK, x1=3 * CHUNK),
             LiveWindow(y0=5 * CHUNK, y1=6 * CHUNK, x0=8 * CHUNK, x1=9 * CHUNK),
         ]
-        merged = merge_bands(rows, chunk_px=CHUNK, max_chunks_per_window=6)
+        merged = merge_bands(rows, chunk_px=CHUNK, max_tasks_per_window=6, tasks_per_chunk=1)
         seen: set[tuple[int, int]] = set()
         for w in merged:
             assert w.y0 % CHUNK == 0 and w.x0 % CHUNK == 0
