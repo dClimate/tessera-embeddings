@@ -155,15 +155,12 @@ def ingest_s1_roi_sar(
     orbit_store = f"{store_path}/sar_{orbit}.zarr"
 
     # Cropped write path: windows derived once from the same mask this ingest
-
     # reads (see ingest.live_windows; identical mechanics to the S2 path).
-
     live_windows: list[tuple[int, int, int, int]] | None = None
-
     if crop_to_live_windows:
         live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in live_windows_for_mask(roi_zarr_path)]
-
         log.info("Cropping writes to %d live window(s)", len(live_windows))
+
     total_processed = 0
     batch_start = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -231,7 +228,7 @@ def ingest_s1_roi_sar(
         )
 
         if data is not None:
-            data, _ = apply_roi_mask(data, roi_zarr_path, spatial_chunks, roi_mask=roi_mask)
+            data = apply_roi_mask(data, roi_zarr_path, spatial_chunks, roi_mask=roi_mask)
 
             def _retrying() -> Retrying:
                 return Retrying(

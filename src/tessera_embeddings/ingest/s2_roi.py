@@ -7,11 +7,9 @@ supply a connected :class:`dask.distributed.Client` and a logger.
 
 The algorithm is unchanged from the reference:
 
-1. Read ROI metadata + mask, and total its live pixels for the coverage
-   denominator. The mask is persisted on workers on the full-extent path; under
-   ``crop_to_live_windows`` it stays lazy and is totalled over the live windows
-   only, because persisting the full grid costs more than every downstream use
-   of it (see the call site).
+1. Read ROI metadata + mask and total its pixels for the coverage denominator.
+   Persisted on workers on the full-extent path; lazy and window-totalled under
+   ``crop_to_live_windows``.
 2. Query STAC for the full date range; sort cloudiest-first so the
    painter's-algorithm mosaic picks the clearest tile last.
 3. Group items by ``solar_day``.
@@ -265,26 +263,17 @@ def ingest_s2_roi_reflectance(
 
     roi_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
     if live_windows is not None:
-        # Cropped: keep the mask LAZY and total it over the live windows only.
+        # Cropped: mask stays LAZY, total comes from the live windows only.
         #
-        # Both halves matter, and getting either wrong reintroduces exactly the
-        # extent-scaled cost cropping exists to remove — measured on the first
-        # cropped 03S run, where these two lines WERE the whole graph: 8,794
-        # tasks (3,706 from-zarr + 3,706 sum + a 1,378-task tree reduce) and
-        # ~60 GiB of mask chunks resident, spilling to disk, to produce one
-        # integer. The mosaic itself was 2 windows / 4 chunks per band-date.
+        # No persist — it would materialise the whole zone grid, while every
+        # consumer (the SCL reduce below, apply_roi_mask) slices to windows, so
+        # dask culls the reads and a per-date re-read beats pinning the grid.
         #
-        # No persist: it materialises every chunk of the full extent, which is
-        # what held the memory. The mask's downstream uses — the SCL reduce
-        # below and apply_roi_mask — both slice to windows, so dask culls the
-        # reads to the few chunks a window touches; re-reading those per date
-        # is far cheaper than pinning the whole grid.
-        #
-        # Window sum: the mask is False outside every window, so this equals the
-        # full-extent total. That is the same coverage-totality property
-        # _compute_scl_phase relies on for the numerator, applied to the
-        # denominator — a mismatched pair would silently skew every coverage
-        # percentage. Row-band windows are chunk-disjoint, so no double count.
+        # The window total equals the full-extent total because the mask is False
+        # outside every window, and row bands are chunk-disjoint so nothing is
+        # counted twice. _compute_scl_phase relies on that same property for the
+        # numerator: both sides of the coverage ratio must stay cropped together,
+        # or every percentage is silently skewed.
         roi_pixel_count = int(_sum_over_windows(roi_mask, live_windows).compute())
     else:
         # Persist the ROI mask on workers so per-day graphs reference small
@@ -354,7 +343,7 @@ def ingest_s2_roi_reflectance(
                 if str(var) != "scl":
                     day_ds[str(var)] = day_ds[str(var)].where(any_valid, other=0)
 
-        day_ds, _ = apply_roi_mask(day_ds, roi_zarr_path, spatial_chunks, roi_mask=roi_mask)
+        day_ds = apply_roi_mask(day_ds, roi_zarr_path, spatial_chunks, roi_mask=roi_mask)
 
         # Tenacity retry on intermittent GDAL errors under high parallelism.
         # Icechunk writes are atomic, so retry is safe — a failed cropped date

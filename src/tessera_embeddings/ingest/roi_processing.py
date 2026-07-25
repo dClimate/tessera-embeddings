@@ -25,11 +25,15 @@ def apply_roi_mask(
     spatial_chunks: dict[str, int],
     fill_value: int = 0,
     roi_mask: da.Array | None = None,
-) -> tuple[xr.Dataset, int]:
+) -> xr.Dataset:
     """Apply a binary ROI mask to all variables in a dataset.
 
     Reads the Zarr ROI store, and sets pixels outside the ROI to
     ``fill_value`` for every data variable.
+
+    Lazy by contract: builds the masking graph and returns. Both sensor paths call
+    this once per date over a full zone grid, so nothing here may compute eagerly.
+    Callers needing the ROI pixel total compute it themselves, once.
 
     Args:
         data: Dataset with (time, northing, easting) dimensions and an ``odc.geobox``.
@@ -37,20 +41,18 @@ def apply_roi_mask(
         spatial_chunks: Dict with ``"northing"`` and ``"easting"`` chunk sizes for the
             broadcast dask array (should match the dataset's load chunks).
         fill_value: Value to assign outside the ROI. Default 0.
-        roi_mask: Pre-computed boolean dask array (northing, easting), e.g. already
-            persisted on workers. When provided, avoids re-reading from
-            the Zarr store.
+        roi_mask: Pre-computed boolean dask array (northing, easting), already
+            persisted on workers or left lazy. When provided, avoids re-reading
+            from the Zarr store.
 
     Returns:
-        Tuple of (masked dataset, roi_pixel_count) where roi_pixel_count is
-        the number of True pixels in the mask.
+        The masked dataset.
     """
     mask_2d = roi_mask if roi_mask is not None else read_roi_mask(roi_zarr_path, spatial_chunks)
     mask_da = mask_2d[np.newaxis, :, :]
-    roi_pixel_count = int(mask_2d.sum().compute())
     for var in data.data_vars:
         data[var] = data[var].where(mask_da, other=fill_value)
-    return data, roi_pixel_count
+    return data
 
 
 def filter_low_coverage_dates(
