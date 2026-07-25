@@ -41,6 +41,7 @@ builds no graph at all.
 """
 
 import logging
+import statistics
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -1026,7 +1027,14 @@ def batched_region_writes(
     repo = _open_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
     yield RegionWriteBatch(session)
+    # --- TEMPORARY DIAGNOSTIC (F-05): time the commit ------------------------------
+    # The one per-date cost outside write_day_windows' own accounting, so without it
+    # the budget has an unexplained remainder. Delete with the block in
+    # write_day_windows.
+    _t0 = time.monotonic()
     session.commit(message)
+    logger.info("commit %.2fs — %s", time.monotonic() - _t0, message)
+    # --- END TEMPORARY DIAGNOSTIC -------------------------------------------------
 
 
 def write_day_windows(
@@ -1105,6 +1113,16 @@ def write_day_windows(
         get_credentials=get_credentials,
         s3_region=s3_region,
     ) as batch:
+        # --- BEGIN TEMPORARY DIAGNOSTIC (F-05, per-window write overhead) ----------
+        # Delete this block, its `_t*` locals, the `writes`/`isels` lists and the two
+        # log calls once the per-window cost is understood. Nothing else depends on
+        # them. Kept as a full per-date budget rather than a single number so the
+        # cost can be attributed without inferring it from dashboard sampling gaps
+        # (which, at 15 s resolution, produced two confidently wrong answers).
+        # The per-WINDOW detail is DEBUG, so it is off by default and cannot bloat
+        # logs on a 220-window zone; only the one-line-per-date summary is INFO.
+        _t_start = time.monotonic()
+        # --- END TEMPORARY DIAGNOSTIC ---------------------------------------------
         if manifest:
             manifest.validate_against(extract_manifest(dict(batch.group.attrs)), store_path)
         t = batch.append_time_slot(when)
@@ -1115,8 +1133,13 @@ def write_day_windows(
         attrs["doy"] = list(cast("list", attrs.get("doy", []))) + compute_doy(np.array([when])).tolist()
         attrs["last_appended"] = utcnow_iso()
         drop = [c for c in ("time", "northing", "easting") if c in day_ds.coords]
-        for y0, y1, x0, x1 in windows:
+        _t_slot = time.monotonic()  # TEMPORARY DIAGNOSTIC (F-05)
+        writes: list[float] = []  # TEMPORARY DIAGNOSTIC (F-05)
+        isels: list[float] = []  # TEMPORARY DIAGNOSTIC (F-05)
+        for i, (y0, y1, x0, x1) in enumerate(windows):
+            _t0 = time.monotonic()  # TEMPORARY DIAGNOSTIC (F-05)
             win = day_ds.isel(northing=slice(y0, y1), easting=slice(x0, x1)).drop_vars(drop)
+            _t1 = time.monotonic()  # TEMPORARY DIAGNOSTIC (F-05)
             to_icechunk(
                 win,
                 batch.session,
@@ -1125,6 +1148,39 @@ def write_day_windows(
                 align_chunks=True,
                 split_every=8,
             )
+            # --- TEMPORARY DIAGNOSTIC (F-05) --------------------------------------
+            _t2 = time.monotonic()
+            isels.append(_t1 - _t0)
+            writes.append(_t2 - _t1)
+            logger.debug(
+                "  window %d/%d [%d:%d, %d:%d] %d chunk(s): graph %.3fs write %.3fs",
+                i + 1,
+                len(windows),
+                y0,
+                y1,
+                x0,
+                x1,
+                max(1, (y1 - y0) // chunks["northing"]) * max(1, (x1 - x0) // chunks["easting"]),
+                _t1 - _t0,
+                _t2 - _t1,
+            )
+            # --- END TEMPORARY DIAGNOSTIC ----------------------------------------
+        # --- BEGIN TEMPORARY DIAGNOSTIC (F-05) ------------------------------------
+        if writes:
+            logger.info(
+                "date %s budget: %d window(s) | slot+attrs %.1fs | graphs %.1fs | "
+                "writes %.1fs (min %.2f med %.2f max %.2f) | unattributed %.1fs",
+                date_str,
+                len(writes),
+                _t_slot - _t_start,
+                sum(isels),
+                sum(writes),
+                min(writes),
+                statistics.median(writes),
+                max(writes),
+                time.monotonic() - _t_start - (_t_slot - _t_start) - sum(isels) - sum(writes),
+            )
+        # --- END TEMPORARY DIAGNOSTIC ---------------------------------------------
 
 
 def compute_doy(timestamps: np.ndarray) -> np.ndarray:
