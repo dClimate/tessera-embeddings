@@ -247,6 +247,51 @@ any window is not store-chunk-aligned. Previously a misaligned window would have
 deep in the write or, worse, straddled a chunk with a neighbouring window and made the result
 depend on write order.
 
+### 3.8 Where the graph work ended, and why — the write floor
+
+**The graph is now essentially all write tasks, at one per (store chunk × band).** Predicted
+against observed, window by window on the shipped configuration:
+
+| blocks | store chunks | predicted (`chunks × 11`) | observed live graph |
+|---|---|---|---|
+| 120 | 480 | 5,280 | 5,831 |
+| 120 | 480 | 5,280 | 5,684 |
+| 117 | 468 | 5,148 | 5,343 |
+| 100 | 400 | 4,400 | 4,246 |
+| 54 | 216 | 2,376 | 2,432 |
+
+Seven windows, seven matches. The read-and-mask side — everything §3.3 through §3.7 attacked —
+has fused down into the noise. What remains is `store_chunks × n_bands`, and **both factors are
+pinned by decisions taken deliberately**: 4096 chunking because the GPU path is tuned around it
+(§4.1), eleven bands because that is the data.
+
+This also retro-explains §3.7: there was never a large win available in the write layer, because
+the write layer emits one task per store chunk regardless of what it is asked to do.
+
+**The only remaining headroom is dead area: windows cover 2,992 store chunks against 2,415 live
+— 577 dead, 19%.** So 32,912 write tasks are issued where 26,565 is the floor. That 19% comes
+from a trade §3.7 introduced: not realigning requires windows on the 8192 block grid, and
+coarsening the live grid marks a whole block live if any quarter of it is. Recovering it means
+4096-grid windows, which brings realignment back — and that measured **worse** (5,159 tasks
+against 4,877).
+
+The configuration space is therefore closed, all three measured:
+
+| configuration | live graph per window |
+|---|---|
+| load 8192, 8192 windows, realigned | 5,159 |
+| **load 8192, 8192 windows, not realigned** (shipped) | **4,877** |
+| load 4096, 4096 windows | worse on wall clock (187.9 s) |
+
+**Verdict: graph work is complete.** We sit within 19% of a floor set by constraints we have
+chosen not to move, and the last three experiments returned 5%, 1.35%, and a 30–50% regression.
+The achievement is not the per-date seconds — it is that the scheduler went from **pinned at
+100% to ~25%**, which is what caps workers per cell and therefore what caps the concurrency
+multiplier (§1).
+
+Anyone reopening this should start by asking whether the store's chunking or the band count can
+move. If neither can, there is nothing here worth more than 19%.
+
 ---
 
 ## 4. What did not work, and why
