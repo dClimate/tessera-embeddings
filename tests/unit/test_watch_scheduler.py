@@ -20,6 +20,15 @@ from tessera_embeddings.profiling.ingest import watch_scheduler as ws
 _HEALTHY = (
     "2026-07-24 18:00:00,000 distributed.scheduler - INFO - "
     "scheduler health: cpu=42% rss=1.50GiB mem=18% lag=0.1s "
+    "fds=42 threads=9 workers=120 tasks=8000 processing=480 no-worker=12 "
+    "wmem=40.00GiB wmanaged=32.00GiB wspill=6.50GiB wmax=14.00GiB"
+)
+
+# A line from before the heartbeat carried fleet memory. --report is routinely
+# pointed at those windows, so parsing must keep working on them.
+_HEALTHY_NO_FLEET = (
+    "2026-07-24 18:00:00,000 distributed.scheduler - INFO - "
+    "scheduler health: cpu=42% rss=1.50GiB mem=18% lag=0.1s "
     "fds=42 threads=9 workers=120 tasks=8000 processing=480 no-worker=12"
 )
 
@@ -37,7 +46,51 @@ def test_parse_health_line_full():
         "tasks": 8000,
         "processing": 480,
         "no_worker": 12,
+        "worker_mem_gib": 40.0,
+        "worker_managed_gib": 32.0,
+        "worker_spill_gib": 6.5,
+        "worker_max_gib": 14.0,
     }
+
+
+def test_parse_health_line_without_fleet_memory_still_parses():
+    """A pre-change log line yields the same keys, with the fleet ones None.
+
+    The alternative — requiring the tail — would make ``--report`` return zero
+    samples for every already-profiled run instead of the scheduler-only series
+    it genuinely contains.
+    """
+    s = ws.parse_health_line(_HEALTHY_NO_FLEET)
+    assert s is not None
+    assert s["cpu"] == 42.0 and s["no_worker"] == 12
+    assert all(s[k] is None for k in ws.WORKER_MEM_KEYS)
+
+
+def test_unknown_fleet_memory_is_json_safe():
+    """``nan`` fleet values become None, so the JSONL output stays strict JSON."""
+    line = (
+        "scheduler health: cpu=1% rss=1.00GiB mem=1% lag=0.0s "
+        "fds=1 threads=1 workers=0 tasks=0 processing=0 no-worker=0 "
+        "wmem=nanGiB wmanaged=nanGiB wspill=nanGiB wmax=nanGiB"
+    )
+    s = ws.parse_health_line(line)
+    assert s is not None
+    assert all(s[k] is None for k in ws.WORKER_MEM_KEYS)
+    snap = ws._snapshot(s, 1000, None, None, [])
+    assert json.loads(json.dumps(snap))["worker_spill_gib"] is None
+
+
+def test_measured_zero_spill_is_not_unknown():
+    """0.0 spill is the healthy RESULT and must stay distinguishable from None."""
+    line = (
+        "scheduler health: cpu=1% rss=1.00GiB mem=1% lag=0.0s "
+        "fds=1 threads=1 workers=4 tasks=10 processing=2 no-worker=0 "
+        "wmem=3.00GiB wmanaged=1.00GiB wspill=0.00GiB wmax=1.00GiB"
+    )
+    s = ws.parse_health_line(line)
+    assert s is not None
+    assert s["worker_spill_gib"] == 0.0
+    assert ws.evaluate_alerts([s], ws.Thresholds()) == []
 
 
 def test_parse_health_line_unknown_mem_is_json_safe():
@@ -87,6 +140,10 @@ def _sample(**over):
         "tasks": 1000,
         "processing": 50,
         "no_worker": 0,
+        "worker_mem_gib": 10.0,
+        "worker_managed_gib": 8.0,
+        "worker_spill_gib": 0.0,
+        "worker_max_gib": 1.0,
     }
     base.update(over)
     return base
@@ -123,6 +180,24 @@ def test_alert_worker_churn():
     assert "worker-churn" not in ws.evaluate_alerts([_sample(workers=100), _sample(workers=110)], th)
 
 
+def test_alert_worker_spill():
+    th = ws.Thresholds()  # spill_gib=1.0
+    assert "worker-spill" in ws.evaluate_alerts([_sample(worker_spill_gib=6.5)], th)
+    assert "worker-spill" not in ws.evaluate_alerts([_sample(worker_spill_gib=0.0)], th)
+    # An older run with no fleet numbers must not trip, exactly like mem-high.
+    assert "worker-spill" not in ws.evaluate_alerts([_sample(worker_spill_gib=None)], th)
+
+
+def test_spill_trips_while_every_scheduler_signal_is_nominal():
+    """The 03S signature: healthy scheduler, fleet drowning.
+
+    This is the case a scheduler-only heartbeat reported as fine, so it is the
+    one worth pinning: the ONLY alert must be worker-spill.
+    """
+    nominal_but_spilling = _sample(cpu=15.0, mem=12.0, lag=0.0, no_worker=0, worker_spill_gib=468.0)
+    assert ws.evaluate_alerts([nominal_but_spilling], ws.Thresholds()) == ["worker-spill"]
+
+
 def test_profile_run_peaks_onsets_events():
     # Build a series that ramps CPU into sustained saturation with a rising
     # backlog and a worker join, then compute the profile.
@@ -139,6 +214,29 @@ def test_profile_run_peaks_onsets_events():
     assert prof["onsets"]["backlog-growth"] is not None
     # one worker join event (100 -> 150)
     assert len(prof["worker_events"]) == 1 and prof["worker_events"][0]["delta"] == 50
+
+
+def test_profile_run_reports_fleet_peaks():
+    series = [
+        ws._snapshot(_sample(worker_mem_gib=m, worker_spill_gib=s, worker_max_gib=x), 1000 + i * 30, None, None, [])
+        for i, (m, s, x) in enumerate([(10.0, 0.0, 3.0), (40.0, 6.5, 14.0), (20.0, 2.0, 8.0)])
+    ]
+    prof = ws.profile_run(series, ws.Thresholds())
+    assert prof["peaks"]["worker_mem_gib"] == 40.0
+    assert prof["peaks"]["worker_spill_gib"] == 6.5
+    assert prof["peaks"]["worker_max_gib"] == 14.0
+    assert prof["onsets"]["worker-spill"] == series[1]["ts"]
+
+
+def test_profile_run_without_fleet_data_reports_null_not_zero():
+    """A pre-change run must read "not recorded", never "peaked at 0 GiB spilled"."""
+    series = [
+        ws._snapshot(_sample(**dict.fromkeys(ws.WORKER_MEM_KEYS)), 1000 + i * 30, None, None, []) for i in range(3)
+    ]
+    prof = ws.profile_run(series, ws.Thresholds())
+    assert prof["peaks"]["worker_spill_gib"] is None
+    assert prof["onsets"]["worker-spill"] is None
+    assert "not recorded" in ws._markdown(prof, "/ecs/x")
 
 
 def test_profile_run_empty():

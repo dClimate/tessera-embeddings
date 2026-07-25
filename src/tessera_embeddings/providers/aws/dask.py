@@ -123,6 +123,18 @@ class SchedulerResourceLogger(SchedulerPlugin):
     - ``workers`` / ``tasks`` — cluster size and total tracked tasks, with a
       breakdown of tasks in flight (``processing``) and stuck waiting
       (``no-worker``) — a rising backlog signals the scheduler falling behind.
+    - ``wmem`` / ``wmanaged`` / ``wspill`` / ``wmax`` — FLEET memory, summed from
+      the per-worker state the scheduler already tracks, plus the hottest single
+      worker. Deliberately not scheduler health: it is a SECOND failure mode,
+      independent of everything above. The first real campaign cell died of
+      *worker* memory pressure — ~1 TB across resident and spilled, a death
+      spiral of kills and recomputes — while every scheduler signal stayed
+      nominal, so a scheduler-only heartbeat could not explain the failure it
+      was watching. ``wspill`` is the leading indicator: spill means the graph
+      no longer fits the fleet, and it precedes the kills rather than following
+      them. These lines do not displace the scheduler metrics — a fleet that
+      fits is the PRECONDITION for the scheduler reading to mean anything,
+      since a run that dies of worker memory never reaches a scheduler limit.
 
     When ``cpu`` or ``lag`` crosses the stack-sampling thresholds, a one-shot
     background thread additionally logs a ``scheduler stack sample`` line: a
@@ -204,6 +216,33 @@ class SchedulerResourceLogger(SchedulerPlugin):
             self._callback.stop()
             self._callback = None
 
+    @staticmethod
+    def _worker_memory(sched: Scheduler) -> tuple[float, float, float, float]:
+        """Fleet memory as ``(process, managed, spilled, hottest_process)`` GiB.
+
+        Read from :class:`distributed.scheduler.MemoryState` on each worker, which
+        the scheduler maintains anyway — no worker-side agent, no extra comms.
+
+        Isolated in its own guard rather than sharing ``_log_usage``'s: a change
+        in ``WorkerState`` internals must cost the four fleet numbers, not the
+        whole heartbeat. Returns NaNs (rendered ``nan``, which the profiler parses
+        as unknown) when the scheduler ref is absent or the fleet is empty.
+        """
+        try:
+            mems = [w.memory for w in sched.workers.values()]
+            if not mems:
+                return (0.0, 0.0, 0.0, 0.0)
+            gib = 1024**3
+            return (
+                sum(m.process for m in mems) / gib,
+                sum(m.managed for m in mems) / gib,
+                sum(m.spilled for m in mems) / gib,
+                max(m.process for m in mems) / gib,
+            )
+        except (AttributeError, TypeError, ValueError):
+            nan = float("nan")
+            return (nan, nan, nan, nan)
+
     def _log_usage(self) -> None:
         proc = self._proc
         sched = self._scheduler
@@ -231,9 +270,12 @@ class SchedulerResourceLogger(SchedulerPlugin):
             processing = sum(len(w.processing) for w in sched.workers.values()) if sched is not None else -1
             no_worker = len(getattr(sched, "unrunnable", ())) if sched is not None else -1
 
+            w_mem, w_managed, w_spill, w_max = self._worker_memory(sched) if sched is not None else (float("nan"),) * 4
+
             log.info(
                 "scheduler health: cpu=%.0f%% rss=%.2fGiB mem=%.0f%% lag=%.1fs "
-                "fds=%d threads=%d workers=%d tasks=%d processing=%d no-worker=%d",
+                "fds=%d threads=%d workers=%d tasks=%d processing=%d no-worker=%d "
+                "wmem=%.2fGiB wmanaged=%.2fGiB wspill=%.2fGiB wmax=%.2fGiB",
                 cpu_pct,
                 rss_gib,
                 mem_pct,
@@ -244,6 +286,10 @@ class SchedulerResourceLogger(SchedulerPlugin):
                 n_tasks,
                 processing,
                 no_worker,
+                w_mem,
+                w_managed,
+                w_spill,
+                w_max,
             )
             if self._stack_sampling and (cpu_pct >= self._stack_trigger_cpu_pct or lag_s >= self._stack_trigger_lag_s):
                 self._maybe_sample_stacks(cpu_pct, lag_s)

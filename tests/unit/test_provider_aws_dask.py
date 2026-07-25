@@ -150,11 +150,26 @@ def test_profiling_tools_target_the_providers_log_group() -> None:
     assert DEFAULT_INGEST_LOG_GROUP == dask_mod.DEFAULT_CLOUDWATCH_LOG_GROUP
 
 
-class _FakeWorker:
-    """Minimal WorkerState stand-in exposing only what the logger reads."""
+class _FakeMemoryState:
+    """The ``MemoryState`` fields the fleet-memory aggregation sums, in bytes."""
 
-    def __init__(self, processing: int) -> None:
+    def __init__(self, process_gib: float, managed_gib: float, spilled_gib: float) -> None:
+        self.process = int(process_gib * 1024**3)
+        self.managed = int(managed_gib * 1024**3)
+        self.spilled = int(spilled_gib * 1024**3)
+
+
+class _FakeWorker:
+    """Minimal WorkerState stand-in exposing only what the logger reads.
+
+    ``memory`` is omitted entirely when None, so a test can reproduce a
+    distributed version whose WorkerState lacks it.
+    """
+
+    def __init__(self, processing: int, memory: _FakeMemoryState | None = None) -> None:
         self.processing = list(range(processing))
+        if memory is not None:
+            self.memory = memory
 
 
 class _FakeLoop:
@@ -168,8 +183,19 @@ class _FakeLoop:
 class _FakeScheduler:
     """Scheduler stand-in with the attributes ``_log_usage`` touches."""
 
-    def __init__(self, *, workers_processing, tasks: int, unrunnable: int, now: float = 1000.0) -> None:
-        self.workers = {f"tcp://w{i}": _FakeWorker(p) for i, p in enumerate(workers_processing)}
+    def __init__(
+        self,
+        *,
+        workers_processing,
+        tasks: int,
+        unrunnable: int,
+        now: float = 1000.0,
+        worker_memory: list[_FakeMemoryState] | None = None,
+    ) -> None:
+        mems = worker_memory if worker_memory is not None else [None] * len(workers_processing)
+        self.workers = {
+            f"tcp://w{i}": _FakeWorker(p, m) for i, (p, m) in enumerate(zip(workers_processing, mems, strict=True))
+        }
         self.tasks = dict.fromkeys(range(tasks))
         self.unrunnable = set(range(unrunnable))
         self.loop = _FakeLoop(now)
@@ -245,6 +271,58 @@ class TestSchedulerResourceLogger:
         assert "tasks=42" in line
         assert "processing=8" in line  # 3 + 5 summed across workers
         assert "no-worker=7" in line
+
+    def test_fleet_memory_is_summed_and_round_trips_through_the_parser(self, caplog) -> None:
+        """Fleet totals are summed across workers; ``wmax`` is the hottest ONE.
+
+        The hottest-worker figure is what distinguishes an evenly loaded fleet
+        from one worker holding the graph — invisible in a sum alone.
+        """
+        plugin = self._make_started()
+        sched = _FakeScheduler(
+            workers_processing=[1, 1, 1],
+            tasks=10,
+            unrunnable=0,
+            worker_memory=[
+                _FakeMemoryState(process_gib=2.0, managed_gib=1.0, spilled_gib=0.0),
+                _FakeMemoryState(process_gib=8.0, managed_gib=6.0, spilled_gib=4.0),
+                _FakeMemoryState(process_gib=4.0, managed_gib=3.0, spilled_gib=1.5),
+            ],
+        )
+        sample = parse_health_line(self._emit(plugin, sched, caplog))
+
+        assert sample is not None
+        assert sample["worker_mem_gib"] == pytest.approx(14.0)
+        assert sample["worker_managed_gib"] == pytest.approx(10.0)
+        assert sample["worker_spill_gib"] == pytest.approx(5.5)
+        assert sample["worker_max_gib"] == pytest.approx(8.0)
+
+    def test_an_idle_fleet_reports_measured_zeros(self, caplog) -> None:
+        """No workers yet is 0.0, not unknown — the cluster is simply empty."""
+        plugin = self._make_started()
+        sched = _FakeScheduler(workers_processing=[], tasks=0, unrunnable=0)
+        sample = parse_health_line(self._emit(plugin, sched, caplog))
+
+        assert sample is not None
+        assert sample["worker_spill_gib"] == 0.0
+        assert sample["worker_mem_gib"] == 0.0
+
+    def test_unreadable_worker_state_costs_only_the_fleet_fields(self, caplog) -> None:
+        """A WorkerState without ``memory`` must not take the heartbeat with it.
+
+        The scheduler-side signals are the ones that have always been there; a
+        distributed upgrade that moves worker memory must degrade the four new
+        numbers to unknown, not blank the line the operator diagnoses from.
+        """
+        plugin = self._make_started()
+        sched = _FakeScheduler(workers_processing=[3, 4], tasks=42, unrunnable=7)  # no memory attr
+        line = self._emit(plugin, sched, caplog)
+        sample = parse_health_line(line)
+
+        assert sample is not None, f"the heartbeat was lost entirely: {line!r}"
+        assert sample["workers"] == 2 and sample["tasks"] == 42 and sample["no_worker"] == 7
+        assert sample["worker_spill_gib"] is None
+        assert sample["worker_mem_gib"] is None
 
     def test_memory_percent_uses_limit(self, caplog) -> None:
         """mem% is RSS as a fraction of the configured container limit, so a

@@ -1,11 +1,29 @@
 """Watch and profile the Dask *scheduler* during an ingest run.
 
-The ingest scheduler is a single event-loop process that builds every task
-graph and routes every task; at UTM scale it — not the workers — is the named
-saturation risk. :class:`SchedulerResourceLogger`
-(``tessera_embeddings.providers.aws.dask``) already ships a 30 s ``scheduler
-health:`` heartbeat to the ``dask-scheduler`` CloudWatch stream. This tool turns
-that heartbeat into something a machine can act on:
+The ingest scheduler is a single event-loop process that builds every task graph
+and routes every task, and it stays the named saturation risk at UTM scale: one
+GIL-bound loop fanning work across many hundreds of workers is a genuine single
+point of failure, and it has bottlenecked before from ~250 workers on. Watching
+it is the primary job here. :class:`SchedulerResourceLogger`
+(``tessera_embeddings.providers.aws.dask``) ships a 30 s ``scheduler health:``
+heartbeat to the ``dask-scheduler`` CloudWatch stream.
+
+There is a SECOND, independent failure mode, which the first real campaign cell
+found: the fleet ran out of memory — roughly a terabyte across resident and
+spilled, workers killed and their completed work recomputed — while every
+scheduler signal stayed nominal. That run never got near a scheduler limit
+because it hit the memory wall first, which is also why it could not have
+measured one. So the heartbeat additionally carries FLEET memory
+(``wmem``/``wmanaged``/``wspill``/``wmax``, summed from the per-worker state the
+scheduler already tracks) and this tool alerts on ``worker-spill``.
+
+The two sets answer different questions and neither substitutes for the other:
+the scheduler metrics answer "is the scheduler keeping up?", which is what a
+high-worker-count rung is built to probe; the fleet metrics answer "does the
+graph fit the cluster at all?", which must be clean *first*, or the scheduler
+reading is measuring a doomed run rather than an envelope.
+
+This tool turns that heartbeat into something a machine can act on:
 
 1. ``--live`` — tail the scheduler stream in near real time, parse each health
    line into a rolling window, derive rates (task-count change, backlog slope,
@@ -99,20 +117,39 @@ class Thresholds:
     lag_s: float = 5.0
     # Worker-count change between two samples that counts as a churn spike.
     churn_delta: int = 25
+    # Fleet bytes spilled to disk, summed across workers, in a single sample.
+    # Spill means the graph no longer fits the fleet, and it is what preceded the
+    # worker death spiral on the first campaign cell — while every scheduler-side
+    # metric above stayed nominal. A healthy ingest spills nothing, so the default
+    # sits just above zero rather than at a fraction of some limit.
+    spill_gib: float = 1.0
 
 
 # One health line, e.g.:
 #   scheduler health: cpu=100% rss=1.50GiB mem=18% lag=5.0s fds=42 threads=9 \
-#   workers=2 tasks=42 processing=8 no-worker=7
+#   workers=2 tasks=42 processing=8 no-worker=7 \
+#   wmem=40.00GiB wmanaged=32.00GiB wspill=6.50GiB wmax=14.00GiB
 # mem may be "nan" when the container limit is unknown; counts may be -1 when
 # the scheduler ref is briefly unavailable. Parse defensively.
+#
+# The fleet-memory tail is OPTIONAL in the pattern on purpose: it was added after
+# runs had already been profiled, and `--report` is routinely pointed at those
+# older windows. Making it required would silently return zero samples for every
+# historical run rather than the scheduler-only series they legitimately contain.
 _NUM = r"-?\d+(?:\.\d+)?"
 _HEALTH_RE = re.compile(
     rf"scheduler health: cpu=(?P<cpu>{_NUM})% rss=(?P<rss>{_NUM})GiB "
     rf"mem=(?P<mem>nan|{_NUM})% lag=(?P<lag>{_NUM})s "
     rf"fds=(?P<fds>-?\d+) threads=(?P<threads>-?\d+) workers=(?P<workers>-?\d+) "
     rf"tasks=(?P<tasks>-?\d+) processing=(?P<processing>-?\d+) no-worker=(?P<no_worker>-?\d+)"
+    rf"(?: wmem=(?P<wmem>nan|{_NUM})GiB wmanaged=(?P<wmanaged>nan|{_NUM})GiB"
+    rf" wspill=(?P<wspill>nan|{_NUM})GiB wmax=(?P<wmax>nan|{_NUM})GiB)?"
 )
+
+#: Parsed keys carrying the fleet-memory tail. Absent on pre-change log lines and
+#: ``nan`` when the scheduler could not read worker state, both of which become
+#: None — the same JSON-safe treatment ``mem`` gets.
+WORKER_MEM_KEYS = ("worker_mem_gib", "worker_managed_gib", "worker_spill_gib", "worker_max_gib")
 
 
 def parse_health_line(message: str) -> dict | None:
@@ -126,11 +163,22 @@ def parse_health_line(message: str) -> dict | None:
     dicts go through ``json.dumps``, which renders NaN as the bare token ``NaN``
     — not valid JSON — so a strict consumer of the advertised JSON/JSONL output
     would break in exactly the unknown-memory case. ``None`` serializes to null.
+
+    The four :data:`WORKER_MEM_KEYS` are always present and get the same
+    treatment, reading None both on a pre-fleet-memory log line and on ``nan``.
+    Every downstream consumer therefore sees one shape regardless of when the run
+    was profiled, and "unknown" stays distinguishable from a measured zero — which
+    matters, because zero spill is the healthy result rather than missing data.
     """
     m = _HEALTH_RE.search(message)
     if not m:
         return None
     g = m.groupdict()
+
+    def _opt(name: str) -> float | None:
+        raw = g[name]
+        return None if raw is None or raw == "nan" else float(raw)
+
     return {
         "cpu": float(g["cpu"]),
         "rss_gib": float(g["rss"]),
@@ -142,6 +190,10 @@ def parse_health_line(message: str) -> dict | None:
         "tasks": int(g["tasks"]),
         "processing": int(g["processing"]),
         "no_worker": int(g["no_worker"]),
+        "worker_mem_gib": _opt("wmem"),
+        "worker_managed_gib": _opt("wmanaged"),
+        "worker_spill_gib": _opt("wspill"),
+        "worker_max_gib": _opt("wmax"),
     }
 
 
@@ -188,6 +240,13 @@ def evaluate_alerts(window: list[dict], thresholds: Thresholds) -> list[str]:
     if len(window) >= 2 and abs(latest["workers"] - window[-2]["workers"]) >= thresholds.churn_delta:
         alerts.append("worker-churn")
 
+    # fleet spill: single sample over the threshold. Listed last but it is the
+    # earliest warning of the worker-memory failure mode — and an unknown value
+    # (older log line) never trips, exactly like mem-high.
+    spill = latest.get("worker_spill_gib")
+    if spill is not None and spill >= thresholds.spill_gib:
+        alerts.append("worker-spill")
+
     return alerts
 
 
@@ -204,10 +263,13 @@ def _snapshot(sample: dict, epoch: int, prev: dict | None, prev_epoch: int | Non
 
 def _human_line(snap: dict) -> str:
     mem = "?" if snap["mem"] is None else f"{snap['mem']:.0f}"
+    fleet = ""
+    if snap.get("worker_mem_gib") is not None:
+        fleet = f" fleet={snap['worker_mem_gib']:.0f}GiB spill={snap['worker_spill_gib']:.1f}GiB"
     return (
         f"{snap['ts']}  cpu={snap['cpu']:.0f}% mem={mem}% lag={snap['lag']:.1f}s "
         f"workers={snap['workers']} tasks={snap['tasks']} "
-        f"proc={snap['processing']} no-worker={snap['no_worker']}"
+        f"proc={snap['processing']} no-worker={snap['no_worker']}{fleet}"
         + (f"  ALERT[{','.join(snap['alerts'])}]" if snap["alerts"] else "")
     )
 
@@ -319,11 +381,18 @@ def profile_run(series: list[dict], thresholds: Thresholds) -> dict:
         "no_worker": max(s["no_worker"] for s in series),
         "workers": max(s["workers"] for s in series),
         "tasks": max(s["tasks"] for s in series),
+        # None (JSON null) for a run profiled before the heartbeat carried fleet
+        # memory — distinct from 0.0, which is a measured, healthy no-spill run.
+        "worker_mem_gib": max(_known("worker_mem_gib"), default=None),
+        "worker_spill_gib": max(_known("worker_spill_gib"), default=None),
+        "worker_max_gib": max(_known("worker_max_gib"), default=None),
     }
 
     # Onsets: first timestamp each sustained/single rule trips, replaying the
     # same evaluator the live path uses so live and post-hoc agree.
-    onsets: dict[str, str | None] = dict.fromkeys(("cpu-sustained", "mem-high", "backlog-growth", "loop-lag"))
+    onsets: dict[str, str | None] = dict.fromkeys(
+        ("cpu-sustained", "mem-high", "backlog-growth", "loop-lag", "worker-spill")
+    )
     window: list[dict] = []
     cooccur = 0
     for i, s in enumerate(series):
@@ -359,6 +428,11 @@ def profile_run(series: list[dict], thresholds: Thresholds) -> dict:
     }
 
 
+def _gib(value: float | None) -> str:
+    """Render a fleet-memory peak, distinguishing "not measured" from zero."""
+    return "not recorded" if value is None else f"{value:.2f} GiB"
+
+
 def _markdown(profile: dict, log_group: str, *, truncated: bool = False) -> str:
     if not profile.get("samples"):
         return f"### Scheduler profile\n\n_No `scheduler health:` lines found in {log_group}._\n"
@@ -378,6 +452,9 @@ def _markdown(profile: dict, log_group: str, *, truncated: bool = False) -> str:
         f"- Window: {w['start']} → {w['end']} ({p['samples']} samples)",
         f"- Peaks: cpu **{pk['cpu']:.0f}%**, mem **{mem}**, lag **{pk['lag']:.1f}s**, "
         f"no-worker backlog **{pk['no_worker']}**, workers **{pk['workers']}**, tasks **{pk['tasks']}**",
+        f"- Fleet peaks: memory **{_gib(pk['worker_mem_gib'])}**, spilled "
+        f"**{_gib(pk['worker_spill_gib'])}**, hottest worker **{_gib(pk['worker_max_gib'])}**"
+        + ("" if pk["worker_spill_gib"] else "  _(no spill — the graph fit the fleet)_"),
         f"- cpu-high ∧ backlog-rising intervals: **{p['cpu_backlog_cooccurrence']}**",
         "- Saturation onsets: " + (", ".join(f"{k} @ {v}" for k, v in p["onsets"].items() if v) or "_none tripped_"),
         f"- Worker join/exit events: **{len(p['worker_events'])}**",
@@ -437,6 +514,7 @@ def _build_thresholds(args: argparse.Namespace) -> Thresholds:
         backlog_intervals=args.backlog_intervals,
         lag_s=args.lag_threshold,
         churn_delta=args.churn_delta,
+        spill_gib=args.spill_threshold,
     )
 
 
@@ -478,6 +556,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backlog-intervals", type=int, default=Thresholds.backlog_intervals)
     parser.add_argument("--lag-threshold", type=float, default=Thresholds.lag_s)
     parser.add_argument("--churn-delta", type=int, default=Thresholds.churn_delta)
+    parser.add_argument(
+        "--spill-threshold",
+        type=float,
+        default=Thresholds.spill_gib,
+        help="fleet GiB spilled to disk in one sample that trips worker-spill (default: %(default)s)",
+    )
     args = parser.parse_args(argv)
 
     thresholds = _build_thresholds(args)
