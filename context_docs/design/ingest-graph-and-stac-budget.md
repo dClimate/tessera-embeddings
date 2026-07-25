@@ -118,13 +118,46 @@ capture the whole win is therefore **disproved**.
 Alignment is fine either way: `SHARD_PX` = 2048 divides 8192 exactly (16 shards per chunk,
 32 of the 256-px inner chunks).
 
-### The inference-side constraint on the store change
+### The inference-side constraint on the store change — already measured, and it vetoes it
 
-Zarr fetches whole chunks, so a 2048-px tile read decompresses 4× its own bytes today and
-would decompress **16×** at 8192 store chunks. Per band-timestep that is 134 MB fetched to
-use 8.4 MB. Whether that binds depends on how much of a chunk each fetch actually uses.
+The GPU-saturation campaign (`inference_gpu_saturation_profile_2026_07.md`) measured this
+effect directly while tuning the strip budget:
 
-Baseline from the completed 15S/2024 fill (2,352 `RESOURCES` samples, 30.9 GB hosts):
+> Budget 4.75 → 5.75 GiB (P3). Lets the whole `T≤71` full-width band load as a single strip
+> instead of two, dropping a ~13 s fixed read/chunk (**source stores use 4000² chunks → every
+> read re-decompresses whole storage chunks; measured fixed read ≈13 s regardless of strip
+> size**).
+
+So a **fixed per-chunk read cost of ~13 s is already attributed to storage chunk size**. For
+a full-width strip the decompressed volume is `W × chunk_px` — linear in the chunk edge — so
+4096 → 8192 roughly **doubles** that fixed read, to ~26 s. Tile-shaped reads amplify worse
+(4× → 16× of the bytes actually used).
+
+Set that against what the campaign bought: GPU-idle overhead per chunk went **50–60 s →
+24–34 s** (striping + background write) → **~6 s median** on prefetch-hit chunks, with ~36 s
+remaining only on the first-per-worker cold start. Adding 13+ s of fixed read back would
+**roughly triple the steady-state overhead the campaign spent a whole branch reducing**, and
+it lands squarely on the resource that is otherwise pinned at 99% utilisation.
+
+There is a second, compounding effect. The strip budget (5.75 GiB) is sized so a full-width
+band load fits in ONE strip; larger storage chunks mean fewer rows fit per budget, so more
+chunks split into two strips, so more two-strip co-residency — which is precisely the
+direction of the 92–95% RAM OOM that motivated striping in the first place. The P3 budget
+raise *lowered* peak RAM (51% → 45–47%) by making more chunks single-strip; coarsening the
+store pushes the same lever backwards.
+
+**Conclusion: reject the store-side 8192 change on existing evidence.** It trades a 3.88×
+ingest graph reduction for a likely 2–4× regression in per-chunk GPU-idle overhead plus
+movement toward a known OOM regime, on the most expensive resource in the stack. The
+load-only 1.41× variant is unaffected — it leaves the store at 4096, so none of the above
+applies.
+
+If the full 4× is ever wanted, the route is NOT a coarser store: it is to reduce ingest
+graph tasks by some means that leaves the store's read geometry alone.
+
+### Baseline for any inference-touching change
+
+From the completed 15S/2024 fill (2,352 `RESOURCES` samples, 30.9 GB hosts):
 
 | phase | samples | GPU util mean/median/max | VRAM mean/max | host RAM mean/max |
 |---|---|---|---|---|
@@ -133,28 +166,22 @@ Baseline from the completed 15S/2024 fill (2,352 `RESOURCES` samples, 30.9 GB ho
 | load | 24 | 0% / 0% / 0% | 64% / 97% | 34% / 35% |
 | (unlabelled) | 294 | 0% / 0% / 29% | 73% / 97% | 12% / 38% |
 
-**Host RAM has slack; GPU has none.** Host peaks at 46% against a 60% operating ceiling —
-and only 35% during the load phase, which is where read amplification would land. The 60%
-ceiling is an operational rule adopted because spikes appeared at very large scale that
-small and medium tests did not show.
+Host RAM has slack (46% peak against the 60% ceiling; 35% during load). GPU has none: VRAM
+peaks at 97% and inference-phase utilisation averages 99% with 98% of samples ≥95%.
 
-GPU is the opposite: VRAM peaks at 97%, and during inference **utilisation averages 99%
-with 98% of samples at or above 95%**. The path is saturated by design — it has been
-optimised hard because GPU workers are by far the most expensive part of the stack.
+**Use the campaign's metrics, not ad-hoc ones.** `te-observe-cluster --ram-report
+--log-group /ec2/global-tessera-dev/ray --since … --until …` gives per-worker peak RAM and
+GPU-util distribution post-hoc with no live cluster; `--start-pollers` then `--report` gives
+1 s DCGM saturation (SMACT/TENSO) and the per-chunk phase-split table from the actors'
+`CHUNK_SUMMARY` lines. The decision metric is **GPU-idle overhead per chunk** (~6 s median
+shipped), with peak RAM as the safety check. `te-compare-outputs` provides the numerical
+parity gate, and per-run provenance goes in
+`src/tessera_embeddings/profiling/inference/RUNS.md`.
 
-**So the risk of the store change is not memory — it is GPU duty cycle.** Read
-amplification lengthens the non-inferring phases, and every second added there idles a
-resource that is otherwise pinned at 100%. The metric that decides the change is therefore
-the share of samples in the inference phase:
-
-```
-baseline GPU duty cycle = 1,876 / 2,352 = 79.8%
-```
-
-A store-chunk change that holds duty cycle and per-tile load time is safe; one that
-depresses either is paying the most expensive resource in the stack to wait for I/O, and
-should be rejected however much it saves on ingest. Memory is the secondary check, not the
-primary one.
+**Sparse zones understate the harm.** Spatially-sparse chunks already read only a narrow
+easting window (optimization C), so a sparse zone shows less amplification than a dense one.
+Any inference-side chunk-geometry test must be run on a DENSE area — or a dense sub-section
+of a zone — or it will look safe and not be.
 
 ---
 
