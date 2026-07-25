@@ -39,6 +39,7 @@ def _ingest_s2_roi_impl(
     collection: str = "sentinel-2-l2a",
     storage_options: dict | None = None,
     crop_to_live_windows: bool = False,
+    stream_stac_monthly: bool = True,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
     future = process_roi_reflectance.submit(
@@ -51,6 +52,7 @@ def _ingest_s2_roi_impl(
         collection=collection,
         storage_options=storage_options,
         crop_to_live_windows=crop_to_live_windows,
+        stream_stac_monthly=stream_stac_monthly,
     )
     return future.result()
 
@@ -79,6 +81,7 @@ def ingest_s2_roi_reflectance(
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
     crop_to_live_windows: bool = False,
+    stream_stac_monthly: bool = True,
 ) -> dict[str, Any]:
     """Ingest S2 L2A reflectance for an ROI using Dask workers.
 
@@ -110,6 +113,10 @@ def ingest_s2_roi_reflectance(
             performance-report HTML for this run is captured and
             uploaded there (probe-rung profiling; default off).
             Ignored on the ``use_local`` path, which warns.
+        stream_stac_monthly: Query the STAC catalog one calendar month at a time,
+            prefetching the next while the current is processed, rather than querying
+            the whole window up front. Bounds retained items so a year-long window fits
+            the worker; ``False`` is the rollback path only.
         crop_to_live_windows: Restrict mosaic writes (and the S2 coverage
             reduce) to the chunk-aligned windows intersecting the ROI mask —
             one commit per date. Default False = legacy full-extent path.
@@ -141,6 +148,7 @@ def ingest_s2_roi_reflectance(
                 collection=collection,
                 storage_options=storage_options,
                 crop_to_live_windows=crop_to_live_windows,
+                stream_stac_monthly=stream_stac_monthly,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -167,4 +175,5 @@ def ingest_s2_roi_reflectance(
                 collection=collection,
                 storage_options=storage_options,
                 crop_to_live_windows=crop_to_live_windows,
+                stream_stac_monthly=stream_stac_monthly,
             )

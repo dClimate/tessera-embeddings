@@ -37,6 +37,7 @@ def process_roi_reflectance(
     collection: str = "sentinel-2-l2a",
     storage_options: dict | None = None,
     crop_to_live_windows: bool = False,
+    stream_stac_monthly: bool = True,
 ) -> dict[str, Any]:
     """Prefect task: ingest S2 reflectance for one ROI.
 
@@ -65,6 +66,7 @@ def process_roi_reflectance(
             log=get_run_logger(),
             storage_options=storage_options,
             crop_to_live_windows=crop_to_live_windows,
+            stream_stac_monthly=stream_stac_monthly,
         )
     return asdict(result)
 

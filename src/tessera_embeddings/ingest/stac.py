@@ -8,9 +8,13 @@ Supports multiple providers (Earth Search, Planetary Computer) and collections
 (Sentinel-2 L2A, Sentinel-1 GRD, Landsat).
 """
 
+import calendar
+import datetime
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -843,3 +847,160 @@ def ingest_tile(
     )
 
     return data, baselines
+
+
+@dataclass(frozen=True)
+class MonthRange:
+    """One calendar month's slice of a query window: what to ASK for vs what to KEEP.
+
+    ``query_*`` is the range handed to the STAC query; ``own_*`` is the range of UTC
+    calendar dates this slice is responsible for. They differ by one day of padding
+    on the query's end — see :func:`iter_month_ranges`.
+    """
+
+    query_start: str
+    query_end: str
+    own_start: str
+    own_end: str
+
+
+def iter_month_ranges(start_date: str, end_date: str) -> list[MonthRange]:
+    """Partition an inclusive ``[start_date, end_date]`` window into calendar months.
+
+    Owned ranges PARTITION the window: every UTC calendar date belongs to exactly one
+    month, so a date can never be processed twice or skipped. That is what makes the
+    slices independent — no cross-month state is needed to deduplicate, which matters
+    because the ingest runs on a worker that may be restarted at any point.
+
+    The query end is padded by one day (clamped to ``end_date``) because a date-only
+    interval end is expanded to that day's last second: without the pad, items in the
+    final seconds of a month's last day could fall outside every slice's query. The
+    padding cannot cause double-processing — ownership is by UTC date, and the padded
+    day is owned by the NEXT month.
+
+    Args:
+        start_date: Inclusive window start, ``YYYY-MM-DD``.
+        end_date: Inclusive window end, ``YYYY-MM-DD``.
+
+    Returns:
+        One :class:`MonthRange` per calendar month intersecting the window, in order.
+
+    Raises:
+        ValueError: If ``end_date`` precedes ``start_date``.
+    """
+    start = datetime.date.fromisoformat(start_date)
+    end = datetime.date.fromisoformat(end_date)
+    if end < start:
+        raise ValueError(f"end_date {end_date} precedes start_date {start_date}")
+
+    ranges: list[MonthRange] = []
+    year, month = start.year, start.month
+    while (year, month) <= (end.year, end.month):
+        last_day = calendar.monthrange(year, month)[1]
+        own_start = max(start, datetime.date(year, month, 1))
+        own_end = min(end, datetime.date(year, month, last_day))
+        query_end = min(end, own_end + datetime.timedelta(days=1))
+        ranges.append(
+            MonthRange(
+                query_start=own_start.isoformat(),
+                query_end=query_end.isoformat(),
+                own_start=own_start.isoformat(),
+                own_end=own_end.isoformat(),
+            )
+        )
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return ranges
+
+
+def stream_stac_months(
+    *,
+    provider: str,
+    collection: str,
+    tile_id: str | None,
+    start_date: str,
+    end_date: str,
+    bbox: tuple[float, float, float, float] | None,
+    existing_dates_fn: Callable[[], set[str]],
+    query_fn: Callable[..., tuple[list[Any], dict[str, int]]] | None = None,
+    log: logging.Logger | logging.LoggerAdapter | None = None,
+) -> Iterator[tuple[MonthRange, list[Any], dict[str, int]]]:
+    """Yield one calendar month of STAC items at a time, prefetching the next.
+
+    Exists because querying a whole window up front retains every item for the run's
+    duration: a zone-year is hundreds of thousands of items, which exhausts the worker
+    the ingest runs on long before the first date is written. Streaming bounds retention
+    to the month being processed plus the one buffered behind it.
+
+    The next month's query runs on a single background thread while the caller processes
+    the current one. Depth-1 is intrinsic — one future in flight — and is sufficient
+    rather than arbitrary: a month's query is a small fraction of a month's processing,
+    so deeper buffering would cost memory to hide nothing. The query is pure network I/O,
+    so a thread overlaps it despite the GIL, and a failed query surfaces when the loop
+    advances rather than needing a sentinel protocol.
+
+    Items are filtered to the month's OWNED UTC dates before yielding, so the caller sees
+    a clean partition and needs no cross-month deduplication — nothing to lose if the
+    worker restarts. Empty months are skipped with a log rather than yielded.
+
+    ``existing_dates_fn`` is called once per month at query-submit time, so a month's
+    query already excludes dates committed by earlier months. Staleness is harmless: the
+    dedupe is an optimisation, and the write path's duplicate-date guard is the actual
+    protection.
+
+    Args:
+        provider: Provider name, e.g. ``"earth-search"``.
+        collection: Collection alias, e.g. ``"sentinel-2-l2a"``.
+        tile_id: Tile identifier, or None for bbox queries.
+        start_date: Inclusive window start, ``YYYY-MM-DD``.
+        end_date: Inclusive window end, ``YYYY-MM-DD``.
+        bbox: Optional WGS84 bbox for the spatial query.
+        existing_dates_fn: Returns dates already committed; called per month.
+        query_fn: Query implementation, for tests that must not touch the network.
+            Defaults to :func:`query_stac_items`.
+        log: Optional logger.
+
+    Yields:
+        ``(month_range, items, baselines)`` per non-empty month, items sorted as
+        :func:`query_stac_items` sorts them.
+    """
+    log = log or logger
+    fetch = query_fn or query_stac_items
+    months = iter_month_ranges(start_date, end_date)
+    log.info("Streaming the STAC query over %d month(s) of %s..%s", len(months), start_date, end_date)
+
+    def run(mr: MonthRange) -> tuple[list[Any], dict[str, int]]:
+        return fetch(
+            provider=provider,
+            collection=collection,
+            tile_id=tile_id,
+            start_date=mr.query_start,
+            end_date=mr.query_end,
+            existing_dates=existing_dates_fn(),
+            bbox=bbox,
+        )
+
+    # max_workers=1 IS the depth-1 buffer: one query in flight, one month in the
+    # caller's hands. cancel_futures on exit so a failure mid-month does not block on
+    # the next month's in-flight HTTP walk.
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="stac-prefetch") as pool:
+        try:
+            pending = pool.submit(run, months[0]) if months else None
+            for i, mr in enumerate(months):
+                items, baselines = pending.result()  # type: ignore[union-attr]
+                if i + 1 < len(months):
+                    pending = pool.submit(run, months[i + 1])
+                owned = [it for it in items if mr.own_start <= str(it.datetime)[:10] <= mr.own_end]
+                dropped = len(items) - len(owned)
+                if not owned:
+                    log.info("Month %s..%s: no new items", mr.own_start, mr.own_end)
+                    continue
+                log.info(
+                    "Month %s..%s: %d item(s)%s",
+                    mr.own_start,
+                    mr.own_end,
+                    len(owned),
+                    f" ({dropped} outside the month)" if dropped else "",
+                )
+                yield mr, owned, baselines
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)

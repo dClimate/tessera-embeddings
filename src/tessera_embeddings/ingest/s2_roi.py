@@ -52,6 +52,7 @@ from tessera_embeddings.ingest.stac import (
     group_items_by_date,
     load_stac_items,
     query_stac_items,
+    stream_stac_months,
 )
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset, write_day_windows
@@ -147,6 +148,7 @@ def ingest_s2_roi_reflectance(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     storage_options: dict | None = None,
     crop_to_live_windows: bool = False,
+    stream_stac_monthly: bool = True,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
 
@@ -180,6 +182,13 @@ def ingest_s2_roi_reflectance(
             the windows only, giving identical numbers because the mask is
             False outside them — and neither the mask nor ``any_valid`` is
             persisted, so no full-extent array is ever materialised.
+        stream_stac_monthly: Query the STAC catalog one calendar month at a
+            time, prefetching the next month while the current one is
+            processed, instead of querying the whole window up front. Bounds
+            retained items to two months: a whole year's items do not fit in
+            the worker this runs on. ``False`` restores the single up-front
+            query and is the rollback path only — a year-long window cannot
+            complete under it.
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items
@@ -224,31 +233,16 @@ def ingest_s2_roi_reflectance(
         roi_mask = client.persist(roi_mask)
         roi_pixel_count = int(roi_mask.sum().compute())
 
-    existing_dates = get_existing_dates(reflectance_store)
-
-    items, baselines = query_stac_items(
-        provider=provider,
-        collection=collection,
-        tile_id=None,
-        start_date=start_date,
-        end_date=end_date,
-        existing_dates=existing_dates,
-        bbox=roi.bbox_wgs84,
-    )
-
-    if not items:
-        log.info("No STAC items found for date range %s..%s", start_date, end_date)
-        return IngestResult(roi_path=roi_zarr_path, status="skipped", dates_processed=0, dates_filtered_coverage=0)
-
-    # query_stac_items sorts by (date, cloud_cover ASC). Re-sort cloudiest-first
-    # so the clearest tile paints last (wins) in solar_day's painter's algorithm.
-    # group_items_by_date preserves this within-group order.
-    items.sort(key=lambda it: (str(it.datetime)[:10], -float(it.properties.get("eo:cloud_cover", 100))))
-    items_by_date = group_items_by_date(items)
     total_processed = 0
     total_filtered = 0
+    total_seen = 0
 
-    for day_items in items_by_date.values():
+    def _ingest_one_date(day_items: list, baselines: dict[str, int]) -> bool:
+        """Ingest one solar day. Returns False if it failed the coverage gate.
+
+        A closure so the streamed and single-query paths run byte-identical work; the
+        per-date logic must not fork on how its items were supplied.
+        """
         # ONE load per date, serving both the coverage gate and the write. SCL is
         # among the written bands, so a separate gate-only load re-read it and paid
         # a second client-side graph build. A date that then fails the gate has
@@ -274,8 +268,7 @@ def ingest_s2_roi_reflectance(
             if "No such band/alias" not in str(exc):
                 raise
             log.warning("Dropping date: load failed on asset-incomplete STAC item(s): %s", exc)
-            total_filtered += 1
-            continue
+            return False
 
         passes, any_valid = _coverage_from_scl(
             day_ds["scl"].isel(time=0),
@@ -286,8 +279,7 @@ def ingest_s2_roi_reflectance(
             windows=live_windows,
         )
         if not passes:
-            total_filtered += 1
-            continue
+            return False
 
         date = day_ds.time.dt.date.values[0]
         day_ds["time"] = [np.datetime64(date, "ns")]
@@ -335,9 +327,51 @@ def ingest_s2_roi_reflectance(
                         manifest=ingest_manifest,
                         crs=roi.native_crs,
                     )
-        total_processed += 1
+        return True
 
-    log.info("%d/%d dates passed coverage filter", len(items_by_date) - total_filtered, len(items_by_date))
+    def _drive(items: list, baselines: dict[str, int]) -> None:
+        """Sort one supply of items cloudiest-first, group by date, and ingest each."""
+        nonlocal total_processed, total_filtered, total_seen
+        # query_stac_items sorts by (date, cloud_cover ASC). Re-sort cloudiest-first so
+        # the clearest tile paints last (wins) in solar_day's painter's algorithm.
+        # group_items_by_date preserves this within-group order.
+        items.sort(key=lambda it: (str(it.datetime)[:10], -float(it.properties.get("eo:cloud_cover", 100))))
+        by_date = group_items_by_date(items)
+        total_seen += len(by_date)
+        for day_items in by_date.values():
+            if _ingest_one_date(day_items, baselines):
+                total_processed += 1
+            else:
+                total_filtered += 1
+
+    if stream_stac_monthly:
+        # Stream month by month: querying the whole window up front retains every item
+        # for the run's duration, which a zone-year cannot fit on this worker.
+        for _mr, month_items, month_baselines in stream_stac_months(
+            provider=provider,
+            collection=collection,
+            tile_id=None,
+            start_date=start_date,
+            end_date=end_date,
+            bbox=roi.bbox_wgs84,
+            existing_dates_fn=lambda: get_existing_dates(reflectance_store),
+            log=log,
+        ):
+            _drive(month_items, month_baselines)
+    else:
+        items, baselines = query_stac_items(
+            provider=provider,
+            collection=collection,
+            tile_id=None,
+            start_date=start_date,
+            end_date=end_date,
+            existing_dates=get_existing_dates(reflectance_store),
+            bbox=roi.bbox_wgs84,
+        )
+        if items:
+            _drive(items, baselines)
+
+    log.info("%d/%d dates passed coverage filter", total_processed, total_seen)
 
     if total_processed == 0:
         return IngestResult(
