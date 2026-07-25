@@ -45,6 +45,18 @@ if INGEST_LOAD_CHUNK_SIZE % INGEST_CHUNK_SIZE:
 
 INGEST_LOAD_CHUNKS = {"time": 1, "northing": INGEST_LOAD_CHUNK_SIZE, "easting": INGEST_LOAD_CHUNK_SIZE}
 
+# Manifest sharding for the campaign mosaics. Without it every commit rewrites the
+# whole array manifest, so per-date cost grows with the number of dates already
+# written — the shape that makes a zone-YEAR disproportionately worse than a month.
+# A campaign mosaic is region-written once per date, hundreds of times, which is
+# exactly the case splitting exists for.
+#
+# The time key is what localises a per-date commit; the spatial keys localise it to
+# the windows that date actually touched. Sizes want a sweep against real zone-year
+# stores — these are a starting point chosen so the split is meaningful at both
+# month and year scale rather than a no-op at one of them.
+INGEST_MANIFEST_SPLIT = {"northing": 4, "easting": 4, "time": 8}
+
 # S2 per-solar-day keep threshold for the GLOBAL CAMPAIGN ingest path, as a
 # PERCENT of ROI pixels that must be valid (cloud-screened) to keep a solar
 # day — the same percent scale as ingest/roi_processing.py's same-named

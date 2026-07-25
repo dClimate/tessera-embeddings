@@ -31,14 +31,12 @@ import logging
 import operator
 from dataclasses import dataclass
 from functools import reduce
-from typing import cast, final
+from typing import final
 
 import dask.array as da
 import dask.distributed
 import numpy as np
-import odc.stac
 import xarray as xr
-from odc.geo.geobox import GeoBox
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
 from tessera_embeddings.config.ingest import (
@@ -49,12 +47,10 @@ from tessera_embeddings.config.ingest import (
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest.live_windows import live_windows_for_mask
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
-from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE, apply_roi_mask
+from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.stac import (
-    chunks_to_odc,
     group_items_by_date,
     load_stac_items,
-    normalize_odc_dims,
     query_stac_items,
 )
 from tessera_embeddings.storage.manifest import IngestManifest
@@ -87,27 +83,6 @@ class IngestResult:
     dates_filtered_coverage: int
 
 
-def _load_scl_only(items: list, geobox: GeoBox, load_chunks: dict[str, int]) -> xr.Dataset:
-    """Load only the SCL band via a minimal ``odc.stac.load`` call.
-
-    Bypasses :func:`load_stac_items` intentionally — SCL is categorical
-    and needs no baseline correction. ``groupby="solar_day"`` fuses
-    overlapping tiles into a single time slice via painter's algorithm
-    (last item wins). Items must be pre-sorted cloudiest-first so the
-    clearest tile paints last.
-    """
-    ds = odc.stac.load(
-        items,
-        bands=["scl"],
-        groupby="solar_day",
-        preserve_original_order=True,
-        geobox=geobox,
-        resampling="nearest",
-        chunks=cast(dict, chunks_to_odc(load_chunks)),
-    )
-    return normalize_odc_dims(ds)
-
-
 def _sum_over_windows(mask: da.Array, windows: list[tuple[int, int, int, int]]) -> da.Array:
     """Total a full-extent ROI mask over its live windows only.
 
@@ -119,69 +94,34 @@ def _sum_over_windows(mask: da.Array, windows: list[tuple[int, int, int, int]]) 
     return reduce(operator.add, parts) if parts else da.zeros((), dtype="int64")
 
 
-def _compute_scl_phase(
-    day_items: list,
-    geobox: GeoBox,
-    load_chunks: dict[str, int],
+def _coverage_from_scl(
+    scl_2d: xr.DataArray,
     roi_mask: da.Array,
     roi_pixel_count: int,
     min_valid_coverage: float,
     client: dask.distributed.Client,
     windows: list[tuple[int, int, int, int]] | None = None,
 ) -> tuple[bool, xr.DataArray | None]:
-    """Phase 1: load only SCL, compute coverage and per-pixel validity.
+    """Decide whether a date passes coverage, from an ALREADY-LOADED SCL slice.
 
-    Uses ``solar_day`` grouping so overlapping tiles are fused into one
-    mosaic via painter's algorithm (items must be pre-sorted
-    cloudiest-first so the clearest tile paints last). The resulting
-    ``any_valid`` mask is coherent with Phase 2, which uses the same
-    grouping and sort order.
+    Takes the SCL array rather than loading it so the gate and the write share one
+    ``odc.stac.load`` graph: SCL is one of the written bands, so loading it twice
+    per date cost a second client-side graph build and a second read of the same
+    data for no information.
 
-    Args:
-        day_items: STAC items for one calendar day, pre-sorted by
-            descending ``eo:cloud_cover`` so the clearest tile wins.
-        geobox: Target GeoBox for the ROI.
-        load_chunks: Chunk sizes for ``odc.stac.load``.
-        roi_mask: Boolean ROI mask on the full zone grid. Persisted on workers on
-            the full-extent path; lazy under ``windows`` (dask culls its reads to
-            the window slices this function and the write path take).
-        roi_pixel_count: Number of ``True`` pixels in ``roi_mask``.
-        min_valid_coverage: Minimum valid coverage percentage.
-        client: Connected Dask client used to persist intermediates.
-        windows: Live windows for the cropped path — the coverage reduce runs
-            over these only and ``any_valid`` is returned LAZY (never
-            persisted full-extent). ``None`` = legacy full-extent behaviour.
+    Both sides of the coverage ratio must be cropped together or every percentage
+    is skewed: under ``windows`` the numerator reduces over the windows only, which
+    equals the full-extent count because the mask is False outside them and row
+    bands are chunk-disjoint. ``any_valid`` stays LAZY there — materialising it
+    would defeat the cropping, and the write pulls only window slices of it.
 
     Returns:
-        ``(passes_coverage, any_valid)``. ``any_valid`` is persisted on
-        workers when ``passes_coverage`` is True (legacy path); ``None``
-        when the date fails coverage.
+        ``(passes, any_valid)``; ``any_valid`` is ``None`` when the date fails.
     """
-    try:
-        scl_ds = _load_scl_only(day_items, geobox, load_chunks)
-    except ValueError as exc:
-        # Earth-search occasionally publishes asset-incomplete items (missing
-        # SCL and/or reflectance bands). odc.stac.load resolves bands eagerly,
-        # so one such item in the day group raises "No such band/alias: scl"
-        # before any graph is built. Drop the whole date rather than crash the
-        # run; Phase 2 would hit the same wall on the same items.
-        if "No such band/alias" not in str(exc):
-            raise
-        logger.warning("Dropping date: SCL load failed on asset-incomplete STAC item(s): %s", exc)
-        return False, None
-
-    invalid_classes = np.array(sorted(S2_SCL_INVALID_CLASSES), dtype=scl_ds["scl"].dtype)
-
-    # solar_day grouping fuses all same-day tiles into exactly one time slice
-    scl_2d = scl_ds["scl"].isel(time=0)
+    invalid_classes = np.array(sorted(S2_SCL_INVALID_CLASSES), dtype=scl_2d.dtype)
     any_valid = ~scl_2d.isin(invalid_classes)
 
     if windows is not None:
-        # Cropped: reduce only the live windows (dask culls the graph to their
-        # chunks — the mask is False outside every window, so the total is
-        # identical to the full reduce by the windows' coverage-totality property).
-        # any_valid stays LAZY: persisting it would materialise the full extent,
-        # and Phase 2's zeroing pulls only window slices of it anyway.
         masked = any_valid & roi_mask
         parts = [masked.isel(northing=slice(y0, y1), easting=slice(x0, x1)).sum() for y0, y1, x0, x1 in windows]
         valid_count_val = int(reduce(operator.add, parts).compute()) if parts else 0
@@ -191,9 +131,7 @@ def _compute_scl_phase(
         valid_count_val = valid_count.compute().item()
 
     passes = float(100.0 * valid_count_val / roi_pixel_count) >= min_valid_coverage
-    if not passes:
-        return False, None
-    return True, any_valid
+    return (True, any_valid) if passes else (False, None)
 
 
 def ingest_s2_roi_reflectance(
@@ -271,12 +209,12 @@ def ingest_s2_roi_reflectance(
         # Cropped: mask stays LAZY, total comes from the live windows only.
         #
         # No persist — it would materialise the whole zone grid, while every
-        # consumer (the SCL reduce below, apply_roi_mask) slices to windows, so
+        # consumer (the SCL reduce below, the masking pass) slices to windows, so
         # dask culls the reads and a per-date re-read beats pinning the grid.
         #
         # The window total equals the full-extent total because the mask is False
         # outside every window, and row bands are chunk-disjoint so nothing is
-        # counted twice. _compute_scl_phase relies on that same property for the
+        # counted twice. _coverage_from_scl relies on that same property for the
         # numerator: both sides of the coverage ratio must stay cropped together,
         # or every percentage is silently skewed.
         roi_pixel_count = int(_sum_over_windows(roi_mask, live_windows).compute())
@@ -311,11 +249,36 @@ def ingest_s2_roi_reflectance(
     total_filtered = 0
 
     for day_items in items_by_date.values():
-        # Phase 1: SCL-only coverage check — tiny graph.
-        passes, any_valid = _compute_scl_phase(
-            day_items,
-            roi.geobox,
-            INGEST_LOAD_CHUNKS,
+        # ONE load per date, serving both the coverage gate and the write. SCL is
+        # among the written bands, so a separate gate-only load re-read it and paid
+        # a second client-side graph build. A date that then fails the gate has
+        # built a graph it discards — cheap, because construction is the same order
+        # either way and nothing was computed.
+        try:
+            day_ds = load_stac_items(
+                day_items,
+                provider=provider,
+                collection=collection,
+                baselines=baselines,
+                bbox=roi.bbox_wgs84,
+                chunks=INGEST_LOAD_CHUNKS,
+                extra_bands=["scl"],
+                resampling="bilinear",
+                groupby="solar_day",
+                geobox=roi.geobox,
+            )
+        except ValueError as exc:
+            # Earth-search occasionally publishes asset-incomplete items (missing
+            # SCL and/or reflectance bands). odc.stac.load resolves bands eagerly,
+            # so one such item raises before any graph is built. Drop the date.
+            if "No such band/alias" not in str(exc):
+                raise
+            log.warning("Dropping date: load failed on asset-incomplete STAC item(s): %s", exc)
+            total_filtered += 1
+            continue
+
+        passes, any_valid = _coverage_from_scl(
+            day_ds["scl"].isel(time=0),
             roi_mask,
             roi_pixel_count,
             min_valid_coverage,
@@ -326,29 +289,19 @@ def ingest_s2_roi_reflectance(
             total_filtered += 1
             continue
 
-        # Phase 2: load all bands with the same solar_day grouping.
-        # Reflectance bands resample bilinear; load_stac_items pins the
-        # categorical SCL band to nearest so its class codes stay valid.
-        day_ds = load_stac_items(
-            day_items,
-            provider=provider,
-            collection=collection,
-            baselines=baselines,
-            bbox=roi.bbox_wgs84,
-            chunks=INGEST_LOAD_CHUNKS,
-            extra_bands=["scl"],
-            resampling="bilinear",
-            groupby="solar_day",
-            geobox=roi.geobox,
-        )
         date = day_ds.time.dt.date.values[0]
         day_ds["time"] = [np.datetime64(date, "ns")]
-        if any_valid is not None:
-            for var in day_ds.data_vars:
-                if str(var) != "scl":
-                    day_ds[str(var)] = day_ds[str(var)].where(any_valid, other=0)
 
-        day_ds = apply_roi_mask(day_ds, roi_zarr_path, spatial_chunks, roi_mask=roi_mask)
+        # ONE masking pass, not two. Zeroing invalid pixels and zeroing outside the
+        # ROI both fill with 0, so `x.where(A, 0).where(B, 0)` is `x.where(A & B, 0)`
+        # — and each `where` is a graph task per (chunk, band), which is the budget
+        # that limits ingest. SCL keeps only the ROI mask: it is categorical, and
+        # zeroing it by its own validity would rewrite the class codes it carries.
+        roi_2d = roi_mask if roi_mask is not None else read_roi_mask(roi_zarr_path, spatial_chunks)
+        keep = roi_2d if any_valid is None else (any_valid & roi_2d)
+        for var in day_ds.data_vars:
+            mask_for_var = roi_2d if str(var) == "scl" else keep
+            day_ds[str(var)] = day_ds[str(var)].where(mask_for_var, other=0)
 
         # Tenacity retry on intermittent GDAL errors under high parallelism.
         # Icechunk writes are atomic, so retry is safe — a failed cropped date

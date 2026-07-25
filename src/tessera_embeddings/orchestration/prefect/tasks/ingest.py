@@ -18,10 +18,11 @@ from typing import Any
 from dask.distributed import get_client
 from prefect import get_run_logger, task
 
+from tessera_embeddings.config.ingest import INGEST_MANIFEST_SPLIT
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
-from tessera_embeddings.storage.zarr_store import credentials_provider
+from tessera_embeddings.storage.zarr_store import credentials_provider, manifest_split
 
 
 @task(name="process-roi-reflectance")
@@ -49,19 +50,22 @@ def process_roi_reflectance(
     transient cases, and outer retries would re-run the whole
     multi-day loop.
     """
-    result = ingest_s2_roi_reflectance(
-        roi_zarr_path=roi_zarr_path,
-        start_date=start_date,
-        end_date=end_date,
-        store_path=store_path,
-        client=get_client(),
-        min_valid_coverage=min_valid_coverage,
-        provider=provider,
-        collection=collection,
-        log=get_run_logger(),
-        storage_options=storage_options,
-        crop_to_live_windows=crop_to_live_windows,
-    )
+    # Shard the mosaic's manifests: the store is created and appended to entirely
+    # within this call, so create and every later append see the same config.
+    with manifest_split(INGEST_MANIFEST_SPLIT):
+        result = ingest_s2_roi_reflectance(
+            roi_zarr_path=roi_zarr_path,
+            start_date=start_date,
+            end_date=end_date,
+            store_path=store_path,
+            client=get_client(),
+            min_valid_coverage=min_valid_coverage,
+            provider=provider,
+            collection=collection,
+            log=get_run_logger(),
+            storage_options=storage_options,
+            crop_to_live_windows=crop_to_live_windows,
+        )
     return asdict(result)
 
 
@@ -122,7 +126,10 @@ def process_roi_sar(
         if storage_options is None and roi_zarr_path.startswith("s3://"):
             storage_options = iam_s3_storage_options()
 
-    with cred_provider_cm:
+    # manifest_split for the same reason as the S2 task: this mosaic is
+    # region-written once per date batch, so an unsharded manifest makes each
+    # commit rewrite every ref written so far.
+    with cred_provider_cm, manifest_split(INGEST_MANIFEST_SPLIT):
         result = ingest_s1_roi_sar(
             roi_zarr_path=roi_zarr_path,
             start_date=start_date,
