@@ -60,7 +60,7 @@ per_date  ≈  C  +  Σ_windows  max( F , tasks_w / R )
 - **R ≈ 600–800 tasks/s** — the single-threaded scheduler's dispatch rate.
 - **F ≈ 7.04 s** — per-window blocking cost; binds only when a window is small enough that
   `tasks_w / R < F`.
-- **C ≈ 15–20 s** — per-date flow-runner constant (client graph build + gate + commit).
+- **C ≈ 15–20 s** — per-date constant on the ingest worker (client graph build + gate + commit).
 
 Reconciliation against all three configurations of the same zone-month at 120 workers:
 
@@ -75,7 +75,7 @@ dispatch. About 86% of a dense date is scheduler dispatch, ~4% is the single-thr
 client build, and the fleet's real fetch/resample/write work hides under both. The
 fleet-bound floor is still unknown and only becomes visible once tasks shrink.
 
-**Consequence:** two single threads (scheduler dispatch, flow runner) serialise ≥95% of a
+**Consequence:** two single threads (scheduler dispatch, the ingest worker) serialise ≥95% of a
 run, so **widening one cell with more workers buys ≤1.1×**. Scaling comes from running more
 cells concurrently — each cell has its own scheduler — not from wider cells.
 
@@ -224,7 +224,7 @@ this change.
 
 ---
 
-## 5. The flow runner's serial phase
+## 5. The ingest worker's serial phase
 
 ### The STAC query
 
@@ -257,17 +257,24 @@ Depth 1 suffices, and deeper prefetch is waste: a month's *processing* is ~31 da
 month's query is exposed, and the lever for that is concurrent sub-range queries (weekly
 threads → ~45 s), not more buffering.
 
-**Note on which memory matters:** the query result is held by the **flow runner**, not the
-Dask scheduler. Scheduler memory is irrelevant to it. Runner memory is the knob, and
-streaming is preferred over raising it because the 4 vCPU Fargate shape caps at 30 GB —
-zero margin against the ~29 GB estimate.
+**CORRECTION (2026-07-25): the memory that matters is a DASK WORKER's, not the flow
+runner's.** The whole ingest body — query, retained items, grouping, and the per-date loop —
+runs inside ONE Prefect task on a single Dask worker (verified: the "Cropping writes to N
+live window(s)" line appears in a `dask/dask-worker/...` log stream; corroborated by the
+orphaned fleet committing a further date seven minutes after the flow runner was killed).
+Workers are **4 vCPU / 16 GiB**. So a year-long query exhausts a WORKER, and Dask's response
+is to kill and restart it, which re-runs the task — a bounded retry loop rather than a clean
+failure. Raising flow-runner memory is irrelevant; raising worker memory multiplies across
+120 workers. Streaming is close to the only fix.
 
 ### Per-date client-side cost
 
-`_load_scl_only` 3.47 s + `load_stac_items` 3.74 s ≈ **7.2 s per date**, single-threaded on
-the runner while all 480 fleet task slots idle. Over ~250 kept dates that is ~30 min per
-zone-year. Fixable by pipelining one date's graph build against the previous date's cluster
-work, and by fusing the coverage gate into the band load so only one graph is built.
+Two `odc.stac.load` graph builds per date — 3.47 s for the gate's SCL-only load and 3.74 s
+for the bands — ≈ **7.2 s per date**, single-threaded on the ingest worker while all 480 fleet
+task slots idle. Over ~250 kept dates that is ~30 min per zone-year. **The gate load is now
+fused into the band load** (one load per date, the gate reading SCL from it), removing one of
+the two. What remains is fixable by pipelining one date's graph build against the previous
+date's cluster work.
 
 ---
 
@@ -314,6 +321,43 @@ concurrent cells**, because each `(zone, year)` writes its own repo under
 on the inference side.
 
 ---
+
+## 8. Results of record (2026-07-25 session)
+
+Same zone (35N), month (January 2024), fleet (120 workers) and mask throughout, so the rows
+are comparable. Per-date figures are means over the dates the run completed.
+
+| configuration | windows | per-date | scheduler cpu mean/max | graph mean/max | hottest worker |
+|---|---|---|---|---|---|
+| row bands | 197 | 1471, 1329 s | — | 482 / 1,048 | — |
+| grouped, greedy | 15 | 225 s (n=8) | 66% / 93% | 17,380 / 22,836 | 5.6 GiB |
+| grouped, cost-model DP | 3 | 194 → 269 s, degrading | 65% / **100% pinned** | 50,875 / 84,054 | 7.2 GiB |
+| **load blocks 8192, store 4096** | **7** | **187.9 s (n=12)** | **27% / 40%** | **5,069 / 6,020** | 8.0–10.3 GiB |
+
+**Per-date variance is 19% (SD 36 s on n=12).** Detecting a 10% change needs ~14 dates per
+arm, so **verify further graph work by TASK COUNT, not wall clock** — the count is
+deterministic and readable from a single date's graph.
+
+Two claims made during the session and then withdrawn, recorded so they are not revived:
+
+- *"1.41× from the load-block change"* — that was one cherry-picked date. On matched means it
+  is **1.23×** (187.9 against the greedy configuration's 225 s).
+- *"Per-date cost drifts upward within a run"* — visible in the first six dates (180.2 → 195.5)
+  but **not established over twelve**: the later half contains a single 289 s outlier and two
+  of the fastest dates in the run. Unproven at month scale; a manifest-driven drift would only
+  be expected at year scale anyway.
+
+### Verified by task count rather than wall clock
+
+Collapsing the two masking passes into one, counted on a real window's optimised graph:
+
+| | tasks per load block |
+|---|---|
+| two passes (validity, then ROI) | 99.9 |
+| one pass (`validity & ROI`) | **77.9** |
+
+**1.28× fewer graph tasks**, matching the predicted ~25%. This is the pattern to follow for
+the remaining shaves: the mechanism is measurable exactly, the wall-clock consequence is not.
 
 ## Changelog
 
