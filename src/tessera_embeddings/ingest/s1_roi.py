@@ -187,9 +187,17 @@ def ingest_s1_roi_sar(
         # by which point the credential refresh below has applied any new
         # session token.
         roi_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
-        # Ensure the mask is materialised on workers so per-batch graphs
-        # reference small future keys.
-        roi_mask = client.persist(roi_mask)
+        if live_windows is None:
+            # Ensure the mask is materialised on workers so per-batch graphs
+            # reference small future keys.
+            roi_mask = client.persist(roi_mask)
+        # Cropped: left LAZY on purpose. persist() materialises every chunk of
+        # the full zone grid — for 03S that is 3,706 chunks / ~60 GiB of mostly
+        # ocean, pinned for the run — while the only consumer, apply_roi_mask,
+        # is written out to the live windows and so touches a handful of them.
+        # Dask culls the reads to those chunks, making a per-batch re-read far
+        # cheaper than the pin. (S2 does the same, and additionally crops the
+        # coverage denominator, which it alone computes.)
 
         # Refresh STS creds + apply (typically: env vars + Dask plugin)
         # once per ``cred_refresh_interval_sec``.

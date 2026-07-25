@@ -1,6 +1,8 @@
 # Cropping ingest to live tiles
 
-**Status:** measured, design chosen, implementation pending.
+**Status:** implemented behind `IngestSettings.crop_to_live_windows` (default off).
+Validated on a live `03S` cell, which also surfaced a second extent-scaled cost in
+the coverage denominator — see "What the first cropped run found" below.
 
 ## Problem
 
@@ -320,6 +322,56 @@ should be sized from a cell's live-chunk count.
 
 **External services were not implicated** — one store-write retry, no catalog
 throttling.
+
+## What the first cropped run found: crop the coverage denominator too
+
+The first `03S` run with the flag on confirmed the mosaic side exactly as designed
+— **2 windows, 4 chunks per band-date** against 3,706, the window derivation
+agreeing with an independent full-resolution scan of the same mask. But the run
+still built an **8,794-task graph** and still spilled, and the dashboard showed
+why: `from-zarr 3706 / 3706`, `sum 3706 / 3706`, `sum-partial 1378`. Those totals
+are the whole graph, and none of it is the mosaic.
+
+It was these two lines, which sit upstream of every window and which the original
+change did not touch:
+
+```python
+roi_mask = client.persist(roi_mask)              # 3,706 chunks, ~60 GiB, pinned
+roi_pixel_count = int(roi_mask.sum().compute())  # a full-extent reduce
+```
+
+The ROI-pixel total is the **denominator** of the S2 coverage check. Cropping had
+already cropped the numerator (the SCL validity reduce) on the stated grounds that
+the mask is False outside every window — so the identical argument applies to the
+denominator, and the fix is to apply it: total the mask over the live windows, and
+drop the persist, since `persist` materialises the entire grid while every
+downstream consumer (that same reduce, and `apply_roi_mask`) slices to windows and
+lets dask cull the reads. S1 carries the same persist and gets the same treatment;
+it computes no coverage total of its own.
+
+For `03S` this is ~8,800 tasks and ~60 GiB down to a handful of tasks and ~64 MiB.
+Note the shape of the mistake, because it generalises: the residual cost was
+**constant per zone** (~3,700–4,000 chunks regardless of how much land a zone
+holds), so it would have been a fixed overhead on all 120 zones × 3 sensor
+children — the same extent-scaled pathology as the original finding, surviving in
+a place nobody was looking because the mosaic numbers looked right.
+
+The numerator/denominator coupling is now pinned by
+`tests/unit/test_s2_coverage_windows.py`, including a deliberately non-vacuous
+case: windows derived from one mask, applied to a mask with land outside them,
+asserting the totals DO diverge. Cropping only one side of that ratio would still
+have produced a plausible-looking percentage, and the write-once ingest marker
+would have made a wrongly-filtered year permanent.
+
+## Also from the first cropped run: the profiler was blind to spill
+
+The scheduler heartbeat recorded no worker-side memory at all, so the residual
+above had to be diagnosed from a screenshot of the Dask dashboard. The heartbeat
+now carries fleet totals (`wmem`/`wmanaged`/`wspill`/`wmax`) summed from the
+per-worker state the scheduler already tracks, and `te-watch-scheduler` alerts on
+`worker-spill`. This does not demote the scheduler: it remains the named
+saturation risk at scale, and a clean fleet is the precondition for a
+high-worker-count rung to measure a scheduler envelope rather than a doomed run.
 
 ## Consequences for the test programme
 
