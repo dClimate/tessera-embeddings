@@ -41,7 +41,6 @@ builds no graph at all.
 """
 
 import logging
-import os
 import statistics
 import time
 from collections.abc import Callable, Iterator
@@ -70,6 +69,13 @@ logger = logging.getLogger(__name__)
 
 # Standard time encoding for all stores
 TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"}
+
+# --- TEMPORARY DIAGNOSTIC (F-05) ---------------------------------------------
+# One-shot guard for the produce-vs-store probe in write_day_windows. Module
+# scope, so it fires once per worker PROCESS (a handful per run) rather than once
+# per date. Delete with the probe.
+_F05_PROBED = False
+# --- END TEMPORARY DIAGNOSTIC ------------------------------------------------
 
 
 def read_time_values(node: zarr.Group) -> np.ndarray:
@@ -1074,6 +1080,8 @@ def write_day_windows(
     anything is written — the per-append structural gate must not be lost to
     batching.
     """
+    global _F05_PROBED  # TEMPORARY DIAGNOSTIC (F-05)
+
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
     if day_ds.sizes["time"] != 1:
@@ -1142,24 +1150,35 @@ def write_day_windows(
             _t0 = time.monotonic()  # TEMPORARY DIAGNOSTIC (F-05)
             win = day_ds.isel(northing=slice(y0, y1), easting=slice(x0, x1)).drop_vars(drop)
             _t1 = time.monotonic()  # TEMPORARY DIAGNOSTIC (F-05)
-            # --- TEMPORARY DIAGNOSTIC (F-05): materialise-then-assign mode ---------
-            # The per-window cost has been measured but not SPLIT: `to_icechunk`
-            # computes the window (fetch + resample from the source scenes) AND
-            # stores it, so "6 s per window" could be either. This mode times the
-            # two separately by materialising to numpy first, which also exercises
-            # RegionWriteBatch.write_window — the documented-but-unused path.
-            # TESSERA_WINDOW_WRITE_MODE=materialise selects it; unset keeps the
-            # shipping behaviour byte-for-byte.
-            if os.environ.get("TESSERA_WINDOW_WRITE_MODE") == "materialise":
+            # --- TEMPORARY DIAGNOSTIC (F-05): one-shot A/B on the FIRST window -----
+            # `to_icechunk` both COMPUTES the window (fetch + resample of the source
+            # scenes) and STORES it, so the measured ~6 s/window could be either, and
+            # every candidate fix depends on which. Once per store — first window of
+            # the first date — materialise to numpy and store via write_window (the
+            # documented-but-unused path), timing both halves, before doing the real
+            # to_icechunk write below. Same values written twice, so the result is
+            # unchanged; cost is one extra window per store.
+            #
+            # Deliberately NOT behind an env var: this runs on a Dask worker, and
+            # the optical flow passes no extra environment to its workers, so a
+            # flag would have been unreachable.
+            if not _F05_PROBED:
                 vals = {str(v): np.asarray(win[v].values)[0] for v in win.data_vars}
                 _tp = time.monotonic()
-                produces.append(_tp - _t1)
                 batch.write_window(t, slice(y0, y1), slice(x0, x1), vals)
-                _t2 = time.monotonic()
-                isels.append(_t1 - _t0)
-                writes.append(_t2 - _tp)
-                logger.debug("  window %d/%d produce %.2fs store %.2fs", i + 1, len(windows), _tp - _t1, _t2 - _tp)
-                continue
+                _tw = time.monotonic()
+                produces.append(_tp - _t1)
+                logger.info(
+                    "F-05 probe [%s]: window %d chunk(s), %.0f MiB — produce %.2fs, "
+                    "store via write_window %.2fs (to_icechunk for the same window follows)",
+                    date_str,
+                    max(1, (y1 - y0) // chunks["northing"]) * max(1, (x1 - x0) // chunks["easting"]),
+                    sum(v.nbytes for v in vals.values()) / 2**20,
+                    _tp - _t1,
+                    _tw - _tp,
+                )
+                _F05_PROBED = True
+                _t1 = time.monotonic()  # so the to_icechunk timing below excludes the probe
             # --- END TEMPORARY DIAGNOSTIC -----------------------------------------
             to_icechunk(
                 win,
@@ -1189,10 +1208,9 @@ def write_day_windows(
         # --- BEGIN TEMPORARY DIAGNOSTIC (F-05) ------------------------------------
         if writes:
             logger.info(
-                "date %s budget [%s]: %d window(s) | slot+attrs %.1fs | graphs %.1fs | "
-                "produce %.1fs | writes %.1fs (min %.2f med %.2f max %.2f) | unattributed %.1fs",
+                "date %s budget: %d window(s) | slot+attrs %.1fs | graphs %.1fs | "
+                "probe-produce %.1fs | writes %.1fs (min %.2f med %.2f max %.2f) | unattributed %.1fs",
                 date_str,
-                os.environ.get("TESSERA_WINDOW_WRITE_MODE", "to_icechunk"),
                 len(writes),
                 _t_slot - _t_start,
                 sum(isels),
