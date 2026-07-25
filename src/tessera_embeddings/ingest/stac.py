@@ -969,7 +969,12 @@ def stream_stac_months(
     log.info("Streaming the STAC query over %d month(s) of %s..%s", len(months), start_date, end_date)
 
     def run(mr: MonthRange) -> tuple[list[Any], dict[str, int]]:
-        return fetch(
+        # Logged at SUBMIT time, not yield time: whether the prefetch is actually
+        # overlapping is otherwise only inferable from the gap between one month's last
+        # commit and the next month's first, which is a weak signal in a long run.
+        t0 = time.monotonic()
+        log.info("Querying %s..%s (prefetch)", mr.query_start, mr.query_end)
+        result = fetch(
             provider=provider,
             collection=collection,
             tile_id=tile_id,
@@ -978,6 +983,8 @@ def stream_stac_months(
             existing_dates=existing_dates_fn(),
             bbox=bbox,
         )
+        log.info("Queried %s..%s in %.1fs", mr.query_start, mr.query_end, time.monotonic() - t0)
+        return result
 
     # max_workers=1 IS the depth-1 buffer: one query in flight, one month in the
     # caller's hands. cancel_futures on exit so a failure mid-month does not block on
