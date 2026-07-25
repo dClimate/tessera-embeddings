@@ -1188,13 +1188,12 @@ def write_day_windows(
                 batch.session,
                 mode="r+",
                 region={"time": slice(t, t + 1), "northing": slice(y0, y1), "easting": slice(x0, x1)},
-                # NOT align_chunks=True. That remaps the producer's dask blocks onto the
-                # store's chunk grid, which these windows already sit on: they are snapped
-                # to INGEST_CHUNK_SIZE by construction (ingest.live_windows) and day_ds is
-                # loaded at INGEST_CHUNKS, so the remap is a no-op that still costs — 1.9x
-                # on a single-chunk window in a local benchmark. If an assumption here is
-                # ever wrong, mode="r+" rejects the partial-chunk write loudly rather than
-                # writing something wrong.
+                # align_chunks stays ON. Dropping it was measured on a live cell and was
+                # consistently ~11% SLOWER across three dates, not faster: the remap's cost
+                # is FIXED (~0.09 s, visible only on a single-chunk window locally, gone by
+                # four chunks), so it was never going to move a ~9 s window. Restored to the
+                # tested default rather than kept as a change with no upside.
+                align_chunks=True,
                 split_every=8,
             )
             # --- TEMPORARY DIAGNOSTIC (F-05) --------------------------------------
