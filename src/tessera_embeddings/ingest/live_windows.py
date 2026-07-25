@@ -120,6 +120,16 @@ def live_chunk_grid_from_keys(
         # A shard object holds many chunks, so its key is not a chunk index.
         logger.debug("mask is sharded; using the block scan")
         return None
+    # POSITIVELY recognise the key layout _CHUNK_KEY_RE assumes: zarr v3 with the
+    # default "c/<row>/<col>" encoding. Without this the regex simply matches
+    # nothing on a v2 mask (keys like "0.0") or a custom separator, and "no chunk
+    # keys found" is indistinguishable from "no live pixels" — so cropped ingest
+    # would derive zero windows and write an EMPTY mosaic while reporting success.
+    # A caller-supplied single-ROI mask is the realistic v2 source.
+    encoding = getattr(mask.metadata, "chunk_key_encoding", None)
+    if type(encoding).__name__ != "DefaultChunkKeyEncoding" or getattr(encoding, "separator", None) != "/":
+        logger.debug("mask chunk-key encoding %r is not the v3 default; using the block scan", encoding)
+        return None
 
     height, width = mask.shape
     rows, cols = math.ceil(height / chunk_px), math.ceil(width / chunk_px)
@@ -143,8 +153,13 @@ def live_chunk_grid_from_keys(
         live[r, c] = True
         matched += 1
 
-    # No chunks at all is a legitimate answer (an ROI with no live pixels), not a
-    # failed listing: the listing succeeded and found only metadata.
+    # No chunks at all is a legitimate answer (an ROI with no live pixels) ONLY if
+    # the listing genuinely found nothing but metadata. If it returned other keys
+    # that this parser did not recognise, the layout is not what we think it is —
+    # fall back rather than report an empty ROI and silently skip every pixel.
+    if matched == 0 and any(not key.endswith(("zarr.json", ".zarray", ".zattrs", ".zgroup")) for key in keys):
+        logger.debug("listing found unrecognised keys and no chunk keys; using the block scan")
+        return None
     logger.info("Derived %d live chunk(s) of %d from the mask's keys", matched, rows * cols)
     return live
 

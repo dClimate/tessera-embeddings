@@ -735,19 +735,31 @@ async def run_global_campaign(
                     max_parallel_ingest,
                 )
 
+            def _shard_needs_cluster(shard: list[str], chained_year: int) -> bool:
+                """True if any cell in the shard will actually provision Ray."""
+                return any(
+                    not status.has(z, chained_year)
+                    and zone_has_live_tiles(
+                        land_mask_path, z, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+                    )
+                    for z in shard
+                )
+
             def _chained_params(shard: list[str], n_shards: int, chained_year: int) -> dict[str, Any]:
                 return {
                     "zones": shard,
                     "year": chained_year,
                     "paths": paths.model_dump(),
                     "ami_ssm_name": ami_ssm_name,
-                    # Pin the fingerprinted image (see _ami_id / _fill_params) — but a
-                    # shard whose every cell is already complete only retags, so it
-                    # never provisions and must not force an SSM read on the cheap
-                    # recovery path. An all-ocean shard still resolves: detecting that
-                    # here would cost the per-zone bitmap reads the chained path
-                    # deliberately defers to the child, which returns early anyway.
-                    "ami_id": _ami_id() if any(not status.has(z, chained_year) for z in shard) else None,
+                    # Pin the fingerprinted image (see _ami_id / _fill_params) — but
+                    # ONLY for a shard that will actually start Ray. A shard whose
+                    # cells are all already-complete (retag) or all-ocean never
+                    # provisions, and forcing an SSM read there breaks the cheap
+                    # recovery paths when the parameter is missing or the role lacks
+                    # access. The ocean probe is one small bitmap GET per zone — the
+                    # same price the per-cell path already pays — and it runs only
+                    # for cells that are not already complete.
+                    "ami_id": _ami_id() if _shard_needs_cluster(shard, chained_year) else None,
                     "store_name": store_name,
                     "mask_name": mask_name,
                     "num_actors": num_actors,

@@ -175,7 +175,7 @@ def export_zone_rois(
     )
 
     rows = _export_zone_rois_impl.with_options(  # type: ignore[call-overload]
-        task_runner=ThreadPoolTaskRunner(max_workers=max_parallel_zones)
+        task_runner=ThreadPoolTaskRunner(max_workers=max_parallel_zones)  # type: ignore[arg-type]
     )(
         zones=todo,
         paths=paths,

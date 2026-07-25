@@ -295,3 +295,32 @@ class TestMergeBands:
         path = _mask_store(tmp_path, mask)
         assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=False)) == 2
         assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=True)) == 1
+
+
+class TestUnrecognisedChunkLayoutFallsBack:
+    """An unreadable key layout must fall back, never read as an empty ROI.
+
+    The key-listing fast path infers liveness from which chunk objects exist. If
+    the parser doesn't recognise the layout it matches nothing — and "no chunk
+    keys" is indistinguishable from "no live pixels" unless the layout is checked
+    first. Getting that wrong yields zero windows, so cropped ingest writes an
+    EMPTY mosaic and reports success.
+    """
+
+    def test_zarr_v2_mask_falls_back_to_the_block_scan(self, tmp_path):
+        """A v2 mask (keys like `0.0`) must not be mistaken for all-ocean."""
+        path = str(tmp_path / "v2.zarr")
+        z = zarr.open(path, mode="w", shape=(8, 8), chunks=(CHUNK, CHUNK), dtype="bool", zarr_format=2)
+        z[0, 0] = True  # one live pixel: an empty answer here would be plainly wrong
+
+        assert live_chunk_grid_from_keys(path, z, chunk_px=CHUNK) is None  # fell back
+        # The full path still finds the land, via the block scan.
+        assert live_windows_for_mask(path, chunk_px=CHUNK) == [LiveWindow(y0=0, y1=4, x0=0, x1=4)]
+
+    def test_genuinely_empty_v3_mask_is_still_empty(self, tmp_path):
+        """The fallback must not swallow the legitimate all-ocean answer."""
+        path = str(tmp_path / "ocean.zarr")
+        z = zarr.open(path, mode="w", shape=(8, 8), chunks=(CHUNK, CHUNK), dtype="bool")
+        grid = live_chunk_grid_from_keys(path, z, chunk_px=CHUNK)
+        assert grid is not None and not grid.any()  # answered, and the answer is "no land"
+        assert live_windows_for_mask(path, chunk_px=CHUNK) == []

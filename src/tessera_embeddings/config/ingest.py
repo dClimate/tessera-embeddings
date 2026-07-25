@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Spatial chunk size for storage (written at ingest). 4096 aligns with the
 # global store's 2048-px shard grid: one ingest chunk is exactly 2x2 shards
@@ -49,8 +49,8 @@ class IngestSettings(BaseModel):
     """
 
     # Dask worker bounds for one (zone, year) ingest.
-    min_workers: int = 1
-    max_workers: int = 50
+    min_workers: int = Field(default=1, ge=1)
+    max_workers: int = Field(default=50, ge=1)
     # S2 per-solar-day keep threshold (percent; see DEFAULT_MIN_VALID_COVERAGE).
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE
     # S1 CMR query batch window, in days. Must be >= 1: the S1 loop advances
@@ -66,3 +66,20 @@ class IngestSettings(BaseModel):
     # windows that intersect the ROI mask (ingest.live_windows). Default False
     # until the cropped path is validated end to end.
     crop_to_live_windows: bool = False
+
+    @model_validator(mode="after")
+    def _worker_bounds_ordered(self) -> IngestSettings:
+        """Reject max_workers < min_workers.
+
+        The cropped path's fleet sizing clamps into ``[max(min_workers, floor),
+        max_workers]``, so inverted bounds make the floor win and the derived cap
+        silently EXCEEDS the configured maximum — the one number an operator sets
+        to bound spend. The uncropped path just hands the provider a nonsense
+        range. Cheaper to refuse the config than to reconcile it downstream.
+        """
+        if self.max_workers < self.min_workers:
+            raise ValueError(
+                f"max_workers ({self.max_workers}) is below min_workers ({self.min_workers}); "
+                "the worker bounds must be orderable."
+            )
+        return self

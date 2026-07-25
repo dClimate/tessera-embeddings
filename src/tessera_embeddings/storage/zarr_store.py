@@ -1079,8 +1079,14 @@ def write_day_windows(
     # retry hits the duplicate-date guard and the STAC dedupe filters the date
     # forever. Existence is probed on the repo, not the (possibly empty) axis.
     try:
-        _open_repo(store_path, get_credentials=get_credentials, region=s3_region)
-    except (FileNotFoundError, icechunk.IcechunkError):
+        # Probe the ROOT GROUP, not just the repo: _create_repo creates the repo
+        # before create_empty_store writes and commits the schema, so a crash in
+        # between leaves a rootless repo. Probing the repo alone would then find
+        # it, skip seeding, and every retry would fail opening the missing group —
+        # wedged forever. (Same failure the global-store seeder hit; see its
+        # GroupNotFoundError handling.)
+        open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
+    except (FileNotFoundError, KeyError, zarr.errors.GroupNotFoundError, icechunk.IcechunkError):
         create_empty_store(
             store_path,
             roi=roi,
