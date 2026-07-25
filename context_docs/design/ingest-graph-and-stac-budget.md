@@ -183,6 +183,45 @@ easting window (optimization C), so a sparse zone shows less amplification than 
 Any inference-side chunk-geometry test must be run on a DENSE area — or a dense sub-section
 of a zone — or it will look safe and not be.
 
+### What shipped: load blocks decoupled from store chunks
+
+`INGEST_LOAD_CHUNK_SIZE` (8192) now sets the dask block size for the read path while
+`INGEST_CHUNK_SIZE` (4096) keeps setting the store's chunks. It must be a multiple, enforced
+at import, because the write rechunks load blocks down to store chunks and a non-multiple
+would make that a cross-block shuffle instead of a pure split.
+
+Windows are derived on the load-block grid (`live_windows_for_mask(window_px=...)`) by
+coarsening the derived live grid — NOT by snapping windows afterwards, which would be
+incorrect: two windows on adjacent fine rows can snap into the same coarse block and stop
+being chunk-disjoint, and the single-session per-date write depends on disjointness. The
+mask stays chunked at `INGEST_CHUNK_SIZE`, so the fast key-listing path is unaffected.
+
+The window cap is now `MAX_TASKS_PER_WINDOW` (24,000) in graph TASKS, converted to a chunk
+area through a `tasks_per_chunk` estimate. Chunk area was the wrong unit: it silently changes
+meaning whenever band count or block geometry moves. The old 2,048-chunk cap did exactly
+that, permitting an 84,054-task window.
+
+**Separating fixed from per-chunk cost in the census.** The ~956 per-item `open` tasks are
+fixed per date, so a small census window overstates the per-chunk figure. Removing them: per
+store chunk the variable cost goes **44 to 27.5 tasks (~1.6x)**; the 1.41x headline is that
+same effect diluted by fixed cost on a small window, so a full date should realise closer to
+1.6x.
+
+**Falsifiable prediction for the validation run** (35N, January, 120 workers), recorded
+before the run so it can be wrong: 7 windows of at most 120 blocks; ~12k tasks per window
+against 43k; ~83k tasks per date against ~130k; dispatch ~119 s at R around 700/s plus C of
+15-20 s, so **~135-145 s per date against 194 s measured**. Scheduler CPU should come off
+the pin.
+
+### Evidence that over-merging degrades, not merely plateaus
+
+The 3-window configuration's later dates were **232.9 s and 268.9 s** against 193.9 s for its
+first — with scheduler CPU pinned at 100% and dispatch lag reaching 1.2-2.0 s, and the
+hottest worker drifting 6.6 to 7.24 GiB. So the plateau was the optimistic reading; past the
+dispatch ceiling the configuration gets worse as the store's manifest grows. The 15-window
+configuration (mean ~225 s over 8 dates, scheduler 66% mean) remains the best measured before
+this change.
+
 ---
 
 ## 5. The flow runner's serial phase
