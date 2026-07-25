@@ -1110,6 +1110,21 @@ def write_day_windows(
 
     if day_ds.sizes["time"] != 1:
         raise ValueError(f"write_day_windows writes one date per call; got time size {day_ds.sizes['time']}")
+
+    # The windowed write does NOT realign the producer's blocks to the store's chunks
+    # (see the to_icechunk call below), which is only sound while every store chunk a
+    # window covers is written WHOLLY by that window. Checked here rather than trusted:
+    # a misaligned window would either be rejected by mode="r+" deep in the write or,
+    # worse, straddle a chunk with a neighbouring window and make the result depend on
+    # write order. Ends are exempt — the array's own last chunk is short.
+    _cy, _cx = chunks["northing"], chunks["easting"]
+    height, width = roi.height, roi.width
+    for y0, y1, x0, x1 in windows:
+        if y0 % _cy or x0 % _cx or (y1 % _cy and y1 != height) or (x1 % _cx and x1 != width):
+            raise ValueError(
+                f"window ({y0}, {y1}, {x0}, {x1}) is not aligned to the store's "
+                f"({_cy}, {_cx}) chunks; the windowed write cannot straddle a chunk"
+            )
     when = np.asarray(day_ds.time.values, dtype="datetime64[ns]")[0]
     date_str = str(when)[:10]
 
@@ -1169,13 +1184,24 @@ def write_day_windows(
                 batch.session,
                 mode="r+",
                 region={"time": slice(t, t + 1), "northing": slice(y0, y1), "easting": slice(x0, x1)},
-                # align_chunks stays ON. Dropping it was measured on a live cell and was
-                # consistently ~11% SLOWER across three dates, not faster: the remap's cost
-                # is FIXED (~0.09 s, visible only on a single-chunk window locally, gone by
-                # four chunks), so it was never going to move a ~9 s window. Restored to the
-                # tested default rather than kept as a change with no upside.
-                align_chunks=True,
-                split_every=8,
+                # NO align_chunks here, deliberately: it would remap the producer's
+                # blocks to the store's chunks, which multiplies the write tasks by
+                # the block/chunk ratio AND adds split nodes upstream — measured at
+                # 2.37x the graph for identical bytes at the current geometry. Graph
+                # task count is what limits this ingest.
+                #
+                # Safe only because of an invariant the caller guarantees: windows are
+                # derived on the LOAD-BLOCK grid (live_windows_for_mask's window_px)
+                # and load blocks are a whole multiple of the store's chunks, so every
+                # store chunk this region covers is written WHOLLY by exactly one
+                # block. Nothing partial, so mode="r+" has no partial-chunk write to
+                # reject and no read-modify-write is needed. Break that alignment and
+                # the remap becomes necessary again.
+                #
+                # (An earlier note here recorded dropping align_chunks as ~11% slower.
+                # That was measured when blocks and store chunks were the SAME size, so
+                # the remap was a no-op and the difference sat inside the ~19% per-date
+                # variance we have since quantified.)
             )
 
 
