@@ -1184,24 +1184,16 @@ def write_day_windows(
                 batch.session,
                 mode="r+",
                 region={"time": slice(t, t + 1), "northing": slice(y0, y1), "easting": slice(x0, x1)},
-                # NO align_chunks here, deliberately: it would remap the producer's
-                # blocks to the store's chunks, which multiplies the write tasks by
-                # the block/chunk ratio AND adds split nodes upstream — measured at
-                # 2.37x the graph for identical bytes at the current geometry. Graph
-                # task count is what limits this ingest.
-                #
-                # Safe only because of an invariant the caller guarantees: windows are
-                # derived on the LOAD-BLOCK grid (live_windows_for_mask's window_px)
-                # and load blocks are a whole multiple of the store's chunks, so every
-                # store chunk this region covers is written WHOLLY by exactly one
-                # block. Nothing partial, so mode="r+" has no partial-chunk write to
-                # reject and no read-modify-write is needed. Break that alignment and
-                # the remap becomes necessary again.
-                #
-                # (An earlier note here recorded dropping align_chunks as ~11% slower.
-                # That was measured when blocks and store chunks were the SAME size, so
-                # the remap was a no-op and the difference sat inside the ~19% per-date
-                # variance we have since quantified.)
+                # align_chunks stays ON, and the reason is memory rather than graph
+                # size. Dropping it does shrink the graph a little and ran ~4% faster,
+                # but it makes each write task carry a whole load block instead of one
+                # store chunk, which pushed workers over their spill threshold: peak
+                # spill 3.19 GiB across ~30% of scheduler samples, against zero with it
+                # on. Spill is a hidden cost that scales badly here, so the ~4% is not
+                # worth it. Untested middle path if it is ever wanted: halve the
+                # threads per worker to restore the headroom.
+                align_chunks=True,
+                split_every=8,
             )
 
 

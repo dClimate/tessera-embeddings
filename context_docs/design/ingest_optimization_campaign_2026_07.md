@@ -42,7 +42,7 @@ the scheduler moved from saturated to ~25% busy.
 | 5 | coverage gate fused into the band load | — | one fewer graph build/date | SCL was loaded twice per date |
 | 6 | decouple load blocks (8192) from store chunks (4096) | **188 s** | **7.5×** | graph scales with block count, not pixels |
 | 7 | manifest sharding by time | 185 s | cost, not speed | every commit rewrote the whole manifest |
-| 8 | stop realigning blocks to store chunks | ~171 s | **~5% only** (see §3.7) | a local census predicted 3.85×; the live graph barely moved |
+| 8 | stop realigning blocks to store chunks | 176.5 s | **REVERTED** (see §4.6) | ~4% faster but it introduced worker spill |
 
 Two things did **not** change, deliberately: the store's 4096 chunking (the GPU path is tuned
 around it) and the per-date atomicity of a commit (what makes a crashed ingest retryable).
@@ -208,45 +208,6 @@ That is ~1–3 s per date, i.e. **worth having because it is free, not because i
 earlier claim in these notes that it would flatten an observed per-date drift was withdrawn —
 see §5.
 
-### 3.7 Removing the realignment — a census that over-predicted, and what it actually bought
-
-`align_chunks` remapped producer blocks to the store's chunks before writing. A local census
-predicted a large win, and **the live run did not reproduce it.** Recorded in full because the
-gap between the two is the useful part.
-
-**What the census said.** Over one fixed window, counting the optimised graph of each variable
-and adding write tasks analytically (one per store chunk with realignment, one per block
-without):
-
-| | read+mask tasks | write tasks | total |
-|---|---|---|---|
-| with `align_chunks` | 1,985 | 528 | 2,513 |
-| without | 929 | 132 | 1,061 |
-
-That is 2.37× on the window, and 3.85× against a load-4096 baseline.
-
-**What the run said.** Live scheduler graph, same zone/month/fleet, image digest verified as the
-build containing the change: **mean 4,877 tasks per window against v4's 5,159** — about 5%.
-Per-date 170.8 s against 179.8 s, also about 5%.
-
-**Why the census over-predicted.** It modelled the write layer *analytically* — assuming
-`to_icechunk` emits one write task per dask block when not realigning. It does not: the region
-write must produce store-chunk-granular writes regardless, so it performs that splitting itself.
-The parameter therefore controls only whether xarray pre-rechunks, and the submitted graph ends
-up nearly the same either way. **The census is a sound instrument for the READ side, where it
-counts a real graph, and unsound for the write side, where it counted a model.**
-
-**What the change is still worth keeping for.** Peak worker memory fell from **10.16 GiB to
-6.86 GiB** — about 32% — because the realignment was materialising intermediate store-chunk
-pieces alongside the blocks they came from. That headroom is worth having on its own, and it is
-what would make a future block-size increase affordable. Plus ~5% wall clock, and one fewer
-graph layer.
-
-**The invariant it introduced is a genuine gain regardless:** `write_day_windows` now raises if
-any window is not store-chunk-aligned. Previously a misaligned window would have been rejected
-deep in the write or, worse, straddled a chunk with a neighbouring window and made the result
-depend on write order.
-
 ### 3.8 Where the graph work ended, and why — the write floor
 
 **The graph is now essentially all write tasks, at one per (store chunk × band).** Predicted
@@ -277,11 +238,11 @@ against 4,877).
 
 The configuration space is therefore closed, all three measured:
 
-| configuration | live graph per window |
-|---|---|
-| load 8192, 8192 windows, realigned | 5,159 |
-| **load 8192, 8192 windows, not realigned** (shipped) | **4,877** |
-| load 4096, 4096 windows | worse on wall clock (187.9 s) |
+| configuration | live graph per window | per-date | spill |
+|---|---|---|---|
+| **load 8192, 8192 windows, realigned** (shipped) | 5,159 | 184.5 s | **0** |
+| load 8192, 8192 windows, not realigned | 4,877 | 176.5 s | 3.19 GiB peak — reverted (§4.6) |
+| load 4096, 4096 windows | — | 187.9 s | 0 |
 
 **Verdict: graph work is complete.** We sit within 19% of a floor set by constraints we have
 chosen not to move, and the last three experiments returned 5%, 1.35%, and a 30–50% regression.
@@ -362,6 +323,45 @@ block size — they are set by the store's chunking, which is pinned. Writes wer
 graph at 4096 and 28% at 16384; even a free read side would only give 3.5× more, ever. Gated on
 a local task census before any spend, which is why nothing was spent.
 
+### 4.6 Removing the realignment — reverted on spill, after a census that over-predicted
+
+Two failures in one, and both are instructive.
+
+**The census over-predicted by ~20×.** It counted, over one fixed window, the optimised graph
+of each variable plus write tasks added *analytically* — one per store chunk with realignment,
+one per block without:
+
+| | read+mask | writes | total |
+|---|---|---|---|
+| with `align_chunks` | 1,985 | 528 | 2,513 |
+| without | 929 | 132 | 1,061 |
+
+That is 2.37× on the window. The live run, image digest verified, measured **mean 4,877 tasks
+against 5,159 — about 5%.** The census had modelled the write layer rather than measuring it:
+the region write must produce store-chunk-granular writes regardless, so it does that splitting
+itself and `align_chunks` only controls whether xarray pre-rechunks. §3.8 later confirmed the
+graph is essentially *all* write tasks, so there was never a large win there to find.
+
+**Then the wall-clock gain that did exist failed its own pass condition.** Over 12 dates the
+change ran **176.5 s against 184.5 s — 4.3% faster** — but worker **spill went from zero to a
+3.19 GiB peak across ~30% of scheduler samples**, because each write task now carried a whole
+load block (134 MB per band) instead of one store chunk (34 MB). Peak worker memory sat at
+10.58 GiB against 10.16 with realignment, i.e. both configurations run near the spill threshold
+and this one crossed it.
+
+The stated pass condition was zero spill, so it was **reverted**. Spill is a hidden cost that
+has scaled badly in this stack before, and 4.3% does not buy it. An untested middle path, if the
+gain is ever wanted: halve the threads per worker to restore the headroom.
+
+**Kept from the attempt:** `write_day_windows` now raises if a window is not store-chunk-aligned.
+That invariant is worth having documented and enforced regardless of which side of this decision
+we are on.
+
+**A correction to an earlier claim in this document:** an interim reading said peak worker memory
+*fell* from 10.16 to 6.86 GiB with the realignment removed. That came from the first twelve
+heartbeats of the run; over the full run it reached 10.58 GiB and spilled. Early samples of a
+memory series are not a memory measurement.
+
 ### 4.5 Rejected without testing, and why that is defensible
 
 - **Coarsening `INGEST_CHUNKS["time"]` beyond 1** — would batch dates per commit, breaking the
@@ -394,7 +394,11 @@ Recorded so they are not revived, and because the pattern is instructive.
 - **"`align_chunks` is ~11% faster kept."** Measured when blocks and store chunks were the same
   size, so the remap was a no-op and the difference sat inside the ~19% per-date variance since
   quantified. The correct answer at the current geometry is the opposite (§3.7).
-- **"Doubling load blocks again gives 2–3×."** Measured 1.35% — see §4.4.
+- **"Doubling load blocks again gives 2–3×."** Measured 1.35× — see §4.4.
+- **"Removing the realignment gives 3.85× and lowers peak worker memory 32%."** The graph gain
+  was ~5% (the census modelled the write layer instead of measuring it) and the memory claim came
+  from the first twelve heartbeats of a run that later reached 10.58 GiB and spilled. Reverted —
+  see §4.6.
 - **"Per-(block, item) overlap tasks dominate the graph."** They do not exist; the loader emits
   one open task per item.
 
