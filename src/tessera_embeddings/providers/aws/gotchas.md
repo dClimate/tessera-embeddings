@@ -253,6 +253,42 @@ crash       ┴─ on_cancellation/on_crashed ──► stop_ecs_tasks_by_tag(
                                                  "tessera-flow-run-id" = flow_run.id)
 ```
 
+### Terminal-state hooks can run twice — keep them idempotent
+
+A single `Cancelling` transition was observed executing
+`dask_cleanup_on_cancellation` **twice** (2026-07-25): two entries into the
+sweep 1 ms apart, two completions 72 ms apart. Prefect 3.7 has two sites that
+run these hooks — the flow engine inside the run's own process, and the runner
+that observes the state change — gated to be mutually exclusive by
+`PREFECT__ENABLE_CANCELLATION_AND_CRASHED_HOOKS`. Nothing in `prefect_aws` sets
+that variable, so a child launched by an ECS *worker* may have both fire; that
+is the leading hypothesis, not yet confirmed against a live cancel.
+
+Harmless today because both teardown hooks are idempotent by construction, and
+they must stay that way — the Ray hook especially, since two concurrent
+`ray down` invocations against one cluster is a worse proposition than two ECS
+sweeps. Each hook logs a site tag (`pid=… thread=… engine_owns=…`, see
+`flows/_hook_invocation.py`) so the next cancellation attributes a doubled pair
+to one process or two without another investigation round.
+
+**Validating any change here needs a killed process, not a polite cancel.** In
+the observed run `ecs_cluster`'s `finally` had already removed 9 of 10 tasks
+before the hook fired — a graceful cancel tests the hook against an
+already-empty cluster.
+
+### Logging: do not add a handler when the root logger is configured
+
+Prefect's `setup_logging()` puts a `PrefectConsoleHandler` on the **root**
+logger. `config/environment.py` also attached one to the `tessera_embeddings`
+package logger, and with propagation on that emitted every line twice to
+CloudWatch in two formats — a straight 2x on log ingest across the campaign,
+and silently inflated counts in any line-counting analysis (see
+`profiling/ingest/ingest_log_queries.py`). The handler is now conditional on the
+root logger being unconfigured; the package logger's LEVEL is still set
+unconditionally, which is the part that actually matters. Prefect UI logs are
+unaffected either way — they come from the `APILogHandler` on `prefect.flow_runs`,
+never from our package logger.
+
 ---
 
 ## Connection modes

@@ -319,6 +319,9 @@ def _cancel_child_ingests_on_cancellation(flow: object, flow_run: object, state:
 
 @flow(
     name="fill-zones-sequential",
+    # Both lists hold the SAME function: a crashed run leaks exactly like a
+    # cancelled one. Hooks here have been seen to run TWICE for one transition
+    # (2026-07-25) — they must stay idempotent; see flows/_hook_invocation.py.
     on_cancellation=[ray_cleanup_on_cancellation, _cancel_child_ingests_on_cancellation],
     on_crashed=[ray_cleanup_on_cancellation, _cancel_child_ingests_on_cancellation],
 )

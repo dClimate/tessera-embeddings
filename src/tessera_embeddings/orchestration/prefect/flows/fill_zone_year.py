@@ -144,6 +144,9 @@ def _assert_seeded_model_matches(
 
 @flow(
     name="fill-zone-year",
+    # Both lists hold the SAME function: a crashed run leaks exactly like a
+    # cancelled one. Hooks here have been seen to run TWICE for one transition
+    # (2026-07-25) — they must stay idempotent; see flows/_hook_invocation.py.
     on_cancellation=[ray_cleanup_on_cancellation],
     on_crashed=[ray_cleanup_on_cancellation],
 )

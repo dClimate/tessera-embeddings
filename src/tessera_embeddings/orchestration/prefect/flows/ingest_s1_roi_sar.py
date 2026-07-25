@@ -79,6 +79,9 @@ def _default_edl_env() -> dict[str, str]:
 
 @flow(
     name="ingest_s1_roi_sar",
+    # Both lists hold the SAME function: a crashed run leaks exactly like a
+    # cancelled one. Hooks here have been seen to run TWICE for one transition
+    # (2026-07-25) — they must stay idempotent; see flows/_hook_invocation.py.
     on_cancellation=[dask_cleanup_on_cancellation],
     on_crashed=[dask_cleanup_on_cancellation],
 )

@@ -57,6 +57,9 @@ def _ingest_s2_roi_impl(
 
 @flow(
     name="ingest_s2_roi_reflectance",
+    # Both lists hold the SAME function: a crashed run leaks exactly like a
+    # cancelled one. Hooks here have been seen to run TWICE for one transition
+    # (2026-07-25) — they must stay idempotent; see flows/_hook_invocation.py.
     on_cancellation=[dask_cleanup_on_cancellation],
     on_crashed=[dask_cleanup_on_cancellation],
 )

@@ -169,6 +169,9 @@ def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) 
 
 @flow(
     name="tessera_embeddings",
+    # Both lists hold the SAME function: a crashed run leaks exactly like a
+    # cancelled one. Hooks here have been seen to run TWICE for one transition
+    # (2026-07-25) — they must stay idempotent; see flows/_hook_invocation.py.
     on_cancellation=[_ray_cleanup_on_cancellation],
     on_crashed=[_ray_cleanup_on_cancellation],
 )
