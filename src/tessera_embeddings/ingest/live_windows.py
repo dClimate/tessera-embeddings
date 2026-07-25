@@ -335,6 +335,138 @@ def coarsen_live_grid(live: np.ndarray, factor: int) -> np.ndarray:
     return cast("np.ndarray", padded.reshape(r_pad // factor, factor, c_pad // factor, factor).any(axis=(1, 3)))
 
 
+#: Window cells added around every reprojected footprint, on all four sides.
+#:
+#: The footprint comes from reprojecting each item's lon/lat bounding box and taking
+#: the result's bounds, which for a curved reprojection can fall marginally inside
+#: the true image. Under-covering would silently drop data, so the footprint is
+#: padded until that is impossible: one window cell is tens of kilometres, orders of
+#: magnitude more than the curvature error of a scene-sized box. The cost is a little
+#: extra computed area, which is the cheap direction.
+FOOTPRINT_PAD_CELLS = 1
+
+
+def grid_from_windows(
+    windows: list[LiveWindow], *, height: int, width: int, chunk_px: int = INGEST_CHUNK_SIZE
+) -> np.ndarray:
+    """The boolean cell grid covered by ``windows`` — the inverse of :func:`row_band_windows`.
+
+    Lets a window list be intersected with another grid and re-derived, without
+    re-listing the mask it originally came from.
+    """
+    grid = np.zeros((math.ceil(height / chunk_px), math.ceil(width / chunk_px)), dtype=bool)
+    for w in windows:
+        grid[w.y0 // chunk_px : math.ceil(w.y1 / chunk_px), w.x0 // chunk_px : math.ceil(w.x1 / chunk_px)] = True
+    return grid
+
+
+def footprint_grid(
+    bboxes: list[tuple[float, float, float, float]],
+    geobox: object,
+    *,
+    chunk_px: int = INGEST_CHUNK_SIZE,
+) -> np.ndarray | None:
+    """Cells a set of lon/lat bounding boxes could put data in, or ``None`` if unsure.
+
+    ``bboxes`` are ``(west, south, east, north)`` in EPSG:4326 — the form STAC
+    publishes — and ``geobox`` is the grid the ingest writes on. Only geometry
+    matters here, so callers pass bounding boxes rather than catalog items and this
+    module stays free of catalog types.
+
+    **Returning ``None`` means "assume everything"**, and every uncertain path takes
+    it: an unusable bounding box, a geobox that cannot be read, a projection that
+    fails. The caller then behaves exactly as it did before this function existed.
+    That asymmetry is the whole safety argument — a footprint that is too LARGE only
+    costs computed area that was going to be discarded anyway, while one that is too
+    SMALL silently drops imagery from a mosaic and nothing downstream would notice.
+    Every rounding here goes outward for the same reason, and
+    :data:`FOOTPRINT_PAD_CELLS` widens the result again on top.
+
+    An empty result (no cell set) is meaningful and distinct from ``None``: those
+    items fall entirely outside this grid.
+    """
+    try:
+        from odc.geo.geom import box
+
+        height, width = int(geobox.height), int(geobox.width)  # type: ignore[attr-defined]
+        inverse = ~geobox.transform  # type: ignore[attr-defined]
+        crs = geobox.crs  # type: ignore[attr-defined]
+    except Exception:  # any geobox we cannot read means "assume everything"
+        logger.debug("footprint: unusable geobox; computing the full extent", exc_info=True)
+        return None
+
+    rows, cols = math.ceil(height / chunk_px), math.ceil(width / chunk_px)
+    grid = np.zeros((rows, cols), dtype=bool)
+
+    for bbox in bboxes:
+        try:
+            west, south, east, north = (float(v) for v in bbox)
+        except (TypeError, ValueError):
+            logger.debug("footprint: unusable bbox %r; computing the full extent", bbox)
+            return None
+        # A west > east box is the STAC convention for crossing the antimeridian.
+        # Splitting keeps each half an ordinary west-to-east box, which is what
+        # reprojection expects — the same treatment the catalog query already applies.
+        halves = (
+            [(west, south, 180.0, north), (-180.0, south, east, north)] if west > east else [(west, south, east, north)]
+        )
+        for w, s, e, n in halves:
+            try:
+                bounds = box(w, s, e, n, "EPSG:4326").to_crs(crs).boundingbox
+                c0, r0 = inverse * (bounds.left, bounds.top)
+                c1, r1 = inverse * (bounds.right, bounds.bottom)
+            except Exception:  # a projection failure means "assume everything"
+                logger.debug("footprint: could not project %r; computing the full extent", bbox, exc_info=True)
+                return None
+            # Outward to whole cells, then padded, then clamped to the grid.
+            cr0 = max(math.floor(min(r0, r1) / chunk_px) - FOOTPRINT_PAD_CELLS, 0)
+            cr1 = min(math.ceil(max(r0, r1) / chunk_px) + FOOTPRINT_PAD_CELLS, rows)
+            cc0 = max(math.floor(min(c0, c1) / chunk_px) - FOOTPRINT_PAD_CELLS, 0)
+            cc1 = min(math.ceil(max(c0, c1) / chunk_px) + FOOTPRINT_PAD_CELLS, cols)
+            if cr0 < cr1 and cc0 < cc1:
+                grid[cr0:cr1, cc0:cc1] = True
+    return grid
+
+
+def windows_for_date(
+    windows: list[LiveWindow],
+    bboxes: list[tuple[float, float, float, float]],
+    geobox: object,
+    *,
+    chunk_px: int = INGEST_CHUNK_SIZE,
+    merge: bool = True,
+) -> list[LiveWindow]:
+    """A run's live windows, narrowed to what ONE date's imagery can actually fill.
+
+    A run's windows describe where the ROI has land, and they are identical on every
+    date. A single date is not: an optical satellite images a fraction of a wide ROI
+    per pass, so most of those windows hold nothing for a given date. Tasks built over
+    them still run, find no data, and write nothing — the mosaic is the same either
+    way, because an all-fill chunk is never stored.
+
+    So this removes work whose result is already discarded, which is why it cannot
+    change what a mosaic contains. What it changes is cost, in both terms that matter:
+    the graph shrinks with the area, and windows the date misses entirely disappear,
+    taking their serial region writes with them.
+
+    Returns the input unchanged when the footprint cannot be determined
+    (:func:`footprint_grid`), so the conservative behaviour is the fallback rather
+    than something a caller opts into. An EMPTY result means this date reaches no
+    live cell at all and there is nothing to write.
+    """
+    if not windows:
+        return windows
+    footprint = footprint_grid(bboxes, geobox, chunk_px=chunk_px)
+    if footprint is None:
+        return windows
+    height, width = int(geobox.height), int(geobox.width)  # type: ignore[attr-defined]
+    covered = grid_from_windows(windows, height=height, width=width, chunk_px=chunk_px) & footprint
+    if not covered.any():
+        return []
+    bands = row_band_windows(covered, height=height, width=width, chunk_px=chunk_px)
+    return merge_bands(bands, chunk_px=chunk_px) if merge else bands
+
+
 def live_windows_for_mask(
     mask_path: str,
     *,

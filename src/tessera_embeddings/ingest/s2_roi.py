@@ -45,7 +45,7 @@ from tessera_embeddings.config.ingest import (
     INGEST_LOAD_CHUNKS,
 )
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
-from tessera_embeddings.ingest.live_windows import live_windows_for_mask
+from tessera_embeddings.ingest.live_windows import live_windows_for_mask, windows_for_date
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.stac import (
@@ -202,11 +202,19 @@ def ingest_s2_roi_reflectance(
 
     # Live windows for the cropped write path, derived once per run from the same
     # mask this ingest already reads (plain tuples: storage takes no ingest types).
+    #
+    # These describe where the ROI has LAND, so they are the same on every date. Each
+    # date is then narrowed further to the land its own imagery can reach
+    # (``windows_for_date``, applied per date below), because a satellite covers only
+    # a fraction of a wide ROI per pass.
     live_windows: list[tuple[int, int, int, int]] | None = None
+    run_windows: list = []
     if crop_to_live_windows:
-        wins = live_windows_for_mask(roi_zarr_path, window_px=INGEST_LOAD_CHUNK_SIZE, storage_options=storage_options)
-        live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in wins]
-        log.info("Cropping writes to %d live window(s)", len(wins))
+        run_windows = live_windows_for_mask(
+            roi_zarr_path, window_px=INGEST_LOAD_CHUNK_SIZE, storage_options=storage_options
+        )
+        live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
+        log.info("Cropping writes to %d live window(s)", len(run_windows))
 
     # LOAD-side blocks, which are a multiple of the store's chunks (see
     # config.ingest.INGEST_LOAD_CHUNK_SIZE): fewer, larger blocks mean a smaller
@@ -284,6 +292,38 @@ def ingest_s2_roi_reflectance(
         date = day_ds.time.dt.date.values[0]
         day_ds["time"] = [np.datetime64(date, "ns")]
 
+        # Narrow this date's writes to the land its own imagery reaches. The run's
+        # windows cover the whole ROI's land on every date, but one pass images a
+        # fraction of a wide ROI, so most of them hold nothing today: those tasks run,
+        # find no data, and write nothing, because an all-fill chunk is never stored.
+        # Dropping them cannot change the mosaic — only what is computed to produce it.
+        #
+        # The COVERAGE GATE above deliberately keeps the run's full window set. Its
+        # ratio is "how much of the ROI's land did this date see", so its denominator
+        # must stay the whole ROI; cropping the gate would rescale every percentage.
+        # The numerator is unaffected either way, since there are no valid pixels
+        # outside the footprint to count.
+        date_windows: list[tuple[int, int, int, int]] = live_windows or []
+        if live_windows is not None and run_windows:
+            narrowed = windows_for_date(
+                run_windows,
+                [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
+                roi.geobox,
+                chunk_px=INGEST_LOAD_CHUNK_SIZE,
+            )
+            if not narrowed:
+                # No live cell is reachable today. Nothing to write, and writing an
+                # empty window set would commit a date holding nothing.
+                log.info("Skipping date: its imagery reaches no live window")
+                return False
+            date_windows = [(w.y0, w.y1, w.x0, w.x1) for w in narrowed]
+            if len(narrowed) != len(run_windows):
+                log.info(
+                    "Date footprint: writing %d of %d live window(s)",
+                    len(narrowed),
+                    len(run_windows),
+                )
+
         # ONE masking pass, not two. Zeroing invalid pixels and zeroing outside the
         # ROI both fill with 0, so `x.where(A, 0).where(B, 0)` is `x.where(A & B, 0)`
         # — and each `where` is a graph task per (chunk, band), which is the budget
@@ -309,7 +349,7 @@ def ingest_s2_roi_reflectance(
                     write_day_windows(
                         reflectance_store,
                         day_ds,
-                        live_windows,
+                        date_windows,
                         roi=roi,
                         manifest=ingest_manifest,
                         baselines=baselines,
