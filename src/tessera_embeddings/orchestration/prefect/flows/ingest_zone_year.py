@@ -29,20 +29,17 @@ guard; the fill re-checks before provisioning Ray.
 from __future__ import annotations
 
 import asyncio
-import math
 from collections.abc import Callable
 from typing import Any, cast
 
 import icechunk
-import numpy as np
 import zarr
 from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
 from pydantic import BaseModel
 
-from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, IngestSettings
+from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.data_loading import (
@@ -51,7 +48,7 @@ from tessera_embeddings.inference.data_loading import (
     check_time_window_coverage,
     resolve_s1_orbit,
 )
-from tessera_embeddings.ingest.land_mask import export_zone_roi
+from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_count
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles
 from tessera_embeddings.storage.object_store import delete_prefix
@@ -127,17 +124,6 @@ _WORKERS_PER_LIVE_CHUNK = 0.5
 _WORKERS_FLOOR = 10
 
 
-def _live_chunk_count(land_mask_path: str, zone: str, *, get_credentials: Callable, s3_region: str | None) -> int:
-    """Live 4096-px ingest chunks in the zone, from the coverage bitmap (a KB read)."""
-    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
-    tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
-    t = INGEST_CHUNK_SIZE // SHARD_PX  # tiles per chunk per axis
-    rows, cols = math.ceil(tile_live.shape[0] / t), math.ceil(tile_live.shape[1] / t)
-    padded = np.zeros((rows * t, cols * t), dtype=bool)
-    padded[: tile_live.shape[0], : tile_live.shape[1]] = tile_live
-    return int(padded.reshape(rows, t, cols, t).any(axis=(1, 3)).sum())
-
-
 def _scaled_max_workers(live_chunks: int, settings: IngestSettings) -> int:
     """Clamp(0.5 x live chunks) into [max(min_workers, floor), max_workers]."""
     floor = max(settings.min_workers, min(_WORKERS_FLOOR, settings.max_workers))
@@ -197,7 +183,7 @@ async def ingest_zone_year(
     zone = canonicalize_zone(zone)
     land_mask_path = paths.land_mask_store(mask_name)
     mosaic_base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}"
-    roi_path = f"{paths.inputs.rstrip('/')}/rois/zarrs/zone_{zone}.zarr"
+    roi_path = paths.zone_roi_store(zone)
 
     # (1) All-ocean zone: no ROI, no ingest — the fill marks it empty.
     if not zone_has_live_tiles(land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region):
@@ -280,8 +266,8 @@ async def ingest_zone_year(
     # 03S incident showed extent-sized fleets are wrong by orders of magnitude.
     max_workers = ingest_settings.max_workers
     if ingest_settings.crop_to_live_windows:
-        n_chunks = _live_chunk_count(
-            land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        n_chunks = live_chunk_count(
+            zone, land_mask_path=land_mask_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region
         )
         max_workers = _scaled_max_workers(n_chunks, ingest_settings)
         log.info("Zone %s: %d live chunk(s) -> max_workers=%d", zone, n_chunks, max_workers)

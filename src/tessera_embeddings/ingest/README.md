@@ -167,6 +167,48 @@ every date. Mosaics are per `(zone, year)` and deleted after the fill is tagged 
 re-derivable inputs at ~TB scale (ADR-011). Zones are named by UTM common name (`33N`/`07S`),
 not EPSG (see `storage/zone_grid.canonicalize_zone`).
 
+#### Pre-generating the zone masks — `export-zone-rois`
+
+`ingest-zone-year` exports the mask it needs on the fly, so the campaign is self-sufficient.
+The `export-zone-rois` flow does the same work for many zones **ahead of the campaign**, and
+adds the check the per-cell path has no reason to run:
+
+```text
+export-zone-rois  (one task per zone, max_parallel_zones in flight, no barrier)
+   └─ per zone ─► live_chunk_count(zone)        coverage bitmap, one ~KB GET
+                  ├─ 0 live chunks ⇒ all_ocean (no mask by design; nothing written)
+                  ├─ export_zone_roi(zone)      skipped when already current
+                  └─ validate_zone_roi(zone)    grid · completion · placement · layout
+```
+
+`validate_zone_roi` is the reason to run this early. Its load-bearing check is **placement**:
+the count of stored chunk objects must equal `live_chunk_count`. That equality holds because
+the writer skips all-ocean blocks and Zarr elides all-fill chunks, so *the set of stored chunks
+is the set of live cells* — one listing asserts, for the whole zone, that the mask marks land
+where the coverage bitmap says land is and nowhere else. It also confirms the chunk grid is
+recoverable from the keys at all, which is the property the cropped ingest's fast path depends
+on (see `live_windows.live_chunk_grid_from_keys`). Alongside that: shape/CRS/affine equal the
+zone's `ZoneSpec` (a wrong origin otherwise surfaces hours later, as data on the wrong ground
+position), and `coverage_sha256` matches the coverage group's `registry_sha256` — stamped last
+by the writer, so it is the only evidence every pixel landed and that the mask is current for
+*this* land-mask delivery.
+
+Safe to run before, or alongside, campaign work. `export_zone_roi` is idempotent on that same
+sha, so a pre-generated mask is what the campaign would have written and the campaign skips it;
+a new delivery changes the sha and both paths rebuild. `validate_only=true` re-checks without
+writing. Any invalid zone **fails the run**, so a green run — not a log line — is the evidence
+that every mask is right.
+
+```bash
+# all zones, then re-assert the gate without writing
+--param zones=null --param max_parallel_zones=16
+--param validate_only=true
+```
+
+Cost is S3 request latency, roughly one PUT per live ingest chunk (~100 k campaign-wide across
+the 112 land zones), which is why it fans out per zone and why running it in-region matters:
+the same export measured ~4 chunk-writes/second from a laptop.
+
 ---
 
 ## Data Transformations

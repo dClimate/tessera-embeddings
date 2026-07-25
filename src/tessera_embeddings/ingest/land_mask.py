@@ -56,6 +56,7 @@ from pyproj import Transformer
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
+from tessera_embeddings.ingest.live_windows import live_chunk_grid_from_keys
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.manifest import RoiManifest
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store_as_zarr_group
@@ -657,6 +658,16 @@ def _live_tile_bbox_wgs84(spec: ZoneSpec, tile_live: np.ndarray) -> tuple[float,
     return float(lon.min()), lat_min, float(lon.max()), lat_max
 
 
+def _zone_roi_transform(spec: ZoneSpec) -> list[float]:
+    """The ROI mask's 6-coeff affine for ``spec``: north-up, top-left origin.
+
+    ``[pixel_w, 0, easting_min, 0, -pixel_h, northing_max]`` — the form
+    :func:`~tessera_embeddings.ingest.roi.read_roi_metadata` reconstructs into a
+    GeoBox. Shared by the writer and the validator so the two cannot drift.
+    """
+    return [PIXEL_M, 0.0, spec.easting[0], 0.0, -PIXEL_M, spec.northing[1]]
+
+
 def _roi_is_current(
     dest_path: str, height: int, width: int, crs: str, transform: list[float], coverage_sha: str | None
 ) -> bool:
@@ -724,9 +735,7 @@ def export_zone_roi(
         return None
 
     height, width = spec.height, spec.width
-    # 6-coeff affine: [pixel_w, 0, easting_min, 0, -pixel_h, northing_max] — the
-    # north-up top-left origin read_roi_metadata reconstructs into a GeoBox.
-    transform = [PIXEL_M, 0.0, spec.easting[0], 0.0, -PIXEL_M, spec.northing[1]]
+    transform = _zone_roi_transform(spec)
 
     if _roi_is_current(dest_path, height, width, spec.crs, transform, coverage_sha):
         logger.info("Zone %s ROI already current at %s — skipping", zone, dest_path)
@@ -765,3 +774,119 @@ def export_zone_roi(
         "Exported zone %s ROI: %d live tiles -> %s (%dx%d px)", zone, int(tile_live.sum()), dest_path, height, width
     )
     return dest_path
+
+
+def live_chunk_count(
+    zone: str,
+    *,
+    land_mask_path: str,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> int:
+    """Live ingest chunks in ``zone``, coarsened from the coverage bitmap (a KB read).
+
+    Counts exactly the blocks :func:`export_zone_roi` writes — same
+    ``INGEST_CHUNK_SIZE`` blocking of ``tile_live_2048``, same
+    skip-if-not-``any`` rule — so it is both the ingest fleet-sizing measure and
+    the expected object count of a correctly written mask
+    (:func:`validate_zone_roi` asserts that equality).
+    """
+    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
+    tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
+    t = INGEST_CHUNK_SIZE // SHARD_PX  # tiles per chunk per axis
+    rows, cols = math.ceil(tile_live.shape[0] / t), math.ceil(tile_live.shape[1] / t)
+    padded = np.zeros((rows * t, cols * t), dtype=bool)
+    padded[: tile_live.shape[0], : tile_live.shape[1]] = tile_live
+    return int(padded.reshape(rows, t, cols, t).any(axis=(1, 3)).sum())
+
+
+def validate_zone_roi(
+    zone: str,
+    *,
+    land_mask_path: str,
+    roi_path: str,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> list[str]:
+    """Check a written zone ROI mask against its contract. Empty list means valid.
+
+    A mask that exists is not a mask that is right, and a wrong one is expensive:
+    the ingest pins its grid from this artifact and the fill validates the mosaic
+    against the same :class:`~tessera_embeddings.storage.zone_grid.ZoneSpec`, so a
+    bad transform surfaces hours later as a grid mismatch — or, worse, as data
+    written to the wrong ground position. Asserted here:
+
+    * **Grid identity** — shape, CRS, and affine equal the zone's ``ZoneSpec``
+      (via :func:`_zone_roi_transform`, the writer's own source), plus a WGS84
+      bbox in range. ``west > east`` is accepted: zones 01/60 straddle the
+      antimeridian and the bbox is deliberately written in the GeoJSON crossing
+      convention.
+    * **Completion** — ``coverage_sha256`` matches the coverage group's
+      ``registry_sha256``. The writer stamps it last, so its presence is the only
+      evidence every pixel landed, and its value is what makes the mask current
+      for *this* land-mask delivery rather than a superseded one.
+    * **Placement** — the count of stored chunk objects equals
+      :func:`live_chunk_count`. Because an all-ocean chunk is never written, this
+      is a whole-zone assertion that the mask marks land where the coverage
+      bitmap says land is, and nowhere else, at the cost of one listing.
+    * **Croppable layout** — the chunk grid is recoverable from the keys at all.
+      The ingest's live-window cropping prefers that listing over a per-position
+      read; a mask this returns ``None`` for still ingests correctly but falls
+      back to the scan, which is worth knowing before a campaign rather than
+      after.
+
+    Returns:
+        One human-readable string per failed check, in check order; empty when
+        the mask satisfies every one.
+    """
+    problems: list[str] = []
+    spec = zone_grid.zone(zone)
+    try:
+        z = zarr.open(roi_path, mode="r")
+    except (FileNotFoundError, KeyError) as exc:
+        return [f"cannot open ROI mask at {roi_path}: {exc!r}"]
+    if not isinstance(z, zarr.Array):
+        return [f"{roi_path} is a {type(z).__name__}, not a zarr array"]
+
+    if tuple(z.shape) != (spec.height, spec.width):
+        problems.append(f"shape {tuple(z.shape)} != zone grid ({spec.height}, {spec.width})")
+    if z.attrs.get("crs") != spec.crs:
+        problems.append(f"crs {z.attrs.get('crs')!r} != zone crs {spec.crs!r}")
+    expected_transform = _zone_roi_transform(spec)
+    actual_transform = list(cast("list[float]", z.attrs.get("transform", [])))
+    if actual_transform != expected_transform:
+        problems.append(f"transform {actual_transform} != {expected_transform}")
+    if z.attrs.get("resolution") != PIXEL_M:
+        problems.append(f"resolution {z.attrs.get('resolution')!r} != {PIXEL_M}")
+
+    bbox = cast("list[float] | None", z.attrs.get("bbox_wgs84"))
+    if bbox is None or len(bbox) != 4 or not all(np.isfinite(bbox)):
+        problems.append(f"bbox_wgs84 {bbox!r} is not four finite numbers")
+    else:
+        west, south, east, north = (float(v) for v in bbox)
+        # west > east is legal (antimeridian crossing), so bound each edge rather
+        # than asserting an ordering that zones 01/60 correctly violate.
+        if not (-180.0 <= west <= 180.0 and -180.0 <= east <= 180.0):
+            problems.append(f"bbox_wgs84 longitudes out of range: {west}, {east}")
+        if not (-90.0 <= south < north <= 90.0):
+            problems.append(f"bbox_wgs84 latitudes not ascending in range: {south}, {north}")
+
+    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
+    coverage_sha = cast("str | None", cov.attrs.get("registry_sha256"))
+    if z.attrs.get("coverage_sha256") != coverage_sha:
+        problems.append(f"coverage_sha256 {z.attrs.get('coverage_sha256')!r} != coverage {coverage_sha!r}")
+
+    if tuple(z.chunks) != (INGEST_CHUNK_SIZE, INGEST_CHUNK_SIZE):
+        problems.append(f"chunks {tuple(z.chunks)} != ({INGEST_CHUNK_SIZE}, {INGEST_CHUNK_SIZE})")
+    else:
+        grid = live_chunk_grid_from_keys(roi_path, z)
+        if grid is None:
+            problems.append("live chunk grid not recoverable from the mask's keys (ingest would fall back to scanning)")
+        else:
+            expected = live_chunk_count(
+                zone, land_mask_path=land_mask_path, get_credentials=get_credentials, s3_region=s3_region
+            )
+            stored = int(grid.sum())
+            if stored != expected:
+                problems.append(f"{stored} stored chunk(s) != {expected} live chunk(s) in the coverage bitmap")
+    return problems

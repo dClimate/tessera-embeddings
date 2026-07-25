@@ -243,11 +243,15 @@ class TestChunkScaledWorkers:
 
         monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
         monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
-        monkeypatch.setattr(
-            mod,
-            "open_store_as_zarr_group",
-            lambda *a, **k: {"tile_live_2048": np.asarray(tile_live, dtype=bool)},
-        )
+
+        def fake_coverage(*a, **k):
+            return {"tile_live_2048": np.asarray(tile_live, dtype=bool)}
+
+        # Two patch targets, deliberately: the flow reads the coverage sha through
+        # its own namespace, while the chunk count is land_mask's function reading
+        # through land_mask's. Patching only one leaves the other reaching for S3.
+        monkeypatch.setattr(mod, "open_store_as_zarr_group", fake_coverage)
+        monkeypatch.setattr("tessera_embeddings.ingest.land_mask.open_store_as_zarr_group", fake_coverage)
         _run(ingest_settings=mod.IngestSettings(crop_to_live_windows=True, **settings_kwargs), s1_orbit="ascending")
         return [p["max_workers"] for _, p in wired["arun"]]
 

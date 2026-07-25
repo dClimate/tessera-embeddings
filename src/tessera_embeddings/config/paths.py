@@ -62,6 +62,17 @@ class BucketPaths(BaseModel):
         else:  # embeddings
             return posixpath.join(self.outputs, "embeddings", f"{roi_name}.zarr")
 
+    def zone_roi_store(self, zone: str) -> str:
+        """Return the URI of the campaign ingest ROI mask for one UTM zone.
+
+        Zone masks are ordinary ``roi``-kind stores under the reserved
+        ``zone_{zone}`` name, so a zone mask and a conventionally-named ROI can
+        never collide. Every producer and consumer of a zone mask addresses it
+        through here: a mask written to a path the ingest does not read would
+        look like success and then be silently rebuilt per cell.
+        """
+        return self.store_for(f"zone_{zone}", "roi")
+
     def global_store(self, name: str = "tessera") -> str:
         """Return the URI of the single global-embeddings Icechunk repo.
 

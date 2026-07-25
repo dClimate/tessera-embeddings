@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pathlib
+
 import numpy as np
 import pytest
 import rasterio
@@ -10,6 +12,7 @@ from rasterio.transform import from_bounds
 
 from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
 from tessera_embeddings.ingest import land_mask
+from tessera_embeddings.ingest.live_windows import live_chunk_grid_from_keys
 from tessera_embeddings.ingest.roi import read_roi_metadata
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store_as_zarr_group
@@ -355,3 +358,91 @@ def test_export_zone_roi_bbox_handles_antimeridian(tmp_path) -> None:
     # longitude span is a single 6° zone's width, never ~360°.
     span = (180.0 - minx) + (maxx + 180.0) if minx > maxx else maxx - minx
     assert span < 30.0
+
+
+# --------------------------------------------------------------------------- #
+# Pre-generation gate (live_chunk_count / validate_zone_roi)
+# --------------------------------------------------------------------------- #
+def test_live_chunk_count_equals_written_chunk_objects(tmp_path) -> None:
+    """The invariant the placement check rests on: the export writes exactly one
+    chunk object per live ingest chunk, so the coverage-derived count and the
+    stored-object count are the same number.
+    """
+    zone = "31N"
+    tiles_per_chunk = land_mask.INGEST_CHUNK_SIZE // SHARD_PX
+    # Two tiles inside one chunk block, plus one in a different block: the count
+    # must coarsen (3 tiles -> 2 chunks), not simply track tiles.
+    cov = _make_coverage(tmp_path, zone, [(0, 0), (0, 1), (4 * tiles_per_chunk, 3 * tiles_per_chunk)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+
+    expected = land_mask.live_chunk_count(zone, land_mask_path=cov)
+    assert expected == 2
+    grid = live_chunk_grid_from_keys(dest, zarr.open(dest, mode="r"))
+    assert grid is not None  # layout the ingest's cropping fast path requires
+    assert int(grid.sum()) == expected
+
+
+def test_validate_zone_roi_accepts_freshly_exported(tmp_path) -> None:
+    zone = "31N"
+    cov = _make_coverage(tmp_path, zone, [(10, 5), (11, 5)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    assert land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest) == []
+
+
+def test_validate_zone_roi_reports_absent_mask(tmp_path) -> None:
+    cov = _make_coverage(tmp_path, "31N", [(10, 5)])
+    problems = land_mask.validate_zone_roi("31N", land_mask_path=cov, roi_path=str(tmp_path / "missing.zarr"))
+    assert len(problems) == 1
+    assert "cannot open" in problems[0]
+
+
+def test_validate_zone_roi_rejects_wrong_transform(tmp_path) -> None:
+    """A mask on the right grid shape but the wrong origin passes every structural
+    check and writes data to the wrong ground position — so the transform is
+    compared, not just the shape.
+    """
+    zone = "31N"
+    cov = _make_coverage(tmp_path, zone, [(10, 5)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    z = zarr.open(dest, mode="a")
+    shifted = list(z.attrs["transform"])
+    shifted[2] += land_mask.PIXEL_M  # origin off by one pixel east
+    z.attrs["transform"] = shifted
+    problems = land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest)
+    assert any("transform" in p for p in problems)
+
+
+def test_validate_zone_roi_rejects_superseded_coverage(tmp_path) -> None:
+    """A mask built from a previous land-mask delivery is not valid for the
+    current one, even though its grid is identical — the sha is the discriminator.
+    """
+    zone = "31N"
+    cov = _make_coverage(tmp_path, zone, [(10, 5)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    z = zarr.open(dest, mode="a")
+    z.attrs["coverage_sha256"] = "sha-from-an-older-delivery"
+    problems = land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest)
+    assert any("coverage_sha256" in p for p in problems)
+
+
+def test_validate_zone_roi_detects_missing_chunk_object(tmp_path) -> None:
+    """The placement check has teeth: losing one chunk leaves a mask whose grid,
+    CRS, transform and sha all still validate, but which no longer marks all the
+    land the coverage bitmap does.
+    """
+    zone = "31N"
+    tiles_per_chunk = land_mask.INGEST_CHUNK_SIZE // SHARD_PX
+    cov = _make_coverage(tmp_path, zone, [(0, 0), (4 * tiles_per_chunk, 3 * tiles_per_chunk)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    assert land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest) == []
+
+    chunks = sorted(pathlib.Path(dest).glob("c/*/*"))
+    assert len(chunks) == 2
+    chunks[0].unlink()
+    problems = land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest)
+    assert any("stored chunk" in p for p in problems)
