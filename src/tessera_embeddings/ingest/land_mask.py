@@ -318,8 +318,10 @@ def build_all(
         dest: URI of the coverage Icechunk repo (``BucketPaths.land_mask_store()``).
         registry_uri: Registry file URI; defaults to ``{delivery_uri}/registry.txt``.
         delivery_uri: Partner delivery prefix (recorded in attrs as ``source``).
-        zones: Restrict to these EPSG strings (default: all 120). A restricted
-            build still commits; unlisted zones simply aren't touched.
+        zones: Restrict to these zone COMMON NAMES — ``"33N"``, ``"07S"`` — the
+            keys ``zone_grid.zone`` is registered under, not EPSG codes
+            (default: all 120). A restricted build still commits; unlisted
+            zones simply aren't touched.
         log: Optional logger.
 
     Returns:

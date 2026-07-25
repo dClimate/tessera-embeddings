@@ -73,6 +73,7 @@ from tessera_embeddings.orchestration.runners.sequential_fill import (
 from tessera_embeddings.orchestration.runners.zone_fill import (
     ZonePlan,
     assemble_zone_year,
+    assert_calendar_year_window,
     fill_zone_year,
     infer_zone_year,
     plan_zone_inference,
@@ -449,6 +450,10 @@ def fill_zones_sequential_flow(
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     window = parse_time_window(time_window_end or f"December {year}")
+    # Before any ingest dispatch or ray_cluster: planning would reject an
+    # offset/partial window, but only after look-ahead ingests have started and
+    # the shared fleet is up.
+    assert_calendar_year_window(window, year)
     checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}"
     gate = _PrefectCommitGate(commit_limit_name) if commit_limit_name else None
 

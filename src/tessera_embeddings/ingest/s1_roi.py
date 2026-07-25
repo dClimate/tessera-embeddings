@@ -158,7 +158,9 @@ def ingest_s1_roi_sar(
     # reads (see ingest.live_windows; identical mechanics to the S2 path).
     live_windows: list[tuple[int, int, int, int]] | None = None
     if crop_to_live_windows:
-        live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in live_windows_for_mask(roi_zarr_path)]
+        live_windows = [
+            (w.y0, w.y1, w.x0, w.x1) for w in live_windows_for_mask(roi_zarr_path, storage_options=storage_options)
+        ]
         log.info("Cropping writes to %d live window(s)", len(live_windows))
 
     total_processed = 0

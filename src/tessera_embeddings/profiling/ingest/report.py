@@ -138,7 +138,9 @@ def _scheduler_section(sched: dict | None) -> str:
         f"- Peak FLEET memory: **{_gib(pk.get('worker_mem_gib'))}** · spilled "
         f"**{_gib(pk.get('worker_spill_gib'))}** · hottest worker "
         f"**{_gib(pk.get('worker_max_gib'))}**"
-        + ("" if pk.get("worker_spill_gib") else "  _(no spill — the graph fit the fleet)_"),
+        # `== 0` not falsiness: a profile predating fleet telemetry has None here,
+        # and calling that "no spill" would assert a healthy fleet from missing data.
+        + ("  _(no spill — the graph fit the fleet)_" if pk.get("worker_spill_gib") == 0 else ""),
         f"- cpu-high ∧ backlog-rising intervals: **{profile['cpu_backlog_cooccurrence']}**",
         f"- Saturation onsets: {onsets}",
         f"- Worker join/exit events: **{len(profile['worker_events'])}**",

@@ -741,7 +741,13 @@ async def run_global_campaign(
                     "year": chained_year,
                     "paths": paths.model_dump(),
                     "ami_ssm_name": ami_ssm_name,
-                    "ami_id": _ami_id(),  # pin the fingerprinted image (see _ami_id / _fill_params)
+                    # Pin the fingerprinted image (see _ami_id / _fill_params) — but a
+                    # shard whose every cell is already complete only retags, so it
+                    # never provisions and must not force an SSM read on the cheap
+                    # recovery path. An all-ocean shard still resolves: detecting that
+                    # here would cost the per-zone bitmap reads the chained path
+                    # deliberately defers to the child, which returns early anyway.
+                    "ami_id": _ami_id() if any(not status.has(z, chained_year) for z in shard) else None,
                     "store_name": store_name,
                     "mask_name": mask_name,
                     "num_actors": num_actors,

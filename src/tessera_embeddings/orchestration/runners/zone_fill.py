@@ -63,6 +63,7 @@ import zarr
 
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     SpatialCoords,
     ZarrWriter,
@@ -77,6 +78,31 @@ from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.shard_writer import CommitGate, read_years_complete, shard_pitch
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, time_index_of
 from tessera_embeddings.storage.zone_grid import PIXEL_M, year_timestamp
+
+
+def assert_calendar_year_window(time_window: TimeWindow, year: int) -> None:
+    """Reject any window that is not exactly January-December of ``year``.
+
+    The single enforcement point for the calendar-year guarantee. Callable BEFORE
+    a cluster is provisioned as well as inside planning: the request is decidable
+    from config alone, and provisioning a GPU fleet (or starting ingests) for a
+    window that planning will certainly reject is pure spend.
+
+    Compares the WHOLE month set, not just "every month falls in ``year``": a
+    same-year partial (e.g. Jan-Jun 2025) also has ``window_years == {year}`` but
+    is only six months, and would otherwise tag the slot complete with a short
+    window while the seeded ``time_bnds`` advertise the full Jan-Dec.
+    """
+    if set(time_window.months) != {(year, m) for m in range(1, 13)}:
+        window_years = sorted({y for y, _ in time_window.months})
+        raise ValueError(
+            f"config.time_window ({time_window.window_end_label}, months in year(s) {window_years}) "
+            f"is not the exact January-December {year} window, but the global store guarantees "
+            f"calendar-year slots (time_convention='calendar_year'): year={year} requires all 12 months "
+            f"January-December {year}. Rolling/offset OR same-year partial windows are not writable to "
+            f"the global store — use the single-ROI `12mo_window_end` path for non-calendar windows "
+            f"(or the ADR-011 windowed-variant design at zone scale)."
+        )
 
 
 def zone_live_tile_count(
@@ -350,16 +376,7 @@ def plan_zone_inference(
     # same-year partial (e.g. Jan-Jun 2025) also has window_years == {year} but is
     # only six months, and would otherwise pass here and tag the slot complete
     # with a short window while the seeded time_bnds advertise the full Jan-Dec.
-    if set(config.time_window.months) != {(year, m) for m in range(1, 13)}:
-        window_years = sorted({y for y, _ in config.time_window.months})
-        raise ValueError(
-            f"config.time_window ({config.time_window.window_end_label}, months in year(s) {window_years}) "
-            f"is not the exact January-December {year} window, but the global store guarantees "
-            f"calendar-year slots (time_convention='calendar_year'): year={year} requires all 12 months "
-            f"January-December {year}. Rolling/offset OR same-year partial windows are not writable to "
-            f"the global store — use the single-ROI `12mo_window_end` path for non-calendar windows "
-            f"(or the ADR-011 windowed-variant design at zone scale)."
-        )
+    assert_calendar_year_window(config.time_window, year)
 
     # Idempotent retry: a cell that already landed is done — re-running it
     # would produce a new snapshot that tag_zone_year rightly refuses to move

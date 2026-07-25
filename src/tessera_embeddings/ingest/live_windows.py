@@ -62,16 +62,25 @@ class LiveWindow:
     x1: int
 
 
-def _open_mask(mask_path: str) -> zarr.Array:
-    """Open + validate the ROI mask array (the shape both mask writers produce)."""
-    z = zarr.open(mask_path, mode="r")
+def _open_mask(mask_path: str, storage_options: dict | None = None) -> zarr.Array:
+    """Open + validate the ROI mask array (the shape both mask writers produce).
+
+    ``storage_options`` mirrors :func:`ingest.roi.read_roi_mask`: a deployment whose
+    mask needs non-default fsspec/S3 settings must pass them here too, or window
+    derivation fails where the ingest's own mask read succeeds.
+    """
+    z = zarr.open(mask_path, mode="r", storage_options=storage_options)
     if not isinstance(z, zarr.Array) or z.ndim != 2 or z.dtype != np.bool_:
         raise ValueError(f"ROI mask at {mask_path} is not a 2-D boolean zarr array")
     return z
 
 
 def live_chunk_grid_from_keys(
-    mask_path: str, mask: zarr.Array, *, chunk_px: int = INGEST_CHUNK_SIZE
+    mask_path: str,
+    mask: zarr.Array,
+    *,
+    chunk_px: int = INGEST_CHUNK_SIZE,
+    storage_options: dict | None = None,
 ) -> np.ndarray | None:
     """The live-chunk grid read from the mask's stored chunk KEYS, not its pixels.
 
@@ -106,7 +115,7 @@ def live_chunk_grid_from_keys(
     height, width = mask.shape
     rows, cols = math.ceil(height / chunk_px), math.ceil(width / chunk_px)
     try:
-        fs, root = fsspec.core.url_to_fs(mask_path)
+        fs, root = fsspec.core.url_to_fs(mask_path, **(storage_options or {}))
         keys = fs.find(root)
     except (OSError, ValueError) as exc:
         logger.debug("cannot list %s (%s); using the block scan", mask_path, exc)
@@ -131,7 +140,9 @@ def live_chunk_grid_from_keys(
     return live
 
 
-def live_chunk_grid(mask_path: str, *, chunk_px: int = INGEST_CHUNK_SIZE) -> np.ndarray:
+def live_chunk_grid(
+    mask_path: str, *, chunk_px: int = INGEST_CHUNK_SIZE, storage_options: dict | None = None
+) -> np.ndarray:
     """Coarsen the ROI mask onto the ingest chunk grid: True where any pixel is live.
 
     Reads one chunk-sized block at a time (~16 MB at the 4096 default), reducing
@@ -142,7 +153,7 @@ def live_chunk_grid(mask_path: str, *, chunk_px: int = INGEST_CHUNK_SIZE) -> np.
     fetches per chunk either way — so this bounds memory without extra I/O.
     Plain zarr, no dask: a metadata-scale scan must not cost a task graph.
     """
-    z = _open_mask(mask_path)
+    z = _open_mask(mask_path, storage_options)
     height, width = z.shape
     rows, cols = math.ceil(height / chunk_px), math.ceil(width / chunk_px)
     live = np.zeros((rows, cols), dtype=bool)
@@ -179,7 +190,11 @@ def row_band_windows(
 
 
 def live_windows_for_mask(
-    mask_path: str, *, chunk_px: int = INGEST_CHUNK_SIZE, prefer_keys: bool = True
+    mask_path: str,
+    *,
+    chunk_px: int = INGEST_CHUNK_SIZE,
+    prefer_keys: bool = True,
+    storage_options: dict | None = None,
 ) -> list[LiveWindow]:
     """The one-call form: mask store → row-band live windows.
 
@@ -190,11 +205,17 @@ def live_windows_for_mask(
     sequential reads.
 
     ``prefer_keys=False`` forces the read path, which is how the two are held to
-    the same answer in tests.
+    the same answer in tests. ``storage_options`` mirrors
+    :func:`ingest.roi.read_roi_mask`, so a deployment whose mask needs non-default
+    fsspec/S3 settings derives windows where its ingest already reads the mask.
     """
-    mask = _open_mask(mask_path)
+    mask = _open_mask(mask_path, storage_options)
     height, width = mask.shape
-    live = live_chunk_grid_from_keys(mask_path, mask, chunk_px=chunk_px) if prefer_keys else None
+    live = (
+        live_chunk_grid_from_keys(mask_path, mask, chunk_px=chunk_px, storage_options=storage_options)
+        if prefer_keys
+        else None
+    )
     if live is None:
-        live = live_chunk_grid(mask_path, chunk_px=chunk_px)
+        live = live_chunk_grid(mask_path, chunk_px=chunk_px, storage_options=storage_options)
     return row_band_windows(live, height=height, width=width, chunk_px=chunk_px)

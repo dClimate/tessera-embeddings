@@ -851,3 +851,31 @@ def test_fill_accepts_a_cropped_written_mosaic(tmp_path, monkeypatch):
         run_id="runCropped",
     )
     assert summary["empty"] is False and summary["succeeded"] == 1
+
+
+def test_calendar_gate_is_callable_before_provisioning():
+    """The gate decides from config alone, so both flows call it pre-cluster.
+
+    An offset or same-year-partial window is rejected by planning regardless —
+    but only after a billable GPU fleet is up (and, on the chained path, after
+    look-ahead ingests have started). One definition, two call sites.
+    """
+    zone_fill.assert_calendar_year_window(_window(2025), 2025)  # exact Jan-Dec: passes
+
+    offset = TimeWindow(
+        window_start=(2024, 2),
+        window_end=(2025, 1),
+        months=tuple([(2024, m) for m in range(2, 13)] + [(2025, 1)]),
+        window_end_label="2025-01-01",
+    )
+    with pytest.raises(ValueError, match="exact January-December 2025 window"):
+        zone_fill.assert_calendar_year_window(offset, 2025)
+
+    partial = TimeWindow(
+        window_start=(2025, 1),
+        window_end=(2025, 6),
+        months=tuple((2025, m) for m in range(1, 7)),
+        window_end_label="2025-06-01",
+    )
+    with pytest.raises(ValueError, match="exact January-December 2025 window"):
+        zone_fill.assert_calendar_year_window(partial, 2025)  # same year, only 6 months

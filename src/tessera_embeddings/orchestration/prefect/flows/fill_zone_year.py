@@ -42,6 +42,7 @@ from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     ray_cleanup_on_cancellation,
 )
 from tessera_embeddings.orchestration.runners.zone_fill import (
+    assert_calendar_year_window,
     fill_zone_year,
     zone_has_live_tiles,
     zone_year_complete,
@@ -289,9 +290,14 @@ def fill_zone_year_flow(
     # 12-month window spanning exactly Jan-Dec (the store's guaranteed convention).
     # A `time_window_end` override producing any other window is rejected loudly by
     # the runner's calendar-year gate — the single enforcement chokepoint.
+    window = parse_time_window(time_window_end or f"December {year}")
+    # Before ray_cluster: the runner's gate would reject an offset/partial window
+    # anyway, but only after a billable GPU fleet is up. Decidable from config, so
+    # decide it here.
+    assert_calendar_year_window(window, year)
     config = build_inference_config(
         s1_orbit=resolved_s1,
-        time_window=parse_time_window(time_window_end or f"December {year}"),
+        time_window=window,
         checkpoint_path=f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}",
         inputs_bucket=paths.inputs,
         output_bucket=paths.outputs,

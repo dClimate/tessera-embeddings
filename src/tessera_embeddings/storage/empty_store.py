@@ -268,6 +268,7 @@ def create_empty_store(
     chunks: dict[str, int] | None = None,
     baselines: dict[str, int] | None = None,
     manifest: IngestManifest | None = None,
+    repo: Repository | None = None,
 ) -> None:
     """Create a 100%-empty store over the ROI extent and given dates.
 
@@ -297,6 +298,9 @@ def create_empty_store(
         baselines: Baseline map written to root attrs. Defaults to empty (no
             baseline correction is meaningful for an unpopulated store).
         manifest: Optional ingest manifest for provenance / append-safety.
+        repo: Pre-opened repository to create the store in. Pass one when the
+            caller's credentials or region differ from the defaults — otherwise
+            this opens its own with the default storage config.
     """
     chunks = chunks if chunks is not None else INGEST_CHUNKS
     times = np.asarray(times, dtype="datetime64[ns]")
@@ -340,6 +344,10 @@ def create_empty_store(
 
     create_empty_store_from_coords(
         store_path,
+        # A caller with callback-only credentials or a non-default region opens the
+        # repo itself and passes it; otherwise from_coords creates one with the
+        # default storage config.
+        repo=repo,
         coords={"time": times, "northing": northing, "easting": easting},
         var_specs={
             name: VarSpec(

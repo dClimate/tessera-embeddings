@@ -253,7 +253,7 @@ def ingest_s2_roi_reflectance(
     # mask this ingest already reads (plain tuples: storage takes no ingest types).
     live_windows: list[tuple[int, int, int, int]] | None = None
     if crop_to_live_windows:
-        wins = live_windows_for_mask(roi_zarr_path)
+        wins = live_windows_for_mask(roi_zarr_path, storage_options=storage_options)
         live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in wins]
         log.info("Cropping writes to %d live window(s)", len(wins))
 

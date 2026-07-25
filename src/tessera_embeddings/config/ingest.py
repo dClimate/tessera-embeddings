@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Spatial chunk size for storage (written at ingest). 4096 aligns with the
 # global store's 2048-px shard grid: one ingest chunk is exactly 2x2 shards
@@ -53,8 +53,10 @@ class IngestSettings(BaseModel):
     max_workers: int = 50
     # S2 per-solar-day keep threshold (percent; see DEFAULT_MIN_VALID_COVERAGE).
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE
-    # S1 CMR query batch window, in days.
-    batch_days: int = 30
+    # S1 CMR query batch window, in days. Must be >= 1: the S1 loop advances
+    # batch_start by this much, so 0 never advances (an ingest cluster billing
+    # forever) and a negative walks it backwards.
+    batch_days: int = Field(default=30, ge=1)
     # Optional base URI (an fsspec target, e.g. s3://.../perf/) for capturing a
     # Dask ``distributed.performance_report`` per child ingest. Default None =
     # off (normal runs pay nothing); set it only on a probe rung — ingest-zone-year

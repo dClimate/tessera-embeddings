@@ -1091,6 +1091,12 @@ def write_day_windows(
             chunks=chunks,
             baselines={},  # merged per date below, exactly like the append path
             manifest=manifest,
+            # Seed through a repo opened with THIS call's credentials/region. Letting
+            # create_empty_store open its own would use the default storage config,
+            # so the probe above and every write below would honour a callback or a
+            # non-default region while the one-time seed silently did not — failing
+            # the first cropped date of any such deployment.
+            repo=_create_repo(store_path, get_credentials=get_credentials, region=s3_region),
         )
 
     with batched_region_writes(
