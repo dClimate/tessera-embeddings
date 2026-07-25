@@ -210,6 +210,12 @@ see §5.
 
 ### 3.8 Where the graph work ended, and why — the write floor
 
+> **SUPERSEDED IN PART by §3.9.** This section's arithmetic is correct but its denominator is
+> not: it derives the floor for writing the WHOLE ROI, and a single date writes only the
+> fifth of the ROI its own imagery reaches. The real floor is about five times smaller, and
+> the conclusion drawn here — that graph work was closed — was premature. Read §3.9 before
+> treating any number below as a limit.
+
 **The graph is now essentially all write tasks, at one per (store chunk × band).** Predicted
 against observed, window by window on the shipped configuration:
 
@@ -254,6 +260,72 @@ Anyone reopening this should start by asking whether the store's chunking or the
 move. If neither can, there is nothing here worth more than 19%.
 
 ---
+
+### 3.9 The per-date footprint — four fifths of every graph was computing nothing
+
+**Found by counting objects, not by profiling**, and it reframes §3.8's write-floor
+conclusion. A completed 7-date run on a dense zone was compared against the area its graph
+covered:
+
+| quantity | value |
+|---|---|
+| chunk objects in the store, 7 dates | **44,797** |
+| ⇒ chunks per band-date | **582** |
+| chunks covered by the run's live windows | **2,992** |
+| ⇒ share of the graph that produces data | **19.4%** |
+| Sentinel-2 revisit ⇒ expected daily coverage of a zone | **20.0%** |
+
+That agreement is the finding. **The live windows describe where the ROI has LAND, and were
+being reused unchanged on every date — but one optical pass images only a fraction of a wide
+ROI.** Four fifths of the ~33,000 write tasks per date ran, found no data, and wrote nothing,
+because an all-fill chunk is never stored. The waste was invisible precisely BECAUSE the
+output was already correct.
+
+**Why it never appeared on the single-ROI path.** The ratio is (ROI extent ÷ what one pass
+covers). A yield ROI is smaller than one satellite swath, so a date covers essentially all of
+it and there is nothing to skip. It only appears once the ROI is a 6-degree zone. Anyone
+reasoning from single-ROI experience will not expect this, and that is not an error on their
+part.
+
+**What it explains.** §3.8 concluded the graph had reached a write floor of
+`store_chunks × bands` and closed graph work. That floor was real but measured against the
+wrong denominator: it is the floor for writing *the whole ROI*, and a date does not write the
+whole ROI. The genuine floor is `chunks_the_date_images × bands`, five times smaller. So the
+per-date fixed cost — graph construction, task dispatch, per-window region writes — was about
+five times larger than the work required.
+
+**The fix** (`live_windows.windows_for_date`): intersect the run's windows with the footprint
+of that date's own items before building the graph. Both cost terms fall together, which is
+the point — the graph shrinks with the area, AND windows the date misses entirely disappear,
+taking their serial region writes with them. Per-date window count on a dense zone should
+drop from 7 to roughly 1–2.
+
+**Why it cannot change a mosaic.** The chunks it skips are already absent from the store —
+that is what the 582-against-2,992 count proves. It removes computation whose result was
+being discarded, so the output is identical by construction. The safety burden is therefore
+entirely on the footprint being CONSERVATIVE:
+
+* every uncertain path returns "assume everything" and restores the previous behaviour — an
+  unreadable bbox, an unreadable geobox, a failed projection;
+* all rounding goes outward, and the footprint is padded a whole cell on every side, which is
+  tens of kilometres against a curvature error measured in metres;
+* the coverage gate deliberately keeps the run's FULL window set, because its ratio asks how
+  much of the ROI's land a date saw and cropping the denominator would rescale every
+  percentage. The numerator is unaffected: there are no valid pixels outside the footprint.
+
+Too large costs discarded area; too small silently drops imagery and nothing downstream
+notices. The tests are weighted at that asymmetry rather than at the happy path.
+
+**Per-date metadata is unaffected**, checked rather than assumed: `doy` is a scalar list with
+one entry per timestep, `baselines_applied` a per-date dict, and the time slot is appended
+once per date — none of them per-window. Narrowed windows stay 8192-aligned with ends clamped
+to the extent, satisfying the write path's chunk-alignment guard, and remain chunk-disjoint by
+construction.
+
+**Status: implemented, measurement pending.** The projection is that per-date cost roughly
+halves and the useful worker count doubles; neither is measured yet. Anchor and footprint runs
+on identical dates are the comparison, with **store object counts as the correctness check** —
+if the two stores hold the same chunk objects, the change did exactly what it claims.
 
 ## 4. What did not work, and why
 
@@ -598,6 +670,8 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | streaming retention cost | +1 month of items on the ingest worker; 1.25 GiB spill at 16 GiB | run telemetry |
 | items deferred across a month boundary | 1,084 of 31,507 (one day's worth) | live cluster |
 | write floor | graph ≈ store_chunks × bands; 2,992 covered vs 2,415 live (19% dead) | measured, all 7 windows |
+| **per-date data share** | **582 of 2,992 covered chunks per band-date = 19.4%**, against 20% predicted by a 5-day revisit | store object count, 7 dates (§3.9) |
+| worker-count scaling, dense zone | median s/date **194.8 at 120w, 232.4 at 60w, 396.7 at 30w**; doubling buys 1.71× at 30→60 and 1.19× at 60→120 | 7 dates per rung |
 
 ---
 
