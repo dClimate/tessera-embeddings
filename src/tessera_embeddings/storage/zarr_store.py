@@ -41,6 +41,7 @@ builds no graph at all.
 """
 
 import logging
+import os
 import statistics
 import time
 from collections.abc import Callable, Iterator
@@ -1136,10 +1137,30 @@ def write_day_windows(
         _t_slot = time.monotonic()  # TEMPORARY DIAGNOSTIC (F-05)
         writes: list[float] = []  # TEMPORARY DIAGNOSTIC (F-05)
         isels: list[float] = []  # TEMPORARY DIAGNOSTIC (F-05)
+        produces: list[float] = []  # TEMPORARY DIAGNOSTIC (F-05)
         for i, (y0, y1, x0, x1) in enumerate(windows):
             _t0 = time.monotonic()  # TEMPORARY DIAGNOSTIC (F-05)
             win = day_ds.isel(northing=slice(y0, y1), easting=slice(x0, x1)).drop_vars(drop)
             _t1 = time.monotonic()  # TEMPORARY DIAGNOSTIC (F-05)
+            # --- TEMPORARY DIAGNOSTIC (F-05): materialise-then-assign mode ---------
+            # The per-window cost has been measured but not SPLIT: `to_icechunk`
+            # computes the window (fetch + resample from the source scenes) AND
+            # stores it, so "6 s per window" could be either. This mode times the
+            # two separately by materialising to numpy first, which also exercises
+            # RegionWriteBatch.write_window — the documented-but-unused path.
+            # TESSERA_WINDOW_WRITE_MODE=materialise selects it; unset keeps the
+            # shipping behaviour byte-for-byte.
+            if os.environ.get("TESSERA_WINDOW_WRITE_MODE") == "materialise":
+                vals = {str(v): np.asarray(win[v].values)[0] for v in win.data_vars}
+                _tp = time.monotonic()
+                produces.append(_tp - _t1)
+                batch.write_window(t, slice(y0, y1), slice(x0, x1), vals)
+                _t2 = time.monotonic()
+                isels.append(_t1 - _t0)
+                writes.append(_t2 - _tp)
+                logger.debug("  window %d/%d produce %.2fs store %.2fs", i + 1, len(windows), _tp - _t1, _t2 - _tp)
+                continue
+            # --- END TEMPORARY DIAGNOSTIC -----------------------------------------
             to_icechunk(
                 win,
                 batch.session,
@@ -1168,17 +1189,19 @@ def write_day_windows(
         # --- BEGIN TEMPORARY DIAGNOSTIC (F-05) ------------------------------------
         if writes:
             logger.info(
-                "date %s budget: %d window(s) | slot+attrs %.1fs | graphs %.1fs | "
-                "writes %.1fs (min %.2f med %.2f max %.2f) | unattributed %.1fs",
+                "date %s budget [%s]: %d window(s) | slot+attrs %.1fs | graphs %.1fs | "
+                "produce %.1fs | writes %.1fs (min %.2f med %.2f max %.2f) | unattributed %.1fs",
                 date_str,
+                os.environ.get("TESSERA_WINDOW_WRITE_MODE", "to_icechunk"),
                 len(writes),
                 _t_slot - _t_start,
                 sum(isels),
+                sum(produces),
                 sum(writes),
                 min(writes),
                 statistics.median(writes),
                 max(writes),
-                time.monotonic() - _t_start - (_t_slot - _t_start) - sum(isels) - sum(writes),
+                time.monotonic() - _t_start - (_t_slot - _t_start) - sum(isels) - sum(produces) - sum(writes),
             )
         # --- END TEMPORARY DIAGNOSTIC ---------------------------------------------
 
