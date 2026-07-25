@@ -1178,14 +1178,23 @@ def write_day_windows(
                     _tw - _tp,
                 )
                 _F05_PROBED = True
-                _t1 = time.monotonic()  # so the to_icechunk timing below excludes the probe
+                # Re-time from here so the to_icechunk measurement below excludes the
+                # probe. _t0 moves too, or `isels` (measured _t1 - _t0) absorbs the
+                # probe and the budget's unattributed term goes negative.
+                _t0 = _t1 = time.monotonic()
             # --- END TEMPORARY DIAGNOSTIC -----------------------------------------
             to_icechunk(
                 win,
                 batch.session,
                 mode="r+",
                 region={"time": slice(t, t + 1), "northing": slice(y0, y1), "easting": slice(x0, x1)},
-                align_chunks=True,
+                # NOT align_chunks=True. That remaps the producer's dask blocks onto the
+                # store's chunk grid, which these windows already sit on: they are snapped
+                # to INGEST_CHUNK_SIZE by construction (ingest.live_windows) and day_ds is
+                # loaded at INGEST_CHUNKS, so the remap is a no-op that still costs — 1.9x
+                # on a single-chunk window in a local benchmark. If an assumption here is
+                # ever wrong, mode="r+" rejects the partial-chunk write loudly rather than
+                # writing something wrong.
                 split_every=8,
             )
             # --- TEMPORARY DIAGNOSTIC (F-05) --------------------------------------
