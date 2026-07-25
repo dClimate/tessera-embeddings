@@ -120,6 +120,18 @@ def resolve_code_artifact_identity(
     publishing a mixed-version year. Resolving the real AMI ID and tarball ETag makes
     any code change flip the fingerprint, so a fresh staging prefix is used.
 
+    KNOWN RESIDUAL WINDOW (dev-overlay path only). The ETag is read here, once, while
+    workers later download the mutable key ``code/src{code_suffix}.tar.gz``. Overwrite
+    that object mid-campaign and workers boot code the fingerprint does not describe.
+    Re-reading the ETag just before launch would narrow the window, not close it — the
+    overwrite can land between that HEAD and the worker's GET — so this is left as a
+    constraint rather than a partial mitigation: DO NOT overwrite a tarball a campaign
+    is running against. Production is unaffected (a baked AMI passes ``code_bucket=None``
+    and has no tarball term at all). To close it properly, upload content-addressed keys
+    (``code/src-<sha>.tar.gz``) so the object is immutable by construction, rather than
+    threading an S3 versionId through provisioning. Same reasoning as the model
+    checkpoint's filename-not-bytes identity in ``_staging_run_id``.
+
     Args:
         ami_ssm_name: SSM parameter holding the worker AMI ID.
         code_bucket: S3 bucket of the source tarball; ``None`` for a pure-AMI deploy.
