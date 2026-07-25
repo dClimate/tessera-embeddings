@@ -323,6 +323,24 @@ block size — they are set by the store's chunking, which is pinned. Writes wer
 graph at 4096 and 28% at 16384; even a free read side would only give 3.5× more, ever. Gated on
 a local task census before any spend, which is why nothing was spent.
 
+### 4.5 Rejected without testing, and why that is defensible
+
+- **Coarsening `INGEST_CHUNKS["time"]` beyond 1** — would batch dates per commit, breaking the
+  property that a date's time slot lands atomically with its pixels. That property is what
+  makes a crashed ingest safely retryable; the ingest marker makes a wrongly-recorded date
+  permanent.
+- **Folding the ROI mask inside `odc.stac.load`** — no clean hook exists; ~80+ LOC of
+  loader-internal surgery for one task per (block, band).
+- **Raising the scheduler's vCPU** — its CPU never exceeded 100% across 114 samples despite ten
+  threads and 4 vCPU allocated. The event loop is single-threaded and GIL-bound; more cores
+  would idle. See §6.
+- **Raising the page size on the STAC query** — capped at 250. `limit=500` and `limit=1000`
+  both fail against earth-search with repeated server errors.
+- **More workers per cell, at the time it was proposed** — two single threads serialised ≥95%
+  of a run, bounding any fleet increase at ≤1.1×. This has since changed; see §7.
+
+---
+
 ### 4.6 Removing the realignment — reverted on spill, after a census that over-predicted
 
 Two failures in one, and both are instructive.
@@ -361,24 +379,6 @@ we are on.
 *fell* from 10.16 to 6.86 GiB with the realignment removed. That came from the first twelve
 heartbeats of the run; over the full run it reached 10.58 GiB and spilled. Early samples of a
 memory series are not a memory measurement.
-
-### 4.5 Rejected without testing, and why that is defensible
-
-- **Coarsening `INGEST_CHUNKS["time"]` beyond 1** — would batch dates per commit, breaking the
-  property that a date's time slot lands atomically with its pixels. That property is what
-  makes a crashed ingest safely retryable; the ingest marker makes a wrongly-recorded date
-  permanent.
-- **Folding the ROI mask inside `odc.stac.load`** — no clean hook exists; ~80+ LOC of
-  loader-internal surgery for one task per (block, band).
-- **Raising the scheduler's vCPU** — its CPU never exceeded 100% across 114 samples despite ten
-  threads and 4 vCPU allocated. The event loop is single-threaded and GIL-bound; more cores
-  would idle. See §6.
-- **Raising the page size on the STAC query** — capped at 250. `limit=500` and `limit=1000`
-  both fail against earth-search with repeated server errors.
-- **More workers per cell, at the time it was proposed** — two single threads serialised ≥95%
-  of a run, bounding any fleet increase at ≤1.1×. This has since changed; see §7.
-
----
 
 ## 5. Claims made and withdrawn
 
@@ -505,12 +505,44 @@ it — roughly 5 GB.
 
 | check | result |
 |---|---|
-| partition property, 6 window shapes incl. leap year and year-crossing | 18 unit tests, no network |
+| partition property, 6 window shapes incl. leap year and year-crossing | 20 unit tests, no network |
 | a failing month raises rather than truncating | pinned (a dropped month would be an incomplete mosaic reporting success) |
 | next month genuinely in flight before the current is consumed | pinned |
+| **retention bound — earlier months provably released** | pinned by weak reference, with a hoarding negative control |
 | **parity vs one whole-window query, live earth-search, across a month boundary** | **12 dates, 13,024 items, identical date sets, zero per-date differences** |
-| three-month cluster run (two prefetches, two boundaries) | in progress |
-| year-scale soak | outstanding — the only test that can prove the fix |
+| **month partition and padding, live cluster** | **31,507 items in January, 1,084 correctly deferred to February** (one day's worth) |
+| **per-date cost unaffected by streaming** | **mean 173.8 s over 10 dates vs a 184.5 s baseline** — within noise |
+| two month transitions with direct submit-time query evidence | in progress on the 30 GiB build |
+| cumulative drift over hundreds of dates | outstanding — see below |
+
+**Retention is bounded to two months REGARDLESS of run length**, so a three-month run tests the
+memory bound exactly as well as a twelve-month one. That reframes the year soak: it is *not* the
+proof of the streaming fix — a three-month run is. What a year adds is **cumulative** effects
+(manifest growth, scheduler RSS drift, commit-time growth), which are a separate question.
+
+### The cost streaming does carry: one extra month of retention
+
+Streaming holds the month being processed **plus** the month prefetched behind it. Against a year
+that is a large win (~5 GB versus ~27–30 GB); against a **single-month window it is a memory
+regression** of about one month's items — and that is the comparison every test run makes.
+Measured, same zone/month/fleet:
+
+| run | realignment | streaming | peak spill |
+|---|---|---|---|
+| no manifest split | on | no | **0.00 GiB** |
+| time-split | on | no | **0.00 GiB** |
+| realignment removed | off | no | 3.19 GiB (reverted, §4.6) |
+| **time-split + streaming** | on | **yes** | **1.25 GiB** |
+
+So the spill I originally attributed solely to removing the realignment has a second source. Both
+were real; the realignment revert stands on its own numbers.
+
+**Resolution: ingest worker memory raised 16 GiB → 30 GiB.** Sized for the ONE worker that runs
+the ingest task, since that is where the retained items live. 30720 MiB is the **ceiling for
+4 vCPU** on Fargate, and the vCPU deliberately stays at 4: the quota is counted in vCPU, so memory
+is free in quota terms while doubling CPU would halve the workers a cell can run (120 workers at
+8 vCPU would need 960 against a 512 allowance). An initial attempt at 32768 MiB was **invalid at
+4 vCPU** and caught before shipping.
 
 **A test-design correction worth keeping:** a one-month run validates nothing here. One month is
 a single slice — no prefetch, no boundary crossing. The smallest useful cluster test is three
@@ -541,6 +573,10 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | memory per band-block | 4096: 34 MB · 8192: 134 MB · 16384: 537 MB | arithmetic |
 | hottest worker | 10.16 GiB of 16 at 8192 blocks; spill 0 throughout | run telemetry |
 | inference baseline (do not regress) | GPU util 99% in-phase, VRAM 97% peak, host RAM 46% of a 60% ceiling, GPU-idle ~6 s/chunk | 2,352 RESOURCES samples |
+| ingest worker size | 4 vCPU / 30720 MiB (the 4-vCPU Fargate memory ceiling) | raised from 16384 on the streaming spill |
+| streaming retention cost | +1 month of items on the ingest worker; 1.25 GiB spill at 16 GiB | run telemetry |
+| items deferred across a month boundary | 1,084 of 31,507 (one day's worth) | live cluster |
+| write floor | graph ≈ store_chunks × bands; 2,992 covered vs 2,415 live (19% dead) | measured, all 7 windows |
 
 ---
 
