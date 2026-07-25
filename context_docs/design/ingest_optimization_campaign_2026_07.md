@@ -21,8 +21,9 @@ a series but not across series, and are labelled accordingly.
 
 ## 1. Headline
 
-Ingest of a dense zone-month went from **not completing at all** to **~185 s per date**, and
-the graph a date submits fell by **~3.9×** on top of the cropping win that preceded it.
+Ingest of a dense zone-month went from **not completing at all** to **~170–185 s per date**,
+with the graph a date submits down roughly an order of magnitude from the full-extent path and
+the scheduler moved from saturated to ~25% busy.
 
 | # | change | per-date | cumulative | what it addressed |
 |---|---|---|---|---|
@@ -34,7 +35,7 @@ the graph a date submits fell by **~3.9×** on top of the cropping win that prec
 | 5 | coverage gate fused into the band load | — | one fewer graph build/date | SCL was loaded twice per date |
 | 6 | decouple load blocks (8192) from store chunks (4096) | **188 s** | **7.5×** | graph scales with block count, not pixels |
 | 7 | manifest sharding by time | 185 s | cost, not speed | every commit rewrote the whole manifest |
-| 8 | stop realigning blocks to store chunks | *validating* | **3.85× graph** | realignment silently undid #6 |
+| 8 | stop realigning blocks to store chunks | ~171 s | **~5% only** (see §3.7) | a local census predicted 3.85×; the live graph barely moved |
 
 Two things did **not** change, deliberately: the store's 4096 chunking (the GPU path is tuned
 around it) and the per-date atomicity of a commit (what makes a crashed ingest retryable).
@@ -200,29 +201,44 @@ That is ~1–3 s per date, i.e. **worth having because it is free, not because i
 earlier claim in these notes that it would flatten an observed per-date drift was withdrawn —
 see §5.
 
-### 3.7 Removing the realignment — 3.85×, and the win we thought we had declined
+### 3.7 Removing the realignment — a census that over-predicted, and what it actually bought
 
-`align_chunks` remapped producer blocks to the store's chunks before writing. Two effects,
-measured over one fixed window:
+`align_chunks` remapped producer blocks to the store's chunks before writing. A local census
+predicted a large win, and **the live run did not reproduce it.** Recorded in full because the
+gap between the two is the useful part.
 
-- **Write tasks 528 → 132** — one per store chunk becomes one per block, exactly the
-  block/chunk ratio, for identical bytes.
-- **Read and mask tasks 1,985 → 929** — the surprise. Demanding 4096-granularity output
-  propagates *backwards*, so the whole upstream load-and-mask chain was being built at the
-  store's granularity. It was never a local remap; it re-expressed the entire per-date graph at
-  4096, **undoing most of §3.5**.
+**What the census said.** Over one fixed window, counting the optimised graph of each variable
+and adding write tasks analytically (one per store chunk with realignment, one per block
+without):
 
-Cumulatively against a load-4096 baseline of 4,085 tasks: 2,513 with realignment (1.63×),
-**1,061 without (3.85×)**.
+| | read+mask tasks | write tasks | total |
+|---|---|---|---|
+| with `align_chunks` | 1,985 | 528 | 2,513 |
+| without | 929 | 132 | 1,061 |
 
-For comparison, coarsening the *store* to 8192 measured 3.88× — and was rejected (§4.1). So
-this recovers essentially the whole declined win with none of the inference risk.
+That is 2.37× on the window, and 3.85× against a load-4096 baseline.
 
-**Sound only under an invariant, which is now checked rather than trusted:** every store chunk
-a window covers must be written wholly by one block. That holds because windows are derived on
-the load-block grid and blocks are a whole multiple of store chunks. `write_day_windows` raises
-on any misaligned window — otherwise it would either be rejected deep in the write or, worse,
-straddle a chunk with a neighbouring window and make the result depend on write order.
+**What the run said.** Live scheduler graph, same zone/month/fleet, image digest verified as the
+build containing the change: **mean 4,877 tasks per window against v4's 5,159** — about 5%.
+Per-date 170.8 s against 179.8 s, also about 5%.
+
+**Why the census over-predicted.** It modelled the write layer *analytically* — assuming
+`to_icechunk` emits one write task per dask block when not realigning. It does not: the region
+write must produce store-chunk-granular writes regardless, so it performs that splitting itself.
+The parameter therefore controls only whether xarray pre-rechunks, and the submitted graph ends
+up nearly the same either way. **The census is a sound instrument for the READ side, where it
+counts a real graph, and unsound for the write side, where it counted a model.**
+
+**What the change is still worth keeping for.** Peak worker memory fell from **10.16 GiB to
+6.86 GiB** — about 32% — because the realignment was materialising intermediate store-chunk
+pieces alongside the blocks they came from. That headroom is worth having on its own, and it is
+what would make a future block-size increase affordable. Plus ~5% wall clock, and one fewer
+graph layer.
+
+**The invariant it introduced is a genuine gain regardless:** `write_day_windows` now raises if
+any window is not store-chunk-aligned. Previously a misaligned window would have been rejected
+deep in the write or, worse, straddled a chunk with a neighbouring window and made the result
+depend on write order.
 
 ---
 
@@ -363,6 +379,13 @@ cleanly; and raising flow-runner memory achieves nothing.
 **Verify graph work by TASK COUNT** — deterministic from one date's graph, built locally with
 no cluster (`dask.optimize`, then count `__dask_graph__()` keys). Several hours were spent
 reading noise before adopting this.
+
+**A local task census is only trustworthy where it counts a real graph.** The read side it
+counts directly and its predictions have held. The WRITE side was modelled analytically and
+over-predicted a change by ~20× (§3.7): the region write splits to store-chunk granularity
+itself, so a model assuming one write task per block was simply wrong. Where a prediction
+depends on what the write layer does internally, measure the live scheduler graph — do not
+extrapolate from a census.
 
 **Change one thing per run, or give each change a deterministic mechanism check.** Three
 changes shipped together once; when wall clock regressed it could not be attributed from
