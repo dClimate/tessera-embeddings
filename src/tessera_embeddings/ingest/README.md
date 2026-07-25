@@ -16,7 +16,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
-| `live_windows.py` | Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes — one row-band window per live chunk-row of the ROI mask. Serves single-ROI and campaign runs identically. |
+| `live_windows.py` | Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows because each window is a serial blocking write. Serves single-ROI and campaign runs identically. |
 
 ---
 
@@ -319,63 +319,83 @@ zone / ROI extent (declared grid — UNCHANGED, the fill validates it)
 └──────────────────────────────────────────────┘
 ```
 
-Windows are derived in two steps. Each cell below is one 4096-px ingest chunk; `#` is live
-(the mask has land in it), `.` is ocean. **Row bands** take one window per live chunk-row,
-spanning that row's first to last live column — so a row's interior gaps are included but
-nothing above or below is:
+Windows are derived in **two stages**, and the second is where most of the win is. Each cell
+below is one 4096-px ingest chunk; `#` is live (the mask has land in it), `.` is ocean.
+
+**Stage 1 — row bands.** One window per live chunk-row, spanning that row's first to last live
+column. A row's interior gaps are included; nothing above or below it is. This is the
+minimum-*area* answer.
+
+**Stage 2 — grouping.** Vertically adjacent bands are unioned into taller windows. That
+computes some dead chunks, and is still a large net win, because the two costs are nothing
+alike:
 
 ```text
-     live chunk grid        row bands: 7 windows      merged: 2 windows
+  chunk area                          a window boundary
+  ──────────                          ─────────────────
+  computed in PARALLEL across the     a BLOCKING region write: the whole
+  whole fleet — adding chunks         fleet waits while one completes.
+  widens the graph, which is           N windows = N serial stalls.
+  what the fleet wants.
+```
+
+So the objective is not "least area" but "least `n_windows × price + area`", where the price is
+one window expressed in the chunk area that costs the same (`WINDOW_COST_IN_CHUNKS`). That
+price is *large*, so grouping pays almost whenever it is geometrically sane.
+
+```text
+     live chunk grid        stage 1: row bands        stage 2: grouped
      c0 c1 c2 c3 c4 c5      c0 c1 c2 c3 c4 c5         c0 c1 c2 c3 c4 c5
-r0    .  #  #  #  .  .       .  A  A  A  .  .          .  a  a  a  A  .
+r0    .  #  #  #  .  .       .  A  A  A  .  .          .  a  a  a  +  .
 r1    .  #  #  #  #  .       .  B  B  B  B  .          .  a  a  a  a  .
 r2    .  #  #  #  #  .       .  C  C  C  C  .          .  a  a  a  a  .
-r3    .  .  #  #  #  .       .  .  D  D  D  .          .  A  a  a  a  .
+r3    .  .  #  #  #  .       .  .  D  D  D  .          .  +  a  a  a  .
 r4    .  #  #  #  #  .       .  E  E  E  E  .          .  a  a  a  a  .
 r5    .  .  .  .  .  .       .  .  .  .  .  .          .  .  .  .  .  .
 r6    #  #  .  .  .  .       F  F  .  .  .  .          b  b  .  .  .  .
 r7    #  #  .  .  .  .       G  G  .  .  .  .          b  b  .  .  .  .
 r8    .  .  .  .  .  .       .  .  .  .  .  .          .  .  .  .  .  .
 
-     # live chunk          A..G one window each      band a = r0-r4 x c1-c4
-     . ocean (unwritten)   r5/r8 have no live         band b = r6-r7 x c0-c1
-                           chunk: no window at all    A/B = the 2 dead chunks
-                                                            merging added
+     # live chunk          7 windows, 7 stalls       2 windows, 2 stalls
+     . never written       A..G one per live row     a = r0-r4 x c1-c4
+                           r5/r8 have no live        b = r6-r7 x c0-c1
+                           chunk, so no window       + = dead chunk the
+                                                         union pulled in
 ```
 
-Band `a` merges r0–r4 because those rows share nearly the same column span: the union pulls in
-only two dead chunks — `(r0,c4)` and `(r3,c1)` — and buys four fewer blocking writes. Band `b`
-stays separate: unioning it with `a` would span `r0–r7 × c0–c4`, 35 chunks against the 20 the
-rows themselves need, so the waste bound rejects it and the ingest never degrades toward a
-bounding box. Rows with no live chunk (r5, r8) produce no window either way.
+Group `a` covers r0–r4 at the cost of two dead chunks (`+`), buying four fewer stalls. Whether
+`b` should join it is likewise a cost question, not a shape one: that union would span
+`r0–r7 × c0–c4`, adding 16 chunks to save one stall — worth it at the production price, which
+is why real masks group harder than this small illustration suggests. Two things stop a group:
+the price ceasing to justify the added area, and `MAX_CHUNKS_PER_WINDOW`, which bounds one
+window's graph so memory and scheduler load stay inside a proven envelope.
 
-That is the whole trade: **chunk area is cheap and parallel, while a window boundary is a
-serial stall.**
+Grouping is solved **exactly**, by a dynamic program over consecutive bands rather than a
+greedy rule — a heuristic bound on wasted area cannot express "extra area is nearly free", and
+so under-merges precisely on the sparse ROIs where the absolute waste is trivial. Windows stay
+chunk-aligned and mutually chunk-disjoint either way, which is what lets one session write a
+whole date and commit once.
 
-- **Windows** come from `live_windows.py`: the boolean ROI mask (the same artifact both
-  `rasterize_roi_zarr` and `export_zone_roi` write) is coarsened to the ingest chunk grid —
-  normally from its chunk keys in one listing, else by scanning one chunk block at a time
-  (~16 MB peak, no Dask) — and each live chunk-row becomes one window spanning its live
-  columns. Row bands are a *measured* choice: campaign-wide they compute within 1% of the
-  exact live-chunk floor, where a single bounding box captures less than half the win (see
-  `context_docs/design/ingest-live-tile-cropping.md` for the full measurement).
-- **Adjacent row bands are then merged** (`merge_bands`), because least-area is the wrong
-  objective on its own. Each window is a separate *blocking* region write whose cost is close
-  to fixed — 7.5 s per window measured on dense 35N with 120 workers whose task slots averaged
-  ~6% busy, against ~6 s per window on a sparse zone at a fraction of that fleet. So 197
-  narrow windows cost 197 serial round trips and leave the fleet idle between them, which is
-  why adding workers bought so little. Merging is bounded two ways: a band may not cover more
-  than `MAX_MERGE_WASTE_FRACTION` (25%) more chunk area than the rows it replaces — measured
-  against the row-band baseline, so it bounds only what merging *adds* — and not more than
-  `MAX_CHUNKS_PER_WINDOW` (512) chunks, so one graph stays a few thousand tasks. Where rows
-  share a column span the merge is free, which is exactly the dense case that needs it:
+Effect on the campaign's zones, smallest to largest:
 
-  | zone | row bands | merged | writes saved | added area |
-  |---|---|---|---|---|
-  | 03S (4 chunks)   | 2   | 1  | 2.0× | +0.0% |
-  | 15S (22 chunks)  | 5   | 2  | 2.5× | +18.2% |
-  | 40S (26 chunks)  | 12  | 7  | 1.7× | +7.7% |
-  | 35N (2428 chunks)| 197 | 15 | 13.1× | +5.6% |
+| zone live chunks | stage 1 windows | grouped | writes saved | added area |
+|---|---|---|---|---|
+| 4     | 2   | 1 | 2.0×  | +0%  |
+| 22    | 5   | 1 | 5.0×  | +45% |
+| 26    | 12  | 2 | 6.0×  | +50% |
+| 2,415 | 197 | 3 | 65.7× | +20% |
+
+Summed over all land zones the grouping cuts predicted per-date ingest cost by about **11×**,
+landing every zone in 2–5 windows. Sparse ROIs group *harder* in relative terms, which is the
+point: a large fraction of a tiny area is still a tiny area.
+
+Calibration of the price, the campaign-wide table, and the cap sweep are in
+`context_docs/design/ingest-live-tile-cropping.md`.
+
+- **Windows** come from `live_windows.py`, from the boolean ROI mask that both
+  `rasterize_roi_zarr` and `export_zone_roi` write. The mask is coarsened to the ingest chunk
+  grid — normally from its chunk keys in one listing, else by scanning one chunk block at a
+  time (~16 MB peak, no Dask) — then row-banded and grouped as above.
 - **Writes** go through `storage.write_day_windows`: a missing store is seeded all-fill
   with an **empty** time axis (schema only — creation cost independent of extent), then
   each date appends its time slot atomically WITH its windows in **one commit**:

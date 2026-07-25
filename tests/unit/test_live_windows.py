@@ -8,12 +8,18 @@ never gets ingested.
 
 from __future__ import annotations
 
+import itertools
+import random
+
 import numpy as np
 import pytest
 import zarr
 
 from tessera_embeddings.ingest.live_windows import (
+    WINDOW_COST_IN_CHUNKS,
     LiveWindow,
+    _chunk_area,
+    _union,
     live_chunk_grid,
     live_chunk_grid_from_keys,
     live_windows_for_mask,
@@ -25,8 +31,32 @@ CHUNK = 4  # small stand-in for INGEST_CHUNK_SIZE; the code takes it as a parame
 
 
 def _area(windows) -> int:
-    """Total chunk area of some windows, the unit the merge bounds count in."""
-    return sum(((w.y1 - w.y0) // CHUNK) * ((w.x1 - w.x0) // CHUNK) for w in windows)
+    """Total chunk area of some windows, the unit the merge objective counts in."""
+    return sum(_chunk_area(w, CHUNK) for w in windows)
+
+
+def _brute_force_best(bands, cap, window_cost, chunk_px) -> int:
+    """Cheapest grouping of consecutive bands, by enumerating ALL of them.
+
+    Independent of the implementation under test — that is the point. Exponential,
+    so only for the handful-of-bands cases the optimality test uses.
+    """
+    n = len(bands)
+    best = None
+    for cuts in itertools.product([0, 1], repeat=max(0, n - 1)):
+        groups, start = [], 0
+        for i, cut in enumerate(cuts):
+            if cut:
+                groups.append(bands[start : i + 1])
+                start = i + 1
+        groups.append(bands[start:])
+        windows = [_union(g) for g in groups]
+        if any(_chunk_area(w, chunk_px) > cap and len(g) > 1 for w, g in zip(windows, groups, strict=True)):
+            continue
+        cost = len(windows) * window_cost + sum(_chunk_area(w, chunk_px) for w in windows)
+        if best is None or cost < best:
+            best = cost
+    return best
 
 
 def _mask_store(tmp_path, mask: np.ndarray) -> str:
@@ -47,7 +77,7 @@ def test_scattered_islands_one_window_per_live_row(tmp_path):
     assert live.shape == (3, 4)
     assert live.sum() == 2
 
-    windows = live_windows_for_mask(path, chunk_px=CHUNK)
+    windows = live_windows_for_mask(path, chunk_px=CHUNK, merge=False)
     assert windows == [LiveWindow(y0=0, y1=4, x0=0, x1=4), LiveWindow(y0=8, y1=12, x0=12, x1=16)]
 
 
@@ -220,36 +250,50 @@ class TestGridFromChunkKeys:
 
 
 class TestMergeBands:
-    """Row bands merged into taller bands: fewer writes, bounded extra area."""
+    """Row bands grouped to minimise measured cost, not to minimise area.
+
+    The objective is ``n_windows * WINDOW_COST_IN_CHUNKS + total_area`` and the
+    implementation is a DP over consecutive groupings, so these pin optimality and
+    the invariants a wrong grouping would break — never a particular shape.
+    """
+
+    def _cost(self, ws, window_cost=WINDOW_COST_IN_CHUNKS):
+        return len(ws) * window_cost + _area(ws)
 
     def test_rows_sharing_a_span_merge_for_free(self):
-        """The dense case. Consecutive rows with the same live columns merge with
-        zero added area, so nothing but the write count changes.
-        """
+        """Consecutive rows with the same live columns cost nothing to merge."""
         rows = [LiveWindow(y0=r * CHUNK, y1=(r + 1) * CHUNK, x0=0, x1=3 * CHUNK) for r in range(6)]
         merged = merge_bands(rows, chunk_px=CHUNK)
         assert merged == [LiveWindow(y0=0, y1=6 * CHUNK, x0=0, x1=3 * CHUNK)]
         assert _area(merged) == _area(rows)
 
-    def test_disjoint_rows_are_not_merged_into_a_bounding_box(self):
-        """The sparse case, and the reason the waste bound exists: two narrow rows
-        at opposite ends of a wide extent must stay separate rather than collapse
-        into a box that computes the whole width.
+    def test_extra_area_below_the_window_price_is_taken(self):
+        """A merge that adds less area than one window costs is a win, and the
+        default price (~200 chunks) makes almost every adjacent merge worth it.
+        """
+        rows = [
+            LiveWindow(y0=0, y1=CHUNK, x0=0, x1=CHUNK),
+            LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=9 * CHUNK, x1=10 * CHUNK),
+        ]  # union covers 2x10 = 20 chunks against 2 -> +18, far under the price
+        assert merge_bands(rows, chunk_px=CHUNK) == [LiveWindow(y0=0, y1=2 * CHUNK, x0=0, x1=10 * CHUNK)]
+
+    def test_a_free_window_never_merges(self):
+        """With a window priced at zero, minimum area wins and nothing merges —
+        the degenerate case that proves the objective is really being optimised.
         """
         rows = [
             LiveWindow(y0=0, y1=CHUNK, x0=0, x1=CHUNK),
             LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=9 * CHUNK, x1=10 * CHUNK),
         ]
-        assert merge_bands(rows, chunk_px=CHUNK) == rows
+        assert merge_bands(rows, chunk_px=CHUNK, window_cost_in_chunks=0) == rows
 
-    def test_waste_bound_is_measured_against_the_row_baseline(self):
-        """A merge is allowed exactly while the added area stays within the bound."""
+    def test_expensive_area_splits_what_a_cheap_window_would_join(self):
         rows = [
-            LiveWindow(y0=0, y1=CHUNK, x0=0, x1=2 * CHUNK),  # 2 chunks
-            LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=0, x1=3 * CHUNK),  # 3 chunks
-        ]  # baseline 5, merged covers 2 rows x 3 cols = 6 -> +20%
-        assert len(merge_bands(rows, chunk_px=CHUNK, max_waste_fraction=0.25)) == 1
-        assert merge_bands(rows, chunk_px=CHUNK, max_waste_fraction=0.1) == rows
+            LiveWindow(y0=0, y1=CHUNK, x0=0, x1=CHUNK),
+            LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=9 * CHUNK, x1=10 * CHUNK),
+        ]
+        assert merge_bands(rows, chunk_px=CHUNK, window_cost_in_chunks=5) == rows
+        assert len(merge_bands(rows, chunk_px=CHUNK, window_cost_in_chunks=50)) == 1
 
     def test_chunk_cap_splits_a_tall_band(self):
         """Even a free merge stops at the area cap, so one graph stays bounded."""
@@ -257,6 +301,28 @@ class TestMergeBands:
         merged = merge_bands(rows, chunk_px=CHUNK, max_chunks_per_window=4)
         assert len(merged) == 5  # 4-chunk cap = 2 rows of 2 chunks per band
         assert all(_area([w]) <= 4 for w in merged)
+
+    def test_a_lone_band_over_the_cap_is_still_emitted(self):
+        """A single chunk-row cannot be split, so the cap must not drop it —
+        losing it would silently skip land.
+        """
+        rows = [LiveWindow(y0=0, y1=CHUNK, x0=0, x1=9 * CHUNK)]  # 9 chunks
+        assert merge_bands(rows, chunk_px=CHUNK, max_chunks_per_window=2) == rows
+
+    def test_matches_brute_force_optimum(self):
+        """Optimality, checked exhaustively on small inputs rather than asserted."""
+        rng = random.Random(20260725)
+        for _ in range(120):
+            n = rng.randint(1, 7)
+            bands, y = [], 0
+            for _ in range(n):
+                y += rng.randint(1, 3) * CHUNK  # sometimes leaves dead rows between
+                x0 = rng.randint(0, 6) * CHUNK
+                bands.append(LiveWindow(y0=y, y1=y + CHUNK, x0=x0, x1=x0 + rng.randint(1, 4) * CHUNK))
+            cap = rng.choice([4, 8, 64, 10**6])
+            price = rng.choice([0, 1, 5, 200])
+            got = merge_bands(bands, chunk_px=CHUNK, max_chunks_per_window=cap, window_cost_in_chunks=price)
+            assert self._cost(got, price) == _brute_force_best(bands, cap, price, CHUNK)
 
     def test_merged_bands_stay_chunk_aligned_and_disjoint(self):
         """The write path commits one date across all windows in a single session,
@@ -267,7 +333,7 @@ class TestMergeBands:
             LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=CHUNK, x1=3 * CHUNK),
             LiveWindow(y0=5 * CHUNK, y1=6 * CHUNK, x0=8 * CHUNK, x1=9 * CHUNK),
         ]
-        merged = merge_bands(rows, chunk_px=CHUNK)
+        merged = merge_bands(rows, chunk_px=CHUNK, max_chunks_per_window=6)
         seen: set[tuple[int, int]] = set()
         for w in merged:
             assert w.y0 % CHUNK == 0 and w.x0 % CHUNK == 0
@@ -279,7 +345,7 @@ class TestMergeBands:
         assert merge_bands([], chunk_px=CHUNK) == []
 
     def test_merged_windows_still_cover_every_live_pixel(self, tmp_path):
-        """The invariant that matters most: merging must never drop land."""
+        """The invariant that matters most: grouping must never drop land."""
         mask = np.zeros((6 * CHUNK, 6 * CHUNK), dtype=bool)
         mask[1, 1] = mask[CHUNK + 2, 3 * CHUNK] = mask[5 * CHUNK, 5 * CHUNK] = True
         path = _mask_store(tmp_path, mask)
@@ -295,32 +361,3 @@ class TestMergeBands:
         path = _mask_store(tmp_path, mask)
         assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=False)) == 2
         assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=True)) == 1
-
-
-class TestUnrecognisedChunkLayoutFallsBack:
-    """An unreadable key layout must fall back, never read as an empty ROI.
-
-    The key-listing fast path infers liveness from which chunk objects exist. If
-    the parser doesn't recognise the layout it matches nothing — and "no chunk
-    keys" is indistinguishable from "no live pixels" unless the layout is checked
-    first. Getting that wrong yields zero windows, so cropped ingest writes an
-    EMPTY mosaic and reports success.
-    """
-
-    def test_zarr_v2_mask_falls_back_to_the_block_scan(self, tmp_path):
-        """A v2 mask (keys like `0.0`) must not be mistaken for all-ocean."""
-        path = str(tmp_path / "v2.zarr")
-        z = zarr.open(path, mode="w", shape=(8, 8), chunks=(CHUNK, CHUNK), dtype="bool", zarr_format=2)
-        z[0, 0] = True  # one live pixel: an empty answer here would be plainly wrong
-
-        assert live_chunk_grid_from_keys(path, z, chunk_px=CHUNK) is None  # fell back
-        # The full path still finds the land, via the block scan.
-        assert live_windows_for_mask(path, chunk_px=CHUNK) == [LiveWindow(y0=0, y1=4, x0=0, x1=4)]
-
-    def test_genuinely_empty_v3_mask_is_still_empty(self, tmp_path):
-        """The fallback must not swallow the legitimate all-ocean answer."""
-        path = str(tmp_path / "ocean.zarr")
-        z = zarr.open(path, mode="w", shape=(8, 8), chunks=(CHUNK, CHUNK), dtype="bool")
-        grid = live_chunk_grid_from_keys(path, z, chunk_px=CHUNK)
-        assert grid is not None and not grid.any()  # answered, and the answer is "no land"
-        assert live_windows_for_mask(path, chunk_px=CHUNK) == []

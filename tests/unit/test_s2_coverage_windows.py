@@ -19,7 +19,7 @@ import dask.array as da
 import numpy as np
 import zarr
 
-from tessera_embeddings.ingest.live_windows import live_windows_for_mask, row_band_windows
+from tessera_embeddings.ingest.live_windows import live_windows_for_mask, merge_bands, row_band_windows
 from tessera_embeddings.ingest.s2_roi import _sum_over_windows
 
 CHUNK = 4  # small stand-in for INGEST_CHUNK_SIZE; both APIs take it as a parameter
@@ -40,7 +40,10 @@ def _windows_for(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
     for r in range(rows):
         for c in range(cols):
             live[r, c] = mask[r * CHUNK : (r + 1) * CHUNK, c * CHUNK : (c + 1) * CHUNK].any()
-    wins = row_band_windows(live, height=h, width=w, chunk_px=CHUNK)
+    # Row bands THEN the cost-model merge — the same two stages
+    # live_windows_for_mask runs, so this helper keeps mirroring the real
+    # derivation rather than one half of it.
+    wins = merge_bands(row_band_windows(live, height=h, width=w, chunk_px=CHUNK), chunk_px=CHUNK)
     return [(x.y0, x.y1, x.x0, x.x1) for x in wins]
 
 
@@ -55,7 +58,9 @@ def test_window_total_equals_full_extent_total():
     mask[9, 13] = True
     mask[9, 14] = True
     windows = _windows_for(mask)
-    assert len(windows) == 2  # two live chunk-rows
+    # The window COUNT is a property of the grouping strategy and deliberately not
+    # asserted — what the denominator rests on is that the windows between them
+    # cover every live pixel exactly once, whatever shape they take.
     assert _sum(mask, windows) == int(mask.sum()) == 3
 
 
@@ -70,11 +75,26 @@ def test_row_band_spanning_a_gap_does_not_double_count():
 
 
 def test_multiple_bands_are_disjoint():
-    """Every chunk-row is its own window, so adjacent bands cannot overlap."""
+    """Several windows must not overlap, or the cropped total double-counts.
+
+    Priced so the merge does NOT collapse the rows into one window — with the
+    production price it would, and then this test would silently stop testing
+    anything about multiple bands.
+    """
     mask = np.zeros((16, 8), dtype=bool)
     for row in range(4):  # one live pixel in every chunk-row
         mask[row * CHUNK + 1, 3] = True
-    windows = _windows_for(mask)
+    h, w = mask.shape
+    live = np.zeros((-(-h // CHUNK), -(-w // CHUNK)), dtype=bool)
+    for r in range(live.shape[0]):
+        for c in range(live.shape[1]):
+            live[r, c] = mask[r * CHUNK : (r + 1) * CHUNK, c * CHUNK : (c + 1) * CHUNK].any()
+    bands = merge_bands(
+        row_band_windows(live, height=h, width=w, chunk_px=CHUNK),
+        chunk_px=CHUNK,
+        window_cost_in_chunks=0,  # a free window -> minimum area -> no merging
+    )
+    windows = [(x.y0, x.y1, x.x0, x.x1) for x in bands]
     assert len(windows) == 4
     assert _sum(mask, windows) == int(mask.sum()) == 4
 

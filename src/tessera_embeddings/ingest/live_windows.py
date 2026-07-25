@@ -3,23 +3,26 @@
 Ingest cost scales with the extent it computes, not the land it keeps, so the
 mosaic loads are restricted to windows that actually intersect the ROI
 (``context_docs/design/ingest-live-tile-cropping.md``). This module is the pure
-geometry half: read the boolean ROI mask (a bare zarr array on the fixed grid —
-the artifact both ``rasterize_roi_zarr`` and ``export_zone_roi`` write), coarsen
-it to the ingest chunk grid, and emit one window per live chunk-row spanning that
-row's live columns.
+geometry half, in two stages: coarsen the boolean ROI mask (a bare zarr array on
+the fixed grid — the artifact both ``rasterize_roi_zarr`` and ``export_zone_roi``
+write) to the ingest chunk grid and emit one window per live chunk-row
+(:func:`row_band_windows`), then group vertically adjacent bands into fewer, taller
+windows (:func:`merge_bands`).
+
+The second stage exists because the two costs a window strategy trades are nothing
+alike. Chunk area is computed in PARALLEL across the fleet, so more of it widens
+the graph — which is what the fleet wants. A window BOUNDARY is a serial, blocking
+region write the whole fleet waits through. Minimising area alone therefore buys
+the cheap thing and pays for the expensive one; grouping does the reverse.
 
 This module is general-purpose: it serves a SINGLE run (any sparse ROI — scattered
-fields, a coastline, any footprint much smaller than its bounding box) and a
-GLOBAL campaign zone identically, because both produce the same mask artifact.
-The strategy choice was measured on the GLOBAL campaign's coverage specifically
-(all 112 land zones; table and per-zone JSON in the design note): row bands
-compute within 1% (median) of the exact live-chunk floor, while a single bounding
-box captures less than half the win. A single ROI sees the same behaviour scaled
-to its own extent-vs-content gap.
+fields, a coastline, any footprint much smaller than its bounding box) and a GLOBAL
+campaign zone identically, because both produce the same mask artifact.
 
 Windows are snapped to the chunk grid by construction, which makes them
 chunk-disjoint — the property that lets one session write every window of a date
-and commit once, with no shared-chunk reconciliation.
+and commit once, with no shared-chunk reconciliation. Grouping preserves it, since
+it only unions adjacent chunk-row ranges.
 
 The grid itself is normally read from the mask's chunk KEYS rather than its pixels:
 an all-ocean chunk is never written, so the set of stored chunks IS the set of live
@@ -47,14 +50,16 @@ logger = logging.getLogger(__name__)
 #: matches, while a key of different rank (``c/1/2/3``) deliberately does not.
 _CHUNK_KEY_RE = re.compile(r"(?:^|/)c/(\d+)/(\d+)$")
 
-#: Chunk-area cap on one merged band, so a single region write stays a few thousand
-#: graph tasks (one chunk position x ~11 mosaic variables) rather than tens of
-#: thousands. See :func:`merge_bands`.
-MAX_CHUNKS_PER_WINDOW = 512
+#: Chunk-area cap on one grouped band, bounding the graph a single region write
+#: builds. Costs almost nothing against no cap at all; it exists to keep memory and
+#: scheduler load inside a proven envelope. See :func:`merge_bands`.
+MAX_CHUNKS_PER_WINDOW = 2048
 
-#: How much MORE chunk area a merged band may cover than the row bands it replaces.
-#: Bounds only what merging adds to the measured row-band strategy.
-MAX_MERGE_WASTE_FRACTION = 0.25
+#: What one window write costs, expressed as the chunk area that costs the same.
+#: Extra computed area is parallel and cheap; a window boundary is a serial,
+#: blocking region write. Calibration in
+#: ``context_docs/design/ingest-live-tile-cropping.md``.
+WINDOW_COST_IN_CHUNKS = 200
 
 
 @dataclass(frozen=True)
@@ -218,59 +223,83 @@ def _chunk_area(w: LiveWindow, chunk_px: int) -> int:
     return math.ceil((w.y1 - w.y0) / chunk_px) * math.ceil((w.x1 - w.x0) / chunk_px)
 
 
+def _union(windows: list[LiveWindow]) -> LiveWindow:
+    """The bounding window of a group — still chunk-aligned, since its inputs are."""
+    return LiveWindow(
+        y0=min(w.y0 for w in windows),
+        y1=max(w.y1 for w in windows),
+        x0=min(w.x0 for w in windows),
+        x1=max(w.x1 for w in windows),
+    )
+
+
 def merge_bands(
     windows: list[LiveWindow],
     *,
     chunk_px: int = INGEST_CHUNK_SIZE,
     max_chunks_per_window: int = MAX_CHUNKS_PER_WINDOW,
-    max_waste_fraction: float = MAX_MERGE_WASTE_FRACTION,
+    window_cost_in_chunks: int = WINDOW_COST_IN_CHUNKS,
 ) -> list[LiveWindow]:
-    """Merge vertically-adjacent row bands into taller, chunk-aligned bands.
+    """Group vertically-adjacent row bands to minimise total ingest cost.
 
     One window per chunk-row computes the least *area*, but area is not what a
-    windowed ingest is billed for. Each window is a separate blocking region
-    write, and that per-window cost is close to fixed: 7.5 s per window measured
-    on dense 35N across a 120-worker fleet whose task slots averaged ~6 % busy,
-    against ~6 s per window on a sparse zone at a fraction of that fleet. 197
-    narrow windows therefore cost 197 serial round trips and leave the fleet idle
-    between them — which is why adding workers bought so little. Merging rows
-    trades a little extra computed area for far fewer, wider graphs.
+    windowed ingest is billed for. Each window is a separate BLOCKING region write,
+    so a date costs about ``n_windows x F + chunk_area x V`` — and the two are
+    wildly different in scale, because area is computed in parallel across the
+    fleet while a window boundary is a serial stall the whole fleet waits through.
+    ``window_cost_in_chunks`` is that exchange rate: the chunk area worth as much
+    as one saved write. It is large, so grouping is usually worth it, and a
+    strategy that minimises area alone leaves most of the win unclaimed.
 
-    Two bounds keep the trade honest:
+    This therefore minimises ``n_windows x window_cost_in_chunks + total_area``
+    EXACTLY, by dynamic programming over groupings of CONSECUTIVE bands — O(n^2)
+    in a zone's live chunk-rows, a few hundred at most. Optimising the true
+    objective matters more than it sounds: a heuristic bound on wasted area cannot
+    express "extra area is nearly free", so it under-merges precisely on the sparse
+    ROIs where the absolute waste is trivial.
 
-    * ``max_waste_fraction`` — a merged band may not cover more than this fraction
-      MORE chunk area than the row bands it replaces. Measured against the
-      row-band baseline rather than against live cells, because the row-band
-      strategy's own per-row slack is the choice the design note already
-      validated; this bounds only what merging *adds*. Where consecutive rows
-      share a column span the added area is zero and bands grow to the chunk cap —
-      exactly the dense case that needs it. On a scattered ROI, rows with disjoint
-      spans stop the merge rather than inflating it toward a bounding box.
-    * ``max_chunks_per_window`` — caps one band's chunk area, so a graph stays a
-      few thousand tasks instead of tens of thousands.
+    ``max_chunks_per_window`` bounds one window's graph, trading a little cost for
+    a memory and scheduler envelope known to be safe. A single row band wider than
+    the cap is still emitted: being one chunk-row, it cannot be split.
 
-    Merging only unions adjacent chunk-row ranges, so windows stay chunk-aligned
+    Grouping only unions adjacent chunk-row ranges, so windows stay chunk-aligned
     and mutually chunk-disjoint — the property that lets one session write a whole
     date and commit once.
+
+    Calibration, the campaign-wide effect, and the cap sweep are in
+    ``context_docs/design/ingest-live-tile-cropping.md``.
     """
-    if not windows:
+    n = len(windows)
+    if n == 0:
         return []
-    merged: list[LiveWindow] = []
-    cur = windows[0]
-    baseline = _chunk_area(cur, chunk_px)  # what the unmerged rows would have covered
-    for nxt in windows[1:]:
-        cand = LiveWindow(
-            y0=min(cur.y0, nxt.y0), y1=max(cur.y1, nxt.y1), x0=min(cur.x0, nxt.x0), x1=max(cur.x1, nxt.x1)
-        )
-        cand_baseline = baseline + _chunk_area(nxt, chunk_px)
-        covered = _chunk_area(cand, chunk_px)
-        if covered <= max_chunks_per_window and covered <= cand_baseline * (1.0 + max_waste_fraction):
-            cur, baseline = cand, cand_baseline
-        else:
-            merged.append(cur)
-            cur, baseline = nxt, _chunk_area(nxt, chunk_px)
-    merged.append(cur)
-    return merged
+
+    # best[i] = min cost of covering the first i bands; cut[i] = where its last
+    # group starts. Costs are in CHUNK-EQUIVALENTS, so no seconds are needed —
+    # only the ratio between a window and a chunk, which is what we measured.
+    best = [0] + [math.inf] * n
+    cut = [0] * (n + 1)
+    for i in range(1, n + 1):
+        # Walk j DOWNWARD so the group grows: windows[j:i] is one band at j=i-1 and
+        # the whole prefix at j=0. Once it exceeds the cap every smaller j is worse,
+        # so we can stop — but a lone band over the cap is still emitted, since a
+        # single chunk-row cannot be split.
+        for j in range(i - 1, -1, -1):
+            group = _union(windows[j:i])
+            area = _chunk_area(group, chunk_px)
+            if area > max_chunks_per_window and i - j > 1:
+                break
+            candidate = best[j] + window_cost_in_chunks + area
+            if candidate < best[i]:
+                best[i], cut[i] = candidate, j
+
+    out: list[LiveWindow] = []
+    i = n
+    while i > 0:
+        j = cut[i]
+        out.append(_union(windows[j:i]))
+        i = j
+    out.reverse()
+    return out
 
 
 def live_windows_for_mask(

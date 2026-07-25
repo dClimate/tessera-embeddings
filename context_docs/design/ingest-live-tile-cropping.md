@@ -380,3 +380,126 @@ benchmarking ocean: as it stands the memory wall arrives long before any schedul
 limit, so it would tune the wrong bottleneck. Fargate worker-count and quota sizing
 derived from full-extent mosaics likewise overstate what the campaign needs, by
 roughly the 4.3× above.
+
+---
+
+# Grouping row bands: why window COUNT was the real limit (2026-07-25)
+
+Cropping to row bands fixed the *area* problem and exposed a different one. Row
+bands minimise computed area, and area turned out not to be what a windowed ingest
+is billed for.
+
+## The measurement
+
+Dense zone `35N`, January 2024, a 120-worker Fargate fleet (4 vCPU each, so 480
+task slots), `crop_to_live_windows=true`, 197 live windows:
+
+| quantity | value |
+|---|---|
+| date `2024-01-01` | 1471.3 s |
+| date `2024-01-02` | 1329.2 s |
+| per window | ~7.1 s |
+| sparse-zone comparison, far smaller fleet | ~6 s per window |
+| mean tasks processing | 30.6 of 480 slots = **6%** |
+| scheduler samples with an EMPTY graph | **16 of 44 (36%)**, twice for 2 min straight |
+| worker spill | 0 GiB |
+| scheduler cpu / rss / lag | 20-50% / 0.78 GiB / ~0 s |
+
+Per-window cost is flat from a sparse zone on a small fleet to a dense zone on 120
+workers. That is a fixed serial cost, not distributed work — and it is the same
+phenomenon the earlier fleet-scaling rung reported as "35% efficiency", seen from
+the other end. **More workers was never going to help.**
+
+The cause is structural: `write_day_windows` loops `to_icechunk` once per window,
+each call blocking. A `35N` row band is at most 17 chunks wide and only ~3 of those
+hold a given day's swath, so each graph is a few dozen tasks against 480 slots, 197
+times in series.
+
+## The cost model
+
+A matched A/B pair — identical zone, month, fleet and mask, only the window count
+differing — gives two equations in two unknowns for
+`cost = n_windows × F + chunk_area × V`:
+
+| run | windows | chunk area | seconds |
+|---|---|---|---|
+| row bands | 197 | 2428 | 1471.3 |
+| grouped (first cut) | 15 | 2563 | 194.4 |
+
+→ **F = 7.04 s per window, V = 0.0346 s per chunk**, so one saved write is worth
+**≈200 chunks** of extra computed area. The second baseline date (1329.2 s against
+1471 s predicted) puts per-date variance around 10%, which is the precision this
+model deserves: its value is the RATIO, not the constants.
+
+Measured A/B outcome at 15 windows: **194.4 / 207.8 / 230.4 / 222.8 / 239.5 s** for
+the first five dates against **1471.3 / 1329.2 s** — a **~6.6× speedup**. Fleet
+occupancy went from 30.6 to ~407 tasks in flight (6% → 85% of slots), mean graph
+size from 482 to ~13,400 tasks, spill stayed at zero, hottest worker 3.96 → 5.6 GiB
+of 16.
+
+## Why the first cut was left as a greedy heuristic, and why it was replaced
+
+The first implementation merged greedily while the added area stayed within 25% of
+the row-band baseline. With the cost model in hand that bound is simply the wrong
+shape: a fixed waste *fraction* cannot express "extra area is nearly free", so it
+stopped merging on sparse zones — exactly where a tiny absolute area makes merging
+almost costless.
+
+Evaluated on all 112 real zone masks, predicted per-date cost summed:
+
+| strategy | total | vs row bands | max graph |
+|---|---|---|---|
+| row bands (one per live chunk-row) | 73,636 s | 100% | 1,650 tasks |
+| greedy, 25% waste bound, 512-chunk cap | 13,143 s | 17.8% | 5,632 tasks |
+| **cost-model DP** | **6,733 s** | **9.1%** | 21,692 tasks |
+| single bounding box per zone | 8,770 s | 11.9% | 42,636 tasks |
+
+The greedy pass left **+95%** on the table. Note the DP also beats the pure bounding
+box, because it adapts per zone instead of committing to one shape; the worst greedy
+zones were the sparse ones (`07S` +402%, `08S` +311%, `03N` +292%).
+
+So `merge_bands` now minimises `n_windows × WINDOW_COST_IN_CHUNKS + total_area`
+exactly, by dynamic programming over groupings of consecutive bands. O(n²) with n =
+a zone's live chunk-rows (≤ ~230), and the unit tests hold it against brute-force
+enumeration on small inputs.
+
+## Choosing the graph-size cap
+
+`MAX_CHUNKS_PER_WINDOW` exists to bound one region write's graph, not to bound cost.
+Sweeping it against the DP optimum:
+
+| area cap | max graph (tasks) | total | vs uncapped |
+|---|---|---|---|
+| none | 28,050 | 6,728 s | — |
+| 2,560 | 28,050 | 6,728 s | +0.0% |
+| **2,048** | **21,692** | **6,733 s** | **+0.07%** |
+| 1,536 | 16,874 | 6,794 s | +1.0% |
+| 1,024 | 11,264 | 6,909 s | +2.7% |
+| 512 | 5,632 | 7,463 s | +10.9% |
+
+2,048 is the pick: it costs 0.07%, and it holds every graph at or below 21,692 tasks
+— just under the 22,812 a live run has actually driven with zero spill and a 5.6 GiB
+hottest worker. Note that even the 512-cap DP (7,463 s) beats the greedy pass
+(13,143 s) by 1.76×, so the win comes from optimising the right objective rather
+than from taking memory risk.
+
+## Per-zone effect
+
+| zone | live chunks | row bands | grouped | added area |
+|---|---|---|---|---|
+| `03S` | 4 | 2 | 1 | +0.0% |
+| `15S` | 22 | 5 | 1 | +45.5% |
+| `40S` | 26 | 12 | 2 | +50.0% |
+| `35N` | 2415 | 197 | 3 | +20.4% |
+
+Median 2 windows per zone, maximum 5. Sparse zones group *harder* in relative terms
+— which is the correction, not a regression: their added area is a large fraction of
+a tiny total, and a tiny total is where extra area cannot matter.
+
+## What this leaves
+
+The empty-graph samples did not disappear — 3 of 10 after grouping against 16 of 44
+before, a similar fraction of a much shorter date. Those gaps are the serial phase
+*between* dates: the STAC query and graph construction, which run single-threaded on
+the flow runner while the fleet waits. That is the next thing to measure, and it is
+a different fix from this one.
