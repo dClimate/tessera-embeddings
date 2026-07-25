@@ -256,16 +256,27 @@ def _create_storage(
 # bands) that single manifest is huge and dominates commit time. Splitting
 # bounds a commit's rewrite to the shards it touches.
 #
-# For the region-write merge workload the dominant axis is SPATIAL, not time:
-# the manifest entry count is n_dates x northing_chunks x easting_chunks, and
-# large continental stores run tens of chunks per spatial axis against often
-# <256 dates — so the manifest is spatially dominated. Each write_region commits
-# one compact, scattered spatial block (~3x3 chunks) across a date run, so a 2D
-# split on (northing, easting) localizes the rewrite to the few tiles that block
-# overlaps. A time split would be a no-op at <=256 dates (one shard == the whole
-# array) and, on the dense >256-date stores, still rewrites every spatial chunk
-# within a touched time-shard. Time remains selectable (include a ``"time"``
-# key) and composes with the spatial split, but is not the default.
+# WHICH AXIS TO SPLIT DEPENDS ENTIRELY ON WHAT ONE COMMIT TOUCHES. Two workloads
+# in this repo want opposite answers, so read this before choosing sizes.
+#
+# (a) Region-write MERGE workload — split SPATIALLY (the default below). Its
+#     manifest entry count is n_dates x northing_chunks x easting_chunks with tens
+#     of chunks per spatial axis against often <256 dates, so it is spatially
+#     dominated, and each write_region commits one compact, scattered ~3x3-chunk
+#     block. A 2D split localizes the rewrite to the few tiles that block overlaps.
+#     A time split is a no-op here at <=256 dates (one shard == the whole array).
+#
+# (b) Campaign zone INGEST — split by TIME ONLY (config.ingest.INGEST_MANIFEST_SPLIT).
+#     One commit is one DATE, and a date writes every live window, i.e. essentially
+#     the zone's whole live area. So a spatial split cannot localise anything —
+#     every commit touches nearly every spatial shard — and all it adds is object
+#     count: measured on a 6-degree zone, a 4x4 split rewrote ~5,097 manifest
+#     objects per commit instead of ~14, and those PUT latencies made ingest 30-50%
+#     SLOWER than no split at all. A time split is what localises a per-date commit,
+#     and at a size well under the date count it is emphatically not a no-op.
+#
+# The rule behind both: split the axis along which a single commit is NARROW. Check
+# that against the caller's write shape rather than inheriting the default.
 #
 # This is OFF by default and opt-in via ``manifest_split`` because (a) it's only
 # a win on large, frequently-region-written stores, and (b) the split config
@@ -274,7 +285,8 @@ def _create_storage(
 # threading a parameter through every public entry point.
 _manifest_split_sizes: dict[str, int] | None = None
 
-# Default for large continental stores: a 2D spatial split at 4 chunks per axis.
+# Default for the region-write merge workload (case (a) above) — NOT for campaign
+# ingest, which wants time-only. A 2D spatial split at 4 chunks per axis.
 # With INGEST_CHUNK_SIZE=4096 that's ~16k px/shard — a touch larger than a
 # typical ~3x3-chunk region write, so most commits hit only 1-4 tiles, while
 # shard objects stay in the low hundreds on a ~50x50-chunk store. Region writes
