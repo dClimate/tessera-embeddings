@@ -301,7 +301,12 @@ def fill_zone_year_flow(
         checkpoint_path=f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}",
         inputs_bucket=paths.inputs,
         output_bucket=paths.outputs,
-        chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
+        # 1 inference tile == 1 output shard == 2x2 tiles per 4096-px ingest chunk
+        # (D3), so assembly writes whole, lean shards with no read-modify-write.
+        # Explicit, NOT the INFERENCE_CHUNK_SIZE default: that default belongs to
+        # the single-ROI output geometry (500-px chunks) and must not be retuned
+        # for this path.
+        chunk_size=SHARD_PX,
         allow_s2_only=allow_s2_only,
     )
 

@@ -796,17 +796,46 @@ def open_store_as_zarr_group(
     the default S3 region — or one reachable only via an explicit credential
     callback — can be read with the same options used for the writer.
     """
+    return open_store_group_and_tip(
+        store_path,
+        max_concurrent_requests=max_concurrent_requests,
+        group=group,
+        get_credentials=get_credentials,
+        region=region,
+    )[0]
+
+
+def open_store_group_and_tip(
+    store_path: str,
+    max_concurrent_requests: int | None = None,
+    group: str | None = None,
+    *,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    region: str | None = None,
+    branch: str = "main",
+) -> tuple[zarr.Group, str]:
+    """Open a store for reading and also return ``branch``'s tip snapshot ID.
+
+    Same as :func:`open_store_as_zarr_group`, plus the commit the returned group
+    is a view of. The snapshot ID is the store's canonical CONTENT identity —
+    it moves on every commit and cannot be left stale the way a bookkeeping
+    attribute can — so callers deciding "is this the same data I saw last
+    time?" should key on it rather than on attrs a writer is trusted to update.
+    Both come from ONE repo open, so asking for the tip costs no extra round
+    trip over opening the group alone.
+    """
     repo = _open_repo(
         store_path, max_concurrent_requests=max_concurrent_requests, get_credentials=get_credentials, region=region
     )
-    session = repo.readonly_session(branch="main")
+    tip = repo.lookup_branch(branch)
+    session = repo.readonly_session(branch=branch)
     root = zarr.open_group(session.store, mode="r")
     if group is None:
-        return root
+        return root, tip
     member = root[group]
     if not isinstance(member, zarr.Group):
         raise ValueError(f"{group!r} is not a group in {store_path}")
-    return member
+    return member, tip
 
 
 def get_existing_dates(store_path: str, group: str | None = None) -> set[str]:

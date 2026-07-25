@@ -147,16 +147,22 @@ DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 # module scope (the Fargate flow runner has no torch).
 PREFETCH_DEPTH = 2
 
-# Spatial read-tile size for inference. 2048 aligns the ChunkSpec grid with the
-# global store's shard grid (ADR-008 D3): one inference tile == one 2048-px
-# shard == 2x2 tiles per 4096-px ingest chunk, so assembly writes whole, lean
-# shards with no read-modify-write. The *resident input working set* is bounded
-# separately via density-sized northing strips (see
-# actors._strip_height_for_density), so a 2048x2048 chunk's peak host RAM is
-# capped by a per-strip byte budget rather than fixed by T x H x W. Sparse
-# chunks load in one full-height strip; only dense chunks split. Independent of
-# the storage chunk size written at ingest (config.ingest.INGEST_CHUNK_SIZE).
-INFERENCE_CHUNK_SIZE = 2048
+# Default spatial read-tile size for inference. This default is the SINGLE-ROI
+# tile size only: the global campaign passes ``chunk_size=SHARD_PX`` (2048)
+# explicitly so one inference tile is exactly one output shard (ADR-008 D3), and
+# never reads this value. So the number here is chosen for the single-ROI output
+# geometry, whose chunks are 500 px (config.store_layout.SINGLE) — 2000 is 4x500,
+# so every tile covers whole output chunks and assembly writes them outright. A
+# tile size that does NOT divide 500 leaves a partial output chunk at each tile
+# boundary, which assembly must read-modify-write sequentially inside one fork;
+# do not "unify" this with the global 2048 without changing SINGLE's chunking
+# too. The *resident input working set* is bounded separately via density-sized
+# northing strips (see actors._strip_height_for_density), so a tile's peak host
+# RAM is capped by a per-strip byte budget rather than fixed by T x H x W.
+# Sparse chunks load in one full-height strip; only dense chunks split.
+# Independent of the storage chunk size written at ingest
+# (config.ingest.INGEST_CHUNK_SIZE).
+INFERENCE_CHUNK_SIZE = 2000
 
 
 @final

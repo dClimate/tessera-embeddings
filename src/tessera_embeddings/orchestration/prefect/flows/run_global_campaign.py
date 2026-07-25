@@ -45,7 +45,7 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
 from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete, zone_year_tag
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
-from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import open_store_group_and_tip
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zone
 
 # S1/S2 grandchild ingest refs are derived from this single source (rather than
@@ -77,18 +77,30 @@ def _mosaic_identity(
 ) -> str:
     """Identity string of the mosaic a fill will read, per ACTIVE child store.
 
-    Called AFTER ingest (for ingest=True), so each store carries its
-    ``ingest_marker`` (window + coverage-delivery sha + min_valid_coverage +
-    orbit + allow_partial_window — the exact per-(zone,year) fingerprint that
-    produced it) plus the ``ingest_completed_at`` that separates two builds
-    sharing one policy; a prebuilt (ingest=False) mosaic falls back to
-    ``last_appended``/``created_at``. This is deliberately per-(zone,year) and
-    post-ingest, NOT one global coverage sha read once up front: a partial
-    ``build_all(zones=...)`` can leave zones on different coverage revisions,
-    and coverage can change after an early read — either would let stale
-    staged tiles resume against a rebuilt mosaic. Genuinely-absent stores
-    (missing repo / not found) are skipped; a PRESENT store with no identity
-    FAILS CLOSED — never degrade to a config-only fingerprint.
+    The AUTHORITATIVE term is each store's branch-tip SNAPSHOT ID: it is
+    Icechunk's own content identity, so it moves on any commit that can change
+    the pixels a fill reads — including ones no bookkeeping attribute records
+    (a re-run of a single date's region write, a hand-repaired store, a
+    prebuilt mosaic maintained outside this pipeline). The attrs below are a
+    proxy that is only as good as the writer's discipline; keying the fingerprint
+    on them alone means a mosaic can change underneath a staging prefix, so a
+    retry resumes tiles built from the OLD pixels and publishes a silent mixture
+    of two inputs. The snapshot ID closes that.
+
+    The attrs ride along for legibility, not for safety: ``ingest_marker``
+    (window + coverage-delivery sha + min_valid_coverage + orbit +
+    allow_partial_window — the exact per-(zone,year) fingerprint that produced
+    the store) plus the ``ingest_completed_at`` that separates two builds sharing
+    one policy, or ``last_appended``/``created_at`` for a prebuilt
+    (``ingest=False``) mosaic. They make a changed run_id diagnosable from the
+    string itself; a store carrying none of them is no longer fatal, because the
+    snapshot ID alone is a complete identity.
+
+    This is deliberately per-(zone,year) and post-ingest, NOT one global
+    coverage sha read once up front: a partial ``build_all(zones=...)`` can leave
+    zones on different coverage revisions, and coverage can change after an early
+    read — either would let stale staged tiles resume against a rebuilt mosaic.
+    Genuinely-absent stores (missing repo / not found) are skipped.
 
     Only the ACTIVE orbit set is fingerprinted (reflectance +
     ``_active_orbits(s1_orbit)``): the fill reads only those, so an inactive
@@ -107,7 +119,7 @@ def _mosaic_identity(
     for store in ["reflectance", *(f"sar_{orbit}" for orbit in _active_orbits(s1_orbit))]:
         path = f"{base}/{store}.zarr"
         try:
-            grp = open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
+            grp, tip = open_store_group_and_tip(path, get_credentials=get_credentials, region=s3_region)
         except FileNotFoundError:
             continue  # absent store (single-orbit mosaic / unproduced orbit) — not active
         except icechunk.IcechunkError as exc:
@@ -115,21 +127,18 @@ def _mosaic_identity(
                 continue
             raise  # transient/auth: fail closed rather than fingerprint a partial view
         marker = grp.attrs.get("ingest_marker")
-        identity = (
+        provenance = (
             # marker + completed_at, not the marker alone: the marker is policy, so a
-            # rebuild under identical settings reproduces it byte for byte and would
-            # resume tiles staged against the PREVIOUS mosaic. completed_at is stamped
-            # in the same commit and only moves when ingest actually re-ran.
+            # rebuild under identical settings reproduces it byte for byte. completed_at
+            # is stamped in the same commit and only moves when ingest actually re-ran.
             f"{marker!r}@{grp.attrs.get('ingest_completed_at')}"
             if isinstance(marker, dict)
             else (grp.attrs.get("last_appended") or grp.attrs.get("created_at"))
         )
-        if identity is None:
-            raise ValueError(
-                f"Mosaic store {path} has no ingest_marker/last_appended/created_at identity attr — cannot "
-                "safely fingerprint it for staging resume. Failing closed (clear staging or fix the mosaic)."
-            )
-        ids.append(f"{store}={identity}")
+        # snapshot FIRST: it is the term that makes this safe. The attrs follow so an
+        # operator diffing two run_ids can see WHY the mosaic changed, not just that it
+        # did; a store with no provenance attrs is still fully identified by its tip.
+        ids.append(f"{store}=snapshot:{tip}" + (f"+{provenance}" if provenance is not None else ""))
     if not ids:
         raise ValueError(f"No mosaic stores found under {base} — nothing to fingerprint or fill.")
     return "|".join(ids)

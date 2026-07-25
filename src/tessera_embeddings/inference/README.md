@@ -39,7 +39,7 @@ Input stores (Icechunk/Zarr on S3):
   reflectance.zarr / sar_ascending.zarr / sar_descending.zarr
             │
             ▼
-  enumerate_chunks_from_dataset()     ← 2048×2048 px chunks
+  enumerate_chunks_from_dataset()     ← 2048 px tiles (global) / 2000 px (single ROI)
             │
             ▼
   filter_chunks_by_roi_mask()         ← drop chunks outside the ROI
@@ -88,13 +88,19 @@ Input stores (Icechunk/Zarr on S3):
 
 ### 1. Chunk Enumeration and ROI Pre-Filter
 
-The input mosaic is divided into a grid of 2048×2048 pixel `ChunkSpec` objects (edge chunks may
-be smaller). ~2k px balances peak RAM during inference (~10 GB vs. ~37 GB at 3000 px) against
-scheduling overhead, and 2048 exactly (2¹¹) aligns the tile grid with the global store's shard
-grid — one inference tile is one output shard (ADR-008 D3). The read-tile size is independent
-of the store's on-disk chunk size: the mosaic is written with larger 4096×4096 chunks at ingest
-(`INGEST_CHUNK_SIZE`; 1 ingest chunk = 2×2 inference tiles), and `load_chunk` reads the
-2048×2048 sub-tile out of them via `zarr.Array.oindex` with no alignment requirement.
+The input mosaic is divided into a grid of square `ChunkSpec` tiles (edge chunks may be
+smaller). ~2k px balances peak RAM during inference (~10 GB vs. ~37 GB at 3000 px) against
+scheduling overhead. **The exact size is chosen to divide the OUTPUT chunking**, so assembly
+writes whole chunks instead of read-modify-writing a partial one at every tile boundary:
+
+| Path | Tile | Output geometry | Why |
+| --- | --- | --- | --- |
+| Global campaign | **2048** (`SHARD_PX`, passed explicitly by `fill_zone_year`) | 256-px inner chunks in 2048² shards | 1 tile = 1 whole shard (ADR-008 D3) |
+| Single ROI | **2000** (`INFERENCE_CHUNK_SIZE`, the default) | 500-px chunks (`store_layout.SINGLE`) | 2000 = 4×500, so a tile is a whole 4×4 chunk block |
+
+The read-tile size is independent of the store's on-disk chunk size: the mosaic is written with
+larger 4096×4096 chunks at ingest (`INGEST_CHUNK_SIZE`), and `load_chunk` reads its sub-tile out
+of them via `zarr.Array.oindex` with no alignment requirement.
 
 `filter_chunks_by_roi_mask` then drops any chunk whose footprint does not intersect the ROI
 zarr mask produced by `generate_roi`. Only the surviving **live chunks** are dispatched to

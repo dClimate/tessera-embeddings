@@ -47,13 +47,14 @@ def wired(monkeypatch):
     # Pinned AMI id (resolved once, threaded into every fill's provisioning) — mocked
     # so tests make no SSM call.
     monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a, **k: "ami-test-id")
-    # Store reads for the staging fingerprint: the coverage delivery sha (global per
-    # delivery) and, for ingest=False, each mosaic store's `last_appended` identity.
+    # Store reads for the staging fingerprint: each mosaic store's branch-tip snapshot
+    # (the authoritative term) plus its provenance attrs.
     monkeypatch.setattr(
         mod,
-        "open_store_as_zarr_group",
-        lambda *a, **k: SimpleNamespace(
-            attrs={"registry_sha256": "cov-sha-test", "last_appended": "2026-01-01T00:00:00Z"}
+        "open_store_group_and_tip",
+        lambda *a, **k: (
+            SimpleNamespace(attrs={"registry_sha256": "cov-sha-test", "last_appended": "2026-01-01T00:00:00Z"}),
+            "SNAPSHOT0",
         ),
     )
 
@@ -124,15 +125,18 @@ def test_fill_run_id_changes_when_the_mosaic_is_rebuilt(wired, monkeypatch):
     marker = {"window": ["2025-01-01", "2025-12-31"], "coverage_sha256": "cov"}
 
     def _mosaic(completed_at):
-        return lambda *a, **k: SimpleNamespace(
-            attrs={"registry_sha256": "cov-sha-test", "ingest_marker": marker, "ingest_completed_at": completed_at}
+        return lambda *a, **k: (
+            SimpleNamespace(
+                attrs={"registry_sha256": "cov-sha-test", "ingest_marker": marker, "ingest_completed_at": completed_at}
+            ),
+            "SNAPSHOT0",
         )
 
-    monkeypatch.setattr(mod, "open_store_as_zarr_group", _mosaic("2026-01-01T00:00:00Z"))
+    monkeypatch.setattr(mod, "open_store_group_and_tip", _mosaic("2026-01-01T00:00:00Z"))
     first = _fill_run_id(wired)
     assert _fill_run_id(wired) == first  # same build → same prefix, so a retry resumes
 
-    monkeypatch.setattr(mod, "open_store_as_zarr_group", _mosaic("2026-02-02T00:00:00Z"))
+    monkeypatch.setattr(mod, "open_store_group_and_tip", _mosaic("2026-02-02T00:00:00Z"))
     assert _fill_run_id(wired) != first  # identical marker, new build → fresh prefix
 
 
@@ -185,9 +189,9 @@ def test_mosaic_identity_fingerprints_only_active_orbits(wired, monkeypatch):
 
     def _capture(path, **k):
         opened.append(path)
-        return SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": "2026-01-01T00:00:00Z"})
+        return SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": "2026-01-01T00:00:00Z"}), "SNAPSHOT0"
 
-    monkeypatch.setattr(mod, "open_store_as_zarr_group", _capture)
+    monkeypatch.setattr(mod, "open_store_group_and_tip", _capture)
     asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False, s1_orbit="ascending"
@@ -208,7 +212,7 @@ def test_all_ocean_cell_uses_empty_run_id_and_skips_cleanup(wired, monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("an empty cell must NOT read the mosaic for a staging fingerprint")
 
-    monkeypatch.setattr(mod, "open_store_as_zarr_group", _boom)
+    monkeypatch.setattr(mod, "open_store_group_and_tip", _boom)
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["ingest-zone-year/ingest-zone-year", "fill-zone-year/fill-zone-year"]  # ingest still probes+skips
@@ -236,8 +240,8 @@ def test_ingest_false_run_id_tracks_prebuilt_mosaic_identity(wired, monkeypatch)
     def _run_with_mosaic_ts(ts: str) -> str:
         monkeypatch.setattr(
             mod,
-            "open_store_as_zarr_group",
-            lambda *a, **k: SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": ts}),
+            "open_store_group_and_tip",
+            lambda *a, **k: (SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": ts}), "SNAPSHOT0"),
         )
         wired["arun"].clear()
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False))
@@ -260,19 +264,43 @@ def test_retag_only_uses_stable_run_id_without_mosaic(wired, monkeypatch):
     def _boom(*a, **k):
         raise AssertionError("retag-only must NOT read the mosaic for a staging fingerprint")
 
-    monkeypatch.setattr(mod, "open_store_as_zarr_group", _boom)
+    monkeypatch.setattr(mod, "open_store_group_and_tip", _boom)
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
     fill = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
     assert fill["run_id"] == "33N-2025-retag"
 
 
-def test_ingest_false_fails_closed_without_mosaic_identity(wired, monkeypatch):
-    """ingest=False fails closed when a prebuilt mosaic store carries no identity
-    attr — better than fingerprinting a partial view and risking a stale resume.
+def _prebuilt_run_id(wired, monkeypatch, *, attrs: dict, tip: str) -> str:
+    """run_id of the ingest=False fill for a prebuilt mosaic with these attrs/tip."""
+    monkeypatch.setattr(mod, "open_store_group_and_tip", lambda *a, **k: (SimpleNamespace(attrs=attrs), tip))
+    wired["arun"].clear()
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False))
+    return next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
+
+
+def test_run_id_tracks_the_snapshot_even_when_provenance_attrs_are_unchanged(wired, monkeypatch):
+    """The snapshot tip — not the attrs — is what makes the fingerprint safe.
+
+    A region overwrite (a re-run of one date's write, a hand repair, a prebuilt mosaic
+    maintained outside this pipeline) changes pixels while leaving `ingest_marker` /
+    `ingest_completed_at` exactly as they were. Keyed on attrs alone the retry would
+    reuse the prefix, skip the already-staged tiles, and publish a zone-year mixing
+    both mosaic revisions — silently. Keyed on the tip, it starts fresh.
     """
-    monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={}))
-    with pytest.raises(RuntimeError, match="last_appended"):
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False))
+    attrs = {"ingest_marker": {"window": ["2025-01-01", "2025-12-31"]}, "ingest_completed_at": "2026-01-01T00:00:00Z"}
+    before = _prebuilt_run_id(wired, monkeypatch, attrs=attrs, tip="SNAPSHOT_BEFORE")
+    assert _prebuilt_run_id(wired, monkeypatch, attrs=attrs, tip="SNAPSHOT_BEFORE") == before  # retry resumes
+    assert _prebuilt_run_id(wired, monkeypatch, attrs=attrs, tip="SNAPSHOT_AFTER") != before
+
+
+def test_attrless_prebuilt_mosaic_is_identified_by_its_snapshot(wired, monkeypatch):
+    """A store with no provenance attrs is no longer fatal: the tip is a complete
+    identity on its own, so a prebuilt mosaic that never learned this pipeline's
+    bookkeeping still gets a correct, change-detecting staging prefix.
+    """
+    rid = _prebuilt_run_id(wired, monkeypatch, attrs={}, tip="SNAPSHOT_A")
+    assert rid.startswith("33N-2025-")
+    assert _prebuilt_run_id(wired, monkeypatch, attrs={}, tip="SNAPSHOT_B") != rid
 
 
 def test_default_run_rejects_unseeded_work_zone(wired, monkeypatch):
