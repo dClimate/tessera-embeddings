@@ -67,8 +67,20 @@ from tornado.ioloop import PeriodicCallback
 
 # Default Fargate task sizes for ingest workloads. Callers can override
 # per-call via ``ecs_cluster``'s ``worker_cpu`` / ``worker_mem`` arguments.
+#
+# Memory is sized for the ONE worker that runs the ingest task, not for the average
+# one. That worker holds the STAC query's retained items — the month being processed
+# plus the month prefetched behind it (``ingest.stac.stream_stac_months``) — on top of
+# its share of the per-date graph. At 16 GiB that combination spilled, and spill is a
+# hidden cost that has scaled badly in this stack; the extra memory is far cheaper
+# than the fleet time a spilling ingest wastes. Sized against a dense 6-degree zone,
+# whose months are the largest the campaign sees.
+#
+# 30720 is the CEILING for 4 vCPU on Fargate (8192-30720 MiB in 1024 steps), and the
+# vCPU stays at 4 deliberately: the Fargate quota is counted in vCPU, so memory is free
+# in quota terms while doubling the CPU would halve the workers a cell can run.
 DEFAULT_INGEST_WORKER_CPU = 4096
-DEFAULT_INGEST_WORKER_MEM = 16384
+DEFAULT_INGEST_WORKER_MEM = 30720
 
 # Schedulers don't need much memory but benefit from a few cores so
 # graph construction and dashboard responsiveness stay smooth.
