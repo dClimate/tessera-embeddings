@@ -41,7 +41,6 @@ builds no graph at all.
 """
 
 import logging
-import statistics
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -69,13 +68,6 @@ logger = logging.getLogger(__name__)
 
 # Standard time encoding for all stores
 TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"}
-
-# --- TEMPORARY DIAGNOSTIC (F-05) ---------------------------------------------
-# One-shot guard for the produce-vs-store probe in write_day_windows. Module
-# scope, so it fires once per worker PROCESS (a handful per run) rather than once
-# per date. Delete with the probe.
-_F05_PROBED = False
-# --- END TEMPORARY DIAGNOSTIC ------------------------------------------------
 
 
 def read_time_values(node: zarr.Group) -> np.ndarray:
@@ -1034,14 +1026,7 @@ def batched_region_writes(
     repo = _open_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
     yield RegionWriteBatch(session)
-    # --- TEMPORARY DIAGNOSTIC (F-05): time the commit ------------------------------
-    # The one per-date cost outside write_day_windows' own accounting, so without it
-    # the budget has an unexplained remainder. Delete with the block in
-    # write_day_windows.
-    _t0 = time.monotonic()
     session.commit(message)
-    logger.info("commit %.2fs — %s", time.monotonic() - _t0, message)
-    # --- END TEMPORARY DIAGNOSTIC -------------------------------------------------
 
 
 def write_day_windows(
@@ -1080,8 +1065,6 @@ def write_day_windows(
     anything is written — the per-append structural gate must not be lost to
     batching.
     """
-    global _F05_PROBED  # TEMPORARY DIAGNOSTIC (F-05)
-
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
     if day_ds.sizes["time"] != 1:
@@ -1122,16 +1105,6 @@ def write_day_windows(
         get_credentials=get_credentials,
         s3_region=s3_region,
     ) as batch:
-        # --- BEGIN TEMPORARY DIAGNOSTIC (F-05, per-window write overhead) ----------
-        # Delete this block, its `_t*` locals, the `writes`/`isels` lists and the two
-        # log calls once the per-window cost is understood. Nothing else depends on
-        # them. Kept as a full per-date budget rather than a single number so the
-        # cost can be attributed without inferring it from dashboard sampling gaps
-        # (which, at 15 s resolution, produced two confidently wrong answers).
-        # The per-WINDOW detail is DEBUG, so it is off by default and cannot bloat
-        # logs on a 220-window zone; only the one-line-per-date summary is INFO.
-        _t_start = time.monotonic()
-        # --- END TEMPORARY DIAGNOSTIC ---------------------------------------------
         if manifest:
             manifest.validate_against(extract_manifest(dict(batch.group.attrs)), store_path)
         t = batch.append_time_slot(when)
@@ -1142,47 +1115,8 @@ def write_day_windows(
         attrs["doy"] = list(cast("list", attrs.get("doy", []))) + compute_doy(np.array([when])).tolist()
         attrs["last_appended"] = utcnow_iso()
         drop = [c for c in ("time", "northing", "easting") if c in day_ds.coords]
-        _t_slot = time.monotonic()  # TEMPORARY DIAGNOSTIC (F-05)
-        writes: list[float] = []  # TEMPORARY DIAGNOSTIC (F-05)
-        isels: list[float] = []  # TEMPORARY DIAGNOSTIC (F-05)
-        produces: list[float] = []  # TEMPORARY DIAGNOSTIC (F-05)
-        for i, (y0, y1, x0, x1) in enumerate(windows):
-            _t0 = time.monotonic()  # TEMPORARY DIAGNOSTIC (F-05)
+        for y0, y1, x0, x1 in windows:
             win = day_ds.isel(northing=slice(y0, y1), easting=slice(x0, x1)).drop_vars(drop)
-            _t1 = time.monotonic()  # TEMPORARY DIAGNOSTIC (F-05)
-            # --- TEMPORARY DIAGNOSTIC (F-05): one-shot A/B on the FIRST window -----
-            # `to_icechunk` both COMPUTES the window (fetch + resample of the source
-            # scenes) and STORES it, so the measured ~6 s/window could be either, and
-            # every candidate fix depends on which. Once per store — first window of
-            # the first date — materialise to numpy and store via write_window (the
-            # documented-but-unused path), timing both halves, before doing the real
-            # to_icechunk write below. Same values written twice, so the result is
-            # unchanged; cost is one extra window per store.
-            #
-            # Deliberately NOT behind an env var: this runs on a Dask worker, and
-            # the optical flow passes no extra environment to its workers, so a
-            # flag would have been unreachable.
-            if not _F05_PROBED:
-                vals = {str(v): np.asarray(win[v].values)[0] for v in win.data_vars}
-                _tp = time.monotonic()
-                batch.write_window(t, slice(y0, y1), slice(x0, x1), vals)
-                _tw = time.monotonic()
-                produces.append(_tp - _t1)
-                logger.info(
-                    "F-05 probe [%s]: window %d chunk(s), %.0f MiB — produce %.2fs, "
-                    "store via write_window %.2fs (to_icechunk for the same window follows)",
-                    date_str,
-                    max(1, (y1 - y0) // chunks["northing"]) * max(1, (x1 - x0) // chunks["easting"]),
-                    sum(v.nbytes for v in vals.values()) / 2**20,
-                    _tp - _t1,
-                    _tw - _tp,
-                )
-                _F05_PROBED = True
-                # Re-time from here so the to_icechunk measurement below excludes the
-                # probe. _t0 moves too, or `isels` (measured _t1 - _t0) absorbs the
-                # probe and the budget's unattributed term goes negative.
-                _t0 = _t1 = time.monotonic()
-            # --- END TEMPORARY DIAGNOSTIC -----------------------------------------
             to_icechunk(
                 win,
                 batch.session,
@@ -1196,40 +1130,6 @@ def write_day_windows(
                 align_chunks=True,
                 split_every=8,
             )
-            # --- TEMPORARY DIAGNOSTIC (F-05) --------------------------------------
-            _t2 = time.monotonic()
-            isels.append(_t1 - _t0)
-            writes.append(_t2 - _t1)
-            logger.debug(
-                "  window %d/%d [%d:%d, %d:%d] %d chunk(s): graph %.3fs write %.3fs",
-                i + 1,
-                len(windows),
-                y0,
-                y1,
-                x0,
-                x1,
-                max(1, (y1 - y0) // chunks["northing"]) * max(1, (x1 - x0) // chunks["easting"]),
-                _t1 - _t0,
-                _t2 - _t1,
-            )
-            # --- END TEMPORARY DIAGNOSTIC ----------------------------------------
-        # --- BEGIN TEMPORARY DIAGNOSTIC (F-05) ------------------------------------
-        if writes:
-            logger.info(
-                "date %s budget: %d window(s) | slot+attrs %.1fs | graphs %.1fs | "
-                "probe-produce %.1fs | writes %.1fs (min %.2f med %.2f max %.2f) | unattributed %.1fs",
-                date_str,
-                len(writes),
-                _t_slot - _t_start,
-                sum(isels),
-                sum(produces),
-                sum(writes),
-                min(writes),
-                statistics.median(writes),
-                max(writes),
-                time.monotonic() - _t_start - (_t_slot - _t_start) - sum(isels) - sum(produces) - sum(writes),
-            )
-        # --- END TEMPORARY DIAGNOSTIC ---------------------------------------------
 
 
 def compute_doy(timestamps: np.ndarray) -> np.ndarray:
