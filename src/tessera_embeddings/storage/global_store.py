@@ -177,6 +177,37 @@ def _root_attrs(layout: StoreLayout, model_version: str | None) -> dict:
     )
 
 
+def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> None:
+    """Reject an incremental seed whose layout differs from the seeded groups'.
+
+    The time axis is validated against existing groups but the GEOMETRY was not, so a
+    store could be half-seeded with one shard pitch and half with another. That is not
+    a cosmetic split: ``plan_zone_inference`` requires the inference tile to equal the
+    group's shard pitch, so the later zones are rejected at fill time — after seeding
+    has already committed them — and the store needs hand repair. Cheaper to refuse
+    the mixed seed here, alongside the axis check it belongs with.
+
+    Compared per-variable against what THIS layout would have created at the existing
+    array's own shape, so shape-clamping (a zone smaller than one nominal shard) is not
+    mistaken for a layout change.
+    """
+    for var, spec in layout.arrays.items():
+        if var not in grp:
+            raise ValueError(
+                f"Refusing to seed: existing group {gname!r} has no {var!r} array, which layout "
+                f"{layout.name!r} requires — the store was seeded with a different layout."
+            )
+        arr = cast("zarr.Array", grp[var])
+        want = spec.create_kwargs(tuple(arr.shape))
+        if tuple(arr.chunks) != tuple(want["chunks"]) or tuple(arr.shards or ()) != tuple(want.get("shards") or ()):
+            raise ValueError(
+                f"Refusing to seed: layout {layout.name!r} would give {var!r} chunks "
+                f"{tuple(want['chunks'])} / shards {want.get('shards')}, but existing group {gname!r} has "
+                f"chunks {tuple(arr.chunks)} / shards {arr.shards}. One store cannot mix shard geometries — "
+                "the fill's tile size is pinned to the shard pitch, so the new zones would be unfillable."
+            )
+
+
 def seed_zone_groups(
     repo: icechunk.Repository,
     specs: Iterable[ZoneSpec],
@@ -231,7 +262,8 @@ def seed_zone_groups(
                 f"years {tuple(years)} differ from the store's existing axis {existing_years} — the time axis "
                 "is fixed at seeding (ADR-008 D1); seeding more groups with a different axis would corrupt it."
             )
-        break  # all groups share one axis (invariant) — one check suffices
+        _check_layout_matches(grp, gname, layout)
+        break  # all groups share one axis and one layout (invariant) — one check suffices
     times = calendar_year_times(years)
     nt = len(times)
     band = _layout_band(layout)

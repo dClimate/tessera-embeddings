@@ -776,6 +776,30 @@ def export_zone_roi(
     return dest_path
 
 
+def expected_live_chunk_grid(
+    zone: str,
+    *,
+    land_mask_path: str,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> np.ndarray:
+    """Boolean grid of the live ingest chunks in ``zone`` (a KB read of the bitmap).
+
+    Marks exactly the blocks :func:`export_zone_roi` writes — same
+    ``INGEST_CHUNK_SIZE`` blocking of ``tile_live_2048``, same skip-if-not-``any``
+    rule — so it is the authority on both HOW MANY chunks a correct mask stores
+    and WHERE they sit. :func:`validate_zone_roi` compares positions against it;
+    :func:`live_chunk_count` is its sum.
+    """
+    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
+    tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
+    t = INGEST_CHUNK_SIZE // SHARD_PX  # tiles per chunk per axis
+    rows, cols = math.ceil(tile_live.shape[0] / t), math.ceil(tile_live.shape[1] / t)
+    padded = np.zeros((rows * t, cols * t), dtype=bool)
+    padded[: tile_live.shape[0], : tile_live.shape[1]] = tile_live
+    return cast("np.ndarray", padded.reshape(rows, t, cols, t).any(axis=(1, 3)))
+
+
 def live_chunk_count(
     zone: str,
     *,
@@ -785,19 +809,14 @@ def live_chunk_count(
 ) -> int:
     """Live ingest chunks in ``zone``, coarsened from the coverage bitmap (a KB read).
 
-    Counts exactly the blocks :func:`export_zone_roi` writes — same
-    ``INGEST_CHUNK_SIZE`` blocking of ``tile_live_2048``, same
-    skip-if-not-``any`` rule — so it is both the ingest fleet-sizing measure and
-    the expected object count of a correctly written mask
-    (:func:`validate_zone_roi` asserts that equality).
+    The ingest fleet-sizing measure, and the expected object count of a correctly
+    written mask. Sum of :func:`expected_live_chunk_grid`.
     """
-    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
-    tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
-    t = INGEST_CHUNK_SIZE // SHARD_PX  # tiles per chunk per axis
-    rows, cols = math.ceil(tile_live.shape[0] / t), math.ceil(tile_live.shape[1] / t)
-    padded = np.zeros((rows * t, cols * t), dtype=bool)
-    padded[: tile_live.shape[0], : tile_live.shape[1]] = tile_live
-    return int(padded.reshape(rows, t, cols, t).any(axis=(1, 3)).sum())
+    return int(
+        expected_live_chunk_grid(
+            zone, land_mask_path=land_mask_path, get_credentials=get_credentials, s3_region=s3_region
+        ).sum()
+    )
 
 
 def validate_zone_roi(
@@ -883,10 +902,21 @@ def validate_zone_roi(
         if grid is None:
             problems.append("live chunk grid not recoverable from the mask's keys (ingest would fall back to scanning)")
         else:
-            expected = live_chunk_count(
+            # POSITIONS, not just the count. This is the pre-campaign placement gate,
+            # and equal sums are exactly what a placement error preserves: one chunk
+            # missing where land is and one present where it isn't cancels out, and a
+            # count check calls a mask with land in the wrong part of the zone valid.
+            expected_grid = expected_live_chunk_grid(
                 zone, land_mask_path=land_mask_path, get_credentials=get_credentials, s3_region=s3_region
             )
-            stored = int(grid.sum())
-            if stored != expected:
-                problems.append(f"{stored} stored chunk(s) != {expected} live chunk(s) in the coverage bitmap")
+            if grid.shape != expected_grid.shape:
+                problems.append(f"live chunk grid shape {grid.shape} != coverage bitmap's {expected_grid.shape}")
+            elif not np.array_equal(grid, expected_grid):
+                missing = int((expected_grid & ~grid).sum())
+                unexpected = int((grid & ~expected_grid).sum())
+                problems.append(
+                    f"live chunk grid misplaced vs the coverage bitmap: {missing} live chunk(s) not stored, "
+                    f"{unexpected} stored chunk(s) not live ({int(grid.sum())} stored, "
+                    f"{int(expected_grid.sum())} live)"
+                )
     return problems

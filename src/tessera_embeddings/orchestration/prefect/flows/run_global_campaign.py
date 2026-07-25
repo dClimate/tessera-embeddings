@@ -102,6 +102,18 @@ def _mosaic_identity(
     read — either would let stale staged tiles resume against a rebuilt mosaic.
     Genuinely-absent stores (missing repo / not found) are skipped.
 
+    SCOPE: this pins the inputs at RESUME time, not at read time. The tip is
+    sampled once, here, while the fill's actors later open each mosaic from the
+    moving ``main``. So it answers "have the inputs changed since the last
+    attempt?" — the retry question the staging prefix exists for — and NOT "did
+    the inputs hold still while this attempt ran?". Nothing in the pipeline
+    writes a mosaic during its own fill (ingest for a cell completes before that
+    cell dispatches, mosaics are per-(zone,year), and cleanup runs after), so the
+    remaining window needs an out-of-band writer committing mid-fill. Closing it
+    would mean threading these snapshot IDs through the fill parameters into every
+    actor store open so reads are pinned too; until then, do not read this
+    function as a guarantee that a fill saw one consistent mosaic revision.
+
     Only the ACTIVE orbit set is fingerprinted (reflectance +
     ``_active_orbits(s1_orbit)``): the fill reads only those, so an inactive
     opposite-orbit store that happens to be present (a stale/markerless
@@ -451,6 +463,12 @@ async def run_global_campaign(
         raise ValueError(f"max_parallel_zones must be >= 1, got {max_parallel_zones} (Semaphore(0) blocks forever)")
     if max_parallel_ingest < 1:
         raise ValueError(f"max_parallel_ingest must be >= 1, got {max_parallel_ingest} (Semaphore(0) blocks forever)")
+    # Checked HERE, not left to run_inference: the child validates only after both fill
+    # strategies have entered ray_cluster, and the chained strategy has primed its
+    # look-ahead ingests first. A typo would otherwise buy a Ray head and a round of
+    # multi-hour ingests before failing deterministically on a value known up front.
+    if num_actors < 1:
+        raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
     if fill_strategy not in ("cluster-per-zone", "chained-clusters"):
         raise ValueError(f"fill_strategy must be 'cluster-per-zone' or 'chained-clusters', got {fill_strategy!r}")
     campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS

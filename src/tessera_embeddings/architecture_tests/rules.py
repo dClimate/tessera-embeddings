@@ -125,7 +125,26 @@ def _is_allowed(rel: str, allowed_prefixes: Iterable[str]) -> bool:
     return any(rel.startswith(prefix) for prefix in allowed_prefixes)
 
 
-def _scan_file(path: Path, rel: str, rules: Iterable[Rule]) -> list[Violation]:
+def _resolved_module(node: ast.ImportFrom, rel: str, package: str) -> str | None:
+    """The absolute dotted module an ``ImportFrom`` names, resolving relative levels.
+
+    ``node.module`` alone is the text after the dots, so a package-relative
+    ``from ..profiling.ingest.watch import main`` reports ``profiling.ingest.watch``
+    and matches no absolute forbidden prefix — the rule silently passes on an import
+    that does exactly what it forbids. Level 1 is the file's own package; each extra
+    level walks one parent up. Returns ``None`` for a relative import that climbs out
+    of the scanned tree, which we cannot attribute to a package name.
+    """
+    if not node.level:
+        return node.module
+    parts = [package, *rel.split("/")[:-1]]
+    if node.level - 1 > len(parts) - 1:
+        return None
+    base = parts[: len(parts) - (node.level - 1)]
+    return ".".join([*base, node.module]) if node.module else ".".join(base)
+
+
+def _scan_file(path: Path, rel: str, package: str, rules: Iterable[Rule]) -> list[Violation]:
     """Scan one file against every rule and return any violations."""
     try:
         tree = ast.parse(path.read_text())
@@ -137,13 +156,13 @@ def _scan_file(path: Path, rel: str, rules: Iterable[Rule]) -> list[Violation]:
         for rule in rules:
             if _is_allowed(rel, rule.allowed_path_prefixes):
                 continue
-            v = _check_node(node, rule, path)
+            v = _check_node(node, rule, path, rel, package)
             if v is not None:
                 violations.append(v)
     return violations
 
 
-def _check_node(node: ast.AST, rule: Rule, path: Path) -> Violation | None:
+def _check_node(node: ast.AST, rule: Rule, path: Path, rel: str, package: str) -> Violation | None:
     """Return a Violation if ``node`` violates ``rule``, else ``None``."""
     if rule.forbidden_import_prefix is not None:
         prefix = rule.forbidden_import_prefix
@@ -156,17 +175,15 @@ def _check_node(node: ast.AST, rule: Rule, path: Path) -> Violation | None:
                         lineno=node.lineno,
                         detail=f"import {alias.name}",
                     )
-        elif (
-            isinstance(node, ast.ImportFrom)
-            and node.module
-            and (node.module == prefix or node.module.startswith(f"{prefix}."))
-        ):
-            return Violation(
-                rule=rule.name,
-                path=path,
-                lineno=node.lineno,
-                detail=f"from {node.module}",
-            )
+        elif isinstance(node, ast.ImportFrom):
+            module = _resolved_module(node, rel, package)
+            if module is not None and (module == prefix or module.startswith(f"{prefix}.")):
+                return Violation(
+                    rule=rule.name,
+                    path=path,
+                    lineno=node.lineno,
+                    detail=f"from {'.' * node.level}{node.module or ''}" + (f" ({module})" if node.level else ""),
+                )
 
     if rule.forbidden_call_names and isinstance(node, ast.Call):
         fn = node.func
@@ -221,7 +238,7 @@ def run(
     violations: list[Violation] = []
     for path in sorted(source_path.rglob("*.py")):
         rel = _path_to_subtree(source_path, path)
-        violations.extend(_scan_file(path, rel, expanded_rules))
+        violations.extend(_scan_file(path, rel, source_path.name, expanded_rules))
 
     violations.sort(key=lambda v: (str(v.path), v.lineno))
     return violations

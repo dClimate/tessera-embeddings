@@ -20,8 +20,6 @@ from __future__ import annotations
 
 import logging
 
-from tessera_embeddings.providers.aws.dask import stop_ecs_tasks_by_tag
-
 #: Tag key stamped on every ECS resource a flow's Dask cluster creates.
 DASK_FLOW_RUN_TAG = "tessera-flow-run-id"
 
@@ -42,4 +40,22 @@ def dask_cleanup_on_cancellation(flow: object, flow_run: object, state: object) 
         log.warning("No flow-run id on the cancellation hook — cannot sweep ECS tasks.")
         return
     log.warning("Flow cancelled/crashed — sweeping ECS tasks for run %s", run_id)
-    stop_ecs_tasks_by_tag(DASK_FLOW_RUN_TAG, str(run_id), log=log)
+    _stop_ecs_tasks_by_tag(DASK_FLOW_RUN_TAG, str(run_id), log=log)
+
+
+def _stop_ecs_tasks_by_tag(tag_key: str, tag_value: str, *, log: logging.Logger) -> None:
+    """Lazy-import wrapper over the AWS provider's ECS sweep.
+
+    Deferred, NOT imported at module scope: both ingest flows import this module
+    unconditionally, and ``providers.aws.dask`` pulls in ``dask-cloudprovider`` and
+    ``psutil`` from the ``aws`` extra. A module-scope import therefore makes a
+    supported ``tessera_embeddings[prefect]`` install unable to so much as IMPORT the
+    ingest flows — including to run them with ``use_local=True`` or a non-AWS
+    provider, which need no AWS packages at all. Deferring it keeps the flows
+    importable everywhere and costs an import only on the AWS teardown path, where a
+    cluster is being swept anyway. Same pattern as ``run_global_campaign``'s
+    ``_resolve_code_identity``.
+    """
+    from tessera_embeddings.providers.aws.dask import stop_ecs_tasks_by_tag
+
+    stop_ecs_tasks_by_tag(tag_key, tag_value, log=log)

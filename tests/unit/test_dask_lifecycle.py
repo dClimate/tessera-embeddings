@@ -28,14 +28,14 @@ def test_both_ingest_flows_register_the_hook_for_both_terminal_states():
 def test_hook_sweeps_by_the_flow_runs_tag(monkeypatch):
     """The sweep is derived from nothing but flow_run.id — fresh-import safe."""
     calls: list = []
-    monkeypatch.setattr(mod, "stop_ecs_tasks_by_tag", lambda k, v, *, log: calls.append((k, v)))
+    monkeypatch.setattr(mod, "_stop_ecs_tasks_by_tag", lambda k, v, *, log: calls.append((k, v)))
     mod.dask_cleanup_on_cancellation(None, SimpleNamespace(id="run-123"), None)
     assert calls == [(mod.DASK_FLOW_RUN_TAG, "run-123")]
 
 
 def test_hook_without_a_run_id_is_a_noop(monkeypatch, caplog):
     calls: list = []
-    monkeypatch.setattr(mod, "stop_ecs_tasks_by_tag", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(mod, "_stop_ecs_tasks_by_tag", lambda *a, **k: calls.append(a))
     with caplog.at_level(logging.WARNING):
         mod.dask_cleanup_on_cancellation(None, SimpleNamespace(), None)
     assert calls == []

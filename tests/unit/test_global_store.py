@@ -141,6 +141,30 @@ def test_reseed_with_different_axis_rejected(tmp_path):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,))
 
 
+def test_reseed_with_different_shard_geometry_rejected(tmp_path):
+    """Layout is fixed across groups for the same reason the axis is.
+
+    `plan_zone_inference` pins the inference tile to the group's shard pitch, so zones
+    seeded at a different pitch are unfillable — and they are only rejected at fill
+    time, long after seeding committed them. Refuse the mixed seed instead.
+    """
+    import dataclasses
+
+    from tessera_embeddings.config.store_layout import GLOBAL
+
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+    global_store.seed_zone_groups(repo, [_ZB], years=(2025,))  # same layout: fine
+
+    emb = GLOBAL.arrays["embeddings"]
+    halved = dataclasses.replace(
+        GLOBAL, arrays={**GLOBAL.arrays, "embeddings": dataclasses.replace(emb, shards=(1, 1024, 1024, EMBEDDING_DIM))}
+    )
+    with pytest.raises(ValueError, match="cannot mix shard geometries"):
+        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), layout=halved)
+
+
 def test_global_store_config_has_time_split_and_preload():
     cfg = zarr_store.global_store_config()
     assert cfg.manifest is not None

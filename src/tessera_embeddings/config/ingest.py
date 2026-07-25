@@ -93,8 +93,12 @@ class IngestSettings(BaseModel):
     # Dask worker bounds for one (zone, year) ingest.
     min_workers: int = Field(default=1, ge=1)
     max_workers: int = Field(default=50, ge=1)
-    # S2 per-solar-day keep threshold (percent; see DEFAULT_MIN_VALID_COVERAGE).
-    min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE
+    # S2 per-solar-day keep threshold (PERCENT, so 0-100; see
+    # DEFAULT_MIN_VALID_COVERAGE). Bounded, not just typed: a negative threshold is
+    # satisfied by every date including one with zero valid pixels, which then counts
+    # toward the month-presence gate and lets an empty year be filled and permanently
+    # tagged complete. Above 100 nothing is ever kept.
+    min_valid_coverage: float = Field(default=DEFAULT_MIN_VALID_COVERAGE, ge=0.0, le=100.0)
     # S1 CMR query batch window, in days. Must be >= 1: the S1 loop advances
     # batch_start by this much, so 0 never advances (an ingest cluster billing
     # forever) and a negative walks it backwards.

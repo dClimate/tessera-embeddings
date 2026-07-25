@@ -92,9 +92,17 @@ def _probe_marker(store_path: str, *, get_credentials: _Creds, s3_region: str | 
     conflating it with a missing repo would let one unreadable store trip the
     clear-and-rebuild branch and delete a valid mosaic (or ingest over unknown
     data). Only a genuinely-missing repo reports ``(False, None)``.
+
+    A ROOTLESS repo — created, then crashed before its schema was committed —
+    reports ``(True, None)``: present and unmarked, so the caller clears the
+    prefix and rebuilds. It must be caught BEFORE ``FileNotFoundError``, which
+    ``GroupNotFoundError`` subclasses; reporting it absent skips that cleanup and
+    every retry then fails creating a repo over the occupied prefix.
     """
     try:
         root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
+    except zarr.errors.GroupNotFoundError:
+        return (True, None)
     except FileNotFoundError:
         return (False, None)
     except icechunk.IcechunkError as exc:

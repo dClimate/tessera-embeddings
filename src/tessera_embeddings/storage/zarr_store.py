@@ -835,12 +835,20 @@ def open_store_group_and_tip(
     time?" should key on it rather than on attrs a writer is trusted to update.
     Both come from ONE repo open, so asking for the tip costs no extra round
     trip over opening the group alone.
+
+    The session is opened AT ``tip``, not at ``branch`` — the two must describe
+    the same bytes or the pair is worse than useless. Resolving the tip and then
+    opening the branch separately lets a commit land between them, returning
+    content from the NEW snapshot labelled with the OLD id; a caller using the
+    pair to decide "same inputs as last time?" would then read fresh data under
+    a stale identity, which is precisely the confusion the snapshot is here to
+    prevent.
     """
     repo = _open_repo(
         store_path, max_concurrent_requests=max_concurrent_requests, get_credentials=get_credentials, region=region
     )
     tip = repo.lookup_branch(branch)
-    session = repo.readonly_session(branch=branch)
+    session = repo.readonly_session(snapshot_id=tip)
     root = zarr.open_group(session.store, mode="r")
     if group is None:
         return root, tip
@@ -1158,7 +1166,13 @@ def write_day_windows(
             # so the probe above and every write below would honour a callback or a
             # non-default region while the one-time seed silently did not — failing
             # the first cropped date of any such deployment.
-            repo=_create_repo(store_path, get_credentials=get_credentials, region=s3_region),
+            #
+            # open_or_create, NOT create: the probe above fires for a MISSING repo and
+            # for an existing-but-ROOTLESS one alike (GroupNotFoundError subclasses
+            # FileNotFoundError). Creating unconditionally would hit Icechunk's
+            # clean-prefix rule on the rootless case and raise CorruptedStoreError on
+            # every retry — wedging exactly the crash window this recovery exists for.
+            repo=open_or_create_repo(store_path, get_credentials=get_credentials, region=s3_region)[0],
         )
 
     with batched_region_writes(

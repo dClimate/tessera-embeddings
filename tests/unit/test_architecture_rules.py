@@ -84,6 +84,36 @@ def test_library_code_may_not_import_the_profiling_subpackage(tmp_path: Path) ->
     ]
 
 
+def test_relative_imports_are_resolved_before_matching(tmp_path: Path) -> None:
+    """A package-relative import of profiling/ is flagged like an absolute one.
+
+    ``ast.ImportFrom.module`` holds only the text after the dots, so
+    ``from ..profiling.ingest import report`` reports ``profiling.ingest`` and matches
+    no absolute prefix. Unresolved, the rule passes on an import doing exactly what it
+    forbids — pulling module-scope boto3 into a base install. The scan resolves the
+    level against the file's own package first; the detail shows both forms.
+    """
+    pkg = tmp_path / "tessera_embeddings"  # the rule's prefix is package-qualified
+    _write(pkg / "inference" / "actors.py", "from ..profiling.ingest import report\n")
+    violations = [v for v in run(pkg) if v.rule == "no-profiling-imports-outside-profiling"]
+    assert len(violations) == 1
+    assert violations[0].path.name == "actors.py"
+    assert "tessera_embeddings.profiling.ingest" in violations[0].detail
+
+    # Still allowed within profiling/ — the tools import each other relatively too.
+    _write(pkg / "profiling" / "ingest" / "report.py", "from .. import _cloudwatch\n")
+    assert not [
+        v for v in run(pkg) if v.rule == "no-profiling-imports-outside-profiling" and v.path.name == "report.py"
+    ]
+
+
+def test_relative_import_climbing_out_of_the_tree_is_not_attributed(tmp_path: Path) -> None:
+    """A relative import above the scanned root names no package we can judge."""
+    pkg = tmp_path / "tessera_embeddings"
+    _write(pkg / "domain.py", "from ...elsewhere import thing\n")
+    assert [v for v in run(pkg) if v.rule != "parse-error"] == []
+
+
 def test_extra_allowed_paths_extend_per_rule(tmp_path: Path) -> None:
     """``extra_allowed_paths`` permits the import in additional subtrees."""
     _write(tmp_path / "yield_modeling" / "iac.py", "import boto3\n")

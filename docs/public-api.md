@@ -19,7 +19,9 @@ CI verifies that the names listed here match `tessera_embeddings.__all__`.
   `"Month YYYY"` strings.
 - `checkpoint_filename(norm_source: str = "aws") -> str` — canonical
   filename for the bundled model checkpoints (`"aws"` or `"mpc"`).
-- `INFERENCE_CHUNK_SIZE` — pixel size of one spatial chunk (2048).
+- `INFERENCE_CHUNK_SIZE` — pixel size of one spatial inference tile (2000).
+  Chosen to divide the single-ROI output's 500-px chunks; the global campaign
+  passes 2048 explicitly to match its shard grid.
 - `EMBEDDING_DIM` — output dimension of one Tessera embedding (128).
 
 ## Errors

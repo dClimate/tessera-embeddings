@@ -119,6 +119,36 @@ def _get_collection_config(
     return provider.collections[collection_alias]
 
 
+def split_antimeridian_bbox(
+    bbox: tuple[float, float, float, float] | None,
+) -> list[tuple[float, float, float, float] | None]:
+    """Split an antimeridian-crossing bbox into catalog-safe halves.
+
+    A ``west > east`` box is the GeoJSON/STAC convention for "crosses +/-180",
+    which :func:`~tessera_embeddings.ingest.land_mask._live_tile_bbox_wgs84`
+    emits for the UTM zones that snap just past the antimeridian (zones 01 and 60) —
+    without it, plain min/max would produce a box spanning nearly the globe.
+
+    Forwarding that tuple to a catalog search is a gamble on the server reading
+    it as a crossing rather than as an empty or globe-spanning range, and the
+    two failure modes are opposite: no dates at all, or an unbounded item set.
+    Splitting at +/-180 into two ordinary west-to-east boxes is correct either
+    way, so this does not depend on any server's interpretation. The native
+    CMR/S1 path already does this (``opera_query._query_cmr_granules``, where
+    CMR is known to reject the crossing form); this is the STAC counterpart, and
+    it is deliberately at the shared query chokepoint so the single-ROI and
+    campaign paths, streamed and unstreamed, all get it.
+
+    Returns a single-element list for an ordinary (or absent) bbox, so callers
+    loop unconditionally.
+    """
+    if bbox is None or bbox[0] <= bbox[2]:
+        return [bbox]
+    west, south, east, north = bbox
+    logger.info("Antimeridian bbox %s split into (%s..180) and (-180..%s)", bbox, west, east)
+    return [(west, south, 180.0, north), (-180.0, south, east, north)]
+
+
 def _build_stac_query(
     collection_config: CollectionConfig,
     tile_id: str | None,
@@ -478,15 +508,23 @@ def _query_stac_items(
     if item_provider_fn is not None:
         return item_provider_fn()
 
-    query_params = _build_stac_query(collection_config, tile_id, start_date, end_date, bbox=bbox)
-
     t0 = time.monotonic()
     logger.info(f"Opening STAC catalog: {provider.catalog_url}")
     stac_io = StacApiIO(max_retries=_STAC_RETRY, timeout=_STAC_TIMEOUT)
     client = Client.open(provider.catalog_url, stac_io=stac_io)
     logger.info(f"STAC catalog opened in {time.monotonic() - t0:.1f}s, executing search")
-    search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
-    items = list(search.items())
+
+    items: list[Any] = []
+    seen: set[str] = set()
+    for sub_bbox in split_antimeridian_bbox(bbox):
+        query_params = _build_stac_query(collection_config, tile_id, start_date, end_date, bbox=sub_bbox)
+        search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
+        for item in search.items():
+            # Dedupe across the two halves: a granule straddling +/-180 is returned by
+            # both searches, and loading it twice would double-count the solar day.
+            if item.id not in seen:
+                seen.add(item.id)
+                items.append(item)
     logger.info(f"STAC query returned {len(items)} items in {time.monotonic() - t0:.1f}s total")
 
     return items

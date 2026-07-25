@@ -36,6 +36,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
+from typing import cast
 
 import fsspec
 import numpy as np
@@ -329,7 +330,9 @@ def coarsen_live_grid(live: np.ndarray, factor: int) -> np.ndarray:
     r_pad, c_pad = math.ceil(rows / factor) * factor, math.ceil(cols / factor) * factor
     padded = np.zeros((r_pad, c_pad), dtype=bool)
     padded[:rows, :cols] = live
-    return padded.reshape(r_pad // factor, factor, c_pad // factor, factor).any(axis=(1, 3))
+    # cast: np.any is typed as possibly-scalar, but a tuple axis over a 4-D array
+    # always yields a 2-D array.
+    return cast("np.ndarray", padded.reshape(r_pad // factor, factor, c_pad // factor, factor).any(axis=(1, 3)))
 
 
 def live_windows_for_mask(

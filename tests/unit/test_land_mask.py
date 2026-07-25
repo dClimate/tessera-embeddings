@@ -391,6 +391,32 @@ def test_validate_zone_roi_accepts_freshly_exported(tmp_path) -> None:
     assert land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest) == []
 
 
+def test_validate_zone_roi_catches_misplaced_land_at_an_equal_count(tmp_path) -> None:
+    """Count-only validation is blind to the error this gate exists to catch.
+
+    Swap one live chunk for a dead one and the totals still match, so a mask with
+    land in the wrong part of the zone passes a sum check. Positions are compared
+    against the coverage bitmap coarsened to ingest chunks.
+    """
+    zone = "31N"
+    tiles_per_chunk = land_mask.INGEST_CHUNK_SIZE // SHARD_PX
+    cov = _make_coverage(tmp_path, zone, [(0, 0), (4 * tiles_per_chunk, 3 * tiles_per_chunk)])
+    dest = str(tmp_path / "roi.zarr")
+    land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
+    assert land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest) == []
+
+    # Move one stored chunk object to a block the bitmap says is ocean: same count,
+    # wrong ground position.
+    root = pathlib.Path(dest) / "c"
+    src_chunk = next(f for f in root.rglob("*") if f.is_file() and f.parent.name != "0")
+    moved = root / "9" / "9"
+    moved.parent.mkdir(parents=True, exist_ok=True)
+    src_chunk.rename(moved)
+
+    problems = land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest)
+    assert any("misplaced" in p for p in problems), problems
+
+
 def test_validate_zone_roi_reports_absent_mask(tmp_path) -> None:
     cov = _make_coverage(tmp_path, "31N", [(10, 5)])
     problems = land_mask.validate_zone_roi("31N", land_mask_path=cov, roi_path=str(tmp_path / "missing.zarr"))

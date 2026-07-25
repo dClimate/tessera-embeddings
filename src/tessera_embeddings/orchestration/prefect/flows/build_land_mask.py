@@ -54,7 +54,9 @@ def build_land_mask(
         name: Coverage repo basename (default ``"global"``).
         registry_uri: Registry file URI; defaults to ``{delivery_uri}/registry.txt``.
         delivery_uri: Partner delivery prefix.
-        zones: Restrict to these EPSG strings (default: all 120).
+        zones: Restrict to these UTM common names, e.g. ``["33N", "07S"]``
+            (default: all 120). NOT EPSG codes — ``zone_grid.zone()`` keys on
+            the common name and an ``"EPSG:32633"`` here raises ``KeyError``.
         verify: When True, reconcile the registry against the bucket and
             spot-check delivery tiles *before* building (guards the all-1s
             assumption the design rests on).

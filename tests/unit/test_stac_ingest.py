@@ -19,7 +19,9 @@ from tessera_embeddings.ingest.stac import (
     _filter_existing_dates,
     _get_collection_config,
     _get_provider_config,
+    _query_stac_items,
     ingest_tile,
+    split_antimeridian_bbox,
 )
 
 
@@ -528,3 +530,59 @@ class TestBuildStacQueryBboxFallback:
         assert "query" in query
         assert "bbox" not in query
         assert query["query"]["grid:code"]["eq"] == "MGRS-33UUP"
+
+
+class TestAntimeridianBboxSplit:
+    """Zones 01 and 60 emit a west>east bbox; the catalog search must not see it.
+
+    The land mask writes the GeoJSON/STAC crossing convention (west > east) for the
+    UTM zones that snap just past +/-180, because plain min/max there would produce a
+    box spanning nearly the globe. Sending that tuple to a catalog is a bet on the
+    server reading it as a crossing; the two ways that bet loses are opposite — no
+    dates at all, or an unbounded item set — so the query is split instead.
+    """
+
+    def test_ordinary_bbox_is_passed_through_untouched(self):
+        bbox = (-95.0, 45.0, -94.0, 46.0)
+        assert split_antimeridian_bbox(bbox) == [bbox]
+
+    def test_absent_bbox_still_yields_one_query(self):
+        # Tile-id queries carry no bbox; callers loop over the result unconditionally.
+        assert split_antimeridian_bbox(None) == [None]
+
+    def test_crossing_bbox_splits_at_the_antimeridian(self):
+        assert split_antimeridian_bbox((179.5, -18.0, -179.5, -16.0)) == [
+            (179.5, -18.0, 180.0, -16.0),
+            (-180.0, -18.0, -179.5, -16.0),
+        ]
+
+    def test_query_runs_both_halves_and_dedupes_straddling_items(self, monkeypatch):
+        """A granule crossing +/-180 is returned by BOTH searches — load it once."""
+        searched: list = []
+
+        class _Item:
+            def __init__(self, id_):
+                self.id = id_
+
+        class _Search:
+            def __init__(self, ids):
+                self._ids = ids
+
+            def items(self):
+                return [_Item(i) for i in self._ids]
+
+        class _Client:
+            def search(self, **kw):
+                searched.append(kw["bbox"])
+                # The straddling granule "S" comes back from each half.
+                return _Search(["S", "E"] if kw["bbox"][2] == 180.0 else ["S", "W"])
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac.Client.open", lambda *a, **k: _Client())
+        config = _get_collection_config("earth-search", "sentinel-2-l2a")
+        provider = _get_provider_config("earth-search")
+        items = _query_stac_items(
+            provider, config, None, "2024-01-01", "2024-01-31", bbox=(179.5, -18.0, -179.5, -16.0)
+        )
+
+        assert searched == [(179.5, -18.0, 180.0, -16.0), (-180.0, -18.0, -179.5, -16.0)]
+        assert [i.id for i in items] == ["S", "E", "W"]
