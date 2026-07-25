@@ -310,9 +310,8 @@ class TestSchedulerResourceLogger:
     def test_unreadable_worker_state_costs_only_the_fleet_fields(self, caplog) -> None:
         """A WorkerState without ``memory`` must not take the heartbeat with it.
 
-        The scheduler-side signals are the ones that have always been there; a
-        distributed upgrade that moves worker memory must degrade the four new
-        numbers to unknown, not blank the line the operator diagnoses from.
+        A distributed upgrade that moves worker memory should degrade the four
+        fleet numbers to unknown, not blank the line the operator diagnoses from.
         """
         plugin = self._make_started()
         sched = _FakeScheduler(workers_processing=[3, 4], tasks=42, unrunnable=7)  # no memory attr

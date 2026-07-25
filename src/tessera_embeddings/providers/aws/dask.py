@@ -123,18 +123,15 @@ class SchedulerResourceLogger(SchedulerPlugin):
     - ``workers`` / ``tasks`` — cluster size and total tracked tasks, with a
       breakdown of tasks in flight (``processing``) and stuck waiting
       (``no-worker``) — a rising backlog signals the scheduler falling behind.
-    - ``wmem`` / ``wmanaged`` / ``wspill`` / ``wmax`` — FLEET memory, summed from
-      the per-worker state the scheduler already tracks, plus the hottest single
-      worker. Deliberately not scheduler health: it is a SECOND failure mode,
-      independent of everything above. The first real campaign cell died of
-      *worker* memory pressure — ~1 TB across resident and spilled, a death
-      spiral of kills and recomputes — while every scheduler signal stayed
-      nominal, so a scheduler-only heartbeat could not explain the failure it
-      was watching. ``wspill`` is the leading indicator: spill means the graph
-      no longer fits the fleet, and it precedes the kills rather than following
-      them. These lines do not displace the scheduler metrics — a fleet that
-      fits is the PRECONDITION for the scheduler reading to mean anything,
-      since a run that dies of worker memory never reaches a scheduler limit.
+    - ``wmem`` / ``wmanaged`` / ``wspill`` / ``wmax`` — FLEET memory, summed
+      across workers from the per-worker state the scheduler already tracks, plus
+      the hottest single worker (a sum alone cannot distinguish an even fleet from
+      one worker holding the graph). Deliberately not scheduler health: worker
+      memory is a second failure mode, independent of every signal above, and a
+      run can die of it with the scheduler entirely nominal. ``wspill`` is the
+      leading indicator — spill means the graph no longer fits the fleet, and it
+      precedes worker kills rather than following them. A fleet that fits is the
+      precondition for the scheduler metrics to mean anything at all.
 
     When ``cpu`` or ``lag`` crosses the stack-sampling thresholds, a one-shot
     background thread additionally logs a ``scheduler stack sample`` line: a

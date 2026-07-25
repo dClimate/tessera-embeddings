@@ -1,27 +1,20 @@
 """Watch and profile the Dask *scheduler* during an ingest run.
 
 The ingest scheduler is a single event-loop process that builds every task graph
-and routes every task, and it stays the named saturation risk at UTM scale: one
-GIL-bound loop fanning work across many hundreds of workers is a genuine single
-point of failure, and it has bottlenecked before from ~250 workers on. Watching
-it is the primary job here. :class:`SchedulerResourceLogger`
+and routes every task, which makes it the named saturation risk at UTM scale: one
+GIL-bound loop fanning work across many hundreds of workers is a real single point
+of failure, and it has bottlenecked from ~250 workers on. Watching it is the
+primary job here. :class:`SchedulerResourceLogger`
 (``tessera_embeddings.providers.aws.dask``) ships a 30 s ``scheduler health:``
-heartbeat to the ``dask-scheduler`` CloudWatch stream.
+heartbeat to the ``dask-scheduler`` CloudWatch stream, which additionally carries
+FLEET memory (``wmem``/``wmanaged``/``wspill``/``wmax``).
 
-There is a SECOND, independent failure mode, which the first real campaign cell
-found: the fleet ran out of memory — roughly a terabyte across resident and
-spilled, workers killed and their completed work recomputed — while every
-scheduler signal stayed nominal. That run never got near a scheduler limit
-because it hit the memory wall first, which is also why it could not have
-measured one. So the heartbeat additionally carries FLEET memory
-(``wmem``/``wmanaged``/``wspill``/``wmax``, summed from the per-worker state the
-scheduler already tracks) and this tool alerts on ``worker-spill``.
-
-The two sets answer different questions and neither substitutes for the other:
-the scheduler metrics answer "is the scheduler keeping up?", which is what a
-high-worker-count rung is built to probe; the fleet metrics answer "does the
-graph fit the cluster at all?", which must be clean *first*, or the scheduler
-reading is measuring a doomed run rather than an envelope.
+The two metric sets answer different questions and neither substitutes for the
+other. Scheduler metrics answer "is the scheduler keeping up?" — what a
+high-worker-count rung exists to probe. Fleet metrics answer "does the graph fit
+the cluster at all?", and must be clean FIRST: a run that dies of worker memory
+never reaches a scheduler limit, so its scheduler numbers describe a doomed run
+rather than an envelope. Hence the ``worker-spill`` alert.
 
 This tool turns that heartbeat into something a machine can act on:
 
@@ -118,10 +111,9 @@ class Thresholds:
     # Worker-count change between two samples that counts as a churn spike.
     churn_delta: int = 25
     # Fleet bytes spilled to disk, summed across workers, in a single sample.
-    # Spill means the graph no longer fits the fleet, and it is what preceded the
-    # worker death spiral on the first campaign cell — while every scheduler-side
-    # metric above stayed nominal. A healthy ingest spills nothing, so the default
-    # sits just above zero rather than at a fraction of some limit.
+    # Spill means the graph no longer fits the fleet. A healthy ingest spills
+    # nothing, so the default sits just above zero rather than at a fraction of
+    # some limit.
     spill_gib: float = 1.0
 
 
@@ -132,10 +124,9 @@ class Thresholds:
 # mem may be "nan" when the container limit is unknown; counts may be -1 when
 # the scheduler ref is briefly unavailable. Parse defensively.
 #
-# The fleet-memory tail is OPTIONAL in the pattern on purpose: it was added after
-# runs had already been profiled, and `--report` is routinely pointed at those
-# older windows. Making it required would silently return zero samples for every
-# historical run rather than the scheduler-only series they legitimately contain.
+# The fleet-memory tail is OPTIONAL on purpose: `--report` is routinely pointed at
+# windows profiled before it existed, and requiring it would return zero samples
+# for those runs instead of the scheduler-only series they legitimately contain.
 _NUM = r"-?\d+(?:\.\d+)?"
 _HEALTH_RE = re.compile(
     rf"scheduler health: cpu=(?P<cpu>{_NUM})% rss=(?P<rss>{_NUM})GiB "
@@ -240,9 +231,8 @@ def evaluate_alerts(window: list[dict], thresholds: Thresholds) -> list[str]:
     if len(window) >= 2 and abs(latest["workers"] - window[-2]["workers"]) >= thresholds.churn_delta:
         alerts.append("worker-churn")
 
-    # fleet spill: single sample over the threshold. Listed last but it is the
-    # earliest warning of the worker-memory failure mode — and an unknown value
-    # (older log line) never trips, exactly like mem-high.
+    # fleet spill: single sample over the threshold. An unknown value (a log line
+    # without the fleet tail) never trips, exactly like mem-high.
     spill = latest.get("worker_spill_gib")
     if spill is not None and spill >= thresholds.spill_gib:
         alerts.append("worker-spill")

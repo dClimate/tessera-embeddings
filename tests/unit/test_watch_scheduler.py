@@ -54,11 +54,10 @@ def test_parse_health_line_full():
 
 
 def test_parse_health_line_without_fleet_memory_still_parses():
-    """A pre-change log line yields the same keys, with the fleet ones None.
+    """A line without the fleet tail yields the same keys, with those ones None.
 
-    The alternative — requiring the tail — would make ``--report`` return zero
-    samples for every already-profiled run instead of the scheduler-only series
-    it genuinely contains.
+    Requiring the tail would make ``--report`` return zero samples for runs
+    profiled before it existed, rather than their scheduler-only series.
     """
     s = ws.parse_health_line(_HEALTHY_NO_FLEET)
     assert s is not None
@@ -189,10 +188,9 @@ def test_alert_worker_spill():
 
 
 def test_spill_trips_while_every_scheduler_signal_is_nominal():
-    """The 03S signature: healthy scheduler, fleet drowning.
+    """Healthy scheduler, drowning fleet — the case scheduler-only metrics call fine.
 
-    This is the case a scheduler-only heartbeat reported as fine, so it is the
-    one worth pinning: the ONLY alert must be worker-spill.
+    The only alert must be worker-spill.
     """
     nominal_but_spilling = _sample(cpu=15.0, mem=12.0, lag=0.0, no_worker=0, worker_spill_gib=468.0)
     assert ws.evaluate_alerts([nominal_but_spilling], ws.Thresholds()) == ["worker-spill"]
