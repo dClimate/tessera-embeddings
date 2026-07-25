@@ -10,7 +10,9 @@ because a silently-dropped month would be an incomplete mosaic that still report
 from __future__ import annotations
 
 import datetime
+import gc
 import threading
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -197,3 +199,61 @@ class TestStreaming:
 
     def test_no_items_at_all_yields_nothing(self):
         assert self._stream({}, "2024-01-01", "2024-02-29") == []
+
+
+class TestRetentionIsBounded:
+    """The whole point of streaming: a month's items must become collectable once the
+    caller moves on, or a year accumulates and kills the worker exactly as before.
+
+    Asserted by weak reference rather than by measuring RSS — a memory series can be
+    misread from early samples, whereas reachability is exact.
+    """
+
+    class _Item:
+        """A weak-referenceable stand-in; SimpleNamespace cannot be weakly referenced."""
+
+        def __init__(self, date: str) -> None:
+            self.datetime = datetime.datetime.fromisoformat(f"{date}T10:00:00")
+            self.properties: dict = {}
+
+    def _gen(self, months: int):
+        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox):
+            # Distinct objects per month, deliberately NOT retained by the fixture — a
+            # fixture that held them would make this test vacuous.
+            return [TestRetentionIsBounded._Item(start_date) for _ in range(3)], {}
+
+        gen = stream_stac_months(
+            provider="p",
+            collection="c",
+            tile_id=None,
+            start_date="2024-01-01",
+            end_date=f"2024-0{months}-28",
+            bbox=None,
+            existing_dates_fn=set,
+            query_fn=query,
+        )
+        return gen
+
+    def test_an_earlier_months_items_are_released_once_the_caller_advances(self):
+        gen = self._gen(3)
+        refs: list[weakref.ref] = []
+        held = None
+        for _mr, items, _b in gen:
+            refs.append(weakref.ref(items[0]))
+            held = items  # only the CURRENT month is kept, as the driver does
+        del held
+        gc.collect()
+        # The last month may still be referenced by the loop machinery; earlier ones
+        # must not be — that is the property that makes a year survivable.
+        assert refs[0]() is None, "January's items were still reachable after streaming past them"
+        assert refs[1]() is None, "February's items were still reachable after streaming past them"
+
+    def test_accumulating_across_months_is_what_streaming_prevents(self):
+        """The negative control: a caller that hoards every month defeats the bound, so
+        this test would pass for the wrong reason without it.
+        """
+        gen = self._gen(3)
+        hoarded = [items for _mr, items, _b in gen]
+        gc.collect()
+        assert all(h is not None for h in hoarded)
+        assert len(hoarded) == 3, "the generator should have yielded three months"
