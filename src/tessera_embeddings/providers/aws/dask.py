@@ -565,8 +565,10 @@ def log_dashboard_ssm_command(
     """Log a copy-pasteable SSM port-forward command for the Dask dashboard.
 
     The SSM target must point at the *scheduler* Fargate task (where the
-    dashboard runs). The caller supplies their own AWS profile via
-    ``--profile`` — it is deliberately not baked into the logged command.
+    dashboard runs). ``--region`` is filled in from the task ARN — the cluster's
+    actual region, so a caller whose default region differs doesn't get an
+    "instance not found" from SSM. ``--profile`` stays a placeholder: it is a
+    property of the caller's credentials, not of the cluster.
 
     Best-effort: if the scheduler task metadata isn't shaped as expected
     (e.g. an EC2 scheduler), logs a warning and returns without raising.
@@ -574,6 +576,8 @@ def log_dashboard_ssm_command(
     try:
         scheduler = cluster.scheduler
         cluster_name, task_id = scheduler.task_arn.rsplit("/", 2)[1:]
+        # arn:aws:ecs:<region>:<account>:task/<cluster>/<task-id>
+        region = scheduler.task_arn.split(":")[3]
         # The scheduler task has multiple containers (dask-scheduler plus
         # injected sidecars like the SSM/ECS-Exec guard); ordering isn't
         # stable, so look up by name.
@@ -590,6 +594,7 @@ def log_dashboard_ssm_command(
         f"  --target {ssm_target} \\\n"
         "  --document-name AWS-StartPortForwardingSessionToRemoteHost \\\n"
         '  --parameters \'{"host":["localhost"],"portNumber":["8787"],"localPortNumber":["8787"]}\' \\\n'
+        f"  --region {region} \\\n"
         "  --profile <your-aws-profile>\n\n"
         "Then open http://localhost:8787/status"
     )

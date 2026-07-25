@@ -17,6 +17,7 @@ import logging
 import pickle
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import cloudpickle
 import psutil
@@ -653,3 +654,36 @@ class TestStopEcsTasksByTag:
             n = dask_mod.stop_ecs_tasks_by_tag("k", "v", log=logging.getLogger("t"))
         assert n == 0  # the hook must never mask the flow's own terminal state
         assert any("ECS_CLUSTER_ARN" in r.getMessage() for r in caplog.records)
+
+
+class TestDashboardSsmCommand:
+    """The copy-pasteable port-forward command logged at cluster start."""
+
+    def _cluster(self, task_arn: str):
+        scheduler = SimpleNamespace(
+            task_arn=task_arn,
+            task={
+                "containers": [{"name": "sidecar", "runtimeId": "nope"}, {"name": "dask-scheduler", "runtimeId": "rt9"}]
+            },
+        )
+        return SimpleNamespace(scheduler=scheduler)
+
+    def test_region_comes_from_the_task_arn(self, caplog):
+        """--region is the CLUSTER's region, not the caller's default.
+
+        SSM resolves the target within one region, so a caller whose default
+        differs gets "instance not found" without it. The ARN already carries
+        the answer; --profile stays a placeholder because it belongs to the
+        caller's credentials, not the cluster.
+        """
+        cluster = self._cluster("arn:aws:ecs:eu-central-1:123456789012:task/my-cluster/abc123")
+        with caplog.at_level(logging.INFO):
+            dask_mod.log_dashboard_ssm_command(logging.getLogger("t"), cluster)
+        msg = caplog.records[-1].getMessage()
+        assert "--region eu-central-1 \\\n  --profile <your-aws-profile>" in msg
+        assert "--target ecs:my-cluster_abc123_rt9" in msg  # container looked up by name, not order
+
+    def test_unexpected_task_shape_warns_without_raising(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            dask_mod.log_dashboard_ssm_command(logging.getLogger("t"), SimpleNamespace(scheduler=None))
+        assert "Could not build SSM dashboard command" in caplog.records[-1].getMessage()
