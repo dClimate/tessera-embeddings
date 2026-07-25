@@ -12,6 +12,13 @@ Related notes: `ingest-live-tile-cropping.md` (why ingest crops at all, and how 
 derived), `ingest-graph-and-stac-budget.md` (the living working notes this summarises),
 `region-writes.md`, ADR-011 (campaign zone ingestion).
 
+**Maintaining this document.** It is the memory of record for this work: update it as findings
+land, and preserve the three-depth structure above all — headline table, then mechanism, then
+full detail. Corrections go **in place** with the superseded claim named (see §5), never as an
+appended log; a reader must be able to trust any section without checking whether a later one
+undoes it. New measurements belong in §8; failed attempts belong in §4 with their numbers, not
+deleted.
+
 **All wall-clock figures are the same cell** — zone `35N`, January 2024, 120-worker
 Dask-on-Fargate fleet (4 vCPU / 16 GiB each), the same frozen ROI mask — so the rows compare.
 Graph-task figures are from local census runs over a fixed pixel window; those compare within
