@@ -71,16 +71,23 @@ from tornado.ioloop import PeriodicCallback
 # Memory is sized for the ONE worker that runs the ingest task, not for the average
 # one. That worker holds the STAC query's retained items — the month being processed
 # plus the month prefetched behind it (``ingest.stac.stream_stac_months``) — on top of
-# its share of the per-date graph. At 16 GiB that combination spilled, and spill is a
-# hidden cost that has scaled badly in this stack; the extra memory is far cheaper
-# than the fleet time a spilling ingest wastes. Sized against a dense 6-degree zone,
-# whose months are the largest the campaign sees.
+# its share of the per-date graph. Every worker gets the same size, so this is paid
+# across the whole fleet to accommodate one of them: keep it as small as the ingest
+# worker safely allows rather than as large as the platform permits.
 #
-# 30720 is the CEILING for 4 vCPU on Fargate (8192-30720 MiB in 1024 steps), and the
-# vCPU stays at 4 deliberately: the Fargate quota is counted in vCPU, so memory is free
-# in quota terms while doubling the CPU would halve the workers a cell can run.
+# Sized to keep that worker clear of the PAUSE threshold, not to eliminate spill.
+# Spilling the retained items is close to free here, because they are exactly the
+# bytes not needed yet — the prefetched month goes untouched until the boundary, so
+# it is the ideal eviction candidate and the cost is one read-back per month. A
+# PAUSED worker is a different matter, and that is what the headroom buys. Sized
+# against a dense 6-degree zone, whose months are the largest the campaign sees.
+#
+# The vCPU stays at 4 deliberately: the Fargate quota is counted in vCPU, so doubling
+# the CPU would halve the workers a cell can run. Valid pairings for 4 vCPU are
+# 8192-30720 MiB in 1024 steps — the ceiling is available but is not worth buying
+# fleet-wide for one worker's working set.
 DEFAULT_INGEST_WORKER_CPU = 4096
-DEFAULT_INGEST_WORKER_MEM = 30720
+DEFAULT_INGEST_WORKER_MEM = 20480
 
 # Schedulers don't need much memory but benefit from a few cores so
 # graph construction and dashboard responsiveness stay smooth.

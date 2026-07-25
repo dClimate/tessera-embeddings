@@ -512,7 +512,7 @@ it — roughly 5 GB.
 | **parity vs one whole-window query, live earth-search, across a month boundary** | **12 dates, 13,024 items, identical date sets, zero per-date differences** |
 | **month partition and padding, live cluster** | **31,507 items in January, 1,084 correctly deferred to February** (one day's worth) |
 | **per-date cost unaffected by streaming** | **mean 173.8 s over 10 dates vs a 184.5 s baseline** — within noise |
-| two month transitions with direct submit-time query evidence | in progress on the 30 GiB build |
+| two month transitions with direct submit-time query evidence | one transition's PREFETCH proven (February's query submitted 13 ms after January's returned, complete before January's first date committed); the CONSUMPTION handoff was not reached before the run was cancelled — the year soak crosses eleven boundaries and covers it |
 | cumulative drift over hundreds of dates | outstanding — see below |
 
 **Retention is bounded to two months REGARDLESS of run length**, so a three-month run tests the
@@ -537,12 +537,33 @@ Measured, same zone/month/fleet:
 So the spill I originally attributed solely to removing the realignment has a second source. Both
 were real; the realignment revert stands on its own numbers.
 
-**Resolution: ingest worker memory raised 16 GiB → 30 GiB.** Sized for the ONE worker that runs
-the ingest task, since that is where the retained items live. 30720 MiB is the **ceiling for
-4 vCPU** on Fargate, and the vCPU deliberately stays at 4: the quota is counted in vCPU, so memory
-is free in quota terms while doubling CPU would halve the workers a cell can run (120 workers at
-8 vCPU would need 960 against a 512 allowance). An initial attempt at 32768 MiB was **invalid at
-4 vCPU** and caught before shipping.
+**Resolution: ingest worker memory 16 GiB → 30 GiB, later CORRECTED to 20 GiB.** Sized for the
+ONE worker that runs the ingest task, since that is where the retained items live. The vCPU
+deliberately stays at 4: the quota is counted in vCPU, so doubling CPU would halve the workers a
+cell can run (120 workers at 8 vCPU would need 960 against a 512 allowance). An initial attempt at
+32768 MiB was **invalid at 4 vCPU** and caught before shipping.
+
+**The 30 GiB figure was wrong, and the reasoning behind it was the error.** It reached for the
+4-vCPU ceiling to eliminate spill, on the assumption that spill is always a hidden cost worth
+paying to avoid. Two things make that false here:
+
+1. **Every worker gets the same size, so the fleet pays for one worker's working set.** 30 GiB
+   across a 120-worker cell over-provisions ~119 workers by 14 GiB each. Memory is free in *quota*
+   terms, which is what justified it — but it is not free in dollars, and that was not weighed.
+2. **The spill was measured to cost nothing.** Per-date mean was **173.8 s while spilling 1.25 GiB
+   at 16 GiB**, against **177.9 s with zero spill at 30 GiB** — the spilling configuration was
+   marginally *faster*. The reason is structural: the spilled bytes are precisely the bytes not
+   needed yet. The prefetched month goes untouched until the boundary, so it is the ideal eviction
+   candidate and the whole cost is one read-back per month.
+
+What the headroom actually needs to buy is distance from the **pause** threshold, not from the
+spill threshold — a paused worker is a real stall where a spilling one is not. Measured demand is
+~12.4 GiB, against a pause threshold of 0.8 × capacity. 16 GiB leaves ~0.4 GiB of margin, which is
+too thin; **20480 MiB leaves ~4 GiB** and recovers two-thirds of the over-provisioning.
+
+The structural fix, unimplemented: stop sizing a whole fleet for one worker's job. The ingest body
+runs on a Dask worker; were it to run somewhere with independent sizing — the flow runner is a
+single task — the cost of that memory would fall by the width of the fleet.
 
 **A test-design correction worth keeping:** a one-month run validates nothing here. One month is
 a single slice — no prefetch, no boundary crossing. The smallest useful cluster test is three
@@ -573,7 +594,7 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | memory per band-block | 4096: 34 MB · 8192: 134 MB · 16384: 537 MB | arithmetic |
 | hottest worker | 10.16 GiB of 16 at 8192 blocks; spill 0 throughout | run telemetry |
 | inference baseline (do not regress) | GPU util 99% in-phase, VRAM 97% peak, host RAM 46% of a 60% ceiling, GPU-idle ~6 s/chunk | 2,352 RESOURCES samples |
-| ingest worker size | 4 vCPU / 30720 MiB (the 4-vCPU Fargate memory ceiling) | raised from 16384 on the streaming spill |
+| ingest worker size | 4 vCPU / **20480 MiB** | 16384 spilled 1.25 GiB and sat ~0.4 GiB from the pause threshold; 30720 (the ceiling) was over-provisioning a whole fleet for one worker and bought no measured speed |
 | streaming retention cost | +1 month of items on the ingest worker; 1.25 GiB spill at 16 GiB | run telemetry |
 | items deferred across a month boundary | 1,084 of 31,507 (one day's worth) | live cluster |
 | write floor | graph ≈ store_chunks × bands; 2,992 covered vs 2,415 live (19% dead) | measured, all 7 windows |
