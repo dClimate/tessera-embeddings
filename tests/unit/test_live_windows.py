@@ -15,6 +15,7 @@ import zarr
 from tessera_embeddings.ingest.live_windows import (
     LiveWindow,
     live_chunk_grid,
+    live_chunk_grid_from_keys,
     live_windows_for_mask,
     row_band_windows,
 )
@@ -94,3 +95,119 @@ def test_non_boolean_mask_is_rejected(tmp_path):
     zarr.open(path, mode="w", shape=(8, 8), chunks=(4, 4), dtype="uint8")
     with pytest.raises(ValueError, match="2-D boolean"):
         live_chunk_grid(path, chunk_px=CHUNK)
+
+
+class TestGridFromChunkKeys:
+    """Deriving the live grid from stored chunk keys instead of reading pixels.
+
+    Sound only because an all-ocean chunk is never written, so the two routes must
+    agree — which is what most of these assert, using the pixel scan as the oracle
+    since it is the behaviour being preserved.
+    """
+
+    def test_agrees_with_the_pixel_scan(self, tmp_path):
+        rng = np.random.default_rng(11)
+        mask = rng.random((20, 24)) > 0.85
+        path = _mask_store(tmp_path, mask)
+        z = zarr.open(path, mode="r")
+
+        from_keys = live_chunk_grid_from_keys(path, z, chunk_px=CHUNK)
+        from_pixels = live_chunk_grid(path, chunk_px=CHUNK)
+        assert from_keys is not None
+        np.testing.assert_array_equal(from_keys, from_pixels)
+
+    def test_windows_are_identical_either_route(self, tmp_path):
+        """The public entry point must not change its answer with prefer_keys."""
+        mask = np.zeros((12, 16), dtype=bool)
+        mask[1, 2] = True
+        mask[9, 13] = True
+        path = _mask_store(tmp_path, mask)
+        assert live_windows_for_mask(path, chunk_px=CHUNK, prefer_keys=True) == live_windows_for_mask(
+            path, chunk_px=CHUNK, prefer_keys=False
+        )
+
+    def test_all_ocean_is_an_answer_not_a_failure(self, tmp_path):
+        """A store with no chunk objects yields an empty grid, NOT None.
+
+        Returning None here would silently fall back to a full pixel scan of a mask
+        that has nothing in it.
+        """
+        path = _mask_store(tmp_path, np.zeros((8, 8), dtype=bool))
+        z = zarr.open(path, mode="r")
+        live = live_chunk_grid_from_keys(path, z, chunk_px=CHUNK)
+        assert live is not None
+        assert live.shape == (2, 2)
+        assert not live.any()
+
+    def test_partial_edge_chunks_are_placed_correctly(self, tmp_path):
+        """A live pixel in a partial trailing chunk maps to that chunk's index."""
+        mask = np.zeros((10, 9), dtype=bool)
+        mask[9, 8] = True  # chunk row 2, col 2 of a 3x3 grid over 4px chunks
+        path = _mask_store(tmp_path, mask)
+        z = zarr.open(path, mode="r")
+        live = live_chunk_grid_from_keys(path, z, chunk_px=CHUNK)
+        assert live is not None
+        assert live.shape == (3, 3)
+        assert live[2, 2] and live.sum() == 1
+
+    def test_multi_digit_chunk_indices_parse(self, tmp_path):
+        """Indices past single digits must not be truncated or mismatched."""
+        mask = np.zeros((60, 60), dtype=bool)
+        mask[47, 51] = True  # chunk (11, 12) at 4px chunks
+        path = _mask_store(tmp_path, mask)
+        z = zarr.open(path, mode="r")
+        live = live_chunk_grid_from_keys(path, z, chunk_px=CHUNK)
+        assert live is not None
+        assert live[11, 12] and live.sum() == 1
+
+    def test_mismatched_chunking_falls_back(self, tmp_path):
+        """Chunks that are not chunk_px cannot map 1:1, so refuse rather than guess."""
+        path = str(tmp_path / "other.zarr")
+        z = zarr.open(path, mode="w", shape=(16, 16), chunks=(8, 8), dtype="bool")
+        z[0, 0] = True
+        assert live_chunk_grid_from_keys(path, zarr.open(path, mode="r"), chunk_px=CHUNK) is None
+
+    def test_sharded_store_falls_back(self, tmp_path):
+        """A shard key is not a chunk index, so the layout is not recognised."""
+        path = str(tmp_path / "sharded.zarr")
+        z = zarr.create_array(store=path, shape=(16, 16), chunks=(4, 4), shards=(8, 8), dtype="bool")
+        z[0, 0] = True
+        assert live_chunk_grid_from_keys(path, zarr.open(path, mode="r"), chunk_px=CHUNK) is None
+
+    def test_a_chunk_index_outside_the_grid_falls_back(self, tmp_path, monkeypatch):
+        """A key that cannot belong to this grid means the layout was misread.
+
+        Cropping on a misread layout would drop land, so this must refuse rather
+        than place what it can.
+        """
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[0, 0] = True
+        path = _mask_store(tmp_path, mask)
+        z = zarr.open(path, mode="r")
+
+        import fsspec
+
+        real = fsspec.core.url_to_fs
+
+        def fake(p, **kw):
+            fs, root = real(p, **kw)
+            monkeypatch.setattr(fs, "find", lambda _r: [f"{root}/c/0/0", f"{root}/c/99/0"], raising=False)
+            return fs, root
+
+        monkeypatch.setattr(fsspec.core, "url_to_fs", fake)
+        assert live_chunk_grid_from_keys(path, z, chunk_px=CHUNK) is None
+
+    def test_a_failed_listing_falls_back(self, tmp_path, monkeypatch):
+        """Listing errors degrade to the slow-but-correct scan, never to a crash."""
+        mask = np.zeros((8, 8), dtype=bool)
+        mask[0, 0] = True
+        path = _mask_store(tmp_path, mask)
+        z = zarr.open(path, mode="r")
+
+        import fsspec
+
+        monkeypatch.setattr(fsspec.core, "url_to_fs", lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
+        assert live_chunk_grid_from_keys(path, z, chunk_px=CHUNK) is None
+        # and the public entry point still produces the right windows
+        monkeypatch.undo()
+        assert live_windows_for_mask(path, chunk_px=CHUNK) == [LiveWindow(y0=0, y1=4, x0=0, x1=4)]
