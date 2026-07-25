@@ -163,8 +163,13 @@ def test_stale_marker_triggers_reingest(wired, monkeypatch):
     result = _run(s1_orbit="ascending")
     assert result["status"] == "ingested"  # re-ingested despite a present (stale) marker
     assert wired["arun"]
-    # Stale mosaic cleared before the rebuild so re-ingest doesn't append onto old data.
-    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025"]
+    # Stale stores cleared before the rebuild so re-ingest doesn't append onto old
+    # data — per store, since a sibling carrying the current fingerprint is fine.
+    assert sorted(wired.get("deletes", [])) == [
+        "s3://in/mosaics/33N/2025/reflectance.zarr",
+        "s3://in/mosaics/33N/2025/sar_ascending.zarr",
+        "s3://in/mosaics/33N/2025/sar_descending.zarr",
+    ]
 
 
 def test_markerless_partial_mosaic_is_cleared(wired, monkeypatch):
@@ -191,8 +196,9 @@ def test_markerless_partial_mosaic_is_cleared(wired, monkeypatch):
     monkeypatch.setattr(mod, "resolve_s1_orbit", flaky_resolve)
     result = _run(s1_orbit="ascending")
     assert result["status"] == "ingested"
-    # The markerless partial was cleared before the rebuild.
-    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025"]
+    # Only the markerless partial is cleared; the SAR stores never landed, so
+    # there is nothing there to delete.
+    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025/reflectance.zarr"]
 
 
 def test_partial_window_marker_does_not_satisfy_strict_run(wired, monkeypatch):
@@ -213,7 +219,11 @@ def test_partial_window_marker_does_not_satisfy_strict_run(wired, monkeypatch):
     # Default run is strict (allow_partial_window=False): fingerprint differs → re-ingest.
     result = _run(s1_orbit="ascending")
     assert result["status"] == "ingested"
-    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025"]  # policy-mismatch mosaic cleared
+    assert sorted(wired.get("deletes", [])) == [  # policy-mismatch stores cleared
+        "s3://in/mosaics/33N/2025/reflectance.zarr",
+        "s3://in/mosaics/33N/2025/sar_ascending.zarr",
+        "s3://in/mosaics/33N/2025/sar_descending.zarr",
+    ]
 
 
 def test_coverage_failure_leaves_no_marker(wired, monkeypatch):
@@ -278,3 +288,38 @@ class TestChunkScaledWorkers:
         monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
         _run(ingest_settings=mod.IngestSettings(max_workers=37), s1_orbit="ascending")
         assert [p["max_workers"] for _, p in wired["arun"]] == [37, 37]
+
+
+def test_a_completed_sibling_store_survives_the_other_sensors_failure(wired, monkeypatch):
+    """The clear must not destroy work that is already correct.
+
+    S1 and S2 ingest concurrently into one prefix. When one fails it leaves no
+    marker, so the next attempt sees a not-clean mosaic — and clearing the whole
+    prefix threw away the sibling's COMPLETED, correctly-marked output. Because
+    such failures are usually deterministic, every retry re-paid that ingest.
+    A store already carrying the current fingerprint is complete regardless of what
+    happened to its siblings, so it is kept.
+    """
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    fp = {
+        "window": ["2025-01-01", "2025-12-31"],
+        "min_valid_coverage": 0.1,
+        "s1_orbit": "ascending",
+        "allow_partial_window": False,
+        "coverage_sha256": "cov-sha-1",
+    }
+
+    def probe(store, **kw):
+        if store.endswith("sar_ascending.zarr"):
+            return (True, fp)  # SAR finished and marked
+        if store.endswith("reflectance.zarr"):
+            return (True, None)  # S2 crashed part-way, unmarked
+        return (False, None)  # descending never ran
+
+    monkeypatch.setattr(mod, "_probe_marker", probe)
+    result = _run(s1_orbit="ascending")
+
+    assert result["status"] == "ingested"
+    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025/reflectance.zarr"], (
+        "the completed SAR store must survive the S2 failure"
+    )

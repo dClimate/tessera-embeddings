@@ -239,18 +239,28 @@ async def ingest_zone_year(
     if resolved is not None and all(probed[s][1] == fingerprint for s in resolved):
         log.info("Zone %s year %d already ingested for %s — skipping", zone, year, fingerprint["window"])
         return {"zone": zone, "year": year, "status": "already_ingested", "fingerprint": fingerprint}
-    if any(exists for exists, _ in probed.values()):
-        # Something exists under mosaic_base but it is NOT a clean, fully-marked
-        # mosaic for the current fingerprint: a stale marker (changed inputs, or an
-        # ascending-only prior run now asked for both), a markerless half-write, or a
-        # SAR crash before marking. Appending would dedupe against stale dates then
-        # stamp the new fingerprint over mixed inputs — so clear the whole prefix for
-        # a clean rebuild (strict=True: a FAILED delete aborts rather than ingesting
-        # onto stale data and marking the result complete).
+    # Clear PER STORE, not the whole prefix. Each child store is ingested
+    # independently and marked independently, so a store already carrying this
+    # fingerprint is complete and correct whatever happened to its siblings.
+    # Clearing the whole prefix meant one sensor's failure destroyed the other's
+    # finished work — and because the failure is usually deterministic, every
+    # retry re-paid that ingest. Only the stores that are NOT clean for this
+    # fingerprint are cleared, which preserves the reason the clear exists:
+    # never append onto stale dates and then stamp a fingerprint over mixed
+    # inputs. strict=True still aborts on a failed delete rather than ingesting
+    # onto stale data and marking the result complete.
+    stale = [s for s, (exists, marker) in probed.items() if exists and marker != fingerprint]
+    if stale:
         log.info(
-            "Zone %s year %d mosaic is stale or partial — clearing %s for a clean rebuild", zone, year, mosaic_base
+            "Zone %s year %d: clearing %d stale/partial store(s) for a clean rebuild, keeping %d already marked: %s",
+            zone,
+            year,
+            len(stale),
+            sum(1 for _, m in probed.values() if m == fingerprint),
+            ", ".join(s.rsplit("/", 1)[-1] for s in stale),
         )
-        delete_prefix(mosaic_base, log=log, strict=True)
+        for store in stale:
+            delete_prefix(store, log=log, strict=True)
 
     # (3) Ensure the zone ROI zarr (idempotent; regenerates if coverage changed).
     export_zone_roi(
