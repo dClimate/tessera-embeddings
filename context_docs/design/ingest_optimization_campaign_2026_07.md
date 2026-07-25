@@ -473,6 +473,52 @@ and idle, deterministically, on every dispatch. Month-by-month streaming with de
 is planned (`yield-embeddings/docs/stac-streaming-implementation-plan.md`); depth 1 suffices
 because a month's query is 2.7% of a month's processing.
 
+## 7b. STAC query streaming — shipped, validation in progress
+
+The blocker described in §7. The query ran once per window and retained every item, so a
+zone-year needed ~27-30 GB on the 16 GiB worker the ingest body executes on: it died ~17 min in,
+Dask retried it four times at ~70-75 min per cycle with the fleet idle, deterministically, on
+every dispatch. Streaming bounds retention to the month in flight plus the one buffered behind
+it — roughly 5 GB.
+
+**Design, and why each choice is forced rather than preferred:**
+
+- **Partition by owned UTC calendar date.** `group_items_by_date` keys on
+  `item.datetime.strftime("%Y-%m-%d")`, so the pipeline's day unit is the UTC date, and a
+  calendar-month partition therefore cannot split a day group. Owned ranges tile the window
+  exactly once, which means **no cross-month state is needed to deduplicate** — and that matters
+  because the worker can be restarted at any instant. A partition survives a restart; an
+  ID-dedupe set would not.
+- **Pad the query end by one day, clamped to the window end.** A date-only interval end covers
+  only that day's final second, so without the pad items in a month's last moments could fall
+  outside every slice. The padded day is *owned* by the next month, so query overlap never
+  becomes work overlap.
+- **Depth-1 prefetch on a single-thread pool.** The pool's `max_workers=1` IS the buffer: one
+  query in flight, one month in the caller's hands. Depth 1 is sufficient rather than arbitrary —
+  a month's query is ~2.7% of a month's processing, so deeper buffering costs memory to hide
+  nothing. A thread suits pure network I/O despite the GIL, and a `Future` gives exception
+  propagation without a sentinel protocol.
+- **A supply-agnostic per-date closure.** Streamed and single-query paths run byte-identical
+  per-date work; the per-date logic must not fork on how its items were supplied.
+
+**Validation status:**
+
+| check | result |
+|---|---|
+| partition property, 6 window shapes incl. leap year and year-crossing | 18 unit tests, no network |
+| a failing month raises rather than truncating | pinned (a dropped month would be an incomplete mosaic reporting success) |
+| next month genuinely in flight before the current is consumed | pinned |
+| **parity vs one whole-window query, live earth-search, across a month boundary** | **12 dates, 13,024 items, identical date sets, zero per-date differences** |
+| three-month cluster run (two prefetches, two boundaries) | in progress |
+| year-scale soak | outstanding — the only test that can prove the fix |
+
+**A test-design correction worth keeping:** a one-month run validates nothing here. One month is
+a single slice — no prefetch, no boundary crossing. The smallest useful cluster test is three
+months.
+
+`stream_stac_monthly` (default True) is the kill switch. `False` restores the single up-front
+query and is a rollback path only: a year-long window cannot complete under it.
+
 ---
 
 ## 8. Numbers of record
