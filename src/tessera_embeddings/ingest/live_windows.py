@@ -47,6 +47,15 @@ logger = logging.getLogger(__name__)
 #: matches, while a key of different rank (``c/1/2/3``) deliberately does not.
 _CHUNK_KEY_RE = re.compile(r"(?:^|/)c/(\d+)/(\d+)$")
 
+#: Chunk-area cap on one merged band, so a single region write stays a few thousand
+#: graph tasks (one chunk position x ~11 mosaic variables) rather than tens of
+#: thousands. See :func:`merge_bands`.
+MAX_CHUNKS_PER_WINDOW = 512
+
+#: How much MORE chunk area a merged band may cover than the row bands it replaces.
+#: Bounds only what merging adds to the measured row-band strategy.
+MAX_MERGE_WASTE_FRACTION = 0.25
+
 
 @dataclass(frozen=True)
 class LiveWindow:
@@ -189,25 +198,88 @@ def row_band_windows(
     return windows
 
 
+def _chunk_area(w: LiveWindow, chunk_px: int) -> int:
+    """A window's area in whole chunks (the unit both merge bounds are counted in)."""
+    return math.ceil((w.y1 - w.y0) / chunk_px) * math.ceil((w.x1 - w.x0) / chunk_px)
+
+
+def merge_bands(
+    windows: list[LiveWindow],
+    *,
+    chunk_px: int = INGEST_CHUNK_SIZE,
+    max_chunks_per_window: int = MAX_CHUNKS_PER_WINDOW,
+    max_waste_fraction: float = MAX_MERGE_WASTE_FRACTION,
+) -> list[LiveWindow]:
+    """Merge vertically-adjacent row bands into taller, chunk-aligned bands.
+
+    One window per chunk-row computes the least *area*, but area is not what a
+    windowed ingest is billed for. Each window is a separate blocking region
+    write, and that per-window cost is close to fixed: 7.5 s per window measured
+    on dense 35N across a 120-worker fleet whose task slots averaged ~6 % busy,
+    against ~6 s per window on a sparse zone at a fraction of that fleet. 197
+    narrow windows therefore cost 197 serial round trips and leave the fleet idle
+    between them — which is why adding workers bought so little. Merging rows
+    trades a little extra computed area for far fewer, wider graphs.
+
+    Two bounds keep the trade honest:
+
+    * ``max_waste_fraction`` — a merged band may not cover more than this fraction
+      MORE chunk area than the row bands it replaces. Measured against the
+      row-band baseline rather than against live cells, because the row-band
+      strategy's own per-row slack is the choice the design note already
+      validated; this bounds only what merging *adds*. Where consecutive rows
+      share a column span the added area is zero and bands grow to the chunk cap —
+      exactly the dense case that needs it. On a scattered ROI, rows with disjoint
+      spans stop the merge rather than inflating it toward a bounding box.
+    * ``max_chunks_per_window`` — caps one band's chunk area, so a graph stays a
+      few thousand tasks instead of tens of thousands.
+
+    Merging only unions adjacent chunk-row ranges, so windows stay chunk-aligned
+    and mutually chunk-disjoint — the property that lets one session write a whole
+    date and commit once.
+    """
+    if not windows:
+        return []
+    merged: list[LiveWindow] = []
+    cur = windows[0]
+    baseline = _chunk_area(cur, chunk_px)  # what the unmerged rows would have covered
+    for nxt in windows[1:]:
+        cand = LiveWindow(
+            y0=min(cur.y0, nxt.y0), y1=max(cur.y1, nxt.y1), x0=min(cur.x0, nxt.x0), x1=max(cur.x1, nxt.x1)
+        )
+        cand_baseline = baseline + _chunk_area(nxt, chunk_px)
+        covered = _chunk_area(cand, chunk_px)
+        if covered <= max_chunks_per_window and covered <= cand_baseline * (1.0 + max_waste_fraction):
+            cur, baseline = cand, cand_baseline
+        else:
+            merged.append(cur)
+            cur, baseline = nxt, _chunk_area(nxt, chunk_px)
+    merged.append(cur)
+    return merged
+
+
 def live_windows_for_mask(
     mask_path: str,
     *,
     chunk_px: int = INGEST_CHUNK_SIZE,
     prefer_keys: bool = True,
+    merge: bool = True,
     storage_options: dict | None = None,
 ) -> list[LiveWindow]:
-    """The one-call form: mask store → row-band live windows.
+    """The one-call form: mask store → live windows to write.
 
     Derives the live-chunk grid from the mask's chunk keys when the store's layout
     is recognised (:func:`live_chunk_grid_from_keys` — one listing) and falls back
     to reading every chunk position (:func:`live_chunk_grid`) when it is not. Both
     routes return the same grid; the difference is one listing against thousands of
-    sequential reads.
+    sequential reads. Row bands are then merged into taller bands
+    (:func:`merge_bands`), because the per-window write cost is what dominates.
 
-    ``prefer_keys=False`` forces the read path, which is how the two are held to
-    the same answer in tests. ``storage_options`` mirrors
-    :func:`ingest.roi.read_roi_mask`, so a deployment whose mask needs non-default
-    fsspec/S3 settings derives windows where its ingest already reads the mask.
+    ``prefer_keys=False`` forces the read path and ``merge=False`` the unmerged row
+    bands, which is how each is held against the other in tests.
+    ``storage_options`` mirrors :func:`ingest.roi.read_roi_mask`, so a deployment
+    whose mask needs non-default fsspec/S3 settings derives windows where its
+    ingest already reads the mask.
     """
     mask = _open_mask(mask_path, storage_options)
     height, width = mask.shape
@@ -218,4 +290,5 @@ def live_windows_for_mask(
     )
     if live is None:
         live = live_chunk_grid(mask_path, chunk_px=chunk_px, storage_options=storage_options)
-    return row_band_windows(live, height=height, width=width, chunk_px=chunk_px)
+    windows = row_band_windows(live, height=height, width=width, chunk_px=chunk_px)
+    return merge_bands(windows, chunk_px=chunk_px) if merge else windows

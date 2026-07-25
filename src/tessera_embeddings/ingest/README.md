@@ -314,18 +314,68 @@ zone / ROI extent (declared grid — UNCHANGED, the fill validates it)
 │ · · · └────────────────────┘ ·  ·  ·  ·  ·   │     fill — Zarr elides all-fill
 │ · · · · · · ┌────────┐ ·  ·  ·  ·  ·  ·  ·   │     chunks anyway)
 │ · · · · · · │████████│ ·  ·  ·  ·  ·  ·  ·   │
-│ · · · · · · └────────┘ ·  ·  ·  ·  ·  ·  ·   │   █ live row-band windows:
-│ ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  │     one per live chunk-row,
-└──────────────────────────────────────────────┘     4096-px chunk-aligned
+│ · · · · · · └────────┘ ·  ·  ·  ·  ·  ·  ·   │   █ live windows: chunk-aligned,
+│ ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  ·  │     4096 px, derived below
+└──────────────────────────────────────────────┘
 ```
 
+Windows are derived in two steps. Each cell below is one 4096-px ingest chunk; `#` is live
+(the mask has land in it), `.` is ocean. **Row bands** take one window per live chunk-row,
+spanning that row's first to last live column — so a row's interior gaps are included but
+nothing above or below is:
+
+```text
+     live chunk grid        row bands: 7 windows      merged: 2 windows
+     c0 c1 c2 c3 c4 c5      c0 c1 c2 c3 c4 c5         c0 c1 c2 c3 c4 c5
+r0    .  #  #  #  .  .       .  A  A  A  .  .          .  a  a  a  A  .
+r1    .  #  #  #  #  .       .  B  B  B  B  .          .  a  a  a  a  .
+r2    .  #  #  #  #  .       .  C  C  C  C  .          .  a  a  a  a  .
+r3    .  .  #  #  #  .       .  .  D  D  D  .          .  A  a  a  a  .
+r4    .  #  #  #  #  .       .  E  E  E  E  .          .  a  a  a  a  .
+r5    .  .  .  .  .  .       .  .  .  .  .  .          .  .  .  .  .  .
+r6    #  #  .  .  .  .       F  F  .  .  .  .          b  b  .  .  .  .
+r7    #  #  .  .  .  .       G  G  .  .  .  .          b  b  .  .  .  .
+r8    .  .  .  .  .  .       .  .  .  .  .  .          .  .  .  .  .  .
+
+     # live chunk          A..G one window each      band a = r0-r4 x c1-c4
+     . ocean (unwritten)   r5/r8 have no live         band b = r6-r7 x c0-c1
+                           chunk: no window at all    A/B = the 2 dead chunks
+                                                            merging added
+```
+
+Band `a` merges r0–r4 because those rows share nearly the same column span: the union pulls in
+only two dead chunks — `(r0,c4)` and `(r3,c1)` — and buys four fewer blocking writes. Band `b`
+stays separate: unioning it with `a` would span `r0–r7 × c0–c4`, 35 chunks against the 20 the
+rows themselves need, so the waste bound rejects it and the ingest never degrades toward a
+bounding box. Rows with no live chunk (r5, r8) produce no window either way.
+
+That is the whole trade: **chunk area is cheap and parallel, while a window boundary is a
+serial stall.**
+
 - **Windows** come from `live_windows.py`: the boolean ROI mask (the same artifact both
-  `rasterize_roi_zarr` and `export_zone_roi` write) is scanned one chunk block at a time
-  (~16 MB peak, no Dask) and coarsened to the ingest chunk grid; each live chunk-row
-  becomes one window spanning its live columns. Row bands are a *measured* choice:
-  campaign-wide they compute within 1% of the exact live-chunk floor, where a single
-  bounding box captures less than half the win (see
+  `rasterize_roi_zarr` and `export_zone_roi` write) is coarsened to the ingest chunk grid —
+  normally from its chunk keys in one listing, else by scanning one chunk block at a time
+  (~16 MB peak, no Dask) — and each live chunk-row becomes one window spanning its live
+  columns. Row bands are a *measured* choice: campaign-wide they compute within 1% of the
+  exact live-chunk floor, where a single bounding box captures less than half the win (see
   `context_docs/design/ingest-live-tile-cropping.md` for the full measurement).
+- **Adjacent row bands are then merged** (`merge_bands`), because least-area is the wrong
+  objective on its own. Each window is a separate *blocking* region write whose cost is close
+  to fixed — 7.5 s per window measured on dense 35N with 120 workers whose task slots averaged
+  ~6% busy, against ~6 s per window on a sparse zone at a fraction of that fleet. So 197
+  narrow windows cost 197 serial round trips and leave the fleet idle between them, which is
+  why adding workers bought so little. Merging is bounded two ways: a band may not cover more
+  than `MAX_MERGE_WASTE_FRACTION` (25%) more chunk area than the rows it replaces — measured
+  against the row-band baseline, so it bounds only what merging *adds* — and not more than
+  `MAX_CHUNKS_PER_WINDOW` (512) chunks, so one graph stays a few thousand tasks. Where rows
+  share a column span the merge is free, which is exactly the dense case that needs it:
+
+  | zone | row bands | merged | writes saved | added area |
+  |---|---|---|---|---|
+  | 03S (4 chunks)   | 2   | 1  | 2.0× | +0.0% |
+  | 15S (22 chunks)  | 5   | 2  | 2.5× | +18.2% |
+  | 40S (26 chunks)  | 12  | 7  | 1.7× | +7.7% |
+  | 35N (2428 chunks)| 197 | 15 | 13.1× | +5.6% |
 - **Writes** go through `storage.write_day_windows`: a missing store is seeded all-fill
   with an **empty** time axis (schema only — creation cost independent of extent), then
   each date appends its time slot atomically WITH its windows in **one commit**:

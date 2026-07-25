@@ -17,10 +17,16 @@ from tessera_embeddings.ingest.live_windows import (
     live_chunk_grid,
     live_chunk_grid_from_keys,
     live_windows_for_mask,
+    merge_bands,
     row_band_windows,
 )
 
 CHUNK = 4  # small stand-in for INGEST_CHUNK_SIZE; the code takes it as a parameter
+
+
+def _area(windows) -> int:
+    """Total chunk area of some windows, the unit the merge bounds count in."""
+    return sum(((w.y1 - w.y0) // CHUNK) * ((w.x1 - w.x0) // CHUNK) for w in windows)
 
 
 def _mask_store(tmp_path, mask: np.ndarray) -> str:
@@ -211,3 +217,81 @@ class TestGridFromChunkKeys:
         # and the public entry point still produces the right windows
         monkeypatch.undo()
         assert live_windows_for_mask(path, chunk_px=CHUNK) == [LiveWindow(y0=0, y1=4, x0=0, x1=4)]
+
+
+class TestMergeBands:
+    """Row bands merged into taller bands: fewer writes, bounded extra area."""
+
+    def test_rows_sharing_a_span_merge_for_free(self):
+        """The dense case. Consecutive rows with the same live columns merge with
+        zero added area, so nothing but the write count changes.
+        """
+        rows = [LiveWindow(y0=r * CHUNK, y1=(r + 1) * CHUNK, x0=0, x1=3 * CHUNK) for r in range(6)]
+        merged = merge_bands(rows, chunk_px=CHUNK)
+        assert merged == [LiveWindow(y0=0, y1=6 * CHUNK, x0=0, x1=3 * CHUNK)]
+        assert _area(merged) == _area(rows)
+
+    def test_disjoint_rows_are_not_merged_into_a_bounding_box(self):
+        """The sparse case, and the reason the waste bound exists: two narrow rows
+        at opposite ends of a wide extent must stay separate rather than collapse
+        into a box that computes the whole width.
+        """
+        rows = [
+            LiveWindow(y0=0, y1=CHUNK, x0=0, x1=CHUNK),
+            LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=9 * CHUNK, x1=10 * CHUNK),
+        ]
+        assert merge_bands(rows, chunk_px=CHUNK) == rows
+
+    def test_waste_bound_is_measured_against_the_row_baseline(self):
+        """A merge is allowed exactly while the added area stays within the bound."""
+        rows = [
+            LiveWindow(y0=0, y1=CHUNK, x0=0, x1=2 * CHUNK),  # 2 chunks
+            LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=0, x1=3 * CHUNK),  # 3 chunks
+        ]  # baseline 5, merged covers 2 rows x 3 cols = 6 -> +20%
+        assert len(merge_bands(rows, chunk_px=CHUNK, max_waste_fraction=0.25)) == 1
+        assert merge_bands(rows, chunk_px=CHUNK, max_waste_fraction=0.1) == rows
+
+    def test_chunk_cap_splits_a_tall_band(self):
+        """Even a free merge stops at the area cap, so one graph stays bounded."""
+        rows = [LiveWindow(y0=r * CHUNK, y1=(r + 1) * CHUNK, x0=0, x1=2 * CHUNK) for r in range(10)]
+        merged = merge_bands(rows, chunk_px=CHUNK, max_chunks_per_window=4)
+        assert len(merged) == 5  # 4-chunk cap = 2 rows of 2 chunks per band
+        assert all(_area([w]) <= 4 for w in merged)
+
+    def test_merged_bands_stay_chunk_aligned_and_disjoint(self):
+        """The write path commits one date across all windows in a single session,
+        which requires the windows never share a chunk.
+        """
+        rows = [
+            LiveWindow(y0=0, y1=CHUNK, x0=0, x1=2 * CHUNK),
+            LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=CHUNK, x1=3 * CHUNK),
+            LiveWindow(y0=5 * CHUNK, y1=6 * CHUNK, x0=8 * CHUNK, x1=9 * CHUNK),
+        ]
+        merged = merge_bands(rows, chunk_px=CHUNK)
+        seen: set[tuple[int, int]] = set()
+        for w in merged:
+            assert w.y0 % CHUNK == 0 and w.x0 % CHUNK == 0
+            cells = {(r, c) for r in range(w.y0 // CHUNK, w.y1 // CHUNK) for c in range(w.x0 // CHUNK, w.x1 // CHUNK)}
+            assert not (cells & seen)
+            seen |= cells
+
+    def test_empty_input(self):
+        assert merge_bands([], chunk_px=CHUNK) == []
+
+    def test_merged_windows_still_cover_every_live_pixel(self, tmp_path):
+        """The invariant that matters most: merging must never drop land."""
+        mask = np.zeros((6 * CHUNK, 6 * CHUNK), dtype=bool)
+        mask[1, 1] = mask[CHUNK + 2, 3 * CHUNK] = mask[5 * CHUNK, 5 * CHUNK] = True
+        path = _mask_store(tmp_path, mask)
+        merged = live_windows_for_mask(path, chunk_px=CHUNK, merge=True)
+        covered = np.zeros_like(mask)
+        for w in merged:
+            covered[w.y0 : w.y1, w.x0 : w.x1] = True
+        assert bool((mask & ~covered).sum() == 0)
+
+    def test_merge_off_returns_the_row_bands(self, tmp_path):
+        mask = np.zeros((4 * CHUNK, 4 * CHUNK), dtype=bool)
+        mask[0, 0] = mask[CHUNK, 0] = True
+        path = _mask_store(tmp_path, mask)
+        assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=False)) == 2
+        assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=True)) == 1
