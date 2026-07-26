@@ -72,21 +72,25 @@ from tornado.ioloop import PeriodicCallback
 # one. That worker holds the STAC query's retained items — the month being processed
 # plus the month prefetched behind it (``ingest.stac.stream_stac_months``) — on top of
 # its share of the per-date graph. Every worker gets the same size, so this is paid
-# across the whole fleet to accommodate one of them: keep it as small as the ingest
-# worker safely allows rather than as large as the platform permits.
+# across the whole fleet to accommodate one of them.
 #
-# Sized to keep that worker clear of the PAUSE threshold, and note that spilling is NOT
-# the mechanism that protects it: a worker's memory here is overwhelmingly UNMANAGED, so
-# Dask has nothing it is allowed to evict. The threshold simply has to sit far enough away
-# that it is never reached. A paused worker does not recover — work waiting on data it
-# holds can never complete, and the run deadlocks with the rest of the fleet idle. Sized
-# against a dense 6-degree zone, whose months are the largest the campaign sees.
+# RAISING THIS IS A WEAK LEVER, which is why it is back at the smaller size. A worker
+# settles at roughly 72% of whatever limit it is given — the memory is overwhelmingly
+# UNMANAGED (caches, allocator arenas), and that expands into whatever space exists —
+# while Dask pauses at 80%. So the steady-state margin is ~8% of the limit at ANY size:
+# more memory raises the ceiling along with the threshold and buys proportionally
+# nothing. What actually protects the worker is keeping its PEAK close to that steady
+# ceiling, i.e. not retaining more per date than necessary.
+#
+# Spilling is NOT the protection either: Dask has nothing it is allowed to evict when
+# the memory is unmanaged. And a paused worker does not recover — work waiting on data
+# it holds can never complete, so the run deadlocks with the rest of the fleet idle.
 #
 # The vCPU stays at 4 deliberately: the Fargate quota is counted in vCPU, so doubling
 # the CPU would halve the workers a cell can run. Valid pairings for 4 vCPU are
 # 8192-30720 MiB in 1024 steps.
 DEFAULT_INGEST_WORKER_CPU = 4096
-DEFAULT_INGEST_WORKER_MEM = 24576
+DEFAULT_INGEST_WORKER_MEM = 20480
 
 # Schedulers don't need much memory but benefit from a few cores so
 # graph construction and dashboard responsiveness stay smooth.
