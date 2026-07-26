@@ -404,10 +404,12 @@ And the line that matters:
 | **irreducible by adding workers** | **73.8 s (56%)** |
 | **ceiling from unlimited workers** | **1.78×** |
 
-> These are the figures from THIS probe — a 2-date run on pre-overlap code — and they are kept as
-> measured. **For the current ceiling read §3.12**, which re-ran this analysis on both arms of the
-> overlap A/B and puts it at **1.60×** (against 1.26× for the same 7 dates pre-overlap). The
-> qualitative verdict below is unaffected: most of a date still does not pack.
+> **EVERY PACKING FIGURE IN THIS SECTION AND §3.12 IS WRONG — read §3.14.** All of them were
+> computed from a **TRUNCATED** Dask task stream (a bounded deque, default 100,000 records), so
+> each report covered only its run's TAIL while the analysis divided by the full date count.
+> Corrected: task work at perfect packing **64.3 s/date**, width-independent residual **~37 s
+> (~36%)**, one-cell ceiling **~2.8×** — not the 1.78× here, nor §3.12's 1.60×. The qualitative
+> verdict does not survive either: **most of a date DOES pack**; about a third does not.
 
 **Three things this settles.**
 
@@ -584,12 +586,14 @@ write phase, which is now a single dask compute: slots stand idle inside it, on 
 structure and straggler tails rather than on anything serial that remains to be lifted. That
 is the next thing worth profiling, and it is a different problem from the one §3.11 solved.
 
-**Caveat on the absolute figures.** Both ceilings are derived from the captured task stream. A
-bounded stream would understate packed work in both arms and so understate both ceilings; the
-two arms captured 182,311 and 178,123 tasks, which are neither round numbers nor equal, so
-truncation is unlikely but not excluded. **The paired DELTA is the robust quantity**, since
-both arms were measured with one instrument at one setting; treat the absolute ceilings as
-lower bounds.
+**Caveat on the absolute figures — and it FIRED. See §3.14.** This section said: "A bounded
+stream would understate packed work in both arms and so understate both ceilings; the two arms
+captured 182,311 and 178,123 tasks, which are neither round numbers nor equal, so truncation is
+unlikely but not excluded." **The stream WAS truncated.** Those totals include inter-worker
+transfer rectangles, which pad them; the NON-transfer counts are **100,008 and 100,025** — the
+100,000 default cap, exactly. The instinct was right and the test was wrong, which is a more
+useful lesson than the number it got wrong: a truncation check must count the records the cap
+applies to. The paired DELTA does survive, as claimed.
 
 ### 3.13 The retained catalogue items — 2.45× smaller, and the first change forced by a LONG run
 
@@ -655,6 +659,71 @@ concluded "bounded, not a leak" from evidence that could not support it. **Exclu
 post-failure tail before fitting any resource trend, and size memory against a long run's
 asymptote rather than a short run's peak** — the 20480 figure was itself chosen against a ~12.4
 GiB peak observed on a short run, and the true ceiling is ~15.
+
+### 3.14 The packing ceiling was measured off a truncated stream — it is ~2.8×; and how wide a cell should be
+
+Two findings, in the order they were established, because the second depends on the first.
+
+**The instrument was lying, and the check that should have caught it measured the wrong thing.**
+Dask's task stream is a bounded deque — `distributed.scheduler.dashboard.tasks.task-stream-length`,
+default **100,000**. At ~25k tasks per date that is about **4 dates**. Both arms of §3.11's A/B hold
+**100,008 and 100,025 non-transfer rectangles**: the cap. So each captured the run's last ~3.5 of 7
+dates and `perf_budget.py` divided by 7. §3.12 explicitly considered truncation and dismissed it
+because the totals — 182,311 and 178,123 — were "neither round numbers nor equal". **Inter-worker
+transfer rectangles pad those totals**; the cap applies to the non-transfer records. The caveat was
+right and its test was wrong.
+
+| quantity | as recorded (§3.10, §3.12) | **corrected** |
+|---|---|---|
+| task work at perfect packing | 57.2 s, then 39.1 s | **64.3 s/date** |
+| width-independent residual | 73.8 s (56%), then (62%) | **~37 s (~36%)** |
+| ceiling, unlimited workers, ONE cell | 1.78×, then 1.60× | **~2.8× (2.0–3.0)** |
+
+**What settles it is two independent instruments agreeing.** The paired 60w/120w width measurement
+gives `T = F + K/W` with no reference to any task stream. Fed the corrected packed figure it
+predicts T(60w) = **166.4 s** against **167.9 s measured (−0.9%)**; fed the recorded figure it
+predicted **141.2 s (−15.9%)**. And the "~30 s unexplained inside the write phase" that §3.13 named
+as the next profiling target **was this arithmetic error**, not a phenomenon. Fixed at source:
+`perf_budget.py` now warns when the non-transfer count approaches the cap, and `ecs_cluster` takes
+`diagnostic_task_stream`, wired to `perf_report_uri` so a report always covers its whole run.
+
+**The budget now closes.** Of a ~102 s date at 120 workers: **64.3 s scalable task work** (71%
+source COG read and resample; the profiler puts 61% of in-task time inside `rasterio._do_read`),
+and **~37 s that no width touches** — commit and build 12–14 s, gate round-trip ~7 s, writer
+assembly and graph submit 5–7 s, plus ~11 s of dispatch ramp and merge tail, consistent with the
+single-threaded scheduler's 600–800 tasks/s against ~25k tasks per date.
+
+**Which makes cell WIDTH answerable, and 120 workers is not the answer.** 120 was never chosen; it
+is 512 vCPU ÷ 4 minus the scheduler and runner — an artifact of the quota. Fitting the paired
+points gives `T(W) = 36.3 + 7896/W`. At a fixed vCPU budget, counting the ~20 vCPU per-cell control
+overhead (dask scheduler + flow runner):
+
+| workers/cell | s/date | vCPU/cell | cells @10k | aggregate dates/h | vs 120w |
+|---|---|---|---|---|---|
+| 15 | 563 | 80 | 125 | 800 | 1.13× |
+| **30** | 300 | 140 | 71 | **853** | **1.21×** |
+| **45** | 212 | 200 | 50 | **850** | **1.21×** |
+| 60 | 168 | 260 | 38 | 815 | 1.16× |
+| 120 | 102 | 500 | 20 | 705 | 1.00× |
+| 250 | 68 | 1020 | 9 | 477 | 0.68× |
+
+**The optimum is broad and sits at 30–45 workers per cell, ~20% better than 120.** The mechanism is
+just the fixed term: every date pays ~36 s regardless, and a wide cell pays it with more workers
+standing by. Below ~30 the per-cell control overhead starts eating the gain, which is what flattens
+the curve rather than any property of the workload.
+
+**Wide cells are better than the record claimed and still lose.** 250 workers buys 1.46× per cell,
+500 buys 1.89×, unlimited ~2.8× — but throughput per vCPU falls monotonically, so **more, narrower
+cells is the topology** at any fleet size. A 10,000 vCPU fleet is ~50 cells of 45 workers →
+**~850 dates/h**, putting a 112-zone optical campaign near 1.5–2 days of ingest.
+
+**Two honest limits on the above.** The fit rests on **two** paired points (60 and 120), so 30 and
+45 are extrapolation — the only 30-worker measurement we have is pre-overlap and stale, and paired
+30/45 rungs are the cheapest outstanding experiment. And nothing above 2 concurrent cells has been
+measured: at 2 cells the interference is 1.04× and nothing shared shows stress (per-cell schedulers,
+separate store prefixes at ~65 PUT/s against 3,500, zero SlowDown anywhere), but aggregate
+source-read elasticity and the ECS start storm are open. Fargate's launch rate is **20 tasks/s
+sustained, 100 burst** — a 10,000 vCPU fleet is ~2,300 tasks, so ~2 minutes of ramp unless raised.
 
 ## 4. What did not work, and why
 
@@ -1083,7 +1152,14 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | per-worker memory ceiling | **13.45 GiB**, flat over six consecutive blocks; **91-100% UNMANAGED**, so unspillable | 53-date soak health lines (§3.13) |
 | driver excess over fleet mean | **~4.9 GiB** (the retained months); paused at 14.89 against a 14.90 threshold | same (§3.13) |
 | ingest worker size, revised | **24576 MiB** (was 20480, chosen against a short run's 12.4 GiB peak; true ceiling ~15) | §3.13 |
-| overlap packing effect | share of a date that packs **20% → 38%**; headroom from adding workers **1.26× → 1.60×**; residual **132.1 → 65.1 s** — serial time REMOVED, not made packable (packed work moved only 34.0 → 39.1 s) | per-arm task streams (§3.12) |
+| ~~overlap packing effect~~ | **SUPERSEDED — the stream was truncated, see §3.14.** Recorded as 20% → 38% packing and a 1.26× → 1.60× ceiling; corrected to **64.3 s packed of a 102 s date (~64%)** and a **~2.8×** one-cell ceiling | §3.14 |
+| **task work at perfect packing** | **64.3 s/date** at 120w; residual **~37 s (~36%)** | corrected task streams, cross-checked against the paired width fit (§3.14) |
+| **ceiling, unlimited workers, ONE cell** | **~2.8× (2.0–3.0)** — not 1.78×, not 1.60× | §3.14 |
+| **width model** | `T(W) = 36.3 + 7896/W` s per date, fitted from paired 60w/120w | §3.14 |
+| **optimal cell width** | **30–45 workers**, ~20% better aggregate throughput than 120w at a fixed budget; 120w was the quota ceiling, never a choice | §3.14 |
+| **cell concurrency cost** | a second concurrent cell slows each by **1.04×**; two 60w cells beat one 120w cell **1.17×** | 6 paired dates (§3.14) |
+| task-stream cap | **100,000 records** default ≈ 4 dates; `diagnostic_task_stream` raises it to 3,000,000 | §3.14 |
+| Fargate launch rate | **20 tasks/s sustained, 100 burst** — a 10,000 vCPU fleet is ~2,300 tasks | measured quota |
 | overlap contention cost | **+15% total slot-seconds** for identical output (2% fewer tasks, +25% transfer) | per-arm task streams (§3.12) |
 | post-overlap residual, unexplained portion | of 65.1 s, **~18.6 s named** (build 10.4, gate 7.3, commit 0.9); **~46 s idles INSIDE the single write compute** | §3.12 |
 | commit cost over a long run | **sawtooth, period 8 dates** (= `INGEST_MANIFEST_SPLIT["time"]`), 0.5 → ~1.5 s then resets — BOUNDED, not cumulative | 17+ dates, soak (§3.11) |
