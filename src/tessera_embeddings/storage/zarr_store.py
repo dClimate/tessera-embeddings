@@ -1499,8 +1499,3 @@ def set_s3_config(config: S3Config | None) -> None:
     """Set a global S3 configuration override for testing."""
     global _s3_config_override
     _s3_config_override = config
-
-
-def get_s3_config() -> S3Config | None:
-    """Get the current S3 configuration override."""
-    return _s3_config_override

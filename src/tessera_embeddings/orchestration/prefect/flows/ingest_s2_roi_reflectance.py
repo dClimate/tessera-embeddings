@@ -123,6 +123,11 @@ def ingest_s2_roi_reflectance(
         crop_to_live_windows: Restrict mosaic writes (and the S2 coverage
             reduce) to the chunk-aligned windows intersecting the ROI mask —
             one commit per date. Default False = legacy full-extent path.
+        overlap_window_writes: Submit a date's windows as ONE dask compute rather
+            than one blocking compute per window, so their critical paths overlap
+            across the fleet instead of summing. Identical stores either way, and
+            it falls back to the sequential write when the overlapped machinery is
+            unavailable. Only meaningful with ``crop_to_live_windows``.
 
     Returns:
         ``IngestResult`` serialised as a dict (see

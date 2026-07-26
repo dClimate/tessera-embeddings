@@ -12,8 +12,6 @@ Usage:
 import logging
 import os
 
-IO_WORKFLOW_DASK_CLUSTER_SPECS = {"DASK_WORKER_CPU": "1024", "DASK_WORKER_MEMORY": "3072"}
-
 
 def configure_gdal_environment() -> None:
     """Configure GDAL/Rasterio environment variables for optimal COG access.
