@@ -591,6 +591,71 @@ truncation is unlikely but not excluded. **The paired DELTA is the robust quanti
 both arms were measured with one instrument at one setting; treat the absolute ceilings as
 lower bounds.
 
+### 3.13 The retained catalogue items — 2.45× smaller, and the first change forced by a LONG run
+
+Everything above was found by shortening a date. This one was found by lengthening a run: a
+two-month soak deadlocked at 53 of 60 dates when the worker running the ingest body crossed
+Dask's memory pause threshold and never resumed. Failure record: F-19 in the test plan; options
+weighed in `yield-embeddings/context_docs/decisions/driver-worker-memory-options.md`.
+
+**Why the driver is the worker that dies.** The ingest body runs as ONE task on ONE worker, so
+that worker holds the streamed month plus the prefetched next month **and** its ordinary share of
+compute. Measured: per-worker memory settles near **13.45 GiB** (flat across six consecutive
+measurement blocks — a real ceiling, not a leak), the driver sits **~4.9 GiB above** the fleet
+mean, and 0.80 × 18.63 = **14.90 GiB** is where Dask pauses. It peaked at **14.89**.
+
+**Why spilling could not save it.** **91–100% of worker memory is UNMANAGED** all run — Dask has
+nothing it is permitted to evict. Raising the spill threshold, spilling harder, or (as was
+considered) raising the pause threshold from 0.80 to 0.90 all fail for the same reason: pausing
+frees nothing here, and Fargate has no swap, so a higher threshold removes the guard without
+buying runway. **This is why the fix had to delete memory rather than manage it.**
+
+**What was deleted.** Sentinel-2 L2A items from earth-search carry **35 assets**; the ingest
+loads **11**. The rest — previews, per-band JP2 variants, metadata documents — were retained for
+a whole month and never read. Measured with the shipped code, streaming so no arm ever holds the
+unpruned form, each form in a fresh process:
+
+| retained form | KiB/item | vs today |
+|---|---|---|
+| hydrated `pystac.Item` — the old behaviour | **86.8** | 1.00× |
+| drop unused assets + links, keep all else verbatim | **35.4** | **2.45×** |
+| also prune properties to an allow-list | 31.8 | 2.79× |
+
+86.8 KiB/item independently reproduces §8's earlier "~80 KB per retained item", measured a
+different way — so the baseline is not in doubt. At a dense zone's 68,000 retained items this is
+**5.63 → 2.30 GiB, i.e. ~3.3 GiB off the driver.**
+
+**A DENY-list, and the reason is a bug this caught.** The aggressive allow-list variant *failed
+on first attempt* with "Failed to auto-guess CRS/resolution", because this collection carries its
+CRS in `proj:code` where the list expected `proj:epsg`. That failure was loud. A subtler one —
+dropping `raster:bands` scale/offset — would have **changed pixel values silently**. Dropping
+whole unread assets cannot lose metadata the loader needs, and it is where 85% of the saving is.
+An item whose asset names are all unrecognised is returned untouched, so a differently-named
+collection degrades to the old behaviour rather than losing its bands.
+
+**Rehydration is a saving, not a cost.** The query now pages `items_as_dicts()` and builds the
+item *after* pruning. Building from a pruned dict costs **252 µs/item against 810 µs** for a full
+one — **3.2× cheaper** — because most of an item's construction cost is the assets being dropped.
+Pruning itself is 8.7 µs/item.
+
+**Correctness is pinned structurally, not by inspection.** A pruned load is identical to a full
+one on band set, dims, dtypes, CRS, transform, geobox and timestamps; nine unit tests pin the
+deny-list contract. The OPERA path supplies items through `item_provider_fn` and returns before
+any of this, so radar is untouched.
+
+**Shipped alongside: worker memory 20480 → 24576 MiB**, moving the pause threshold to ~17.9 GiB.
+Both were needed. Pruning alone leaves every worker ~1.5 GiB below a hard threshold — the margin
+that just failed — and **where ordinary compute workers level off is still unmeasured** (mean
+9.9 GiB, still rising slowly at 53 dates). Headroom covers what pruning does not reach.
+
+**The durable methodological lesson, and it is the reason this section exists.** A 7-date A/B
+cannot see this: the failure appears past ~40 dates. Worse, the first drift analysis was fitted
+over samples from *after* the deadlock, when a frozen cluster reads as a plateau, and briefly
+concluded "bounded, not a leak" from evidence that could not support it. **Exclude the
+post-failure tail before fitting any resource trend, and size memory against a long run's
+asymptote rather than a short run's peak** — the 20480 figure was itself chosen against a ~12.4
+GiB peak observed on a short run, and the true ceiling is ~15.
+
 ## 4. What did not work, and why
 
 ### 4.1 Coarsening the STORE chunk to 8192 — rejected on the GPU side's own evidence
@@ -1013,6 +1078,11 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | **where the residual was** | `write_day_windows` computing windows serially: per-window times summed to **146.9 s of a 148.0 s write phase**; commit only **0.6 s** | 7 dates, per-window instrumentation (§3.11) |
 | **window overlap** | write phase **148.0 → 86.5 s (1.71×)**; per-date **166.1 → 104.2 s (1.59×)**; chunk objects **44,797 both arms** | A/B, identical dates and width (§3.11) |
 | overlap memory cost | peak worker **12.30 of 20 GiB**, spill 0.00 GiB, no pause | parallel arm health lines (§3.11) |
+| retained item size | hydrated **86.8 KiB**, deny-list pruned **35.4 KiB (2.45×)**; ~3.3 GiB off the driver at 68,000 items | shipped code, streaming, fresh process per form (§3.13) |
+| item build cost | full **810 µs/item**, pruned **252 µs/item (3.2× cheaper)**; prune itself 8.7 µs | same (§3.13) |
+| per-worker memory ceiling | **13.45 GiB**, flat over six consecutive blocks; **91-100% UNMANAGED**, so unspillable | 53-date soak health lines (§3.13) |
+| driver excess over fleet mean | **~4.9 GiB** (the retained months); paused at 14.89 against a 14.90 threshold | same (§3.13) |
+| ingest worker size, revised | **24576 MiB** (was 20480, chosen against a short run's 12.4 GiB peak; true ceiling ~15) | §3.13 |
 | overlap packing effect | share of a date that packs **20% → 38%**; headroom from adding workers **1.26× → 1.60×**; residual **132.1 → 65.1 s** — serial time REMOVED, not made packable (packed work moved only 34.0 → 39.1 s) | per-arm task streams (§3.12) |
 | overlap contention cost | **+15% total slot-seconds** for identical output (2% fewer tasks, +25% transfer) | per-arm task streams (§3.12) |
 | post-overlap residual, unexplained portion | of 65.1 s, **~18.6 s named** (build 10.4, gate 7.3, commit 0.9); **~46 s idles INSIDE the single write compute** | §3.12 |
