@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import operator
+import time
 from dataclasses import dataclass
 from functools import reduce
 from typing import final
@@ -149,6 +150,7 @@ def ingest_s2_roi_reflectance(
     storage_options: dict | None = None,
     crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
+    overlap_window_writes: bool = False,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
 
@@ -189,6 +191,11 @@ def ingest_s2_roi_reflectance(
             the worker this runs on. ``False`` restores the single up-front
             query and is the rollback path only — a year-long window cannot
             complete under it.
+        overlap_window_writes: Submit every window of a date as one dask
+            compute instead of one blocking compute per window, so the
+            windows' critical paths overlap across the fleet rather than
+            summing. Identical stores either way; falls back to the
+            sequential write when the overlapped machinery is unavailable.
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items
@@ -256,6 +263,7 @@ def ingest_s2_roi_reflectance(
         # a second client-side graph build. A date that then fails the gate has
         # built a graph it discards — cheap, because construction is the same order
         # either way and nothing was computed.
+        stage_started = time.monotonic()
         try:
             day_ds = load_stac_items(
                 day_items,
@@ -278,6 +286,7 @@ def ingest_s2_roi_reflectance(
             log.warning("Dropping date: load failed on asset-incomplete STAC item(s): %s", exc)
             return False
 
+        built_at = time.monotonic()
         passes, any_valid = _coverage_from_scl(
             day_ds["scl"].isel(time=0),
             roi_mask,
@@ -288,6 +297,7 @@ def ingest_s2_roi_reflectance(
         )
         if not passes:
             return False
+        gated_at = time.monotonic()
 
         date = day_ds.time.dt.date.values[0]
         day_ds["time"] = [np.datetime64(date, "ns")]
@@ -356,6 +366,7 @@ def ingest_s2_roi_reflectance(
                         tile_id=roi_zarr_path,
                         crs=roi.native_crs,
                         chunks=INGEST_CHUNKS,
+                        parallel_windows=overlap_window_writes,
                     )
                 else:
                     write_dataset(
@@ -367,6 +378,20 @@ def ingest_s2_roi_reflectance(
                         manifest=ingest_manifest,
                         crs=roi.native_crs,
                     )
+        # One line per kept date, partitioning its wall clock into the client-side
+        # graph build, the coverage-gate compute, and the write (windows + commit).
+        # Stable format: CloudWatch queries and the pipeline analysis key off it.
+        finished_at = time.monotonic()
+        log.info(
+            "Stage timings date=%s: build=%.1fs gate=%.1fs write=%.1fs total=%.1fs windows=%d mode=%s",
+            date,
+            built_at - stage_started,
+            gated_at - built_at,
+            finished_at - gated_at,
+            finished_at - stage_started,
+            len(date_windows) if live_windows is not None else 0,
+            "parallel" if overlap_window_writes else "sequential",
+        )
         return True
 
     def _drive(items: list, baselines: dict[str, int]) -> None:

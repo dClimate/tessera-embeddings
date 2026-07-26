@@ -1092,7 +1092,103 @@ def batched_region_writes(
     repo = _open_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
     yield RegionWriteBatch(session)
+    # Timed because the commit (manifest + snapshot writes) is serial per-date work
+    # no fleet width can compress — the pipeline instrumentation needs it separable
+    # from the window computes it follows.
+    commit_started = time.monotonic()
     session.commit(message)
+    logger.info("Committed '%s' in %.1fs", message, time.monotonic() - commit_started)
+
+
+def _write_windows_overlapped(
+    session: "icechunk.Session",
+    day_ds: xr.Dataset,
+    windows: "list[tuple[int, int, int, int]]",
+    time_index: int,
+    drop: "list[str]",
+) -> bool:
+    """Write every window of a date as ONE dask compute on one forked session.
+
+    The sequential path issues one ``to_icechunk`` per window, and each call runs
+    its graph to completion before the next window starts — so a date costs the SUM
+    of its windows' critical paths while the fleet works on one window at a time.
+    This lifts icechunk's own dask sequence (fork → lazy stored arrays → merge
+    reduction) one level so all windows share a single compute and their critical
+    paths overlap across the fleet. The windows' chunk-disjointness (enforced by the
+    caller's alignment guard) is what makes the merged changesets conflict-free —
+    the same property the sequential path relies on for one-commit-per-date.
+
+    Returns ``False`` without computing anything when the icechunk internals this
+    lifts are unavailable or have drifted, so the caller falls back to the
+    sequential path. The metadata writes performed before such a fallback change no
+    array values (the windows are region writes into existing arrays), so the
+    sequential rewrite of the same windows is safe. The two paths are byte-identical
+    by test; drift degrades to the shipped behaviour, never to a failure.
+    """
+    try:
+        from icechunk.dask import session_merge_reduction
+        from icechunk.xarray import _XarrayDatasetWriter
+    except ImportError as exc:
+        logger.warning("Overlapped window write unavailable (%s); writing sequentially", exc)
+        return False
+
+    started = time.monotonic()
+    try:
+        writers = []
+        for y0, y1, x0, x1 in windows:
+            win = day_ds.isel(northing=slice(y0, y1), easting=slice(x0, x1)).drop_vars(drop)
+            writer = _XarrayDatasetWriter(
+                win,
+                store=session.store,
+                safe_chunks=True,
+                # Same memory rationale as the sequential call below: each write task
+                # carries one store chunk, not one load block.
+                align_chunks=True,
+            )
+            writer._open_group(
+                group=None,
+                mode="r+",
+                append_dim=None,
+                region={
+                    "time": slice(time_index, time_index + 1),
+                    "northing": slice(y0, y1),
+                    "easting": slice(x0, x1),
+                },
+            )
+            writer.write_metadata(None)
+            writer.write_eager()
+            writers.append(writer)
+
+        # ONE fork for all windows: every lazy region write lands its changeset in
+        # the same fork, and one merge returns them to the session together.
+        fork = session.fork()
+        stored: list = []
+        for writer in writers:
+            if not writer.writer.sources:
+                continue  # nothing lazy in this window; write_eager covered it
+            writer.writer.targets = [
+                zarr.open_array(fork.store, path=target.path, mode="a") for target in writer.writer.targets
+            ]
+            stored.extend(
+                writer.writer.sync(
+                    compute=False,
+                    chunkmanager_store_kwargs={"load_stored": False, "return_stored": True},
+                )
+            )
+    except (AttributeError, TypeError) as exc:
+        logger.warning("Overlapped window write failed to assemble (%s); writing sequentially", exc)
+        return False
+
+    if stored:
+        # The single compute: every window's loads, masks and chunk writes in one
+        # graph, reduced to one mergeable changeset.
+        session.merge(session_merge_reduction(stored, split_every=8))
+    logger.info(
+        "Parallel window compute: %d window(s) in one graph: %.1fs",
+        len(windows),
+        time.monotonic() - started,
+    )
+    return True
 
 
 def write_day_windows(
@@ -1111,8 +1207,16 @@ def write_day_windows(
     chunks: dict[str, int],
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
+    parallel_windows: bool = False,
 ) -> None:
     """Write ONE date's live windows into a mosaic store, one commit for the date.
+
+    ``parallel_windows`` submits every window of the date as a single dask compute
+    (:func:`_write_windows_overlapped`) instead of one blocking compute per window,
+    so the windows' critical paths overlap across the fleet rather than summing.
+    Both paths produce identical stores (pinned by test); when the overlapped
+    machinery is unavailable the sequential path runs regardless, so the flag can
+    never make a write fail that would otherwise have succeeded.
 
     The cropped counterpart of :func:`write_dataset` (same bookkeeping contract,
     write volume proportional to live area instead of extent). ``day_ds`` is the
@@ -1220,7 +1324,10 @@ def write_day_windows(
         attrs["doy"] = list(cast("list", attrs.get("doy", []))) + compute_doy(np.array([when])).tolist()
         attrs["last_appended"] = utcnow_iso()
         drop = [c for c in ("time", "northing", "easting") if c in day_ds.coords]
-        for y0, y1, x0, x1 in windows:
+        if parallel_windows and _write_windows_overlapped(batch.session, day_ds, windows, t, drop):
+            return  # normal context exit: the batched commit below still runs
+        for i, (y0, y1, x0, x1) in enumerate(windows, 1):
+            window_started = time.monotonic()
             win = day_ds.isel(northing=slice(y0, y1), easting=slice(x0, x1)).drop_vars(drop)
             to_icechunk(
                 win,
@@ -1237,6 +1344,17 @@ def write_day_windows(
                 # threads per worker to restore the headroom.
                 align_chunks=True,
                 split_every=8,
+            )
+            # Each window is a blocking compute, so these lines ARE the write
+            # pipeline's decomposition: their sum against the date's write phase says
+            # whether windows serialise, and their spread says what overlap can buy.
+            logger.info(
+                "Window %d/%d rows=%d..%d: %.1fs",
+                i,
+                len(windows),
+                y0,
+                y1,
+                time.monotonic() - window_started,
             )
 
 

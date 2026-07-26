@@ -160,3 +160,103 @@ def test_crash_between_seed_and_first_windows_is_retryable(tmp_path):
     g = open_store_as_zarr_group(store)
     assert (np.asarray(g["band"])[0, 0:4, :] == 7).all()
     assert dict(g.attrs)["doy"] == [153]
+
+
+# --- the overlapped window write -------------------------------------------------
+#
+# One dask compute for all of a date's windows instead of one blocking compute per
+# window. Equivalence with the sequential path is the shipping gate: the parallel
+# path lifts icechunk's own fork/merge machinery, and these tests pin that the lift
+# changes nothing about what lands in the store or when a commit happens.
+
+
+def _write_mode(store: str, date: str, band_val: int, windows, parallel: bool) -> None:
+    write_day_windows(
+        store,
+        _day_ds(date, band_val),
+        list(windows),
+        roi=_Roi(),
+        manifest=MANIFEST,
+        baselines={date: 5},
+        tile_id="roi.zarr",
+        crs="EPSG:32601",
+        chunks=CHUNKS,
+        parallel_windows=parallel,
+    )
+
+
+def _snapshots(store: str) -> int:
+    return len(list(_open_repo(store).ancestry(branch="main")))
+
+
+def test_parallel_windows_matches_sequential(tmp_path):
+    """Byte-identical stores, identical merged attrs, one snapshot per date each."""
+    seq, par = str(tmp_path / "seq"), str(tmp_path / "par")
+    windows = [(0, 4, 0, 8), (4, 8, 0, 4)]  # two disjoint windows, one partial row
+    for store, flag in ((seq, False), (par, True)):
+        _write_mode(store, "2024-01-01", 7, windows, flag)
+        _write_mode(store, "2024-01-02", 9, windows, flag)
+
+    gs = open_store_as_zarr_group(seq)
+    gp = open_store_as_zarr_group(par)
+    for var in ("band", "scl"):
+        np.testing.assert_array_equal(gs[var][:], gp[var][:])
+    for key in ("baselines_applied", "doy"):
+        assert gs.attrs[key] == gp.attrs[key]
+    assert _snapshots(seq) == _snapshots(par)
+
+
+def test_parallel_failure_commits_nothing_and_retry_succeeds(tmp_path):
+    """A poisoned window fails the single compute; the date never lands; a clean
+    retry writes it — the abandoned-session contract, unchanged by overlap.
+    """
+    store = str(tmp_path / "s")
+    _write_mode(store, "2024-01-01", 7, [(0, 4, 0, 8)], True)
+    before = _snapshots(store)
+
+    def _poison(block):
+        raise RuntimeError("poisoned window")
+
+    bad = _day_ds("2024-01-02", 3)
+    bad["band"] = (("time", "northing", "easting"), bad["band"].data.map_blocks(_poison, dtype=np.uint16))
+    with pytest.raises(RuntimeError, match="poisoned window"):
+        write_day_windows(
+            store,
+            bad,
+            [(0, 4, 0, 8), (4, 8, 0, 4)],
+            roi=_Roi(),
+            manifest=MANIFEST,
+            baselines={"2024-01-02": 5},
+            tile_id="roi.zarr",
+            crs="EPSG:32601",
+            chunks=CHUNKS,
+            parallel_windows=True,
+        )
+    assert _snapshots(store) == before, "a failed parallel write must commit nothing"
+    assert get_existing_dates(store) == {"2024-01-01"}
+
+    _write_mode(store, "2024-01-02", 9, [(0, 4, 0, 8)], True)  # clean retry
+    assert get_existing_dates(store) == {"2024-01-01", "2024-01-02"}
+    g = open_store_as_zarr_group(store)
+    assert (g["band"][1, :4, :] == 9).all()
+
+
+def test_parallel_falls_back_when_private_api_missing(tmp_path, monkeypatch, caplog):
+    """Private-API drift degrades to the sequential path, not to a failure.
+
+    Simulated by poisoning ``sys.modules`` so only FRESH imports of the icechunk
+    xarray module fail: the overlapped helper imports at call time and must decline,
+    while the sequential path's ``to_icechunk`` was bound at module load and keeps
+    working — the same topology as a real drift, where the private symbol moves but
+    the public API stays.
+    """
+    import sys
+
+    monkeypatch.setitem(sys.modules, "icechunk.xarray", None)
+    store = str(tmp_path / "s")
+    with caplog.at_level("WARNING"):
+        _write_mode(store, "2024-01-01", 7, [(0, 4, 0, 8), (4, 8, 0, 4)], True)
+    assert "writing sequentially" in caplog.text
+    g = open_store_as_zarr_group(store)
+    assert (g["band"][0, :4, :] == 7).all()
+    assert (g["band"][0, 4:, :4] == 7).all()
