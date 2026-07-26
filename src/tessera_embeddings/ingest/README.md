@@ -16,7 +16,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
-| `live_windows.py` | Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows because each window is a serial blocking write. Serves single-ROI and campaign runs identically. |
+| `live_windows.py` | Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
 
 ---
 
@@ -578,6 +578,42 @@ Per-date iteration (what ingest_s2_roi_reflectance actually does):
 Each single-date graph is small: `spatial_chunks × bands` tasks, with no date dimension to
 multiply through. The per-date overhead (one Python loop iteration, one Zarr append) is
 negligible compared to the Dask compute time for a large spatial ROI.
+
+### Overlapping a date's window writes (`overlap_window_writes`)
+
+Under `crop_to_live_windows` a date is written as several chunk-disjoint windows. The
+obvious implementation writes them one at a time, and that turns out to dominate the cost of
+a date: each window's compute runs to completion before the next begins, so the date costs
+the **sum** of the windows' critical paths while the fleet works on one window and idles
+through the rest of each.
+
+```text
+Sequential windows — the fleet sees one window at a time:
+ │◄─ window 1 ─►│◄─ window 2 ─►│◄─ window 3 ─►│◄ w4 ►│◄─ window 5 ─►│
+ └─ the date costs the SUM of these, and most slots idle within each ─┘
+
+Overlapped (overlap_window_writes, the default) — one graph, one commit:
+ │◄─ window 1 ─►│
+ │◄─ window 2 ──►│     all submitted together, so the fleet packs them and
+ │◄─ window 3 ─►│      the date costs roughly the LONGEST window plus
+ │◄ w4 ►│              whatever the total work itself requires
+ │◄─ window 5 ──►│
+ └── one merge, one commit for the date (contract unchanged) ──┘
+```
+
+Mechanism: icechunk's dask path already forks a session, stores lazily, and merges
+changesets; writing per window merely runs that whole sequence once per window. Overlapping
+lifts it one level — fork once, collect every window's lazy stored arrays, run one merge
+reduction — so all the windows' loads, masks and chunk writes occupy a single graph.
+
+The resulting store is identical either way, and the reason is the windows'
+chunk-disjointness: that is what makes the merged changesets conflict-free, and it is the
+same property that lets a date commit exactly once. Should icechunk's internals move, the
+write falls back to the sequential loop with a warning rather than failing.
+
+Default **on** for S2. `write_day_windows` itself still defaults to the sequential path,
+because S1 shares it and its window structure has never been compared — a storage-layer
+default should not change behaviour for a caller nobody has measured.
 
 ### S1: time-windowed batching (task graph management)
 

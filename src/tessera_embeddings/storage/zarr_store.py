@@ -26,6 +26,11 @@ Five write paths, all committing atomically:
   live-window region writes, all under ONE commit. Same bookkeeping contract
   as create/append (attr set, baselines/doy merge, per-write manifest
   validation); write volume scales with live area instead of extent.
+  ``parallel_windows`` submits the date's windows as a SINGLE dask compute
+  rather than one blocking compute per window, so their critical paths overlap
+  across the fleet instead of summing — the same store either way, and the
+  windows' chunk-disjointness is what makes the merged changesets
+  conflict-free.
 - **shard-assemble** (embeddings only; lives in
   :mod:`tessera_embeddings.inference.assembly` +
   :mod:`tessera_embeddings.storage.shard_writer`) — staged inference tiles

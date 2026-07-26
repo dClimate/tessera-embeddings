@@ -740,7 +740,18 @@ timings and took an object count to identify.
   that is gone by ~200 workers. Sweep medians were 194.8 / 232.4 / 396.7 s, giving 1.71× for
   30→60 and only 1.19× for 60→120 — the knee sits between 60 and 120. **Caveat on those absolute
   values: they are not reproducible** (§5, external latency drift); the SHAPE is what carries.
-- **THE open question now: can a date's serial residual be taken off the critical path?** 74 s
+- **NEW, opened by §3.11: is the 4096 write-window idea now viable?** §4.7 rejected narrowing
+  write windows to the 4096 grid because it took windows from 5-6 to 12-13 per date at ~17 s of
+  SERIAL cost each. Overlapping the windows removes most of that per-window serial cost, so the
+  arithmetic that killed it no longer holds. The remaining costs of more windows are graph size,
+  merge work and memory in flight — all smaller than 17 s a window. Worth re-deriving before
+  re-testing: it would cut computed area ~1.6× (§4.7's measurement), and area was NOT on the
+  critical path when measured (§3.9), so the expected win is small and the memory cost real.
+  Measure the prize first, per §3.11's lesson.
+- **~~THE open question: can a date's serial residual be taken off the critical path?~~
+  ANSWERED — yes, 1.59× (§3.11).** Retained below for the reasoning, which still applies to
+  what remains: after the overlap, a date is build 10.4 s + gate 7.3 s + write 86.5 s, and the
+  write is now near its packing floor rather than a sum of serial parts. 74 s
   of every 131 s date is serial client work, dispatch, blocking region writes and commit, and it
   is now the largest single target in the ingest by a wide margin. Shrinking it is one route;
   **overlapping it with the next date's compute is the better one**, because it removes the term
