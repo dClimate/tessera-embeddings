@@ -41,7 +41,6 @@ from tessera_embeddings.storage.zone_grid import (
     CAMPAIGN_YEARS,
     PIXEL_M,
     ZONE_SCHEME,
-    ZONES,
     ZoneSpec,
     calendar_year_times,
     easting_coords,
@@ -354,16 +353,3 @@ def seed_zone_groups(
         node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
         node.attrs.update(_zone_attrs(spec, north, east, layout))
     return session.commit(commit_msg or f"seed {len(specs)} zone group(s)")
-
-
-def seed_all_zones(
-    repo: icechunk.Repository,
-    *,
-    years: tuple[int, ...] = CAMPAIGN_YEARS,
-    layout: StoreLayout = GLOBAL,
-    model_version: str | None = None,
-) -> str:
-    """Seed all 120 UTM-zone groups in one commit."""
-    return seed_zone_groups(
-        repo, ZONES.values(), years=years, layout=layout, model_version=model_version, commit_msg="seed all 120 zones"
-    )

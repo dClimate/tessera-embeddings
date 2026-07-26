@@ -56,7 +56,7 @@ from pyproj import Transformer
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
 from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
-from tessera_embeddings.ingest.live_windows import live_chunk_grid_from_keys
+from tessera_embeddings.ingest.live_windows import coarsen_live_grid, live_chunk_grid_from_keys
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.manifest import RoiManifest
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store_as_zarr_group
@@ -793,11 +793,7 @@ def expected_live_chunk_grid(
     """
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
     tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
-    t = INGEST_CHUNK_SIZE // SHARD_PX  # tiles per chunk per axis
-    rows, cols = math.ceil(tile_live.shape[0] / t), math.ceil(tile_live.shape[1] / t)
-    padded = np.zeros((rows * t, cols * t), dtype=bool)
-    padded[: tile_live.shape[0], : tile_live.shape[1]] = tile_live
-    return cast("np.ndarray", padded.reshape(rows, t, cols, t).any(axis=(1, 3)))
+    return coarsen_live_grid(tile_live, INGEST_CHUNK_SIZE // SHARD_PX)
 
 
 def live_chunk_count(

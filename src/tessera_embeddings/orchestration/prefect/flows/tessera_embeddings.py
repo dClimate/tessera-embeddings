@@ -24,13 +24,11 @@ from __future__ import annotations
 
 import datetime
 import logging
-import subprocess
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-import yaml
 from prefect import flow, get_run_logger
 from prefect.runtime import flow_run as flow_run_ctx
 from pydantic import BaseModel
@@ -46,21 +44,16 @@ from tessera_embeddings.inference.orchestration_helpers import (
     build_inference_config,
     enumerate_mosaic_chunks,
 )
+from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
+    activate,
+    deactivate,
+    ray_cleanup_on_cancellation,
+)
 from tessera_embeddings.orchestration.prefect.tasks.inference import (
     assemble_embeddings_task,
     run_inference_task,
 )
-from tessera_embeddings.providers.aws.ray import (
-    RAY_DOWN_TIMEOUT_S,
-    cleanup_ray_tempfiles,
-    cluster_name_for_flow_run,
-    terminate_ray_instances_by_tag,
-)
-
-# Module-level state for the cancellation hook. The flow body sets these
-# on entry and clears them on normal exit; the hook reads them.
-_active_resolved_yaml: str | None = None
-_active_cluster_name: str | None = None
+from tessera_embeddings.providers.aws.ray import cluster_name_for_flow_run
 
 # Fresh runs with allow_s2_only=True carry this run_id prefix. The run_id
 # namespaces the staging directory, so the prefix records the per-pixel S1
@@ -92,14 +85,6 @@ class EmbeddingsDevParams(BaseModel):
     sync_source_path: str | None = None
 
 
-def _cluster_name_for_flow_run(flow_run_id: object) -> str | None:
-    """Deterministic Ray cluster name for a flow run — delegates to the shared
-    provider helper so this flow and ``fill-zone-year`` derive it identically. See
-    :func:`tessera_embeddings.providers.aws.ray.cluster_name_for_flow_run`.
-    """
-    return cluster_name_for_flow_run(flow_run_id)
-
-
 def _resolve_run_id(previous_run_id: str | None, *, allow_s2_only: bool, assembly_only: bool) -> str:
     """Derive the staging run_id, encoding the S2-only mode via S2_ONLY_RUN_PREFIX.
 
@@ -128,52 +113,13 @@ def _resolve_run_id(previous_run_id: str | None, *, allow_s2_only: bool, assembl
     return (S2_ONLY_RUN_PREFIX if allow_s2_only else "") + uuid.uuid4().hex[:12]
 
 
-def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
-    """Emergency teardown when the flow is cancelled or crashes.
-
-    Prefect runs these hooks in a FRESH import of this module after the
-    flow's child process has been killed, so the module globals set by
-    the flow body are normally ``None`` here and ``ray down`` (which
-    needs the dead process's resolved YAML tempfile) is normally
-    impossible. The authoritative path is therefore tag-based: re-derive
-    the cluster name from the flow-run id and terminate every instance
-    carrying its ``ray-cluster-name`` tag. The YAML fast path is kept for
-    the rare same-process case; both paths are idempotent.
-    """
-    log = logging.getLogger(__name__)
-    log.warning("Flow cancelled/crashed — tearing down Ray cluster")
-
-    if _active_resolved_yaml and Path(_active_resolved_yaml).exists():
-        log.info("Running ray down with %s", _active_resolved_yaml)
-        # Bound the call: a hung `ray down` must not block the tag-based
-        # termination below, which is the authoritative teardown here anyway.
-        try:
-            subprocess.run(["ray", "down", _active_resolved_yaml, "-y"], check=False, timeout=RAY_DOWN_TIMEOUT_S)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            # A hang OR a launch failure (e.g. `ray` not on PATH) before a return code
-            # must fall through to the unconditional tag-based termination below.
-            log.warning("`ray down` did not complete (%s) — falling through to tag-based termination", exc)
-        finally:
-            cleanup_ray_tempfiles(_active_resolved_yaml)
-
-    run_id = getattr(flow_run, "id", None)
-    cluster_name = _active_cluster_name or (_cluster_name_for_flow_run(run_id) if run_id else None)
-    if cluster_name:
-        log.warning("Terminating instances for cluster '%s'", cluster_name)
-        terminate_ray_instances_by_tag(cluster_name=cluster_name, log=log)
-    else:
-        log.warning(
-            "No flow-run id or cluster name available — cannot derive the cluster tag. Check the AWS console manually."
-        )
-
-
 @flow(
     name="tessera_embeddings",
     # Both lists hold the SAME function: a crashed run leaks exactly like a
     # cancelled one. Keep the hook IDEMPOTENT — cancelling a parent and its child
     # together delivers the transition twice and runs it twice (2026-07-25).
-    on_cancellation=[_ray_cleanup_on_cancellation],
-    on_crashed=[_ray_cleanup_on_cancellation],
+    on_cancellation=[ray_cleanup_on_cancellation],
+    on_crashed=[ray_cleanup_on_cancellation],
 )
 def tessera_embeddings(
     *,
@@ -372,25 +318,20 @@ def tessera_embeddings(
         ZarrWriter(staging_base).verify_staged_completeness(run_id, live_chunks, log=log)
         return _run_assembly(log=log, result_stats=None, **assemble_kwargs)
 
-    global _active_resolved_yaml, _active_cluster_name
-    # Deterministic, flow-run-derived cluster name so the cancellation/crash
-    # hook can re-derive it in a fresh process (see _cluster_name_for_flow_run).
-    # Outside a Prefect run (unit tests) the id is None and ray_cluster falls
-    # back to its own random suffix.
+    # Deterministic, flow-run-derived cluster name so the cancellation/crash hook can
+    # re-derive it in a fresh process (see _ray_lifecycle). Outside a Prefect run
+    # (unit tests) the id is None and ray_cluster falls back to its own random suffix.
     with ray_cluster(
         log,
         ami_ssm_name=ami_ssm_name,
-        cluster_name=_cluster_name_for_flow_run(flow_run_ctx.id) if flow_run_ctx.id else None,
+        cluster_name=cluster_name_for_flow_run(flow_run_ctx.id) if flow_run_ctx.id else None,
         ssm_prefix=ssm_prefix,
         cloudwatch_log_group=cloudwatch_log_group,
         code_bucket=code_bucket,
         code_suffix=code_suffix,
         sync_source_path=Path(dev_params.sync_source_path) if dev_params.sync_source_path else None,
     ) as resolved_yaml:
-        _active_resolved_yaml = resolved_yaml
-        if resolved_yaml and Path(resolved_yaml).exists():
-            with Path(resolved_yaml).open() as _f:
-                _active_cluster_name = yaml.safe_load(_f).get("cluster_name")
+        activate(resolved_yaml)
 
         from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 
@@ -405,8 +346,7 @@ def tessera_embeddings(
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
         )
-    _active_resolved_yaml = None
-    _active_cluster_name = None
+    deactivate()
 
     succeeded = [r for r in results if r["status"] == "success"]
     skipped = [r for r in results if r["status"] == "skipped"]

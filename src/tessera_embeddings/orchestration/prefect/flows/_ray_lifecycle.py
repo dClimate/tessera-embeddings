@@ -1,9 +1,11 @@
-"""Shared Ray-cluster teardown hook for cluster-owning campaign flows.
+"""Shared Ray-cluster teardown hook for every cluster-owning flow.
 
-``fill_zone_year`` and ``fill_zones_sequential`` provision a Ray cluster the
-same way and need the same emergency teardown when the flow is cancelled OR
-crashes; this module holds the one hook (and the module state it reads) so the
-pattern isn't copied per flow. A flow calls :func:`activate` right after
+``fill_zone_year``, ``fill_zones_sequential`` and the single-ROI
+``tessera_embeddings`` flow all provision a Ray cluster the same way and need the
+same emergency teardown when the flow is cancelled OR crashes; this module holds
+the one hook (and the module state it reads) so the pattern isn't copied per
+flow. It is deliberately ONE implementation: teardown failures leak billed GPU
+instances, and a second copy is a second thing to fix when that is discovered. A flow calls :func:`activate` right after
 ``ray_cluster`` yields and :func:`deactivate` on normal exit, and registers
 :func:`ray_cleanup_on_cancellation` as BOTH its ``on_cancellation`` and
 ``on_crashed`` hook. A crashed run (OOM, host loss, unhandled error) is exactly
@@ -16,7 +18,6 @@ pin a deterministic ``cluster_name`` from their flow-run id
 (:func:`~tessera_embeddings.providers.aws.ray.cluster_name_for_flow_run`) and
 the hook re-derives the same name as its fallback, terminating the fleet by
 tag even from nothing but the ``flow_run`` argument.
-(:mod:`.tessera_embeddings` keeps its own variant of the same pattern.)
 
 **This hook MUST stay idempotent, and it is the expensive one.** Cancelling a
 parent run and its child together delivers the transition twice and runs the
