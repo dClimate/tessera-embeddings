@@ -508,6 +508,30 @@ is what the deadline cares about.
 been A/B'd, and a storage-layer default must not change behaviour for an unmeasured caller. S1 can
 opt in when someone measures it.
 
+**The commit-growth concern it raised is RESOLVED — the cost is bounded, not cumulative.** The
+A/B's parallel arm showed commit times climbing monotonically across its 7 dates (0.5 → 1.2 s)
+where the sequential arm stayed flat (~0.6 s), which read as possible cumulative drift and was
+recorded as the sharpest question for the year soak. A longer run answers it: the series is a
+**sawtooth with a period of exactly 8 dates**, climbing to ~1.5 s and resetting to 0.5 s —
+
+```
+0.5 0.9 0.9 0.9 1.2 1.1 1.2 1.5 │ 0.5 0.9 0.9 1.0 1.1 1.3 1.0 1.2 │ 0.5 …
+└──────── dates 1-8 ────────────┘ └──────── dates 9-16 ───────────┘  └ 17
+```
+
+8 is `INGEST_MANIFEST_SPLIT["time"]`. Each commit rewrites the current shard's manifest, which
+grows as dates accumulate in it and resets when the next shard opens. So over a 330-date
+zone-year the commit oscillates between 0.5 and ~1.5 s rather than growing — **§3.6's manifest
+sharding turns out to bound commit cost as well as object count**, which was not among the
+reasons it was adopted.
+
+Two residual facts worth keeping. The overlapped path DOES grow commit time faster *within* a
+shard than the sequential one (1.2 s against 0.6 s by date 7), plausibly because one merged
+changeset per date produces a larger manifest delta than several smaller merges. And the reason
+the A/B could not see the reset at all is that both arms ran 7 dates — entirely inside one
+8-date shard. **A 7-date window cannot distinguish bounded periodic cost from unbounded growth**;
+only a run crossing a shard boundary can.
+
 **Robustness.** The lift uses `_XarrayDatasetWriter`, which icechunk marks private. The version is
 lockfile-pinned, parity is pinned by test, and any import or signature drift falls back to the
 sequential loop with a warning — so drift degrades to the previously shipped behaviour, never to a
@@ -931,6 +955,7 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | overlap memory cost | peak worker **12.30 of 20 GiB**, spill 0.00 GiB, no pause | parallel arm health lines (§3.11) |
 | overlap packing effect | share of a date that packs **20% → 38%**; headroom from adding workers **1.26× → 1.60×** | per-arm task streams (§3.11) |
 | overlap contention cost | **+15% total slot-seconds** for identical output (2% fewer tasks, +25% transfer) | per-arm task streams (§3.11) |
+| commit cost over a long run | **sawtooth, period 8 dates** (= `INGEST_MANIFEST_SPLIT["time"]`), 0.5 → ~1.5 s then resets — BOUNDED, not cumulative | 17+ dates, soak (§3.11) |
 | **task work composition** | source read+resample **72.3%**, mask+write 16.3%, transfer 7.8%, gate 2.9% | same report (§3.10) |
 | **ceiling from unlimited workers, one cell** | **1.78×** | from the budget; independently 1.2–1.7× from an `A + B/W` sweep fit (§3.10) |
 | window-strategy bound | best any rectangle strategy achieves is **0.50×** current area; shipped achieves 0.75× | local, real footprints (§4.7b) |
