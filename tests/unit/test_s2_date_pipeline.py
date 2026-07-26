@@ -1,0 +1,303 @@
+"""The S2 date loop under both drive modes (pure, offline).
+
+``pipeline_dates`` moves WHEN a date is prepared, and nothing else: the same
+dates must be written, in the same order, with the same counters, and a failure
+must still reach the caller. Everything outside the loop is stubbed here — the
+STAC query, the band load, the ROI store, the write — so what these tests
+actually exercise is the loop, the gate's dask arithmetic, and the two log lines
+the A/B is read from.
+
+Every behavioural test runs under BOTH modes against the same literal
+expectation rather than comparing two runs to each other, so a bug that moved
+both modes the same way still fails.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+from datetime import datetime
+from itertools import pairwise
+from types import SimpleNamespace
+
+import dask.array as da
+import numpy as np
+import pytest
+import tenacity
+import xarray as xr
+
+from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
+from tessera_embeddings.ingest import s2_roi
+
+BOTH_MODES = pytest.mark.parametrize("pipeline_dates", [False, True], ids=["serial", "pipelined"])
+
+SIZE = 8
+VALID_CLASS = next(c for c in range(12) if c not in S2_SCL_INVALID_CLASSES)
+INVALID_CLASS = sorted(S2_SCL_INVALID_CLASSES)[0]
+COVERAGE_THRESHOLD = 50.0
+
+#: ``Pipeline date=<d>: prepare=<s>s hidden=<s>s stall=<s>s`` — the stable format the
+#: A/B greps for, parsed here so a change to it fails a test rather than an analysis.
+PIPELINE_LINE = re.compile(
+    r"Pipeline date=(?P<date>\S+): prepare=(?P<prepare>[\d.]+)s hidden=(?P<hidden>[\d.]+)s stall=(?P<stall>[\d.]+)s"
+)
+STAGE_LINE = re.compile(
+    r"Stage timings date=(?P<date>\S+): build=(?P<build>[\d.]+)s gate=(?P<gate>[\d.]+)s "
+    r"write=(?P<write>[\d.]+)s total=(?P<total>[\d.]+)s"
+)
+
+_ROI = SimpleNamespace(
+    bbox_wgs84=(-105.0, 39.0, -104.9, 39.1),
+    native_crs="EPSG:32613",
+    geobox=None,
+    height=SIZE,
+    width=SIZE,
+)
+
+
+class _FakeClient:
+    """Identity ``persist``, so the gate's reduce runs on dask's local scheduler.
+
+    This does not stub the gate itself — its validity arithmetic really executes.
+    Only the hand-off to a distributed scheduler is replaced.
+    """
+
+    @staticmethod
+    def persist(obj):
+        return obj
+
+
+def _item(date: str):
+    return SimpleNamespace(datetime=datetime.fromisoformat(f"{date}T10:00:00"), properties={"eo:cloud_cover": 0.0})
+
+
+def _day_ds(date: str, *, valid: bool) -> xr.Dataset:
+    """One date's toy mosaic: one reflectance band plus the SCL the gate reads."""
+    scl = np.full((1, SIZE, SIZE), VALID_CLASS if valid else INVALID_CLASS, dtype="uint8")
+    blue = np.arange(SIZE * SIZE, dtype="uint16").reshape(1, SIZE, SIZE)
+    return xr.Dataset(
+        {
+            "blue": (("time", "northing", "easting"), da.from_array(blue, chunks=(1, SIZE, SIZE))),
+            "scl": (("time", "northing", "easting"), da.from_array(scl, chunks=(1, SIZE, SIZE))),
+        },
+        coords={"time": [np.datetime64(f"{date}T10:00:00", "ns")]},
+    )
+
+
+class _Run:
+    """What one offline ingest did: its result, and the order things happened in."""
+
+    def __init__(self) -> None:
+        self.result = None
+        self.loaded: list[str] = []
+        self.written: list[str] = []
+        self.load_started: dict[str, float] = {}
+        self.write_ended: dict[str, float] = {}
+        self.attempts: list[str] = []
+
+
+@pytest.fixture
+def run_ingest(monkeypatch):
+    """Return a factory driving :func:`ingest_s2_roi_reflectance` fully offline.
+
+    ``dates`` maps each date to whether its SCL is valid, so a False entry is a
+    date the coverage gate drops. ``fail_on`` makes that date's write raise, and
+    ``write_s`` slows the write so overlap is observable.
+    """
+    # Retries keep their COUNT (three attempts, then reraise) and lose only their
+    # backoff, which would otherwise cost the suite six seconds per failure case.
+    monkeypatch.setattr(s2_roi, "wait_exponential", lambda **_kwargs: tenacity.wait_none())
+
+    runs: list[_Run] = []
+
+    def _run(
+        dates: dict[str, bool],
+        *,
+        pipeline_dates: bool,
+        fail_on: str | None = None,
+        write_s: float = 0.0,
+        log: logging.Logger | None = None,
+    ) -> _Run:
+        run = _Run()
+        runs.append(run)  # so a test can inspect a run whose write raised
+
+        def load_stac_items(day_items, **_kwargs):
+            date = day_items[0].datetime.strftime("%Y-%m-%d")
+            run.load_started[date] = time.monotonic()
+            run.loaded.append(date)
+            return _day_ds(date, valid=dates[date])
+
+        def write_dataset(_store, day_ds, **_kwargs):
+            date = str(day_ds.time.dt.date.values[0])
+            run.attempts.append(date)
+            if date == fail_on:
+                raise RuntimeError(f"write of {date} failed")
+            time.sleep(write_s)
+            run.written.append(date)
+            run.write_ended[date] = time.monotonic()
+
+        monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([_item(d) for d in dates], {}))
+        monkeypatch.setattr(s2_roi, "load_stac_items", load_stac_items)
+        monkeypatch.setattr(s2_roi, "write_dataset", write_dataset)
+        monkeypatch.setattr(s2_roi, "get_existing_dates", lambda *_a, **_k: set())
+        monkeypatch.setattr(s2_roi, "read_roi_metadata", lambda *_a, **_k: _ROI)
+        monkeypatch.setattr(s2_roi, "read_roi_mask", lambda *_a, **_k: da.ones((SIZE, SIZE), dtype=bool))
+        monkeypatch.setattr(s2_roi, "IngestManifest", SimpleNamespace(from_roi_store=lambda _p: None))
+
+        run.result = s2_roi.ingest_s2_roi_reflectance(
+            roi_zarr_path="memory://roi.zarr",
+            start_date=min(dates),
+            end_date=max(dates),
+            store_path="memory://store",
+            client=_FakeClient(),
+            min_valid_coverage=COVERAGE_THRESHOLD,
+            log=log,
+            stream_stac_monthly=False,
+            pipeline_dates=pipeline_dates,
+        )
+        return run
+
+    _run.runs = runs  # type: ignore[attr-defined]
+    return _run
+
+
+# A run of gate failures between two kept dates: the case where the pipeline is
+# draining skips while a write is in flight, and the one most likely to miscount.
+SKIP_CHAIN = {
+    "2024-01-01": True,
+    "2024-01-02": False,
+    "2024-01-03": False,
+    "2024-01-04": False,
+    "2024-01-05": True,
+}
+
+
+@BOTH_MODES
+def test_a_skip_chain_counts_and_writes_identically(run_ingest, pipeline_dates):
+    """Three consecutive gate failures between two kept dates, counted the same way.
+
+    The counters are the ingest's report of what a (zone, year) contains, and the
+    marker makes them permanent, so a mode that dropped or double-counted a skip
+    would corrupt the record rather than merely run differently.
+    """
+    run = run_ingest(SKIP_CHAIN, pipeline_dates=pipeline_dates)
+    assert run.written == ["2024-01-01", "2024-01-05"], "the kept dates, in date order"
+    assert run.loaded == sorted(SKIP_CHAIN), "every date is prepared exactly once, in order"
+    assert run.result.dates_processed == 2
+    assert run.result.dates_filtered_coverage == 3
+    assert run.result.status == "success"
+
+
+@BOTH_MODES
+def test_every_date_failing_the_gate_reports_skipped(run_ingest, pipeline_dates):
+    run = run_ingest(dict.fromkeys(SKIP_CHAIN, False), pipeline_dates=pipeline_dates)
+    assert run.written == []
+    assert run.result.status == "skipped"
+    assert run.result.dates_filtered_coverage == 5
+
+
+@BOTH_MODES
+def test_a_write_failure_surfaces_after_its_retries(run_ingest, pipeline_dates):
+    """A failed write must reach the caller in both modes, on the date that failed.
+
+    Under pipelining the NEXT date is already being prepared when the write
+    raises, so the risk is a failure that is swallowed, deferred to the wrong
+    date, or reported after later dates have been committed.
+    """
+    with pytest.raises(RuntimeError, match="write of 2024-01-03 failed"):
+        run_ingest(SKIP_CHAIN | {"2024-01-03": True}, pipeline_dates=pipeline_dates, fail_on="2024-01-03")
+
+
+@BOTH_MODES
+def test_a_write_failure_retries_three_times_then_stops(run_ingest, pipeline_dates):
+    """Retry scope is unchanged by the split: three attempts at the WRITE, no more.
+
+    A retry that re-ran preparation would rebuild the graph and re-run the gate,
+    turning one transient GDAL error into a second cluster round trip per attempt.
+
+    The FOLLOWING date may already have been prepared when the write fails — that
+    is what depth-1 pipelining does — and its preparation is simply discarded. What
+    must not happen is the failing date being prepared again per attempt.
+    """
+    dates = {"2024-01-01": True, "2024-01-02": True}
+    with pytest.raises(RuntimeError):
+        run_ingest(dates, pipeline_dates=pipeline_dates, fail_on="2024-01-01")
+    run = run_ingest.runs[-1]
+    assert run.attempts == ["2024-01-01"] * 3
+    assert run.loaded.count("2024-01-01") == 1, "a write retry must not re-prepare its date"
+
+
+@BOTH_MODES
+def test_the_pipeline_line_is_emitted_once_per_written_date(run_ingest, pipeline_dates, caplog):
+    """One line per WRITTEN date — skipped dates never reach the write, so never log.
+
+    The A/B reads per-date medians off this line, so a duplicated or missing line
+    silently rescales the result it is used to judge.
+    """
+    with caplog.at_level(logging.INFO, logger="s2-pipeline-test"):
+        run = run_ingest(SKIP_CHAIN, pipeline_dates=pipeline_dates, log=logging.getLogger("s2-pipeline-test"))
+    lines = [m.groupdict() for m in map(PIPELINE_LINE.search, caplog.messages) if m]
+    assert [line["date"] for line in lines] == run.written
+
+
+@BOTH_MODES
+def test_the_pipeline_lines_fields_are_non_negative(run_ingest, pipeline_dates, caplog):
+    with caplog.at_level(logging.INFO, logger="s2-pipeline-test"):
+        run_ingest(SKIP_CHAIN, pipeline_dates=pipeline_dates, log=logging.getLogger("s2-pipeline-test"))
+    lines = [m.groupdict() for m in map(PIPELINE_LINE.search, caplog.messages) if m]
+    assert lines, "no Pipeline line was emitted at all"
+    for line in lines:
+        prepare, hidden, stall = (float(line[k]) for k in ("prepare", "hidden", "stall"))
+        assert prepare >= 0.0 and hidden >= 0.0 and stall >= 0.0
+        assert hidden + stall >= prepare, f"hidden and stall must account for prepare: {line}"
+
+
+def test_serial_mode_reports_nothing_hidden(run_ingest, caplog):
+    """The measurement contract: serially the driver waits out every preparation.
+
+    Reporting ``hidden`` above zero without a pipeline would make the serial
+    baseline look like a working pipeline and the whole A/B unreadable — so this
+    pins the direction, not just the arithmetic.
+    """
+    with caplog.at_level(logging.INFO, logger="s2-pipeline-test"):
+        run_ingest(SKIP_CHAIN, pipeline_dates=False, log=logging.getLogger("s2-pipeline-test"))
+    lines = [m.groupdict() for m in map(PIPELINE_LINE.search, caplog.messages) if m]
+    assert lines
+    for line in lines:
+        assert float(line["hidden"]) == 0.0, f"serial mode hid nothing, yet reported it: {line}"
+        assert line["stall"] == line["prepare"], f"serial mode stalls for its whole preparation: {line}"
+
+
+@BOTH_MODES
+def test_stage_timings_total_stays_the_serial_equivalent_cost(run_ingest, pipeline_dates, caplog):
+    """``total`` is build+gate+write in both modes, so the field stays comparable.
+
+    Under pipelining part of that total ran concurrently with the previous write,
+    which is what the Pipeline line reports; making `total` a wall-clock figure
+    instead would break every comparison against a pre-pipeline run.
+    """
+    with caplog.at_level(logging.INFO, logger="s2-pipeline-test"):
+        run_ingest(SKIP_CHAIN, pipeline_dates=pipeline_dates, log=logging.getLogger("s2-pipeline-test"))
+    lines = [m.groupdict() for m in map(STAGE_LINE.search, caplog.messages) if m]
+    assert lines
+    for line in lines:
+        build, gate, write, total = (float(line[k]) for k in ("build", "gate", "write", "total"))
+        assert total == pytest.approx(build + gate + write, abs=0.15)
+
+
+def test_the_next_date_is_prepared_during_the_current_write(run_ingest):
+    """The property the flag exists for, observed from a recorded timeline.
+
+    Asserted against the serial run as its control: without one, a flag that did
+    nothing at all would still pass every other test in this module.
+    """
+    dates = dict.fromkeys(["2024-01-01", "2024-01-02", "2024-01-03"], True)
+    overlaps = {}
+    for pipeline_dates in (False, True):
+        run = run_ingest(dates, pipeline_dates=pipeline_dates, write_s=0.1)
+        overlaps[pipeline_dates] = [
+            run.load_started[later] < run.write_ended[earlier] for earlier, later in pairwise(run.written)
+        ]
+    assert all(overlaps[True]), "pipelined mode prepared no date during a write"
+    assert not any(overlaps[False]), "serial mode overlapped a preparation with a write"

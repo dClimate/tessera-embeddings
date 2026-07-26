@@ -41,6 +41,7 @@ def _ingest_s2_roi_impl(
     crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
+    pipeline_dates: bool = False,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
     future = process_roi_reflectance.submit(
@@ -55,6 +56,7 @@ def _ingest_s2_roi_impl(
         crop_to_live_windows=crop_to_live_windows,
         stream_stac_monthly=stream_stac_monthly,
         overlap_window_writes=overlap_window_writes,
+        pipeline_dates=pipeline_dates,
     )
     return future.result()
 
@@ -85,6 +87,7 @@ def ingest_s2_roi_reflectance(
     crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
+    pipeline_dates: bool = False,
 ) -> dict[str, Any]:
     """Ingest S2 L2A reflectance for an ROI using Dask workers.
 
@@ -128,6 +131,11 @@ def ingest_s2_roi_reflectance(
             across the fleet instead of summing. Identical stores either way, and
             it falls back to the sequential write when the overlapped machinery is
             unavailable. Only meaningful with ``crop_to_live_windows``.
+        pipeline_dates: Prepare the next date (load graph, coverage gate, footprint
+            narrowing, masking) on a background thread while the current date is
+            written, so preparation costs wall clock only where the write cannot
+            cover it. The write itself stays serial and in date order — one commit
+            per date — and the stores are identical either way.
 
     Returns:
         ``IngestResult`` serialised as a dict (see
@@ -158,6 +166,7 @@ def ingest_s2_roi_reflectance(
                 crop_to_live_windows=crop_to_live_windows,
                 stream_stac_monthly=stream_stac_monthly,
                 overlap_window_writes=overlap_window_writes,
+                pipeline_dates=pipeline_dates,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -189,4 +198,5 @@ def ingest_s2_roi_reflectance(
                 crop_to_live_windows=crop_to_live_windows,
                 stream_stac_monthly=stream_stac_monthly,
                 overlap_window_writes=overlap_window_writes,
+                pipeline_dates=pipeline_dates,
             )

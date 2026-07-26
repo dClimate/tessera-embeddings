@@ -22,6 +22,10 @@ The algorithm is unchanged from the reference:
      :func:`tessera_embeddings.storage.zarr_store.write_dataset` with a
      narrow tenacity retry on transient GDAL errors.
 
+Step 4 is split into a prepare half and a write half so ``pipeline_dates`` can
+overlap one date's preparation with the previous date's write. The write stays
+serial either way: one commit per date, in date order.
+
 This module imports nothing from Prefect or any cloud provider.
 """
 
@@ -31,7 +35,7 @@ import logging
 import operator
 import time
 from dataclasses import dataclass
-from functools import reduce
+from functools import partial, reduce
 from typing import final
 
 import dask.array as da
@@ -46,6 +50,7 @@ from tessera_embeddings.config.ingest import (
     INGEST_LOAD_CHUNKS,
 )
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
+from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.live_windows import live_windows_for_mask, windows_for_date
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
@@ -126,7 +131,11 @@ def _coverage_from_scl(
     if windows is not None:
         masked = any_valid & roi_mask
         parts = [masked.isel(northing=slice(y0, y1), easting=slice(x0, x1)).sum() for y0, y1, x0, x1 in windows]
-        valid_count_val = int(reduce(operator.add, parts).compute()) if parts else 0
+        # Submitted through the client explicitly rather than by a bare .compute():
+        # the gate runs off the driver thread under date pipelining, and the
+        # scheduler this reduce goes to must be the caller's, not whichever one
+        # dask's default resolution finds from the thread it happens to be on.
+        valid_count_val = int(client.compute(reduce(operator.add, parts)).result()) if parts else 0
     else:
         valid_count = (any_valid & roi_mask).sum()
         any_valid, valid_count = client.persist([any_valid, valid_count])
@@ -134,6 +143,24 @@ def _coverage_from_scl(
 
     passes = float(100.0 * valid_count_val / roi_pixel_count) >= min_valid_coverage
     return (True, any_valid) if passes else (False, None)
+
+
+@dataclass
+class _PreparedDate:
+    """One date's write-ready state, or the reason it has none.
+
+    ``day_ds is None`` means the date was skipped before the write (asset-incomplete
+    items, coverage-gate failure, or no reachable live window); ``skip_reason`` says
+    which, for the consume-side counters. Everything a retry of the write needs is
+    here, so preparation never re-runs on write failure.
+    """
+
+    date: str
+    day_ds: xr.Dataset | None
+    windows: list[tuple[int, int, int, int]]
+    build_s: float
+    gate_s: float
+    skip_reason: str | None = None
 
 
 def ingest_s2_roi_reflectance(
@@ -151,6 +178,7 @@ def ingest_s2_roi_reflectance(
     crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
+    pipeline_dates: bool = False,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
 
@@ -196,6 +224,14 @@ def ingest_s2_roi_reflectance(
             windows' critical paths overlap across the fleet rather than
             summing. Identical stores either way; falls back to the
             sequential write when the overlapped machinery is unavailable.
+        pipeline_dates: Prepare the next date — its load graph, its coverage
+            gate, its footprint narrowing and masking — on a background thread
+            while the current date is being written, so that preparation costs
+            wall clock only when the write cannot cover it. The WRITE stays
+            serial and in date order: one commit per date, and the store has
+            exactly one writer either way. Identical stores either way, which
+            rests on preparation being side-effect-free — it must touch nothing
+            but the dataset it returns.
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items
@@ -252,12 +288,21 @@ def ingest_s2_roi_reflectance(
     total_filtered = 0
     total_seen = 0
 
-    def _ingest_one_date(day_items: list, baselines: dict[str, int]) -> bool:
-        """Ingest one solar day. Returns False if it failed the coverage gate.
+    def _prepare_date(day_items: list, baselines: dict[str, int]) -> _PreparedDate:
+        """Build one solar day's write-ready dataset, or the reason it has none.
 
         A closure so the streamed and single-query paths run byte-identical work; the
         per-date logic must not fork on how its items were supplied.
+
+        SIDE-EFFECT-FREE by contract: under ``pipeline_dates`` this runs on a
+        background thread while the previous date is being written, so anything it
+        mutated outside its return value would race the writer. Everything the write
+        needs travels back in the :class:`_PreparedDate`.
         """
+        # The group's own date, which is all a skipped date needs; refined below to the
+        # mosaic's solar day, which is only knowable once the load has resolved it.
+        date = day_items[0].datetime.strftime("%Y-%m-%d")
+
         # ONE load per date, serving both the coverage gate and the write. SCL is
         # among the written bands, so a separate gate-only load re-read it and paid
         # a second client-side graph build. A date that then fails the gate has
@@ -284,7 +329,7 @@ def ingest_s2_roi_reflectance(
             if "No such band/alias" not in str(exc):
                 raise
             log.warning("Dropping date: load failed on asset-incomplete STAC item(s): %s", exc)
-            return False
+            return _PreparedDate(date, None, [], time.monotonic() - stage_started, 0.0, "asset-incomplete")
 
         built_at = time.monotonic()
         passes, any_valid = _coverage_from_scl(
@@ -295,11 +340,11 @@ def ingest_s2_roi_reflectance(
             client,
             windows=live_windows,
         )
+        build_s, gate_s = built_at - stage_started, time.monotonic() - built_at
         if not passes:
-            return False
-        gated_at = time.monotonic()
+            return _PreparedDate(date, None, [], build_s, gate_s, "coverage")
 
-        date = day_ds.time.dt.date.values[0]
+        date = str(day_ds.time.dt.date.values[0])
         day_ds["time"] = [np.datetime64(date, "ns")]
 
         # Narrow this date's writes to the land its own imagery reaches. The run's
@@ -325,7 +370,7 @@ def ingest_s2_roi_reflectance(
                 # No live cell is reachable today. Nothing to write, and writing an
                 # empty window set would commit a date holding nothing.
                 log.info("Skipping date: its imagery reaches no live window")
-                return False
+                return _PreparedDate(date, None, [], build_s, gate_s, "no-live-window")
             date_windows = [(w.y0, w.y1, w.x0, w.x1) for w in narrowed]
             if len(narrowed) != len(run_windows):
                 log.info(
@@ -345,9 +390,23 @@ def ingest_s2_roi_reflectance(
             mask_for_var = roi_2d if str(var) == "scl" else keep
             day_ds[str(var)] = day_ds[str(var)].where(mask_for_var, other=0)
 
+        return _PreparedDate(date, day_ds, date_windows, build_s, gate_s)
+
+    def _write_date(prepared: _PreparedDate, stall_s: float, baselines: dict[str, int]) -> None:
+        """Write one prepared date's pixels: the store's only writer.
+
+        Runs on the driver thread, one date at a time, under both modes — icechunk
+        commits are sequential on one branch and one commit per date is the contract,
+        so this half is what stays serial when preparation is overlapped.
+        """
+        day_ds = prepared.day_ds
+        assert day_ds is not None, f"date {prepared.date} was skipped ({prepared.skip_reason}); nothing to write"
+        write_started = time.monotonic()
+
         # Tenacity retry on intermittent GDAL errors under high parallelism.
         # Icechunk writes are atomic, so retry is safe — a failed cropped date
         # commits nothing (batched_region_writes) and the retry starts clean.
+        # A retry re-runs only the write, from the graph preparation already built.
         for attempt in Retrying(
             stop=stop_after_attempt(3),
             wait=wait_exponential(multiplier=1, min=2, max=8),
@@ -359,7 +418,7 @@ def ingest_s2_roi_reflectance(
                     write_day_windows(
                         reflectance_store,
                         day_ds,
-                        date_windows,
+                        prepared.windows,
                         roi=roi,
                         manifest=ingest_manifest,
                         baselines=baselines,
@@ -381,33 +440,70 @@ def ingest_s2_roi_reflectance(
         # One line per kept date, partitioning its wall clock into the client-side
         # graph build, the coverage-gate compute, and the write (windows + commit).
         # Stable format: CloudWatch queries and the pipeline analysis key off it.
-        finished_at = time.monotonic()
+        # `total` remains build+gate+write — the date's SERIAL-EQUIVALENT cost, so the
+        # figure stays comparable across both modes however much of it was hidden.
+        write_s = time.monotonic() - write_started
+        prepare_s = prepared.build_s + prepared.gate_s
         log.info(
             "Stage timings date=%s: build=%.1fs gate=%.1fs write=%.1fs total=%.1fs windows=%d mode=%s",
-            date,
-            built_at - stage_started,
-            gated_at - built_at,
-            finished_at - gated_at,
-            finished_at - stage_started,
-            len(date_windows) if live_windows is not None else 0,
+            prepared.date,
+            prepared.build_s,
+            prepared.gate_s,
+            write_s,
+            prepare_s + write_s,
+            len(prepared.windows) if live_windows is not None else 0,
             "parallel" if overlap_window_writes else "sequential",
         )
-        return True
+        # What the overlap actually bought: `stall` is the preparation the write could
+        # not cover, `hidden` the part it did. Emitted in BOTH modes — serially every
+        # date stalls for its whole preparation and hides none of it — so the two are
+        # comparable from one grep.
+        log.info(
+            "Pipeline date=%s: prepare=%.1fs hidden=%.1fs stall=%.1fs",
+            prepared.date,
+            prepare_s,
+            max(prepare_s - stall_s, 0.0),
+            stall_s,
+        )
 
     def _drive(items: list, baselines: dict[str, int]) -> None:
         """Sort one supply of items cloudiest-first, group by date, and ingest each."""
-        nonlocal total_processed, total_filtered, total_seen
+        nonlocal total_seen
+
+        def _consume(prepared: _PreparedDate, stall_s: float) -> None:
+            """Count or write one prepared date — the ONE consume path both modes take.
+
+            Serial and pipelined differ only in where ``prepared`` came from, so the
+            counters and the write cannot drift between them.
+            """
+            nonlocal total_processed, total_filtered
+            if prepared.day_ds is None:
+                total_filtered += 1
+                return
+            _write_date(prepared, stall_s, baselines)
+            total_processed += 1
+
         # query_stac_items sorts by (date, cloud_cover ASC). Re-sort cloudiest-first so
         # the clearest tile paints last (wins) in solar_day's painter's algorithm.
         # group_items_by_date preserves this within-group order.
         items.sort(key=lambda it: (str(it.datetime)[:10], -float(it.properties.get("eo:cloud_cover", 100))))
         by_date = group_items_by_date(items)
         total_seen += len(by_date)
-        for day_items in by_date.values():
-            if _ingest_one_date(day_items, baselines):
-                total_processed += 1
-            else:
-                total_filtered += 1
+        prepare = partial(_prepare_date, baselines=baselines)
+        if pipeline_dates:
+            # The pipeline drains at each month boundary, since it lives inside one
+            # _drive call: one unhidden preparation per month, not worth threading
+            # the buffer across the streamed months.
+            for prepared, stall_s in pipelined(by_date.values(), prepare):
+                _consume(prepared, stall_s)
+        else:
+            for day_items in by_date.values():
+                prepared = prepare(day_items)
+                # Serially the driver waited out the whole preparation, so ALL of it is
+                # stall and none of it is hidden. Reporting 0.0 here would print the
+                # serial baseline as a perfectly-hidden pipeline and make the two modes
+                # incomparable, which is the one thing this line exists to do.
+                _consume(prepared, prepared.build_s + prepared.gate_s)
 
     if stream_stac_monthly:
         # Stream month by month: querying the whole window up front retains every item
