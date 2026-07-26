@@ -88,6 +88,7 @@ def ingest_s2_roi_reflectance(
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
+    worker_env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Ingest S2 L2A reflectance for an ROI using Dask workers.
 
@@ -136,6 +137,11 @@ def ingest_s2_roi_reflectance(
             written, so preparation costs wall clock only where the write cannot
             cover it. The write itself stays serial and in date order — one commit
             per date — and the stores are identical either way.
+        worker_env_overrides: Env vars merged into every Dask worker's environment
+            for THIS run only, for A/B-ing worker-side tuning (allocator and cache
+            behaviour) one arm at a time. Not a configuration channel: anything
+            meant to hold for every run belongs in ``FargateConfig``. Ignored on
+            the ``use_local`` path, which provisions no Fargate workers.
 
     Returns:
         ``IngestResult`` serialised as a dict (see
@@ -179,6 +185,7 @@ def ingest_s2_roi_reflectance(
         # A capped task stream silently truncates the report to the run's last few
         # dates; raise it only when a report is actually being captured.
         diagnostic_task_stream=bool(perf_report_uri),
+        extra_worker_env=worker_env_overrides,
         # Tag every cluster resource with this run's id so the cancellation/crash
         # hook can sweep the tasks from a fresh process (see _dask_lifecycle).
         resource_tags=dask_resource_tags(flow_run_ctx.id),

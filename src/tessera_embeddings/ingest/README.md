@@ -16,6 +16,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
+| `_pipeline.py` | A depth-1 prepare/consume pipeline: overlaps the preparation of the next item with the consumption of the current one on one background thread, and reports the preparation time the consumer had to wait for. Used by the S2 date loop (`pipeline_dates`); the consumer stays serial. |
 | `live_windows.py` | Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
 
 ---
@@ -614,6 +615,36 @@ write falls back to the sequential loop with a warning rather than failing.
 Default **on** for S2. `write_day_windows` itself still defaults to the sequential path,
 because S1 shares it and its window structure has never been compared — a storage-layer
 default should not change behaviour for a caller nobody has measured.
+
+### Pipelining a date's preparation (`pipeline_dates`)
+
+A date's wall clock splits into **preparation** — building the load graph, running the
+coverage gate, narrowing the footprint, constructing the masks — and the **write**. Only
+the write scales with fleet width; preparation is client-side CPU plus one cluster round
+trip and costs the same however many workers are running, so on a wide fleet it is pure
+serial residual.
+
+`pipeline_dates` prepares date N+1 on one background thread while date N is being written
+(`ingest/_pipeline.py`). What stays serial is the write: icechunk commits are sequential on
+a branch, one commit per date is the contract, and the store therefore has exactly one
+writer either way. Preparation is required to be **side-effect-free** — it may touch nothing
+but the dataset it hands back — which is what makes the two modes produce identical stores
+(pinned by a parity test that includes a date failing the coverage gate mid-run).
+
+Depth is 1 and that is intrinsic rather than tuned: preparation is a small fraction of a
+write, so buffering more dates would hold graphs in memory to hide nothing. The pipeline
+lives inside one `_drive` call, so it drains naturally at each streamed month boundary,
+leaving one unhidden preparation per month.
+
+Each written date logs a `Pipeline date=…: prepare=… hidden=… stall=…` line in both modes.
+`stall` is the preparation the write could not cover and is the health metric: near zero
+when preparation hides fully, and rising toward the whole preparation when the gate is
+starved behind the write's own tasks. Serially every date stalls for its full preparation
+and hides none of it, so the two modes are comparable from one line.
+
+Default **off**, and the flag threads from the outer flow through the task shell to the
+domain function. S1 has no coverage gate and a different batch loop; it is deliberately
+untouched.
 
 ### S1: time-windowed batching (task graph management)
 
