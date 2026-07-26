@@ -74,13 +74,16 @@ from tornado.ioloop import PeriodicCallback
 # its share of the per-date graph. Every worker gets the same size, so this is paid
 # across the whole fleet to accommodate one of them.
 #
-# RAISING THIS IS A WEAK LEVER, which is why it is back at the smaller size. A worker
-# settles at roughly 72% of whatever limit it is given — the memory is overwhelmingly
-# UNMANAGED (caches, allocator arenas), and that expands into whatever space exists —
-# while Dask pauses at 80%. So the steady-state margin is ~8% of the limit at ANY size:
-# more memory raises the ceiling along with the threshold and buys proportionally
-# nothing. What actually protects the worker is keeping its PEAK close to that steady
-# ceiling, i.e. not retaining more per date than necessary.
+# RAISING THIS IS A WEAK LEVER against the UNMANAGED baseline: a worker settles at
+# roughly 72% of whatever limit it is given — caches and allocator arenas expand into
+# whatever space exists — while Dask pauses at 80%, so the steady-state margin is ~8%
+# of the limit at ANY size. What protects the worker is keeping its PEAK close to that
+# steady ceiling, i.e. not retaining more per date than necessary.
+#
+# Currently 24576 rather than 20480 as TESTING HEADROOM for the date-pipelining and
+# gate-mask-persist work (docs/ingest-date-pipelining-plan.md in yield-embeddings):
+# those hold MANAGED, spillable data on workers, which — unlike the unmanaged baseline
+# — does benefit from a larger limit. Decide the final size from that A/B, not here.
 #
 # Spilling is NOT the protection either: Dask has nothing it is allowed to evict when
 # the memory is unmanaged. And a paused worker does not recover — work waiting on data
@@ -90,7 +93,7 @@ from tornado.ioloop import PeriodicCallback
 # the CPU would halve the workers a cell can run. Valid pairings for 4 vCPU are
 # 8192-30720 MiB in 1024 steps.
 DEFAULT_INGEST_WORKER_CPU = 4096
-DEFAULT_INGEST_WORKER_MEM = 20480
+DEFAULT_INGEST_WORKER_MEM = 24576
 
 # Schedulers don't need much memory but benefit from a few cores so
 # graph construction and dashboard responsiveness stay smooth.
