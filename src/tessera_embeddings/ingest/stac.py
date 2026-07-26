@@ -563,7 +563,12 @@ def _query_stac_items(
         for raw in search.items_as_dicts():
             # Dedupe across the two halves: a granule straddling +/-180 is returned by
             # both searches, and loading it twice would double-count the solar day.
-            item_id = raw.get("id")
+            # `id` is required by the STAC spec; an item without one cannot be deduped,
+            # and defaulting it would collapse EVERY such item into a single entry —
+            # so say so rather than silently drop data.
+            if raw.get("id") is None:
+                raise ValueError(f"STAC item without an 'id' from {provider.catalog_url} — cannot dedupe it")
+            item_id = str(raw["id"])
             if item_id not in seen:
                 seen.add(item_id)
                 items.append(Item.from_dict(_prune_item_dict(raw, keep_assets)))

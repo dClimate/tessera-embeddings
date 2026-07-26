@@ -766,9 +766,9 @@ def ecs_cluster(
         cluster_kwargs["environment"].update(extra_worker_env)
 
     if diagnostic_task_stream:
-        cluster_kwargs["environment"][
-            "DASK_DISTRIBUTED__SCHEDULER__DASHBOARD__TASKS__TASK_STREAM_LENGTH"
-        ] = str(DIAGNOSTIC_TASK_STREAM_LENGTH)
+        cluster_kwargs["environment"]["DASK_DISTRIBUTED__SCHEDULER__DASHBOARD__TASKS__TASK_STREAM_LENGTH"] = str(
+            DIAGNOSTIC_TASK_STREAM_LENGTH
+        )
 
     if ec2_scheduler:
         capacity_provider = os.environ.get("EC2_SCHEDULER_CAPACITY_PROVIDER", "")
