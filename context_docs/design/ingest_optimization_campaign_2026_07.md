@@ -37,10 +37,11 @@ the scheduler moved from saturated to ~25% busy.
 > work, graph dispatch, blocking region writes and the commit, which **no number of workers can
 > compress**. Within the task work, **72% is reading and resampling the source imagery** — real
 > data movement, not overhead. Two consequences that should be read before planning any further
-> ingest work: **the ceiling from unlimited workers on one cell is 1.78×**, and the only lever
-> left of that size is removing the 74 s serial residual from the critical path, not shrinking
-> the graph further. A 23% graph reduction was shipped and measured at **zero** wall-clock gain
-> (§3.9).
+> ingest work: **widening one cell cannot buy much** — the ceiling from unlimited workers was
+> 1.78× when first measured here and is **1.60× today** (§3.12 re-measured it on both arms of the
+> overlap A/B; treat §3.12 as the current figure) — and the only lever of that size is removing
+> the serial residual from the critical path, not shrinking the graph further. A 23% graph
+> reduction was shipped and measured at **zero** wall-clock gain (§3.9).
 >
 > **That residual has since been located and largely removed (§3.11).** It was not the commit
 > (0.6 s), not graph construction (3.4 s) and not the drive loop (0.2–0.8 s between dates): it
@@ -403,6 +404,11 @@ And the line that matters:
 | **irreducible by adding workers** | **73.8 s (56%)** |
 | **ceiling from unlimited workers** | **1.78×** |
 
+> These are the figures from THIS probe — a 2-date run on pre-overlap code — and they are kept as
+> measured. **For the current ceiling read §3.12**, which re-ran this analysis on both arms of the
+> overlap A/B and puts it at **1.60×** (against 1.26× for the same 7 dates pre-overlap). The
+> qualitative verdict below is unaffected: most of a date still does not pack.
+
 **Three things this settles.**
 
 *The graph was never the cost.* 72% of compute is fetching and resampling source COGs — real data
@@ -537,6 +543,53 @@ lockfile-pinned, parity is pinned by test, and any import or signature drift fal
 sequential loop with a warning — so drift degrades to the previously shipped behaviour, never to a
 failure. The A/B confirmed the fallback did not fire and no per-window lines appeared, i.e. the new
 path genuinely ran.
+
+### 3.12 What the overlap did to the packing budget — and why §3.10's programme verdict survives
+
+§3.11 established the overlap's win from wall clock and store contents. Re-running §3.10's
+packing analysis on **both arms' performance reports** — same instrument, same 480 slots, same
+7 dates — checks the mechanism from the other side, and corrects a plausible-sounding
+inference about what the change did.
+
+| | sequential | parallel |
+|---|---|---|
+| wall clock per date | 166.1 s | 104.2 s |
+| task work at PERFECT packing | 34.0 s (20%) | 39.1 s (38%) |
+| **residual no worker count can remove** | **132.1 s (80%)** | **65.1 s (62%)** |
+| ceiling from unlimited workers, one cell | 1.26× | **1.60×** |
+| total slot-seconds | 114,294 s | 131,528 s (**+15%**) |
+| source read + resample, share of task work | 72.3% | 71.3% |
+
+**The overlap REMOVED serial time; it did not convert serial time into packable work.** That
+distinction matters and the obvious reading gets it backwards. Packed task work barely moved
+(34.0 → 39.1 s); what collapsed was the residual, 132.1 → 65.1 s. The windows' critical paths
+were never *work* the fleet could have absorbed — they were waiting, and the fix deleted the
+waiting rather than parallelising it.
+
+**Two independent confirmations fall out.** The +15% slot-seconds reproduces the overlap's
+CPU cost from a second instrument (it was first measured from worker-time totals), and the
+stage shares are stable to within a percentage point, so the change did not silently alter
+what the graph computes — the same conclusion the identical 44,797 chunk-object counts reach
+from store contents.
+
+**§3.10's programme verdict stands, and this is the point of the section.** The ceiling moved
+from 1.26× to 1.60×, which is real but modest: **62% of a date still cannot be compressed by
+any worker count**, so widening a single cell remains unprofitable and the campaign's lever
+is still cell CONCURRENCY rather than cell width. It would have been easy to assume that
+halving the residual freed the fleet to scale; measurement says it did not.
+
+**What the remaining 65.1 s is.** Roughly 18.6 s is accounted for by name — build 10.4 s
+(client-side graph construction), gate 7.3 s, commit 0.9 s. The other ~46 s sits *inside* the
+write phase, which is now a single dask compute: slots stand idle inside it, on dependency
+structure and straggler tails rather than on anything serial that remains to be lifted. That
+is the next thing worth profiling, and it is a different problem from the one §3.11 solved.
+
+**Caveat on the absolute figures.** Both ceilings are derived from the captured task stream. A
+bounded stream would understate packed work in both arms and so understate both ceilings; the
+two arms captured 182,311 and 178,123 tasks, which are neither round numbers nor equal, so
+truncation is unlikely but not excluded. **The paired DELTA is the robust quantity**, since
+both arms were measured with one instrument at one setting; treat the absolute ceilings as
+lower bounds.
 
 ## 4. What did not work, and why
 
@@ -781,12 +834,19 @@ timings and took an object count to identify.
 
 ## 7. Open questions
 
-- **~~Is the fleet-bound floor now reached?~~ ANSWERED — yes, and the number is 1.78×.** The
+- **~~Is the fleet-bound floor now reached?~~ ANSWERED — yes; the current number is 1.60×.** The
   downward sweep ran (120/60/30, 7 dates each) and the profile settled it (§3.10): of a 131 s
-  date only 57 s packs across the fleet, so unlimited workers on ONE cell buy 1.78× and most of
+  date only 57 s packs across the fleet, so unlimited workers on ONE cell buy little and most of
   that is gone by ~200 workers. Sweep medians were 194.8 / 232.4 / 396.7 s, giving 1.71× for
   30→60 and only 1.19× for 60→120 — the knee sits between 60 and 120. **Caveat on those absolute
   values: they are not reproducible** (§5, external latency drift); the SHAPE is what carries.
+  **Updated post-overlap (§3.12):** the ceiling is now **1.60×**, up from 1.26× measured on the
+  same instrument pre-overlap; the 1.78× first recorded here came from a pre-overlap 2-date probe.
+  The verdict is unchanged in direction and that is the load-bearing part — **62% of a date still
+  cannot be compressed by any worker count**, so cell concurrency remains the lever and cell width
+  does not. **The sweep's own width curve is additionally STALE**: it ran pre-overlap (no
+  `overlap_window_writes` parameter), and the overlap halves the residual it was measuring, so
+  post-overlap width sensitivity has to be re-measured rather than inherited.
 - **NEW, opened by §3.11: is the 4096 write-window idea now viable?** §4.7 rejected narrowing
   write windows to the 4096 grid because it took windows from 5-6 to 12-13 per date at ~17 s of
   SERIAL cost each. Overlapping the windows removes most of that per-window serial cost, so the
@@ -953,11 +1013,12 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | **where the residual was** | `write_day_windows` computing windows serially: per-window times summed to **146.9 s of a 148.0 s write phase**; commit only **0.6 s** | 7 dates, per-window instrumentation (§3.11) |
 | **window overlap** | write phase **148.0 → 86.5 s (1.71×)**; per-date **166.1 → 104.2 s (1.59×)**; chunk objects **44,797 both arms** | A/B, identical dates and width (§3.11) |
 | overlap memory cost | peak worker **12.30 of 20 GiB**, spill 0.00 GiB, no pause | parallel arm health lines (§3.11) |
-| overlap packing effect | share of a date that packs **20% → 38%**; headroom from adding workers **1.26× → 1.60×** | per-arm task streams (§3.11) |
-| overlap contention cost | **+15% total slot-seconds** for identical output (2% fewer tasks, +25% transfer) | per-arm task streams (§3.11) |
+| overlap packing effect | share of a date that packs **20% → 38%**; headroom from adding workers **1.26× → 1.60×**; residual **132.1 → 65.1 s** — serial time REMOVED, not made packable (packed work moved only 34.0 → 39.1 s) | per-arm task streams (§3.12) |
+| overlap contention cost | **+15% total slot-seconds** for identical output (2% fewer tasks, +25% transfer) | per-arm task streams (§3.12) |
+| post-overlap residual, unexplained portion | of 65.1 s, **~18.6 s named** (build 10.4, gate 7.3, commit 0.9); **~46 s idles INSIDE the single write compute** | §3.12 |
 | commit cost over a long run | **sawtooth, period 8 dates** (= `INGEST_MANIFEST_SPLIT["time"]`), 0.5 → ~1.5 s then resets — BOUNDED, not cumulative | 17+ dates, soak (§3.11) |
 | **task work composition** | source read+resample **72.3%**, mask+write 16.3%, transfer 7.8%, gate 2.9% | same report (§3.10) |
-| **ceiling from unlimited workers, one cell** | **1.78×** | from the budget; independently 1.2–1.7× from an `A + B/W` sweep fit (§3.10) |
+| **ceiling from unlimited workers, one cell** | **1.60×** post-overlap (was 1.26× on the same instrument pre-overlap). §3.10's **1.78×** came from a pre-overlap 2-date probe and is SUPERSEDED as a current figure, though its programme verdict — widen cells, no; multiply cells, yes — survives unchanged | paired per-arm task streams (§3.12); independently 1.2–1.7× from an `A + B/W` sweep fit (§3.10) |
 | window-strategy bound | best any rectangle strategy achieves is **0.50×** current area; shipped achieves 0.75× | local, real footprints (§4.7b) |
 | external catalog latency drift | identical query **37.6 s vs 33.1 s** two hours apart (~12%) | §5 |
 | worker-count scaling, dense zone | median s/date **194.8 at 120w, 232.4 at 60w, 396.7 at 30w**; doubling buys 1.71× at 30→60 and 1.19× at 60→120 | 7 dates per rung |
