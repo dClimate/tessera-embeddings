@@ -20,7 +20,7 @@ undoes it. New measurements belong in §8; failed attempts belong in §4 with th
 deleted.
 
 **All wall-clock figures are the same cell** — zone `35N`, January 2024, 120-worker
-Dask-on-Fargate fleet (4 vCPU / 16 GiB each), the same frozen ROI mask — so the rows compare.
+Dask-on-Fargate fleet (4 vCPU; 16 GiB for figures up to 2026-07-25, **20 GiB after** — see §4.7), the same frozen ROI mask — so the rows compare.
 Graph-task figures are from local census runs over a fixed pixel window; those compare within
 a series but not across series, and are labelled accordingly.
 
@@ -31,6 +31,16 @@ a series but not across series, and are labelled accordingly.
 Ingest of a dense zone-month went from **not completing at all** to **~170–185 s per date**,
 with the graph a date submits down roughly an order of magnitude from the full-extent path and
 the scheduler moved from saturated to ~25% busy.
+
+> **THE GRAPH IS NO LONGER THE COST, and a profile now says what is (§3.10).** Of a 131 s date,
+> only **57 s is task work even at perfect packing**; the other **74 s (56%)** is serial client
+> work, graph dispatch, blocking region writes and the commit, which **no number of workers can
+> compress**. Within the task work, **72% is reading and resampling the source imagery** — real
+> data movement, not overhead. Two consequences that should be read before planning any further
+> ingest work: **the ceiling from unlimited workers on one cell is 1.78×**, and the only lever
+> left of that size is removing the 74 s serial residual from the critical path, not shrinking
+> the graph further. A 23% graph reduction was shipped and measured at **zero** wall-clock gain
+> (§3.9).
 
 | # | change | per-date | cumulative | what it addressed |
 |---|---|---|---|---|
@@ -322,10 +332,91 @@ once per date — none of them per-window. Narrowed windows stay 8192-aligned wi
 to the extent, satisfying the write path's chunk-alignment guard, and remain chunk-disjoint by
 construction.
 
-**Status: implemented, measurement pending.** The projection is that per-date cost roughly
-halves and the useful worker count doubles; neither is measured yet. Anchor and footprint runs
-on identical dates are the comparison, with **store object counts as the correctness check** —
-if the two stores hold the same chunk objects, the change did exactly what it claims.
+**Status: SHIPPED, CORRECT, and worth ZERO wall clock.** Measured against an anchor run on
+identical dates and width:
+
+| | anchor | footprint |
+|---|---|---|
+| median per date | 172.5 s | **172.4 s** |
+| paired speedup over 7 identical dates | — | **1.01×**, 4/7 faster, mixed directions |
+| windows per date | 7 | 5.3 mean |
+| graph tasks per date | ~40,000 | ~31,000 (−23%) |
+| scheduler CPU | ~40% | ~26% |
+| **chunk objects written** | **44,797** | **44,797 — IDENTICAL** |
+
+The correctness claim held exactly: the two stores are object-for-object the same, so the change
+provably removed computation and not data. **The performance projection was wrong**, and the
+reasoning behind it was wrong in two independent ways:
+
+**1. The 19.4% was a granularity artifact.** It counts 4096 px chunks; windows are built on the
+8192 px load-block grid, where one cell is 82 km. A swath edge clipping a cell dirties the whole
+cell. Measured at the grid the ingest actually uses, one date touches **47–57% of live cells**,
+not 20%. Nothing can narrow below its own grid.
+
+**2. The dead area splits two ways, and the split was stated backwards.** Measured over three
+dates at the 4096 grid (live 2,415 chunks):
+
+| | share of live |
+|---|---|
+| **geometric dead** — no image that day | **55–66%** — a window strategy CAN skip it |
+| radiometric dead — imaged, but cloud/invalid so masking zeroed it | 10–21% — it CANNOT |
+| written | 24% |
+
+An earlier version of this section claimed the radiometric part dominated and that geometry
+therefore could not help. **That is withdrawn (§5)** — geometry is the larger share. What limited
+the shipped change was the grid it operates on, not the nature of the dead area. The catalog
+returns ~960 items per date for this zone, roughly twice what covers it, because the zone reaches
+84°N where orbits converge — so imagery is present for far more of the zone than a 5-day revisit
+suggests, and the cloud share is a genuine floor no footprint can see in advance.
+
+**Keep it anyway**, on the scheduler rather than the clock: −23% graph and −35% scheduler CPU are
+the currency that buys worker count, and §3.10 shows the clock was never graph-bound. That is a
+hypothesis about scale, not a measured benefit.
+
+### 3.10 Where a date's time actually goes — the profile that reframed the campaign
+
+Measured with the toolkit's existing hook: `perf_report_uri` is already a flow parameter, so this
+needed **no code change** — a two-date probe run captures the Dask task stream to S3, and the
+report's own numbers are grouped per stage (`scratchpad/perf_budget.py`).
+
+| stage | share of task work | s/date at perfect packing |
+|---|---|---|
+| **source read + resample** | **72.3%** | 41.4 s |
+| mask + region write | 16.3% | 9.4 s |
+| inter-worker transfer | 7.8% | 4.5 s |
+| coverage gate reduce | 2.9% | 1.7 s |
+| total task work | 100% | **57.2 s** |
+
+And the line that matters:
+
+| | |
+|---|---|
+| measured wall clock per date | 131.0 s |
+| task work at PERFECT packing | 57.2 s (44%) |
+| **irreducible by adding workers** | **73.8 s (56%)** |
+| **ceiling from unlimited workers** | **1.78×** |
+
+**Three things this settles.**
+
+*The graph was never the cost.* 72% of compute is fetching and resampling source COGs — real data
+movement against the public Sentinel-2 archive. That is why removing 23% of the graph (§3.9)
+moved the clock by nothing, and why §3.8's write-floor framing pointed at the wrong quantity.
+
+*More workers cannot help much, and the number is now known.* Only the 57 s packs; the 74 s of
+serial client work, dispatch, blocking region writes and commit does not. 1.78× is the ceiling on
+one cell however wide the fleet — independently consistent with the 1.2–1.7× obtained by fitting
+`A + B/W` to a three-rung worker sweep, which is worth noting because the two methods share no
+inputs.
+
+*It reconciles two results that looked contradictory.* Real I/O should scale with workers, and it
+does — that is the 41 s. A worker sweep showed scaling flattening above 60 workers, and it does —
+because the 74 s residual is more than half the date. Both observations were correct.
+
+**The lever this identifies.** The residual is the target, and shrinking it is not the only way to
+remove it: **overlapping one date's serial phase with the next date's compute** takes it off the
+critical path entirely, which is worth more than any further graph work. That is the open question
+in §7, and it is the first ingest change in this campaign to be proposed from a profile rather
+than from a model.
 
 ## 4. What did not work, and why
 
@@ -452,10 +543,57 @@ we are on.
 heartbeats of the run; over the full run it reached 10.58 GiB and spilled. Early samples of a
 memory series are not a memory measurement.
 
+### 4.7 Window geometry beyond the shipped narrowing — three variants, all worse
+
+Measured locally against a real date's item footprints (`scratchpad/window_geometry.py`), so none
+of these cost fleet time. Area is in 8192 cells; the ideal is the live-and-imaged cells themselves.
+
+| strategy | windows | area | vs current | verdict |
+|---|---|---|---|---|
+| current static (every date) | 7 | 748 | 1.00× | — |
+| **narrowed + merge (shipped)** | **5** | **560** | **0.75×** | kept |
+| narrowed rows, unmerged | **80** | 382 | 0.51× | rejected — 80 serial region writes |
+| narrowed columns, unmerged | 8 | 531 | 0.71× | rejected — no better than shipped |
+| ideal (cells themselves) | — | 372 | 0.50× | unreachable by rectangles |
+
+**The whole prize was 2×, not 5×, and three quarters of it is already taken.** Reaching the ideal
+costs 16× the window boundaries, and a window boundary is a blocking region write — the exact
+regression §3.2 fixed.
+
+Two further variants were rejected on arithmetic rather than experiment:
+
+- **Load blocks 8192 → 4096**, to let narrowing work on a finer grid. Would recover ~1.6× more
+  area, but the same measurement shows it touching **1,083 load blocks instead of 372 — 2.9× the
+  load tasks**, reversing §3.5. Graph size is the scale constraint, so this trades the scarce
+  thing for the abundant one.
+- **Write windows at 4096 while load blocks stay 8192.** Technically sound (`align_chunks=True` is
+  already on for the windowed write, so producer blocks remap), but it takes windows from 5–6 to
+  **12–13 per date**. A within-run natural experiment bounds what that costs: in the footprint run
+  the five-window dates averaged **158.3 s** and the six-window dates **175.8 s** — about **17 s
+  per window** (n=2, wide spread, but it brackets the ~7 s of §3.2 rather than contradicting it).
+  So 5 → 12 windows costs 50–120 s per date to save write area that §3.10 shows is not on the
+  critical path.
+
 ## 5. Claims made and withdrawn
 
 Recorded so they are not revived, and because the pattern is instructive.
 
+- **"Four fifths of every date's graph can be skipped."** The 19.4% data share is real but is
+  measured at the 4096 chunk grid, while windows are built on the 8192 load-block grid where a
+  date touches 47–57% of live cells. The achievable prize was **2×, not 5×** (§4.7b), and the
+  shipped change already took three quarters of it for **zero** wall clock (§3.9).
+- **"Most of the dead area is not geometric — it is cloud."** Backwards. Geometric dead is
+  **55–66%** of live chunks and radiometric **10–21%** (§3.9). The claim was made to explain the
+  null result and was not measured before being asserted; the real explanation is grid
+  granularity plus the fact that area was never on the critical path.
+- **"The sweep's timing gap came from contention with concurrent automation testing."** Asserted
+  from three paired dates with no mechanism, and withdrawn: CloudWatch and ECS API calls do not
+  contend with COG reads from a public bucket. An identical catalog query measured **37.6 s at
+  21:45 and 33.1 s at 23:45** — external service latency drifts ~12% over two hours, which is a
+  supported explanation where the contention story was not. The operative lesson is
+  methodological: **timing comparisons across runs separated by tens of minutes are unreliable at
+  the 20% level**, so the footprint verdict was re-based on deterministic quantities (windows per
+  date, graph task count, object counts).
 - **"1.41× from decoupling load blocks."** That was one cherry-picked date. On matched means it
   is **1.23×** (187.9 s against 225 s).
 - **"Per-date cost drifts upward within a run."** Visible across the first six dates
@@ -523,11 +661,19 @@ timings and took an object count to identify.
 
 ## 7. Open questions
 
-- **Is the fleet-bound floor now reached?** At ~185 s/date, dispatch accounts for ~55 s and the
-  client build ~15–20 s, leaving ~70 s that is plausibly real fetch-and-resample work. If so,
-  the earlier ≤1.1× bound on adding workers no longer holds and per-cell width matters again.
-  The discriminator is a downward worker sweep (120/60/30 at a fixed plan and fixed dates),
-  which needs no quota increase.
+- **~~Is the fleet-bound floor now reached?~~ ANSWERED — yes, and the number is 1.78×.** The
+  downward sweep ran (120/60/30, 7 dates each) and the profile settled it (§3.10): of a 131 s
+  date only 57 s packs across the fleet, so unlimited workers on ONE cell buy 1.78× and most of
+  that is gone by ~200 workers. Sweep medians were 194.8 / 232.4 / 396.7 s, giving 1.71× for
+  30→60 and only 1.19× for 60→120 — the knee sits between 60 and 120. **Caveat on those absolute
+  values: they are not reproducible** (§5, external latency drift); the SHAPE is what carries.
+- **THE open question now: can a date's serial residual be taken off the critical path?** 74 s
+  of every 131 s date is serial client work, dispatch, blocking region writes and commit, and it
+  is now the largest single target in the ingest by a wide margin. Shrinking it is one route;
+  **overlapping it with the next date's compute is the better one**, because it removes the term
+  rather than reducing it. Prerequisite question: the ingest is date-serial by construction
+  (`_ingest_one_date` per date, one commit per date), so this is a restructuring of the drive
+  loop, not a tuning change — and the commit-per-date contract must survive it.
 - **Is `F` fleet-invariant?** If it is one block's fetch latency it should be; if it is
   scheduler round-trip it grows with fleet size. This decides whether a window cap tuned at 120
   workers transfers at all.
@@ -670,7 +816,13 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | streaming retention cost | +1 month of items on the ingest worker; 1.25 GiB spill at 16 GiB | run telemetry |
 | items deferred across a month boundary | 1,084 of 31,507 (one day's worth) | live cluster |
 | write floor | graph ≈ store_chunks × bands; 2,992 covered vs 2,415 live (19% dead) | measured, all 7 windows |
-| **per-date data share** | **582 of 2,992 covered chunks per band-date = 19.4%**, against 20% predicted by a 5-day revisit | store object count, 7 dates (§3.9) |
+| **per-date data share** | **582 of 2,992 covered chunks per band-date = 19.4%** at the 4096 grid; **47–57% of live CELLS** at the 8192 window grid | store object count + local footprint measurement (§3.9) |
+| **dead-area split** | geometric **55–66%** of live, radiometric (cloud) **10–21%**, written 24% | 3 dates, local (§3.9) |
+| **per-date time budget** | task work **57.2 s** at perfect packing of a **131 s** date; residual **73.8 s (56%)** | Dask performance report, 2-date probe (§3.10) |
+| **task work composition** | source read+resample **72.3%**, mask+write 16.3%, transfer 7.8%, gate 2.9% | same report (§3.10) |
+| **ceiling from unlimited workers, one cell** | **1.78×** | from the budget; independently 1.2–1.7× from an `A + B/W` sweep fit (§3.10) |
+| window-strategy bound | best any rectangle strategy achieves is **0.50×** current area; shipped achieves 0.75× | local, real footprints (§4.7b) |
+| external catalog latency drift | identical query **37.6 s vs 33.1 s** two hours apart (~12%) | §5 |
 | worker-count scaling, dense zone | median s/date **194.8 at 120w, 232.4 at 60w, 396.7 at 30w**; doubling buys 1.71× at 30→60 and 1.19× at 60→120 | 7 dates per rung |
 
 ---
