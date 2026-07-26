@@ -16,6 +16,7 @@ from affine import Affine
 from odc.geo.geobox import GeoBox
 
 from tessera_embeddings.errors import ConfigMismatchError
+from tessera_embeddings.storage.empty_store import create_empty_store
 from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
 from tessera_embeddings.storage.zarr_store import (
     _open_repo,
@@ -139,8 +140,6 @@ def test_crash_between_seed_and_first_windows_is_retryable(tmp_path):
     crash after the seed leaves a zero-date store, and the retry appends the
     date atomically with its windows.
     """
-    from tessera_embeddings.storage.empty_store import create_empty_store
-
     store = str(tmp_path / "reflectance.zarr")
     # Simulate the crash: store seeded, no date committed.
     create_empty_store(

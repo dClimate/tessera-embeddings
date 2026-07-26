@@ -21,35 +21,53 @@ from tessera_embeddings.inference.conventions import expected_model_url
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
 
-@pytest.mark.parametrize("allow_partial", [False, True])
-def test_coverage_gate_fails_before_ray(monkeypatch, allow_partial):
-    """A coverage-check failure raises before Ray, and threads the flag + creds."""
+@pytest.fixture()
+def wired(monkeypatch):
+    """Stub every touchpoint the flow reaches BEFORE the thing under test.
+
+    Defaults put the flow on the live-cell path — on-axis, not complete, has land —
+    because that is the only path where the pre-Ray gates and the Ray branch run at
+    all. Both gates pass by default; a test that is about one of them re-patches it.
+    Nothing here provisions Ray, so a test that wants the Ray branch must supply its
+    own ``ray_cluster``.
+    """
     monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-fill"))
     monkeypatch.setattr(
         "tessera_embeddings.providers.aws.credentials.iam_icechunk_credentials", object(), raising=False
     )
-    ray_calls: list = []
-    monkeypatch.setattr(
-        "tessera_embeddings.providers.aws.ray.ray_cluster",
-        lambda *a, **k: ray_calls.append((a, k)),
-        raising=False,
-    )
-    # needs_cluster = on_axis and not complete and has_live -> True
     monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: False)
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
     monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
     monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(time_window="W"))
-    # Model guard also runs pre-Ray; stub it so this test isolates the coverage gate.
     monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "check_time_window_coverage", lambda *a, **k: None)
+    return monkeypatch
 
+
+def _stop_before_ray(monkeypatch):
+    """Make the coverage gate raise, so a test can assert on pre-Ray behaviour."""
+
+    def _raise(*a, **k):
+        raise InsufficientCoverageError("stop before Ray")
+
+    monkeypatch.setattr(mod, "check_time_window_coverage", _raise)
+
+
+@pytest.mark.parametrize("allow_partial", [False, True])
+def test_coverage_gate_fails_before_ray(wired, allow_partial):
+    """A coverage-check failure raises before Ray, and threads the flag + creds."""
+    ray_calls: list = []
+    wired.setattr(
+        "tessera_embeddings.providers.aws.ray.ray_cluster", lambda *a, **k: ray_calls.append((a, k)), raising=False
+    )
     captured: dict = {}
 
     def _coverage(mosaic_base, window, *, s1_orbit, skip_coverage_check, get_credentials, s3_region=None):
         captured.update(mosaic_base=mosaic_base, skip=skip_coverage_check, creds=get_credentials)
         raise InsufficientCoverageError("reflectance store missing months")
 
-    monkeypatch.setattr(mod, "check_time_window_coverage", _coverage)
+    wired.setattr(mod, "check_time_window_coverage", _coverage)
 
     with pytest.raises(InsufficientCoverageError):
         mod.fill_zone_year_flow.fn(
@@ -67,189 +85,131 @@ def test_coverage_gate_fails_before_ray(monkeypatch, allow_partial):
 
 
 @pytest.mark.parametrize("flag", [False, True])
-def test_allow_s2_only_reaches_inference_config(monkeypatch, flag):
+def test_allow_s2_only_reaches_inference_config(wired, flag):
     """The flow's allow_s2_only lands in build_inference_config — the single
     chokepoint through which it reaches the dataset's per-pixel gate. The
-    zone-level gates are NOT relaxed by it (coverage gate still raises here).
+    zone-level gates are NOT relaxed by it (the coverage gate still raises here).
     """
-    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-fill"))
-    monkeypatch.setattr(
-        "tessera_embeddings.providers.aws.credentials.iam_icechunk_credentials", object(), raising=False
-    )
-    monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: False)
-    monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)
-    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
-    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
-
     captured: dict = {}
-
-    def _config(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(time_window="W")
-
-    monkeypatch.setattr(mod, "build_inference_config", _config)
-
-    def _coverage(*a, **k):
-        raise InsufficientCoverageError("stop before Ray")
-
-    monkeypatch.setattr(mod, "check_time_window_coverage", _coverage)
+    wired.setattr(mod, "build_inference_config", lambda **kw: captured.update(kw) or SimpleNamespace(time_window="W"))
+    _stop_before_ray(wired)
 
     with pytest.raises(InsufficientCoverageError):
         mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami", allow_s2_only=flag)
     assert captured["allow_s2_only"] is flag
 
 
-def test_model_guard_rejects_encoder_mismatch(monkeypatch):
-    """A store seeded for a different encoder than this build is rejected — a
-    mid-campaign model upgrade would otherwise mix encoders under one store.
-    """
-    monkeypatch.setattr(
-        mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"geoemb:model": "https://x/OLD"})
-    )
-    with pytest.raises(ValueError, match="was seeded for encoder"):
-        mod._assert_seeded_model_matches(
-            "s3://in/store", build_checkpoint="ckpt.pt", allow_model_mismatch=False, get_credentials=None
-        )
+_AWS_CKPT = "tessera_v1_1_aws_encoder.pt"
+_MPC_CKPT = "tessera_v1_1_mpc_encoder.pt"
 
 
-def test_model_guard_allows_match_override_and_missing(monkeypatch):
-    """The guard passes when the encoder matches, when the override flag is set,
-    and when the store advertises no model at all (legacy/unseeded root).
-    """
-    monkeypatch.setattr(
-        mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"geoemb:model": expected_model_url()})
-    )
-    mod._assert_seeded_model_matches(
-        "s3://in/store", build_checkpoint="ckpt.pt", allow_model_mismatch=False, get_credentials=None
-    )  # matches
-
-    monkeypatch.setattr(
-        mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"geoemb:model": "https://x/OLD"})
-    )
-    mod._assert_seeded_model_matches(
-        "s3://in/store", build_checkpoint="ckpt.pt", allow_model_mismatch=True, get_credentials=None
-    )  # override
-
-    monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={}))
-    mod._assert_seeded_model_matches(
-        "s3://in/store", build_checkpoint="ckpt.pt", allow_model_mismatch=False, get_credentials=None
-    )  # no attr
-
-
-def test_model_guard_rejects_checkpoint_mismatch(monkeypatch):
-    """Same encoder URL but a different concrete checkpoint (norm source) recorded in
-    checkpoint_id is rejected — geoemb:model versions only the encoder, so the
-    aws/mpc v1.1 checkpoints would otherwise be silently mixed under one URL.
-    """
-    monkeypatch.setattr(
-        mod,
-        "open_store_as_zarr_group",
-        lambda *a, **k: SimpleNamespace(
-            attrs={"geoemb:model": expected_model_url(), "checkpoint_id": "tessera_v1_1_mpc_encoder.pt"}
-        ),
-    )
-    with pytest.raises(ValueError, match="seeded for checkpoint"):
-        mod._assert_seeded_model_matches(
-            "s3://in/store",
-            build_checkpoint="tessera_v1_1_aws_encoder.pt",
-            allow_model_mismatch=False,
-            get_credentials=None,
-        )
-    # A matching checkpoint_id passes; the override tolerates a mismatch.
+def _guard(monkeypatch, attrs: dict, *, build_checkpoint: str = "ckpt.pt", allow_mismatch: bool = False) -> None:
+    """Run the seeded-model guard against a store root carrying ``attrs``."""
+    monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs=attrs))
     mod._assert_seeded_model_matches(
         "s3://in/store",
-        build_checkpoint="tessera_v1_1_mpc_encoder.pt",
-        allow_model_mismatch=False,
+        build_checkpoint=build_checkpoint,
+        allow_model_mismatch=allow_mismatch,
         get_credentials=None,
     )
-    mod._assert_seeded_model_matches(
-        "s3://in/store", build_checkpoint="tessera_v1_1_aws_encoder.pt", allow_model_mismatch=True, get_credentials=None
-    )
 
 
-def test_ray_path_wires_actor_terminator(monkeypatch):
+@pytest.mark.parametrize(
+    "attrs,build_checkpoint,match",
+    [
+        # A store seeded for a different ENCODER than this build embeds with. Filling
+        # it would mix encoders under one store and tag the result permanently.
+        pytest.param({"geoemb:model": "https://x/OLD"}, "ckpt.pt", "was seeded for encoder", id="encoder"),
+        # Same encoder URL, different concrete CHECKPOINT. geoemb:model versions only
+        # the encoder, so the aws/mpc v1.1 checkpoints share a URL and would otherwise
+        # be mixed silently; checkpoint_id is what tells them apart.
+        pytest.param(
+            {"geoemb:model": expected_model_url(), "checkpoint_id": _MPC_CKPT},
+            _AWS_CKPT,
+            "seeded for checkpoint",
+            id="checkpoint",
+        ),
+    ],
+)
+def test_model_guard_rejects_a_mismatched_store(monkeypatch, attrs, build_checkpoint, match):
+    with pytest.raises(ValueError, match=match):
+        _guard(monkeypatch, attrs, build_checkpoint=build_checkpoint)
+
+
+@pytest.mark.parametrize(
+    "attrs,build_checkpoint,allow_mismatch,why",
+    [
+        ({"geoemb:model": expected_model_url()}, "ckpt.pt", False, "encoder matches"),
+        ({}, "ckpt.pt", False, "store advertises no model (legacy/unseeded root)"),
+        ({"geoemb:model": expected_model_url(), "checkpoint_id": _MPC_CKPT}, _MPC_CKPT, False, "checkpoint matches"),
+        ({"geoemb:model": "https://x/OLD"}, "ckpt.pt", True, "encoder override"),
+        (
+            {"geoemb:model": expected_model_url(), "checkpoint_id": _MPC_CKPT},
+            _AWS_CKPT,
+            True,
+            "checkpoint override",
+        ),
+    ],
+    ids=["encoder-match", "no-attr", "checkpoint-match", "encoder-override", "checkpoint-override"],
+)
+def test_model_guard_admits_a_compatible_store(monkeypatch, attrs, build_checkpoint, allow_mismatch, why):
+    """Each case must pass the guard — the assertion is that it does not raise."""
+    _guard(monkeypatch, attrs, build_checkpoint=build_checkpoint, allow_mismatch=allow_mismatch)
+
+
+def _fake_ray_cluster(captured: dict | None = None):
+    """A ``ray_cluster`` stand-in that provisions nothing.
+
+    Yields ``None`` rather than a resolved YAML path, which is what makes the
+    flow's cluster-name probe skip — the tests here are about what the Ray branch
+    WIRES, not about the cluster.
+    """
+
+    @contextmanager
+    def _cm(*a, **k):
+        if captured is not None:
+            captured.update(k)
+        yield None
+
+    return _cm
+
+
+def test_ray_path_wires_actor_terminator(wired):
     """The Ray branch wires make_instance_terminator into on_actor_retire, so idle
     GPU nodes are terminated mid-fill instead of held until the cluster teardown.
     """
-    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-fill"))
-    monkeypatch.setattr(
-        "tessera_embeddings.providers.aws.credentials.iam_icechunk_credentials", object(), raising=False
-    )
-    # needs_cluster = on_axis and not complete and has_live -> True
-    monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: False)
-    monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)
-    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
-    monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(time_window="W"))
-    # Pre-Ray gates pass so we reach the terminator wiring + Ray branch.
-    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
-    monkeypatch.setattr(mod, "check_time_window_coverage", lambda *a, **k: None)
-
     sentinel = object()
-    monkeypatch.setattr(
-        "tessera_embeddings.providers.aws.ray.make_instance_terminator", lambda **k: sentinel, raising=False
-    )
-
-    @contextmanager
-    def fake_ray_cluster(*a, **k):
-        yield None  # no resolved yaml → the cluster-name probe is skipped
-
-    monkeypatch.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", fake_ray_cluster, raising=False)
-
+    wired.setattr("tessera_embeddings.providers.aws.ray.make_instance_terminator", lambda **k: sentinel, raising=False)
+    wired.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", _fake_ray_cluster(), raising=False)
     captured: dict = {}
-    monkeypatch.setattr(mod, "fill_zone_year", lambda **kw: captured.update(kw) or {"tag": "t"})
+    wired.setattr(mod, "fill_zone_year", lambda **kw: captured.update(kw) or {"tag": "t"})
 
     mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami")
     assert captured["on_actor_retire"] is sentinel
 
 
-def test_pinned_ami_id_reaches_ray_cluster(monkeypatch):
+def test_pinned_ami_id_reaches_ray_cluster(wired):
     """A campaign-pinned ami_id is threaded into ray_cluster so the fleet boots the
     exact image the staging fingerprint recorded, not whatever ami_ssm_name resolves
     to at provisioning time.
     """
-    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-fill"))
-    monkeypatch.setattr(
-        "tessera_embeddings.providers.aws.credentials.iam_icechunk_credentials", object(), raising=False
-    )
-    monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: False)
-    monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)
-    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
-    monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
-    monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(time_window="W"))
-    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
-    monkeypatch.setattr(mod, "check_time_window_coverage", lambda *a, **k: None)
-    monkeypatch.setattr(
-        "tessera_embeddings.providers.aws.ray.make_instance_terminator", lambda **k: object(), raising=False
-    )
-    monkeypatch.setattr(mod, "fill_zone_year", lambda **kw: {"tag": "t"})
-
+    wired.setattr("tessera_embeddings.providers.aws.ray.make_instance_terminator", lambda **k: object(), raising=False)
+    wired.setattr(mod, "fill_zone_year", lambda **kw: {"tag": "t"})
     captured: dict = {}
+    wired.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", _fake_ray_cluster(captured), raising=False)
 
-    @contextmanager
-    def fake_ray_cluster(*a, **k):
-        captured.update(k)
-        yield None
-
-    monkeypatch.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", fake_ray_cluster, raising=False)
     mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami", ami_id="ami-pinned-01")
     assert captured["ami_id"] == "ami-pinned-01"
 
 
-def test_staging_base_scoped_to_zone_year(monkeypatch):
+def test_staging_base_scoped_to_zone_year(wired):
     """The runner is handed a (zone, year)-scoped staging_base so a reused run_id
     can't cross-contaminate another cell's staged tiles.
     """
-    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-fill"))
-    monkeypatch.setattr(
-        "tessera_embeddings.providers.aws.credentials.iam_icechunk_credentials", object(), raising=False
-    )
-    monkeypatch.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", lambda *a, **k: None, raising=False)
-    monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: True)  # retag-only → no cluster, no gate
-    monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(time_window="W"))
+    wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)  # retag-only: no cluster, no gate
+    wired.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", lambda *a, **k: None, raising=False)
     captured: dict = {}
-    monkeypatch.setattr(mod, "fill_zone_year", lambda **kw: captured.update(kw) or {"tag": "t"})
+    wired.setattr(mod, "fill_zone_year", lambda **kw: captured.update(kw) or {"tag": "t"})
 
     mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami")
     assert captured["staging_base"] == "s3://out/staging/33N/2025"

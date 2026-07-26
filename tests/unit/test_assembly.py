@@ -89,6 +89,38 @@ def _quantized_embeddings(
     return quantize_embeddings(raw)
 
 
+#: The 2x2 tile grid most assembly tests use: 5-px rows except the short bottom
+#: band, so partial edge chunks are always in play rather than an even split.
+_GRID_2X2 = [
+    ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5),
+    ChunkSpec(row=0, col=1, y_start=0, y_stop=5, x_start=5, x_stop=10),
+    ChunkSpec(row=1, col=0, y_start=5, y_stop=8, x_start=0, x_stop=5),
+    ChunkSpec(row=1, col=1, y_start=5, y_stop=8, x_start=5, x_stop=10),
+]
+#: Its top row alone, for tests that need two chunks rather than four.
+_GRID_1X2 = _GRID_2X2[:2]
+
+
+def _stage_chunks(writer, chunks, run_id, rng, shape) -> np.ndarray:
+    """Stage every chunk and return the mosaic they should assemble into.
+
+    Building the expectation from the SAME arrays that were staged is the point:
+    a test that recomputed them from the rng would pass even if `write_chunk`
+    silently dropped or reordered a chunk.
+    """
+    expected = np.zeros((*shape, EMBEDDING_DIM), dtype=np.int8)
+    for chunk in chunks:
+        emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
+        writer.write_chunk(chunk, emb, run_id, scales=scales)
+        expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop, :] = emb
+    return expected
+
+
+def _assembled(output: str) -> np.ndarray:
+    """The single-timestep embeddings array from an assembled output store."""
+    return open_store(output)["embeddings"].values[0, ...]
+
+
 class TestStagedStorageOptions:
     """Tests for _staged_storage_options: attach botocore retries on S3, nowhere else.
 
@@ -220,18 +252,9 @@ class TestAssembly:
         run_id = "assemble_test"
 
         rng = np.random.default_rng(42)
-        chunks = [
-            ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5),
-            ChunkSpec(row=0, col=1, y_start=0, y_stop=5, x_start=5, x_stop=10),
-            ChunkSpec(row=1, col=0, y_start=5, y_stop=8, x_start=0, x_stop=5),
-            ChunkSpec(row=1, col=1, y_start=5, y_stop=8, x_start=5, x_stop=10),
-        ]
+        chunks = _GRID_2X2
 
-        expected = np.zeros((8, 10, EMBEDDING_DIM), dtype=np.int8)
-        for chunk in chunks:
-            emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
-            writer.write_chunk(chunk, emb, run_id, scales=scales)
-            expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop, :] = emb
+        expected = _stage_chunks(writer, chunks, run_id, rng, (8, 10))
 
         writer.assemble(
             chunks,
@@ -258,16 +281,9 @@ class TestAssembly:
         run_id = "xr_test"
 
         rng = np.random.default_rng(99)
-        chunks = [
-            ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5),
-            ChunkSpec(row=0, col=1, y_start=0, y_stop=5, x_start=5, x_stop=10),
-        ]
+        chunks = _GRID_1X2
 
-        expected = np.zeros((5, 10, EMBEDDING_DIM), dtype=np.int8)
-        for chunk in chunks:
-            emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width)
-            writer.write_chunk(chunk, emb, run_id, scales=scales)
-            expected[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop, :] = emb
+        expected = _stage_chunks(writer, chunks, run_id, rng, (5, 10))
 
         writer.assemble(
             chunks,
@@ -421,10 +437,7 @@ class TestAssembly:
         writer = ZarrWriter(staging)
 
         rng = np.random.default_rng(42)
-        chunks = [
-            ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5),
-            ChunkSpec(row=0, col=1, y_start=0, y_stop=5, x_start=5, x_stop=10),
-        ]
+        chunks = _GRID_1X2
         roi = _make_full_roi_mask(tmp_path, 5, 10)
         day = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
 
@@ -474,10 +487,7 @@ class TestAssembly:
         output = str(tmp_path / "output.zarr")
         writer = ZarrWriter(staging)
         rng = np.random.default_rng(42)
-        chunks = [
-            ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5),
-            ChunkSpec(row=0, col=1, y_start=0, y_stop=5, x_start=5, x_stop=10),
-        ]
+        chunks = _GRID_1X2
         day = datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC)
 
         # Run 1: FULL ROI — both chunks carry real data.
@@ -736,12 +746,7 @@ class TestAssembly:
         run_id = "obs_assemble"
 
         rng = np.random.default_rng(42)
-        chunks = [
-            ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5),
-            ChunkSpec(row=0, col=1, y_start=0, y_stop=5, x_start=5, x_stop=10),
-            ChunkSpec(row=1, col=0, y_start=5, y_stop=8, x_start=0, x_stop=5),
-            ChunkSpec(row=1, col=1, y_start=5, y_stop=8, x_start=5, x_stop=10),
-        ]
+        chunks = _GRID_2X2
 
         expected_obs = {var: np.zeros((8, 10), dtype=np.uint16) for var in OBS_COUNT_VARS}
         for chunk in chunks:
@@ -784,12 +789,7 @@ class TestAssembly:
         run_id = "skip_marker_test"
 
         rng = np.random.default_rng(7)
-        chunks = [
-            ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5),
-            ChunkSpec(row=0, col=1, y_start=0, y_stop=5, x_start=5, x_stop=10),
-            ChunkSpec(row=1, col=0, y_start=5, y_stop=8, x_start=0, x_stop=5),
-            ChunkSpec(row=1, col=1, y_start=5, y_stop=8, x_start=5, x_stop=10),
-        ]
+        chunks = _GRID_2X2
 
         # Three chunks have real data; chunk_1_0 gets a skip marker only.
         skipped_chunk = chunks[2]
@@ -812,8 +812,7 @@ class TestAssembly:
             n_workers=1,
         )
 
-        ds = open_store(output)
-        result = ds["embeddings"].values[0, ...]
+        result = _assembled(output)
         # Skipped chunk's footprint is zeros (int8 fill); other chunks match what we staged.
         np.testing.assert_array_equal(result, expected)
         skipped_region = result[
@@ -830,10 +829,7 @@ class TestAssembly:
         output = str(tmp_path / "output.zarr")
         writer = ZarrWriter(staging)
         run_id = "all_skipped"
-        chunks = [
-            ChunkSpec(row=0, col=0, y_start=0, y_stop=5, x_start=0, x_stop=5),
-            ChunkSpec(row=0, col=1, y_start=0, y_stop=5, x_start=5, x_stop=10),
-        ]
+        chunks = _GRID_1X2
         for chunk in chunks:
             writer.write_skip_marker(chunk, run_id)
 
@@ -897,8 +893,7 @@ class TestAssembly:
             n_workers=1,
         )
 
-        ds = open_store(output)
-        result = ds["embeddings"].values[0, ...]
+        result = _assembled(output)
         np.testing.assert_array_equal(result, expected)
         non_live_region = result[non_live.y_start : non_live.y_stop, non_live.x_start : non_live.x_stop]
         assert np.all(non_live_region == 0), "Non-live chunk region must be zero-filled"

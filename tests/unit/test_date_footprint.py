@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 from affine import Affine
 from odc.geo.geobox import GeoBox
+from odc.geo.geom import box
 
 from tessera_embeddings.ingest.live_windows import (
     FOOTPRINT_PAD_CELLS,
@@ -39,8 +40,6 @@ GEOBOX = GeoBox((HEIGHT, WIDTH), Affine(10.0, 0.0, 500_000.0, 0.0, -10.0, 4_000_
 
 def _lonlat_bbox_for_pixels(y0: int, y1: int, x0: int, x1: int) -> tuple[float, float, float, float]:
     """The lon/lat bbox of a pixel rectangle — how a STAC item would describe it."""
-    from odc.geo.geom import box
-
     left, top = GEOBOX.transform * (x0, y0)
     right, bottom = GEOBOX.transform * (x1, y1)
     bb = box(min(left, right), min(top, bottom), max(left, right), max(top, bottom), GEOBOX.crs)

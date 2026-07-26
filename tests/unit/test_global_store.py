@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM
+from tessera_embeddings.config.store_layout import GLOBAL
 from tessera_embeddings.storage import global_store, zarr_store
 from tessera_embeddings.storage.zone_grid import ZoneSpec
 
@@ -148,10 +151,6 @@ def test_reseed_with_different_shard_geometry_rejected(tmp_path):
     seeded at a different pitch are unfillable — and they are only rejected at fill
     time, long after seeding committed them. Refuse the mixed seed instead.
     """
-    import dataclasses
-
-    from tessera_embeddings.config.store_layout import GLOBAL
-
     store = str(tmp_path / "g.icechunk")
     repo = global_store.create_global_repo(store)
     global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
@@ -170,10 +169,6 @@ def test_reseed_with_same_geometry_but_different_dtype_rejected(tmp_path):
     dtype passes a pitch check and then creates zones the int8 staging writer refuses
     to fill — a heterogeneous store that only shows up at fill time.
     """
-    import dataclasses
-
-    from tessera_embeddings.config.store_layout import GLOBAL
-
     store = str(tmp_path / "g.icechunk")
     repo = global_store.create_global_repo(store)
     global_store.seed_zone_groups(repo, [_ZA], years=(2025,))

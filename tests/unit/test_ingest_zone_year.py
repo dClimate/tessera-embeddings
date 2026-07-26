@@ -10,6 +10,7 @@ import asyncio
 import logging
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from prefect.states import StateType
 
@@ -249,7 +250,6 @@ class TestChunkScaledWorkers:
     """
 
     def _dispatch(self, wired, monkeypatch, *, tile_live, **settings_kwargs):
-        import numpy as np
 
         monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
         monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
@@ -271,13 +271,11 @@ class TestChunkScaledWorkers:
         assert self._dispatch(wired, monkeypatch, tile_live=tiles) == [10, 10]  # s1 + s2
 
     def test_dense_zone_is_capped_by_settings(self, wired, monkeypatch):
-        import numpy as np
 
         tiles = np.ones((40, 40), dtype=bool)  # 400 live chunks -> 200 > cap
         assert self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=50) == [50, 50]
 
     def test_mid_zone_scales_half_worker_per_chunk(self, wired, monkeypatch):
-        import numpy as np
 
         tiles = np.zeros((20, 20), dtype=bool)
         tiles[::2, ::2] = True  # every 2x2 tile block live -> all 100 chunks live

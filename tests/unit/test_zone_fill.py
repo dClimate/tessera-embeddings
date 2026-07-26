@@ -52,6 +52,29 @@ def _config(year: int = 2025) -> InferenceConfig:
     return InferenceConfig(time_window=_window(year), chunk_size=_TILE, num_gpus=0)
 
 
+def _fill(tmp_path, store, **overrides):
+    """Call ``fill_zone_year`` with this module's standard wiring.
+
+    Every test drives the same runner against the same miniature zone, so the
+    eight arguments that never vary are defaulted here and each test passes only
+    what it is actually about. Paths are derived from ``tmp_path`` so a test that
+    does not build a mask or a mosaic still names one — several gates fire before
+    either is opened, and pointing at an absent path is the honest way to say so.
+    """
+    kwargs = {
+        "store_path": store,
+        "zone": _ZONE,
+        "year": 2025,
+        "land_mask_path": str(tmp_path / "mask.zarr"),
+        "mosaic_base": str(tmp_path / "mosaics"),
+        "staging_base": str(tmp_path / "staging"),
+        "config": _config(),
+        "num_actors": 1,
+        "log": log,
+    }
+    return zone_fill.fill_zone_year(**{**kwargs, **overrides})
+
+
 def _seed_global(tmp_path) -> str:
     store = str(tmp_path / "global.icechunk")
     repo = global_store.create_global_repo(store)
@@ -152,18 +175,7 @@ def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
     staged: dict[str, np.ndarray] = {}
     monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
 
-    summary = zone_fill.fill_zone_year(
-        store_path=store,
-        zone=_ZONE,
-        year=2025,
-        land_mask_path=mask,
-        mosaic_base=mosaic_base,
-        staging_base=str(tmp_path / "staging"),
-        config=_config(),
-        num_actors=1,
-        log=log,
-        run_id="runZ",
-    )
+    summary = _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, run_id="runZ")
 
     assert summary["empty"] is False
     assert summary["live_tiles"] == 3
@@ -205,16 +217,13 @@ def test_all_ocean_cell_marked_complete_without_inference(tmp_path, monkeypatch)
 
     monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
 
-    summary = zone_fill.fill_zone_year(
-        store_path=store,
-        zone=_ZONE,
+    summary = _fill(
+        tmp_path,
+        store,
         year=2024,
         land_mask_path=mask,
         mosaic_base=mosaic_base,
-        staging_base=str(tmp_path / "staging"),
         config=_config(2024),
-        num_actors=1,
-        log=log,
         run_id="runE",
     )
 
@@ -230,51 +239,21 @@ def test_all_ocean_cell_marked_complete_without_inference(tmp_path, monkeypatch)
 def test_unseeded_zone_raises(tmp_path):
     store = _seed_global(tmp_path)
     with pytest.raises(ValueError, match="not seeded"):
-        zone_fill.fill_zone_year(
-            store_path=store,
-            zone="60N",
-            year=2025,
-            land_mask_path=str(tmp_path / "mask.zarr"),
-            mosaic_base=str(tmp_path / "mosaics"),
-            staging_base=str(tmp_path / "staging"),
-            config=_config(),
-            num_actors=1,
-            log=log,
-        )
+        _fill(tmp_path, store, zone="60N")
 
 
 def test_chunk_size_shard_mismatch_raises(tmp_path):
     store = _seed_global(tmp_path)
     config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE * 2, num_gpus=0)
     with pytest.raises(ValueError, match="1 inference tile == 1 shard"):
-        zone_fill.fill_zone_year(
-            store_path=store,
-            zone=_ZONE,
-            year=2025,
-            land_mask_path=str(tmp_path / "mask.zarr"),
-            mosaic_base=str(tmp_path / "mosaics"),
-            staging_base=str(tmp_path / "staging"),
-            config=config,
-            num_actors=1,
-            log=log,
-        )
+        _fill(tmp_path, store, config=config)
 
 
 def test_mosaic_grid_mismatch_raises(tmp_path):
     store = _seed_global(tmp_path)
     mosaic_base = _make_mosaic(tmp_path, ny=_NY + _TILE)  # taller than the zone grid
     with pytest.raises(ValueError, match="does not match"):
-        zone_fill.fill_zone_year(
-            store_path=store,
-            zone=_ZONE,
-            year=2025,
-            land_mask_path=_make_mask(tmp_path, [(0, 0)]),
-            mosaic_base=mosaic_base,
-            staging_base=str(tmp_path / "staging"),
-            config=_config(),
-            num_actors=1,
-            log=log,
-        )
+        _fill(tmp_path, store, land_mask_path=_make_mask(tmp_path, [(0, 0)]), mosaic_base=mosaic_base)
 
 
 def test_wrong_grid_sar_store_raises(tmp_path, monkeypatch):
@@ -297,17 +276,7 @@ def test_wrong_grid_sar_store_raises(tmp_path, monkeypatch):
 
     monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
     with pytest.raises(ValueError, match="SAR ascending"):
-        zone_fill.fill_zone_year(
-            store_path=store,
-            zone=_ZONE,
-            year=2025,
-            land_mask_path=_make_mask(tmp_path, [(0, 0)]),
-            mosaic_base=mosaic_base,
-            staging_base=str(tmp_path / "staging"),
-            config=_config(),
-            num_actors=1,
-            log=log,
-        )
+        _fill(tmp_path, store, land_mask_path=_make_mask(tmp_path, [(0, 0)]), mosaic_base=mosaic_base)
 
 
 def test_inference_failure_aborts_before_assembly(tmp_path, monkeypatch):
@@ -322,17 +291,7 @@ def test_inference_failure_aborts_before_assembly(tmp_path, monkeypatch):
     monkeypatch.setattr(zone_fill, "run_inference", failing_inference)
 
     with pytest.raises(RuntimeError, match="1 tiles failed"):
-        zone_fill.fill_zone_year(
-            store_path=store,
-            zone=_ZONE,
-            year=2025,
-            land_mask_path=mask,
-            mosaic_base=mosaic_base,
-            staging_base=str(tmp_path / "staging"),
-            config=_config(),
-            num_actors=1,
-            log=log,
-        )
+        _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base)
 
     repo = global_store.open_global_repo(store)
     node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
@@ -348,35 +307,13 @@ def test_completed_and_tagged_cell_short_circuits(tmp_path, monkeypatch):
     staged: dict[str, np.ndarray] = {}
     monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
 
-    first = zone_fill.fill_zone_year(
-        store_path=store,
-        zone=_ZONE,
-        year=2025,
-        land_mask_path=mask,
-        mosaic_base=mosaic_base,
-        staging_base=str(tmp_path / "staging"),
-        config=_config(),
-        num_actors=1,
-        log=log,
-        run_id="run1",
-    )
+    first = _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, run_id="run1")
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("a completed+tagged cell must not re-run inference")
 
     monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
-    retry = zone_fill.fill_zone_year(
-        store_path=store,
-        zone=_ZONE,
-        year=2025,
-        land_mask_path=mask,
-        mosaic_base=mosaic_base,
-        staging_base=str(tmp_path / "staging"),
-        config=_config(),
-        num_actors=1,
-        log=log,
-        run_id="run2",
-    )
+    retry = _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, run_id="run2")
     assert retry["already_complete"] is True
     assert retry["snapshot_id"] == first["snapshot_id"]
     assert retry["tag"] == first["tag"]
@@ -398,18 +335,7 @@ def test_all_tiles_skipped_marks_complete_empty(tmp_path, monkeypatch):
 
     monkeypatch.setattr(zone_fill, "run_inference", all_skip_inference)
 
-    summary = zone_fill.fill_zone_year(
-        store_path=store,
-        zone=_ZONE,
-        year=2025,
-        land_mask_path=mask,
-        mosaic_base=mosaic_base,
-        staging_base=str(tmp_path / "staging"),
-        config=_config(),
-        num_actors=1,
-        log=log,
-        run_id="runS",
-    )
+    summary = _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, run_id="runS")
 
     assert summary["empty"] is True
     assert summary["skipped"] == 2
@@ -438,17 +364,7 @@ def test_wrong_zone_coverage_mask_raises(tmp_path, kwargs, match):
     mask = _make_mask(tmp_path, [(0, 0)], **kwargs)
 
     with pytest.raises(ValueError, match=match):
-        zone_fill.fill_zone_year(
-            store_path=store,
-            zone=_ZONE,
-            year=2025,
-            land_mask_path=mask,
-            mosaic_base=mosaic_base,
-            staging_base=str(tmp_path / "staging"),
-            config=_config(),
-            num_actors=1,
-            log=log,
-        )
+        _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base)
 
 
 def test_coverage_bitmap_shape_mismatch_raises(tmp_path):
@@ -459,17 +375,7 @@ def test_coverage_bitmap_shape_mismatch_raises(tmp_path):
     mask = _make_mask(tmp_path, [], tile_shape=(1, 1))
 
     with pytest.raises(ValueError, match="inconsistent with the seeded grid"):
-        zone_fill.fill_zone_year(
-            store_path=store,
-            zone=_ZONE,
-            year=2025,
-            land_mask_path=mask,
-            mosaic_base=mosaic_base,
-            staging_base=str(tmp_path / "staging"),
-            config=_config(),
-            num_actors=1,
-            log=log,
-        )
+        _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base)
 
 
 def test_all_ocean_cell_skips_missing_mosaic(tmp_path, monkeypatch):
@@ -484,16 +390,15 @@ def test_all_ocean_cell_skips_missing_mosaic(tmp_path, monkeypatch):
         raise AssertionError("run_inference must not run for an all-ocean cell")
 
     monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
-    summary = zone_fill.fill_zone_year(
-        store_path=store,
-        zone=_ZONE,
+    summary = _fill(
+        tmp_path,
+        store,
         year=2024,
         land_mask_path=mask,
-        mosaic_base=str(tmp_path / "does_not_exist"),  # missing mosaic must not be read
+        mosaic_base=str(tmp_path / "does_not_exist"),
+        # missing mosaic must not be read
         staging_base=str(tmp_path / "staging"),
         config=_config(2024),
-        num_actors=1,
-        log=log,
         run_id="runNM",
     )
     assert summary["empty"] is True
@@ -509,16 +414,11 @@ def test_zone_year_complete_reflects_years_complete(tmp_path, monkeypatch):
     assert zone_fill.zone_year_complete(store, "60N", 2025) is False  # not seeded in this store
 
     monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub({}))
-    zone_fill.fill_zone_year(
-        store_path=store,
-        zone=_ZONE,
-        year=2025,
+    _fill(
+        tmp_path,
+        store,
         land_mask_path=_make_mask(tmp_path, [(0, 0)]),
         mosaic_base=_make_mosaic(tmp_path),
-        staging_base=str(tmp_path / "staging"),
-        config=_config(),
-        num_actors=1,
-        log=log,
         run_id="rc",
     )
     assert zone_fill.zone_year_complete(store, _ZONE, 2025) is True
@@ -563,90 +463,54 @@ def test_off_axis_year_fails_before_inference(tmp_path, monkeypatch):
         window_end_label="2015-12-01",
     )
     with pytest.raises(ValueError, match="not on 01N's pre-allocated time axis"):
-        zone_fill.fill_zone_year(
-            store_path=store,
-            zone=_ZONE,
-            year=2015,
-            land_mask_path=str(tmp_path / "mask.zarr"),
-            mosaic_base=str(tmp_path / "mosaics"),
-            staging_base=str(tmp_path / "staging"),
-            config=InferenceConfig(time_window=window, chunk_size=_TILE, num_gpus=0),
-            num_actors=1,
-            log=log,
-        )
+        _fill(tmp_path, store, year=2015, config=InferenceConfig(time_window=window, chunk_size=_TILE, num_gpus=0))
 
 
-def test_window_year_mismatch_raises(tmp_path):
-    """A window for a DIFFERENT year than the target slot is an operator error
-    (e.g. a cloned invocation whose year was edited but not its time_window).
-    """
-    store = _seed_global(tmp_path)
-    with pytest.raises(ValueError, match="guarantees calendar-year slots"):
-        zone_fill.fill_zone_year(
-            store_path=store,
-            zone=_ZONE,
-            year=2024,
-            land_mask_path=str(tmp_path / "mask.zarr"),
-            mosaic_base=str(tmp_path / "mosaics"),
-            staging_base=str(tmp_path / "staging"),
-            config=_config(2025),  # exact Jan-Dec 2025 window, but year=2024
-            num_actors=1,
-            log=log,
-        )
-
-
-def test_rolling_window_rejected(tmp_path):
-    """The calendar-year gate: a rolling 12-month window that merely OVERLAPS the
-    target year is rejected — the store guarantees calendar-year slots (a rolling
-    window's label would be inaccurate, CF containment), and the error points
-    non-calendar consumers at the single-ROI `12mo_window_end` path.
-    """
-    store = _seed_global(tmp_path)
-    rolling = TimeWindow(
+def _rolling_window() -> TimeWindow:
+    """A 12-month window that merely OVERLAPS the target year."""
+    return TimeWindow(
         window_start=(2024, 7),
         window_end=(2025, 6),
         months=tuple([(2024, m) for m in range(7, 13)] + [(2025, m) for m in range(1, 7)]),
         window_end_label="2025-06-01",
     )
-    with pytest.raises(ValueError, match="12mo_window_end"):
-        zone_fill.fill_zone_year(
-            store_path=store,
-            zone=_ZONE,
-            year=2025,  # rolling window overlaps 2025 — still rejected
-            land_mask_path=str(tmp_path / "mask.zarr"),
-            mosaic_base=str(tmp_path / "mosaics"),
-            staging_base=str(tmp_path / "staging"),
-            config=InferenceConfig(time_window=rolling, chunk_size=_TILE, num_gpus=0),
-            num_actors=1,
-            log=log,
-        )
 
 
-def test_same_year_partial_window_rejected(tmp_path):
-    """A same-year PARTIAL window (every month in `year`, but fewer than 12) is
-    rejected too: the slot must hold the full Jan-Dec year the seeded time_bnds
-    advertise, not a short window. The gate compares the whole month set, not just
-    'all months fall in `year`'.
-    """
-    store = _seed_global(tmp_path)
-    partial = TimeWindow(
+def _partial_window() -> TimeWindow:
+    """Every month inside the target year, but fewer than twelve of them."""
+    return TimeWindow(
         window_start=(2025, 1),
         window_end=(2025, 6),
-        months=tuple((2025, m) for m in range(1, 7)),  # Jan-Jun 2025 only
+        months=tuple((2025, m) for m in range(1, 7)),
         window_end_label="2025-06-01",
     )
-    with pytest.raises(ValueError, match="guarantees calendar-year slots"):
-        zone_fill.fill_zone_year(
-            store_path=store,
-            zone=_ZONE,
-            year=2025,
-            land_mask_path=str(tmp_path / "mask.zarr"),
-            mosaic_base=str(tmp_path / "mosaics"),
-            staging_base=str(tmp_path / "staging"),
-            config=InferenceConfig(time_window=partial, chunk_size=_TILE, num_gpus=0),
-            num_actors=1,
-            log=log,
-        )
+
+
+@pytest.mark.parametrize(
+    "year,window,match",
+    [
+        # A window for a DIFFERENT year than the target slot — an operator error, e.g. a
+        # cloned invocation whose year was edited but not its time_window.
+        pytest.param(2024, _window(2025), "guarantees calendar-year slots", id="wrong-year"),
+        # A rolling window overlapping the target year. Rejected even though it is 12
+        # months: the slot's seeded time_bnds advertise Jan-Dec, so a rolling window's
+        # label would be inaccurate (CF containment). The message points non-calendar
+        # consumers at the single-ROI `12mo_window_end` path.
+        pytest.param(2025, _rolling_window(), "12mo_window_end", id="rolling"),
+        # A same-year PARTIAL window. The gate compares the whole month SET, not just
+        # "every month falls in `year`" — a short window would under-fill the slot.
+        pytest.param(2025, _partial_window(), "guarantees calendar-year slots", id="partial"),
+    ],
+)
+def test_non_calendar_year_windows_are_rejected(tmp_path, year, window, match):
+    """The slot must hold exactly the Jan-Dec year its seeded time_bnds advertise.
+
+    All three rejections happen before any mask or mosaic is opened, which is why
+    this can run against paths that do not exist.
+    """
+    store = _seed_global(tmp_path)
+    with pytest.raises(ValueError, match=match):
+        _fill(tmp_path, store, year=year, config=InferenceConfig(time_window=window, chunk_size=_TILE, num_gpus=0))
 
 
 def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatch):
@@ -677,18 +541,7 @@ def test_landed_but_untagged_cell_is_retagged_without_rerun(tmp_path, monkeypatc
         raise AssertionError("a landed cell must not re-run inference just to re-tag")
 
     monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
-    retry = zone_fill.fill_zone_year(
-        store_path=store,
-        zone=_ZONE,
-        year=2025,
-        land_mask_path=mask,
-        mosaic_base=mosaic_base,
-        staging_base=str(tmp_path / "staging"),
-        config=_config(),
-        num_actors=1,
-        log=log,
-        run_id="run2",
-    )
+    retry = _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, run_id="run2")
     assert retry["already_complete"] is True
     assert repo.lookup_tag("zone-01N-2025") == retry["snapshot_id"]
 
@@ -838,18 +691,7 @@ def test_fill_accepts_a_cropped_written_mosaic(tmp_path, monkeypatch):
 
     staged: dict[str, np.ndarray] = {}
     monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
-    summary = zone_fill.fill_zone_year(
-        store_path=store,
-        zone=_ZONE,
-        year=2025,
-        land_mask_path=mask,
-        mosaic_base=base,
-        staging_base=str(tmp_path / "staging"),
-        config=_config(),
-        num_actors=1,
-        log=log,
-        run_id="runCropped",
-    )
+    summary = _fill(tmp_path, store, land_mask_path=mask, mosaic_base=base, run_id="runCropped")
     assert summary["empty"] is False and summary["succeeded"] == 1
 
 

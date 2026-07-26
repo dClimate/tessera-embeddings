@@ -11,10 +11,13 @@ provisioned once with the idle-timeout override.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from prefect.states import StateType
 
 import tessera_embeddings.orchestration.prefect.flows.fill_zones_sequential as mod
 from tessera_embeddings.config.paths import BucketPaths
@@ -282,9 +285,34 @@ def _state(state_type, *, final):
     return SimpleNamespace(type=state_type, name=state_type.value, is_final=lambda: final)
 
 
-def test_adapter_wait_polls_child_run_to_completion(monkeypatch):
-    from prefect.states import StateType
+def _running_child(monkeypatch, run_id: str):
+    """An adapter whose dispatched child run never reaches a terminal state.
 
+    The shape every shutdown/abort test needs: a fast poll interval, a
+    ``run_deployment`` that reports one child id, and a client that keeps
+    answering RUNNING — so the poller stays in its loop and the test can act on a
+    genuinely in-flight run rather than a race against a child that finished.
+    Returns ``(adapter, client)``; the client records what was cancelled.
+    """
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id=run_id, state=None)
+    )
+    client = _FakeClient([_state(StateType.RUNNING, final=False)])
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    return _adapter(), client
+
+
+def _await_inflight(adapter, expected: dict) -> None:
+    """Block until the adapter's worker thread has registered its in-flight run."""
+    for _ in range(200):
+        if adapter._inflight:
+            break
+        time.sleep(0.01)
+    assert adapter._inflight == expected
+
+
+def test_adapter_wait_polls_child_run_to_completion(monkeypatch):
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
     monkeypatch.setattr(
         mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-1", state=None)
@@ -305,23 +333,9 @@ def test_adapter_shutdown_cancels_in_flight_child_runs(monkeypatch):
     shutdown() must request cancellation of the in-flight child flow run —
     otherwise it keeps writing the mosaic prefix a prompt retry would race.
     """
-    import time as _time
-
-    from prefect.states import StateType
-
-    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
-    monkeypatch.setattr(
-        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-9", state=None)
-    )
-    client = _FakeClient([_state(StateType.RUNNING, final=False)])  # never terminal
-    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
-    adapter = _adapter()
+    adapter, client = _running_child(monkeypatch, "fr-9")
     adapter.start("33N", 2025)
-    for _ in range(200):  # let the worker register its in-flight run id
-        if adapter._inflight:
-            break
-        _time.sleep(0.01)
-    assert adapter._inflight == {("33N", 2025): "fr-9"}
+    _await_inflight(adapter, {("33N", 2025): "fr-9"})
     adapter.shutdown()
     # The sweep cancels synchronously; the woken poller may ALSO self-cancel
     # (belt + suspenders for the late-registration window) — assert the sweep's.
@@ -332,25 +346,14 @@ def test_adapter_wait_honors_the_runner_stop_event(monkeypatch):
     """A blocked wait() returns promptly (raising) once the runner's stop event
     is set — the feeder must never sit behind a full ingest during unwind.
     """
-    import threading as _threading
-    import time as _time
-
-    from prefect.states import StateType
-
-    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
-    monkeypatch.setattr(
-        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-2", state=None)
-    )
-    client = _FakeClient([_state(StateType.RUNNING, final=False)])  # never terminal
-    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
-    adapter = _adapter()
-    stop = _threading.Event()
-    t0 = _time.monotonic()
-    _threading.Timer(0.3, stop.set).start()
+    adapter, client = _running_child(monkeypatch, "fr-2")
+    stop = threading.Event()
+    t0 = time.monotonic()
+    threading.Timer(0.3, stop.set).start()
     try:
         with pytest.raises(RuntimeError, match="aborted: runner stopping"):
             adapter.wait("33N", 2025, stop=stop)
-        assert _time.monotonic() - t0 < 30
+        assert time.monotonic() - t0 < 30
     finally:
         adapter.shutdown()
 
@@ -384,23 +387,14 @@ def test_abandoned_poller_cancels_its_own_child(monkeypatch):
     before raising — closing the late-registration window the snapshot sweep
     can miss.
     """
-    from prefect.states import StateType
-
-    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
-    monkeypatch.setattr(
-        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-7", state=None)
-    )
-    client = _FakeClient([_state(StateType.RUNNING, final=False)])  # never terminal
-    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
-    adapter = _adapter()
+    adapter, client = _running_child(monkeypatch, "fr-7")
     adapter.start("33N", 2025)
     fut = adapter._futures[("33N", 2025)]
-    import time as _time
 
     for _ in range(200):  # let the worker register before shutting down
         if adapter._inflight:
             break
-        _time.sleep(0.01)
+        time.sleep(0.01)
     adapter.shutdown()
     with pytest.raises(RuntimeError, match="abandoned"):
         fut.result(timeout=5)
@@ -408,8 +402,6 @@ def test_abandoned_poller_cancels_its_own_child(monkeypatch):
 
 
 def test_adapter_tags_child_runs_with_parent_derived_tag(monkeypatch):
-    from prefect.states import StateType
-
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
     captured: dict = {}
 
@@ -437,8 +429,6 @@ def test_cancel_child_ingests_hook_sweeps_live_runs_by_tag(monkeypatch):
     """The hook re-derives the parent tag and cancels only LIVE children — the
     in-process shutdown() never runs when Prefect kills the flow process.
     """
-    from prefect.states import StateType
-
     live = SimpleNamespace(id="fr-live", state=_state(StateType.RUNNING, final=False))
     done = SimpleNamespace(id="fr-done", state=_state(StateType.COMPLETED, final=True))
 
@@ -484,8 +474,6 @@ def test_poll_retries_transient_errors_then_completes(monkeypatch):
     """A transient read error must NOT fail the ingest wait — the poller retries
     across it and the id stays registered throughout (visible to shutdown).
     """
-    from prefect.states import StateType
-
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.001)
     monkeypatch.setattr(
         mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-4", state=None)
@@ -505,8 +493,6 @@ def test_poll_error_keeps_id_registered_for_shutdown(monkeypatch):
     """A persistent poll failure gives up — but must leave the child id in
     _inflight so shutdown can still cancel the live server-side run.
     """
-    from prefect.states import StateType
-
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.001)
     monkeypatch.setattr(mod, "_INGEST_POLL_MAX_ERRORS", 3)
     monkeypatch.setattr(

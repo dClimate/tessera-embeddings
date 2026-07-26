@@ -11,6 +11,7 @@ from __future__ import annotations
 import itertools
 import random
 
+import fsspec
 import numpy as np
 import pytest
 import zarr
@@ -221,8 +222,6 @@ class TestGridFromChunkKeys:
         path = _mask_store(tmp_path, mask)
         z = zarr.open(path, mode="r")
 
-        import fsspec
-
         real = fsspec.core.url_to_fs
 
         def fake(p, **kw):
@@ -239,8 +238,6 @@ class TestGridFromChunkKeys:
         mask[0, 0] = True
         path = _mask_store(tmp_path, mask)
         z = zarr.open(path, mode="r")
-
-        import fsspec
 
         monkeypatch.setattr(fsspec.core, "url_to_fs", lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
         assert live_chunk_grid_from_keys(path, z, chunk_px=CHUNK) is None

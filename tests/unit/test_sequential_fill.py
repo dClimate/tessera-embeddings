@@ -16,13 +16,14 @@ import time
 import pytest
 
 import tessera_embeddings.orchestration.runners.sequential_fill as mod
+from tessera_embeddings.inference.assembly import StagedResume
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.orchestration.runners.sequential_fill import (
     PreparedCell,
     SequentialCell,
     fill_zones_sequential,
 )
-from tessera_embeddings.orchestration.runners.zone_fill import ZonePlan
+from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff, ZonePlan
 
 LOG = logging.getLogger("test-sequential-fill")
 
@@ -152,8 +153,6 @@ class BudgetProbeInputs(RecordingInputs):
 
 def _resume(done=frozenset(), skipped=frozenset()):
     """A StagedResume stub for the resume scan."""
-    from tessera_embeddings.inference.assembly import StagedResume
-
     return StagedResume(done=set(done), skipped=set(skipped))
 
 
@@ -274,7 +273,6 @@ def test_orbit_mismatch_defers_to_fallback():
 
     def infer_single(cell, prep, final):
         calls.append((cell.zone, final))
-        from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff
 
         return ZoneFillHandoff(
             zone=cell.zone, year=cell.year, run_id=prep.run_id, t0=0.0, summary={}, live=[], results=[]
@@ -380,7 +378,6 @@ def test_deferred_mosaics_capped_with_loud_failure():
 
     def infer_single(cell, prep, final):
         calls.append(cell.zone)
-        from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff
 
         return ZoneFillHandoff(
             zone=cell.zone, year=cell.year, run_id=prep.run_id, t0=0.0, summary={}, live=[], results=[]
@@ -439,7 +436,6 @@ def test_lookahead_does_not_deadlock_on_early_deferrals():
 
     def infer_single(cell, prep, final):
         calls.append(cell.zone)
-        from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff
 
         return ZoneFillHandoff(
             zone=cell.zone, year=cell.year, run_id=prep.run_id, t0=0.0, summary={}, live=[], results=[]
