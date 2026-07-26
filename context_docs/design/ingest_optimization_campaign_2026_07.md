@@ -480,6 +480,29 @@ exactly what Phase I existed to prevent.
 has to happen, and ~85 s is near the packing floor rather than the critical path. The remaining
 per-date budget is build 10.4 + gate 7.3 + write 86.5.
 
+**It also made a date MORE responsive to fleet width, which bears directly on scaling.** Both
+arms captured task streams, so each arm's packing can be derived from its own instrument:
+
+| | sequential | parallel |
+|---|---|---|
+| task work at perfect packing | 34.0 s/date | 39.1 s/date |
+| share of the date that packs | **20%** | **38%** |
+| headroom from adding workers | **1.26×** | **1.60×** |
+| total task work | 114,294 slot-s | 131,528 slot-s (**+15%**) |
+| task count | 182,311 | 178,123 (−2%) |
+| inter-worker transfer | 8,019 slot-s | 10,032 slot-s (+25%) |
+
+Two things follow. **The overlap nearly doubled the fraction of a date that parallelises** (20% →
+38%), so per-cell width is worth more after this change than before — a wider fleet now buys
+~1.60× where it bought ~1.26×. That partially softens §3.10's conclusion that fleet width is
+nearly spent: it is spent *for the serialised implementation*, less so for this one.
+
+And **it costs ~15% more total CPU-seconds for the same output**, with 2% FEWER tasks and 25%
+more inter-worker transfer — so individual tasks got slower rather than there being more work.
+That is contention, the ordinary price of parallelism: 1.15× the compute for 1.59× the latency.
+Worth stating because at multi-cell concurrency the aggregate CPU matters, whereas here latency
+is what the deadline cares about.
+
 **Now the default** for S2 (`overlap_window_writes=True`). `write_day_windows`' own
 `parallel_windows` default stays **False** deliberately: S1 also calls it, its windows have never
 been A/B'd, and a storage-layer default must not change behaviour for an unmeasured caller. S1 can
@@ -906,6 +929,8 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | **where the residual was** | `write_day_windows` computing windows serially: per-window times summed to **146.9 s of a 148.0 s write phase**; commit only **0.6 s** | 7 dates, per-window instrumentation (§3.11) |
 | **window overlap** | write phase **148.0 → 86.5 s (1.71×)**; per-date **166.1 → 104.2 s (1.59×)**; chunk objects **44,797 both arms** | A/B, identical dates and width (§3.11) |
 | overlap memory cost | peak worker **12.30 of 20 GiB**, spill 0.00 GiB, no pause | parallel arm health lines (§3.11) |
+| overlap packing effect | share of a date that packs **20% → 38%**; headroom from adding workers **1.26× → 1.60×** | per-arm task streams (§3.11) |
+| overlap contention cost | **+15% total slot-seconds** for identical output (2% fewer tasks, +25% transfer) | per-arm task streams (§3.11) |
 | **task work composition** | source read+resample **72.3%**, mask+write 16.3%, transfer 7.8%, gate 2.9% | same report (§3.10) |
 | **ceiling from unlimited workers, one cell** | **1.78×** | from the budget; independently 1.2–1.7× from an `A + B/W` sweep fit (§3.10) |
 | window-strategy bound | best any rectangle strategy achieves is **0.50×** current area; shipped achieves 0.75× | local, real footprints (§4.7b) |
