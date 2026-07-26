@@ -37,6 +37,7 @@ from tessera_embeddings.inference.actors import (
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
+from tests.unit.mosaic_stores import make_sar_group, store_opener
 
 
 class TestStripSlices:
@@ -209,38 +210,6 @@ class TestStripPlan:
 _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
 
 
-def _make_s2_zarr_group(n_t: int, h: int, w: int, seed: int = 10) -> zarr.Group:
-    rng = np.random.default_rng(seed)
-    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-    for band in S2_BAND_ORDER:
-        vals = rng.integers(100, 5000, size=(n_t, h, w)).astype(np.uint16)
-        arr = root.create_array(band, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
-        arr[:] = vals
-    # Mix valid and invalid SCL classes so pruning has something to do.
-    scl_vals = rng.choice([0, 4, 5, 8], size=(n_t, h, w)).astype(np.uint8)
-    scl_arr = root.create_array("scl", shape=scl_vals.shape, dtype=scl_vals.dtype, chunks=scl_vals.shape)
-    scl_arr[:] = scl_vals
-    times = pd.date_range("2024-01-01", periods=n_t, freq="5D")
-    time_ns = times.values.astype("datetime64[ns]").astype("int64")
-    t_arr = root.create_array("time", shape=time_ns.shape, dtype=np.int64, chunks=time_ns.shape)
-    t_arr[:] = time_ns
-    return root
-
-
-def _make_sar_zarr_group(n_t: int, h: int, w: int, seed: int = 20) -> zarr.Group:
-    rng = np.random.default_rng(seed)
-    times = pd.date_range("2024-01-01", periods=n_t, freq="12D")
-    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-    for name in ("0_VV", "0_VH"):
-        vals = rng.integers(1000, 8000, size=(n_t, h, w)).astype(np.uint16)
-        arr = root.create_array(name, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
-        arr[:] = vals
-    time_ns = times.values.astype("datetime64[ns]").astype("int64")
-    t_arr = root.create_array("time", shape=time_ns.shape, dtype=np.int64, chunks=time_ns.shape)
-    t_arr[:] = time_ns
-    return root
-
-
 class _CapturingWriter:
     """Stand-in for ZarrWriter that records the single whole-chunk write."""
 
@@ -277,21 +246,7 @@ def _make_actor(inference_config, test_model):
 
 
 def _open_store_side_effect():
-    h, w = _CHUNK.height, _CHUNK.width
-    s2_root = _make_s2_zarr_group(8, h, w, seed=10)
-    sar_asc = _make_sar_zarr_group(5, h, w, seed=20)
-    sar_desc = _make_sar_zarr_group(5, h, w, seed=30)
-
-    def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
-        if "reflectance" in path:
-            return s2_root
-        if "ascending" in path:
-            return sar_asc
-        if "descending" in path:
-            return sar_desc
-        raise ValueError(f"Unexpected store path: {path}")
-
-    return _open_store
+    return store_opener(_CHUNK, n_t_s2=8, n_t_sar=5)
 
 
 def _run_process_chunk(inference_config, test_model):
@@ -426,7 +381,7 @@ class TestProcessChunkStriping:
         times = pd.date_range("2024-01-01", periods=4, freq="5D").values.astype("datetime64[ns]").astype("int64")
         t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
         t_arr[:] = times
-        sar = _make_sar_zarr_group(3, h, w)
+        sar = make_sar_group(3, h, w)
 
         def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
             return s2_root if "reflectance" in path else sar
@@ -557,8 +512,8 @@ class TestEmptyStripBandReadSkip:
         times = pd.date_range("2024-12-01", periods=6, freq="3D").values.astype("datetime64[ns]").astype("int64")
         t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
         t_arr[:] = times
-        sar_asc = _make_sar_zarr_group(4, h, w, seed=201)
-        sar_desc = _make_sar_zarr_group(4, h, w, seed=202)
+        sar_asc = make_sar_group(4, h, w, seed=201)
+        sar_desc = make_sar_group(4, h, w, seed=202)
 
         def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
             if "reflectance" in path:
@@ -630,8 +585,8 @@ class TestEastingBboxCrop:
         times = pd.date_range("2024-12-01", periods=6, freq="3D").values.astype("datetime64[ns]").astype("int64")
         t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
         t_arr[:] = times
-        sar_asc = _make_sar_zarr_group(4, h, w, seed=301)
-        sar_desc = _make_sar_zarr_group(4, h, w, seed=302)
+        sar_asc = make_sar_group(4, h, w, seed=301)
+        sar_desc = make_sar_group(4, h, w, seed=302)
 
         def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
             if "reflectance" in path:
@@ -849,8 +804,8 @@ class TestAllowS2Only:
         t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
         t_arr[:] = times
 
-        sar_asc = _make_sar_zarr_group(5, h, w, seed=20)
-        sar_desc = _make_sar_zarr_group(5, h, w, seed=30)
+        sar_asc = make_sar_group(5, h, w, seed=20)
+        sar_desc = make_sar_group(5, h, w, seed=30)
         for grp in (sar_asc, sar_desc):
             for name in ("0_VV", "0_VH"):
                 data = grp[name][:]

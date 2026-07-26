@@ -16,6 +16,7 @@ from tessera_embeddings.ingest.live_windows import live_chunk_grid_from_keys
 from tessera_embeddings.ingest.roi import read_roi_metadata
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store_as_zarr_group
+from tests.unit.coverage_repo import make_coverage
 
 
 # --------------------------------------------------------------------------- #
@@ -242,25 +243,8 @@ def test_spot_check_delivery_rejects_shifted_right_edge(tmp_path) -> None:
 # --------------------------------------------------------------------------- #
 # Zone ROI synthesis (export_zone_roi)
 # --------------------------------------------------------------------------- #
-def _make_coverage(tmp_path, zone: str, live_tiles: list[tuple[int, int]]) -> str:
-    """A minimal coverage repo with a controlled ``tile_live_2048`` for ``zone``."""
-    spec = zone_grid.zone(zone)
-    nty, ntx = spec.height // SHARD_PX, spec.width // SHARD_PX
-    path = str(tmp_path / "coverage.icechunk")
-    repo, _ = open_or_create_repo(path)
-    session = repo.writable_session("main")
-    node = zarr.open_group(session.store, mode="a").require_group(zone)
-    tl = np.zeros((nty, ntx), dtype=bool)
-    for r, c in live_tiles:
-        tl[r, c] = True
-    node.create_array("tile_live_2048", data=tl, chunks=(nty, ntx), dimension_names=("tile_row", "tile_col"))
-    node.attrs["registry_sha256"] = "test-coverage-sha"  # real deliveries carry this; the ROI ties to it
-    session.commit("seed coverage")
-    return path
-
-
 def test_export_zone_roi_ocean_returns_none(tmp_path) -> None:
-    cov = _make_coverage(tmp_path, "01N", [])
+    cov = make_coverage(tmp_path, "01N", [])
     assert land_mask.export_zone_roi("01N", land_mask_path=cov, dest_path=str(tmp_path / "roi.zarr")) is None
 
 
@@ -270,7 +254,7 @@ def test_export_zone_roi_roundtrip_matches_zone_grid(tmp_path) -> None:
     """
     zone = "31N"
     spec = zone_grid.zone(zone)
-    cov = _make_coverage(tmp_path, zone, [(10, 5), (11, 5)])
+    cov = make_coverage(tmp_path, zone, [(10, 5), (11, 5)])
     dest = str(tmp_path / "zone_31N.zarr")
     assert land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest) == dest
 
@@ -287,7 +271,7 @@ def test_export_zone_roi_roundtrip_matches_zone_grid(tmp_path) -> None:
 
 def test_export_zone_roi_mask_upsamples_live_tiles(tmp_path) -> None:
     zone = "31N"
-    cov = _make_coverage(tmp_path, zone, [(10, 5)])
+    cov = make_coverage(tmp_path, zone, [(10, 5)])
     dest = str(tmp_path / "roi.zarr")
     land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
     z = zarr.open(dest, mode="r")
@@ -300,7 +284,7 @@ def test_export_zone_roi_mask_upsamples_live_tiles(tmp_path) -> None:
 def test_export_zone_roi_bbox_contains_live_tiles(tmp_path) -> None:
     zone = "31N"
     spec = zone_grid.zone(zone)
-    cov = _make_coverage(tmp_path, zone, [(10, 5), (11, 5)])
+    cov = make_coverage(tmp_path, zone, [(10, 5), (11, 5)])
     dest = str(tmp_path / "roi.zarr")
     land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
     minx, miny, maxx, maxy = zarr.open(dest, mode="r").attrs["bbox_wgs84"]
@@ -314,7 +298,7 @@ def test_export_zone_roi_bbox_contains_live_tiles(tmp_path) -> None:
 
 def test_export_zone_roi_idempotent(tmp_path) -> None:
     zone = "31N"
-    cov = _make_coverage(tmp_path, zone, [(10, 5)])
+    cov = make_coverage(tmp_path, zone, [(10, 5)])
     dest = str(tmp_path / "roi.zarr")
     first = land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
     second = land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)  # matching grid -> skip
@@ -329,7 +313,7 @@ def test_export_zone_roi_rebuilds_after_partial_write(tmp_path) -> None:
     must never skip a partially-written array.
     """
     zone = "31N"
-    cov = _make_coverage(tmp_path, zone, [(10, 5)])
+    cov = make_coverage(tmp_path, zone, [(10, 5)])
     dest = str(tmp_path / "roi.zarr")
     land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
     # Simulate a crash that landed shape/CRS/transform but not the final sha.
@@ -350,7 +334,7 @@ def test_export_zone_roi_bbox_handles_antimeridian(tmp_path) -> None:
     row = spec.height // SHARD_PX // 2  # a mid-latitude tile row
     # A west→east strip that crosses the -180 boundary (west cols wrap to +179,
     # east cols stay near -176).
-    cov = _make_coverage(tmp_path, zone, [(row, c) for c in range(8)])
+    cov = make_coverage(tmp_path, zone, [(row, c) for c in range(8)])
     dest = str(tmp_path / "roi.zarr")
     land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
     minx, miny, maxx, maxy = zarr.open(dest, mode="r").attrs["bbox_wgs84"]
@@ -372,7 +356,7 @@ def test_live_chunk_count_equals_written_chunk_objects(tmp_path) -> None:
     tiles_per_chunk = land_mask.INGEST_CHUNK_SIZE // SHARD_PX
     # Two tiles inside one chunk block, plus one in a different block: the count
     # must coarsen (3 tiles -> 2 chunks), not simply track tiles.
-    cov = _make_coverage(tmp_path, zone, [(0, 0), (0, 1), (4 * tiles_per_chunk, 3 * tiles_per_chunk)])
+    cov = make_coverage(tmp_path, zone, [(0, 0), (0, 1), (4 * tiles_per_chunk, 3 * tiles_per_chunk)])
     dest = str(tmp_path / "roi.zarr")
     land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
 
@@ -385,7 +369,7 @@ def test_live_chunk_count_equals_written_chunk_objects(tmp_path) -> None:
 
 def test_validate_zone_roi_accepts_freshly_exported(tmp_path) -> None:
     zone = "31N"
-    cov = _make_coverage(tmp_path, zone, [(10, 5), (11, 5)])
+    cov = make_coverage(tmp_path, zone, [(10, 5), (11, 5)])
     dest = str(tmp_path / "roi.zarr")
     land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
     assert land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest) == []
@@ -400,7 +384,7 @@ def test_validate_zone_roi_catches_misplaced_land_at_an_equal_count(tmp_path) ->
     """
     zone = "31N"
     tiles_per_chunk = land_mask.INGEST_CHUNK_SIZE // SHARD_PX
-    cov = _make_coverage(tmp_path, zone, [(0, 0), (4 * tiles_per_chunk, 3 * tiles_per_chunk)])
+    cov = make_coverage(tmp_path, zone, [(0, 0), (4 * tiles_per_chunk, 3 * tiles_per_chunk)])
     dest = str(tmp_path / "roi.zarr")
     land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
     assert land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest) == []
@@ -418,7 +402,7 @@ def test_validate_zone_roi_catches_misplaced_land_at_an_equal_count(tmp_path) ->
 
 
 def test_validate_zone_roi_reports_absent_mask(tmp_path) -> None:
-    cov = _make_coverage(tmp_path, "31N", [(10, 5)])
+    cov = make_coverage(tmp_path, "31N", [(10, 5)])
     problems = land_mask.validate_zone_roi("31N", land_mask_path=cov, roi_path=str(tmp_path / "missing.zarr"))
     assert len(problems) == 1
     assert "cannot open" in problems[0]
@@ -430,7 +414,7 @@ def test_validate_zone_roi_rejects_wrong_transform(tmp_path) -> None:
     compared, not just the shape.
     """
     zone = "31N"
-    cov = _make_coverage(tmp_path, zone, [(10, 5)])
+    cov = make_coverage(tmp_path, zone, [(10, 5)])
     dest = str(tmp_path / "roi.zarr")
     land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
     z = zarr.open(dest, mode="a")
@@ -446,7 +430,7 @@ def test_validate_zone_roi_rejects_superseded_coverage(tmp_path) -> None:
     current one, even though its grid is identical — the sha is the discriminator.
     """
     zone = "31N"
-    cov = _make_coverage(tmp_path, zone, [(10, 5)])
+    cov = make_coverage(tmp_path, zone, [(10, 5)])
     dest = str(tmp_path / "roi.zarr")
     land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
     z = zarr.open(dest, mode="a")
@@ -462,7 +446,7 @@ def test_validate_zone_roi_detects_missing_chunk_object(tmp_path) -> None:
     """
     zone = "31N"
     tiles_per_chunk = land_mask.INGEST_CHUNK_SIZE // SHARD_PX
-    cov = _make_coverage(tmp_path, zone, [(0, 0), (4 * tiles_per_chunk, 3 * tiles_per_chunk)])
+    cov = make_coverage(tmp_path, zone, [(0, 0), (4 * tiles_per_chunk, 3 * tiles_per_chunk)])
     dest = str(tmp_path / "roi.zarr")
     land_mask.export_zone_roi(zone, land_mask_path=cov, dest_path=dest)
     assert land_mask.validate_zone_roi(zone, land_mask_path=cov, roi_path=dest) == []

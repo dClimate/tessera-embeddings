@@ -10,16 +10,14 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
 import pytest
 import zarr
 
 import tessera_embeddings.orchestration.prefect.flows.export_zone_rois as mod
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.ingest import land_mask
 from tessera_embeddings.storage import zone_grid
-from tessera_embeddings.storage.zarr_store import open_or_create_repo
+from tests.unit.coverage_repo import make_coverage
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
@@ -35,23 +33,6 @@ def _no_prefect_runtime(monkeypatch):
     monkeypatch.setattr("tessera_embeddings.providers.aws.credentials.iam_icechunk_credentials", None, raising=False)
 
 
-def _coverage(tmp_path, zone: str, live_tiles: list[tuple[int, int]]) -> str:
-    """A minimal coverage repo with a controlled ``tile_live_2048`` for ``zone``."""
-    spec = zone_grid.zone(zone)
-    nty, ntx = spec.height // SHARD_PX, spec.width // SHARD_PX
-    path = str(tmp_path / "coverage.icechunk")
-    repo, _ = open_or_create_repo(path)
-    session = repo.writable_session("main")
-    node = zarr.open_group(session.store, mode="a").require_group(zone)
-    tl = np.zeros((nty, ntx), dtype=bool)
-    for r, c in live_tiles:
-        tl[r, c] = True
-    node.create_array("tile_live_2048", data=tl, chunks=(nty, ntx), dimension_names=("tile_row", "tile_col"))
-    node.attrs["registry_sha256"] = "test-coverage-sha"
-    session.commit("seed coverage")
-    return path
-
-
 def _export(zone: str, cov: str, dest: str, *, validate_only: bool = False) -> dict:
     return mod.export_one_zone_roi.fn(
         zone, land_mask_path=cov, roi_path=dest, validate_only=validate_only, s3_region=None
@@ -62,7 +43,7 @@ class TestPerZoneTask:
     """The per-zone unit: what it writes, what it skips, and what it reports."""
 
     def test_exports_and_validates(self, tmp_path) -> None:
-        cov = _coverage(tmp_path, "31N", [(10, 5), (11, 5)])
+        cov = make_coverage(tmp_path, "31N", [(10, 5), (11, 5)])
         dest = str(tmp_path / "roi.zarr")
         row = _export("31N", cov, dest)
         assert row["status"] == "exported"
@@ -74,14 +55,14 @@ class TestPerZoneTask:
         """An all-ocean zone has no mask by design, so it must be reported rather
         than validated — validating it would fail on an artifact that should not exist.
         """
-        cov = _coverage(tmp_path, "01N", [])
+        cov = make_coverage(tmp_path, "01N", [])
         dest = tmp_path / "roi.zarr"
         row = _export("01N", cov, str(dest))
         assert row == {"zone": "01N", "status": "all_ocean", "live_chunks": 0, "problems": []}
         assert not dest.exists()
 
     def test_validate_only_does_not_write(self, tmp_path) -> None:
-        cov = _coverage(tmp_path, "31N", [(10, 5)])
+        cov = make_coverage(tmp_path, "31N", [(10, 5)])
         dest = tmp_path / "roi.zarr"
         row = _export("31N", cov, str(dest), validate_only=True)
         assert row["status"] == "invalid"
@@ -89,7 +70,7 @@ class TestPerZoneTask:
         assert any("cannot open" in p for p in row["problems"])
 
     def test_validate_only_passes_an_already_current_mask(self, tmp_path) -> None:
-        cov = _coverage(tmp_path, "31N", [(10, 5)])
+        cov = make_coverage(tmp_path, "31N", [(10, 5)])
         dest = str(tmp_path / "roi.zarr")
         _export("31N", cov, dest)
         assert _export("31N", cov, dest, validate_only=True)["status"] == "validated"
@@ -98,7 +79,7 @@ class TestPerZoneTask:
         """A bad mask must come back as data, not an exception: one broken zone
         should not abort the other 111, and the flow decides what to do with it.
         """
-        cov = _coverage(tmp_path, "31N", [(10, 5)])
+        cov = make_coverage(tmp_path, "31N", [(10, 5)])
         dest = str(tmp_path / "roi.zarr")
         _export("31N", cov, dest)
         z = zarr.open(dest, mode="a")
