@@ -19,6 +19,8 @@ from tessera_embeddings.ingest.stac import (
     _filter_existing_dates,
     _get_collection_config,
     _get_provider_config,
+    _loadable_assets,
+    _prune_item_dict,
     _query_stac_items,
     ingest_tile,
     split_antimeridian_bbox,
@@ -560,16 +562,30 @@ class TestAntimeridianBboxSplit:
         """A granule crossing +/-180 is returned by BOTH searches — load it once."""
         searched: list = []
 
-        class _Item:
-            def __init__(self, id_):
-                self.id = id_
+        def _raw(id_: str) -> dict:
+            """A minimal valid STAC item dict.
+
+            Dicts rather than stubs because the query pages ``items_as_dicts()`` and
+            hydrates AFTER pruning, so this also covers that a pruned item is still
+            something ``Item.from_dict`` accepts.
+            """
+            return {
+                "type": "Feature",
+                "stac_version": "1.0.0",
+                "id": id_,
+                "geometry": {"type": "Point", "coordinates": [179.9, -17.0]},
+                "bbox": [179.9, -17.0, 179.9, -17.0],
+                "properties": {"datetime": "2024-01-05T00:00:00Z"},
+                "links": [{"rel": "self", "href": f"https://example/{id_}"}],
+                "assets": {"blue": {"href": f"s3://b/{id_}-blue.tif"}},
+            }
 
         class _Search:
             def __init__(self, ids):
                 self._ids = ids
 
-            def items(self):
-                return [_Item(i) for i in self._ids]
+            def items_as_dicts(self):
+                return [_raw(i) for i in self._ids]
 
         class _Client:
             def search(self, **kw):
@@ -586,3 +602,93 @@ class TestAntimeridianBboxSplit:
 
         assert searched == [(179.5, -18.0, 180.0, -16.0), (-180.0, -18.0, -179.5, -16.0)]
         assert [i.id for i in items] == ["S", "E", "W"]
+
+
+class TestItemPruning:
+    """Tests for _prune_item_dict / _loadable_assets.
+
+    Retained items dominate the ingest driver's memory, and pruning them is only safe if
+    it cannot drop metadata the loader needs. These tests pin the deny-list contract: kept
+    assets and all other item fields survive byte-for-byte.
+    """
+
+    @staticmethod
+    def _item(assets: dict | None = None) -> dict:
+        return {
+            "type": "Feature",
+            "stac_version": "1.0.0",
+            "stac_extensions": ["https://stac-extensions.github.io/projection/v1.1.0/schema.json"],
+            "id": "S2A_TEST_20240603",
+            "collection": "sentinel-2-l2a",
+            "bbox": [24.0, 36.0, 25.0, 37.0],
+            "geometry": {"type": "Polygon", "coordinates": [[[24, 36], [25, 36], [25, 37], [24, 36]]]},
+            "properties": {
+                "datetime": "2024-06-03T10:04:10.274000Z",
+                # The CRS lives here for this collection. An allow-list built expecting
+                # `proj:epsg` silently dropped it, which is why pruning is a deny-list.
+                "proj:code": "EPSG:32634",
+                "s2:processing_baseline": "05.10",
+                "eo:cloud_cover": 4.66,
+            },
+            "assets": assets
+            if assets is not None
+            else {
+                "blue": {
+                    "href": "s3://b/blue.tif",
+                    "proj:shape": [10980, 10980],
+                    "raster:bands": [{"nodata": 0, "scale": 1}],
+                },
+                "scl": {"href": "s3://b/scl.tif", "proj:shape": [5490, 5490]},
+                "visual": {"href": "s3://b/visual.tif"},
+                "thumbnail": {"href": "s3://b/thumb.jpg"},
+                "granule_metadata": {"href": "s3://b/meta.xml"},
+            },
+            "links": [{"rel": "self", "href": "https://example/item"}],
+        }
+
+    def test_loadable_assets_is_bands_plus_scl(self):
+        cfg = CollectionConfig(collection_id="c", bands=["blue", "green"], resolution=10, has_scl=True)
+        assert _loadable_assets(cfg) == frozenset({"blue", "green", "scl"})
+
+    def test_loadable_assets_omits_scl_when_absent(self):
+        cfg = CollectionConfig(collection_id="c", bands=["vv", "vh"], resolution=10, has_scl=False)
+        assert _loadable_assets(cfg) == frozenset({"vv", "vh"})
+
+    def test_drops_unread_assets_and_links(self):
+        pruned = _prune_item_dict(self._item(), frozenset({"blue", "scl"}))
+        assert set(pruned["assets"]) == {"blue", "scl"}
+        assert pruned["links"] == []
+
+    def test_kept_assets_and_other_fields_survive_verbatim(self):
+        """The deny-list contract: nothing inside a kept asset, and no other field, changes."""
+        src = self._item()
+        pruned = _prune_item_dict(src, frozenset({"blue", "scl"}))
+        assert pruned["assets"]["blue"] == src["assets"]["blue"]
+        assert pruned["assets"]["scl"] == src["assets"]["scl"]
+        for key in ("id", "collection", "type", "stac_version", "stac_extensions", "bbox", "geometry", "properties"):
+            assert pruned[key] == src[key], key
+
+    def test_does_not_mutate_the_input(self):
+        src = self._item()
+        _prune_item_dict(src, frozenset({"blue"}))
+        assert set(src["assets"]) == {"blue", "scl", "visual", "thumbnail", "granule_metadata"}
+        assert src["links"] != []
+
+    def test_unrecognised_asset_names_leave_the_item_untouched(self):
+        """A collection whose assets are named differently must keep its bands, not lose them."""
+        src = self._item(assets={"B02": {"href": "s3://b/B02.tif"}})
+        assert _prune_item_dict(src, frozenset({"blue", "scl"})) is src
+
+    def test_item_without_assets_is_returned_unchanged(self):
+        src = self._item(assets={})
+        assert _prune_item_dict(src, frozenset({"blue"})) is src
+
+    def test_pruned_dict_still_builds_a_pystac_item(self):
+        """The pruned form is hydrated immediately, so it must remain a valid STAC Item."""
+        from pystac import Item
+
+        item = Item.from_dict(_prune_item_dict(self._item(), frozenset({"blue", "scl"})))
+        assert item.id == "S2A_TEST_20240603"
+        assert set(item.assets) == {"blue", "scl"}
+        assert item.properties["proj:code"] == "EPSG:32634"
+        assert str(item.datetime)[:10] == "2024-06-03"

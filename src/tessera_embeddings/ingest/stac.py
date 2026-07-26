@@ -477,6 +477,43 @@ def _apply_baseline_corrections_by_date(
 # =============================================================================
 
 
+def _loadable_assets(collection_config: CollectionConfig) -> frozenset[str]:
+    """Every asset the loader could read for this collection."""
+    names = set(collection_config.bands)
+    if collection_config.has_scl:
+        names.add("scl")
+    return frozenset(names)
+
+
+def _prune_item_dict(item: dict[str, Any], keep_assets: frozenset[str]) -> dict[str, Any]:
+    """Drop assets the loader never reads, plus links, from a STAC item dict.
+
+    Retained items dominate the ingest driver's memory: streaming holds a month plus the
+    prefetched next month, and a catalogue item is mostly assets for bands nobody asked
+    for. Sentinel-2 L2A on earth-search carries 35 assets — previews, per-band JP2
+    variants, metadata documents — of which the ingest loads 11.
+
+    Deliberately a DENY-list: every remaining key, and every field of every kept asset, is
+    preserved verbatim. An allow-list of properties was tried first and silently omitted
+    the CRS, because this collection carries it in ``proj:code`` where the list expected
+    ``proj:epsg``. Dropping whole unread assets cannot lose metadata the loader needs,
+    and it is where nearly all of the saving is anyway.
+
+    Leaves the item untouched if no asset name is recognised, so a collection whose assets
+    are named differently degrades to today's behaviour rather than losing its bands.
+    """
+    assets = item.get("assets")
+    if not assets:
+        return item
+    kept = {name: a for name, a in assets.items() if name in keep_assets}
+    if not kept:
+        return item
+    pruned = dict(item)
+    pruned["assets"] = kept
+    pruned["links"] = []  # still valid for from_dict; the loader never follows them
+    return pruned
+
+
 def _query_stac_items(
     provider: STACProvider,
     collection_config: CollectionConfig,
@@ -516,15 +553,20 @@ def _query_stac_items(
 
     items: list[Any] = []
     seen: set[str] = set()
+    keep_assets = _loadable_assets(collection_config)
     for sub_bbox in split_antimeridian_bbox(bbox):
         query_params = _build_stac_query(collection_config, tile_id, start_date, end_date, bbox=sub_bbox)
         search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
-        for item in search.items():
+        # Paged as DICTS rather than Items so a full item is never hydrated: pruning first
+        # and hydrating second is both smaller to retain and ~3x cheaper to build, because
+        # most of an item's construction cost is the assets that get dropped.
+        for raw in search.items_as_dicts():
             # Dedupe across the two halves: a granule straddling +/-180 is returned by
             # both searches, and loading it twice would double-count the solar day.
-            if item.id not in seen:
-                seen.add(item.id)
-                items.append(item)
+            item_id = raw.get("id")
+            if item_id not in seen:
+                seen.add(item_id)
+                items.append(Item.from_dict(_prune_item_dict(raw, keep_assets)))
     logger.info(f"STAC query returned {len(items)} items in {time.monotonic() - t0:.1f}s total")
 
     return items
