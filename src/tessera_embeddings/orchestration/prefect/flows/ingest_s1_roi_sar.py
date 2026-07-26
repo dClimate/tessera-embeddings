@@ -42,6 +42,7 @@ def _ingest_s1_roi_impl(
     use_s3_direct: bool,
     storage_options: dict | None,
     crop_to_live_windows: bool,
+    overlap_window_writes: bool,
 ) -> dict[str, Any]:
     """Inner flow: submits the S1 ingestion task to the configured Dask runner."""
     future = process_roi_sar.submit(
@@ -56,6 +57,7 @@ def _ingest_s1_roi_impl(
         use_s3_direct=use_s3_direct,
         storage_options=storage_options,
         crop_to_live_windows=crop_to_live_windows,
+        overlap_window_writes=overlap_window_writes,
     )
     return future.result()
 
@@ -100,6 +102,7 @@ def ingest_s1_roi_sar(
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
     crop_to_live_windows: bool = False,
+    overlap_window_writes: bool = False,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
 
@@ -128,6 +131,13 @@ def ingest_s1_roi_sar(
             performance-report HTML for this run is captured and
             uploaded there (probe-rung profiling; default off).
             Ignored on the ``use_local`` path, which warns.
+        overlap_window_writes: Submit a date's windows as ONE dask compute rather
+            than one blocking compute per window, so their critical paths overlap
+            across the fleet instead of summing. Identical stores either way.
+            Defaults off pending an S1 measurement; the S2 path measured 1.59x per
+            date from the same change and S1 shares the mechanism, but its band
+            count and per-window volume differ. Only meaningful with
+            ``crop_to_live_windows``.
         crop_to_live_windows: Restrict mosaic writes (and the S2 coverage
             reduce) to the chunk-aligned windows intersecting the ROI mask —
             one commit per date. Default False = legacy full-extent path.
@@ -175,6 +185,7 @@ def ingest_s1_roi_sar(
                 use_s3_direct=use_s3_direct,
                 storage_options=storage_options,
                 crop_to_live_windows=crop_to_live_windows,
+                overlap_window_writes=overlap_window_writes,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -205,4 +216,5 @@ def ingest_s1_roi_sar(
                 use_s3_direct=use_s3_direct,
                 storage_options=storage_options,
                 crop_to_live_windows=crop_to_live_windows,
+                overlap_window_writes=overlap_window_writes,
             )

@@ -87,6 +87,7 @@ def process_roi_sar(
     use_s3_direct: bool = True,
     storage_options: dict | None = None,
     crop_to_live_windows: bool = False,
+    overlap_window_writes: bool = False,
 ) -> dict[str, Any]:
     """Prefect task: ingest S1 OPERA SAR for one ROI.
 
@@ -148,5 +149,6 @@ def process_roi_sar(
             log=get_run_logger(),
             storage_options=storage_options,
             crop_to_live_windows=crop_to_live_windows,
+            overlap_window_writes=overlap_window_writes,
         )
     return asdict(result)

@@ -92,6 +92,7 @@ def ingest_s1_roi_sar(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     storage_options: dict | None = None,
     crop_to_live_windows: bool = False,
+    overlap_window_writes: bool = False,
 ) -> SarIngestResult:
     """Ingest OPERA RTC-S1 SAR for an ROI using batched time windows.
 
@@ -133,6 +134,12 @@ def ingest_s1_roi_sar(
             callback.
         log: Optional logger; defaults to ``logging.getLogger(__name__)``.
         storage_options: fsspec storage options for the ROI mask reads.
+        overlap_window_writes: Submit a date's windows as ONE dask compute rather
+            than one blocking compute per window, so their critical paths overlap
+            across the fleet instead of summing. Identical stores either way.
+            Defaults off here pending an S1 measurement — the S2 path measured
+            1.59x per date from the same change, and S1 shares the mechanism, but
+            its band count and per-window volume differ.
         crop_to_live_windows: Write only the chunk-aligned windows that
             intersect the ROI mask (``ingest.live_windows``), one commit per
             date within each batch. Default False = legacy full-extent path.
@@ -263,6 +270,7 @@ def ingest_s1_roi_sar(
                                 tile_id=roi_zarr_path,
                                 crs=roi.native_crs,
                                 chunks=INGEST_CHUNKS,
+                                parallel_windows=overlap_window_writes,
                             )
             else:
                 for attempt in _retrying():
