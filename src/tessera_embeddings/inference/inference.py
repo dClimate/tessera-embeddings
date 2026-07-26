@@ -275,10 +275,10 @@ class _LoopProgress:
     # Worst single-batch CPU prep this call — averages hide the spikes that
     # actually starve the GPU (feed-fix telemetry; see actors' reserve_cpus).
     get_batch_max: float = 0.0
-    # Per-bucket (pixels, sub-batches) — the workload-side input to the
-    # adaptive token-budget gate (temp/token-budget-batching-findings.md §Step 0):
-    # the expected gain is bucket occupancy weighted by the per-shape speedup
-    # curve, and occupancy varies by region, so it's logged on every run.
+    # Per-bucket (pixels, sub-batches) — the workload-side input to any
+    # token-budget batching decision: the expected gain is bucket occupancy
+    # weighted by the per-shape speedup curve, and occupancy varies by region,
+    # so it is logged on every run rather than assumed from one measurement.
     # Counts only — per-bucket forward times are NOT recorded because the
     # pipelined loop's timings are enqueue-side and would mislead.
     bucket_px: dict[tuple[int, int], tuple[int, int]] = field(default_factory=dict)

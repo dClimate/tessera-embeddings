@@ -36,7 +36,12 @@ CI verifies that the names listed here match `tessera_embeddings.__all__`.
 - `ingest_s2_roi_reflectance(*, roi_zarr_path, start_date, end_date,
   store_path, client, ...) -> IngestResult` — pure-domain S2 L2A
   reflectance ingest. Caller supplies a connected
-  `dask.distributed.Client`.
+  `dask.distributed.Client`. Two keyword options change how much work it
+  does without changing what it writes: `stream_stac_monthly` (default
+  **True**) queries the catalog one month at a time instead of the whole
+  window up front, bounding how many STAC items are retained at once; and
+  `crop_to_live_windows` (default False) restricts loads and writes to the
+  chunk-aligned windows where the ROI mask has land.
 - `ingest_s1_roi_sar(*, roi_zarr_path, start_date, end_date,
   store_path, client, orbit, ...) -> SarIngestResult` — pure-domain
   S1 OPERA RTC ingest with batched windows + per-batch credential

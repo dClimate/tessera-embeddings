@@ -176,7 +176,7 @@ GPU-util distribution post-hoc with no live cluster; `--start-pollers` then `--r
 `CHUNK_SUMMARY` lines. The decision metric is **GPU-idle overhead per chunk** (~6 s median
 shipped), with peak RAM as the safety check. `te-compare-outputs` provides the numerical
 parity gate, and per-run provenance goes in
-`src/tessera_embeddings/profiling/inference/RUNS.md`.
+`context_docs/design/inference-perf-run-ledger.md`.
 
 **Sparse zones understate the harm.** Spatially-sparse chunks already read only a narrow
 easting window (optimization C), so a sparse zone shows less amplification than a dense one.

@@ -73,45 +73,21 @@ te-observe-cluster \
   comparison (assembly's `verify_staged_completeness` would refuse it).
 
 ```
-                    ┌─ per-chunk wall-clock anatomy (from --report) ─┐
-   gap+mask   band read   SAR+build   inference              write
-  ├───3s───┼───20-35s──┼───9-17s───┼════137-220s════════┼───7-8s──┤
-   GPU idle   GPU idle    GPU idle    GPU 21-100% (osc.)   GPU idle
+        ┌─ per-chunk wall-clock anatomy, as --report lays it out ─┐
+   gap+mask    band read    SAR+build    inference          write
+  ├─────────┼────────────┼────────────┼══════════════════┼─────────┤
+   GPU idle    GPU idle     GPU idle    GPU busy           GPU idle
+  └──────── prologue: overlappable ────┘                  └ epilogue ┘
 ```
 
-## Baseline: 2026-07-16, Iowa ROI, main @ batch_size=3584, 4× g6e.xlarge (L40S)
+The shape is the point: everything outside the inference band is GPU-idle time
+on that worker, so `--report`'s phase table tells you whether a run is limited
+by the GPU or by everything around it. Absolute figures depend on the instance
+type, the ROI's valid-pixel density and the batch size, so read them from your
+own run rather than from a number written here.
 
-Fleet GPU polls over ~10.5 min steady state (all 4 workers within a few %):
-
-| metric | value |
-|---|---|
-| avg GPU util (nvidia-smi) | 48–57% |
-| busy fraction (util > 5%) | ~0.70 |
-| avg power | 219–248 W / 350 W |
-| DCGM SMACT during inference | 0.31–0.68 |
-| DCGM TENSO (tensor pipes) during inference | **0.12–0.26** |
-| DCGM DRAMA | 0.25–0.49 |
-
-Per-chunk phase splits (12 chunks, all single-strip, 40–70% valid):
-
-| phase | wall | GPU |
-|---|---|---|
-| scheduler gap + SCL mask load | ~3 s | idle |
-| S2 band read (5–8 GB) | 20–35 s | idle |
-| SAR read + dataset build | 9–17 s | idle |
-| inference (1.6–2.8 M px) | 137–221 s @ 9.6–13.3K px/s | oscillating 21–100% |
-| staging write | 7–8 s | idle |
-| **total** | **204–281 s** | **~22–25% fully idle** |
-
-Reading: two independent losses. (1) Structural — ~50–60 s of GPU-idle
-prologue/epilogue per chunk with no cross-chunk overlap (Phase 1 target).
-(2) Within-inference — tensor pipes ≤26% active even mid-forward: CPU batch
-prep gating (~165 ms/sub-batch), serial per-sub-batch H2D→forward→D2H
-bubbles, and the launch-bound CustomGRU loop (Phase 2–3 targets). px/s is
-density-dependent; completion logs now report tok/sec and effective TFLOPS
-(`profiling.transformer_flops`) for cross-chunk comparison.
-
-Note: production workers are g6e.xlarge (L40S 48 GB, **4 vCPU**, 32 GB RAM).
-The L40S's tensor ceiling (~181 TFLOPS BF16 dense) is enormous relative to the
-observed TENSO ≤0.26, and only 4 host vCPUs feed it — which is why the
-CPU-side/pipeline bottlenecks above dominate.
+Measurements from the campaign this harness was built for — baselines, the
+per-phase progression, and what each change bought — are in
+`context_docs/design/inference_gpu_saturation_profile_2026_07.md` and its run
+ledger. They are recorded there rather than here so this file stays a
+description of the tools, which does not go stale when the next run lands.

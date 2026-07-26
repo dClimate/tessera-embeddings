@@ -6,7 +6,7 @@ how correctness was preserved, and the gotchas future work must respect. This is
 the empirical basis for why the pipeline looks the way it does.
 
 **Complete per-run data + staging run-id mapping:
-[`src/tessera_embeddings/profiling/inference/RUNS.md`](../../src/tessera_embeddings/profiling/inference/RUNS.md).** Raw
+[`inference-perf-run-ledger.md`](inference-perf-run-ledger.md).** Raw
 telemetry (TIMING / RESOURCES / EFFECTIVE-TFLOPS lines) survives in CloudWatch
 (`/ec2/yield-embeddings/ray`); reproduce fleet stats with
 `te-observe-cluster` (`--report`, `--ram-report`).
@@ -19,7 +19,7 @@ Hardware: g6e.xlarge — 1× L40S (181 TFLOPS BF16 dense, 46 GB VRAM, 864 GB/s),
 Numbers below are the **final shipped state**: the phase-5 run `a60550ae`
 (bounded cross-chunk starter prefetch — the last optimization on the branch).
 `main` is the batch-3584 baseline `a85be572e2fb`. Both single runs; see
-[RUNS.md](../../src/tessera_embeddings/profiling/inference/RUNS.md) for the per-phase progression.
+[the run ledger](inference-perf-run-ledger.md) for the per-phase progression.
 
 | metric | `main` baseline (batch 3584) | shipped (branch, batch 7168) |
 |---|---|---|
@@ -167,7 +167,7 @@ comparison carries over to the shipped state unchanged.
   penalty is A10G-specific). BF16 stays.
 - **Adaptive token-budget batching:** real-model forward sweep — B=7168 is
   throughput-optimal at EVERY sequence length (even T=8 at 84/88 TFLOPS); larger
-  B is neutral-to-worse. Shelved (`temp/token-budget-batching-findings.md`).
+  B is neutral-to-worse. Shelved.
 - **Eager bucketing (P4):** opens `dataset.py`; post-striping payoff is a sliver;
   rejected.
 - **GRU restructure:** builder already fuses `CustomGRU` → cuDNN `nn.GRU`; reverted
@@ -215,3 +215,48 @@ source-store chunk geometry: the 4000² storage chunking drives the ~13 s
 fixed read amplification — an inference-aligned geometry chosen before the global
 UTM-zone ingestion would cut it for every future run (a config choice then, a
 re-ingest later).
+
+
+---
+
+## Appendix: the phase-0 baseline (moved here from the harness README)
+
+The harness README describes the tools; these are the numbers one campaign got out
+of them, which is why they live here.
+
+### Baseline: 2026-07-16, Iowa ROI, main @ batch_size=3584, 4× g6e.xlarge (L40S)
+
+Fleet GPU polls over ~10.5 min steady state (all 4 workers within a few %):
+
+| metric | value |
+|---|---|
+| avg GPU util (nvidia-smi) | 48–57% |
+| busy fraction (util > 5%) | ~0.70 |
+| avg power | 219–248 W / 350 W |
+| DCGM SMACT during inference | 0.31–0.68 |
+| DCGM TENSO (tensor pipes) during inference | **0.12–0.26** |
+| DCGM DRAMA | 0.25–0.49 |
+
+Per-chunk phase splits (12 chunks, all single-strip, 40–70% valid):
+
+| phase | wall | GPU |
+|---|---|---|
+| scheduler gap + SCL mask load | ~3 s | idle |
+| S2 band read (5–8 GB) | 20–35 s | idle |
+| SAR read + dataset build | 9–17 s | idle |
+| inference (1.6–2.8 M px) | 137–221 s @ 9.6–13.3K px/s | oscillating 21–100% |
+| staging write | 7–8 s | idle |
+| **total** | **204–281 s** | **~22–25% fully idle** |
+
+Reading: two independent losses. (1) Structural — ~50–60 s of GPU-idle
+prologue/epilogue per chunk with no cross-chunk overlap (Phase 1 target).
+(2) Within-inference — tensor pipes ≤26% active even mid-forward: CPU batch
+prep gating (~165 ms/sub-batch), serial per-sub-batch H2D→forward→D2H
+bubbles, and the launch-bound CustomGRU loop (Phase 2–3 targets). px/s is
+density-dependent; completion logs now report tok/sec and effective TFLOPS
+(`profiling.transformer_flops`) for cross-chunk comparison.
+
+Note: production workers are g6e.xlarge (L40S 48 GB, **4 vCPU**, 32 GB RAM).
+The L40S's tensor ceiling (~181 TFLOPS BF16 dense) is enormous relative to the
+observed TENSO ≤0.26, and only 4 host vCPUs feed it — which is why the
+CPU-side/pipeline bottlenecks above dominate.

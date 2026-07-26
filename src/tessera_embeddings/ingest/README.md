@@ -86,6 +86,32 @@ cloud classification is handled later (SCL for S2, ML model for inference). For 
 are sorted by `(date, eo:cloud_cover)` so that within a solar-day mosaic the clearest tile
 is placed first, which is what `odc.stac.load`'s groupby mosaicking relies on.
 
+#### Streaming the query month by month (S2)
+
+`ingest_s2_roi_reflectance` queries **one month at a time** by default
+(`stream_stac_monthly`), prefetching the next month while the current one is being
+ingested. Querying a whole window up front is simpler, but it retains every returned item
+for the run's duration, and a zone-year's worth does not fit alongside the ingest on one
+worker. Streaming bounds retention to the month in hand plus the one being fetched.
+
+The prefetch runs on a daemon thread rather than a pooled worker: an in-flight catalog
+walk cannot be interrupted from outside, so abandoning it is the only way to stop waiting,
+and a daemon thread does not hold the process open when a run is cancelled mid-query.
+
+Month ranges **partition** the window — each month owns a half-open slice and items are
+filtered to their owner — so a date cannot be ingested twice or skipped at a boundary.
+Set `stream_stac_monthly=False` to issue one query for the whole window; the per-date work
+is byte-identical either way.
+
+#### Antimeridian queries
+
+UTM zones 01 and 60 straddle ±180°, and the ROI's WGS84 bounding box is written in the
+GeoJSON crossing convention (`west > east`) so it stays narrow instead of spanning the
+globe. Neither catalog can be relied on to read that form — the native CMR path is known
+to reject it — so both query paths split the box at ±180° into two ordinary west-to-east
+queries and deduplicate the results by item id. A granule straddling the line is returned
+by both halves and must be loaded once.
+
 ---
 
 ## ROI Workflow
@@ -296,10 +322,9 @@ This is a fully lazy Dask operation — no data is materialised until the Zarr w
 
 Ingest cost scales with the **extent it computes, not the land it keeps**: the mosaic
 loads cover the whole ROI grid even where the mask is entirely ocean/out-of-footprint.
-The first real campaign cell made the gap concrete — zone `03S` has 4 live tiles out of
-14,355, yet its full-extent mosaic built a 119,002-task graph and spilled ~1 TB of worker
-memory before being cancelled. Measured across all 112 land zones, ~78% of campaign
-ingest compute is spent on ocean.
+On a UTM zone that is mostly sea this is the difference between a graph that fits and one
+that does not — the extreme cells hold a few live tiles out of many thousands, and across
+the campaign's land zones roughly three-quarters of the compute would go to ocean.
 
 `crop_to_live_windows` (an `IngestSettings` knob for the campaign; a flag on both ingest
 flows and domain functions for single runs) restricts every load and write to the
@@ -367,8 +392,12 @@ Group `a` covers r0–r4 at the cost of two dead chunks (`+`), buying four fewer
 `b` should join it is likewise a cost question, not a shape one: that union would span
 `r0–r7 × c0–c4`, adding 16 chunks to save one stall — worth it at the production price, which
 is why real masks group harder than this small illustration suggests. Two things stop a group:
-the price ceasing to justify the added area, and `MAX_CHUNKS_PER_WINDOW`, which bounds one
-window's graph so memory and scheduler load stay inside a proven envelope.
+the price ceasing to justify the added area, and `MAX_TASKS_PER_WINDOW`, which bounds one
+window's graph so memory and scheduler load stay inside a proven envelope. That cap is
+expressed in TASKS, converted to a chunk area through `DEFAULT_TASKS_PER_CHUNK`, because
+the scheduler dispatches tasks on a single-threaded event loop — past its throughput extra
+area stops being cheap, which is how an unbounded objective over-merges into a saturated
+scheduler and gets slower.
 
 Grouping is solved **exactly**, by a dynamic program over consecutive bands rather than a
 greedy rule — a heuristic bound on wasted area cannot express "extra area is nearly free", and
@@ -413,6 +442,30 @@ per passing date (one writable session ── one commit)
   The empty-axis seed matters: the time axis only ever contains dates whose pixels
   committed, which is what keeps `get_existing_dates` (the STAC dedupe),
   `check_time_window_coverage`, and the empty-timestep prunes truthful.
+- **Each date narrows further, to the land its own imagery reaches.** A run's windows
+  say where the ROI has land, and are the same on every date; a single date is not, because
+  an optical satellite images a fraction of a wide ROI per pass. Windows a date does not
+  reach still built tasks that ran, found nothing, and wrote nothing. `windows_for_date`
+  intersects the run's windows with the footprint of that date's own STAC items
+  (reprojected onto the ingest grid, padded outward by one cell so a curved reprojection
+  cannot under-cover), then re-bands and re-groups the remainder. This cannot change what
+  a mosaic holds — it only removes work whose result was already discarded — but it shrinks
+  both the graph and the count of serial region writes. When the footprint cannot be
+  determined the run's full window list is returned unchanged, so the conservative
+  behaviour is the fallback rather than something a caller must opt into.
+
+```text
+   run windows (where the ROI has land)   one date's items      that date writes
+     c0 c1 c2 c3 c4                        c0 c1 c2 c3 c4        c0 c1 c2 c3 c4
+r0    a  a  a  a  .                         .  F  F  .  .    r0   .  a  a  .  .
+r1    a  a  a  a  .          ∩              .  F  F  F  .  = r1   .  a  a  a  .
+r2    a  a  a  a  .                         .  .  .  .  .    r2   .  .  .  .  .
+r3    b  b  .  .  .                         .  .  .  .  .    r3   .  .  .  .  .
+
+     2 windows, every date                F = the swath           1 window; window b
+                                            this date covers        is skipped entirely
+```
+
 - **The declared grid stays full-extent**, so the zone fill's exact-grid validation is
   unaffected — Zarr/Icechunk arrays are sparse and unwritten chunks read back as fill.
 - **The SCL coverage phase is cropped too**: its reduce runs over the windows only
@@ -681,9 +734,11 @@ credentials, bypassing the env vars. The mechanism:
   botocore chain with the `env` provider **removed**, so it always lands on the deployment's
   IAM role (instance-metadata / ECS task role / local SSO) regardless of what STS tokens the
   env vars hold. It returns `icechunk.S3StaticCredentials`.
-- `storage.zarr_store` exposes a process-wide `set_credentials_provider()` hook.
+- `storage.zarr_store` exposes a `credentials_provider(provider)` **context manager**.
   `_create_storage` uses the registered provider as the `get_credentials` callback for any S3
-  open lacking an explicit one. The storage layer ships this as `None` and never imports
+  open lacking an explicit one, for the duration of the block — scoped rather than permanent
+  so a reused process (a Dask worker) is not left pinned to it for later, unrelated opens,
+  and the previous provider is restored even if the body raises. The storage layer ships this as `None` and never imports
   botocore (it must stay cloud-agnostic, per the `no-botocore-outside-aws-provider`
   architecture rule); only the AWS provider supplies the concrete callback.
 - The `process_roi_sar` Prefect task registers `iam_icechunk_credentials` via that hook when

@@ -187,6 +187,6 @@ exactly which field was bad.
 ## Public API
 
 The pydantic models and helpers documented above are part of the
-public API surface (see [`docs/public-api.md`](public-api.md)). The
-internal helpers (e.g. `_chunkscaledClusterConfig` base class) are
-not — depend only on what's listed.
+public API surface (see [`docs/public-api.md`](public-api.md)).
+Anything underscore-prefixed is not — depend only on what is listed
+there.

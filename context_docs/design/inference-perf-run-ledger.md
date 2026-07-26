@@ -39,8 +39,7 @@ WITH full cross-chunk interleaving; that 95% is the removed interleaving design'
 footprint, NOT `main` (which ran ~50%) nor the shipped pipeline. The shipped
 striping run measured **45–47% peak** (Phase 4 entry below). Fleet sample-weighted avg
 GPU util **79.4%** → total idle-recovery ceiling ~21% (incl. structural
-write/cold-start idle); CPU-feed-specific slice ~7–15% GPU-hours (see
-`temp/token-budget-batching-findings.md` for the g6e.2xlarge vs software tradeoff).
+write/cold-start idle); CPU-feed-specific slice ~7–15% GPU-hours (the g6e.2xlarge vs software tradeoff was assessed separately and shelved).
 
 Few-valid-pixel / edge coverage 2026-07-17 (P2+3 vs baseline, `--cross-config`):
 chunk_0_22 (3.5% valid): exact 99.85%, max|Δ|=2, cosine ≥ 0.99992, 0 NaN
@@ -120,5 +119,4 @@ starts, density mix, and ramp; live-chunk-only basis ~13K).
 Correctness: **bit-identical to phase 4** (output-preserving — the prefetch
 changes *when* the prologue loads, not the tensors), spot-checked across 8
 chunks / ~1.2B px (exact 100%, max|Δ|=0, obs-mismatch 0, cosine 1.0). So the
-phase-4 cross-config comparison vs `main` above carries over unchanged. Full
-detail: `temp/phase5-validation-a60550ae.md`.
+phase-4 cross-config comparison vs `main` above carries over unchanged. Full.

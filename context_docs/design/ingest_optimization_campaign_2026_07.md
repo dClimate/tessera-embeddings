@@ -686,7 +686,7 @@ All installed as console scripts; do not rebuild these.
   saturation (SMACT/TENSO) and the per-chunk phase-split table from the actors'
   `CHUNK_SUMMARY` lines.
 - `te-compare-outputs` — the numerical parity gate for any change that could alter values.
-- Per-run provenance belongs in `profiling/inference/RUNS.md`.
+- Per-run provenance belongs in `context_docs/design/inference-perf-run-ledger.md`.
 
 The scheduler heartbeat self-reports every 30 s: CPU, RSS, memory percentage, queue lag, worker
 and task counts, tasks processing, and fleet memory including spill and the hottest worker.
