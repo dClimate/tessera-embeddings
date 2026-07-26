@@ -197,6 +197,9 @@ def ingest_s1_roi_sar(
         min_workers=min_workers,
         max_workers=max_workers,
         extra_worker_env=edl_env,
+        # A capped task stream silently truncates the report to the run's last few
+        # dates; raise it only when a report is actually being captured.
+        diagnostic_task_stream=bool(perf_report_uri),
         # Tag every cluster resource with this run's id so the cancellation/crash
         # hook can sweep the tasks from a fresh process (see _dask_lifecycle).
         resource_tags=dask_resource_tags(flow_run_ctx.id),

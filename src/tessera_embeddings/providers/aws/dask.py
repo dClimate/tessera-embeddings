@@ -99,6 +99,20 @@ DEFAULT_INGEST_SCHEDULER_MEM = 8192
 
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/ecs/tessera/dask"
 
+#: Task-stream buffer for DIAGNOSTIC runs only.
+#:
+#: Dask's task stream is a bounded deque
+#: (``distributed.scheduler.dashboard.tasks.task-stream-length``, default 100,000). A
+#: performance report built from a capped stream holds only the run's TAIL, and dividing it
+#: by the run's date count understates packed task work — which put this campaign's packing
+#: ceiling at 1.60x when the true figure is ~2.8x. It survived review because the report's
+#: TOTAL rectangle count looks unremarkable once inter-worker transfers pad it.
+#:
+#: At ~25k tasks per date, 100,000 covers about 4 dates; 3,000,000 covers a ~120-date run.
+#: Applied only when a performance report is requested: it is scheduler memory, and campaign
+#: runs neither need it nor should pay for it.
+DIAGNOSTIC_TASK_STREAM_LENGTH = 3_000_000
+
 # How often the scheduler logs its own resource usage. The default scheduler
 # logs are event-driven (worker register/connect) and say nothing about the
 # scheduler process's own load, so a slow event loop only shows up as the
@@ -680,6 +694,7 @@ def ecs_cluster(
     extra_worker_env: dict[str, str] | None = None,
     extra_scheduler_env: dict[str, str] | None = None,
     ec2_scheduler: bool = False,
+    diagnostic_task_stream: bool = False,
     image: str | None = None,
     resource_tags: dict[str, str] | None = None,
 ) -> Iterator[ECSCluster]:
@@ -712,6 +727,11 @@ def ecs_cluster(
             Fargate. Provides better single-threaded CPU performance
             for large-graph planning. Workers still run on Fargate.
             Requires ``EC2_SCHEDULER_CAPACITY_PROVIDER`` env var.
+        diagnostic_task_stream: Raise the scheduler's task-stream buffer to
+            :data:`DIAGNOSTIC_TASK_STREAM_LENGTH` so a performance report covers the whole
+            run rather than only its last few dates. Pass this whenever a report is being
+            captured; leave it off for campaign runs, where the buffer is scheduler memory
+            spent on data nobody reads.
         image: Override Docker image URI for scheduler and workers.
         resource_tags: Extra tags applied to every AWS resource the cluster
             creates (scheduler + worker ECS tasks included). The flows tag with
@@ -744,6 +764,11 @@ def ecs_cluster(
 
     if extra_worker_env:
         cluster_kwargs["environment"].update(extra_worker_env)
+
+    if diagnostic_task_stream:
+        cluster_kwargs["environment"][
+            "DASK_DISTRIBUTED__SCHEDULER__DASHBOARD__TASKS__TASK_STREAM_LENGTH"
+        ] = str(DIAGNOSTIC_TASK_STREAM_LENGTH)
 
     if ec2_scheduler:
         capacity_provider = os.environ.get("EC2_SCHEDULER_CAPACITY_PROVIDER", "")
