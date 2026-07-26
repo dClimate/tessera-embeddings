@@ -40,7 +40,7 @@ def _ingest_s2_roi_impl(
     storage_options: dict | None = None,
     crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
-    overlap_window_writes: bool = False,
+    overlap_window_writes: bool = True,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
     future = process_roi_reflectance.submit(
@@ -84,7 +84,7 @@ def ingest_s2_roi_reflectance(
     perf_report_uri: str | None = None,
     crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
-    overlap_window_writes: bool = False,
+    overlap_window_writes: bool = True,
 ) -> dict[str, Any]:
     """Ingest S2 L2A reflectance for an ROI using Dask workers.
 

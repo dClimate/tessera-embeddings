@@ -1100,6 +1100,29 @@ def batched_region_writes(
     logger.info("Committed '%s' in %.1fs", message, time.monotonic() - commit_started)
 
 
+#: Fan-in of the tree reduction that merges window changesets back into the session.
+#: Shared by both write paths so they reduce identically — the overlapped path merges
+#: every window's changesets in one reduction, the sequential path one window's at a
+#: time, and a difference here would show up as a behaviour difference between them.
+_MERGE_SPLIT_EVERY = 8
+
+
+def _window_slice(day_ds: xr.Dataset, window: "tuple[int, int, int, int]", drop: "list[str]") -> xr.Dataset:
+    """The date's dataset restricted to one window, coords dropped for a region write."""
+    y0, y1, x0, x1 = window
+    return day_ds.isel(northing=slice(y0, y1), easting=slice(x0, x1)).drop_vars(drop)
+
+
+def _window_region(window: "tuple[int, int, int, int]", time_index: int) -> dict:
+    """The zarr region one window occupies at a date's time index."""
+    y0, y1, x0, x1 = window
+    return {
+        "time": slice(time_index, time_index + 1),
+        "northing": slice(y0, y1),
+        "easting": slice(x0, x1),
+    }
+
+
 def _write_windows_overlapped(
     session: "icechunk.Session",
     day_ds: xr.Dataset,
@@ -1134,27 +1157,17 @@ def _write_windows_overlapped(
 
     started = time.monotonic()
     try:
-        writers = []
-        for y0, y1, x0, x1 in windows:
-            win = day_ds.isel(northing=slice(y0, y1), easting=slice(x0, x1)).drop_vars(drop)
+        writers: list = []
+        for window in windows:
             writer = _XarrayDatasetWriter(
-                win,
+                _window_slice(day_ds, window, drop),
                 store=session.store,
                 safe_chunks=True,
-                # Same memory rationale as the sequential call below: each write task
-                # carries one store chunk, not one load block.
+                # Same memory rationale as the sequential path: each write task carries
+                # one store chunk, not one whole load block.
                 align_chunks=True,
             )
-            writer._open_group(
-                group=None,
-                mode="r+",
-                append_dim=None,
-                region={
-                    "time": slice(time_index, time_index + 1),
-                    "northing": slice(y0, y1),
-                    "easting": slice(x0, x1),
-                },
-            )
+            writer._open_group(group=None, mode="r+", append_dim=None, region=_window_region(window, time_index))
             writer.write_metadata(None)
             writer.write_eager()
             writers.append(writer)
@@ -1182,7 +1195,7 @@ def _write_windows_overlapped(
     if stored:
         # The single compute: every window's loads, masks and chunk writes in one
         # graph, reduced to one mergeable changeset.
-        session.merge(session_merge_reduction(stored, split_every=8))
+        session.merge(session_merge_reduction(stored, split_every=_MERGE_SPLIT_EVERY))
     logger.info(
         "Parallel window compute: %d window(s) in one graph: %.1fs",
         len(windows),
@@ -1326,14 +1339,13 @@ def write_day_windows(
         drop = [c for c in ("time", "northing", "easting") if c in day_ds.coords]
         if parallel_windows and _write_windows_overlapped(batch.session, day_ds, windows, t, drop):
             return  # normal context exit: the batched commit below still runs
-        for i, (y0, y1, x0, x1) in enumerate(windows, 1):
+        for i, window in enumerate(windows, 1):
             window_started = time.monotonic()
-            win = day_ds.isel(northing=slice(y0, y1), easting=slice(x0, x1)).drop_vars(drop)
             to_icechunk(
-                win,
+                _window_slice(day_ds, window, drop),
                 batch.session,
                 mode="r+",
-                region={"time": slice(t, t + 1), "northing": slice(y0, y1), "easting": slice(x0, x1)},
+                region=_window_region(window, t),
                 # align_chunks stays ON, and the reason is memory rather than graph
                 # size. Dropping it does shrink the graph a little and ran ~4% faster,
                 # but it makes each write task carry a whole load block instead of one
@@ -1343,7 +1355,7 @@ def write_day_windows(
                 # worth it. Untested middle path if it is ever wanted: halve the
                 # threads per worker to restore the headroom.
                 align_chunks=True,
-                split_every=8,
+                split_every=_MERGE_SPLIT_EVERY,
             )
             # Each window is a blocking compute, so these lines ARE the write
             # pipeline's decomposition: their sum against the date's write phase says
@@ -1352,8 +1364,8 @@ def write_day_windows(
                 "Window %d/%d rows=%d..%d: %.1fs",
                 i,
                 len(windows),
-                y0,
-                y1,
+                window[0],
+                window[1],
                 time.monotonic() - window_started,
             )
 

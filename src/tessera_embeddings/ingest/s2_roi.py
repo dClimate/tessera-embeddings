@@ -150,7 +150,7 @@ def ingest_s2_roi_reflectance(
     storage_options: dict | None = None,
     crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
-    overlap_window_writes: bool = False,
+    overlap_window_writes: bool = True,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
 

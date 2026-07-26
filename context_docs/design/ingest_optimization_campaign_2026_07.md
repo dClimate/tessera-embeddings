@@ -41,6 +41,13 @@ the scheduler moved from saturated to ~25% busy.
 > left of that size is removing the 74 s serial residual from the critical path, not shrinking
 > the graph further. A 23% graph reduction was shipped and measured at **zero** wall-clock gain
 > (§3.9).
+>
+> **That residual has since been located and largely removed (§3.11).** It was not the commit
+> (0.6 s), not graph construction (3.4 s) and not the drive loop (0.2–0.8 s between dates): it
+> was `write_day_windows` computing each window to completion before starting the next, so a
+> date cost the SUM of its windows' critical paths. Writing a date's windows as ONE dask compute
+> took the write phase from **148.0 s → 86.5 s** and per-date from **166.1 s → 104.2 s
+> (1.59×)**, with **byte-identical stores** (44,797 chunk objects both arms). Now the default.
 
 | # | change | per-date | cumulative | what it addressed |
 |---|---|---|---|---|
@@ -417,6 +424,72 @@ remove it: **overlapping one date's serial phase with the next date's compute** 
 critical path entirely, which is worth more than any further graph work. That is the open question
 in §7, and it is the first ingest change in this campaign to be proposed from a profile rather
 than from a model.
+
+### 3.11 Overlapping a date's windows — 1.59×, and the first change proposed from a profile
+
+§3.10 left one target: 74 s of every date that no fleet width could compress. Instrumenting the
+write path located it precisely, and the location was a surprise — it was none of the candidates
+reasoning had offered.
+
+**Phase I: instrument, then decide.** Three permanent log lines (per-date stage timings, per-window
+timings, commit timing) partitioned a date without inference. Measured over 7 dates, sequential:
+
+| | mean |
+|---|---|
+| build (client-side graph construction) | 10.8 s |
+| gate (coverage compute) | 7.2 s |
+| **write phase** | **148.0 s** |
+| total | 166.1 s |
+| **commit** | **0.6 s** |
+| sum of per-window times | **146.9 s** |
+| longest single window | 37.8 s |
+
+**The windows explained 99% of the write phase** (146.9 of 148.0), and no single window dominated
+(37.8 s against a 146.9 s sum). So `write_day_windows`' loop — one blocking `to_icechunk` per
+window — was the residual: the fleet worked on exactly one window at a time and idled through the
+rest of each date. The commit was never the cost.
+
+This was gated on a pre-registered kill condition: had one window been most of its date, the
+overlap would have bought nothing and the plan said stop. It was not.
+
+**Phase II: one compute for the date.** icechunk's dask path already forks a session, stores
+lazily and merges; `to_icechunk` merely runs that once per call. Lifting the sequence one level —
+build every window's region writer, fork ONCE, collect all windows' lazy stored arrays, run ONE
+merge reduction — puts every window's loads, masks and chunk writes in a single graph whose
+critical paths overlap across the fleet. One commit per date, `align_chunks`, the alignment guard
+and the failure contract are unchanged by construction.
+
+**Phase III: the A/B, on identical dates and width.**
+
+| | sequential | parallel | |
+|---|---|---|---|
+| **chunk objects written** | **44,797** | **44,797** | **identical** |
+| write phase | 148.0 s | **86.5 s** | **1.71×** |
+| per-date total | 166.1 s | **104.2 s** | **1.59×** |
+| commit | 0.6 s | 0.9 s | negligible |
+| peak worker memory | — | 12.30 of 20 GiB | no pause |
+| worker spill | 0.00 GiB | 0.00 GiB | |
+
+Pre-registered prediction was 90–110 s per date at 1.5–1.8×; measured **104.2 s at 1.59×**, inside
+the range and independently consistent with §3.10's 1.78× packing ceiling derived from a different
+instrument. **This is the only projection in this campaign that landed** — the two that did not
+(§3.9, §5) were both projected from aggregates without measuring the mechanism first, which is
+exactly what Phase I existed to prevent.
+
+**Why not more.** The write phase falls to ~86 s, not to the 37.8 s longest window: the work still
+has to happen, and ~85 s is near the packing floor rather than the critical path. The remaining
+per-date budget is build 10.4 + gate 7.3 + write 86.5.
+
+**Now the default** for S2 (`overlap_window_writes=True`). `write_day_windows`' own
+`parallel_windows` default stays **False** deliberately: S1 also calls it, its windows have never
+been A/B'd, and a storage-layer default must not change behaviour for an unmeasured caller. S1 can
+opt in when someone measures it.
+
+**Robustness.** The lift uses `_XarrayDatasetWriter`, which icechunk marks private. The version is
+lockfile-pinned, parity is pinned by test, and any import or signature drift falls back to the
+sequential loop with a warning — so drift degrades to the previously shipped behaviour, never to a
+failure. The A/B confirmed the fallback did not fire and no per-window lines appeared, i.e. the new
+path genuinely ran.
 
 ## 4. What did not work, and why
 
@@ -819,6 +892,9 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | **per-date data share** | **582 of 2,992 covered chunks per band-date = 19.4%** at the 4096 grid; **47–57% of live CELLS** at the 8192 window grid | store object count + local footprint measurement (§3.9) |
 | **dead-area split** | geometric **55–66%** of live, radiometric (cloud) **10–21%**, written 24% | 3 dates, local (§3.9) |
 | **per-date time budget** | task work **57.2 s** at perfect packing of a **131 s** date; residual **73.8 s (56%)** | Dask performance report, 2-date probe (§3.10) |
+| **where the residual was** | `write_day_windows` computing windows serially: per-window times summed to **146.9 s of a 148.0 s write phase**; commit only **0.6 s** | 7 dates, per-window instrumentation (§3.11) |
+| **window overlap** | write phase **148.0 → 86.5 s (1.71×)**; per-date **166.1 → 104.2 s (1.59×)**; chunk objects **44,797 both arms** | A/B, identical dates and width (§3.11) |
+| overlap memory cost | peak worker **12.30 of 20 GiB**, spill 0.00 GiB, no pause | parallel arm health lines (§3.11) |
 | **task work composition** | source read+resample **72.3%**, mask+write 16.3%, transfer 7.8%, gate 2.9% | same report (§3.10) |
 | **ceiling from unlimited workers, one cell** | **1.78×** | from the budget; independently 1.2–1.7× from an `A + B/W` sweep fit (§3.10) |
 | window-strategy bound | best any rectangle strategy achieves is **0.50×** current area; shipped achieves 0.75× | local, real footprints (§4.7b) |

@@ -38,7 +38,7 @@ def process_roi_reflectance(
     storage_options: dict | None = None,
     crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
-    overlap_window_writes: bool = False,
+    overlap_window_writes: bool = True,
 ) -> dict[str, Any]:
     """Prefect task: ingest S2 reflectance for one ROI.
 
