@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tessera_embeddings.ingest.stac import iter_month_ranges, stream_stac_months
+from tessera_embeddings.ingest.stac import _prefetch, iter_month_ranges, stream_stac_months
 
 
 def _item(date: str, cloud: float = 0.0):
@@ -257,3 +257,40 @@ class TestRetentionIsBounded:
         gc.collect()
         assert all(h is not None for h in hoarded)
         assert len(hoarded) == 3, "the generator should have yielded three months"
+
+
+def test_prefetch_runs_on_a_daemon_thread_so_it_can_be_abandoned():
+    """An in-flight query nobody wants must not keep the interpreter alive.
+
+    `cancel_futures=True` only drops futures that have not STARTED, and a
+    ThreadPoolExecutor's workers are non-daemon and joined by an atexit hook — so
+    abandoning a running catalog walk pinned the process (and, on the Prefect path,
+    its per-run ECS task) for the query's full timeout-and-retry budget. There is no
+    way to interrupt an in-flight request from outside, so abandonment is the
+    mechanism, and a daemon thread is what makes abandonment free.
+    """
+    release = threading.Event()
+    started = threading.Event()
+    captured: list[threading.Thread] = []
+
+    def slow(_arg):
+        captured.append(threading.current_thread())
+        started.set()
+        release.wait(30)  # stands in for an HTTP walk with retries
+        return "late"
+
+    _prefetch(slow, None)  # started, then dropped on the floor
+    assert started.wait(5)
+    assert captured[0].daemon and captured[0].is_alive()  # nothing for atexit to join
+    release.set()
+
+
+def test_prefetch_reraises_in_the_caller_thread():
+    """A failing prefetch must surface where the caller waits, not vanish."""
+
+    def boom(_arg):
+        raise RuntimeError("catalog exploded")
+
+    pending = _prefetch(boom, None)
+    with pytest.raises(RuntimeError, match="catalog exploded"):
+        pending()

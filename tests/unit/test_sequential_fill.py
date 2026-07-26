@@ -150,11 +150,21 @@ class BudgetProbeInputs(RecordingInputs):
             self.alive -= 1
 
 
+def _resume(done=frozenset(), skipped=frozenset()):
+    """A StagedResume stub for the resume scan."""
+    from tessera_embeddings.inference.assembly import StagedResume
+
+    return StagedResume(done=set(done), skipped=set(skipped))
+
+
 @pytest.fixture(autouse=True)
 def _no_scan(monkeypatch):
     """Staged-resume scan: nothing staged unless a test overrides."""
     monkeypatch.setattr(
-        mod.ZarrWriter, "scan_existing_staged_chunks", lambda self, run_id, chunks, **kw: set(), raising=True
+        mod.ZarrWriter,
+        "scan_existing_staged_artifacts",
+        lambda self, run_id, chunks, **kw: _resume(),
+        raising=True,
     )
 
 
@@ -221,13 +231,41 @@ def test_all_resumed_zone_goes_straight_to_assembly(monkeypatch):
     events: list[str] = []
     monkeypatch.setattr(
         mod.ZarrWriter,
-        "scan_existing_staged_chunks",
-        lambda self, run_id, chunks, **kw: {c.label for c in chunks} if run_id == "r-01N" else set(),
+        "scan_existing_staged_artifacts",
+        lambda self, run_id, chunks, **kw: _resume({c.label for c in chunks}) if run_id == "r-01N" else _resume(),
     )
     summary = _run(_cells(2), session=_sync_session(events=events), assemble=_assemble(events))
     assert summary["succeeded"] == 2
     assert not [e for e in events if e.startswith("infer:r-01N")]  # nothing left to infer
     assert "assemble:01N" in events  # but it still assembles (verify + tag)
+
+
+def test_resumed_skip_markers_are_counted_as_skips_not_successes(monkeypatch):
+    """A restored artifact must report the outcome it actually recorded.
+
+    Skip markers and staged zarrs both mean "do not re-infer", but only one of them
+    produced pixels. Counting a restored skip as a success makes a resumed zone's
+    tally disagree with the same zone's tally on a fresh run: an all-skipped resume
+    publishes empty while reporting zero skips.
+    """
+    seen: dict[str, list[dict]] = {}
+
+    def assemble(handoff, prep):
+        seen[handoff.zone] = list(handoff.results)
+        return {"zone": handoff.zone, "empty": False}
+
+    # 01N resumes entirely from skip markers; 02N resumes entirely from staged zarrs.
+    monkeypatch.setattr(
+        mod.ZarrWriter,
+        "scan_existing_staged_artifacts",
+        lambda self, run_id, chunks, **kw: _resume(
+            {c.label for c in chunks}, {c.label for c in chunks} if run_id == "r-01N" else set()
+        ),
+    )
+    _run(_cells(2), session=_sync_session(), assemble=assemble)
+
+    assert seen["01N"] and all(r["status"] == "skipped" for r in seen["01N"])
+    assert seen["02N"] and all(r["status"] == "success" for r in seen["02N"])
 
 
 def test_orbit_mismatch_defers_to_fallback():

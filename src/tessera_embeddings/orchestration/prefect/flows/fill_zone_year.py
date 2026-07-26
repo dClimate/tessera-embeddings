@@ -239,6 +239,14 @@ def fill_zone_year_flow(
     """
     log = get_run_logger()
 
+    # Checked HERE, not left to run_inference: this deployment is invoked directly as
+    # well as by the campaign, and on that path the value is only validated after the
+    # flow has cleared preflight and entered `ray_cluster` — so a typo buys a billable
+    # GPU cluster before failing on something knowable at call time. The campaign
+    # wrapper rejects it too; the child is the authority for a direct invocation.
+    if num_actors < 1:
+        raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
+
     # Lazily import the AWS providers so the flow file imports on machines
     # without ray/boto installed (arch tests, local inspection).
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials

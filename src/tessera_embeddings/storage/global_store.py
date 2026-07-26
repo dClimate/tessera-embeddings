@@ -177,6 +177,31 @@ def _root_attrs(layout: StoreLayout, model_version: str | None) -> dict:
     )
 
 
+def _fill_equal(have: object, want: object) -> bool:
+    """Compare two fill values across the numpy-scalar / Python-literal boundary.
+
+    An existing array reports ``np.int8(0)`` where the layout says ``0``, and NaN is
+    never equal to itself — so neither ``==`` nor ``repr`` alone works. Values are
+    compared numerically, with NaN treated as equal to NaN (both mean "no data").
+    """
+    h, w = np.asarray(have), np.asarray(want)
+    if h.dtype.kind == "f" and w.dtype.kind == "f" and bool(np.isnan(h)) and bool(np.isnan(w)):
+        return True
+    return bool(h == w)
+
+
+def _codec_id(arr: zarr.Array) -> str:
+    """The layout ``codec`` key an existing array corresponds to.
+
+    Mirrors :meth:`ArrayLayout.create_kwargs`'s three cases: a PCodec serializer is
+    ``"pcodec"``; otherwise ``"zstd"`` when a compressor is configured and ``"raw"``
+    when none is.
+    """
+    if type(getattr(arr, "serializer", None)).__name__ == "PCodec":
+        return "pcodec"
+    return "zstd" if arr.compressors else "raw"
+
+
 def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> None:
     """Reject an incremental seed whose layout differs from the seeded groups'.
 
@@ -199,12 +224,36 @@ def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> N
             )
         arr = cast("zarr.Array", grp[var])
         want = spec.create_kwargs(tuple(arr.shape))
-        if tuple(arr.chunks) != tuple(want["chunks"]) or tuple(arr.shards or ()) != tuple(want.get("shards") or ()):
+        # The WHOLE schema, not only the geometry. Matching chunks and shards with a
+        # different dtype is the nastier case: same pitch, so a geometry-only check
+        # passes, and the new zones are then created as (say) float32 while the
+        # staging writer emits int8 and refuses to fill them — a heterogeneous store
+        # that only reveals itself at fill time. Fill value and codec go the same way.
+        checks: tuple[tuple[str, object, object, bool], ...] = (
+            ("chunks", tuple(arr.chunks), tuple(want["chunks"]), tuple(arr.chunks) == tuple(want["chunks"])),
+            (
+                "shards",
+                tuple(arr.shards or ()),
+                tuple(want.get("shards") or ()),
+                tuple(arr.shards or ()) == tuple(want.get("shards") or ()),
+            ),
+            ("dtype", arr.dtype, want["dtype"], arr.dtype == want["dtype"]),
+            (
+                "fill_value",
+                arr.fill_value,
+                want["fill_value"],
+                _fill_equal(arr.fill_value, want["fill_value"]),
+            ),
+            ("codec", _codec_id(arr), spec.codec, _codec_id(arr) == spec.codec),
+        )
+        mismatch = {k: (have, wanted) for k, have, wanted, ok in checks if not ok}
+        if mismatch:
             raise ValueError(
-                f"Refusing to seed: layout {layout.name!r} would give {var!r} chunks "
-                f"{tuple(want['chunks'])} / shards {want.get('shards')}, but existing group {gname!r} has "
-                f"chunks {tuple(arr.chunks)} / shards {arr.shards}. One store cannot mix shard geometries — "
-                "the fill's tile size is pinned to the shard pitch, so the new zones would be unfillable."
+                f"Refusing to seed: layout {layout.name!r} disagrees with existing group {gname!r} on "
+                f"{var!r} — "
+                + ", ".join(f"{k}: have {h!r}, layout wants {w!r}" for k, (h, w) in mismatch.items())
+                + ". One store cannot mix schemas: the fill's tile size is pinned to the shard pitch and the "
+                "staging writer emits one dtype, so the new zones would be unfillable."
             )
 
 
@@ -225,6 +274,18 @@ def seed_zone_groups(
     conventions). Returns the commit snapshot id.
     """
     specs = list(specs)
+    # The time axis is created from `years` verbatim and is fixed forever after
+    # (ADR-008 D1), so a malformed tuple is not recoverable by reseeding. Duplicates
+    # are the dangerous shape: years=(2025, 2025) makes two identical coordinates,
+    # `time_index_of` always resolves to the first, and `years_complete` then marks
+    # the pair done while the second slot is never written — permanently empty, and
+    # invisible to the campaign because status reports it complete. A non-monotonic
+    # tuple additionally produces a CF-invalid time coordinate.
+    if not years or list(years) != sorted(set(years)):
+        raise ValueError(
+            f"years must be a non-empty, strictly increasing tuple, got {tuple(years)} — the time axis is "
+            "fixed at seeding and a duplicate or unordered year cannot be repaired afterwards."
+        )
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
     # geoemb: provenance is stated once on the root (utm_zones layout). It is

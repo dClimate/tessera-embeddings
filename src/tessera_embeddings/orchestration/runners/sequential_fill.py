@@ -486,17 +486,29 @@ def fill_zones_sequential(
                         continue
                     # Per-zone staged-resume scan (the single-zone path does
                     # this inside run_inference; the stream pre-filters here).
-                    already = ZarrWriter(prep.staging_base).scan_existing_staged_chunks(
+                    restored = ZarrWriter(prep.staging_base).scan_existing_staged_artifacts(
                         prep.run_id, zplan.live, compute_std=prep.config.compute_std, log=log
                     )
+                    already = restored.done
                 except Exception as exc:
                     _record_failure(cell, "plan", exc)
                     _retain_failed_mosaic(cell)  # mosaic retained for resume, counted
                     zone_slots.release()
                     continue
                 live = [c for c in zplan.live if c.label not in already]
+                # Restore each artifact under the outcome it actually recorded. A skip
+                # marker means the tile had no pixels to write; calling that a success
+                # makes a resumed zone's tally disagree with the same zone's tally on a
+                # fresh run — an all-skipped resume publishes empty while reporting
+                # `skipped: 0`, and a mixed retry quietly inflates the success count.
                 resumed = [
-                    {"chunk": label, "status": "success", "valid_pixels": 0, "elapsed_sec": 0.0, "resumed": True}
+                    {
+                        "chunk": label,
+                        "status": "skipped" if label in restored.skipped else "success",
+                        "valid_pixels": 0,
+                        "elapsed_sec": 0.0,
+                        "resumed": True,
+                    }
                     for label in already
                 ]
                 tally = _ZoneTally(cell=cell, prep=prep, plan=zplan, remaining=len(live), results=resumed)

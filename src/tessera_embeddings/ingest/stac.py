@@ -11,9 +11,9 @@ Supports multiple providers (Earth Search, Planetary Computer) and collections
 import calendar
 import datetime
 import logging
+import threading
 import time
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -950,6 +950,46 @@ def iter_month_ranges(start_date: str, end_date: str) -> list[MonthRange]:
     return ranges
 
 
+def _prefetch[A, T](fn: Callable[[A], T], arg: A) -> Callable[[], T]:
+    """Start ``fn(arg)`` on a DAEMON thread; return a callable that waits for it.
+
+    A ThreadPoolExecutor cannot express what this needs. ``cancel_futures=True``
+    only drops futures that have not STARTED, and the executor's worker threads are
+    non-daemon and joined by an ``atexit`` hook — so an abandoned prefetch keeps the
+    interpreter (and, on the Prefect path, the per-run ECS task) alive for the whole
+    remaining timeout-and-retry budget of an HTTP walk whose result nobody wants.
+    A daemon thread simply does not hold the process open, so abandoning the query
+    costs nothing beyond the socket the OS reclaims on exit.
+
+    There is no cancel: an in-flight ``requests`` call is not interruptible from
+    outside. Abandonment is the mechanism — the caller stops waiting, and the thread
+    dies with the process.
+
+    Exceptions are captured and re-raised in the CALLER's thread on ``result()``, so
+    a failing prefetch surfaces exactly where the executor's ``future.result()``
+    raised it before.
+    """
+    out: list[T] = []
+    err: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            out.append(fn(arg))
+        except BaseException as exc:
+            err.append(exc)
+
+    thread = threading.Thread(target=target, name="stac-prefetch", daemon=True)
+    thread.start()
+
+    def result() -> T:
+        thread.join()
+        if err:
+            raise err[0]
+        return out[0]
+
+    return result
+
+
 def stream_stac_months(
     *,
     provider: str,
@@ -1024,34 +1064,22 @@ def stream_stac_months(
         log.info("Queried %s..%s in %.1fs", mr.query_start, mr.query_end, time.monotonic() - t0)
         return result
 
-    # max_workers=1 IS the depth-1 buffer: one query in flight, one month in the
-    # caller's hands. cancel_futures on shutdown so a failure mid-month does not block
-    # on the next month's in-flight HTTP walk.
-    #
-    # Deliberately NOT a `with` block: ThreadPoolExecutor.__exit__ is an unconditional
-    # shutdown(wait=True) that would run AFTER this finally, so the non-blocking
-    # shutdown would be followed immediately by a blocking one and a failed or
-    # closed-early ingest would still hang until the prefetched query and its retries
-    # finished. Not waiting is the entire point of cancelling here.
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stac-prefetch")
-    try:
-        pending = pool.submit(run, months[0]) if months else None
-        for i, mr in enumerate(months):
-            items, baselines = pending.result()  # type: ignore[union-attr]
-            if i + 1 < len(months):
-                pending = pool.submit(run, months[i + 1])
-            owned = [it for it in items if mr.own_start <= str(it.datetime)[:10] <= mr.own_end]
-            dropped = len(items) - len(owned)
-            if not owned:
-                log.info("Month %s..%s: no new items", mr.own_start, mr.own_end)
-                continue
-            log.info(
-                "Month %s..%s: %d item(s)%s",
-                mr.own_start,
-                mr.own_end,
-                len(owned),
-                f" ({dropped} outside the month)" if dropped else "",
-            )
-            yield mr, owned, baselines
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+    # One query in flight, one month in the caller's hands: the depth-1 buffer.
+    pending = _prefetch(run, months[0]) if months else None
+    for i, mr in enumerate(months):
+        items, baselines = pending()  # type: ignore[misc]
+        if i + 1 < len(months):
+            pending = _prefetch(run, months[i + 1])
+        owned = [it for it in items if mr.own_start <= str(it.datetime)[:10] <= mr.own_end]
+        dropped = len(items) - len(owned)
+        if not owned:
+            log.info("Month %s..%s: no new items", mr.own_start, mr.own_end)
+            continue
+        log.info(
+            "Month %s..%s: %d item(s)%s",
+            mr.own_start,
+            mr.own_end,
+            len(owned),
+            f" ({dropped} outside the month)" if dropped else "",
+        )
+        yield mr, owned, baselines

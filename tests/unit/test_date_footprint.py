@@ -58,10 +58,10 @@ def _cells(grid: np.ndarray) -> set[tuple[int, int]]:
 @pytest.mark.parametrize(
     ("y0", "y1", "x0", "x1"),
     [
-        (0, CELL, 0, CELL),                      # a single cell at the origin
-        (CELL, 2 * CELL, CELL, 2 * CELL),        # one interior cell
+        (0, CELL, 0, CELL),  # a single cell at the origin
+        (CELL, 2 * CELL, CELL, 2 * CELL),  # one interior cell
         (CELL // 3, CELL * 2 + 17, 0, CELL + 5),  # deliberately cell-unaligned
-        (0, HEIGHT, 0, WIDTH),                   # the whole grid
+        (0, HEIGHT, 0, WIDTH),  # the whole grid
         (HEIGHT - 3, HEIGHT, WIDTH - 3, WIDTH),  # the far corner
     ],
 )

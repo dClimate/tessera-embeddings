@@ -383,6 +383,22 @@ def _extend_time_axis(node: zarr.Group, time_date: np.datetime64) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
+class StagedResume:
+    """What a resume scan found in staging, with the two artifact kinds kept apart.
+
+    ``done`` is every label that must NOT be re-inferred — staged tiles and skip
+    markers together, which is all an inference loop needs. ``skipped`` is the
+    subset that came from skip markers, i.e. tiles a previous attempt determined
+    had no pixels to write. Callers that report per-tile outcomes need the split:
+    counting a restored skip as a success makes a resumed zone's tally disagree
+    with the same zone's tally on a fresh run.
+    """
+
+    done: set[str]
+    skipped: set[str]
+
+
+@dataclasses.dataclass(frozen=True)
 class StagedShardSource:
     """:class:`~tessera_embeddings.storage.shard_writer.ShardSource` over staged tiles.
 
@@ -864,17 +880,36 @@ class ZarrWriter:
 
         Returns:
             Set of ``chunk.label`` strings for chunks already staged and valid.
+            Use :meth:`scan_existing_staged_artifacts` when the caller needs to
+            know WHICH of those came from skip markers rather than staged tiles.
 
         Raises:
             RuntimeError: If any staged Zarrs are invalid. Lists all invalid
                 paths so the user can remove them before retrying.
+        """
+        return self.scan_existing_staged_artifacts(run_id, chunks, compute_std=compute_std, log=log).done
+
+    def scan_existing_staged_artifacts(
+        self,
+        run_id: str,
+        chunks: list[ChunkSpec],
+        *,
+        compute_std: bool = False,
+        log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+    ) -> StagedResume:
+        """:meth:`scan_existing_staged_chunks`, keeping skip markers distinguishable.
+
+        Both artifact kinds mean "do not re-infer this tile", which is why the
+        set-returning form merges them. But they are different OUTCOMES: a staged
+        zarr produced pixels, a skip marker recorded that the tile had none. A
+        resumed zone that reports its skips as successes misstates what the run did.
         """
         _log = log or logger
         staged_labels, skip_list = self._list_run_labels(run_id)
         skip_marker_labels = set(skip_list)
         if not staged_labels and not skip_marker_labels:
             _log.info("No staged chunks or skip markers found for run %s — starting fresh", run_id)
-            return set()
+            return StagedResume(done=set(), skipped=set())
 
         _log.info(
             "Found %d staged chunk Zarrs and %d skip markers — validating",
@@ -934,7 +969,7 @@ class ZarrWriter:
             len(valid & set(staged_labels)),
             len(valid & skip_marker_labels),
         )
-        return valid
+        return StagedResume(done=valid, skipped=valid & skip_marker_labels)
 
     def _staged_vars_present(self, run_id: str, chunks: list[ChunkSpec], var_names: tuple[str, ...]) -> set[str]:
         """Which of *var_names* exist in the staged Zarrs — checked across EVERY tile.

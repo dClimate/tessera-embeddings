@@ -161,8 +161,43 @@ def test_reseed_with_different_shard_geometry_rejected(tmp_path):
     halved = dataclasses.replace(
         GLOBAL, arrays={**GLOBAL.arrays, "embeddings": dataclasses.replace(emb, shards=(1, 1024, 1024, EMBEDDING_DIM))}
     )
-    with pytest.raises(ValueError, match="cannot mix shard geometries"):
+    with pytest.raises(ValueError, match="shards: have"):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,), layout=halved)
+
+
+def test_reseed_with_same_geometry_but_different_dtype_rejected(tmp_path):
+    """Geometry alone is not the schema. Matching chunks and shards with a different
+    dtype passes a pitch check and then creates zones the int8 staging writer refuses
+    to fill — a heterogeneous store that only shows up at fill time.
+    """
+    import dataclasses
+
+    from tessera_embeddings.config.store_layout import GLOBAL
+
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+
+    emb = GLOBAL.arrays["embeddings"]
+    as_float = dataclasses.replace(
+        GLOBAL, arrays={**GLOBAL.arrays, "embeddings": dataclasses.replace(emb, dtype="float32")}
+    )
+    with pytest.raises(ValueError, match="dtype: have"):
+        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), layout=as_float)
+
+
+def test_seeding_rejects_duplicate_or_unordered_years(tmp_path):
+    """The axis is fixed at seeding, so a malformed `years` is unrepairable.
+
+    Duplicates are the dangerous shape: `time_index_of` always resolves to the first
+    of two identical coordinates, so the second slot is never written while
+    `years_complete` reports the pair done — permanently empty and invisible.
+    """
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    for bad in [(2025, 2025), (2025, 2024), ()]:
+        with pytest.raises(ValueError, match="strictly increasing"):
+            global_store.seed_zone_groups(repo, [_ZA], years=bad)
 
 
 def test_global_store_config_has_time_split_and_preload():

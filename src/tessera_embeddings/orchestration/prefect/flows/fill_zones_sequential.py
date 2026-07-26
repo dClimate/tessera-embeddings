@@ -435,6 +435,11 @@ def fill_zones_sequential_flow(
     # has launched ingests and the GPU cluster is up. Fail fast instead.
     if look_ahead < 0:
         raise ValueError(f"look_ahead must be >= 0, got {look_ahead}")
+    # Same rule, same reason: on a direct invocation nothing else rejects this until
+    # run_inference validates `session_actors`, by which point triage has run, the
+    # look-ahead ingests are away and the shared Ray cluster is up.
+    if num_actors < 1:
+        raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
 
     # Lazily import the AWS providers so the flow file imports on machines
     # without ray/boto installed (arch tests, local inspection).

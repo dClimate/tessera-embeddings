@@ -55,7 +55,20 @@ def _stop_ecs_tasks_by_tag(tag_key: str, tag_value: str, *, log: logging.Logger)
     importable everywhere and costs an import only on the AWS teardown path, where a
     cluster is being swept anyway. Same pattern as ``run_global_campaign``'s
     ``_resolve_code_identity``.
+
+    An ``ImportError`` here is NOT a failure. Deferring the import fixed the flows
+    being unimportable, but a ``use_local=True`` run on a ``[prefect]``-only install
+    still reaches this hook on cancellation, where the import that never mattered —
+    there is no ECS cluster to sweep — would raise and fail the terminal hook. The
+    absence of the AWS provider is itself the proof there is nothing to tear down, so
+    it is logged and swallowed. Every OTHER exception propagates: on a real AWS run a
+    failed sweep means leaked ECS tasks that keep billing, which is precisely what
+    this hook exists to prevent and must never be hidden.
     """
-    from tessera_embeddings.providers.aws.dask import stop_ecs_tasks_by_tag
+    try:
+        from tessera_embeddings.providers.aws.dask import stop_ecs_tasks_by_tag
+    except ImportError as exc:
+        log.info("AWS provider not installed (%s) — no ECS cluster to sweep for this run.", exc)
+        return
 
     stop_ecs_tasks_by_tag(tag_key, tag_value, log=log)
