@@ -33,6 +33,15 @@ def test_checkpoint_filename_invalid_raises() -> None:
         checkpoint_filename("bogus")
 
 
+def test_checkpoint_filename_v2_large() -> None:
+    assert checkpoint_filename(model_version="v2-large") == "student_large.pt"
+
+
+def test_checkpoint_filename_v2_ignores_norm_source() -> None:
+    """v2 ships one checkpoint per student size — no norm_source split."""
+    assert checkpoint_filename("mpc", model_version="v2-large") == checkpoint_filename(model_version="v2-large")
+
+
 # ---------------------------------------------------------------------------
 # _normalize_obs_checkpoints
 # ---------------------------------------------------------------------------
@@ -110,6 +119,16 @@ def test_inference_config_num_obs_checkpoints_coerced() -> None:
 def test_inference_config_empty_num_obs_checkpoints_raises() -> None:
     with pytest.raises(ValueError):
         _minimal_config(num_obs_checkpoints=())
+
+
+def test_inference_config_default_model_version_is_v11() -> None:
+    cfg = _minimal_config()
+    assert cfg.model_version == "v1.1"
+
+
+def test_inference_config_invalid_model_version_raises() -> None:
+    with pytest.raises(ValueError, match="Invalid model_version"):
+        _minimal_config(model_version="v3")
 
 
 def test_inference_config_compute_std_forced_false() -> None:

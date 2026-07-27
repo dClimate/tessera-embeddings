@@ -20,6 +20,11 @@ at checkpoint load time — they are not part of the inference graph.
 
 Ported from ``ucam-eo/tessera`` tag ``v1.1``
 (``tessera_infer_QAT/src/models/ssl_model_v1_1.py``).
+
+``MultimodalBTInferenceModel`` also hosts the v2 Large student: its topology,
+parameter names, and fusion math are the same, only the backbone pooling head
+and the reducer's trailing LayerNorm differ (see ``student_v2.py``).
+``build_dim_reducer`` below stays v1.1-specific.
 """
 
 from __future__ import annotations
@@ -30,24 +35,27 @@ import time
 import torch
 import torch.nn as nn
 
-from .modules import TransformerEncoder
-
 logger = logging.getLogger(__name__)
 
 
 class MultimodalBTInferenceModel(nn.Module):
-    """Two-backbone Tessera v1.1 inference model (concat fusion).
+    """Two-backbone Tessera inference model (concat fusion).
 
-    Output is the 192-dim representation. Callers that want the canonical 128-d
-    downstream save should slice ``out[:, :128]`` — this is done in the inference
-    loop, not the model, so the forward stays aligned with the tessera v1.1
-    reference implementation.
+    Output is the model's native representation: 192-dim under v1.1, 128-dim
+    under v2 Large. Callers that want the canonical 128-d downstream save slice
+    ``out[:, :128]`` — done in the inference loop, not the model, so the forward
+    stays aligned with the upstream reference implementations.
+
+    The parameter names (``s2_backbone``, ``s1_backbone``, ``dim_reducer``) and
+    the fusion math are identical in both versions, so this wrapper hosts either
+    version's backbones and reducer; the version-specific blocks live in
+    ``modules.py`` (v1.1) and ``student_v2.py`` (v2). ``builder.py`` picks.
     """
 
     def __init__(
         self,
-        s2_backbone: TransformerEncoder,
-        s1_backbone: TransformerEncoder,
+        s2_backbone: nn.Module,
+        s1_backbone: nn.Module,
         dim_reducer: nn.Module,
         fusion_method: str = "concat",
     ) -> None:

@@ -20,13 +20,8 @@ import numpy as np
 
 from tessera_embeddings.config.inference import (
     DEFAULT_NUM_OBS_CHECKPOINTS,
-    S1_ASC_BAND_MEAN,
-    S1_ASC_BAND_STD,
-    S1_DESC_BAND_MEAN,
-    S1_DESC_BAND_STD,
-    S2_BAND_MEAN,
-    S2_BAND_STD,
     _normalize_obs_checkpoints,
+    band_stats,
 )
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.sampling import compute_bin_keys, resample_s1_bucket, resample_s2_bucket
@@ -46,6 +41,11 @@ class MosaicChunkInferenceDataset:
         num_obs_checkpoints: Sorted bucket sizes. A pixel with ``k`` valid
             observations is mapped to the smallest checkpoint ``>= k``.
         s1_orbit: Which S1 orbit direction(s) are active. Only affects logging.
+        stats: Band normalisation statistics, from
+            :func:`config.inference.band_stats`. Defaults to the v1.1 AWS stats.
+            Each model version standardises with the stats it was trained on, so
+            actors pass the set for their ``config.model_version`` /
+            ``config.norm_source``.
     """
 
     def __init__(
@@ -53,18 +53,20 @@ class MosaicChunkInferenceDataset:
         chunk_data: ChunkData,
         num_obs_checkpoints: tuple[int, ...] = DEFAULT_NUM_OBS_CHECKPOINTS,
         s1_orbit: Literal["ascending", "descending", "both"] = "both",
+        stats: dict[str, list[float]] | None = None,
     ) -> None:
         self.num_obs_checkpoints = _normalize_obs_checkpoints(num_obs_checkpoints)
         self.s1_orbit = s1_orbit
         self.H = chunk_data.height
         self.W = chunk_data.width
 
-        self.s2_band_mean = np.array(S2_BAND_MEAN, dtype=np.float32)
-        self.s2_band_std = np.array(S2_BAND_STD, dtype=np.float32)
-        self.s1a_band_mean = np.array(S1_ASC_BAND_MEAN, dtype=np.float32)
-        self.s1a_band_std = np.array(S1_ASC_BAND_STD, dtype=np.float32)
-        self.s1d_band_mean = np.array(S1_DESC_BAND_MEAN, dtype=np.float32)
-        self.s1d_band_std = np.array(S1_DESC_BAND_STD, dtype=np.float32)
+        stats = stats if stats is not None else band_stats()
+        self.s2_band_mean = np.array(stats["s2_mean"], dtype=np.float32)
+        self.s2_band_std = np.array(stats["s2_std"], dtype=np.float32)
+        self.s1a_band_mean = np.array(stats["s1_asc_mean"], dtype=np.float32)
+        self.s1a_band_std = np.array(stats["s1_asc_std"], dtype=np.float32)
+        self.s1d_band_mean = np.array(stats["s1_desc_mean"], dtype=np.float32)
+        self.s1d_band_std = np.array(stats["s1_desc_std"], dtype=np.float32)
 
         self._bucket_pixels: dict[tuple[int, int], np.ndarray] = {}
         self._rows = np.empty((0,), dtype=np.int64)

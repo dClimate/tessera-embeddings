@@ -1,12 +1,13 @@
-"""Core inference loop for Tessera v1.1 embeddings.
+"""Core inference loop for Tessera embeddings (v1.1 and v2 Large).
 
 Iterates buckets (pixels sharing a ``(s2_target, s1_target)`` key), then
 sub-batches each bucket by ``config.batch_size``. Each sub-batch goes through
-a single forward pass; the 192-D output is sliced to the canonical 128-D
-downstream representation and written into a flat per-pixel output array.
+a single forward pass; the model's representation is sliced to the canonical
+128-D downstream width (a real slice for v1.1's 192-D output, a no-op for v2
+Large's native 128-D) and written into a flat per-pixel output array.
 
-Sampling is deterministic under v1.1 (no random repeats), so ``compute_std``
-from v1.0 is now a no-op and the ``embeddings_std`` field is always ``None``.
+Sampling is deterministic (no random repeats), so ``compute_std`` from v1.0 is
+a no-op and the ``embeddings_std`` field is always ``None``.
 """
 
 from __future__ import annotations
@@ -195,7 +196,7 @@ def _transfer_and_forward(
     if profile:
         enable_model_profiling(model)
 
-    z = model(s2_input, s1_input)  # (B, representation_dim) — 192 for v1.1
+    z = model(s2_input, s1_input)  # (B, representation_dim) — 192 for v1.1, 128 for v2 Large
     if profile and device.type == "cuda":
         # Only the profile batch pays a sync, to time the forward accurately.
         torch.cuda.synchronize()
@@ -224,7 +225,7 @@ def _transfer_and_forward(
                 s1_seq_len=bucket_key[1],
             )
 
-    # Slice 192-D rep to canonical save_dim, quantize on-device, then pull the
+    # Slice the representation to the canonical save_dim, quantize on-device, then pull the
     # compact int8 + scales to host in one D2H. The .cpu() blocks until the
     # forward+quantize complete, which is what bounds the GPU work for this batch.
     q, scales = quantize_rows_torch(z[:, :save_dim])
@@ -585,8 +586,9 @@ def run_inference(
     bucket_sizes = dataset.bucket_sizes()
     total_sub_batches = sum((n + batch_size - 1) // batch_size for n in bucket_sizes.values())
 
-    # Save the canonical 128-D slice of the model's 192-D representation.
-    # If the model is configured smaller (e.g. tiny test model), save the full width.
+    # Save the canonical 128-D slice of the model's representation — a real slice
+    # under v1.1 (192-D), the identity under v2 Large (native 128-D). If the model
+    # is configured smaller (e.g. tiny test model), save the full width.
     save_dim = min(EMBEDDING_DIM, config.representation_dim)
 
     h, w = dataset.H, dataset.W
@@ -602,7 +604,8 @@ def run_inference(
     flat_scales = np.full(h * w, np.nan, dtype=np.float32)
 
     logger.info(
-        "Starting v1.1 inference: %d buckets, %d sub-batches, %d valid pixels, batch_size=%d",
+        "Starting %s inference: %d buckets, %d sub-batches, %d valid pixels, batch_size=%d",
+        config.model_version,
         len(bucket_sizes),
         total_sub_batches,
         n_valid,

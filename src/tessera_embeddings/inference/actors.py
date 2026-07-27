@@ -27,7 +27,13 @@ import numpy as np
 import ray
 import requests
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM, PREFETCH_DEPTH, S2_BAND_ORDER, InferenceConfig
+from tessera_embeddings.config.inference import (
+    EMBEDDING_DIM,
+    PREFETCH_DEPTH,
+    S2_BAND_ORDER,
+    InferenceConfig,
+    band_stats,
+)
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
@@ -648,6 +654,7 @@ class InferenceActor:
             data,
             num_obs_checkpoints=self.config.num_obs_checkpoints,
             s1_orbit=self.config.s1_orbit,
+            stats=band_stats(self.config.model_version, self.config.norm_source),
         )
         return data, dataset
 

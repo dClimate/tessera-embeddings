@@ -36,7 +36,12 @@ from prefect.runtime import flow_run as flow_run_ctx
 from pydantic import BaseModel
 
 from tessera_embeddings.config.dask import AssemblyConfig
-from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
+from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
+    INFERENCE_CHUNK_SIZE,
+    ModelVersion,
+    checkpoint_filename,
+)
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import ZarrWriter
@@ -147,6 +152,7 @@ def tessera_embeddings(
     code_suffix: str = "",
     num_actors: int = 20,
     s1_orbit: str = "both",
+    model_version: ModelVersion = DEFAULT_MODEL_VERSION,
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
 ) -> dict[str, Any]:
     """Generate Tessera embeddings for a mosaicked ROI.
@@ -182,6 +188,9 @@ def tessera_embeddings(
             Empty for production tarballs.
         num_actors: Number of GPU actors to create.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
+        model_version: Which Tessera model to run — ``"v1.1"`` (default) or
+            ``"v2-large"``. Also selects the checkpoint filename expected under
+            ``{inputs}/models/``.
         dev_params: See :class:`EmbeddingsDevParams`.
 
     Returns:
@@ -212,7 +221,7 @@ def tessera_embeddings(
         time_window.window_end_label,
     )
 
-    checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename()}"
+    checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename(model_version=model_version)}"
 
     mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
     log.info("Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s", roi_name, mosaic_base, run_id)
@@ -227,6 +236,7 @@ def tessera_embeddings(
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
+        model_version=model_version,
     )
 
     staging_base = f"{output_bucket.rstrip('/')}/staging"
