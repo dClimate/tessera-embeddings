@@ -61,14 +61,34 @@ the scheduler moved from saturated to ~25% busy.
 | 6 | decouple load blocks (8192) from store chunks (4096) | **188 s** | **7.5×** | graph scales with block count, not pixels |
 | 7 | manifest sharding by time | 185 s | cost, not speed | every commit rewrote the whole manifest |
 | 8 | stop realigning blocks to store chunks | 176.5 s | **REVERTED** (see §4.6) | ~4% faster but it introduced worker spill |
+| 9 | **re-unify load blocks with store chunks (row 6 REVERSED)** | zone 98.6→95.5 s cycle; **compact ROI 35.4→19.8 s** | see §3.15 | row 6 capped a date's parallel WIDTH at blocks × bands |
+| 10 | **batch k dates into one compute + one commit** | 19.8→**17.4 s** on a compact ROI | 1.14× | per-date graphs under-filled the fleet; overheads paid per date |
 
 Two things did **not** change, deliberately: the store's 4096 chunking (the GPU path is tuned
-around it) and the per-date atomicity of a commit (what makes a crashed ingest retryable).
+around it) and the atomicity of a commit — though row 10 makes the atomic unit a BATCH of dates
+rather than one date, which is forced by the time-axis resize, not chosen (§3.16).
+
+> **2026-07-27: rows 6 and 8's shared premise — that dispatch is the binding cost — is STALE.**
+> The cost model below (`R ≈ 600–800 tasks/s`) predicted a ~150–190 s dispatch floor for a dense
+> zone-date at 4096 load blocks. Measured on the new code: the write alone is **79.8 s**, roughly
+> **2× faster than that floor**. Either the culled graph is far smaller than `4 × bands × blocks`
+> now, or the dispatch rate improved with the masking collapse, gate fusion and window overlap
+> that landed after `R` was measured. **Do not plan cell widths against `R` until it is
+> re-measured** — in particular, the "run 40–45w cells to stay under the floor" advice this model
+> produced is withdrawn.
 
 **Feasibility frame.** At ~185 s/date and ~250 kept dates, a dense zone-year is ~11 h against
 the ~14 h it was, and ~70 h if it had never been cropped. Sequentially that is ~51 days for 112
 zones; with ~20 concurrent cells it is under 3. But the concurrency multiplier is only worth
 what each cell's fleet can absorb — which is why the graph work came first (below).
+
+> **Updated 2026-07-27.** Dates per zone-year is now MEASURED, not assumed: a full-height zone
+> sees imagery on **every day** (35N and 22N each returned 30 distinct acquisition days in June
+> 2024 from the catalogue; a small-bbox zone, 07S, returned 24). So a zone-year is ~365 dates,
+> not the ~250 assumed above, and the campaign projection scales accordingly. Iowa's ~263
+> dates/year does NOT transfer to zones — it spans ~3° of latitude against a zone's pole-ward
+> reach, so it intersects far fewer orbit swaths. Current campaign arithmetic lives in
+> `yield-embeddings/context_docs/measurements/`.
 
 ### Why graph size was attacked FIRST, ahead of streaming and cell concurrency
 
@@ -737,6 +757,106 @@ measured: at 2 cells the interference is 1.04× and nothing shared shows stress 
 separate store prefixes at ~65 PUT/s against 3,500, zero SlowDown anywhere), but aggregate
 source-read elasticity and the ECS start storm are open. Fargate's launch rate is **20 tasks/s
 sustained, 100 burst** — a 10,000 vCPU fleet is ~2,300 tasks, so ~2 minutes of ramp unless raised.
+
+### 3.15 Load blocks re-unified with store chunks — width, not dispatch, was the limit
+
+`INGEST_LOAD_CHUNK_SIZE` (§3.5) is gone; load blocks equal store chunks again. What §3.5 missed
+is that a coarser load block caps a date's **parallel width** at `blocks × bands`, and that cap
+binds on compact ROIs:
+
+| workload | live 4096-chunks | read width @8192 | read width @4096 | fleet slots |
+|---|---|---|---|---|
+| Iowa (whole state) | 126 | ~297 | ~1,180 | 480 |
+| a dense UTM zone | ~2,400 | ~6,600 | ~26,000 | 480 |
+
+Iowa's *entire* extent is ~27 load blocks at 8192, so a date's graph could never fill 120
+workers — it peaked at 0.88× of slots and spent each write draining a straggler tail of 4–7 s
+tasks. A zone was never width-starved (already 14 tasks/slot at 8192), which is why the same
+change is transformative for one and a rounding error for the other. Measured, 7 paired dates,
+120 workers, same instrument:
+
+| | build | gate | write | cycle |
+|---|---|---|---|---|
+| Iowa @8192 | 0.1 s | 4.2 s | 23.8 s | 27.9 s |
+| Iowa @4096 | 0.2 s | 2.0 s | 14.9 s | **16.9 s** |
+| 35N @8192 | 5.6 s | 6.9 s | 86.3 s | 98.6 s |
+| 35N @4096 | 6.1 s | 10.0 s | 79.8 s | **95.5 s** |
+
+The zone's gate got dearer (6.9 → 10.0 s) because windows are now derived on the 4096 grid, so
+there are more of them (5 → 13). That is also the change's **second and larger campaign win**:
+windows are chunk-aligned and kept if *any* part is live, so a finer grid hugs coastlines more
+tightly. Computed offline from all 112 real zone masks (geometry only — no cluster):
+
+**dead area 30.7% → 14.9%, i.e. an 18.6% cut in ingest write volume campaign-wide.** Sparse
+zones dominate the gain (57S 65%, 60S 62%, 59S 52%, 58S 51%); dense zones see almost none.
+Tool: `yield-embeddings` scratchpad `window_efficiency.py`. Remaining headroom to a live-only
+floor is 14.9%, which a 2048 window grid would attack.
+
+**Values are NOT bit-identical across the two block sizes, and this is understood and accepted.**
+On Iowa, 78% of shared-data pixels differ — but the median absolute difference is **1** on
+reflectances averaging 1,859 (0.05%, p90 = 5), there is **no geometric shift** (unshifted mean
+|Δ| 2.0; any one-pixel shift jumps it to 51+), and `scl` differs on only **0.09%**. Cause:
+`odc.loader._rio` calls `rasterio.warp.reproject` once **per output chunk** with that chunk's own
+`dst_transform`, and GDAL's approximate transformer is fitted over the region being warped — so
+the block size perturbs sub-pixel source coordinates, which bilinear turns into ±1 rounding.
+`scl` resamples NEAREST, hence its near-immunity: that asymmetry is the signature.
+
+Two controls make this safe to accept: **runs with IDENTICAL config are bit-identical** (0.000%
+differing, max 0, over 250k+ pixels on two dates — so the pipeline is deterministic, and the
+difference is caused by the change rather than by chance), and the perturbation is two orders of
+magnitude below Sentinel-2 L2A's own ~3% radiometric accuracy. Note the same code has a
+**bit-exact short-circuit** (`paste_ok and read_shrink == 1`) that skips warping entirely when
+source and destination grids align — a same-CRS zone workload should take it, which would make
+the campaign path unaffected; that specific prediction is **untested**. Also note bit parity with
+`main` was already impossible: main is at `INGEST_CHUNK_SIZE = 4000`, this branch at 4096.
+
+### 3.16 Batching dates — one compute, one commit, and the scheduler becomes the limit
+
+`batch_dates=k` computes k consecutive PASSING dates as one dask graph and commits them as one
+snapshot. Measured on Iowa, 120 workers, 5 dates, same instrument on both arms:
+
+| | build | gate | write | total/date | commits |
+|---|---|---|---|---|---|
+| per-date | 0.4 s | 5.1 s | 14.4 s | 19.8 s | 5 |
+| batched k=4 | 0.4 s | 4.1 s | 12.9 s | **17.4 s** | **2** |
+
+**1.14×**, and output is **bit-identical** to the per-date path on real data (4 bands × 3 dates)
+as well as in the parity test. The write gain is cross-date packing: one date's straggling reads
+backfill with another's writes.
+
+> **Methodology warning, and it cost a wrong headline.** The first reading of this A/B put it at
+> 1.33× by comparing commit-to-commit intervals. That is invalid: the store's seeding snapshot
+> lands AFTER a batch's preparation, so the batched arm's first interval excludes ~20 s of
+> build+gate that the per-date arm's intervals include. Compare `Stage timings` against
+> `Batch timings` — the same decomposition on both sides — never commit cadence.
+
+**One commit per batch is forced, not chosen.** Every date's append resizes the time axis, so
+per-date sessions forked from one snapshot conflict on array METADATA even though their chunk
+data is disjoint. Dates are chunk-disjoint in DATA only. Consequence: a mid-batch failure commits
+none of its dates and the retry re-ingests exactly the uncommitted ones; `get_existing_dates`
+resume is unchanged.
+
+**Resource cost, and where the next ceiling is:**
+
+| | per-date | batched k=4 |
+|---|---|---|
+| peak worker memory (`wmax`) | 1.6 GiB | 2.81 GiB (of a 20 GiB limit) |
+| spill | 0 | **0** |
+| peak graph | 5,244 tasks | 14,595 tasks |
+| **scheduler CPU peak** | **17%** | **48%** |
+| event-loop lag | 0 | 0 |
+| queue depth peak | 1.55× | 1.74× |
+
+**The scheduler, not memory, caps k.** Memory extrapolates safely to ~k=20 (14% of limit at
+k=4, zero spill), but scheduler CPU is single-threaded and scaled ~linearly: k=6 lands near 72%
+and k=8 at or past saturation. The speed case for larger k is also weak — queue depth is already
+1.74× at k=4, so the fleet is saturated and extra width buys nothing; only the ~0.7 s/batch of
+overhead remains to amortize. **k=4–6 is the useful range; watch scheduler CPU, not memory.**
+
+Next lever from this profile: build+gate is **20.1 s of the 4-date batch's 73.8 s (27%)**, and
+the k gates still run SEQUENTIALLY as separate small graphs on an idle fleet. Fusing them into
+the batch's single compute — or composing batching with `pipeline_dates`, currently refused as
+mutually exclusive — is the largest remaining per-date win.
 
 ## 4. What did not work, and why
 
