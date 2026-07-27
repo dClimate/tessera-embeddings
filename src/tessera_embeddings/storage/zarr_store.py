@@ -45,6 +45,7 @@ was removed as unused; the windowed per-date batch is NOT its return, since it
 builds no graph at all.
 """
 
+import itertools
 import logging
 import time
 from collections.abc import Callable, Iterator
@@ -1130,12 +1131,9 @@ def _window_region(window: "tuple[int, int, int, int]", time_index: int) -> dict
 
 def _write_windows_overlapped(
     session: "icechunk.Session",
-    day_ds: xr.Dataset,
-    windows: "list[tuple[int, int, int, int]]",
-    time_index: int,
-    drop: "list[str]",
+    writes: "list[tuple[xr.Dataset, list[tuple[int, int, int, int]], int, list[str]]]",
 ) -> bool:
-    """Write every window of a date as ONE dask compute on one forked session.
+    """Write every window of one or more dates as ONE dask compute on one forked session.
 
     The sequential path issues one ``to_icechunk`` per window, and each call runs
     its graph to completion before the next window starts — so a date costs the SUM
@@ -1145,6 +1143,15 @@ def _write_windows_overlapped(
     paths overlap across the fleet. The windows' chunk-disjointness (enforced by the
     caller's alignment guard) is what makes the merged changesets conflict-free —
     the same property the sequential path relies on for one-commit-per-date.
+
+    ``writes`` carries ``(day_ds, windows, time_index, drop)`` per date. Several
+    dates in one call is the windows→date induction applied once more: distinct
+    time indices make the dates' chunk writes mutually disjoint exactly as windows
+    within a date are, so they share the single fork, compute and merge the same
+    way. What dates cannot share is a session each: every date's append resizes the
+    time axis, so sibling sessions forked from one snapshot conflict on array
+    METADATA even though their chunk data never overlaps. A multi-date batch is
+    therefore one session and one commit by construction, not by preference.
 
     Returns ``False`` without computing anything when the icechunk internals this
     lifts are unavailable or have drifted, so the caller falls back to the
@@ -1161,24 +1168,26 @@ def _write_windows_overlapped(
         return False
 
     started = time.monotonic()
+    n_windows = sum(len(windows) for _, windows, _, _ in writes)
     try:
         writers: list = []
-        for window in windows:
-            writer = _XarrayDatasetWriter(
-                _window_slice(day_ds, window, drop),
-                store=session.store,
-                safe_chunks=True,
-                # Same memory rationale as the sequential path: each write task carries
-                # one store chunk, not one whole load block.
-                align_chunks=True,
-            )
-            writer._open_group(group=None, mode="r+", append_dim=None, region=_window_region(window, time_index))
-            writer.write_metadata(None)
-            writer.write_eager()
-            writers.append(writer)
+        for day_ds, windows, time_index, drop in writes:
+            for window in windows:
+                writer = _XarrayDatasetWriter(
+                    _window_slice(day_ds, window, drop),
+                    store=session.store,
+                    safe_chunks=True,
+                    # Same memory rationale as the sequential path: each write task carries
+                    # one store chunk, not one whole load block.
+                    align_chunks=True,
+                )
+                writer._open_group(group=None, mode="r+", append_dim=None, region=_window_region(window, time_index))
+                writer.write_metadata(None)
+                writer.write_eager()
+                writers.append(writer)
 
-        # ONE fork for all windows: every lazy region write lands its changeset in
-        # the same fork, and one merge returns them to the session together.
+        # ONE fork for all windows of all dates: every lazy region write lands its
+        # changeset in the same fork, and one merge returns them to the session together.
         fork = session.fork()
         stored: list = []
         for writer in writers:
@@ -1202,8 +1211,9 @@ def _write_windows_overlapped(
         # graph, reduced to one mergeable changeset.
         session.merge(session_merge_reduction(stored, split_every=_MERGE_SPLIT_EVERY))
     logger.info(
-        "Parallel window compute: %d window(s) in one graph: %.1fs",
-        len(windows),
+        "Parallel window compute: %d window(s) across %d date(s) in one graph: %.1fs",
+        n_windows,
+        len(writes),
         time.monotonic() - started,
     )
     return True
@@ -1229,20 +1239,70 @@ def write_day_windows(
 ) -> None:
     """Write ONE date's live windows into a mosaic store, one commit for the date.
 
-    ``parallel_windows`` submits every window of the date as a single dask compute
+    The single-date form of :func:`write_days_windows`, kept as the everyday entry
+    point: one call is one date is one snapshot, which is the granularity the
+    resume machinery (``get_existing_dates`` + gap backfill) and the retry story
+    are built around. See :func:`write_days_windows` for everything else — this
+    delegates verbatim.
+    """
+    # This function's own contract, checked here so its error names the caller's
+    # mistake ("per call") rather than the batch form's ("per entry").
+    if day_ds.sizes["time"] != 1:
+        raise ValueError(f"write_day_windows writes one date per call; got time size {day_ds.sizes['time']}")
+    write_days_windows(
+        store_path,
+        [(day_ds, windows)],
+        roi=roi,
+        manifest=manifest,
+        baselines=baselines,
+        tile_id=tile_id,
+        crs=crs,
+        chunks=chunks,
+        get_credentials=get_credentials,
+        s3_region=s3_region,
+        parallel_windows=parallel_windows,
+    )
+
+
+def write_days_windows(
+    store_path: str,
+    days: "list[tuple[xr.Dataset, list[tuple[int, int, int, int]]]]",
+    *,
+    roi: Any,  # noqa: ANN401 — duck-typed; see write_day_windows
+    manifest: IngestManifest | None,
+    baselines: dict[str, int],
+    tile_id: str,
+    crs: str,
+    chunks: dict[str, int],
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+    parallel_windows: bool = False,
+) -> None:
+    """Write one or more dates' live windows into a mosaic store, ONE commit for the batch.
+
+    ``parallel_windows`` submits every window of every date as a single dask compute
     (:func:`_write_windows_overlapped`) instead of one blocking compute per window,
-    so the windows' critical paths overlap across the fleet rather than summing.
-    Both paths produce identical stores (pinned by test); when the overlapped
+    so all the critical paths overlap across the fleet rather than summing — and
+    with several dates, one date's straggling reads backfill with another date's
+    work. Both paths produce identical stores (pinned by test); when the overlapped
     machinery is unavailable the sequential path runs regardless, so the flag can
     never make a write fail that would otherwise have succeeded.
 
+    The batch is one commit BY CONSTRUCTION, not by preference: each date's append
+    resizes the time axis, so per-date sessions forked from one snapshot would
+    conflict on array metadata even though their chunk data is disjoint. The
+    atomicity unit is therefore the batch — a failure commits none of its dates,
+    the retry starts clean from the last committed state, and ``get_existing_dates``
+    sees exactly the committed dates either way. Dates must arrive in strictly
+    increasing order, because their append order IS the time axis's order.
+
     The cropped counterpart of :func:`write_dataset` (same bookkeeping contract,
-    write volume proportional to live area instead of extent). ``day_ds`` is the
-    date's full-extent LAZY dataset (``time`` size 1); each ``(y0, y1, x0, x1)``
+    write volume proportional to live area instead of extent). Each ``day_ds`` is
+    that date's full-extent LAZY dataset (``time`` size 1); each ``(y0, y1, x0, x1)``
     window — chunk-disjoint, from ``ingest.live_windows`` — is written as a
     ``to_icechunk`` region on one shared session, so the pixels flow from the Dask
     workers that computed them (never materialised on the caller — see the design
-    note's dense-zone arithmetic) and the date lands as ONE snapshot.
+    note's dense-zone arithmetic).
 
     A missing store is seeded all-fill with an EMPTY time axis via
     :func:`~.empty_store.create_empty_store` (schema-only: cost independent of
@@ -1255,25 +1315,33 @@ def write_day_windows(
     """
     from tessera_embeddings.storage.empty_store import create_empty_store  # local: storage-internal, avoids cycle
 
-    if day_ds.sizes["time"] != 1:
-        raise ValueError(f"write_day_windows writes one date per call; got time size {day_ds.sizes['time']}")
+    if not days:
+        return  # nothing to write; a commit recording nothing would be noise
 
-    # The windowed write does NOT realign the producer's blocks to the store's chunks
-    # (see the to_icechunk call below), which is only sound while every store chunk a
-    # window covers is written WHOLLY by that window. Checked here rather than trusted:
-    # a misaligned window would either be rejected by mode="r+" deep in the write or,
-    # worse, straddle a chunk with a neighbouring window and make the result depend on
-    # write order. Ends are exempt — the array's own last chunk is short.
+    whens: list[np.datetime64] = []
     _cy, _cx = chunks["northing"], chunks["easting"]
     height, width = roi.height, roi.width
-    for y0, y1, x0, x1 in windows:
-        if y0 % _cy or x0 % _cx or (y1 % _cy and y1 != height) or (x1 % _cx and x1 != width):
-            raise ValueError(
-                f"window ({y0}, {y1}, {x0}, {x1}) is not aligned to the store's "
-                f"({_cy}, {_cx}) chunks; the windowed write cannot straddle a chunk"
-            )
-    when = np.asarray(day_ds.time.values, dtype="datetime64[ns]")[0]
-    date_str = str(when)[:10]
+    for day_ds, windows in days:
+        if day_ds.sizes["time"] != 1:
+            raise ValueError(f"write_days_windows writes one date per entry; got time size {day_ds.sizes['time']}")
+        # The windowed write does NOT realign the producer's blocks to the store's chunks
+        # (see the to_icechunk call below), which is only sound while every store chunk a
+        # window covers is written WHOLLY by that window. Checked here rather than trusted:
+        # a misaligned window would either be rejected by mode="r+" deep in the write or,
+        # worse, straddle a chunk with a neighbouring window and make the result depend on
+        # write order. Ends are exempt — the array's own last chunk is short.
+        for y0, y1, x0, x1 in windows:
+            if y0 % _cy or x0 % _cx or (y1 % _cy and y1 != height) or (x1 % _cx and x1 != width):
+                raise ValueError(
+                    f"window ({y0}, {y1}, {x0}, {x1}) is not aligned to the store's "
+                    f"({_cy}, {_cx}) chunks; the windowed write cannot straddle a chunk"
+                )
+        whens.append(np.asarray(day_ds.time.values, dtype="datetime64[ns]")[0])
+    if any(b <= a for a, b in itertools.pairwise(whens)):
+        raise ValueError(f"batch dates must be strictly increasing; got {[str(w)[:10] for w in whens]}")
+
+    day_ds = days[0][0]  # schema donor for seeding; every date shares the store's schema
+    date_str = str(whens[0])[:10]
 
     # Seed with an EMPTY time axis, so the first date takes the same atomic
     # append+windows commit as every other date. Seeding times=[when] would
@@ -1326,53 +1394,69 @@ def write_day_windows(
             repo=open_or_create_repo(store_path, get_credentials=get_credentials, region=s3_region)[0],
         )
 
+    total_windows = sum(len(w) for _, w in days)
+    if len(days) == 1:
+        # The single-date message format is a stable interface: commit-cadence
+        # tooling and log queries parse `date <iso>:` out of snapshot messages.
+        message = f"date {date_str}: {total_windows} live window(s)"
+    else:
+        message = f"dates {date_str}..{str(whens[-1])[:10]} ({len(days)} dates): {total_windows} live window(s)"
+
     with batched_region_writes(
         store_path,
-        message=f"date {date_str}: {len(windows)} live window(s)",
+        message=message,
         get_credentials=get_credentials,
         s3_region=s3_region,
     ) as batch:
         if manifest:
             manifest.validate_against(extract_manifest(dict(batch.group.attrs)), store_path)
-        t = batch.append_time_slot(when)
+        # Slots are appended for every date up front — the session sees its own
+        # uncommitted resizes, so each date's windows write into its own index. The
+        # appends and the windows land in the ONE commit together, preserving the
+        # no-date-before-its-pixels invariant at batch granularity.
+        writes: list[tuple[xr.Dataset, list[tuple[int, int, int, int]], int, list[str]]] = []
+        for (one_ds, one_windows), when in zip(days, whens, strict=True):
+            t = batch.append_time_slot(when)
+            drop = [c for c in ("time", "northing", "easting") if c in one_ds.coords]
+            writes.append((one_ds, one_windows, t, drop))
         attrs = batch.group.attrs
         merged = dict(cast("dict", attrs.get("baselines_applied", {})))
         merged.update(baselines)
         attrs["baselines_applied"] = merged
-        attrs["doy"] = list(cast("list", attrs.get("doy", []))) + compute_doy(np.array([when])).tolist()
+        attrs["doy"] = list(cast("list", attrs.get("doy", []))) + compute_doy(np.array(whens)).tolist()
         attrs["last_appended"] = utcnow_iso()
-        drop = [c for c in ("time", "northing", "easting") if c in day_ds.coords]
-        if parallel_windows and _write_windows_overlapped(batch.session, day_ds, windows, t, drop):
+        if parallel_windows and _write_windows_overlapped(batch.session, writes):
             return  # normal context exit: the batched commit below still runs
-        for i, window in enumerate(windows, 1):
-            window_started = time.monotonic()
-            to_icechunk(
-                _window_slice(day_ds, window, drop),
-                batch.session,
-                mode="r+",
-                region=_window_region(window, t),
-                # align_chunks stays ON, and the reason is memory rather than graph
-                # size. Dropping it does shrink the graph a little and ran ~4% faster,
-                # but it makes each write task carry a whole load block instead of one
-                # store chunk, which pushed workers over their spill threshold: peak
-                # spill 3.19 GiB across ~30% of scheduler samples, against zero with it
-                # on. Spill is a hidden cost that scales badly here, so the ~4% is not
-                # worth it. Untested middle path if it is ever wanted: halve the
-                # threads per worker to restore the headroom.
-                align_chunks=True,
-                split_every=_MERGE_SPLIT_EVERY,
-            )
-            # Each window is a blocking compute, so these lines ARE the write
-            # pipeline's decomposition: their sum against the date's write phase says
-            # whether windows serialise, and their spread says what overlap can buy.
-            logger.info(
-                "Window %d/%d rows=%d..%d: %.1fs",
-                i,
-                len(windows),
-                window[0],
-                window[1],
-                time.monotonic() - window_started,
-            )
+        for one_ds, one_windows, t, drop in writes:
+            for i, window in enumerate(one_windows, 1):
+                window_started = time.monotonic()
+                to_icechunk(
+                    _window_slice(one_ds, window, drop),
+                    batch.session,
+                    mode="r+",
+                    region=_window_region(window, t),
+                    # align_chunks stays ON, and the reason is memory rather than graph
+                    # size. Dropping it does shrink the graph a little and ran ~4% faster,
+                    # but it makes each write task carry a whole load block instead of one
+                    # store chunk, which pushed workers over their spill threshold: peak
+                    # spill 3.19 GiB across ~30% of scheduler samples, against zero with it
+                    # on. Spill is a hidden cost that scales badly here, so the ~4% is not
+                    # worth it. Untested middle path if it is ever wanted: halve the
+                    # threads per worker to restore the headroom.
+                    align_chunks=True,
+                    split_every=_MERGE_SPLIT_EVERY,
+                )
+                # Each window is a blocking compute, so these lines ARE the write
+                # pipeline's decomposition: their sum against the date's write phase says
+                # whether windows serialise, and their spread says what overlap can buy.
+                logger.info(
+                    "Window %d/%d rows=%d..%d: %.1fs",
+                    i,
+                    len(one_windows),
+                    window[0],
+                    window[1],
+                    time.monotonic() - window_started,
+                )
 
 
 def compute_doy(timestamps: np.ndarray) -> np.ndarray:
