@@ -63,11 +63,26 @@ MAX_TASKS_PER_WINDOW = 24_000
 #: than late — and overridable by callers that have measured their own geometry.
 DEFAULT_TASKS_PER_CHUNK = 200
 
-#: What one window write costs, expressed as the chunk area that costs the same.
-#: Extra computed area is parallel and cheap; a window boundary is a serial,
-#: blocking region write. Calibration in
-#: ``context_docs/design/ingest-live-tile-cropping.md``.
+#: What one window write costs when each window is its own SEQUENTIAL blocking region
+#: write, expressed as the chunk area that costs the same. Extra computed area is
+#: parallel and cheap; a serial window boundary is not. Calibration in
+#: ``context_docs/design/ingest-live-tile-cropping.md``. Still the right value for the
+#: sequential write path — S1 is on it (``overlap_window_writes`` defaults False there).
 WINDOW_COST_IN_CHUNKS = 200
+
+#: The same exchange rate once a date's windows share ONE dask graph
+#: (``overlap_window_writes``), which is what makes a window boundary cheap rather than
+#: a serial stall. A window then costs a client-side subgraph, one leaf in the merge
+#: reduction and one changeset — order 15 chunks against the 200 a serial write cost.
+#:
+#: Lower is not free: paying less per window makes the DP merge less, so it stops
+#: dragging ocean into ragged-edge merges (the dead area this recovers) but issues more
+#: windows. Measured over all 112 zone masks, 200 -> 20 cuts covered area 6.0% for 14.4%
+#: more windows, and total submitted tasks FALL 6% because area dominates. The knee is
+#: 10-20: 200->50 buys 74 chunks per added window, 50->20 buys 28, 20->10 buys 13.5.
+#: Numbers and the per-zone spread in
+#: ``yield-embeddings/context_docs/measurements/`` (2026-07-27 sweep).
+WINDOW_COST_IN_CHUNKS_OVERLAPPED = 20
 
 
 @dataclass(frozen=True)
@@ -474,6 +489,7 @@ def live_windows_for_mask(
     window_px: int | None = None,
     prefer_keys: bool = True,
     merge: bool = True,
+    window_cost_in_chunks: int = WINDOW_COST_IN_CHUNKS,
     storage_options: dict | None = None,
 ) -> list[LiveWindow]:
     """The one-call form: mask store → live windows to write.
@@ -489,6 +505,13 @@ def live_windows_for_mask(
     set it to the ingest's load-block size so every window lands on whole load
     blocks. It must be a multiple of ``chunk_px``; ``None`` means the mask's grid.
     The mask itself stays at ``chunk_px``, so the fast key-listing path is unaffected.
+
+    ``window_cost_in_chunks`` is what one window is assumed to cost, in chunk area, and
+    the caller owns it because it depends on how that caller WRITES: pass
+    :data:`WINDOW_COST_IN_CHUNKS_OVERLAPPED` when the windows of a date share one dask
+    graph, and leave the default when each window is its own blocking write. Getting
+    this backwards is a real regression rather than a mis-tuning — a sequential writer
+    on the overlapped rate pays extra serial boundaries for area it does not care about.
 
     ``prefer_keys=False`` forces the read path and ``merge=False`` the unmerged row
     bands, which is how each is held against the other in tests.
@@ -510,4 +533,6 @@ def live_windows_for_mask(
         live = live_chunk_grid(mask_path, chunk_px=chunk_px, storage_options=storage_options)
     live = coarsen_live_grid(live, window_px // chunk_px)
     windows = row_band_windows(live, height=height, width=width, chunk_px=window_px)
-    return merge_bands(windows, chunk_px=window_px) if merge else windows
+    if not merge:
+        return windows
+    return merge_bands(windows, chunk_px=window_px, window_cost_in_chunks=window_cost_in_chunks)

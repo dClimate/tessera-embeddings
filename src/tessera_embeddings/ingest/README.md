@@ -17,7 +17,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
 | `_pipeline.py` | A depth-1 prepare/consume pipeline: overlaps the preparation of the next item with the consumption of the current one on one background thread, and reports the preparation time the consumer had to wait for. Used by the S2 date loop (`pipeline_dates`); the consumer stays serial. |
-| `live_windows.py` | Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
+| `live_windows.py` | (Merge exchange rate is caller-owned: pass `WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one graph, the higher `WINDOW_COST_IN_CHUNKS` when each is a blocking write — S1 is the latter.) Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
 
 ---
 
@@ -685,9 +685,18 @@ Skipped dates do not occupy batch slots, so batches stay full exactly where the 
 filters most; the trailing partial batch flushes at each streamed month boundary. In
 batched mode the per-date `Stage timings` line is replaced by one `Batch timings` line
 per batch (build/gate are sums of real per-date values; the write is one shared compute
-and has no per-date decomposition). Requires `crop_to_live_windows`; mutually exclusive
-with `pipeline_dates` until the combined memory footprint is measured. Default 1 — the
-one-commit-per-date path — is unchanged.
+and has no per-date decomposition). Requires `crop_to_live_windows`. Default 1 — the one-commit-per-date path — is unchanged.
+
+**Composing with `pipeline_dates`.** The two are complementary and compose: batching removes
+the fleet idleness *within* a date's write, pipelining removes the serial preparation
+*between* writes. Composed, the pipeline's look-ahead is sized to the batch rather than to
+one date — a batch's write is one long consume, so a depth-1 buffer would hide only one
+date's preparation out of k. Preparation stays single-threaded at any depth, so its
+side-effect-free contract is unchanged; the extra cost is that up to k prepared dates are
+buffered while k more are written. `Batch timings` reports `prepare`/`hidden`/`stall` for the
+batch so the two modes are comparable from one log line, with the same caveat as the per-date
+line: `hidden` is bounded by the SERIAL preparation cost, never by a pipelined `prepare`
+figure that contention has inflated.
 
 ### S1: time-windowed batching (task graph management)
 

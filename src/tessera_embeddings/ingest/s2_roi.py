@@ -49,7 +49,12 @@ from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_expone
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
-from tessera_embeddings.ingest.live_windows import live_windows_for_mask, windows_for_date
+from tessera_embeddings.ingest.live_windows import (
+    WINDOW_COST_IN_CHUNKS,
+    WINDOW_COST_IN_CHUNKS_OVERLAPPED,
+    live_windows_for_mask,
+    windows_for_date,
+)
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.stac import (
@@ -244,9 +249,10 @@ def ingest_s2_roi_reflectance(
             and the retry re-ingests exactly those (per-date sessions are
             impossible — each date's append resizes the time axis, so sibling
             sessions conflict on array metadata). Identical stores either way.
-            Requires ``crop_to_live_windows``; mutually exclusive with
-            ``pipeline_dates``. Default 1 is today's one-commit-per-date path,
-            unchanged.
+            Requires ``crop_to_live_windows``. COMPOSES with ``pipeline_dates``:
+            the look-ahead is then sized to the batch, so the next batch's whole
+            preparation overlaps this batch's write instead of only one date's.
+            Default 1 is the one-commit-per-date path, unchanged.
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items
@@ -259,11 +265,6 @@ def ingest_s2_roi_reflectance(
         # The batched write is the windowed write lifted across dates; the legacy
         # full-extent path has no windowed form to lift.
         raise ValueError("batch_dates > 1 requires crop_to_live_windows")
-    if batch_dates > 1 and pipeline_dates:
-        # Composing them multiplies the in-flight memory reasoning (k dates writing
-        # while k more prepare); neither has been measured in combination. Refuse
-        # rather than guess — either alone is a supported mode.
-        raise ValueError("batch_dates > 1 and pipeline_dates are mutually exclusive")
     reflectance_store = f"{store_path}/reflectance.zarr"
     roi = read_roi_metadata(roi_zarr_path)
 
@@ -279,7 +280,17 @@ def ingest_s2_roi_reflectance(
     live_windows: list[tuple[int, int, int, int]] | None = None
     run_windows: list = []
     if crop_to_live_windows:
-        run_windows = live_windows_for_mask(roi_zarr_path, window_px=INGEST_CHUNK_SIZE, storage_options=storage_options)
+        run_windows = live_windows_for_mask(
+            roi_zarr_path,
+            window_px=INGEST_CHUNK_SIZE,
+            # The merge exchange rate follows how this run WRITES: overlapped windows
+            # share one graph, so a boundary is cheap and the DP should stop trading
+            # ocean area for fewer windows. Sequential writes still pay the serial cost.
+            window_cost_in_chunks=(
+                WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
+            ),
+            storage_options=storage_options,
+        )
         live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
         log.info("Cropping writes to %d live window(s)", len(run_windows))
 
@@ -489,7 +500,7 @@ def ingest_s2_roi_reflectance(
             stall_s,
         )
 
-    def _write_batch(batch: list[_PreparedDate], baselines: dict[str, int]) -> None:
+    def _write_batch(batch: list[_PreparedDate], baselines: dict[str, int], stall_s: float = 0.0) -> None:
         """Write a batch of prepared dates: one dask compute, ONE commit.
 
         The same retry contract as ``_write_date``, at batch granularity: the
@@ -523,8 +534,10 @@ def ingest_s2_roi_reflectance(
         # as a measurement — this line is the batched counterpart of `Stage timings`
         # and analysis divides by n. build/gate are sums of the real per-date values.
         write_s = time.monotonic() - write_started
+        prepare_s = sum(p.build_s + p.gate_s for p in batch)
         log.info(
-            "Batch timings dates=%s..%s n=%d: build=%.1fs gate=%.1fs write=%.1fs windows=%d",
+            "Batch timings dates=%s..%s n=%d: build=%.1fs gate=%.1fs write=%.1fs windows=%d "
+            "prepare=%.1fs hidden=%.1fs stall=%.1fs",
             batch[0].date,
             batch[-1].date,
             len(batch),
@@ -532,6 +545,14 @@ def ingest_s2_roi_reflectance(
             sum(p.gate_s for p in batch),
             write_s,
             sum(len(p.windows) for p in batch),
+            prepare_s,
+            # What the look-ahead actually bought: `stall` is the preparation the previous
+            # batch's write could not cover. Unpipelined every batch stalls for all of its
+            # preparation and hides none, so both modes read from one grep — and, as with
+            # the per-date line, `hidden` is bounded by the SERIAL prepare cost, never by
+            # a pipelined `prepare` figure inflated by contention.
+            max(prepare_s - stall_s, 0.0),
+            stall_s,
         )
 
     def _drive(items: list, baselines: dict[str, int]) -> None:
@@ -565,19 +586,31 @@ def ingest_s2_roi_reflectance(
             # at the end of each _drive call (one streamed month), like the pipeline's
             # month-boundary drain.
             nonlocal total_processed, total_filtered
+            # With pipelining the look-ahead is the BATCH size, not 1: a batch's write
+            # is one long consume, so a depth-1 buffer would hide only one date's
+            # preparation out of k. Depth k has the next batch ready as this one lands.
+            # Preparation stays single-threaded either way (see ingest._pipeline).
+            supply = (
+                pipelined(by_date.values(), prepare, depth=batch_dates)
+                if pipeline_dates
+                # Unpipelined: prepare inline and report the whole preparation as stall,
+                # so the two modes stay comparable from one log line.
+                else ((lambda p: (p, p.build_s + p.gate_s))(prepare(d)) for d in by_date.values())
+            )
             batch: list[_PreparedDate] = []
-            for day_items in by_date.values():
-                prepared = prepare(day_items)
+            batch_stall = 0.0
+            for prepared, stall_s in supply:
                 if prepared.day_ds is None:
                     total_filtered += 1
                     continue
                 batch.append(prepared)
+                batch_stall += stall_s
                 if len(batch) == batch_dates:
-                    _write_batch(batch, baselines)
+                    _write_batch(batch, baselines, batch_stall)
                     total_processed += len(batch)
-                    batch = []
+                    batch, batch_stall = [], 0.0
             if batch:
-                _write_batch(batch, baselines)
+                _write_batch(batch, baselines, batch_stall)
                 total_processed += len(batch)
         elif pipeline_dates:
             # The pipeline drains at each month boundary, since it lives inside one
