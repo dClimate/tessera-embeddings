@@ -167,9 +167,7 @@ def ingest_s1_roi_sar(
     if crop_to_live_windows:
         live_windows = [
             (w.y0, w.y1, w.x0, w.x1)
-            for w in live_windows_for_mask(
-                roi_zarr_path, window_px=INGEST_CHUNK_SIZE, storage_options=storage_options
-            )
+            for w in live_windows_for_mask(roi_zarr_path, window_px=INGEST_CHUNK_SIZE, storage_options=storage_options)
         ]
         log.info("Cropping writes to %d live window(s)", len(live_windows))
 
