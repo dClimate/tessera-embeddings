@@ -91,6 +91,7 @@ def _ingest(
     client: Client,
     monkeypatch: pytest.MonkeyPatch,
     batch_dates: int,
+    pipeline_dates: bool = False,
 ):
     monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([_item(d) for d in DATES], {}))
     monkeypatch.setattr(
@@ -111,6 +112,7 @@ def _ingest(
         stream_stac_monthly=False,
         crop_to_live_windows=True,
         batch_dates=batch_dates,
+        pipeline_dates=pipeline_dates,
     )
 
 
@@ -169,5 +171,36 @@ def test_batch_dates_validation_rejects_bad_combinations(tmp_path: Path) -> None
         s2_roi.ingest_s2_roi_reflectance(**kwargs, batch_dates=0)
     with pytest.raises(ValueError, match="requires crop_to_live_windows"):
         s2_roi.ingest_s2_roi_reflectance(**kwargs, batch_dates=2)
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        s2_roi.ingest_s2_roi_reflectance(**kwargs, batch_dates=2, crop_to_live_windows=True, pipeline_dates=True)
+
+
+@pytest.mark.parity
+def test_batching_composed_with_pipelining_is_identical(
+    tmp_path: Path,
+    parity_cluster: Client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batching + pipelining must equal plain per-date writing, byte for byte.
+
+    The composition is where a preparation running on the background thread overlaps a
+    BATCH's write, with the look-ahead sized to the batch. That is the arrangement most
+    likely to reorder or drop a date — and the gate-failing date mid-batch means a skip
+    is in flight while a batch is being written, which is exactly the race worth pinning.
+    """
+    roi_zarr = _stage_roi(tmp_path)
+    plain, composed = tmp_path / "plain", tmp_path / "composed"
+
+    a = _ingest(roi_zarr=roi_zarr, store_path=plain, client=parity_cluster, monkeypatch=monkeypatch, batch_dates=1)
+    b = _ingest(
+        roi_zarr=roi_zarr,
+        store_path=composed,
+        client=parity_cluster,
+        monkeypatch=monkeypatch,
+        batch_dates=BATCH,
+        pipeline_dates=True,
+    )
+
+    assert a.status == b.status == "success"
+    assert a.dates_processed == b.dates_processed == len(DATES) - 1
+    assert a.dates_filtered_coverage == b.dates_filtered_coverage == 1
+    assert get_existing_dates(str(composed / "reflectance.zarr")) == set(DATES) - {GATE_FAILS_ON}
+    assert_zarr_equivalent(str(plain / "reflectance.zarr"), str(composed / "reflectance.zarr"))

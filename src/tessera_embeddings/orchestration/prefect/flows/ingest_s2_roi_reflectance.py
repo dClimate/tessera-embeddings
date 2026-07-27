@@ -190,8 +190,10 @@ def ingest_s2_roi_reflectance(
             once per batch. The commit unit becomes the batch (a mid-batch
             failure commits none of its dates; the retry re-ingests exactly
             those). Identical stores either way. Requires
-            ``crop_to_live_windows``; mutually exclusive with ``pipeline_dates``.
-            Default 1 keeps today's one-commit-per-date behaviour.
+            ``crop_to_live_windows``, and composes with ``pipeline_dates`` — the
+            look-ahead is then the batch, so a whole batch's preparation hides
+            behind the previous batch's write. Default 1 keeps the existing
+            one-commit-per-date behaviour.
         worker_env_overrides: Env vars merged into every Dask worker's environment
             for THIS run only, for A/B-ing worker-side tuning (allocator and cache
             behaviour) one arm at a time. Not a configuration channel: anything

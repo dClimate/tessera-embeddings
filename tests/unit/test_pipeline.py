@@ -141,3 +141,76 @@ def test_consumer_break_joins_background_thread():
 
     assert workers and not workers[0].is_alive(), "the preparation thread outlived the generator"
     assert threading.active_count() == baseline
+
+
+# ── depth > 1: the look-ahead a BATCHING consumer needs ──
+
+
+def test_depth_buffers_that_many_ahead_not_more():
+    """With depth=k, exactly k preparations are in flight while the first is consumed.
+
+    The bound matters in both directions: too few and a batching consumer hides only one
+    item's preparation per batch; too many and prepared results pile up in memory.
+    """
+    started = threading.Semaphore(0)
+    release = threading.Event()
+
+    def prepare(i: int) -> int:
+        started.release()
+        release.wait(5)
+        return i
+
+    gen = pipelined(range(10), prepare, depth=3)
+    # Pull one; its own preparation must complete, and the look-ahead must be primed.
+    release.set()
+    first, _ = next(gen)
+    assert first == 0
+    # 3 primed + 1 refilled after the first yield = at most 4 ever submitted so far.
+    counted = sum(1 for _ in range(4) if started.acquire(timeout=1))
+    assert counted == 4, f"expected 4 submissions with depth=3, saw {counted}"
+    assert not started.acquire(timeout=0.2), "depth bound exceeded"
+    gen.close()
+
+
+def test_depth_one_is_unchanged_and_default():
+    """depth=1 must stay the historical one-ahead behaviour: first item unhidden."""
+    order: list[str] = []
+
+    def prepare(i: int) -> int:
+        order.append(f"prep{i}")
+        return i
+
+    got = []
+    for prepared, _stall in pipelined(range(3), prepare):
+        order.append(f"consume{prepared}")
+        got.append(prepared)
+    assert got == [0, 1, 2]
+    # prep0 before consume0, and prep1 issued before consume0 returns.
+    assert order[0] == "prep0"
+    assert order.index("prep1") < order.index("consume1")
+
+
+def test_depth_preserves_order_and_single_threading():
+    """Deeper buffering must not reorder items nor prepare two at once."""
+    concurrent = []
+    live = 0
+    lock = threading.Lock()
+
+    def prepare(i: int) -> int:
+        nonlocal live
+        with lock:
+            live += 1
+            concurrent.append(live)
+        time.sleep(0.01)
+        with lock:
+            live -= 1
+        return i
+
+    got = [p for p, _ in pipelined(range(8), prepare, depth=4)]
+    assert got == list(range(8)), "depth must not reorder"
+    assert max(concurrent) == 1, f"preparation must stay single-threaded, saw {max(concurrent)}"
+
+
+def test_depth_rejects_zero():
+    with pytest.raises(ValueError, match="depth must be >= 1"):
+        next(pipelined(range(3), lambda i: i, depth=0))
