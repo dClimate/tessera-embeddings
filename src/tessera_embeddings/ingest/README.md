@@ -663,6 +663,32 @@ Default **off**, and the flag threads from the outer flow through the task shell
 domain function. S1 has no coverage gate and a different batch loop; it is deliberately
 untouched.
 
+### Batching dates into one compute (`batch_dates`)
+
+Under `crop_to_live_windows` a date's write is one dask graph, and a graph's parallel
+width is bounded by the date's own block count — on a compact ROI that is fewer pieces
+of work than the fleet has slots, so every date pays a ramp, a drain tail and a commit
+gap that no width can remove. `batch_dates` computes up to k consecutive PASSING dates
+as ONE graph: the dates' work packs the fleet together, one date's straggling reads
+backfill with another's writes, and the tail and gap are paid once per batch.
+
+The commit unit becomes the batch, and that is forced rather than chosen: every date's
+append resizes the time axis, so per-date sessions forked from one snapshot would
+conflict on array metadata even though their chunk data is disjoint
+(`storage.zarr_store.write_days_windows`). A mid-batch failure therefore commits none
+of the batch's dates, and a retry — or a fresh run — re-ingests exactly the uncommitted
+dates; `get_existing_dates` sees only committed dates either way. Stores are
+byte-identical to the per-date path (pinned by a parity test whose gate-failing date
+sits mid-batch).
+
+Skipped dates do not occupy batch slots, so batches stay full exactly where the gate
+filters most; the trailing partial batch flushes at each streamed month boundary. In
+batched mode the per-date `Stage timings` line is replaced by one `Batch timings` line
+per batch (build/gate are sums of real per-date values; the write is one shared compute
+and has no per-date decomposition). Requires `crop_to_live_windows`; mutually exclusive
+with `pipeline_dates` until the combined memory footprint is measured. Default 1 — the
+one-commit-per-date path — is unchanged.
+
 ### S1: time-windowed batching (task graph management)
 
 `ingest_s1_roi_sar` uses a different approach: it splits the full date range into

@@ -23,8 +23,10 @@ The algorithm is unchanged from the reference:
      narrow tenacity retry on transient GDAL errors.
 
 Step 4 is split into a prepare half and a write half so ``pipeline_dates`` can
-overlap one date's preparation with the previous date's write. The write stays
-serial either way: one commit per date, in date order.
+overlap one date's preparation with the previous date's write, and so
+``batch_dates`` can compute several dates' writes as one graph (one commit per
+BATCH — see ``storage.zarr_store.write_days_windows`` for why that unit is
+forced). Writes stay in date order under every mode.
 
 This module imports nothing from Prefect or any cloud provider.
 """
@@ -57,7 +59,12 @@ from tessera_embeddings.ingest.stac import (
     stream_stac_months,
 )
 from tessera_embeddings.storage.manifest import IngestManifest
-from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset, write_day_windows
+from tessera_embeddings.storage.zarr_store import (
+    get_existing_dates,
+    write_dataset,
+    write_day_windows,
+    write_days_windows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +182,7 @@ def ingest_s2_roi_reflectance(
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
+    batch_dates: int = 1,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
 
@@ -228,12 +236,34 @@ def ingest_s2_roi_reflectance(
             exactly one writer either way. Identical stores either way, which
             rests on preparation being side-effect-free — it must touch nothing
             but the dataset it returns.
+        batch_dates: Write up to this many consecutive PASSING dates as one dask
+            compute and one commit, so the dates' graphs pack the fleet together —
+            one date's straggling reads backfill with another's work — and the
+            per-date drain tail and commit gap are paid once per batch. The commit
+            unit becomes the batch: a mid-batch failure commits none of its dates
+            and the retry re-ingests exactly those (per-date sessions are
+            impossible — each date's append resizes the time axis, so sibling
+            sessions conflict on array metadata). Identical stores either way.
+            Requires ``crop_to_live_windows``; mutually exclusive with
+            ``pipeline_dates``. Default 1 is today's one-commit-per-date path,
+            unchanged.
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items
         were returned or zero dates passed the coverage filter.
     """
     log = log or logging.getLogger(__name__)
+    if batch_dates < 1:
+        raise ValueError(f"batch_dates must be >= 1, got {batch_dates}")
+    if batch_dates > 1 and not crop_to_live_windows:
+        # The batched write is the windowed write lifted across dates; the legacy
+        # full-extent path has no windowed form to lift.
+        raise ValueError("batch_dates > 1 requires crop_to_live_windows")
+    if batch_dates > 1 and pipeline_dates:
+        # Composing them multiplies the in-flight memory reasoning (k dates writing
+        # while k more prepare); neither has been measured in combination. Refuse
+        # rather than guess — either alone is a supported mode.
+        raise ValueError("batch_dates > 1 and pipeline_dates are mutually exclusive")
     reflectance_store = f"{store_path}/reflectance.zarr"
     roi = read_roi_metadata(roi_zarr_path)
 
@@ -459,6 +489,51 @@ def ingest_s2_roi_reflectance(
             stall_s,
         )
 
+    def _write_batch(batch: list[_PreparedDate], baselines: dict[str, int]) -> None:
+        """Write a batch of prepared dates: one dask compute, ONE commit.
+
+        The same retry contract as ``_write_date``, at batch granularity: the
+        batched write commits nothing on failure, so a retry re-runs the whole
+        batch cleanly from the graphs already prepared.
+        """
+        write_started = time.monotonic()
+        for attempt in Retrying(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=8),
+            before_sleep=before_sleep_log(log, logging.WARNING),
+            reraise=True,
+        ):
+            with attempt:
+                days: list[tuple[xr.Dataset, list[tuple[int, int, int, int]]]] = []
+                for p in batch:
+                    assert p.day_ds is not None, f"date {p.date} was skipped ({p.skip_reason}); not batchable"
+                    days.append((p.day_ds, p.windows))
+                write_days_windows(
+                    reflectance_store,
+                    days,
+                    roi=roi,
+                    manifest=ingest_manifest,
+                    baselines=baselines,
+                    tile_id=roi_zarr_path,
+                    crs=roi.native_crs,
+                    chunks=INGEST_CHUNKS,
+                    parallel_windows=overlap_window_writes,
+                )
+        # The batch's write is ONE compute, so a per-date write time does not exist
+        # as a measurement — this line is the batched counterpart of `Stage timings`
+        # and analysis divides by n. build/gate are sums of the real per-date values.
+        write_s = time.monotonic() - write_started
+        log.info(
+            "Batch timings dates=%s..%s n=%d: build=%.1fs gate=%.1fs write=%.1fs windows=%d",
+            batch[0].date,
+            batch[-1].date,
+            len(batch),
+            sum(p.build_s for p in batch),
+            sum(p.gate_s for p in batch),
+            write_s,
+            sum(len(p.windows) for p in batch),
+        )
+
     def _drive(items: list, baselines: dict[str, int]) -> None:
         """Sort one supply of items cloudiest-first, group by date, and ingest each."""
         nonlocal total_seen
@@ -483,7 +558,28 @@ def ingest_s2_roi_reflectance(
         by_date = group_items_by_date(items)
         total_seen += len(by_date)
         prepare = partial(_prepare_date, baselines=baselines)
-        if pipeline_dates:
+        if batch_dates > 1:
+            # Only PASSING dates occupy batch slots — a skipped date adds no work to
+            # the batch's compute, so letting it consume a slot would shrink batches
+            # exactly where the gate filters most. The trailing partial batch flushes
+            # at the end of each _drive call (one streamed month), like the pipeline's
+            # month-boundary drain.
+            nonlocal total_processed, total_filtered
+            batch: list[_PreparedDate] = []
+            for day_items in by_date.values():
+                prepared = prepare(day_items)
+                if prepared.day_ds is None:
+                    total_filtered += 1
+                    continue
+                batch.append(prepared)
+                if len(batch) == batch_dates:
+                    _write_batch(batch, baselines)
+                    total_processed += len(batch)
+                    batch = []
+            if batch:
+                _write_batch(batch, baselines)
+                total_processed += len(batch)
+        elif pipeline_dates:
             # The pipeline drains at each month boundary, since it lives inside one
             # _drive call: one unhidden preparation per month, not worth threading
             # the buffer across the streamed months.

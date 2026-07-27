@@ -40,6 +40,7 @@ def process_roi_reflectance(
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
+    batch_dates: int = 1,
 ) -> dict[str, Any]:
     """Prefect task: ingest S2 reflectance for one ROI.
 
@@ -71,6 +72,7 @@ def process_roi_reflectance(
             stream_stac_monthly=stream_stac_monthly,
             overlap_window_writes=overlap_window_writes,
             pipeline_dates=pipeline_dates,
+            batch_dates=batch_dates,
         )
     return asdict(result)
 

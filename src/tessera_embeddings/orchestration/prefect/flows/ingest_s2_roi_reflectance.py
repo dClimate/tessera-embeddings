@@ -84,6 +84,7 @@ def _ingest_s2_roi_impl(
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
+    batch_dates: int = 1,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
     future = process_roi_reflectance.submit(
@@ -99,6 +100,7 @@ def _ingest_s2_roi_impl(
         stream_stac_monthly=stream_stac_monthly,
         overlap_window_writes=overlap_window_writes,
         pipeline_dates=pipeline_dates,
+        batch_dates=batch_dates,
     )
     return future.result()
 
@@ -130,6 +132,7 @@ def ingest_s2_roi_reflectance(
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
+    batch_dates: int = 1,
     worker_env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Ingest S2 L2A reflectance for an ROI using Dask workers.
@@ -181,6 +184,14 @@ def ingest_s2_roi_reflectance(
             per date — and the stores are identical either way. Ignored with a
             warning above ``MAX_PIPELINE_DATES_WORKERS``, where the overlap stops
             paying; narrow fleets benefit most.
+        batch_dates: Compute up to this many consecutive passing dates as one
+            dask graph and land them as ONE commit, so the dates' work packs the
+            fleet together and the per-date drain tail and commit gap are paid
+            once per batch. The commit unit becomes the batch (a mid-batch
+            failure commits none of its dates; the retry re-ingests exactly
+            those). Identical stores either way. Requires
+            ``crop_to_live_windows``; mutually exclusive with ``pipeline_dates``.
+            Default 1 keeps today's one-commit-per-date behaviour.
         worker_env_overrides: Env vars merged into every Dask worker's environment
             for THIS run only, for A/B-ing worker-side tuning (allocator and cache
             behaviour) one arm at a time. Not a configuration channel: anything
@@ -221,6 +232,7 @@ def ingest_s2_roi_reflectance(
                 stream_stac_monthly=stream_stac_monthly,
                 overlap_window_writes=overlap_window_writes,
                 pipeline_dates=pipeline_dates,
+                batch_dates=batch_dates,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -254,4 +266,5 @@ def ingest_s2_roi_reflectance(
                 stream_stac_monthly=stream_stac_monthly,
                 overlap_window_writes=overlap_window_writes,
                 pipeline_dates=pipeline_dates,
+                batch_dates=batch_dates,
             )
