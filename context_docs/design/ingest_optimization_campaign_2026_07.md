@@ -789,8 +789,58 @@ tightly. Computed offline from all 112 real zone masks (geometry only — no clu
 
 **dead area 30.7% → 14.9%, i.e. an 18.6% cut in ingest write volume campaign-wide.** Sparse
 zones dominate the gain (57S 65%, 60S 62%, 59S 52%, 58S 51%); dense zones see almost none.
-Tool: `yield-embeddings` scratchpad `window_efficiency.py`. Remaining headroom to a live-only
-floor is 14.9%, which a 2048 window grid would attack.
+Tool: `yield-embeddings/context_docs/measurements/window_efficiency.py`, raw output for all 112
+zones alongside it.
+
+> **A 2048 window grid is IMPOSSIBLE, and the residual has a different cause.** Three
+> independent blocks: the write's alignment guard rejects windows not aligned to the 4096 store
+> chunks; `coarsen_live_grid`'s factor is `window_px // chunk_px` = 0 below one chunk; and the
+> mask is itself chunked at 4096 so liveness is not KNOWN any finer. The store's chunking is
+> fixed (the GPU path is tuned around it). So the 14.9% residual is not granularity — it is
+> **over-merging**, and §3.17 addresses it.
+
+### 3.17 The window merge exchange rate — priced for a cost that no longer exists
+
+`merge_bands` groups adjacent row bands by minimising `n_windows × WINDOW_COST_IN_CHUNKS +
+total_area`, and 200 was calibrated with the constant's own docstring justifying it: "a window
+boundary is a serial, blocking region write". §3.11 (`overlap_window_writes`) made that false —
+a date's windows now share one graph, so a boundary costs a subgraph, a merge leaf and a
+changeset, order 15 chunks rather than 200. Priced at 200 the DP over-merges, trading real ocean
+area for a saving that no longer exists.
+
+Swept offline over all 112 real masks (geometry only, no cluster):
+
+| rate | covered chunks | dead | windows | tasks/date | vs 200 |
+|---|---|---|---|---|---|
+| **200 (was)** | 114,705 | 14.9% | 1,177 | 5.05 M | — |
+| 50 | 111,380 | 12.4% | 1,222 | 4.90 M | −2.9% area |
+| **20 (shipped)** | 107,872 | 9.5% | 1,346 | 4.75 M | **−6.0% area, +14.4% windows** |
+| 10 | 104,975 | 7.0% | 1,560 | 4.62 M | −8.5% |
+| 1 | 99,889 | 2.3% | 3,333 | 4.40 M | −12.9% |
+
+Total submitted tasks FALL 6% at rate 20 — area dominates window count — so this does not push
+toward the dispatch saturation that §4.2 punished. Unmerged row bands cover 99,847 and the
+live-only floor is 97,597, so **12.9% is the entire prize at any rate**; the knee is 10–20
+(200→50 buys 74 chunks per added window, 50→20 buys 28, 20→10 buys 13.5).
+
+**Shipped as a CALLER-OWNED parameter, not a lowered constant**, and that distinction is
+load-bearing: `WINDOW_COST_IN_CHUNKS_OVERLAPPED = 20` sits alongside the 200 default, and
+`live_windows_for_mask` takes the rate. S1 still defaults `overlap_window_writes` to False and
+derives windows through the same helper, so a global change would hand a SEQUENTIAL writer ~1.5
+extra serial windows per zone-date — cancelling its own 6% area saving. S2 passes the low rate
+only when it is actually overlapping.
+
+**`DEFAULT_TASKS_PER_CHUNK` is deliberately left at 200** though a chunk really costs ~44 tasks.
+That 4.5× conservatism is what keeps the per-window cap at 120 chunks; "correcting" it would
+raise the cap to ~545 and reinvite exactly the over-merge §4.2 regressed on. It is also why the
+rate is not the binding constraint on dense geometry — 85 of 112 zones already sit within ten
+chunks of the cap at rate 200, which is why dropping 200→100 moves area only 0.6%.
+
+Unverified offline: that a window's post-overlap cost really is ~15 chunks rather than ~50, and
+that more concurrent region-write buffers in one graph cost no spill (the risk that forced §4.6's
+revert). Cheapest settling run: a paired 200-vs-20 A/B on **17N** (predicted −14.7% write volume,
+21→28 windows) — NOT 35N, whose predicted 4.5% would drown in noise. Needs a flow parameter to
+force the old rate.
 
 **Values are NOT bit-identical across the two block sizes, and this is understood and accepted.**
 On Iowa, 78% of shared-data pixels differ — but the median absolute difference is **1** on
@@ -854,9 +904,27 @@ and k=8 at or past saturation. The speed case for larger k is also weak — queu
 overhead remains to amortize. **k=4–6 is the useful range; watch scheduler CPU, not memory.**
 
 Next lever from this profile: build+gate is **20.1 s of the 4-date batch's 73.8 s (27%)**, and
-the k gates still run SEQUENTIALLY as separate small graphs on an idle fleet. Fusing them into
-the batch's single compute — or composing batching with `pipeline_dates`, currently refused as
-mutually exclusive — is the largest remaining per-date win.
+the k gates still run SEQUENTIALLY as separate small graphs on an idle fleet.
+
+**Composed with `pipeline_dates` as of 2026-07-27** — the two were refused together only while
+the combined memory footprint was unmeasured. They attack different halves: batching removes the
+fleet idleness WITHIN a write, pipelining removes the serial preparation BETWEEN writes, which is
+that 27%. The look-ahead is sized to `batch_dates`, because a batch's write is one long consume
+and the original depth-1 buffer would hide one date's preparation out of k. `pipelined()` gained
+a `depth` parameter defaulting to 1, so every existing caller is unchanged (its six original
+tests pass untouched); **depth buys BUFFERING, never concurrency** — preparation stays on one
+worker in order, so the side-effect-free contract that makes background preparation safe is
+untouched. `Batch timings` now carries prepare/hidden/stall in both modes, with the same caveat
+as the per-date line: `hidden` is bounded by the SERIAL preparation cost, never by a pipelined
+`prepare` figure that contention has inflated. Chosen over fusing the gates because it is a
+quarter of the code, touches no existing invariant, and captures 27% rather than the gate's 17%.
+
+Expected memory cost is much smaller than "two batches in flight" suggests: a prepared date is a
+LAZY graph plus a scalar, not materialised pixels, so the real increment is the look-ahead
+batch's gate computes, which touch one band (`scl`) against the write's eleven — order +10%.
+That is a prediction; the 91-date 60-worker A/B on 35N is what tests it, and it is sized to span
+three monthly STAC rollovers because those, not the batch buffer, are where retained-item memory
+has failed before.
 
 ## 4. What did not work, and why
 
