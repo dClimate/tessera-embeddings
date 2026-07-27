@@ -619,10 +619,18 @@ default should not change behaviour for a caller nobody has measured.
 ### Pipelining a date's preparation (`pipeline_dates`)
 
 A date's wall clock splits into **preparation** — building the load graph, running the
-coverage gate, narrowing the footprint, constructing the masks — and the **write**. Only
-the write scales with fleet width; preparation is client-side CPU plus one cluster round
-trip and costs the same however many workers are running, so on a wide fleet it is pure
-serial residual.
+coverage gate, narrowing the footprint, constructing the masks — and the **write**.
+Preparation is part client-side CPU (graph building, genuinely independent of fleet width)
+and part cluster compute (the coverage gate reads SCL on the workers, so it scales with
+width like any other fleet work). Only the client-side part is serial residual that a wider
+fleet cannot shrink.
+
+**The overlap's payoff is therefore not symmetric between the two parts.** Hiding the
+client-side part behind the write is free. Hiding the gate is not: it is fleet work, so on a
+fleet the write already saturates it competes for the same slots and is additive regardless
+of scheduling order — and task priorities cannot change that, since they reorder a queue
+without creating capacity. The overlap pays off in proportion to the spare capacity the
+write leaves, which makes it **more** valuable on narrow fleets than on wide ones.
 
 `pipeline_dates` prepares date N+1 on one background thread while date N is being written
 (`ingest/_pipeline.py`). What stays serial is the write: icechunk commits are sequential on
@@ -641,6 +649,15 @@ Each written date logs a `Pipeline date=…: prepare=… hidden=… stall=…` l
 when preparation hides fully, and rising toward the whole preparation when the gate is
 starved behind the write's own tasks. Serially every date stalls for its full preparation
 and hides none of it, so the two modes are comparable from one line.
+
+> **`hidden` is not a saving, and reading it as one overstates the benefit several-fold.**
+> When pipelined, `prepare` is wall time on a background thread that spans the whole
+> concurrent write, so it inflates with contention: the same preparation reports a small
+> number serially and a large one pipelined, because it is being *queued behind the write*,
+> not because more of it was avoided. The ceiling on what the overlap can save is what
+> preparation costs when nothing competes with it — i.e. the serial mode's own
+> `prepare` — so any A/B must take its expected saving from the **control** arm and treat
+> `hidden` as a diagnostic of contention only.
 
 Default **off**, and the flag threads from the outer flow through the task shell to the
 domain function. S1 has no coverage gate and a different batch loop; it is deliberately
