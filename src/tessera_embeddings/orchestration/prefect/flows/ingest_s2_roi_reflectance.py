@@ -13,6 +13,7 @@ into a single ``@flow``.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from prefect import flow, get_run_logger
@@ -25,6 +26,47 @@ from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
 )
 from tessera_embeddings.orchestration.prefect.flows._dask_runner import get_task_runner_for_cluster
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_reflectance
+
+MAX_PIPELINE_DATES_WORKERS = 140
+"""Widest fleet on which date pipelining is allowed to run.
+
+Overlapping the next date's preparation with the current date's write only pays while the
+write leaves the fleet room to absorb the coverage gate — that gate is worker-side work, so
+on a fleet the write already keeps busy it is additive no matter how it is scheduled, and
+past some width the overlap costs more than the client-side graph build it saves. This bound
+is a measured calibration, not a property of the code; the measurements and the break-even
+estimate behind it live in `yield-embeddings/context_docs/measurements/`.
+
+Above it the flow declines to pipeline rather than obeying, because the flag reaches this
+code from many callers and the failure is silent — a slower run looks like a slower run.
+Declining can only prevent harm: pipelining is off by default, so nothing that did not ask
+for it is affected.
+"""
+
+
+def _gated_pipeline_dates(
+    *,
+    pipeline_dates: bool,
+    use_local: bool,
+    max_workers: int,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
+) -> bool:
+    """Return the pipelining flag actually in force, declining above the width bound.
+
+    Scoped to the Fargate path: on ``use_local`` the ``max_workers`` parameter provisions
+    nothing, so gating on it would disable pipelining for a cluster whose width it does not
+    describe. The bound is inclusive.
+    """
+    if pipeline_dates and not use_local and max_workers > MAX_PIPELINE_DATES_WORKERS:
+        log.warning(
+            "pipeline_dates requested with max_workers=%d, above the %d-worker bound where "
+            "overlapping preparation still pays; running WITHOUT pipelining. See "
+            "MAX_PIPELINE_DATES_WORKERS.",
+            max_workers,
+            MAX_PIPELINE_DATES_WORKERS,
+        )
+        return False
+    return pipeline_dates
 
 
 @flow(name="ingest_s2_roi_impl")
@@ -136,7 +178,9 @@ def ingest_s2_roi_reflectance(
             narrowing, masking) on a background thread while the current date is
             written, so preparation costs wall clock only where the write cannot
             cover it. The write itself stays serial and in date order — one commit
-            per date — and the stores are identical either way.
+            per date — and the stores are identical either way. Ignored with a
+            warning above ``MAX_PIPELINE_DATES_WORKERS``, where the overlap stops
+            paying; narrow fleets benefit most.
         worker_env_overrides: Env vars merged into every Dask worker's environment
             for THIS run only, for A/B-ing worker-side tuning (allocator and cache
             behaviour) one arm at a time. Not a configuration channel: anything
@@ -149,6 +193,10 @@ def ingest_s2_roi_reflectance(
     """
     log = get_run_logger()
     log.info("Starting ingest_s2_roi_reflectance for %s", roi_zarr_path)
+
+    pipeline_dates = _gated_pipeline_dates(
+        pipeline_dates=pipeline_dates, use_local=use_local, max_workers=max_workers, log=log
+    )
 
     if use_local:
         from tessera_embeddings.providers.local.dask import local_cluster
