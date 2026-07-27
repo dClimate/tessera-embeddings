@@ -46,7 +46,7 @@ import numpy as np
 import xarray as xr
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
-from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS, auto_batch_dates
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.live_windows import (
@@ -187,7 +187,7 @@ def ingest_s2_roi_reflectance(
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
-    batch_dates: int = 1,
+    batch_dates: int | None = None,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
 
@@ -252,16 +252,19 @@ def ingest_s2_roi_reflectance(
             Requires ``crop_to_live_windows``. COMPOSES with ``pipeline_dates``:
             the look-ahead is then sized to the batch, so the next batch's whole
             preparation overlaps this batch's write instead of only one date's.
-            Default 1 is the one-commit-per-date path, unchanged.
+            ``None`` (the default) derives it from the ROI's covered window area via
+            :func:`~tessera_embeddings.config.ingest.auto_batch_dates`, because the
+            benefit is not monotonic in ROI size; 1 forces the one-commit-per-date
+            path.
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items
         were returned or zero dates passed the coverage filter.
     """
     log = log or logging.getLogger(__name__)
-    if batch_dates < 1:
-        raise ValueError(f"batch_dates must be >= 1, got {batch_dates}")
-    if batch_dates > 1 and not crop_to_live_windows:
+    if batch_dates is not None and batch_dates < 1:
+        raise ValueError(f"batch_dates must be >= 1 or None for auto, got {batch_dates}")
+    if batch_dates is not None and batch_dates > 1 and not crop_to_live_windows:
         # The batched write is the windowed write lifted across dates; the legacy
         # full-extent path has no windowed form to lift.
         raise ValueError("batch_dates > 1 requires crop_to_live_windows")
@@ -293,6 +296,20 @@ def ingest_s2_roi_reflectance(
         )
         live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
         log.info("Cropping writes to %d live window(s)", len(run_windows))
+
+    # Resolve `batch_dates=None` (auto) now that the windows are known. Derived from
+    # the area those windows COVER, which is what the write graph touches. Falls back
+    # to 1 on the uncropped path, where a batched write has no windowed form to lift.
+    if batch_dates is None:
+        covered_chunks = sum(
+            ((w.y1 - w.y0) // INGEST_CHUNK_SIZE) * ((w.x1 - w.x0) // INGEST_CHUNK_SIZE) for w in run_windows
+        )
+        batch_dates = auto_batch_dates(covered_chunks) if crop_to_live_windows else 1
+        log.info(
+            "batch_dates=auto -> %d (%d chunk(s) covered by live windows)",
+            batch_dates,
+            covered_chunks,
+        )
 
     # Load blocks match the store's chunks, so a date's read parallelism is one task
     # per (chunk, band) and the write needs no rechunk at all.

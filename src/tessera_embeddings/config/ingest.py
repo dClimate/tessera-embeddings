@@ -57,6 +57,29 @@ INGEST_MANIFEST_SPLIT = {"time": 8}
 # defaults.
 DEFAULT_MIN_VALID_COVERAGE = 0.1
 
+# Date batching is enabled per ROI by SIZE, because its benefit is not monotonic in
+# size: it amortises the per-batch commit and cannot speed the write (which is
+# fleet-bound), so it pays only where the commit is a large share of a date's cost,
+# and it LOSES where a bigger write graph crowds out the preparation overlapping it.
+#
+# A THRESHOLD, not an interpolated curve. Deliberately set at the upper edge of the
+# range where batching was measured to win, not at the estimated crossover: widening it
+# means measuring an ROI in between, not extrapolating. Measurements and the per-size
+# ratios are in context_docs/design/ingest_optimization_campaign_2026_07.md.
+#
+# Denominated in the COVERED chunk area of a run's live windows — the area the write
+# graph actually touches, and already known once windows are merged, so deriving this
+# costs no extra I/O.
+AUTO_BATCH_DATES_MAX_COVERED_CHUNKS = 500
+
+# Dates fused per graph when batching turns on. The only batch size measured.
+AUTO_BATCH_DATES = 4
+
+
+def auto_batch_dates(covered_chunks: int) -> int:
+    """Dates to fuse for a run whose live windows cover ``covered_chunks`` chunks."""
+    return AUTO_BATCH_DATES if covered_chunks <= AUTO_BATCH_DATES_MAX_COVERED_CHUNKS else 1
+
 
 class IngestSettings(BaseModel):
     """Shared ingest tuning knobs, grouped for Prefect flow signatures.

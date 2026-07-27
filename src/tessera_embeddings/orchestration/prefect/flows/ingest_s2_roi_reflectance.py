@@ -84,7 +84,7 @@ def _ingest_s2_roi_impl(
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
-    batch_dates: int = 1,
+    batch_dates: int | None = None,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
     future = process_roi_reflectance.submit(
@@ -132,7 +132,7 @@ def ingest_s2_roi_reflectance(
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
-    batch_dates: int = 1,
+    batch_dates: int | None = None,
     worker_env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Ingest S2 L2A reflectance for an ROI using Dask workers.
@@ -192,8 +192,10 @@ def ingest_s2_roi_reflectance(
             those). Identical stores either way. Requires
             ``crop_to_live_windows``, and composes with ``pipeline_dates`` — the
             look-ahead is then the batch, so a whole batch's preparation hides
-            behind the previous batch's write. Default 1 keeps the existing
-            one-commit-per-date behaviour.
+            behind the previous batch's write. Leave at ``None`` to size it from
+            the ROI, which is what the campaign wants: the benefit is not
+            monotonic in ROI size, so one global value regresses part of the
+            range. Pass an int only to pin one arm of a comparison.
         worker_env_overrides: Env vars merged into every Dask worker's environment
             for THIS run only, for A/B-ing worker-side tuning (allocator and cache
             behaviour) one arm at a time. Not a configuration channel: anything

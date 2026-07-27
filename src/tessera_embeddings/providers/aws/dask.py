@@ -80,21 +80,33 @@ from tornado.ioloop import PeriodicCallback
 # of the limit at ANY size. What protects the worker is keeping its PEAK close to that
 # steady ceiling, i.e. not retaining more per date than necessary.
 #
-# 20480 is the settled size. It was briefly raised as headroom while date pipelining was
-# measured, on the theory that pipelining's MANAGED, spillable data would benefit from a
-# larger limit; the A/B gave no sign that it needs one, and by the 72% rule above the
-# extra space mostly becomes more cache rather than more margin. What removed the memory
-# failure was pruning the retained STAC items, not the limit.
+# The size is set by ONE rule: leave the driver worker's peak a comfortable multiple
+# below the PAUSE threshold. Not below the container limit, and not below the spill
+# threshold — spilling the retained items was measured to cost nothing, because the
+# spilled bytes are precisely the prefetched month nobody reads until the boundary.
 #
-# Spilling is NOT the protection either: Dask has nothing it is allowed to evict when
-# the memory is unmanaged. And a paused worker does not recover — work waiting on data
-# it holds can never complete, so the run deadlocks with the rest of the fleet idle.
+# Spilling is NOT the protection: Dask has nothing it is allowed to evict when the
+# memory is unmanaged. And a paused worker does not recover — work waiting on data it
+# holds can never complete, so the run DEADLOCKS with the rest of the fleet idle. That
+# is the observed failure this size exists to prevent, and it is why the margin is
+# stated as a multiple rather than a few hundred MiB: undersizing costs a whole run,
+# not a retry.
+#
+# A larger limit is a WEAK lever against that, per the 72% rule above — most of the
+# extra space becomes cache rather than margin. Pruning the retained items is what
+# actually moved the demand, and it moved it far enough that a smaller limit became
+# affordable: memory costs nothing in quota terms but it is not free in dollars, and
+# every worker in a cell pays it to accommodate one of them.
+#
+# See context_docs/design/ingest_optimization_campaign_2026_07.md for the measured
+# peaks and the margin this size was chosen against — deliberately not inlined here,
+# because a calibration goes stale while the rule above does not.
 #
 # The vCPU stays at 4 deliberately: the Fargate quota is counted in vCPU, so doubling
 # the CPU would halve the workers a cell can run. Valid pairings for 4 vCPU are
 # 8192-30720 MiB in 1024 steps.
 DEFAULT_INGEST_WORKER_CPU = 4096
-DEFAULT_INGEST_WORKER_MEM = 20480
+DEFAULT_INGEST_WORKER_MEM = 16384
 
 # Schedulers don't need much memory but benefit from a few cores so
 # graph construction and dashboard responsiveness stay smooth.
