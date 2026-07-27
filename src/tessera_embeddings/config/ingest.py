@@ -21,29 +21,15 @@ INGEST_CHUNK_SIZE = 4096
 
 INGEST_CHUNKS = {"time": 1, "northing": INGEST_CHUNK_SIZE, "easting": INGEST_CHUNK_SIZE}
 
-# Dask block size for the LOAD side of ingest — deliberately DECOUPLED from the
-# storage chunk size above, and the reason the two exist separately.
-#
-# Graph task count is what limits ingest, and it scales with the number of blocks
-# the read path builds. Coarsening the load blocks shrinks that count without
-# touching the store's read geometry, which matters because the inference side is
-# tuned around the STORED chunk size: zarr decompresses whole stored chunks to
-# serve any part of one, so a coarser store adds a fixed per-chunk read cost to
-# the GPU path (measured, and the reason the store stays at 4096 — see
-# context_docs/design/ingest-graph-and-stac-budget.md).
-#
-# Must be a positive multiple of INGEST_CHUNK_SIZE: the write rechunks load blocks
-# down to store chunks, and a non-multiple would make that a cross-block shuffle
-# instead of a pure split. Set equal to INGEST_CHUNK_SIZE to disable the decoupling.
-INGEST_LOAD_CHUNK_SIZE = 8192
-
-if INGEST_LOAD_CHUNK_SIZE % INGEST_CHUNK_SIZE:
-    raise ValueError(
-        f"INGEST_LOAD_CHUNK_SIZE ({INGEST_LOAD_CHUNK_SIZE}) must be a multiple of "
-        f"INGEST_CHUNK_SIZE ({INGEST_CHUNK_SIZE}) so the write is a pure split"
-    )
-
-INGEST_LOAD_CHUNKS = {"time": 1, "northing": INGEST_LOAD_CHUNK_SIZE, "easting": INGEST_LOAD_CHUNK_SIZE}
+# The load side deliberately uses the SAME block size as the store. A coarser load
+# block (8192) was shipped once to shrink graph task counts for the scheduler's
+# single-threaded dispatch, and was removed: fewer, larger read tasks cap a date's
+# parallel width at blocks x bands, which starves any fleet wider than that. The
+# width cost is paid on every compact ROI while the dispatch saving only binds on
+# the densest zones at wide fleets. History, measurements and the cost model are in
+# context_docs/design/ingest_optimization_campaign_2026_07.md (section 3.5 and its
+# 2026-07-27 correction); do not reintroduce a load/store split without re-reading
+# that record.
 
 # Manifest sharding for the campaign mosaics. Without it every commit rewrites the
 # whole array manifest, so the bytes rewritten grow with the number of dates already

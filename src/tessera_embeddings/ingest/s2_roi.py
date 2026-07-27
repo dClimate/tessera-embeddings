@@ -44,11 +44,7 @@ import numpy as np
 import xarray as xr
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
-from tessera_embeddings.config.ingest import (
-    INGEST_CHUNKS,
-    INGEST_LOAD_CHUNK_SIZE,
-    INGEST_LOAD_CHUNKS,
-)
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.live_windows import live_windows_for_mask, windows_for_date
@@ -253,16 +249,13 @@ def ingest_s2_roi_reflectance(
     live_windows: list[tuple[int, int, int, int]] | None = None
     run_windows: list = []
     if crop_to_live_windows:
-        run_windows = live_windows_for_mask(
-            roi_zarr_path, window_px=INGEST_LOAD_CHUNK_SIZE, storage_options=storage_options
-        )
+        run_windows = live_windows_for_mask(roi_zarr_path, window_px=INGEST_CHUNK_SIZE, storage_options=storage_options)
         live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
         log.info("Cropping writes to %d live window(s)", len(run_windows))
 
-    # LOAD-side blocks, which are a multiple of the store's chunks (see
-    # config.ingest.INGEST_LOAD_CHUNK_SIZE): fewer, larger blocks mean a smaller
-    # graph, and the write rechunks them down to store chunks as a pure split.
-    spatial_chunks = {"northing": INGEST_LOAD_CHUNKS["northing"], "easting": INGEST_LOAD_CHUNKS["easting"]}
+    # Load blocks match the store's chunks, so a date's read parallelism is one task
+    # per (chunk, band) and the write needs no rechunk at all.
+    spatial_chunks = {"northing": INGEST_CHUNKS["northing"], "easting": INGEST_CHUNKS["easting"]}
 
     roi_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
     if live_windows is not None:
@@ -316,7 +309,7 @@ def ingest_s2_roi_reflectance(
                 collection=collection,
                 baselines=baselines,
                 bbox=roi.bbox_wgs84,
-                chunks=INGEST_LOAD_CHUNKS,
+                chunks=INGEST_CHUNKS,
                 extra_bands=["scl"],
                 resampling="bilinear",
                 groupby="solar_day",
@@ -364,7 +357,7 @@ def ingest_s2_roi_reflectance(
                 run_windows,
                 [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
                 roi.geobox,
-                chunk_px=INGEST_LOAD_CHUNK_SIZE,
+                chunk_px=INGEST_CHUNK_SIZE,
             )
             if not narrowed:
                 # No live cell is reachable today. Nothing to write, and writing an

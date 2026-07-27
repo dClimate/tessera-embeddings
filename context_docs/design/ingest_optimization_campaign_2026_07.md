@@ -203,10 +203,23 @@ direction.
 
 ### 3.5 Decoupling load blocks from store chunks — the key structural move
 
-Graph tasks scale with the number of *blocks* the read path builds, not with pixels. So
-`INGEST_LOAD_CHUNK_SIZE` (8192) now sets the dask block size while `INGEST_CHUNK_SIZE` (4096)
-keeps setting the store's chunking. It must be a whole multiple, enforced at import: the write
-splits blocks down to store chunks, and a non-multiple would make that a cross-block shuffle.
+> **REMOVED 2026-07-27 — the decoupling is gone; load blocks equal store chunks again.**
+> The 8192 load block capped a date's parallel width at `blocks × bands`: on a compact ROI
+> (Iowa, 126 store chunks → ~27 load blocks → ~297-wide graphs against 480 slots) the write ran
+> **~5× slower than its own work content**, measured against a main-code control doing 1.6× the
+> executed work in half the wall clock. The dispatch saving that justified 8192 was real but is
+> a *fleet-width-independent* floor (`~44 × blocks / R`), and at the campaign's chosen 40–60w
+> cells it roughly coincides with the fleet-work line — §3.8's config table shows the two walls
+> meeting at ~185 s at 120w, which was misread at the time as "8192 costs nothing". Densest-zone
+> cells at wide fleets are the one regime that genuinely benefited; date batching (planned)
+> recovers width there without re-coarsening reads. Numbers: the 2026-07-27 Iowa paired profile
+> in `yield-embeddings/context_docs/measurements/`.
+
+The original rationale, kept for the record: graph tasks scale with the number of *blocks* the
+read path builds, not with pixels. So `INGEST_LOAD_CHUNK_SIZE` (8192) set the dask block size
+while `INGEST_CHUNK_SIZE` (4096) kept setting the store's chunking, a whole multiple enforced
+at import: the write split blocks down to store chunks, and a non-multiple would make that a
+cross-block shuffle.
 
 Windows are derived on the load-block grid by **coarsening the live grid**, not by snapping
 windows afterwards. Snapping is incorrect: two windows on adjacent fine rows can snap into the
