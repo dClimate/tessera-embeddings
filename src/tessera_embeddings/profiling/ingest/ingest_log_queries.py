@@ -64,6 +64,48 @@ from tessera_embeddings.profiling.ingest import DEFAULT_INGEST_LOG_GROUP
 # name -> (description, Insights query string). The run window + log group are
 # passed to start_query separately, so the query strings carry no per-run state.
 QUERIES: dict[str, tuple[str, str]] = {
+    "date_stage_timings": (
+        "Per-date stage decomposition (build / gate / write) from the ingest's "
+        "`Stage timings` lines — the workhorse table for any per-date A/B. "
+        "Emitted on the one-commit-per-date path only; batched runs "
+        "(batch_dates > 1) emit `Batch timings` instead, so run batch_timings "
+        "alongside this on mixed runs.",
+        r"fields @timestamp"
+        r" | filter @message like /Stage timings/"
+        r" | parse @message /date=(?<date>\S+): build=(?<build_s>[\d.]+)s"
+        r" gate=(?<gate_s>[\d.]+)s write=(?<write_s>[\d.]+)s"
+        r" total=(?<total_s>[\d.]+)s windows=(?<n_windows>\d+) mode=(?<mode>\S+)/"
+        r" | display @timestamp, date, build_s, gate_s, write_s, total_s, n_windows, mode"
+        r" | sort date asc",
+    ),
+    "batch_timings": (
+        "Per-batch decomposition from `Batch timings` lines (batch_dates > 1). "
+        "build/gate are SUMS of the batch's real per-date values; write is the "
+        "one shared compute — divide by n_dates for a per-date figure, and do "
+        "not look for a per-date write time: it does not exist as a measurement "
+        "in this mode.",
+        r"fields @timestamp"
+        r" | filter @message like /Batch timings/"
+        r" | parse @message /dates=(?<first_date>\S+)\.\.(?<last_date>\S+)"
+        r" n=(?<n_dates>\d+): build=(?<build_s>[\d.]+)s gate=(?<gate_s>[\d.]+)s"
+        r" write=(?<write_s>[\d.]+)s windows=(?<n_windows>\d+)/"
+        r" | display @timestamp, first_date, last_date, n_dates, build_s, gate_s, write_s, n_windows"
+        r" | sort first_date asc",
+    ),
+    "pipeline_stalls": (
+        "How much preparation the write covered under date pipelining. The line "
+        "is emitted in BOTH modes: serially stall equals prepare and hidden is "
+        "zero, so pipelined-vs-serial is one query. Under pipelining, `prepare` "
+        "is wall time on a background thread spanning the concurrent write, so "
+        "`hidden` OVERSTATES the saving — the hideable ceiling is the serial "
+        "arm's own prepare, never this field.",
+        r"fields @timestamp"
+        r" | filter @message like /Pipeline date=/"
+        r" | parse @message /Pipeline date=(?<date>\S+): prepare=(?<prepare_s>[\d.]+)s"
+        r" hidden=(?<hidden_s>[\d.]+)s stall=(?<stall_s>[\d.]+)s/"
+        r" | display @timestamp, date, prepare_s, hidden_s, stall_s"
+        r" | sort date asc",
+    ),
     "http_retries_by_service": (
         "Catalog HTTP retry count by service (CMR vs STAC/earth-search) — the "
         "primary external-throttling discriminator.",

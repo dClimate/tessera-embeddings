@@ -17,6 +17,12 @@ group).
   `te-watch-scheduler` (live scheduler heartbeat → JSON + alerts),
   `te-ingest-log-queries` (429/503/retry/worker-exit aggregates across every
   worker stream), `te-ingest-report` (assemble the per-run dossier).
+- **"Where does a date's time go, and what did a mode change buy?"** → also
+  `te-ingest-log-queries` — `date_stage_timings` (per-date build/gate/write from
+  the `Stage timings` lines), `batch_timings` (its `batch_dates > 1`
+  counterpart: one shared write per batch, divide by `n_dates`), and
+  `pipeline_stalls` (how much preparation `pipeline_dates` hid; emitted in both
+  modes so the A/B is one query).
 - **"Are the GPUs busy? are workers OOMing?"** → `inference/` —
   `te-observe-cluster` (live GPU/RAM pollers + post-hoc CloudWatch rollups),
   plus the `te-compare-*` output-equivalence gates.
