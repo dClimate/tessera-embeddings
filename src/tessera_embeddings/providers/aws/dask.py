@@ -80,10 +80,11 @@ from tornado.ioloop import PeriodicCallback
 # of the limit at ANY size. What protects the worker is keeping its PEAK close to that
 # steady ceiling, i.e. not retaining more per date than necessary.
 #
-# Currently 24576 rather than 20480 as TESTING HEADROOM for the date-pipelining and
-# gate-mask-persist work (docs/ingest-date-pipelining-plan.md in yield-embeddings):
-# those hold MANAGED, spillable data on workers, which — unlike the unmanaged baseline
-# — does benefit from a larger limit. Decide the final size from that A/B, not here.
+# 20480 is the settled size. It was briefly raised as headroom while date pipelining was
+# measured, on the theory that pipelining's MANAGED, spillable data would benefit from a
+# larger limit; the A/B gave no sign that it needs one, and by the 72% rule above the
+# extra space mostly becomes more cache rather than more margin. What removed the memory
+# failure was pruning the retained STAC items, not the limit.
 #
 # Spilling is NOT the protection either: Dask has nothing it is allowed to evict when
 # the memory is unmanaged. And a paused worker does not recover — work waiting on data
@@ -93,7 +94,7 @@ from tornado.ioloop import PeriodicCallback
 # the CPU would halve the workers a cell can run. Valid pairings for 4 vCPU are
 # 8192-30720 MiB in 1024 steps.
 DEFAULT_INGEST_WORKER_CPU = 4096
-DEFAULT_INGEST_WORKER_MEM = 24576
+DEFAULT_INGEST_WORKER_MEM = 20480
 
 # Schedulers don't need much memory but benefit from a few cores so
 # graph construction and dashboard responsiveness stay smooth.
