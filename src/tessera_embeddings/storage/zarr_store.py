@@ -481,10 +481,10 @@ def open_repo(
     """Open an EXISTING Icechunk repository; raise if it is not there.
 
     The counterpart to :func:`open_or_create_repo`, and the right call whenever the
-    store is known to exist — writing a marker onto a store just written, say.
-    `open_or_create_repo` swallows every ``IcechunkError`` on its way to creating,
-    which turns a throttle or an expired credential into a confusing dirty-prefix
-    failure against a perfectly good store.
+    store is known to exist — writing a marker onto a store just written, say. Prefer it
+    on that path even now that ``open_or_create_repo`` discriminates absence correctly:
+    saying "this must already be there" makes a missing store an error rather than a
+    silent creation, which is the stronger statement wherever it is true.
     """
     return icechunk.Repository.open(
         _create_storage(
@@ -517,8 +517,16 @@ def _create_repo(
         )
     except icechunk.IcechunkError as e:
         if "repositories can only be created in clean prefixes" in str(e):
+            # Say what the state IS, and do not instruct a delete. Reaching here means the
+            # prefix holds objects but no readable repository — a writer interrupted between
+            # creating the repo and committing its schema. The prefix may still hold chunks
+            # somebody wants, so deleting is a judgement the operator makes, not an
+            # instruction we hand them.
             raise CorruptedStoreError(
-                f"Store {store_path} appears corrupted. Delete it or use a different path."
+                f"Store {store_path} holds objects but no readable repository — a writer was "
+                f"interrupted between creating it and committing its schema. If nothing has "
+                f"been successfully ingested here, clear the prefix and re-run; if it may "
+                f"hold data, inspect it before deleting anything."
             ) from e
         raise
 
@@ -545,6 +553,17 @@ def open_or_create_repo(
     Returns:
         Tuple of ``(repository, is_new)``. ``is_new`` is True if the repo was
         just created.
+
+    Creates ONLY on proven absence — see :func:`is_missing_repo`. Every other failure of
+    the open leg is re-raised unchanged, because routing one into the create leg is
+    actively harmful rather than merely imprecise: the create then trips Icechunk's
+    clean-prefix rule and surfaces as a ``CorruptedStoreError`` naming a store that is
+    perfectly healthy, whose advice is to delete it, and which is DETERMINISTIC from then
+    on. That last part is what does the damage. Callers wrap these writes in a retry that
+    retries every exception, so a transient open failure is already survivable — but once
+    the repo exists, every retry's create fails identically, and the retry cannot escape.
+    A momentary blip becomes a hard failure reported as corruption, with the real error
+    destroyed.
     """
     try:
         return open_repo(
@@ -554,14 +573,22 @@ def open_or_create_repo(
             region=region,
             scatter_initial_credentials=scatter_initial_credentials,
         ), False
-    except (FileNotFoundError, icechunk.IcechunkError):
-        return _create_repo(
-            store_path,
-            max_concurrent_requests,
-            get_credentials=get_credentials,
-            region=region,
-            scatter_initial_credentials=scatter_initial_credentials,
-        ), True
+    except FileNotFoundError:
+        # Unambiguous absence: a local path that is not there, and zarr's
+        # GroupNotFoundError, which subclasses this.
+        pass
+    except icechunk.IcechunkError as exc:
+        if not is_missing_repo(exc):
+            raise
+    # Outside the `try` deliberately, so a failure from the create leg cannot be caught by
+    # this function's own handlers and re-attributed.
+    return _create_repo(
+        store_path,
+        max_concurrent_requests,
+        get_credentials=get_credentials,
+        region=region,
+        scatter_initial_credentials=scatter_initial_credentials,
+    ), True
 
 
 def rollback_commits(

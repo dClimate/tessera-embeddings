@@ -117,13 +117,16 @@ def _probe_marker(store_path: str, *, get_credentials: _Creds, s3_region: str | 
 def _write_ingest_marker(store_path: str, fingerprint: dict, *, get_credentials: _Creds, s3_region: str | None) -> None:
     """Stamp the ``ingest_marker`` fingerprint + ``ingest_completed_at`` on a store's root.
 
-    OPENS, never creates. This runs only for a store that was just written, so
-    creation is never the right answer — and `open_or_create_repo` swallows every
-    IcechunkError to get there, so a throttle or an expired credential on this last
-    write would be retried as "create a repo in a populated prefix", fail as a dirty
-    prefix, and leave a complete multi-terabyte store UNMARKED. The next run then
-    reads it as stale and deletes it. Surfacing the real error costs a retry;
-    mistaking it for absence costs the ingest.
+    OPENS, never creates. This runs only for a store that was just written, so creation is
+    never the right answer, and the cost of getting that wrong is the whole ingest: a
+    throttle or an expired credential mistaken for absence would leave a complete
+    multi-terabyte store UNMARKED, and the next run reads an unmarked store as stale and
+    deletes it. Surfacing the real error costs a retry; mistaking it for absence costs the
+    ingest.
+
+    `open_or_create_repo` no longer conflates the two — it creates only on proven absence —
+    but this call stays :func:`open_repo` regardless, because "must already exist" is both
+    true and a stronger statement here than "create if needed".
     """
     repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
