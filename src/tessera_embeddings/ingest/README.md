@@ -632,14 +632,13 @@ Default **on** for both S2 and S1. `write_day_windows` itself still defaults to 
 sequential path: a storage-layer default should not decide write strategy for its callers,
 so each ingest path opts in explicitly.
 
-S1 was measured before it opted in, and the gain does **not** depend on how many windows a
-date has — 23, 9 and 7 windows gained 2.79×, 2.86× and 2.40×. That rules out the obvious
-reading (sequential costs the sum of its windows, overlapped the longest, so the gain should
-track window count). What it tracks instead is **fleet occupancy**: one window's graph is
-only a few tasks wide, so writing windows one at a time leaves most of the fleet idle no
-matter how many wait behind it, while overlapping lets them collectively fill it. The gain is
-therefore fleet width over per-window width, with window count absent — which also means it
-should grow on wider fleets.
+S1 was measured before it opted in. The gain is **2.4–3.9×** on per-date write time and does
+not vary with either quantity we can vary: not with window count (23, 9 and 7 windows gave
+2.79×, 2.86× and 2.40×) and not with fleet width (30 and 60 workers gave 3.67× and 3.85×,
+inside the noise floor). **Why it is that size is not explained** — the two obvious accounts
+both predicted one of those dependencies and neither survived. Rely on the gain, which is
+reproducible; do not extrapolate the magnitude far outside the widths measured. The campaign
+record's §4.9 has both refutations.
 
 ### Pipelining a date's preparation (`pipeline_dates`)
 

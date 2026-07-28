@@ -12,22 +12,13 @@ Related notes: `ingest-live-tile-cropping.md` (why ingest crops at all, and how 
 derived), `ingest-graph-and-stac-budget.md` (the living working notes this summarises),
 `region-writes.md`, ADR-011 (campaign zone ingestion).
 
-**Maintaining this document.** It is the memory of record for this work: update it as findings
-land, and preserve the three-depth structure above all — headline table, then mechanism, then
-full detail. Corrections go **in place** with the superseded claim named (see §5), never as an
-appended log; a reader must be able to trust any section without checking whether a later one
-undoes it. New measurements belong in §8; failed attempts belong in §4 with their numbers, not
-deleted.
+Unless a figure says otherwise, every wall-clock number here is the **same cell** — zone `35N`,
+January 2024, on a 120-worker Dask-on-Fargate fleet against one frozen ROI mask — so the rows
+compare directly. §10 records the finer measurement caveats and how to keep this document.
 
-**All wall-clock figures are the same cell** — zone `35N`, January 2024, 120-worker
-Dask-on-Fargate fleet, the same frozen ROI mask — so the rows compare. Worker memory is NOT
-constant across rows: 16 GiB up to 2026-07-25, 20 GiB after, and **back to 16 GiB from
-2026-07-27** (§4.8), once pruning the retained catalogue entries had removed the demand that
-justified the larger size. Memory size barely moves wall clock so the timing rows still compare,
-but a peak-memory figure only means something next to the limit it was measured under.
-
-Graph-task figures are from local census runs over a fixed pixel window; those compare within
-a series but not across series, and are labelled accordingly.
+**Start with §1.** It is the whole story at a level you can act on. Detail deepens as the
+document goes: §2 gives the cost model, §3 and §4 are the per-change archive, and §8 holds the
+numbers of record.
 
 ---
 
@@ -156,47 +147,27 @@ forecast multiplied out a 1.04-per-cell penalty, implying 2.56× at 40 cells; th
 
 ### Two corrections worth reading before planning
 
-> **The dispatch-rate cost model below is stale.** It predicted a 150–190 s floor for a dense
-> zone-date; the write alone now measures 79.8 s, roughly twice as fast as that floor. The advice
-> it produced — run narrow cells to stay under the floor — is **withdrawn**. Do not size cells
-> against it until it is re-measured.
+> **Do not size cells against the dispatch-rate model in §2.** Its shape still holds but its
+> constant is stale, and the advice it produced — keep cells narrow — is **withdrawn**. §2 has
+> the detail.
 
 > **Dates per zone-year is 365, not the ~250 once assumed.** A full-height zone sees imagery
-> every day. An earlier estimate came from a region spanning only about 3° of latitude, which
+> every day. The earlier figure came from a region spanning about 3° of latitude, which
 > intersects far fewer orbit passes and does not generalise to a zone.
 
-### Where the detail lives
+### Why the graph was shrunk before buying concurrency
 
-Sections 3 and 4 are the archive: what each change bought, and what was tried and abandoned,
-both with their numbers. Section 5 lists claims that were made and later withdrawn. Section 6 is
-the set of constraints future work must respect. Sections 7 and 8 hold open questions and the
-numbers of record. Read section 6 before changing anything here.
+Running many cells at once is the obvious multiplier and needs no new code, so it is worth saying
+why it came last. **Graph size sets the ceiling on how many workers one cell can usefully absorb**,
+and the two multiply: a cell that chokes its scheduler at 120 workers cannot spend a larger
+allocation however much quota arrives, and every concurrent cell has its own scheduler hitting the
+same wall. Buying concurrency first would have bought the right to run twenty cells that each waste
+most of their fleet.
 
----
-### Why graph size was attacked FIRST, ahead of streaming and cell concurrency
-
-Cell concurrency is the campaign's obvious multiplier — each `(zone, year)` cell brings its own
-scheduler, so running many cells at once scales almost linearly and needs no code. Graph size
-was fixed first anyway, and deliberately, because **graph size sets the ceiling on how many
-workers a single cell can usefully absorb.**
-
-The two compose multiplicatively. Campaign throughput is roughly
-`cells_in_parallel × workers_usable_per_cell × per-worker efficiency`. Cell concurrency buys the
-first term and quota buys the budget, but a cell that chokes its scheduler at 120 workers cannot
-spend a larger allocation no matter how much is available — and every concurrent cell has its
-own scheduler hitting the same wall. Optimising concurrency first would have bought the right to
-run twenty cells that each waste most of their fleet.
-
-This is not speculative. **Ingest has previously been run at ~250–300 workers and showed
-performance degradation attributable primarily to the scheduler.** Today's measurements are the
-same phenomenon at the smaller fleet the current quota allows: the scheduler saturates one core,
-never exceeds it, and pins at 100% once a window's graph reaches ~84k tasks. Cutting the graph
-~3.9× moves that ceiling up by roughly the same factor, which is what makes the concurrency
-multiplier worth having.
-
-So the sequencing is: **shrink the graph → raise the per-cell worker ceiling → then spend quota
-on concurrency**, with streaming landing in between because year-scale cells cannot execute at
-all without it.
+That was known rather than guessed — ingest had previously degraded at ~250–300 workers, primarily
+because of the scheduler. Cutting the graph ~3.9× moves the ceiling up by about the same factor. So
+the order was **shrink the graph, raise the per-cell ceiling, then spend quota on concurrency**,
+with catalogue streaming in between because year-scale cells cannot run at all without it (§7b).
 
 ---
 
@@ -286,11 +257,17 @@ campaign time  =  zone-hours per year  ×  years  ÷  cells run at once
                                                 ~744 vCPU, not one at ~248
 ```
 
-Concurrency was measured, not assumed: per-cell throughput is **unchanged** from 5 concurrent
-cells to 10 (median ratio 0.99 across five paired zones, every one inside the noise floor), with
-no spill and no task ever waiting for a worker. So the divisor is limited by quota rather than by
-contention — which makes the account's vCPU limit, not interference, the thing that sets campaign
-duration.
+**The divisor is set by quota, not by contention** — measured, not assumed, and now up to 20
+concurrent cells. Per-window cost paired by zone: 5 → 10 cells is **1.01×**; 10 → 20 cells is
+**1.24×**, against the **1.33×** predicted by the narrower fleet that quota forced at 20. Fleet
+width more than accounts for the slowdown, so no contention term survives. No spill, and no task
+ever waited for a worker. An earlier forecast applied a 1.04× penalty per cell — implying 2.56× at
+40 cells — which is **withdrawn**.
+
+Raw per-date medians do not compare across rungs, because each used a different set of zones and a
+date's cost tracks its **rectangle count** (in the 20-cell rung, a 10-rectangle zone cost 136.7 s
+and a 3-rectangle zone 25.5 s in the same run). Normalise per rectangle and pair by zone, or the
+comparison measures zone composition instead of concurrency.
 
 ---
 ## 3. What each change bought
@@ -871,23 +848,26 @@ overhead (dask scheduler + flow runner):
 | 120 | 102 | 500 | 20 | 705 | 1.00× |
 | 250 | 68 | 1020 | 9 | 477 | 0.68× |
 
-**The optimum is broad and sits at 30–45 workers per cell, ~20% better than 120.** The mechanism is
-just the fixed term: every date pays ~36 s regardless, and a wide cell pays it with more workers
-standing by. Below ~30 the per-cell control overhead starts eating the gain, which is what flattens
-the curve rather than any property of the workload.
+> **CORRECTION — the table above and the two conclusions drawn from it are SUPERSEDED.** Both of
+> its inputs turned out to be wrong. (1) The width curve was fitted from **two** paired points (60
+> and 120), which cannot constrain a two-parameter model: a third control at 45 workers put `F`
+> anywhere from 11.4 to 39.3, and the three-point fit `T = 18.0 + 9391/W` makes aggregate
+> throughput **flat within ~6% from 20 to 120 workers**. There is no meaningful optimum, so the
+> "30–45 workers, ~20% better than 120" claim is **withdrawn** — prefer whatever width is simplest
+> to operate. (2) The per-cell interference of 1.04× came from a single two-cell measurement and is
+> **withdrawn**: none is measurable to 20 concurrent cells (§1). The table is kept because its
+> *shape* — throughput per vCPU falling as cells widen — survives both corrections, and because the
+> reasoning is worth not repeating.
 
-**Wide cells are better than the record claimed and still lose.** 250 workers buys 1.46× per cell,
-500 buys 1.89×, unlimited ~2.8× — but throughput per vCPU falls monotonically, so **more, narrower
-cells is the topology** at any fleet size. A 10,000 vCPU fleet is ~50 cells of 45 workers →
-**~850 dates/h**, putting a 112-zone optical campaign near 1.5–2 days of ingest.
+What does survive: **wide cells are better than this record originally claimed and still lose per
+vCPU.** 250 workers buys 1.46× per cell, 500 buys 1.89×, unlimited ~2.8×, while throughput per vCPU
+falls monotonically. Combined with flat width sensitivity and no measurable interference, the
+practical rule is that **topology barely matters — pick the width that is easiest to run** and
+spend the quota on more cells.
 
-**Two honest limits on the above.** The fit rests on **two** paired points (60 and 120), so 30 and
-45 are extrapolation — the only 30-worker measurement we have is pre-overlap and stale, and paired
-30/45 rungs are the cheapest outstanding experiment. And nothing above 2 concurrent cells has been
-measured: at 2 cells the interference is 1.04× and nothing shared shows stress (per-cell schedulers,
-separate store prefixes at ~65 PUT/s against 3,500, zero SlowDown anywhere), but aggregate
-source-read elasticity and the ECS start storm are open. Fargate's launch rate is **20 tasks/s
-sustained, 100 burst** — a 10,000 vCPU fleet is ~2,300 tasks, so ~2 minutes of ramp unless raised.
+The remaining open constraint is not contention but **launch**: Fargate sustains **20 tasks/s, 100
+burst**, and a 10,000 vCPU fleet is ~2,300 tasks, so about two minutes of ramp unless raised.
+Aggregate source-read elasticity at large cell counts is still unmeasured.
 
 ### 3.15 Load blocks re-unified with store chunks — width, not dispatch, was the limit
 
@@ -1328,41 +1308,35 @@ and shrink toward nothing as window count fell. Three ROIs, each run twice at S1
 Bigger than predicted, and — the part that matters — **flat in window count**. Nine windows gained
 marginally *more* than twenty-three. That refutes the reasoning behind the prediction.
 
-> **CORRECTION.** The superseded claim was that a date's sequential cost is the SUM of its windows
-> while its overlapped cost is roughly the MAX, making the gain scale with window count. Flat
-> gains across a 3.3× spread in window count are not consistent with that, so the sum-over-max
-> account is wrong and is withdrawn.
+> **TWO MECHANISM ACCOUNTS HAVE BEEN PROPOSED AND BOTH ARE WITHDRAWN.** The gain is real and
+> reproducible; why it is the size it is remains **unexplained**. Recorded in full because the
+> pattern of failure is itself the useful part.
+>
+> 1. **Sum-over-max.** A date's sequential cost is the SUM of its windows and its overlapped cost
+>    roughly the MAX, so the gain should scale with window count. **Refuted:** flat across a 3.3×
+>    spread in window count (above).
+> 2. **Fleet occupancy.** One window's graph is only a few tasks wide, so sequential writing
+>    occupies little of the fleet however many windows queue behind it; the gain would then be
+>    fleet width ÷ per-window width, which drops window count out (consistent with the table) and
+>    predicts the gain should **grow with fleet width**. **Refuted:** a 2×2 on 35N, all four arms
+>    launched together, gave **3.67× at 30 workers and 3.85× at 60** — a 1.05× difference, at the
+>    5% noise floor. Doubling the fleet did not move it.
 
-**The mechanism is fleet occupancy, not window arithmetic.** A single window's task graph is only
-a few tasks wide. Writing windows one at a time therefore occupies only that much of the fleet no
-matter how many windows wait behind it; the rest of the fleet idles. Overlapping makes every
-window's graph live at once, so they collectively fill the fleet:
+**What is established, and it is the operationally important part:** overlapping S1's window
+writes buys **2.4–3.9×** on per-date write time, and that gain is **insensitive to both variables
+tested** — window count over a 3.3× range and fleet width over a 2× range. An effect that does not
+move with either is one we can apply across the campaign rather than only to the zones and widths
+it was measured on. That is a stronger operational position than either mechanism would have given.
 
-```
-SEQUENTIAL — one window's graph at a time, so the fleet is mostly idle
-   fleet (30 workers)
-   ├──────────────────────────────┤
-   │####..........................│   window 1   ─┐
-   │####..........................│   window 2    │  one after another:
-   │####..........................│   window 3    │  23 x (narrow and slow)
-   │            ...               │               ─┘
+Two cautions on the numbers. The measured ratio is **what shipping the pair buys, not the overlap
+alone**: the merge rate now follows the write mode, so the overlapped arms derive 25 windows to the
+sequential arms' 23 and write ~6% less dead area. And because the mechanism is unknown, treat the
+magnitude as an empirical range rather than something to extrapolate from — in particular, do not
+assume it holds at fleet widths far outside 30–60.
 
-OVERLAPPED — every window's graph is live, so the fleet fills
-   ├──────────────────────────────┤
-   │##############################│   windows 1..23 together
-```
-
-So the gain is **fleet width ÷ per-window width**, capped once the windows collectively saturate
-the fleet. Window count drops out of that expression entirely, which is why the measurements are
-flat — and it predicts something the withdrawn account did not: **the gain should grow with fleet
-width**, since a wider fleet leaves a sequential writer proportionally more idle capacity to
-recover. At 30 workers it is ~2.4–2.9×.
-
-Two consequences worth stating plainly. The gain **generalises across the campaign** rather than
-concentrating in dense zones, because it never depended on window count. And **narrowing S1
-windows now looks more attractive, not less** — under the withdrawn account fewer, larger windows
-were preferable; under fleet occupancy, narrower windows raise the parallel width available per
-unit of work.
+One consequence survives both withdrawals: **narrowing S1's per-date windows is worth doing**
+(§4.9 continues below). That case rests on the measured fraction of windows a pass actually
+reaches, not on either mechanism.
 
 **The largest remaining S1 win is per-date window narrowing, and it is bigger than expected.**
 S2 narrows each date to the windows that date's own imagery can reach (`windows_for_date`); S1
@@ -1754,3 +1728,41 @@ Read it on every rung rather than waiting to be asked.
 For graph work, the cheapest and sharpest instrument is local: build one date's graph, call
 `dask.optimize`, and count `__dask_graph__()` keys by prefix. No cluster, no spend, exact
 answer.
+
+---
+
+## 10. Reading and maintaining this document
+
+### How to compare the numbers
+
+- **Wall clock.** Unless stated otherwise, every timing is zone `35N`, January 2024, 120 workers,
+  one frozen ROI mask. Figures from other zones, widths or dates say so, and cross-zone timings do
+  **not** compare — a date's cost tracks its rectangle count, which varies several-fold between
+  zones.
+- **Worker memory is not constant across rows**: 16 GiB up to 2026-07-25, 20 GiB after, and back
+  to **16 GiB from 2026-07-27** (§4.8). Memory size barely moves wall clock, so the timing rows
+  still compare — but a peak-memory figure only means something beside the limit it was measured
+  against.
+- **Graph-task counts** come from local census runs over a fixed pixel window. They compare within
+  a series, not across series, and are labelled accordingly.
+- **Two independent instruments** appear throughout: wall clock from logs, and packed task work
+  from Dask performance reports. Where they agree the result is solid; where they disagree, the
+  report has usually been truncated (§3.14).
+
+### The rules this record is kept by
+
+**Corrections go in place, with the superseded claim named** (§5 collects them), never as an
+appended log. A reader must be able to trust any section without checking whether a later one
+quietly undoes it — that property is the document's whole value, and it has been violated twice by
+leaving an old number in one section while correcting it in another.
+
+**Depth increases through the document.** §1 is the actionable summary and should stay readable by
+someone who has never touched the ingest; the mechanism belongs in §2, and the full numbers in §3,
+§4 and §8. Resist moving detail forward — a header dense with caveats stops people reading §1 at
+all.
+
+**Failed attempts stay, with their numbers** (§4). They are the cheapest thing here: each one is a
+path a future reader would otherwise re-walk. The same goes for withdrawn claims — §5 exists so
+that a plausible idea already measured and killed is not revived a third time.
+
+**New measurements belong in §8**, one row each, with what they supersede named in the row.
