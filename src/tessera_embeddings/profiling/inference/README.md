@@ -49,12 +49,24 @@ te-observe-cluster \
 ## Tools
 
 - **`observe_cluster.py`** — against a live cluster: `--start-pollers`
-  launches 1 s nvidia-smi + DCGM (SMACT/TENSO/DRAMA) + host-RAM captures on
-  every GPU worker via SSM; `--report` fetches per-worker GPU/RAM summaries,
-  OOM events, and a per-chunk phase-split table (preferring the actors'
-  `CHUNK_SUMMARY` JSON lines; legacy prose-log parsing remains as a fallback
-  for runs from older code); `--ram-report` reconstructs RAM/GPU rollups and
-  1 s spike analysis from CloudWatch after teardown.
+  launches 1 s nvidia-smi + DCGM (SMACT/TENSO/DRAMA) + host-RAM + outbound-:443
+  socket captures on every GPU worker via SSM; `--report` fetches per-worker
+  GPU/RAM summaries, a staging-write concurrency histogram, OOM events, and a
+  per-chunk phase-split table (preferring the actors' `CHUNK_SUMMARY` JSON
+  lines; legacy prose-log parsing remains as a fallback for runs from older
+  code); `--ram-report` reconstructs RAM/GPU rollups and 1 s spike analysis
+  from CloudWatch after teardown.
+
+  **Staging-write concurrency.** The phase table reports what a write cost, not
+  why. Zarr caps its own concurrent store operations, so a write costing more
+  wall time than its byte volume explains has two causes that look identical
+  from outside: the cap is binding, or each request is slow (host CPU contention
+  with inference prep, or S3 throttling the staging prefix). Only the first is
+  fixed by raising the cap. The histogram separates them — samples piling onto
+  one level mean the cap binds; a spread below it means the writer is not
+  saturating the parallelism it already has. The sampler counts all outbound
+  TLS, so the SSM/CloudWatch agents form a small constant floor: read the swing
+  above it, not the absolute number.
 - **`compare_coarsened_stores.py`** — bit-identity check between two
   *coarsened* (e.g. 500 m) embedding icechunk stores (float32 pre-dequantized
   `embeddings`, uint32 obs counts — no `scales`). Compares raw bit patterns;

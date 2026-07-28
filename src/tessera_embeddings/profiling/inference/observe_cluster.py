@@ -7,17 +7,26 @@ Workers are discovered by the Ray autoscaler's own tags (``ray-cluster-name``
 reachable via ``--cluster``/``--cluster-prefix`` regardless of naming scheme.
 
 1. ``--start-pollers`` — start 1 s pollers on every GPU worker via SSM:
-   ``nvidia-smi``, DCGM (``dcgmi dmon``: GRACT/SMACT/TENSO/DRAMA/PCIe), and a
-   host-RAM sampler (used/avail/pct + top-3 process RSS each second). The RAM
-   sampler writes where the CloudWatch agent's dedicated ``ram_poll`` entry
-   ships it — so 1 s RAM data SURVIVES cluster teardown (the GPU/DCGM CSVs
-   stay in /tmp and die with the worker; summarize them live).
+   ``nvidia-smi``, DCGM (``dcgmi dmon``: GRACT/SMACT/TENSO/DRAMA/PCIe), a
+   host-RAM sampler (used/avail/pct + top-3 process RSS each second), and an
+   outbound-:443 socket sampler standing in for staging-write concurrency. The
+   RAM sampler writes where the CloudWatch agent's dedicated ``ram_poll`` entry
+   ships it — so 1 s RAM data SURVIVES cluster teardown (the GPU/DCGM/socket
+   captures stay in /tmp and die with the worker; summarize them live).
 2. ``--report`` — fetch a fleet report from live workers: per-worker GPU-poll
    summary (avg/max util, avg power, busy fraction), a 1 s RAM summary (peak,
-   time ≥55%/60%, top spikes), OOM forensics (kernel OOM-killer + Ray memory
-   monitor events), and a per-chunk phase-split table. The table prefers the
-   actors' machine-readable ``CHUNK_SUMMARY`` JSON lines and falls back to
-   legacy prose-log regex parsing for runs from older code.
+   time ≥55%/60%, top spikes), a staging-write concurrency histogram, OOM
+   forensics (kernel OOM-killer + Ray memory monitor events), and a per-chunk
+   phase-split table. The table prefers the actors' machine-readable
+   ``CHUNK_SUMMARY`` JSON lines and falls back to legacy prose-log regex
+   parsing for runs from older code.
+
+   The concurrency histogram answers a question the phase table cannot: when a
+   staging write costs more wall time than its byte volume explains, is the
+   writer's concurrency cap binding, or is each request slow? Sockets piling
+   onto a single level say the cap binds and raising it should help; a spread
+   below the cap says the writer is not saturating what it already has, and the
+   cost lies in host CPU contention or S3 throttling instead.
 3. ``--ram-report`` — post-hoc, from CloudWatch (no live cluster needed):
    per-worker peak host RAM + GPU-util distribution from the 30 s RESOURCES
    lines, plus — when the 1 s RAM poller ran — a per-worker 1 s rollup
@@ -130,18 +139,83 @@ while True:
     time.sleep(1)
 """
 
+# 1 s sampler for OUTBOUND HTTPS socket count — a proxy for how many staging
+# PUTs are actually in flight at once.
+#
+# The staging write is a Zarr store write, and Zarr caps its own concurrent
+# store operations at ``async.concurrency``. When a write is slower than its
+# byte volume can explain, two very different causes look identical from the
+# outside: the concurrency cap is binding (the writer wants more parallelism
+# than it is allowed), or each individual request is slow (host CPU starved by
+# inference prep, or S3 throttling the prefix). Raising the cap only helps in
+# the first case, so the two must be told apart before tuning anything.
+#
+# Counting established sockets separates them directly. If the count pins at
+# the configured cap for the duration of a write, the cap binds. If it sits
+# below the cap, the writer is not even saturating what it already has and the
+# latency is elsewhere. The report prints a full histogram rather than a mean
+# for exactly this reason — a plateau is the signal, and an average smears it.
+#
+# Caveat: this counts ALL outbound :443, not S3 specifically. A GPU worker's
+# other TLS talkers (SSM agent, CloudWatch agent) are few and long-lived, so
+# they form a small constant floor; the write-driven swing above that floor is
+# what carries meaning. Reads /proc/net directly — no `ss` or psutil needed.
+S3_POLLER_PY = r"""
+import os, time
+from datetime import datetime, timezone
+
+REMOTE_PORT_HEX = "01BB"  # 443
+ESTABLISHED = "01"
+
+def counts():
+    # (established, actively-sending) sockets to a remote :443.
+    est = sending = 0
+    for proc in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(proc) as f:
+                next(f, None)  # header
+                for line in f:
+                    c = line.split()
+                    if len(c) < 5 or c[3] != ESTABLISHED:
+                        continue
+                    if not c[2].endswith(":" + REMOTE_PORT_HEX):
+                        continue
+                    est += 1
+                    # tx_queue:rx_queue — a non-empty send queue means bytes
+                    # are still going out on that socket right now.
+                    if int(c[4].split(":")[0], 16) > 0:
+                        sending += 1
+        except OSError:
+            pass
+    return est, sending
+
+# Truncate at startup, matching the other pollers: a re-run must not report the
+# prior session's plateau as this run's.
+path = "/tmp/s3_poll.log"
+open(path, "w").close()
+while True:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        est, sending = counts()
+        with open(path, "a") as f:
+            f.write(f"S3POLL ts={ts} est443={est} sending={sending}\n")
+    except Exception:
+        pass
+    time.sleep(1)
+"""
+
 # Kill any prior pollers before starting new ones. Match the actual long-lived
-# processes (the `nvidia-smi --query-gpu ... -l`, `dcgmi dmon`, and ram_poll.py
-# command lines), not just the redirect-filename wrapper — otherwise re-running
-# --start-pollers leaves the old samplers writing concurrently to the same
-# files and corrupts the measurements. The `[n]`/`[d]`/`[r]` bracket idiom
-# keeps the pattern from matching any shell whose own command line contains it
-# (e.g. an SSM wrapper), which pkill -f would otherwise kill before the
-# poller-start commands run.
+# processes (the `nvidia-smi --query-gpu ... -l`, `dcgmi dmon`, ram_poll.py and
+# s3_poll.py command lines), not just the redirect-filename wrapper — otherwise
+# re-running --start-pollers leaves the old samplers writing concurrently to the
+# same files and corrupts the measurements. The `[n]`/`[d]`/`[r]`/`[s]` bracket
+# idiom keeps the pattern from matching any shell whose own command line
+# contains it (e.g. an SSM wrapper), which pkill -f would otherwise kill before
+# the poller-start commands run.
 POLLER_COMMANDS = [
     (
         "pkill -f '[n]vidia-smi --query-gpu' 2>/dev/null; pkill -f '[d]cgmi dmon' 2>/dev/null; "
-        "pkill -f '[r]am_poll.py' 2>/dev/null; true"
+        "pkill -f '[r]am_poll.py' 2>/dev/null; pkill -f '[s]3_poll.py' 2>/dev/null; true"
     ),
     (
         "setsid nohup bash -c 'nvidia-smi --query-gpu=timestamp,utilization.gpu,"
@@ -155,7 +229,9 @@ POLLER_COMMANDS = [
     ),
     f"cat > /tmp/ram_poll.py << 'RAMPYEOF'\n{RAM_POLLER_PY}\nRAMPYEOF",
     "setsid nohup python3 /tmp/ram_poll.py </dev/null >/dev/null 2>&1 &",
-    "sleep 2; pgrep -af 'nvidia-smi --query|dcgmi dmon|ram_poll' | head -6",
+    f"cat > /tmp/s3_poll.py << 'S3PYEOF'\n{S3_POLLER_PY}\nS3PYEOF",
+    "setsid nohup python3 /tmp/s3_poll.py </dev/null >/dev/null 2>&1 &",
+    "sleep 2; pgrep -af 'nvidia-smi --query|dcgmi dmon|ram_poll|s3_poll' | head -8",
 ]
 
 GPU_SUMMARY_CMD = (
@@ -175,6 +251,22 @@ RAM_SUMMARY_CMD = (
     'n, s/n, mx, ts, h55, h60; else print "no ram_poll data (pollers not started?)"}\' "$F"; '
     "echo '--- top 5 RAM spike samples ---'; "
     "grep -h '^RAMPOLL' \"$F\" 2>/dev/null | sort -t= -k5 -rn | head -5; true"
+)
+
+# 1 s outbound-:443 socket summary. The HISTOGRAM is the point, not the mean:
+# the question this answers is whether the writer's concurrency cap is binding,
+# and that shows up as the sample count piling onto one value (the cap) rather
+# than spreading. A mean over a run that is mostly inference — few sockets —
+# and briefly writing — many — lands in between and says nothing.
+S3_SUMMARY_CMD = (
+    'F=/tmp/s3_poll.log; [ -f "$F" ] || { echo "no s3_poll data (pollers not started?)"; exit 0; }; '
+    'awk \'/^S3POLL/{split($3,a,"="); e=a[2]+0; split($4,b,"="); s=b[2]+0; '
+    "n++; se+=e; ss+=s; h[e]++; if(e>mx)mx=e; if(s>smx)smx=s} "
+    'END{if(n==0){print "no samples"; exit} '
+    'printf "samples=%d  established:443 mean=%.1f max=%d | sending mean=%.1f max=%d\\n", '
+    "n, se/n, mx, ss/n, smx; "
+    'print "concurrency histogram (sockets -> seconds at that level):"; '
+    'for(k=0;k<=mx;k++) if(h[k]>0) printf "  %3d -> %d\\n", k, h[k]}\' "$F"'
 )
 
 # Runs on the worker: build the per-chunk phase table. Preferred source is the
@@ -289,6 +381,8 @@ REPORT_COMMANDS = [
     "tail -6 /tmp/dcgm_poll.txt 2>/dev/null || echo no-dcgm",
     "echo '=== RAM POLL SUMMARY (1s) ==='",
     RAM_SUMMARY_CMD,
+    "echo '=== S3 WRITE CONCURRENCY (1s) ==='",
+    S3_SUMMARY_CMD,
     "echo '=== OOM / MEMORY EVENTS ==='",
     (
         "{ sudo -n dmesg -T 2>/dev/null || dmesg -T 2>/dev/null; } "
