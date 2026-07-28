@@ -382,9 +382,20 @@ def ingest_s2_roi_reflectance(
         mutated outside its return value would race the writer. Everything the write
         needs travels back in the :class:`_PreparedDate`.
         """
-        # The group's own date, which is all a skipped date needs; refined below to the
-        # mosaic's solar day, which is only knowable once the load has resolved it.
-        date = day_items[0].datetime.strftime("%Y-%m-%d")
+        # THE GROUP'S SOLAR DAY, which is what this mosaic slice represents. Every item in
+        # the group shares it by construction — it is the grouping key — so any item yields
+        # it, and shifting one item is cheaper than threading the key through the pipeline.
+        #
+        # Deliberately NOT taken from the loaded dataset's own time coordinate. odc stamps
+        # each group with `group[0].nominal_datetime`, and `preserve_original_order=True`
+        # (needed so the clearest tile paints last) makes group[0] the CLOUDIEST item, whose
+        # acquisition time is arbitrary within the day. Where the solar offset is large
+        # enough to cross UTC midnight, that timestamp's calendar date can be the day
+        # BEFORE the solar day — so two consecutive solar days can normalise onto the same
+        # date and collide. Measured on 56N (+10 h): six of twenty-two days landed on the
+        # previous date, and which six depended on cloud cover, not geography.
+        solar_offset = timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
+        date = (day_items[0].datetime + solar_offset).strftime("%Y-%m-%d")
 
         # ONE load per date, serving both the coverage gate and the write. SCL is
         # among the written bands, so a separate gate-only load re-read it and paid
@@ -427,7 +438,10 @@ def ingest_s2_roi_reflectance(
         if not passes:
             return _PreparedDate(date, None, [], build_s, gate_s, "coverage")
 
-        date = str(day_ds.time.dt.date.values[0])
+        # Stamp the slice with its SOLAR DAY. The axis is day-granular either way — this
+        # only decides WHICH day — and taking it from the grouping rather than from odc's
+        # label is what makes the value identify the day it describes, unique per slice and
+        # monotonic across them.
         day_ds["time"] = [np.datetime64(date, "ns")]
 
         # Narrow this date's writes to the land its own imagery reaches. The run's

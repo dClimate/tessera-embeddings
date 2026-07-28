@@ -36,6 +36,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal, cast, final
 
 import dask.distributed
+import numpy as np
 import xarray as xr
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
@@ -145,7 +146,11 @@ class _PreparedBatch:
     #: Solar day (keyed by the loaded slice's own timestamp) -> the live windows that day's
     #: imagery reaches. Empty list = reaches nothing, so skip. Missing key = unknown, so
     #: write everything. Empty dict = the whole batch falls back.
-    date_windows: dict[str, list[tuple[int, int, int, int]]]
+    #: Loaded-slice timestamp -> (that slice's SOLAR DAY, the live windows its imagery
+    #: reaches). The solar day is carried because odc labels a slice with its first
+    #: item's timestamp, whose calendar date can differ from the solar day the slice
+    #: actually represents wherever the offset crosses UTC midnight.
+    date_windows: dict[str, tuple[str, list[tuple[int, int, int, int]]]]
 
 
 def _baselines_for(baselines: dict[str, int], dates: Iterable[str]) -> dict[str, int]:
@@ -334,7 +339,7 @@ def ingest_s1_roi_sar(
 
     mid_longitude = solar_grouping_longitude(roi)
 
-    def _date_footprints(items: list) -> dict[str, list[tuple[int, int, int, int]]]:
+    def _date_footprints(items: list) -> dict[str, tuple[str, list[tuple[int, int, int, int]]]]:
         """Per solar day, the live windows that day's imagery can actually reach.
 
         Empty list for a day whose imagery reaches NO live window — those days are skipped
@@ -356,8 +361,8 @@ def ingest_s1_roi_sar(
                 return {}  # cannot group reliably; fall back for the whole batch
             by_day.setdefault((when + offset).date(), []).append(item)
 
-        out: dict[str, list[tuple[int, int, int, int]]] = {}
-        for day_items in by_day.values():
+        out: dict[str, tuple[str, list[tuple[int, int, int, int]]]] = {}
+        for solar_day, day_items in by_day.items():
             # odc's coordinate for this group is its EARLIEST item's timestamp.
             key = _footprint_key(min(i.datetime for i in day_items))
             narrowed = windows_for_date(
@@ -372,7 +377,7 @@ def ingest_s1_roi_sar(
             # windows_for_date returns its INPUT unchanged when the footprint cannot be
             # determined, so an unchanged length is not evidence of narrowing — that is
             # fine here, since writing the full set is the conservative outcome anyway.
-            out[key] = [(w.y0, w.y1, w.x0, w.x1) for w in narrowed]
+            out[key] = (solar_day.isoformat(), [(w.y0, w.y1, w.x0, w.x1) for w in narrowed])
         return out
 
     total_processed = 0
@@ -532,9 +537,18 @@ def ingest_s1_roi_sar(
                 # whole loop would restart at a date an earlier attempt already
                 # committed and trip the duplicate-date guard.
                 for i in range(data.sizes["time"]):
-                    # datetime64 stringifies as "YYYY-MM-DDThh:mm:ss…"; the date half is
-                    # all this needs, and it matches get_existing_dates' own slicing.
-                    date_str = str(data["time"].values[i])[:10]
+                    # Match this slice on its EXACT timestamp — the value odc took from the
+                    # group's first item — and take BOTH the solar day and the footprint from
+                    # what was grouped. The slice's own label cannot be trusted as the day:
+                    # odc stamps it with an item timestamp whose calendar date can be the day
+                    # BEFORE the solar day wherever the offset crosses UTC midnight, so two
+                    # solar days can normalise onto one date and collide on the time axis.
+                    #
+                    # Unmatched means the footprint is unknown, so fall back to the label —
+                    # the pre-existing behaviour, and the conservative branch.
+                    entry = prepared.date_windows.get(str(data["time"].values[i])[:19])
+                    solar_day, footprint = entry if entry else (None, None)
+                    date_str = solar_day or str(data["time"].values[i])[:10]
                     # THE authority on what has been written, checked here rather than
                     # relying on the query filter: under a look-ahead the query for this
                     # batch may have been built before an earlier batch committed, so a
@@ -544,11 +558,6 @@ def ingest_s1_roi_sar(
                         log.info("[%s] Skipping date %s: already written", orbit, date_str)
                         continue
 
-                    # This date's own footprint, matched on the slice's exact timestamp —
-                    # the same value odc took from the group's earliest item. A MISSING key
-                    # means the footprint is unknown, so write everything; it must never
-                    # mean write nothing.
-                    footprint = prepared.date_windows.get(str(data["time"].values[i])[:19])
                     if footprint is not None and not footprint:
                         # Reaches no live window at all. Writing it would build a full graph
                         # to store nothing, since all-fill chunks are never persisted.
@@ -556,6 +565,13 @@ def ingest_s1_roi_sar(
                         empty_dates += 1
                         continue
                     date_windows = footprint if (narrow_windows_per_date and footprint) else live_windows
+
+                    # Stamp the slice with its solar day. The store's axis is day-granular
+                    # either way, so this only decides WHICH day — and taking it from the
+                    # grouping is what makes it unique per slice and monotonic across them.
+                    day_slice = data.isel(time=slice(i, i + 1))
+                    if solar_day:
+                        day_slice = day_slice.assign_coords(time=[np.datetime64(solar_day, "ns")])
 
                     # Inside the per-date loop deliberately: a batch can outlive the
                     # credential, so renewing only at batch boundaries is what failed.
@@ -565,7 +581,7 @@ def ingest_s1_roi_sar(
                         with attempt:
                             write_day_windows(
                                 orbit_store,
-                                data.isel(time=slice(i, i + 1)),
+                                day_slice,
                                 date_windows,
                                 roi=roi,
                                 manifest=ingest_manifest,
