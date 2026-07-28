@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Literal, final
@@ -377,10 +377,19 @@ def ingest_s1_roi_sar(
     # look-ahead already covers it; more would retain catalogue items to hide nothing.
     # Unpipelined, `pipelined` is bypassed entirely rather than run at depth 0 — the
     # serial path must stay available as a rollback that shares no machinery.
-    if pipeline_batches:
-        prepared_batches = pipelined(batch_ranges, _prepare_batch, depth=1)
-    else:
-        prepared_batches = ((_prepare_batch(rng), 0.0) for rng in batch_ranges)
+    def _serially() -> Iterator[tuple[_PreparedBatch, float]]:
+        """The rollback path, yielding the same ``(prepared, stall)`` shape as the pipeline.
+
+        ``stall`` is the preparation the consumer had to WAIT for, so serially it is the
+        whole query — not zero. Reporting zero would make ``hidden`` read as the full query
+        and claim the serial path hides everything, which is backwards, and would corrupt
+        any A/B using that log line as its instrument.
+        """
+        for rng in batch_ranges:
+            prepared_serial = _prepare_batch(rng)
+            yield prepared_serial, prepared_serial.query_s
+
+    prepared_batches = pipelined(batch_ranges, _prepare_batch, depth=1) if pipeline_batches else _serially()
 
     for prepared, stall_s in prepared_batches:
         batch_start_str, batch_end_str = prepared.start, prepared.end
