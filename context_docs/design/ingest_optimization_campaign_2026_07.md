@@ -59,6 +59,29 @@ many small rectangles into fewer larger ones was worth 6.2× even though it comp
 including some ocean. Almost every subsequent tuning decision is a version of this trade:
 how much dead area is worth avoiding one more boundary.
 
+```
+        the whole zone            only the land            land, merged
+     (what we used to do)       (many rectangles)      (fewer rectangles)
+
+    ┌──────────────────┐      ┌──────────────────┐    ┌──────────────────┐
+    │~~~~~~~~~~~~~~~~~~│      │~~~~~~~~~~~~~~~~~~│    │~~~~~~~~~~~~~~~~~~│
+    │~~~~~▓▓▓▓~~~~~~~~~│      │~~~~~[▓▓▓]~~~~~~~~│    │~~~~[▓▓▓▓▓▓▓▓]~~~~│
+    │~~~▓▓▓▓▓▓▓▓~~~~~~~│      │~~~[▓▓▓▓▓▓▓]~~~~~~│    │~~~~[▓▓▓▓▓▓▓▓]~~~~│
+    │~~~~▓▓▓▓~~~~▓▓~~~~│      │~~~~[▓▓▓]~~[▓▓]~~~│    │~~~~[▓▓▓▓▓▓▓▓]~~~~│
+    │~~~~~~~~~~~~~~~~~~│      │~~~~~~~~~~~~~~~~~~│    │~~~~~~~~~~~~~~~~~~│
+    └──────────────────┘      └──────────────────┘    └──────────────────┘
+      computes everything;      4 boundaries to pay     2 boundaries, some
+      ~78% of it is ocean       for, almost no           ocean recomputed —
+      → never finished          wasted area              and it is FASTER
+
+    ~ ocean, nothing to compute    ▓ land    [ ] one rectangle we write
+```
+
+The right-hand picture is the counter-intuitive one, and it is this campaign's central lesson:
+**deliberately computing some ocean is cheaper than paying for another boundary.** Every later
+tuning question — how coarsely to merge, when to stop — is that same trade re-priced as the other
+costs moved.
+
 **The scheduler is single-threaded, and it is the thing that runs out.** Its dispatch loop uses
 one core no matter how many it is given, so the number of *tasks* a date creates — not the number
 of pixels — sets how much fleet a single run can usefully absorb. This is why work went into
@@ -169,51 +192,99 @@ all without it.
 
 ---
 
-## 2. The one equation, and why it is the whole story
+## 2. The shape of the cost — a picture and two formulas
+
+### Where a date's time goes
 
 ```
-graph_tasks_per_date  ≈  4 × n_bands (11) × area_in_blocks
+   ONE DATE, dense zone, 60 workers  (~175 s)
+   ├─────────────────────────────────────────────────────────────────┐
+   │ prepare ~20 s        │ write ~150 s                    │ commit │
+   │ ask the catalogue,   │ read + reproject + mask + store  │  <1 s  │
+   │ build the graph,     │ every live rectangle             │        │
+   │ check for cloud      │                                  │        │
+   └──────────────────────┴──────────────────────────────────┴────────┘
+       ^ can overlap the                ^ THE COST. Of the part that
+         PREVIOUS date's write            runs on workers, ~72% is
+         (this is "pipelining")           reading and resampling
+                                          source imagery — real data
+                                          movement, not overhead
 ```
 
-Measured by building a real date's graph and classifying every task by key prefix. The
-submitted (culled) graph is ~4 tasks per (block × band): the `odc.stac.load` fetch/mosaic, the
-mask `where`, a `getitem`, and the store write. Predictions matched observed cluster graphs to
-within 0.5% — a 972-chunk window predicted 42,768 tasks and measured 42,588; a 1,904-chunk
-window predicted 83,776 and measured 84,054.
+Two things follow. The write dominates, so anything that does not shrink the write, overlap it,
+or remove a boundary from it will not move the total. And the preparation is *hideable* — it can
+run during the previous date's write — which is why the overlap changes paid and why several
+later ideas did not: once preparation is fully hidden, hiding it harder buys nothing.
 
-Everything that worked reduced one of those three multiplicands. Everything that failed either
-raised the task count or traded it for something more expensive.
-
-**A hypothesis worth recording as dead:** `odc.stac.load` emits ONE `open-<band>` task per
-source ITEM (956 for a solar day over a 6° zone), **not** per (item, block). The per-block path
-was already lean; there is no elementwise fat to fuse away. Anyone who assumes ~1,000 items
-means ~1,000 tasks per block will chase the wrong thing.
-
-### The cost model: a dispatch floor, not a linear sum
+### How big is the work? Task count, not pixel count
 
 ```
-per_date  ≈  C  +  Σ_windows  max( F , tasks_w / R )
+tasks for one date  ≈  4  ×  bands (11)  ×  area in blocks
+                       ^        ^                  ^
+                       |        |                  how many blocks the
+                       |        |                  live rectangles cover
+                       |        one task set per band
+                       fetch, mask, select, store
 ```
 
-- **R ≈ 600–800 tasks/s** — the single-threaded Dask scheduler's dispatch rate.
-- **F ≈ 7.04 s** — per-window blocking cost; binds only when a window is small enough that
-  `tasks_w / R < F`.
-- **C ≈ 15–20 s** — per-date constant on the ingest worker (client graph build, gate, commit).
+This predicted real graphs to within 0.5% (a 972-block window predicted 42,768 tasks and
+measured 42,588). It matters because the **scheduler dispatches tasks on a single thread**, so
+task count — not data volume — is what limits how much fleet one run can absorb. Every change
+that worked reduced one of those three multiplicands; every change that failed either raised the
+count or traded it for something dearer.
 
-A linear `n_windows × F + area × V` was fitted first and **failed its first out-of-sample
-test** (predicted 122 s at 3 windows; measured 193.9). The `max()` form reproduces all three
-window configurations, including the plateau that killed the linear model:
+> **Dead hypothesis worth recording.** The loader emits one open-file task per source *image*
+> (about 956 for one day over a 6° zone), **not** one per image per block. The per-block path was
+> already lean, so there is no elementwise fat to fuse away. Anyone assuming a thousand images
+> means a thousand tasks per block will optimise the wrong thing.
 
-| windows | area | tasks/window | regime | predicted | measured |
-|---|---|---|---|---|---|
-| 197 | 2,428 | ~540 | latency-bound (F binds) | ~1,407 s | 1,329–1,471 s |
-| 15 | 2,563 | ~7.5k | dispatch-bound | ~180 s | 194–242 s |
-| 3 | 2,924 | 0.7k/43k/84k | dispatch-bound | ~199 s | 193.9 s |
+### Why cost is not proportional to area
 
-`V` was never fleet work — it was dispatch.
+```
+per_date  ≈  C  +  Σ over rectangles  max( F , tasks / R )
+                                      ^^^^^^^^^^^^^^^^^^^^
+                          a rectangle costs the GREATER of a fixed
+                          overhead and its dispatch time — never the sum
+```
+
+- **F** — fixed cost of one rectangle, about 7 s. Binds when the rectangle is small.
+- **R** — the scheduler's dispatch rate. Binds when the rectangle is large.
+- **C** — per-date constant: graph build, cloud check, commit.
+
+The `max()` is the whole point, and it is why a simpler "rectangles × fixed + area × rate" model
+was fitted first and **failed its first out-of-sample test** — it predicted 122 s where 194 s was
+measured. Small rectangles are latency-bound and large ones dispatch-bound, and a model that adds
+the two instead of taking the larger cannot reproduce either regime:
+
+| rectangles | tasks each | regime | predicted | measured |
+|---|---|---|---|---|
+| 197 | ~540 | latency-bound, F binds | ~1,407 s | 1,329–1,471 s |
+| 15 | ~7,500 | dispatch-bound | ~180 s | 194–242 s |
+| 3 | up to 84,000 | dispatch-bound | ~199 s | 193.9 s |
+
+> **The dispatch rate R is STALE and must not be used for planning.** It predicted a 150–190 s
+> floor for a dense date; the write alone now measures 79.8 s, roughly twice as fast. The advice
+> it produced — keep cells narrow to stay under the floor — is **withdrawn**. The `max()` shape
+> still holds; only the constant is wrong.
+
+### And the campaign multiplies out like this
+
+```
+campaign time  =  zone-hours per year  ×  years  ÷  cells run at once
+
+                  ^ set by per-date cost      ^ set by the QUOTA, because a
+                    and dates per year          real cell is three fleets
+                                                (S2 + both S1 orbits) at
+                                                ~744 vCPU, not one at ~248
+```
+
+Concurrency was measured, not assumed: per-cell throughput is **unchanged** from 5 concurrent
+cells to 10 (median ratio 0.99 across five paired zones, every one inside the noise floor), with
+no spill and no task ever waiting for a worker. So the divisor is limited by quota rather than by
+contention — which makes the account's vCPU limit, not interference, the thing that sets campaign
+duration.
 
 ---
-
 ## 3. What each change bought
 
 ### 3.1 Cropping to live windows — the precondition
@@ -912,10 +983,21 @@ source and destination grids align — a same-CRS zone workload should take it, 
 the campaign path unaffected; that specific prediction is **untested**. Also note bit parity with
 `main` was already impossible: main is at `INGEST_CHUNK_SIZE = 4000`, this branch at 4096.
 
-### 3.16 Batching dates — one compute, one commit, and the scheduler becomes the limit
+### 3.16 Batching dates — a win at one size, a LOSS at another, so it is sized per region
 
 `batch_dates=k` computes k consecutive PASSING dates as one dask graph and commits them as one
-snapshot. Measured on Iowa, 120 workers, 5 dates, same instrument on both arms:
+snapshot.
+
+> **CORRECTION, 2026-07-28. The "1.14× and adopt it" reading below is SUPERSEDED.** That figure is
+> real but it is one point on a curve that is **not monotonic**, and the same setting measured on
+> four further regions *loses* on two of them. Batching is therefore no longer a global setting: it
+> is chosen per region by a size threshold (`config.ingest.auto_batch_dates`), and `batch_dates`
+> defaults to "derive". The Iowa measurement and the scheduler-CPU ceiling below stand as written;
+> what changes is the conclusion drawn from them. See "The shape, and why a threshold" below.
+
+#### The original Iowa measurement
+
+Measured on Iowa, 120 workers, 5 dates, same instrument on both arms:
 
 | | build | gate | write | total/date | commits |
 |---|---|---|---|---|---|
@@ -977,6 +1059,49 @@ batch's gate computes, which touch one band (`scl`) against the write's eleven �
 That is a prediction; the 91-date 60-worker A/B on 35N is what tests it, and it is sized to span
 three monthly STAC rollovers because those, not the batch buffer, are where retained-item memory
 has failed before.
+
+#### The shape, and why it ships as a threshold (2026-07-28)
+
+Five regions, each arm **launched together** on the same dates so time-of-day and catalogue
+conditions cancel in the ratio, k=1 against k=4, both arms pipelined so batching alone varies:
+
+| region | live chunks | covered chunks | k=1 | k=4 | ratio | |
+|---|---|---|---|---|---|---|
+| 26S | 19 | 42 | 10.4 s | 6.5 s | **1.61×** | win |
+| 59S | 188 | 493 | 32.8 s | 29.4 s | **1.12×** | win |
+| 21N | 644 | 930 | 35.9 s | 50.6 s | **0.71×** | REGRESSION |
+| 35N | 2,415 | 2,620 | 175.6 s | 188.6 s | **0.93×** | mild regression |
+| 47N | 2,418 | 2,631 | 138.4 s | 136.6 s | 1.01× | neutral — 4 dates only, weak |
+
+35N is the best-powered row: 91 dates per arm. It **supersedes 47N's neutral reading**, which
+rested on four dates each. One caveat on 35N specifically — its two arms varied *both* batching and
+pipelining (control had neither), so its 7% cannot be attributed to batching alone; what ships on a
+region that size is k=1 *with* pipelining, and that combination is untested.
+
+**The arithmetic that explains the shape.** At batch size k the write costs `k·W` and the
+preparation running alongside it costs `k·P`, so per-date wall clock is `max(W, P) + commit/k`.
+Batching therefore buys **only commit amortisation** — it cannot make the write faster, because the
+fleet is already the constraint (§3.10) — and it **loses** wherever the larger write graph crowds
+out the concurrent preparation. 21N is that case exactly: at k=1 its preparation already fitted
+inside its write with zero stall, and batching disturbed an already-optimal overlap.
+
+**Why a threshold rather than a fitted curve.** A curve through a non-monotonic relation fits
+noise. The shipped threshold sits at the **top of the measured-win range**, not at an estimated
+crossover, so widening it requires measuring a region in between rather than interpolating.
+
+**Denominated in COVERED window area, and that couples it to §3.17.** Covered area is an *output*
+of the window merge, so changing the merge cost moves every region along this axis without anyone
+touching the threshold — a finer merge covers less, so regions drift downward and more of them
+batch. The offline census in the table above was computed at the sequential merge cost and reads
+about 1.25× the runtime value at the overlapped cost (21N: 930 census against 749 measured in a
+run). The threshold classifies all five regions correctly either way, but **recalibrate against
+runs, never an offline sweep taken at a different cost.**
+
+**Campaign value is modest, and the headline number is misleading.** Regions under the threshold
+are 31 of 111 zones — 28% by count but only **1.7% of total live chunk volume**. Weighting by wall
+clock rather than volume, since sparse regions still pay fixed per-date costs, the campaign saving
+is roughly **2–3%**. The 1.61× applies only to the very smallest regions. Its more valuable
+function is preventing a global k, which would have cost 29% on mid-sized regions.
 
 ## 4. What did not work, and why
 
@@ -1133,6 +1258,86 @@ Two further variants were rejected on arithmetic rather than experiment:
   per window** (n=2, wide spread, but it brackets the ~7 s of §3.2 rather than contradicting it).
   So 5 → 12 windows costs 50–120 s per date to save write area that §3.10 shows is not on the
   critical path.
+
+### 4.8 Worker memory back to 16 GiB — a rejected size that pruning made affordable
+
+`DEFAULT_INGEST_WORKER_MEM` 20480 → **16384 MiB** (2026-07-28). Not a new idea: 16384 was
+**explicitly rejected** once, on the grounds that "demand is ~12.4 GiB; 16 GiB leaves ~0.4 GiB of
+margin which is too thin". That premise no longer holds, because pruning the retained catalogue
+entries (§3.13) took roughly 3.3 GiB off the driver worker.
+
+Measured over a 91-date run spanning three monthly rollovers, 60 workers, dense zone:
+
+| arm | peak hottest worker | spill | shape |
+|---|---|---|---|
+| k=1 | 6.41 GiB | 0.00 | plateaus by ~hour 3 |
+| k=4 | **7.91 GiB** | 0.00 | plateaus by ~hour 3, flat for the final 2.5 h |
+
+Both **plateau and stay flat across two further month boundaries**, which is the retained-item
+accumulation question answered directly rather than by extrapolation: monthly streaming does bound
+retention.
+
+**Sized against the PAUSE threshold, not the container limit.** At 16 GiB the pause threshold is
+12.8 GiB, so the worst case leaves **1.6×**. That is tighter than the 3.3× short runs suggested,
+because batching costs ~1.5 GiB of peak — and batching is now mostly *not* used (§3.16), so the
+realistic peak is the 6.41 GiB k=1 figure and the margin is 2×. What makes the pause threshold the
+right target rather than the limit: a paused worker **does not recover**, so work waiting on data it
+holds can never complete and the run DEADLOCKS with the rest of the fleet idle. Undersizing costs a
+whole run, not a retry.
+
+Still to verify before the campaign: **one full-year cell**, because twelve rollovers is four times
+what this run exercised and a slow leak would compound.
+
+### 4.9 S1 never received two changes S2 depends on — the largest remaining easy win
+
+Sentinel-1 pays **both** serial penalties the S2 path has already shed:
+
+| axis | S2 today | S1 today |
+|---|---|---|
+| windows within a date | one shared computation (§3.11) | **sequential** — a date costs the SUM of its windows |
+| dates per commit | sized per region (§3.16) | one commit per date |
+| window merge pricing | cheap-boundary rate (§3.17) | expensive rate — *correct*, given it writes serially |
+
+`overlap_window_writes` defaults **False** on the S1 path, which is precisely the configuration
+that cost the S2 path 1.59×. The consequence is visible: on a sparse zone S1 cost ~39–59 s/date
+against S2's ~29–33, **despite carrying 2 bands against S2's 11**. Its per-date data volume is a
+fraction of S2's and it still takes longer.
+
+Turning overlapping on should therefore transfer the 1.59×, and the finer merging follows with no
+further code because the merge rate is already caller-owned (§3.17) — S1 simply has not opted in.
+
+Two cautions for that work. S1 has **no look-ahead at all**: a batch pays its whole catalogue query
+before writing anything, so overlapping the next batch's query is a further win — but it must buy
+overlap with a **one-batch buffer only**, because more retention is what deadlocked the driver
+before (§3.13). And date fusing for S1 is the least certain lever: by §3.16's arithmetic it wins
+only where the fleet has idle capacity, which needs measuring rather than assuming.
+
+S1 was also **uninstrumented** — it reported only "wrote N dates", so a slow batch was
+indistinguishable from a slow catalogue, and those have opposite remedies. It now emits per-date
+`write` and window `mode`, and per-batch `query` share.
+
+### 4.10 A latent S1 correctness bug: credentials renewed on the wrong clock
+
+Found under load, not by review. ASF mints AWS credentials (via Earthdata) that live about an hour,
+and the S1 loop renewed them **only between time batches**. At the 30-day default a 15-day range is
+ONE batch, so there was no boundary at which to renew: a batch longer than the credential could
+never refresh it, and every read afterwards failed with
+`CPLE_AWSError: The provided token has expired`.
+
+It is a **duration threshold**, which is why it presented as "some runs fail and others don't"
+rather than as a configuration error. In one 5-cell concurrency rung both dense zones failed (394,
+355, 127 and 110 errors) while the sparse zone in the same rung finished cleanly, having completed
+inside the hour. Zero S2 cells were affected.
+
+Fixed by driving renewal from the credential's own advertised expiry with a 15-minute margin, and
+checking before **every date's write** rather than per batch. The margin must exceed one date's
+write, since a credential valid when a write starts must still be valid when it ends. The per-date
+check is two timestamp comparisons with no I/O, so the refresh *rate* is unchanged at roughly once
+per 45 minutes — what changed is how often staleness can be noticed. An absent or unparseable
+expiry degrades to the old cadence rather than raising.
+
+**The general lesson:** a renewal cadence tied to a unit of work is only safe while that unit is
+shorter than the credential. Tie it to the credential's clock instead.
 
 ## 5. Claims made and withdrawn
 

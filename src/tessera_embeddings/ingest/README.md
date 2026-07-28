@@ -12,11 +12,11 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 |---|---|
 | `stac.py` | STAC-based data loading via `odc.stac.load`. Handles multiple providers (Earth Search, Planetary Computer), S2 baseline correction, and date filtering. |
 | `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, item construction from the native CMR Granule Search API (bypasses CMR-STAC search; orbit-direction filtered server-side), UTM EPSG derivation, and asset preparation. |
-| `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary STS credentials) and legacy CloudFront signed URL resolution. |
+| `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary AWS credentials minted by ASF, ~1 hour) and legacy CloudFront signed URL resolution. Those credentials expire on their OWN clock, unrelated to any unit of work: renew against the advertised expiry, never on a cadence tied to a batch, or a long batch outlives them and every read fails. |
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
-| `_pipeline.py` | A depth-1 prepare/consume pipeline: overlaps the preparation of the next item with the consumption of the current one on one background thread, and reports the preparation time the consumer had to wait for. Used by the S2 date loop (`pipeline_dates`); the consumer stays serial. |
+| `_pipeline.py` | A prepare/consume pipeline with a configurable look-ahead `depth`: overlaps the preparation of the next item with the consumption of the current one on one background thread, and reports the preparation time the consumer had to wait for. Used by the S2 date loop (`pipeline_dates`), with `depth` sized to `batch_dates` so a batch's whole preparation can hide behind the previous batch's write. Depth buys BUFFERING, never concurrency — preparation stays on one thread in order, so the side-effect-free contract holds at any depth. |
 | `live_windows.py` | (Merge exchange rate is caller-owned: pass `WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one graph, the higher `WINDOW_COST_IN_CHUNKS` when each is a blocking write — S1 is the latter.) Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
 
 ---
@@ -665,12 +665,37 @@ untouched.
 
 ### Batching dates into one compute (`batch_dates`)
 
-Under `crop_to_live_windows` a date's write is one dask graph, and a graph's parallel
-width is bounded by the date's own block count — on a compact ROI that is fewer pieces
-of work than the fleet has slots, so every date pays a ramp, a drain tail and a commit
-gap that no width can remove. `batch_dates` computes up to k consecutive PASSING dates
-as ONE graph: the dates' work packs the fleet together, one date's straggling reads
-backfill with another's writes, and the tail and gap are paid once per batch.
+**Sized per ROI, and NOT a straight win.** `batch_dates=None` (the default) derives the batch size
+from the ROI's covered window area via `config.ingest.auto_batch_dates`; an explicit integer forces
+one, which is how an A/B arm is pinned. Batching helps small ROIs, is roughly neutral on large
+ones, and **costs about 29% on mid-sized ones** — so one global value is wrong for part of the
+range.
+
+The arithmetic behind that shape:
+
+```
+per-date wall clock  ≈  max( W , P )  +  commit / k
+
+    W = the batch's write, per date          k = dates fused into one graph
+    P = the preparation running alongside it, per date
+```
+
+Batching divides the commit by `k` and does nothing else. It **cannot** make the write faster,
+because the fleet is already the constraint — so commit amortisation is its only gain, and it
+LOSES wherever the larger write graph crowds out the preparation overlapping it. On a mid-sized
+ROI, preparation at `k=1` already fitted exactly inside the write with zero stall, and batching
+disturbed an already-optimal overlap.
+
+So batching pays only where the fleet has idle capacity for the extra work to fill. The threshold
+sits at the top of the range where that was *measured* to hold, not at an estimated crossover, so
+widening it means measuring an ROI in between. Being denominated in covered window area also couples
+it to the merge exchange rate above: a finer merge covers less area, so ROIs drift below the
+threshold and more of them batch. Recalibrate against runs, never an offline sweep at a different
+merge cost. Figures in `context_docs/design/ingest_optimization_campaign_2026_07.md` §3.16.
+
+When it is on, k consecutive PASSING dates compute as ONE graph: their work packs the fleet
+together, one date's straggling reads backfill with another's writes, and the drain tail and commit
+gap are paid once per batch.
 
 The commit unit becomes the batch, and that is forced rather than chosen: every date's
 append resizes the time axis, so per-date sessions forked from one snapshot would
