@@ -34,6 +34,7 @@ from tessera_embeddings.inference.actors import (
     _strip_slices,
     _StripPlan,
     _xchunk_rung,
+    est_px_per_sec,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
@@ -323,7 +324,9 @@ def _force_strip_plan(strip_h: int, prefetch: bool, pair_budget: bool = False):
     the synthetic chunk's density estimates.
     """
 
-    def _plan(_t_kept, height, _width, _valid_px, mask_width=None):
+    # **_ swallows planning-only hints (e.g. px_per_sec) the real signature
+    # grows: this stub forces its tiling outright, so those never apply to it.
+    def _plan(_t_kept, height, _width, _valid_px, mask_width=None, **_):
         return _StripPlan(
             strips=_strip_slices(height, strip_h),
             prefetch=prefetch,
@@ -767,6 +770,29 @@ class TestXChunkPrefetch:
         assert _xchunk_rung(big, 60, None, 100_000, single) == "mask-only"
         # Byte cap: very dense chunks fall back to the mask rung.
         assert _xchunk_rung(big, 400, None, 4_000_000, dense_starter) == "mask-only"
+
+    def test_rate_estimate_is_per_model(self):
+        # Planning divides by this rate to ask "will the GPU be busy long enough
+        # to hide the read?", so a faster model must not inherit a slower one's
+        # figure — it would over-predict the cover available.
+        assert est_px_per_sec("v2-large") > est_px_per_sec("v1.1")
+        # A version the table does not know must still plan, not raise: this is
+        # a speed hint, and refusing to plan is the worse failure.
+        assert est_px_per_sec("some-future-model") == est_px_per_sec("v1.1")
+
+    def test_faster_model_is_less_willing_to_convert_to_starter(self):
+        # A single-strip chunk is promoted to the starter rung only when the
+        # starter's own inference covers the extra fixed read it introduces.
+        # Faster inference means less cover, so the marginal chunk that just
+        # cleared the bar under a slow estimate must stop clearing it under a
+        # fast one. Pick valid_px to sit between the two thresholds.
+        big = ChunkSpec(row=0, col=0, y_start=0, y_stop=2000, x_start=0, x_stop=2000)
+        single = _StripPlan([slice(0, 2000)], prefetch=False, strategy="single", strip_h=2000)
+        slow, fast = 16_000.0, 22_000.0
+        # Threshold is valid_px * (256/2000) / rate >= fixed_read_s.
+        marginal = int(1.1 * 13.0 * slow * (2000 / 256))
+        assert _xchunk_rung(big, 60, None, marginal, single, px_per_sec=slow) == "starter"
+        assert _xchunk_rung(big, 60, None, marginal, single, px_per_sec=fast) == "mask-only"
 
     def test_chain_bit_identical_mask_only_rung(self, inference_config, test_model):
         # The tiny test chunk plans single-strip below the starter height, so
