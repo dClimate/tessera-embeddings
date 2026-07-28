@@ -966,9 +966,9 @@ def ingest_tile(
 class MonthRange:
     """One calendar month's slice of a query window: what to ASK for vs what to KEEP.
 
-    ``query_*`` is the range handed to the STAC query; ``own_*`` is the range of UTC
-    calendar dates this slice is responsible for. They differ by one day of padding
-    on the query's end — see :func:`iter_month_ranges`.
+    ``query_*`` is the range handed to the STAC query; ``own_*`` is the range of
+    calendar dates this slice is responsible for. They differ by a day of padding at
+    each end — see :func:`iter_month_ranges`.
     """
 
     query_start: str
@@ -980,16 +980,20 @@ class MonthRange:
 def iter_month_ranges(start_date: str, end_date: str) -> list[MonthRange]:
     """Partition an inclusive ``[start_date, end_date]`` window into calendar months.
 
-    Owned ranges PARTITION the window: every UTC calendar date belongs to exactly one
+    Owned ranges PARTITION the window: every calendar date belongs to exactly one
     month, so a date can never be processed twice or skipped. That is what makes the
     slices independent — no cross-month state is needed to deduplicate, which matters
     because the ingest runs on a worker that may be restarted at any point.
 
-    The query end is padded by one day (clamped to ``end_date``) because a date-only
-    interval end is expanded to that day's last second: without the pad, items in the
-    final seconds of a month's last day could fall outside every slice's query. The
-    padding cannot cause double-processing — ownership is by UTC date, and the padded
-    day is owned by the NEXT month.
+    Both query ends are padded by one day (clamped to the window) and the padding
+    cannot cause double-processing, because ownership is decided separately.
+
+    The END pad exists because a date-only interval end is expanded to that day's last
+    second: without it, items in the final seconds of a month's last day could fall
+    outside every slice's query. The START pad exists for solar-day ownership: an
+    acquisition late on the last UTC day of a month has a SOLAR day in the next month
+    at eastern longitudes (:func:`solar_day_offset_seconds`), so the month that owns it
+    must ask for the day before its own range or the item is never fetched by anyone.
 
     Args:
         start_date: Inclusive window start, ``YYYY-MM-DD``.
@@ -1013,9 +1017,10 @@ def iter_month_ranges(start_date: str, end_date: str) -> list[MonthRange]:
         own_start = max(start, datetime.date(year, month, 1))
         own_end = min(end, datetime.date(year, month, last_day))
         query_end = min(end, own_end + datetime.timedelta(days=1))
+        query_start = max(start, own_start - datetime.timedelta(days=1))
         ranges.append(
             MonthRange(
-                query_start=own_start.isoformat(),
+                query_start=query_start.isoformat(),
                 query_end=query_end.isoformat(),
                 own_start=own_start.isoformat(),
                 own_end=own_end.isoformat(),
@@ -1075,6 +1080,7 @@ def stream_stac_months(
     bbox: tuple[float, float, float, float] | None,
     existing_dates_fn: Callable[[], set[str]],
     query_fn: Callable[..., tuple[list[Any], dict[str, int]]] | None = None,
+    mid_longitude: float | None = None,
     log: logging.Logger | logging.LoggerAdapter | None = None,
 ) -> Iterator[tuple[MonthRange, list[Any], dict[str, int]]]:
     """Yield one calendar month of STAC items at a time, prefetching the next.
@@ -1110,6 +1116,11 @@ def stream_stac_months(
         existing_dates_fn: Returns dates already committed; called per month.
         query_fn: Query implementation, for tests that must not touch the network.
             Defaults to :func:`query_stac_items`.
+        mid_longitude: ROI centroid longitude, whenever the load groups by solar day.
+            Month ownership then uses the SOLAR date, matching
+            :func:`group_items_by_date`; without it a solar day straddling a month
+            boundary is split across two slices and written twice. Omit for callers
+            that group by UTC date.
         log: Optional logger.
 
     Yields:
@@ -1139,13 +1150,19 @@ def stream_stac_months(
         log.info("Queried %s..%s in %.1fs", mr.query_start, mr.query_end, time.monotonic() - t0)
         return result
 
+    day_offset = datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
     # One query in flight, one month in the caller's hands: the depth-1 buffer.
     pending = _prefetch(run, months[0]) if months else None
     for i, mr in enumerate(months):
         items, baselines = pending()  # type: ignore[misc]
         if i + 1 < len(months):
             pending = _prefetch(run, months[i + 1])
-        owned = [it for it in items if mr.own_start <= str(it.datetime)[:10] <= mr.own_end]
+        # Ownership by SOLAR day when the load groups by solar day, matching
+        # group_items_by_date. Partitioning on the UTC date instead splits one solar
+        # day across two months wherever the offset crosses midnight — the far-eastern
+        # and far-western zones — and the two halves then arrive as separate writes
+        # for a single day: a duplicate timestamp, or half the day's imagery.
+        owned = [it for it in items if mr.own_start <= (it.datetime + day_offset).strftime("%Y-%m-%d") <= mr.own_end]
         dropped = len(items) - len(owned)
         if not owned:
             log.info("Month %s..%s: no new items", mr.own_start, mr.own_end)

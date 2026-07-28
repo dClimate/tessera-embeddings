@@ -701,6 +701,10 @@ def ingest_s2_roi_reflectance(
             end_date=end_date,
             bbox=roi.bbox_wgs84,
             existing_dates_fn=lambda: get_existing_dates(reflectance_store, s3_region=s3_region),
+            # The loader groups by solar day, so the month partition must too — see
+            # stream_stac_months. Without it a solar day straddling a month boundary
+            # is written twice, once per half.
+            mid_longitude=mid_longitude,
             log=log,
         ):
             _drive(month_items, month_baselines)

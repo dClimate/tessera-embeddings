@@ -64,13 +64,25 @@ class TestMonthPartition:
         assert months[1].query_end == "2024-03-01"
         assert months[-1].query_end == "2024-03-31", "the last month must not query past the window"
 
+    def test_query_start_is_padded_by_one_day_except_at_the_window_start(self):
+        """Solar-day ownership can hand a month an item whose UTC date is the day
+        before it. At eastern longitudes an acquisition late on a month's last UTC day
+        has its SOLAR day in the next month — so the owning month must ask for that
+        day, or no slice ever fetches the item.
+        """
+        months = iter_month_ranges("2024-01-01", "2024-03-31")
+        assert months[0].query_start == "2024-01-01", "the first month must not query before the window"
+        assert months[1].query_start == "2024-01-31"
+        assert months[2].query_start == "2024-02-29"
+
     def test_padding_cannot_double_process(self):
         """The padded day is OWNED by the next month, so overlap in the query does not
         become overlap in the work.
         """
         a, b = iter_month_ranges("2024-01-01", "2024-02-29")[:2]
         assert a.query_end == b.own_start
-        assert a.own_end < b.own_start
+        assert b.query_start <= a.own_end  # the pads overlap...
+        assert a.own_end < b.own_start  # ...but the owned ranges never do
 
     def test_leap_day_is_owned(self):
         feb = next(mr for mr in iter_month_ranges("2024-01-01", "2024-12-31") if mr.own_start == "2024-02-01")
@@ -150,7 +162,7 @@ class TestStreaming:
 
         def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox):
             queried.append(start_date)
-            if start_date.startswith("2024-02"):
+            if start_date == "2024-01-31":  # February's slice, padded a day early
                 second_started.set()
             return [_item(start_date)], {}
 
@@ -166,7 +178,7 @@ class TestStreaming:
         )
         next(gen)  # consume January; February's query should already have been submitted
         assert second_started.wait(timeout=5), "February's query was never submitted"
-        assert "2024-02-01" in queried
+        assert "2024-01-31" in queried  # February's query starts one padded day early
         list(gen)
 
     def test_a_failing_month_query_raises_rather_than_truncating(self):
@@ -218,9 +230,15 @@ class TestRetentionIsBounded:
 
     def _gen(self, months: int):
         def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox):
-            # Distinct objects per month, deliberately NOT retained by the fixture — a
-            # fixture that held them would make this test vacuous.
-            return [TestRetentionIsBounded._Item(start_date) for _ in range(3)], {}
+            # Dated at the MIDPOINT of the queried span, which is always inside the
+            # slice's own range — both ends are padded into a neighbour's, so an item
+            # dated at either one would be owned by that neighbour and this month would
+            # yield nothing. Distinct objects per month, deliberately NOT retained by
+            # the fixture: a fixture that held them would make this test vacuous.
+            lo = datetime.date.fromisoformat(start_date)
+            hi = datetime.date.fromisoformat(end_date)
+            mid = (lo + (hi - lo) / 2).isoformat()
+            return [TestRetentionIsBounded._Item(mid) for _ in range(3)], {}
 
         gen = stream_stac_months(
             provider="p",
@@ -294,3 +312,52 @@ def test_prefetch_reraises_in_the_caller_thread():
     pending = _prefetch(boom, None)
     with pytest.raises(RuntimeError, match="catalog exploded"):
         pending()
+
+
+class TestSolarDayOwnership:
+    """The month partition must agree with how the loader groups, or a day splits.
+
+    S2 loads with ``groupby="solar_day"``, which shifts each timestamp by the ROI's
+    longitude. Partitioning months on the UTC date instead puts the two halves of one
+    solar day in different months, and each half is then driven as its own write:
+    either a duplicate timestamp, or half the day's imagery. Only far-eastern and
+    far-western ROIs are affected, which is why it survives ordinary testing.
+    """
+
+    @staticmethod
+    def _months(mid_longitude):
+        seen: dict[str, list[str]] = {}
+
+        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox):
+            # One acquisition at 22:00 UTC on 31 January. At +150° the solar offset is
+            # +10 h, so its solar day is 1 February.
+            item = SimpleNamespace(datetime=datetime.datetime(2024, 1, 31, 22, 0), properties={})
+            return ([item] if start_date <= "2024-01-31" <= end_date else []), {}
+
+        for mr, items, _b in stream_stac_months(
+            provider="p",
+            collection="c",
+            tile_id=None,
+            start_date="2024-01-01",
+            end_date="2024-02-29",
+            bbox=None,
+            existing_dates_fn=set,
+            query_fn=query,
+            mid_longitude=mid_longitude,
+        ):
+            seen.setdefault(mr.own_start, []).extend(str(i.datetime)[:10] for i in items)
+        return seen
+
+    def test_an_eastern_acquisition_is_owned_by_its_solar_month(self):
+        assert self._months(150.0) == {"2024-02-01": ["2024-01-31"]}
+
+    def test_the_same_acquisition_stays_in_january_without_a_longitude(self):
+        """Omitting the longitude keeps UTC ownership — correct for callers that do
+        not group by solar day, and the reason this cannot be applied unconditionally.
+        """
+        assert self._months(None) == {"2024-01-01": ["2024-01-31"]}
+
+    def test_it_is_owned_exactly_once_either_way(self):
+        for lon in (150.0, -150.0, 0.0, None):
+            owners = [m for m, dates in self._months(lon).items() if dates]
+            assert len(owners) == 1, f"longitude {lon} produced {owners}"
