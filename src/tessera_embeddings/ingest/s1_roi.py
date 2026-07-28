@@ -39,6 +39,7 @@ import dask.distributed
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
+from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.live_windows import (
     WINDOW_COST_IN_CHUNKS,
     WINDOW_COST_IN_CHUNKS_OVERLAPPED,
@@ -114,6 +115,28 @@ class SarIngestResult:
     dates_processed: dict[str, int] = field(default_factory=dict)
 
 
+@final
+@dataclass(frozen=True)
+class _PreparedBatch:
+    """One batch carried from the catalogue query to the write loop.
+
+    The split is the same one the phase logging measures: everything up to a write-ready
+    dataset on one side (catalogue query plus lazy graph build, no cluster reads), the
+    per-date writes on the other. That boundary is what makes the query hideable — it
+    touches no store and holds no credential, so it can run on a background thread while
+    the previous batch writes.
+
+    ``data`` is ``None`` when the batch has no new dates, which is a normal outcome and
+    not an error: a sparse region or an already-ingested range yields nothing to write.
+    """
+
+    start: str
+    end: str
+    data: object | None
+    baselines: dict[str, int]
+    query_s: float
+
+
 def ingest_s1_roi_sar(
     *,
     roi_zarr_path: str,
@@ -131,6 +154,7 @@ def ingest_s1_roi_sar(
     storage_options: dict | None = None,
     crop_to_live_windows: bool = False,
     overlap_window_writes: bool = True,
+    pipeline_batches: bool = True,
 ) -> SarIngestResult:
     """Ingest OPERA RTC-S1 SAR for an ROI using batched time windows.
 
@@ -180,6 +204,12 @@ def ingest_s1_roi_sar(
         crop_to_live_windows: Write only the chunk-aligned windows that
             intersect the ROI mask (``ingest.live_windows``), one commit per
             date within each batch. Default False = legacy full-extent path.
+        pipeline_batches: Defaults ON. Prepare the NEXT batch's catalogue query while
+            the current batch writes, so only the first batch pays its query on the
+            critical path. Shares ``ingest._pipeline.pipelined`` with the S2 date loop.
+            Look-ahead is fixed at one batch: a batch's write is one long consume, so
+            depth 1 already covers it, and deeper retention is what once deadlocked the
+            S2 driver. Set False to restore the strictly serial query-then-write loop.
 
     Returns:
         :class:`SarIngestResult`. ``status="skipped"`` if zero dates
@@ -255,44 +285,65 @@ def ingest_s1_roi_sar(
     batch_start = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
+    # Inclusive batch windows of up to ``batch_days`` calendar days. CMR/STAC also treat
+    # their end date as inclusive, and each range starts the day after the previous one
+    # ends, so every day is queried by exactly one batch.
+    #
+    # Materialised as a list rather than advanced in the loop because the look-ahead has
+    # to know what comes next before the current batch is done with.
+    batch_ranges: list[tuple[str, str]] = []
     while batch_start <= end_dt:
-        # Inclusive batch window of up to ``batch_days`` calendar days. CMR/STAC
-        # also treat their end date as inclusive, and the loop advances to the
-        # day after ``batch_end``, so each day is queried by exactly one batch.
         batch_end = min(batch_start + timedelta(days=batch_days - 1), end_dt)
-        batch_start_str = batch_start.strftime("%Y-%m-%d")
-        batch_end_str = batch_end.strftime("%Y-%m-%d")
+        batch_ranges.append((batch_start.strftime("%Y-%m-%d"), batch_end.strftime("%Y-%m-%d")))
+        batch_start = batch_end + timedelta(days=1)
 
+    # Read ONCE, then maintained in-process as dates are written.
+    #
+    # The serial loop re-read this from the store every batch, so that a date written by
+    # an earlier batch would be skipped by a later one. Under a look-ahead that read is
+    # unsafe: the next batch's query is prepared BEFORE the current batch has written, so
+    # a store read there would miss dates that are about to exist. Tracking writes
+    # in-process is correct regardless of when the query runs, and drops a per-batch S3
+    # read as a side effect.
+    #
+    # Why any of this is needed at all: batches are cut on UTC dates while the loader
+    # groups by SOLAR day, so an acquisition late on a batch's last UTC day can belong to
+    # the next batch's solar day, and two consecutive batches can then contain the same
+    # day. Probing real catalogue responses did not find such a boundary (12 boundaries
+    # across a +1 h and a +10 h zone), but the offset is a translation rather than a
+    # split, so nothing rules it out — and the cost of being wrong is a duplicate-date
+    # commit. The consume side below is therefore the authority on what has been written,
+    # and the query filter is only an optimisation.
+    written_dates: set[str] = get_existing_dates(orbit_store)
+    # Frozen at the start so the background thread reads an object nothing mutates.
+    already_present = frozenset(written_dates)
+
+    def _prepare_batch(rng: tuple[str, str]) -> _PreparedBatch:
+        """Catalogue query plus lazy graph build for one batch. No cluster reads.
+
+        Runs on the pipeline's background thread when ``pipeline_batches`` is on, so it
+        must touch nothing the write loop owns: no credential application, no store
+        writes, and only the immutable snapshot of ``written_dates`` taken when the
+        pipeline started.
+        """
+        batch_start_str, batch_end_str = rng
         log.info("[%s] Batch %s..%s: querying catalog", orbit, batch_start_str, batch_end_str)
 
-        # Re-read existing dates each batch so prior-batch writes are skipped.
-        existing_dates = get_existing_dates(orbit_store)
-
-        # Rebuild the lazy ROI mask each batch so frozen IAM creds inside
-        # any embedded boto chain are fresh. The call is cheap (graph
-        # construction only); actual S3 reads happen during compute(),
-        # by which point the credential refresh below has applied any new
-        # session token.
-        roi_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
+        # Rebuild the lazy ROI mask per batch so frozen IAM creds inside any embedded
+        # boto chain are fresh. Graph construction only; the actual S3 reads happen
+        # during the write's compute(), by which point the credential refresh has
+        # applied any new session token.
+        batch_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
         if live_windows is None:
-            # Ensure the mask is materialised on workers so per-batch graphs
-            # reference small future keys.
-            roi_mask = client.persist(roi_mask)
-        # Cropped: left LAZY on purpose. persist() materialises every chunk of
-        # the full zone grid — for 03S that is 3,706 chunks / ~60 GiB of mostly
-        # ocean, pinned for the run — while the only consumer, apply_roi_mask,
-        # is written out to the live windows and so touches a handful of them.
-        # Dask culls the reads to those chunks, making a per-batch re-read far
-        # cheaper than the pin. (S2 does the same, and additionally crops the
-        # coverage denominator, which it alone computes.)
+            # Materialise on workers so per-batch graphs reference small future keys.
+            batch_mask = client.persist(batch_mask)
+        # Cropped: left LAZY on purpose. persist() materialises every chunk of the full
+        # zone grid — for 03S that is 3,706 chunks / ~60 GiB of mostly ocean, pinned for
+        # the run — while the only consumer, apply_roi_mask, is written out to the live
+        # windows and so touches a handful of them. Dask culls the reads to those chunks,
+        # making a per-batch re-read far cheaper than the pin. (S2 does the same, and
+        # additionally crops the coverage denominator, which it alone computes.)
 
-        refresh_credentials_if_stale()
-
-        # Phase boundaries are timed so a batch's cost can be attributed rather than
-        # only totalled. The split mirrors the S2 path's: everything up to a
-        # write-ready dataset (catalogue query plus lazy graph build) on one side, the
-        # per-date writes on the other. Without it a slow batch is indistinguishable
-        # from a slow catalogue, and the two have opposite remedies.
         query_started = time.monotonic()
         data, baselines = ingest_tile(
             provider="cmr-asf",
@@ -300,7 +351,9 @@ def ingest_s1_roi_sar(
             tile_id=None,
             start_date=batch_start_str,
             end_date=batch_end_str,
-            existing_dates=existing_dates,
+            # The snapshot, not the live set: a background thread must not read a set the
+            # write loop is mutating. Anything it misses is caught when consuming.
+            existing_dates=already_present,
             bbox=roi.bbox_wgs84,
             chunks=INGEST_CHUNKS,
             resampling="bilinear",
@@ -315,12 +368,31 @@ def ingest_s1_roi_sar(
             post_load_fn=amplitude_to_db,
             geobox=roi.geobox,
         )
-
         query_s = time.monotonic() - query_started
+        if data is not None:
+            data = apply_roi_mask(data, roi_zarr_path, spatial_chunks, roi_mask=batch_mask)
+        return _PreparedBatch(batch_start_str, batch_end_str, data, baselines, query_s)
+
+    # depth=1: one batch prepared ahead. A batch's write is one long consume, so a single
+    # look-ahead already covers it; more would retain catalogue items to hide nothing.
+    # Unpipelined, `pipelined` is bypassed entirely rather than run at depth 0 — the
+    # serial path must stay available as a rollback that shares no machinery.
+    if pipeline_batches:
+        prepared_batches = pipelined(batch_ranges, _prepare_batch, depth=1)
+    else:
+        prepared_batches = ((_prepare_batch(rng), 0.0) for rng in batch_ranges)
+
+    for prepared, stall_s in prepared_batches:
+        batch_start_str, batch_end_str = prepared.start, prepared.end
+        data, baselines, query_s = prepared.data, prepared.baselines, prepared.query_s
+
+        refresh_credentials_if_stale()
 
         if data is not None:
-            data = apply_roi_mask(data, roi_zarr_path, spatial_chunks, roi_mask=roi_mask)
+            # The ROI mask was applied in _prepare_batch, on the same side of the phase
+            # boundary as the graph build it belongs to.
             write_total_s = 0.0
+            written_this_batch = 0
 
             def _retrying() -> Retrying:
                 return Retrying(
@@ -336,6 +408,17 @@ def ingest_s1_roi_sar(
                 # whole loop would restart at a date an earlier attempt already
                 # committed and trip the duplicate-date guard.
                 for i in range(data.sizes["time"]):
+                    # datetime64 stringifies as "YYYY-MM-DDThh:mm:ss…"; the date half is
+                    # all this needs, and it matches get_existing_dates' own slicing.
+                    date_str = str(data["time"].values[i])[:10]
+                    # THE authority on what has been written, checked here rather than
+                    # relying on the query filter: under a look-ahead the query for this
+                    # batch may have been built before an earlier batch committed, so a
+                    # solar day shared across a UTC batch boundary could arrive twice.
+                    # Writing it twice would trip the duplicate-date guard mid-run.
+                    if date_str in written_dates:
+                        log.info("[%s] Skipping date %s: already written", orbit, date_str)
+                        continue
                     # Inside the per-date loop deliberately: a batch can outlive the
                     # credential, so renewing only at batch boundaries is what failed.
                     refresh_credentials_if_stale()
@@ -356,6 +439,8 @@ def ingest_s1_roi_sar(
                             )
                     date_s = time.monotonic() - date_started
                     write_total_s += date_s
+                    written_dates.add(date_str)
+                    written_this_batch += 1
                     # ``mode`` is the load-bearing field: sequential means this date
                     # cost the SUM of its windows' critical paths rather than their
                     # maximum, which is the single largest difference between how S1
@@ -363,9 +448,7 @@ def ingest_s1_roi_sar(
                     log.info(
                         "[%s] S1 stage timings date=%s: write=%.1fs windows=%d mode=%s",
                         orbit,
-                        # datetime64 stringifies as "YYYY-MM-DDThh:mm:ss..."; the date
-                        # half is all this line needs and slicing avoids a numpy import.
-                        str(data["time"].values[i])[:10],
+                        date_str,
                         date_s,
                         len(live_windows),
                         "parallel" if overlap_window_writes else "sequential",
@@ -382,7 +465,10 @@ def ingest_s1_roi_sar(
                             manifest=ingest_manifest,
                             crs=roi.native_crs,
                         )
-            n = data.sizes["time"]
+            # Count what was WRITTEN, not what the batch held: under a look-ahead a date
+            # can arrive already committed by an earlier batch and be skipped above, and
+            # reporting it as processed would overstate a resumed run's progress.
+            n = written_this_batch if live_windows is not None else data.sizes["time"]
             total_processed += n
             log.info(
                 "[%s] Batch %s..%s: wrote %d dates (total: %d)",
@@ -392,22 +478,24 @@ def ingest_s1_roi_sar(
                 n,
                 total_processed,
             )
-            # `query` is the catalogue lookup plus lazy graph build, and it is SERIAL
-            # with the writes: this flow has no look-ahead, so a batch pays it in full
-            # before writing anything. Its share of the batch is what decides whether
-            # overlapping the next batch's query is worth building.
+            # `stall` is what the look-ahead failed to hide — how long this batch waited
+            # for its own query after the previous batch's writes finished. Near zero
+            # means the query hid completely; approaching `query` means it hid nothing,
+            # which is the expected reading for the FIRST batch since nothing precedes
+            # it. `hidden` is therefore the saving, and it is what to watch: if it stays
+            # near zero on later batches the look-ahead is not paying.
             log.info(
-                "[%s] S1 batch timings %s..%s n=%d: query=%.1fs write=%.1fs per_date=%.1fs",
+                "[%s] S1 batch timings %s..%s n=%d: query=%.1fs hidden=%.1fs stall=%.1fs write=%.1fs per_date=%.1fs",
                 orbit,
                 batch_start_str,
                 batch_end_str,
                 n,
                 query_s,
+                max(query_s - stall_s, 0.0),
+                stall_s,
                 write_total_s,
-                (query_s + write_total_s) / n if n else 0.0,
+                (stall_s + write_total_s) / n if n else 0.0,
             )
-
-        batch_start = batch_end + timedelta(days=1)
 
     if total_processed == 0:
         return SarIngestResult(

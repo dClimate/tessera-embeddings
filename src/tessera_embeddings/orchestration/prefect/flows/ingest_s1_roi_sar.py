@@ -43,6 +43,7 @@ def _ingest_s1_roi_impl(
     storage_options: dict | None,
     crop_to_live_windows: bool,
     overlap_window_writes: bool,
+    pipeline_batches: bool,
 ) -> dict[str, Any]:
     """Inner flow: submits the S1 ingestion task to the configured Dask runner."""
     future = process_roi_sar.submit(
@@ -58,6 +59,7 @@ def _ingest_s1_roi_impl(
         storage_options=storage_options,
         crop_to_live_windows=crop_to_live_windows,
         overlap_window_writes=overlap_window_writes,
+        pipeline_batches=pipeline_batches,
     )
     return future.result()
 
@@ -103,6 +105,7 @@ def ingest_s1_roi_sar(
     perf_report_uri: str | None = None,
     crop_to_live_windows: bool = False,
     overlap_window_writes: bool = True,
+    pipeline_batches: bool = True,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
 
@@ -133,12 +136,16 @@ def ingest_s1_roi_sar(
             Ignored on the ``use_local`` path, which warns.
         overlap_window_writes: Submit a date's windows as ONE dask compute rather
             than one blocking compute per window, so they share the fleet instead of
-            each waiting its turn. Identical stores either way. **Defaults ON**: it is
-            worth a factor of 2.4-2.9 on S1, measured across ROIs spanning a threefold
-            range of window counts. Sequential writing can only occupy as much of the
-            fleet as ONE window's work provides, which is why the gain tracks fleet
-            width rather than window count. Only meaningful with
+            each waiting its turn. Produces an identical store either way. **Defaults
+            ON.** Also selects the window merge exchange rate, which prices a boundary
+            by how it is written, so the two cannot drift apart. Only meaningful with
             ``crop_to_live_windows``.
+        pipeline_batches: Prepare the NEXT batch's catalogue query while the current
+            batch writes, so only the first batch pays its query on the critical path.
+            **Defaults ON.** Look-ahead is one batch and not configurable: a batch's
+            write is one long consume, so depth 1 covers it, and deeper retention is
+            what once deadlocked the S2 driver. Set False for a strictly serial
+            query-then-write loop.
         crop_to_live_windows: Restrict mosaic writes (and the S2 coverage
             reduce) to the chunk-aligned windows intersecting the ROI mask —
             one commit per date. Default False = legacy full-extent path.
@@ -187,6 +194,7 @@ def ingest_s1_roi_sar(
                 storage_options=storage_options,
                 crop_to_live_windows=crop_to_live_windows,
                 overlap_window_writes=overlap_window_writes,
+                pipeline_batches=pipeline_batches,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -221,4 +229,5 @@ def ingest_s1_roi_sar(
                 storage_options=storage_options,
                 crop_to_live_windows=crop_to_live_windows,
                 overlap_window_writes=overlap_window_writes,
+                pipeline_batches=pipeline_batches,
             )
