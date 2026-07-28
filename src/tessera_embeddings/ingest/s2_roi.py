@@ -37,6 +37,7 @@ import logging
 import operator
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from functools import partial, reduce
 from typing import final
 
@@ -61,6 +62,7 @@ from tessera_embeddings.ingest.stac import (
     group_items_by_date,
     load_stac_items,
     query_stac_items,
+    solar_day_offset_seconds,
     stream_stac_months,
 )
 from tessera_embeddings.storage.manifest import IngestManifest
@@ -171,6 +173,33 @@ class _PreparedDate:
     skip_reason: str | None = None
 
 
+def _solar_grouping_longitude(roi: object) -> float | None:
+    """The longitude to group solar days by, matching the loader's own choice.
+
+    The loader shifts every item by ONE longitude — its geobox extent's centroid in
+    WGS84 — so preferring the geobox here makes the two agree by construction rather
+    than by approximation. Both must land on the same whole-hour offset, and a bbox
+    midpoint can differ from an extent centroid by enough to cross a 15-degree
+    boundary and so disagree.
+
+    Falls back to the WGS84 bbox midpoint, then to ``None``, which restores UTC-date
+    grouping. Degrading rather than raising is deliberate: a missing geobox is a
+    caller that is not loading by solar day, and no longitude is recoverable from
+    nothing.
+    """
+    geobox = getattr(roi, "geobox", None)
+    if geobox is not None:
+        try:
+            ((lon, _),) = geobox.extent.centroid.to_crs("epsg:4326").points
+            return float(lon)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    bbox = getattr(roi, "bbox_wgs84", None)
+    if bbox is not None and len(bbox) >= 3:
+        return (float(bbox[0]) + float(bbox[2])) / 2.0
+    return None
+
+
 def ingest_s2_roi_reflectance(
     *,
     roi_zarr_path: str,
@@ -272,6 +301,8 @@ def ingest_s2_roi_reflectance(
     roi = read_roi_metadata(roi_zarr_path)
 
     ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path)
+
+    mid_longitude = _solar_grouping_longitude(roi)
 
     # Live windows for the cropped write path, derived once per run from the same
     # mask this ingest already reads (plain tuples: storage takes no ingest types).
@@ -592,8 +623,20 @@ def ingest_s2_roi_reflectance(
         # query_stac_items sorts by (date, cloud_cover ASC). Re-sort cloudiest-first so
         # the clearest tile paints last (wins) in solar_day's painter's algorithm.
         # group_items_by_date preserves this within-group order.
-        items.sort(key=lambda it: (str(it.datetime)[:10], -float(it.properties.get("eo:cloud_cover", 100))))
-        by_date = group_items_by_date(items)
+        #
+        # Both the sort and the grouping key off the SOLAR day, not the UTC date, because
+        # that is what the loader groups by. Using UTC here let a group the loader saw as
+        # two solar days arrive as two time slices, against a cloud mask reduced to one —
+        # a dimension conflict, and one that fires only where the solar offset is large
+        # enough to cross UTC midnight (the far-eastern and far-western zones).
+        day_offset = timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
+        items.sort(
+            key=lambda it: (
+                (it.datetime + day_offset).strftime("%Y-%m-%d"),
+                -float(it.properties.get("eo:cloud_cover", 100)),
+            )
+        )
+        by_date = group_items_by_date(items, mid_longitude=mid_longitude)
         total_seen += len(by_date)
         prepare = partial(_prepare_date, baselines=baselines)
         if batch_dates > 1:

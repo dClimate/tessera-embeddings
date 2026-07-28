@@ -35,17 +35,17 @@ from tessera_embeddings.ingest.s1_roi import (
 )
 def test_parses_the_spellings_asf_actually_returns(raw: str) -> None:
     """All three differ only in punctuation and must give the same instant."""
-    assert _parse_credential_expiry({"expiration": raw}) == datetime(
-        2026, 7, 28, 3, 5, 1, tzinfo=UTC
-    ).timestamp()
+    assert _parse_credential_expiry({"expiration": raw}) == datetime(2026, 7, 28, 3, 5, 1, tzinfo=UTC).timestamp()
 
 
 def test_naive_timestamp_is_read_as_utc() -> None:
     """A missing zone must not be read as local time — that would mis-date the expiry
-    by the machine's offset and could make a stale credential look fresh."""
-    assert _parse_credential_expiry({"expiration": "2026-07-28T03:05:01"}) == datetime(
-        2026, 7, 28, 3, 5, 1, tzinfo=UTC
-    ).timestamp()
+    by the machine's offset and could make a stale credential look fresh.
+    """
+    assert (
+        _parse_credential_expiry({"expiration": "2026-07-28T03:05:01"})
+        == datetime(2026, 7, 28, 3, 5, 1, tzinfo=UTC).timestamp()
+    )
 
 
 @pytest.mark.parametrize("creds", [{}, {"expiration": ""}, {"expiration": "not a date"}])

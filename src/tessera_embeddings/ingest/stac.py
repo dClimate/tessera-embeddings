@@ -805,22 +805,50 @@ def load_stac_items(
     return data
 
 
-def group_items_by_date(items: list[Any]) -> dict[str, list[Any]]:
-    """Group STAC items by calendar date string.
+def solar_day_offset_seconds(mid_longitude: float) -> int:
+    """UTC-to-solar-day offset for a longitude, in whole hours.
 
-    Items should typically be pre-sorted by (date, cloud_cover) via
-    ``query_stac_items`` so that within each group, clearer tiles come first.
+    Mirrors ``odc.stac``'s own conversion exactly, including the truncation to whole
+    hours. Matching it matters more than being astronomically precise: the two must
+    agree on which day an acquisition belongs to, and any divergence reappears as a
+    date group that loads with more time slices than the caller grouped for.
+    """
+    return int(mid_longitude / 15) * 3600
 
-    Args:
-        items: List of pystac Items
+
+def group_items_by_date(items: list[Any], *, mid_longitude: float | None = None) -> dict[str, list[Any]]:
+    """Group STAC items by day, matching how the loader will group them.
+
+    Pass ``mid_longitude`` — the ROI geobox centroid's longitude in WGS84 — whenever the
+    load uses ``groupby="solar_day"``, which is every S2 path. The loader groups by LOCAL
+    solar day, shifting each timestamp by that longitude; grouping here by UTC calendar
+    date instead lets the two disagree, and a group the caller believes is one day then
+    loads as TWO time slices.
+
+    That divergence is not hypothetical and not uniform: it appears where the solar offset
+    is large enough to push acquisitions across UTC midnight, i.e. the far-eastern and
+    far-western zones, and never in the middle longitudes. Downstream code assumes one
+    slice per group (the cloud mask is reduced to a single 2-D slice), so the mismatch
+    surfaces as a dimension conflict rather than as anything that names the cause.
+
+    Omitting ``mid_longitude`` keeps the old UTC-date behaviour, which is correct only for
+    callers that do not group by solar day.
+
+    Items should typically be pre-sorted by (date, cloud_cover) via ``query_stac_items``
+    so that within each group, clearer tiles come first.
 
     Returns:
-        Dict mapping date strings (YYYY-MM-DD) to lists of items,
-        preserving insertion order and within-group order.
+        Dict mapping ``YYYY-MM-DD`` to lists of items, preserving insertion order and
+        within-group order.
     """
+    offset = (
+        datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude))
+        if mid_longitude is not None
+        else datetime.timedelta(0)
+    )
     groups: dict[str, list[Any]] = {}
     for item in items:
-        date_str = item.datetime.strftime("%Y-%m-%d")
+        date_str = (item.datetime + offset).strftime("%Y-%m-%d")
         groups.setdefault(date_str, []).append(item)
     return groups
 
