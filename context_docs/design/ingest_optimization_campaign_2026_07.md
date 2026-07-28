@@ -1524,6 +1524,86 @@ derived key, derive it from the same source rather than reimplementing the defin
 found this month are a local notion of time disagreeing with an external one — a credential's expiry
 clock against a batch boundary, and a solar day against a UTC date.
 
+### 4.12 A third definition of "a day": the slice LABEL, and it blocked four zones outright
+
+§4.11 fixed which items form a day. This is the same disagreement one layer further down —
+which day the resulting slice is *called* — and it stopped zone 56N ingesting S2 at all.
+
+**It failed two different ways depending on the path**, which is how the scope became clear:
+
+| path | failure |
+|---|---|
+| batched write | `batch dates must be strictly increasing; got ['2024-01-25', '2024-01-25', …]` |
+| unbatched write | `date 2024-01-20T00:00:00 is already on the time axis; refusing a duplicate slot` |
+
+Both **failed closed**, which is why no corrupt data exists anywhere — and the only zone-named
+mosaics that exist are `03S` and `40S`, neither far-eastern nor far-western.
+
+**Every link in the chain is individually correct, which is why it survived three fixes in this
+family.** S2 sorts a solar day's items cloudiest-first so the clearest tile paints last and wins
+the mosaic. `preserve_original_order=True` preserves that against odc's own re-sorting. odc then
+stamps each group with `group[0].nominal_datetime` — which is now the CLOUDIEST item, whose
+acquisition time is arbitrary within the day. Where the solar offset crosses UTC midnight, that
+timestamp's calendar date can be the day BEFORE the solar day it belongs to.
+
+```
+   56N, +10 h offset. A solar day spans UTC 14:00 the previous day to 13:59.
+
+   solar 2024-01-20   cloudiest item 2024-01-20T00:52   -> labelled 01-20   ok
+   solar 2024-01-21   cloudiest item 2024-01-20T23:45   -> labelled 01-20   COLLIDES
+                                     ^^^^^^^^^^^^^^^^
+                      late-UTC acquisition, next solar day, previous calendar date
+```
+
+**The error was inconsistent, not offset, and that is the part worth remembering.** Six of
+twenty-two solar days on 56N landed on the previous date — and *which* six depended on cloud
+cover, because cloud cover decides which item is first. So it varied within one zone-year and
+would differ on a re-ingest after the catalogue revised its cloud estimates. No adjustment of a
+stored axis could have corrected it; re-ingest would have been the only remedy.
+
+**The fix is to take the day from the GROUPING, not from the loaded slice.** The solar day is
+the grouping key, and every item in a group shares it by construction, so any member yields it.
+Three properties then hold by construction rather than by care: labels are unique per slice,
+monotonic across slices (consecutive solar days differ by exactly one day, so the batched guard
+passes without sorting), and stable against the catalogue revising cloud estimates.
+
+**Disruption: none beyond the correction itself.** The store's time axis was ALREADY
+day-granular — it normalises to midnight — so the label only ever decided WHICH day, and no
+consumer could have depended on the time of day. Pixel values, the cloudiest-first ordering,
+`preserve_original_order`, and which tile wins a pixel are all untouched. At mid longitudes the
+solar day IS the UTC date, so nothing moves for the great majority of zones, which is exactly
+why this hid until a far-eastern zone was attempted.
+
+**S1 had the same defect** for the same reason: its items arrive in CMR order, so `group[0]` is
+equally arbitrary. It already matched footprints to slices on the exact timestamp (§4.9), so the
+solar day travels through that same map and stamps the written slice.
+
+### 4.13 Recording what an ingest EXAMINED, so an absent month is a finding
+
+Related to §4.9's empty-date skip, and forced by it. A mosaic's time axis says what was WRITTEN
+and nothing about what was LOOKED AT, so a missing month meant either "examined, nothing
+reachable" or "the ingest never got there" — and the coverage gate failed on both. That was
+tolerable while every date was written regardless; the skip makes the first case normal.
+
+Both ingest paths now record **`assessed_window`** on the store: the range processed in full.
+The gate excuses a month lying WHOLLY inside it and still fails on anything outside, so widening
+a window later cannot be excused by an older, narrower assessment, and a partially-covered month
+stays an error because it could hide unexamined days.
+
+Written by the ingest rather than by the completion marker, because the marker is written AFTER
+the gate on a first ingest, and the fill re-runs the gate later from a separate process.
+
+One attribute suffices, and the reason is worth stating: the ingest queries the catalogue across
+the whole window and writes every date with reachable imagery, so absence INSIDE an assessed
+range logically implies nothing was reachable. A failed ingest raises before the record is
+written, so its presence also means the window completed.
+
+**Every degraded path makes the gate STRICTER** — an absent, malformed or unparseable attribute
+excuses nothing, and failing to write it is logged rather than raised. Over-excusing publishes a
+mosaic with a hole in it; under-excusing costs a re-ingest. `assessed_empty_dates` rides along
+for observability: it separates "sparse region" from "the footprints are wrong", which look
+identical in a date count.
+
 ## 5. Claims made and withdrawn
 
 Recorded so they are not revived, and because the pattern is instructive.
@@ -1610,6 +1690,24 @@ timings and took an object count to identify.
 ---
 
 ## 7. Open questions
+
+- **ANSWERED — is the ingest REPRODUCIBLE across the campaign and single-ROI paths? Yes, on
+  current code.** This was the campaign's one open question about whether the output is
+  scientifically sound. The earlier answer was no: optical observation counts disagreed on
+  **3.11%** of pixels, and every disagreeing pixel produced unrelated embeddings.
+
+  Re-measured against the preserved July reference on IDENTICAL geometry (its own 1024x1025 ROI,
+  so a differing footprint could not produce a differing coverage-gate outcome): **65 of 65
+  shared dates, none lost**, identical arrays, shapes and chunking, and **bit-identical pixel
+  values across all 11 bands** on five dates sampled through the year. The single extra date
+  today is the coverage threshold — the campaign's 0.1% against the single-ROI path's 5% default
+  — i.e. configuration, not code.
+
+  Three date-handling bugs landed between the two measurements: solar-day grouping (§4.11),
+  solar-day month partitioning in the streamed query, and the narrowing plus empty-date skip
+  (§4.9). Each changes WHICH DATES are written, which is exactly the symptom, so one of them was
+  almost certainly the cause. **Note this compares mosaics, not embeddings** — deliberately, since
+  the failure was located in ingest and inference was already equivalent on identical inputs.
 
 - **ANSWERED — is the fleet-bound floor reached? Yes.** Full reasoning in §3.10 and §3.12; the
   load-bearing conclusion is that **a large fraction of a date cannot be compressed by any worker

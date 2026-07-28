@@ -640,6 +640,39 @@ proposed for the family of S1 write effects and all three were refuted by their 
 predictions. Rely on the measured range; do not model it, and do not extrapolate far outside
 the widths measured. The campaign record's §4.9 has each refutation.
 
+### Which day a slice is called (and why it is not an item's timestamp)
+
+A mosaic slice represents one **solar day**, and it is labelled with that day — taken from the
+grouping key, not from the loaded dataset's own time coordinate.
+
+That distinction is load-bearing. `odc.stac.load` stamps each group with
+`group[0].nominal_datetime`, and because `preserve_original_order=True` (so the clearest tile
+paints last and wins) `group[0]` is the CLOUDIEST item, whose acquisition time is arbitrary
+within the day. Where the solar offset crosses UTC midnight, that timestamp's calendar date can
+be the day BEFORE the solar day — so two consecutive solar days normalise onto one date. That
+blocked far-eastern zones from ingesting at all: the batched write rejected the dates as not
+strictly increasing, the unbatched write rejected the second as a duplicate time slot.
+
+Taking the day from the grouping makes three things true by construction rather than by care:
+labels are unique per slice, monotonic across them (consecutive solar days differ by exactly one
+day, so the batched write needs no sorting), and stable against the catalogue revising its cloud
+estimates. The store's axis is day-granular either way, so this only decides WHICH day — pixels,
+ordering and which tile wins are untouched, and at mid longitudes the value is unchanged because
+the solar day IS the UTC date there.
+
+### Recording the window an ingest examined
+
+Both paths write `assessed_window` — the date range processed in full — onto the store. A month
+absent from the time axis but wholly inside that range was **examined and found to hold nothing
+reachable**, which is a finding; a month outside it is a gap. Without the record those are
+indistinguishable, and the coverage gate has to fail on both.
+
+Every uncertain path is strict: an absent, malformed or unparseable attribute excuses nothing,
+and a partially-covered month stays an error because it could hide unexamined days. Failing to
+write the attribute is logged, never raised — the gate simply falls back to requiring every
+month. `assessed_empty_dates` is recorded alongside for observability, separating "sparse region"
+from "the footprints are wrong".
+
 ### Narrowing a date's windows, and skipping dates that reach none
 
 A run's live windows describe where the ROI has land, so they are the same on every date. One
