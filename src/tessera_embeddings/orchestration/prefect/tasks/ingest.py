@@ -44,6 +44,7 @@ def process_roi_reflectance(
     # (config.ingest.auto_batch_dates), so an ``int``-annotated shell defaulting to 1 cannot
     # express it and pins any caller that omits the flag to never batching.
     batch_dates: int | None = None,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Prefect task: ingest S2 reflectance for one ROI.
 
@@ -75,6 +76,7 @@ def process_roi_reflectance(
             stream_stac_monthly=stream_stac_monthly,
             overlap_window_writes=overlap_window_writes,
             pipeline_dates=pipeline_dates,
+            s3_region=s3_region,
             batch_dates=batch_dates,
         )
     return asdict(result)
@@ -100,6 +102,7 @@ def process_roi_sar(
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = False,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Prefect task: ingest S1 OPERA SAR for one ROI.
 
@@ -164,5 +167,6 @@ def process_roi_sar(
             overlap_window_writes=overlap_window_writes,
             pipeline_batches=pipeline_batches,
             narrow_windows_per_date=narrow_windows_per_date,
+            s3_region=s3_region,
         )
     return asdict(result)

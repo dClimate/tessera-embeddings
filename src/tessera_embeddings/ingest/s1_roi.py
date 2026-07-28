@@ -175,6 +175,7 @@ def ingest_s1_roi_sar(
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = False,
+    s3_region: str | None = None,
 ) -> SarIngestResult:
     """Ingest OPERA RTC-S1 SAR for an ROI using batched time windows.
 
@@ -236,6 +237,10 @@ def ingest_s1_roi_sar(
             several-fold, but S1's scheduler is not saturated, so it is unclear how much
             of that becomes wall clock. Dates whose imagery reaches NO live window are
             skipped either way — that costs nothing and writing one stores nothing.
+
+        s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
+            storage layer's default; set it when the bucket lives elsewhere, or
+            every write below signs against the wrong region.
 
     Returns:
         :class:`SarIngestResult`. ``status="skipped"`` if zero dates
@@ -398,7 +403,7 @@ def ingest_s1_roi_sar(
     # split, so nothing rules it out — and the cost of being wrong is a duplicate-date
     # commit. The consume side below is therefore the authority on what has been written,
     # and the query filter is only an optimisation.
-    written_dates: set[str] = get_existing_dates(orbit_store)
+    written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region)
     # Frozen at the start so the background thread reads an object nothing mutates.
     already_present = frozenset(written_dates)
 
@@ -560,6 +565,7 @@ def ingest_s1_roi_sar(
                                 crs=roi.native_crs,
                                 chunks=INGEST_CHUNKS,
                                 parallel_windows=overlap_window_writes,
+                                s3_region=s3_region,
                             )
                     date_s = time.monotonic() - date_started
                     write_total_s += date_s
@@ -589,6 +595,7 @@ def ingest_s1_roi_sar(
                             chunks=INGEST_CHUNKS,
                             manifest=ingest_manifest,
                             crs=roi.native_crs,
+                            s3_region=s3_region,
                         )
             # Count what was WRITTEN, not what the batch held: under a look-ahead a date
             # can arrive already committed by an earlier batch and be skipped above, and

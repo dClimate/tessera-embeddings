@@ -328,6 +328,11 @@ async def ingest_zone_year(
         "max_workers": max_workers,
         "use_local": use_local,
         "crop_to_live_windows": ingest_settings.crop_to_live_windows,
+        # The children open and CREATE the mosaic repos; without this they sign
+        # against the storage default while this flow's own probes use s3_region,
+        # so a non-default-region campaign fails inside the costly S1/S2 jobs
+        # rather than at preflight.
+        "s3_region": s3_region,
     }
     orbits = _active_orbits(s1_orbit)
     # Optional perf-report capture: the setting is a base URI. Scope it by CELL

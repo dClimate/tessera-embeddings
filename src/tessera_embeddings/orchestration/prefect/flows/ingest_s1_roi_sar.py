@@ -45,6 +45,7 @@ def _ingest_s1_roi_impl(
     overlap_window_writes: bool,
     pipeline_batches: bool,
     narrow_windows_per_date: bool,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Inner flow: submits the S1 ingestion task to the configured Dask runner."""
     future = process_roi_sar.submit(
@@ -62,6 +63,7 @@ def _ingest_s1_roi_impl(
         overlap_window_writes=overlap_window_writes,
         pipeline_batches=pipeline_batches,
         narrow_windows_per_date=narrow_windows_per_date,
+        s3_region=s3_region,
     )
     return future.result()
 
@@ -109,6 +111,7 @@ def ingest_s1_roi_sar(
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = False,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
 
@@ -157,6 +160,11 @@ def ingest_s1_roi_sar(
             reduce) to the chunk-aligned windows intersecting the ROI mask —
             one commit per date. Default False = legacy full-extent path.
 
+        s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
+            storage layer's default (us-west-2); set it when the input bucket
+            lives elsewhere, or the mosaic writes sign against the wrong region
+            and fail after the preflight checks have already passed.
+
     Returns:
         ``SarIngestResult`` serialised as a dict.
     """
@@ -203,6 +211,7 @@ def ingest_s1_roi_sar(
                 overlap_window_writes=overlap_window_writes,
                 pipeline_batches=pipeline_batches,
                 narrow_windows_per_date=narrow_windows_per_date,
+                s3_region=s3_region,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -239,4 +248,5 @@ def ingest_s1_roi_sar(
                 overlap_window_writes=overlap_window_writes,
                 pipeline_batches=pipeline_batches,
                 narrow_windows_per_date=narrow_windows_per_date,
+                s3_region=s3_region,
             )

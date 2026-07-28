@@ -344,3 +344,18 @@ def test_a_completed_sibling_store_survives_the_other_sensors_failure(wired, mon
     assert wired.get("deletes") == ["s3://in/mosaics/33N/2025/reflectance.zarr"], (
         "the completed SAR store must survive the S2 failure"
     )
+
+
+def test_child_ingests_receive_the_configured_region(wired, monkeypatch):
+    """The children CREATE the mosaic repos, so the region has to reach them.
+
+    This flow's own probes use `s3_region`, so a non-default-region campaign gets
+    through preflight and then fails inside the multi-hour S1/S2 jobs, signing
+    against the storage layer's default instead.
+    """
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+    _run(s3_region="eu-west-1")
+    dispatched = [p for _, p in wired["arun"]]
+    assert dispatched, "no child ingests dispatched"
+    assert all(p["s3_region"] == "eu-west-1" for p in dispatched), dispatched

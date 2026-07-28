@@ -206,6 +206,7 @@ def ingest_s2_roi_reflectance(
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
     batch_dates: int | None = None,
+    s3_region: str | None = None,
 ) -> IngestResult:
     """Ingest S2 L2A reflectance for an ROI defined by a Zarr mask.
 
@@ -274,6 +275,10 @@ def ingest_s2_roi_reflectance(
             :func:`~tessera_embeddings.config.ingest.auto_batch_dates`, because the
             benefit is not monotonic in ROI size; 1 forces the one-commit-per-date
             path.
+
+        s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
+            storage layer's default; set it when the bucket lives elsewhere, or
+            every write below signs against the wrong region.
 
     Returns:
         :class:`IngestResult`. ``status="skipped"`` if zero STAC items
@@ -503,6 +508,7 @@ def ingest_s2_roi_reflectance(
                         crs=roi.native_crs,
                         chunks=INGEST_CHUNKS,
                         parallel_windows=overlap_window_writes,
+                        s3_region=s3_region,
                     )
                 else:
                     write_dataset(
@@ -513,6 +519,7 @@ def ingest_s2_roi_reflectance(
                         chunks=INGEST_CHUNKS,
                         manifest=ingest_manifest,
                         crs=roi.native_crs,
+                        s3_region=s3_region,
                     )
         # One line per kept date, partitioning its wall clock into the client-side
         # graph build, the coverage-gate compute, and the write (windows + commit).
@@ -572,6 +579,7 @@ def ingest_s2_roi_reflectance(
                     crs=roi.native_crs,
                     chunks=INGEST_CHUNKS,
                     parallel_windows=overlap_window_writes,
+                    s3_region=s3_region,
                 )
         # The batch's write is ONE compute, so a per-date write time does not exist
         # as a measurement — this line is the batched counterpart of `Stage timings`
@@ -692,7 +700,7 @@ def ingest_s2_roi_reflectance(
             start_date=start_date,
             end_date=end_date,
             bbox=roi.bbox_wgs84,
-            existing_dates_fn=lambda: get_existing_dates(reflectance_store),
+            existing_dates_fn=lambda: get_existing_dates(reflectance_store, s3_region=s3_region),
             log=log,
         ):
             _drive(month_items, month_baselines)
@@ -703,7 +711,7 @@ def ingest_s2_roi_reflectance(
             tile_id=None,
             start_date=start_date,
             end_date=end_date,
-            existing_dates=get_existing_dates(reflectance_store),
+            existing_dates=get_existing_dates(reflectance_store, s3_region=s3_region),
             bbox=roi.bbox_wgs84,
         )
         if items:

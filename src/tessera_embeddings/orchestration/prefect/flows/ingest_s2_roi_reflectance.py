@@ -85,6 +85,7 @@ def _ingest_s2_roi_impl(
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
     batch_dates: int | None = None,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Inner flow: submits the S2 ingestion task to the configured Dask runner."""
     future = process_roi_reflectance.submit(
@@ -101,6 +102,7 @@ def _ingest_s2_roi_impl(
         overlap_window_writes=overlap_window_writes,
         pipeline_dates=pipeline_dates,
         batch_dates=batch_dates,
+        s3_region=s3_region,
     )
     return future.result()
 
@@ -134,6 +136,7 @@ def ingest_s2_roi_reflectance(
     pipeline_dates: bool = False,
     batch_dates: int | None = None,
     worker_env_overrides: dict[str, str] | None = None,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Ingest S2 L2A reflectance for an ROI using Dask workers.
 
@@ -202,6 +205,11 @@ def ingest_s2_roi_reflectance(
             meant to hold for every run belongs in ``FargateConfig``. Ignored on
             the ``use_local`` path, which provisions no Fargate workers.
 
+        s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
+            storage layer's default (us-west-2); set it when the input bucket
+            lives elsewhere, or the mosaic writes sign against the wrong region
+            and fail after the preflight checks have already passed.
+
     Returns:
         ``IngestResult`` serialised as a dict (see
         :class:`tessera_embeddings.ingest.s2_roi.IngestResult`).
@@ -237,6 +245,7 @@ def ingest_s2_roi_reflectance(
                 overlap_window_writes=overlap_window_writes,
                 pipeline_dates=pipeline_dates,
                 batch_dates=batch_dates,
+                s3_region=s3_region,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -271,4 +280,5 @@ def ingest_s2_roi_reflectance(
                 overlap_window_writes=overlap_window_writes,
                 pipeline_dates=pipeline_dates,
                 batch_dates=batch_dates,
+                s3_region=s3_region,
             )

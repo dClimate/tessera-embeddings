@@ -682,9 +682,12 @@ def _write_new(
     data: xr.Dataset,
     encoding: dict[str, Any] | None,
     message: str,
+    *,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
 ) -> None:
     """Create a new store with data. Cleans up on failure."""
-    repo = _create_repo(store_path)
+    repo = _create_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
     to_icechunk(data, session, mode="w", encoding=encoding, align_chunks=True)
     session.commit(message)
@@ -723,9 +726,12 @@ def _write_append(
     data: xr.Dataset,
     message: str,
     update_attrs: dict[str, Any] | None = None,
+    *,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
 ) -> None:
     """Append data to existing store."""
-    repo = open_repo(store_path)
+    repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
 
     _commit_preserving_attrs(
@@ -888,12 +894,18 @@ def open_store_group_and_tip(
     return member, tip
 
 
-def get_existing_dates(store_path: str, group: str | None = None) -> set[str]:
+def get_existing_dates(
+    store_path: str,
+    group: str | None = None,
+    *,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+) -> set[str]:
     """Get dates already present in a store. Returns empty set if store doesn't exist."""
     t0 = time.monotonic()
     logger.debug(f"Opening store: {store_path}")
     try:
-        ds = _open_readonly(store_path, group=group)
+        ds = _open_readonly(store_path, group=group, get_credentials=get_credentials, region=s3_region)
         dates = {str(t.values)[:10] for t in ds.time}
         ds.close()
         logger.debug(f"Store has {len(dates)} existing dates ({time.monotonic() - t0:.1f}s)")
@@ -1484,6 +1496,8 @@ def write_dataset(
     manifest: IngestManifest | None = None,
     *,
     crs: str,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
 ) -> None:
     """Write dataset to Icechunk Zarr store, creating or appending as needed.
 
@@ -1497,8 +1511,12 @@ def write_dataset(
             Written on create, validated on append.
         crs: CRS authority code (e.g. ``"EPSG:32615"``). Stored in root
             attrs so downstream consumers can determine the projection.
+        get_credentials: Optional credential callback for Icechunk's S3 client.
+        s3_region: Optional S3 region override. Threaded through EVERY open below,
+            not just the first: a store outside the default region must be read,
+            created and appended the same way, or the ingest fails partway.
     """
-    existing_dates = get_existing_dates(store_path)
+    existing_dates = get_existing_dates(store_path, get_credentials=get_credentials, s3_region=s3_region)
 
     # Normalize time to nanosecond resolution to match TIME_ENCODING.
     # Newer pandas/xarray versions may produce datetime64[us]; coerce
@@ -1510,7 +1528,7 @@ def write_dataset(
 
     if existing_dates:
         # Single store open: read manifest + baseline attrs together
-        existing_ds = _open_readonly(store_path)
+        existing_ds = _open_readonly(store_path, get_credentials=get_credentials, region=s3_region)
         if manifest:
             manifest.validate_against(extract_manifest(existing_ds.attrs), store_path)
         merged_baselines = dict(existing_ds.attrs.get("baselines_applied", {}))
@@ -1527,6 +1545,8 @@ def write_dataset(
                 "doy": existing_doy + doy.tolist(),
                 "last_appended": utcnow_iso(),
             },
+            get_credentials=get_credentials,
+            s3_region=s3_region,
         )
     else:
         chunk_sizes = (
@@ -1550,7 +1570,14 @@ def write_dataset(
             logger.info("Writing _manifest to %s", store_path)
 
         data.attrs.update(store_attrs)
-        _write_new(store_path, data, encoding, f"Create with {data.sizes['time']} dates")
+        _write_new(
+            store_path,
+            data,
+            encoding,
+            f"Create with {data.sizes['time']} dates",
+            get_credentials=get_credentials,
+            s3_region=s3_region,
+        )
 
 
 # =============================================================================
