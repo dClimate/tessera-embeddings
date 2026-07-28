@@ -1339,6 +1339,45 @@ expiry degrades to the old cadence rather than raising.
 **The general lesson:** a renewal cadence tied to a unit of work is only safe while that unit is
 shorter than the credential. Tie it to the credential's clock instead.
 
+### 4.11 A latent S2 correctness bug: two definitions of "a day"
+
+Found by a 20-cell concurrency rung, not by review — and only on one zone of the twenty.
+
+We grouped STAC items by **UTC calendar date**; the loader groups by **local solar day**,
+shifting every timestamp by one longitude (its geobox extent centroid in WGS84, truncated to whole
+hours). Where the solar offset is large enough to cross UTC midnight the two disagree, so a group we
+believed was one day arrived as TWO time slices — against a cloud mask reduced to a single 2-D
+slice. The result is a dimension conflict that names nothing about its cause:
+
+```
+ValueError: conflicting sizes for dimension 'time':
+  length 2 on 'blue' and length 1 on {...}
+```
+
+```
+        UTC:   ... 23:00 | 00:00  01:00 ...        ONE UTC date
+   solar day:       day N |  day N+1               TWO solar days
+                          ^ zone 56N images here (+10 h offset, ~00:30 UTC)
+```
+
+**Why it stayed hidden.** It is a longitude threshold, not a load or scale effect. Zone 56N spans
+150–156°E and images at roughly 00:30 UTC, right on the boundary; central-longitude zones image
+mid-UTC-day and can never hit it. Roughly **ten of the 111 land zones** sit in the affected band
+(about 01–04 and 55–60), so the campaign would have failed on those and only those.
+
+**The fix** derives the longitude the way the loader does — geobox extent centroid reprojected,
+*not* the bbox midpoint, since those can differ by enough to fall either side of a 15° boundary and
+the offset truncates to whole hours. Matching by construction is the point: any divergence reappears
+as the same conflict. It degrades to the bbox midpoint and then to UTC grouping rather than raising,
+because a caller with no geobox is not loading by solar day. The pre-sort uses the same key, since it
+carries the painter's-algorithm contract and sorting on a different notion of "day" would silently
+let a cloudier pixel win.
+
+**The general lesson, and it is the same one as §4.10:** when two components must agree on a
+derived key, derive it from the same source rather than reimplementing the definition. Both bugs
+found this month are a local notion of time disagreeing with an external one — a credential's expiry
+clock against a batch boundary, and a solar day against a UTC date.
+
 ## 5. Claims made and withdrawn
 
 Recorded so they are not revived, and because the pattern is instructive.

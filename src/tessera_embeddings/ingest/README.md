@@ -555,7 +555,23 @@ ChunkSpec-vs-sub-chunk decoupling that makes assembly survive on the same budget
 ### S2: per-date iteration (task graph management)
 
 `ingest_s2_roi_reflectance` queries STAC for the full date range upfront, groups items by
-calendar day via `group_items_by_date`, then processes one day at a time in a Python loop.
+**local solar day** via `group_items_by_date`, then processes one day at a time in a Python loop.
+
+The grouping key is load-bearing and must match the loader's. `odc.stac.load(groupby="solar_day")`
+shifts every timestamp by ONE longitude — its geobox extent's centroid in WGS84, truncated to whole
+hours — and groups on the result. Grouping here by UTC calendar date instead lets the two disagree,
+and a group we believe is one day then loads as TWO time slices against a cloud mask reduced to one:
+
+```text
+   UTC:      ... 23:00 | 00:00  01:00 ...      ONE UTC date
+   solar:        day N |  day N+1              TWO solar days   (at a +10 h offset)
+                       ^ far-eastern zones image right here
+```
+
+That is why `group_items_by_date` takes a `mid_longitude`, and why the pre-sort uses the same key —
+the sort carries the painter's-algorithm contract (clearest tile last within a group), so sorting on
+a different notion of "day" than the grouping would silently let a cloudier pixel win. Central
+longitudes image far from UTC midnight and are unaffected, which is what kept this latent.
 Each iteration builds a single-date Dask graph, calls `odc.stac.load` for that day, filters
 coverage, and writes before moving to the next date:
 
