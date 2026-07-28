@@ -38,6 +38,7 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
+from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import _assert_seeded_model_matches
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import IngestDeployments
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import (
@@ -383,6 +384,7 @@ async def run_global_campaign(
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     allow_partial_window: bool = False,
     allow_s2_only: bool = False,
+    allow_model_mismatch: bool = False,
     sweep_orphan_mosaics: bool = False,
 ) -> dict[str, Any]:
     """Fill every pending (zone, year), year-serial with bounded zone parallelism.
@@ -474,6 +476,11 @@ async def run_global_campaign(
             run_id so a retry across a flipped flag never resumes mixed tiles.
             S2-only pixel quality is unvalidated (see the optional-S1 ADR);
             affected pixels are identifiable via s1_*_obs_count == 0.
+        allow_model_mismatch: Proceed even though the store was seeded for a
+            different encoder/checkpoint than this build embeds with. The gate runs
+            ONCE up front, before any ingest is dispatched, so a mismatch costs a
+            metadata read rather than a mosaic per in-flight zone. Deliberate
+            override only — mixing encoders under one store is permanent.
         sweep_orphan_mosaics: Before the run, delete mosaics for cells that are
             already complete+tagged in scope — recovering orphans left by a
             per-cell cleanup that failed after tagging (that cell is no longer in
@@ -518,6 +525,18 @@ async def run_global_campaign(
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     repo = open_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
+    # ONCE, before any dispatch. Each fill re-checks this, but by then the campaign has
+    # already paid for that cell's ingest — and it dispatches cells concurrently, so a
+    # store seeded for a different encoder buys a multi-terabyte mosaic per in-flight
+    # zone before the first fill fails. Those mosaics are retained on failure (that is
+    # what makes a resume cheap), so the disk stays occupied too. A metadata-only read.
+    _assert_seeded_model_matches(
+        store_path,
+        build_checkpoint=checkpoint_filename(),
+        allow_model_mismatch=allow_model_mismatch,
+        get_credentials=iam_icechunk_credentials,
+        s3_region=s3_region,
+    )
     status = campaign_status(repo, years=campaign_years)
     existing_tags = set(repo.list_tags())
 

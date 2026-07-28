@@ -48,6 +48,9 @@ def wired(monkeypatch):
     # Pinned AMI id (resolved once, threaded into every fill's provisioning) — mocked
     # so tests make no SSM call.
     monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a, **k: "ami-test-id")
+    # Seeded-model gate: real in production (a metadata read of the store root),
+    # stubbed here so tests exercise dispatch rather than store contents.
+    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
     # Store reads for the staging fingerprint: each mosaic store's branch-tip snapshot
     # (the authoritative term) plus its provenance attrs.
     monkeypatch.setattr(
@@ -595,3 +598,28 @@ def test_campaign_registers_child_cancellation_on_cancel_and_crash():
     flow = mod.run_global_campaign
     assert mod._cancel_children_on_cancellation in flow.on_cancellation_hooks
     assert mod._cancel_children_on_cancellation in flow.on_crashed_hooks
+
+
+def test_model_gate_runs_before_any_dispatch(wired, monkeypatch):
+    """A store seeded for another encoder must cost a metadata read, not a mosaic.
+
+    Each fill re-checks this, but the campaign dispatches ingest first and runs cells
+    concurrently — so by the time the first fill fails there is a multi-terabyte
+    mosaic per in-flight zone, and failed cells retain theirs to keep a resume cheap.
+    """
+
+    def _reject(*a, **k):
+        raise ValueError("store was seeded for encoder https://x/OLD")
+
+    monkeypatch.setattr(mod, "_assert_seeded_model_matches", _reject)
+    with pytest.raises(ValueError, match="seeded for encoder"):
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    assert wired["arun"] == [], "nothing may be dispatched once the gate fails"
+
+
+def test_model_gate_override_lets_the_campaign_proceed(wired, monkeypatch):
+    """The escape hatch is threaded through rather than reimplemented."""
+    seen: dict = {}
+    monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: seen.update(k))
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", allow_model_mismatch=True))
+    assert seen["allow_model_mismatch"] is True
