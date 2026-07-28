@@ -477,11 +477,18 @@ def _apply_baseline_corrections_by_date(
 # =============================================================================
 
 
-def _loadable_assets(collection_config: CollectionConfig) -> frozenset[str]:
-    """Every asset the loader could read for this collection."""
+def _loadable_assets(collection_config: CollectionConfig, extra_bands: "list[str] | None" = None) -> frozenset[str]:
+    """Every asset the loader could read for this collection.
+
+    ``extra_bands`` must be included: pruning happens at query time, before
+    ``odc.stac.load`` runs, so an asset dropped here is simply gone. Without it a
+    caller asking for a QA or visualisation band gets a missing-band error instead
+    of the band — and `ingest_tile`/`load_stac_items` both still document that option.
+    """
     names = set(collection_config.bands)
     if collection_config.has_scl:
         names.add("scl")
+    names.update(extra_bands or ())
     return frozenset(names)
 
 
@@ -522,6 +529,7 @@ def _query_stac_items(
     end_date: str,
     bbox: tuple[float, float, float, float] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
+    extra_bands: list[str] | None = None,
 ) -> list[Any]:
     """Query STAC catalog for items matching tile and date range.
 
@@ -539,6 +547,10 @@ def _query_stac_items(
             ``cmr-asf`` OPERA path, which builds items from the native CMR
             granule API to avoid CMR-STAC's 500-prone cursor pagination.
 
+        extra_bands: Additional assets the caller will load. Kept in the pruned
+            items — pruning runs at query time, so an asset dropped here cannot
+            be loaded later.
+
     Returns:
         List of pystac Items
     """
@@ -553,7 +565,7 @@ def _query_stac_items(
 
     items: list[Any] = []
     seen: set[str] = set()
-    keep_assets = _loadable_assets(collection_config)
+    keep_assets = _loadable_assets(collection_config, extra_bands)
     for sub_bbox in split_antimeridian_bbox(bbox):
         query_params = _build_stac_query(collection_config, tile_id, start_date, end_date, bbox=sub_bbox)
         search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
@@ -663,6 +675,7 @@ def query_stac_items(
     bbox: tuple[float, float, float, float] | None = None,
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
+    extra_bands: list[str] | None = None,
 ) -> tuple[list[Any], dict[str, int]]:
     """Query STAC catalog, filter items, and extract baselines.
 
@@ -682,6 +695,10 @@ def query_stac_items(
         item_provider_fn: Optional callable returning items directly,
             bypassing CMR-STAC search (OPERA native-granule path).
 
+        extra_bands: Additional assets the caller will load. Kept in the pruned
+            items — pruning runs at query time, so an asset dropped here cannot
+            be loaded later.
+
     Returns:
         Tuple of (items, baselines) where:
         - items: Filtered list of pystac Items (excluding existing dates)
@@ -699,6 +716,7 @@ def query_stac_items(
         end_date,
         bbox=bbox,
         item_provider_fn=item_provider_fn,
+        extra_bands=extra_bands,
     )
 
     query_label = f"tile {tile_id}" if tile_id else f"bbox {bbox}"

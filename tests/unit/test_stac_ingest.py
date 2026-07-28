@@ -692,3 +692,17 @@ class TestItemPruning:
         assert set(item.assets) == {"blue", "scl"}
         assert item.properties["proj:code"] == "EPSG:32634"
         assert str(item.datetime)[:10] == "2024-06-03"
+
+
+def test_requested_extra_bands_survive_item_pruning(monkeypatch):
+    """Pruning runs at QUERY time, before odc.stac.load resolves bands.
+
+    An asset dropped there cannot be loaded later, so a caller asking for a QA or
+    visualisation band would get a missing-band error instead of the band —
+    `ingest_tile` and `load_stac_items` both still document that option.
+    """
+    config = _get_collection_config("earth-search", "sentinel-2-l2a")
+    assert "aot" not in _loadable_assets(config)
+    assert "aot" in _loadable_assets(config, ["aot"])
+    # The collection's own bands are never dropped by asking for an extra one.
+    assert set(config.bands) <= _loadable_assets(config, ["aot"])
