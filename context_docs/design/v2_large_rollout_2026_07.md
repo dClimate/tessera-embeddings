@@ -122,20 +122,25 @@ which also explains the utilization gap against v1.1 despite higher throughput.
 
 `zarr.config` `async.concurrency` defaults to **10** and is never overridden
 anywhere in the source. Correlating 1 s outbound-:443 socket samples against
-reconstructed write windows (`observe_cluster --start-pollers`, added for this):
+reconstructed write windows (`observe_cluster --start-pollers`, added for this),
+over **117 write windows / 465 in-write samples across 10 workers**:
 
 | | established :443 | median | max |
 |---|---|---|---|
-| during a write | 42.5 mean | 41 | 56 |
-| baseline | 18.1 mean | 9 | 80 |
+| during a write | 41.6 mean | 40 | 72 |
+| baseline | 14.4 mean | 3 | 64 |
 
-**No plateau at 10.** If the cap bound, samples would pile there. Preliminary —
-only 2 write windows / 39 in-write samples, and the window is contaminated because
-a staging write overlaps the next chunk's background strip read, so some of those
-sockets are reads. The *absence of a plateau* is the robust part; the exact
-write-attributable count is not.
+**No plateau at 10, and no plateau anywhere.** The in-write distribution spans
+24–72, with broad clusters near 32–36 and 49–52 and no single value the samples
+pile onto. A binding cap would show as a spike at that value; concurrency here is
+demand-driven, not limit-driven. So the write is **not concurrency-limited** — its
+~20 s cost is per-request latency or host CPU contention with inference batch prep.
 
-Implication: raising the cap is unlikely to help. Remaining levers are fewer/larger
+The window overlaps the next chunk's background strip read, so some of those sockets
+are reads rather than uploads. That does not rescue the cap hypothesis: even
+attributing half to reads leaves the writer far above 10.
+
+Implication: raising the cap will not help. Remaining levers are fewer/larger
 staged objects (couples to the assembly read path, which pins
 `500×500×(embedding_dim/BAND_CHUNK_DIVISOR)`) or accepting the cost. Deepening the
 write pipeline past its current depth of 1 is **not** advised: the pending write
