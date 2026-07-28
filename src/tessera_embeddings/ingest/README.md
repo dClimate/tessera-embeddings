@@ -635,10 +635,36 @@ so each ingest path opts in explicitly.
 S1 was measured before it opted in. The gain is **2.4–3.9×** on per-date write time and does
 not vary with either quantity we can vary: not with window count (23, 9 and 7 windows gave
 2.79×, 2.86× and 2.40×) and not with fleet width (30 and 60 workers gave 3.67× and 3.85×,
-inside the noise floor). **Why it is that size is not explained** — the two obvious accounts
-both predicted one of those dependencies and neither survived. Rely on the gain, which is
-reproducible; do not extrapolate the magnitude far outside the widths measured. The campaign
-record's §4.9 has both refutations.
+inside the noise floor). **Why it is that size is not explained** — three accounts have been
+proposed for the family of S1 write effects and all three were refuted by their own
+predictions. Rely on the measured range; do not model it, and do not extrapolate far outside
+the widths measured. The campaign record's §4.9 has each refutation.
+
+### Narrowing a date's windows, and skipping dates that reach none
+
+A run's live windows describe where the ROI has land, so they are the same on every date. One
+date is not: a satellite images a fraction of a wide ROI per pass, so most of those windows hold
+nothing for a given date. `windows_for_date` removes them. Tasks over them would run, find no
+data and write nothing — an all-fill chunk is never stored — so this cannot change what a mosaic
+contains. Both sensors now do it (`narrow_windows_per_date` on S1, always on S2): six times fewer
+windows per date on the S1 zones measured, worth 7–20% of per-date wall clock.
+
+**A date whose imagery reaches NO live window is skipped entirely**, on both paths and
+unconditionally. Writing it builds a full graph to store nothing. On S1 this is not a rare case:
+one zone skipped 13 of 58 dates, and some zones have an orbit that reaches land on *no* date of
+the year. Skipping those means no store is created, which is what lets `resolve_s1_orbit`
+correctly downgrade to single-orbit instead of publishing a store full of fill that inference
+would read as real signal.
+
+**The safety rule, and it is the whole design.** A footprint that is too LARGE only costs
+computed area that would have been discarded; one that is too SMALL drops imagery and nothing
+downstream notices. So every uncertain path widens rather than narrows: an unreadable footprint
+returns the full window set, and on S1 a time slice that cannot be matched to its items writes
+everything. "Reaches nothing" and "we cannot tell" are separate branches — only the first skips.
+
+S1's match is on an **exact timestamp** rather than a date string, because odc sets a slice's
+time coordinate to its group's earliest item timestamp. Keying by solar day instead would
+disagree with the loader wherever the offset crosses UTC midnight.
 
 ### Pipelining a date's preparation (`pipeline_dates`)
 

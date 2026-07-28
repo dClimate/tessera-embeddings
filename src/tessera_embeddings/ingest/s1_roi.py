@@ -174,7 +174,7 @@ def ingest_s1_roi_sar(
     crop_to_live_windows: bool = False,
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
-    narrow_windows_per_date: bool = False,
+    narrow_windows_per_date: bool = True,
     s3_region: str | None = None,
 ) -> SarIngestResult:
     """Ingest OPERA RTC-S1 SAR for an ROI using batched time windows.
@@ -232,11 +232,11 @@ def ingest_s1_roi_sar(
             depth 1 already covers it, and deeper retention is what once deadlocked the
             S2 driver. Set False to restore the strictly serial query-then-write loop.
         narrow_windows_per_date: Write only the live windows a date's own imagery can
-            reach, as the S2 path does. **Defaults OFF pending a measurement**: a
-            Sentinel-1 pass reaches a minority of a zone's windows, so the graph shrinks
-            several-fold, but S1's scheduler is not saturated, so it is unclear how much
-            of that becomes wall clock. Dates whose imagery reaches NO live window are
-            skipped either way — that costs nothing and writing one stores nothing.
+            reach, as the S2 path does. **Defaults ON, measured.** A Sentinel-1 pass
+            reaches a minority of a zone's windows — six times fewer in both zones tested
+            — and that converts to 7-20% of per-date wall clock. Dates reaching NO live
+            window are skipped unconditionally, independent of this flag: writing one
+            builds a full graph to store nothing, since all-fill chunks never persist.
 
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
             storage layer's default; set it when the bucket lives elsewhere, or

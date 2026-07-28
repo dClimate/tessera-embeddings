@@ -1357,14 +1357,37 @@ are never stored, so the mosaic is identical either way — this is work whose r
 discarded, the same argument that justified narrowing on S2. Some dates reach **no** live window
 at all (the 0% minima), and S1 currently commits those dates rather than skipping them.
 
-Two cautions, both about how it must be built rather than whether. The share figures bound the
-*graph*, not the wall clock: the real windows cost the same either way, so what narrowing removes
-is the per-window overhead on the empty ones (order 15 chunks each, §3.17) — sized, but not the
-5–20× the table might suggest. And the implementation has one dangerous failure mode: S1 would
-have to key each date's footprint by **solar day**, and getting that key off by one would narrow
-to the wrong date's footprint and silently drop real imagery. That is the same disagreement-about-
-dates shape as §4.11. It needs the safe fallback (unmatched date → keep all windows, never skip)
-and a paired A/B, not a blind change.
+**SHIPPED, and measured at 7–20%.** Both zones wrote **six times fewer windows per date**
+(11.0 → 1.8 and 12.0 → 2.0), worth **20.1%** and **7.3%** of per-date wall clock at 13 workers.
+That partly contradicts the caution written here first: the share figures do bound the *graph*
+rather than the wall clock, and the conversion is nowhere near 6× — but it is not negligible
+either, and the argument that S1's unsaturated scheduler would make it worthless was wrong.
+
+**The dangerous failure mode was designed out rather than accepted.** Keying each date's
+footprint by solar day would disagree with the loader wherever the offset crosses UTC midnight
+and would then narrow to the wrong footprint, dropping imagery silently. Instead the join is on
+an **exact timestamp**: odc sets each slice's time coordinate to `group[0].nominal_datetime`, the
+earliest item's real timestamp, so the minimum item datetime in a group reproduces it exactly. An
+unmatched slice writes every window; "reaches nothing" and "we do not know" are separate branches
+and only the former skips.
+
+**Dates reaching no live window are skipped unconditionally, and that mattered more than the wall
+clock.** On one zone it removed **13 of 58 dates (22%)**. Verified on both sides by re-deriving
+footprints from the catalogue: the eight sampled skipped dates reach **zero** live windows despite
+carrying **483–1,113 granules each**, while sampled kept dates reach one to three. They are not
+no-data days — they are days whose swath covers only the zone's ocean.
+
+> **The skip fixes a latent correctness bug, which is not why it was built.** Some zones have an
+> orbit that never reaches land at all: **40S and 24S ascending have granules on ~30 days of 2024
+> and reach zero live windows on every one of them.** Writing those dates created a SAR store full
+> of fill, which `resolve_s1_orbit` then read as a *present* orbit — so inference consumed an
+> all-fill band as real signal, the same hazard the dual-pol granule guard exists to prevent. With
+> the skip, nothing is written, no store is created, and the orbit is correctly downgraded to
+> single-orbit; the coverage gate follows, since it derives its orbit from the stores present.
+>
+> Residual case, **not observed** across eight zone-orbits: a zone with some months emptied and
+> others not would leave a store missing those months, and the gate counts months present.
+> `allow_partial_window` is the designed relief. Worth a census before the campaign.
 
 **The catalogue look-ahead is now SHIPPED and measured — ~10%, and the query hides completely.**
 S1 used to pay its whole catalogue query before writing anything. It now prepares the next batch
@@ -1390,12 +1413,50 @@ optimising because the overlap made the write several times faster.** At the seq
 speed the same query was 4–5% of a batch, below the threshold for being worth building. Speeding
 up one phase promotes the next, so re-rank remaining work after every win rather than once.
 
+**The look-ahead's gain RISES with density, and the third mechanism is refuted too.** The
+prediction was that the saving per batch is `min(query, write)`, so the relative gain should peak
+where the two are comparable and be largest on sparse zones. Tested at a genuine 6.25× contrast
+(25 live windows against 4):
+
+| zone | live windows | serial | look-ahead | gain |
+|---|---|---|---|---|
+| 40S | 4 | 2.80 s | 3.15 s | **−12.5%** |
+| 21N | 11 | 20.93 s | 18.65 s | +10.9% |
+| 59S | 12 | 14.76 s | 13.48 s | +8.7% |
+| 35N | 25 | 74.45 s | 63.05 s | **+15.3%** |
+
+Exactly backwards: the gain rises with density and the sparsest zone loses. **Three mechanisms
+have now been proposed for this effect and all three refuted** — sum-over-max, fleet occupancy,
+and `min(query, write)`. No fourth is offered. Use the measured range and do not model it:
+**9–15% where coverage is continuous**, negligibly negative where batches are mostly empty.
+
+Why 40S loses is at least legible: its look-ahead arm *still stalls*, so the query never hid. It
+wrote only 4 dates across 4 of 12 batches — most batches held no data, so there was no preceding
+write to hide behind and it paid contention for nothing. Absolute cost across the run: **1.4
+seconds**. Recorded so nobody "fixes" it.
+
+**S1 is NOT fleet-bound, so narrowing its fleet cuts COST as well as quota.** The 13-worker width
+was chosen on the standard assumption that worker-hours are width-independent — halve the fleet,
+double the duration, same bill. Measured, that is false:
+
+| zone | 30w | 13w | time ratio | worker-seconds/date |
+|---|---|---|---|---|
+| 21N | 18.65 s | 24.90 s | **1.34×** (not 2.31×) | 560 → **324**, −42% |
+| 59S | 13.48 s | 20.50 s | **1.52×** (not 2.31×) | 404 → **267**, −34% |
+
+A 2.31× narrowing cost only 1.34–1.52× in time, so a 30-worker S1 fleet was paying for idle
+capacity. Two consequences. The re-sizing saves **34–42% of S1's compute** where the forecast
+assumed zero — though that is a large proportional cut on a base the overlap had already shrunk to
+9–16% of worker-hours, so the campaign total moves only ~4%, and longer-running narrow fleets raise
+per-fleet scheduler and runner cost enough to offset part of it. And it leaves S1 at roughly **half**
+the cell rather than the 83% the width-neutral model predicted, so 13 workers has about 2× margin.
+
+**Do not reuse "worker-hours are width-independent."** Where a fleet is not the constraint,
+narrowing is strictly cheaper on both axes, and the only way to know is to measure two widths.
+
 **Also still open on S1.** Date fusing remains the least certain lever: by §3.16's arithmetic it
 wins only where the fleet has idle capacity, and overlapping has just consumed much of exactly
-that, so the case for it is now *weaker* than before. And the prediction that the look-ahead's
-relative gain rises as a zone sparsens — the saving per batch is `min(query, write)`, so it should
-peak where the two are comparable — is **untested**: the two zones chosen for that contrast came
-back within one window of each other once the merge rate was re-priced.
+that, so the case for it is now *weaker* than before.
 
 S1 was also **uninstrumented** — it reported only "wrote N dates", so a slow batch was
 indistinguishable from a slow catalogue, and those have opposite remedies. It now emits per-date
