@@ -49,6 +49,7 @@ from tessera_embeddings.inference.data_loading import check_time_window_coverage
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.inference.scheduling import WorkItem
+from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
 from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     activate,
     deactivate,
@@ -275,47 +276,20 @@ class _DeploymentCellInputs:
             self._log.warning("Ingest cancellation sweep failed — check the Prefect UI for orphans", exc_info=True)
 
 
+#: Tag prefix for this flow's child ingest deployments.
+_INGEST_TAG_PREFIX = "chained-ingest"
+
+
 def _ingest_child_tag(flow_run_id: object) -> str | None:
-    """Deterministic tag for this run's child ingest deployments.
-
-    Derived from the parent flow-run id alone so the cancellation/crash hook —
-    which Prefect runs in a FRESH process after killing the flow (module state
-    gone, ``finally: inputs.shutdown()`` never ran) — can re-derive it and sweep
-    the children server-side. Same contract as
-    :func:`~tessera_embeddings.providers.aws.ray.cluster_name_for_flow_run`.
-    """
-    return f"chained-ingest:{flow_run_id}" if flow_run_id else None
+    """Deterministic tag for this run's child ingest deployments."""
+    return child_run_tag(_INGEST_TAG_PREFIX, flow_run_id)
 
 
-def _cancel_child_ingests_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
-    """Cancel this run's live child ingest deployments on CANCEL or CRASH.
-
-    The in-process ``inputs.shutdown()`` handles normal failure paths, but a
-    cancelled/crashed flow's process is killed before its ``finally`` runs —
-    without this hook, every active child ingest (dispatched from threads, so
-    no parent-run link) keeps writing the mosaic prefix a retry will race.
-    Children are found by the deterministic parent-derived tag.
-    """
-    log = logging.getLogger(__name__)
-    tag = _ingest_child_tag(getattr(flow_run, "id", None))
-    if not tag:
-        log.warning("No flow-run id — cannot sweep child ingest runs by tag. Check the Prefect UI manually.")
-        return
-    try:
-        from prefect.client.schemas.filters import FlowRunFilter, FlowRunFilterTags
-
-        with get_client(sync_client=True) as client:
-            runs = client.read_flow_runs(flow_run_filter=FlowRunFilter(tags=FlowRunFilterTags(all_=[tag])))
-            live = [r for r in runs if r.state is None or not r.state.is_final()]
-            if live:
-                log.warning("Cancelling %d live child ingest run(s) tagged %r", len(live), tag)
-            for r in live:
-                try:
-                    client.set_flow_run_state(r.id, state=Cancelling())
-                except Exception:
-                    log.warning("Could not cancel child ingest %s", r.id, exc_info=True)
-    except Exception:
-        log.warning("Child-ingest sweep failed — check the Prefect UI for tag %r", tag, exc_info=True)
+#: The in-process ``inputs.shutdown()`` covers normal failure paths; a cancelled or
+#: crashed flow is killed before its ``finally`` runs, and its child ingests — which
+#: are dispatched from threads, so carry no parent-run link — keep writing the mosaic
+#: prefix a retry will race.
+_cancel_child_ingests_on_cancellation = make_child_cancel_hook(_INGEST_TAG_PREFIX, "child ingest run")
 
 
 @flow(

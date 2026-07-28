@@ -30,12 +30,14 @@ import icechunk
 import zarr
 from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
+from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.inference.data_loading import _active_orbits
+from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import IngestDeployments
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import (
@@ -53,6 +55,26 @@ from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, canonicalize_zo
 # duplicated string literals), so a future rename of the ingest deployments stays
 # in one place — ingest_zone_year.IngestDeployments.
 _INGEST_DEPLOYMENT_DEFAULTS = IngestDeployments()
+
+
+#: Tag prefix for every deployment this campaign dispatches — ingests, per-cell
+#: fills and chained-fill shards alike.
+_CHILD_TAG_PREFIX = "campaign"
+
+
+def _child_tag(flow_run_id: object) -> str | None:
+    """Deterministic tag for this campaign's dispatched children."""
+    return child_run_tag(_CHILD_TAG_PREFIX, flow_run_id)
+
+
+#: Cancelling the campaign must stop what it started. Each `arun_deployment` creates
+#: an INDEPENDENT run: killing this flow leaves its ingests and fills running, still
+#: writing mosaics and store attrs a retry will race, with their Dask and Ray fleets
+#: still billing — and a campaign has many in flight at once. Registered as both
+#: terminal hooks because a crashed parent orphans children exactly like a cancelled
+#: one. The child flows keep their OWN teardown hooks; this one stops the runs those
+#: hooks then clean up after.
+_cancel_children_on_cancellation = make_child_cancel_hook(_CHILD_TAG_PREFIX, "campaign child run")
 
 
 def _dpl(prod_ref: str, branch: str | None) -> str:
@@ -327,7 +349,11 @@ def _resolve_ami_id(ami_ssm_name: str, region: str | None) -> str:
     return resolve_ami_id(ami_ssm_name, region or "us-west-2")
 
 
-@flow(name="run-global-campaign")
+@flow(
+    name="run-global-campaign",
+    on_cancellation=[_cancel_children_on_cancellation],
+    on_crashed=[_cancel_children_on_cancellation],
+)
 async def run_global_campaign(
     *,
     paths: BucketPaths,
@@ -459,6 +485,10 @@ async def run_global_campaign(
         Summary: pending count at start, dispatched run ids per year, totals.
     """
     log = get_run_logger()
+    # Stamped on every deployment this campaign dispatches so the terminal hooks can
+    # find them from the flow-run id alone (see _child_tag). None outside a Prefect
+    # run — a direct .fn() call in tests dispatches nothing worth sweeping.
+    _tags = [t] if (t := _child_tag(flow_run_ctx.id)) else None
     # Resolve branch-scoped deployment names once. A default (None) child ref is
     # derived from `branch`; an explicit ref passes through verbatim. The S1/S2
     # grandchildren are derived from the same `branch` in `_ingest_params`.
@@ -671,7 +701,7 @@ async def run_global_campaign(
             did_ingest = ingest and not retag_only
             if did_ingest:
                 async with ingest_sem:  # each ingest provisions its own Dask cluster
-                    irun = await arun_deployment(ingest_deployment, parameters=_ingest_params(zone, year))
+                    irun = await arun_deployment(ingest_deployment, parameters=_ingest_params(zone, year), tags=_tags)
                     _check_completed(irun, f"ingest {zone}-{year}")
             # An all-ocean cell (no live tiles) produces no mosaic: ingest returns
             # skipped_ocean, and the fill marks it empty + tags with no staging/inference
@@ -708,6 +738,7 @@ async def run_global_campaign(
                 frun = await arun_deployment(
                     fill_deployment,
                     parameters=_fill_params(zone, year, run_id, needs_cluster=not (retag_only or empty_cell)),
+                    tags=_tags,
                 )
                 _check_completed(frun, f"fill {zone}-{year}")
             # Only delete a mosaic THIS campaign produced: with ingest=False the mosaic
@@ -823,7 +854,9 @@ async def run_global_campaign(
 
             chained_results = await asyncio.gather(
                 *(
-                    arun_deployment(chained_fill_deployment, parameters=_chained_params(sh, len(shards), year))
+                    arun_deployment(
+                        chained_fill_deployment, parameters=_chained_params(sh, len(shards), year), tags=_tags
+                    )
                     for sh in shards
                 ),
                 return_exceptions=True,

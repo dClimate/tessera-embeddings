@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 from prefect.states import StateType
 
+import tessera_embeddings.orchestration.prefect.flows._child_runs as _child_runs
 import tessera_embeddings.orchestration.prefect.flows.fill_zones_sequential as mod
 from tessera_embeddings.config.paths import BucketPaths
 
@@ -428,6 +429,9 @@ def test_ingest_child_tag_derivation():
 def test_cancel_child_ingests_hook_sweeps_live_runs_by_tag(monkeypatch):
     """The hook re-derives the parent tag and cancels only LIVE children — the
     in-process shutdown() never runs when Prefect kills the flow process.
+
+    Patched on `_child_runs`, which is where the hook resolves its client: the
+    sweep is shared with run-global-campaign rather than copied per flow.
     """
     live = SimpleNamespace(id="fr-live", state=_state(StateType.RUNNING, final=False))
     done = SimpleNamespace(id="fr-done", state=_state(StateType.COMPLETED, final=True))
@@ -442,7 +446,7 @@ def test_cancel_child_ingests_hook_sweeps_live_runs_by_tag(monkeypatch):
             return [live, done]
 
     client = _SweepClient()
-    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    monkeypatch.setattr(_child_runs, "get_client", lambda sync_client=True: client)
     mod._cancel_child_ingests_on_cancellation(None, SimpleNamespace(id="run-1"), None)
     assert client.cancelled == [("fr-live", StateType.CANCELLING)]  # final child untouched
     assert client.filters[0].tags.all_ == ["chained-ingest:run-1"]

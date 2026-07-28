@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from prefect.states import StateType
@@ -58,8 +59,9 @@ def wired(monkeypatch):
         ),
     )
 
-    async def fake_arun(dep, parameters=None):
+    async def fake_arun(dep, parameters=None, tags=None):
         rec["arun"].append((dep, parameters))
+        rec.setdefault("tags", []).append(tags)
         return _completed_run()
 
     monkeypatch.setattr(mod, "arun_deployment", fake_arun)
@@ -564,3 +566,32 @@ class TestAmiIsResolvedOnlyForCellsThatStartRay:
         fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
         assert fill["run_id"].endswith("-empty")
         assert fill["ami_id"] is None
+
+
+def test_every_dispatched_child_carries_the_campaign_tag(wired):
+    """The tag is the only thing the terminal hooks can work from.
+
+    Prefect runs them in a fresh process after killing the flow, so nothing in
+    memory records what was dispatched — an untagged child is an unsweepable one.
+    """
+    with patch.object(mod.flow_run_ctx, "id", "run-abc"):
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    assert wired["tags"], "no children dispatched"
+    assert all(t == ["campaign:run-abc"] for t in wired["tags"]), wired["tags"]
+
+
+def test_children_go_untagged_outside_a_flow_run(wired):
+    """A direct .fn() call has no run id, and dispatches nothing worth sweeping."""
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    assert all(t is None for t in wired["tags"])
+
+
+def test_campaign_registers_child_cancellation_on_cancel_and_crash():
+    """Cancelling the campaign must stop the ingests and fills it started.
+
+    Each dispatch is an INDEPENDENT run: without this the parent dies and its
+    children keep writing, with their Dask and Ray fleets still billing.
+    """
+    flow = mod.run_global_campaign
+    assert mod._cancel_children_on_cancellation in flow.on_cancellation_hooks
+    assert mod._cancel_children_on_cancellation in flow.on_crashed_hooks
