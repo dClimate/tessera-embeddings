@@ -1604,6 +1604,20 @@ mosaic with a hole in it; under-excusing costs a re-ingest. `assessed_empty_date
 for observability: it separates "sparse region" from "the footprints are wrong", which look
 identical in a date count.
 
+**Correction (`9559316`): "both ingest paths now record `assessed_window`" was FALSE for S2 for
+as long as the attribute existed.** S2 passed `record_assessed_window` its `store_path` — the
+mosaic PARENT directory, which holds all three child repos — where the function needs the
+reflectance repo. `open_repo` raised `the repository doesn't exist`, and the catch-and-log above
+swallowed it. S1 was correct (`orbit_store`), so nothing looked systematically wrong. Caught by
+opening a finished 56N store and finding no attribute on it; the same wrong path had raised the
+identical error a minute earlier in the verification script itself.
+
+The failure direction was safe — no attribute means the gate falls back to strict
+every-month-present — but that is exactly the behaviour this section exists to remove, so the
+feature was inert on the sensor with the most dates. **The lesson is about the design, not the
+typo: a deliberately non-fatal write has no failure signal, so the only way to know its path is
+right is to READ THE VALUE BACK from a real store.** A completed run proves nothing about it.
+
 ## 5. Claims made and withdrawn
 
 Recorded so they are not revived, and because the pattern is instructive.
