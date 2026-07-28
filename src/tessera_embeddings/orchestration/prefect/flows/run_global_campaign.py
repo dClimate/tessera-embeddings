@@ -16,8 +16,8 @@ therefore accumulate ahead of the fills that consume them — hundreds of
 terabytes, transient, deleted per cell as each fill lands (``cleanup_mosaics``)
 and swept after a crash (``sweep_orphan_mosaics``). What is deliberately absent
 is backpressure; what remains is cleanup. GPUs are the resource that must not
-wait: under ``"chained-clusters"`` a shard blocks on its first mosaic before
-requesting a fleet, so a cluster is never booted with nothing to work on.
+wait: under ``"chained-clusters"`` a shard ingests EVERY one of its cells before
+requesting a fleet, so a cluster is never billed against an unfinished ingest.
 
 **Scheduling (ADR-008 D6 + the runner contract).** Inference is parallel across
 zones; only commits contend, and only *same-zone* fills conflict (shared
@@ -444,10 +444,12 @@ async def run_global_campaign(
             actor churn, or model reload. Amortizes ``ray up`` + per-worker
             bringup + model-load cold starts across the whole shard; ingest
             look-ahead and trailing assembly cover the remaining seams (see
-            the runner's module docstring). Each shard also waits for its first
-            mosaic before requesting GPUs, so a fleet is never booted with
-            nothing to work on. ``max_parallel_zones=1`` degenerates to a single
-            cluster for the whole year. ``"cluster-per-zone"`` dispatches one
+            the runner's module docstring). Each shard also ingests EVERY one of
+            its cells before requesting GPUs, so a fleet is never billed against
+            an unfinished ingest — which makes the up-front ingest scale with
+            shard size. ``max_parallel_zones=1`` degenerates to a single cluster
+            for the whole year, and therefore to a whole year of ingest before
+            any inference. ``"cluster-per-zone"`` dispatches one
             ``fill-zone-year`` run per cell instead, each provisioning its own
             short-lived Ray cluster — simpler, and it pays a full cluster
             bringup and model load per zone.

@@ -720,40 +720,61 @@ def fill_zones_sequential_flow(
             s3_region=s3_region,
         )
 
-    # Prime the pipeline: kick off the initial ingest window BEFORE `ray up`.
-    # Idempotent — the runner's feeder immediately re-issues these same starts (and
-    # admits them through its mosaic budget); the window is 1 + look_ahead ≤ the
-    # budget's look_ahead + 2, so priming can't overshoot it.
+    # INGEST THE WHOLE SHARD BEFORE ASKING FOR A SINGLE GPU.
+    #
+    # A GPU fleet is never booted speculatively, and "speculatively" is stricter
+    # than "with nothing at all ready". Waiting only for the head cell still left
+    # the fleet exposed: cells finish at very different times — S1 typically lands
+    # well ahead of S2, and zones differ several-fold in size — so a cluster that
+    # started on cell one would routinely catch up with the stream and idle,
+    # billing GPU-hours against an ingest that had not finished. Every cell is
+    # ingested first, and the fleet is requested only once they have all landed.
+    #
+    # The cost is real and accepted: a shard's wall clock now begins with its full
+    # ingest, unoverlapped, and its mosaics all coexist (which the campaign no
+    # longer bounds — see run_global_campaign and ADR-011). Ingest waiting is cheap;
+    # a provisioned fleet waiting is not. Note this scales with SHARD size, so
+    # `max_parallel_zones=1` (one cluster for a whole year) means a whole year of
+    # ingest before any inference.
+    #
+    # Ingest CONCURRENCY is unchanged: the adapter's executor is sized to
+    # `look_ahead`, so submitting every cell queues them rather than running them
+    # all at once. `wait` is idempotent, so the runner's own wait per cell returns
+    # immediately from the same completed future.
     if inputs is not None:
-        for cell in live[: 1 + look_ahead]:
+        for cell in live:
             inputs.start(cell.zone, cell.year)
 
-        # Then BLOCK until the first cell's mosaic exists, and only then ask for GPUs.
-        #
-        # A GPU fleet must never be booted speculatively. Bringing the cluster up
-        # concurrently with this ingest looked like free overlap — and would be, if
-        # `ray up` were the long pole — but an ingest is tens of minutes to hours
-        # against five to ten for the cluster, so in practice the fleet finished
-        # provisioning and then billed idle for the remainder of the first ingest,
-        # once per shard per year. Waiting here converts that into ingest-only time,
-        # which is the cheap resource. `wait` is idempotent (it starts the cell if
-        # needed and joins the same future), so the runner's own wait for this cell
-        # returns immediately.
-        #
-        # Only the FIRST cell is waited on: the rest of the primed window keeps
-        # ingesting during bring-up and during cell one's inference, which is the
-        # look-ahead doing its job. The guarantee is "never boot GPUs with nothing
-        # ready", not "serialise ingest behind inference".
-        head = live[0]
-        log.info(
-            "Waiting for %s-%d's mosaic before requesting GPUs (%d more cell(s) ingesting behind it)",
-            head.zone,
-            head.year,
-            max(0, len(live[: 1 + look_ahead]) - 1),
-        )
+        log.info("Ingesting all %d cell(s) before requesting GPUs (%d at a time)", len(live), look_ahead)
         t0 = time.monotonic()
-        inputs.wait(head.zone, head.year)
-        log.info("Mosaic for %s-%d ready after %.1fs — requesting GPUs", head.zone, head.year, time.monotonic() - t0)
+        # A cell whose ingest failed is NOT fatal here. Its exception is cached on
+        # the future, so the runner re-raises it at that cell's own wait and handles
+        # it as a failed cell — the shard's other zones still fill. Only a shard
+        # where nothing landed skips the cluster, since there would be no work.
+        failed: list[str] = []
+        for cell in live:
+            try:
+                inputs.wait(cell.zone, cell.year)
+            except Exception as exc:  # re-raised per cell by the runner's own wait
+                failed.append(f"{cell.zone}-{cell.year}: {exc}")
+        if failed:
+            log.warning(
+                "%d of %d ingest(s) failed; filling the rest and letting each failure surface at its own cell: %s",
+                len(failed),
+                len(live),
+                "; ".join(failed),
+            )
+        if len(failed) == len(live):
+            raise RuntimeError(
+                f"year {year}: all {len(live)} ingest(s) failed — not provisioning a GPU fleet with "
+                f"no mosaic to fill: {'; '.join(failed)}"
+            )
+        log.info(
+            "All mosaics ready after %.1fs (%d cell(s), %d failed) — requesting GPUs",
+            time.monotonic() - t0,
+            len(live) - len(failed),
+            len(failed),
+        )
 
     try:
         # Pin a deterministic cluster name from the flow-run id so the cancellation

@@ -20,15 +20,17 @@ the flow and README point here):
   re-created between zones (no per-zone model reload either). Zones stay
   near-sequential: at most one zone's tail overlaps the next zone's head.
 - **Ingest look-ahead** (``inputs``): the next cells' mosaics are ingested
-  *while earlier cells infer*, bounded so in-flight mosaics stay within
-  ADR-011's "peak input storage bounded by in-flight cells". Two gates
-  cooperate: ``zone_slots`` admits at most ``look_ahead + 2`` *un-finalized*
-  zones (a zone holds its slot from prepare until its assembly lands), and a
-  mosaic budget (:class:`_MosaicBudget`, same capacity) admits every ingest
-  *start* — a mosaic occupies a budget slot from the moment its ingest is
-  kicked off until its cleanup, so look-ahead can never materialize more than
-  ``look_ahead + 2`` mosaics at once (it used to escape the bound and peak at
-  ~``2 * look_ahead + 2``). Mosaics deliberately RETAINED past the run —
+  *while earlier cells infer*. Two gates cooperate: ``zone_slots`` admits at
+  most ``look_ahead + 2`` *un-finalized* zones (a zone holds its slot from
+  prepare until its assembly lands), and a mosaic budget
+  (:class:`_MosaicBudget`, same capacity) admits every ingest *start*.
+  Together they pace how far the feeder runs ahead of finalization.
+
+  These were a STORAGE bound while the caller primed only a look-ahead window.
+  They are not any more: the flow ingests its whole shard before requesting
+  GPUs, so a fleet is never billed against an unfinished ingest, and peak
+  storage is a shard's mosaics by design (ADR-011). The gates still matter for
+  pacing and for the fleet-fill limitation noted below. Mosaics RETAINED —
   failed cells (kept for staged resume) and orbit-mismatch deferrals awaiting
   the fallback — are handled explicitly: failures release their budget slot
   with a warning (storage honesty over a feeder deadlock), and deferrals may
@@ -119,15 +121,24 @@ class CellInputs(Protocol):
 
 
 class _MosaicBudget:
-    """Bounds mosaics alive on storage: ingest *start* through cleanup.
+    """Paces mosaic admission: ingest *start* through cleanup.
 
     ``zone_slots`` alone bounds only *admitted* zones — look-ahead ingest
     starts happen before admission, so without this gate they escape the
-    storage bound. A slot is acquired (idempotently, keyed by cell) before a
+    pacing. A slot is acquired (idempotently, keyed by cell) before a
     cell's ingest is started and released at its mosaic cleanup — or, for
     mosaics deliberately retained past the run (failed cells kept for staged
     resume), released explicitly with a warning so a permanently-held slot
     can never starve the feeder into deadlock.
+
+    NOT a storage bound any more. It was one while the caller primed only a
+    look-ahead window, but the flow now ingests its ENTIRE shard before asking
+    for GPUs, so every mosaic is already on storage before this gate sees it —
+    ``acquire`` finds each ingest already started and returns immediately. What
+    it still does is pace how far the feeder runs ahead of finalization, which
+    is what keeps `zone_slots` and the trailing assembly honest. Peak storage is
+    now the shard, deliberately: see ADR-011 and
+    :mod:`...prefect.flows.fill_zones_sequential`.
     """
 
     def __init__(self, slots: int) -> None:

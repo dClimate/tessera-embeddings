@@ -182,10 +182,14 @@ The single-ROI path is deliberately untouched by all of this.
   transient. Cleanup is unchanged and still matters: `cleanup_mosaics` deletes each
   mosaic as its fill lands, `sweep_orphan_mosaics` collects what a crash leaves.
   The trade accepted is storage cost for ingest throughput.
-- GPUs are never booted speculatively. Under `chained-clusters` a shard waits for
-  its first mosaic before requesting a fleet, so cluster bring-up is never billed
-  against an ingest that has not finished. Ingest waiting is cheap; a provisioned
-  GPU fleet waiting is not.
+- GPUs are never booted speculatively. Under `chained-clusters` a shard ingests
+  **every** cell before requesting a fleet. Waiting only for the first mosaic was
+  tried and is not sufficient: cells finish at very different times (S1 lands well
+  ahead of S2; zones differ several-fold in size), so a fleet started on the head
+  cell catches up with the stream and idles. The accepted cost is a shard's full
+  ingest up front, unoverlapped — it scales with shard size, so
+  `max_parallel_zones=1` means a whole year of ingest before any inference.
+  Ingest waiting is cheap; a provisioned GPU fleet waiting is not.
 - A deliberate refill re-ingests (hours, STAC/ASF re-pull) — acceptable given the
   storage saving; the coverage store + zone ROI regenerate in seconds.
 - The zone-fill chain gained its first temporal-coverage gate; a missing-months

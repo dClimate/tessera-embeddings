@@ -234,33 +234,57 @@ class _RecordingInputs:
         self._order.append("inputs_shutdown")
 
 
-def test_first_ingest_window_starts_before_ray_up(wired, monkeypatch):
-    """The initial ingest window is kicked off BEFORE `ray up`, so the look-ahead
-    cells materialize during cluster bring-up and the first cell's inference.
+def test_the_whole_shard_is_ingested_before_ray_up(wired, monkeypatch):
+    """Every cell, not a look-ahead window: the fleet is requested last.
+
+    Cells finish at very different times — S1 lands well before S2, and zones
+    differ several-fold in size — so a cluster started on the head cell would
+    routinely catch up with the stream and idle, billing GPU-hours against an
+    ingest that had not finished. `look_ahead` still caps how many ingests run
+    at once; it no longer caps how many are started before the cluster.
     """
     monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
     _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
-    # Window = 1 + look_ahead cells, all before the cluster:
-    starts = [e for e in wired["order"] if e.startswith("start:")]
-    assert starts == ["start:01N", "start:02N"]
-    assert wired["order"].index("start:02N") < wired["order"].index("ray_up")
+    order = wired["order"]
+    assert [e for e in order if e.startswith("start:")] == ["start:01N", "start:02N", "start:03N"]
+    assert [e for e in order if e.startswith("wait:")] == ["wait:01N", "wait:02N", "wait:03N"]
+    # The last cell's mosaic exists before a single GPU is asked for.
+    assert order.index("wait:03N") < order.index("ray_up")
 
 
-def test_gpus_are_not_requested_until_the_first_mosaic_exists(wired, monkeypatch):
-    """A GPU fleet must never be booted speculatively.
+def test_a_failed_ingest_does_not_sink_the_shard(wired, monkeypatch):
+    """One bad zone must not cost the others their fill.
 
-    Overlapping `ray up` with the first ingest reads as free parallelism, but an
-    ingest runs tens of minutes to hours against five to ten for the cluster — so
-    the fleet finished provisioning and then billed idle for the remainder, once
-    per shard per year. The wait converts that into ingest-only time.
+    The exception stays on the cached future, so the runner re-raises it at that
+    cell's own wait and records a failed cell — the surviving zones still fill.
     """
-    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
+
+    class _OneBadCell(_RecordingInputs):
+        def wait(self, zone, year, stop=None):
+            super().wait(zone, year, stop)
+            if zone == "02N":
+                raise RuntimeError("ingest 02N exploded")
+
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_OneBadCell, wired["order"]))
     _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
-    assert wired["order"].index("wait:01N") < wired["order"].index("ray_up")
-    # ONLY the head cell is waited on — the rest of the window keeps ingesting
-    # through bring-up and the first cell's inference, which is the look-ahead
-    # doing its job. Waiting on all of them would serialise ingest behind nothing.
-    assert [e for e in wired["order"] if e.startswith("wait:")] == ["wait:01N"]
+    assert "ray_up" in wired["order"]
+    assert [e for e in wired["order"] if e.startswith("wait:")] == ["wait:01N", "wait:02N", "wait:03N"]
+
+
+def test_no_gpus_when_every_ingest_failed(wired, monkeypatch):
+    """Nothing landed means nothing to fill — provisioning a fleet would burn
+    GPU-hours to discover that, so fail before `ray up` instead.
+    """
+
+    class _AllBad(_RecordingInputs):
+        def wait(self, zone, year, stop=None):
+            super().wait(zone, year, stop)
+            raise RuntimeError(f"ingest {zone} exploded")
+
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_AllBad, wired["order"]))
+    with pytest.raises(RuntimeError, match=r"all 2 ingest\(s\) failed"):
+        _run(zones=["01N", "02N"], ingest=True, look_ahead=1)
+    assert "ray_up" not in wired["order"]
 
 
 def test_no_ingest_means_no_wait_before_the_cluster(wired, monkeypatch):

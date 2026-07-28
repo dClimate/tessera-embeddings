@@ -50,10 +50,10 @@ loop), under one of two strategies:
   start, and the EC2 capacity roll across the whole shard instead of per zone
   (`max_parallel_zones=1` = a single cluster for the whole year). Zones whose
   mosaics resolve a different S1 orbit than the session run per-cell after
-  the stream. Each shard **waits for its first mosaic before requesting GPUs**,
-  so a fleet is never provisioned against an ingest that has not finished. The
-  shared fleet is then kept busy at the seams by **ingest look-ahead** (the next
-  cells' mosaics ingest while the current cell infers) and **trailing assembly**
+  the stream. Each shard **ingests every one of its cells before requesting
+  GPUs**, so a fleet is never provisioned against an unfinished ingest — see
+  below. The shared fleet is then kept busy at the seams by **ingest look-ahead**
+  (relevant on a resume, where some mosaics already exist) and **trailing assembly**
   (a cell's shard write runs on a background thread — assembly is ~10-15% of a
   cell's inference wall — while the next cell's inference keeps the GPUs busy).
   Retag-only and all-ocean cells settle before the cluster exists, and
@@ -80,6 +80,31 @@ They are transient. `cleanup_mosaics` deletes each one as its fill lands, and
 
 The asymmetry is intentional: ingest waiting is cheap, and a provisioned GPU fleet
 waiting is not.
+
+### GPUs are never booted speculatively
+
+A `chained-clusters` shard ingests **all** of its cells and only then calls
+`ray up`. Waiting for just the first mosaic is not enough: cells finish at very
+different times — Sentinel-1 typically lands well ahead of Sentinel-2, and zones
+differ several-fold in size — so a fleet started on the head cell routinely
+catches up with the stream and idles, billing GPU-hours against an ingest that
+has not finished.
+
+The trade is a shard's full ingest up front, unoverlapped, in exchange for no
+idle GPU time at the seams. It scales with **shard** size, so `max_parallel_zones=1`
+(one cluster for a whole year) means a whole year of ingest before any inference.
+Ingest *concurrency* is unaffected — the per-shard look-ahead still caps how many
+run at once; it no longer caps how many are started before the cluster.
+
+A cell whose ingest fails is not fatal: the failure surfaces at that cell's own
+turn in the stream and the shard's other zones still fill. Only a shard where
+*every* ingest failed skips the cluster and raises, since there would be nothing
+to fill.
+
+```text
+ingest all N cells (look_ahead at a time)  ─────────────►│
+                                                          ray up ──► stream N zones
+```
 
 Under `chained-clusters` the ingest cap is divided across the shards as their
 per-shard look-aheads, **rounded up** — a shard cannot hold less than one, and
