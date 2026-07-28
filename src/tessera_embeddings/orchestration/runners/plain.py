@@ -253,6 +253,7 @@ def _run_inference_and_assemble(
             time_window=time_window,
             tile_id=roi_name,
             model_version=checkpoint_id,
+            encoder_version=config.model_version,
             manifest=manifest,
             n_workers=max_workers,
         )

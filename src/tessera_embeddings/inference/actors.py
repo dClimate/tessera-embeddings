@@ -28,11 +28,13 @@ import ray
 import requests
 
 from tessera_embeddings.config.inference import (
+    DEFAULT_MODEL_VERSION,
     EMBEDDING_DIM,
     PREFETCH_DEPTH,
     S2_BAND_ORDER,
     InferenceConfig,
     band_stats,
+    est_px_per_sec,
 )
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -171,26 +173,10 @@ _MIN_STRIP_H = 256
 _EST_READ_BYTES_PER_SEC = 900e6
 _EST_FIXED_READ_S = 13.0
 
-# Inference throughput, PER MODEL. Every planning decision that asks "will the
-# GPU be busy long enough to hide this read?" divides by this, so it must track
-# the model actually running: a faster encoder finishes sooner and hides less,
-# and an estimate inherited from a slower one silently over-predicts the
-# available cover. Distilled students are materially quicker than the v1.1
-# encoder, so a single shared figure cannot serve both.
-#
-# Unknown versions fall back to the v1.1 figure rather than raising — this is a
-# speed hint, and refusing to plan would be a worse failure than planning with
-# a stale number. Per-model calibration lives in context_docs, not here.
-_EST_PX_PER_SEC_BY_MODEL: dict[str, float] = {
-    "v1.1": 16_000.0,
-    "v2-large": 22_000.0,
-}
-_EST_PX_PER_SEC = _EST_PX_PER_SEC_BY_MODEL["v1.1"]
-
-
-def est_px_per_sec(model_version: str) -> float:
-    """Planning-only inference-rate estimate for *model_version*."""
-    return _EST_PX_PER_SEC_BY_MODEL.get(model_version, _EST_PX_PER_SEC)
+# Inference throughput is per-model (config.inference.MODEL_EST_PX_PER_SEC).
+# This is only the signature fallback for the planning helpers below; callers
+# that know their model pass est_px_per_sec(config.model_version).
+_EST_PX_PER_SEC = est_px_per_sec(DEFAULT_MODEL_VERSION)
 
 
 # P2 starter strip: a deliberately small first strip so the GPU starts inferring

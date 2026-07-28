@@ -5,6 +5,7 @@ from importlib.metadata import version as _dist_version
 import numpy as np
 import pytest
 
+from tessera_embeddings.config.inference import encoder_url
 from tessera_embeddings.inference.conventions import ENCODER_VERSION, build_convention_attrs, tile_id_to_epsg
 
 _PKG_VERSION = _dist_version("tessera_embeddings")
@@ -162,6 +163,27 @@ class TestBuildConventionAttrs:
         assert attrs["geoemb:build_version"] == _PKG_VERSION
         # No checkpoint id supplied -> no checkpoint_id attr.
         assert "checkpoint_id" not in build_convention_attrs(total_y=10, total_x=10, embedding_dim=128)
+
+    def test_model_url_tracks_the_encoder_family(self) -> None:
+        """A v2 store must not advertise v1.1's public URL.
+
+        The checkpoint stem and the public URL are separate provenance, so the
+        stem alone cannot select the URL — the family has to be threaded.
+        """
+        v2 = build_convention_attrs(
+            total_y=10, total_x=10, embedding_dim=128, model_version="student_large", encoder_version="v2-large"
+        )
+        assert v2["geoemb:model"] == encoder_url("v2-large")
+        assert v2["geoemb:model"] != encoder_url("v1.1")
+        assert v2["checkpoint_id"] == "student_large"  # stem stays separate provenance
+        # An explicit URL still wins over the family lookup.
+        explicit = build_convention_attrs(
+            total_y=10, total_x=10, embedding_dim=128, encoder_version="v2-large", model_url="https://example/x"
+        )
+        assert explicit["geoemb:model"] == "https://example/x"
+        # Provenance is never guessed: an unregistered family errors, not defaults.
+        with pytest.raises(ValueError, match="No public encoder URL"):
+            encoder_url("v3-imaginary")  # type: ignore[arg-type]
 
     def test_spatial_layout_omitted_by_default_included_when_set(self) -> None:
         """spatial_layout is optional: omitted for a root-only single-ROI store,

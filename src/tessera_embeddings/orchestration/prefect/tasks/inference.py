@@ -171,6 +171,7 @@ def assemble_embeddings_task(
         time_window=time_window or config.time_window,
         tile_id=roi_name,
         model_version=model_version,
+        encoder_version=config.model_version,
         manifest=embedding_manifest,
         n_workers=n_workers,
         get_credentials=get_credentials,

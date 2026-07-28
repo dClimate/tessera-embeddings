@@ -292,6 +292,63 @@ MODEL_ARCHS: dict[str, ModelArch] = {
     "v2-large": _V2_LARGE_ARCH,
 }
 
+# --- Per-model deployment facts (same keys as MODEL_ARCHS) -----------------
+# Non-architecture properties of the model. Centralised because the failure
+# mode is a constant that silently keeps a PREVIOUS version's value.
+
+#: PUBLIC encoder URL a store advertises as ``geoemb:model`` — the externally
+#: resolvable identity of the model FAMILY, deliberately not the internal
+#: checkpoint filename (that is ``checkpoint_id``).
+MODEL_ENCODER_URLS: dict[str, str] = {
+    "v1.1": "https://geotessera.org/model/1.1",
+    # v2 Large is published as a Hugging Face repo, not under the
+    # geotessera.org/model/<version> scheme. Replace if a canonical path is
+    # minted; seed and fill need only agree on whatever is registered here.
+    "v2-large": "https://huggingface.co/geotessera/TESSERA-V-2.0-2B-L",
+}
+
+#: Planning-only inference throughput (px/s/worker). Strip and prefetch
+#: planning divides by this to ask "will the GPU stay busy long enough to hide
+#: this read?", so a faster model must not inherit a slower one's figure.
+#: Strategy only — never correctness, never a RAM bound. Calibration in
+#: context_docs.
+MODEL_EST_PX_PER_SEC: dict[str, float] = {
+    "v1.1": 16_000.0,
+    "v2-large": 22_000.0,
+}
+
+
+def encoder_url(model_version: ModelVersion = DEFAULT_MODEL_VERSION) -> str:
+    """Public ``geoemb:model`` URL for *model_version*.
+
+    Raises on unknown versions rather than defaulting: a store stamped with
+    another encoder's URL misidentifies itself to every downstream reader, and
+    does so silently.
+
+    MERGE NOTE (global-tessera-scoping): that branch's
+    ``conventions.expected_model_url()`` re-derives this URL at fill time and
+    compares it to the seed's, from a single module constant. Route it through
+    here and pass the fill's ``model_version``, or the gate checks a v2 fill
+    against v1.1's URL — rejecting a correct run, or waving through a real
+    mismatch when the seed carried the same stale constant.
+    """
+    try:
+        return MODEL_ENCODER_URLS[model_version]
+    except KeyError:
+        valid = ", ".join(repr(k) for k in MODEL_ENCODER_URLS)
+        msg = f"No public encoder URL registered for model_version={model_version!r}. Known: {valid}."
+        raise ValueError(msg) from None
+
+
+def est_px_per_sec(model_version: str = DEFAULT_MODEL_VERSION) -> float:
+    """Planning-only inference-rate estimate; unknown versions fall back.
+
+    Falls back rather than raising because this is a speed hint — planning with
+    a stale number beats refusing to plan.
+    """
+    return MODEL_EST_PX_PER_SEC.get(model_version, MODEL_EST_PX_PER_SEC[DEFAULT_MODEL_VERSION])
+
+
 # v1.1 observation-count buckets. Every pixel with k valid observations is resampled
 # to the next bucket size; pixels sharing a bucket form rectangular batches for the
 # transformer. Multiples of 8 from 8 to 256 match tessera v1.1 defaults.

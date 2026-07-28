@@ -23,6 +23,8 @@ from importlib.metadata import version as _dist_version
 import numpy as np
 from pyproj import CRS
 
+from tessera_embeddings.config.inference import DEFAULT_MODEL_VERSION, ModelVersion, encoder_url
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,12 +84,11 @@ _GEOEMB_CONVENTION = {
 }
 
 # --- geoemb: field defaults (this pipeline's fixed provenance) --------------
-#: Encoder checkpoint version (v1.1 pipeline). Versions the ``geoemb:model`` URL;
-#: overridable per call via ``model_version``. (``geoemb:build_version`` is the
+#: v1.1's public encoder version. The live ``geoemb:model`` lookup is
+#: :func:`~tessera_embeddings.config.inference.encoder_url`, keyed by model
+#: family; this remains the v1.1 identifier. (``geoemb:build_version`` is the
 #: software/package version, not this.)
 ENCODER_VERSION = "1.1"
-#: Public encoder reference URL, keyed by the encoder version (ENCODER_VERSION).
-_MODEL_URL_TEMPLATE = "https://geotessera.org/model/{version}"
 #: Precise source datasets we pull from: Sentinel-2 L2A COGs (Earth Search AWS
 #: Open Data) and OPERA RTC-S1 (ASF datapool).
 DEFAULT_SOURCE_DATA: tuple[str, ...] = (
@@ -236,6 +237,7 @@ def build_convention_attrs(
     y_coords: np.ndarray | None = None,
     x_coords: np.ndarray | None = None,
     model_version: str | None = None,
+    encoder_version: ModelVersion | None = None,
     model_url: str | None = None,
     data_type: str = QUANTIZED_DTYPE,
     gsd: float | None = None,
@@ -257,10 +259,12 @@ def build_convention_attrs(
 
     The ``geoemb:`` fields record encoder-model provenance and quantization:
     ``geoemb:model`` is the PUBLIC encoder reference URL — *model_url* when a
-    caller supplies the exact public URI for the encoder it used, else derived
-    from :data:`ENCODER_VERSION`. It is NEVER built from *model_version*, which
-    in production is an internal checkpoint filename stem; that is recorded as a
-    plain ``checkpoint_id`` provenance attr. ``geoemb:build_version`` is the
+    caller supplies the exact public URI for the encoder it used, else looked up
+    from *encoder_version* (the model FAMILY, e.g. ``"v2-large"``). It is NEVER
+    built from *model_version*, which in production is an internal checkpoint
+    filename stem; that is recorded as a plain ``checkpoint_id`` provenance attr.
+    Passing the family matters: omitting it stamps the default model's URL, so a
+    v2 store would advertise itself as v1.1. ``geoemb:build_version`` is the
     software/package version. *data_type* is the quantized storage dtype.
     *gsd* (metres) is emitted only when trustworthy — derived from a metre-based
     CRS's coordinate spacing, or an explicit *gsd* the caller vouches for; for a
@@ -301,13 +305,13 @@ def build_convention_attrs(
     attrs["geoemb:type"] = "pixel"  # per-pixel embeddings (not chip)
     attrs["geoemb:dimensions"] = embedding_dim
     # geoemb:model is the PUBLIC encoder reference URL. A caller passes the exact
-    # public URI for the encoder it used (model_url); otherwise we derive it from
-    # the pipeline's public encoder version (ENCODER_VERSION). It is NEVER built
-    # from *model_version*, which in production is an internal checkpoint filename
+    # public URI for the encoder it used (model_url); otherwise it is looked up
+    # from the model FAMILY (encoder_version). It is NEVER built from
+    # *model_version*, which in production is an internal checkpoint filename
     # stem (checkpoint_to_version(...)) — that is kept as separate `checkpoint_id`
     # provenance, so a v1.0 / future / custom checkpoint doesn't advertise a
     # synthetic or wrong public model URL.
-    attrs["geoemb:model"] = model_url or _MODEL_URL_TEMPLATE.format(version=ENCODER_VERSION)
+    attrs["geoemb:model"] = model_url or encoder_url(encoder_version or DEFAULT_MODEL_VERSION)
     if model_version:
         attrs["checkpoint_id"] = model_version
     attrs["geoemb:source_data"] = list(source_data)

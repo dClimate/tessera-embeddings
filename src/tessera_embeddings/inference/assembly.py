@@ -841,6 +841,7 @@ class ZarrWriter:
         time_window: TimeWindow | None = None,
         tile_id: str | None = None,
         model_version: str | None = None,
+        encoder_version: str | None = None,
         manifest: EmbeddingManifest | None = None,
         n_workers: int,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
@@ -881,7 +882,9 @@ class ZarrWriter:
             tile_id: Sentinel-2 MGRS tile ID (e.g. ``"37PBM"``). Used to derive
                 the EPSG code for ``proj:`` convention attributes when the
                 mosaic store does not carry a ``crs`` attr.
-            model_version: Model version string for ``tessera:model_version``.
+            model_version: Checkpoint filename stem, recorded as ``checkpoint_id``.
+            encoder_version: Model FAMILY (e.g. ``"v2-large"``) selecting the public
+                ``geoemb:model`` URL. Omitting it stamps the default model's URL.
             manifest: Typed manifest for append-safety validation.
                 Written on create, validated on append.
             n_workers: Max Dask worker count for this assembly. Used to divide
@@ -1079,6 +1082,7 @@ class ZarrWriter:
                 y_coords=spatial.northing if spatial else None,
                 x_coords=spatial.easting if spatial else None,
                 model_version=model_version,
+                encoder_version=encoder_version,
             )
             if conv_attrs:
                 # Drop any retired tessera:* attrs first: appending to a store
