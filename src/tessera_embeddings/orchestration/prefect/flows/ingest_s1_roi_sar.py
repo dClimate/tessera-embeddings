@@ -44,6 +44,7 @@ def _ingest_s1_roi_impl(
     crop_to_live_windows: bool,
     overlap_window_writes: bool,
     pipeline_batches: bool,
+    narrow_windows_per_date: bool,
 ) -> dict[str, Any]:
     """Inner flow: submits the S1 ingestion task to the configured Dask runner."""
     future = process_roi_sar.submit(
@@ -60,6 +61,7 @@ def _ingest_s1_roi_impl(
         crop_to_live_windows=crop_to_live_windows,
         overlap_window_writes=overlap_window_writes,
         pipeline_batches=pipeline_batches,
+        narrow_windows_per_date=narrow_windows_per_date,
     )
     return future.result()
 
@@ -106,6 +108,7 @@ def ingest_s1_roi_sar(
     crop_to_live_windows: bool = False,
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
+    narrow_windows_per_date: bool = False,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
 
@@ -140,6 +143,10 @@ def ingest_s1_roi_sar(
             ON.** Also selects the window merge exchange rate, which prices a boundary
             by how it is written, so the two cannot drift apart. Only meaningful with
             ``crop_to_live_windows``.
+        narrow_windows_per_date: Write only the live windows a date's own imagery reaches,
+            as the S2 path does. **Defaults OFF pending measurement** — the graph shrinks
+            several-fold but S1's scheduler is not saturated, so how much becomes wall clock
+            is unknown. Dates reaching NO live window are skipped either way.
         pipeline_batches: Prepare the NEXT batch's catalogue query while the current
             batch writes, so only the first batch pays its query on the critical path.
             **Defaults ON.** Look-ahead is one batch and not configurable: a batch's
@@ -195,6 +202,7 @@ def ingest_s1_roi_sar(
                 crop_to_live_windows=crop_to_live_windows,
                 overlap_window_writes=overlap_window_writes,
                 pipeline_batches=pipeline_batches,
+                narrow_windows_per_date=narrow_windows_per_date,
             )
 
     from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
@@ -230,4 +238,5 @@ def ingest_s1_roi_sar(
                 crop_to_live_windows=crop_to_live_windows,
                 overlap_window_writes=overlap_window_writes,
                 pipeline_batches=pipeline_batches,
+                narrow_windows_per_date=narrow_windows_per_date,
             )

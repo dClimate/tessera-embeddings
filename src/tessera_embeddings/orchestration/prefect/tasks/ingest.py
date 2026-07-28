@@ -99,6 +99,7 @@ def process_roi_sar(
     # that does not pass the flag explicitly.
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
+    narrow_windows_per_date: bool = False,
 ) -> dict[str, Any]:
     """Prefect task: ingest S1 OPERA SAR for one ROI.
 
@@ -162,5 +163,6 @@ def process_roi_sar(
             crop_to_live_windows=crop_to_live_windows,
             overlap_window_writes=overlap_window_writes,
             pipeline_batches=pipeline_batches,
+            narrow_windows_per_date=narrow_windows_per_date,
         )
     return asdict(result)

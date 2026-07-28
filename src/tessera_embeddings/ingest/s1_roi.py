@@ -44,11 +44,12 @@ from tessera_embeddings.ingest.live_windows import (
     WINDOW_COST_IN_CHUNKS,
     WINDOW_COST_IN_CHUNKS_OVERLAPPED,
     live_windows_for_mask,
+    windows_for_date,
 )
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import apply_roi_mask
-from tessera_embeddings.ingest.stac import ingest_tile
+from tessera_embeddings.ingest.stac import ingest_tile, solar_day_offset_seconds, solar_grouping_longitude
 from tessera_embeddings.ingest.transforms import amplitude_to_db
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset, write_day_windows
@@ -135,6 +136,10 @@ class _PreparedBatch:
     data: object | None
     baselines: dict[str, int]
     query_s: float
+    #: Solar day (keyed by the loaded slice's own timestamp) -> the live windows that day's
+    #: imagery reaches. Empty list = reaches nothing, so skip. Missing key = unknown, so
+    #: write everything. Empty dict = the whole batch falls back.
+    date_windows: dict[str, list[tuple[int, int, int, int]]]
 
 
 def ingest_s1_roi_sar(
@@ -155,6 +160,7 @@ def ingest_s1_roi_sar(
     crop_to_live_windows: bool = False,
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
+    narrow_windows_per_date: bool = False,
 ) -> SarIngestResult:
     """Ingest OPERA RTC-S1 SAR for an ROI using batched time windows.
 
@@ -210,6 +216,12 @@ def ingest_s1_roi_sar(
             Look-ahead is fixed at one batch: a batch's write is one long consume, so
             depth 1 already covers it, and deeper retention is what once deadlocked the
             S2 driver. Set False to restore the strictly serial query-then-write loop.
+        narrow_windows_per_date: Write only the live windows a date's own imagery can
+            reach, as the S2 path does. **Defaults OFF pending a measurement**: a
+            Sentinel-1 pass reaches a minority of a zone's windows, so the graph shrinks
+            several-fold, but S1's scheduler is not saturated, so it is unclear how much
+            of that becomes wall clock. Dates whose imagery reaches NO live window are
+            skipped either way — that costs nothing and writing one stores nothing.
 
     Returns:
         :class:`SarIngestResult`. ``status="skipped"`` if zero dates
@@ -262,24 +274,79 @@ def ingest_s1_roi_sar(
 
     # Cropped write path: windows derived once from the same mask this ingest
     # reads (see ingest.live_windows; identical mechanics to the S2 path).
+    #
+    # `run_windows` keeps the window OBJECTS because per-date narrowing needs them;
+    # `live_windows` is the plain-tuple form the storage layer takes.
+    run_windows: list = []
     live_windows: list[tuple[int, int, int, int]] | None = None
     if crop_to_live_windows:
-        live_windows = [
-            (w.y0, w.y1, w.x0, w.x1)
-            for w in live_windows_for_mask(
-                roi_zarr_path,
-                window_px=INGEST_CHUNK_SIZE,
-                # The merge exchange rate follows how this run WRITES, exactly as on the
-                # S2 path: overlapped windows share one graph, so a boundary is cheap and
-                # the DP should stop trading ocean area for fewer windows. A sequential
-                # writer still pays the serial cost per boundary and keeps the high rate.
-                window_cost_in_chunks=(
-                    WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
-                ),
-                storage_options=storage_options,
-            )
-        ]
+        run_windows = live_windows_for_mask(
+            roi_zarr_path,
+            window_px=INGEST_CHUNK_SIZE,
+            # The merge exchange rate follows how this run WRITES, exactly as on the
+            # S2 path: overlapped windows share one graph, so a boundary is cheap and
+            # the DP should stop trading ocean area for fewer windows. A sequential
+            # writer still pays the serial cost per boundary and keeps the high rate.
+            window_cost_in_chunks=(
+                WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
+            ),
+            storage_options=storage_options,
+        )
+        live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
         log.info("Cropping writes to %d live window(s)", len(live_windows))
+
+    # A date's own footprint, keyed so it can be matched back to the loaded time slice.
+    #
+    # THE JOIN IS ON AN EXACT TIMESTAMP, not a date string, and that is what makes this
+    # safe. odc groups by solar day but sets each slice's time coordinate to
+    # `group[0].nominal_datetime` — the EARLIEST item's real timestamp, since items are
+    # sorted by time within a group. So the minimum item datetime in a group reproduces
+    # odc's coordinate exactly. Keying by a derived solar-day string instead would
+    # disagree with the coordinate wherever the solar offset crosses UTC midnight, and
+    # would then narrow a date to the wrong footprint and drop real imagery silently.
+    def _footprint_key(when: datetime) -> str:
+        """Join key: naive-UTC timestamp to the second, matching odc's coordinate."""
+        return when.replace(tzinfo=None).isoformat(timespec="seconds")
+
+    mid_longitude = solar_grouping_longitude(roi)
+
+    def _date_footprints(items: list) -> dict[str, list[tuple[int, int, int, int]]]:
+        """Per solar day, the live windows that day's imagery can actually reach.
+
+        Empty list for a day whose imagery reaches NO live window — those days are skipped
+        rather than committed, since writing one stores nothing and pays a full graph.
+
+        Returns ``{}`` when anything is unusable (no windows, no longitude, no items), which
+        makes the caller fall back to the full window set. That asymmetry is the safety
+        argument: a footprint that is too LARGE only costs computed area that would have
+        been discarded, while one that is too SMALL drops imagery and nothing downstream
+        would notice.
+        """
+        if not run_windows or mid_longitude is None or not items:
+            return {}
+        offset = timedelta(seconds=solar_day_offset_seconds(mid_longitude))
+        by_day: dict[object, list] = {}
+        for item in items:
+            when = getattr(item, "datetime", None)
+            if when is None:
+                return {}  # cannot group reliably; fall back for the whole batch
+            by_day.setdefault((when + offset).date(), []).append(item)
+
+        out: dict[str, list[tuple[int, int, int, int]]] = {}
+        for day_items in by_day.values():
+            # odc's coordinate for this group is its EARLIEST item's timestamp.
+            key = _footprint_key(min(i.datetime for i in day_items))
+            narrowed = windows_for_date(
+                run_windows,
+                [getattr(i, "bbox", None) for i in day_items],
+                roi.geobox,
+                chunk_px=INGEST_CHUNK_SIZE,
+            )
+            # windows_for_date returns its INPUT unchanged when the footprint cannot be
+            # determined, so an unchanged length is not evidence of narrowing — that is
+            # fine here, since writing the full set is the conservative outcome anyway.
+            out[key] = [(w.y0, w.y1, w.x0, w.x1) for w in narrowed]
+        return out
 
     total_processed = 0
     batch_start = datetime.strptime(start_date, "%Y-%m-%d")
@@ -344,6 +411,23 @@ def ingest_s1_roi_sar(
         # making a per-batch re-read far cheaper than the pin. (S2 does the same, and
         # additionally crops the coverage denominator, which it alone computes.)
 
+        # Wrap the provider to keep the items odc was given. Wrapping rather than querying
+        # twice matters: these must be the SAME objects odc grouped, after any timestamp
+        # normalisation, or the footprints would describe a different set of acquisitions.
+        base_provider = make_s1_item_provider(
+            orbit,
+            roi.bbox_wgs84,
+            batch_start_str,
+            batch_end_str,
+            use_s3_direct=use_s3_direct,
+        )
+        seen_items: list = []
+
+        def _capturing_provider() -> list:
+            items = base_provider()
+            seen_items.extend(items)
+            return items
+
         query_started = time.monotonic()
         data, baselines = ingest_tile(
             provider="cmr-asf",
@@ -358,20 +442,21 @@ def ingest_s1_roi_sar(
             chunks=INGEST_CHUNKS,
             resampling="bilinear",
             groupby="solar_day",
-            item_provider_fn=make_s1_item_provider(
-                orbit,
-                roi.bbox_wgs84,
-                batch_start_str,
-                batch_end_str,
-                use_s3_direct=use_s3_direct,
-            ),
+            item_provider_fn=_capturing_provider,
             post_load_fn=amplitude_to_db,
             geobox=roi.geobox,
         )
         query_s = time.monotonic() - query_started
         if data is not None:
             data = apply_roi_mask(data, roi_zarr_path, spatial_chunks, roi_mask=batch_mask)
-        return _PreparedBatch(batch_start_str, batch_end_str, data, baselines, query_s)
+        return _PreparedBatch(
+            batch_start_str,
+            batch_end_str,
+            data,
+            baselines,
+            query_s,
+            _date_footprints(seen_items),
+        )
 
     # depth=1: one batch prepared ahead. A batch's write is one long consume, so a single
     # look-ahead already covers it; more would retain catalogue items to hide nothing.
@@ -428,6 +513,19 @@ def ingest_s1_roi_sar(
                     if date_str in written_dates:
                         log.info("[%s] Skipping date %s: already written", orbit, date_str)
                         continue
+
+                    # This date's own footprint, matched on the slice's exact timestamp —
+                    # the same value odc took from the group's earliest item. A MISSING key
+                    # means the footprint is unknown, so write everything; it must never
+                    # mean write nothing.
+                    footprint = prepared.date_windows.get(str(data["time"].values[i])[:19])
+                    if footprint is not None and not footprint:
+                        # Reaches no live window at all. Writing it would build a full graph
+                        # to store nothing, since all-fill chunks are never persisted.
+                        log.info("[%s] Skipping date %s: imagery reaches no live window", orbit, date_str)
+                        continue
+                    date_windows = footprint if (narrow_windows_per_date and footprint) else live_windows
+
                     # Inside the per-date loop deliberately: a batch can outlive the
                     # credential, so renewing only at batch boundaries is what failed.
                     refresh_credentials_if_stale()
@@ -437,7 +535,7 @@ def ingest_s1_roi_sar(
                             write_day_windows(
                                 orbit_store,
                                 data.isel(time=slice(i, i + 1)),
-                                live_windows,
+                                date_windows,
                                 roi=roi,
                                 manifest=ingest_manifest,
                                 baselines=baselines,
@@ -455,10 +553,11 @@ def ingest_s1_roi_sar(
                     # maximum, which is the single largest difference between how S1
                     # and S2 write today.
                     log.info(
-                        "[%s] S1 stage timings date=%s: write=%.1fs windows=%d mode=%s",
+                        "[%s] S1 stage timings date=%s: write=%.1fs windows=%d of %d mode=%s",
                         orbit,
                         date_str,
                         date_s,
+                        len(date_windows),
                         len(live_windows),
                         "parallel" if overlap_window_writes else "sequential",
                     )

@@ -1158,3 +1158,30 @@ def stream_stac_months(
             f" ({dropped} outside the month)" if dropped else "",
         )
         yield mr, owned, baselines
+
+
+def solar_grouping_longitude(roi: object) -> float | None:
+    """The longitude to group solar days by, matching the loader's own choice.
+
+    The loader shifts every item by ONE longitude — its geobox extent's centroid in
+    WGS84 — so preferring the geobox here makes the two agree by construction rather
+    than by approximation. Both must land on the same whole-hour offset, and a bbox
+    midpoint can differ from an extent centroid by enough to cross a 15-degree
+    boundary and so disagree.
+
+    Falls back to the WGS84 bbox midpoint, then to ``None``, which restores UTC-date
+    grouping. Degrading rather than raising is deliberate: a missing geobox is a
+    caller that is not loading by solar day, and no longitude is recoverable from
+    nothing.
+    """
+    geobox = getattr(roi, "geobox", None)
+    if geobox is not None:
+        try:
+            ((lon, _),) = geobox.extent.centroid.to_crs("epsg:4326").points
+            return float(lon)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    bbox = getattr(roi, "bbox_wgs84", None)
+    if bbox is not None and len(bbox) >= 3:
+        return (float(bbox[0]) + float(bbox[2])) / 2.0
+    return None

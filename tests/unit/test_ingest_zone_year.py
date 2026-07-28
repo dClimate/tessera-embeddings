@@ -262,30 +262,53 @@ class TestChunkScaledWorkers:
         # through land_mask's. Patching only one leaves the other reaching for S3.
         monkeypatch.setattr(mod, "open_store_as_zarr_group", fake_coverage)
         monkeypatch.setattr("tessera_embeddings.ingest.land_mask.open_store_as_zarr_group", fake_coverage)
+        wired["arun"].clear()  # the fixture accumulates; a test may dispatch more than once
         _run(ingest_settings=mod.IngestSettings(crop_to_live_windows=True, **settings_kwargs), s1_orbit="ascending")
+        # Dispatch order is S1 orbits then S2, so the LAST entry is always S2's width.
         return [p["max_workers"] for _, p in wired["arun"]]
 
     def test_sparse_zone_gets_the_floor_not_the_ceiling(self, wired, monkeypatch):
         # 03S in miniature: 4 live tiles in one 4096-chunk -> 1 chunk -> floor(10).
-        tiles = [[True, True], [True, True]]
-        assert self._dispatch(wired, monkeypatch, tile_live=tiles) == [10, 10]  # s1 + s2
+        s1, s2 = self._dispatch(wired, monkeypatch, tile_live=[[True, True], [True, True]])
+        assert s2 == 10
+        # S1 takes its fraction of that, which on a tiny zone is a couple of workers. A
+        # fixed S1 width would have exceeded S2's own fleet here.
+        assert s1 == 2
 
     def test_dense_zone_is_capped_by_settings(self, wired, monkeypatch):
 
         tiles = np.ones((40, 40), dtype=bool)  # 400 live chunks -> 200 > cap
-        assert self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=50) == [50, 50]
+        s1, s2 = self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=50)
+        assert s2 == 50
+        assert s1 == 11  # round(50 * 0.22)
 
     def test_mid_zone_scales_half_worker_per_chunk(self, wired, monkeypatch):
 
         tiles = np.zeros((20, 20), dtype=bool)
         tiles[::2, ::2] = True  # every 2x2 tile block live -> all 100 chunks live
-        assert self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=200) == [50, 50]
+        s1, s2 = self._dispatch(wired, monkeypatch, tile_live=tiles, max_workers=200)
+        assert s2 == 50
+        assert s1 == 11
+
+    def test_s1_is_never_wider_than_s2_nor_below_min_workers(self, wired, monkeypatch):
+        """The two clamps that keep a narrow S2 fleet from being out-sized by its S1 pair.
+
+        A cell's duration is set by S2, so an S1 orbit wider than S2 buys nothing and holds
+        quota that limits how many cells run at once.
+        """
+        tiles = [[True, True], [True, True]]  # smallest zone: S2 lands on the floor
+        s1, s2 = self._dispatch(wired, monkeypatch, tile_live=tiles, s1_worker_fraction=1.0)
+        assert s1 == s2, "fraction 1.0 must give parity, never more"
+        s1, s2 = self._dispatch(wired, monkeypatch, tile_live=tiles, min_workers=6, s1_worker_fraction=0.01)
+        assert s1 == 6, "a tiny fraction must still respect min_workers"
 
     def test_crop_off_keeps_the_settings_value(self, wired, monkeypatch):
         monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
         monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
         _run(ingest_settings=mod.IngestSettings(max_workers=37), s1_orbit="ascending")
-        assert [p["max_workers"] for _, p in wired["arun"]] == [37, 37]
+        # S2 takes the settings value verbatim; S1 still takes its fraction of it, because
+        # the ratio is about the WORK split between sensors, not about cropping.
+        assert [p["max_workers"] for _, p in wired["arun"]] == [8, 37]  # round(37 * 0.22) = 8
 
 
 def test_a_completed_sibling_store_survives_the_other_sensors_failure(wired, monkeypatch):

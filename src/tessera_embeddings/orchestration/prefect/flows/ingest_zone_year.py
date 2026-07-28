@@ -137,6 +137,21 @@ def _scaled_max_workers(live_chunks: int, settings: IngestSettings) -> int:
     return max(floor, min(settings.max_workers, round(live_chunks * _WORKERS_PER_LIVE_CHUNK)))
 
 
+def _s1_max_workers(s2_max_workers: int, settings: IngestSettings) -> int:
+    """One S1 orbit's fleet width, as a fraction of the S2 fleet's.
+
+    A cell runs three fleets concurrently and lasts as long as its LONGEST, which is always
+    S2 — so S1's width is chosen to finish inside S2's runtime, not to go fast. Giving S1
+    the same width as S2 (which one shared ``max_workers`` did) left it idle for most of the
+    cell while still holding quota, and quota is what caps how many cells run at once.
+
+    Never wider than S2 and never below ``min_workers``: the fraction is calibrated against
+    a 60-worker S2 fleet, and a sparse zone can scale S2 down far enough that the raw
+    fraction would round below a single worker.
+    """
+    return max(settings.min_workers, min(s2_max_workers, round(s2_max_workers * settings.s1_worker_fraction)))
+
+
 @flow(name="ingest-zone-year")
 async def ingest_zone_year(
     *,
@@ -308,6 +323,11 @@ async def ingest_zone_year(
     # suffix then separates the S1 orbits from S2 within a cell.
     perf_cell = ingest_settings.perf_report_uri
     perf_base = f"{perf_cell.rstrip('/')}/{zone}-{year}" if perf_cell else None
+    # S1 runs NARROWER than S2, overriding the shared width in `common`. Its work is a
+    # fixed fraction of S2's, so an equal fleet finishes early and then holds quota it
+    # cannot use — and quota is what limits concurrent cells, hence the campaign's schedule.
+    s1_workers = _s1_max_workers(max_workers, ingest_settings)
+    log.info("Zone %s: S2 max_workers=%d, each S1 orbit max_workers=%d", zone, max_workers, s1_workers)
     s1_coros = [
         arun_deployment(
             deployments.ingest_s1_roi_sar,
@@ -315,6 +335,7 @@ async def ingest_zone_year(
                 **common,
                 "orbit": orbit,
                 "batch_days": ingest_settings.batch_days,
+                "max_workers": s1_workers,
                 "perf_report_uri": f"{perf_base}/s1-{orbit}.html" if perf_base else None,
             },
         )

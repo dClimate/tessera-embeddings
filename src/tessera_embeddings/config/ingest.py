@@ -108,6 +108,18 @@ class IngestSettings(BaseModel):
     # Dask worker bounds for one (zone, year) ingest.
     min_workers: int = Field(default=1, ge=1)
     max_workers: int = Field(default=50, ge=1)
+    # Each S1 orbit's fleet width as a FRACTION of the S2 fleet's, because S1's work is a
+    # fixed fraction of S2's rather than a fixed size: measured at 15.5-18.1% of S2 across
+    # a 13x span of zone density, so one ratio holds where an absolute count would not.
+    #
+    # An absolute count would also break the chunk-scaled sizing below it — a sparse zone
+    # scales S2 down toward the floor, and a fixed S1 width could then exceed S2's.
+    #
+    # Sized so S1 finishes comfortably INSIDE S2's runtime. S1 must never become the cell's
+    # critical path: it would extend every cell while wasting the headroom the ratio buys.
+    # Calibration and the margin behind this number live in context_docs; re-derive it
+    # against runs if S1's per-date cost changes again.
+    s1_worker_fraction: float = Field(default=0.22, gt=0.0, le=1.0)
     # S2 per-solar-day keep threshold (PERCENT, so 0-100; see
     # DEFAULT_MIN_VALID_COVERAGE). Bounded, not just typed: a negative threshold is
     # satisfied by every date including one with zero valid pixels, which then counts
