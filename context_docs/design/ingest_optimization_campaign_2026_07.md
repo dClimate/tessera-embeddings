@@ -21,10 +21,10 @@ deleted.
 
 **All wall-clock figures are the same cell** — zone `35N`, January 2024, 120-worker
 Dask-on-Fargate fleet, the same frozen ROI mask — so the rows compare. Worker memory is NOT
-constant across rows: 16 GiB up to 2026-07-25, 20 GiB after (§4.7), and **back to 16 GiB from
-2026-07-27**, once pruning the retained catalogue entries had removed the demand that justified
-the larger size. Memory size barely moves wall clock so the timing rows still compare, but a
-peak-memory figure only means something next to the limit it was measured under.
+constant across rows: 16 GiB up to 2026-07-25, 20 GiB after, and **back to 16 GiB from
+2026-07-27** (§4.8), once pruning the retained catalogue entries had removed the demand that
+justified the larger size. Memory size barely moves wall clock so the timing rows still compare,
+but a peak-memory figure only means something next to the limit it was measured under.
 
 Graph-task figures are from local census runs over a fixed pixel window; those compare within
 a series but not across series, and are labelled accordingly.
@@ -145,6 +145,14 @@ container limit, and undersizing costs an entire run rather than a retry.
 Sentinel-1 orbits concurrently, so its resource footprint is roughly three times a single ingest
 run. Any concurrency plan costed on Sentinel-2 alone understates what the campaign needs by that
 factor.
+
+**What does NOT limit us: running many cells at once.** This was the campaign's largest open risk
+and it is now measured up to **20 concurrent cells** (60 fleets, ~1,300 workers). Comparing
+per-window cost and pairing each zone against itself, 5→10 cells costs **1.01×** and 10→20 costs
+**1.24×** — against the **1.33×** that the narrower fleet quota forced at 20 cells predicts on its
+own. Fleet width more than accounts for the slowdown, so no contention term survives. An earlier
+forecast multiplied out a 1.04-per-cell penalty, implying 2.56× at 40 cells; that is **withdrawn**.
+**The binding constraint on schedule is the Fargate quota, not interference between cells.**
 
 ### Two corrections worth reading before planning
 
@@ -401,17 +409,17 @@ against observed, window by window on the shipped configuration:
 | 100 | 400 | 4,400 | 4,246 |
 | 54 | 216 | 2,376 | 2,432 |
 
-Seven windows, seven matches. The read-and-mask side — everything §3.3 through §3.7 attacked —
+Seven windows, seven matches. The read-and-mask side — everything §3.3 through §3.6 attacked —
 has fused down into the noise. What remains is `store_chunks × n_bands`, and **both factors are
 pinned by decisions taken deliberately**: 4096 chunking because the GPU path is tuned around it
 (§4.1), eleven bands because that is the data.
 
-This also retro-explains §3.7: there was never a large win available in the write layer, because
+This also retro-explains the realignment work (§4.6): there was never a large win available in the write layer, because
 the write layer emits one task per store chunk regardless of what it is asked to do.
 
 **The only remaining headroom is dead area: windows cover 2,992 store chunks against 2,415 live
 — 577 dead, 19%.** So 32,912 write tasks are issued where 26,565 is the floor. That 19% comes
-from a trade §3.7 introduced: not realigning requires windows on the 8192 block grid, and
+from a trade the realignment removal (§4.6) introduced: not realigning requires windows on the 8192 block grid, and
 coarsening the live grid marks a whole block live if any quarter of it is. Recovering it means
 4096-grid windows, which brings realignment back — and that measured **worse** (5,159 tasks
 against 4,877).
@@ -1462,7 +1470,7 @@ Recorded so they are not revived, and because the pattern is instructive.
 
 - **"Four fifths of every date's graph can be skipped."** The 19.4% data share is real but is
   measured at the 4096 chunk grid, while windows are built on the 8192 load-block grid where a
-  date touches 47–57% of live cells. The achievable prize was **2×, not 5×** (§4.7b), and the
+  date touches 47–57% of live cells. The achievable prize was **2×, not 5×** (§4.7), and the
   shipped change already took three quarters of it for **zero** wall clock (§3.9).
 - **"Most of the dead area is not geometric — it is cloud."** Backwards. Geometric dead is
   **55–66%** of live chunks and radiometric **10–21%** (§3.9). The claim was made to explain the
@@ -1485,7 +1493,7 @@ Recorded so they are not revived, and because the pattern is instructive.
   per date. The drift claim was itself withdrawn above.
 - **"`align_chunks` is ~11% faster kept."** Measured when blocks and store chunks were the same
   size, so the remap was a no-op and the difference sat inside the ~19% per-date variance since
-  quantified. The correct answer at the current geometry is the opposite (§3.7).
+  quantified. The correct answer at the current geometry is the opposite (§4.6).
 - **"Doubling load blocks again gives 2–3×."** Measured 1.35× — see §4.4.
 - **"Removing the realignment gives 3.85× and lowers peak worker memory 32%."** The graph gain
   was ~5% (the census modelled the write layer instead of measuring it) and the memory claim came
@@ -1530,7 +1538,7 @@ reading noise before adopting this.
 
 **A local task census is only trustworthy where it counts a real graph.** The read side it
 counts directly and its predictions have held. The WRITE side was modelled analytically and
-over-predicted a change by ~20× (§3.7): the region write splits to store-chunk granularity
+over-predicted a change by ~20× (§4.6): the region write splits to store-chunk granularity
 itself, so a model assuming one write task per block was simply wrong. Where a prediction
 depends on what the write layer does internally, measure the live scheduler graph — do not
 extrapolate from a census.
@@ -1543,19 +1551,12 @@ timings and took an object count to identify.
 
 ## 7. Open questions
 
-- **~~Is the fleet-bound floor now reached?~~ ANSWERED — yes; the current number is 1.60×.** The
-  downward sweep ran (120/60/30, 7 dates each) and the profile settled it (§3.10): of a 131 s
-  date only 57 s packs across the fleet, so unlimited workers on ONE cell buy little and most of
-  that is gone by ~200 workers. Sweep medians were 194.8 / 232.4 / 396.7 s, giving 1.71× for
-  30→60 and only 1.19× for 60→120 — the knee sits between 60 and 120. **Caveat on those absolute
-  values: they are not reproducible** (§5, external latency drift); the SHAPE is what carries.
-  **Updated post-overlap (§3.12):** the ceiling is now **1.60×**, up from 1.26× measured on the
-  same instrument pre-overlap; the 1.78× first recorded here came from a pre-overlap 2-date probe.
-  The verdict is unchanged in direction and that is the load-bearing part — **62% of a date still
-  cannot be compressed by any worker count**, so cell concurrency remains the lever and cell width
-  does not. **The sweep's own width curve is additionally STALE**: it ran pre-overlap (no
-  `overlap_window_writes` parameter), and the overlap halves the residual it was measuring, so
-  post-overlap width sensitivity has to be re-measured rather than inherited.
+- **ANSWERED — is the fleet-bound floor reached? Yes.** Full reasoning in §3.10 and §3.12; the
+  load-bearing conclusion is that **a large fraction of a date cannot be compressed by any worker
+  count** (62% post-overlap), so **cell concurrency is the lever and cell width is not**. Two
+  caveats on the numbers there: the sweep's absolute values are not reproducible (§5, external
+  latency drift) and its width curve ran **pre-overlap**, so post-overlap width sensitivity must
+  be re-measured rather than inherited.
 - **NEW, opened by §3.11: is the 4096 write-window idea now viable?** §4.7 rejected narrowing
   write windows to the 4096 grid because it took windows from 5-6 to 12-13 per date at ~17 s of
   SERIAL cost each. Overlapping the windows removes most of that per-window serial cost, so the
@@ -1564,16 +1565,11 @@ timings and took an object count to identify.
   re-testing: it would cut computed area ~1.6× (§4.7's measurement), and area was NOT on the
   critical path when measured (§3.9), so the expected win is small and the memory cost real.
   Measure the prize first, per §3.11's lesson.
-- **~~THE open question: can a date's serial residual be taken off the critical path?~~
-  ANSWERED — yes, 1.59× (§3.11).** Retained below for the reasoning, which still applies to
-  what remains: after the overlap, a date is build 10.4 s + gate 7.3 s + write 86.5 s, and the
-  write is now near its packing floor rather than a sum of serial parts. 74 s
-  of every 131 s date is serial client work, dispatch, blocking region writes and commit, and it
-  is now the largest single target in the ingest by a wide margin. Shrinking it is one route;
-  **overlapping it with the next date's compute is the better one**, because it removes the term
-  rather than reducing it. Prerequisite question: the ingest is date-serial by construction
-  (`_ingest_one_date` per date, one commit per date), so this is a restructuring of the drive
-  loop, not a tuning change — and the commit-per-date contract must survive it.
+- **ANSWERED — can a date's serial residual be taken off the critical path? Yes, 1.59× (§3.11),
+  and date pipelining took the rest (§3.16 area).** Post-overlap a date is build 10.4 s + gate
+  7.3 s + write 86.5 s, with the write near its packing floor rather than a sum of serial parts.
+  The durable lesson: **removing a serial term beats shrinking it**, and the commit-per-date
+  contract survived the restructuring.
 - **Is `F` fleet-invariant?** If it is one block's fetch latency it should be; if it is
   scheduler round-trip it grows with fleet size. This decides whether a window cap tuned at 120
   workers transfers at all.
@@ -1584,14 +1580,10 @@ timings and took an object count to identify.
 Questions genuinely requiring more workers than the current quota allows are tracked as
 entries S-1..S-6 in `yield-embeddings/docs/global-tessera-test-plan.md`.
 
-**The known blocker, independent of all of the above:** the STAC query runs once per run and
-retains every item, so a zone-YEAR needs ~27–30 GB against a 16 GiB worker and dies ~17 minutes
-in — then Dask retries it four times at ~70–75 min per cycle with the whole fleet provisioned
-and idle, deterministically, on every dispatch. Month-by-month streaming with depth-1 prefetch
-is planned (`yield-embeddings/docs/stac-streaming-implementation-plan.md`); depth 1 suffices
-because a month's query is 2.7% of a month's processing.
+**The blocker this section was written around is FIXED** — month-by-month streaming with depth-1
+prefetch shipped and is validated (§7b). It is described there rather than here.
 
-## 7b. STAC query streaming — shipped, validation in progress
+## 7b. STAC query streaming — shipped and validated
 
 The blocker described in §7. The query ran once per window and retained every item, so a
 zone-year needed ~27-30 GB on the 16 GiB worker the ingest body executes on: it died ~17 min in,
@@ -1630,8 +1622,8 @@ it — roughly 5 GB.
 | **parity vs one whole-window query, live earth-search, across a month boundary** | **12 dates, 13,024 items, identical date sets, zero per-date differences** |
 | **month partition and padding, live cluster** | **31,507 items in January, 1,084 correctly deferred to February** (one day's worth) |
 | **per-date cost unaffected by streaming** | **mean 173.8 s over 10 dates vs a 184.5 s baseline** — within noise |
-| two month transitions with direct submit-time query evidence | one transition's PREFETCH proven (February's query submitted 13 ms after January's returned, complete before January's first date committed); the CONSUMPTION handoff was not reached before the run was cancelled — the year soak crosses eleven boundaries and covers it |
-| cumulative drift over hundreds of dates | outstanding — see below |
+| two month transitions with direct submit-time query evidence | PREFETCH proven (February's query submitted 13 ms after January's returned, complete before January's first date committed) |
+| cumulative drift over hundreds of dates | **91 dates across three month rollovers, zero spill, peak worker memory plateauing by hour three** (§4.8). Outstanding only at full-year length: twelve rollovers is four times what this exercised. |
 
 **Retention is bounded to two months REGARDLESS of run length**, so a three-month run tests the
 memory bound exactly as well as a twelve-month one. That reframes the year soak: it is *not* the
@@ -1655,33 +1647,30 @@ Measured, same zone/month/fleet:
 So the spill I originally attributed solely to removing the realignment has a second source. Both
 were real; the realignment revert stands on its own numbers.
 
-**Resolution: ingest worker memory 16 GiB → 30 GiB, later CORRECTED to 20 GiB.** Sized for the
-ONE worker that runs the ingest task, since that is where the retained items live. The vCPU
-deliberately stays at 4: the quota is counted in vCPU, so doubling CPU would halve the workers a
-cell can run (120 workers at 8 vCPU would need 960 against a 512 allowance). An initial attempt at
-32768 MiB was **invalid at 4 vCPU** and caught before shipping.
+**Worker memory moved 16 → 30 → 20 GiB while this was being sized, and is now back at 16 GiB
+(§4.8 — read that for the current number and why it became affordable).** Sizing targets the ONE
+worker that runs the ingest task, since that is where the retained items live. The vCPU stays at
+4 deliberately: the quota is counted in vCPU, so doubling CPU would halve the workers a cell can
+run (120 at 8 vCPU would need 960 against a 512 allowance). An attempt at 32768 MiB was **invalid
+at 4 vCPU** — check Fargate CPU/memory pairings before shipping a size.
 
-**The 30 GiB figure was wrong, and the reasoning behind it was the error.** It reached for the
-4-vCPU ceiling to eliminate spill, on the assumption that spill is always a hidden cost worth
-paying to avoid. Two things make that false here:
+Three lessons from that detour outlived every number in it:
 
 1. **Every worker gets the same size, so the fleet pays for one worker's working set.** 30 GiB
    across a 120-worker cell over-provisions ~119 workers by 14 GiB each. Memory is free in *quota*
    terms, which is what justified it — but it is not free in dollars, and that was not weighed.
-2. **The spill was measured to cost nothing.** Per-date mean was **173.8 s while spilling 1.25 GiB
-   at 16 GiB**, against **177.9 s with zero spill at 30 GiB** — the spilling configuration was
-   marginally *faster*. The reason is structural: the spilled bytes are precisely the bytes not
-   needed yet. The prefetched month goes untouched until the boundary, so it is the ideal eviction
-   candidate and the whole cost is one read-back per month.
+2. **The spill was measured to cost nothing**, so eliminating spill was never worth paying for.
+   Per-date mean was **173.8 s while spilling 1.25 GiB at 16 GiB** against **177.9 s with zero
+   spill at 30 GiB** — the spilling configuration was marginally *faster*. That is structural, not
+   luck: the spilled bytes are precisely the bytes not needed yet, because the prefetched month
+   goes untouched until the boundary. The whole cost is one read-back per month.
+3. **Headroom must buy distance from the PAUSE threshold, not the spill threshold.** A spilling
+   worker is fine; a paused one never recovers and deadlocks the fleet. This is the rule §4.8
+   sizes against.
 
-What the headroom actually needs to buy is distance from the **pause** threshold, not from the
-spill threshold — a paused worker is a real stall where a spilling one is not. Measured demand is
-~12.4 GiB, against a pause threshold of 0.8 × capacity. 16 GiB leaves ~0.4 GiB of margin, which is
-too thin; **20480 MiB leaves ~4 GiB** and recovers two-thirds of the over-provisioning.
-
-The structural fix, unimplemented: stop sizing a whole fleet for one worker's job. The ingest body
-runs on a Dask worker; were it to run somewhere with independent sizing — the flow runner is a
-single task — the cost of that memory would fall by the width of the fleet.
+The structural fix, still unimplemented: stop sizing a whole fleet for one worker's job. The
+ingest body runs on a Dask worker; were it to run somewhere with independent sizing — the flow
+runner is a single task — the cost of that memory would fall by the width of the fleet.
 
 **A test-design correction worth keeping:** a one-month run validates nothing here. One month is
 a single slice — no prefetch, no boundary crossing. The smallest useful cluster test is three
@@ -1712,7 +1701,7 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | memory per band-block | 4096: 34 MB · 8192: 134 MB · 16384: 537 MB | arithmetic |
 | hottest worker | 10.16 GiB of 16 at 8192 blocks; spill 0 throughout | run telemetry |
 | inference baseline (do not regress) | GPU util 99% in-phase, VRAM 97% peak, host RAM 46% of a 60% ceiling, GPU-idle ~6 s/chunk | 2,352 RESOURCES samples |
-| ingest worker size | 4 vCPU / **20480 MiB** | 16384 spilled 1.25 GiB and sat ~0.4 GiB from the pause threshold; 30720 (the ceiling) was over-provisioning a whole fleet for one worker and bought no measured speed |
+| **ingest worker size (CURRENT)** | 4 vCPU / **16384 MiB** | §4.8. Peak 7.91 GiB over 91 dates and three rollovers, plateauing by hour three, zero spill → 1.6× margin to the pause threshold. Superseding, in order: 16384 → 30720 → 20480 → 24576 → **16384**; pruning the retained catalogue (§3.13) is what made the original size affordable again. vCPU stays at 4 — the quota counts vCPU. |
 | streaming retention cost | +1 month of items on the ingest worker; 1.25 GiB spill at 16 GiB | run telemetry |
 | items deferred across a month boundary | 1,084 of 31,507 (one day's worth) | live cluster |
 | write floor | graph ≈ store_chunks × bands; 2,992 covered vs 2,415 live (19% dead) | measured, all 7 windows |
@@ -1726,21 +1715,20 @@ query and is a rollback path only: a year-long window cannot complete under it.
 | item build cost | full **810 µs/item**, pruned **252 µs/item (3.2× cheaper)**; prune itself 8.7 µs | same (§3.13) |
 | per-worker memory ceiling | **13.45 GiB**, flat over six consecutive blocks; **91-100% UNMANAGED**, so unspillable | 53-date soak health lines (§3.13) |
 | driver excess over fleet mean | **~4.9 GiB** (the retained months); paused at 14.89 against a 14.90 threshold | same (§3.13) |
-| ingest worker size, revised | **24576 MiB** (was 20480, chosen against a short run's 12.4 GiB peak; true ceiling ~15) | §3.13 |
 | ~~overlap packing effect~~ | **SUPERSEDED — the stream was truncated, see §3.14.** Recorded as 20% → 38% packing and a 1.26× → 1.60× ceiling; corrected to **64.3 s packed of a 102 s date (~64%)** and a **~2.8×** one-cell ceiling | §3.14 |
 | **task work at perfect packing** | **64.3 s/date** at 120w; residual **~37 s (~36%)** | corrected task streams, cross-checked against the paired width fit (§3.14) |
 | **ceiling, unlimited workers, ONE cell** | **~2.8× (2.0–3.0)** — not 1.78×, not 1.60× | §3.14 |
 | **width model** | `T(W) = 36.3 + 7896/W` s per date, fitted from paired 60w/120w | §3.14 |
-| **optimal cell width** | **30–45 workers**, ~20% better aggregate throughput than 120w at a fixed budget; 120w was the quota ceiling, never a choice | §3.14 |
-| **cell concurrency cost** | a second concurrent cell slows each by **1.04×**; two 60w cells beat one 120w cell **1.17×** | 6 paired dates (§3.14) |
+| **optimal cell width** | **flat within ~6% from 20w to 120w** — no meaningful optimum, so prefer whatever is simplest to operate. The earlier "30–45 workers, ~20% better" came from a **two-point** fit that cannot constrain two parameters; a third control at 45w put `F` anywhere from 11.4 to 39.3. **Withdrawn.** 120w was always the quota ceiling, never a choice | three-point fit `T = 18.0 + 9391/W` (§3.14) |
+| **cell concurrency cost (CURRENT)** | **none measurable to 20 concurrent cells.** Per-window, paired by zone: 5→10 cells **1.01×**; 10→20 cells **1.24×** against a **1.33×** width-only prediction. The earlier **1.04× per cell** — one two-cell measurement, implying 2.56× at 40 cells — is **WITHDRAWN**. Schedule is set by the quota, not contention | 10 paired zones at N=20, 60 fleets (§1) |
 | task-stream cap | **100,000 records** default ≈ 4 dates; `diagnostic_task_stream` raises it to 3,000,000 | §3.14 |
 | Fargate launch rate | **20 tasks/s sustained, 100 burst** — a 10,000 vCPU fleet is ~2,300 tasks | measured quota |
 | overlap contention cost | **+15% total slot-seconds** for identical output (2% fewer tasks, +25% transfer) | per-arm task streams (§3.12) |
 | post-overlap residual, unexplained portion | of 65.1 s, **~18.6 s named** (build 10.4, gate 7.3, commit 0.9); **~46 s idles INSIDE the single write compute** | §3.12 |
 | commit cost over a long run | **sawtooth, period 8 dates** (= `INGEST_MANIFEST_SPLIT["time"]`), 0.5 → ~1.5 s then resets — BOUNDED, not cumulative | 17+ dates, soak (§3.11) |
 | **task work composition** | source read+resample **72.3%**, mask+write 16.3%, transfer 7.8%, gate 2.9% | same report (§3.10) |
-| **ceiling from unlimited workers, one cell** | **1.60×** post-overlap (was 1.26× on the same instrument pre-overlap). §3.10's **1.78×** came from a pre-overlap 2-date probe and is SUPERSEDED as a current figure, though its programme verdict — widen cells, no; multiply cells, yes — survives unchanged | paired per-arm task streams (§3.12); independently 1.2–1.7× from an `A + B/W` sweep fit (§3.10) |
-| window-strategy bound | best any rectangle strategy achieves is **0.50×** current area; shipped achieves 0.75× | local, real footprints (§4.7b) |
+| ~~ceiling, one cell — earlier values~~ | **SUPERSEDED by the ~2.8× row above.** 1.78× (pre-overlap 2-date probe), 1.26× (pre-overlap), 1.60× (post-overlap) were all measured off a TRUNCATED task stream or a stale probe. The programme verdict they supported — widen cells, no; multiply cells, yes — survives unchanged | §3.12, §3.14 |
+| window-strategy bound | best any rectangle strategy achieves is **0.50×** current area; shipped achieves 0.75× | local, real footprints (§4.7) |
 | external catalog latency drift | identical query **37.6 s vs 33.1 s** two hours apart (~12%) | §5 |
 | worker-count scaling, dense zone | median s/date **194.8 at 120w, 232.4 at 60w, 396.7 at 30w**; doubling buys 1.71× at 30→60 and 1.19× at 60→120 | 7 dates per rung |
 
