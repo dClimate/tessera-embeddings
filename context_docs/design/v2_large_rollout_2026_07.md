@@ -204,6 +204,8 @@ absmax is near-constant at ~3–4σ, so resolution is spent covering the tail. N
 defect, but v2 gets slightly lower quantization SNR for the same storage budget.
 
 Gate: `scripts/validate_embedding_model_change.py` in the yield-embeddings repo.
+Its method, threshold rationale and same-model calibration ceiling are in
+[`v2_large_readback_gate_2026_07.md`](v2_large_readback_gate_2026_07.md).
 
 ## 7. Operational notes
 
