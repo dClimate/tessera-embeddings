@@ -2,10 +2,22 @@
 
 Reads the live fill progress from the seeded store
 (:func:`~tessera_embeddings.storage.campaign.campaign_status`) and dispatches
-fills for every pending cell via ``arun_deployment`` — a ``fill-zone-year`` run
-per cell (``fill_strategy="cluster-per-zone"``), or size-balanced
-``fill-zones-sequential`` shards on long-lived clusters (``"chained-clusters"``)
-— mirroring :mod:`tessera_full_pipeline`'s driver pattern.
+fills for every pending cell via ``arun_deployment`` — size-balanced
+``fill-zones-sequential`` shards on long-lived clusters
+(``fill_strategy="chained-clusters"``, the default), or a ``fill-zone-year`` run
+per cell (``"cluster-per-zone"``) — mirroring :mod:`tessera_full_pipeline`'s
+driver pattern.
+
+**Ingest runs WIDE and ahead of inference.** The two are chained per zone but
+nothing throttles the first against the second: ingest is the cheap half, it
+scales better across many narrow fleets than a few wide ones, and its default
+concurrency is deliberately higher than the fill cap. A year's mosaics can
+therefore accumulate ahead of the fills that consume them — hundreds of
+terabytes, transient, deleted per cell as each fill lands (``cleanup_mosaics``)
+and swept after a crash (``sweep_orphan_mosaics``). What is deliberately absent
+is backpressure; what remains is cleanup. GPUs are the resource that must not
+wait: under ``"chained-clusters"`` a shard blocks on its first mosaic before
+requesting a fleet, so a cluster is never booted with nothing to work on.
 
 **Scheduling (ADR-008 D6 + the runner contract).** Inference is parallel across
 zones; only commits contend, and only *same-zone* fills conflict (shared
@@ -364,8 +376,8 @@ async def run_global_campaign(
     store_name: str = "tessera",
     years: tuple[int, ...] | None = None,
     zones: list[str] | None = None,
-    max_parallel_zones: int = 8,
-    fill_strategy: str = "cluster-per-zone",
+    max_parallel_zones: int = 40,
+    fill_strategy: str = "chained-clusters",
     chained_fill_deployment: str | None = None,
     commit_limit_name: str = "tessera-global-commits",
     num_actors: int = 20,
@@ -379,7 +391,7 @@ async def run_global_campaign(
     ingest: bool = True,
     ingest_deployment: str | None = None,
     mask_name: str = "global",
-    max_parallel_ingest: int = 2,
+    max_parallel_ingest: int = 60,
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     allow_partial_window: bool = False,
@@ -417,12 +429,13 @@ async def run_global_campaign(
         max_parallel_zones: Bounds simultaneous Ray clusters within a year (a
             cost knob, distinct from the commit gate): the concurrent per-cell
             fill runs under ``"cluster-per-zone"``, or the shard/cluster count
-            under ``"chained-clusters"``.
+            under ``"chained-clusters"``. Defaults to 40 — measurement favours
+            many narrow fleets over few wide ones, so size ``num_actors`` and
+            ``IngestSettings.max_workers`` down to match, or the aggregate fleet
+            will exceed the account's EC2 quota.
         fill_strategy: Named for the CLUSTER LIFECYCLE — both strategies run
-            up to ``max_parallel_zones`` zones at once. ``"cluster-per-zone"``
-            (default) dispatches one ``fill-zone-year`` run per cell, each
-            provisioning its own short-lived Ray cluster.
-            ``"chained-clusters"`` dispatches up to ``max_parallel_zones``
+            up to ``max_parallel_zones`` zones at once.
+            ``"chained-clusters"`` (default) dispatches up to ``max_parallel_zones``
             ``fill-zones-sequential`` runs per year, each owning ONE
             long-lived Ray cluster whose actors stream through a
             size-balanced shard of the year's zones — strictly ordered, the
@@ -431,8 +444,13 @@ async def run_global_campaign(
             actor churn, or model reload. Amortizes ``ray up`` + per-worker
             bringup + model-load cold starts across the whole shard; ingest
             look-ahead and trailing assembly cover the remaining seams (see
-            the runner's module docstring). ``max_parallel_zones=1``
-            degenerates to a single cluster for the whole year.
+            the runner's module docstring). Each shard also waits for its first
+            mosaic before requesting GPUs, so a fleet is never booted with
+            nothing to work on. ``max_parallel_zones=1`` degenerates to a single
+            cluster for the whole year. ``"cluster-per-zone"`` dispatches one
+            ``fill-zone-year`` run per cell instead, each provisioning its own
+            short-lived Ray cluster — simpler, and it pays a full cluster
+            bringup and model load per zone.
         chained_fill_deployment: ``flow-name/deployment-name`` of the chained
             fill deployment (``fill_strategy="chained-clusters"`` only). ``None``
             (default) derives ``fill-zones-sequential/fill-zones-sequential``
@@ -454,15 +472,21 @@ async def run_global_campaign(
             by ``branch``; an explicit value is used verbatim. The S1/S2 refs it
             dispatches are always branch-derived (see ``branch``).
         mask_name: Coverage-store basename, forwarded to ingest.
-        max_parallel_ingest: Max concurrent ingests (each provisions its own Dask
-            cluster) — a separate, smaller knob than the fill cap. Under
-            ``"chained-clusters"`` it is divided across the shards as their
-            ingest look-aheads with a floor of one per shard, so with more
-            shards than this cap the effective ceiling is the shard count
-            (warned at dispatch); a hard fleet-wide cap needs a concurrency
-            limit on the ingest deployment itself.
+        max_parallel_ingest: Max concurrent ingests, each provisioning its own Dask
+            cluster. Defaults to 60 — ingest scales better across many narrow
+            fleets than a few wide ones, and it is the cheap half of the campaign,
+            so it is deliberately wider than the fill cap rather than smaller.
+            Under ``"chained-clusters"`` it is divided across the shards as their
+            ingest look-aheads, rounded UP (a shard cannot hold less than one), so
+            the real ceiling is ``ceil(this / shards) * shards`` and any mismatch
+            with the request is warned at dispatch. Set it to a multiple of
+            ``max_parallel_zones`` for an exact fit; a hard fleet-wide cap needs a
+            concurrency limit on the ingest deployment itself.
         cleanup_mosaics: Delete ``mosaics/{zone}/{year}`` (all versions) after the
             fill lands (default; the mosaic is a transient input). Keep for dev.
+            Nothing throttles ingest against fill throughput, so at these defaults
+            a year's mosaics can accumulate faster than the fills drain them —
+            this is what keeps that from becoming permanent.
         ingest_settings: Grouped ingest tuning knobs (worker bounds, S2
             coverage threshold, S1 batch window), forwarded verbatim to every
             ingest — see :class:`tessera_embeddings.config.ingest.IngestSettings`.
@@ -703,75 +727,81 @@ async def run_global_campaign(
 
     fill_sem = asyncio.Semaphore(max_parallel_zones)
     ingest_sem = asyncio.Semaphore(max_parallel_ingest)
-    # Bound the cells holding a live mosaic (ingested but not yet cleaned) so
-    # ingestion cannot run ahead of fills and pile up dozens of multi-TB mosaics —
-    # ADR-011's "peak input storage bounded by in-flight cells". Acquired BEFORE
-    # ingest and held through fill + cleanup; sized to fills-at-capacity plus an
-    # ingest look-ahead, so retained mosaics peak at ~this sum, not the whole year.
-    inflight_sem = asyncio.Semaphore(max_parallel_zones + max_parallel_ingest)
+    # NO cap on cells holding a live mosaic. There used to be one (ADR-011's "peak
+    # input storage bounded by in-flight cells", sized to fills + an ingest
+    # look-ahead), and it was removed deliberately: it made ingest wait on fill
+    # throughput, which throttles the cheap half of the campaign to protect a
+    # storage cost we would rather pay. Ingest is far more efficient run wide, so
+    # mosaics may now accumulate up to a whole year's worth (~120 cells) before the
+    # fills drain them. `cleanup_mosaics` still deletes each one as its fill lands,
+    # and `sweep_orphan_mosaics` still collects what a crash left behind; what is
+    # gone is the BACKPRESSURE, not the cleanup.
+    #
+    # This applies to `cluster-per-zone` only. In `chained-clusters` — the default —
+    # the per-cell chain below is bypassed and each child bounds its own mosaics at
+    # `look_ahead + 2` (sequential_fill._MosaicBudget). Across the shard count those
+    # settings imply, that bound already exceeds the zones in a year, so it is not
+    # the binding constraint there either.
 
     async def _process(zone: str, year: int) -> str:
-        # Ingest (if enabled) → fill → drop the transient mosaic. The outer
-        # inflight_sem (held across ALL three) backpressures ingestion by fill
-        # throughput so mosaics don't accumulate; ingest_sem/fill_sem cap the
-        # expensive Dask/Ray clusters within.
+        # Ingest (if enabled) → fill → drop the transient mosaic. ingest_sem/fill_sem
+        # cap the expensive Dask/Ray clusters; nothing gates the chain as a whole.
         #
         # A complete-but-untagged cell (in years_complete, missing its tag) is in
         # the work list only so the fill re-creates the tag — no inference, no
         # mosaic. Skip ingest and cleanup for it entirely.
-        async with inflight_sem:
-            retag_only = status.has(zone, year)
-            did_ingest = ingest and not retag_only
-            if did_ingest:
-                async with ingest_sem:  # each ingest provisions its own Dask cluster
-                    irun = await arun_deployment(ingest_deployment, parameters=_ingest_params(zone, year), tags=_tags)
-                    _check_completed(irun, f"ingest {zone}-{year}")
-            # An all-ocean cell (no live tiles) produces no mosaic: ingest returns
-            # skipped_ocean, and the fill marks it empty + tags with no staging/inference
-            # (the same signal the fill preflights on). There is nothing to fingerprint —
-            # _staging_run_id would raise "No mosaic stores found" and strand the whole
-            # year — and nothing to clean up. Give it a stable, mosaic-free id. Checked
-            # for every non-retag cell (one cheap bitmap GET); a live cell falls through
-            # to the input-fingerprinted id. Covers ingest=False empty cells too.
-            empty_cell = not retag_only and not zone_has_live_tiles(
-                land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        retag_only = status.has(zone, year)
+        did_ingest = ingest and not retag_only
+        if did_ingest:
+            async with ingest_sem:  # each ingest provisions its own Dask cluster
+                irun = await arun_deployment(ingest_deployment, parameters=_ingest_params(zone, year), tags=_tags)
+                _check_completed(irun, f"ingest {zone}-{year}")
+        # An all-ocean cell (no live tiles) produces no mosaic: ingest returns
+        # skipped_ocean, and the fill marks it empty + tags with no staging/inference
+        # (the same signal the fill preflights on). There is nothing to fingerprint —
+        # _staging_run_id would raise "No mosaic stores found" and strand the whole
+        # year — and nothing to clean up. Give it a stable, mosaic-free id. Checked
+        # for every non-retag cell (one cheap bitmap GET); a live cell falls through
+        # to the input-fingerprinted id. Covers ingest=False empty cells too.
+        empty_cell = not retag_only and not zone_has_live_tiles(
+            land_mask_path, zone, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        )
+        # Compute the staging run_id AFTER ingest so ingest=True fingerprints the
+        # freshly-written mosaic marker. A retag-only cell does no inference/staging
+        # and its mosaic may already be cleaned up — give it a stable id that does
+        # NOT inspect the mosaic (fingerprinting would raise before the tag repair).
+        if retag_only:
+            run_id = f"{zone}-{year}-retag"
+        elif empty_cell:
+            run_id = f"{zone}-{year}-empty"
+        else:
+            run_id = _staging_run_id(
+                zone,
+                year,
+                inputs_bucket=paths.inputs,
+                min_valid_coverage=ingest_settings.min_valid_coverage,
+                s1_orbit=s1_orbit,
+                allow_partial_window=allow_partial_window,
+                allow_s2_only=allow_s2_only,
+                code_identity=_code_identity(),
+                get_credentials=iam_icechunk_credentials,
+                s3_region=s3_region,
             )
-            # Compute the staging run_id AFTER ingest so ingest=True fingerprints the
-            # freshly-written mosaic marker. A retag-only cell does no inference/staging
-            # and its mosaic may already be cleaned up — give it a stable id that does
-            # NOT inspect the mosaic (fingerprinting would raise before the tag repair).
-            if retag_only:
-                run_id = f"{zone}-{year}-retag"
-            elif empty_cell:
-                run_id = f"{zone}-{year}-empty"
-            else:
-                run_id = _staging_run_id(
-                    zone,
-                    year,
-                    inputs_bucket=paths.inputs,
-                    min_valid_coverage=ingest_settings.min_valid_coverage,
-                    s1_orbit=s1_orbit,
-                    allow_partial_window=allow_partial_window,
-                    allow_s2_only=allow_s2_only,
-                    code_identity=_code_identity(),
-                    get_credentials=iam_icechunk_credentials,
-                    s3_region=s3_region,
-                )
-            async with fill_sem:  # bound concurrent fills (hence Ray clusters) within a year
-                frun = await arun_deployment(
-                    fill_deployment,
-                    parameters=_fill_params(zone, year, run_id, needs_cluster=not (retag_only or empty_cell)),
-                    tags=_tags,
-                )
-                _check_completed(frun, f"fill {zone}-{year}")
-            # Only delete a mosaic THIS campaign produced: with ingest=False the mosaic
-            # is an upstream input we must not remove; an empty cell produced none.
-            # Offload the blocking s5cmd/fsspec delete to a thread so a multi-TB mosaic
-            # teardown doesn't stall the event loop (freezing every other zone's
-            # deployment waits) while it runs.
-            if did_ingest and not empty_cell and cleanup_mosaics:
-                await asyncio.to_thread(delete_prefix, f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}", log=log)
-            return str(frun.id)
+        async with fill_sem:  # bound concurrent fills (hence Ray clusters) within a year
+            frun = await arun_deployment(
+                fill_deployment,
+                parameters=_fill_params(zone, year, run_id, needs_cluster=not (retag_only or empty_cell)),
+                tags=_tags,
+            )
+            _check_completed(frun, f"fill {zone}-{year}")
+        # Only delete a mosaic THIS campaign produced: with ingest=False the mosaic
+        # is an upstream input we must not remove; an empty cell produced none.
+        # Offload the blocking s5cmd/fsspec delete to a thread so a multi-TB mosaic
+        # teardown doesn't stall the event loop (freezing every other zone's
+        # deployment waits) while it runs.
+        if did_ingest and not empty_cell and cleanup_mosaics:
+            await asyncio.to_thread(delete_prefix, f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}", log=log)
+        return str(frun.id)
 
     # Descending: the campaign fills the current year first, then backwards
     # (ADR-008) — deliver the most-recent year soonest. Override via `years`.
@@ -806,19 +836,29 @@ async def run_global_campaign(
                 len(year_zones),
                 [len(sh) for sh in shards],
             )
-            # No silent caps: each shard needs a look-ahead of >= 1 to make
-            # progress, so with more shards than max_parallel_ingest the true
-            # concurrent-ingest ceiling is len(shards), not the requested cap —
-            # only a cross-run gate (a concurrency limit on the ingest
-            # deployment) can enforce it below one-per-shard.
-            if ingest and len(shards) > max_parallel_ingest:
+            # Each shard's look-ahead is its OWN ingest concurrency, so the fleet-wide
+            # figure is the per-shard value times the shard count. Rounded UP, because
+            # flooring silently under-delivers the requested width: at 60 ingests across
+            # 40 shards, `60 // 40` is 1 and the campaign would run 40 — the operator
+            # asked for 60 and no log would say otherwise. Overshooting is the better
+            # error here, since ingest is the cheap half and the request is a target
+            # rather than a quota.
+            look_ahead = -(-max_parallel_ingest // len(shards)) if shards else 1
+            effective_ingest = look_ahead * len(shards)
+            # No silent caps, in either direction: report the real ceiling whenever it
+            # misses the requested one. A shard needs a look-ahead of >= 1 to make
+            # progress at all, so with more shards than max_parallel_ingest the floor
+            # is len(shards) and only a cross-run gate (a concurrency limit on the
+            # ingest deployment) can enforce anything below one-per-shard.
+            if ingest and effective_ingest != max_parallel_ingest:
                 log.warning(
-                    "chained-clusters: %d shards each hold an ingest look-ahead of >= 1, so up to %d "
-                    "ingest Dask clusters may run concurrently — exceeding max_parallel_ingest=%d. "
-                    "Reduce max_parallel_zones, or set a concurrency limit on the ingest deployment "
-                    "for a hard fleet-wide cap.",
+                    "chained-clusters: %d shard(s) x look_ahead=%d means up to %d concurrent ingest "
+                    "Dask clusters, not the requested max_parallel_ingest=%d. Set max_parallel_ingest "
+                    "to a multiple of max_parallel_zones for an exact fit, or put a concurrency limit "
+                    "on the ingest deployment for a hard fleet-wide cap.",
                     len(shards),
-                    len(shards),
+                    look_ahead,
+                    effective_ingest,
                     max_parallel_ingest,
                 )
 
@@ -832,7 +872,12 @@ async def run_global_campaign(
                     for z in shard
                 )
 
-            def _chained_params(shard: list[str], n_shards: int, chained_year: int) -> dict[str, Any]:
+            # Every per-year value this closure reads is passed IN rather than captured:
+            # it is defined inside the year loop, so a captured name would be whatever
+            # the last iteration left behind if the call ever outlived its iteration.
+            def _chained_params(
+                shard: list[str], n_shards: int, chained_year: int, cell_look_ahead: int
+            ) -> dict[str, Any]:
                 return {
                     "zones": shard,
                     "year": chained_year,
@@ -867,11 +912,11 @@ async def run_global_campaign(
                     # the direct ingest/fill refs above are already branch-resolved.
                     "branch": branch,
                     # Split the strategy-level bounds across the shards: the
-                    # look-aheads together match max_parallel_ingest (the same
-                    # global ingest bound the parallel strategy enforces), and
+                    # look-aheads together cover max_parallel_ingest (computed and
+                    # reported above, since rounding rarely lands exactly), and
                     # each child's staging+assembly slice keeps the fleet-wide
                     # S3-PUT rate at the aggregate target.
-                    "look_ahead": max(1, max_parallel_ingest // n_shards),
+                    "look_ahead": cell_look_ahead,
                     "s3_concurrency": max(1, TARGET_AGGREGATE_S3_CONCURRENCY // (2 * n_shards)),
                     "cleanup_mosaics": cleanup_mosaics,
                     "ingest_settings": ingest_settings.model_dump(),
@@ -880,7 +925,9 @@ async def run_global_campaign(
             chained_results = await asyncio.gather(
                 *(
                     arun_deployment(
-                        chained_fill_deployment, parameters=_chained_params(sh, len(shards), year), tags=_tags
+                        chained_fill_deployment,
+                        parameters=_chained_params(sh, len(shards), year, look_ahead),
+                        tags=_tags,
                     )
                     for sh in shards
                 ),

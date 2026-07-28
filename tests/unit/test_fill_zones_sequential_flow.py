@@ -14,6 +14,7 @@ import logging
 import threading
 import time
 from contextlib import contextmanager
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -74,6 +75,25 @@ def wired(monkeypatch):
         return {"cells": len(kwargs["cells"]), "succeeded": len(kwargs["cells"]), "failed": 0}
 
     monkeypatch.setattr(mod, "fill_zones_sequential", fake_sequential)
+
+    # The ingest adapter is the REAL one (several tests assert on it), so its one
+    # external call is stubbed instead of the class. Needed because the flow now
+    # BLOCKS on the first cell's ingest before `ray up`: previously `start` merely
+    # queued a worker whose failure nothing ever joined, so an ingest that could not
+    # dispatch was invisible here. Immediately-terminal so priming does not stall.
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
+    monkeypatch.setattr(
+        mod,
+        "run_deployment",
+        lambda dep, parameters, timeout, tags=None: SimpleNamespace(
+            id=f"fr-{parameters['zone']}-{parameters['year']}", state=None
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "get_client",
+        lambda sync_client=True: _FakeClient([_state(StateType.COMPLETED, final=True)]),
+    )
     return rec
 
 
@@ -197,28 +217,60 @@ def test_stream_contract_wired(wired):
 # ---------------------------------------------------------------------------
 
 
+class _RecordingInputs:
+    """Records the priming sequence: which cells start, which are waited on."""
+
+    def __init__(self, order: list, **kwargs):
+        self.kwargs = kwargs
+        self._order = order
+
+    def start(self, zone, year):
+        self._order.append(f"start:{zone}")
+
+    def wait(self, zone, year, stop=None):
+        self._order.append(f"wait:{zone}")
+
+    def shutdown(self):
+        self._order.append("inputs_shutdown")
+
+
 def test_first_ingest_window_starts_before_ray_up(wired, monkeypatch):
-    """The initial ingest window is kicked off BEFORE `ray up`, so the first
-    mosaic materializes during cluster bring-up instead of the fresh GPU fleet
-    idling through a full ingest at the start of every year.
+    """The initial ingest window is kicked off BEFORE `ray up`, so the look-ahead
+    cells materialize during cluster bring-up and the first cell's inference.
     """
-
-    class FakeInputs:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-        def start(self, zone, year):
-            wired["order"].append(f"start:{zone}")
-
-        def shutdown(self):
-            wired["order"].append("inputs_shutdown")
-
-    monkeypatch.setattr(mod, "_DeploymentCellInputs", FakeInputs)
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
     _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
     # Window = 1 + look_ahead cells, all before the cluster:
     starts = [e for e in wired["order"] if e.startswith("start:")]
     assert starts == ["start:01N", "start:02N"]
     assert wired["order"].index("start:02N") < wired["order"].index("ray_up")
+
+
+def test_gpus_are_not_requested_until_the_first_mosaic_exists(wired, monkeypatch):
+    """A GPU fleet must never be booted speculatively.
+
+    Overlapping `ray up` with the first ingest reads as free parallelism, but an
+    ingest runs tens of minutes to hours against five to ten for the cluster — so
+    the fleet finished provisioning and then billed idle for the remainder, once
+    per shard per year. The wait converts that into ingest-only time.
+    """
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
+    _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
+    assert wired["order"].index("wait:01N") < wired["order"].index("ray_up")
+    # ONLY the head cell is waited on — the rest of the window keeps ingesting
+    # through bring-up and the first cell's inference, which is the look-ahead
+    # doing its job. Waiting on all of them would serialise ingest behind nothing.
+    assert [e for e in wired["order"] if e.startswith("wait:")] == ["wait:01N"]
+
+
+def test_no_ingest_means_no_wait_before_the_cluster(wired, monkeypatch):
+    """With mosaics supplied upstream there is nothing to wait for, and blocking
+    on a cell this run never started would hang forever.
+    """
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
+    _run(zones=["01N", "02N"], ingest=False)
+    assert not [e for e in wired["order"] if e.startswith("wait:")]
+    assert "ray_up" in wired["order"]
 
 
 def test_ingest_false_skips_priming(wired, monkeypatch):

@@ -39,10 +39,7 @@ build_land_mask   →   seed_global_store   →   run_global_campaign
 and dispatches fills for every pending cell, **year by year** (outer serial
 loop), under one of two strategies:
 
-- **`fill_strategy="cluster-per-zone"`** (default): a `fill-zone-year` run per cell,
-  with **bounded zone parallelism** within each year (`max_parallel_zones`
-  simultaneous Ray clusters). Best wall-clock; each cell pays its own cluster.
-- **`fill_strategy="chained-clusters"`**: up to `max_parallel_zones`
+- **`fill_strategy="chained-clusters"`** (default): up to `max_parallel_zones`
   `fill-zones-sequential` runs per year, each owning ONE long-lived Ray
   cluster whose actors are created once and **stream** through a
   size-balanced shard of the year's zones — strictly ordered, with the next
@@ -53,15 +50,49 @@ loop), under one of two strategies:
   start, and the EC2 capacity roll across the whole shard instead of per zone
   (`max_parallel_zones=1` = a single cluster for the whole year). Zones whose
   mosaics resolve a different S1 orbit than the session run per-cell after
-  the stream. The shared
-  fleet is kept busy at the seams by **ingest look-ahead** (the next cells'
-  mosaics ingest while the current cell infers, bounded so in-flight mosaics
-  stay within ADR-011's storage budget) and **trailing assembly** (a cell's
-  shard write runs on a background thread — assembly is ~10-15% of a cell's
-  inference wall — while the next cell's inference keeps the GPUs busy).
+  the stream. Each shard **waits for its first mosaic before requesting GPUs**,
+  so a fleet is never provisioned against an ingest that has not finished. The
+  shared fleet is then kept busy at the seams by **ingest look-ahead** (the next
+  cells' mosaics ingest while the current cell infers) and **trailing assembly**
+  (a cell's shard write runs on a background thread — assembly is ~10-15% of a
+  cell's inference wall — while the next cell's inference keeps the GPUs busy).
   Retag-only and all-ocean cells settle before the cluster exists, and
-  all-ocean cells are never ingested at all. Trades wall-clock (zones no
-  longer overlap) for GPU-hours + capacity risk.
+  all-ocean cells are never ingested at all.
+- **`fill_strategy="cluster-per-zone"`**: a `fill-zone-year` run per cell, with
+  **bounded zone parallelism** within each year (`max_parallel_zones`
+  simultaneous Ray clusters). Simpler, and every zone pays a full cluster
+  bringup and model load.
+
+### Ingest runs wide, and ahead
+
+Nothing throttles ingest against fill throughput. Ingest is the cheap half of the
+campaign and measures far better across many narrow fleets than a few wide ones,
+so `max_parallel_ingest` (60) is deliberately **larger** than `max_parallel_zones`
+(40), and the semaphore that used to make a cell hold a slot from ingest through
+to cleanup is gone.
+
+The consequence is real and accepted: a year's mosaics can pile up ahead of the
+fills that consume them — of order a hundred zone-mosaics, hundreds of terabytes.
+They are transient. `cleanup_mosaics` deletes each one as its fill lands, and
+`sweep_orphan_mosaics` collects what a crash left behind. What was removed is the
+*backpressure*, not the cleanup. See ADR-011's consequences, where the older
+"peak input storage is bounded by in-flight cells" claim is marked superseded.
+
+The asymmetry is intentional: ingest waiting is cheap, and a provisioned GPU fleet
+waiting is not.
+
+Under `chained-clusters` the ingest cap is divided across the shards as their
+per-shard look-aheads, **rounded up** — a shard cannot hold less than one, and
+flooring would silently deliver fewer concurrent ingests than asked for. The real
+ceiling is `ceil(max_parallel_ingest / shards) × shards`; any mismatch with the
+requested number is logged at dispatch. Set `max_parallel_ingest` to a multiple of
+`max_parallel_zones` for an exact fit.
+
+> **Size the fleets down to match.** These caps count *clusters*, not machines.
+> Forty inference clusters at the default `num_actors` and sixty ingest clusters at
+> the default `IngestSettings.max_workers` is far more EC2 than a stock account
+> quota allows. Lower `num_actors` and `max_workers` alongside — running many
+> narrow fleets rather than few wide ones is the point of these defaults.
 
 Zone-parallelism (either flavor) is safe because inference is independent
 across zones and only *same-zone* fills conflict (shared group attrs →

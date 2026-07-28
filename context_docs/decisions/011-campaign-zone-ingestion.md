@@ -170,7 +170,22 @@ The single-ROI path is deliberately untouched by all of this.
 
 - The campaign is self-contained: seed → build mask → (per cell) ingest → fill →
   cleanup. Ingestion and fill have independent concurrency caps.
-- Peak input storage is bounded by in-flight cells, not the whole campaign.
+- ~~Peak input storage is bounded by in-flight cells, not the whole campaign.~~
+  **Superseded (2026-07-28).** This held while a semaphore made a cell hold a slot
+  from the start of its ingest through to its cleanup, sized to the fill cap plus
+  an ingest look-ahead. Measurement then showed ingest is markedly more efficient
+  run across many narrow fleets than a few wide ones, and that bound is precisely
+  what prevented it: it throttled the cheap half of the campaign to the throughput
+  of the expensive half. It was removed, and the ingest concurrency default raised
+  above the fill default. Peak input storage is now bounded by a **year**, not by
+  in-flight cells — of order a hundred zone-mosaics, hundreds of terabytes,
+  transient. Cleanup is unchanged and still matters: `cleanup_mosaics` deletes each
+  mosaic as its fill lands, `sweep_orphan_mosaics` collects what a crash leaves.
+  The trade accepted is storage cost for ingest throughput.
+- GPUs are never booted speculatively. Under `chained-clusters` a shard waits for
+  its first mosaic before requesting a fleet, so cluster bring-up is never billed
+  against an ingest that has not finished. Ingest waiting is cheap; a provisioned
+  GPU fleet waiting is not.
 - A deliberate refill re-ingests (hours, STAC/ASF re-pull) — acceptable given the
   storage saving; the coverage store + zone ROI regenerate in seconds.
 - The zone-fill chain gained its first temporal-coverage gate; a missing-months

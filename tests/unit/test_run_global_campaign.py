@@ -8,6 +8,7 @@ sequence, the ingest bypass, and mosaic cleanup.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,6 +20,18 @@ import tessera_embeddings.orchestration.prefect.flows.run_global_campaign as mod
 from tessera_embeddings.config.paths import BucketPaths
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
+
+
+def _per_cell(**kwargs):
+    """Drive the campaign on the PER-CELL chain (ingest → fill → cleanup).
+
+    Explicit because the default strategy is now ``"chained-clusters"``, which
+    bypasses that chain entirely — these tests would otherwise silently assert
+    against a code path they are not about. Strategy-agnostic tests use it too;
+    the default itself is pinned by ``test_default_strategy_is_chained_clusters``.
+    """
+    kwargs.setdefault("fill_strategy", "cluster-per-zone")
+    return asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
 
 
 def _completed_run(rid: str = "r") -> SimpleNamespace:
@@ -72,8 +85,80 @@ def wired(monkeypatch):
     return rec
 
 
+class TestCampaignDefaults:
+    """The scheduling defaults are load-bearing and expensive to get wrong.
+
+    Pinned as literals rather than derived, so a change has to be made on purpose
+    and shows up as a failing test rather than a surprise on a live campaign.
+    """
+
+    def test_the_default_strategy_is_chained_clusters(self, wired):
+        """GPUs stream through a shard instead of paying a cluster per zone."""
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential"]
+
+    def test_ingest_runs_wider_than_inference(self):
+        """Ingest is the cheap half and scales across many narrow fleets, so its
+        cap is deliberately the LARGER of the two — it used to be far smaller.
+        """
+        sig = inspect.signature(mod.run_global_campaign.fn)
+        zones = sig.parameters["max_parallel_zones"].default
+        ingests = sig.parameters["max_parallel_ingest"].default
+        assert (zones, ingests) == (40, 60)
+        assert ingests > zones
+
+    def test_nothing_bounds_mosaics_in_flight(self, wired, monkeypatch):
+        """A whole year's mosaics may coexist: no backpressure from fill onto ingest.
+
+        Measured as PEAK MOSAICS ALIVE — ingested but not yet cleaned — because that
+        is the quantity the removed semaphore actually bounded. Concurrent-ingest
+        counts cannot detect it: the old bound was ``zones + ingests``, always
+        greater than the ``ingests`` cap that limits ingestion anyway.
+
+        Fills are held until every mosaic exists, which is satisfiable only without
+        a chain-wide gate. With one, a cell could not begin ingesting until an
+        earlier cell's fill had returned, so the peak would stall at that bound —
+        the wait then times out and the assertion reports how far it got, rather
+        than the test hanging. ADR-011 records why the trade was accepted.
+        """
+        names = [f"{i + 1:02d}N" for i in range(12)]
+        status = SimpleNamespace(zones=dict.fromkeys(names, ()), has=lambda z, y: False)
+        monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+        monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [(z, 2025) for z in names])
+
+        alive = 0
+        peak = 0
+        all_ingested = asyncio.Event()
+
+        def _cleaned(_uri, **_k):
+            nonlocal alive
+            alive -= 1  # a mosaic stops being alive at ITS cleanup, not at its ingest
+
+        async def gated_arun(dep, parameters=None, tags=None):
+            nonlocal alive, peak
+            wired["arun"].append((dep, parameters))
+            if "ingest-zone-year" in dep:
+                alive += 1
+                peak = max(peak, alive)
+                if alive == len(names):
+                    all_ingested.set()
+            else:
+                try:
+                    await asyncio.wait_for(all_ingested.wait(), timeout=2)
+                except TimeoutError:
+                    pass  # regression: report the peak reached instead of hanging
+            return _completed_run()
+
+        monkeypatch.setattr(mod, "arun_deployment", gated_arun)
+        monkeypatch.setattr(mod, "delete_prefix", _cleaned)
+        # Both caps well below the cell count, so only the absence of a chain-wide
+        # gate can let all twelve mosaics exist at once.
+        _per_cell(max_parallel_zones=2, max_parallel_ingest=3)
+        assert peak == len(names), f"only {peak} of {len(names)} mosaics coexisted"
+
+
 def test_ingest_then_fill_then_cleanup(wired):
-    result = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    result = _per_cell()
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["ingest-zone-year/ingest-zone-year", "fill-zone-year/fill-zone-year"]  # ingest BEFORE fill
     # Ingest + fill both target the same (zone, year).
@@ -96,14 +181,14 @@ def test_driver_reads_are_credentialed(wired, monkeypatch):
     onaxis: dict = {}
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: onaxis.update(k) or True)
 
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    _per_cell()
     assert captured["open_kw"].get("get_credentials") is not None
     assert onaxis.get("get_credentials") is not None
 
 
 def _fill_run_id(rec: dict, **kwargs) -> str:
     rec["arun"].clear()
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
+    _per_cell(**kwargs)
     return next(p for d, p in rec["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
 
 
@@ -180,7 +265,7 @@ def test_code_identity_resolves_in_ray_region_not_storage_region(wired, monkeypa
     """
     calls: list = []
     monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a: calls.append(a) or "ami=ami-test")
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", s3_region="eu-west-1"))
+    _per_cell(s3_region="eu-west-1")
     # Called once (memoized) with region (4th positional arg) = None, NOT "eu-west-1".
     assert calls and calls[0][3] is None
 
@@ -197,11 +282,7 @@ def test_mosaic_identity_fingerprints_only_active_orbits(wired, monkeypatch):
         return SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": "2026-01-01T00:00:00Z"}), "SNAPSHOT0"
 
     monkeypatch.setattr(mod, "open_store_group_and_tip", _capture)
-    asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False, s1_orbit="ascending"
-        )
-    )
+    _per_cell(ingest=False, cleanup_mosaics=False, s1_orbit="ascending")
     assert any("reflectance.zarr" in p for p in opened)
     assert any("sar_ascending.zarr" in p for p in opened)
     assert not any("sar_descending.zarr" in p for p in opened)  # inactive orbit never touched
@@ -218,7 +299,7 @@ def test_all_ocean_cell_uses_empty_run_id_and_skips_cleanup(wired, monkeypatch):
         raise AssertionError("an empty cell must NOT read the mosaic for a staging fingerprint")
 
     monkeypatch.setattr(mod, "open_store_group_and_tip", _boom)
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    _per_cell()
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["ingest-zone-year/ingest-zone-year", "fill-zone-year/fill-zone-year"]  # ingest still probes+skips
     fill = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
@@ -230,7 +311,7 @@ def test_ingest_params_carry_s3_region(wired):
     """The campaign's s3_region reaches the ingest deployment (not just the fill), so a
     non-default-region deployment's ingest metadata opens hit the right bucket.
     """
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", s3_region="eu-west-1"))
+    _per_cell(s3_region="eu-west-1")
     ingest = next(p for d, p in wired["arun"] if d == "ingest-zone-year/ingest-zone-year")
     fill = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
     assert ingest["s3_region"] == "eu-west-1" and fill["s3_region"] == "eu-west-1"
@@ -249,7 +330,7 @@ def test_ingest_false_run_id_tracks_prebuilt_mosaic_identity(wired, monkeypatch)
             lambda *a, **k: (SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": ts}), "SNAPSHOT0"),
         )
         wired["arun"].clear()
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False))
+        _per_cell(ingest=False, cleanup_mosaics=False)
         return next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
 
     rid1 = _run_with_mosaic_ts("2026-01-01T00:00:00Z")
@@ -270,7 +351,7 @@ def test_retag_only_uses_stable_run_id_without_mosaic(wired, monkeypatch):
         raise AssertionError("retag-only must NOT read the mosaic for a staging fingerprint")
 
     monkeypatch.setattr(mod, "open_store_group_and_tip", _boom)
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    _per_cell()
     fill = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")
     assert fill["run_id"] == "33N-2025-retag"
 
@@ -279,7 +360,7 @@ def _prebuilt_run_id(wired, monkeypatch, *, attrs: dict, tip: str) -> str:
     """run_id of the ingest=False fill for a prebuilt mosaic with these attrs/tip."""
     monkeypatch.setattr(mod, "open_store_group_and_tip", lambda *a, **k: (SimpleNamespace(attrs=attrs), tip))
     wired["arun"].clear()
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False))
+    _per_cell(ingest=False, cleanup_mosaics=False)
     return next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
 
 
@@ -314,12 +395,12 @@ def test_default_run_rejects_unseeded_work_zone(wired, monkeypatch):
     """
     monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("02N", 2025)])  # 02N not in status.zones
     with pytest.raises(ValueError, match="not seeded"):
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        _per_cell()
     assert wired["arun"] == []  # nothing dispatched
 
 
 def test_ingest_disabled_skips_ingest_and_cleanup(wired):
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, cleanup_mosaics=False))
+    _per_cell(ingest=False, cleanup_mosaics=False)
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["fill-zone-year/fill-zone-year"]  # fill only
     assert wired["deletes"] == []
@@ -327,14 +408,14 @@ def test_ingest_disabled_skips_ingest_and_cleanup(wired):
 
 def test_rejects_zero_parallel_ingest(wired):
     with pytest.raises(ValueError, match="max_parallel_ingest"):
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_ingest=0))
+        _per_cell(max_parallel_ingest=0)
 
 
 def test_off_axis_year_rejected(wired, monkeypatch):
     """An off-axis year fails up front, before any ingest/fill is dispatched."""
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: False)
     with pytest.raises(ValueError, match="not on the store's pre-allocated axis"):
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", years=(2026,)))
+        _per_cell(years=(2026,))
     assert wired["arun"] == []  # nothing dispatched
 
 
@@ -342,7 +423,7 @@ def test_retag_only_cell_skips_ingest(wired, monkeypatch):
     """A complete-but-untagged cell only needs a retag — no ingest, no cleanup."""
     status = SimpleNamespace(zones={"33N": (2025,)}, has=lambda z, y: True)  # already complete
     monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    _per_cell()
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["fill-zone-year/fill-zone-year"]  # fill (retag) only, no ingest
     assert wired["deletes"] == []
@@ -351,13 +432,13 @@ def test_retag_only_cell_skips_ingest(wired, monkeypatch):
 def test_unseeded_explicit_zone_rejected(wired):
     """An explicit zones= entry that isn't seeded fails before dispatch."""
     with pytest.raises(ValueError, match="not seeded"):
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", zones=["02N"]))
+        _per_cell(zones=["02N"])
     assert wired["arun"] == []
 
 
 def test_duplicate_years_dispatch_once(wired):
     """The dispatch loop dedupes years — years=(2025, 2025) runs the cell once."""
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", years=(2025, 2025)))
+    _per_cell(years=(2025, 2025))
     assert len(wired["arun"]) == 2  # one ingest + one fill, not two of each
 
 
@@ -371,8 +452,8 @@ def test_sequential_strategy_dispatches_one_run_per_year(wired):
     assert deps == ["fill-zones-sequential/fill-zones-sequential"]
     params = wired["arun"][0][1]
     assert params["zones"] == ["33N"] and params["year"] == 2025
-    # The child's ingest look-ahead inherits the driver's ingest bound + params.
-    assert params["ingest"] is True and params["look_ahead"] == 2
+    # One shard, so it carries the whole ingest bound as its look-ahead.
+    assert params["ingest"] is True and params["look_ahead"] == 60
     assert params["ingest_deployment"] == "ingest-zone-year/ingest-zone-year"
     # Mosaic lifecycle belongs to the child in this mode.
     assert wired["deletes"] == []
@@ -405,15 +486,71 @@ def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
 
     asyncio.run(
         mod.run_global_campaign.fn(
-            paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", max_parallel_zones=2
+            paths=_PATHS,
+            ami_ssm_name="ami",
+            fill_strategy="chained-clusters",
+            max_parallel_zones=2,
+            max_parallel_ingest=6,
         )
     )
     assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential"] * 2
     shards = [p["zones"] for _, p in wired["arun"]]
     # LPT: 500 alone; 300+250 together — balanced totals (500 vs 550).
     assert sorted(map(sorted, shards)) == [["33N"], ["34N", "35N"]]
-    # The global ingest bound (max_parallel_ingest=2) is divided across shards.
-    assert all(p["look_ahead"] == 1 for _, p in wired["arun"])
+    # The global ingest bound is divided across shards: 6 over 2 shards = 3 each.
+    assert all(p["look_ahead"] == 3 for _, p in wired["arun"])
+
+
+class TestIngestBoundAcrossShards:
+    """The per-shard look-ahead IS that shard's ingest concurrency, so the
+    fleet-wide figure is the per-shard value times the shard count.
+    """
+
+    @staticmethod
+    def _look_ahead(wired, monkeypatch, *, zones: int, shards: int, ingest_cap: int) -> int:
+        names = [f"{i + 1:02d}N" for i in range(zones)]
+        status = SimpleNamespace(zones=dict.fromkeys(names, ()), has=lambda z, y: False)
+        monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+        monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [(z, 2025) for z in names])
+        monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: 100)
+        wired["arun"].clear()
+        asyncio.run(
+            mod.run_global_campaign.fn(
+                paths=_PATHS,
+                ami_ssm_name="ami",
+                fill_strategy="chained-clusters",
+                max_parallel_zones=shards,
+                max_parallel_ingest=ingest_cap,
+            )
+        )
+        return wired["arun"][0][1]["look_ahead"]
+
+    def test_an_exact_division_delivers_the_requested_width(self, wired, monkeypatch):
+        assert self._look_ahead(wired, monkeypatch, zones=4, shards=4, ingest_cap=8) == 2
+
+    def test_a_remainder_rounds_up_rather_than_under_delivering(self, wired, monkeypatch):
+        """Flooring is what the defaults would hit: 60 ingests over 40 shards is
+        1.5, and `//` would quietly run 40 when the operator asked for 60.
+        Overshooting is the better error — ingest is the cheap half, and the
+        number is a target rather than a quota.
+        """
+        assert self._look_ahead(wired, monkeypatch, zones=4, shards=4, ingest_cap=6) == 2
+
+    def test_a_cap_below_the_shard_count_still_gives_every_shard_one(self, wired, monkeypatch):
+        """A shard with a look-ahead of zero can never start an ingest, so the
+        real floor is one per shard however low the cap is set.
+        """
+        assert self._look_ahead(wired, monkeypatch, zones=4, shards=4, ingest_cap=1) == 1
+
+    def test_the_real_ceiling_is_logged_when_it_misses_the_request(self, wired, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="test-campaign"):
+            self._look_ahead(wired, monkeypatch, zones=4, shards=4, ingest_cap=6)
+        assert any("not the requested max_parallel_ingest=6" in m for m in caplog.messages), caplog.messages
+
+    def test_an_exact_fit_warns_about_nothing(self, wired, monkeypatch, caplog):
+        with caplog.at_level(logging.WARNING, logger="test-campaign"):
+            self._look_ahead(wired, monkeypatch, zones=4, shards=4, ingest_cap=8)
+        assert not [m for m in caplog.messages if "max_parallel_ingest" in m], caplog.messages
 
 
 def test_sequential_single_shard_reads_no_tile_counts(wired, monkeypatch):
@@ -468,7 +605,7 @@ def test_branch_none_keeps_prod_refs_everywhere(wired):
     """Regression guard: with no branch, every child ref — direct AND grandchild —
     is the unsuffixed production default (today's behaviour, byte-for-byte).
     """
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    _per_cell()
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["ingest-zone-year/ingest-zone-year", "fill-zone-year/fill-zone-year"]
     _, ingest_params = _dep(wired, "ingest-zone-year")
@@ -482,7 +619,7 @@ def test_branch_suffixes_all_four_derived_refs(wired):
     """The fix: a branch slug routes the fill, the ingest, AND the S1/S2
     grandchildren that ingest_zone_year dispatches (the ones that used to 404).
     """
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", branch="global-tessera"))
+    _per_cell(branch="global-tessera")
     fill_dep, _ = _dep(wired, "fill-zone-year")
     ingest_dep, ingest_params = _dep(wired, "ingest-zone-year")
     assert fill_dep == "fill-zone-year/fill-zone-year-global-tessera"
@@ -497,15 +634,7 @@ def test_explicit_direct_ref_is_verbatim_but_grandchildren_still_route(wired):
     """Precedence: an explicit fill/ingest ref is used verbatim (never re-suffixed),
     yet the S1/S2 grandchildren still follow `branch` — they have no explicit knob.
     """
-    asyncio.run(
-        mod.run_global_campaign.fn(
-            paths=_PATHS,
-            ami_ssm_name="ami",
-            branch="b",
-            fill_deployment="custom/fill",
-            ingest_deployment="custom/ingest",
-        )
-    )
+    _per_cell(branch="b", fill_deployment="custom/fill", ingest_deployment="custom/ingest")
     fill_dep, _ = _dep(wired, "custom/fill")
     ingest_dep, ingest_params = _dep(wired, "custom/ingest")
     assert fill_dep == "custom/fill"  # not custom/fill-b
@@ -515,7 +644,7 @@ def test_explicit_direct_ref_is_verbatim_but_grandchildren_still_route(wired):
 
 def test_branch_routes_fill_when_ingest_disabled(wired):
     """ingest=False: no ingest dispatch, but the fill ref is still branch-routed."""
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False, branch="b"))
+    _per_cell(ingest=False, branch="b")
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["fill-zone-year/fill-zone-year-b"]  # fill only, suffixed
 
@@ -525,7 +654,7 @@ def test_both_strategies_pin_the_resolved_ami_id(wired):
     fill — cluster-per-zone AND chained — so a fill boots the exact image its
     staging fingerprint recorded instead of re-reading the SSM pointer.
     """
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    _per_cell()
     fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
     assert fill["ami_id"] == "ami-test-id"
 
@@ -573,7 +702,7 @@ class TestAmiIsResolvedOnlyForCellsThatStartRay:
         monkeypatch.setattr(
             mod, "campaign_status", lambda *a, **k: SimpleNamespace(zones={"33N": (2025,)}, has=lambda z, y: True)
         )
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        _per_cell()
         fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
         assert fill["run_id"].endswith("-retag")
         assert fill["ami_id"] is None
@@ -583,7 +712,7 @@ class TestAmiIsResolvedOnlyForCellsThatStartRay:
     def test_all_ocean_cell_neither_resolves_nor_pins(self, wired, monkeypatch):
         self._no_ssm(monkeypatch)
         monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: False)
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        _per_cell()
         fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
         assert fill["run_id"].endswith("-empty")
         assert fill["ami_id"] is None
@@ -596,14 +725,14 @@ def test_every_dispatched_child_carries_the_campaign_tag(wired):
     memory records what was dispatched — an untagged child is an unsweepable one.
     """
     with patch.object(mod.flow_run_ctx, "id", "run-abc"):
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        _per_cell()
     assert wired["tags"], "no children dispatched"
     assert all(t == ["campaign:run-abc"] for t in wired["tags"]), wired["tags"]
 
 
 def test_children_go_untagged_outside_a_flow_run(wired):
     """A direct .fn() call has no run id, and dispatches nothing worth sweeping."""
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+    _per_cell()
     assert all(t is None for t in wired["tags"])
 
 
@@ -631,7 +760,7 @@ def test_model_gate_runs_before_any_dispatch(wired, monkeypatch):
 
     monkeypatch.setattr(mod, "_assert_seeded_model_matches", _reject)
     with pytest.raises(ValueError, match="seeded for encoder"):
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        _per_cell()
     assert wired["arun"] == [], "nothing may be dispatched once the gate fails"
 
 
@@ -639,5 +768,5 @@ def test_model_gate_override_lets_the_campaign_proceed(wired, monkeypatch):
     """The escape hatch is threaded through rather than reimplemented."""
     seen: dict = {}
     monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: seen.update(k))
-    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", allow_model_mismatch=True))
+    _per_cell(allow_model_mismatch=True)
     assert seen["allow_model_mismatch"] is True

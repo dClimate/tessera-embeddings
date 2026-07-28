@@ -720,15 +720,40 @@ def fill_zones_sequential_flow(
             s3_region=s3_region,
         )
 
-    # Prime the pipeline: kick off the initial ingest window BEFORE `ray up`, so
-    # the first cell's mosaic materializes during cluster bring-up instead of a
-    # freshly-provisioned GPU fleet idling through a full ingest at the start of
-    # every year. Idempotent — the runner's feeder immediately re-issues these
-    # same starts (and admits them through its mosaic budget); the window is
-    # 1 + look_ahead ≤ the budget's look_ahead + 2, so priming can't overshoot it.
+    # Prime the pipeline: kick off the initial ingest window BEFORE `ray up`.
+    # Idempotent — the runner's feeder immediately re-issues these same starts (and
+    # admits them through its mosaic budget); the window is 1 + look_ahead ≤ the
+    # budget's look_ahead + 2, so priming can't overshoot it.
     if inputs is not None:
         for cell in live[: 1 + look_ahead]:
             inputs.start(cell.zone, cell.year)
+
+        # Then BLOCK until the first cell's mosaic exists, and only then ask for GPUs.
+        #
+        # A GPU fleet must never be booted speculatively. Bringing the cluster up
+        # concurrently with this ingest looked like free overlap — and would be, if
+        # `ray up` were the long pole — but an ingest is tens of minutes to hours
+        # against five to ten for the cluster, so in practice the fleet finished
+        # provisioning and then billed idle for the remainder of the first ingest,
+        # once per shard per year. Waiting here converts that into ingest-only time,
+        # which is the cheap resource. `wait` is idempotent (it starts the cell if
+        # needed and joins the same future), so the runner's own wait for this cell
+        # returns immediately.
+        #
+        # Only the FIRST cell is waited on: the rest of the primed window keeps
+        # ingesting during bring-up and during cell one's inference, which is the
+        # look-ahead doing its job. The guarantee is "never boot GPUs with nothing
+        # ready", not "serialise ingest behind inference".
+        head = live[0]
+        log.info(
+            "Waiting for %s-%d's mosaic before requesting GPUs (%d more cell(s) ingesting behind it)",
+            head.zone,
+            head.year,
+            max(0, len(live[: 1 + look_ahead]) - 1),
+        )
+        t0 = time.monotonic()
+        inputs.wait(head.zone, head.year)
+        log.info("Mosaic for %s-%d ready after %.1fs — requesting GPUs", head.zone, head.year, time.monotonic() - t0)
 
     try:
         # Pin a deterministic cluster name from the flow-run id so the cancellation
