@@ -102,7 +102,7 @@ def ingest_s1_roi_sar(
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
     crop_to_live_windows: bool = False,
-    overlap_window_writes: bool = False,
+    overlap_window_writes: bool = True,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
 
@@ -132,11 +132,12 @@ def ingest_s1_roi_sar(
             uploaded there (probe-rung profiling; default off).
             Ignored on the ``use_local`` path, which warns.
         overlap_window_writes: Submit a date's windows as ONE dask compute rather
-            than one blocking compute per window, so their critical paths overlap
-            across the fleet instead of summing. Identical stores either way.
-            Defaults off pending an S1 measurement; the S2 path measured 1.59x per
-            date from the same change and S1 shares the mechanism, but its band
-            count and per-window volume differ. Only meaningful with
+            than one blocking compute per window, so they share the fleet instead of
+            each waiting its turn. Identical stores either way. **Defaults ON**: it is
+            worth a factor of 2.4-2.9 on S1, measured across ROIs spanning a threefold
+            range of window counts. Sequential writing can only occupy as much of the
+            fleet as ONE window's work provides, which is why the gain tracks fleet
+            width rather than window count. Only meaningful with
             ``crop_to_live_windows``.
         crop_to_live_windows: Restrict mosaic writes (and the S2 coverage
             reduce) to the chunk-aligned windows intersecting the ROI mask —
