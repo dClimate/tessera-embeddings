@@ -26,6 +26,8 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 from tessera_embeddings.ingest._pipeline import pipelined
 
 
@@ -105,7 +107,12 @@ def _run_ingest(monkeypatch, batch_dates: dict[str, list[str]], existing: set[st
 
     ``batch_dates`` maps a batch's start date to the solar dates its query returns, which
     is how a shared boundary day is expressed: name it in two consecutive batches.
-    Returns the dates actually handed to ``write_day_windows``, in order.
+    Returns the dates actually written, in order.
+
+    Both writers are captured, because which one runs is the thing under test:
+    ``crop_to_live_windows=True`` writes a date at a time through ``write_day_windows``,
+    and the full-extent path appends a whole batch through ``write_dataset``. Pass
+    ``crop_to_live_windows`` in ``kwargs`` to choose.
     """
     import numpy as np
     import xarray as xr
@@ -127,8 +134,13 @@ def _run_ingest(monkeypatch, batch_dates: dict[str, list[str]], existing: set[st
     def fake_write_day_windows(_store, data, *_args, **_kwargs):
         written.append(str(data["time"].values[0])[:10])
 
+    def fake_write_dataset(_store, data, *_args, **_kwargs):
+        written.extend(str(t)[:10] for t in data["time"].values)
+
+    kwargs.setdefault("crop_to_live_windows", True)
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", fake_write_day_windows)
+    monkeypatch.setattr(s1_roi, "write_dataset", fake_write_dataset)
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set(existing))
     monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
     monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
@@ -152,55 +164,67 @@ def _run_ingest(monkeypatch, batch_dates: dict[str, list[str]], existing: set[st
         client=type("C", (), {"persist": staticmethod(lambda x: x)})(),
         orbit="ascending",
         batch_days=2,
-        crop_to_live_windows=True,
         **kwargs,
     )
     return written
 
 
-def test_a_solar_day_in_two_batches_is_written_once(monkeypatch) -> None:
+#: Every combination of the two knobs that pick a write path and a supply. The guard
+#: belongs to the loop, not to one branch of it, so all four must hold — the full-extent
+#: branch used to write the whole batch unfiltered, so its duplicate landed on the time
+#: axis silently (write_dataset appends; only the cropped path has a slot guard).
+_WRITE_PATHS = [
+    pytest.param(crop, pipe, id=f"{'cropped' if crop else 'full-extent'}-{'lookahead' if pipe else 'serial'}")
+    for crop in (True, False)
+    for pipe in (True, False)
+]
+
+
+@pytest.mark.parametrize(("crop", "pipe"), _WRITE_PATHS)
+def test_a_solar_day_in_two_batches_is_written_once(monkeypatch, crop: bool, pipe: bool) -> None:
     """The rule the in-process written-date set exists to enforce, through the real loop.
 
     Two consecutive batches both report 2024-01-02, which is what a UTC-cut boundary
-    falling inside a solar day produces. Committing it twice would trip the store's
-    duplicate-date guard part-way through a run.
+    falling inside a solar day produces. Committing it twice puts a duplicate timestamp
+    on the time axis — caught by the store's guard on the cropped path, silent on the
+    full-extent one.
     """
     written = _run_ingest(
         monkeypatch,
         batch_dates={"2024-01-01": ["2024-01-01", "2024-01-02"], "2024-01-03": ["2024-01-02", "2024-01-04"]},
         existing=set(),
+        crop_to_live_windows=crop,
+        pipeline_batches=pipe,
     )
     assert written.count("2024-01-02") == 1, f"the shared solar day was written twice: {written}"
     assert written == ["2024-01-01", "2024-01-02", "2024-01-04"]
 
 
-def test_the_guard_holds_with_the_look_ahead_disabled_too(monkeypatch) -> None:
-    """The serial path must not be the only correct one — both share the same authority."""
-    written = _run_ingest(
-        monkeypatch,
-        batch_dates={"2024-01-01": ["2024-01-01", "2024-01-02"], "2024-01-03": ["2024-01-02", "2024-01-04"]},
-        existing=set(),
-        pipeline_batches=False,
-    )
-    assert written == ["2024-01-01", "2024-01-02", "2024-01-04"]
-
-
-def test_dates_already_in_the_store_are_skipped_on_resume(monkeypatch) -> None:
+@pytest.mark.parametrize(("crop", "pipe"), _WRITE_PATHS)
+def test_dates_already_in_the_store_are_skipped_on_resume(monkeypatch, crop: bool, pipe: bool) -> None:
     """Seeding from the store is what makes a resumed run skip finished work."""
     written = _run_ingest(
         monkeypatch,
+        crop_to_live_windows=crop,
+        pipeline_batches=pipe,
         batch_dates={"2024-01-01": ["2024-01-01", "2024-01-02"], "2024-01-03": ["2024-01-03"]},
         existing={"2024-01-01"},
     )
     assert written == ["2024-01-02", "2024-01-03"]
 
 
-def _run_with_footprints(monkeypatch, dates, bboxes_by_date, *, narrow: bool, windows: int = 4):
+def _run_with_footprints(
+    monkeypatch, dates, bboxes_by_date, *, narrow: bool, windows: int = 4, costs: dict | None = None, **ingest_kwargs
+):
     """Drive the ingest with a controllable per-date footprint.
 
     ``bboxes_by_date`` maps a date to the item bboxes reported for it, which is what decides
     the footprint. A date whose items all carry ``None`` has imagery reaching NO window; a
     date with no items at all is UNKNOWN, which is a different case and must fall back.
+
+    Pass ``costs`` to collect the window price each of the two merges was given, under
+    the keys ``"run"`` and ``"date"``. Recorded here rather than by re-patching from the
+    caller, whose patches this function would otherwise overwrite.
     """
     import numpy as np
     import xarray as xr
@@ -232,9 +256,16 @@ def _run_with_footprints(monkeypatch, dates, bboxes_by_date, *, narrow: bool, wi
 
     # windows_for_date is real geometry; stub it to express "reaches these many windows"
     # so the test pins the SKIP and NARROW rules rather than re-testing that function.
-    def fake_windows_for_date(run_windows, bboxes, _geobox, **_kw):
+    def fake_windows_for_date(run_windows, bboxes, _geobox, *, window_cost_in_chunks=None, **_kw):
+        if costs is not None:
+            costs["date"] = window_cost_in_chunks
         reach = len([b for b in bboxes if b is not None])
         return run_windows[:reach]
+
+    def fake_live_windows_for_mask(*_a, window_cost_in_chunks=None, **_k):
+        if costs is not None:
+            costs["run"] = window_cost_in_chunks
+        return all_windows
 
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "windows_for_date", fake_windows_for_date)
@@ -247,7 +278,7 @@ def _run_with_footprints(monkeypatch, dates, bboxes_by_date, *, narrow: bool, wi
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _s, **_kw: set())
     monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
     monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
-    monkeypatch.setattr(s1_roi, "live_windows_for_mask", lambda *a, **k: all_windows)
+    monkeypatch.setattr(s1_roi, "live_windows_for_mask", fake_live_windows_for_mask)
     monkeypatch.setattr(s1_roi, "solar_grouping_longitude", lambda _roi: 0.0)
     monkeypatch.setattr(
         s1_roi,
@@ -266,6 +297,7 @@ def _run_with_footprints(monkeypatch, dates, bboxes_by_date, *, narrow: bool, wi
         batch_days=5,
         crop_to_live_windows=True,
         narrow_windows_per_date=narrow,
+        **ingest_kwargs,
     )
     return written
 
@@ -344,3 +376,27 @@ def test_an_unmatched_timestamp_falls_back_to_every_window(monkeypatch) -> None:
         narrow=True,
     )
     assert written == [("2024-01-01", 4)], f"unmatched slice must not be narrowed or skipped: {written}"
+
+
+@pytest.mark.parametrize("overlapped", [False, True], ids=["sequential-writes", "overlapped-writes"])
+def test_per_date_narrowing_is_priced_like_the_run(monkeypatch, overlapped: bool) -> None:
+    """The run's window price must reach the per-date re-merge, not stop at the run.
+
+    Both merges answer the same question — is a window boundary worth the dead area it
+    saves? — so pricing them differently across narrowing undoes the calibration for
+    every date the footprint narrows. Pinned for S2 in test_s2_date_pipeline and on
+    ``windows_for_date`` itself in test_live_windows.
+    """
+    from tessera_embeddings.ingest.live_windows import WINDOW_COST_IN_CHUNKS, WINDOW_COST_IN_CHUNKS_OVERLAPPED
+
+    costs: dict = {}
+    _run_with_footprints(
+        monkeypatch,
+        dates=["2024-01-01T00:00:00"],
+        bboxes_by_date={"2024-01-01T00:00:00": [(0, 0, 1, 1)]},
+        narrow=True,
+        costs=costs,
+        overlap_window_writes=overlapped,
+    )
+    expected = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else WINDOW_COST_IN_CHUNKS
+    assert costs == {"run": expected, "date": expected}

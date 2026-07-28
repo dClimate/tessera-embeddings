@@ -706,3 +706,23 @@ def test_requested_extra_bands_survive_item_pruning(monkeypatch):
     assert "aot" in _loadable_assets(config, ["aot"])
     # The collection's own bands are never dropped by asking for an extra one.
     assert set(config.bands) <= _loadable_assets(config, ["aot"])
+
+    # ...and the request has to REACH the pruning, which happens two calls below
+    # `ingest_tile`. Keeping only the `_loadable_assets` half of this correct still
+    # loses the band, because the query never hears about it.
+    seen: dict = {}
+
+    def capture(*_a, extra_bands=None, **_k):
+        seen["extra_bands"] = extra_bands
+        return []
+
+    monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", capture)
+    ingest_tile(
+        provider="earth-search",
+        collection="sentinel-2-l2a",
+        tile_id="33UUP",
+        start_date="2024-01-01",
+        end_date="2024-01-10",
+        extra_bands=["aot"],
+    )
+    assert seen["extra_bands"] == ["aot"]

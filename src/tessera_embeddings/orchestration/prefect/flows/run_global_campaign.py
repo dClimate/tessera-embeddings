@@ -676,6 +676,10 @@ async def run_global_campaign(
             "commit_limit_name": commit_limit_name,
             "allow_partial_window": allow_partial_window,
             "allow_s2_only": allow_s2_only,
+            # The child re-runs the model gate this flow already cleared in preflight, so
+            # without forwarding the override it rejects the same store — after its ingest
+            # has been paid for. The campaign-level flag has to reach the gate that fires.
+            "allow_model_mismatch": allow_model_mismatch,
             # Divide the fleet S3-PUT budget across concurrent fills so K shard-write
             # phases don't burst K times the target PUTs (the ~800-req SlowDown). D6
             # gates committers; this bounds the ungated upload phase.
@@ -851,6 +855,8 @@ async def run_global_campaign(
                     "commit_limit_name": commit_limit_name,
                     "allow_partial_window": allow_partial_window,
                     "allow_s2_only": allow_s2_only,
+                    # As in _fill_params: the chained child gates on the seeded model too.
+                    "allow_model_mismatch": allow_model_mismatch,
                     "ssm_prefix": ssm_prefix,
                     "cloudwatch_log_group": cloudwatch_log_group,
                     "code_bucket": code_bucket,

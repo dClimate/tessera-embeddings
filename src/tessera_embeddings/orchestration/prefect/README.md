@@ -104,7 +104,32 @@ override.
 | `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
 | `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commit gate = a Prefect global concurrency limit. |
 | `fill_zones_sequential.py` | Global campaign: fill one year's zones sequentially on a SINGLE shared Ray cluster (largest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Pre-cluster triage settles retag/all-ocean cells. |
+| `ingest_zone_year.py` | Global campaign: build one cell's S1/S2 mosaics on the fixed zone grid by dispatching the ROI ingest deployments onto a synthesised zone-shaped ROI. Marker-gated and crash-safe: a stale or half-written mosaic is cleared and rebuilt, never appended onto. |
 | `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="cluster-per-zone"`), or size-balanced `fill-zones-sequential` shards on long-lived clusters (`"chained-clusters"`). |
+
+### Cancelling reaches every level
+
+`arun_deployment` creates an **independent** run: killing the flow that started
+one does not touch it. A cancelled campaign would otherwise leave Dask and Ray
+fleets billing, still writing into prefixes a retry is about to clear and
+rebuild — the one race the clear-and-rebuild recovery cannot survive.
+
+Each dispatching flow therefore stamps a tag derived from its own flow-run id on
+every child, and cancels anything still live under that tag from **both** its
+cancellation and its crashed hook (a crashed parent orphans children exactly like
+a cancelled one). The tag is re-derived rather than remembered, because Prefect
+runs terminal hooks in a fresh import after the flow process is gone. The shared
+machinery is `flows/_child_runs.py`; the chain is three deep:
+
+```text
+run_global_campaign   --"campaign:<id>"-->        ingest-zone-year, fill-zone-year,
+                                                  fill-zones-sequential
+ingest_zone_year      --"ingest-zone-year:<id>"-->  ingest_s1_roi_sar, ingest_s2_roi_reflectance
+fill_zones_sequential --"chained-ingest:<id>"-->    ingest-zone-year (look-ahead)
+```
+
+Each flow keeps its own teardown hook as well; the sweep stops the runs those
+hooks then clean up after.
 
 > **Why so many flow files?** The two-flow pattern below explains the inner/outer
 > split per file. The flows themselves are kept thin — task-graph discipline

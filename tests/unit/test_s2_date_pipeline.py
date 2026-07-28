@@ -67,6 +67,11 @@ class _FakeClient:
     def persist(obj):
         return obj
 
+    @staticmethod
+    def compute(obj):
+        """The cropped gate submits its reduce explicitly; hand back a local future."""
+        return SimpleNamespace(result=obj.compute)
+
 
 def _item(date: str):
     return SimpleNamespace(datetime=datetime.fromisoformat(f"{date}T10:00:00"), properties={"eo:cloud_cover": 0.0})
@@ -118,6 +123,7 @@ def run_ingest(monkeypatch):
         fail_on: str | None = None,
         write_s: float = 0.0,
         log: logging.Logger | None = None,
+        **ingest_kwargs,
     ) -> _Run:
         run = _Run()
         runs.append(run)  # so a test can inspect a run whose write raised
@@ -155,6 +161,7 @@ def run_ingest(monkeypatch):
             log=log,
             stream_stac_monthly=False,
             pipeline_dates=pipeline_dates,
+            **ingest_kwargs,
         )
         return run
 
@@ -301,3 +308,52 @@ def test_the_next_date_is_prepared_during_the_current_write(run_ingest):
         ]
     assert all(overlaps[True]), "pipelined mode prepared no date during a write"
     assert not any(overlaps[False]), "serial mode overlapped a preparation with a write"
+
+
+@pytest.mark.parametrize("overlapped", [False, True], ids=["sequential-writes", "overlapped-writes"])
+def test_per_date_narrowing_is_priced_like_the_run(run_ingest, monkeypatch, overlapped: bool):
+    """The run's window price must reach the per-date re-merge, not stop at the run.
+
+    The two merges answer the same question — is this window boundary worth the dead
+    area it saves? — so answering it differently on either side of narrowing undoes the
+    calibration for every date the footprint narrows. See the same rule pinned on
+    ``windows_for_date`` itself in test_live_windows.
+    """
+    seen: dict[str, int | None] = {}
+    window = SimpleNamespace(y0=0, y1=SIZE, x0=0, x1=SIZE)
+
+    def fake_live_windows_for_mask(*_a, window_cost_in_chunks=None, **_k):
+        seen["run"] = window_cost_in_chunks
+        return [window]
+
+    def fake_windows_for_date(run_windows, *_a, window_cost_in_chunks=None, **_k):
+        seen["date"] = window_cost_in_chunks
+        return run_windows
+
+    monkeypatch.setattr(s2_roi, "live_windows_for_mask", fake_live_windows_for_mask)
+    monkeypatch.setattr(s2_roi, "windows_for_date", fake_windows_for_date)
+    monkeypatch.setattr(s2_roi, "write_day_windows", lambda *_a, **_k: None)
+    monkeypatch.setattr(s2_roi, "write_days_windows", lambda *_a, **_k: None)
+
+    run_ingest(
+        dict.fromkeys(["2024-01-01"], True),
+        pipeline_dates=False,
+        crop_to_live_windows=True,
+        overlap_window_writes=overlapped,
+    )
+    expected = s2_roi.WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else s2_roi.WINDOW_COST_IN_CHUNKS
+    assert seen == {"run": expected, "date": expected}
+
+
+def test_the_assessed_window_lands_on_the_reflectance_repo(run_ingest, monkeypatch):
+    """It must be written to the repo the coverage gate opens, not the parent directory.
+
+    ``store_path`` holds all three child repos; the S2 mosaic is the ``reflectance.zarr``
+    inside it. ``record_assessed_window`` only logs when its open fails, so aiming at the
+    parent left the attribute unwritten in silence — and a month that was examined and
+    found genuinely empty then reads as an unexplained gap, failing the fill.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(s2_roi, "record_assessed_window", lambda path, *_a, **_k: seen.append(path))
+    run_ingest(dict.fromkeys(["2024-01-01"], True), pipeline_dates=False)
+    assert seen == ["memory://store/reflectance.zarr"]

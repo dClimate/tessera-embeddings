@@ -32,7 +32,7 @@ import logging
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Literal, cast, final
 
 import dask.distributed
@@ -308,17 +308,17 @@ def ingest_s1_roi_sar(
     # `live_windows` is the plain-tuple form the storage layer takes.
     run_windows: list = []
     live_windows: list[tuple[int, int, int, int]] | None = None
+    # The merge exchange rate follows how this run WRITES, exactly as on the S2 path:
+    # overlapped windows share one graph, so a boundary is cheap and the DP should stop
+    # trading ocean area for fewer windows. A sequential writer still pays the serial
+    # cost per boundary and keeps the high rate. Bound once because per-date narrowing
+    # re-merges on the same terms — a second, differing rate there would undo this.
+    window_cost = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
     if crop_to_live_windows:
         run_windows = live_windows_for_mask(
             roi_zarr_path,
             window_px=INGEST_CHUNK_SIZE,
-            # The merge exchange rate follows how this run WRITES, exactly as on the
-            # S2 path: overlapped windows share one graph, so a boundary is cheap and
-            # the DP should stop trading ocean area for fewer windows. A sequential
-            # writer still pays the serial cost per boundary and keeps the high rate.
-            window_cost_in_chunks=(
-                WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
-            ),
+            window_cost_in_chunks=window_cost,
             storage_options=storage_options,
         )
         live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
@@ -354,7 +354,8 @@ def ingest_s1_roi_sar(
         if not run_windows or mid_longitude is None or not items:
             return {}
         offset = timedelta(seconds=solar_day_offset_seconds(mid_longitude))
-        by_day: dict[object, list] = {}
+        # Keyed on the SOLAR date, which is what `solar_day.isoformat()` writes below.
+        by_day: dict[date, list] = {}
         for item in items:
             when = getattr(item, "datetime", None)
             if when is None:
@@ -373,6 +374,7 @@ def ingest_s1_roi_sar(
                 cast("list[tuple[float, float, float, float]]", [getattr(i, "bbox", None) for i in day_items]),
                 roi.geobox,
                 chunk_px=INGEST_CHUNK_SIZE,
+                window_cost_in_chunks=window_cost,
             )
             # windows_for_date returns its INPUT unchanged when the footprint cannot be
             # determined, so an unchanged length is not evidence of narrowing — that is
@@ -480,6 +482,11 @@ def ingest_s1_roi_sar(
             item_provider_fn=_capturing_provider,
             post_load_fn=amplitude_to_db,
             geobox=roi.geobox,
+            # Key the existing-date filter on solar days, matching groupby above and the
+            # days the store actually holds. The consume loop re-checks anyway, so this
+            # only saves loading a group that is already committed — but filtering on UTC
+            # dates would let half of one through, which is the case that costs a write.
+            mid_longitude=mid_longitude,
         )
         query_s = time.monotonic() - query_started
         if data is not None:
@@ -610,22 +617,40 @@ def ingest_s1_roi_sar(
                         "parallel" if overlap_window_writes else "sequential",
                     )
             else:
-                for attempt in _retrying():
-                    with attempt:
-                        write_dataset(
-                            orbit_store,
-                            data,
-                            tile_id=roi_zarr_path,
-                            baselines=baselines,
-                            chunks=INGEST_CHUNKS,
-                            manifest=ingest_manifest,
-                            crs=roi.native_crs,
-                            s3_region=s3_region,
-                        )
+                # Dedupe against what has ACTUALLY been written, exactly as the cropped
+                # branch does per date. The query filter used the snapshot frozen before
+                # the run began, so under a look-ahead a solar day shared across a UTC
+                # batch boundary can reach here already committed — and `write_dataset`
+                # appends whatever it is handed, so that duplicate would land on the time
+                # axis silently rather than tripping the windowed path's slot guard.
+                dates = [str(t)[:10] for t in data["time"].values]
+                keep = [i for i, d in enumerate(dates) if d not in written_dates]
+                if len(keep) < len(dates):
+                    log.info(
+                        "[%s] Skipping %d date(s) already written: %s",
+                        orbit,
+                        len(dates) - len(keep),
+                        ", ".join(sorted({d for d in dates if d in written_dates})),
+                    )
+                if keep:
+                    for attempt in _retrying():
+                        with attempt:
+                            write_dataset(
+                                orbit_store,
+                                data if len(keep) == len(dates) else data.isel(time=keep),
+                                tile_id=roi_zarr_path,
+                                baselines=baselines,
+                                chunks=INGEST_CHUNKS,
+                                manifest=ingest_manifest,
+                                crs=roi.native_crs,
+                                s3_region=s3_region,
+                            )
+                    written_dates.update(dates[i] for i in keep)
+                written_this_batch = len(keep)
             # Count what was WRITTEN, not what the batch held: under a look-ahead a date
             # can arrive already committed by an earlier batch and be skipped above, and
             # reporting it as processed would overstate a resumed run's progress.
-            n = written_this_batch if live_windows is not None else data.sizes["time"]
+            n = written_this_batch
             total_processed += n
             log.info(
                 "[%s] Batch %s..%s: wrote %d dates (total: %d)",

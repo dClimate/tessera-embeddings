@@ -308,16 +308,17 @@ def ingest_s2_roi_reflectance(
     # a fraction of a wide ROI per pass.
     live_windows: list[tuple[int, int, int, int]] | None = None
     run_windows: list = []
+    # The merge exchange rate follows how this run WRITES: overlapped windows share one
+    # graph, so a boundary is cheap and the DP should stop trading ocean area for fewer
+    # windows. Sequential writes still pay the serial cost. Bound once because per-date
+    # narrowing re-merges on the same terms — a second, differing rate there would undo
+    # this for every narrowed date.
+    window_cost = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
     if crop_to_live_windows:
         run_windows = live_windows_for_mask(
             roi_zarr_path,
             window_px=INGEST_CHUNK_SIZE,
-            # The merge exchange rate follows how this run WRITES: overlapped windows
-            # share one graph, so a boundary is cheap and the DP should stop trading
-            # ocean area for fewer windows. Sequential writes still pay the serial cost.
-            window_cost_in_chunks=(
-                WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
-            ),
+            window_cost_in_chunks=window_cost,
             storage_options=storage_options,
         )
         live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
@@ -462,6 +463,7 @@ def ingest_s2_roi_reflectance(
                 [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
                 roi.geobox,
                 chunk_px=INGEST_CHUNK_SIZE,
+                window_cost_in_chunks=window_cost,
             )
             if not narrowed:
                 # No live cell is reachable today. Nothing to write, and writing an
@@ -732,6 +734,10 @@ def ingest_s2_roi_reflectance(
             end_date=end_date,
             existing_dates=get_existing_dates(reflectance_store, s3_region=s3_region),
             bbox=roi.bbox_wgs84,
+            # The committed dates are SOLAR days (that is what _drive groups and writes),
+            # so the filter has to key on solar days too — see stream_stac_months, which
+            # passes the same value for the same reason.
+            mid_longitude=mid_longitude,
         )
         if items:
             _drive(items, baselines)
@@ -742,8 +748,13 @@ def ingest_s2_roi_reflectance(
     # finding rather than a gap (storage.zarr_store.record_assessed_window). S2 skips a date
     # whose imagery reaches no live window exactly as S1 does, so it needs the same record.
     # Only when a store exists: with nothing written there is nothing to annotate.
+    #
+    # `reflectance_store`, NOT `store_path`: the attr belongs on the repo the coverage gate
+    # opens, and `store_path` is the mosaic parent directory holding all three child repos.
+    # record_assessed_window only logs when the open fails, so passing the parent left the
+    # attr unwritten and silently turned every legitimately empty month back into a gap.
     if total_processed:
-        record_assessed_window(store_path, start_date, end_date, s3_region=s3_region)
+        record_assessed_window(reflectance_store, start_date, end_date, s3_region=s3_region)
 
     if total_processed == 0:
         return IngestResult(

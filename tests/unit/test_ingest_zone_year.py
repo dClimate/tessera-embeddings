@@ -36,8 +36,9 @@ def wired(monkeypatch):
         "tessera_embeddings.providers.aws.credentials.iam_icechunk_credentials", object(), raising=False
     )
 
-    async def fake_arun(dep, parameters=None):
+    async def fake_arun(dep, parameters=None, tags=None):
         rec["arun"].append((dep, parameters))
+        rec.setdefault("tags", []).append(tags)
         return _completed_run()
 
     monkeypatch.setattr(mod, "arun_deployment", fake_arun)
@@ -175,26 +176,26 @@ def test_stale_marker_triggers_reingest(wired, monkeypatch):
 
 def test_markerless_partial_mosaic_is_cleared(wired, monkeypatch):
     """A prior attempt that wrote reflectance then crashed before any SAR store or
-    marker landed must be cleared, not appended onto: the resolved-orbit probe
-    can't see it (no SAR -> resolve raises), so existence over the maximal
-    candidate set is what triggers the clean rebuild.
+    marker landed must be cleared, not appended onto: existence over the maximal
+    candidate set is what triggers the clean rebuild, and the flow must reach that
+    clearing without first asking the orbit probe about the wreckage.
     """
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
     # Reflectance exists (markerless half-write); the SAR stores never landed.
     monkeypatch.setattr(
         mod, "_probe_marker", lambda store, **kw: (True, None) if store.endswith("reflectance.zarr") else (False, None)
     )
-    # No SAR store yet -> the FIRST orbit resolution (the probe) raises; the
-    # SECOND (post-ingest verification) succeeds once the ingesters have written.
-    calls = {"n": 0}
 
-    def flaky_resolve(mosaic_base, orbit, **k):
-        calls["n"] += 1
-        if calls["n"] == 1:
+    # Resolution keyed on STATE, not on call ordinality: there is no SAR store to
+    # resolve until the ingesters have been dispatched. So a resolution attempted
+    # before the clear-and-rebuild raises, and the post-ingest one succeeds — and
+    # the test stays honest about which side of the dispatch the flow probes from.
+    def resolve_once_ingested(mosaic_base, orbit, **k):
+        if not wired["arun"]:
             raise InsufficientCoverageError("no SAR store yet")
         return orbit
 
-    monkeypatch.setattr(mod, "resolve_s1_orbit", flaky_resolve)
+    monkeypatch.setattr(mod, "resolve_s1_orbit", resolve_once_ingested)
     result = _run(s1_orbit="ascending")
     assert result["status"] == "ingested"
     # Only the markerless partial is cleared; the SAR stores never landed, so
@@ -359,3 +360,72 @@ def test_child_ingests_receive_the_configured_region(wired, monkeypatch):
     dispatched = [p for _, p in wired["arun"]]
     assert dispatched, "no child ingests dispatched"
     assert all(p["s3_region"] == "eu-west-1" for p in dispatched), dispatched
+
+
+class TestChildRunsAreCancellable:
+    """Cancelling this flow has to stop the S1/S2 jobs it started.
+
+    Each is an independent deployment run, so killing this one leaves them writing
+    into the mosaic prefix with their Dask fleets billing — and a retry clears and
+    rebuilds that same prefix, which is the one race the recovery cannot survive.
+    The campaign already sweeps ITS children by tag; that reaches this flow but
+    stops there, because these grandchildren carried no tag of their own.
+    """
+
+    def test_the_terminal_hooks_are_registered(self):
+        """Both, not just cancellation: a crashed parent orphans children identically."""
+        assert mod._cancel_children_on_cancellation in mod.ingest_zone_year.on_cancellation_hooks
+        assert mod._cancel_children_on_cancellation in mod.ingest_zone_year.on_crashed_hooks
+
+    def test_every_child_carries_the_sweep_tag(self, wired, monkeypatch):
+        """Derived from the flow-run id alone, because the hook runs in a fresh import
+        after the process is killed and nothing in memory survives to tell it what
+        was started.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        monkeypatch.setattr(mod.flow_run_ctx, "id", "RUN123", raising=False)
+        _run(s1_orbit="both")
+        assert wired["tags"], "no child ingests dispatched"
+        assert all(t == ["ingest-zone-year:RUN123"] for t in wired["tags"]), wired["tags"]
+
+    def test_no_run_id_means_no_tag_rather_than_a_bogus_one(self, wired, monkeypatch):
+        """A direct .fn() call dispatches nothing worth sweeping, so an id-less run must
+        not stamp a tag that would later match every other id-less run.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        monkeypatch.setattr(mod.flow_run_ctx, "id", None, raising=False)
+        _run()
+        assert all(t is None for t in wired["tags"]), wired["tags"]
+
+
+def test_a_rootless_store_is_cleared_rather_than_wedging_every_retry(wired, monkeypatch):
+    """A repo created but crashed before its root group is committed must be REBUILT.
+
+    `resolve_s1_orbit` re-raises GroupNotFoundError deliberately — at fill time a
+    rootless SAR store must never read as an absent orbit and quietly halve the radar.
+    Resolving before the clear put that raise in front of the only code that repairs
+    the wreckage, so the prefix stayed wedged for every retry.
+    """
+    import zarr
+
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    # The ascending SAR store exists but is rootless; the others were never written.
+    monkeypatch.setattr(
+        mod,
+        "_probe_marker",
+        lambda store, **kw: (True, None) if store.endswith("sar_ascending.zarr") else (False, None),
+    )
+
+    def resolve_on_a_rootless_store(mosaic_base, orbit, **k):
+        # Keyed on STATE, not on call ordinality: the store stays rootless until it is
+        # cleared, whichever side of the clear the flow happens to resolve from.
+        if not wired.get("deletes"):
+            raise zarr.errors.GroupNotFoundError(f"{mosaic_base}/sar_ascending.zarr")
+        return orbit
+
+    monkeypatch.setattr(mod, "resolve_s1_orbit", resolve_on_a_rootless_store)
+    result = _run(s1_orbit="ascending")
+    assert result["status"] == "ingested"
+    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025/sar_ascending.zarr"]

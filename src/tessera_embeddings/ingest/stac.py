@@ -239,20 +239,32 @@ def _extract_baselines(items: list[Any]) -> dict[str, int]:
 def _filter_existing_dates(
     items: list[Any],
     existing_dates: set[str],
+    mid_longitude: float | None = None,
 ) -> list[Any]:
     """Filter STAC items to exclude dates already in the store.
+
+    ``mid_longitude`` must be supplied whenever the load groups by solar day, because
+    the store's dates are then SOLAR days and an item's UTC date is not the key they
+    were written under. Comparing a UTC date against a solar-day set matches only the
+    items on the near side of midnight: the rest of an already-committed group survives
+    the filter, loads, regroups onto the same solar day, and is written a second time.
+    Only the far-eastern and far-western zones have an offset large enough to cross
+    midnight, which is exactly where the group splits.
 
     Args:
         items: List of pystac Items
         existing_dates: Set of date strings (YYYY-MM-DD) already processed
+        mid_longitude: ROI centroid longitude for solar-day keying; omit for callers
+            that group by UTC date.
 
     Returns:
         Filtered list of items not in existing_dates
     """
+    offset = datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
     filtered = []
     for item in items:
         try:
-            date_str = item.datetime.strftime("%Y-%m-%d")
+            date_str = (item.datetime + offset).strftime("%Y-%m-%d")
             if date_str not in existing_dates:
                 filtered.append(item)
             else:
@@ -676,6 +688,7 @@ def query_stac_items(
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
     extra_bands: list[str] | None = None,
+    mid_longitude: float | None = None,
 ) -> tuple[list[Any], dict[str, int]]:
     """Query STAC catalog, filter items, and extract baselines.
 
@@ -698,6 +711,10 @@ def query_stac_items(
         extra_bands: Additional assets the caller will load. Kept in the pruned
             items — pruning runs at query time, so an asset dropped here cannot
             be loaded later.
+        mid_longitude: ROI centroid longitude, whenever the load groups by solar
+            day. ``existing_dates`` is then keyed on solar days, and matching an
+            item's UTC date against it half-filters a committed group. Omit for
+            callers that group by UTC date.
 
     Returns:
         Tuple of (items, baselines) where:
@@ -743,7 +760,7 @@ def query_stac_items(
     baselines = _extract_baselines(items)
 
     if existing_dates:
-        items = _filter_existing_dates(items, existing_dates)
+        items = _filter_existing_dates(items, existing_dates, mid_longitude)
 
     return items, baselines
 
@@ -890,6 +907,7 @@ def ingest_tile(
     preserve_low_values: bool = False,
     groupby: str = "time",
     geobox: GeoBox | None = None,
+    mid_longitude: float | None = None,
 ) -> tuple[xr.Dataset | None, dict[str, int]]:
     """Query STAC, filter existing dates, load data, and apply corrections.
 
@@ -937,6 +955,10 @@ def ingest_tile(
         geobox: Optional odc.geo.geobox.GeoBox specifying the exact output
               grid. When provided, overrides bbox/crs/resolution for the load
               step (bbox is still used for the STAC query).
+        mid_longitude: ROI centroid longitude. Supply it with
+              ``groupby="solar_day"``: ``existing_dates`` then holds solar days,
+              which an item's UTC date does not match wherever the offset crosses
+              midnight, and half a committed group would survive the filter.
 
     Returns:
         Tuple of (dataset, baselines) where:
@@ -953,6 +975,11 @@ def ingest_tile(
         bbox=bbox,
         item_filter_fn=item_filter_fn,
         item_provider_fn=item_provider_fn,
+        # Asset pruning happens inside the query, so a band not forwarded here is gone
+        # before load_stac_items below asks odc for it — turning a valid extra_bands
+        # request into a missing-band failure.
+        extra_bands=extra_bands,
+        mid_longitude=mid_longitude,
     )
 
     if not items:
@@ -1164,6 +1191,11 @@ def stream_stac_months(
             end_date=mr.query_end,
             existing_dates=existing_dates_fn(),
             bbox=bbox,
+            # Key the existing-date filter the same way the store was written. The
+            # committed dates are solar days whenever this is set, so filtering on UTC
+            # dates would drop only the half of a committed group that falls on the
+            # matching side of midnight and rewrite the rest as a duplicate slice.
+            mid_longitude=mid_longitude,
         )
         log.info("Queried %s..%s in %.1fs", mr.query_start, mr.query_end, time.monotonic() - t0)
         return result

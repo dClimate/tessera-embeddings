@@ -36,6 +36,7 @@ import icechunk
 import zarr
 from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
+from prefect.runtime import flow_run as flow_run_ctx
 from pydantic import BaseModel
 
 from tessera_embeddings.config.ingest import IngestSettings
@@ -48,6 +49,7 @@ from tessera_embeddings.inference.data_loading import (
     resolve_s1_orbit,
 )
 from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_count
+from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles
 from tessera_embeddings.storage.object_store import delete_prefix
@@ -161,7 +163,24 @@ def _s1_max_workers(s2_max_workers: int, settings: IngestSettings) -> int:
     return max(settings.min_workers, min(s2_max_workers, round(s2_max_workers * settings.s1_worker_fraction)))
 
 
-@flow(name="ingest-zone-year")
+#: Tag prefix for the S1/S2 ROI ingest runs this flow dispatches.
+_CHILD_TAG_PREFIX = "ingest-zone-year"
+
+
+#: The campaign cancels the runs it started, which reaches THIS flow — but its own S1/S2
+#: children are separate deployment runs that nothing was cancelling. They would keep
+#: their Dask fleets billing and keep writing into the mosaic prefix that a retry is
+#: about to clear and rebuild, which is the one race the clear-and-rebuild recovery
+#: cannot survive. Registered on both terminal hooks: a crashed parent orphans children
+#: exactly as a cancelled one does.
+_cancel_children_on_cancellation = make_child_cancel_hook(_CHILD_TAG_PREFIX, "child ingest run")
+
+
+@flow(
+    name="ingest-zone-year",
+    on_cancellation=[_cancel_children_on_cancellation],
+    on_crashed=[_cancel_children_on_cancellation],
+)
 async def ingest_zone_year(
     *,
     zone: str,
@@ -271,7 +290,15 @@ async def ingest_zone_year(
     #     the new fingerprint over mixed inputs. Physical existence is the signal.
     candidates = _mosaic_stores(mosaic_base, "both")
     probed = {s: _probe_marker(s, get_credentials=iam_icechunk_credentials, s3_region=s3_region) for s in candidates}
-    resolved = _resolved_stores()
+    stale = [s for s, (exists, marker) in probed.items() if exists and marker != fingerprint]
+    # Resolve orbits ONLY when nothing needs clearing. `resolve_s1_orbit` re-raises
+    # GroupNotFoundError deliberately — at fill time a rootless SAR store must never be
+    # read as an absent orbit and quietly halve the radar. But that is exactly the store
+    # the clearing branch below repairs, and resolving first put the raise in front of
+    # the repair: every retry died at the probe and the prefix stayed wedged forever.
+    # Skipping the call costs nothing, because a stale store cannot match the
+    # fingerprint and so could never have short-circuited anyway.
+    resolved = None if stale else _resolved_stores()
     if resolved is not None and all(probed[s][1] == fingerprint for s in resolved):
         log.info("Zone %s year %d already ingested for %s — skipping", zone, year, fingerprint["window"])
         return {"zone": zone, "year": year, "status": "already_ingested", "fingerprint": fingerprint}
@@ -285,7 +312,6 @@ async def ingest_zone_year(
     # never append onto stale dates and then stamp a fingerprint over mixed
     # inputs. strict=True still aborts on a failed delete rather than ingesting
     # onto stale data and marking the result complete.
-    stale = [s for s, (exists, marker) in probed.items() if exists and marker != fingerprint]
     if stale:
         log.info(
             "Zone %s year %d: clearing %d stale/partial store(s) for a clean rebuild, keeping %d already marked: %s",
@@ -347,6 +373,10 @@ async def ingest_zone_year(
     # cannot use — and quota is what limits concurrent cells, hence the campaign's schedule.
     s1_workers = _s1_max_workers(max_workers, ingest_settings)
     log.info("Zone %s: S2 max_workers=%d, each S1 orbit max_workers=%d", zone, max_workers, s1_workers)
+    # Stamped on every child so the terminal hooks can find them from this flow-run id
+    # alone (see _CHILD_TAG_PREFIX). None outside a Prefect run — a direct .fn() call in
+    # tests dispatches nothing worth sweeping.
+    child_tags = [t] if (t := child_run_tag(_CHILD_TAG_PREFIX, flow_run_ctx.id)) else None
     s1_coros = [
         arun_deployment(
             deployments.ingest_s1_roi_sar,
@@ -357,6 +387,7 @@ async def ingest_zone_year(
                 "max_workers": s1_workers,
                 "perf_report_uri": f"{perf_base}/s1-{orbit}.html" if perf_base else None,
             },
+            tags=child_tags,
         )
         for orbit in orbits
     ]
@@ -367,6 +398,7 @@ async def ingest_zone_year(
             "min_valid_coverage": ingest_settings.min_valid_coverage,
             "perf_report_uri": f"{perf_base}/s2.html" if perf_base else None,
         },
+        tags=child_tags,
     )
     # return_exceptions=True so we WAIT for every deployment to settle before raising:
     # a plain gather() surfaces the first failure while the sibling S1/S2 jobs keep

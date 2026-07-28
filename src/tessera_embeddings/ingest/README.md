@@ -246,7 +246,7 @@ These happen before `odc.stac.load` is called:
 
 | Transform | Where | What |
 |---|---|---|
-| **Date dedup** | `stac._filter_existing_dates` | Drops STAC items whose date is already written to the store. |
+| **Date dedup** | `stac._filter_existing_dates` | Drops STAC items whose date is already written to the store. Keyed on the SOLAR day when the caller passes `mid_longitude`, matching how the store was written. |
 | **Item sort** | `stac.query_stac_items` | For S2: sorts by `(date, cloud_cover)` so mosaicking picks the clearest tile. |
 | **Item provider** | `opera_query.make_s1_item_provider` | Builds orbit-filtered OPERA items directly from the native CMR granule API (bypasses CMR-STAC search). |
 | **URL rewriting** | `auth.rewrite_assets_to_s3` | Rewrites HTTPS datapool/earthdatacloud URLs to `s3://` URIs. |
@@ -368,6 +368,12 @@ alike:
 So the objective is not "least area" but "least `n_windows × price + area`", where the price is
 one window expressed in the chunk area that costs the same (`WINDOW_COST_IN_CHUNKS`). That
 price is *large*, so grouping pays almost whenever it is geometrically sane.
+
+The merge runs **twice** — once over the run's live grid, once over each date's narrowed grid —
+and both must use the same price. `windows_for_date` takes it as a parameter for that reason:
+priced at the sequential default while the run used the overlapped rate, the per-date re-merge
+would buy dead area back to save boundaries the write path has already made cheap, undoing the
+calibration for every narrowed date.
 
 ```text
      live chunk grid        stage 1: row bands        stage 2: grouped
@@ -667,6 +673,9 @@ absent from the time axis but wholly inside that range was **examined and found 
 reachable**, which is a finding; a month outside it is a gap. Without the record those are
 indistinguishable, and the coverage gate has to fail on both.
 
+The attribute belongs on the repo the gate opens — `reflectance.zarr` or `sar_<orbit>.zarr` —
+not on the mosaic directory that contains them.
+
 Every uncertain path is strict: an absent, malformed or unparseable attribute excuses nothing,
 and a partially-covered month stays an error because it could hide unexamined days. Failing to
 write the attribute is logged, never raised — the gate simply falls back to requiring every
@@ -856,6 +865,19 @@ reading band data for cloud-covered or off-ROI scenes.
 `_filter_existing_dates` removes items whose dates are already in the Zarr store before
 calling `odc.stac.load`. This avoids building Dask task graphs for data that will be
 discarded, and prevents unnecessary COG reads from S3.
+
+The filter must be keyed the same way the store was written. Both S1 and S2 load with
+`groupby="solar_day"`, so their time axes hold solar days — and an acquisition's UTC date
+is not its solar day wherever the offset crosses midnight (the far-eastern and far-western
+zones). Callers that group by solar day pass `mid_longitude` down through `ingest_tile` /
+`query_stac_items`; matching UTC dates against a solar-day set instead would filter only the
+half of a committed group that falls on the near side of midnight, and the surviving half
+would reload, regroup onto the day already present, and be written a second time.
+
+The filter is an optimisation, not the guarantee. On S1 the queries are built one batch
+ahead of the writes, so the set they filter against is a snapshot frozen before the run
+began; the write loop tracks what it has actually written and is the authority, on the
+cropped and full-extent branches alike.
 
 ### S3 direct access for OPERA
 

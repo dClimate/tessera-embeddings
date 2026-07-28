@@ -29,6 +29,7 @@ from tessera_embeddings.ingest.live_windows import (
     live_windows_for_mask,
     merge_bands,
     row_band_windows,
+    windows_for_date,
 )
 
 CHUNK = 4  # small stand-in for INGEST_CHUNK_SIZE; the code takes it as a parameter
@@ -363,6 +364,32 @@ class TestMergeBands:
         path = _mask_store(tmp_path, mask)
         assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=False)) == 2
         assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=True)) == 1
+
+
+def test_per_date_narrowing_re_merges_at_the_run_s_price(monkeypatch):
+    """The narrowed bands must be priced the way the run's windows were priced.
+
+    The run builds its windows with the OVERLAPPED rate when the writes share one dask
+    graph, because a window boundary is then cheap. Re-merging the narrowed bands at
+    ``merge_bands``' sequential default instead buys dead area to save boundaries that
+    cost nothing — undoing that calibration for every date the footprint narrows.
+    """
+    # Two live rows far apart: joining them adds 18 chunks of dead area for one window.
+    # Cheap windows should refuse the trade; expensive ones should take it.
+    windows = [
+        LiveWindow(y0=0, y1=CHUNK, x0=0, x1=CHUNK),
+        LiveWindow(y0=CHUNK, y1=2 * CHUNK, x0=9 * CHUNK, x1=10 * CHUNK),
+    ]
+    geobox = SimpleNamespace(height=2 * CHUNK, width=10 * CHUNK, transform=Affine.identity(), crs="EPSG:32633")
+    # A footprint covering everything, so narrowing changes nothing but the re-merge.
+    monkeypatch.setattr(live_windows, "footprint_grid", lambda *a, **k: np.ones((2, 10), dtype=bool))
+
+    kw = {"chunk_px": CHUNK}
+    assert windows_for_date(windows, [], geobox, window_cost_in_chunks=5, **kw) == windows
+    assert len(windows_for_date(windows, [], geobox, window_cost_in_chunks=50, **kw)) == 1
+    # The default stays the sequential rate for callers that never crop.
+    assert len(windows_for_date(windows, [], geobox, **kw)) == 1
+    assert WINDOW_COST_IN_CHUNKS > 18
 
 
 def test_non_finite_projection_takes_the_conservative_fallback(monkeypatch):

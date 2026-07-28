@@ -458,6 +458,7 @@ def windows_for_date(
     *,
     chunk_px: int = INGEST_CHUNK_SIZE,
     merge: bool = True,
+    window_cost_in_chunks: int = WINDOW_COST_IN_CHUNKS,
 ) -> list[LiveWindow]:
     """A run's live windows, narrowed to what ONE date's imagery can actually fill.
 
@@ -476,6 +477,12 @@ def windows_for_date(
     (:func:`footprint_grid`), so the conservative behaviour is the fallback rather
     than something a caller opts into. An EMPTY result means this date reaches no
     live cell at all and there is nothing to write.
+
+    ``window_cost_in_chunks`` must be the value the RUN's windows were built with
+    (:func:`live_windows_for_mask`): the re-merge below is the same exchange rate
+    decision made again on a smaller grid, and leaving it at the sequential default
+    would buy dead area to save window boundaries that the overlapped write path has
+    already made cheap — undoing the calibration for every narrowed date.
     """
     if not windows:
         return windows
@@ -487,7 +494,7 @@ def windows_for_date(
     if not covered.any():
         return []
     bands = row_band_windows(covered, height=height, width=width, chunk_px=chunk_px)
-    return merge_bands(bands, chunk_px=chunk_px) if merge else bands
+    return merge_bands(bands, chunk_px=chunk_px, window_cost_in_chunks=window_cost_in_chunks) if merge else bands
 
 
 def live_windows_for_mask(

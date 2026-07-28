@@ -17,7 +17,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from tessera_embeddings.ingest.stac import _prefetch, iter_month_ranges, stream_stac_months
+from tessera_embeddings.ingest.stac import (
+    _filter_existing_dates,
+    _prefetch,
+    iter_month_ranges,
+    stream_stac_months,
+)
 
 
 def _item(date: str, cloud: float = 0.0):
@@ -97,7 +102,7 @@ class TestStreaming:
     """What the generator yields, and what it does when a query fails."""
 
     def _fake_query(self, per_date: dict[str, int], calls: list | None = None):
-        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox):
+        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox, **_):
             if calls is not None:
                 calls.append((start_date, end_date, frozenset(existing_dates or ())))
             items = [
@@ -160,7 +165,7 @@ class TestStreaming:
         second_started = threading.Event()
         queried: list[str] = []
 
-        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox):
+        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox, **_):
             queried.append(start_date)
             if start_date == "2024-01-31":  # February's slice, padded a day early
                 second_started.set()
@@ -186,7 +191,7 @@ class TestStreaming:
         the failure must reach the caller.
         """
 
-        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox):
+        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox, **_):
             if start_date.startswith("2024-02"):
                 raise RuntimeError("STAC exhausted its retries")
             return [_item(start_date)], {}
@@ -229,7 +234,7 @@ class TestRetentionIsBounded:
             self.properties: dict = {}
 
     def _gen(self, months: int):
-        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox):
+        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox, **_):
             # Dated at the MIDPOINT of the queried span, which is always inside the
             # slice's own range — both ends are padded into a neighbour's, so an item
             # dated at either one would be owned by that neighbour and this month would
@@ -328,7 +333,7 @@ class TestSolarDayOwnership:
     def _months(mid_longitude):
         seen: dict[str, list[str]] = {}
 
-        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox):
+        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox, **_):
             # One acquisition at 22:00 UTC on 31 January. At +150° the solar offset is
             # +10 h, so its solar day is 1 February.
             item = SimpleNamespace(datetime=datetime.datetime(2024, 1, 31, 22, 0), properties={})
@@ -361,3 +366,48 @@ class TestSolarDayOwnership:
         for lon in (150.0, -150.0, 0.0, None):
             owners = [m for m, dates in self._months(lon).items() if dates]
             assert len(owners) == 1, f"longitude {lon} produced {owners}"
+
+    def test_the_existing_date_filter_is_keyed_the_same_way(self):
+        """Month ownership and the resume filter must agree, or a rerun half-filters.
+
+        The store's dates are SOLAR days. Matching an item's UTC date against them keeps
+        every item on the far side of midnight — the committed group's other half — which
+        then loads, regroups onto the day already present, and is written a second time.
+        """
+        item = SimpleNamespace(datetime=datetime.datetime(2024, 1, 31, 22, 0), properties={})
+        # Committed as 1 February (its solar day at +150°), so a resume must drop it.
+        assert _filter_existing_dates([item], {"2024-02-01"}, 150.0) == []
+        # ...and its UTC date being absent from the store is not a reason to keep it.
+        assert _filter_existing_dates([item], {"2024-01-31"}, 150.0) == [item]
+
+    def test_the_filter_keeps_utc_keying_without_a_longitude(self):
+        """The same reason ownership cannot shift unconditionally: a caller grouping by
+        UTC date stores UTC dates, and shifting the filter would strand its resume.
+        """
+        item = SimpleNamespace(datetime=datetime.datetime(2024, 1, 31, 22, 0), properties={})
+        assert _filter_existing_dates([item], {"2024-01-31"}) == []
+
+    def test_the_longitude_reaches_the_query(self):
+        """The filter runs inside the query, so ownership alone is not enough — the
+        stream has to hand the same longitude down for the two to agree.
+        """
+        seen: list = []
+
+        def query(*, provider, collection, tile_id, start_date, end_date, existing_dates, bbox, **kw):
+            seen.append(kw.get("mid_longitude"))
+            return [], {}
+
+        list(
+            stream_stac_months(
+                provider="p",
+                collection="c",
+                tile_id=None,
+                start_date="2024-01-01",
+                end_date="2024-01-31",
+                bbox=None,
+                existing_dates_fn=set,
+                query_fn=query,
+                mid_longitude=150.0,
+            )
+        )
+        assert seen == [150.0]
