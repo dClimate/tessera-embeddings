@@ -71,6 +71,7 @@ from tessera_embeddings.ingest.stac import (
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
     get_existing_dates,
+    record_assessed_window,
     write_dataset,
     write_day_windows,
     write_days_windows,
@@ -722,6 +723,13 @@ def ingest_s2_roi_reflectance(
             _drive(items, baselines)
 
     log.info("%d/%d dates passed coverage filter", total_processed, total_seen)
+
+    # Record the range examined IN FULL, so a month absent from this store reads as a
+    # finding rather than a gap (storage.zarr_store.record_assessed_window). S2 skips a date
+    # whose imagery reaches no live window exactly as S1 does, so it needs the same record.
+    # Only when a store exists: with nothing written there is nothing to annotate.
+    if total_processed:
+        record_assessed_window(store_path, start_date, end_date, s3_region=s3_region)
 
     if total_processed == 0:
         return IngestResult(

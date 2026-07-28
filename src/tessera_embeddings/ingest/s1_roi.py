@@ -53,7 +53,12 @@ from tessera_embeddings.ingest.roi_processing import apply_roi_mask
 from tessera_embeddings.ingest.stac import ingest_tile, solar_day_offset_seconds, solar_grouping_longitude
 from tessera_embeddings.ingest.transforms import amplitude_to_db
 from tessera_embeddings.storage.manifest import IngestManifest
-from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset, write_day_windows
+from tessera_embeddings.storage.zarr_store import (
+    get_existing_dates,
+    record_assessed_window,
+    write_dataset,
+    write_day_windows,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -404,6 +409,9 @@ def ingest_s1_roi_sar(
     # commit. The consume side below is therefore the authority on what has been written,
     # and the query filter is only an optimisation.
     written_dates: set[str] = get_existing_dates(orbit_store, s3_region=s3_region)
+    # Counted for the assessed-window record: it separates "sparse region" from
+    # "the footprints are wrong", which look identical in a date count alone.
+    empty_dates = 0
     # Frozen at the start so the background thread reads an object nothing mutates.
     already_present = frozenset(written_dates)
 
@@ -545,6 +553,7 @@ def ingest_s1_roi_sar(
                         # Reaches no live window at all. Writing it would build a full graph
                         # to store nothing, since all-fill chunks are never persisted.
                         log.info("[%s] Skipping date %s: imagery reaches no live window", orbit, date_str)
+                        empty_dates += 1
                         continue
                     date_windows = footprint if (narrow_windows_per_date and footprint) else live_windows
 
@@ -628,6 +637,20 @@ def ingest_s1_roi_sar(
                 write_total_s,
                 (stall_s + write_total_s) / n if n else 0.0,
             )
+
+    # Record the range examined IN FULL, so a month absent from this store reads as a
+    # finding rather than a gap (see storage.zarr_store.record_assessed_window). Only when a
+    # store exists: with nothing written there is no store to annotate, and that case is
+    # already unambiguous — no store means the orbit is absent and callers downgrade.
+    if total_processed:
+        record_assessed_window(
+            orbit_store,
+            start_date,
+            end_date,
+            empty_dates=empty_dates,
+            get_credentials=None,
+            s3_region=s3_region,
+        )
 
     if total_processed == 0:
         return SarIngestResult(

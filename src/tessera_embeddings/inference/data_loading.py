@@ -14,6 +14,7 @@ loaded eagerly.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 from collections.abc import Callable
@@ -29,7 +30,12 @@ from tessera_embeddings.config.inference import S2_BAND_ORDER, SCL_VALID_CLASSES
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.storage.zarr_store import compute_doy, is_missing_repo, open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import (
+    ASSESSED_WINDOW_ATTR,
+    compute_doy,
+    is_missing_repo,
+    open_store_as_zarr_group,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -347,6 +353,31 @@ def resolve_s1_orbit(
     return "both"
 
 
+def _months_within_assessed(months: list[tuple[int, int]], assessed: object) -> set[tuple[int, int]]:
+    """Of ``months``, those lying ENTIRELY inside an ``assessed_window`` attribute.
+
+    Returns an empty set for any unusable attribute — absent, malformed, unparseable — so a
+    damaged record makes the gate STRICTER rather than more permissive. That asymmetry is the
+    safety argument: over-excusing a month publishes a mosaic with a hole in it, while
+    under-excusing one costs a re-ingest.
+    """
+    if not isinstance(assessed, (list, tuple)) or len(assessed) != 2:
+        return set()
+    try:
+        start = datetime.date.fromisoformat(str(assessed[0]))
+        end = datetime.date.fromisoformat(str(assessed[1]))
+    except ValueError:
+        logger.warning("Unparseable %s attribute %r — treating as absent", ASSESSED_WINDOW_ATTR, assessed)
+        return set()
+    inside = set()
+    for year, month in months:
+        first = datetime.date(year, month, 1)
+        last = datetime.date(year + month // 12, month % 12 + 1, 1) - datetime.timedelta(days=1)
+        if start <= first and last <= end:
+            inside.add((year, month))
+    return inside
+
+
 def check_time_window_coverage(
     mosaic_base: str,
     window: TimeWindow,
@@ -404,12 +435,44 @@ def check_time_window_coverage(
         # intervening month, and the write-once tag would make that partial year
         # permanent. Month granularity matches the campaign's calendar-year window.
         missing = sorted(required_months - present_months)
+
+        # A month can be absent because the ingest EXAMINED it and found nothing reachable,
+        # which is a finding, or because the ingest never covered it, which is a gap. Only
+        # the second is an error, and `assessed_window` is what tells them apart: the ingest
+        # records the range it processed in full, so a month wholly inside that range was
+        # looked at. A satellite pass covers a swath rather than a whole UTM zone, and some
+        # zones have an orbit that reaches their land on no date of the year at all.
+        #
+        # Requires the month to be COVERED ENTIRELY. A partially-assessed month could hide
+        # unexamined days, so it stays an error — strict here costs nothing on the campaign's
+        # calendar-year windows, where months are always wholly inside.
+        if missing:
+            assessed = root.attrs.get(ASSESSED_WINDOW_ATTR)
+            examined = _months_within_assessed(missing, assessed)
+            if examined:
+                logger.info(
+                    "%s store at %s: %d month(s) absent but inside the assessed window %s "
+                    "— examined and holding no reachable imagery, not a gap (e.g. %s)",
+                    label,
+                    path,
+                    len(examined),
+                    assessed,
+                    ", ".join(f"{y}-{m:02d}" for y, m in sorted(examined)[:6]),
+                )
+                missing = [m for m in missing if m not in examined]
+
         if missing:
             preview = ", ".join(f"{y}-{m:02d}" for y, m in missing[:6])
+            assessed = root.attrs.get(ASSESSED_WINDOW_ATTR)
+            why = (
+                f"assessed window {assessed} does not cover them"
+                if assessed
+                else "the store records no assessed window, so absence cannot be explained"
+            )
             msg = (
                 f"{label} store at {path} is missing {len(missing)} of the window's "
                 f"{len(required_months)} month(s) (e.g. {preview}) — "
-                f"window {earliest[0]}-{earliest[1]:02d}..{latest[0]}-{latest[1]:02d}"
+                f"window {earliest[0]}-{earliest[1]:02d}..{latest[0]}-{latest[1]:02d}; {why}"
             )
             raise InsufficientCoverageError(msg)
 

@@ -894,6 +894,54 @@ def open_store_group_and_tip(
     return member, tip
 
 
+ASSESSED_WINDOW_ATTR = "assessed_window"
+"""Root attribute naming the date range an ingest examined in full.
+
+The distinction it exists to draw: a month absent from a mosaic's time axis means either
+"the ingest looked and there was nothing reachable" or "the ingest never got there", and
+without this those are indistinguishable. The coverage gate must fail on the second and
+must not fail on the first.
+
+Written by the ingest paths themselves rather than by the completion marker, because the
+gate runs BEFORE the marker on a first ingest, and again later from the fill.
+"""
+
+
+def record_assessed_window(
+    store_path: str,
+    start_date: str,
+    end_date: str,
+    *,
+    empty_dates: int = 0,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+) -> None:
+    """Record on ``store_path`` that ``start_date..end_date`` was examined in full.
+
+    Absence of a month INSIDE this range is then a finding — the imagery for it either did
+    not exist or reached no live window — rather than a gap. Absence outside it remains a
+    gap, so widening a window later cannot be excused by an older, narrower assessment.
+
+    ``empty_dates`` is recorded for observability only; the gate does not read it. It says
+    how many dates were examined and skipped as reaching no live window, which is the
+    difference between "sparse region" and "something is wrong with the footprints".
+
+    OPENS, never creates: this runs only against a store that was just written. Failing
+    here must not be fatal — the assessment is an optimisation of the gate's judgement, and
+    a store without it simply falls back to the stricter every-month-present rule.
+    """
+    try:
+        repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
+        session = repo.writable_session("main")
+        root = zarr.open_group(session.store, mode="a")
+        root.attrs[ASSESSED_WINDOW_ATTR] = [start_date, end_date]
+        root.attrs["assessed_empty_dates"] = int(empty_dates)
+        session.commit(f"assessed window {start_date}..{end_date} ({empty_dates} empty date(s))")
+        logger.info(f"Recorded assessed window {start_date}..{end_date} on {store_path}")
+    except Exception as exc:
+        logger.warning(f"Could not record assessed window on {store_path}: {exc}")
+
+
 def get_existing_dates(
     store_path: str,
     group: str | None = None,
