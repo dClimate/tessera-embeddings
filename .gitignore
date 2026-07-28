@@ -106,7 +106,10 @@ ai/
 # Local scale-test artifacts (multi-GB icechunk stores) — never commit
 scripts/scale_test_stores/
 scripts/scale_test_results/
-scripts/scale_tests/
+# NOT scripts/scale_tests/ — that is maintained source now. Ignoring the package
+# meant a new benchmark added beside the tracked ones never showed up in git status.
+scripts/scale_tests/**/results/
+scripts/scale_tests/scale_testing_results.md
 
 # Local one-off analysis scripts kept out of the repo for now.
 scripts/plot_corn_sample_500m_regions.py

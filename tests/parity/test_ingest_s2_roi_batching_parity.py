@@ -30,7 +30,7 @@ from dask.distributed import Client
 
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest import s2_roi
-from tessera_embeddings.storage.zarr_store import _open_repo, get_existing_dates, open_store
+from tessera_embeddings.storage.zarr_store import get_existing_dates, open_repo, open_store
 from tests.parity.helpers import assert_zarr_equivalent
 
 SIZE = 64
@@ -117,7 +117,7 @@ def _ingest(
 
 
 def _snapshots(store: Path) -> int:
-    return len(list(_open_repo(str(store / "reflectance.zarr")).ancestry(branch="main")))
+    return len(list(open_repo(str(store / "reflectance.zarr")).ancestry(branch="main")))
 
 
 @pytest.mark.parity

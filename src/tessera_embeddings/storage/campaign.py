@@ -106,6 +106,16 @@ def tag_year_complete(
     raises with the missing zones otherwise. Idempotent like :func:`tag_zone_year`.
     """
     expected = tuple(expected_zones) if expected_zones is not None else tuple(ZONES)
+    if not expected:
+        # An empty scope makes the missing-zone check vacuous, so the year would be
+        # tagged complete having verified nothing — and Icechunk tags are write-once,
+        # so that false marker could never be corrected under its own name. `None`
+        # means "all 120"; an empty list means the caller computed a scope and got
+        # nothing, which is a bug in the caller, not a completed year.
+        raise ValueError(
+            f"cannot tag year {year} complete: expected_zones is empty. Pass None for all "
+            "zones, or a non-empty scope; an empty scope verifies nothing."
+        )
     # Verify completeness at the SAME snapshot we will tag, not the moving branch
     # tip — otherwise an explicit older snapshot_id could be tagged "complete"
     # on the strength of zones that only landed later on the branch.

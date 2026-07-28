@@ -883,6 +883,17 @@ def ecs_cluster(
         cluster.close()
 
 
+def _region_from_arn(arn: str) -> str | None:
+    """The region encoded in an AWS ARN, or ``None`` if it does not look like one.
+
+    ``arn:aws:ecs:<region>:<account>:cluster/<name>`` — field 3. Returning ``None``
+    rather than guessing lets boto3 fall back to its own resolution, which is the
+    right behaviour for a malformed or non-standard ARN.
+    """
+    parts = arn.split(":")
+    return parts[3] if len(parts) > 4 and parts[3] else None
+
+
 def stop_ecs_tasks_by_tag(
     tag_key: str,
     tag_value: str,
@@ -911,7 +922,11 @@ def stop_ecs_tasks_by_tag(
     if not arn:
         log.warning("ECS_CLUSTER_ARN unset — cannot sweep tasks for %s=%s", tag_key, tag_value)
         return 0
-    ecs = boto3.client("ecs")
+    # Built in the CLUSTER's region, not the ambient one. A cluster ARN carries its
+    # region, and passing one to a default-region client does not redirect the call —
+    # so a cross-region sweep would fail to list anything and leave the fleet running
+    # and billing, at exactly the moment this hook exists to prevent that.
+    ecs = boto3.client("ecs", region_name=_region_from_arn(arn))
     task_arns: list[str] = []
     paginator = ecs.get_paginator("list_tasks")
     for page in paginator.paginate(cluster=arn):

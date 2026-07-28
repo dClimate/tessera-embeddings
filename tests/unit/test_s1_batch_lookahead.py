@@ -288,7 +288,7 @@ def test_a_date_reaching_no_live_window_is_skipped(monkeypatch) -> None:
 
 
 def test_a_date_with_no_items_at_all_is_written_in_full_not_skipped(monkeypatch) -> None:
-    """ "Reaches nothing" and "we do not know" must not collapse into the same branch.
+    """Reaches-nothing and we-do-not-know must not collapse into the same branch.
 
     No items for a slice means the footprint is unknown, and the conservative answer is to
     write every window. Treating it as "reaches nothing" would silently drop the date.

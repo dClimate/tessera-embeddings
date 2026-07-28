@@ -184,3 +184,21 @@ def test_custom_rule_runs(tmp_path: Path) -> None:
     violations = run(tmp_path, rules=[rule])
     assert len(violations) == 1
     assert violations[0].rule == "no-sneaky"
+
+
+def test_importing_the_subpackage_by_name_is_flagged(tmp_path: Path) -> None:
+    """`from tessera_embeddings import profiling` imports the forbidden subpackage.
+
+    The source module resolves to `tessera_embeddings`, which matches no forbidden
+    prefix — so matching the module alone let the exact import the rule exists to
+    prevent through. The imported NAMES are checked too.
+    """
+    pkg = tmp_path / "tessera_embeddings"
+    _write(pkg / "inference" / "actors.py", "from tessera_embeddings import profiling\n")
+    _write(pkg / "inference" / "relative.py", "from .. import profiling\n")
+    flagged = {v.path.name for v in run(pkg) if v.rule == "no-profiling-imports-outside-profiling"}
+    assert flagged == {"actors.py", "relative.py"}
+
+    # An unrelated name from the same package is still fine.
+    _write(pkg / "inference" / "ok.py", "from tessera_embeddings import storage\n")
+    assert "ok.py" not in {v.path.name for v in run(pkg) if v.rule == "no-profiling-imports-outside-profiling"}

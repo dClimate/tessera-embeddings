@@ -444,7 +444,11 @@ def _markdown(profile: dict, log_group: str, *, truncated: bool = False) -> str:
         f"no-worker backlog **{pk['no_worker']}**, workers **{pk['workers']}**, tasks **{pk['tasks']}**",
         f"- Fleet peaks: memory **{_gib(pk['worker_mem_gib'])}**, spilled "
         f"**{_gib(pk['worker_spill_gib'])}**, hottest worker **{_gib(pk['worker_max_gib'])}**"
-        + ("" if pk["worker_spill_gib"] else "  _(no spill — the graph fit the fleet)_"),
+        # `== 0`, not falsiness: worker_spill_gib is None when worker state could not be
+        # read, and None is falsy — so an UNKNOWN measurement would be reported as the
+        # positive finding "the graph fit the fleet", which is exactly what an experiment
+        # sizing decision would act on.
+        + ("  _(no spill — the graph fit the fleet)_" if pk["worker_spill_gib"] == 0 else ""),
         f"- cpu-high ∧ backlog-rising intervals: **{p['cpu_backlog_cooccurrence']}**",
         "- Saturation onsets: " + (", ".join(f"{k} @ {v}" for k, v in p["onsets"].items() if v) or "_none tripped_"),
         f"- Worker join/exit events: **{len(p['worker_events'])}**",

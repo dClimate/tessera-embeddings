@@ -30,12 +30,13 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Literal, final
+from typing import Literal, cast, final
 
 import dask.distributed
+import xarray as xr
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
@@ -133,13 +134,26 @@ class _PreparedBatch:
 
     start: str
     end: str
-    data: object | None
+    data: xr.Dataset | None
     baselines: dict[str, int]
     query_s: float
     #: Solar day (keyed by the loaded slice's own timestamp) -> the live windows that day's
     #: imagery reaches. Empty list = reaches nothing, so skip. Missing key = unknown, so
     #: write everything. Empty dict = the whole batch falls back.
     date_windows: dict[str, list[tuple[int, int, int, int]]]
+
+
+def _baselines_for(baselines: dict[str, int], dates: Iterable[str]) -> dict[str, int]:
+    """The baseline entries belonging to ``dates`` only.
+
+    Each cropped per-date write is its own atomic commit, and ``write_day_windows`` merges the
+    map it is handed into the store's ``baselines_applied``. Handing it the whole
+    query's map makes the very first commit claim provenance for every date in the
+    month — including dates a later coverage rejection or crash means the store never
+    receives. Provenance that describes data which is not there is worse than none.
+    """
+    wanted = {d[:10] for d in dates}
+    return {k: v for k, v in baselines.items() if k[:10] in wanted}
 
 
 def ingest_s1_roi_sar(
@@ -338,7 +352,10 @@ def ingest_s1_roi_sar(
             key = _footprint_key(min(i.datetime for i in day_items))
             narrowed = windows_for_date(
                 run_windows,
-                [getattr(i, "bbox", None) for i in day_items],
+                # An item may carry no bbox; windows_for_date reads that as an unusable
+                # footprint and falls back to every window, which is the conservative
+                # answer. cast because the list is Optional only in that fallback sense.
+                cast("list[tuple[float, float, float, float]]", [getattr(i, "bbox", None) for i in day_items]),
                 roi.geobox,
                 chunk_px=INGEST_CHUNK_SIZE,
             )
@@ -437,7 +454,7 @@ def ingest_s1_roi_sar(
             end_date=batch_end_str,
             # The snapshot, not the live set: a background thread must not read a set the
             # write loop is mutating. Anything it misses is caught when consuming.
-            existing_dates=already_present,
+            existing_dates=set(already_present),
             bbox=roi.bbox_wgs84,
             chunks=INGEST_CHUNKS,
             resampling="bilinear",
@@ -538,7 +555,7 @@ def ingest_s1_roi_sar(
                                 date_windows,
                                 roi=roi,
                                 manifest=ingest_manifest,
-                                baselines=baselines,
+                                baselines=_baselines_for(baselines, [date_str]),
                                 tile_id=roi_zarr_path,
                                 crs=roi.native_crs,
                                 chunks=INGEST_CHUNKS,

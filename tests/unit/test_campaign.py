@@ -289,3 +289,15 @@ def test_work_list_dedupes_duplicate_inputs(tmp_path):
     status = campaign.campaign_status(repo, years=_YEARS)
     work = campaign.campaign_work_list(status, set(), expected_zones=("01N", "01N"), years=(2023, 2023))
     assert work == [("01N", 2023)]
+
+
+def test_year_tag_refuses_an_empty_completion_scope(tmp_path):
+    """An empty scope verifies nothing, and the tag it would write is write-once.
+
+    `None` means "all 120 zones". An empty list means the caller computed a scope and
+    got nothing back — a bug in the caller, not a finished year. Tagging on it would
+    stamp a permanent completion marker that cannot be corrected under its own name.
+    """
+    _, repo = _seed(tmp_path)
+    with pytest.raises(ValueError, match="expected_zones is empty"):
+        campaign.tag_year_complete(repo, _YEARS[0], expected_zones=[])

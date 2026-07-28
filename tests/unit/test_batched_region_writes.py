@@ -14,9 +14,9 @@ import pytest
 
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
 from tessera_embeddings.storage.zarr_store import (
-    _open_repo,
     batched_region_writes,
     get_existing_dates,
+    open_repo,
     open_store_as_zarr_group,
     read_time_values,
 )
@@ -42,7 +42,7 @@ def store(tmp_path) -> str:
 
 
 def _snapshots(path: str) -> int:
-    return len(list(_open_repo(path).ancestry(branch="main")))
+    return len(list(open_repo(path).ancestry(branch="main")))
 
 
 def test_append_plus_windows_is_one_snapshot(store):

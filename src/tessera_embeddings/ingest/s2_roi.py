@@ -34,8 +34,10 @@ This module imports nothing from Prefect or any cloud provider.
 from __future__ import annotations
 
 import logging
+import math
 import operator
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import partial, reduce
@@ -174,6 +176,19 @@ class _PreparedDate:
     skip_reason: str | None = None
 
 
+def _baselines_for(baselines: dict[str, int], dates: Iterable[str]) -> dict[str, int]:
+    """The baseline entries belonging to ``dates`` only.
+
+    Each cropped write is its own atomic commit, and ``write_day_windows`` merges the
+    map it is handed into the store's ``baselines_applied``. Handing it the whole
+    query's map makes the very first commit claim provenance for every date in the
+    month — including dates a later coverage rejection or crash means the store never
+    receives. Provenance that describes data which is not there is worse than none.
+    """
+    wanted = {d[:10] for d in dates}
+    return {k: v for k, v in baselines.items() if k[:10] in wanted}
+
+
 def ingest_s2_roi_reflectance(
     *,
     roi_zarr_path: str,
@@ -306,8 +321,14 @@ def ingest_s2_roi_reflectance(
     # the area those windows COVER, which is what the write graph touches. Falls back
     # to 1 on the uncropped path, where a batched write has no windowed form to lift.
     if batch_dates is None:
+        # CEIL, not floor. Windows are clamped to the ROI extent, so an edge window can
+        # be narrower or shorter than one chunk — floor counts that dimension as zero, and
+        # a tall narrow ROI (one partial-width column over many rows) totals zero covered
+        # chunks. auto_batch_dates would then read a large graph as empty and enable
+        # 4-date batching on it, which is the case the threshold exists to prevent.
         covered_chunks = sum(
-            ((w.y1 - w.y0) // INGEST_CHUNK_SIZE) * ((w.x1 - w.x0) // INGEST_CHUNK_SIZE) for w in run_windows
+            math.ceil((w.y1 - w.y0) / INGEST_CHUNK_SIZE) * math.ceil((w.x1 - w.x0) / INGEST_CHUNK_SIZE)
+            for w in run_windows
         )
         batch_dates = auto_batch_dates(covered_chunks) if crop_to_live_windows else 1
         log.info(
@@ -477,7 +498,7 @@ def ingest_s2_roi_reflectance(
                         prepared.windows,
                         roi=roi,
                         manifest=ingest_manifest,
-                        baselines=baselines,
+                        baselines=_baselines_for(baselines, [prepared.date]),
                         tile_id=roi_zarr_path,
                         crs=roi.native_crs,
                         chunks=INGEST_CHUNKS,
@@ -488,7 +509,7 @@ def ingest_s2_roi_reflectance(
                         reflectance_store,
                         day_ds,
                         tile_id=roi_zarr_path,
-                        baselines=baselines,
+                        baselines=_baselines_for(baselines, [prepared.date]),
                         chunks=INGEST_CHUNKS,
                         manifest=ingest_manifest,
                         crs=roi.native_crs,
@@ -546,7 +567,7 @@ def ingest_s2_roi_reflectance(
                     days,
                     roi=roi,
                     manifest=ingest_manifest,
-                    baselines=baselines,
+                    baselines=_baselines_for(baselines, [p.date for p in batch]),
                     tile_id=roi_zarr_path,
                     crs=roi.native_crs,
                     chunks=INGEST_CHUNKS,

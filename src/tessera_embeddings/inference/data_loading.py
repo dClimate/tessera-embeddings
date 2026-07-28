@@ -320,6 +320,13 @@ def resolve_s1_orbit(
         try:
             open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
             present.append(orbit)
+        except zarr.errors.GroupNotFoundError:
+            # PRESENT but rootless (created, then crashed before the schema commit).
+            # GroupNotFoundError subclasses FileNotFoundError, so without this clause a
+            # damaged orbit reads as an absent one — and with s1_orbit="both" and the
+            # sibling healthy, the campaign would quietly resolve to a single orbit and
+            # permanently publish half the radar it was asked for. Fail closed.
+            raise
         except FileNotFoundError:
             logger.info("SAR %s store not present at %s — will be excluded", orbit, path)
         except icechunk.IcechunkError as exc:

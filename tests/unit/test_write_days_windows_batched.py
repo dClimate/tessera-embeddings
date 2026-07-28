@@ -26,8 +26,8 @@ from odc.geo.geobox import GeoBox
 
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
-    _open_repo,
     get_existing_dates,
+    open_repo,
     open_store,
     write_day_windows,
     write_days_windows,
@@ -85,7 +85,7 @@ def _single(store: str, date: str, band_val: int) -> None:
 
 
 def _snapshots(store: str) -> int:
-    return len(list(_open_repo(store).ancestry(branch="main")))
+    return len(list(open_repo(store).ancestry(branch="main")))
 
 
 DATES = [("2024-06-01", 7), ("2024-06-02", 9), ("2024-06-03", 11)]

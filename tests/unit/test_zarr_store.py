@@ -41,11 +41,11 @@ from tessera_embeddings.storage.zarr_store import (
     _DEFAULT_STORAGE_MAX_TRIES,
     S3Config,
     _default_repo_config,
-    _open_repo,
     _open_writable_session,
     _write_new,
     compute_doy,
     get_existing_dates,
+    open_repo,
     open_store,
     open_store_as_zarr_group,
     resolve_region,
@@ -207,25 +207,25 @@ class TestRollbackCommits:
         store_path = str(local_zarr_path / "rb_id" / "reflectance.zarr")
         self._build_history(store_path, sample_reflectance_data, ["2024-01-01", "2024-01-06", "2024-01-11"])
 
-        repo = _open_repo(store_path)
+        repo = open_repo(store_path)
         history = list(repo.ancestry(branch="main"))
         expected_target = history[1].id  # one commit back
 
         new_head = rollback_commits(store_path, 1)
 
         assert new_head == expected_target
-        assert _open_repo(store_path).lookup_branch("main") == expected_target
+        assert open_repo(store_path).lookup_branch("main") == expected_target
 
     def test_dry_run_does_not_move_branch(self, local_zarr_path, sample_reflectance_data):
         """dry_run resolves the target id but leaves HEAD untouched."""
         store_path = str(local_zarr_path / "rb_dry" / "reflectance.zarr")
         self._build_history(store_path, sample_reflectance_data, ["2024-01-01", "2024-01-06", "2024-01-11"])
 
-        head_before = _open_repo(store_path).lookup_branch("main")
+        head_before = open_repo(store_path).lookup_branch("main")
 
         target = rollback_commits(store_path, 1, dry_run=True)
 
-        assert _open_repo(store_path).lookup_branch("main") == head_before
+        assert open_repo(store_path).lookup_branch("main") == head_before
         assert target != head_before
         assert open_store(store_path).sizes["time"] == 3
 
@@ -234,11 +234,11 @@ class TestRollbackCommits:
         store_path = str(local_zarr_path / "rb_rev" / "reflectance.zarr")
         self._build_history(store_path, sample_reflectance_data, ["2024-01-01", "2024-01-06", "2024-01-11"])
 
-        original_head = _open_repo(store_path).lookup_branch("main")
+        original_head = open_repo(store_path).lookup_branch("main")
         rollback_commits(store_path, 2)
         assert open_store(store_path).sizes["time"] == 1
 
-        _open_repo(store_path).reset_branch("main", original_head)
+        open_repo(store_path).reset_branch("main", original_head)
         assert open_store(store_path).sizes["time"] == 3
 
     def test_n_below_one_raises(self, local_zarr_path, sample_reflectance_data):

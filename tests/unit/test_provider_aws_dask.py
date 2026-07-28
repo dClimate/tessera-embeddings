@@ -705,14 +705,27 @@ class TestStopEcsTasksByTag:
         def stop_task(self, cluster, task, reason):
             self.stopped.append(task)
 
-    def _sweep(self, monkeypatch, tagged, **kw):
+    def _sweep(self, monkeypatch, tagged, *, arn="arn:aws:ecs:eu-west-1:1:cluster/test", **kw):
         fake = self._FakeEcs(tagged)
-        monkeypatch.setenv("ECS_CLUSTER_ARN", "arn:cluster/test")
+        monkeypatch.setenv("ECS_CLUSTER_ARN", arn)
         import boto3
 
-        monkeypatch.setattr(boto3, "client", lambda name: fake)
+        self.client_kwargs: dict = {}
+        monkeypatch.setattr(boto3, "client", lambda name, **ck: (self.client_kwargs.update(ck), fake)[1])
         n = dask_mod.stop_ecs_tasks_by_tag("tessera-flow-run-id", "run-A", log=logging.getLogger("t"), **kw)
         return n, fake
+
+    def test_client_is_built_in_the_cluster_arns_region(self, monkeypatch):
+        """A cluster ARN carries its region, and a default-region client does not follow
+        it — a cross-region sweep would list nothing and leave the fleet billing.
+        """
+        self._sweep(monkeypatch, {}, arn="arn:aws:ecs:eu-west-1:1:cluster/test")
+        assert self.client_kwargs["region_name"] == "eu-west-1"
+
+    def test_unparseable_arn_leaves_region_to_boto(self, monkeypatch):
+        """Guessing a region would be worse than boto3's own resolution."""
+        self._sweep(monkeypatch, {}, arn="arn:cluster/test")
+        assert self.client_kwargs["region_name"] is None
 
     def test_stops_only_this_runs_tasks(self, monkeypatch):
         tagged = {

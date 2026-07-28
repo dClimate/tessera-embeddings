@@ -237,14 +237,19 @@ overhead:       95% of wall-clock       overhead:      <5%
 
 Storage and read granularity are tuned separately. Ingest writes
 `INGEST_CHUNK_SIZE = 4096` storage chunks to keep the satellite-ingest
-Dask graph small (¼ the spatial tasks), while inference reads
-`INFERENCE_CHUNK_SIZE = 2048` sub-tiles out of them — small enough to keep
-peak GPU-node RAM in check. Zarr's `oindex` reads the 2048 sub-tile out
-of a 4096 chunk without any alignment requirement. Go smaller on the
-ingest chunk and the satellite-ingest Dask scheduler drowns in tasks;
-go larger on the read tile and you OOM on a g6e.xlarge. And 2048 is
-load-bearing for the global store: one inference tile must equal one
-2048-px shard (ADR-008 D3). If you change either, profile.
+Dask graph small (¼ the spatial tasks), while inference reads a smaller
+sub-tile out of them — small enough to keep peak GPU-node RAM in check.
+Zarr's `oindex` reads a sub-tile out of a 4096 chunk with no alignment
+requirement, so the two sizes are independent.
+
+The read tile is chosen to divide the OUTPUT chunking, and the two paths
+differ. The global campaign passes **2048** explicitly, because one
+inference tile must equal one 2048-px shard (ADR-008 D3). The single-ROI
+default, `INFERENCE_CHUNK_SIZE = 2000`, divides that path's 500-px output
+chunks — 2048 would leave a partial chunk at every tile boundary for
+assembly to read-modify-write. Go smaller on the ingest chunk and the
+satellite-ingest Dask scheduler drowns in tasks; go larger on the read
+tile and you OOM on a g6e.xlarge. If you change either, profile.
 
 The powers of two are not cosmetic — they align every stage of the
 pipeline on one grid (see the global store below):

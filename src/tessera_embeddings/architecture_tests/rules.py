@@ -177,7 +177,15 @@ def _check_node(node: ast.AST, rule: Rule, path: Path, rel: str, package: str) -
                     )
         elif isinstance(node, ast.ImportFrom):
             module = _resolved_module(node, rel, package)
-            if module is not None and (module == prefix or module.startswith(f"{prefix}.")):
+            if module is None:
+                return None
+            # The imported NAMES matter too, not just the source module. `from
+            # tessera_embeddings import profiling` resolves to `tessera_embeddings`,
+            # which does not match the forbidden prefix — yet it imports precisely the
+            # subpackage the rule exists to keep out of library code. Each alias is
+            # therefore appended to the module and matched as well.
+            candidates = [module, *(f"{module}.{a.name}" for a in node.names)]
+            if any(c == prefix or c.startswith(f"{prefix}.") for c in candidates):
                 return Violation(
                     rule=rule.name,
                     path=path,

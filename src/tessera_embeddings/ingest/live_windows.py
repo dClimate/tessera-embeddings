@@ -433,6 +433,14 @@ def footprint_grid(
             except Exception:  # a projection failure means "assume everything"
                 logger.debug("footprint: could not project %r; computing the full extent", bbox, exc_info=True)
                 return None
+            # A projection can return NaN/inf without raising, and math.floor/ceil on
+            # those throws OUTSIDE the guard above — turning this function's documented
+            # conservative fallback into an aborted date, or an aborted ingest. Checked
+            # here so a non-finite corner takes the same "assume everything" path as a
+            # projection that failed outright.
+            if not all(math.isfinite(v) for v in (r0, r1, c0, c1)):
+                logger.debug("footprint: non-finite projection of %r; computing the full extent", bbox)
+                return None
             # Outward to whole cells, then padded, then clamped to the grid.
             cr0 = max(math.floor(min(r0, r1) / chunk_px) - FOOTPRINT_PAD_CELLS, 0)
             cr1 = min(math.ceil(max(r0, r1) / chunk_px) + FOOTPRINT_PAD_CELLS, rows)

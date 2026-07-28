@@ -27,6 +27,7 @@ from functools import partial
 from typing import Any
 
 import icechunk
+import zarr
 from prefect import flow, get_run_logger
 from prefect.deployments import arun_deployment
 
@@ -132,6 +133,11 @@ def _mosaic_identity(
         path = f"{base}/{store}.zarr"
         try:
             grp, tip = open_store_group_and_tip(path, get_credentials=get_credentials, region=s3_region)
+        except zarr.errors.GroupNotFoundError:
+            # PRESENT but rootless — see the identical guard in data_loading's orbit
+            # probe. Skipping it here would fingerprint (and later fill) a zone as
+            # single-orbit because the other orbit's repo was damaged, not absent.
+            raise
         except FileNotFoundError:
             continue  # absent store (single-orbit mosaic / unproduced orbit) — not active
         except icechunk.IcechunkError as exc:

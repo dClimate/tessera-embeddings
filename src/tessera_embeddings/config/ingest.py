@@ -125,7 +125,12 @@ class IngestSettings(BaseModel):
     # satisfied by every date including one with zero valid pixels, which then counts
     # toward the month-presence gate and lets an empty year be filled and permanently
     # tagged complete. Above 100 nothing is ever kept.
-    min_valid_coverage: float = Field(default=DEFAULT_MIN_VALID_COVERAGE, ge=0.0, le=100.0)
+    # gt=0, not ge=0: the gate is `coverage >= min_valid_coverage`, so a threshold of
+    # zero admits a date with NO valid pixels. That date's timestamp then counts toward
+    # the month-presence check, and an entirely empty year can be filled and
+    # permanently tagged complete. Zero is not "keep everything" here, it is
+    # "keep things that are not there".
+    min_valid_coverage: float = Field(default=DEFAULT_MIN_VALID_COVERAGE, gt=0.0, le=100.0)
     # S1 CMR query batch window, in days. Must be >= 1: the S1 loop advances
     # batch_start by this much, so 0 never advances (an ingest cluster billing
     # forever) and a negative walks it backwards.

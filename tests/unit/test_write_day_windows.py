@@ -19,8 +19,8 @@ from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.storage.empty_store import create_empty_store
 from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
 from tessera_embeddings.storage.zarr_store import (
-    _open_repo,
     get_existing_dates,
+    open_repo,
     open_store_as_zarr_group,
     write_day_windows,
 )
@@ -81,10 +81,10 @@ def test_first_date_seeds_then_windows_land_and_rest_stays_fill(tmp_path):
 def test_later_dates_are_one_snapshot_each_with_merged_attrs(tmp_path):
     store = str(tmp_path / "reflectance.zarr")
     _write(store, "2024-06-01", 7)
-    before = len(list(_open_repo(store).ancestry(branch="main")))
+    before = len(list(open_repo(store).ancestry(branch="main")))
     _write(store, "2024-06-11", 9, windows=[(0, 4, 0, 8), (4, 8, 0, 8)])
 
-    assert len(list(_open_repo(store).ancestry(branch="main"))) == before + 1  # windows + attrs: ONE commit
+    assert len(list(open_repo(store).ancestry(branch="main"))) == before + 1  # windows + attrs: ONE commit
     assert get_existing_dates(store) == {"2024-06-01", "2024-06-11"}
     g = open_store_as_zarr_group(store)
     attrs = dict(g.attrs)
@@ -185,7 +185,7 @@ def _write_mode(store: str, date: str, band_val: int, windows, parallel: bool) -
 
 
 def _snapshots(store: str) -> int:
-    return len(list(_open_repo(store).ancestry(branch="main")))
+    return len(list(open_repo(store).ancestry(branch="main")))
 
 
 def test_parallel_windows_matches_sequential(tmp_path):

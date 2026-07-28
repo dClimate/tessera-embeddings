@@ -51,7 +51,7 @@ from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_coun
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles
 from tessera_embeddings.storage.object_store import delete_prefix
-from tessera_embeddings.storage.zarr_store import is_missing_repo, open_or_create_repo, open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import is_missing_repo, open_repo, open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 from tessera_embeddings.utils import utcnow_iso
 
@@ -113,8 +113,17 @@ def _probe_marker(store_path: str, *, get_credentials: _Creds, s3_region: str | 
 
 
 def _write_ingest_marker(store_path: str, fingerprint: dict, *, get_credentials: _Creds, s3_region: str | None) -> None:
-    """Stamp the ``ingest_marker`` fingerprint + ``ingest_completed_at`` on a store's root."""
-    repo = open_or_create_repo(store_path, get_credentials=get_credentials, region=s3_region)[0]
+    """Stamp the ``ingest_marker`` fingerprint + ``ingest_completed_at`` on a store's root.
+
+    OPENS, never creates. This runs only for a store that was just written, so
+    creation is never the right answer — and `open_or_create_repo` swallows every
+    IcechunkError to get there, so a throttle or an expired credential on this last
+    write would be retried as "create a repo in a populated prefix", fail as a dirty
+    prefix, and leave a complete multi-terabyte store UNMARKED. The next run then
+    reads it as stale and deletes it. Surfacing the real error costs a retry;
+    mistaking it for absence costs the ingest.
+    """
+    repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
     root.attrs["ingest_marker"] = dict(fingerprint)
@@ -202,6 +211,11 @@ async def ingest_zone_year(
     # Lazy AWS import so the flow file imports on non-AWS machines (arch tests).
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 
+    # Validate the orbit FIRST. It is part of the ingest fingerprint, so a typo makes
+    # every correctly-marked mosaic look stale — and the stale branch below deletes
+    # multi-terabyte stores. `_active_orbits` would reject it, but only after that
+    # deletion has already run.
+    _active_orbits(s1_orbit)
     zone = canonicalize_zone(zone)
     land_mask_path = paths.land_mask_store(mask_name)
     mosaic_base = f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}"

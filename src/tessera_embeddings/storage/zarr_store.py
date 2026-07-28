@@ -326,7 +326,7 @@ _DEFAULT_STORAGE_MAX_BACKOFF_MS = 30_000
 def manifest_split(split_sizes: "dict[str, int] | None" = DEFAULT_MANIFEST_SPLIT_SIZES) -> "Iterator[None]":
     """Enable manifest splitting for repos opened in this block.
 
-    Every ``_open_repo`` / ``_create_repo`` inside the ``with`` block applies a
+    Every ``open_repo`` / ``_create_repo`` inside the ``with`` block applies a
     :class:`icechunk.ManifestSplittingConfig` built from ``split_sizes`` — a
     ``{dimension_name: shard_size_in_chunks}`` mapping — so commits rewrite only
     the touched shards rather than the whole array manifest. The default splits
@@ -471,14 +471,21 @@ def is_missing_repo(exc: icechunk.IcechunkError) -> bool:
     return "doesn't exist" in msg or "does not exist" in msg
 
 
-def _open_repo(
+def open_repo(
     store_path: str,
     max_concurrent_requests: int | None = None,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     region: str | None = None,
     scatter_initial_credentials: bool = False,
 ) -> icechunk.Repository:
-    """Open an existing Icechunk repository."""
+    """Open an EXISTING Icechunk repository; raise if it is not there.
+
+    The counterpart to :func:`open_or_create_repo`, and the right call whenever the
+    store is known to exist — writing a marker onto a store just written, say.
+    `open_or_create_repo` swallows every ``IcechunkError`` on its way to creating,
+    which turns a throttle or an expired credential into a confusing dirty-prefix
+    failure against a perfectly good store.
+    """
     return icechunk.Repository.open(
         _create_storage(
             store_path,
@@ -540,7 +547,7 @@ def open_or_create_repo(
         just created.
     """
     try:
-        return _open_repo(
+        return open_repo(
             store_path,
             max_concurrent_requests,
             get_credentials=get_credentials,
@@ -594,7 +601,7 @@ def rollback_commits(
     if n < 1:
         raise ValueError(f"n must be >= 1, got {n}")
 
-    repo = _open_repo(store_path, get_credentials=get_credentials, region=region)
+    repo = open_repo(store_path, get_credentials=get_credentials, region=region)
 
     # ancestry is newest-first: history[0] is the current HEAD, history[n] is
     # the snapshot n commits back. The final entry is the repo's root commit.
@@ -662,7 +669,7 @@ def _open_readonly(
     layout). ``None`` reads the root. Readers should target a single group; never
     open the whole 120-group repo as a datatree (~200x slower — ADR-008 D5).
     """
-    repo = _open_repo(store_path, get_credentials=get_credentials, region=region)
+    repo = open_repo(store_path, get_credentials=get_credentials, region=region)
     session = repo.readonly_session(branch="main")
     if isinstance(chunks, _ChunksUnset):
         return xr.open_zarr(session.store, consolidated=False, group=group)
@@ -718,7 +725,7 @@ def _write_append(
     update_attrs: dict[str, Any] | None = None,
 ) -> None:
     """Append data to existing store."""
-    repo = _open_repo(store_path)
+    repo = open_repo(store_path)
     session = repo.writable_session("main")
 
     _commit_preserving_attrs(
@@ -746,7 +753,7 @@ def _write_region(
     region_name: str | None = None,
 ) -> None:
     """Overwrite an existing region of a store in a single atomic commit."""
-    repo = _open_repo(store_path, get_credentials=get_credentials, region=region_name)
+    repo = open_repo(store_path, get_credentials=get_credentials, region=region_name)
     session = repo.writable_session("main")
 
     # Committed view for padding unaligned regions. Read from a *readonly*
@@ -867,7 +874,7 @@ def open_store_group_and_tip(
     a stale identity, which is precisely the confusion the snapshot is here to
     prevent.
     """
-    repo = _open_repo(
+    repo = open_repo(
         store_path, max_concurrent_requests=max_concurrent_requests, get_credentials=get_credentials, region=region
     )
     tip = repo.lookup_branch(branch)
@@ -1095,7 +1102,7 @@ def batched_region_writes(
     :func:`write_region`, which pads to chunk boundaries; this path requires
     chunk-disjoint windows and one commit is the point.
     """
-    repo = _open_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    repo = open_repo(store_path, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
     yield RegionWriteBatch(session)
     # Timed because the commit (manifest + snapshot writes) is serial per-date work
@@ -1553,7 +1560,7 @@ def write_dataset(
 
 def _open_writable_session(store_path: str) -> tuple[icechunk.Session, icechunk.IcechunkStore]:
     """Open a writable session. Caller must commit."""
-    repo = _open_repo(store_path)
+    repo = open_repo(store_path)
     session = repo.writable_session("main")
     return session, session.store
 

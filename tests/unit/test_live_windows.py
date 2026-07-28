@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import itertools
 import random
+from types import SimpleNamespace
 
 import fsspec
 import numpy as np
 import pytest
 import zarr
+from affine import Affine
 
+from tessera_embeddings.ingest import live_windows
 from tessera_embeddings.ingest.live_windows import (
     WINDOW_COST_IN_CHUNKS,
     LiveWindow,
@@ -360,3 +363,26 @@ class TestMergeBands:
         path = _mask_store(tmp_path, mask)
         assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=False)) == 2
         assert len(live_windows_for_mask(path, chunk_px=CHUNK, merge=True)) == 1
+
+
+def test_non_finite_projection_takes_the_conservative_fallback(monkeypatch):
+    """A projection can yield NaN without raising, and floor/ceil on NaN throws.
+
+    That exception escapes the guarded block, so what is documented as "assume
+    everything" would instead abort the date — or the whole ingest. A non-finite
+    corner must reach the same fallback as a projection that failed outright.
+    """
+
+    class _NaNBox:
+        left = top = right = bottom = float("nan")
+
+    class _Projected:
+        boundingbox = _NaNBox()
+
+        def to_crs(self, _crs):
+            return self
+
+    # `box` is imported inside footprint_grid, so patch it at its source.
+    monkeypatch.setattr("odc.geo.geom.box", lambda *a, **k: _Projected())
+    geobox = SimpleNamespace(height=8192, width=8192, transform=Affine.identity(), crs="EPSG:32633")
+    assert live_windows.footprint_grid([(0.0, 0.0, 1.0, 1.0)], geobox) is None
