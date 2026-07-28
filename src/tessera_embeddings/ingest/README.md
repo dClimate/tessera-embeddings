@@ -17,7 +17,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
 | `_pipeline.py` | A prepare/consume pipeline with a configurable look-ahead `depth`: overlaps the preparation of the next item with the consumption of the current one on one background thread, and reports the preparation time the consumer had to wait for. Used by the S2 date loop (`pipeline_dates`), with `depth` sized to `batch_dates` so a batch's whole preparation can hide behind the previous batch's write. Depth buys BUFFERING, never concurrency — preparation stays on one thread in order, so the side-effect-free contract holds at any depth. |
-| `live_windows.py` | (Merge exchange rate is caller-owned: pass `WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one graph, the higher `WINDOW_COST_IN_CHUNKS` when each is a blocking write — S1 is the latter.) Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
+| `live_windows.py` | (Merge exchange rate is caller-owned: pass `WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one graph, the higher `WINDOW_COST_IN_CHUNKS` when each is a blocking write. Both S2 and S1 select it from how the run writes, so the rate cannot drift from the write strategy it prices.) Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
 
 ---
 
@@ -628,9 +628,18 @@ chunk-disjointness: that is what makes the merged changesets conflict-free, and 
 same property that lets a date commit exactly once. Should icechunk's internals move, the
 write falls back to the sequential loop with a warning rather than failing.
 
-Default **on** for S2. `write_day_windows` itself still defaults to the sequential path,
-because S1 shares it and its window structure has never been compared — a storage-layer
-default should not change behaviour for a caller nobody has measured.
+Default **on** for both S2 and S1. `write_day_windows` itself still defaults to the
+sequential path: a storage-layer default should not decide write strategy for its callers,
+so each ingest path opts in explicitly.
+
+S1 was measured before it opted in, and the gain does **not** depend on how many windows a
+date has — 23, 9 and 7 windows gained 2.79×, 2.86× and 2.40×. That rules out the obvious
+reading (sequential costs the sum of its windows, overlapped the longest, so the gain should
+track window count). What it tracks instead is **fleet occupancy**: one window's graph is
+only a few tasks wide, so writing windows one at a time leaves most of the fleet idle no
+matter how many wait behind it, while overlapping lets them collectively fill it. The gain is
+therefore fleet width over per-window width, with window count absent — which also means it
+should grow on wider fleets.
 
 ### Pipelining a date's preparation (`pipeline_dates`)
 
