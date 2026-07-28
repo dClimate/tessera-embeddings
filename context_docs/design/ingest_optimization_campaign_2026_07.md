@@ -1356,7 +1356,34 @@ windows now looks more attractive, not less** — under the withdrawn account fe
 were preferable; under fleet occupancy, narrower windows raise the parallel width available per
 unit of work.
 
-**What is still open on S1.** Date fusing remains the least certain lever: by §3.16's arithmetic it
+**The largest remaining S1 win is per-date window narrowing, and it is bigger than expected.**
+S2 narrows each date to the windows that date's own imagery can reach (`windows_for_date`); S1
+writes the run's **full** land-window set on every date. How much that costs was never measured,
+so we measured it offline — public CMR granule footprints against the real masks, grouped by solar
+day, no cluster and no credentials needed:
+
+| ROI | live windows | median windows a date actually reaches | share |
+|---|---|---|---|
+| 35N asc / desc | 25 | 4 / 5 | **16% / 20%** |
+| 21N asc / desc | 11 | 1 / 0.5 | **9% / 5%** |
+| 59S asc / desc | 12 | 2 / 2 | **17% / 17%** |
+
+A single Sentinel-1 pass covers a swath, not a UTM zone, so **S1 builds and runs 5–20× more
+window-writes per date than have any data in them.** Those windows produce all-fill chunks that
+are never stored, so the mosaic is identical either way — this is work whose result is already
+discarded, the same argument that justified narrowing on S2. Some dates reach **no** live window
+at all (the 0% minima), and S1 currently commits those dates rather than skipping them.
+
+Two cautions, both about how it must be built rather than whether. The share figures bound the
+*graph*, not the wall clock: the real windows cost the same either way, so what narrowing removes
+is the per-window overhead on the empty ones (order 15 chunks each, §3.17) — sized, but not the
+5–20× the table might suggest. And the implementation has one dangerous failure mode: S1 would
+have to key each date's footprint by **solar day**, and getting that key off by one would narrow
+to the wrong date's footprint and silently drop real imagery. That is the same disagreement-about-
+dates shape as §4.11. It needs the safe fallback (unmatched date → keep all windows, never skip)
+and a paired A/B, not a blind change.
+
+**Also still open on S1.** Date fusing remains the least certain lever: by §3.16's arithmetic it
 wins only where the fleet has idle capacity, and overlapping has just consumed much of exactly
 that, so the case for it is now *weaker* than before. S1 also has **no catalogue look-ahead**: a
 batch pays its whole query before writing anything, so overlapping the next batch's query is a
