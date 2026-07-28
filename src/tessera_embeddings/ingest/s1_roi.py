@@ -14,9 +14,10 @@ Algorithm (unchanged from the reference):
    ``compute()`` call's task graph manageable.
 3. Each batch:
 
-   * Refresh STS credentials if more than ``cred_refresh_interval``
-     seconds have elapsed since the last refresh (default 30 minutes,
-     well within the 1-hour STS TTL).
+   * Renew the OPERA read credentials whenever they are close to expiring —
+     checked at the start of a batch AND before every date's write, because
+     the credential's roughly one-hour life is unrelated to batch boundaries:
+     a longer batch outlives it and every read afterwards fails.
    * Build an OPERA RTC item filter for the orbit / bounding box /
      batch window.
    * Call :func:`ingest_tile` to produce a per-batch ``xarray.Dataset``.
@@ -31,7 +32,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Literal, final
 
 import dask.distributed
@@ -47,10 +48,43 @@ from tessera_embeddings.ingest.transforms import amplitude_to_db
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import get_existing_dates, write_dataset, write_day_windows
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_CRED_REFRESH_INTERVAL_SEC = 30 * 60
-"""STS credentials are refreshed at most every 30 minutes (1-hour TTL minus headroom)."""
+"""Fallback refresh cadence, used only when the credential advertises no expiry."""
+
+CRED_EXPIRY_MARGIN_SEC = 15 * 60
+"""Renew this far ahead of expiry.
+
+Must exceed the longest single date write, because a credential that is valid when a
+write starts must still be valid when it ends — the reads happen throughout. Renewing is
+two cheap HTTP calls, so a generous margin costs almost nothing and the failure it
+prevents costs the remainder of the run.
+"""
 
 S1Orbit = Literal["ascending", "descending"]
+
+
+def _parse_credential_expiry(creds: dict[str, str]) -> float | None:
+    """Epoch seconds at which ``creds`` expires, or ``None`` if not stated or unparseable.
+
+    Returning ``None`` rather than raising is deliberate: an unreadable expiry must
+    degrade to the age-based cadence, not sink an ingest that would otherwise run.
+    """
+    raw = creds.get("expiration")
+    if not raw:
+        return None
+    try:
+        # ASF returns ISO-8601; tolerate both the "Z" and "+00:00" spellings, and a
+        # space instead of "T".
+        text = str(raw).strip().replace("Z", "+00:00").replace(" ", "T", 1)
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.timestamp()
+    except ValueError:
+        logger.warning("Could not parse credential expiry %r; falling back to age-based refresh", raw)
+        return None
 
 
 @final
@@ -158,6 +192,38 @@ def ingest_s1_roi_sar(
     spatial_chunks = {"northing": INGEST_CHUNKS["northing"], "easting": INGEST_CHUNKS["easting"]}
 
     last_cred_refresh: float = float("-inf")
+    cred_expires_at: float | None = None
+
+    def refresh_credentials_if_stale() -> None:
+        """Re-fetch the OPERA read credentials when they are close to expiring.
+
+        Driven by the credential's OWN expiry rather than a fixed cadence, and called
+        before every date's write rather than only between batches. Both changes fix the
+        same defect: the credential ASF mints lives about an hour, so any unit of work
+        longer than that outlives it, and every subsequent read fails with an expired
+        token. Refreshing only between batches meant a single long batch could never
+        renew — the credential's clock does not care about batch boundaries.
+
+        Calling it per date bounds staleness to one date's write, which is the smallest
+        unit this loop can renew between. The margin must exceed that duration, since a
+        credential valid at the start of a write must still be valid at its end.
+        """
+        nonlocal last_cred_refresh, cred_expires_at
+        if edl_credentials_fn is None:
+            return
+        now_wall, now_mono = time.time(), time.monotonic()
+        if cred_expires_at is not None:
+            fresh_enough = now_wall < cred_expires_at - CRED_EXPIRY_MARGIN_SEC
+        else:
+            # No expiry advertised: fall back to the age-based cadence.
+            fresh_enough = now_mono - last_cred_refresh <= cred_refresh_interval_sec
+        if fresh_enough:
+            return
+        creds = edl_credentials_fn()
+        if apply_credentials_fn is not None:
+            apply_credentials_fn(creds)
+        last_cred_refresh = now_mono
+        cred_expires_at = _parse_credential_expiry(creds)
 
     orbit_store = f"{store_path}/sar_{orbit}.zarr"
 
@@ -206,15 +272,14 @@ def ingest_s1_roi_sar(
         # cheaper than the pin. (S2 does the same, and additionally crops the
         # coverage denominator, which it alone computes.)
 
-        # Refresh STS creds + apply (typically: env vars + Dask plugin)
-        # once per ``cred_refresh_interval_sec``.
-        now = time.monotonic()
-        if edl_credentials_fn is not None and now - last_cred_refresh > cred_refresh_interval_sec:
-            creds = edl_credentials_fn()
-            if apply_credentials_fn is not None:
-                apply_credentials_fn(creds)
-            last_cred_refresh = now
+        refresh_credentials_if_stale()
 
+        # Phase boundaries are timed so a batch's cost can be attributed rather than
+        # only totalled. The split mirrors the S2 path's: everything up to a
+        # write-ready dataset (catalogue query plus lazy graph build) on one side, the
+        # per-date writes on the other. Without it a slow batch is indistinguishable
+        # from a slow catalogue, and the two have opposite remedies.
+        query_started = time.monotonic()
         data, baselines = ingest_tile(
             provider="cmr-asf",
             collection="opera-rtc-s1",
@@ -237,8 +302,11 @@ def ingest_s1_roi_sar(
             geobox=roi.geobox,
         )
 
+        query_s = time.monotonic() - query_started
+
         if data is not None:
             data = apply_roi_mask(data, roi_zarr_path, spatial_chunks, roi_mask=roi_mask)
+            write_total_s = 0.0
 
             def _retrying() -> Retrying:
                 return Retrying(
@@ -254,6 +322,10 @@ def ingest_s1_roi_sar(
                 # whole loop would restart at a date an earlier attempt already
                 # committed and trip the duplicate-date guard.
                 for i in range(data.sizes["time"]):
+                    # Inside the per-date loop deliberately: a batch can outlive the
+                    # credential, so renewing only at batch boundaries is what failed.
+                    refresh_credentials_if_stale()
+                    date_started = time.monotonic()
                     for attempt in _retrying():
                         with attempt:
                             write_day_windows(
@@ -268,6 +340,22 @@ def ingest_s1_roi_sar(
                                 chunks=INGEST_CHUNKS,
                                 parallel_windows=overlap_window_writes,
                             )
+                    date_s = time.monotonic() - date_started
+                    write_total_s += date_s
+                    # ``mode`` is the load-bearing field: sequential means this date
+                    # cost the SUM of its windows' critical paths rather than their
+                    # maximum, which is the single largest difference between how S1
+                    # and S2 write today.
+                    log.info(
+                        "[%s] S1 stage timings date=%s: write=%.1fs windows=%d mode=%s",
+                        orbit,
+                        # datetime64 stringifies as "YYYY-MM-DDThh:mm:ss..."; the date
+                        # half is all this line needs and slicing avoids a numpy import.
+                        str(data["time"].values[i])[:10],
+                        date_s,
+                        len(live_windows),
+                        "parallel" if overlap_window_writes else "sequential",
+                    )
             else:
                 for attempt in _retrying():
                     with attempt:
@@ -289,6 +377,20 @@ def ingest_s1_roi_sar(
                 batch_end_str,
                 n,
                 total_processed,
+            )
+            # `query` is the catalogue lookup plus lazy graph build, and it is SERIAL
+            # with the writes: this flow has no look-ahead, so a batch pays it in full
+            # before writing anything. Its share of the batch is what decides whether
+            # overlapping the next batch's query is worth building.
+            log.info(
+                "[%s] S1 batch timings %s..%s n=%d: query=%.1fs write=%.1fs per_date=%.1fs",
+                orbit,
+                batch_start_str,
+                batch_end_str,
+                n,
+                query_s,
+                write_total_s,
+                (query_s + write_total_s) / n if n else 0.0,
             )
 
         batch_start = batch_end + timedelta(days=1)

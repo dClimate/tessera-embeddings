@@ -20,76 +20,128 @@ undoes it. New measurements belong in §8; failed attempts belong in §4 with th
 deleted.
 
 **All wall-clock figures are the same cell** — zone `35N`, January 2024, 120-worker
-Dask-on-Fargate fleet (4 vCPU; 16 GiB for figures up to 2026-07-25, **20 GiB after** — see §4.7), the same frozen ROI mask — so the rows compare.
+Dask-on-Fargate fleet, the same frozen ROI mask — so the rows compare. Worker memory is NOT
+constant across rows: 16 GiB up to 2026-07-25, 20 GiB after (§4.7), and **back to 16 GiB from
+2026-07-27**, once pruning the retained catalogue entries had removed the demand that justified
+the larger size. Memory size barely moves wall clock so the timing rows still compare, but a
+peak-memory figure only means something next to the limit it was measured under.
+
 Graph-task figures are from local census runs over a fixed pixel window; those compare within
 a series but not across series, and are labelled accordingly.
 
 ---
 
-## 1. Headline
+## 1. Overview
 
-Ingest of a dense zone-month went from **not completing at all** to **~170–185 s per date**,
-with the graph a date submits down roughly an order of magnitude from the full-extent path and
-the scheduler moved from saturated to ~25% busy.
+### What the ingest actually does
 
-> **THE GRAPH IS NO LONGER THE COST, and a profile now says what is (§3.10).** Of a 131 s date,
-> only **57 s is task work even at perfect packing**; the other **74 s (56%)** is serial client
-> work, graph dispatch, blocking region writes and the commit, which **no number of workers can
-> compress**. Within the task work, **72% is reading and resampling the source imagery** — real
-> data movement, not overhead. Two consequences that should be read before planning any further
-> ingest work: **widening one cell cannot buy much** — the ceiling from unlimited workers was
-> 1.78× when first measured here and is **1.60× today** (§3.12 re-measured it on both arms of the
-> overlap A/B; treat §3.12 as the current figure) — and the only lever of that size is removing
-> the serial residual from the critical path, not shrinking the graph further. A 23% graph
-> reduction was shipped and measured at **zero** wall-clock gain (§3.9).
->
-> **That residual has since been located and largely removed (§3.11).** It was not the commit
-> (0.6 s), not graph construction (3.4 s) and not the drive loop (0.2–0.8 s between dates): it
-> was `write_day_windows` computing each window to completion before starting the next, so a
-> date cost the SUM of its windows' critical paths. Writing a date's windows as ONE dask compute
-> took the write phase from **148.0 s → 86.5 s** and per-date from **166.1 s → 104.2 s
-> (1.59×)**, with **byte-identical stores** (44,797 chunk objects both arms). Now the default.
+For each UTM zone and year, the ingest builds a cloud-free mosaic of satellite imagery on a
+fixed pixel grid. For every acquisition date it asks the satellite catalogue what images exist,
+reads the ones it needs, discards cloudy pixels, and appends that date to a Zarr store. Sentinel-2
+optical imagery and Sentinel-1 radar are separate stores built by separate runs, and a campaign
+cell runs them at the same time.
 
-| # | change | per-date | cumulative | what it addressed |
-|---|---|---|---|---|
-| 0 | full-extent mosaics | *never completed* | — | ingest computed the whole zone grid, ocean included |
-| 1 | crop to live windows (row bands) | 1,400 s | baseline | ~78% of campaign ingest compute was ocean |
-| 2 | group row bands into fewer windows | **225 s** | **6.2×** | per-window cost is near-fixed, so window COUNT dominated |
-| 3 | cost-model grouping (3 windows) | 194→269 s | **regression** | over-merged past the scheduler's dispatch ceiling |
-| 4 | one masking pass instead of two | — | 1.28× graph | two `where` passes cost a task per (chunk, band) each |
-| 5 | coverage gate fused into the band load | — | one fewer graph build/date | SCL was loaded twice per date |
-| 6 | decouple load blocks (8192) from store chunks (4096) | **188 s** | **7.5×** | graph scales with block count, not pixels |
-| 7 | manifest sharding by time | 185 s | cost, not speed | every commit rewrote the whole manifest |
-| 8 | stop realigning blocks to store chunks | 176.5 s | **REVERTED** (see §4.6) | ~4% faster but it introduced worker spill |
-| 9 | **re-unify load blocks with store chunks (row 6 REVERSED)** | zone 98.6→95.5 s cycle; **compact ROI 35.4→19.8 s** | see §3.15 | row 6 capped a date's parallel WIDTH at blocks × bands |
-| 10 | **batch k dates into one compute + one commit** | 19.8→**17.4 s** on a compact ROI | 1.14× | per-date graphs under-filled the fleet; overheads paid per date |
+The work is distributed with Dask on Fargate: one scheduler and a fleet of workers per run. The
+scheduler breaks the work into tasks and hands them out; the workers read, reproject, mask and
+write. Almost everything below is about the relationship between those two.
 
-Two things did **not** change, deliberately: the store's 4096 chunking (the GPU path is tuned
-around it) and the atomicity of a commit — though row 10 makes the atomic unit a BATCH of dates
-rather than one date, which is forced by the time-axis resize, not chosen (§3.16).
+### Where the time goes, and why
 
-> **2026-07-27: rows 6 and 8's shared premise — that dispatch is the binding cost — is STALE.**
-> The cost model below (`R ≈ 600–800 tasks/s`) predicted a ~150–190 s dispatch floor for a dense
-> zone-date at 4096 load blocks. Measured on the new code: the write alone is **79.8 s**, roughly
-> **2× faster than that floor**. Either the culled graph is far smaller than `4 × bands × blocks`
-> now, or the dispatch rate improved with the masking collapse, gate fusion and window overlap
-> that landed after `R` was measured. **Do not plan cell widths against `R` until it is
-> re-measured** — in particular, the "run 40–45w cells to stay under the floor" advice this model
-> produced is withdrawn.
+Three facts explain nearly every decision in this document.
 
-**Feasibility frame.** At ~185 s/date and ~250 kept dates, a dense zone-year is ~11 h against
-the ~14 h it was, and ~70 h if it had never been cropped. Sequentially that is ~51 days for 112
-zones; with ~20 concurrent cells it is under 3. But the concurrency multiplier is only worth
-what each cell's fleet can absorb — which is why the graph work came first (below).
+**A zone is mostly ocean.** A UTM zone is a tall, thin strip of the globe and typically only a
+fifth of it is land. Computing the whole grid meant most of the work produced nothing, and the
+first and largest change was to compute only the rectangles that contain land.
 
-> **Updated 2026-07-27.** Dates per zone-year is now MEASURED, not assumed: a full-height zone
-> sees imagery on **every day** (35N and 22N each returned 30 distinct acquisition days in June
-> 2024 from the catalogue; a small-bbox zone, 07S, returned 24). So a zone-year is ~365 dates,
-> not the ~250 assumed above, and the campaign projection scales accordingly. Iowa's ~263
-> dates/year does NOT transfer to zones — it spans ~3° of latitude against a zone's pole-ward
-> reach, so it intersects far fewer orbit swaths. Current campaign arithmetic lives in
-> `yield-embeddings/context_docs/measurements/`.
+**A separate write costs far more than the pixels in it.** Each region write carries a
+near-fixed overhead, so the *number* of rectangles mattered more than their total area. Merging
+many small rectangles into fewer larger ones was worth 6.2× even though it computes more area,
+including some ocean. Almost every subsequent tuning decision is a version of this trade:
+how much dead area is worth avoiding one more boundary.
 
+**The scheduler is single-threaded, and it is the thing that runs out.** Its dispatch loop uses
+one core no matter how many it is given, so the number of *tasks* a date creates — not the number
+of pixels — sets how much fleet a single run can usefully absorb. This is why work went into
+shrinking the task graph before spending money on more workers: a run that chokes its scheduler
+at 120 workers cannot spend a larger allocation, and every concurrent run has its own scheduler
+hitting the same wall.
+
+### What changed, and the mechanism behind each gain
+
+| Change | Effect | Why it worked |
+|---|---|---|
+| Compute only rectangles containing land | ingest completes at all | ~78% of the work was ocean |
+| Merge those rectangles into fewer, larger ones | **6.2×** | a write's cost is mostly fixed, so count beat area |
+| One masking pass instead of two | 1.28× smaller graph | each pass cost a task per block per band |
+| Read the cloud mask as part of the band read | one fewer graph per date | it was being read twice |
+| Write all of a date's rectangles as ONE computation | **1.59×** | they had been serial, so a date cost their sum |
+| Prune unused metadata from retained catalogue entries | 2.45× less driver memory | most of each entry described bands we never read |
+| Store the date index in shards | cost, not speed | every commit had rewritten the whole index |
+| Match read blocks to stored chunks | **1.65×** on compact regions | coarse blocks capped how much could run at once |
+| Re-price rectangle merging for overlapped writes | **18.6%** less written | a boundary stopped being expensive, so merge less ocean |
+| Fuse several dates into one computation and commit | 1.61× to 0.71× **by region size** | amortises the commit only; see below |
+
+Two things deliberately did not change: the store's chunk size, which the GPU inference path is
+tuned around, and the atomicity of a commit — though fusing dates makes the atomic unit a group
+of dates rather than one, which is forced by how Zarr resizes the time axis, not chosen.
+
+### The one result that is not a straight win
+
+Fusing several dates into a single computation **helps small regions and hurts middling ones.**
+The arithmetic is that a fused write costs proportionally more and the preparation running
+alongside it costs proportionally more, so the per-date cost is whichever of the two dominates,
+plus one commit divided among the dates. Fusing therefore buys only the commit saving; it cannot
+make the write faster, because the fleet is already the constraint. And it actively loses where
+the larger write crowds out the preparation overlapping it.
+
+Measured across four regions spanning a 127-fold size range: the smallest gained 1.61×, the next
+1.12×, the middling one **lost 29%**, and the largest was unchanged. Because the relationship is
+not monotonic, this ships as a size threshold rather than a fitted curve, and the threshold is
+set at the top of the range where fusing was measured to win rather than at an estimated
+crossover.
+
+### What still limits us
+
+**The fleet is already full on a dense region.** One date's work oversubscribes the workers, so
+adding workers to a single run buys much less than it appears to — the measured ceiling from
+unlimited workers is under 3×. More importantly, it means several optimisations that look like
+they should help cannot: there is no idle capacity for them to fill.
+
+**More than half of a date's elapsed time cannot be parallelised at all.** Client-side graph
+building, dispatch, the blocking write and the commit are serial. Within the part that *is*
+parallel, about 72% is reading and resampling the source imagery — real data movement, not
+overhead — so there is no large inefficiency left to remove, only less work to do.
+
+**One worker holds the retained catalogue and can deadlock the run.** The worker driving the
+ingest keeps the current month of catalogue entries plus the next month prefetched. If it crosses
+Dask's pause threshold it stops and never resumes, and the rest of the fleet waits forever on
+data it holds. Worker memory is therefore sized against that pause threshold, not against the
+container limit, and undersizing costs an entire run rather than a retry.
+
+**A realistic cell is three fleets, not one.** A campaign cell runs Sentinel-2 and both
+Sentinel-1 orbits concurrently, so its resource footprint is roughly three times a single ingest
+run. Any concurrency plan costed on Sentinel-2 alone understates what the campaign needs by that
+factor.
+
+### Two corrections worth reading before planning
+
+> **The dispatch-rate cost model below is stale.** It predicted a 150–190 s floor for a dense
+> zone-date; the write alone now measures 79.8 s, roughly twice as fast as that floor. The advice
+> it produced — run narrow cells to stay under the floor — is **withdrawn**. Do not size cells
+> against it until it is re-measured.
+
+> **Dates per zone-year is 365, not the ~250 once assumed.** A full-height zone sees imagery
+> every day. An earlier estimate came from a region spanning only about 3° of latitude, which
+> intersects far fewer orbit passes and does not generalise to a zone.
+
+### Where the detail lives
+
+Sections 3 and 4 are the archive: what each change bought, and what was tried and abandoned,
+both with their numbers. Section 5 lists claims that were made and later withdrawn. Section 6 is
+the set of constraints future work must respect. Sections 7 and 8 hold open questions and the
+numbers of record. Read section 6 before changing anything here.
+
+---
 ### Why graph size was attacked FIRST, ahead of streaming and cell concurrency
 
 Cell concurrency is the campaign's obvious multiplier — each `(zone, year)` cell brings its own

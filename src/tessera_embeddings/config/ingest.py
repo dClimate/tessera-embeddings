@@ -70,6 +70,12 @@ DEFAULT_MIN_VALID_COVERAGE = 0.1
 # Denominated in the COVERED chunk area of a run's live windows — the area the write
 # graph actually touches, and already known once windows are merged, so deriving this
 # costs no extra I/O.
+#
+# COUPLED TO THE WINDOW MERGE COST, and that is a trap worth naming: covered area is an
+# output of the merge, so changing ``live_windows.WINDOW_COST_IN_CHUNKS*`` moves every
+# ROI along this axis without anyone touching this constant. A finer merge covers less
+# area, so ROIs drift DOWN and more of them batch. Recalibrate this against runs, not
+# against an offline sweep at a different cost, whenever that exchange rate changes.
 AUTO_BATCH_DATES_MAX_COVERED_CHUNKS = 500
 
 # Dates fused per graph when batching turns on. The only batch size measured.
