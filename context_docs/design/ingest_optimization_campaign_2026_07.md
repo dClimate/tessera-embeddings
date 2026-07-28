@@ -94,6 +94,7 @@ hitting the same wall.
 | Match read blocks to stored chunks | **1.65×** on compact regions | coarse blocks capped how much could run at once |
 | Re-price rectangle merging for overlapped writes | **18.6%** less written | a boundary stopped being expensive, so merge less ocean |
 | Fuse several dates into one computation and commit | 1.61× to 0.71× **by region size** | amortises the commit only; see below |
+| Prepare S1's next catalogue query during the current batch's writes | **~10%** on S1 | the query was serial and is now hidden |
 
 Two things deliberately did not change: the store's chunk size, which the GPU inference path is
 tuned around, and the atomicity of a commit — though fusing dates makes the atomic unit a group
@@ -1365,12 +1366,36 @@ to the wrong date's footprint and silently drop real imagery. That is the same d
 dates shape as §4.11. It needs the safe fallback (unmatched date → keep all windows, never skip)
 and a paired A/B, not a blind change.
 
+**The catalogue look-ahead is now SHIPPED and measured — ~10%, and the query hides completely.**
+S1 used to pay its whole catalogue query before writing anything. It now prepares the next batch
+during the current batch's writes, reusing `ingest._pipeline.pipelined` unchanged — the same
+helper the S2 date loop uses — because the phase boundary the S1 timing logs already measured
+turned out to be exactly the prepare/consume split it wants: the query holds no credential and
+touches no store, so it is safe on a background thread. **One batch of look-ahead only**, because
+a batch's write is one long consume and deeper retention is what deadlocked the driver (§3.13).
+
+Measured, four arms launched together, 12 batches each: median stall on every batch after the
+first is **0.0 s** against queries of 3.5–23 s, so the query hides *entirely*. Per-date wall
+clock fell **10.9%** on a 53-date arm and 8.7% on a weaker 31-date one.
+
+**That is below the 14% query share, and the reason is the useful part: a query run concurrently
+gets SLOWER** — 178 → 291 s on one zone (+63%). The background thread contends with the write it
+hides behind, so the log's `hidden` field overstates the saving badly (279.7 s claimed against
+120.8 s realised). **Treat the paired per-date difference as the result and `hidden` as an upper
+bound.** Against the honest ceiling — the *serial* arm's query — the look-ahead captured 74% of
+what was available.
+
+It also demonstrates a sequencing rule worth generalising: **the query only became worth
+optimising because the overlap made the write several times faster.** At the sequential write
+speed the same query was 4–5% of a batch, below the threshold for being worth building. Speeding
+up one phase promotes the next, so re-rank remaining work after every win rather than once.
+
 **Also still open on S1.** Date fusing remains the least certain lever: by §3.16's arithmetic it
 wins only where the fleet has idle capacity, and overlapping has just consumed much of exactly
-that, so the case for it is now *weaker* than before. S1 also has **no catalogue look-ahead**: a
-batch pays its whole query before writing anything, so overlapping the next batch's query is a
-further win — but it must buy that overlap with a **one-batch buffer only**, because more retention
-is what deadlocked the driver before (§3.13).
+that, so the case for it is now *weaker* than before. And the prediction that the look-ahead's
+relative gain rises as a zone sparsens — the saving per batch is `min(query, write)`, so it should
+peak where the two are comparable — is **untested**: the two zones chosen for that contrast came
+back within one window of each other once the merge rate was re-priced.
 
 S1 was also **uninstrumented** — it reported only "wrote N dates", so a slow batch was
 indistinguishable from a slow catalogue, and those have opposite remedies. It now emits per-date
