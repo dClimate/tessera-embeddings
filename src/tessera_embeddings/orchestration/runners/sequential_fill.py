@@ -6,7 +6,9 @@ K fills at once, each in its own flow run with its own cluster; this runner
 exploits it the other way: **one long-lived cluster whose actors are created
 once and stream through every zone**, so the per-cluster costs — ``ray up``,
 per-worker EC2 bringup (minutes each), the model-load cold start on every
-worker — are paid once per shard of a campaign year instead of once per zone.
+worker — are paid once per CLUSTER of a campaign year instead of once per zone.
+("cluster" throughout means one Ray cluster and the UTM zones assigned to it;
+"zone" always means a UTM zone, and "shard" always means a storage shard.)
 
 Keeping the shared fleet busy is the whole game, and three mechanisms
 cooperate on it (this docstring is the canonical statement of the rationale —
@@ -27,9 +29,9 @@ the flow and README point here):
   Together they pace how far the feeder runs ahead of finalization.
 
   These were a STORAGE bound while the caller primed only a look-ahead window.
-  They are not any more: the flow ingests its whole shard before requesting
+  They are not any more: the flow ingests its whole cluster before requesting
   GPUs, so a fleet is never billed against an unfinished ingest, and peak
-  storage is a shard's mosaics by design (ADR-011). The gates still matter for
+  storage is a cluster's mosaics by design (ADR-011). The gates still matter for
   pacing and for the fleet-fill limitation noted below. Mosaics RETAINED —
   failed cells (kept for staged resume) and orbit-mismatch deferrals awaiting
   the fallback — are handled explicitly: failures release their budget slot
@@ -45,7 +47,7 @@ the flow and README point here):
   in-flight upload.
 
 Idle-actor retirement needs no per-zone gating here: the scheduler suppresses
-it while the work source is unexhausted and resumes it for the true shard
+it while the work source is unexhausted and resumes it for the true cluster
 tail (see ``scheduling._process_chunks_work_stealing``).
 
 A zone whose mosaic resolves a DIFFERENT s1 orbit than the shared session's
@@ -56,11 +58,11 @@ caller-supplied ``infer_single`` fallback.
 KNOWN LIMITATION — small-zone fleet fill. The ``look_ahead + 2`` admission
 bound doubles as the fleet-fill parallelism: only that many zones' tiles can
 be in flight at once. When a zone is at least as large as the fleet this is
-irrelevant (one zone fills every actor), but a shard of zones each far
-smaller than the fleet (e.g. an all-island Pacific shard) can leave actors
+irrelevant (one zone fills every actor), but a cluster of zones each far
+smaller than the fleet (e.g. an all-island Pacific cluster) can leave actors
 idle — at most ``(look_ahead + 2) * tiles_per_zone`` tiles are ever
 dispatchable. Largest-first zone ordering pushes these to the low-cost tail,
-so the wasted GPU time is bounded; a shard known to be all-small should be
+so the wasted GPU time is bounded; a cluster known to be all-small should be
 run with a larger ``look_ahead`` (its mosaics are small, so the storage bound
 above is slack). Decoupling admission (a storage-bytes budget) from
 fleet-fill parallelism is a possible future refinement — measure first.
@@ -132,12 +134,12 @@ class _MosaicBudget:
     can never starve the feeder into deadlock.
 
     NOT a storage bound any more. It was one while the caller primed only a
-    look-ahead window, but the flow now ingests its ENTIRE shard before asking
+    look-ahead window, but the flow now ingests its ENTIRE cluster before asking
     for GPUs, so every mosaic is already on storage before this gate sees it —
     ``acquire`` finds each ingest already started and returns immediately. What
     it still does is pace how far the feeder runs ahead of finalization, which
     is what keeps `zone_slots` and the trailing assembly honest. Peak storage is
-    now the shard, deliberately: see ADR-011 and
+    now the cluster, deliberately: see ADR-011 and
     :mod:`...prefect.flows.fill_zones_sequential`.
     """
 
@@ -184,11 +186,18 @@ class SequentialCell:
     ``num_actors`` sizes only the per-cell FALLBACK session (orbit-mismatch
     cells filled after the shared stream); the stream itself is sized by the
     flow's fleet parameter.
+
+    ``n_tiles`` is the UNCLAMPED live-tile count, and it is what cells are ordered
+    by. Ordering on ``num_actors`` instead looks equivalent and is not: it is
+    ``min(num_actors, n_tiles)``, so every zone bigger than the fleet collapses to
+    the same value and their relative density is lost — which is exactly the range
+    the densest-first ordering exists to sort.
     """
 
     zone: str
     year: int
     num_actors: int
+    n_tiles: int = 0
 
 
 @dataclass
@@ -310,7 +319,7 @@ def fill_zones_sequential(
     # A FAILED cell keeps its mosaic (for the retry's staged resume) but frees
     # its budget slot — otherwise a systematic failure deadlocks the feeder (no
     # cell ever succeeds to free a slot). But freeing every failed slot lets a
-    # systematic failure ADMIT and retain every shard's multi-TB mosaic,
+    # systematic failure ADMIT and retain every cluster's multi-TB mosaic,
     # bypassing the budget the other way. So retained failures are counted, and
     # once they reach this cap the feeder stops admitting new cells (the run
     # then winds down and fails on the recorded failures). Bounded either way.
@@ -325,7 +334,7 @@ def fill_zones_sequential(
     def _retain_failed_mosaic(cell: SequentialCell) -> None:
         """A failed cell frees its budget slot (no deadlock) but keeps its mosaic
         (staged resume) — counted so a systematic failure can't accumulate every
-        shard's mosaic off-budget (the feeder stops at ``max_retained_failures``).
+        cluster's mosaic off-budget (the feeder stops at ``max_retained_failures``).
         """
         if budget is None:
             return
@@ -409,7 +418,7 @@ def fill_zones_sequential(
             for i, cell in enumerate(cells):
                 # Stop admitting once too many failed cells are retaining mosaics
                 # off-budget: a systematic failure would otherwise keep freeing
-                # slots and pile up every shard's multi-TB input. The in-flight
+                # slots and pile up every cluster's multi-TB input. The in-flight
                 # cells finish and the run fails on the recorded failures; the
                 # unattempted cells stay pending for the next campaign pass.
                 with lock:

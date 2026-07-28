@@ -32,92 +32,103 @@ from the single-ROI path above:
 ```text
 build_land_mask   →   seed_global_store   →   run_global_campaign
 (coverage bitmaps)    (metadata-only)          ├─ cluster-per-zone: per pending (zone, year): fill_zone_year (Ray cluster each)
-                                               └─ chained-clusters: per year: K fill_zones_sequential shards (K long-lived Ray clusters)
+                                               └─ chained-clusters: per year: K fill_zones_sequential runs (K long-lived Ray clusters)
 ```
 
 `run_global_campaign` reads live progress via `storage.campaign.campaign_status`
 and dispatches fills for every pending cell, **year by year** (outer serial
 loop), under one of two strategies:
 
-- **`fill_strategy="chained-clusters"`** (default): up to `max_parallel_zones`
+- **`fill_strategy="chained-clusters"`** (default): up to `max_parallel_clusters`
   `fill-zones-sequential` runs per year, each owning ONE long-lived Ray
   cluster whose actors are created once and **stream** through a
-  size-balanced shard of the year's zones — strictly ordered, with the next
+  size-balanced share of the year's zones — strictly ordered, with the next
   zone's tiles interleaving only once the current zone's queue is exhausted,
   so zone tails never idle the fleet and there is no per-zone teardown, actor
   churn, or model reload. Amortizes `ray up` (~5-10 min), per-worker EC2
   bringup (minutes of billed GPU idle each), the per-worker model-load cold
-  start, and the EC2 capacity roll across the whole shard instead of per zone
-  (`max_parallel_zones=1` = a single cluster for the whole year). Zones whose
+  start, and the EC2 capacity roll across the whole cluster instead of per zone
+  (`max_parallel_clusters=1` = a single cluster for the whole year). Zones whose
   mosaics resolve a different S1 orbit than the session run per-cell after
-  the stream. Each shard **ingests every one of its cells before requesting
-  GPUs**, so a fleet is never provisioned against an unfinished ingest — see
-  below. The shared fleet is then kept busy at the seams by **ingest look-ahead**
-  (relevant on a resume, where some mosaics already exist) and **trailing assembly**
-  (a cell's shard write runs on a background thread — assembly is ~10-15% of a
-  cell's inference wall — while the next cell's inference keeps the GPUs busy).
-  Retag-only and all-ocean cells settle before the cluster exists, and
-  all-ocean cells are never ingested at all.
+  the stream. The shared fleet is kept busy at the seams by **ingest look-ahead**
+  (the next zones' mosaics ingest while the current one infers) and **trailing
+  assembly** (a zone's shard write runs on a background thread — assembly is
+  ~10-15% of a zone's inference wall — while the next zone's inference keeps the
+  GPUs busy). Retag-only and all-ocean cells settle before the cluster exists,
+  and all-ocean cells are never ingested at all.
 - **`fill_strategy="cluster-per-zone"`**: a `fill-zone-year` run per cell, with
-  **bounded zone parallelism** within each year (`max_parallel_zones`
+  **bounded parallelism** within each year (`max_parallel_clusters`
   simultaneous Ray clusters). Simpler, and every zone pays a full cluster
   bringup and model load.
 
-### Ingest runs wide, and ahead
+> **Naming.** A **zone** is always a UTM zone. A **cluster** is one Ray cluster
+> and the UTM zones assigned to it. A **shard** is always a storage shard — never
+> a group of zones.
+
+### Ingest runs wide, under one fleet-wide cap
 
 Nothing throttles ingest against fill throughput. Ingest is the cheap half of the
 campaign and measures far better across many narrow fleets than a few wide ones,
-so `max_parallel_ingest` (60) is deliberately **larger** than `max_parallel_zones`
-(40), and the semaphore that used to make a cell hold a slot from ingest through
-to cleanup is gone.
+so the semaphore that used to make a cell hold a slot from ingest through to
+cleanup is gone (see ADR-011, where the older "peak input storage is bounded by
+in-flight cells" claim is marked superseded).
 
-The consequence is real and accepted: a year's mosaics can pile up ahead of the
-fills that consume them — of order a hundred zone-mosaics, hundreds of terabytes.
-They are transient. `cleanup_mosaics` deletes each one as its fill lands, and
+What remains is a single number: **`max_parallel_ingest` (40) is how many UTM
+zones may ingest simultaneously across the whole campaign**, however many clusters
+are running. With `max_parallel_clusters` at 8 that is 5 zones per cluster.
+
+Because the clusters are separate Prefect flow runs on separate machines, no
+in-process semaphore can see across them, so the cap is a **Prefect global
+concurrency limit** — the same mechanism as the commit gate. Each zone's ingest
+holds one slot for its whole duration. The campaign upserts the limit to
+`max_parallel_ingest` at start, so the parameter is the only place the number is
+written and it cannot drift from the server's. Each cluster also takes an even
+share of the cap as its own window, so the clusters divide it by construction
+rather than racing for slots.
+
+Mosaics can still pile up ahead of the fills that consume them — hundreds of
+terabytes, transient. `cleanup_mosaics` deletes each one as its fill lands and
 `sweep_orphan_mosaics` collects what a crash left behind. What was removed is the
-*backpressure*, not the cleanup. See ADR-011's consequences, where the older
-"peak input storage is bounded by in-flight cells" claim is marked superseded.
+*backpressure*, not the cleanup.
 
-The asymmetry is intentional: ingest waiting is cheap, and a provisioned GPU fleet
-waiting is not.
+### GPUs are never booted speculatively — and density ordering keeps them fed
 
-### GPUs are never booted speculatively
+A cluster starts its ingest window, waits for its **first** zone alone, then calls
+`ray up`. Waiting for one zone is safe only because of how zones are ordered, and
+that ordering is load-bearing in two places:
 
-A `chained-clusters` shard ingests **all** of its cells and only then calls
-`ray up`. Waiting for just the first mosaic is not enough: cells finish at very
-different times — Sentinel-1 typically lands well ahead of Sentinel-2, and zones
-differ several-fold in size — so a fleet started on the head cell routinely
-catches up with the stream and idles, billing GPU-hours against an ingest that
-has not finished.
+1. **Across clusters.** Zones are dealt out densest-first to the currently-lightest
+   cluster, so the N densest zones of the year go one to each of the N clusters.
+   Every cluster therefore *opens* on a big zone.
+2. **Within a cluster.** Zones are sorted by their true live-tile count, descending,
+   so a cluster works from dense to sparse.
 
-The trade is a shard's full ingest up front, unoverlapped, in exchange for no
-idle GPU time at the seams. It scales with **shard** size, so `max_parallel_zones=1`
-(one cluster for a whole year) means a whole year of ingest before any inference.
-Ingest *concurrency* is unaffected — the per-shard look-ahead still caps how many
-run at once; it no longer caps how many are started before the cluster.
-
-A cell whose ingest fails is not fatal: the failure surfaces at that cell's own
-turn in the stream and the shard's other zones still fill. Only a shard where
-*every* ingest failed skips the cluster and raises, since there would be nothing
-to fill.
+The opening zone being dense is what makes the single-zone wait safe: it takes long
+enough to infer that the rest of the window lands behind it, and inference is slower
+than ingest in almost every case, so the stream does not run dry and the fleet does
+not idle.
 
 ```text
-ingest all N cells (look_ahead at a time)  ─────────────►│
-                                                          ray up ──► stream N zones
+start window (1 + look_ahead zones) ──►│
+        wait for the densest zone ─────►│
+                                         ray up ──► stream dense ──────► sparse
+                                                    (rest of the window ingests behind)
 ```
 
-Under `chained-clusters` the ingest cap is divided across the shards as their
-per-shard look-aheads, **rounded up** — a shard cannot hold less than one, and
-flooring would silently deliver fewer concurrent ingests than asked for. The real
-ceiling is `ceil(max_parallel_ingest / shards) × shards`; any mismatch with the
-requested number is logged at dispatch. Set `max_parallel_ingest` to a multiple of
-`max_parallel_zones` for an exact fit.
+Two subtleties worth knowing:
 
-> **Size the fleets down to match.** These caps count *clusters*, not machines.
-> Forty inference clusters at the default `num_actors` and sixty ingest clusters at
-> the default `IngestSettings.max_workers` is far more EC2 than a stock account
-> quota allows. Lower `num_actors` and `max_workers` alongside — running many
-> narrow fleets rather than few wide ones is the point of these defaults.
+- Sort on the **unclamped** tile count. The per-cell actor request is
+  `min(num_actors, n_tiles)`, so every zone bigger than the fleet collapses to the
+  same value — sorting on that leaves the whole dense end of the list in arbitrary
+  order, which is exactly the part that decides what the fleet opens on.
+- Waiting for a cluster's *entire* ingest was tried and is worse: unoverlapped
+  ingest time paid up front, for a risk the ordering already removes.
+
+> **Size the fleets to match.** These caps count *clusters* and *zones*, not
+> machines. Eight inference clusters at the default `num_actors` plus forty
+> concurrent ingests at the default `IngestSettings.max_workers` is a large amount
+> of EC2; lower `num_actors` and `max_workers` alongside, since running many narrow
+> fleets rather than few wide ones is the point of these defaults.
 
 Zone-parallelism (either flavor) is safe because inference is independent
 across zones and only *same-zone* fills conflict (shared group attrs →
@@ -159,9 +170,9 @@ override.
 | `build_land_mask.py` | Global campaign: build per-zone coverage bitmaps from the partner delivery registry (ADR-010). Optional pre-build delivery verification + post-build validation. No cluster. |
 | `seed_global_store.py` | Global campaign: create the global-store repo and seed every unseeded UTM-zone group (metadata-only, ADR-008 D1). Idempotent. No cluster. |
 | `fill_zone_year.py` | Global campaign: fill one `(zone, year)` on a Ray cluster (coverage mask → inference → shard assembly → tag). Commit gate = a Prefect global concurrency limit. |
-| `fill_zones_sequential.py` | Global campaign: fill one year's zones sequentially on a SINGLE shared Ray cluster (largest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Pre-cluster triage settles retag/all-ocean cells. |
+| `fill_zones_sequential.py` | Global campaign: fill one cluster's zones sequentially on a SINGLE shared Ray cluster (densest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Waits for its densest zone's mosaic before requesting GPUs. Pre-cluster triage settles retag/all-ocean cells. |
 | `ingest_zone_year.py` | Global campaign: build one cell's S1/S2 mosaics on the fixed zone grid by dispatching the ROI ingest deployments onto a synthesised zone-shaped ROI. Marker-gated and crash-safe: a stale or half-written mosaic is cleared and rebuilt, never appended onto. |
-| `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="cluster-per-zone"`), or size-balanced `fill-zones-sequential` shards on long-lived clusters (`"chained-clusters"`). |
+| `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="cluster-per-zone"`), or size-balanced `fill-zones-sequential` runs on long-lived clusters (`"chained-clusters"`). |
 
 ### Cancelling reaches every level
 

@@ -234,57 +234,47 @@ class _RecordingInputs:
         self._order.append("inputs_shutdown")
 
 
-def test_the_whole_shard_is_ingested_before_ray_up(wired, monkeypatch):
-    """Every cell, not a look-ahead window: the fleet is requested last.
+def test_the_ingest_window_starts_before_ray_up(wired, monkeypatch):
+    """The window is `1 + look_ahead` zones, all kicked off before the cluster."""
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
+    _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
+    order = wired["order"]
+    assert [e for e in order if e.startswith("start:")] == ["start:01N", "start:02N"]
+    assert order.index("start:02N") < order.index("ray_up")
 
-    Cells finish at very different times — S1 lands well before S2, and zones
-    differ several-fold in size — so a cluster started on the head cell would
-    routinely catch up with the stream and idle, billing GPU-hours against an
-    ingest that had not finished. `look_ahead` still caps how many ingests run
-    at once; it no longer caps how many are started before the cluster.
+
+def test_gpus_wait_for_the_densest_zone_only(wired, monkeypatch):
+    """A GPU fleet is never booted speculatively — but only the HEAD zone is waited
+    for, and the densest-first ordering is what makes that safe.
+
+    The opening zone is the biggest this cluster owns, so it takes the longest to
+    infer; the rest of the window lands behind it while it runs. Waiting for the
+    whole cluster instead is unoverlapped ingest time paid up front for a risk the
+    ordering already removes.
     """
     monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
     _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
     order = wired["order"]
-    assert [e for e in order if e.startswith("start:")] == ["start:01N", "start:02N", "start:03N"]
-    assert [e for e in order if e.startswith("wait:")] == ["wait:01N", "wait:02N", "wait:03N"]
-    # The last cell's mosaic exists before a single GPU is asked for.
-    assert order.index("wait:03N") < order.index("ray_up")
+    assert [e for e in order if e.startswith("wait:")] == ["wait:01N"]
+    assert order.index("wait:01N") < order.index("ray_up")
 
 
-def test_a_failed_ingest_does_not_sink_the_shard(wired, monkeypatch):
-    """One bad zone must not cost the others their fill.
+def test_cells_are_ordered_by_true_tile_count_not_the_clamped_fleet_request(wired, monkeypatch):
+    """Densest first, on the UNCLAMPED count.
 
-    The exception stays on the cached future, so the runner re-raises it at that
-    cell's own wait and records a failed cell — the surviving zones still fill.
+    `num_actors` is `min(num_actors, n_tiles)`, so every zone bigger than the fleet
+    collapses to the same value — sorting on it leaves the whole dense end of the
+    list in arbitrary order, which is exactly the part that decides which zone the
+    fleet opens on.
     """
-
-    class _OneBadCell(_RecordingInputs):
-        def wait(self, zone, year, stop=None):
-            super().wait(zone, year, stop)
-            if zone == "02N":
-                raise RuntimeError("ingest 02N exploded")
-
-    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_OneBadCell, wired["order"]))
-    _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
-    assert "ray_up" in wired["order"]
-    assert [e for e in wired["order"] if e.startswith("wait:")] == ["wait:01N", "wait:02N", "wait:03N"]
-
-
-def test_no_gpus_when_every_ingest_failed(wired, monkeypatch):
-    """Nothing landed means nothing to fill — provisioning a fleet would burn
-    GPU-hours to discover that, so fail before `ray up` instead.
-    """
-
-    class _AllBad(_RecordingInputs):
-        def wait(self, zone, year, stop=None):
-            super().wait(zone, year, stop)
-            raise RuntimeError(f"ingest {zone} exploded")
-
-    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_AllBad, wired["order"]))
-    with pytest.raises(RuntimeError, match=r"all 2 ingest\(s\) failed"):
-        _run(zones=["01N", "02N"], ingest=True, look_ahead=1)
-    assert "ray_up" not in wired["order"]
+    counts = {"01N": 900, "02N": 100, "03N": 500}
+    monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: counts[zone])
+    _run(zones=["01N", "02N", "03N"], num_actors=20)
+    cells = wired["seq_kwargs"]["cells"]
+    assert [c.zone for c in cells] == ["01N", "03N", "02N"]
+    # ...and all three clamp to the same actor request, which is what made the old
+    # sort key unable to tell 900 tiles from 500.
+    assert [c.num_actors for c in cells] == [20, 20, 20]
 
 
 def test_no_ingest_means_no_wait_before_the_cluster(wired, monkeypatch):

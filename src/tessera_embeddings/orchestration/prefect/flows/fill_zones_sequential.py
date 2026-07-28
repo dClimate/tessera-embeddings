@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 
 from prefect import flow, get_run_logger
 from prefect.client.orchestration import get_client
+from prefect.concurrency.sync import concurrency
 from prefect.deployments import run_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import Cancelling
@@ -99,6 +100,9 @@ _INGEST_POLL_S = 15.0
 # retry across it. A PERSISTENT failure eventually raises — leaving the id
 # registered so shutdown's sweep can still reach the live child.
 _INGEST_POLL_MAX_ERRORS = 10
+# Lease length for a held fleet-wide ingest slot. Renewed in the background for the
+# life of the ingest; generous so a slow renewal round-trip never drops the slot.
+_INGEST_LEASE_S = 900.0
 
 
 class _DeploymentCellInputs:
@@ -110,12 +114,15 @@ class _DeploymentCellInputs:
     join and — crucially — the child run's id is known while it executes:
     ``shutdown`` can request cancellation of every in-flight ingest instead of
     orphaning children that keep writing after the parent has failed (a quick
-    retry would then race the orphan on the same mosaic prefix). The executor
-    is sized to ``look_ahead`` so concurrent ingest Dask clusters stay bounded
-    exactly like the parallel driver's ``max_parallel_ingest``. ``cleanup``
-    deletes only mosaics THIS adapter produced (a cell never started here is
-    someone else's input), matching the parallel driver's ``did_ingest and
-    cleanup_mosaics`` rule.
+    retry would then race the orphan on the same mosaic prefix). ``max_parallel``
+    sizes the executor, and the flow passes its full cell count: every UTM zone of
+    a cluster is submitted at once so they finish together, since the cluster waits
+    for all of them before requesting GPUs. What actually limits how many RUN at
+    once is ``ingest_limit_name``, a Prefect global concurrency limit shared by
+    every cluster — the clusters are separate flow runs, so only a server-side gate
+    can bound them together. ``cleanup`` deletes only mosaics THIS adapter produced
+    (a cell never started here is someone else's input), matching the parallel
+    driver's ``did_ingest and cleanup_mosaics`` rule.
 
     Threads don't inherit the flow's Prefect context, so ingest runs dispatch
     without a parent-run link — they are still tracked as ordinary runs of the
@@ -132,12 +139,14 @@ class _DeploymentCellInputs:
         max_parallel: int,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger],
         child_tag: str | None = None,
+        ingest_limit_name: str | None = None,
     ) -> None:
         self._deployment = deployment
         self._params_for = params_for
         self._inputs_bucket = inputs_bucket
         self._cleanup_mosaics = cleanup_mosaics
         self._log = log
+        self._ingest_limit_name = ingest_limit_name
         # Deterministic tag stamped on every child run, derived from the PARENT
         # flow-run id — the cancellation/crash hook re-derives it in a fresh
         # process and sweeps live children by tag (the in-process shutdown()
@@ -151,6 +160,39 @@ class _DeploymentCellInputs:
         self._stopping = threading.Event()
 
     def _run(self, zone: str, year: int) -> None:
+        """Hold a fleet-wide ingest slot for this zone, then dispatch and poll it.
+
+        The slot is the ONLY thing limiting how many zones ingest at once. Every
+        cluster submits all of its zones immediately; the gate decides how many
+        actually start, so a cluster spins up only as many as fit under the
+        fleet-wide cap and the rest wait here for a slot. Held across the whole
+        ingest (dispatch through terminal state), because that is the window in
+        which the zone owns a Dask cluster.
+
+        A Prefect GLOBAL concurrency limit rather than a local semaphore: the
+        clusters are separate flow runs on separate machines, so nothing
+        in-process can see across them. Same mechanism as the commit gate.
+        """
+        if self._ingest_limit_name is None:
+            self._dispatch_and_wait(zone, year)
+            return
+        with concurrency(
+            self._ingest_limit_name,
+            occupy=1,
+            # Fail closed on a missing limit: an unprovisioned name would silently
+            # run every zone at once, which is the thing the cap exists to prevent.
+            strict=True,
+            # Generous, because an ingest runs tens of minutes to hours and the
+            # lease is renewed in the background throughout.
+            lease_duration=_INGEST_LEASE_S,
+            # ...but a renewal blip must not kill an ingest that is already hours
+            # deep. The cap is a cost control, not a correctness invariant, so a
+            # transient overshoot beats discarding the work.
+            raise_on_lease_renewal_failure=False,
+        ):
+            self._dispatch_and_wait(zone, year)
+
+    def _dispatch_and_wait(self, zone: str, year: int) -> None:
         # Never CREATE a child once shutdown began — a run dispatched after the
         # cancellation sweep would be the one orphan the sweep can't see.
         if self._stopping.is_set():
@@ -328,6 +370,7 @@ def fill_zones_sequential_flow(
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
     branch: str | None = None,
     look_ahead: int = 2,
+    ingest_limit_name: str | None = None,
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
 ) -> dict[str, Any]:
@@ -387,6 +430,13 @@ def fill_zones_sequential_flow(
             ``ingest_zone_year`` to their branch-scoped deployments (see
             :func:`run_global_campaign._dpl`). ``None`` (default) = unsuffixed prod
             refs. The direct ``ingest_deployment`` above is resolved by the caller.
+        ingest_limit_name: Prefect global concurrency limit bounding how many UTM
+            zones ingest simultaneously across ALL clusters. Every zone of this
+            cluster is submitted at once and each holds one slot for the duration
+            of its ingest, so a cluster starts only as many as fit under the
+            fleet-wide cap and the rest queue. ``None`` disables the gate — every
+            submitted zone starts immediately, which suits a direct single-cluster
+            run and not a campaign.
         look_ahead: Cells beyond the current one kept in ingest flight (bounds
             concurrent ingest Dask clusters AND in-flight mosaics, ADR-011).
         cleanup_mosaics: Delete each campaign-ingested mosaic after its cell
@@ -495,11 +545,18 @@ def fill_zones_sequential_flow(
             # (there is no staging to fingerprint and no mosaic to read).
             empty.append(_fill_no_cluster(zone, f"{zone}-{year}-empty"))
             continue
-        live.append(SequentialCell(zone=zone, year=year, num_actors=min(num_actors, n_tiles)))
+        live.append(SequentialCell(zone=zone, year=year, num_actors=min(num_actors, n_tiles), n_tiles=n_tiles))
 
-    # Largest-first: the shared fleet only ever shrinks across the run, so no
-    # mid-campaign worker relaunch; island zones land at the natural taper.
-    live.sort(key=lambda c: c.num_actors, reverse=True)
+    # DENSEST FIRST, on the unclamped tile count. Two things depend on it: the
+    # shared fleet only ever shrinks across the run (no mid-campaign worker
+    # relaunch, island zones at the natural taper), and — since the cluster starts
+    # inferring as soon as its FIRST zone lands — that first zone must be big enough
+    # to keep the fleet busy while the rest of the window ingests behind it.
+    #
+    # NOT `num_actors`, which is `min(num_actors, n_tiles)`: every zone bigger than
+    # the fleet clamps to the same value, so sorting on it left the whole dense end
+    # of the list in arbitrary order — precisely the part this ordering is for.
+    live.sort(key=lambda c: c.n_tiles, reverse=True)
     log.info(
         "Triage for year %d: %d retagged, %d empty, %d live cell(s) — order: %s",
         year,
@@ -547,12 +604,17 @@ def fill_zones_sequential_flow(
             params_for=_ingest_params,
             inputs_bucket=paths.inputs,
             cleanup_mosaics=cleanup_mosaics,
+            # This cluster's SHARE of the fleet-wide ingest cap, so the clusters
+            # divide it evenly by construction rather than racing for slots on the
+            # global gate. The gate (`ingest_limit_name`) is still the hard ceiling —
+            # this only decides how many a single cluster ever asks for at once.
             max_parallel=look_ahead,
             log=log,
             # Parent-derived tag so the cancellation/crash hook can sweep live
             # child ingests from a fresh process (see _ingest_child_tag). None
             # outside a Prefect run (unit tests) — children just go untagged.
             child_tag=_ingest_child_tag(flow_run_ctx.id) if flow_run_ctx.id else None,
+            ingest_limit_name=ingest_limit_name,
         )
         if ingest
         else None
@@ -619,7 +681,7 @@ def fill_zones_sequential_flow(
 
     # on_actor_retire fires only from idle retirement, which the scheduler
     # suppresses while the zone stream is unexhausted — so this terminator is
-    # inert mid-stream and only drains the fleet early during the true shard
+    # inert mid-stream and only drains the fleet early during the true cluster
     # tail. A dead actor's abandoned instance is reclaimed by the autoscaler
     # idle timeout instead (idle_timeout_minutes, below).
     terminator = make_instance_terminator(log=log)
@@ -659,7 +721,7 @@ def fill_zones_sequential_flow(
 
     # Size the shared session by the LARGEST cell's clamped request, not the raw
     # fleet ceiling: the session provisions its first actor batch before any
-    # streamed work arrives, so a small shard (e.g. a one-tile zone list) would
+    # streamed work arrives, so a small cluster (e.g. a one-tile zone list) would
     # otherwise request the full default fleet for work that can never use it.
     # live is sorted num_actors-descending and each cell is already clamped to
     # min(num_actors, its live tiles), so live[0] IS the run's true ceiling.
@@ -720,61 +782,41 @@ def fill_zones_sequential_flow(
             s3_region=s3_region,
         )
 
-    # INGEST THE WHOLE SHARD BEFORE ASKING FOR A SINGLE GPU.
+    # START THE INGEST WINDOW, THEN WAIT FOR THE DENSEST ZONE BEFORE ASKING FOR GPUs.
     #
-    # A GPU fleet is never booted speculatively, and "speculatively" is stricter
-    # than "with nothing at all ready". Waiting only for the head cell still left
-    # the fleet exposed: cells finish at very different times — S1 typically lands
-    # well ahead of S2, and zones differ several-fold in size — so a cluster that
-    # started on cell one would routinely catch up with the stream and idle,
-    # billing GPU-hours against an ingest that had not finished. Every cell is
-    # ingested first, and the fleet is requested only once they have all landed.
+    # A GPU fleet is never booted speculatively — `ray up` is not requested until a
+    # real mosaic exists to work on. It is the HEAD cell that is waited for, not all
+    # of them, and the ordering is what makes that safe: cells are sorted densest
+    # first, so the fleet's opening zone is the biggest one this cluster owns and
+    # takes the longest to infer. Inference is slower than ingest in almost every
+    # case, so by the time that zone is done the rest of the window has landed and
+    # the stream never runs dry.
     #
-    # The cost is real and accepted: a shard's wall clock now begins with its full
-    # ingest, unoverlapped, and its mosaics all coexist (which the campaign no
-    # longer bounds — see run_global_campaign and ADR-011). Ingest waiting is cheap;
-    # a provisioned fleet waiting is not. Note this scales with SHARD size, so
-    # `max_parallel_zones=1` (one cluster for a whole year) means a whole year of
-    # ingest before any inference.
+    # Waiting for the WHOLE cluster was tried and is worse: it is unoverlapped ingest
+    # time paid up front, for a risk the density ordering already removes.
     #
-    # Ingest CONCURRENCY is unchanged: the adapter's executor is sized to
-    # `look_ahead`, so submitting every cell queues them rather than running them
-    # all at once. `wait` is idempotent, so the runner's own wait per cell returns
-    # immediately from the same completed future.
+    # The window is `1 + look_ahead` cells — the head plus the cells that ingest
+    # during its inference — and `look_ahead` is this cluster's share of the
+    # fleet-wide ingest cap. The runner's feeder re-issues these starts (idempotent)
+    # and keeps the window full as cells finalize; `wait` is idempotent too, so the
+    # runner's own wait for the head returns immediately.
     if inputs is not None:
-        for cell in live:
+        ingest_window = live[: 1 + look_ahead]
+        for cell in ingest_window:
             inputs.start(cell.zone, cell.year)
 
-        log.info("Ingesting all %d cell(s) before requesting GPUs (%d at a time)", len(live), look_ahead)
-        t0 = time.monotonic()
-        # A cell whose ingest failed is NOT fatal here. Its exception is cached on
-        # the future, so the runner re-raises it at that cell's own wait and handles
-        # it as a failed cell — the shard's other zones still fill. Only a shard
-        # where nothing landed skips the cluster, since there would be no work.
-        failed: list[str] = []
-        for cell in live:
-            try:
-                inputs.wait(cell.zone, cell.year)
-            except Exception as exc:  # re-raised per cell by the runner's own wait
-                failed.append(f"{cell.zone}-{cell.year}: {exc}")
-        if failed:
-            log.warning(
-                "%d of %d ingest(s) failed; filling the rest and letting each failure surface at its own cell: %s",
-                len(failed),
-                len(live),
-                "; ".join(failed),
-            )
-        if len(failed) == len(live):
-            raise RuntimeError(
-                f"year {year}: all {len(live)} ingest(s) failed — not provisioning a GPU fleet with "
-                f"no mosaic to fill: {'; '.join(failed)}"
-            )
+        head = live[0]
         log.info(
-            "All mosaics ready after %.1fs (%d cell(s), %d failed) — requesting GPUs",
-            time.monotonic() - t0,
-            len(live) - len(failed),
-            len(failed),
+            "Waiting for %s-%d (%d tiles, the densest zone here) before requesting GPUs; "
+            "%d more zone(s) ingesting behind it",
+            head.zone,
+            head.year,
+            head.n_tiles,
+            len(ingest_window) - 1,
         )
+        t0 = time.monotonic()
+        inputs.wait(head.zone, head.year)
+        log.info("Mosaic for %s-%d ready after %.1fs — requesting GPUs", head.zone, head.year, time.monotonic() - t0)
 
     try:
         # Pin a deterministic cluster name from the flow-run id so the cancellation

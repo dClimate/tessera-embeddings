@@ -82,6 +82,11 @@ def wired(monkeypatch):
 
     monkeypatch.setattr(mod, "arun_deployment", fake_arun)
     monkeypatch.setattr(mod, "delete_prefix", lambda uri, **k: rec["deletes"].append(uri))
+    # The fleet-wide ingest limit is a real Prefect API write; record the value
+    # instead of making it.
+    monkeypatch.setattr(
+        mod, "_upsert_ingest_limit", lambda name, limit, **k: rec.setdefault("limits", []).append((name, limit))
+    )
     return rec
 
 
@@ -93,19 +98,38 @@ class TestCampaignDefaults:
     """
 
     def test_the_default_strategy_is_chained_clusters(self, wired):
-        """GPUs stream through a shard instead of paying a cluster per zone."""
+        """GPUs stream through a cluster instead of paying a cluster per zone."""
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
         assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential"]
 
-    def test_ingest_runs_wider_than_inference(self):
-        """Ingest is the cheap half and scales across many narrow fleets, so its
-        cap is deliberately the LARGER of the two — it used to be far smaller.
+    def test_eight_clusters_share_forty_ingest_slots(self):
+        """Five UTM zones ingesting per cluster: 8 x 5 = the 40-zone fleet-wide cap.
+
+        The two numbers are a pair, not independent knobs — the per-cluster ingest
+        window is the cap divided by the cluster count, so changing either changes
+        how many zones a cluster keeps in flight.
         """
         sig = inspect.signature(mod.run_global_campaign.fn)
-        zones = sig.parameters["max_parallel_zones"].default
+        clusters = sig.parameters["max_parallel_clusters"].default
         ingests = sig.parameters["max_parallel_ingest"].default
-        assert (zones, ingests) == (40, 60)
-        assert ingests > zones
+        assert (clusters, ingests) == (8, 40)
+        assert ingests % clusters == 0, "an uneven split rounds up and overshoots the cap"
+
+    def test_the_ingest_cap_is_published_to_the_server(self, wired):
+        """The clusters are separate flow runs, so the cap only binds if it reaches
+        the Prefect limit they all name. Writing it from the parameter is what stops
+        the two drifting apart.
+        """
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        assert wired["limits"] == [("tessera-global-ingests", 40)]
+        assert wired["arun"][0][1]["ingest_limit_name"] == "tessera-global-ingests"
+
+    def test_no_limit_is_published_when_ingest_is_off(self, wired):
+        """Prebuilt mosaics mean no ingest to gate; writing the limit anyway would
+        be a pointless API write on every fill-only run.
+        """
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False))
+        assert wired.get("limits", []) == []
 
     def test_nothing_bounds_mosaics_in_flight(self, wired, monkeypatch):
         """A whole year's mosaics may coexist: no backpressure from fill onto ingest.
@@ -153,7 +177,7 @@ class TestCampaignDefaults:
         monkeypatch.setattr(mod, "delete_prefix", _cleaned)
         # Both caps well below the cell count, so only the absence of a chain-wide
         # gate can let all twelve mosaics exist at once.
-        _per_cell(max_parallel_zones=2, max_parallel_ingest=3)
+        _per_cell(max_parallel_clusters=2, max_parallel_ingest=3)
         assert peak == len(names), f"only {peak} of {len(names)} mosaics coexisted"
 
 
@@ -452,8 +476,8 @@ def test_sequential_strategy_dispatches_one_run_per_year(wired):
     assert deps == ["fill-zones-sequential/fill-zones-sequential"]
     params = wired["arun"][0][1]
     assert params["zones"] == ["33N"] and params["year"] == 2025
-    # One shard, so it carries the whole ingest bound as its look-ahead.
-    assert params["ingest"] is True and params["look_ahead"] == 60
+    # One cluster, so it carries the whole ingest bound as its window.
+    assert params["ingest"] is True and params["look_ahead"] == 40
     assert params["ingest_deployment"] == "ingest-zone-year/ingest-zone-year"
     # Mosaic lifecycle belongs to the child in this mode.
     assert wired["deletes"] == []
@@ -474,8 +498,8 @@ def test_invalid_fill_strategy_rejected(wired):
 
 
 def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
-    """max_parallel_zones > 1 in sequential mode = that many chained clusters:
-    zones are LPT-partitioned by live-tile count and each shard's child divides
+    """max_parallel_clusters > 1 in sequential mode = that many chained clusters:
+    zones are LPT-partitioned by live-tile count and each cluster's child divides
     the global ingest look-ahead bound.
     """
     status = SimpleNamespace(zones={"33N": (), "34N": (), "35N": ()}, has=lambda z, y: False)
@@ -489,25 +513,25 @@ def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
             paths=_PATHS,
             ami_ssm_name="ami",
             fill_strategy="chained-clusters",
-            max_parallel_zones=2,
+            max_parallel_clusters=2,
             max_parallel_ingest=6,
         )
     )
     assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential"] * 2
-    shards = [p["zones"] for _, p in wired["arun"]]
+    clusters = [p["zones"] for _, p in wired["arun"]]
     # LPT: 500 alone; 300+250 together — balanced totals (500 vs 550).
-    assert sorted(map(sorted, shards)) == [["33N"], ["34N", "35N"]]
-    # The global ingest bound is divided across shards: 6 over 2 shards = 3 each.
+    assert sorted(map(sorted, clusters)) == [["33N"], ["34N", "35N"]]
+    # The global ingest bound is divided across clusters: 6 over 2 clusters = 3 each.
     assert all(p["look_ahead"] == 3 for _, p in wired["arun"])
 
 
-class TestIngestBoundAcrossShards:
-    """The per-shard look-ahead IS that shard's ingest concurrency, so the
-    fleet-wide figure is the per-shard value times the shard count.
+class TestIngestBoundAcrossClusters:
+    """The per-cluster look-ahead IS that cluster's ingest concurrency, so the
+    fleet-wide figure is the per-cluster value times the cluster count.
     """
 
     @staticmethod
-    def _look_ahead(wired, monkeypatch, *, zones: int, shards: int, ingest_cap: int) -> int:
+    def _look_ahead(wired, monkeypatch, *, zones: int, clusters: int, ingest_cap: int) -> int:
         names = [f"{i + 1:02d}N" for i in range(zones)]
         status = SimpleNamespace(zones=dict.fromkeys(names, ()), has=lambda z, y: False)
         monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
@@ -519,45 +543,68 @@ class TestIngestBoundAcrossShards:
                 paths=_PATHS,
                 ami_ssm_name="ami",
                 fill_strategy="chained-clusters",
-                max_parallel_zones=shards,
+                max_parallel_clusters=clusters,
                 max_parallel_ingest=ingest_cap,
             )
         )
         return wired["arun"][0][1]["look_ahead"]
 
     def test_an_exact_division_delivers_the_requested_width(self, wired, monkeypatch):
-        assert self._look_ahead(wired, monkeypatch, zones=4, shards=4, ingest_cap=8) == 2
+        assert self._look_ahead(wired, monkeypatch, zones=4, clusters=4, ingest_cap=8) == 2
+
+    def test_the_default_split_is_five_zones_per_cluster(self, wired, monkeypatch):
+        """8 clusters over a 40-zone cap: the shape the campaign actually runs."""
+        assert self._look_ahead(wired, monkeypatch, zones=8, clusters=8, ingest_cap=40) == 5
 
     def test_a_remainder_rounds_up_rather_than_under_delivering(self, wired, monkeypatch):
-        """Flooring is what the defaults would hit: 60 ingests over 40 shards is
-        1.5, and `//` would quietly run 40 when the operator asked for 60.
-        Overshooting is the better error — ingest is the cheap half, and the
-        number is a target rather than a quota.
+        """Flooring would hand a cluster less ingest width than was asked for, with
+        nothing in the logs saying so. The global gate is the hard ceiling, so
+        rounding up overshoots the intent and never the actual cap.
         """
-        assert self._look_ahead(wired, monkeypatch, zones=4, shards=4, ingest_cap=6) == 2
+        assert self._look_ahead(wired, monkeypatch, zones=4, clusters=4, ingest_cap=6) == 2
 
-    def test_a_cap_below_the_shard_count_still_gives_every_shard_one(self, wired, monkeypatch):
-        """A shard with a look-ahead of zero can never start an ingest, so the
-        real floor is one per shard however low the cap is set.
+    def test_a_cap_below_the_cluster_count_still_gives_every_cluster_one(self, wired, monkeypatch):
+        """A cluster with a window of zero could never start a zone, so the real
+        floor is one per cluster however low the cap is set. The gate still holds
+        the fleet to the cap; the clusters just queue on it.
         """
-        assert self._look_ahead(wired, monkeypatch, zones=4, shards=4, ingest_cap=1) == 1
+        assert self._look_ahead(wired, monkeypatch, zones=4, clusters=4, ingest_cap=1) == 1
 
-    def test_the_real_ceiling_is_logged_when_it_misses_the_request(self, wired, monkeypatch, caplog):
-        with caplog.at_level(logging.WARNING, logger="test-campaign"):
-            self._look_ahead(wired, monkeypatch, zones=4, shards=4, ingest_cap=6)
-        assert any("not the requested max_parallel_ingest=6" in m for m in caplog.messages), caplog.messages
 
-    def test_an_exact_fit_warns_about_nothing(self, wired, monkeypatch, caplog):
-        with caplog.at_level(logging.WARNING, logger="test-campaign"):
-            self._look_ahead(wired, monkeypatch, zones=4, shards=4, ingest_cap=8)
-        assert not [m for m in caplog.messages if "max_parallel_ingest" in m], caplog.messages
+def test_every_cluster_opens_on_one_of_the_densest_zones(wired, monkeypatch):
+    """The property the GPU-start rule depends on.
+
+    A cluster requests its fleet as soon as its FIRST zone has ingested, which is
+    only safe if that zone is big enough to keep the fleet busy while the rest of
+    the window ingests behind it. The LPT assignment gives that for free — every
+    total starts at zero, so the N densest zones go one to each of the N clusters —
+    but it falls out of the assignment order rather than being an explicit step, so
+    it is pinned here.
+    """
+    counts = {"01N": 900, "02N": 800, "03N": 700, "04N": 50, "05N": 40, "06N": 30}
+    status = SimpleNamespace(zones=dict.fromkeys(counts, ()), has=lambda z, y: False)
+    monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+    monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [(z, 2025) for z in counts])
+    monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: counts[zone])
+
+    asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", max_parallel_clusters=3
+        )
+    )
+    dispatched = [p["zones"] for _, p in wired["arun"]]
+    assert {zs[0] for zs in dispatched} == {"01N", "02N", "03N"}, dispatched
+    # ...and each cluster tapers from dense to sparse rather than the reverse.
+    for zs in dispatched:
+        tiles = [counts[z] for z in zs]
+        assert tiles == sorted(tiles, reverse=True), zs
 
 
 def test_sequential_single_shard_reads_no_tile_counts(wired, monkeypatch):
-    """One work zone → one shard → the partitioner must not read the mask."""
+    """One work zone → one cluster → the partitioner must not read the mask."""
 
     def boom(*a, **k):
-        raise AssertionError("tile counts must not be read for a single shard")
+        raise AssertionError("tile counts must not be read for a single cluster")
 
     monkeypatch.setattr(mod, "zone_live_tile_count", boom)
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
@@ -576,11 +623,11 @@ def test_partition_zero_weights_known_complete_cells(monkeypatch):
         return counts[zone]
 
     monkeypatch.setattr(mod, "zone_live_tile_count", count)
-    shards = mod._partition_by_live_tiles(
+    clusters = mod._partition_by_live_tiles(
         ["01N", "02N", "03N", "04N"], 2, land_mask_path="mask", known_complete={"04N"}
     )
     # LPT over {100, 90, 80}: [01N] vs [02N, 03N]; 04N rides along at zero cost.
-    assert sorted(map(sorted, shards)) == [["01N", "04N"], ["02N", "03N"]]
+    assert sorted(map(sorted, clusters)) == [["01N", "04N"], ["02N", "03N"]]
 
 
 # ── branch-scoped deployment routing ──

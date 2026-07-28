@@ -176,20 +176,35 @@ The single-ROI path is deliberately untouched by all of this.
   an ingest look-ahead. Measurement then showed ingest is markedly more efficient
   run across many narrow fleets than a few wide ones, and that bound is precisely
   what prevented it: it throttled the cheap half of the campaign to the throughput
-  of the expensive half. It was removed, and the ingest concurrency default raised
-  above the fill default. Peak input storage is now bounded by a **year**, not by
-  in-flight cells — of order a hundred zone-mosaics, hundreds of terabytes,
-  transient. Cleanup is unchanged and still matters: `cleanup_mosaics` deletes each
-  mosaic as its fill lands, `sweep_orphan_mosaics` collects what a crash leaves.
-  The trade accepted is storage cost for ingest throughput.
-- GPUs are never booted speculatively. Under `chained-clusters` a shard ingests
-  **every** cell before requesting a fleet. Waiting only for the first mosaic was
-  tried and is not sufficient: cells finish at very different times (S1 lands well
-  ahead of S2; zones differ several-fold in size), so a fleet started on the head
-  cell catches up with the stream and idles. The accepted cost is a shard's full
-  ingest up front, unoverlapped — it scales with shard size, so
-  `max_parallel_zones=1` means a whole year of ingest before any inference.
-  Ingest waiting is cheap; a provisioned GPU fleet waiting is not.
+  of the expensive half. It was removed. Peak input storage is now bounded by a
+  **year**, not by in-flight cells — of order a hundred zone-mosaics, hundreds of
+  terabytes, transient. Cleanup is unchanged and still matters: `cleanup_mosaics`
+  deletes each mosaic as its fill lands, `sweep_orphan_mosaics` collects what a
+  crash leaves. The trade accepted is storage cost for ingest throughput.
+- Ingestion has exactly ONE limit: `max_parallel_ingest` (40), the number of UTM
+  zones ingesting simultaneously across the whole campaign. Under
+  `chained-clusters` the clusters are separate Prefect flow runs, so no in-process
+  semaphore can see across them and the cap is a Prefect **global concurrency
+  limit** — the same mechanism as the D6 commit gate. Each zone's ingest holds one
+  slot for its duration; a cluster starts as many zones as fit and queues the rest.
+  The campaign upserts the limit from the parameter at start (failing preflight if
+  it cannot), so the two can never drift. Each cluster also takes an even share of
+  the cap as its own window, dividing it by construction rather than by races.
+- GPUs are never booted speculatively, and **density ordering** is what makes the
+  cheap version of that guarantee sound. A cluster starts its ingest window, waits
+  for its FIRST zone only, then requests a fleet. That is safe because zones are
+  dealt out densest-first — the N densest zones of a year go one to each of the N
+  clusters, and each cluster then works from dense to sparse — so a cluster always
+  opens on a big zone whose inference outlasts the ingest of the rest of its
+  window. Inference is slower than ingest in almost every case, so the stream does
+  not run dry.
+
+  Two alternatives were tried and rejected. Waiting for a cluster's *entire* ingest
+  is unoverlapped time paid up front for a risk the ordering already removes.
+  Ordering on the clamped per-cell actor request (`min(num_actors, n_tiles)`) looks
+  equivalent and is not: every zone bigger than the fleet collapses to the same
+  value, leaving the dense end of the list — the part that decides what the fleet
+  opens on — in arbitrary order. The sort key is the unclamped tile count.
 - A deliberate refill re-ingests (hours, STAC/ASF re-pull) — acceptable given the
   storage saving; the coverage store + zone ROI regenerate in seconds.
 - The zone-fill chain gained its first temporal-coverage gate; a missing-months
