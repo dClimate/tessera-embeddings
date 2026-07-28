@@ -948,10 +948,16 @@ live-only floor is 97,597, so **12.9% is the entire prize at any rate**; the kne
 
 **Shipped as a CALLER-OWNED parameter, not a lowered constant**, and that distinction is
 load-bearing: `WINDOW_COST_IN_CHUNKS_OVERLAPPED = 20` sits alongside the 200 default, and
-`live_windows_for_mask` takes the rate. S1 still defaults `overlap_window_writes` to False and
-derives windows through the same helper, so a global change would hand a SEQUENTIAL writer ~1.5
-extra serial windows per zone-date — cancelling its own 6% area saving. S2 passes the low rate
-only when it is actually overlapping.
+`live_windows_for_mask` takes the rate. A global change would hand a SEQUENTIAL writer ~1.5 extra
+serial windows per zone-date — cancelling its own 6% area saving. So each caller passes the rate
+that matches **how it writes**, not what it is: both paths now select on `overlap_window_writes`,
+and a caller that turns overlapping off returns to the high rate in the same step.
+
+> This coupling was initially missed on S1. Flipping `overlap_window_writes` to True (§4.9) does
+> **not** move the merge rate with it — the two are separate arguments, and S1 was left paying the
+> expensive rate while writing cheaply, forfeiting the ~6% area saving. Fixed by having S1 select
+> the rate the same way S2 does. The lesson is the one this whole section is about: the rate must
+> track the write strategy, so anything that changes the strategy has to change the rate too.
 
 **`DEFAULT_TASKS_PER_CHUNK` is deliberately left at 200** though a chunk really costs ~44 tasks.
 That 4.5× conservatism is what keeps the per-window cap at 120 chunks; "correcting" it would
@@ -1288,29 +1294,74 @@ whole run, not a retry.
 Still to verify before the campaign: **one full-year cell**, because twelve rollovers is four times
 what this run exercised and a slow leak would compound.
 
-### 4.9 S1 never received two changes S2 depends on — the largest remaining easy win
+### 4.9 S1 never received the changes S2 depends on — and overlapping paid double
 
-Sentinel-1 pays **both** serial penalties the S2 path has already shed:
+Sentinel-1 pays the serial penalties the S2 path had already shed. Two of the three are now closed:
 
-| axis | S2 today | S1 today |
-|---|---|---|
-| windows within a date | one shared computation (§3.11) | **sequential** — a date costs the SUM of its windows |
-| dates per commit | sized per region (§3.16) | one commit per date |
-| window merge pricing | cheap-boundary rate (§3.17) | expensive rate — *correct*, given it writes serially |
+| axis | S2 | S1 before | S1 now |
+|---|---|---|---|
+| windows within a date | one shared computation (§3.11) | **sequential** — a date costs the SUM of its windows | overlapped, by default (`12d2aed`) |
+| window merge pricing | cheap-boundary rate (§3.17) | expensive rate — *correct*, given it wrote serially | cheap rate, once overlapping (§3.17) |
+| dates per commit | sized per region (§3.16) | one commit per date | unchanged — still open, see below |
 
-`overlap_window_writes` defaults **False** on the S1 path, which is precisely the configuration
-that cost the S2 path 1.59×. The consequence is visible: on a sparse zone S1 cost ~39–59 s/date
-against S2's ~29–33, **despite carrying 2 bands against S2's 11**. Its per-date data volume is a
-fraction of S2's and it still takes longer.
+**The symptom that pointed here.** On a sparse zone S1 cost ~39–59 s/date against S2's ~29–33,
+**despite carrying 2 bands against S2's 11**. A fraction of the data volume, and slower.
 
-Turning overlapping on should therefore transfer the 1.59×, and the finer merging follows with no
-further code because the merge rate is already caller-owned (§3.17) — S1 simply has not opted in.
+**What we predicted, and what we measured.** The prediction was that turning overlapping on would
+transfer the S2 path's 1.59×, and that the gain would be **largest where a date has many windows**
+and shrink toward nothing as window count fell. Three ROIs, each run twice at S1 = 30 workers:
 
-Two cautions for that work. S1 has **no look-ahead at all**: a batch pays its whole catalogue query
-before writing anything, so overlapping the next batch's query is a further win — but it must buy
-overlap with a **one-batch buffer only**, because more retention is what deadlocked the driver
-before (§3.13). And date fusing for S1 is the least certain lever: by §3.16's arithmetic it wins
-only where the fleet has idle capacity, which needs measuring rather than assuming.
+| ROI | windows/date | sequential | overlapped | gain |
+|---|---|---|---|---|
+| 35N | 23 | 172.1 s | 61.8 s | **2.79×** |
+| 21N | 9 | 61.9 s | 21.6 s | **2.86×** |
+| 59S | 7 | 34.5 s | 14.3 s | **2.40×** |
+
+Bigger than predicted, and — the part that matters — **flat in window count**. Nine windows gained
+marginally *more* than twenty-three. That refutes the reasoning behind the prediction.
+
+> **CORRECTION.** The superseded claim was that a date's sequential cost is the SUM of its windows
+> while its overlapped cost is roughly the MAX, making the gain scale with window count. Flat
+> gains across a 3.3× spread in window count are not consistent with that, so the sum-over-max
+> account is wrong and is withdrawn.
+
+**The mechanism is fleet occupancy, not window arithmetic.** A single window's task graph is only
+a few tasks wide. Writing windows one at a time therefore occupies only that much of the fleet no
+matter how many windows wait behind it; the rest of the fleet idles. Overlapping makes every
+window's graph live at once, so they collectively fill the fleet:
+
+```
+SEQUENTIAL — one window's graph at a time, so the fleet is mostly idle
+   fleet (30 workers)
+   ├──────────────────────────────┤
+   │####..........................│   window 1   ─┐
+   │####..........................│   window 2    │  one after another:
+   │####..........................│   window 3    │  23 x (narrow and slow)
+   │            ...               │               ─┘
+
+OVERLAPPED — every window's graph is live, so the fleet fills
+   ├──────────────────────────────┤
+   │##############################│   windows 1..23 together
+```
+
+So the gain is **fleet width ÷ per-window width**, capped once the windows collectively saturate
+the fleet. Window count drops out of that expression entirely, which is why the measurements are
+flat — and it predicts something the withdrawn account did not: **the gain should grow with fleet
+width**, since a wider fleet leaves a sequential writer proportionally more idle capacity to
+recover. At 30 workers it is ~2.4–2.9×.
+
+Two consequences worth stating plainly. The gain **generalises across the campaign** rather than
+concentrating in dense zones, because it never depended on window count. And **narrowing S1
+windows now looks more attractive, not less** — under the withdrawn account fewer, larger windows
+were preferable; under fleet occupancy, narrower windows raise the parallel width available per
+unit of work.
+
+**What is still open on S1.** Date fusing remains the least certain lever: by §3.16's arithmetic it
+wins only where the fleet has idle capacity, and overlapping has just consumed much of exactly
+that, so the case for it is now *weaker* than before. S1 also has **no catalogue look-ahead**: a
+batch pays its whole query before writing anything, so overlapping the next batch's query is a
+further win — but it must buy that overlap with a **one-batch buffer only**, because more retention
+is what deadlocked the driver before (§3.13).
 
 S1 was also **uninstrumented** — it reported only "wrote N dates", so a slow batch was
 indistinguishable from a slow catalogue, and those have opposite remedies. It now emits per-date

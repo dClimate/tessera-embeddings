@@ -39,7 +39,11 @@ import dask.distributed
 from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
-from tessera_embeddings.ingest.live_windows import live_windows_for_mask
+from tessera_embeddings.ingest.live_windows import (
+    WINDOW_COST_IN_CHUNKS,
+    WINDOW_COST_IN_CHUNKS_OVERLAPPED,
+    live_windows_for_mask,
+)
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import apply_roi_mask
@@ -233,7 +237,18 @@ def ingest_s1_roi_sar(
     if crop_to_live_windows:
         live_windows = [
             (w.y0, w.y1, w.x0, w.x1)
-            for w in live_windows_for_mask(roi_zarr_path, window_px=INGEST_CHUNK_SIZE, storage_options=storage_options)
+            for w in live_windows_for_mask(
+                roi_zarr_path,
+                window_px=INGEST_CHUNK_SIZE,
+                # The merge exchange rate follows how this run WRITES, exactly as on the
+                # S2 path: overlapped windows share one graph, so a boundary is cheap and
+                # the DP should stop trading ocean area for fewer windows. A sequential
+                # writer still pays the serial cost per boundary and keeps the high rate.
+                window_cost_in_chunks=(
+                    WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
+                ),
+                storage_options=storage_options,
+            )
         ]
         log.info("Cropping writes to %d live window(s)", len(live_windows))
 
