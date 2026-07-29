@@ -721,3 +721,33 @@ def test_calendar_gate_is_callable_before_provisioning():
     )
     with pytest.raises(ValueError, match="exact January-December 2025 window"):
         zone_fill.assert_calendar_year_window(partial, 2025)  # same year, only 6 months
+
+
+def test_non_affine_mosaic_axis_raises(tmp_path, monkeypatch):
+    """Endpoints and length are not enough to pin an axis, and inference writes positionally.
+
+    A mosaic whose easting axis has the right count and the right first and last values
+    but a permuted interior passes every earlier check — shape, CRS, endpoints — while
+    describing pixels in a different order than the seeded grid. Inference reads it by
+    positional slice, so those pixels would be published at the wrong coordinates with
+    nothing anywhere to signal it. The campaign's own ingest cannot produce this (odc
+    builds every load against the zone geobox), but ``ingest=False`` accepts a mosaic the
+    operator staged, which is the path this guards.
+    """
+    store = _seed_global(tmp_path)
+    mosaic_base = str(tmp_path / "scrambled-mosaics")
+    scrambled = easting_coords(_SPEC).copy()
+    # Swap two interior samples: same endpoints, same length, same CRS, wrong order.
+    scrambled[1], scrambled[2] = scrambled[2], scrambled[1]
+    _make_mosaic_store(f"{mosaic_base}/reflectance.zarr", northing_coords(_SPEC), scrambled, _NY, _NX, _SPEC.crs)
+    for orbit in ("ascending", "descending"):
+        _make_mosaic_store(
+            f"{mosaic_base}/sar_{orbit}.zarr", northing_coords(_SPEC), easting_coords(_SPEC), _NY, _NX, _SPEC.crs
+        )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("inference must not run on a non-affine mosaic grid")
+
+    monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
+    with pytest.raises(ValueError, match="not a uniform"):
+        _fill(tmp_path, store, land_mask_path=_make_mask(tmp_path, [(0, 0)]), mosaic_base=mosaic_base)

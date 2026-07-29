@@ -518,6 +518,28 @@ def plan_zone_inference(
                 f"easting {coords.easting[0]}..{coords.easting[-1]}) do not lie on zone {zone}'s grid — "
                 "shifted or reversed axes would silently misgeoreference the fill."
             )
+        # Length, CRS and endpoints still do not pin an axis: a REORDERED or non-affine
+        # interior satisfies all three. Inference writes positionally onto the seeded
+        # grid, so such a mosaic would publish real pixels at the wrong coordinates with
+        # nothing to signal it. Checking uniform PIXEL_M spacing closes that — together
+        # with the matching length and endpoints above it makes the axis exactly the
+        # seeded one, and it costs one diff over a coordinate vector already in hand.
+        #
+        # The campaign's own ingest cannot produce a bad axis (odc builds every load
+        # against the zone geobox), but `ingest=False` accepts a mosaic the operator
+        # staged, and that path is supported.
+        for axis, values in (("northing", coords.northing), ("easting", coords.easting)):
+            if len(values) < 2:
+                continue
+            diffs = np.diff(np.asarray(values, dtype="float64"))
+            if not np.all(np.isclose(np.abs(diffs), PIXEL_M, rtol=0.0, atol=atol)):
+                worst = int(np.argmax(np.abs(np.abs(diffs) - PIXEL_M)))
+                raise ValueError(
+                    f"{label} {axis} at {store_path} is not a uniform {PIXEL_M} m axis: step "
+                    f"{diffs[worst]} between index {worst} and {worst + 1}. Endpoints and length "
+                    f"match zone {zone}'s grid, so this is a reordered or non-affine interior — "
+                    "inference writes positionally and would misgeoreference those pixels silently."
+                )
 
     _assert_on_zone_grid(
         "Mosaic reflectance",

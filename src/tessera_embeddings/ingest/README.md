@@ -486,10 +486,20 @@ r3    b  b  .  .  .                         .  .  .  .  .    r3   .  .  .  .  .
   from the cell's live-chunk count (0.5 workers/chunk, clamped) instead of granting a
   4-tile zone the same fleet as a dense one.
 
-Default **off** at every layer — the legacy full-extent path is byte-identical until the
-cropped path is validated on a live cell. S1 and S2 share the mechanism; the one
-difference is that S1's multi-date batches loop per date (non-contiguous dates cannot
-share a region write), each date keeping its own atomic commit and retry scope.
+Unconditional at every layer — see "Cropping to live windows (unconditional)" above for
+why the flag was removed rather than defaulted. The full-extent write path it used to
+select is gone from both modules, along with every branch that tested for it. S1 and S2
+share the mechanism; the one difference is that S1's multi-date batches loop per date
+(non-contiguous dates cannot share a region write), each date keeping its own atomic
+commit and retry scope.
+
+The zone fill's grid validation checks the declared grid COMPLETELY, not just its
+corners: matching length, CRS and endpoints still admit a reordered or non-affine
+interior, and inference writes positionally, so such a mosaic would publish real pixels
+at wrong coordinates in silence. Uniform 10 m spacing is asserted on both axes. Nothing
+this ingest produces can fail that — odc builds every load against the zone geobox — but
+a fill run with `ingest=False` accepts a mosaic staged by hand, and that path is
+supported.
 
 ### Background: how Dask task graphs consume scheduler RAM
 
