@@ -60,25 +60,48 @@ class TestMonthPartition:
             covered.extend(_dates(mr.own_start, mr.own_end))
         assert covered == _dates(start, end), "owned dates must tile the window exactly once"
 
-    def test_query_end_is_padded_by_one_day_except_at_the_window_end(self):
+    def test_query_end_is_padded_by_one_day_including_at_the_window_end(self):
         """A date-only interval end covers that day, so without a pad an item in the
         final seconds of a month's last day could fall outside every slice's query.
+
+        The LAST month is padded too. It used to be clamped to the window, on the
+        reasoning that a query should not reach outside what was asked for — but the
+        window is in solar days and the query is bounded in UTC, so at western
+        longitudes the final owned solar day includes acquisitions dated the following
+        UTC day. Clamping made those unfetchable by any slice and the last day of the
+        year was written incomplete, with nothing to signal it.
         """
         months = iter_month_ranges("2024-01-01", "2024-03-31")
         assert months[0].query_end == "2024-02-01"  # padded past its own end
         assert months[1].query_end == "2024-03-01"
-        assert months[-1].query_end == "2024-03-31", "the last month must not query past the window"
+        assert months[-1].query_end == "2024-04-01", "the last month must still reach the following UTC day"
 
-    def test_query_start_is_padded_by_one_day_except_at_the_window_start(self):
+    def test_query_start_is_padded_by_one_day_including_at_the_window_start(self):
         """Solar-day ownership can hand a month an item whose UTC date is the day
         before it. At eastern longitudes an acquisition late on a month's last UTC day
         has its SOLAR day in the next month — so the owning month must ask for that
         day, or no slice ever fetches the item.
+
+        That applies to the FIRST month against the window's own start exactly as it
+        applies between months; clamping it lost the first solar day's evening imagery.
         """
         months = iter_month_ranges("2024-01-01", "2024-03-31")
-        assert months[0].query_start == "2024-01-01", "the first month must not query before the window"
+        assert months[0].query_start == "2023-12-31", "the first month must still reach the preceding UTC day"
         assert months[1].query_start == "2024-01-31"
         assert months[2].query_start == "2024-02-29"
+
+    def test_out_of_window_dates_are_excluded_by_ownership_not_by_the_query_bound(self):
+        """What the unclamped pad relies on: owned ranges never leave the window.
+
+        The query now reaches a day either side of the whole window, so the only thing
+        stopping an out-of-window solar day from being written is the ownership filter.
+        Pin that the owned ranges stay inside the requested window exactly.
+        """
+        months = iter_month_ranges("2024-01-01", "2024-12-31")
+        assert months[0].own_start == "2024-01-01"
+        assert months[-1].own_end == "2024-12-31"
+        assert months[0].query_start < months[0].own_start
+        assert months[-1].query_end > months[-1].own_end
 
     def test_padding_cannot_double_process(self):
         """The padded day is OWNED by the next month, so overlap in the query does not
@@ -169,7 +192,10 @@ class TestStreaming:
             queried.append(start_date)
             if start_date == "2024-01-31":  # February's slice, padded a day early
                 second_started.set()
-            return [_item(start_date)], {}
+            # Every date in the PADDED range, so each month still owns something after
+            # the ownership filter — returning only the query's first date would hand
+            # each month nothing but the pad day its neighbour owns.
+            return [_item(d) for d in _dates(start_date, end_date)], {}
 
         gen = stream_stac_months(
             provider="p",

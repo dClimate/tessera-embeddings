@@ -1861,10 +1861,22 @@ it — roughly 5 GB.
   exactly once, which means **no cross-month state is needed to deduplicate** — and that matters
   because the worker can be restarted at any instant. A partition survives a restart; an
   ID-dedupe set would not.
-- **Pad the query end by one day, clamped to the window end.** A date-only interval end covers
+- **Pad the query end by one day.** A date-only interval end covers
   only that day's final second, so without the pad items in a month's last moments could fall
   outside every slice. The padded day is *owned* by the next month, so query overlap never
   becomes work overlap.
+
+  *Superseded 2026-07-29:* the pads were originally CLAMPED to the window,
+  on the reasoning that a query should never reach outside what was asked for. That was wrong,
+  and it cost real imagery. The window is expressed in SOLAR days while a STAC query is bounded
+  in UTC, so the two disagree at exactly the window's own edges: the first owned solar day
+  includes acquisitions dated the preceding UTC day at eastern longitudes, and the last owned
+  solar day acquisitions dated the following UTC day at western ones. Clamped, no slice could
+  fetch them, so the first and last day of every zone-year were written with part of their
+  imagery missing — invisibly, because `assessed_window` still covered them and the month-level
+  coverage gate still passed. The pads are now unclamped. What keeps out-of-window dates out of
+  the store is the solar-day ownership filter, which is what it always was; the query bound
+  never was that guard and could not be.
 - **Depth-1 prefetch on a single-thread pool.** The pool's `max_workers=1` IS the buffer: one
   query in flight, one month in the caller's hands. Depth 1 is sufficient rather than arbitrary —
   a month's query is ~2.7% of a month's processing, so deeper buffering costs memory to hide

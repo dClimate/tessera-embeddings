@@ -1030,8 +1030,19 @@ def iter_month_ranges(start_date: str, end_date: str) -> list[MonthRange]:
     slices independent — no cross-month state is needed to deduplicate, which matters
     because the ingest runs on a worker that may be restarted at any point.
 
-    Both query ends are padded by one day (clamped to the window) and the padding
-    cannot cause double-processing, because ownership is decided separately.
+    Both query ends are padded by one day and the padding cannot cause
+    double-processing, because ownership is decided separately.
+
+    The pads are NOT clamped to the window, and that is load-bearing rather than
+    sloppy. The window is expressed in SOLAR days, but a STAC query is bounded in UTC,
+    so at the window's own edges the two disagree: the first owned solar day can include
+    acquisitions whose UTC date is the day BEFORE the window starts (eastern longitudes),
+    and the last owned solar day acquisitions whose UTC date is the day AFTER it ends
+    (western). Clamping the query to the window made those unfetchable by any slice, so
+    the edge solar days were written with part of their imagery missing — silently, since
+    ``assessed_window`` still covered them and the month gate still passed. What keeps
+    out-of-window dates out of the store is the ownership filter below, which compares
+    SOLAR days; the query bound never was that guard and could not be.
 
     The END pad exists because a date-only interval end is expanded to that day's last
     second: without it, items in the final seconds of a month's last day could fall
@@ -1061,8 +1072,8 @@ def iter_month_ranges(start_date: str, end_date: str) -> list[MonthRange]:
         last_day = calendar.monthrange(year, month)[1]
         own_start = max(start, datetime.date(year, month, 1))
         own_end = min(end, datetime.date(year, month, last_day))
-        query_end = min(end, own_end + datetime.timedelta(days=1))
-        query_start = max(start, own_start - datetime.timedelta(days=1))
+        query_end = own_end + datetime.timedelta(days=1)
+        query_start = own_start - datetime.timedelta(days=1)
         ranges.append(
             MonthRange(
                 query_start=query_start.isoformat(),

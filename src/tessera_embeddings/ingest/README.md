@@ -588,6 +588,16 @@ and a group we believe is one day then loads as TWO time slices against a cloud 
                        ^ far-eastern zones image right here
 ```
 
+The same disagreement decides how a query window is bounded. A STAC query is bounded in UTC
+while the ingest window is a range of SOLAR days, so at the window's own edges the two do not
+line up: the first owned solar day includes acquisitions dated the preceding UTC day at eastern
+longitudes, and the last owned solar day acquisitions dated the following UTC day at western
+ones. `iter_month_ranges` therefore pads both query ends by a day and does **not** clamp the
+pads to the window — clamping them made those acquisitions unfetchable by any slice, so the
+first and last day of a zone-year were written incomplete while `assessed_window` still claimed
+them and the month gate still passed. Out-of-window dates are excluded by the solar-day
+**ownership** filter, never by the query bound.
+
 That is why `group_items_by_date` takes a `mid_longitude`, and why the pre-sort uses the same key —
 the sort carries the painter's-algorithm contract (clearest tile last within a group), so sorting on
 a different notion of "day" than the grouping would silently let a cloudier pixel win. Central
