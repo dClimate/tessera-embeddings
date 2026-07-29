@@ -58,7 +58,7 @@ Defaults are in `run_global_campaign`. Only the starred row needs changing.
 | `ingest_settings.max_workers` | 50 | S2 fleet width; **already the default, do not raise to 60** |
 | `ingest_settings.s1_worker_fraction` | 0.22 | → 11 workers per S1 orbit, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
-| `num_actors` | 20 → see §4 | GPU actors per cluster |
+| `num_actors` | 20 → **~210 (v1.1) or ~153 (v2)** | GPU actors per cluster; match the fleet to ingest supply, see §4 |
 | `s1_orbit` | `"both"` | downgrades per zone when an orbit has no imagery |
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
@@ -93,10 +93,16 @@ Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md).
 | Fargate vCPU | 12,640 | **22,436** |
 | Ingest wall clock | 7.9 days | **4.5 days** |
 | Mosaic supply | 5.24 zone-yr/h | **9.30 zone-yr/h** |
-| **GPU fleet that stays busy** | **946** | **1,678** |
+| **GPU fleet that stays busy — v1.1** | **946** | **1,678** |
+| **GPU fleet that stays busy — v2 Large** | **688** | **1,220** |
 | Ingest cost | ~$121,000 | ~$121,000 |
-| Inference cost (v1.1 / v2 Large) | $335,000 / $244,000 | $335,000 / $244,000 |
-| **Campaign total (v1.1 / v2 Large)** | **$461,000 / $370,000** | **$461,000 / $370,000** |
+| Inference cost — v1.1 | $335,000 | $335,000 |
+| Inference cost — v2 Large | $244,000 | $244,000 |
+| **Campaign total — v1.1** | **$461,000** | **$461,000** |
+| **Campaign total — v2 Large** | **$370,000** | **$370,000** |
+
+Both models are carried because the model choice is still open (§8) and it must be settled
+before the store is seeded — a store's advertised model identity is write-once.
 
 **GPUs are on-demand.** Spot is excluded by decision, not by oversight: sustaining ~1,700
 g6e instances for days makes interruption a certainty, and a campaign that stalls on
@@ -106,9 +112,14 @@ capacity is worse than one that costs more. Settled; do not re-open.
 about 180 GPU-hours. Provisioning the full 2,500-actor quota against 40-cell ingest runs
 the fleet at 38% duty and burns roughly **$550,000 of idle GPU time** — more than the
 inference it is trying to do, and more than four times the ingest bill. At 71 cells the
-matched fleet is 1,678 GPUs, or **~210 actors across 8 clusters** — and **1,220, or ~153
-actors, if the campaign runs v2 Large**, which is 1.375× faster and so needs less fleet to
-keep pace with the same ingest.
+matched fleet is 1,678 GPUs (**~210 actors across 8 clusters**) on v1.1, or 1,220 (**~153
+actors**) on v2 Large, which is 1.375× faster and so needs less fleet to keep pace with the
+same ingest.
+
+Note the direction that pushes: a faster model makes an oversized fleet **worse**, because
+each zone-year is consumed sooner and the fleet starves longer. At the full quota the idle
+burn is $552,000 on v1.1 and $643,000 on v2. The model choice and the fleet size are
+coupled and must be decided together.
 
 Raising the ingest cap costs nothing measurable and is worth 3.4 days and 732 GPUs of
 usable fleet. It is the single highest-value setting in this document.

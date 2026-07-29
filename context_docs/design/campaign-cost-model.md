@@ -135,44 +135,60 @@ GPU-hours follow from pixels and throughput alone:
   GPU-hours  =  1.363 × 10¹³ px  ÷  (px/s/worker × 3600)
 ```
 
-| throughput | GPU-hours | cost @ $1.861/h |
-|---|---|---|
-| 15K px/s — fleet-overall, incl. cold starts | 252,300 | $469,600 |
-| **21K px/s — measured, while processing** | **180,200** | **$335,400** |
-| 24K px/s — best observed | 157,700 | $293,500 |
+Both models, at all three throughput bases. v2 Large's column is the v1.1 rate × 1.375
+(§6); all costs are on-demand at $1.861/GPU-hour.
+
+| basis (v1.1 rate) | v1.1 GPU-h | **v1.1 cost** | v2 rate | v2 GPU-h | **v2 cost** |
+|---|---|---|---|---|---|
+| 15K px/s — fleet-overall, incl. cold starts | 252,300 | **$469,600** | 20.6K | 183,500 | **$341,500** |
+| **21K px/s — measured, while processing** | **180,200** | **$335,400** | **28.9K** | **131,100** | **$243,900** |
+| 24K px/s — best observed | 157,700 | **$293,500** | 33.0K | 114,700 | **$213,400** |
 
 **None of this varies with the ingest scenario.** The same pixels are inferred at the same
-rate either way.
+rate either way. It varies only with the model and with which throughput basis turns out
+to be right — the two open questions §9 lists, and the reason one measured run is worth
+making before committing.
 
 ### What the ingest scenario actually decides: whether GPUs sit idle
 
 An idle GPU bills. So the question is not how many GPUs the quota allows, it is **how many
 GPUs the ingest rate can keep fed**.
 
-At 21K px/s a zone-year costs **180.4 GPU-hours**. Multiply by the supply rate:
+A zone-year costs **180.4 GPU-hours on v1.1** and **131.2 on v2 Large**. Multiply by the
+supply rate:
 
 ```
-  matched fleet  =  zone-years per hour from ingest  ×  180.4 GPU-hours each
+  matched fleet  =  zone-years per hour from ingest  ×  GPU-hours per zone-year
 ```
 
-| ingest scenario | supply | **matched fleet** | duty at 1,280 GPUs | duty at 2,500 GPUs |
+| ingest scenario | supply | **matched fleet, v1.1** | **matched fleet, v2** |
+|---|---|---|---|
+| **shipped — 40 × 50w** | 5.24 zone-yr/h | **946** | **688** |
+| 40 × 60w | 6.29 zone-yr/h | 1,135 | 825 |
+| **optimal — 71 × 50w** | 9.30 zone-yr/h | **1,678** | **1,220** |
+| 80 × 50w | 10.48 zone-yr/h | 1,891 | 1,375 |
+
+**This is the expensive mistake available in this campaign** — provisioning to the quota
+instead of to that column. Idle burn at the full 2,500-actor fleet:
+
+| ingest scenario | v1.1 duty | **v1.1 idle burn** | v2 duty | **v2 idle burn** |
 |---|---|---|---|---|
-| **shipped — 40 × 50w** | 5.24 zone-yr/h | **946 GPUs** | 74% | **38%** |
-| 40 × 60w | 6.29 zone-yr/h | 1,135 GPUs | 89% | 45% |
-| **optimal — 71 × 50w** | 9.30 zone-yr/h | **1,678 GPUs** | 100% | **67%** |
-| 80 × 50w | 10.48 zone-yr/h | 1,891 GPUs | 100% | 76% |
+| shipped — 40 × 50w | 38% | **$552,000** | 28% | **$643,000** |
+| optimal — 71 × 50w | 67% | **$164,000** | 49% | **$256,000** |
 
-**This is the expensive mistake available in this campaign.** Running the full
-2,500-actor GPU quota against ingest as shipped leaves the fleet **38% busy** and burns
-roughly **$550,000** of idle GPU time on demand — more than four times the entire ingest
-bill, and more than the inference it is trying to do. At 40 × 60w it is $404,000; against
-71-cell ingest it falls to $164,000. Neither is a
-throughput problem; both are a scheduling mismatch.
+Against ingest as shipped, an oversized fleet wastes more than four times the entire
+ingest bill, and more than the inference it is trying to do. Neither row is a throughput
+problem; both are a scheduling mismatch.
 
-So the honest way to state the case for the optimal ingest configuration is not the
-$1,700 it costs, nor even the two days it saves, but this: **it raises the fleet you can
-keep busy from 1,135 to 1,678 GPUs**, which is what converts GPU quota into finished work
-instead of idle time.
+**Note which way v2 pushes this.** A faster model makes oversizing *worse*, not better:
+each zone-year is consumed more quickly, so the same fleet starves sooner and idles
+longer. Choosing v2 saves $91,500 on the work and would lose $91,000 more to idle if the
+fleet were left at the quota. The two decisions are coupled and must be made together.
+
+So the case for the optimal ingest configuration is not the $1,700 it costs, nor the 3.4
+days it saves, but this: **it raises the fleet you can keep busy from 946 to 1,678 GPUs on
+v1.1, or 688 to 1,220 on v2** — which is what converts GPU quota into finished work rather
+than idle time.
 
 > The GPU fleet already boots only when a finished mosaic is waiting, and the feeder takes
 > whichever mosaic lands first, so the pipeline does not idle *within* a cluster. What the
@@ -298,23 +314,28 @@ Open Data application asks how large the dataset is.
 
 ## 8. Scenario summary
 
-Ingest at its cost midpoint; inference at 21K px/s with a **matched** GPU fleet, so no
-idle burn in either row.
+Ingest at its cost midpoint; inference at the 21K basis with a **matched** GPU fleet, so
+no idle burn in any column. All four combinations of the two decisions still open.
 
-| | shipped — 40 × 50w | optimal — 71 × 50w |
-|---|---|---|
-| Fargate vCPU required | 12,640 | 22,436 |
-| Matched GPU fleet | 946 | 1,678 |
-| Ingest | $121,000 | $121,000 |
-| Inference | $335,400 | $335,400 |
-| Assembly + S3 + mosaics | $4,800 | $4,800 |
-| **Total, v1.1** | **$461,000** | **$461,000** |
-| **Total, v2 Large** | **$370,000** | **$370,000** |
-| Ingest wall clock | 7.9 d | 4.5 d |
-| Campaign wall clock (staged) | ~8.1 d | ~4.6 d |
-| Idle burn if you run 2,500 GPUs anyway | **+$550,000** | **+$164,000** |
+| | shipped 40×50w<br>**v1.1** | shipped 40×50w<br>**v2 Large** | optimal 71×50w<br>**v1.1** | optimal 71×50w<br>**v2 Large** |
+|---|---|---|---|---|
+| Fargate vCPU required | 12,640 | 12,640 | 22,436 | 22,436 |
+| Matched GPU fleet | 946 | 688 | 1,678 | 1,220 |
+| Ingest | $121,000 | $121,000 | $121,000 | $121,000 |
+| Inference | $335,400 | $243,900 | $335,400 | $243,900 |
+| Assembly + S3 + mosaics | $4,800 | $4,800 | $4,800 | $4,800 |
+| **Total** | **$461,000** | **$370,000** | **$461,000** | **$370,000** |
+| Ingest wall clock | 7.9 d | 7.9 d | 4.5 d | 4.5 d |
+| Campaign wall clock (staged) | ~8.1 d | ~8.1 d | ~4.6 d | ~4.6 d |
+| Idle burn if you run 2,500 GPUs anyway | +$552,000 | +$643,000 | +$164,000 | +$256,000 |
 
-At 15K px/s rather than 21K, add **$134,000** to both columns (**$98,000** on v2 Large).
+Read the columns in pairs. **Choosing v2 Large is worth $91,000 and is independent of the
+ingest configuration.** **Choosing 71 cells is worth 3.4 days and costs nothing** — its
+value is entirely in wall clock and in the fleet it lets you keep busy. The bottom row is
+what either choice costs if the fleet is then sized to the quota instead of to the work.
+
+At the pessimistic 15K basis rather than 21K, add **$134,000** to the v1.1 columns and
+**$98,000** to the v2 columns.
 
 **The two scenarios cost the same to within a rounding error.** The decision between them
 is about wall clock — 7.9 days against 4.5 — and about how much GPU quota you can convert
