@@ -24,14 +24,23 @@ attempted. The messages asserted on are the real ones observed in production, no
 
 from __future__ import annotations
 
+import unittest.mock as mock
 from pathlib import Path
 
 import icechunk
+import numpy as np
 import pytest
+import xarray as xr
 import zarr
 
+from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.storage import zarr_store
-from tessera_embeddings.storage.zarr_store import CorruptedStoreError, open_or_create_repo
+from tessera_embeddings.storage.zarr_store import (
+    CorruptedStoreError,
+    get_existing_dates,
+    open_or_create_repo,
+    write_dataset,
+)
 
 #: Real messages, from Icechunk and from a real failure. Named so a failure report says
 #: which class of transient slipped through rather than just quoting a string.
@@ -41,6 +50,18 @@ TRANSIENTS = [
     pytest.param("io error: No space left on device (os error 28)", id="disk-full"),
     pytest.param("error deserializing snapshot: unexpected end of input", id="real-corruption"),
 ]
+
+
+def _sar_like() -> xr.Dataset:
+    """A minimal two-date SAR-shaped dataset — enough for write_dataset's create path."""
+    return xr.Dataset(
+        {"vv": (("time", "northing", "easting"), np.ones((2, 8, 8), dtype="int16"))},
+        coords={
+            "time": np.array(["2024-01-01", "2024-01-02"], dtype="datetime64[ns]"),
+            "northing": np.arange(8, dtype="float64"),
+            "easting": np.arange(8, dtype="float64"),
+        },
+    )
 
 
 @pytest.fixture
@@ -190,3 +211,64 @@ def test_a_dirty_prefix_still_raises_corrupted_with_an_actionable_message(tmp_pa
     # The old text ordered a delete outright; that must not come back.
     assert "Delete it or use a different path" not in message
     assert isinstance(caught.value.__cause__, icechunk.IcechunkError)
+
+
+# --- resumability: an interrupted write must be adoptable, not a dead end ---------------
+
+
+def test_write_dataset_adopts_a_store_an_interrupted_attempt_left(tmp_path: Path) -> None:
+    """The property that makes a failure an interruption rather than a restart.
+
+    Reproduces the real sequence: the first write creates the repo, then dies before its
+    commit, and its cleanup fails to remove the prefix. Previously the retry called
+    `Repository.create` on that non-empty prefix and raised CorruptedStoreError — forever,
+    since the error was deterministic. Now it adopts the repo and completes.
+    """
+    path = str(tmp_path / "interrupted")
+    data = _sar_like()
+
+    # Attempt 1: fail inside the write, with the cleanup disabled to mimic a denied delete.
+    with (
+        mock.patch.object(zarr_store, "to_icechunk", side_effect=OSError("[Errno 28] No space left")),
+        mock.patch.object(zarr_store, "_delete_store", return_value=False),
+        pytest.raises(OSError, match="No space left"),
+    ):
+        write_dataset(path, data, tile_id="t", baselines={}, chunks=INGEST_CHUNKS, crs="EPSG:32715")
+
+    # The prefix now holds a repo with nothing committed — the wedging condition.
+    assert open_or_create_repo(path)[1] is False, "expected a repo left behind by the failed attempt"
+    assert get_existing_dates(path) == set()
+
+    # Attempt 2: the retry. It must succeed, not raise CorruptedStoreError.
+    write_dataset(path, data, tile_id="t", baselines={}, chunks=INGEST_CHUNKS, crs="EPSG:32715")
+    assert get_existing_dates(path) == {"2024-01-01", "2024-01-02"}
+
+
+def test_cleanup_forwards_credentials_to_the_delete(tmp_path: Path, monkeypatch) -> None:
+    """The delete must authenticate the way the write did.
+
+    fsspec reads the AWS_* environment variables, and on the S1 ingest path those hold
+    OPERA-scoped tokens for downloading granules — so an ambient delete authenticates as
+    OPERA against our own bucket and is refused. Observed live as
+    ``Failed to delete store …: Forbidden``, which is what left the prefix wedged.
+    """
+    seen: dict[str, object] = {}
+
+    def _spy(store_path: str, *, get_credentials=None, s3_region=None) -> bool:
+        seen.update(path=store_path, creds=get_credentials, region=s3_region)
+        return True
+
+    monkeypatch.setattr(zarr_store, "_delete_store", _spy)
+
+    def _creds():
+        raise AssertionError("not called in this test")
+
+    @zarr_store.cleanup_on_failure
+    def _boom(store_path: str, *, get_credentials=None, s3_region=None) -> None:
+        raise RuntimeError("write failed")
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        _boom(str(tmp_path / "s"), get_credentials=_creds, s3_region="us-west-2")
+
+    assert seen["creds"] is _creds, "cleanup dropped the credential callback"
+    assert seen["region"] == "us-west-2", "cleanup dropped the region"

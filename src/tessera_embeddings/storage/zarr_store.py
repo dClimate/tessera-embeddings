@@ -104,16 +104,63 @@ def time_index_of(node: zarr.Group, value: np.datetime64) -> int | None:
 # =============================================================================
 
 
-def _delete_store(store_path: str) -> bool:
-    """Delete a store at the given path. Returns True if deleted, False if not found."""
+def _fsspec_credentials(
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    region: str | None = None,
+) -> dict[str, Any]:
+    """Storage options for fsspec, drawn from the SAME credential source icechunk uses.
+
+    fsspec resolves the ``AWS_*`` environment variables, and on the S1 ingest path those
+    have been overwritten with OPERA-scoped STS tokens for downloading NASA granules. So a
+    bare ``fsspec.filesystem("s3")`` there authenticates as OPERA against OUR bucket and is
+    refused — which is how a store cleanup came to fail with ``Forbidden`` while every
+    icechunk write beside it succeeded. Explicit credentials, or the registered provider,
+    are the only reliable source in that process. See ``_default_credentials_provider``.
+    """
+    provider = get_credentials or _default_credentials_provider
+    if provider is None:
+        return {}
+    creds = provider()
+    opts: dict[str, Any] = {"key": creds.access_key_id, "secret": creds.secret_access_key}
+    if creds.session_token:
+        opts["token"] = creds.session_token
+    if region:
+        opts["client_kwargs"] = {"region_name": region}
+    return opts
+
+
+def _delete_store(
+    store_path: str,
+    *,
+    get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
+    s3_region: str | None = None,
+) -> bool:
+    """Delete a store at the given path. Returns True if deleted, False if not found.
+
+    Takes credentials for the reason :func:`_fsspec_credentials` gives: without them this
+    is the one S3 operation in the module authenticating from the environment, and on the
+    S1 path the environment is pointed somewhere else entirely.
+
+    Still returns rather than raises — it runs while another exception is propagating and
+    must not mask it — but a failure is logged at ERROR with its consequence, because a
+    silent failed cleanup is what turns an interrupted write into a wedged prefix.
+    """
+    protocol = fsspec.utils.get_protocol(store_path)
     try:
-        fs = fsspec.filesystem(fsspec.utils.get_protocol(store_path))
+        options = _fsspec_credentials(get_credentials, s3_region) if protocol == "s3" else {}
+        fs = fsspec.filesystem(protocol, **options)
         if fs.exists(store_path):
             fs.rm(store_path, recursive=True)
             return True
         return False
     except Exception as e:
-        logger.warning(f"Failed to delete store {store_path}: {e}")
+        logger.error(
+            "Failed to delete store %s: %s. The prefix may now hold objects with no "
+            "readable repository; a retry can adopt it, but inspect it if the ingest "
+            "does not recover.",
+            store_path,
+            e,
+        )
         return False
 
 
@@ -121,6 +168,15 @@ def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
     """Decorator that deletes the store at store_path (first arg) if the function fails.
 
     Use on store creation functions to prevent leaving corrupted/partial stores.
+
+    Forwards the wrapped call's ``get_credentials`` / ``s3_region`` to the delete, so the
+    cleanup authenticates the same way the write it is cleaning up after did. It used to
+    delete with ambient credentials, which on the S1 path meant OPERA's — see
+    :func:`_fsspec_credentials`.
+
+    Best-effort by design, and no longer the only line of defence: an interrupted create
+    leaves a repo that the next attempt ADOPTS rather than re-creates (see
+    :func:`_write_new`), so a failed cleanup costs a wasted prefix rather than a wedged one.
     """
 
     @wraps(func)
@@ -132,7 +188,11 @@ def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
             return func(*args, **kwargs)
         except Exception:
             logger.warning(f"Store creation failed, cleaning up {store_path}")
-            _delete_store(store_path)
+            _delete_store(
+                store_path,
+                get_credentials=kwargs.get("get_credentials"),  # type: ignore[arg-type]
+                s3_region=kwargs.get("s3_region"),  # type: ignore[arg-type]
+            )
             raise
 
     return wrapper
@@ -713,8 +773,23 @@ def _write_new(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
 ) -> None:
-    """Create a new store with data. Cleans up on failure."""
-    repo = _create_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    """Write ``data`` as a store's first commit, ADOPTING a repo an earlier attempt left.
+
+    ``open_or_create_repo``, not ``_create_repo``: an interrupted first write leaves a repo
+    holding only its initialization snapshot, and creating unconditionally then trips
+    Icechunk's clean-prefix rule and raises ``CorruptedStoreError`` on EVERY retry. That
+    made a momentary failure permanent — the caller's retry could not escape, because the
+    error it now hit was deterministic and of its own making. Adopting instead means an
+    interruption costs the work in flight and nothing more.
+
+    Reached only when the store holds no dates (see :func:`write_dataset`), so writing
+    ``mode="w"`` over whatever the interrupted attempt staged is correct: there is no
+    committed data to lose. The complementary half is that a store WITH dates takes the
+    append path and is never handed here.
+    """
+    repo, is_new = open_or_create_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    if not is_new:
+        logger.info("Adopting existing repo at %s — an earlier attempt left it uncommitted", store_path)
     session = repo.writable_session("main")
     to_icechunk(data, session, mode="w", encoding=encoding, align_chunks=True)
     session.commit(message)

@@ -45,13 +45,12 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import fsspec
 import numpy as np
 import zarr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.config.store_layout import clamp_chunks_and_shards
-from tessera_embeddings.storage.zarr_store import TIME_ENCODING, _create_repo, compute_doy
+from tessera_embeddings.storage.zarr_store import TIME_ENCODING, _create_repo, _delete_store, compute_doy
 from tessera_embeddings.utils import utcnow_iso
 
 if TYPE_CHECKING:
@@ -246,14 +245,14 @@ def create_empty_store_from_coords(
         # Mirror write_dataset's cleanup_on_failure — delete partial store on
         # error, but only when we created the repo. A caller-supplied repo owns
         # its own lifecycle (and may already hold data we must not delete).
+        #
+        # Delegates to `_delete_store` rather than opening its own fsspec filesystem: that
+        # duplicate is how the credential gap stayed hidden in two places at once. This
+        # branch has no credentials to pass (the whole `repo is None` path resolves them
+        # ambiently), but going through the shared helper means it inherits any fix.
         if owns_repo:
             logger.warning("Empty store creation failed, cleaning up %s", store_path)
-            try:
-                fs = fsspec.filesystem(fsspec.utils.get_protocol(store_path))
-                if fs.exists(store_path):
-                    fs.rm(store_path, recursive=True)
-            except Exception as cleanup_err:
-                logger.warning("Failed to clean up partial store %s: %s", store_path, cleanup_err)
+            _delete_store(store_path)
         raise
 
 
