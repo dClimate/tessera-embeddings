@@ -100,6 +100,10 @@ def test_no_prefect_or_get_client_in_domain_modules() -> None:
                     raise AssertionError(f"{path} calls {fn.attr}()")
 
 
+# Window derivation runs on every path now that cropping is unconditional, and this test
+# has no ROI mask on disk. One window stands in; the test is about how the DATE RANGE is
+# tiled into batches, which the windows do not affect.
+@patch("tessera_embeddings.ingest.s1_roi.live_windows_for_mask", return_value=[MagicMock(y0=0, y1=1, x0=0, x1=1)])
 @patch("tessera_embeddings.ingest.s1_roi.make_s1_item_provider")
 @patch("tessera_embeddings.ingest.s1_roi.get_existing_dates", return_value=set())
 @patch("tessera_embeddings.ingest.s1_roi.read_roi_mask")
@@ -113,6 +117,7 @@ def test_s1_batch_windows_tile_inclusive_range_without_overlap(
     mock_read_mask,
     mock_existing,
     mock_provider,
+    mock_live_windows,
 ):
     """Batches tile the inclusive [start, end] range with no day queried twice.
 

@@ -30,8 +30,8 @@ from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_re
 #: Knobs that must be plumbed end to end, per sensor. Not every domain parameter belongs
 #: here — credential callbacks and loggers are constructed per layer by design — so this
 #: lists the ones a CALLER is expected to be able to set.
-S1_KNOBS = ("batch_days", "crop_to_live_windows", "overlap_window_writes", "pipeline_batches")
-S2_KNOBS = ("crop_to_live_windows", "overlap_window_writes", "pipeline_dates", "batch_dates")
+S1_KNOBS = ("batch_days", "overlap_window_writes", "pipeline_batches")
+S2_KNOBS = ("overlap_window_writes", "pipeline_dates", "batch_dates")
 
 
 def _params(fn) -> dict[str, inspect.Parameter]:

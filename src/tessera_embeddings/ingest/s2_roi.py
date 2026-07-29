@@ -8,8 +8,10 @@ supply a connected :class:`dask.distributed.Client` and a logger.
 The algorithm is unchanged from the reference:
 
 1. Read ROI metadata + mask and total its pixels for the coverage denominator.
-   Persisted on workers on the full-extent path; lazy and window-totalled under
-   ``crop_to_live_windows``.
+   Lazy and totalled over the live windows only — the coverage ratio is cropped on
+   BOTH sides, giving identical numbers because the mask is False outside them, and
+   neither the mask nor ``any_valid`` is persisted, so no full-extent array is ever
+   materialised.
 2. Query STAC for the full date range; sort cloudiest-first so the
    painter's-algorithm mosaic picks the clearest tile last.
 3. Group items by ``solar_day``.
@@ -202,7 +204,6 @@ def ingest_s2_roi_reflectance(
     collection: str = "sentinel-2-l2a",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     storage_options: dict | None = None,
-    crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
@@ -232,15 +233,6 @@ def ingest_s2_roi_reflectance(
         log: Optional logger; defaults to ``logging.getLogger(__name__)``.
         storage_options: fsspec storage options for reading the ROI
             mask. ``None`` lets fsspec auto-detect from the URI.
-        crop_to_live_windows: Write only the chunk-aligned windows that
-            intersect the ROI mask (``ingest.live_windows``) instead of the
-            full extent — one commit per date either way. Default False
-            preserves the byte-identical legacy path while the cropped one
-            is validated. The coverage check is cropped too, on BOTH sides of
-            its ratio — the SCL reduce and the ROI pixel total each run over
-            the windows only, giving identical numbers because the mask is
-            False outside them — and neither the mask nor ``any_valid`` is
-            persisted, so no full-extent array is ever materialised.
         stream_stac_monthly: Query the STAC catalog one calendar month at a
             time, prefetching the next month while the current one is
             processed, instead of querying the whole window up front. Bounds
@@ -269,7 +261,7 @@ def ingest_s2_roi_reflectance(
             and the retry re-ingests exactly those (per-date sessions are
             impossible — each date's append resizes the time axis, so sibling
             sessions conflict on array metadata). Identical stores either way.
-            Requires ``crop_to_live_windows``. COMPOSES with ``pipeline_dates``:
+            COMPOSES with ``pipeline_dates``:
             the look-ahead is then sized to the batch, so the next batch's whole
             preparation overlaps this batch's write instead of only one date's.
             ``None`` (the default) derives it from the ROI's covered window area via
@@ -288,10 +280,6 @@ def ingest_s2_roi_reflectance(
     log = log or logging.getLogger(__name__)
     if batch_dates is not None and batch_dates < 1:
         raise ValueError(f"batch_dates must be >= 1 or None for auto, got {batch_dates}")
-    if batch_dates is not None and batch_dates > 1 and not crop_to_live_windows:
-        # The batched write is the windowed write lifted across dates; the legacy
-        # full-extent path has no windowed form to lift.
-        raise ValueError("batch_dates > 1 requires crop_to_live_windows")
     reflectance_store = f"{store_path}/reflectance.zarr"
     roi = read_roi_metadata(roi_zarr_path)
 
@@ -306,27 +294,23 @@ def ingest_s2_roi_reflectance(
     # date is then narrowed further to the land its own imagery can reach
     # (``windows_for_date``, applied per date below), because a satellite covers only
     # a fraction of a wide ROI per pass.
-    live_windows: list[tuple[int, int, int, int]] | None = None
-    run_windows: list = []
     # The merge exchange rate follows how this run WRITES: overlapped windows share one
     # graph, so a boundary is cheap and the DP should stop trading ocean area for fewer
     # windows. Sequential writes still pay the serial cost. Bound once because per-date
     # narrowing re-merges on the same terms — a second, differing rate there would undo
     # this for every narrowed date.
     window_cost = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
-    if crop_to_live_windows:
-        run_windows = live_windows_for_mask(
-            roi_zarr_path,
-            window_px=INGEST_CHUNK_SIZE,
-            window_cost_in_chunks=window_cost,
-            storage_options=storage_options,
-        )
-        live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
-        log.info("Cropping writes to %d live window(s)", len(run_windows))
+    run_windows = live_windows_for_mask(
+        roi_zarr_path,
+        window_px=INGEST_CHUNK_SIZE,
+        window_cost_in_chunks=window_cost,
+        storage_options=storage_options,
+    )
+    live_windows: list[tuple[int, int, int, int]] = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
+    log.info("Writing %d live window(s)", len(run_windows))
 
     # Resolve `batch_dates=None` (auto) now that the windows are known. Derived from
-    # the area those windows COVER, which is what the write graph touches. Falls back
-    # to 1 on the uncropped path, where a batched write has no windowed form to lift.
+    # the area those windows COVER, which is what the write graph touches.
     if batch_dates is None:
         # CEIL, not floor. Windows are clamped to the ROI extent, so an edge window can
         # be narrower or shorter than one chunk — floor counts that dimension as zero, and
@@ -337,7 +321,7 @@ def ingest_s2_roi_reflectance(
             math.ceil((w.y1 - w.y0) / INGEST_CHUNK_SIZE) * math.ceil((w.x1 - w.x0) / INGEST_CHUNK_SIZE)
             for w in run_windows
         )
-        batch_dates = auto_batch_dates(covered_chunks) if crop_to_live_windows else 1
+        batch_dates = auto_batch_dates(covered_chunks)
         log.info(
             "batch_dates=auto -> %d (%d chunk(s) covered by live windows)",
             batch_dates,

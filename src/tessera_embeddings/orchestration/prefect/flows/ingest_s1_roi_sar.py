@@ -41,7 +41,6 @@ def _ingest_s1_roi_impl(
     apply_credentials_fn: Callable[[dict[str, str]], None] | None,
     use_s3_direct: bool,
     storage_options: dict | None,
-    crop_to_live_windows: bool,
     overlap_window_writes: bool,
     pipeline_batches: bool,
     narrow_windows_per_date: bool,
@@ -59,7 +58,6 @@ def _ingest_s1_roi_impl(
         apply_credentials_fn=apply_credentials_fn,
         use_s3_direct=use_s3_direct,
         storage_options=storage_options,
-        crop_to_live_windows=crop_to_live_windows,
         overlap_window_writes=overlap_window_writes,
         pipeline_batches=pipeline_batches,
         narrow_windows_per_date=narrow_windows_per_date,
@@ -107,7 +105,6 @@ def ingest_s1_roi_sar(
     use_local: bool = False,
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
-    crop_to_live_windows: bool = False,
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = True,
@@ -144,8 +141,7 @@ def ingest_s1_roi_sar(
             than one blocking compute per window, so they share the fleet instead of
             each waiting its turn. Produces an identical store either way. **Defaults
             ON.** Also selects the window merge exchange rate, which prices a boundary
-            by how it is written, so the two cannot drift apart. Only meaningful with
-            ``crop_to_live_windows``.
+            by how it is written, so the two cannot drift apart.
         narrow_windows_per_date: Write only the live windows a date's own imagery reaches,
             as the S2 path does. **Defaults ON**: six times fewer windows per date in both
             zones measured, worth 7-20% of per-date wall clock. Dates reaching NO live window
@@ -156,9 +152,6 @@ def ingest_s1_roi_sar(
             write is one long consume, so depth 1 covers it, and deeper retention is
             what once deadlocked the S2 driver. Set False for a strictly serial
             query-then-write loop.
-        crop_to_live_windows: Restrict mosaic writes (and the S2 coverage
-            reduce) to the chunk-aligned windows intersecting the ROI mask —
-            one commit per date. Default False = legacy full-extent path.
 
         s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
             storage layer's default (us-west-2); set it when the input bucket
@@ -207,7 +200,6 @@ def ingest_s1_roi_sar(
                 apply_credentials_fn=apply_credentials_fn,
                 use_s3_direct=use_s3_direct,
                 storage_options=storage_options,
-                crop_to_live_windows=crop_to_live_windows,
                 overlap_window_writes=overlap_window_writes,
                 pipeline_batches=pipeline_batches,
                 narrow_windows_per_date=narrow_windows_per_date,
@@ -244,7 +236,6 @@ def ingest_s1_roi_sar(
                 apply_credentials_fn=apply_credentials_fn,
                 use_s3_direct=use_s3_direct,
                 storage_options=storage_options,
-                crop_to_live_windows=crop_to_live_windows,
                 overlap_window_writes=overlap_window_writes,
                 pipeline_batches=pipeline_batches,
                 narrow_windows_per_date=narrow_windows_per_date,

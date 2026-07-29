@@ -181,7 +181,6 @@ def ingest_s1_roi_sar(
     cred_refresh_interval_sec: float = DEFAULT_CRED_REFRESH_INTERVAL_SEC,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     storage_options: dict | None = None,
-    crop_to_live_windows: bool = False,
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = True,
@@ -232,9 +231,6 @@ def ingest_s1_roi_sar(
             overlap across the fleet instead of summing. Produces an identical store
             either way. Also selects the window merge exchange rate, since that prices
             a window boundary by how it is written — the two must not drift apart.
-        crop_to_live_windows: Write only the chunk-aligned windows that
-            intersect the ROI mask (``ingest.live_windows``), one commit per
-            date within each batch. Default False = legacy full-extent path.
         pipeline_batches: Defaults ON. Prepare the NEXT batch's catalogue query while
             the current batch writes, so only the first batch pays its query on the
             critical path. Shares ``ingest._pipeline.pipelined`` with the S2 date loop.
@@ -306,23 +302,20 @@ def ingest_s1_roi_sar(
     #
     # `run_windows` keeps the window OBJECTS because per-date narrowing needs them;
     # `live_windows` is the plain-tuple form the storage layer takes.
-    run_windows: list = []
-    live_windows: list[tuple[int, int, int, int]] | None = None
     # The merge exchange rate follows how this run WRITES, exactly as on the S2 path:
     # overlapped windows share one graph, so a boundary is cheap and the DP should stop
     # trading ocean area for fewer windows. A sequential writer still pays the serial
     # cost per boundary and keeps the high rate. Bound once because per-date narrowing
     # re-merges on the same terms — a second, differing rate there would undo this.
     window_cost = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlap_window_writes else WINDOW_COST_IN_CHUNKS
-    if crop_to_live_windows:
-        run_windows = live_windows_for_mask(
-            roi_zarr_path,
-            window_px=INGEST_CHUNK_SIZE,
-            window_cost_in_chunks=window_cost,
-            storage_options=storage_options,
-        )
-        live_windows = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
-        log.info("Cropping writes to %d live window(s)", len(live_windows))
+    run_windows = live_windows_for_mask(
+        roi_zarr_path,
+        window_px=INGEST_CHUNK_SIZE,
+        window_cost_in_chunks=window_cost,
+        storage_options=storage_options,
+    )
+    live_windows: list[tuple[int, int, int, int]] = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
+    log.info("Writing %d live window(s)", len(live_windows))
 
     # A date's own footprint, keyed so it can be matched back to the loaded time slice.
     #

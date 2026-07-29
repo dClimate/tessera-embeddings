@@ -110,7 +110,6 @@ def _ingest(
         min_valid_coverage=50.0,
         log=log,
         stream_stac_monthly=False,
-        crop_to_live_windows=True,
         batch_dates=batch_dates,
         pipeline_dates=pipeline_dates,
     )
@@ -169,8 +168,9 @@ def test_batch_dates_validation_rejects_bad_combinations(tmp_path: Path) -> None
     )
     with pytest.raises(ValueError, match="batch_dates must be >= 1"):
         s2_roi.ingest_s2_roi_reflectance(**kwargs, batch_dates=0)
-    with pytest.raises(ValueError, match="requires crop_to_live_windows"):
-        s2_roi.ingest_s2_roi_reflectance(**kwargs, batch_dates=2)
+    # `batch_dates > 1 requires crop_to_live_windows` used to be checked here. Cropping is
+    # now unconditional, so the precondition holds by construction and there is nothing
+    # left to refuse — batch_dates=2 is simply valid.
 
 
 @pytest.mark.parity

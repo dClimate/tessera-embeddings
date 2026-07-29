@@ -17,12 +17,18 @@ from prefect.states import StateType
 import tessera_embeddings.orchestration.prefect.flows.ingest_zone_year as mod
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.errors import InsufficientCoverageError
+from tessera_embeddings.ingest import land_mask
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
 
 def _completed_run(rid: str = "r") -> SimpleNamespace:
     return SimpleNamespace(id=rid, state=SimpleNamespace(type=StateType.COMPLETED, name="Completed"))
+
+
+#: Live chunks the fixture reports. Small enough that _scaled_max_workers lands on its
+#: floor, so a test not about sizing gets a stable, uninteresting fleet.
+_LIVE_CHUNKS = 4
 
 
 @pytest.fixture()
@@ -50,6 +56,10 @@ def wired(monkeypatch):
     # itself without probing, so _resolved_stores is deterministic in tests).
     monkeypatch.setattr(mod, "_coverage_sha", lambda *a, **k: "cov-sha-1")
     monkeypatch.setattr(mod, "resolve_s1_orbit", lambda mosaic_base, orbit, **k: orbit)
+    # Fleet sizing reads the zone's live chunk count on EVERY run now that cropping is
+    # unconditional, so it is an external touchpoint like the rest. A test that cares about
+    # the resulting worker count overrides this in its own body.
+    monkeypatch.setattr(mod, "live_chunk_count", lambda zone, **kw: _LIVE_CHUNKS)
     return rec
 
 
@@ -263,8 +273,11 @@ class TestChunkScaledWorkers:
         # through land_mask's. Patching only one leaves the other reaching for S3.
         monkeypatch.setattr(mod, "open_store_as_zarr_group", fake_coverage)
         monkeypatch.setattr("tessera_embeddings.ingest.land_mask.open_store_as_zarr_group", fake_coverage)
+        # These tests are ABOUT the chunk count, so undo the fixture's stub of it and let
+        # the real function derive it from `tile_live` above.
+        monkeypatch.setattr(mod, "live_chunk_count", land_mask.live_chunk_count)
         wired["arun"].clear()  # the fixture accumulates; a test may dispatch more than once
-        _run(ingest_settings=mod.IngestSettings(crop_to_live_windows=True, **settings_kwargs), s1_orbit="ascending")
+        _run(ingest_settings=mod.IngestSettings(**settings_kwargs), s1_orbit="ascending")
         # Dispatch order is S1 orbits then S2, so the LAST entry is always S2's width.
         return [p["max_workers"] for _, p in wired["arun"]]
 
@@ -303,12 +316,21 @@ class TestChunkScaledWorkers:
         s1, s2 = self._dispatch(wired, monkeypatch, tile_live=tiles, min_workers=6, s1_worker_fraction=0.01)
         assert s1 == 6, "a tiny fraction must still respect min_workers"
 
-    def test_crop_off_keeps_the_settings_value(self, wired, monkeypatch):
+    def test_the_settings_value_is_a_cap_not_the_fleet_size(self, wired, monkeypatch):
+        """Sizing always scales from live chunks; max_workers only bounds the result.
+
+        This replaces a test for the crop-off path, which used to take the settings value
+        verbatim. There is no crop-off path now — an extent-sized fleet for a 4-tile zone
+        was wrong by orders of magnitude (the 03S incident), and the only reason it was
+        ever reachable was a flag that no longer exists.
+        """
         monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
         monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        # Far more live chunks than the cap allows, so the cap is what binds.
+        monkeypatch.setattr(mod, "live_chunk_count", lambda zone, **kw: 10_000)
         _run(ingest_settings=mod.IngestSettings(max_workers=37), s1_orbit="ascending")
-        # S2 takes the settings value verbatim; S1 still takes its fraction of it, because
-        # the ratio is about the WORK split between sensors, not about cropping.
+        # S2 is capped at the settings value; S1 still takes its fraction of what S2 got,
+        # because the ratio is about the WORK split between sensors.
         assert [p["max_workers"] for _, p in wired["arun"]] == [8, 37]  # round(37 * 0.22) = 8
 
 

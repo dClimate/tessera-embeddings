@@ -36,7 +36,6 @@ def process_roi_reflectance(
     provider: str = "earth-search",
     collection: str = "sentinel-2-l2a",
     storage_options: dict | None = None,
-    crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
@@ -72,7 +71,6 @@ def process_roi_reflectance(
             collection=collection,
             log=get_run_logger(),
             storage_options=storage_options,
-            crop_to_live_windows=crop_to_live_windows,
             stream_stac_monthly=stream_stac_monthly,
             overlap_window_writes=overlap_window_writes,
             pipeline_dates=pipeline_dates,
@@ -95,7 +93,6 @@ def process_roi_sar(
     apply_credentials_fn: Callable[[dict[str, str]], None] | None = None,
     use_s3_direct: bool = True,
     storage_options: dict | None = None,
-    crop_to_live_windows: bool = False,
     # Mirror the domain defaults: these shells forward knobs, so a default here that
     # disagrees with s1_roi.ingest_s1_roi_sar silently changes behaviour for any caller
     # that does not pass the flag explicitly.
@@ -163,7 +160,6 @@ def process_roi_sar(
             use_s3_direct=use_s3_direct,
             log=get_run_logger(),
             storage_options=storage_options,
-            crop_to_live_windows=crop_to_live_windows,
             overlap_window_writes=overlap_window_writes,
             pipeline_batches=pipeline_batches,
             narrow_windows_per_date=narrow_windows_per_date,

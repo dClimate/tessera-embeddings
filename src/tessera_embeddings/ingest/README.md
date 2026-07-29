@@ -17,7 +17,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
 | `_pipeline.py` | A prepare/consume pipeline with a configurable look-ahead `depth`: overlaps the preparation of the next item with the consumption of the current one on one background thread, and reports the preparation time the consumer had to wait for. Used by the S2 date loop (`pipeline_dates`), with `depth` sized to `batch_dates` so a batch's whole preparation can hide behind the previous batch's write. Depth buys BUFFERING, never concurrency — preparation stays on one thread in order, so the side-effect-free contract holds at any depth. |
-| `live_windows.py` | (Merge exchange rate is caller-owned: pass `WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one graph, the higher `WINDOW_COST_IN_CHUNKS` when each is a blocking write. Both S2 and S1 select it from how the run writes, so the rate cannot drift from the write strategy it prices.) Derives the chunk-aligned live windows the cropped ingest path (`crop_to_live_windows`) loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
+| `live_windows.py` | (Merge exchange rate is caller-owned: pass `WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one graph, the higher `WINDOW_COST_IN_CHUNKS` when each is a blocking write. Both S2 and S1 select it from how the run writes, so the rate cannot drift from the write strategy it prices.) Derives the chunk-aligned live windows every ingest loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
 
 ---
 
@@ -177,7 +177,7 @@ run_global_campaign  (per pending (zone, year), zone-parallel within a year)
    ├─ ingest-zone-year ──► export_zone_roi(zone)         {inputs}/rois/zarrs/zone_33N.zarr
    │      │                  (ZoneSpec grid + tile_live mask; ocean-tile skip)
    │      ├─ marker probe (ingest_marker fingerprint; stale/partial ⇒ clear+rebuild)
-   │      ├─ (crop_to_live_windows: live-chunk count ⇒ max_workers)
+   │      ├─ (live-chunk count ⇒ max_workers)
    │      ├─ ingest_s1_roi_sar × orbit ┐  concurrent, onto
    │      ├─ ingest_s2_roi_reflectance ┘  {inputs}/mosaics/33N/2025/
    │      ├─ check_time_window_coverage (strict span; allow_partial_window escape)
@@ -319,7 +319,7 @@ This is a fully lazy Dask operation — no data is materialised until the Zarr w
 
 ## Performance Optimizations
 
-### Cropping to live windows (`crop_to_live_windows`)
+### Cropping to live windows (unconditional)
 
 Ingest cost scales with the **extent it computes, not the land it keeps**: the mosaic
 loads cover the whole ROI grid even where the mask is entirely ocean/out-of-footprint.
@@ -327,9 +327,13 @@ On a UTM zone that is mostly sea this is the difference between a graph that fit
 that does not — the extreme cells hold a few live tiles out of many thousands, and across
 the campaign's land zones roughly three-quarters of the compute would go to ocean.
 
-`crop_to_live_windows` (an `IngestSettings` knob for the campaign; a flag on both ingest
-flows and domain functions for single runs) restricts every load and write to the
-chunk-aligned windows that intersect the ROI mask:
+Every load and write is restricted to the chunk-aligned windows that intersect the ROI
+mask. **This is not optional and has no flag.** It was `crop_to_live_windows`, defaulting
+OFF while the path was validated; the validation passed, the default was never flipped, and
+the consequence of running without it is catastrophic rather than merely slower — on a zone
+where land is 0.238% of the extent, uncropped is ~420x the array volume, which exhausts a
+worker's disk and invalidates every measured campaign figure. No caller wanted it off, so
+the parameter is gone rather than defaulted.
 
 ```text
 zone / ROI extent (declared grid — UNCHANGED, the fill validates it)
@@ -604,7 +608,7 @@ negligible compared to the Dask compute time for a large spatial ROI.
 
 ### Overlapping a date's window writes (`overlap_window_writes`)
 
-Under `crop_to_live_windows` a date is written as several chunk-disjoint windows. The
+A date is written as several chunk-disjoint windows. The
 obvious implementation writes them one at a time, and that turns out to dominate the cost of
 a date: each window's compute runs to completion before the next begins, so the date costs
 the **sum** of the windows' critical paths while the fleet works on one window and idles
@@ -802,7 +806,7 @@ Skipped dates do not occupy batch slots, so batches stay full exactly where the 
 filters most; the trailing partial batch flushes at each streamed month boundary. In
 batched mode the per-date `Stage timings` line is replaced by one `Batch timings` line
 per batch (build/gate are sums of real per-date values; the write is one shared compute
-and has no per-date decomposition). Requires `crop_to_live_windows`. Default 1 — the one-commit-per-date path — is unchanged.
+and has no per-date decomposition). Default 1 — the one-commit-per-date path — is unchanged.
 
 **Composing with `pipeline_dates`.** The two are complementary and compose: batching removes
 the fleet idleness *within* a date's write, pipelining removes the serial preparation

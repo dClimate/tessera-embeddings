@@ -114,6 +114,18 @@ def run_ingest(monkeypatch):
     # backoff, which would otherwise cost the suite six seconds per failure case.
     monkeypatch.setattr(s2_roi, "wait_exponential", lambda **_kwargs: tenacity.wait_none())
 
+    # Cropping is unconditional, so window derivation runs on every path and needs a mask
+    # these tests do not have. One window covering the whole ROI keeps the date pipeline —
+    # what this module tests — writing exactly what it used to; real window geometry is
+    # covered in test_live_windows.
+    #
+    # Installed at FIXTURE SETUP, not inside the helper: a test that stubs these itself to
+    # assert on the arguments they receive does so in its own body, which runs after the
+    # fixture and before the helper, so setting them here lets that override win.
+    whole_roi = SimpleNamespace(y0=0, y1=SIZE, x0=0, x1=SIZE)
+    monkeypatch.setattr(s2_roi, "live_windows_for_mask", lambda *_a, **_k: [whole_roi])
+    monkeypatch.setattr(s2_roi, "windows_for_date", lambda run_windows, *_a, **_k: run_windows)
+
     runs: list[_Run] = []
 
     def _run(
@@ -134,7 +146,13 @@ def run_ingest(monkeypatch):
             run.loaded.append(date)
             return _day_ds(date, valid=dates[date])
 
-        def write_dataset(_store, day_ds, **_kwargs):
+        def _record_write(day_ds) -> None:
+            """The write stub's whole behaviour, shared by every writer it stands in for.
+
+            Kept in one place because the pipeline tests measure WHEN a write starts and
+            ends; a second copy that forgot ``write_s`` would silently stop testing the
+            overlap this module exists to check.
+            """
             date = str(day_ds.time.dt.date.values[0])
             run.attempts.append(date)
             if date == fail_on:
@@ -143,6 +161,18 @@ def run_ingest(monkeypatch):
             run.written.append(date)
             run.write_ended[date] = time.monotonic()
 
+        def write_dataset(_store, day_ds, **_kwargs):
+            _record_write(day_ds)
+
+        def write_day_windows(_store, day_ds, _windows, **_kwargs):
+            _record_write(day_ds)
+
+        def write_days_windows(_store, days, **_kwargs):
+            # The batched writer takes (day_ds, windows) pairs; each still counts as its
+            # own write, which is what the one-commit-per-date accounting assumes.
+            for day_ds, _windows in days:
+                _record_write(day_ds)
+
         monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([_item(d) for d in dates], {}))
         monkeypatch.setattr(s2_roi, "load_stac_items", load_stac_items)
         monkeypatch.setattr(s2_roi, "write_dataset", write_dataset)
@@ -150,6 +180,8 @@ def run_ingest(monkeypatch):
         monkeypatch.setattr(s2_roi, "read_roi_metadata", lambda *_a, **_k: _ROI)
         monkeypatch.setattr(s2_roi, "read_roi_mask", lambda *_a, **_k: da.ones((SIZE, SIZE), dtype=bool))
         monkeypatch.setattr(s2_roi, "IngestManifest", SimpleNamespace(from_roi_store=lambda _p: None))
+        monkeypatch.setattr(s2_roi, "write_day_windows", write_day_windows)
+        monkeypatch.setattr(s2_roi, "write_days_windows", write_days_windows)
 
         run.result = s2_roi.ingest_s2_roi_reflectance(
             roi_zarr_path="memory://roi.zarr",
@@ -161,7 +193,11 @@ def run_ingest(monkeypatch):
             log=log,
             stream_stac_monthly=False,
             pipeline_dates=pipeline_dates,
-            **ingest_kwargs,
+            # ONE COMMIT PER DATE. This module measures the per-date pipeline — when a
+            # date's preparation overlaps the previous date's write — and the batched
+            # writer reports per BATCH instead, so auto-sizing would silently stop
+            # exercising what these tests assert on. Batching has its own tests.
+            **{"batch_dates": 1, **ingest_kwargs},
         )
         return run
 
@@ -338,7 +374,6 @@ def test_per_date_narrowing_is_priced_like_the_run(run_ingest, monkeypatch, over
     run_ingest(
         dict.fromkeys(["2024-01-01"], True),
         pipeline_dates=False,
-        crop_to_live_windows=True,
         overlap_window_writes=overlapped,
     )
     expected = s2_roi.WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else s2_roi.WINDOW_COST_IN_CHUNKS

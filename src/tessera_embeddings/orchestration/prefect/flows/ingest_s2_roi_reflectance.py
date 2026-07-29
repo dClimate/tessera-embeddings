@@ -80,7 +80,6 @@ def _ingest_s2_roi_impl(
     provider: str = "earth-search",
     collection: str = "sentinel-2-l2a",
     storage_options: dict | None = None,
-    crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
@@ -97,7 +96,6 @@ def _ingest_s2_roi_impl(
         provider=provider,
         collection=collection,
         storage_options=storage_options,
-        crop_to_live_windows=crop_to_live_windows,
         stream_stac_monthly=stream_stac_monthly,
         overlap_window_writes=overlap_window_writes,
         pipeline_dates=pipeline_dates,
@@ -130,7 +128,6 @@ def ingest_s2_roi_reflectance(
     use_local: bool = False,
     storage_options: dict | None = None,
     perf_report_uri: str | None = None,
-    crop_to_live_windows: bool = False,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
@@ -172,14 +169,11 @@ def ingest_s2_roi_reflectance(
             prefetching the next while the current is processed, rather than querying
             the whole window up front. Bounds retained items so a year-long window fits
             the worker; ``False`` is the rollback path only.
-        crop_to_live_windows: Restrict mosaic writes (and the S2 coverage
-            reduce) to the chunk-aligned windows intersecting the ROI mask —
-            one commit per date. Default False = legacy full-extent path.
         overlap_window_writes: Submit a date's windows as ONE dask compute rather
             than one blocking compute per window, so their critical paths overlap
             across the fleet instead of summing. Identical stores either way, and
             it falls back to the sequential write when the overlapped machinery is
-            unavailable. Only meaningful with ``crop_to_live_windows``.
+            unavailable.
         pipeline_dates: Prepare the next date (load graph, coverage gate, footprint
             narrowing, masking) on a background thread while the current date is
             written, so preparation costs wall clock only where the write cannot
@@ -193,7 +187,7 @@ def ingest_s2_roi_reflectance(
             once per batch. The commit unit becomes the batch (a mid-batch
             failure commits none of its dates; the retry re-ingests exactly
             those). Identical stores either way. Requires
-            ``crop_to_live_windows``, and composes with ``pipeline_dates`` — the
+            composes with ``pipeline_dates`` — the
             look-ahead is then the batch, so a whole batch's preparation hides
             behind the previous batch's write. Leave at ``None`` to size it from
             the ROI, which is what the campaign wants: the benefit is not
@@ -240,7 +234,6 @@ def ingest_s2_roi_reflectance(
                 provider=provider,
                 collection=collection,
                 storage_options=storage_options,
-                crop_to_live_windows=crop_to_live_windows,
                 stream_stac_monthly=stream_stac_monthly,
                 overlap_window_writes=overlap_window_writes,
                 pipeline_dates=pipeline_dates,
@@ -275,7 +268,6 @@ def ingest_s2_roi_reflectance(
                 provider=provider,
                 collection=collection,
                 storage_options=storage_options,
-                crop_to_live_windows=crop_to_live_windows,
                 stream_stac_monthly=stream_stac_monthly,
                 overlap_window_writes=overlap_window_writes,
                 pipeline_dates=pipeline_dates,

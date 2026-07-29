@@ -140,10 +140,6 @@ class IngestSettings(BaseModel):
     # off (normal runs pay nothing); set it only on a probe rung — ingest-zone-year
     # composes a unique per-child filename (``s2.html``, ``s1-<orbit>.html``) under it.
     perf_report_uri: str | None = None
-    # Restrict mosaic writes (and the SCL coverage reduce) to the chunk-aligned
-    # windows that intersect the ROI mask (ingest.live_windows). Default False
-    # until the cropped path is validated end to end.
-    crop_to_live_windows: bool = False
 
     @model_validator(mode="after")
     def _worker_bounds_ordered(self) -> IngestSettings:

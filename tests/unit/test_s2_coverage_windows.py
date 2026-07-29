@@ -1,6 +1,6 @@
 """The cropped coverage denominator (pure, offline).
 
-Under ``crop_to_live_windows`` the S2 coverage check crops BOTH sides of its
+The S2 coverage check crops BOTH sides of its
 ratio: the SCL validity reduce (numerator) and the ROI pixel total
 (denominator) each run over the live windows instead of the full zone grid.
 That is only sound because of one property — the ROI mask is False everywhere

@@ -336,16 +336,14 @@ async def ingest_zone_year(
         s3_region=s3_region,
     )
 
-    # (4) Size the fleet from the cell's live work when cropping: with writes
-    # restricted to live windows the chunk count IS the work measure, and the
-    # 03S incident showed extent-sized fleets are wrong by orders of magnitude.
-    max_workers = ingest_settings.max_workers
-    if ingest_settings.crop_to_live_windows:
-        n_chunks = live_chunk_count(
-            zone, land_mask_path=land_mask_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region
-        )
-        max_workers = _scaled_max_workers(n_chunks, ingest_settings)
-        log.info("Zone %s: %d live chunk(s) -> max_workers=%d", zone, n_chunks, max_workers)
+    # (4) Size the fleet from the cell's LIVE work. Writes are restricted to live
+    # windows, so the live chunk count IS the work measure — the 03S incident showed
+    # extent-sized fleets are wrong by orders of magnitude.
+    n_chunks = live_chunk_count(
+        zone, land_mask_path=land_mask_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+    )
+    max_workers = _scaled_max_workers(n_chunks, ingest_settings)
+    log.info("Zone %s: %d live chunk(s) -> max_workers=%d", zone, n_chunks, max_workers)
 
     # Dispatch S1 (per REQUESTED orbit) + S2 ingestion concurrently onto the ROI.
     common: dict[str, Any] = {
@@ -356,7 +354,6 @@ async def ingest_zone_year(
         "min_workers": ingest_settings.min_workers,
         "max_workers": max_workers,
         "use_local": use_local,
-        "crop_to_live_windows": ingest_settings.crop_to_live_windows,
         # The children open and CREATE the mosaic repos; without this they sign
         # against the storage default while this flow's own probes use s3_region,
         # so a non-default-region campaign fails inside the costly S1/S2 jobs

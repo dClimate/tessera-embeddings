@@ -109,10 +109,9 @@ def _run_ingest(monkeypatch, batch_dates: dict[str, list[str]], existing: set[st
     is how a shared boundary day is expressed: name it in two consecutive batches.
     Returns the dates actually written, in order.
 
-    Both writers are captured, because which one runs is the thing under test:
-    ``crop_to_live_windows=True`` writes a date at a time through ``write_day_windows``,
-    and the full-extent path appends a whole batch through ``write_dataset``. Pass
-    ``crop_to_live_windows`` in ``kwargs`` to choose.
+    Writes go a date at a time through ``write_day_windows``. ``write_dataset`` is still
+    stubbed so a regression that routed a batch there would surface as unexpected dates
+    rather than as an AttributeError.
     """
     import numpy as np
     import xarray as xr
@@ -137,7 +136,6 @@ def _run_ingest(monkeypatch, batch_dates: dict[str, list[str]], existing: set[st
     def fake_write_dataset(_store, data, *_args, **_kwargs):
         written.extend(str(t)[:10] for t in data["time"].values)
 
-    kwargs.setdefault("crop_to_live_windows", True)
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", fake_write_day_windows)
     monkeypatch.setattr(s1_roi, "write_dataset", fake_write_dataset)
@@ -169,19 +167,18 @@ def _run_ingest(monkeypatch, batch_dates: dict[str, list[str]], existing: set[st
     return written
 
 
-#: Every combination of the two knobs that pick a write path and a supply. The guard
-#: belongs to the loop, not to one branch of it, so all four must hold — the full-extent
-#: branch used to write the whole batch unfiltered, so its duplicate landed on the time
-#: axis silently (write_dataset appends; only the cropped path has a slot guard).
-_WRITE_PATHS = [
-    pytest.param(crop, pipe, id=f"{'cropped' if crop else 'full-extent'}-{'lookahead' if pipe else 'serial'}")
-    for crop in (True, False)
-    for pipe in (True, False)
-]
+#: Both supply modes. The dedupe guard belongs to the LOOP, not to one branch of it, so
+#: it must hold whether the next batch is prefetched or fetched serially.
+#:
+#: This was four cases until cropping became unconditional: the other two exercised the
+#: full-extent branch, where `write_dataset` appended a whole batch and a duplicate solar
+#: day landed on the time axis silently. That branch no longer exists, so those cases
+#: cannot be written — not merely redundant, unreachable.
+_WRITE_PATHS = [pytest.param(pipe, id="lookahead" if pipe else "serial") for pipe in (True, False)]
 
 
-@pytest.mark.parametrize(("crop", "pipe"), _WRITE_PATHS)
-def test_a_solar_day_in_two_batches_is_written_once(monkeypatch, crop: bool, pipe: bool) -> None:
+@pytest.mark.parametrize("pipe", _WRITE_PATHS)
+def test_a_solar_day_in_two_batches_is_written_once(monkeypatch, pipe: bool) -> None:
     """The rule the in-process written-date set exists to enforce, through the real loop.
 
     Two consecutive batches both report 2024-01-02, which is what a UTC-cut boundary
@@ -193,19 +190,17 @@ def test_a_solar_day_in_two_batches_is_written_once(monkeypatch, crop: bool, pip
         monkeypatch,
         batch_dates={"2024-01-01": ["2024-01-01", "2024-01-02"], "2024-01-03": ["2024-01-02", "2024-01-04"]},
         existing=set(),
-        crop_to_live_windows=crop,
         pipeline_batches=pipe,
     )
     assert written.count("2024-01-02") == 1, f"the shared solar day was written twice: {written}"
     assert written == ["2024-01-01", "2024-01-02", "2024-01-04"]
 
 
-@pytest.mark.parametrize(("crop", "pipe"), _WRITE_PATHS)
-def test_dates_already_in_the_store_are_skipped_on_resume(monkeypatch, crop: bool, pipe: bool) -> None:
+@pytest.mark.parametrize("pipe", _WRITE_PATHS)
+def test_dates_already_in_the_store_are_skipped_on_resume(monkeypatch, pipe: bool) -> None:
     """Seeding from the store is what makes a resumed run skip finished work."""
     written = _run_ingest(
         monkeypatch,
-        crop_to_live_windows=crop,
         pipeline_batches=pipe,
         batch_dates={"2024-01-01": ["2024-01-01", "2024-01-02"], "2024-01-03": ["2024-01-03"]},
         existing={"2024-01-01"},
@@ -295,7 +290,6 @@ def _run_with_footprints(
         client=type("C", (), {"persist": staticmethod(lambda x: x)})(),
         orbit="ascending",
         batch_days=5,
-        crop_to_live_windows=True,
         narrow_windows_per_date=narrow,
         **ingest_kwargs,
     )
