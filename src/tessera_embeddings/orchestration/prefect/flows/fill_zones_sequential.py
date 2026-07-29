@@ -297,9 +297,17 @@ class _DeploymentCellInputs:
         lands first is a real mosaic, and the failure still surfaces when the runner
         reaches that cell.
 
-        Only when EVERY cell has finished and every one failed does this return a failed
-        cell rather than blocking forever — there is no mosaic coming, and the caller must
-        proceed to the runner to surface the error.
+        When EVERY cell has finished and every one FAILED this RAISES, rather than
+        blocking forever or nominating one of the failures. Reporting a failed cell as
+        landed would send the caller straight into ``ray up`` — five to ten minutes of
+        billed GPU bringup for a mosaic that does not exist, torn down again the moment
+        the feeder reaches the same failure. Raising costs nothing and loses nothing: the
+        underlying ingest error is chained as the cause, and the priming this call belongs
+        to runs inside the flow's shutdown guard, so the started children are still
+        cancelled on the way out.
+
+        ``None`` therefore means one thing only: the wait timed out (or no cell of
+        ``cells`` was ever started).
         """
         futs = {self._futures[c]: c for c in cells if c in self._futures}
         if not futs:
@@ -320,8 +328,26 @@ class _DeploymentCellInputs:
                 except CancelledError:
                     continue
             if not pending:
-                return futs[next(iter(done))]
+                self._raise_window_all_failed(futs, done)
         return None
+
+    @staticmethod
+    def _raise_window_all_failed(futs: dict[Future[None], tuple[str, int]], done: set[Future[None]]) -> None:
+        """Every cell offered to :meth:`wait_first` finished and every one failed."""
+        cells = sorted(futs[f] for f in done)
+        cause: BaseException | None = None
+        for fut in done:
+            try:
+                cause = fut.exception()
+            except CancelledError as exc:
+                cause = exc
+            if cause is not None:
+                break
+        listed = ", ".join(f"{z}-{y}" for z, y in cells)
+        raise RuntimeError(
+            f"every ingest in the opening window failed ({listed}) — there is no mosaic to "
+            f"infer, so no GPU fleet is requested. The first failure is chained below."
+        ) from cause
 
     def cleanup(self, zone: str, year: int) -> None:
         if (zone, year) not in self._futures or not self._cleanup_mosaics:

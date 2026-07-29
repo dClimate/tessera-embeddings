@@ -125,12 +125,13 @@ for roughly six hours with finished mosaics already on disk.
 A *failed* ingest is not a landed mosaic. Bad credentials or a bad parameter fail a
 child within seconds, and treating that as the signal to start would boot the paid
 fleet immediately for a mosaic that does not exist. The wait therefore passes over a
-failed cell while any sibling is still running, and returns one only when every cell
-in the window has finished and every one has failed — at which point there is no
-mosaic coming and the runner needs to surface the error. The priming and the wait
-both sit inside the flow's shutdown guard, so a failure anywhere in them still
-cancels the child ingests already dispatched rather than leaving them writing to
-mosaic prefixes a retry would race.
+failed cell while any sibling is still running. If every cell in the window finishes
+and every one has failed, it **raises** — no mosaic is coming, so requesting a fleet
+would buy five to ten minutes of billed GPU bringup and then tear it straight back
+down when the feeder hit the same failure. The underlying ingest error is chained as
+the cause. The priming and the wait both sit inside the flow's shutdown guard, so a
+failure anywhere in them still cancels the child ingests already dispatched rather
+than leaving them writing to mosaic prefixes a retry would race.
 
 The density ordering is still load-bearing in two places — it is just not a
 barrier any more:

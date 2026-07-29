@@ -649,19 +649,26 @@ def test_wait_first_skips_a_failed_cell_while_a_sibling_is_still_ingesting():
         adapter.shutdown()
 
 
-def test_wait_first_returns_a_failed_cell_once_every_cell_has_failed():
-    """The other side of it: no mosaic is coming, so blocking forever is the worse answer.
+def test_wait_first_raises_rather_than_booting_gpus_when_every_cell_failed():
+    """No mosaic is coming, so the one thing that must not happen is `ray up`.
 
-    The caller proceeds to the runner, which surfaces the failure. Returning ``None`` here
-    would read as "timed out" and send it on without any diagnosis at all.
+    Nominating one of the failures as "landed" sent the caller into a five-to-ten-minute
+    billed GPU bringup for a mosaic that does not exist, torn down again as soon as the
+    feeder reached the same failure. Raising costs nothing: the ingest error is chained as
+    the cause, and priming runs inside the flow's shutdown guard so the children are still
+    cancelled. Returning ``None`` would be worse still — it reads as a timeout.
     """
     adapter = _adapter()
     try:
         adapter._futures = {
-            ("01N", 2024): _settled(RuntimeError("boom")),
-            ("02N", 2024): _settled(RuntimeError("boom")),
+            ("01N", 2024): _settled(RuntimeError("bad credentials")),
+            ("02N", 2024): _settled(RuntimeError("bad credentials")),
         }
-        assert adapter.wait_first([("01N", 2024), ("02N", 2024)]) in {("01N", 2024), ("02N", 2024)}
+        with pytest.raises(RuntimeError, match="every ingest in the opening window failed") as caught:
+            adapter.wait_first([("01N", 2024), ("02N", 2024)])
+        assert "01N-2024" in str(caught.value) and "02N-2024" in str(caught.value)
+        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert "bad credentials" in str(caught.value.__cause__), "the ingest error must be chained"
     finally:
         adapter.shutdown()
 
