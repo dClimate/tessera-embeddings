@@ -358,13 +358,23 @@ V2_SPEEDUP = 1.375
 ACTORS_V11 = 210
 ACTORS_V2 = 153
 
-#: The recommended bank, sized to the WORST combination rather than the average.
+#: The recommended bank: 4.5 work-hours, chosen from the MIDDLE of a safe plateau.
 #:
-#: Three hours suffices whenever the fleet is matched to its model. Four is needed if v2 runs
-#: on a v1.1-sized fleet, which is the realistic mistake — switching models is one config
-#: change and resizing the fleet is another. FIVE is needed because one of the eight clusters
-#: still leaves ~12 minutes idle at four. See test_the_bank_holds_across_the_whole_envelope.
-BANK_WORK_HOURS = 5.0
+#: The threshold effect is a STEP function, because the policy fires on a discrete mosaic
+#: landing rather than on a continuous quantity. Scanned across the full envelope:
+#:
+#:   4.00-4.20 h   starves in 2 of 96   max delay 16.54 h
+#:   4.25-4.90 h   starves in 0 of 96   max delay 16.54 h  <- same cost as 4.0
+#:   5.00 h        starves in 0 of 96   max delay 18.73 h
+#:
+#: So every value from 4.25 to 4.9 is free: it clears the envelope at exactly the delay 4.0
+#: already pays. Five hours crosses to the next landing and buys 2.2 h of extra delay per
+#: cluster-year — ~158 h across 72 cluster-years — for no additional safety.
+#:
+#: 4.5 rather than 4.25 because 4.25 sits on the plateau's edge, and the ingest durations
+#: underneath are modelled with a 2x unresolved disagreement. Mid-plateau costs nothing and
+#: absorbs some of that.
+BANK_WORK_HOURS = 4.5
 
 
 @pytest.mark.parametrize("speed", INGEST_SPEED_CASES.values(), ids=INGEST_SPEED_CASES.keys())
@@ -426,9 +436,13 @@ def test_the_bank_holds_across_the_whole_envelope() -> None:
     """Every cluster, both models, both ingest speeds, both ingest caps — 96 combinations.
 
     The figure is sized to the worst combination rather than to the densest cluster, because a
-    buffer validated only on the deepest queue is tuned to the easiest case. That is what moved
-    the recommendation from four hours to five: one cluster of the eight — 15 zones opening on
-    8,731 tiles — still left ~12 minutes of idle at four, and four starved in 2 of 96.
+    buffer validated only on the deepest queue is tuned to the easiest case. That is what ruled
+    out four hours: one cluster of the eight — 15 zones opening on 8,731 tiles — still left
+    ~12 minutes of idle there, 2 starving combinations of 96.
+
+    It did NOT justify five, which is what the constant's comment records: the delay is a step
+    function, so the whole 4.25-4.9 band clears the envelope at the same cost 4.0 pays, and
+    five buys 2.2 h of extra delay per cluster-year for nothing.
     """
     fleets = (
         (ACTORS_V11, RATE_CAPACITY_PLANNING),
