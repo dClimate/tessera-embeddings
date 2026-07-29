@@ -9,16 +9,33 @@ which ``generate_roi``'s bbox-fit grid could not — and the S1/S2 ROI ingest
 deployments write onto it. Only orchestration lives here (``arun_deployment``);
 each ingest deployment provisions its own Dask cluster.
 
-**Idempotent + crash-safe.** A per-store completion marker (root attr
+**Idempotent, and RESUMABLE.** A per-store completion marker (root attr
 ``ingest_marker``, fingerprinting window + min_valid_coverage + s1_orbit +
-allow_partial_window + coverage sha) gates the work: a matching marker on every
-required store short-circuits, and the marker is written only after coverage is
-verified. Recovery is by re-run, but NOT an incremental append: the probe keys on
-physical existence over the maximal candidate set, so a stale, markerless, or
-half-written mosaic is CLEARED (``delete_prefix``, strict) and rebuilt cleanly
-rather than appended onto. A changed input (rebuilt coverage, new threshold,
-different orbit or window, or a flipped ``allow_partial_window``) changes the
-fingerprint and likewise forces a clean rebuild.
+allow_partial_window + coverage sha) gates the work: a matching marker on every required
+store short-circuits, and the marker is written only after coverage is verified.
+
+Three states, three answers:
+
+* **absent** — ingest it.
+* **present and unmarked** — an interrupted attempt at this same work. **RESUMED.** Dates
+  already committed are skipped rather than rewritten, because Icechunk commits a date's
+  time slot atomically WITH its pixels, so a date present is complete and a date absent
+  was never started. Both ingests already skip what they find, so resuming is simply not
+  clearing.
+* **present and marked DIFFERENTLY** — raises ``ConfigMismatchError``. See the branch
+  itself for why neither automatic answer is defensible.
+
+**Campaign assumption this rests on (documented, not enforced here).** A campaign holds its
+inputs fixed: one land mask, one date window per year, one coverage threshold, both orbits,
+one partial-window policy. So an unmarked store can only be an interruption of the same
+work — there is no other configuration for it to be left over from. The one input whose
+change would silently corrupt rather than raise is the LAND MASK, and that is enforced
+independently: ``IngestManifest.coverage_sha256`` is validated on every write, so a changed
+mask fails at the first append.
+
+**Two writers** is the hazard resume makes reachable, and Icechunk guards it: these commits
+do not rebase, so a second writer's commit fails with ``ConflictError`` against a moved
+branch tip instead of merging silently.
 
 **Coverage gate (ADR-011).** After ingestion, :func:`check_time_window_coverage`
 requires the mosaics' months to span the window; ``allow_partial_window`` relaxes
@@ -42,7 +59,7 @@ from pydantic import BaseModel
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.errors import InsufficientCoverageError
+from tessera_embeddings.errors import ConfigMismatchError, InsufficientCoverageError
 from tessera_embeddings.inference.data_loading import (
     _active_orbits,
     check_time_window_coverage,
@@ -52,7 +69,6 @@ from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_coun
 from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles
-from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_repo, open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 from tessera_embeddings.utils import utcnow_iso
@@ -90,15 +106,14 @@ def _probe_marker(store_path: str, *, get_credentials: _Creds, s3_region: str | 
     ``exists`` is whether the repo is physically present; ``marker`` is its
     ``ingest_marker`` fingerprint dict (``None`` when present but unmarked). A
     transient/auth ``IcechunkError`` re-raises rather than reporting "absent":
-    conflating it with a missing repo would let one unreadable store trip the
-    clear-and-rebuild branch and delete a valid mosaic (or ingest over unknown
-    data). Only a genuinely-missing repo reports ``(False, None)``.
+    conflating it with a missing repo would have the caller ingest over data it cannot
+    read. Only a genuinely-missing repo reports ``(False, None)``.
 
     A ROOTLESS repo — created, then crashed before its schema was committed —
-    reports ``(True, None)``: present and unmarked, so the caller clears the
-    prefix and rebuilds. It must be caught BEFORE ``FileNotFoundError``, which
-    ``GroupNotFoundError`` subclasses; reporting it absent skips that cleanup and
-    every retry then fails creating a repo over the occupied prefix.
+    reports ``(True, None)``: present and unmarked, so the caller RESUMES it (the child's
+    own seed probe recreates the missing schema). It must be caught BEFORE
+    ``FileNotFoundError``, which ``GroupNotFoundError`` subclasses; reporting it absent
+    would make the caller treat the prefix as empty.
     """
     try:
         root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
@@ -120,9 +135,8 @@ def _write_ingest_marker(store_path: str, fingerprint: dict, *, get_credentials:
     OPENS, never creates. This runs only for a store that was just written, so creation is
     never the right answer, and the cost of getting that wrong is the whole ingest: a
     throttle or an expired credential mistaken for absence would leave a complete
-    multi-terabyte store UNMARKED, and the next run reads an unmarked store as stale and
-    deletes it. Surfacing the real error costs a retry; mistaking it for absence costs the
-    ingest.
+    multi-terabyte store UNMARKED, and the next run would then re-query its whole window to
+    rediscover that every date is already present. Surfacing the real error costs a retry.
 
     `open_or_create_repo` no longer conflates the two — it creates only on proven absence —
     but this call stays :func:`open_repo` regardless, because "must already exist" is both
@@ -293,39 +307,69 @@ async def ingest_zone_year(
     #     the new fingerprint over mixed inputs. Physical existence is the signal.
     candidates = _mosaic_stores(mosaic_base, "both")
     probed = {s: _probe_marker(s, get_credentials=iam_icechunk_credentials, s3_region=s3_region) for s in candidates}
-    stale = [s for s, (exists, marker) in probed.items() if exists and marker != fingerprint]
-    # Resolve orbits ONLY when nothing needs clearing. `resolve_s1_orbit` re-raises
-    # GroupNotFoundError deliberately — at fill time a rootless SAR store must never be
-    # read as an absent orbit and quietly halve the radar. But that is exactly the store
-    # the clearing branch below repairs, and resolving first put the raise in front of
-    # the repair: every retry died at the probe and the prefix stayed wedged forever.
-    # Skipping the call costs nothing, because a stale store cannot match the
-    # fingerprint and so could never have short-circuited anyway.
-    resolved = None if stale else _resolved_stores()
+    # An UNMARKED store is an interrupted attempt at THIS work, and is resumed. A store
+    # marked with a DIFFERENT fingerprint is a violated assumption, and raises — see the
+    # two branches below for why those answers are opposite.
+    unmarked = [s for s, (exists, marker) in probed.items() if exists and marker is None]
+    mismatched = {
+        s: marker for s, (exists, marker) in probed.items() if exists and marker is not None and marker != fingerprint
+    }
+    # Resolve orbits ONLY when every present store is complete. `resolve_s1_orbit`
+    # re-raises GroupNotFoundError deliberately — at fill time a rootless SAR store must
+    # never be read as an absent orbit and quietly halve the radar. But an interrupted
+    # store is exactly how one becomes rootless, and resolving first put that raise in
+    # front of the resume. Skipping the call costs nothing: an incomplete store cannot
+    # match the fingerprint and so could never have short-circuited anyway.
+    resolved = None if (unmarked or mismatched) else _resolved_stores()
     if resolved is not None and all(probed[s][1] == fingerprint for s in resolved):
         log.info("Zone %s year %d already ingested for %s — skipping", zone, year, fingerprint["window"])
         return {"zone": zone, "year": year, "status": "already_ingested", "fingerprint": fingerprint}
-    # Clear PER STORE, not the whole prefix. Each child store is ingested
-    # independently and marked independently, so a store already carrying this
-    # fingerprint is complete and correct whatever happened to its siblings.
-    # Clearing the whole prefix meant one sensor's failure destroyed the other's
-    # finished work — and because the failure is usually deterministic, every
-    # retry re-paid that ingest. Only the stores that are NOT clean for this
-    # fingerprint are cleared, which preserves the reason the clear exists:
-    # never append onto stale dates and then stamp a fingerprint over mixed
-    # inputs. strict=True still aborts on a failed delete rather than ingesting
-    # onto stale data and marking the result complete.
-    if stale:
+
+    # A completed store whose fingerprint DISAGREES means one of the campaign's documented
+    # invariants was broken: the window, the coverage gate, the orbit set, the
+    # partial-window policy and the land mask are all fixed for a campaign. Neither
+    # automatic answer is right. Resuming would append dates admitted under one
+    # configuration onto dates admitted under another and then stamp one fingerprint over
+    # the mixture; clearing would destroy a complete, correct mosaic because a parameter
+    # was mistyped. So this raises and a human decides — the situation is rare by
+    # construction and expensive to get wrong either way.
+    if mismatched:
+        detail = "; ".join(f"{s.rsplit('/', 1)[-1]}: stored {m}" for s, m in mismatched.items())
+        raise ConfigMismatchError(
+            f"Zone {zone} year {year}: {len(mismatched)} store(s) are COMPLETE under a different "
+            f"fingerprint than this run requests. Wanted {fingerprint}. {detail}. A campaign holds "
+            f"these inputs fixed, so this is a changed parameter rather than an interrupted run. "
+            f"Delete the store(s) deliberately if the new inputs are intended, or correct the "
+            f"parameters — this flow will not choose between discarding a finished mosaic and "
+            f"mixing two configurations."
+        )
+
+    # RESUME, do not rebuild. An unmarked store holds dates this same work already
+    # committed, and Icechunk commits a date's time slot atomically WITH its pixels, so a
+    # date present is complete and a date absent was never started — there is no partial
+    # date to repair. Both ingests already skip dates they find (`get_existing_dates`), so
+    # simply not clearing is the whole mechanism.
+    #
+    # This replaced a clear-and-rebuild. At campaign scale that discarded everything a
+    # cell had ingested for any interruption at all — and interruptions are expected, since
+    # the orphan sweeper cancels runs by design. A dense zone interrupted near the end lost
+    # hours to re-pay deterministically on every retry.
+    #
+    # TWO WRITERS is the hazard resume makes reachable, and Icechunk is what guards it:
+    # these commits do NOT rebase, so a second writer's commit fails with ConflictError
+    # against a moved branch tip rather than merging silently. That protection is a
+    # property of NOT passing `rebase_with` — see `storage.shard_writer.commit_with_rebase`,
+    # which deliberately does the opposite for disjoint groups. The ingest path must never
+    # adopt it.
+    if unmarked:
         log.info(
-            "Zone %s year %d: clearing %d stale/partial store(s) for a clean rebuild, keeping %d already marked: %s",
+            "Zone %s year %d: RESUMING %d interrupted store(s) — dates already committed are "
+            "skipped, not rewritten: %s",
             zone,
             year,
-            len(stale),
-            sum(1 for _, m in probed.values() if m == fingerprint),
-            ", ".join(s.rsplit("/", 1)[-1] for s in stale),
+            len(unmarked),
+            ", ".join(s.rsplit("/", 1)[-1] for s in unmarked),
         )
-        for store in stale:
-            delete_prefix(store, log=log, strict=True)
 
     # (3) Ensure the zone ROI zarr (idempotent; regenerates if coverage changed).
     export_zone_roi(

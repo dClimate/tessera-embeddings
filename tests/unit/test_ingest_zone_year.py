@@ -16,7 +16,7 @@ from prefect.states import StateType
 
 import tessera_embeddings.orchestration.prefect.flows.ingest_zone_year as mod
 from tessera_embeddings.config.paths import BucketPaths
-from tessera_embeddings.errors import InsufficientCoverageError
+from tessera_embeddings.errors import ConfigMismatchError, InsufficientCoverageError
 from tessera_embeddings.ingest import land_mask
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
@@ -51,7 +51,6 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "export_zone_roi", lambda z, **kw: rec["roi_exported"].append((z, kw)))
     monkeypatch.setattr(mod, "check_time_window_coverage", lambda *a, **k: rec["coverage_checked"].append((a, k)))
     monkeypatch.setattr(mod, "_write_ingest_marker", lambda store, fp, **kw: rec["markers_written"].append(store))
-    monkeypatch.setattr(mod, "delete_prefix", lambda uri, **kw: rec.setdefault("deletes", []).append(uri))
     # Fingerprint inputs: coverage sha + orbit resolution ("ascending" resolves to
     # itself without probing, so _resolved_stores is deterministic in tests).
     monkeypatch.setattr(mod, "_coverage_sha", lambda *a, **k: "cov-sha-1")
@@ -88,7 +87,7 @@ def test_matching_markers_skip_ingest(wired, monkeypatch):
     result = _run(s1_orbit="ascending")
     assert result["status"] == "already_ingested"
     assert result["fingerprint"] == fp
-    assert wired["arun"] == [] and wired["roi_exported"] == [] and wired.get("deletes", []) == []
+    assert wired["arun"] == [] and wired["roi_exported"] == []
 
 
 def test_dispatches_and_marks_on_success(wired, monkeypatch):
@@ -160,9 +159,16 @@ def test_s3_region_threaded_through_metadata_opens(wired, monkeypatch):
     assert wired["coverage_checked"][0][1].get("s3_region") == "eu-west-1"  # coverage gate
 
 
-def test_stale_marker_triggers_reingest(wired, monkeypatch):
-    """A present marker with a different fingerprint (e.g. rebuilt coverage) does
-    NOT short-circuit — the mosaic is re-ingested under the new inputs.
+def test_a_complete_store_under_a_different_fingerprint_raises(wired, monkeypatch):
+    """A campaign holds its inputs fixed, so this means a parameter changed — not a crash.
+
+    Neither automatic answer is defensible. Resuming would append dates admitted under one
+    configuration onto dates admitted under another and stamp one fingerprint over the
+    mixture; clearing would destroy a complete, correct mosaic because someone mistyped a
+    window. It raises and a human decides.
+
+    This replaces a test asserting the stores were cleared. That behaviour is what made
+    every interruption re-pay a whole cell.
     """
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
     stale = {
@@ -172,16 +178,9 @@ def test_stale_marker_triggers_reingest(wired, monkeypatch):
         "coverage_sha256": "OLD-sha",  # != current "cov-sha-1"
     }
     monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (True, stale))
-    result = _run(s1_orbit="ascending")
-    assert result["status"] == "ingested"  # re-ingested despite a present (stale) marker
-    assert wired["arun"]
-    # Stale stores cleared before the rebuild so re-ingest doesn't append onto old
-    # data — per store, since a sibling carrying the current fingerprint is fine.
-    assert sorted(wired.get("deletes", [])) == [
-        "s3://in/mosaics/33N/2025/reflectance.zarr",
-        "s3://in/mosaics/33N/2025/sar_ascending.zarr",
-        "s3://in/mosaics/33N/2025/sar_descending.zarr",
-    ]
+    with pytest.raises(ConfigMismatchError, match="different"):
+        _run(s1_orbit="ascending")
+    assert wired["arun"] == [], "nothing may be dispatched once the mismatch is known"
 
 
 def test_markerless_partial_mosaic_is_cleared(wired, monkeypatch):
@@ -197,9 +196,9 @@ def test_markerless_partial_mosaic_is_cleared(wired, monkeypatch):
     )
 
     # Resolution keyed on STATE, not on call ordinality: there is no SAR store to
-    # resolve until the ingesters have been dispatched. So a resolution attempted
-    # before the clear-and-rebuild raises, and the post-ingest one succeeds — and
-    # the test stays honest about which side of the dispatch the flow probes from.
+    # resolve until the ingesters have been dispatched. So a resolution attempted before
+    # the dispatch raises, and the post-ingest one succeeds — and the test stays honest
+    # about which side of the dispatch the flow probes from.
     def resolve_once_ingested(mosaic_base, orbit, **k):
         if not wired["arun"]:
             raise InsufficientCoverageError("no SAR store yet")
@@ -208,16 +207,18 @@ def test_markerless_partial_mosaic_is_cleared(wired, monkeypatch):
     monkeypatch.setattr(mod, "resolve_s1_orbit", resolve_once_ingested)
     result = _run(s1_orbit="ascending")
     assert result["status"] == "ingested"
-    # Only the markerless partial is cleared; the SAR stores never landed, so
-    # there is nothing there to delete.
-    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025/reflectance.zarr"]
+    # The markerless partial is RESUMED, not cleared — the flow has no delete path left,
+    # so its absence is structural rather than something this asserts around.
+    assert not hasattr(mod, "delete_prefix"), "the resume path must not reintroduce a clear"
 
 
 def test_partial_window_marker_does_not_satisfy_strict_run(wired, monkeypatch):
-    """A mosaic accepted under allow_partial_window=True must NOT short-circuit a
-    later strict run — the policy is in the fingerprint, so the strict run clears
-    and re-ingests (re-running the strict coverage gate) instead of reusing a
-    partial mosaic whose fill would fail strict preflight forever.
+    """A mosaic accepted under allow_partial_window=True must NOT short-circuit a strict run.
+
+    The policy is in the fingerprint, so a strict run sees a complete store under different
+    inputs and RAISES rather than silently reusing a partial mosaic (whose fill would fail
+    strict preflight forever) or discarding it. A campaign does not flip this policy
+    mid-flight, so reaching here means someone changed it deliberately and should say so.
     """
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
     partial = {
@@ -228,14 +229,9 @@ def test_partial_window_marker_does_not_satisfy_strict_run(wired, monkeypatch):
         "coverage_sha256": "cov-sha-1",
     }
     monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (True, partial))
-    # Default run is strict (allow_partial_window=False): fingerprint differs → re-ingest.
-    result = _run(s1_orbit="ascending")
-    assert result["status"] == "ingested"
-    assert sorted(wired.get("deletes", [])) == [  # policy-mismatch stores cleared
-        "s3://in/mosaics/33N/2025/reflectance.zarr",
-        "s3://in/mosaics/33N/2025/sar_ascending.zarr",
-        "s3://in/mosaics/33N/2025/sar_descending.zarr",
-    ]
+    # Default run is strict (allow_partial_window=False), so the fingerprint differs.
+    with pytest.raises(ConfigMismatchError, match="different"):
+        _run(s1_orbit="ascending")
 
 
 def test_coverage_failure_leaves_no_marker(wired, monkeypatch):
@@ -364,9 +360,9 @@ def test_a_completed_sibling_store_survives_the_other_sensors_failure(wired, mon
     result = _run(s1_orbit="ascending")
 
     assert result["status"] == "ingested"
-    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025/reflectance.zarr"], (
-        "the completed SAR store must survive the S2 failure"
-    )
+    # Stronger than before: the completed SAR store survives because NOTHING is deleted,
+    # not because the clear was scoped narrowly enough to spare it.
+    assert not hasattr(mod, "delete_prefix"), "the resume path must not reintroduce a clear"
 
 
 def test_child_ingests_receive_the_configured_region(wired, monkeypatch):
@@ -422,7 +418,7 @@ class TestChildRunsAreCancellable:
         assert all(t is None for t in wired["tags"]), wired["tags"]
 
 
-def test_a_rootless_store_is_cleared_rather_than_wedging_every_retry(wired, monkeypatch):
+def test_a_rootless_store_is_resumed_rather_than_wedging_every_retry(wired, monkeypatch):
     """A repo created but crashed before its root group is committed must be REBUILT.
 
     `resolve_s1_orbit` re-raises GroupNotFoundError deliberately — at fill time a
@@ -441,13 +437,17 @@ def test_a_rootless_store_is_cleared_rather_than_wedging_every_retry(wired, monk
     )
 
     def resolve_on_a_rootless_store(mosaic_base, orbit, **k):
-        # Keyed on STATE, not on call ordinality: the store stays rootless until it is
-        # cleared, whichever side of the clear the flow happens to resolve from.
-        if not wired.get("deletes"):
+        # Keyed on STATE, not on call ordinality: the store stays rootless until a child
+        # re-seeds it, so resolution must fail until the ingesters have been dispatched.
+        if not wired["arun"]:
             raise zarr.errors.GroupNotFoundError(f"{mosaic_base}/sar_ascending.zarr")
         return orbit
 
     monkeypatch.setattr(mod, "resolve_s1_orbit", resolve_on_a_rootless_store)
     result = _run(s1_orbit="ascending")
+    # The point of the test: the run gets PAST the probe. Orbit resolution re-raises
+    # GroupNotFoundError by design, and resolving before the ingesters were dispatched put
+    # that raise in front of the only code that repairs the store — every retry died there
+    # and the prefix stayed wedged. It is now skipped whenever a store is incomplete.
     assert result["status"] == "ingested"
-    assert wired.get("deletes") == ["s3://in/mosaics/33N/2025/sar_ascending.zarr"]
+    assert wired["arun"], "the rootless store must be resumed, which means children run"

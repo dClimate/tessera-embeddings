@@ -21,7 +21,7 @@ import json
 import logging
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
-from typing import Any, Self
+from typing import Any, Self, cast
 
 import zarr
 
@@ -162,9 +162,22 @@ class IngestManifest(StoreManifest):
     """Manifest for satellite ingestion stores: upstream ROI identity.
 
     Resolution and CRS are captured transitively via ``roi_manifest_hash``.
+
+    ``coverage_sha256`` pins the LAND MASK the ROI was built from, and it is the one
+    piece of identity nothing else caught. ``RoiManifest`` records resolution, chunk
+    size and CRS, so two ROIs built from different coverage deliveries of the same zone
+    hash IDENTICALLY — same grid, different land. Writes only ever appended, so a
+    changed mask would have mixed windows from two geometries with nothing objecting.
+
+    Recorded here because the manifest is validated on EVERY write
+    (``validate_against``), which makes a mask change a loud failure at the first
+    append rather than a comparison somebody has to remember to make. That matters
+    more now that an interrupted store is RESUMED rather than rebuilt: resume assumes
+    the existing pixels were computed from the same mask, and this is what enforces it.
     """
 
     roi_manifest_hash: str | None = None
+    coverage_sha256: str | None = None
 
     @classmethod
     def from_roi_store(cls, roi_zarr_path: str) -> IngestManifest:
@@ -173,14 +186,19 @@ class IngestManifest(StoreManifest):
         Args:
             roi_zarr_path: Path to the ROI Zarr store.
         """
+        coverage_sha: str | None = None
         try:
             z = zarr.open(roi_zarr_path, mode="r")
             roi_manifest_dict = extract_manifest(z.attrs)
+            # A zone ROI carries the coverage delivery it was exported from
+            # (``land_mask.export_zone_roi``). Absent for a plain single-ROI store,
+            # which has no land mask behind it — None is then correct, not a gap.
+            coverage_sha = cast("str | None", z.attrs.get("coverage_sha256"))
         except (KeyError, ValueError) as exc:
             logger.warning("Could not read _manifest from ROI store %s: %s", roi_zarr_path, exc)
             roi_manifest_dict = None
         roi_mhash = RoiManifest.from_dict(roi_manifest_dict).hash() if roi_manifest_dict else None
-        return cls(roi_manifest_hash=roi_mhash)
+        return cls(roi_manifest_hash=roi_mhash, coverage_sha256=coverage_sha)
 
 
 @dataclass(frozen=True)

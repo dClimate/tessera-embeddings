@@ -272,3 +272,38 @@ def test_cleanup_forwards_credentials_to_the_delete(tmp_path: Path, monkeypatch)
 
     assert seen["creds"] is _creds, "cleanup dropped the credential callback"
     assert seen["region"] == "us-west-2", "cleanup dropped the region"
+
+
+# --- what keeps two concurrent writers from corrupting a store -------------------------
+
+
+def test_the_ingest_commit_path_never_rebases() -> None:
+    """Icechunk is the two-writer guard, and rebasing is what would disable it.
+
+    Resume makes concurrent writers reachable: the flow now appends alongside whatever an
+    interrupted attempt left, where it used to delete the prefix first. What stops a second
+    writer corrupting the store is Icechunk's optimistic concurrency — a plain
+    ``session.commit()`` fails with ``ConflictError`` when the branch tip has moved, so the
+    loser is refused rather than merged. Verified directly: two sessions from one tip, the
+    second raising ``ConflictError`` and the time axis left holding only the winner's date.
+
+    That protection exists ONLY because these commits pass no ``rebase_with``.
+    ``storage.shard_writer.commit_with_rebase`` deliberately does the opposite, and is
+    correct there — the global store's writers touch disjoint groups and must merge. Adopting
+    it here would silently interleave two independent ingests of the SAME store.
+
+    So this pins the absence of a call, which is unusual and deliberate: the failure it
+    guards against is someone unifying two commit paths that look alike and are not.
+    """
+    import inspect
+
+    from tessera_embeddings.storage import zarr_store
+
+    source = inspect.getsource(zarr_store)
+    assert "rebase_with" not in source, (
+        "zarr_store now rebases on commit. The ingest path must not: rebasing merges a "
+        "second concurrent writer into the store instead of refusing it, which is the one "
+        "thing standing between a resumed ingest and a silently interleaved one. If this is "
+        "intentional, the two-writer guard needs replacing first — see "
+        "storage.shard_writer.commit_with_rebase for the case where rebasing IS right."
+    )
