@@ -545,8 +545,11 @@ class _StaggeredInputs(RecordingInputs):
 
 def test_the_feeder_takes_a_landed_cell_over_its_head_cell():
     """The densest zone is ordered first AND ingests slowest, so insisting on it
-    idles the fleet while smaller mosaics sit finished. Only the look-ahead window
-    is eligible, since those are the only cells whose ingest has been started.
+    idles the fleet while smaller mosaics sit finished.
+
+    Two conditions, not one: a cell must be in the look-ahead window to be
+    CONSIDERED (only those have an ingest running), and must have COMPLETED to be
+    taken. Inference never sees a partial mosaic.
     """
     events: list[str] = []
     inputs = _StaggeredInputs(events, landed={"02N", "03N", "04N"})  # everything but the head

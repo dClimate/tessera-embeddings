@@ -441,10 +441,18 @@ def fill_zones_sequential(
         ~10 h of ingest, so the strict order idles the GPUs for ~6 h at the start
         of every year.
 
-        Only the look-ahead window is considered, because those are the only cells
-        whose ingest has been started. When nothing has landed this returns the
-        head and the caller blocks on it, which is exactly the previous behaviour
-        — so a cluster that is genuinely ingest-starved is unaffected.
+        TWO separate conditions, easily conflated. To be CONSIDERED, a cell must be
+        in the look-ahead window — those are the only ones whose ingest has been
+        *started*, and reaching past them would begin a mosaic the budget has not
+        admitted. To be TAKEN, its ingest must have *completed* (``ready``). A
+        partial mosaic is never handed to inference under any branch: when nothing
+        has landed this returns the head and the caller BLOCKS on it, which is
+        exactly the previous behaviour, so an ingest-starved cluster is unaffected.
+
+        ``ready`` is also true for a cell whose ingest FAILED (the future is done
+        either way). That is deliberate — the caller's ``wait`` re-raises, the cell
+        is recorded as failed, and the cluster continues with its others. Blocking
+        forever on a mosaic that will never arrive is the worse outcome.
 
         The DENSITY ORDER ITSELF IS UNCHANGED: it still sizes the session (the
         fleet is provisioned for the largest cell up front) and still puts the
