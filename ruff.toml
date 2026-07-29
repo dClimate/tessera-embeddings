@@ -70,3 +70,8 @@ convention = "google"
 # for an agent to consume plus a human view on stderr, so T201 doesn't apply
 # (same reasoning as architecture_tests above).
 "src/tessera_embeddings/profiling/**/*.py" = ["T201"]
+# A diagnostic that reports how the world's UTM zones divide across N Ray
+# clusters. Printing IS its output contract, same as the tools above — it lives
+# in tests/ rather than profiling/ because it drives the real partitioner, which
+# is inside the Prefect layer and so cannot be imported from the package.
+"tests/unit/test_cluster_balance.py" = ["T201"]
