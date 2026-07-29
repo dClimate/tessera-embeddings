@@ -345,3 +345,113 @@ def test_the_fleet_size_supply_can_feed_depends_on_the_ingest_speed(opener_clust
         opener_cluster, n_actors=min(800, actors * 2), look_ahead=LOOK_AHEAD_AT_71, speed=speed, bank_work_hours=6.0
     )
     assert doubled["start_h"] + doubled["busy_h"] + doubled["idle_h"] >= hours - 0.5
+
+
+# --- the buffer figure, and why one number covers both models ----------------------------
+
+#: v2 Large's rate relative to v1.1, from the branch's own per-model estimator in
+#: `inference/actors.py` (22,000 against 16,000 px/s). Strategy-only and its calibration is
+#: undocumented, so the RATIO is what is defensible, not the absolutes.
+V2_SPEEDUP = 1.375
+#: Matched fleets per cluster from `campaign-cost-model.md`: 1,678 GPUs on v1.1 and 1,220 on
+#: v2, over 8 clusters. The fleet shrinks because a faster model needs less of it to keep pace.
+ACTORS_V11 = 210
+ACTORS_V2 = 153
+
+#: The recommended bank, sized to the WORST combination rather than the average.
+#:
+#: Three hours suffices whenever the fleet is matched to its model. Four is needed if v2 runs
+#: on a v1.1-sized fleet, which is the realistic mistake — switching models is one config
+#: change and resizing the fleet is another. FIVE is needed because one of the eight clusters
+#: still leaves ~12 minutes idle at four. See test_the_bank_holds_across_the_whole_envelope.
+BANK_WORK_HOURS = 5.0
+
+
+@pytest.mark.parametrize("speed", INGEST_SPEED_CASES.values(), ids=INGEST_SPEED_CASES.keys())
+@pytest.mark.parametrize("look_ahead", [LOOK_AHEAD_AT_40, LOOK_AHEAD_AT_71])
+def test_one_bank_figure_serves_both_models_when_the_fleet_is_matched(
+    opener_cluster, speed: float, look_ahead: int
+) -> None:
+    """The work-hours bank is MODEL-INVARIANT, which is why one figure is enough.
+
+    A matched fleet shrinks in inverse proportion to the model's rate — 210 actors at 14.0K
+    and 153 at 19.25K consume 2.940 and 2.945 Mpx/s, within 0.2% — so the same number of
+    work-hours means the same number of pixels. That is a property of expressing the buffer in
+    work-hours: a pixel threshold or a mosaic count would each need re-deriving per model.
+
+    So the model choice, which is still open and worth $91,000-$128,000, does not also require
+    choosing a buffer.
+    """
+    v11 = run(
+        opener_cluster,
+        n_actors=ACTORS_V11,
+        look_ahead=look_ahead,
+        speed=speed,
+        rate=RATE_CAPACITY_PLANNING,
+        bank_work_hours=BANK_WORK_HOURS,
+    )
+    v2 = run(
+        opener_cluster,
+        n_actors=ACTORS_V2,
+        look_ahead=look_ahead,
+        speed=speed,
+        rate=RATE_CAPACITY_PLANNING * V2_SPEEDUP,
+        bank_work_hours=BANK_WORK_HOURS,
+    )
+    assert v11["start_h"] == pytest.approx(v2["start_h"], rel=0.02)
+    assert v11["idle_h"] == pytest.approx(v2["idle_h"], abs=0.05)
+    assert v11["idle_h"] == pytest.approx(0.0, abs=0.05), "the recommended bank must not starve"
+
+
+@pytest.mark.parametrize("speed", INGEST_SPEED_CASES.values(), ids=INGEST_SPEED_CASES.keys())
+def test_three_hours_is_not_enough_if_v2_runs_on_a_v11_sized_fleet(opener_cluster, speed: float) -> None:
+    """Why the recommendation is not three hours.
+
+    Switching models is one configuration change and resizing the fleet is another, so the
+    realistic mistake is running v2 on a fleet still sized for v1.1 — which consumes 1.375x
+    faster and drains a three-hour bank before supply catches up. Four covers it, and costs
+    nothing in the matched case.
+    """
+    kw = dict(n_actors=ACTORS_V11, look_ahead=LOOK_AHEAD_AT_71, speed=speed, rate=RATE_CAPACITY_PLANNING * V2_SPEEDUP)
+    assert run(opener_cluster, bank_work_hours=BANK_WORK_HOURS, **kw)["idle_h"] == pytest.approx(0.0, abs=0.05), (
+        "the recommended bank must hold even on an unrescaled fleet"
+    )
+    # At the slower ingest basis three hours leaves real idle time; at the faster one it does
+    # not, which is exactly why the figure is chosen against the worse case.
+    if speed == 1.0:
+        assert run(opener_cluster, bank_work_hours=3.0, **kw)["idle_h"] > 0.05
+
+
+def test_the_bank_holds_across_the_whole_envelope() -> None:
+    """Every cluster, both models, both ingest speeds, both ingest caps — 96 combinations.
+
+    The figure is sized to the worst combination rather than to the densest cluster, because a
+    buffer validated only on the deepest queue is tuned to the easiest case. That is what moved
+    the recommendation from four hours to five: one cluster of the eight — 15 zones opening on
+    8,731 tiles — still left ~12 minutes of idle at four, and four starved in 2 of 96.
+    """
+    fleets = (
+        (ACTORS_V11, RATE_CAPACITY_PLANNING),
+        (ACTORS_V2, RATE_CAPACITY_PLANNING * V2_SPEEDUP),
+        # v2 on a fleet still sized for v1.1 — one config change without the other.
+        (ACTORS_V11, RATE_CAPACITY_PLANNING * V2_SPEEDUP),
+    )
+    starving = []
+    for cluster in plan(CLUSTERS):
+        for actors, rate in fleets:
+            for speed in INGEST_SPEED_CASES.values():
+                for look_ahead in (LOOK_AHEAD_AT_40, LOOK_AHEAD_AT_71):
+                    r = run(
+                        cluster.tiles,
+                        n_actors=actors,
+                        look_ahead=look_ahead,
+                        rate=rate,
+                        speed=speed,
+                        bank_work_hours=BANK_WORK_HOURS,
+                    )
+                    if r["idle_h"] > 0.05:
+                        starving.append(
+                            f"opener {cluster.opener:,} / {actors} actors / {rate:.0f} px/s / "
+                            f"speed {speed} / look_ahead {look_ahead}: {r['idle_h']:.2f} h idle"
+                        )
+    assert not starving, f"{len(starving)} starving combination(s), e.g. {starving[:2]}"
