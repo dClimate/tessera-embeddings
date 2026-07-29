@@ -10,6 +10,7 @@ the function lives in the domain layer with no Prefect coupling.
 from __future__ import annotations
 
 import inspect
+from datetime import date, timedelta
 from itertools import pairwise
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -119,14 +120,20 @@ def test_s1_batch_windows_tile_inclusive_range_without_overlap(
     mock_provider,
     mock_live_windows,
 ):
-    """Batches tile the inclusive [start, end] range with no day queried twice.
+    """Batches OWN a tiling of the inclusive [start, end] range and QUERY a day past it.
 
-    Two regressions guarded here:
+    The two ranges are different on purpose, and the overlap between consecutive
+    queries is the point rather than a defect. A solar day straddling a batch cut has
+    acquisitions on both sides of it, so the owning batch has to ask for the day beyond
+    its own range or it commits that day missing half its imagery. Ownership — applied
+    to items before the loader sees them — is what stops the overlap becoming duplicate
+    work. See ingest.solar_days.
 
-    * CMR/STAC treat their end date as inclusive, so a batch advancing to
-      ``batch_start = batch_end`` re-queries every batch boundary day. The
-      loop must advance to the day *after* ``batch_end``.
-    * ``end_date`` is inclusive: the final day must be queried, not dropped.
+    Still guarded here, unchanged in substance:
+
+    * ``end_date`` is inclusive: the final day must be owned, not dropped.
+    * The item provider is built for the same window the query uses; they diverged once
+      and the result was a batch loading imagery it had not asked for.
     """
     mock_read_meta.return_value = MagicMock(bbox_wgs84=(-105.0, 39.0, -104.0, 40.0))
 
@@ -145,21 +152,33 @@ def test_s1_batch_windows_tile_inclusive_range_without_overlap(
 
     windows = [(c.kwargs["start_date"], c.kwargs["end_date"]) for c in mock_ingest_tile.call_args_list]
 
-    # 30-day inclusive batches tile [2024-01-01, 2024-03-01]: each batch
-    # covers batch_days calendar days, the next starts the following day, and
-    # the trailing batch lands exactly on the inclusive end_date.
-    assert windows == [
+    # 30-day batches OWN a tiling of [2024-01-01, 2024-03-01] — each covering batch_days
+    # solar days, the next starting the following day, the last landing exactly on the
+    # inclusive end_date — and each QUERIES that span padded a day either side.
+    owned = [
         ("2024-01-01", "2024-01-30"),
         ("2024-01-31", "2024-02-29"),
         ("2024-03-01", "2024-03-01"),
     ]
+    assert windows == [
+        ("2023-12-31", "2024-01-31"),
+        ("2024-01-30", "2024-03-01"),
+        ("2024-02-29", "2024-03-02"),
+    ]
 
-    # No day appears as both a window end and the next window's start.
+    # The owned spans still tile the window exactly once — that, not the query bound, is
+    # what stops a day being written twice or written at all outside the window.
+    covered: list[str] = []
+    for own_start, own_end in owned:
+        d0, d1 = date.fromisoformat(own_start), date.fromisoformat(own_end)
+        covered.extend((d0 + timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1))
+    start, end = date(2024, 1, 1), date(2024, 3, 1)
+    assert covered == [(start + timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
+
+    # Consecutive queries DO overlap, by exactly the pad. Asserting it keeps a future
+    # "tidy-up" from clamping the pads away again and silently truncating boundary days.
     for (_, prev_end), (next_start, _) in pairwise(windows):
-        assert prev_end < next_start, f"boundary day re-queried: {prev_end} >= {next_start}"
-
-    # end_date is inclusive: the last batch's queried end is end_date itself.
-    assert windows[-1][1] == "2024-03-01"
+        assert next_start < prev_end, f"the query pad was lost at {prev_end}/{next_start}"
 
     # The item provider is built for the same window as the query.
     provider_windows = [(c.args[2], c.args[3]) for c in mock_provider.call_args_list]

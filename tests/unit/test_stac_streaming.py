@@ -17,10 +17,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from tessera_embeddings.ingest.solar_days import month_ranges
 from tessera_embeddings.ingest.stac import (
     _filter_existing_dates,
     _prefetch,
-    iter_month_ranges,
     stream_stac_months,
 )
 
@@ -56,7 +56,7 @@ class TestMonthPartition:
     )
     def test_owned_ranges_partition_the_window(self, start, end):
         covered: list[str] = []
-        for mr in iter_month_ranges(start, end):
+        for mr in month_ranges(start, end):
             covered.extend(_dates(mr.own_start, mr.own_end))
         assert covered == _dates(start, end), "owned dates must tile the window exactly once"
 
@@ -71,7 +71,7 @@ class TestMonthPartition:
         UTC day. Clamping made those unfetchable by any slice and the last day of the
         year was written incomplete, with nothing to signal it.
         """
-        months = iter_month_ranges("2024-01-01", "2024-03-31")
+        months = month_ranges("2024-01-01", "2024-03-31")
         assert months[0].query_end == "2024-02-01"  # padded past its own end
         assert months[1].query_end == "2024-03-01"
         assert months[-1].query_end == "2024-04-01", "the last month must still reach the following UTC day"
@@ -85,7 +85,7 @@ class TestMonthPartition:
         That applies to the FIRST month against the window's own start exactly as it
         applies between months; clamping it lost the first solar day's evening imagery.
         """
-        months = iter_month_ranges("2024-01-01", "2024-03-31")
+        months = month_ranges("2024-01-01", "2024-03-31")
         assert months[0].query_start == "2023-12-31", "the first month must still reach the preceding UTC day"
         assert months[1].query_start == "2024-01-31"
         assert months[2].query_start == "2024-02-29"
@@ -97,7 +97,7 @@ class TestMonthPartition:
         stopping an out-of-window solar day from being written is the ownership filter.
         Pin that the owned ranges stay inside the requested window exactly.
         """
-        months = iter_month_ranges("2024-01-01", "2024-12-31")
+        months = month_ranges("2024-01-01", "2024-12-31")
         assert months[0].own_start == "2024-01-01"
         assert months[-1].own_end == "2024-12-31"
         assert months[0].query_start < months[0].own_start
@@ -107,18 +107,18 @@ class TestMonthPartition:
         """The padded day is OWNED by the next month, so overlap in the query does not
         become overlap in the work.
         """
-        a, b = iter_month_ranges("2024-01-01", "2024-02-29")[:2]
+        a, b = month_ranges("2024-01-01", "2024-02-29")[:2]
         assert a.query_end == b.own_start
         assert b.query_start <= a.own_end  # the pads overlap...
         assert a.own_end < b.own_start  # ...but the owned ranges never do
 
     def test_leap_day_is_owned(self):
-        feb = next(mr for mr in iter_month_ranges("2024-01-01", "2024-12-31") if mr.own_start == "2024-02-01")
+        feb = next(mr for mr in month_ranges("2024-01-01", "2024-12-31") if mr.own_start == "2024-02-01")
         assert feb.own_end == "2024-02-29"
 
     def test_rejects_a_backwards_window(self):
         with pytest.raises(ValueError, match="precedes"):
-            iter_month_ranges("2024-03-01", "2024-01-01")
+            month_ranges("2024-03-01", "2024-01-01")
 
 
 class TestStreaming:

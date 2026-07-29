@@ -588,15 +588,64 @@ and a group we believe is one day then loads as TWO time slices against a cloud 
                        ^ far-eastern zones image right here
 ```
 
-The same disagreement decides how a query window is bounded. A STAC query is bounded in UTC
-while the ingest window is a range of SOLAR days, so at the window's own edges the two do not
-line up: the first owned solar day includes acquisitions dated the preceding UTC day at eastern
-longitudes, and the last owned solar day acquisitions dated the following UTC day at western
-ones. `iter_month_ranges` therefore pads both query ends by a day and does **not** clamp the
-pads to the window — clamping them made those acquisitions unfetchable by any slice, so the
-first and last day of a zone-year were written incomplete while `assessed_window` still claimed
-them and the month gate still passed. Out-of-window dates are excluded by the solar-day
-**ownership** filter, never by the query bound.
+### Solar days versus UTC queries (`solar_days.py`)
+
+The same disagreement decides how every query window is bounded, on every path, which is why
+it lives in one module — `ingest/solar_days.py` — instead of being re-derived per sensor.
+
+A catalogue query is bounded in **UTC**. An ingest window, and every chunk of it, is a range of
+**solar** days. Wherever a zone's offset crosses UTC midnight the two do not line up, and both
+ways of ignoring that have been in this codebase:
+
+- **Query the chunk's own range and write whatever comes back.** A solar day straddling the cut
+  is split: the earlier chunk writes it from its half, and the later chunk's half is then dropped
+  as an already-written date. The day lands looking complete and is missing acquisitions. The S1
+  batch loop did this at *every* batch boundary.
+- **Pad the query, but clamp the pad to the window.** The padding then vanishes at the window's
+  own two edges, so the first and last solar day of a zone-year lose whatever imagery was dated
+  the adjacent UTC day. The S2 month slicing did this.
+
+Both are silent: `assessed_window` still covers the days, and the month coverage gate still
+passes. Only a comparison against the catalogue would reveal them.
+
+The mechanism is one idea. A chunk **owns** a range of solar days and **queries** a wider range
+of UTC dates:
+
+```text
+                 own:            2024-01-31 .............. 2024-02-29
+                 query:   2024-01-30 ........................... 2024-03-01
+                          └─ pad ─┘                              └─ pad ─┘
+
+  a solar day landing on the cut is drawn from BOTH sides by the batch that owns it,
+  and is owned by exactly one batch, so it is written once and written whole
+```
+
+Owned ranges tile the window exactly, so nothing is processed twice and nothing outside the
+window is written — **ownership is what guarantees that, never the query bound**, which cannot
+see solar days at all. The pads are deliberately *not* clamped to the window, because a solar day
+owned at its very edge still draws on the UTC day beyond it. One day of padding is always enough:
+the offset is a whole number of hours in `[-12, +12]`, so solar day `D` lies inside UTC
+`[D-1, D+1]`.
+
+`owned_items` is applied **between the query and the loader**, never after loading. Filtered
+there, the loader builds a group only for an owned day and that group holds every image of it.
+Filtered afterwards, a straddling day has already been split into two partial groups and what is
+needed to rejoin them is gone.
+
+Three chunkings share it today, and a new provider adds a fourth by writing a span producer and
+nothing else:
+
+| producer | used by | chunk |
+|---|---|---|
+| `month_ranges` | S2, streaming (default) | one calendar month, to bound item retention |
+| `fixed_day_ranges` | S1 | `batch_days` solar days, to bound Dask graph size |
+| `whole_window_range` | S2, `stream_stac_monthly=False` | the window in one query |
+
+This rests on our offset arithmetic agreeing exactly with the loader's — both truncate
+longitude over fifteen to whole hours. If they diverged, an image could be filtered out as
+another chunk's while the loader would have grouped it into this one, dropping it from the run
+entirely. `solar_day_offset_seconds` is the single definition, and it is the reason
+`solar_grouping_longitude` prefers the geobox centroid over a bbox midpoint.
 
 That is why `group_items_by_date` takes a `mid_longitude`, and why the pre-sort uses the same key —
 the sort carries the painter's-algorithm contract (clearest tile last within a group), so sorting on

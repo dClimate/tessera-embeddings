@@ -51,7 +51,14 @@ from tessera_embeddings.ingest.live_windows import (
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import apply_roi_mask
-from tessera_embeddings.ingest.stac import ingest_tile, solar_day_offset_seconds, solar_grouping_longitude
+from tessera_embeddings.ingest.solar_days import (
+    SolarDayRange,
+    fixed_day_ranges,
+    owned_items,
+    solar_day_offset_seconds,
+    solar_grouping_longitude,
+)
+from tessera_embeddings.ingest.stac import ingest_tile
 from tessera_embeddings.ingest.transforms import amplitude_to_db
 from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
@@ -380,20 +387,18 @@ def ingest_s1_roi_sar(
         return out
 
     total_processed = 0
-    batch_start = datetime.strptime(start_date, "%Y-%m-%d")
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
-    # Inclusive batch windows of up to ``batch_days`` calendar days. CMR/STAC also treat
-    # their end date as inclusive, and each range starts the day after the previous one
-    # ends, so every day is queried by exactly one batch.
+    # Batches of up to ``batch_days`` SOLAR days, each querying a UTC range padded a day
+    # either side. The two are different ranges on purpose: cutting on UTC dates and
+    # writing every group the loader returned split any solar day landing on a cut, and
+    # the later batch's half was then discarded as an already-written date — so the day
+    # was committed missing acquisitions, at every boundary, in the zones whose offset
+    # puts UTC midnight near a satellite pass. ingest.solar_days owns that reasoning and
+    # the S2 month slicing uses the same mechanism.
     #
     # Materialised as a list rather than advanced in the loop because the look-ahead has
     # to know what comes next before the current batch is done with.
-    batch_ranges: list[tuple[str, str]] = []
-    while batch_start <= end_dt:
-        batch_end = min(batch_start + timedelta(days=batch_days - 1), end_dt)
-        batch_ranges.append((batch_start.strftime("%Y-%m-%d"), batch_end.strftime("%Y-%m-%d")))
-        batch_start = batch_end + timedelta(days=1)
+    batch_ranges: list[SolarDayRange] = fixed_day_ranges(start_date, end_date, batch_days)
 
     # Read ONCE, then maintained in-process as dates are written.
     #
@@ -419,7 +424,7 @@ def ingest_s1_roi_sar(
     # Frozen at the start so the background thread reads an object nothing mutates.
     already_present = frozenset(written_dates)
 
-    def _prepare_batch(rng: tuple[str, str]) -> _PreparedBatch:
+    def _prepare_batch(rng: SolarDayRange) -> _PreparedBatch:
         """Catalogue query plus lazy graph build for one batch. No cluster reads.
 
         Runs on the pipeline's background thread when ``pipeline_batches`` is on, so it
@@ -427,8 +432,15 @@ def ingest_s1_roi_sar(
         writes, and only the immutable snapshot of ``written_dates`` taken when the
         pipeline started.
         """
-        batch_start_str, batch_end_str = rng
-        log.info("[%s] Batch %s..%s: querying catalog", orbit, batch_start_str, batch_end_str)
+        batch_start_str, batch_end_str = rng.own_start, rng.own_end
+        log.info(
+            "[%s] Batch %s..%s: querying catalog (%s..%s)",
+            orbit,
+            batch_start_str,
+            batch_end_str,
+            rng.query_start,
+            rng.query_end,
+        )
 
         # Rebuild the lazy ROI mask per batch so frozen IAM creds inside any embedded
         # boto chain are fresh. Graph construction only; the actual S3 reads happen
@@ -448,14 +460,20 @@ def ingest_s1_roi_sar(
         base_provider = make_s1_item_provider(
             orbit,
             roi.bbox_wgs84,
-            batch_start_str,
-            batch_end_str,
+            rng.query_start,
+            rng.query_end,
             use_s3_direct=use_s3_direct,
         )
         seen_items: list = []
 
         def _capturing_provider() -> list:
-            items = base_provider()
+            # OWNERSHIP, applied here rather than after the load. The query deliberately
+            # reaches a day past this batch on both sides so that a solar day straddling
+            # a boundary is complete for whichever batch owns it; handing those pad-day
+            # items to the loader as well would have it build a partial group for the
+            # NEIGHBOUR's day, which the write loop would then commit. Filtering first
+            # means the loader only ever sees whole days that are ours.
+            items = owned_items(base_provider(), rng, mid_longitude=mid_longitude)
             seen_items.extend(items)
             return items
 
@@ -464,8 +482,8 @@ def ingest_s1_roi_sar(
             provider="cmr-asf",
             collection="opera-rtc-s1",
             tile_id=None,
-            start_date=batch_start_str,
-            end_date=batch_end_str,
+            start_date=rng.query_start,
+            end_date=rng.query_end,
             # The snapshot, not the live set: a background thread must not read a set the
             # write loop is mutating. Anything it misses is caught when consuming.
             existing_dates=set(already_present),

@@ -62,12 +62,16 @@ from tessera_embeddings.ingest.live_windows import (
 )
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
+from tessera_embeddings.ingest.solar_days import (
+    owned_items,
+    solar_day_offset_seconds,
+    solar_grouping_longitude,
+    whole_window_range,
+)
 from tessera_embeddings.ingest.stac import (
     group_items_by_date,
     load_stac_items,
     query_stac_items,
-    solar_day_offset_seconds,
-    solar_grouping_longitude,
     stream_stac_months,
 )
 from tessera_embeddings.storage.manifest import IngestManifest
@@ -704,12 +708,18 @@ def ingest_s2_roi_reflectance(
         ):
             _drive(month_items, month_baselines)
     else:
+        # One query for the whole window, and it needs the SAME own-versus-query
+        # separation the streamed path uses. Asking for exactly [start, end] cannot
+        # return the imagery that belongs to the first and last solar day but carries an
+        # adjacent UTC date, so those two days were quietly written short. The range
+        # pads the query and still owns only the window — see ingest.solar_days.
+        window = whole_window_range(start_date, end_date)
         items, baselines = query_stac_items(
             provider=provider,
             collection=collection,
             tile_id=None,
-            start_date=start_date,
-            end_date=end_date,
+            start_date=window.query_start,
+            end_date=window.query_end,
             existing_dates=get_existing_dates(reflectance_store, s3_region=s3_region),
             bbox=roi.bbox_wgs84,
             # The committed dates are SOLAR days (that is what _drive groups and writes),
@@ -717,8 +727,9 @@ def ingest_s2_roi_reflectance(
             # passes the same value for the same reason.
             mid_longitude=mid_longitude,
         )
-        if items:
-            _drive(items, baselines)
+        owned = owned_items(items, window, mid_longitude=mid_longitude)
+        if owned:
+            _drive(owned, baselines)
 
     log.info("%d/%d dates passed coverage filter", total_processed, total_seen)
 

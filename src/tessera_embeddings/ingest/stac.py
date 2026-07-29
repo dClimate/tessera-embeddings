@@ -8,13 +8,11 @@ Supports multiple providers (Earth Search, Planetary Computer) and collections
 (Sentinel-2 L2A, Sentinel-1 GRD, Landsat).
 """
 
-import calendar
 import datetime
 import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -34,6 +32,12 @@ from tessera_embeddings.config import (
 from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest._http import make_logging_retry
+from tessera_embeddings.ingest.solar_days import (
+    SolarDayRange,
+    month_ranges,
+    owned_items,
+    solar_day_offset_seconds,
+)
 
 # =============================================================================
 # GDAL/Rasterio Configuration
@@ -840,17 +844,6 @@ def load_stac_items(
     return data
 
 
-def solar_day_offset_seconds(mid_longitude: float) -> int:
-    """UTC-to-solar-day offset for a longitude, in whole hours.
-
-    Mirrors ``odc.stac``'s own conversion exactly, including the truncation to whole
-    hours. Matching it matters more than being astronomically precise: the two must
-    agree on which day an acquisition belongs to, and any divergence reappears as a
-    date group that loads with more time slices than the caller grouped for.
-    """
-    return int(mid_longitude / 15) * 3600
-
-
 def group_items_by_date(items: list[Any], *, mid_longitude: float | None = None) -> dict[str, list[Any]]:
     """Group STAC items by day, matching how the loader will group them.
 
@@ -1007,85 +1000,6 @@ def ingest_tile(
     return data, baselines
 
 
-@dataclass(frozen=True)
-class MonthRange:
-    """One calendar month's slice of a query window: what to ASK for vs what to KEEP.
-
-    ``query_*`` is the range handed to the STAC query; ``own_*`` is the range of
-    calendar dates this slice is responsible for. They differ by a day of padding at
-    each end — see :func:`iter_month_ranges`.
-    """
-
-    query_start: str
-    query_end: str
-    own_start: str
-    own_end: str
-
-
-def iter_month_ranges(start_date: str, end_date: str) -> list[MonthRange]:
-    """Partition an inclusive ``[start_date, end_date]`` window into calendar months.
-
-    Owned ranges PARTITION the window: every calendar date belongs to exactly one
-    month, so a date can never be processed twice or skipped. That is what makes the
-    slices independent — no cross-month state is needed to deduplicate, which matters
-    because the ingest runs on a worker that may be restarted at any point.
-
-    Both query ends are padded by one day and the padding cannot cause
-    double-processing, because ownership is decided separately.
-
-    The pads are NOT clamped to the window, and that is load-bearing rather than
-    sloppy. The window is expressed in SOLAR days, but a STAC query is bounded in UTC,
-    so at the window's own edges the two disagree: the first owned solar day can include
-    acquisitions whose UTC date is the day BEFORE the window starts (eastern longitudes),
-    and the last owned solar day acquisitions whose UTC date is the day AFTER it ends
-    (western). Clamping the query to the window made those unfetchable by any slice, so
-    the edge solar days were written with part of their imagery missing — silently, since
-    ``assessed_window`` still covered them and the month gate still passed. What keeps
-    out-of-window dates out of the store is the ownership filter below, which compares
-    SOLAR days; the query bound never was that guard and could not be.
-
-    The END pad exists because a date-only interval end is expanded to that day's last
-    second: without it, items in the final seconds of a month's last day could fall
-    outside every slice's query. The START pad exists for solar-day ownership: an
-    acquisition late on the last UTC day of a month has a SOLAR day in the next month
-    at eastern longitudes (:func:`solar_day_offset_seconds`), so the month that owns it
-    must ask for the day before its own range or the item is never fetched by anyone.
-
-    Args:
-        start_date: Inclusive window start, ``YYYY-MM-DD``.
-        end_date: Inclusive window end, ``YYYY-MM-DD``.
-
-    Returns:
-        One :class:`MonthRange` per calendar month intersecting the window, in order.
-
-    Raises:
-        ValueError: If ``end_date`` precedes ``start_date``.
-    """
-    start = datetime.date.fromisoformat(start_date)
-    end = datetime.date.fromisoformat(end_date)
-    if end < start:
-        raise ValueError(f"end_date {end_date} precedes start_date {start_date}")
-
-    ranges: list[MonthRange] = []
-    year, month = start.year, start.month
-    while (year, month) <= (end.year, end.month):
-        last_day = calendar.monthrange(year, month)[1]
-        own_start = max(start, datetime.date(year, month, 1))
-        own_end = min(end, datetime.date(year, month, last_day))
-        query_end = own_end + datetime.timedelta(days=1)
-        query_start = own_start - datetime.timedelta(days=1)
-        ranges.append(
-            MonthRange(
-                query_start=query_start.isoformat(),
-                query_end=query_end.isoformat(),
-                own_start=own_start.isoformat(),
-                own_end=own_end.isoformat(),
-            )
-        )
-        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-    return ranges
-
-
 def _prefetch[A, T](fn: Callable[[A], T], arg: A) -> Callable[[], T]:
     """Start ``fn(arg)`` on a DAEMON thread; return a callable that waits for it.
 
@@ -1138,7 +1052,7 @@ def stream_stac_months(
     query_fn: Callable[..., tuple[list[Any], dict[str, int]]] | None = None,
     mid_longitude: float | None = None,
     log: logging.Logger | logging.LoggerAdapter | None = None,
-) -> Iterator[tuple[MonthRange, list[Any], dict[str, int]]]:
+) -> Iterator[tuple[SolarDayRange, list[Any], dict[str, int]]]:
     """Yield one calendar month of STAC items at a time, prefetching the next.
 
     Exists because querying a whole window up front retains every item for the run's
@@ -1185,10 +1099,10 @@ def stream_stac_months(
     """
     log = log or logger
     fetch = query_fn or query_stac_items
-    months = iter_month_ranges(start_date, end_date)
+    months = month_ranges(start_date, end_date)
     log.info("Streaming the STAC query over %d month(s) of %s..%s", len(months), start_date, end_date)
 
-    def run(mr: MonthRange) -> tuple[list[Any], dict[str, int]]:
+    def run(mr: SolarDayRange) -> tuple[list[Any], dict[str, int]]:
         # Logged at SUBMIT time, not yield time: whether the prefetch is actually
         # overlapping is otherwise only inferable from the gap between one month's last
         # commit and the next month's first, which is a weak signal in a long run.
@@ -1211,19 +1125,15 @@ def stream_stac_months(
         log.info("Queried %s..%s in %.1fs", mr.query_start, mr.query_end, time.monotonic() - t0)
         return result
 
-    day_offset = datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
     # One query in flight, one month in the caller's hands: the depth-1 buffer.
     pending = _prefetch(run, months[0]) if months else None
     for i, mr in enumerate(months):
         items, baselines = pending()  # type: ignore[misc]
         if i + 1 < len(months):
             pending = _prefetch(run, months[i + 1])
-        # Ownership by SOLAR day when the load groups by solar day, matching
-        # group_items_by_date. Partitioning on the UTC date instead splits one solar
-        # day across two months wherever the offset crosses midnight — the far-eastern
-        # and far-western zones — and the two halves then arrive as separate writes
-        # for a single day: a duplicate timestamp, or half the day's imagery.
-        owned = [it for it in items if mr.own_start <= (it.datetime + day_offset).strftime("%Y-%m-%d") <= mr.own_end]
+        # Ownership by SOLAR day, applied BEFORE the loader sees an item — see
+        # ingest.solar_days for why the queried range and the owned range differ.
+        owned = owned_items(items, mr, mid_longitude=mid_longitude)
         dropped = len(items) - len(owned)
         if not owned:
             log.info("Month %s..%s: no new items", mr.own_start, mr.own_end)
@@ -1236,30 +1146,3 @@ def stream_stac_months(
             f" ({dropped} outside the month)" if dropped else "",
         )
         yield mr, owned, baselines
-
-
-def solar_grouping_longitude(roi: object) -> float | None:
-    """The longitude to group solar days by, matching the loader's own choice.
-
-    The loader shifts every item by ONE longitude — its geobox extent's centroid in
-    WGS84 — so preferring the geobox here makes the two agree by construction rather
-    than by approximation. Both must land on the same whole-hour offset, and a bbox
-    midpoint can differ from an extent centroid by enough to cross a 15-degree
-    boundary and so disagree.
-
-    Falls back to the WGS84 bbox midpoint, then to ``None``, which restores UTC-date
-    grouping. Degrading rather than raising is deliberate: a missing geobox is a
-    caller that is not loading by solar day, and no longitude is recoverable from
-    nothing.
-    """
-    geobox = getattr(roi, "geobox", None)
-    if geobox is not None:
-        try:
-            ((lon, _),) = geobox.extent.centroid.to_crs("epsg:4326").points
-            return float(lon)
-        except (AttributeError, TypeError, ValueError):
-            pass
-    bbox = getattr(roi, "bbox_wgs84", None)
-    if bbox is not None and len(bbox) >= 3:
-        return (float(bbox[0]) + float(bbox[2])) / 2.0
-    return None

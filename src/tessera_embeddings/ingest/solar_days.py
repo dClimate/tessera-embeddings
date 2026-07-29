@@ -1,0 +1,236 @@
+"""Solar-day ownership for catalogue queries that are bounded in UTC.
+
+Every ingest in this package has the same shape: slice a date window into chunks, ask
+a catalogue for each chunk, then let the loader group the returned images into **solar
+days**. The catch is that the window and the chunks are expressed in solar days while
+the query is bounded in **UTC**, and the two disagree wherever a region's solar offset
+crosses UTC midnight — the far-eastern and far-western zones.
+
+Getting that wrong is silent, which is why it belongs in one module instead of being
+re-derived per provider. Both spellings of the mistake have been in this codebase:
+
+* **Query the chunk's own range and write everything you get.** A solar day straddling
+  the cut is split. The earlier chunk writes it from its half; the later chunk's half
+  is then dropped as an already-written date, so the day lands looking complete and is
+  missing acquisitions. This is what the S1 batch loop did at every batch boundary.
+* **Pad the query but clamp the pad to the window.** The padding then vanishes at the
+  window's own two edges, so the first and last solar day of the run lose the
+  acquisitions dated the adjacent UTC day. This is what the S2 month slicing did.
+
+The fix is one idea, and it is the whole content of this module: a chunk **owns** a
+range of solar days and **queries** a wider range of UTC dates. Owned ranges tile the
+window exactly, so nothing is processed twice and nothing outside the window is written
+— the ownership filter is what guarantees that, never the query bound, which cannot see
+solar days at all. The query is padded a day either side and is NOT clamped, because a
+solar day owned at the very edge of the window still draws on the UTC day beyond it.
+
+One day of padding is always enough: the offset is a whole number of hours in
+``[-12, +12]``, so solar day ``D`` lies entirely within UTC ``[D-1, D+1]``.
+
+Adding a provider means adding a span producer. It does not mean re-deriving any of
+the above.
+
+    ranges = fixed_day_ranges("2024-01-01", "2024-12-31", 30)
+    for rng in ranges:
+        items = catalogue_query(rng.query_start, rng.query_end)
+        mine = owned_items(items, rng, mid_longitude=lon)   # hand only these to the loader
+
+Filtering the ITEMS, before the loader sees them, is what makes this work for both
+paths at once. The loader then builds a group only for a day the chunk owns, and every
+day it owns arrives whole because the query reached a day either side.
+"""
+
+from __future__ import annotations
+
+import calendar
+import datetime
+from dataclasses import dataclass
+from typing import Any, final
+
+__all__ = [
+    "SolarDayRange",
+    "fixed_day_ranges",
+    "month_ranges",
+    "owned_items",
+    "solar_day_of",
+    "solar_day_offset_seconds",
+    "solar_grouping_longitude",
+    "whole_window_range",
+]
+
+#: Padding applied to each side of a chunk's query range, in days. One is sufficient
+#: and two would only widen the catalogue call: the solar offset is a whole number of
+#: hours no larger than 12, so a solar day never reaches further than the adjacent UTC
+#: day in either direction.
+_QUERY_PAD = datetime.timedelta(days=1)
+
+
+def solar_day_offset_seconds(mid_longitude: float) -> int:
+    """UTC-to-solar-day offset for a longitude, in whole hours.
+
+    Mirrors ``odc.stac``'s own conversion exactly, including the truncation to whole
+    hours. Matching it matters more than being astronomically precise: the two must
+    agree on which day an acquisition belongs to, and any divergence reappears as a
+    date group that loads with more time slices than the caller grouped for.
+
+    This agreement is load-bearing for :func:`owned_items` in particular. That filter
+    decides which images the loader is allowed to see, so if our offset and the
+    loader's ever disagreed at a 15-degree boundary, an image could be filtered out as
+    another chunk's while the loader would have grouped it into this one — dropping it
+    from the run entirely rather than merely mislabelling it.
+    """
+    return int(mid_longitude / 15) * 3600
+
+
+def solar_grouping_longitude(roi: object) -> float | None:
+    """The longitude to group solar days by, matching the loader's own choice.
+
+    The loader shifts every item by ONE longitude — its geobox extent's centroid in
+    WGS84 — so preferring the geobox here makes the two agree by construction rather
+    than by approximation. Both must land on the same whole-hour offset, and a bbox
+    midpoint can differ from an extent centroid by enough to cross a 15-degree
+    boundary and so disagree.
+
+    Falls back to the WGS84 bbox midpoint, then to ``None``, which restores UTC-date
+    grouping. Degrading rather than raising is deliberate: a missing geobox is a
+    caller that is not loading by solar day, and no longitude is recoverable from
+    nothing.
+    """
+    geobox = getattr(roi, "geobox", None)
+    if geobox is not None:
+        try:
+            ((lon, _),) = geobox.extent.centroid.to_crs("epsg:4326").points
+            return float(lon)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    bbox = getattr(roi, "bbox_wgs84", None)
+    if bbox is not None and len(bbox) >= 3:
+        return float((bbox[0] + bbox[2]) / 2.0)
+    return None
+
+
+def solar_day_of(item: Any, *, mid_longitude: float | None) -> str:  # noqa: ANN401 — any STAC-like item
+    """The ``YYYY-MM-DD`` solar day ``item`` belongs to.
+
+    ``mid_longitude`` of ``None`` means the caller is not grouping by solar day, and
+    the UTC date is returned unchanged — the same degradation
+    :func:`solar_grouping_longitude` describes.
+    """
+    offset = datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
+    return (item.datetime + offset).strftime("%Y-%m-%d")
+
+
+@final
+@dataclass(frozen=True)
+class SolarDayRange:
+    """One chunk of an ingest window: the solar days it owns, the UTC dates it asks for.
+
+    ``own_start``/``own_end`` are inclusive solar days and are what decides whether an
+    image is processed here. ``query_start``/``query_end`` are inclusive UTC dates and
+    are only ever handed to a catalogue. Keeping them apart is the entire point of this
+    type — see the module docstring for what happens each time they are conflated.
+    """
+
+    own_start: str
+    own_end: str
+    query_start: str
+    query_end: str
+
+    def owns(self, solar_day: str) -> bool:
+        """Whether ``solar_day`` (``YYYY-MM-DD``) is this chunk's to process."""
+        return self.own_start <= solar_day <= self.own_end
+
+
+def _padded(spans: list[tuple[datetime.date, datetime.date]]) -> list[SolarDayRange]:
+    """Turn owned spans into ranges, padding the query a day either side.
+
+    The pad is deliberately NOT clamped to the spans' collective extent. Clamping it
+    was the S2 bug: at the first and last chunk the padding disappeared, and the edge
+    solar days lost whatever imagery was dated the adjacent UTC day. Nothing
+    out-of-window escapes as a result, because the owned spans are what gate writing
+    and they are unchanged.
+    """
+    return [
+        SolarDayRange(
+            own_start=own_start.isoformat(),
+            own_end=own_end.isoformat(),
+            query_start=(own_start - _QUERY_PAD).isoformat(),
+            query_end=(own_end + _QUERY_PAD).isoformat(),
+        )
+        for own_start, own_end in spans
+    ]
+
+
+def _window(start_date: str, end_date: str) -> tuple[datetime.date, datetime.date]:
+    start = datetime.date.fromisoformat(start_date)
+    end = datetime.date.fromisoformat(end_date)
+    if end < start:
+        raise ValueError(f"end_date {end_date} precedes start_date {start_date}")
+    return start, end
+
+
+def month_ranges(start_date: str, end_date: str) -> list[SolarDayRange]:
+    """One range per calendar month intersecting ``[start_date, end_date]``.
+
+    Used by the S2 reflectance ingest, which streams a month at a time so that item
+    retention stays bounded: a zone-year is hundreds of thousands of items and holding
+    them all exhausts the worker long before the first date is written.
+
+    Owned ranges PARTITION the window — every calendar date belongs to exactly one
+    month — which is what makes the slices independent. No cross-month state is needed
+    to deduplicate, and that matters because the worker can be restarted at any point.
+    """
+    start, end = _window(start_date, end_date)
+    spans: list[tuple[datetime.date, datetime.date]] = []
+    year, month = start.year, start.month
+    while (year, month) <= (end.year, end.month):
+        last_day = calendar.monthrange(year, month)[1]
+        spans.append((max(start, datetime.date(year, month, 1)), min(end, datetime.date(year, month, last_day))))
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return _padded(spans)
+
+
+def fixed_day_ranges(start_date: str, end_date: str, days: int) -> list[SolarDayRange]:
+    """One range per ``days``-long run of solar days across ``[start_date, end_date]``.
+
+    Used by the S1 SAR ingest, which walks the window in batches to keep each Dask
+    graph manageable rather than to bound item retention.
+
+    The spans are runs of SOLAR days, not UTC dates. That is the correction: the batch
+    loop used to cut on UTC dates and write every group the loader produced, which
+    truncated any solar day landing on a cut.
+    """
+    if days < 1:
+        raise ValueError(f"days must be >= 1, got {days}")
+    start, end = _window(start_date, end_date)
+    spans: list[tuple[datetime.date, datetime.date]] = []
+    span_start = start
+    while span_start <= end:
+        span_end = min(span_start + datetime.timedelta(days=days - 1), end)
+        spans.append((span_start, span_end))
+        span_start = span_end + datetime.timedelta(days=1)
+    return _padded(spans)
+
+
+def whole_window_range(start_date: str, end_date: str) -> SolarDayRange:
+    """A single range owning the entire window.
+
+    For callers that query the window in one shot — the S2 path with monthly streaming
+    turned off. It needs the padding for exactly the same reason the sliced paths do:
+    without it the first and last solar day of the run are queried on a UTC bound that
+    excludes part of their imagery.
+    """
+    start, end = _window(start_date, end_date)
+    return _padded([(start, end)])[0]
+
+
+def owned_items(items: list[Any], rng: SolarDayRange, *, mid_longitude: float | None) -> list[Any]:
+    """The subset of ``items`` whose solar day ``rng`` owns.
+
+    Apply this between the catalogue query and the loader, never after loading. Filtered
+    here, the loader builds a group only for an owned day and that group holds every
+    image of it, because the query reached a day either side. Filtered after loading, a
+    straddling day has already been split into two partial groups and the information
+    needed to rejoin them is gone.
+    """
+    return [it for it in items if rng.owns(solar_day_of(it, mid_longitude=mid_longitude))]

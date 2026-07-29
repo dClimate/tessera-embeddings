@@ -19,7 +19,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from tessera_embeddings.ingest.stac import group_items_by_date, solar_day_offset_seconds
+from tessera_embeddings.ingest.solar_days import solar_day_offset_seconds
+from tessera_embeddings.ingest.stac import group_items_by_date
 
 # +10 h: the offset for UTM zone 56 (150-156 E), where the failure was observed.
 FAR_EAST_LON = 153.0

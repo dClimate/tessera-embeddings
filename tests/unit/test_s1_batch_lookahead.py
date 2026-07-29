@@ -102,12 +102,20 @@ def test_prepare_exceptions_surface_when_the_batch_is_consumed() -> None:
     assert consumed == [0], f"batch 0 should have been consumed before the failure: {consumed}"
 
 
-def _run_ingest(monkeypatch, batch_dates: dict[str, list[str]], existing: set[str], **kwargs) -> list[str]:
+def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs) -> list[str]:
     """Drive ``ingest_s1_roi_sar`` against a faked catalogue and store.
 
-    ``batch_dates`` maps a batch's start date to the solar dates its query returns, which
-    is how a shared boundary day is expressed: name it in two consecutive batches.
+    ``catalogue`` is every solar date the catalogue holds; the fake returns the ones
+    inside whatever range each batch asks for, which is what a real catalogue does.
     Returns the dates actually written, in order.
+
+    That range is deliberately WIDER than the batch owns — ``fixed_day_ranges`` pads it a
+    day either side so a solar day straddling a boundary is complete for whichever batch
+    owns it. A boundary day therefore comes back from two consecutive queries, and this
+    fake reproduces that faithfully: it stands in for ``ingest_tile``, which is upstream
+    of the ownership filter, so what these tests exercise is the write loop's in-process
+    dedup — the backstop behind ownership. Ownership itself is covered in
+    test_solar_days.
 
     Writes go a date at a time through ``write_day_windows`` — the only writer this
     module has now that cropping is unconditional and the whole-batch ``write_dataset``
@@ -120,8 +128,8 @@ def _run_ingest(monkeypatch, batch_dates: dict[str, list[str]], existing: set[st
 
     written: list[str] = []
 
-    def fake_ingest_tile(*, start_date: str, existing_dates=None, **_):
-        dates = batch_dates.get(start_date, [])
+    def fake_ingest_tile(*, start_date: str, end_date: str, existing_dates=None, **_):
+        dates = [d for d in catalogue if start_date <= d <= end_date]
         if not dates:
             return None, {}
         ds = xr.Dataset(
@@ -177,14 +185,15 @@ _WRITE_PATHS = [pytest.param(pipe, id="lookahead" if pipe else "serial") for pip
 def test_a_solar_day_in_two_batches_is_written_once(monkeypatch, pipe: bool) -> None:
     """The rule the in-process written-date set exists to enforce, through the real loop.
 
-    Two consecutive batches both report 2024-01-02, which is what a UTC-cut boundary
-    falling inside a solar day produces. Committing it twice puts a duplicate timestamp
-    on the time axis — caught by the store's guard on the cropped path, silent on the
-    full-extent one.
+    Batches own two days each, so 2024-01-02 is owned by the first and 2024-01-03 begins
+    the second — but the queries are padded a day either side, so both of them RETURN
+    2024-01-02. That overlap is deliberate and permanent: it is what makes a straddling
+    solar day complete for its owner. Committing it twice would put a duplicate timestamp
+    on the time axis, so the write loop dedups against what it has already written.
     """
     written = _run_ingest(
         monkeypatch,
-        batch_dates={"2024-01-01": ["2024-01-01", "2024-01-02"], "2024-01-03": ["2024-01-02", "2024-01-04"]},
+        catalogue=["2024-01-01", "2024-01-02", "2024-01-04"],
         existing=set(),
         pipeline_batches=pipe,
     )
@@ -198,7 +207,7 @@ def test_dates_already_in_the_store_are_skipped_on_resume(monkeypatch, pipe: boo
     written = _run_ingest(
         monkeypatch,
         pipeline_batches=pipe,
-        batch_dates={"2024-01-01": ["2024-01-01", "2024-01-02"], "2024-01-03": ["2024-01-03"]},
+        catalogue=["2024-01-01", "2024-01-02", "2024-01-03"],
         existing={"2024-01-01"},
     )
     assert written == ["2024-01-02", "2024-01-03"]
@@ -408,7 +417,7 @@ def test_the_assessed_window_is_recorded_when_a_resume_writes_no_new_date(monkey
 
     written = _run_ingest(
         monkeypatch,
-        batch_dates={"2024-01-01": ["2024-01-01", "2024-01-02"]},
+        catalogue=["2024-01-01", "2024-01-02"],
         existing={"2024-01-01", "2024-01-02"},
     )
 
@@ -427,7 +436,7 @@ def test_no_assessed_window_is_recorded_when_the_orbit_store_does_not_exist(monk
     recorded: list[str] = []
     monkeypatch.setattr(s1_roi, "record_assessed_window", lambda path, *_a, **_k: recorded.append(path))
 
-    written = _run_ingest(monkeypatch, batch_dates={}, existing=set())
+    written = _run_ingest(monkeypatch, catalogue=[], existing=set())
 
     assert written == []
     assert recorded == []

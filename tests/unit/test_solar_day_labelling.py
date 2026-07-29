@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import datetime as dt
 
-from tessera_embeddings.ingest.stac import group_items_by_date, solar_day_offset_seconds
+from tessera_embeddings.ingest.solar_days import solar_day_offset_seconds
+from tessera_embeddings.ingest.stac import group_items_by_date
 
 #: 56N's centroid: 153 E, a +10 h offset, the zone where this actually fired.
 FAR_EAST_LON = 153.0
