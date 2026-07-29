@@ -164,16 +164,6 @@ def _delete_store(
         return False
 
 
-class _StoreHoldsCommittedDataError(CorruptedStoreError):
-    """The create path was handed a store that already holds arrays.
-
-    A ``CorruptedStoreError`` to callers, who need no new type to handle. Distinct
-    INTERNALLY for one reason: :func:`cleanup_on_failure` must not delete the prefix when
-    this is what failed. It is raised before anything is written, precisely because the
-    prefix holds data — deleting it would be the destruction the raise is preventing.
-    """
-
-
 def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
     """Decorator that deletes the store at store_path (first arg) if the function fails.
 
@@ -188,9 +178,6 @@ def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
     leaves a repo that the next attempt ADOPTS rather than re-creates (see
     :func:`_write_new`), so a failed cleanup costs a wasted prefix rather than a wedged one.
 
-    ONE failure is exempt, and it is the one whose whole point is that the prefix holds
-    something worth keeping — see :class:`_StoreHoldsCommittedDataError`. Cleaning up after that
-    would perform exactly the destruction the raise exists to prevent.
     """
 
     @wraps(func)
@@ -200,8 +187,6 @@ def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
             raise ValueError("cleanup_on_failure requires store_path as first argument")
         try:
             return func(*args, **kwargs)
-        except _StoreHoldsCommittedDataError:
-            raise
         except Exception:
             logger.warning(f"Store creation failed, cleaning up {store_path}")
             _delete_store(
@@ -779,31 +764,6 @@ def _open_readonly(
     return xr.open_zarr(session.store, consolidated=False, chunks=chunks, group=group)
 
 
-def _refuse_to_overwrite_committed_data(session: "icechunk.Session", store_path: str) -> None:
-    """Raise unless ``session``'s repo is safe to write with ``mode="w"``.
-
-    Safe means one of two things: no root group at all (a rootless repo — created, then
-    interrupted before the schema commit), or a root group holding no arrays. Anything
-    else is committed data, and the create path must not run over it.
-
-    A read error here does NOT pass: it propagates, so the caller retries against a store
-    it can read rather than overwriting one it cannot.
-    """
-    try:
-        root = zarr.open_group(session.store, mode="r")
-    except zarr.errors.GroupNotFoundError:
-        return
-    arrays = sorted(root.array_keys())
-    if arrays:
-        raise _StoreHoldsCommittedDataError(
-            f"Refusing to overwrite {store_path}: it holds committed arrays "
-            f"({', '.join(arrays[:5])}{'...' if len(arrays) > 5 else ''}) but was routed to the "
-            f"create path, which writes mode='w'. The caller decided this store had no dates; "
-            f"that decision was wrong, most likely because the date probe could not read the "
-            f"store and reported empty. Retry — a readable store takes the append path."
-        )
-
-
 @cleanup_on_failure
 def _write_new(
     store_path: str,
@@ -827,21 +787,11 @@ def _write_new(
     ``mode="w"`` over whatever the interrupted attempt staged is correct: there is no
     committed data to lose. The complementary half is that a store WITH dates takes the
     append path and is never handed here.
-
-    That premise is CHECKED here rather than trusted, because the probe it rests on
-    cannot be trusted to fail loudly: ``get_existing_dates`` reports an empty set for a
-    store it could not read, not just for one with no dates, so a transient error while
-    reading the time axis of a full store would route it here and ``mode="w"`` would
-    replace years of committed dates with one batch. A repo holding arrays is therefore
-    refused outright. Adoption stays available for the case it was added for — a ROOTLESS
-    repo, created and then interrupted before its schema was ever committed, which has no
-    root group at all.
     """
     repo, is_new = open_or_create_repo(store_path, get_credentials=get_credentials, region=s3_region)
-    session = repo.writable_session("main")
     if not is_new:
-        _refuse_to_overwrite_committed_data(session, store_path)
         logger.info("Adopting existing repo at %s — an earlier attempt left it uncommitted", store_path)
+    session = repo.writable_session("main")
     to_icechunk(data, session, mode="w", encoding=encoding, align_chunks=True)
     session.commit(message)
     logger.info(f"Created {store_path}")

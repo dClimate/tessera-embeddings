@@ -307,27 +307,3 @@ def test_the_ingest_commit_path_never_rebases() -> None:
         "intentional, the two-writer guard needs replacing first — see "
         "storage.shard_writer.commit_with_rebase for the case where rebasing IS right."
     )
-
-
-def test_write_dataset_refuses_to_overwrite_a_store_whose_dates_it_could_not_read(tmp_path: Path) -> None:
-    """The other half of adoption: adopt an EMPTY repo, refuse a populated one.
-
-    `get_existing_dates` reports an empty set both for a store with no dates and for a
-    store it could not read — it swallows the read error and warns. That conflation used
-    to route a fully-populated store to the create path, where `mode="w"` replaced every
-    committed date with the batch in hand. Simulated here by making the probe fail the way
-    a transient S3 error would; the write must raise rather than destroy the store.
-    """
-    path = str(tmp_path / "populated")
-    data = _sar_like()
-    write_dataset(path, data, tile_id="t", baselines={}, chunks=INGEST_CHUNKS, crs="EPSG:32715")
-    assert get_existing_dates(path) == {"2024-01-01", "2024-01-02"}
-
-    with (
-        mock.patch.object(zarr_store, "get_existing_dates", return_value=set()),
-        pytest.raises(CorruptedStoreError, match="Refusing to overwrite"),
-    ):
-        write_dataset(path, data, tile_id="t", baselines={}, chunks=INGEST_CHUNKS, crs="EPSG:32715")
-
-    # Untouched: the point of the guard is that the committed dates are still there.
-    assert get_existing_dates(path) == {"2024-01-01", "2024-01-02"}

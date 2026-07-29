@@ -141,12 +141,12 @@ Two supported paths:
    [`docs/providers/adding-your-own.md`](docs/providers/adding-your-own.md).
 
 Ingest cost scales with the area you actually keep, not your ROI's
-bounding extent: with `crop_to_live_windows` on, the mosaic loads and
-writes are restricted to the chunk-aligned windows that intersect the
-ROI mask (measured campaign-wide: ~4.3× less compute; a sparse island
-zone drops from 3,706 chunks per band-date to 4). Same flag serves a
-single sparse ROI and a global campaign zone. See
-[the ingest README](src/tessera_embeddings/ingest/README.md#cropping-to-live-windows-crop_to_live_windows).
+bounding extent: mosaic loads and writes are restricted to the
+chunk-aligned windows that intersect the ROI mask (measured
+campaign-wide: ~4.3× less compute; a sparse island zone drops from
+3,706 chunks per band-date to 4). This is unconditional and has no
+flag — it serves a single sparse ROI and a global campaign zone alike.
+See [the ingest README](src/tessera_embeddings/ingest/README.md#cropping-to-live-windows-unconditional).
 
 ### Profiling a run
 
@@ -335,13 +335,9 @@ Four write paths, all committing atomically (`storage/zarr_store.py` has
 the first three; `inference/assembly.py` + `storage/shard_writer.py` the
 fourth):
 
-1. **create** — `write_dataset` on a fresh store. It adopts a repo an
+1. **create** — `write_dataset` on a fresh store; it adopts a repo an
    interrupted attempt left behind rather than failing forever on a dirty
-   prefix, but refuses outright to run its `mode="w"` write over a store
-   that holds committed arrays — the date probe that routes writes here
-   reports "empty" for a store it merely could not read, and without the
-   refusal a transient read error would replace years of dates with one
-   batch;
+   prefix;
 2. **append** — extend the time axis of an existing store;
 3. **region overwrite** — rewrite a temporal/spatial slice in place;
 4. **shard-assemble** — staged inference tiles written as whole, lean
