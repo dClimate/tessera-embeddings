@@ -371,10 +371,13 @@ ACTORS_V2 = 153
 #: already pays. Five hours crosses to the next landing and buys 2.2 h of extra delay per
 #: cluster-year — ~158 h across 72 cluster-years — for no additional safety.
 #:
-#: 4.5 rather than 4.25 because 4.25 sits on the plateau's edge, and the ingest durations
-#: underneath are modelled with a 2x unresolved disagreement. Mid-plateau costs nothing and
-#: absorbs some of that.
-BANK_WORK_HOURS = 4.5
+#: 4.25 is the threshold itself — the lowest value that clears the envelope. Set deliberately
+#: at the edge rather than mid-plateau: anywhere in the band costs the same delay, so the only
+#: thing a higher value buys is margin against the MODEL, and the model's own uncertainty is
+#: in the ingest durations underneath (a 2x unresolved disagreement), which a fifth of an hour
+#: does not meaningfully cover either way. Sitting on the threshold keeps the number honest
+#: about what was actually shown, and the envelope test is what defends it.
+BANK_WORK_HOURS = 4.25
 
 
 @pytest.mark.parametrize("speed", INGEST_SPEED_CASES.values(), ids=INGEST_SPEED_CASES.keys())
@@ -440,9 +443,11 @@ def test_the_bank_holds_across_the_whole_envelope() -> None:
     out four hours: one cluster of the eight — 15 zones opening on 8,731 tiles — still left
     ~12 minutes of idle there, 2 starving combinations of 96.
 
-    It did NOT justify five, which is what the constant's comment records: the delay is a step
-    function, so the whole 4.25-4.9 band clears the envelope at the same cost 4.0 pays, and
-    five buys 2.2 h of extra delay per cluster-year for nothing.
+    It did NOT justify five: the delay is a step function, so the whole 4.25-4.9 band clears
+    the envelope at the same cost 4.0 pays, and five buys 2.2 h of extra delay per cluster-year
+    for nothing. The constant sits at 4.25, the threshold itself, and this test is what
+    defends it — if a mask rebuild moves the tile distribution, this fails rather than quietly
+    eroding a margin nobody chose.
     """
     fleets = (
         (ACTORS_V11, RATE_CAPACITY_PLANNING),
