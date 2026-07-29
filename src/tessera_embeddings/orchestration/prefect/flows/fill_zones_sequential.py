@@ -30,7 +30,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -276,6 +276,29 @@ class _DeploymentCellInputs:
                 # sitting behind the full remaining ingest duration.
                 if stop is not None and stop.is_set():
                     raise RuntimeError(f"wait for ingest {zone}-{year} aborted: runner stopping") from None
+
+    def ready(self, zone: str, year: int) -> bool:
+        """True if this cell's ingest has finished (or failed). Never blocks."""
+        fut = self._futures.get((zone, year))
+        return fut is not None and fut.done()
+
+    def wait_first(self, cells: list[tuple[str, int]], timeout: float | None = None) -> tuple[str, int] | None:
+        """Block until ANY of ``cells`` has ingested; return which, or None on timeout.
+
+        The flow waits for a mosaic before requesting GPUs, and which one it waits
+        for decides how long a fleet sits idle. Waiting on a NAMED cell means
+        waiting on the densest zone in the window — the slowest to ingest — while
+        smaller ones land hours earlier. Any landed mosaic is enough to start.
+
+        A cell whose ingest FAILED counts as landed: its exception surfaces when
+        the runner reaches it, and blocking here for a mosaic that will never
+        arrive would be the worse outcome.
+        """
+        futs = {self._futures[c]: c for c in cells if c in self._futures}
+        if not futs:
+            return None
+        done, _ = wait(list(futs), timeout=timeout, return_when=FIRST_COMPLETED)
+        return futs[next(iter(done))] if done else None
 
     def cleanup(self, zone: str, year: int) -> None:
         if (zone, year) not in self._futures or not self._cleanup_mosaics:
@@ -782,41 +805,48 @@ def fill_zones_sequential_flow(
             s3_region=s3_region,
         )
 
-    # START THE INGEST WINDOW, THEN WAIT FOR THE DENSEST ZONE BEFORE ASKING FOR GPUs.
+    # START THE INGEST WINDOW, THEN WAIT FOR THE FIRST MOSAIC TO LAND — ANY OF THEM.
     #
-    # A GPU fleet is never booted speculatively — `ray up` is not requested until a
-    # real mosaic exists to work on. It is the HEAD cell that is waited for, not all
-    # of them, and the ordering is what makes that safe: cells are sorted densest
-    # first, so the fleet's opening zone is the biggest one this cluster owns and
-    # takes the longest to infer. Inference is slower than ingest in almost every
-    # case, so by the time that zone is done the rest of the window has landed and
-    # the stream never runs dry.
+    # A GPU fleet is never booted speculatively: `ray up` is not requested until a
+    # real mosaic exists. But WHICH mosaic decides how long the fleet waits, and
+    # waiting on a named cell means waiting on the DENSEST zone in the window,
+    # because that is what `live[0]` is. The densest zone is also the slowest to
+    # ingest. On the real coverage counts a cluster's opening window spans about
+    # 4 h to 10 h of ingest, so blocking on the head idles the fleet for ~6 h with
+    # finished mosaics already on disk — and the wider the fleet, the larger that
+    # is as a share of the run.
     #
-    # Waiting for the WHOLE cluster was tried and is worse: it is unoverlapped ingest
-    # time paid up front, for a risk the density ordering already removes.
+    # So: start the whole window, then take whichever lands first. The feeder does
+    # the same thing thereafter (sequential_fill._take_next), which is what keeps
+    # the saving instead of handing it back at the next cell.
     #
-    # The window is `1 + look_ahead` cells — the head plus the cells that ingest
-    # during its inference — and `look_ahead` is this cluster's share of the
-    # fleet-wide ingest cap. The runner's feeder re-issues these starts (idempotent)
-    # and keeps the window full as cells finalize; `wait` is idempotent too, so the
-    # runner's own wait for the head returns immediately.
+    # The densest-first ORDER is unchanged and still doing its two jobs: it sizes
+    # the session from the largest cell, and it puts the island tail last. What it
+    # is no longer is a barrier.
     if inputs is not None:
         ingest_window = live[: 1 + look_ahead]
         for cell in ingest_window:
             inputs.start(cell.zone, cell.year)
 
-        head = live[0]
         log.info(
-            "Waiting for %s-%d (%d tiles, the densest zone here) before requesting GPUs; "
-            "%d more zone(s) ingesting behind it",
-            head.zone,
-            head.year,
-            head.n_tiles,
-            len(ingest_window) - 1,
+            "Ingesting %d UTM zone(s); GPUs are requested as soon as the first mosaic lands (sizes %s tiles)",
+            len(ingest_window),
+            ", ".join(f"{c.n_tiles:,}" for c in ingest_window),
         )
         t0 = time.monotonic()
-        inputs.wait(head.zone, head.year)
-        log.info("Mosaic for %s-%d ready after %.1fs — requesting GPUs", head.zone, head.year, time.monotonic() - t0)
+        first = inputs.wait_first([(c.zone, c.year) for c in ingest_window])
+        if first is None:  # nothing was started (no adapter cells) — nothing to wait for
+            log.warning("No ingest was started for this cluster; requesting GPUs without waiting")
+        else:
+            landed = next(c for c in ingest_window if (c.zone, c.year) == first)
+            log.info(
+                "Mosaic for %s-%d (%s tiles) ready after %.1fs — requesting GPUs; %d zone(s) still ingesting",
+                landed.zone,
+                landed.year,
+                f"{landed.n_tiles:,}",
+                time.monotonic() - t0,
+                len(ingest_window) - 1,
+            )
 
     try:
         # Pin a deterministic cluster name from the flow-run id so the cancellation

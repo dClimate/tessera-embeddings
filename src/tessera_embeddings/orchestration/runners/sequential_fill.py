@@ -21,6 +21,13 @@ the flow and README point here):
   fleet for ~half a tile-duration per actor, and actors are never killed or
   re-created between zones (no per-zone model reload either). Zones stay
   near-sequential: at most one zone's tail overlaps the next zone's head.
+- **Readiest-first within the window** (``_take_next``): cells are ordered
+  densest-first, and the densest zone is also the slowest to ingest — so taking
+  them strictly in order makes the fleet wait on the last mosaic of its opening
+  window while smaller ones sit finished. The feeder takes whichever look-ahead
+  cell has LANDED, falling back to its head when none has. The density order is
+  unchanged and still does its two jobs (sizing the session from the largest
+  cell, putting the island tail last); it is simply no longer a barrier.
 - **Ingest look-ahead** (``inputs``): the next cells' mosaics are ingested
   *while earlier cells infer*. Two gates cooperate: ``zone_slots`` admits at
   most ``look_ahead + 2`` *un-finalized* zones (a zone holds its slot from
@@ -119,6 +126,18 @@ class CellInputs(Protocol):
 
     def cleanup(self, zone: str, year: int) -> None:
         """Delete the cell's mosaics (only if this adapter produced them)."""
+        ...
+
+    def ready(self, zone: str, year: int) -> bool:
+        """True if :meth:`wait` would return immediately. Never blocks.
+
+        Lets the feeder take whichever look-ahead cell has landed instead of
+        stalling on the one that happens to be first in density order — the
+        densest zone is also the slowest to ingest, so waiting for it idles the
+        fleet while smaller mosaics sit finished on disk. A conservative ``False``
+        is always safe: the feeder falls back to blocking on its head cell, which
+        is the ordering it had before.
+        """
         ...
 
 
@@ -359,7 +378,7 @@ def fill_zones_sequential(
         with lock:
             outcomes.append(result)
 
-    def _start_lookahead(feed_index: int) -> None:
+    def _start_lookahead(pending: list[SequentialCell]) -> None:
         """Keep ingests running ahead of the feed head (idempotent starts).
 
         Every start is admitted through the mosaic budget first, so look-ahead
@@ -373,7 +392,7 @@ def fill_zones_sequential(
         """
         if inputs is None or budget is None:
             return
-        for offset, cell in enumerate(cells[feed_index : feed_index + 1 + look_ahead]):
+        for offset, cell in enumerate(pending[: 1 + look_ahead]):
             if not budget.acquire((cell.zone, cell.year), stop, blocking=offset == 0):
                 return  # stop set (current) or budget tight (look-ahead) — retry next step
             inputs.start(cell.zone, cell.year)
@@ -412,10 +431,39 @@ def fill_zones_sequential(
                 _retain_failed_mosaic(cell)
             zone_slots.release()
 
+    def _take_next(pending: list[SequentialCell]) -> SequentialCell:
+        """Pop the first look-ahead cell whose mosaic has LANDED, else the head.
+
+        Cells are ordered densest-first, and the densest zone is also the slowest
+        to ingest — so taking them strictly in order makes the fleet wait on the
+        very last mosaic of its opening window while smaller ones sit finished.
+        Measured on the real coverage counts: a cluster's window spans ~4 h to
+        ~10 h of ingest, so the strict order idles the GPUs for ~6 h at the start
+        of every year.
+
+        Only the look-ahead window is considered, because those are the only cells
+        whose ingest has been started. When nothing has landed this returns the
+        head and the caller blocks on it, which is exactly the previous behaviour
+        — so a cluster that is genuinely ingest-starved is unaffected.
+
+        The DENSITY ORDER ITSELF IS UNCHANGED: it still sizes the session (the
+        fleet is provisioned for the largest cell up front) and still puts the
+        island tail last. What changes is that it is no longer a barrier.
+        """
+        if inputs is not None:
+            for idx, cell in enumerate(pending[: 1 + look_ahead]):
+                try:
+                    if inputs.ready(cell.zone, cell.year):
+                        return pending.pop(idx)
+                except Exception:  # a broken probe must never stall the feeder
+                    log.warning("Readiness probe failed for %s-%d", cell.zone, cell.year, exc_info=True)
+        return pending.pop(0)
+
     def _feed() -> None:
-        """Walk cells in order: inputs → prepare → plan → scan → enqueue."""
+        """Drain cells: inputs → prepare → plan → scan → enqueue, readiest first."""
         try:
-            for i, cell in enumerate(cells):
+            pending = list(cells)
+            while pending:
                 # Stop admitting once too many failed cells are retaining mosaics
                 # off-budget: a systematic failure would otherwise keep freeing
                 # slots and pile up every cluster's multi-TB input. The in-flight
@@ -429,10 +477,12 @@ def fill_zones_sequential(
                         "stopping the feeder before admitting more ingests; %d cell(s) left unattempted "
                         "(they stay pending for the next campaign pass). Likely a systematic failure — investigate.",
                         n_failed,
-                        len(cells) - i,
+                        len(pending),
                     )
                     return
-                _start_lookahead(i)
+                # Start ingests for the window BEFORE choosing, so a cell can only
+                # be picked once its start has been admitted through the budget.
+                _start_lookahead(pending)
                 # Bounded admission; poll so a crashed session unwinds us.
                 while not zone_slots.acquire(timeout=1.0):
                     if stop.is_set():
@@ -440,11 +490,15 @@ def fill_zones_sequential(
                 if stop.is_set():
                     zone_slots.release()
                     return
+                # Chosen AFTER the slot is held, so the pick reflects what has
+                # landed by the time this cell can actually be worked.
+                cell = _take_next(pending)
                 try:
                     if inputs is not None:
                         # stop-aware: the adapter must return promptly (raising)
                         # once stop is set, so a crashed session is never stuck
-                        # behind a running ingest for its full duration.
+                        # behind a running ingest for its full duration. A cell
+                        # `ready()` picked returns from here immediately.
                         inputs.wait(cell.zone, cell.year, stop=stop)
                     prep = prepare(cell)
                 except Exception as exc:

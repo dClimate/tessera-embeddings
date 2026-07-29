@@ -46,6 +46,15 @@ densest-first sort in `fill_zones_sequential`. They are asserted in
    the N densest zones of a year are dealt one to each of the N clusters. This is
    what lets a cluster request GPUs after a *single* zone has ingested instead of
    waiting out its whole list.
+
+   **But the order must not be a barrier.** The densest zone is also the slowest
+   to ingest, so a cluster that blocks on it waits ~10 h when a smaller mosaic in
+   the same window landed at ~4 h. Since 2026-07-28 the flow waits for whichever
+   mosaic lands FIRST and the feeder then takes any landed cell over its head
+   cell (`sequential_fill._take_next`); the ordering still sizes the session and
+   still puts the island tail last. At 20 actors this was worth ~6 h a year; on a
+   2,500-actor fleet, where a whole cluster's inference is 8 h, it is most of the
+   run.
 2. **Every cluster runs dense → sparse.** The autoscaled fleet then only ever
    shrinks (no mid-run worker relaunch) and the cheap island zones land at the tail.
 3. **Clusters finish together.** Near-even total work, so no cluster is still

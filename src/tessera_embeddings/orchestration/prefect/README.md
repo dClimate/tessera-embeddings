@@ -93,9 +93,15 @@ terabytes, transient. `cleanup_mosaics` deletes each one as its fill lands and
 
 ### GPUs are never booted speculatively — and density ordering keeps them fed
 
-A cluster starts its ingest window, waits for its **first** zone alone, then calls
-`ray up`. Waiting for one zone is safe only because of how zones are ordered, and
-that ordering is load-bearing in two places:
+A cluster starts its ingest window, waits for the **first mosaic to land — any of
+them** — then calls `ray up`, and thereafter its feeder always takes a landed cell
+over its head cell. Waiting on a *named* zone would mean waiting on the densest
+one, which is also the slowest to ingest: on real coverage counts a cluster's
+opening window spans about 4 to 10 hours, so blocking on the head idles the fleet
+for roughly six hours with finished mosaics already on disk.
+
+The density ordering is still load-bearing in two places — it is just not a
+barrier any more:
 
 1. **Across clusters.** Zones are dealt out densest-first to the currently-lightest
    cluster, so the N densest zones of the year go one to each of the N clusters.
@@ -109,10 +115,10 @@ than ingest in almost every case, so the stream does not run dry and the fleet d
 not idle.
 
 ```text
-start window (1 + look_ahead zones) ──►│
-        wait for the densest zone ─────►│
-                                         ray up ──► stream dense ──────► sparse
-                                                    (rest of the window ingests behind)
+start window (1 + look_ahead zones), all ingesting in parallel
+   smallest lands ──►│                       (densest lands much later)
+                      ray up ──► stream, taking whichever zone has landed
+                                 (density order preserved, minus the barrier)
 ```
 
 Two subtleties worth knowing:

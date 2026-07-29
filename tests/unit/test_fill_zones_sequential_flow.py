@@ -218,7 +218,12 @@ def test_stream_contract_wired(wired):
 
 
 class _RecordingInputs:
-    """Records the priming sequence: which cells start, which are waited on."""
+    """Records the priming sequence: which cells start, which are waited on.
+
+    ``wait_first`` returns the SMALLEST-numbered zone of those offered, standing in
+    for "whichever mosaic lands first" — the real adapter resolves that from its
+    futures, and in the campaign the smallest zone is the one that finishes first.
+    """
 
     def __init__(self, order: list, **kwargs):
         self.kwargs = kwargs
@@ -229,6 +234,13 @@ class _RecordingInputs:
 
     def wait(self, zone, year, stop=None):
         self._order.append(f"wait:{zone}")
+
+    def ready(self, zone, year):
+        return True
+
+    def wait_first(self, cells, timeout=None):
+        self._order.append("wait_first:" + ",".join(z for z, _ in cells))
+        return cells[-1] if cells else None
 
     def shutdown(self):
         self._order.append("inputs_shutdown")
@@ -243,20 +255,21 @@ def test_the_ingest_window_starts_before_ray_up(wired, monkeypatch):
     assert order.index("start:02N") < order.index("ray_up")
 
 
-def test_gpus_wait_for_the_densest_zone_only(wired, monkeypatch):
-    """A GPU fleet is never booted speculatively — but only the HEAD zone is waited
-    for, and the densest-first ordering is what makes that safe.
+def test_gpus_wait_for_whichever_mosaic_lands_first(wired, monkeypatch):
+    """Not for a NAMED zone — which would mean the densest, the slowest to ingest.
 
-    The opening zone is the biggest this cluster owns, so it takes the longest to
-    infer; the rest of the window lands behind it while it runs. Waiting for the
-    whole cluster instead is unoverlapped ingest time paid up front for a risk the
-    ordering already removes.
+    A cluster's opening window spans roughly 4 h to 10 h of ingest on the real
+    coverage counts, so blocking on the head idles the fleet for about six hours
+    with finished mosaics already on disk. The whole window is offered and the
+    first to land wins.
     """
     monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_RecordingInputs, wired["order"]))
     _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
     order = wired["order"]
-    assert [e for e in order if e.startswith("wait:")] == ["wait:01N"]
-    assert order.index("wait:01N") < order.index("ray_up")
+    # Every started zone is offered, and no single zone is waited on by name.
+    assert "wait_first:01N,02N" in order
+    assert not [e for e in order if e.startswith("wait:")]
+    assert order.index("wait_first:01N,02N") < order.index("ray_up")
 
 
 def test_cells_are_ordered_by_true_tile_count_not_the_clamped_fleet_request(wired, monkeypatch):

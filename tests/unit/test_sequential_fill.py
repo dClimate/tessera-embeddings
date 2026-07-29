@@ -517,3 +517,78 @@ def test_feeder_crash_is_surfaced_not_silent_success():
 
     with pytest.raises(RuntimeError, match="zone feeder crashed"):
         _run(_cells(3), inputs=ExplodingInputs([]), look_ahead=1)
+
+
+class _StaggeredInputs(RecordingInputs):
+    """Mosaics that land out of order, as ingest really finishes them.
+
+    ``landed`` is what exists now. ``ready`` reports it truthfully. ``wait`` on a
+    zone that has NOT landed records the block and then lets it through — which is
+    what blocking really does — so a feeder that ignores readiness still completes
+    but leaves a visible trail of stalls.
+    """
+
+    def __init__(self, events: list[str], landed: set[str]) -> None:
+        super().__init__(events)
+        self.landed = set(landed)
+        self.blocked_on: list[str] = []
+
+    def ready(self, zone: str, year: int) -> bool:
+        return zone in self.landed
+
+    def wait(self, zone: str, year: int, stop: threading.Event | None = None) -> None:
+        super().wait(zone, year, stop)
+        if zone not in self.landed:
+            self.blocked_on.append(zone)
+            self.landed.add(zone)  # the ingest we waited for finishes
+
+
+def test_the_feeder_takes_a_landed_cell_over_its_head_cell():
+    """The densest zone is ordered first AND ingests slowest, so insisting on it
+    idles the fleet while smaller mosaics sit finished. Only the look-ahead window
+    is eligible, since those are the only cells whose ingest has been started.
+    """
+    events: list[str] = []
+    inputs = _StaggeredInputs(events, landed={"02N", "03N", "04N"})  # everything but the head
+    _run(_cells(4), inputs=inputs, look_ahead=2)
+    order = [e.split(":")[1] for e in events if e.startswith("wait:")]
+    assert order[0] == "02N", f"took its head instead of a landed cell: {order}"
+    assert inputs.blocked_on == ["01N"], f"stalled on more than the one unlanded zone: {inputs.blocked_on}"
+
+
+def test_every_cell_is_filled_exactly_once_when_taken_out_of_order():
+    """Reordering must not drop, duplicate, or strand work."""
+    events: list[str] = []
+    inputs = _StaggeredInputs(events, landed={f"{i:02d}N" for i in range(1, 7)})
+    result = _run(
+        _cells(6), inputs=inputs, look_ahead=3, session=_sync_session(events=events), assemble=_assemble(events)
+    )
+    assembled = [e.split(":")[1] for e in events if e.startswith("assemble:")]
+    assert sorted(assembled) == [f"{i:02d}N" for i in range(1, 7)]
+    assert result["succeeded"] == 6 and result["failed"] == 0
+    assert inputs.blocked_on == [], "nothing should have stalled: every mosaic had landed"
+
+
+def test_nothing_landed_falls_back_to_strict_head_order():
+    """The previous behaviour, preserved. A genuinely ingest-starved cluster
+    blocks on its head rather than spinning over an all-unready window, so this
+    change cannot make a starved run worse.
+    """
+    events: list[str] = []
+    inputs = _StaggeredInputs(events, landed=set())
+    _run(_cells(3), inputs=inputs, look_ahead=2)
+    order = [e.split(":")[1] for e in events if e.startswith("wait:")]
+    assert order == ["01N", "02N", "03N"], f"expected strict head order, got {order}"
+
+
+def test_only_the_started_window_is_eligible():
+    """A cell beyond the look-ahead has no ingest running, so it cannot be picked
+    however 'ready' it might look — jumping to it would start a mosaic outside the
+    budget that admits them.
+    """
+    events: list[str] = []
+    # The LAST cell has landed; the window (look_ahead=1 -> 2 cells) has not.
+    inputs = _StaggeredInputs(events, landed={"05N"})
+    _run(_cells(5), inputs=inputs, look_ahead=1)
+    order = [e.split(":")[1] for e in events if e.startswith("wait:")]
+    assert order[0] == "01N", f"reached outside its window: {order}"
