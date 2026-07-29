@@ -95,8 +95,8 @@ Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md).
 | Mosaic supply | 5.24 zone-yr/h | **9.30 zone-yr/h** |
 | **GPU fleet that stays busy** | **946** | **1,678** |
 | Ingest cost | ~$121,000 | ~$121,000 |
-| Inference cost | $335,000 | $335,000 |
-| **Campaign total** | **$461,000** | **$461,000** |
+| Inference cost (v1.1 / v2 Large) | $335,000 / $244,000 | $335,000 / $244,000 |
+| **Campaign total (v1.1 / v2 Large)** | **$461,000 / $370,000** | **$461,000 / $370,000** |
 
 **GPUs are on-demand.** Spot is excluded by decision, not by oversight: sustaining ~1,700
 g6e instances for days makes interruption a certainty, and a campaign that stalls on
@@ -106,7 +106,9 @@ capacity is worse than one that costs more. Settled; do not re-open.
 about 180 GPU-hours. Provisioning the full 2,500-actor quota against 40-cell ingest runs
 the fleet at 38% duty and burns roughly **$550,000 of idle GPU time** — more than the
 inference it is trying to do, and more than four times the ingest bill. At 71 cells the
-matched fleet is 1,678 GPUs, or **~210 actors across 8 clusters**.
+matched fleet is 1,678 GPUs, or **~210 actors across 8 clusters** — and **1,220, or ~153
+actors, if the campaign runs v2 Large**, which is 1.375× faster and so needs less fleet to
+keep pace with the same ingest.
 
 Raising the ingest cap costs nothing measurable and is worth 3.4 days and 732 GPUs of
 usable fleet. It is the single highest-value setting in this document.
@@ -167,14 +169,18 @@ There are **no Prefect-level retries** on any ingest flow, deliberately.
 
 ## 8. Open before launch
 
-1. **Which model.** v2 Large is ~0.89× the per-token compute of v1.1 and produces 128-D
-   natively. There is no measured throughput for it. Choosing it also changes the store's
-   advertised model identity, which is write-once per store.
+1. **Which model.** v2 Large runs **1.375× faster** on the branch's own per-model rate
+   (22,000 against 16,000 px/s in `inference/actors.py`), which is worth
+   **$91,000–$128,000** and cuts the matched fleet from 1,678 to 1,220. It also emits 128-D
+   natively rather than truncating 192-D. Against that: the rate is a strategy-only
+   planning constant whose calibration is not written down anywhere, and the model identity
+   a store advertises is write-once — so this must be decided *before* seeding, not after.
 2. **One instrumented dense-zone run.** Settles the throughput question (15K vs 21K px/s,
-   worth $134,000) and the v2 question in the same run. This is the last preflight gate.
-3. **Public release.** The permanent store is 0.9–1.8 PB at $21,000–$42,000 a month, which
-   exceeds the cost of producing it within a year. AWS Open Data sponsorship is the
-   strongest lever available on lifetime cost, and it has lead time.
+   worth $134,000) and puts a documented number behind the 1.375× ratio, in one run. This
+   is the last preflight gate.
+3. **Public release.** The permanent store is 0.9–1.8 PB and goes to AWS Open Data, which
+   sponsors the storage — so it is not costed. It has lead time, and the size figure is
+   what the application will ask for.
 4. **Ingest cap 40 → 71**, conditional on the Fargate quota landing.
 
 ---

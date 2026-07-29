@@ -16,16 +16,16 @@ as derived). Two things are neither, and they are called out in §8 rather than 
 | | |
 |---|---|
 | Ingest (Fargate) | $115,000 – $126,000 |
-| **Inference (GPU, on-demand)** | **$293,000 – $470,000** |
+| **Inference (GPU, on-demand) — v1.1** | **$293,000 – $470,000** |
+| **Inference (GPU, on-demand) — v2 Large** | **$213,000 – $342,000** |
 | Assembly | ~$200 |
 | Mosaic storage (transient) | ~$3,000 |
-| **Campaign total** | **$411,000 – $599,000** |
+| **Campaign total, v1.1** | **$411,000 – $599,000** |
+| **Campaign total, v2 Large** | **$331,000 – $471,000** |
 
-Then, separately and forever:
-
-| | |
-|---|---|
-| **Permanent embeddings store** | **0.9 – 1.8 PB → $21,000 – $42,000 per month** |
+The permanent embeddings store (0.9–1.8 PB) is **not costed here**: it goes to AWS Open
+Data, which sponsors the storage. Sizing it still matters for bucket planning — see §7 —
+but it is not a line on this bill.
 
 **GPUs are on-demand. Spot is not costed here and is not an option** — sustaining ~1,700
 g6e instances for days makes interruption a certainty rather than a risk, and a campaign
@@ -38,9 +38,9 @@ that stalls on capacity is worse than one that costs more. Settled; do not re-op
 2. **Inference cost is invariant to the ingest scenario.** Same pixels, same throughput,
    same GPU-hours whether you run 40 cells or 71. What the ingest scenario changes is
    whether the GPU fleet has anything to do.
-3. **Fleet sizing is now the largest lever in the model, worth up to $550,000** — the cost
-   of provisioning to the GPU quota rather than to what ingest can actually feed (§5). With
-   spot off the table it is also the only remaining six-figure one.
+3. **Fleet sizing is the largest lever, worth up to $550,000** — the cost of provisioning
+   to the GPU quota rather than to what ingest can actually feed (§5). **Running v2 Large
+   is the second, at $91,000–$128,000** (§6). Both are within our control.
 
 ---
 
@@ -189,12 +189,55 @@ mix. For a campaign average the truth is between them and probably nearer 21K, s
 starts amortise over a 999-zone-year run far better than over one ROI. The range is
 carried through rather than collapsed: it is worth **$176,000** on-demand.
 
-### v2 Large is cheaper per token than v1.1, not more expensive
+### v2 Large is materially faster — worth $91,000 – $128,000
 
-There is **no measured v2 throughput anywhere in the repository.** The profiling document
-on `feature/v2-large-model` is unchanged in substance from ours — the diff is file-path
-renames and an appendix removal. So this is derived from the two architectures, and should
-be replaced by a measurement before anyone spends against it.
+`feature/v2-large-model` carries a **per-model inference rate**, in
+`inference/actors.py`:
+
+```python
+_EST_PX_PER_SEC_BY_MODEL = {"v1.1": 16_000.0, "v2-large": 22_000.0}
+```
+
+**A ratio of 1.375×.** Applied to the campaign's costing rates:
+
+| basis | v1.1 | v2 Large | inference cost, v1.1 → v2 | saving |
+|---|---|---|---|---|
+| optimistic — 21K while-processing | 21,000 px/s | 28,900 px/s | $335,400 → $243,900 | **$91,500** |
+| pessimistic — 15K fleet-overall | 15,000 px/s | 20,600 px/s | $469,600 → $341,500 | **$128,100** |
+
+**Two caveats on that number, both real.** The constants are labelled a *strategy-only
+estimator* — they exist so the striping planner can ask "will the GPU stay busy long
+enough to hide this read?", explicitly "never a correctness value". And the commit that
+added them says "per-model calibration lives in context_docs", but no such calibration is
+on that branch: the pointer is dangling. So the **ratio** is the branch's own working
+assumption and is the defensible thing to carry; the absolute 16,000 is a third basis
+again, matching neither the 21–24K while-processing nor the 13–15K fleet-overall figures.
+
+**A faster model also shrinks the fleet you need**, because the matched fleet is set by
+GPU-hours per zone-year:
+
+| | GPU-h per zone-year | matched fleet, 40 cells | matched fleet, 71 cells |
+|---|---|---|---|
+| v1.1 @ 21K | 180.4 | 946 | 1,678 |
+| **v2 Large @ 28.9K** | **131.2** | **688** | **1,220** |
+
+### Correcting my own earlier estimate
+
+An earlier version of this document derived the v2/v1.1 ratio from the two `ModelArch`
+definitions and put it at **1.12×**, then argued that since inference is not tensor-bound
+the real gain would be *smaller* still — "expect 0–11%, plan on 0". The branch's own
+calibration says **1.375×**, so that was wrong by a factor of 1.22 and wrong in direction
+of argument.
+
+The reasoning error is worth keeping. Not being tensor-bound does not mean a smaller model
+gains less; it means the arithmetic is not what it gains on. A narrower model also moves
+less weight and activation traffic, launches smaller kernels, and does less host-side work
+per token — and those are precisely the things the profiling run identified as the actual
+bottleneck. A FLOP ratio was the wrong instrument for a workload measured at 0.12–0.26
+tensor-pipe utilisation.
+
+The architecture comparison is retained below because it explains *why* v2 is cheaper at
+all; it is not a throughput prediction.
 
 Reading both `ModelArch` definitions (`config/inference.py` on that branch):
 
@@ -214,16 +257,10 @@ Per-token multiply-accumulates, across every sequence bucket from T=8 to T=256:
 | 64 | 22.41M | 19.99M | 0.892 |
 | 256 | 23.59M | 20.97M | 0.889 |
 
-**v2 Large is about 0.89× the compute of v1.1** — roughly 11% cheaper. The narrower model
-dimension more than offsets the wider feed-forward. "Large" is the student-size tier
-within the v2 family; it is not larger than v1.1.
-
-**Do not budget the 11% as a saving.** Inference is not tensor-bound: the profiling run
-measured tensor-pipe activity at 0.12–0.26 even mid-forward, with CPU-side batch
-preparation and pipeline bubbles dominating. Cutting arithmetic that is already only a
-quarter-utilised should move throughput very little. The defensible planning statement is
-**between 0% and 11% better than v1.1, most likely near the bottom of that range**, and
-that v2 poses no cost risk. One measured run on a dense zone settles it.
+**v2 Large is about 0.89× the arithmetic of v1.1.** The narrower model dimension more than
+offsets the wider feed-forward. "Large" is the student-size tier within the v2 family; it
+is not larger than v1.1. The measured 1.375× speedup exceeds this comfortably, which is
+the evidence that arithmetic is not what the pipeline is spending its time on.
 
 ---
 
@@ -241,21 +278,21 @@ PUTs, $33) and mosaic reads (~316M GETs at $0.40/M, $126).
 more data for proportionally less time. This figure depends entirely on mosaics being
 deleted as inference consumes them; if inference lags, it grows linearly with the backlog.
 
-**Permanent embeddings storage — the largest number in this document.**
+**Permanent embeddings storage — sized, but not billed to us.**
 
 ```
   1.363 × 10¹³ px  ×  128 dims  ×  1 byte (int8)   =  1.74 PB
   + observation counts (3 × uint16 per pixel)      =  0.08 PB
                                                       ────────
   uncompressed                                        1.83 PB
-  at zstd ~1.4×                                       1.28 PB  →  $29,400 / month
-  at zstd ~2×                                         0.91 PB  →  $21,000 / month
+  at zstd ~1.4×                                       1.28 PB
+  at zstd ~2×                                         0.91 PB
 ```
 
-At S3 Standard this is **$21,000–$42,000 every month, indefinitely** — within a year it
-exceeds the entire cost of producing the data. It is not a campaign cost and it is not in
-the totals above, but it dominates the lifetime economics and it is the strongest
-financial argument for the AWS Open Data route, where AWS sponsors the storage.
+This goes to **AWS Open Data, which sponsors the storage**, so it is not in the totals.
+The figure is still worth holding: it sets bucket and quota planning, it is what a
+mirror or an egress-heavy consumer would cost, and it is the number to quote when the
+Open Data application asks how large the dataset is.
 
 ---
 
@@ -271,12 +308,13 @@ idle burn in either row.
 | Ingest | $121,000 | $121,000 |
 | Inference | $335,400 | $335,400 |
 | Assembly + S3 + mosaics | $4,800 | $4,800 |
-| **Total** | **$461,000** | **$461,000** |
+| **Total, v1.1** | **$461,000** | **$461,000** |
+| **Total, v2 Large** | **$370,000** | **$370,000** |
 | Ingest wall clock | 7.9 d | 4.5 d |
 | Campaign wall clock (staged) | ~8.1 d | ~4.6 d |
 | Idle burn if you run 2,500 GPUs anyway | **+$550,000** | **+$164,000** |
 
-At 15K px/s rather than 21K, add **$134,000** to both columns.
+At 15K px/s rather than 21K, add **$134,000** to both columns (**$98,000** on v2 Large).
 
 **The two scenarios cost the same to within a rounding error.** The decision between them
 is about wall clock — 7.9 days against 4.5 — and about how much GPU quota you can convert
@@ -296,8 +334,10 @@ into work rather than idle: 946 GPUs against 1,678. It is not about money spent 
    average and late supply faster. Expect real duty to be somewhat below the table.
 5. **Ingest carries the ±10% per-date fit** from its own estimate, plus the untested
    assumption that cell interference stays flat above 20 concurrent cells.
-6. **The permanent store's compression ratio is unmeasured.** The 1.4×–2× band is a guess
-   at zstd on int8 embeddings and it swings a $21,000/month line by half.
+6. **The v2 rate's provenance is undocumented.** 22,000 against 16,000 px/s is the
+   branch's own planning estimator, labelled strategy-only, and the calibration its
+   comment points at is not on the branch. The 1.375× ratio is worth $91,000–$128,000 and
+   currently rests on a constant nobody has shown their working for.
 7. **Pixel count.** The 2048-tile census gives 1.363 × 10¹³; the ingest estimate's
    4096-chunk census implies 1.459 × 10¹³, about 7% higher. The larger figure would add
    ~$23,000 to inference.
@@ -313,10 +353,10 @@ into work rather than idle: 946 GPUs against 1,678. It is not about money spent 
    71.** No width change is needed — 50 workers is already the shipped default. It costs
    nothing measurable, halves ingest wall clock from 7.9 days to 4.5, and raises the GPU
    fleet you can keep busy from 946 to 1,678.
-3. **Measure one dense zone end to end on v2 Large.** It resolves the throughput question
-   (worth $134,000) and the v2 question (worth up to $37,000) in a single run.
-4. **Pursue AWS Open Data for the output store.** Storage exceeds the entire production
-   cost within a year of publication.
+3. **Run v2 Large, and measure one dense zone end to end on it.** The branch's own rate
+   makes it worth $91,000–$128,000, which is second only to fleet sizing — and the same
+   run settles the 15K-versus-21K question ($134,000) and puts a documented number behind
+   the 1.375× ratio. One run, three answers.
 
 ---
 
