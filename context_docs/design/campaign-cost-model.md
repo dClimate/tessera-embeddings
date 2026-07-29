@@ -79,20 +79,31 @@ transfer (everything is in us-west-2, so there is no egress); engineering time.
 ## 4. Ingest — the two scenarios
 
 A cell is **three concurrent fleets**: S2 plus one S1 deployment per orbit. Each fleet
-costs `workers × 4 + 4 (scheduler) + 4 (runner)` vCPU, and the parent flow adds 4.
+costs `workers × 4 + 4 (scheduler) + 4 (runner)` vCPU, and the parent flow adds 4. S1's
+width is derived, not set: `s1_worker_fraction = 0.22` of the S2 fleet.
 
 ```
-  vCPU per cell  =  (S2w × 4 + 8)  +  2 × (13 × 4 + 8)  +  4
+  vCPU per cell  =  (S2w × 4 + 8)  +  2 × (round(0.22 × S2w) × 4 + 8)  +  4
 ```
 
-| scenario | vCPU/cell | total vCPU | wall clock | supply rate | ingest cost |
-|---|---|---|---|---|---|
-| **current — 40 cells × 60w** | 372 | 14,880 | **6.6 days** | 6.29 zone-yr/h | $113,900 – $124,000 |
-| **optimal — 71 cells × 50w** | 332 | 23,572 | **4.5 days** | 9.30 zone-yr/h | $115,400 – $126,000 |
-| doc's 20K-quota point — 53 × 60w | 372 | 19,716 | 5.0 days | 8.33 zone-yr/h | $113,900 – $124,000 |
-| quota-max — 80 cells × 60w | 372 | 29,760 | 3.3 days | 12.58 zone-yr/h | $113,900 – $124,000 |
+> **The shipped S2 default is 50 workers, not 60.** `IngestSettings.max_workers` is 50
+> (`config/ingest.py`), which puts S1 at 11 per orbit rather than the 13 measured. The
+> 60-worker figures in the July-27 estimate describe the configuration that was *measured*,
+> not the one that will run. Both are given below so the comparison is honest either way;
+> the duration basis of 6,354 cell-hours was measured at 60w and is scaled by 60/S2w for
+> other widths, which is width-neutral and therefore the conservative direction.
 
-**The 71 × 50w scenario is very slightly more expensive, not cheaper.** Worker-hours are
+| scenario | S1/orbit | vCPU/cell | total vCPU | wall clock | supply rate | ingest cost |
+|---|---|---|---|---|---|---|
+| **shipped today — 40 × 50w** | 11 | 316 | 12,640 | **7.9 days** | 5.24 zone-yr/h | $115,400 – $126,000 |
+| as asked — 40 × 60w | 13 | 372 | 14,880 | 6.6 days | 6.29 zone-yr/h | $113,900 – $124,000 |
+| **optimal — 71 × 50w** | 11 | 316 | **22,436** | **4.5 days** | 9.30 zone-yr/h | $115,400 – $126,000 |
+| quota-max — 80 × 50w | 11 | 316 | 25,280 | 4.0 days | 10.48 zone-yr/h | $115,400 – $126,000 |
+
+A 25,000 vCPU quota fits **79 cells at 50w** but only **67 at 60w** — which is the whole
+argument for the narrower fleet, since worker-hours (and therefore cost) do not care.
+
+**The 71 × 50w scenario is very slightly more expensive than the 60w rows, not cheaper.** Worker-hours are
 the billing unit and they are width-neutral — halve the fleet, double the duration, same
 bill — so narrowing S2 from 60 to 50 workers buys nothing on compute. What it does is free
 40 vCPU per cell, which is what lets 71 cells fit under a 25,000 vCPU quota instead of 67.
@@ -142,15 +153,16 @@ At 21K px/s a zone-year costs **180.4 GPU-hours**. Multiply by the supply rate:
 
 | ingest scenario | supply | **matched fleet** | duty at 1,280 GPUs | duty at 2,500 GPUs |
 |---|---|---|---|---|
-| 40 cells × 60w | 6.29 zone-yr/h | **1,135 GPUs** | 89% | **45%** |
-| 71 cells × 50w | 9.30 zone-yr/h | **1,678 GPUs** | 100% | **67%** |
-| 53 cells × 60w | 8.33 zone-yr/h | 1,503 GPUs | 100% | 60% |
-| 80 cells × 60w | 12.58 zone-yr/h | 2,269 GPUs | 100% | 91% |
+| **shipped — 40 × 50w** | 5.24 zone-yr/h | **946 GPUs** | 74% | **38%** |
+| 40 × 60w | 6.29 zone-yr/h | 1,135 GPUs | 89% | 45% |
+| **optimal — 71 × 50w** | 9.30 zone-yr/h | **1,678 GPUs** | 100% | **67%** |
+| 80 × 50w | 10.48 zone-yr/h | 1,891 GPUs | 100% | 76% |
 
 **This is the expensive mistake available in this campaign.** Running the full
-2,500-actor GPU quota against 40-cell ingest leaves the fleet 45% busy and burns
-**217,000 idle GPU-hours — about $404,000 on demand**, more than three times the entire
-ingest bill. The same fleet against 71-cell ingest wastes $164,000. Neither is a
+2,500-actor GPU quota against ingest as shipped leaves the fleet **38% busy** and burns
+roughly **$550,000** of idle GPU time on demand — more than four times the entire ingest
+bill, and more than the inference it is trying to do. At 40 × 60w it is $404,000; against
+71-cell ingest it falls to $164,000. Neither is a
 throughput problem; both are a scheduling mismatch.
 
 So the honest way to state the case for the optimal ingest configuration is not the
@@ -248,26 +260,26 @@ financial argument for the AWS Open Data route, where AWS sponsors the storage.
 Ingest at its cost midpoint; inference at 21K px/s with a **matched** GPU fleet, so no
 idle burn in either row.
 
-| | 40 cells × 60w | 71 cells × 50w |
+| | shipped — 40 × 50w | optimal — 71 × 50w |
 |---|---|---|
-| Fargate vCPU required | 14,880 | 23,572 |
-| Matched GPU fleet | 1,135 | 1,678 |
-| Ingest | $119,000 | $121,000 |
+| Fargate vCPU required | 12,640 | 22,436 |
+| Matched GPU fleet | 946 | 1,678 |
+| Ingest | $121,000 | $121,000 |
 | Inference, on-demand | $335,400 | $335,400 |
 | Inference, spot | $126,200 | $126,200 |
 | Assembly + S3 + mosaics | $4,800 | $4,800 |
-| **Total, on-demand** | **$459,000** | **$461,000** |
-| **Total, spot** | **$250,000** | **$252,000** |
-| Ingest wall clock | 6.6 d | 4.5 d |
-| Campaign wall clock (staged) | ~6.8 d | ~4.6 d |
-| Idle burn if you run 2,500 GPUs anyway | **+$404,000** | **+$164,000** |
+| **Total, on-demand** | **$461,000** | **$461,000** |
+| **Total, spot** | **$252,000** | **$252,000** |
+| Ingest wall clock | 7.9 d | 4.5 d |
+| Campaign wall clock (staged) | ~8.1 d | ~4.6 d |
+| Idle burn if you run 2,500 GPUs anyway | **+$550,000** | **+$164,000** |
 
 At 15K px/s rather than 21K, add **$134,000** on-demand or **$50,000** on spot to both
 columns.
 
-**The two scenarios cost the same to within half a percent.** The decision between them is
-about wall clock and about how much GPU quota you can convert into work — not about money
-spent on ingest.
+**The two scenarios cost the same to within a rounding error.** The decision between them
+is about wall clock — 7.9 days against 4.5 — and about how much GPU quota you can convert
+into work rather than idle: 946 GPUs against 1,678. It is not about money spent on ingest.
 
 ---
 
@@ -303,8 +315,10 @@ spent on ingest.
 2. **Size the GPU fleet to the ingest supply rate, not to the quota** — 1,135 GPUs at 40
    cells, 1,678 at 71. Provisioning the full 2,500-actor quota against 40-cell ingest is
    a $404,000 mistake.
-3. **Raise the Fargate quota to ~24,000 vCPU and run 71 × 50w.** It costs about $1,700,
-   saves two days, and raises the fleet you can keep busy by 48%.
+3. **Raise the Fargate quota to ~23,000 vCPU and raise `max_parallel_ingest` from 40 to
+   71.** No width change is needed — 50 workers is already the shipped default. It costs
+   nothing measurable, halves ingest wall clock from 7.9 days to 4.5, and raises the GPU
+   fleet you can keep busy from 946 to 1,678.
 4. **Measure one dense zone end to end on v2 Large.** It resolves the throughput question
    (worth $134,000) and the v2 question (worth up to $37,000) in a single run.
 5. **Pursue AWS Open Data for the output store.** Storage exceeds the entire production
