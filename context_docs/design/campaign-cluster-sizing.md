@@ -1,10 +1,12 @@
 # Campaign cluster sizing — how the world's UTM zones divide across N Ray clusters
 
 Authoritative basis for choosing `max_parallel_clusters` and `max_parallel_ingest`
-on the chained (`fill_strategy="chained-clusters"`) campaign. Measured against the
-**real** coverage bitmaps, not synthetic weights, because every conclusion here
-depends on the actual distribution of land: a handful of huge continental zones
-and a long tail of islands.
+on the chained (`fill_strategy="chained-clusters"`) campaign. Two halves: how the
+work **balances** across clusters, and whether the **commit** path to the global
+Icechunk store constrains how many you can run. Measured against the **real**
+coverage bitmaps, not synthetic weights, because every conclusion here depends on
+the actual distribution of land: a handful of huge continental zones and a long
+tail of islands.
 
 Reproduce any of it:
 
@@ -117,6 +119,112 @@ fleet can leave actors idle. On real data this never bites.
 The taper is real and costs essentially nothing. Do not spend effort decoupling
 admission from fleet-fill parallelism on this evidence.
 
+## Commits to the global store: nowhere near the limit
+
+Cluster count also sets how many writers can hit the global Icechunk store at
+once, so the second half of the sizing question is whether the commit path
+constrains it. It does not, by three orders of magnitude — but the reasoning is
+worth recording because the headroom is not obvious and the protection is not
+self-enforcing.
+
+### Only one commit site is in the hot path
+
+Three places commit to the global store. Everything else in the package —
+mosaic writes, the ingest marker, the assessed-window attribute, the land mask,
+the single-ROI embeddings path — writes to a *different* repository and cannot
+contend.
+
+| Site | When | Volume |
+|---|---|---|
+| `write_year_shards` (end of assembly) | Every live zone-year | **112 per campaign year** |
+| `mark_zone_year_empty` | All-ocean cells, in pre-cluster triage | 8 per year, before Ray exists |
+| `seed_zone_groups` | Once, at seeding | 1 ever |
+
+Tags are not commits: `create_tag` points at an existing snapshot and never
+advances the branch, so zone-year and year-milestone tags contend with nothing.
+
+### The ceiling is structural: one commit per cluster
+
+Each cluster's trailing assembly runs on a `ThreadPoolExecutor(max_workers=1)`,
+so a cluster can have exactly one assembly — hence one commit — in flight. N
+clusters means at most N committers. That is a property of the code, not a
+convention.
+
+The one caveat: a cluster has a *second* thread that can commit. The feeder
+commits inside `plan()` when a cell turns out already-complete or all-ocean,
+which is why `_PrefectCommitGate` keeps its state in a per-thread stack. The
+flow's triage removes those cells before the stream starts, so a terminal plan
+mid-stream means the store changed underneath the run. Rare, but it makes the
+true ceiling **2N**, not N.
+
+### The measured storm curve
+
+From ADR-008 run 1, committing to distinct zone groups:
+
+| Simultaneous committers | Rebase retries | Commit wall |
+|---:|---:|---:|
+| 1 (uncontended) | 0 | 0.2 s |
+| 2 | 0.5 | 0.5 s |
+| 8 | 3.5 | 1.3 s |
+| 16 | 7.5 | 2.2 s |
+| 120 | 58 | 15 s |
+
+Those five are the measured points; `retries ≈ (N−1)/2` fits them well enough to
+interpolate. Retries scale with N, so *aggregate* wasted work scales with N², and
+the recorded firm constraint is 4–8 simultaneous committers. Contention is on the
+branch-tip compare-and-swap — every commit re-serialises the repo-global snapshot
+file — so it depends only on how many writers race, never on which zones they
+touch.
+
+### Duty cycle: the reason it never bites
+
+Combining the tile counts above with the measured fleet throughput from
+[`inference_gpu_saturation_profile_2026_07.md`](inference_gpu_saturation_profile_2026_07.md)
+(~15.3K px/s per worker, fleet-overall, L40S) at 20 actors per cluster:
+
+| Clusters | GPUs | Wall per campaign year | Avg gap between commits | Fleet commit duty cycle |
+|---:|---:|---:|---:|---:|
+| 1 | 20 | 57.3 d | 736 min | 0.0005% |
+| 4 | 80 | 14.3 d | 184 min | 0.0018% |
+| **8** | **160** | **7.2 d** | **92 min** | **0.0036%** |
+| 16 | 320 | 3.6 d | 46 min | 0.0072% |
+| 24 | 480 | 2.4 d | 31 min | 0.0109% |
+| 40 | 800 | 1.4 d | 18 min | 0.0181% |
+
+A campaign year is 1.51 Tpx and ~27,500 GPU-hours; all nine years are ~247,000
+GPU-hours and 1,008 commits. Against Icechunk v2's "tens of thousands of commits
+per repo" target, the whole backfill is two orders of magnitude inside. Each
+commit carries ~10⁵–10⁶ chunk refs against a ~7×10⁷ panic threshold (icechunk
+\#1558) — two more orders of magnitude.
+
+**The implication for sizing: the commit path does not constrain the cluster
+count anywhere in this table.** At 8 clusters the fleet spends four thousandths
+of a percent of its time committing, and a 1.3-second contended commit against a
+35-hour zone is invisible. Balance (above) is what should decide the number, not
+commits.
+
+### Two things that are NOT automatically safe
+
+**The cap is enforced by a gate whose value nothing in the code sets.**
+`commit_limit_name` (default `tessera-global-commits`) is passed everywhere as a
+*name*; the number lives on the Prefect server and no flow writes it. The gate is
+`strict=True`, so a missing limit stops the fill loudly at its first commit rather
+than letting every cluster storm the branch — a good failure mode. But a limit
+that *exists* and is set too high storms silently. The ingest cap has since been
+given an upsert-from-parameter (see `_upsert_ingest_limit`); **the commit limit
+should get the same treatment.**
+
+**Concurrent zone-years are safe; concurrent years OF THE SAME ZONE are not.**
+Commits to different groups rebase cleanly — run 1 found zero unresolvable
+conflicts at every N up to 120. But two fills of the same zone both rewrite that
+group's `years_complete`/`runs` attrs, and `ConflictDetector` cannot auto-merge
+attribute conflicts, so the loser raises `RebaseFailedError` (see the
+`write_year_shards` concurrency contract). The constraint is **zone**-disjointness,
+not year-disjointness. Today's year-serial outer loop guarantees it, but more
+strongly than necessary: 33N-2025 alongside 34N-2024 is perfectly safe. Running
+years concurrently needs a scheduler that guarantees zone-disjointness, or a
+restructuring where a cluster owns a zone and works all nine of its years.
+
 ## Known limitation: the balance is spatial, not temporal
 
 Zones are balanced on **land area**, not on observation count. A zone with the
@@ -135,6 +243,9 @@ the scoped `T201` exemption in `ruff.toml` alongside the profiling tools'.
 
 ## Related
 
+- [ADR-008 — global store architecture](../decisions/008-global-store-architecture.md),
+  D5/D6: the run-1 commit-storm experiment the concurrency numbers above come from,
+  and why one commit per zone-year is the unit.
 - [ADR-011 — campaign-triggered per-zone ingestion](../decisions/011-campaign-zone-ingestion.md):
   the ingest cap, the GPU-start rule, and why the density ordering is load-bearing.
 - [`orchestration/prefect/README.md`](../../src/tessera_embeddings/orchestration/prefect/README.md):
