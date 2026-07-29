@@ -95,8 +95,12 @@ Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md).
 | Mosaic supply | 5.24 zone-yr/h | **9.30 zone-yr/h** |
 | **GPU fleet that stays busy** | **946** | **1,678** |
 | Ingest cost | ~$121,000 | ~$121,000 |
-| Inference cost (on-demand / spot) | $335,000 / $126,000 | same |
-| **Campaign total (on-demand / spot)** | **$461,000 / $252,000** | **$461,000 / $252,000** |
+| Inference cost | $335,000 | $335,000 |
+| **Campaign total** | **$461,000** | **$461,000** |
+
+**GPUs are on-demand.** Spot is excluded by decision, not by oversight: sustaining ~1,700
+g6e instances for days makes interruption a certainty, and a campaign that stalls on
+capacity is worse than one that costs more. Settled; do not re-open.
 
 **Size the GPU fleet to the ingest supply rate, never to the quota.** A zone-year costs
 about 180 GPU-hours. Provisioning the full 2,500-actor quota against 40-cell ingest runs
@@ -163,19 +167,15 @@ There are **no Prefect-level retries** on any ingest flow, deliberately.
 
 ## 8. Open before launch
 
-1. **Spot or on-demand for inference.** Worth $209,000 — larger than every ingest
-   optimisation shipped, combined. Inference checkpoints at tile granularity and the
-   campaign retries zones, so interruption tolerance is plausible but untested at fleet
-   scale. **Decide first.**
-2. **Which model.** v2 Large is ~0.89× the per-token compute of v1.1 and produces 128-D
+1. **Which model.** v2 Large is ~0.89× the per-token compute of v1.1 and produces 128-D
    natively. There is no measured throughput for it. Choosing it also changes the store's
    advertised model identity, which is write-once per store.
-3. **One instrumented dense-zone run.** Settles the throughput question (15K vs 21K px/s,
+2. **One instrumented dense-zone run.** Settles the throughput question (15K vs 21K px/s,
    worth $134,000) and the v2 question in the same run. This is the last preflight gate.
-4. **Public release.** The permanent store is 0.9–1.8 PB at $21,000–$42,000 a month, which
+3. **Public release.** The permanent store is 0.9–1.8 PB at $21,000–$42,000 a month, which
    exceeds the cost of producing it within a year. AWS Open Data sponsorship is the
    strongest lever available on lifetime cost, and it has lead time.
-5. **Ingest cap 40 → 71**, conditional on the Fargate quota landing.
+4. **Ingest cap 40 → 71**, conditional on the Fargate quota landing.
 
 ---
 

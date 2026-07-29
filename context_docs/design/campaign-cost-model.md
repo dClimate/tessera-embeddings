@@ -13,13 +13,13 @@ as derived). Two things are neither, and they are called out in §8 rather than 
 
 ## 1. The headline
 
-| | on-demand GPUs | spot GPUs |
-|---|---|---|
-| Ingest (Fargate) | $114,000 – $124,000 | same |
-| **Inference (GPU)** | **$293,000 – $470,000** | **$110,000 – $177,000** |
-| Assembly | ~$200 | same |
-| Mosaic storage (transient) | ~$3,000 | same |
-| **Campaign total** | **$410,000 – $597,000** | **$227,000 – $304,000** |
+| | |
+|---|---|
+| Ingest (Fargate) | $115,000 – $126,000 |
+| **Inference (GPU, on-demand)** | **$293,000 – $470,000** |
+| Assembly | ~$200 |
+| Mosaic storage (transient) | ~$3,000 |
+| **Campaign total** | **$411,000 – $599,000** |
 
 Then, separately and forever:
 
@@ -27,16 +27,20 @@ Then, separately and forever:
 |---|---|
 | **Permanent embeddings store** | **0.9 – 1.8 PB → $21,000 – $42,000 per month** |
 
+**GPUs are on-demand. Spot is not costed here and is not an option** — sustaining ~1,700
+g6e instances for days makes interruption a certainty rather than a risk, and a campaign
+that stalls on capacity is worse than one that costs more. Settled; do not re-open.
+
 **Three findings worth acting on.**
 
 1. **Inference, not ingest, is where the money is** — two-and-a-half to four times the
-   ingest bill on-demand. Every optimisation effort so far has gone into the cheaper half.
+   ingest bill. Every optimisation effort so far has gone into the cheaper half.
 2. **Inference cost is invariant to the ingest scenario.** Same pixels, same throughput,
    same GPU-hours whether you run 40 cells or 71. What the ingest scenario changes is
-   whether the GPU fleet has anything to do — and that is worth more than the ingest
-   saving (§5).
-3. **Spot pricing is the single largest lever in the model**, worth $180,000–$290,000.
-   Larger than every ingest optimisation delivered to date, combined.
+   whether the GPU fleet has anything to do.
+3. **Fleet sizing is now the largest lever in the model, worth up to $550,000** — the cost
+   of provisioning to the GPU quota rather than to what ingest can actually feed (§5). With
+   spot off the table it is also the only remaining six-figure one.
 
 ---
 
@@ -70,7 +74,7 @@ transfer (everything is in us-west-2, so there is no egress); engineering time.
 | S1 worker-hours | 39,600 – 71,100 | ingest estimate §6 |
 | Fargate | $0.04048/vCPU-h, $0.004445/GB-h | ingest estimate §6 |
 | Worker | 4 vCPU, 16 GiB → **$0.2330/worker-hour** | derived |
-| g6e.xlarge | $1.861/h on-demand, $0.5–0.9/h spot | `docs/providers/aws.md` |
+| g6e.xlarge | $1.861/h **on-demand** (spot excluded by decision) | `docs/providers/aws.md` |
 | Inference throughput | 15K / 21K / 24K px/s/worker | see §6 |
 | Embedding output | int8, 128 dims | `config/store_layout.py` |
 
@@ -131,11 +135,11 @@ GPU-hours follow from pixels and throughput alone:
   GPU-hours  =  1.363 × 10¹³ px  ÷  (px/s/worker × 3600)
 ```
 
-| throughput | GPU-hours | on-demand | spot @ $0.70 |
-|---|---|---|---|
-| 15K px/s — fleet-overall, incl. cold starts | 252,300 | $469,600 | $176,600 |
-| **21K px/s — measured, while processing** | **180,200** | **$335,400** | **$126,200** |
-| 24K px/s — best observed | 157,700 | $293,500 | $110,400 |
+| throughput | GPU-hours | cost @ $1.861/h |
+|---|---|---|
+| 15K px/s — fleet-overall, incl. cold starts | 252,300 | $469,600 |
+| **21K px/s — measured, while processing** | **180,200** | **$335,400** |
+| 24K px/s — best observed | 157,700 | $293,500 |
 
 **None of this varies with the ingest scenario.** The same pixels are inferred at the same
 rate either way.
@@ -265,17 +269,14 @@ idle burn in either row.
 | Fargate vCPU required | 12,640 | 22,436 |
 | Matched GPU fleet | 946 | 1,678 |
 | Ingest | $121,000 | $121,000 |
-| Inference, on-demand | $335,400 | $335,400 |
-| Inference, spot | $126,200 | $126,200 |
+| Inference | $335,400 | $335,400 |
 | Assembly + S3 + mosaics | $4,800 | $4,800 |
-| **Total, on-demand** | **$461,000** | **$461,000** |
-| **Total, spot** | **$252,000** | **$252,000** |
+| **Total** | **$461,000** | **$461,000** |
 | Ingest wall clock | 7.9 d | 4.5 d |
 | Campaign wall clock (staged) | ~8.1 d | ~4.6 d |
 | Idle burn if you run 2,500 GPUs anyway | **+$550,000** | **+$164,000** |
 
-At 15K px/s rather than 21K, add **$134,000** on-demand or **$50,000** on spot to both
-columns.
+At 15K px/s rather than 21K, add **$134,000** to both columns.
 
 **The two scenarios cost the same to within a rounding error.** The decision between them
 is about wall clock — 7.9 days against 4.5 — and about how much GPU quota you can convert
@@ -285,13 +286,8 @@ into work rather than idle: 946 GPUs against 1,678. It is not about money spent 
 
 ## 9. Assumptions and uncertainties, largest first
 
-1. **On-demand versus spot is worth more than every other line.** $335,400 against
-   $126,200 at 21K px/s. Inference is checkpointed at tile granularity and the campaign
-   already retries failed zones, so interruption tolerance is plausible — but it is
-   untested at fleet scale, and a spot-capacity shortfall for g6e in us-west-2 would stall
-   the campaign rather than merely slow it. **This is the first thing to settle.**
-2. **Throughput, 15K versus 21K px/s.** Worth $134,000 on-demand. Resolvable with one
-   instrumented dense-zone run.
+1. **Throughput, 15K versus 21K px/s.** Worth $134,000, and now the largest open number
+   in the model. Resolvable with one instrumented dense-zone run.
 3. **No measured v2 Large throughput exists.** The 0.89× compute ratio is derived from the
    architectures, and the pipeline is not compute-bound, so it may not appear at all.
 4. **Fleet-matching assumes ingest and inference stay in lockstep.** The duty-cycle
@@ -304,24 +300,22 @@ into work rather than idle: 946 GPUs against 1,678. It is not about money spent 
    at zstd on int8 embeddings and it swings a $21,000/month line by half.
 7. **Pixel count.** The 2048-tile census gives 1.363 × 10¹³; the ingest estimate's
    4096-chunk census implies 1.459 × 10¹³, about 7% higher. The larger figure would add
-   ~$23,000 to on-demand inference.
+   ~$23,000 to inference.
 
 ---
 
 ## 10. What to do about it
 
-1. **Decide spot versus on-demand for inference.** It is worth more than everything else
-   in this document combined, and it is the only remaining six-figure lever.
-2. **Size the GPU fleet to the ingest supply rate, not to the quota** — 1,135 GPUs at 40
+1. **Size the GPU fleet to the ingest supply rate, not to the quota** — 946 GPUs at 40
    cells, 1,678 at 71. Provisioning the full 2,500-actor quota against 40-cell ingest is
-   a $404,000 mistake.
-3. **Raise the Fargate quota to ~23,000 vCPU and raise `max_parallel_ingest` from 40 to
+   a $550,000 mistake, and with spot excluded it is the only six-figure lever left.
+2. **Raise the Fargate quota to ~23,000 vCPU and raise `max_parallel_ingest` from 40 to
    71.** No width change is needed — 50 workers is already the shipped default. It costs
    nothing measurable, halves ingest wall clock from 7.9 days to 4.5, and raises the GPU
    fleet you can keep busy from 946 to 1,678.
-4. **Measure one dense zone end to end on v2 Large.** It resolves the throughput question
+3. **Measure one dense zone end to end on v2 Large.** It resolves the throughput question
    (worth $134,000) and the v2 question (worth up to $37,000) in a single run.
-5. **Pursue AWS Open Data for the output store.** Storage exceeds the entire production
+4. **Pursue AWS Open Data for the output store.** Storage exceeds the entire production
    cost within a year of publication.
 
 ---
