@@ -1618,6 +1618,96 @@ feature was inert on the sensor with the most dates. **The lesson is about the d
 typo: a deliberately non-fatal write has no failure signal, so the only way to know its path is
 right is to READ THE VALUE BACK from a real store.** A completed run proves nothing about it.
 
+**The same family bit twice more, and the second one wedged an ingest permanently.**
+`open_or_create_repo` caught `icechunk.IcechunkError` wholesale on its open leg. That class is
+the library's catch-all — absence, an expired credential, a throttle, an IO error and real
+corruption all arrive as it — so ANY open failure was read as "not there" and sent to create,
+which then trips the clean-prefix rule and surfaces as `CorruptedStoreError` naming a store
+that is perfectly healthy, whose advice is to delete it. The damage is that it is
+**deterministic**: callers wrap these writes in a three-attempt retry that retries every
+exception, so a transient failure was already survivable, but once the repo exists every
+retry's create fails identically. `is_missing_repo` already existed for this and was already
+used at five call sites; this was the one place that did not honour it. TE `abc64f1`.
+
+Then the full chain, traced from one worker's log: a Dask worker's disk filled (§4.14),
+`cleanup_on_failure` fired, **the delete was DENIED with `Forbidden` and swallowed**, and the
+retry created into the non-empty prefix its own failed cleanup had left. The `Forbidden` was
+not an IAM policy gap: fsspec resolves the `AWS_*` environment variables, and the S1 path has
+overwritten them with OPERA-scoped tokens for downloading granules, so an ambient delete
+authenticated as OPERA against our own bucket. Every other S3 operation in the module threads
+credentials explicitly for exactly that reason — the cleanup was the one that did not. Fixed
+by threading them, by making `_write_new` ADOPT an interrupted repo rather than re-create it,
+and by logging a failed cleanup at ERROR with its consequence. TE `3878827`.
+
+**The pattern across all three: a swallowed exception plus an overloaded absence.** Each time,
+something read "I could not tell" as "it is not there" and acted on the wrong one.
+
+### 4.14 The crop flag was OFF by default, and that is why a "tiny" zone exhausted its workers
+
+The campaign's own default path had never been run. Every measurement in this document passed
+`crop_to_live_windows=True` **explicitly**, because they dispatched the S1/S2 deployments
+directly with their own parameters. The first test to go through `ingest_zone_year` with
+default `IngestSettings` — M8 — took the uncropped path, because the setting defaulted to
+`False` ("until the cropped path is validated end to end") and NOTHING in production source
+set it True: not `run_global_campaign`, not `fill_zones_sequential`, not `ingest_zone_year`,
+which reads it straight from the settings object.
+
+**The gap is ~420x.** On 15S land is 0.238% of the zone: 2,187 live 256-px chunks of 918,720.
+Uncropped materialises the whole zone extent, so Dask spilled managed task results to a worker
+holding Fargate's default 20 GiB and the spill failed with `OSError: [Errno 28]`. Worth being
+exact about what spills, because it is a common confusion: Dask can only spill data it
+MANAGES. **Unmanaged memory cannot be spilled at all** — and ingest is ~82% unmanaged (§8) —
+so the spill traffic was the loaded full-extent arrays, not a leak.
+
+**Every figure in this document assumes cropping.** Wall clock, cost, vCPU per cell, the
+batching thresholds, the fleet widths. Run uncropped and none of them hold.
+
+**The flag is now GONE rather than defaulted to True**, because no scenario wants it off: the
+mask IS the ROI store so cropping needs no extra prerequisite; a fully-dense ROI degenerates
+correctly; an all-ocean ROI correctly writes nothing; `batch_dates > 1` ALREADY required it,
+so the shipped optimisations presumed it; and yield-embeddings never referenced it. Removing
+it also deleted the `batch_dates > 1 requires crop_to_live_windows` validation, whose
+precondition now holds by construction. TE `d2dbb8f`.
+
+### 4.15 An interrupted ingest is RESUMED, not rebuilt
+
+A cancelled or crashed cell used to be CLEARED and re-ingested from scratch. At campaign scale
+that made every interruption cost a whole cell — and interruptions are expected, since the
+orphan sweeper cancels runs by design. A dense zone interrupted near the end lost hours,
+deterministically, on every retry.
+
+Three states, three answers. **Absent**: ingest. **Present and unmarked**: resume — dates
+already committed are skipped, not rewritten. **Present and marked with a DIFFERENT
+fingerprint**: raise `ConfigMismatchError`, because neither automatic answer is defensible.
+Resuming would append dates admitted under one configuration onto dates admitted under another
+and stamp one fingerprint over the mixture; clearing would destroy a complete correct mosaic
+because a parameter was mistyped. A campaign holds its inputs fixed, so reaching it means an
+assumption broke and a human should choose.
+
+**What makes resume sound is already in the format.** A date's time slot is committed
+atomically WITH its pixels, so a date present is complete and a date absent was never started
+— there is no partial date to repair. Both ingests already skip dates they find, so resuming
+is simply NOT CLEARING: no new marker, no extra read, no extra commit. Verified live on
+15S/2024 — all three stores' oldest snapshots predated the re-run, zero duplicate date
+commits, and neither pre-cancel radar date was re-written. The radar counts came out at 51
+ascending and 60 descending, matching a clean run exactly.
+
+**The campaign's fixed inputs are an ASSUMPTION, documented not checked** — one land mask, one
+window per year, one coverage threshold, both orbits, one partial-window policy. With one
+exception, because it is the only one whose change would corrupt silently rather than raise:
+`RoiManifest` records resolution, chunk size and CRS, so two ROIs built from different coverage
+deliveries hash IDENTICALLY. So `IngestManifest` now carries `coverage_sha256`, read from the
+ROI store `export_zone_roi` already stamps it on. The manifest is validated on EVERY write, so
+a changed mask fails at the first append rather than at a comparison somebody has to remember.
+
+**Two writers is the hazard resume makes reachable, and Icechunk guards it for free.** These
+commits pass no `rebase_with`, so a second writer's commit fails with `ConflictError` against a
+moved branch tip instead of merging. Verified directly: two sessions from one tip, the second
+refused, the time axis left holding only the winner's date. **That protection is the ABSENCE
+of a call**, and `storage.shard_writer.commit_with_rebase` deliberately does the opposite for
+disjoint groups — so a test pins the absence, because unifying two commit paths that look
+alike would silently interleave two ingests of one store. TE `3878827`, `38d5603`.
+
 ## 5. Claims made and withdrawn
 
 Recorded so they are not revived, and because the pattern is instructive.
