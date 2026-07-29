@@ -25,6 +25,8 @@ context_docs/
 │   ├── 012-validated-equivalence-for-inference-outputs.md
 │   └── 013-optional-s1-s2-only-pixels.md
 └── design/           Long-form framing docs (ported from planning)
+    ├── campaign-plan.md          <- START HERE for the global campaign
+    ├── campaign-cost-model.md
     ├── campaign-cluster-sizing.md
     ├── d3-sharding-plan.md
     ├── global-store-implementation-plan.md
@@ -51,6 +53,11 @@ a new record rather than editing in place.
 **Design docs** are the longer-form framing material that informed
 the decisions. Read these if a single ADR doesn't satisfy your
 question and you need the broader thinking.
+
+**For the global campaign specifically**, `design/campaign-plan.md` is
+the entry point: what will run, with what settings, at what cost, and
+what is still open. It links onward to the sizing, cost and ingest
+evidence rather than restating it.
 
 ## When to add a new ADR
 
