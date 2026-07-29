@@ -14,6 +14,7 @@ below with the launch/teardown helpers stubbed out.
 from __future__ import annotations
 
 import logging
+import subprocess
 from pathlib import Path
 
 import boto3
@@ -390,3 +391,23 @@ def test_resolve_ray_config_idle_timeout_override(tmp_path: Path) -> None:
     finally:
         cleanup_ray_tempfiles(kept)
         cleanup_ray_tempfiles(overridden)
+
+
+def test_ray_down_is_bounded_so_the_tag_fallback_can_still_run(monkeypatch):
+    """An unreachable head must not wedge teardown and strand a billing GPU fleet.
+
+    ``ray down`` SSHes into the head. Unbounded, a head that never answers means this
+    call never returns — so the caller never reaches ``terminate_ray_instances_by_tag``,
+    which is the fallback that exists for exactly this failure. The timeout is reported
+    as a failed ``ray down`` rather than raised, which is what routes the caller there.
+    """
+    seen: dict = {}
+
+    def _hangs(cmd, **kwargs):
+        seen.update(cmd=cmd, timeout=kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    monkeypatch.setattr(ray_mod.subprocess, "run", _hangs)
+
+    assert ray_mod._stop_ray_cluster("/tmp/resolved.yaml", _LOG) is False
+    assert seen["timeout"] == ray_mod.RAY_DOWN_TIMEOUT_S

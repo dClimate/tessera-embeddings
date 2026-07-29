@@ -109,9 +109,9 @@ def _run_ingest(monkeypatch, batch_dates: dict[str, list[str]], existing: set[st
     is how a shared boundary day is expressed: name it in two consecutive batches.
     Returns the dates actually written, in order.
 
-    Writes go a date at a time through ``write_day_windows``. ``write_dataset`` is still
-    stubbed so a regression that routed a batch there would surface as unexpected dates
-    rather than as an AttributeError.
+    Writes go a date at a time through ``write_day_windows`` — the only writer this
+    module has now that cropping is unconditional and the whole-batch ``write_dataset``
+    branch is gone.
     """
     import numpy as np
     import xarray as xr
@@ -133,12 +133,8 @@ def _run_ingest(monkeypatch, batch_dates: dict[str, list[str]], existing: set[st
     def fake_write_day_windows(_store, data, *_args, **_kwargs):
         written.append(str(data["time"].values[0])[:10])
 
-    def fake_write_dataset(_store, data, *_args, **_kwargs):
-        written.extend(str(t)[:10] for t in data["time"].values)
-
     monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
     monkeypatch.setattr(s1_roi, "write_day_windows", fake_write_day_windows)
-    monkeypatch.setattr(s1_roi, "write_dataset", fake_write_dataset)
     monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set(existing))
     monkeypatch.setattr(s1_roi, "apply_roi_mask", lambda data, *a, **k: data)
     monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
@@ -394,3 +390,44 @@ def test_per_date_narrowing_is_priced_like_the_run(monkeypatch, overlapped: bool
     )
     expected = WINDOW_COST_IN_CHUNKS_OVERLAPPED if overlapped else WINDOW_COST_IN_CHUNKS
     assert costs == {"run": expected, "date": expected}
+
+
+def test_the_assessed_window_is_recorded_when_a_resume_writes_no_new_date(monkeypatch) -> None:
+    """The SAR half of the zero-write repair, and the reason it cannot be left to a retry.
+
+    A run interrupted after its last date commit but before the assessed-window write
+    leaves the orbit store complete and unannotated. Every retry then dedupes all of its
+    dates away, writes nothing, and — keyed on what this invocation wrote — skips the
+    record again. A month the orbit genuinely never saw stays indistinguishable from a
+    gap, and ``check_time_window_coverage`` fails the zone-year forever.
+    """
+    from tessera_embeddings.ingest import s1_roi
+
+    recorded: list[str] = []
+    monkeypatch.setattr(s1_roi, "record_assessed_window", lambda path, *_a, **_k: recorded.append(path))
+
+    written = _run_ingest(
+        monkeypatch,
+        batch_dates={"2024-01-01": ["2024-01-01", "2024-01-02"]},
+        existing={"2024-01-01", "2024-01-02"},
+    )
+
+    assert written == [], "every date was already committed; nothing should be rewritten"
+    assert recorded == ["s3://bucket/mosaics/sar_ascending.zarr"]
+
+
+def test_no_assessed_window_is_recorded_when_the_orbit_store_does_not_exist(monkeypatch) -> None:
+    """The complement: an orbit with no store has nothing to annotate, and that is unambiguous.
+
+    ``record_assessed_window`` opens and never creates, so an unconditional call here would
+    be a warning on every orbit that this zone-window simply has no granules for.
+    """
+    from tessera_embeddings.ingest import s1_roi
+
+    recorded: list[str] = []
+    monkeypatch.setattr(s1_roi, "record_assessed_window", lambda path, *_a, **_k: recorded.append(path))
+
+    written = _run_ingest(monkeypatch, batch_dates={}, existing=set())
+
+    assert written == []
+    assert recorded == []

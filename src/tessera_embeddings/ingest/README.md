@@ -680,6 +680,17 @@ indistinguishable, and the coverage gate has to fail on both.
 The attribute belongs on the repo the gate opens — `reflectance.zarr` or `sar_<orbit>.zarr` —
 not on the mosaic directory that contains them.
 
+**It is written whenever the store exists, not only when the run wrote a date.** The case that
+needs it most writes nothing. A run interrupted between its last date commit and this record
+leaves every date present and the attribute absent; the retry then dedupes all of those dates
+away, takes the zero-write path, and — keyed on what *this* invocation wrote — skipped the record
+again. Every retry after it did the same, so a legitimately empty month stayed permanently
+indistinguishable from a gap and the zone-year could never complete. Keyed on the store, the
+resume repairs the attribute. The extra existence probe runs only when nothing was written, so a
+normal run pays nothing for it. A genuinely absent store is still left alone: there is no repo to
+annotate, and that case was never ambiguous — no store means the orbit is absent and callers
+downgrade.
+
 Every uncertain path is strict: an absent, malformed or unparseable attribute excuses nothing,
 and a partially-covered month stays an error because it could hide unexamined days. Failing to
 write the attribute is logged, never raised — the gate simply falls back to requiring every

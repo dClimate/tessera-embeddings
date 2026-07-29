@@ -20,8 +20,8 @@ The algorithm is unchanged from the reference:
    * Phase 1 — load only SCL, compute coverage from the same
      ``solar_day`` mosaic; reject days below ``min_valid_coverage``.
    * Phase 2 — load all bands, mask invalid pixels via the Phase 1
-     ``any_valid`` mask, apply ROI mask, write via
-     :func:`tessera_embeddings.storage.zarr_store.write_dataset` with a
+     ``any_valid`` mask, apply ROI mask, write the date's live windows via
+     :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a
      narrow tenacity retry on transient GDAL errors.
 
 Step 4 is split into a prepare half and a write half so ``pipeline_dates`` can
@@ -74,7 +74,6 @@ from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
     get_existing_dates,
     record_assessed_window,
-    write_dataset,
     write_day_windows,
     write_days_windows,
 )
@@ -141,6 +140,14 @@ def _coverage_from_scl(
     Returns:
         ``(passes, any_valid)``; ``any_valid`` is ``None`` when the date fails.
     """
+    # An ROI with no live pixel at all — an all-ocean mask yields no live window and so a
+    # zero denominator (see _sum_over_windows). No date can have coverage of nothing, so
+    # fail the date rather than divide: the campaign screens these out with
+    # zone_has_live_tiles, but the public ROI path has no such preflight and used to raise
+    # ZeroDivisionError from inside the per-date gate.
+    if roi_pixel_count == 0:
+        return (False, None)
+
     invalid_classes = np.array(sorted(S2_SCL_INVALID_CLASSES), dtype=scl_2d.dtype)
     any_valid = ~scl_2d.isin(invalid_classes)
 
@@ -333,24 +340,23 @@ def ingest_s2_roi_reflectance(
     spatial_chunks = {"northing": INGEST_CHUNKS["northing"], "easting": INGEST_CHUNKS["easting"]}
 
     roi_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
-    if live_windows is not None:
-        # Cropped: mask stays LAZY, total comes from the live windows only.
-        #
-        # No persist — it would materialise the whole zone grid, while every
-        # consumer (the SCL reduce below, the masking pass) slices to windows, so
-        # dask culls the reads and a per-date re-read beats pinning the grid.
-        #
-        # The window total equals the full-extent total because the mask is False
-        # outside every window, and row bands are chunk-disjoint so nothing is
-        # counted twice. _coverage_from_scl relies on that same property for the
-        # numerator: both sides of the coverage ratio must stay cropped together,
-        # or every percentage is silently skewed.
-        roi_pixel_count = int(_sum_over_windows(roi_mask, live_windows).compute())
-    else:
-        # Persist the ROI mask on workers so per-day graphs reference small
-        # future keys instead of re-reading from Zarr each time.
-        roi_mask = client.persist(roi_mask)
-        roi_pixel_count = int(roi_mask.sum().compute())
+    # The mask stays LAZY and the total comes from the live windows only.
+    #
+    # No persist — it would materialise the whole zone grid, while every
+    # consumer (the SCL reduce below, the masking pass) slices to windows, so
+    # dask culls the reads and a per-date re-read beats pinning the grid.
+    #
+    # The window total equals the full-extent total because the mask is False
+    # outside every window, and row bands are chunk-disjoint so nothing is
+    # counted twice. _coverage_from_scl relies on that same property for the
+    # numerator: both sides of the coverage ratio must stay cropped together,
+    # or every percentage is silently skewed.
+    roi_pixel_count = int(_sum_over_windows(roi_mask, live_windows).compute())
+
+    if roi_pixel_count == 0:
+        # Say so ONCE, here, rather than leaving the reader to infer it from every date
+        # failing coverage: an ROI with no live pixel can only ever produce a skip.
+        log.warning("ROI has no live pixels — every date will fail the coverage gate")
 
     total_processed = 0
     total_filtered = 0
@@ -440,8 +446,8 @@ def ingest_s2_roi_reflectance(
         # must stay the whole ROI; cropping the gate would rescale every percentage.
         # The numerator is unaffected either way, since there are no valid pixels
         # outside the footprint to count.
-        date_windows: list[tuple[int, int, int, int]] = live_windows or []
-        if live_windows is not None and run_windows:
+        date_windows: list[tuple[int, int, int, int]] = live_windows
+        if run_windows:
             narrowed = windows_for_date(
                 run_windows,
                 [getattr(item, "bbox", None) for item in day_items],  # type: ignore[misc]
@@ -497,31 +503,19 @@ def ingest_s2_roi_reflectance(
             reraise=True,
         ):
             with attempt:
-                if live_windows is not None:
-                    write_day_windows(
-                        reflectance_store,
-                        day_ds,
-                        prepared.windows,
-                        roi=roi,
-                        manifest=ingest_manifest,
-                        baselines=_baselines_for(baselines, [prepared.date]),
-                        tile_id=roi_zarr_path,
-                        crs=roi.native_crs,
-                        chunks=INGEST_CHUNKS,
-                        parallel_windows=overlap_window_writes,
-                        s3_region=s3_region,
-                    )
-                else:
-                    write_dataset(
-                        reflectance_store,
-                        day_ds,
-                        tile_id=roi_zarr_path,
-                        baselines=_baselines_for(baselines, [prepared.date]),
-                        chunks=INGEST_CHUNKS,
-                        manifest=ingest_manifest,
-                        crs=roi.native_crs,
-                        s3_region=s3_region,
-                    )
+                write_day_windows(
+                    reflectance_store,
+                    day_ds,
+                    prepared.windows,
+                    roi=roi,
+                    manifest=ingest_manifest,
+                    baselines=_baselines_for(baselines, [prepared.date]),
+                    tile_id=roi_zarr_path,
+                    crs=roi.native_crs,
+                    chunks=INGEST_CHUNKS,
+                    parallel_windows=overlap_window_writes,
+                    s3_region=s3_region,
+                )
         # One line per kept date, partitioning its wall clock into the client-side
         # graph build, the coverage-gate compute, and the write (windows + commit).
         # Stable format: CloudWatch queries and the pipeline analysis key off it.
@@ -536,7 +530,7 @@ def ingest_s2_roi_reflectance(
             prepared.gate_s,
             write_s,
             prepare_s + write_s,
-            len(prepared.windows) if live_windows is not None else 0,
+            len(prepared.windows),
             "parallel" if overlap_window_writes else "sequential",
         )
         # What the overlap actually bought: `stall` is the preparation the write could
@@ -737,7 +731,15 @@ def ingest_s2_roi_reflectance(
     # opens, and `store_path` is the mosaic parent directory holding all three child repos.
     # record_assessed_window only logs when the open fails, so passing the parent left the
     # attr unwritten and silently turned every legitimately empty month back into a gap.
-    if total_processed:
+    #
+    # Keyed on the STORE, not on `total_processed`. That counter is what THIS invocation
+    # wrote, and the case that needs the attr most writes nothing: a run interrupted after
+    # its last date commit but before this line leaves every date present and the attr
+    # absent, so the resume dedupes all of them away, takes the zero-write path, and skips
+    # the record again — on every retry, forever. The gate then reads a legitimately empty
+    # month as an unexplained gap and the zone-year can never complete. The extra probe
+    # runs ONLY in the zero-write case, so a normal run pays nothing for it.
+    if total_processed or get_existing_dates(reflectance_store, s3_region=s3_region):
         record_assessed_window(reflectance_store, start_date, end_date, s3_region=s3_region)
 
     if total_processed == 0:

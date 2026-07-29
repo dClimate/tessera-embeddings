@@ -30,7 +30,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -290,15 +290,38 @@ class _DeploymentCellInputs:
         waiting on the densest zone in the window — the slowest to ingest — while
         smaller ones land hours earlier. Any landed mosaic is enough to start.
 
-        A cell whose ingest FAILED counts as landed: its exception surfaces when
-        the runner reaches it, and blocking here for a mosaic that will never
-        arrive would be the worse outcome.
+        A FAILED ingest is not a landed mosaic, so it does not end the wait while any
+        sibling is still running. The caller's next act is to request a GPU fleet, and a
+        fast failure — bad credentials, a bad parameter — would otherwise boot one within
+        seconds for a mosaic that does not exist. Keep waiting instead: whichever sibling
+        lands first is a real mosaic, and the failure still surfaces when the runner
+        reaches that cell.
+
+        Only when EVERY cell has finished and every one failed does this return a failed
+        cell rather than blocking forever — there is no mosaic coming, and the caller must
+        proceed to the runner to surface the error.
         """
         futs = {self._futures[c]: c for c in cells if c in self._futures}
         if not futs:
             return None
-        done, _ = wait(list(futs), timeout=timeout, return_when=FIRST_COMPLETED)
-        return futs[next(iter(done))] if done else None
+        deadline = None if timeout is None else time.monotonic() + timeout
+        pending = set(futs)
+        while pending:
+            budget = None if deadline is None else max(0.0, deadline - time.monotonic())
+            done, pending = wait(pending, timeout=budget, return_when=FIRST_COMPLETED)
+            if not done:
+                return None
+            for fut in done:
+                # .exception() cannot block — every future in `done` is settled. A
+                # CANCELLED one raises instead of returning, and is not a mosaic either.
+                try:
+                    if fut.exception() is None:
+                        return futs[fut]
+                except CancelledError:
+                    continue
+            if not pending:
+                return futs[next(iter(done))]
+        return None
 
     def cleanup(self, zone: str, year: int) -> None:
         if (zone, year) not in self._futures or not self._cleanup_mosaics:
@@ -823,32 +846,38 @@ def fill_zones_sequential_flow(
     # The densest-first ORDER is unchanged and still doing its two jobs: it sizes
     # the session from the largest cell, and it puts the island tail last. What it
     # is no longer is a barrier.
-    if inputs is not None:
-        ingest_window = live[: 1 + look_ahead]
-        for cell in ingest_window:
-            inputs.start(cell.zone, cell.year)
-
-        log.info(
-            "Ingesting %d UTM zone(s); GPUs are requested as soon as the first mosaic lands (sizes %s tiles)",
-            len(ingest_window),
-            ", ".join(f"{c.n_tiles:,}" for c in ingest_window),
-        )
-        t0 = time.monotonic()
-        first = inputs.wait_first([(c.zone, c.year) for c in ingest_window])
-        if first is None:  # nothing was started (no adapter cells) — nothing to wait for
-            log.warning("No ingest was started for this cluster; requesting GPUs without waiting")
-        else:
-            landed = next(c for c in ingest_window if (c.zone, c.year) == first)
-            log.info(
-                "Mosaic for %s-%d (%s tiles) ready after %.1fs — requesting GPUs; %d zone(s) still ingesting",
-                landed.zone,
-                landed.year,
-                f"{landed.n_tiles:,}",
-                time.monotonic() - t0,
-                len(ingest_window) - 1,
-            )
-
+    # INSIDE the shutdown guard, deliberately. `start` submits every cell in the window
+    # at once, so from the first submission onward there are child ingest runs that only
+    # `shutdown()` can cancel. Priming above the `try` meant any failure between the first
+    # submission and the `with` — a raising `start`, an unexpected error in the wait —
+    # returned without cancelling them, leaving children writing to mosaic prefixes
+    # server-side that a prompt retry of this flow would then race.
     try:
+        if inputs is not None:
+            ingest_window = live[: 1 + look_ahead]
+            for cell in ingest_window:
+                inputs.start(cell.zone, cell.year)
+
+            log.info(
+                "Ingesting %d UTM zone(s); GPUs are requested as soon as the first mosaic lands (sizes %s tiles)",
+                len(ingest_window),
+                ", ".join(f"{c.n_tiles:,}" for c in ingest_window),
+            )
+            t0 = time.monotonic()
+            first = inputs.wait_first([(c.zone, c.year) for c in ingest_window])
+            if first is None:  # nothing was started (no adapter cells) — nothing to wait for
+                log.warning("No ingest was started for this cluster; requesting GPUs without waiting")
+            else:
+                landed = next(c for c in ingest_window if (c.zone, c.year) == first)
+                log.info(
+                    "Mosaic for %s-%d (%s tiles) ready after %.1fs — requesting GPUs; %d zone(s) still ingesting",
+                    landed.zone,
+                    landed.year,
+                    f"{landed.n_tiles:,}",
+                    time.monotonic() - t0,
+                    len(ingest_window) - 1,
+                )
+
         # Pin a deterministic cluster name from the flow-run id so the cancellation
         # hook can re-derive it and terminate the fleet by tag even in a fresh module
         # import (globals unset) — a cancel before activate() records the name must

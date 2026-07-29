@@ -135,6 +135,7 @@ def run_ingest(monkeypatch):
         fail_on: str | None = None,
         write_s: float = 0.0,
         log: logging.Logger | None = None,
+        existing_dates: set[str] | None = None,
         **ingest_kwargs,
     ) -> _Run:
         run = _Run()
@@ -161,9 +162,6 @@ def run_ingest(monkeypatch):
             run.written.append(date)
             run.write_ended[date] = time.monotonic()
 
-        def write_dataset(_store, day_ds, **_kwargs):
-            _record_write(day_ds)
-
         def write_day_windows(_store, day_ds, _windows, **_kwargs):
             _record_write(day_ds)
 
@@ -175,8 +173,9 @@ def run_ingest(monkeypatch):
 
         monkeypatch.setattr(s2_roi, "query_stac_items", lambda **_kwargs: ([_item(d) for d in dates], {}))
         monkeypatch.setattr(s2_roi, "load_stac_items", load_stac_items)
-        monkeypatch.setattr(s2_roi, "write_dataset", write_dataset)
-        monkeypatch.setattr(s2_roi, "get_existing_dates", lambda *_a, **_k: set())
+        # What the store already holds. Default empty — a fresh ingest — but a test can
+        # populate it to stand a run up over an existing store, which is what a resume is.
+        monkeypatch.setattr(s2_roi, "get_existing_dates", lambda *_a, **_k: set(existing_dates or ()))
         monkeypatch.setattr(s2_roi, "read_roi_metadata", lambda *_a, **_k: _ROI)
         monkeypatch.setattr(s2_roi, "read_roi_mask", lambda *_a, **_k: da.ones((SIZE, SIZE), dtype=bool))
         monkeypatch.setattr(s2_roi, "IngestManifest", SimpleNamespace(from_roi_store=lambda _p: None))
@@ -392,3 +391,36 @@ def test_the_assessed_window_lands_on_the_reflectance_repo(run_ingest, monkeypat
     monkeypatch.setattr(s2_roi, "record_assessed_window", lambda path, *_a, **_k: seen.append(path))
     run_ingest(dict.fromkeys(["2024-01-01"], True), pipeline_dates=False)
     assert seen == ["memory://store/reflectance.zarr"]
+
+
+def test_the_assessed_window_is_recorded_when_a_populated_store_gains_no_dates(run_ingest, monkeypatch):
+    """The permanent-failure case: a run that wrote nothing over a store that is already full.
+
+    Two ways in, one shape. A resume whose query filtered every date away as already
+    committed writes nothing; so does a pass whose only dates all fail coverage — the case
+    below, and the very case the attribute exists to explain. Keyed on what THIS invocation
+    wrote, the record was skipped, and skipped again on every retry, because each one takes
+    the same zero-write path. The coverage gate then reads the empty month as an
+    unexplained gap and the zone-year can never complete. Keyed on the STORE, it is written.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(s2_roi, "record_assessed_window", lambda path, *_a, **_k: seen.append(path))
+    run = run_ingest(dict.fromkeys(["2024-01-01"], False), pipeline_dates=False, existing_dates={"2023-12-31"})
+
+    assert run.written == [], "the only date fails coverage; nothing should be written"
+    assert seen == ["memory://store/reflectance.zarr"]
+
+
+def test_no_assessed_window_is_recorded_when_the_store_does_not_exist(run_ingest, monkeypatch):
+    """The complement: nothing written and nothing present means there is no repo to annotate.
+
+    Guards the probe added for the case above from becoming an unconditional write against
+    a store that was never created — ``record_assessed_window`` opens and never creates, so
+    that would be a warning on every genuinely empty run.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(s2_roi, "record_assessed_window", lambda path, *_a, **_k: seen.append(path))
+
+    run_ingest(dict.fromkeys(["2024-01-01"], False), pipeline_dates=False)
+
+    assert seen == []

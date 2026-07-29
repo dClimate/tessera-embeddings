@@ -135,3 +135,21 @@ def test_threshold_boundaries(threshold):
     roi = _mask(np.ones((CHUNK, CHUNK)))
     passes, _ = _coverage_from_scl(scl, roi, CHUNK * CHUNK, threshold, SYNC_CLIENT, windows=[(0, CHUNK, 0, CHUNK)])
     assert passes
+
+
+def test_an_roi_with_no_live_pixel_fails_the_date_instead_of_dividing_by_zero():
+    """An all-ocean ROI yields no live window, so the coverage denominator is zero.
+
+    ``_sum_over_windows`` returns 0 for an empty window list — documented behaviour, not
+    an accident — and the ratio below then raised ``ZeroDivisionError`` from inside the
+    per-date gate. The campaign never sees it (``zone_has_live_tiles`` screens all-ocean
+    zones out before ingest), but the public ROI ingest has no such preflight, so an ROI
+    over open water crashed rather than reporting that it had nothing to ingest.
+    """
+    scl = _scl(np.full((CHUNK, CHUNK), VALID_CLASS))
+    roi = _mask(np.zeros((CHUNK, CHUNK)))
+
+    passes, any_valid = _coverage_from_scl(scl, roi, 0, 0.0, SYNC_CLIENT, windows=[])
+
+    assert not passes
+    assert any_valid is None

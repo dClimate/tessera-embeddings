@@ -335,7 +335,13 @@ Four write paths, all committing atomically (`storage/zarr_store.py` has
 the first three; `inference/assembly.py` + `storage/shard_writer.py` the
 fourth):
 
-1. **create** — `write_dataset` on a fresh store;
+1. **create** — `write_dataset` on a fresh store. It adopts a repo an
+   interrupted attempt left behind rather than failing forever on a dirty
+   prefix, but refuses outright to run its `mode="w"` write over a store
+   that holds committed arrays — the date probe that routes writes here
+   reports "empty" for a store it merely could not read, and without the
+   refusal a transient read error would replace years of dates with one
+   batch;
 2. **append** — extend the time axis of an existing store;
 3. **region overwrite** — rewrite a temporal/spatial slice in place;
 4. **shard-assemble** — staged inference tiles written as whole, lean

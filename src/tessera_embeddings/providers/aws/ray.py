@@ -615,9 +615,23 @@ def _stop_ray_cluster(
     Returns True if ``ray down`` exited 0, False otherwise (caller may then fall
     back to tag-based termination so a head that ``ray down`` couldn't reach
     doesn't leak).
+
+    BOUNDED by ``RAY_DOWN_TIMEOUT_S``, for the reason that constant documents: this
+    SSHes into the head, and an unreachable head makes it hang indefinitely. Unbounded,
+    the fallback in the sentence above is unreachable exactly when it is needed — the
+    call never returns, so nothing terminates the fleet by tag and the GPUs bill on. A
+    timeout is therefore reported as a failed ``ray down``, not raised.
     """
     log.info("Tearing down Ray cluster")
-    result = subprocess.run(["ray", "down", cluster_yaml, "-y"], check=False)
+    try:
+        result = subprocess.run(["ray", "down", cluster_yaml, "-y"], check=False, timeout=RAY_DOWN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "ray down did not finish within %ds — treating as failed so the caller falls "
+            "back to terminating instances by ray-cluster-name tag.",
+            RAY_DOWN_TIMEOUT_S,
+        )
+        return False
     if result.returncode == 0:
         log.info("Ray cluster stopped")
         return True

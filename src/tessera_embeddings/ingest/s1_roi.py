@@ -21,8 +21,8 @@ Algorithm (unchanged from the reference):
    * Build an OPERA RTC item filter for the orbit / bounding box /
      batch window.
    * Call :func:`ingest_tile` to produce a per-batch ``xarray.Dataset``.
-   * Apply the ROI mask, then write via
-     :func:`tessera_embeddings.storage.zarr_store.write_dataset` with a
+   * Apply the ROI mask, then write each date's live windows via
+     :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a
      narrow tenacity retry on transient GDAL errors.
 """
 
@@ -57,7 +57,6 @@ from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
     get_existing_dates,
     record_assessed_window,
-    write_dataset,
     write_day_windows,
 )
 
@@ -172,7 +171,7 @@ def ingest_s1_roi_sar(
     start_date: str,
     end_date: str,
     store_path: str,
-    client: dask.distributed.Client,
+    client: dask.distributed.Client,  # noqa: ARG001 — see the docstring: held, not called
     orbit: S1Orbit,
     batch_days: int = 30,
     edl_credentials_fn: Callable[[], dict[str, str]] | None = None,
@@ -198,7 +197,12 @@ def ingest_s1_roi_sar(
         store_path: Base path for satellite mosaics; the function
             creates ``sar_<orbit>.zarr`` underneath.
         client: Connected :class:`dask.distributed.Client`. Callers
-            create this; we do not call ``get_client``.
+            create this; we do not call ``get_client``. Required but never
+            invoked directly: every compute here goes through the AMBIENT
+            client, which constructing one makes current. Keeping it in the
+            signature is what states that a connected cluster is a
+            precondition — the S2 ingest takes it for the same reason and
+            does use it, so the two entry points stay symmetric.
         orbit: ``"ascending"`` or ``"descending"`` — one orbit per call.
             Multi-orbit ingestion is a flow-level concern (call twice).
         batch_days: Days per time batch. Smaller values keep each Dask
@@ -431,10 +435,7 @@ def ingest_s1_roi_sar(
         # during the write's compute(), by which point the credential refresh has
         # applied any new session token.
         batch_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
-        if live_windows is None:
-            # Materialise on workers so per-batch graphs reference small future keys.
-            batch_mask = client.persist(batch_mask)
-        # Cropped: left LAZY on purpose. persist() materialises every chunk of the full
+        # Left LAZY on purpose. persist() materialises every chunk of the full
         # zone grid — for 03S that is 3,706 chunks / ~60 GiB of mostly ocean, pinned for
         # the run — while the only consumer, apply_roi_mask, is written out to the live
         # windows and so touches a handful of them. Dask culls the reads to those chunks,
@@ -531,115 +532,83 @@ def ingest_s1_roi_sar(
                     reraise=True,
                 )
 
-            if live_windows is not None:
-                # A batch holds many NON-contiguous dates, each its own atomic
-                # commit — so the retry scope is PER DATE. One retry around the
-                # whole loop would restart at a date an earlier attempt already
-                # committed and trip the duplicate-date guard.
-                for i in range(data.sizes["time"]):
-                    # Match this slice on its EXACT timestamp — the value odc took from the
-                    # group's first item — and take BOTH the solar day and the footprint from
-                    # what was grouped. The slice's own label cannot be trusted as the day:
-                    # odc stamps it with an item timestamp whose calendar date can be the day
-                    # BEFORE the solar day wherever the offset crosses UTC midnight, so two
-                    # solar days can normalise onto one date and collide on the time axis.
-                    #
-                    # Unmatched means the footprint is unknown, so fall back to the label —
-                    # the pre-existing behaviour, and the conservative branch.
-                    entry = prepared.date_windows.get(str(data["time"].values[i])[:19])
-                    solar_day, footprint = entry if entry else (None, None)
-                    date_str = solar_day or str(data["time"].values[i])[:10]
-                    # THE authority on what has been written, checked here rather than
-                    # relying on the query filter: under a look-ahead the query for this
-                    # batch may have been built before an earlier batch committed, so a
-                    # solar day shared across a UTC batch boundary could arrive twice.
-                    # Writing it twice would trip the duplicate-date guard mid-run.
-                    if date_str in written_dates:
-                        log.info("[%s] Skipping date %s: already written", orbit, date_str)
-                        continue
+            # A batch holds many NON-contiguous dates, each its own atomic
+            # commit — so the retry scope is PER DATE. One retry around the
+            # whole loop would restart at a date an earlier attempt already
+            # committed and trip the duplicate-date guard.
+            for i in range(data.sizes["time"]):
+                # Match this slice on its EXACT timestamp — the value odc took from the
+                # group's first item — and take BOTH the solar day and the footprint from
+                # what was grouped. The slice's own label cannot be trusted as the day:
+                # odc stamps it with an item timestamp whose calendar date can be the day
+                # BEFORE the solar day wherever the offset crosses UTC midnight, so two
+                # solar days can normalise onto one date and collide on the time axis.
+                #
+                # Unmatched means the footprint is unknown, so fall back to the label —
+                # the pre-existing behaviour, and the conservative branch.
+                entry = prepared.date_windows.get(str(data["time"].values[i])[:19])
+                solar_day, footprint = entry if entry else (None, None)
+                date_str = solar_day or str(data["time"].values[i])[:10]
+                # THE authority on what has been written, checked here rather than
+                # relying on the query filter: under a look-ahead the query for this
+                # batch may have been built before an earlier batch committed, so a
+                # solar day shared across a UTC batch boundary could arrive twice.
+                # Writing it twice would trip the duplicate-date guard mid-run.
+                if date_str in written_dates:
+                    log.info("[%s] Skipping date %s: already written", orbit, date_str)
+                    continue
 
-                    if footprint is not None and not footprint:
-                        # Reaches no live window at all. Writing it would build a full graph
-                        # to store nothing, since all-fill chunks are never persisted.
-                        log.info("[%s] Skipping date %s: imagery reaches no live window", orbit, date_str)
-                        empty_dates += 1
-                        continue
-                    date_windows = footprint if (narrow_windows_per_date and footprint) else live_windows
+                if footprint is not None and not footprint:
+                    # Reaches no live window at all. Writing it would build a full graph
+                    # to store nothing, since all-fill chunks are never persisted.
+                    log.info("[%s] Skipping date %s: imagery reaches no live window", orbit, date_str)
+                    empty_dates += 1
+                    continue
+                date_windows = footprint if (narrow_windows_per_date and footprint) else live_windows
 
-                    # Stamp the slice with its solar day. The store's axis is day-granular
-                    # either way, so this only decides WHICH day — and taking it from the
-                    # grouping is what makes it unique per slice and monotonic across them.
-                    day_slice = data.isel(time=slice(i, i + 1))
-                    if solar_day:
-                        day_slice = day_slice.assign_coords(time=[np.datetime64(solar_day, "ns")])
+                # Stamp the slice with its solar day. The store's axis is day-granular
+                # either way, so this only decides WHICH day — and taking it from the
+                # grouping is what makes it unique per slice and monotonic across them.
+                day_slice = data.isel(time=slice(i, i + 1))
+                if solar_day:
+                    day_slice = day_slice.assign_coords(time=[np.datetime64(solar_day, "ns")])
 
-                    # Inside the per-date loop deliberately: a batch can outlive the
-                    # credential, so renewing only at batch boundaries is what failed.
-                    refresh_credentials_if_stale()
-                    date_started = time.monotonic()
-                    for attempt in _retrying():
-                        with attempt:
-                            write_day_windows(
-                                orbit_store,
-                                day_slice,
-                                date_windows,
-                                roi=roi,
-                                manifest=ingest_manifest,
-                                baselines=_baselines_for(baselines, [date_str]),
-                                tile_id=roi_zarr_path,
-                                crs=roi.native_crs,
-                                chunks=INGEST_CHUNKS,
-                                parallel_windows=overlap_window_writes,
-                                s3_region=s3_region,
-                            )
-                    date_s = time.monotonic() - date_started
-                    write_total_s += date_s
-                    written_dates.add(date_str)
-                    written_this_batch += 1
-                    # ``mode`` is the load-bearing field: sequential means this date
-                    # cost the SUM of its windows' critical paths rather than their
-                    # maximum, which is the single largest difference between how S1
-                    # and S2 write today.
-                    log.info(
-                        "[%s] S1 stage timings date=%s: write=%.1fs windows=%d of %d mode=%s",
-                        orbit,
-                        date_str,
-                        date_s,
-                        len(date_windows),
-                        len(live_windows),
-                        "parallel" if overlap_window_writes else "sequential",
-                    )
-            else:
-                # Dedupe against what has ACTUALLY been written, exactly as the cropped
-                # branch does per date. The query filter used the snapshot frozen before
-                # the run began, so under a look-ahead a solar day shared across a UTC
-                # batch boundary can reach here already committed — and `write_dataset`
-                # appends whatever it is handed, so that duplicate would land on the time
-                # axis silently rather than tripping the windowed path's slot guard.
-                dates = [str(t)[:10] for t in data["time"].values]
-                keep = [i for i, d in enumerate(dates) if d not in written_dates]
-                if len(keep) < len(dates):
-                    log.info(
-                        "[%s] Skipping %d date(s) already written: %s",
-                        orbit,
-                        len(dates) - len(keep),
-                        ", ".join(sorted({d for d in dates if d in written_dates})),
-                    )
-                if keep:
-                    for attempt in _retrying():
-                        with attempt:
-                            write_dataset(
-                                orbit_store,
-                                data if len(keep) == len(dates) else data.isel(time=keep),
-                                tile_id=roi_zarr_path,
-                                baselines=baselines,
-                                chunks=INGEST_CHUNKS,
-                                manifest=ingest_manifest,
-                                crs=roi.native_crs,
-                                s3_region=s3_region,
-                            )
-                    written_dates.update(dates[i] for i in keep)
-                written_this_batch = len(keep)
+                # Inside the per-date loop deliberately: a batch can outlive the
+                # credential, so renewing only at batch boundaries is what failed.
+                refresh_credentials_if_stale()
+                date_started = time.monotonic()
+                for attempt in _retrying():
+                    with attempt:
+                        write_day_windows(
+                            orbit_store,
+                            day_slice,
+                            date_windows,
+                            roi=roi,
+                            manifest=ingest_manifest,
+                            baselines=_baselines_for(baselines, [date_str]),
+                            tile_id=roi_zarr_path,
+                            crs=roi.native_crs,
+                            chunks=INGEST_CHUNKS,
+                            parallel_windows=overlap_window_writes,
+                            s3_region=s3_region,
+                        )
+                date_s = time.monotonic() - date_started
+                write_total_s += date_s
+                written_dates.add(date_str)
+                written_this_batch += 1
+                # ``mode`` is the load-bearing field: sequential means this date
+                # cost the SUM of its windows' critical paths rather than their
+                # maximum, which is the single largest difference between how S1
+                # and S2 write today.
+                log.info(
+                    "[%s] S1 stage timings date=%s: write=%.1fs windows=%d of %d mode=%s",
+                    orbit,
+                    date_str,
+                    date_s,
+                    len(date_windows),
+                    len(live_windows),
+                    "parallel" if overlap_window_writes else "sequential",
+                )
             # Count what was WRITTEN, not what the batch held: under a look-ahead a date
             # can arrive already committed by an earlier batch and be skipped above, and
             # reporting it as processed would overstate a resumed run's progress.
@@ -676,7 +645,14 @@ def ingest_s1_roi_sar(
     # finding rather than a gap (see storage.zarr_store.record_assessed_window). Only when a
     # store exists: with nothing written there is no store to annotate, and that case is
     # already unambiguous — no store means the orbit is absent and callers downgrade.
-    if total_processed:
+    #
+    # "A store exists", NOT "this invocation wrote a date". A run interrupted after its
+    # last commit but before this line leaves the orbit store complete and unannotated; the
+    # resume then dedupes every date away, writes nothing, and would skip the record again
+    # on every retry, leaving a legitimately empty month permanently indistinguishable from
+    # a gap. `empty_dates` is 0 on such a resume, which is honest — this pass examined no
+    # date — and the gate does not read it. The probe runs ONLY when nothing was written.
+    if total_processed or get_existing_dates(orbit_store, s3_region=s3_region):
         record_assessed_window(
             orbit_store,
             start_date,

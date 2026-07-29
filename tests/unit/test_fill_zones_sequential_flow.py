@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import Future
 from contextlib import contextmanager
 from functools import partial
 from types import SimpleNamespace
@@ -615,3 +616,76 @@ def test_session_orbit_is_the_request(wired):
     """
     _run(s1_orbit="both")
     assert wired["seq_kwargs"]["session_s1_orbit"] == "both"
+
+
+# ---------------------------------------------------------------------------
+# wait_first: a failed ingest is not a landed mosaic
+# ---------------------------------------------------------------------------
+
+
+def _settled(exc: BaseException | None):
+    """A finished ``Future`` carrying ``exc`` (or a result when None)."""
+    fut: Future = Future()
+    fut.set_exception(exc) if exc is not None else fut.set_result(None)
+    return fut
+
+
+def test_wait_first_skips_a_failed_cell_while_a_sibling_is_still_ingesting():
+    """A fast failure must not be mistaken for a mosaic and boot a GPU fleet.
+
+    The caller's next act after this returns is ``ray up``. Bad credentials or a bad
+    parameter fail a child ingest within seconds, so returning it as "landed" spun up the
+    paid fleet immediately, for a mosaic that does not exist, only for the feeder to
+    surface the same failure and tear it back down. The sibling is what the wait is for.
+    """
+    adapter = _adapter()
+    try:
+        pending: Future = Future()
+        adapter._futures = {("01N", 2024): _settled(RuntimeError("bad credentials")), ("02N", 2024): pending}
+        threading.Timer(0.05, lambda: pending.set_result(None)).start()
+
+        assert adapter.wait_first([("01N", 2024), ("02N", 2024)]) == ("02N", 2024)
+    finally:
+        adapter.shutdown()
+
+
+def test_wait_first_returns_a_failed_cell_once_every_cell_has_failed():
+    """The other side of it: no mosaic is coming, so blocking forever is the worse answer.
+
+    The caller proceeds to the runner, which surfaces the failure. Returning ``None`` here
+    would read as "timed out" and send it on without any diagnosis at all.
+    """
+    adapter = _adapter()
+    try:
+        adapter._futures = {
+            ("01N", 2024): _settled(RuntimeError("boom")),
+            ("02N", 2024): _settled(RuntimeError("boom")),
+        }
+        assert adapter.wait_first([("01N", 2024), ("02N", 2024)]) in {("01N", 2024), ("02N", 2024)}
+    finally:
+        adapter.shutdown()
+
+
+def test_a_failure_while_priming_still_cancels_the_ingests_it_started(wired, monkeypatch):
+    """Priming lives inside the shutdown guard, so no child ingest is ever orphaned.
+
+    ``start`` submits the whole window at once, so from the first submission there are
+    child runs that only ``shutdown()`` can cancel. With priming above the ``try``, a
+    failure between the first submission and the cluster — a raising ``start``, an
+    unexpected error in the wait — returned without cancelling them, leaving children
+    writing mosaic prefixes server-side that a prompt retry would then race.
+    """
+
+    class _FailingInputs(_RecordingInputs):
+        def wait_first(self, cells, timeout=None):
+            self._order.append("wait_first:raised")
+            raise RuntimeError("prefect API unreachable")
+
+    monkeypatch.setattr(mod, "_DeploymentCellInputs", partial(_FailingInputs, wired["order"]))
+    with pytest.raises(RuntimeError, match="prefect API unreachable"):
+        _run(zones=["01N", "02N", "03N"], ingest=True, look_ahead=1)
+
+    order = wired["order"]
+    assert "start:01N" in order, "the window was primed, so its children must be cancelled"
+    assert "inputs_shutdown" in order, "shutdown never ran; the started ingests are orphans"
+    assert "ray_up" not in order, "no cluster should be requested once the wait failed"
