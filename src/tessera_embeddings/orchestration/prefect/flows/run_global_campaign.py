@@ -75,7 +75,13 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_live_tile_count,
     zone_year_on_axis,
 )
-from tessera_embeddings.storage.campaign import campaign_status, campaign_work_list, tag_year_complete, zone_year_tag
+from tessera_embeddings.storage.campaign import (
+    CampaignStatus,
+    campaign_status,
+    campaign_work_list,
+    tag_year_complete,
+    zone_year_tag,
+)
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store_group_and_tip
@@ -451,6 +457,7 @@ async def run_global_campaign(
     ingest_deployment: str | None = None,
     mask_name: str = "global",
     max_parallel_ingest: int = 40,
+    max_zone_attempts: int = 2,
     ingest_limit_name: str = "tessera-global-ingests",
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
@@ -550,6 +557,16 @@ async def run_global_campaign(
             clusters are separate flow runs, so the cap has to live server-side);
             under ``"cluster-per-zone"`` an in-process semaphore is equivalent,
             because that strategy has one driver.
+        max_zone_attempts: How many times a year's remaining cells are dispatched
+            before the campaign gives up on them. A failed zone must not cost the
+            campaign: interruptions are EXPECTED (the orphan sweeper cancels child
+            runs by design), and an interrupted mosaic is resumed rather than
+            rebuilt, so a re-dispatch is cheap. Each round re-reads the store and
+            targets only what is still missing, so a retry never re-does landed
+            work. Rounds stop early when one makes no progress at all — that is
+            what a DETERMINISTIC failure looks like from here (a coverage gate, a
+            fingerprint mismatch, an unseeded group), and those want a human, not
+            another cluster. Set to 1 to disable retries.
         ingest_limit_name: Prefect global concurrency limit backing
             ``max_parallel_ingest`` under ``"chained-clusters"``. The campaign
             upserts it to that value at start, so the parameter is the single place
@@ -603,6 +620,8 @@ async def run_global_campaign(
         raise ValueError(msg)
     if max_parallel_ingest < 1:
         raise ValueError(f"max_parallel_ingest must be >= 1, got {max_parallel_ingest} (Semaphore(0) blocks forever)")
+    if max_zone_attempts < 1:
+        raise ValueError(f"max_zone_attempts must be >= 1, got {max_zone_attempts} (no cell would ever be dispatched)")
     # Publish both fleet-wide caps so the numbers the operator set here are the
     # numbers actually enforced in the children (see _upsert_limit). Cheap,
     # idempotent, and safe to repeat.
@@ -898,151 +917,220 @@ async def run_global_campaign(
     # Dedupe (campaign_work_list already dedupes years, so a duplicate here would
     # re-dispatch the same static work entries against a non-refreshed status).
     runs_by_year: dict[int, list[str]] = {}
+    #: Cells still missing after every attempt, per year. Collected rather than
+    #: raised on, so one bad zone cannot cost the years that follow it.
+    unfilled: dict[int, list[str]] = {}
     for year in sorted(set(campaign_years), reverse=True):
-        year_zones = [z for z, y in work if y == year]
-        if year_zones and fill_strategy == "chained-clusters":
-            # Up to max_parallel_clusters child runs fill the year, each owning
-            # ONE shared Ray cluster and draining its own list of zones strictly
-            # sequentially — clusters take up their next zone without actor
-            # churn instead of being torn down per cell. Shards are
-            # size-balanced (LPT over live-tile counts) so they finish
-            # together. Ingest, per-cell run_ids, retag/empty triage, and
-            # mosaic cleanup all live inside the children (their ingest
-            # look-ahead pipelines mosaics against each cluster), so the
-            # per-cell _process chain is bypassed; the global ingest bound is
-            # preserved by dividing max_parallel_ingest across the clusters.
-            clusters = _partition_by_live_tiles(
-                year_zones,
-                min(max_parallel_clusters, len(year_zones)),
-                land_mask_path=paths.land_mask_store(mask_name),
-                known_complete={z for z in year_zones if status.has(z, year)},
-                get_credentials=iam_icechunk_credentials,
-                s3_region=s3_region,
-            )
-            log.info(
-                "Year %d: dispatching %d chained fill(s) for %d zone(s): %s",
-                year,
-                len(clusters),
-                len(year_zones),
-                [len(cl) for cl in clusters],
-            )
-            # Each cluster's EVEN SHARE of the fleet-wide ingest cap, so the clusters
-            # divide it by construction rather than racing for slots on the global
-            # gate — which sets the hard ceiling, not who reaches it first. Rounded
-            # up: a share of zero would leave a cluster unable to start any zone, and
-            # flooring would silently deliver less ingest width than was asked for.
-            look_ahead = -(-max_parallel_ingest // len(clusters)) if clusters else 1
-            if ingest:
+        # BOUNDED RE-DISPATCH. A failed zone must not cost the campaign the rest of
+        # the year, nor the years after it — interruptions are EXPECTED here, because
+        # the orphan sweeper cancels child runs by design. Every round re-reads the
+        # STORE (not our bookkeeping) for what is still missing, so a retry can only
+        # ever target genuinely unfilled cells and an interrupted mosaic is resumed
+        # rather than rebuilt.
+        remaining = [z for z, y in work if y == year]
+        for attempt in range(1, max_zone_attempts + 1):
+            if not remaining:
+                break
+            year_zones = list(remaining)
+            round_failures: list[str] = []
+            round_runs: list[str] = []
+
+            if year_zones and fill_strategy == "chained-clusters":
+                # Up to max_parallel_clusters child runs fill the year, each owning
+                # ONE shared Ray cluster and draining its own list of zones strictly
+                # sequentially — clusters take up their next zone without actor
+                # churn instead of being torn down per cell. Shards are
+                # size-balanced (LPT over live-tile counts) so they finish
+                # together. Ingest, per-cell run_ids, retag/empty triage, and
+                # mosaic cleanup all live inside the children (their ingest
+                # look-ahead pipelines mosaics against each cluster), so the
+                # per-cell _process chain is bypassed; the global ingest bound is
+                # preserved by dividing max_parallel_ingest across the clusters.
+                clusters = _partition_by_live_tiles(
+                    year_zones,
+                    min(max_parallel_clusters, len(year_zones)),
+                    land_mask_path=paths.land_mask_store(mask_name),
+                    known_complete={z for z in year_zones if status.has(z, year)},
+                    get_credentials=iam_icechunk_credentials,
+                    s3_region=s3_region,
+                )
                 log.info(
-                    "chained-clusters: %d cluster(s) x %d zone(s) at a time = %d simultaneous ingest(s), "
-                    "hard-capped fleet-wide at max_parallel_ingest=%d by %r",
+                    "Year %d: dispatching %d chained fill(s) for %d zone(s): %s",
+                    year,
                     len(clusters),
-                    look_ahead,
-                    look_ahead * len(clusters),
-                    max_parallel_ingest,
-                    ingest_limit_name,
+                    len(year_zones),
+                    [len(cl) for cl in clusters],
                 )
-
-            def _needs_ray(cluster: list[str], chained_year: int) -> bool:
-                """True if any UTM zone in this cluster will actually provision Ray."""
-                return any(
-                    not status.has(z, chained_year)
-                    and zone_has_live_tiles(
-                        land_mask_path, z, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+                # Each cluster's EVEN SHARE of the fleet-wide ingest cap, so the clusters
+                # divide it by construction rather than racing for slots on the global
+                # gate — which sets the hard ceiling, not who reaches it first. Rounded
+                # up: a share of zero would leave a cluster unable to start any zone, and
+                # flooring would silently deliver less ingest width than was asked for.
+                look_ahead = -(-max_parallel_ingest // len(clusters)) if clusters else 1
+                if ingest:
+                    log.info(
+                        "chained-clusters: %d cluster(s) x %d zone(s) at a time = %d simultaneous ingest(s), "
+                        "hard-capped fleet-wide at max_parallel_ingest=%d by %r",
+                        len(clusters),
+                        look_ahead,
+                        look_ahead * len(clusters),
+                        max_parallel_ingest,
+                        ingest_limit_name,
                     )
-                    for z in cluster
+
+                # `status` is re-read between retry rounds, so it is bound as a default
+                # rather than captured: a closure that outlived its round would otherwise
+                # read whichever snapshot the loop left behind.
+                def _needs_ray(cluster: list[str], chained_year: int, snapshot: CampaignStatus = status) -> bool:
+                    """True if any UTM zone in this cluster will actually provision Ray."""
+                    return any(
+                        not snapshot.has(z, chained_year)
+                        and zone_has_live_tiles(
+                            land_mask_path, z, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+                        )
+                        for z in cluster
+                    )
+
+                # Every per-year value this closure reads is passed IN rather than captured:
+                # it is defined inside the year loop, so a captured name would be whatever
+                # the last iteration left behind if the call ever outlived its iteration.
+                def _chained_params(
+                    cluster: list[str], n_clusters: int, chained_year: int, cell_look_ahead: int
+                ) -> dict[str, Any]:
+                    return {
+                        "zones": cluster,
+                        "year": chained_year,
+                        "paths": paths.model_dump(),
+                        "ami_ssm_name": ami_ssm_name,
+                        # Pin the fingerprinted image (see _ami_id / _fill_params) — but
+                        # ONLY for a cluster that will actually start Ray. A cluster whose
+                        # cells are all already-complete (retag) or all-ocean never
+                        # provisions, and forcing an SSM read there breaks the cheap
+                        # recovery paths when the parameter is missing or the role lacks
+                        # access. The ocean probe is one small bitmap GET per zone — the
+                        # same price the per-cell path already pays — and it runs only
+                        # for cells that are not already complete.
+                        "ami_id": _ami_id() if _needs_ray(cluster, chained_year) else None,
+                        "store_name": store_name,
+                        "mask_name": mask_name,
+                        "num_actors": num_actors,
+                        "s1_orbit": s1_orbit,
+                        "s3_region": s3_region,
+                        "commit_limit_name": commit_limit_name,
+                        "allow_partial_window": allow_partial_window,
+                        "allow_s2_only": allow_s2_only,
+                        # As in _fill_params: the chained child gates on the seeded model too.
+                        "allow_model_mismatch": allow_model_mismatch,
+                        "ssm_prefix": ssm_prefix,
+                        "cloudwatch_log_group": cloudwatch_log_group,
+                        "code_bucket": code_bucket,
+                        "code_suffix": code_suffix,
+                        "ingest": ingest,
+                        "ingest_deployment": ingest_deployment,
+                        # Route this cluster's S1/S2 ingest grandchildren (see `branch`);
+                        # the direct ingest/fill refs above are already branch-resolved.
+                        "branch": branch,
+                        # This cluster's OWN zone count, so its admission gates never
+                        # limit fleet fill (see the dispatch comment above). The
+                        # staging+assembly slice below keeps the fleet-wide S3-PUT rate
+                        # at the aggregate target.
+                        "look_ahead": cell_look_ahead,
+                        "s3_concurrency": max(1, TARGET_AGGREGATE_S3_CONCURRENCY // (2 * n_clusters)),
+                        "cleanup_mosaics": cleanup_mosaics,
+                        "ingest_settings": ingest_settings.model_dump(),
+                        # The shared cap. Every cluster names the same limit, which is
+                        # what makes it fleet-wide rather than per-cluster.
+                        "ingest_limit_name": ingest_limit_name,
+                    }
+
+                chained_results = await asyncio.gather(
+                    *(
+                        arun_deployment(
+                            chained_fill_deployment,
+                            parameters=_chained_params(cl, len(clusters), year, look_ahead),
+                            tags=_tags,
+                        )
+                        for cl in clusters
+                    ),
+                    return_exceptions=True,
                 )
+                # RECORDED, never raised: one cluster failing must not abandon the
+                # year, and certainly not the years after it. What each cluster
+                # actually landed is already committed and tagged per zone-year, so
+                # the round's survivors keep their work and the retry below targets
+                # only what is genuinely still missing.
+                for cl, r in zip(clusters, chained_results, strict=True):
+                    if isinstance(r, BaseException):
+                        round_failures.append(f"chained fill {cl[0]}..({len(cl)} zones): {r!r}")
+                        continue
+                    try:
+                        _check_completed(r, f"chained fill year {year}")
+                    except Exception as exc:  # a returned-but-not-COMPLETED terminal state
+                        round_failures.append(str(exc))
+                        continue
+                    round_runs.append(str(r.id))
+                log.info(
+                    "Year %d: %d/%d chained fill(s) landed", year, len(clusters) - len(round_failures), len(clusters)
+                )
+            elif year_zones:
+                log.info("Year %d: dispatching %d zone fill(s)", year, len(year_zones))
+                # All zones in a year are distinct groups → safe to fill concurrently.
+                # The outer loop is serial, so the SAME zone never fills two years at once.
+                # return_exceptions=True so a single zone's failure doesn't abandon its
+                # siblings mid-flight (default gather() would leave them running orphaned);
+                # we let the whole year settle, then fail loudly with every failure.
+                cell_results = await asyncio.gather(*(_process(z, year) for z in year_zones), return_exceptions=True)
+                for z, cr in zip(year_zones, cell_results, strict=True):
+                    if isinstance(cr, BaseException):
+                        round_failures.append(f"{z}-{year}: {cr!r}")
+                    else:
+                        round_runs.append(str(cr))
+                log.info("Year %d: %d/%d fill(s) landed", year, len(round_runs), len(year_zones))
 
-            # Every per-year value this closure reads is passed IN rather than captured:
-            # it is defined inside the year loop, so a captured name would be whatever
-            # the last iteration left behind if the call ever outlived its iteration.
-            def _chained_params(
-                cluster: list[str], n_clusters: int, chained_year: int, cell_look_ahead: int
-            ) -> dict[str, Any]:
-                return {
-                    "zones": cluster,
-                    "year": chained_year,
-                    "paths": paths.model_dump(),
-                    "ami_ssm_name": ami_ssm_name,
-                    # Pin the fingerprinted image (see _ami_id / _fill_params) — but
-                    # ONLY for a cluster that will actually start Ray. A cluster whose
-                    # cells are all already-complete (retag) or all-ocean never
-                    # provisions, and forcing an SSM read there breaks the cheap
-                    # recovery paths when the parameter is missing or the role lacks
-                    # access. The ocean probe is one small bitmap GET per zone — the
-                    # same price the per-cell path already pays — and it runs only
-                    # for cells that are not already complete.
-                    "ami_id": _ami_id() if _needs_ray(cluster, chained_year) else None,
-                    "store_name": store_name,
-                    "mask_name": mask_name,
-                    "num_actors": num_actors,
-                    "s1_orbit": s1_orbit,
-                    "s3_region": s3_region,
-                    "commit_limit_name": commit_limit_name,
-                    "allow_partial_window": allow_partial_window,
-                    "allow_s2_only": allow_s2_only,
-                    # As in _fill_params: the chained child gates on the seeded model too.
-                    "allow_model_mismatch": allow_model_mismatch,
-                    "ssm_prefix": ssm_prefix,
-                    "cloudwatch_log_group": cloudwatch_log_group,
-                    "code_bucket": code_bucket,
-                    "code_suffix": code_suffix,
-                    "ingest": ingest,
-                    "ingest_deployment": ingest_deployment,
-                    # Route this cluster's S1/S2 ingest grandchildren (see `branch`);
-                    # the direct ingest/fill refs above are already branch-resolved.
-                    "branch": branch,
-                    # This cluster's OWN zone count, so its admission gates never
-                    # limit fleet fill (see the dispatch comment above). The
-                    # staging+assembly slice below keeps the fleet-wide S3-PUT rate
-                    # at the aggregate target.
-                    "look_ahead": cell_look_ahead,
-                    "s3_concurrency": max(1, TARGET_AGGREGATE_S3_CONCURRENCY // (2 * n_clusters)),
-                    "cleanup_mosaics": cleanup_mosaics,
-                    "ingest_settings": ingest_settings.model_dump(),
-                    # The shared cap. Every cluster names the same limit, which is
-                    # what makes it fleet-wide rather than per-cluster.
-                    "ingest_limit_name": ingest_limit_name,
-                }
-
-            chained_results = await asyncio.gather(
-                *(
-                    arun_deployment(
-                        chained_fill_deployment,
-                        parameters=_chained_params(cl, len(clusters), year, look_ahead),
-                        tags=_tags,
-                    )
-                    for cl in clusters
-                ),
-                return_exceptions=True,
+            runs_by_year.setdefault(year, []).extend(round_runs)
+            if not round_failures:
+                remaining = []
+                break
+            # Re-read the store: a cluster can fail having landed most of its zones,
+            # and those must not be re-dispatched. This is also what makes "progress"
+            # measurable rather than inferred from the failure list.
+            before = set(remaining)
+            status = campaign_status(repo, years=campaign_years)
+            remaining = [
+                z
+                for z, _y in campaign_work_list(
+                    status, set(repo.list_tags()), expected_zones=expected_zones, years=(year,)
+                )
+            ]
+            for f in round_failures:
+                log.warning("Year %d attempt %d/%d: %s", year, attempt, max_zone_attempts, f)
+            if not remaining:
+                break
+            if attempt >= max_zone_attempts:
+                break
+            if set(remaining) == before and attempt > 1:
+                # A whole round achieved nothing. That is what a DETERMINISTIC
+                # failure looks like from out here — a coverage gate, a fingerprint
+                # mismatch, an unseeded group — and it wants a human, not another
+                # cluster. Stop spending fleets on it.
+                log.error(
+                    "Year %d: attempt %d made no progress on %d cell(s) — treating as deterministic "
+                    "and stopping retries for this year. Investigate before re-running: %s",
+                    year,
+                    attempt,
+                    len(remaining),
+                    ", ".join(sorted(remaining)[:10]),
+                )
+                break
+            log.warning(
+                "Year %d: %d cell(s) still unfilled after attempt %d — re-dispatching (%d attempt(s) left)",
+                year,
+                len(remaining),
+                attempt,
+                max_zone_attempts - attempt,
             )
-            chained_failures = [r for r in chained_results if isinstance(r, BaseException)]
-            if chained_failures:
-                raise RuntimeError(
-                    f"year {year}: {len(chained_failures)}/{len(clusters)} chained fill(s) failed "
-                    f"(e.g. {chained_failures[0]})"
-                )
-            chained_runs = [r for r in chained_results if not isinstance(r, BaseException)]
-            for frun in chained_runs:
-                _check_completed(frun, f"chained fill year {year}")
-            runs_by_year[year] = [str(r.id) for r in chained_runs]
-            log.info("Year %d: %d chained fill(s) landed", year, len(clusters))
-        elif year_zones:
-            log.info("Year %d: dispatching %d zone fill(s)", year, len(year_zones))
-            # All zones in a year are distinct groups → safe to fill concurrently.
-            # The outer loop is serial, so the SAME zone never fills two years at once.
-            # return_exceptions=True so a single zone's failure doesn't abandon its
-            # siblings mid-flight (default gather() would leave them running orphaned);
-            # we let the whole year settle, then fail loudly with every failure.
-            results = await asyncio.gather(*(_process(z, year) for z in year_zones), return_exceptions=True)
-            failures = [(z, r) for z, r in zip(year_zones, results, strict=True) if isinstance(r, BaseException)]
-            if failures:
-                raise RuntimeError(
-                    f"year {year}: {len(failures)}/{len(year_zones)} zone fill(s) failed "
-                    f"(e.g. {failures[0][0]}: {failures[0][1]})"
-                )
-            runs_by_year[year] = [str(r) for r in results]
-            log.info("Year %d: %d fill(s) landed", year, len(runs_by_year[year]))
+        if remaining:
+            unfilled[year] = sorted(remaining)
 
         # Backfill the year-complete milestone/retention tag even when NO fills
         # ran this pass — a prior run may have completed every zone for the year
@@ -1058,4 +1146,17 @@ async def run_global_campaign(
 
     dispatched = sum(len(v) for v in runs_by_year.values())
     log.info("Campaign dispatch complete: %d fill run(s) across %d year(s)", dispatched, len(runs_by_year))
+    if unfilled:
+        # Loudly, and LAST. Every year got its attempts and every landed zone-year is
+        # committed and tagged, so a re-run resumes from here rather than repeating
+        # any of it — but a campaign that did not finish its work must not report
+        # success, and the operator needs the whole list rather than the first cell
+        # that happened to fail.
+        detail = "; ".join(f"{y}: {', '.join(z)}" for y, z in sorted(unfilled.items(), reverse=True))
+        total = sum(len(z) for z in unfilled.values())
+        raise RuntimeError(
+            f"campaign finished with {total} unfilled cell(s) after up to {max_zone_attempts} attempt(s) "
+            f"per year — every other cell landed and is tagged, so a re-run resumes from here. "
+            f"Unfilled: {detail}"
+        )
     return {"work_at_start": len(work), "dispatched": dispatched, "runs_by_year": runs_by_year}

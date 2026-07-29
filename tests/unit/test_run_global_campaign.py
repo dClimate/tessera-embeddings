@@ -841,3 +841,99 @@ def test_model_gate_override_lets_the_campaign_proceed(wired, monkeypatch):
     monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: seen.update(k))
     _per_cell(allow_model_mismatch=True)
     assert seen["allow_model_mismatch"] is True
+
+
+class TestFailedZonesAreRetried:
+    """One zone must not cost the campaign the rest of the year, nor later years.
+
+    Interruptions are expected here — the orphan sweeper cancels child runs by
+    design — and an interrupted mosaic is resumed rather than rebuilt, so a
+    re-dispatch is cheap. Each round re-reads the STORE for what is still missing,
+    which is also what makes "progress" measurable rather than guessed.
+    """
+
+    @staticmethod
+    def _wire(monkeypatch, wired, zones, *, complete_after):
+        """Zones that become complete once ``complete_after`` rounds have run."""
+        rounds = {"n": 0}
+        state: set[str] = set()
+
+        def status_now(*_a, **_k):
+            return SimpleNamespace(zones=dict.fromkeys(zones, ()), has=lambda z, y: z in state)
+
+        monkeypatch.setattr(mod, "campaign_status", status_now)
+        monkeypatch.setattr(
+            mod, "campaign_work_list", lambda st, *a, **k: [(z, 2025) for z in zones if not st.has(z, 2025)]
+        )
+
+        async def arun(dep, parameters=None, tags=None):
+            wired["arun"].append((dep, parameters))
+            if "fill-zones-sequential" in dep:
+                rounds["n"] += 1
+                state.update(complete_after.get(rounds["n"], ()))
+                if any(z not in state for z in parameters["zones"]):
+                    raise RuntimeError("cluster failed")
+            return _completed_run()
+
+        monkeypatch.setattr(mod, "arun_deployment", arun)
+        return rounds
+
+    def test_a_failed_zone_is_re_dispatched(self, wired, monkeypatch):
+        """Round one leaves 02N unfilled; round two lands it and the campaign passes."""
+        rounds = self._wire(monkeypatch, wired, ["01N", "02N"], complete_after={1: {"01N"}, 2: {"01N", "02N"}})
+        result = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
+        assert rounds["n"] == 2, "the failed cell was never re-dispatched"
+        assert result["dispatched"] >= 1
+
+    def test_a_retry_targets_only_what_is_still_missing(self, wired, monkeypatch):
+        """A cluster can fail having landed most of its zones; those must not be
+        re-dispatched, or a retry would repeat hours of finished work.
+        """
+        self._wire(
+            monkeypatch,
+            wired,
+            ["01N", "02N", "03N"],
+            complete_after={1: {"01N", "02N"}, 2: {"01N", "02N", "03N"}},
+        )
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
+        dispatched = [p["zones"] for d, p in wired["arun"] if "fill-zones-sequential" in d]
+        assert dispatched[0] == ["01N", "02N", "03N"]
+        assert dispatched[1] == ["03N"], f"second round re-dispatched landed zones: {dispatched[1]}"
+
+    def test_a_round_that_makes_no_progress_stops_the_retries(self, wired, monkeypatch):
+        """What a DETERMINISTIC failure looks like from the campaign — a coverage
+        gate, a fingerprint mismatch. It wants a human, not another cluster, so the
+        retries stop rather than burning a fleet per attempt.
+        """
+        rounds = self._wire(monkeypatch, wired, ["01N", "02N"], complete_after={1: {"01N"}})  # 02N never lands
+        with pytest.raises(RuntimeError, match="unfilled cell"):
+            asyncio.run(
+                mod.run_global_campaign.fn(
+                    paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_zone_attempts=5
+                )
+            )
+        # One attempt, one retry that achieves nothing, then stop — the minimum
+        # possible without guessing at the child's failure type.
+        assert rounds["n"] == 2, f"kept retrying a deterministic failure: {rounds['n']} rounds"
+
+    def test_the_campaign_reports_every_unfilled_cell_and_fails(self, wired, monkeypatch):
+        """Loudly, and last: a campaign that did not finish must not report success,
+        and the operator needs the whole list rather than the first failure.
+        """
+        self._wire(monkeypatch, wired, ["01N", "02N"], complete_after={})
+        with pytest.raises(RuntimeError, match=r"unfilled cell\(s\).*01N.*02N"):
+            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
+
+    def test_retries_are_disabled_at_one_attempt(self, wired, monkeypatch):
+        rounds = self._wire(monkeypatch, wired, ["01N"], complete_after={})
+        with pytest.raises(RuntimeError, match="unfilled cell"):
+            asyncio.run(
+                mod.run_global_campaign.fn(
+                    paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_zone_attempts=1
+                )
+            )
+        assert rounds["n"] == 1
+
+    def test_zero_attempts_is_rejected(self, wired):
+        with pytest.raises(ValueError, match="max_zone_attempts"):
+            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_zone_attempts=0))

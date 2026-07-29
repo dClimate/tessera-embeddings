@@ -65,6 +65,28 @@ loop), under one of two strategies:
 > and the UTM zones assigned to it. A **shard** is always a storage shard — never
 > a group of zones.
 
+### A failed zone does not cost the campaign
+
+Interruptions are expected — the orphan sweeper cancels child runs by design, and
+an interrupted mosaic is **resumed rather than rebuilt**, so no ingest work is lost.
+What the campaign adds on top is a **bounded re-dispatch**: `max_zone_attempts`
+(default 2) rounds per year, each re-reading the store for what is genuinely still
+missing, so a retry never repeats a landed zone.
+
+Failures are recorded, never raised mid-flight. A cluster that dies having landed
+most of its zones keeps that work — every zone-year is committed and tagged
+independently — and the next round picks up only the remainder. Later years still
+run.
+
+Retries stop early when a round makes **no progress at all**. That is what a
+deterministic failure looks like from the driver: a coverage gate, a fingerprint
+mismatch, an unseeded group. Those want a human, not another GPU fleet, so the
+campaign logs them at ERROR and moves on rather than burning a cluster per attempt.
+
+At the very end — after every year has had its attempts — the campaign raises with
+the complete list of unfilled cells. It fails loudly, but only once it has done
+everything it could, and a re-run resumes from exactly there.
+
 ### Ingest runs wide, under one fleet-wide cap
 
 Nothing throttles ingest against fill throughput. Ingest is the cheap half of the
