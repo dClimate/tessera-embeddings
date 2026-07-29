@@ -258,6 +258,15 @@ zone-year committers to ~4–8 (measured: N=2 → ~0.5 retries/0.5 s commit; N=8
 ~3.5/1.3 s; N=16 → ~7.5/2.2 s; N=120 → ~58/15 s). Cross-group conflict-freedom
 held: zero unresolvable conflicts at every N.
 
+**Enforced in code since 2026-07-28.** The cap is a Prefect global concurrency
+limit (`commit_limit_name`) held around each commit, and `run_global_campaign`
+upserts its VALUE at preflight to
+`min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS=8)`. Previously only the
+limit's *name* was threaded through and the number lived on the server, where it
+could silently drift from this constraint. Duty-cycle measurements showing how
+much headroom this leaves are in
+[`design/campaign-cluster-sizing.md`](../design/campaign-cluster-sizing.md).
+
 ### D7 — Snapshot hygiene: tags + expiry policy (FIRM policy; cadence PENDING T6)
 
 Tag every completed zone-year and each year-complete milestone (tags protect

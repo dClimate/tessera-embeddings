@@ -107,26 +107,37 @@ def _child_tag(flow_run_id: object) -> str | None:
 _cancel_children_on_cancellation = make_child_cancel_hook(_CHILD_TAG_PREFIX, "campaign child run")
 
 
-def _upsert_ingest_limit(name: str, limit: int, *, log: logging.Logger | LoggerAdapter) -> None:
-    """Set the fleet-wide simultaneous-ingest limit to ``limit``.
+#: Ceiling on simultaneous zone-year committers, from ADR-008 D5/D6 run 1. Commit
+#: contention is on the branch-tip CAS — every commit re-serialises the repo-global
+#: snapshot — so rebase retries scale with the number of racing writers and the
+#: aggregate wasted work with its square. Measured: N=2 -> 0.5 retries / 0.5 s,
+#: N=8 -> 3.5 / 1.3 s, N=16 -> 7.5 / 2.2 s (which BREACHED the run's own
+#: <=2x-serial acceptance criterion), N=120 -> 58 / 15 s. The recorded firm
+#: constraint is 4-8; this is its upper end.
+MAX_SIMULTANEOUS_COMMITTERS = 8
 
-    The chained clusters each hold slots of this named limit while their UTM zones
-    ingest (see ``fill_zones_sequential``'s ingest gate). They are separate flow
-    runs, so the cap can only live on the Prefect server — and a server-side value
-    the operator has to keep in step with the flow parameter by hand is a
-    silent-drift bug. Writing it from the parameter keeps one source of truth.
 
-    Raises on failure, deliberately. This runs in preflight, before a single
-    cluster is dispatched, so failing here costs nothing. Failing later costs a
-    great deal: the clusters would already be running, and the choice at that point
-    is between ingesting ungated (blowing through the cap this call exists to set)
-    and stopping them one by one at their first acquire, after their work has been
+def _upsert_limit(name: str, limit: int, *, what: str, log: logging.Logger | LoggerAdapter) -> None:
+    """Set a Prefect global concurrency limit to ``limit``.
+
+    Both fleet-wide caps this campaign relies on — simultaneous ingests and
+    simultaneous committers — are enforced by gates in CHILD flow runs, on other
+    machines. Nothing in-process can see across those, so the number has to live on
+    the Prefect server; and a server-side number the operator keeps in step with a
+    flow parameter by hand is a silent-drift bug. Writing it from the parameter
+    makes the parameter the single source of truth.
+
+    Raises on failure, deliberately. This runs in preflight, before a single cluster
+    is dispatched, so failing here costs nothing. Failing later costs a great deal:
+    the clusters would already be running, and the choice at that point is between
+    proceeding ungated — blowing through the cap this call exists to set — and
+    stopping them one by one at their first acquire, after their work has been
     scheduled. A limit that cannot be written is a broken precondition, not a
     degraded mode.
     """
     with get_client(sync_client=True) as client:
         client.upsert_global_concurrency_limit_by_name(name, limit)
-    log.info("Fleet-wide ingest limit %r set to %d simultaneous UTM zone(s)", name, limit)
+    log.info("Fleet-wide %s limit %r set to %d", what, name, limit)
 
 
 def _dpl(prod_ref: str, branch: str | None) -> str:
@@ -507,7 +518,14 @@ async def run_global_campaign(
             (default) derives ``fill-zones-sequential/fill-zones-sequential``
             routed by ``branch``; an explicit value is used verbatim.
         commit_limit_name: Prefect global concurrency limit bounding fleet-wide
-            simultaneous committers (D6); forwarded to every fill.
+            simultaneous committers to the global store (ADR-008 D6); forwarded to
+            every fill, which holds one slot for the duration of each zone-year
+            commit. Its VALUE is derived, not a parameter: the campaign upserts it
+            to ``min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS)`` at
+            preflight — a cluster's trailing assembly is single-threaded, so more
+            slots than clusters could never be used, and the run-1 curve caps it at
+            8 however many clusters run. Set to ``""`` to disable the gate; the
+            fills then commit ungated, which the run-1 storm makes a bad idea.
         num_actors: GPU actor count, forwarded to each fill.
         s1_orbit: S1 orbit selection, forwarded to both ingest and fill.
         s3_region: Optional S3 region for the global store, forwarded to the driver's
@@ -585,14 +603,23 @@ async def run_global_campaign(
         raise ValueError(msg)
     if max_parallel_ingest < 1:
         raise ValueError(f"max_parallel_ingest must be >= 1, got {max_parallel_ingest} (Semaphore(0) blocks forever)")
-    # Make the number in the parameter the number actually enforced. The chained
-    # clusters are separate flow runs, so their shared cap has to live server-side
-    # (see fill_zones_sequential's ingest gate) — and a server-side limit that the
-    # operator has to remember to set to the same value is a silent-drift bug
-    # waiting to happen. Upserting it here means `max_parallel_ingest` is the one
-    # place the number is written. Cheap, idempotent, and safe to repeat.
+    # Publish both fleet-wide caps so the numbers the operator set here are the
+    # numbers actually enforced in the children (see _upsert_limit). Cheap,
+    # idempotent, and safe to repeat.
     if ingest and fill_strategy == "chained-clusters":
-        _upsert_ingest_limit(ingest_limit_name, max_parallel_ingest, log=log)
+        _upsert_limit(ingest_limit_name, max_parallel_ingest, what="ingest", log=log)
+    if commit_limit_name:
+        # DERIVED, not a parameter. A cluster's trailing assembly is a single
+        # thread, so N clusters can produce at most N assembly commits at once —
+        # a larger limit would be a number that never binds. And the run-1 curve
+        # says never exceed MAX_SIMULTANEOUS_COMMITTERS however many clusters run.
+        #
+        # A cluster's FEEDER can also commit (a terminal plan inside `plan()`),
+        # so the fleet's true ceiling is 2N and the gate can briefly queue those.
+        # That is the intent: the gate is a bound, not an operating point, and a
+        # queued commit costs seconds against zones that run for hours.
+        commit_limit = min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS)
+        _upsert_limit(commit_limit_name, commit_limit, what="commit", log=log)
     # Checked HERE, not left to run_inference: the child validates only after both fill
     # strategies have entered ray_cluster, and the chained strategy has primed its
     # look-ahead ingests first. A typo would otherwise buy a Ray head and a round of

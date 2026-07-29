@@ -82,10 +82,9 @@ def wired(monkeypatch):
 
     monkeypatch.setattr(mod, "arun_deployment", fake_arun)
     monkeypatch.setattr(mod, "delete_prefix", lambda uri, **k: rec["deletes"].append(uri))
-    # The fleet-wide ingest limit is a real Prefect API write; record the value
-    # instead of making it.
+    # The fleet-wide caps are real Prefect API writes; record them instead.
     monkeypatch.setattr(
-        mod, "_upsert_ingest_limit", lambda name, limit, **k: rec.setdefault("limits", []).append((name, limit))
+        mod, "_upsert_limit", lambda name, limit, **k: rec.setdefault("limits", []).append((name, limit))
     )
     return rec
 
@@ -115,21 +114,46 @@ class TestCampaignDefaults:
         assert (clusters, ingests) == (8, 40)
         assert ingests % clusters == 0, "an uneven split rounds up and overshoots the cap"
 
-    def test_the_ingest_cap_is_published_to_the_server(self, wired):
-        """The clusters are separate flow runs, so the cap only binds if it reaches
-        the Prefect limit they all name. Writing it from the parameter is what stops
-        the two drifting apart.
+    def test_both_caps_are_published_to_the_server(self, wired):
+        """Both gates live in CHILD flow runs, so a cap only binds if it reaches the
+        Prefect limit they name. Writing both from this flow is what stops the
+        server's numbers drifting from the ones chosen here.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
-        assert wired["limits"] == [("tessera-global-ingests", 40)]
+        assert dict(wired["limits"]) == {"tessera-global-ingests": 40, "tessera-global-commits": 8}
         assert wired["arun"][0][1]["ingest_limit_name"] == "tessera-global-ingests"
+        assert wired["arun"][0][1]["commit_limit_name"] == "tessera-global-commits"
 
-    def test_no_limit_is_published_when_ingest_is_off(self, wired):
-        """Prebuilt mosaics mean no ingest to gate; writing the limit anyway would
-        be a pointless API write on every fill-only run.
+    def test_no_ingest_cap_is_published_when_ingest_is_off(self, wired):
+        """Prebuilt mosaics mean no ingest to gate. Commits still happen, so that
+        cap is still published.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False))
-        assert wired.get("limits", []) == []
+        assert dict(wired["limits"]) == {"tessera-global-commits": 8}
+
+    @pytest.mark.parametrize(("clusters", "expected"), [(1, 1), (4, 4), (8, 8), (16, 8), (40, 8)])
+    def test_the_commit_cap_is_derived_from_the_cluster_count(self, wired, clusters, expected):
+        """``min(clusters, 8)``, and both halves earn their place.
+
+        A cluster's trailing assembly is single-threaded, so N clusters can produce
+        at most N assembly commits at once — more slots than clusters is a number
+        that could never bind. And the run-1 curve caps it at 8 however many
+        clusters run: 16 simultaneous committers measured 7.5 rebase retries and a
+        2.2 s commit, which breached that experiment's own acceptance criterion.
+        """
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=clusters))
+        assert dict(wired["limits"])["tessera-global-commits"] == expected
+
+    def test_the_commit_cap_is_never_above_the_measured_ceiling(self):
+        """Pinned as a literal so raising it is a deliberate act against the ADR."""
+        assert mod.MAX_SIMULTANEOUS_COMMITTERS == 8
+
+    def test_an_empty_commit_limit_name_publishes_nothing(self, wired):
+        """The documented escape hatch for running ungated — it must not then write
+        a limit named ``""``.
+        """
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", commit_limit_name=""))
+        assert dict(wired["limits"]) == {"tessera-global-ingests": 40}
 
     def test_nothing_bounds_mosaics_in_flight(self, wired, monkeypatch):
         """A whole year's mosaics may coexist: no backpressure from fill onto ingest.

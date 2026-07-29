@@ -155,7 +155,10 @@ commits inside `plan()` when a cell turns out already-complete or all-ocean,
 which is why `_PrefectCommitGate` keeps its state in a per-thread stack. The
 flow's triage removes those cells before the stream starts, so a terminal plan
 mid-stream means the store changed underneath the run. Rare, but it makes the
-true ceiling **2N**, not N.
+true ceiling **2N**, not N — which is why the gate is set to N rather than 2N and
+is expected to queue occasionally. That is the gate doing its job: it is a bound,
+not an operating point, and a queued commit costs seconds against zones that run
+for hours.
 
 ### The measured storm curve
 
@@ -205,14 +208,19 @@ commits.
 
 ### Two things that are NOT automatically safe
 
-**The cap is enforced by a gate whose value nothing in the code sets.**
-`commit_limit_name` (default `tessera-global-commits`) is passed everywhere as a
-*name*; the number lives on the Prefect server and no flow writes it. The gate is
-`strict=True`, so a missing limit stops the fill loudly at its first commit rather
-than letting every cluster storm the branch — a good failure mode. But a limit
-that *exists* and is set too high storms silently. The ingest cap has since been
-given an upsert-from-parameter (see `_upsert_ingest_limit`); **the commit limit
-should get the same treatment.**
+**The cap's value is now derived, not configured** (it was an open gap when this
+doc was first written). `commit_limit_name` is passed to the children as a *name*,
+and the campaign upserts its VALUE at preflight to
+`min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS)` — see `_upsert_limit`.
+Both halves earn their place: a cluster's trailing assembly is single-threaded, so
+more slots than clusters is a number that could never bind, and the run-1 curve
+caps it at 8 however many clusters run. It is deliberately NOT a parameter — an
+operator-set number is exactly the thing that drifts from the server's.
+
+The gate is also `strict=True`, so a limit that somehow does not exist stops the
+fill loudly at its first commit rather than letting every cluster storm the
+branch. `commit_limit_name=""` disables the gate entirely; the run-1 storm makes
+that a bad idea outside a single-cluster test.
 
 **Concurrent zone-years are safe; concurrent years OF THE SAME ZONE are not.**
 Commits to different groups rebase cleanly — run 1 found zero unresolvable
