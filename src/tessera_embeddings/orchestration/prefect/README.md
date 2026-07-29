@@ -124,6 +124,12 @@ Two subtleties worth knowing:
 - Waiting for a cluster's *entire* ingest was tried and is worse: unoverlapped
   ingest time paid up front, for a risk the ordering already removes.
 
+How this plays out on the real world — 112 live UTM zones, 360,953 land tiles —
+and what happens if you move off 8 clusters is measured in
+[`context_docs/design/campaign-cluster-sizing.md`](../../../../context_docs/design/campaign-cluster-sizing.md).
+Short version: 8 splits the year to within 0.0%, 16 costs 0.6% and roughly halves
+wall clock, and past ~20 the largest zones start to dominate.
+
 > **Size the fleets to match.** These caps count *clusters* and *zones*, not
 > machines. Eight inference clusters at the default `num_actors` plus forty
 > concurrent ingests at the default `IngestSettings.max_workers` is a large amount

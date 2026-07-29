@@ -199,6 +199,12 @@ The single-ROI path is deliberately untouched by all of this.
   window. Inference is slower than ingest in almost every case, so the stream does
   not run dry.
 
+  Measured against the real coverage bitmaps in
+  [`design/campaign-cluster-sizing.md`](../design/campaign-cluster-sizing.md):
+  at 8 clusters every one opens on a zone of 8,593+ tiles (~20% of its own
+  workload) and totals land within 0.0% of each other. That doc is the basis for
+  choosing the cluster count.
+
   Two alternatives were tried and rejected. Waiting for a cluster's *entire* ingest
   is unoverlapped time paid up front for a risk the ordering already removes.
   Ordering on the clamped per-cell actor request (`min(num_actors, n_tiles)`) looks

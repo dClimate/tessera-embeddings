@@ -22,13 +22,20 @@ context_docs/
 │   ├── 009-native-cmr-granule-query.md
 │   ├── 010-landmask-registry-coverage.md
 │   ├── 011-campaign-zone-ingestion.md
-│   └── 012-validated-equivalence-for-inference-outputs.md
+│   ├── 012-validated-equivalence-for-inference-outputs.md
+│   └── 013-optional-s1-s2-only-pixels.md
 └── design/           Long-form framing docs (ported from planning)
+    ├── campaign-cluster-sizing.md
     ├── d3-sharding-plan.md
     ├── global-store-implementation-plan.md
     ├── global-store-test-impl-spec.md
     ├── global-store-test-plan.md
+    ├── inference-perf-run-ledger.md
     ├── inference_gpu_saturation_profile_2026_07.md
+    ├── ingest-graph-and-stac-budget.md
+    ├── ingest-live-tile-cropping.md
+    ├── ingest-live-tile-cropping-icechunk-experiment.md
+    ├── ingest_optimization_campaign_2026_07.md
     ├── open_sourcing_conceptual_background.md
     ├── orchestration_infra_leakage_audit.md
     └── region-writes.md
