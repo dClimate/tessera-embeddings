@@ -368,8 +368,23 @@ ACTORS_V2 = 153
 #:   5.00 h        starves in 0 of 96   max delay 18.73 h
 #:
 #: So every value from 4.25 to 4.9 is free: it clears the envelope at exactly the delay 4.0
-#: already pays. Five hours crosses to the next landing and buys 2.2 h of extra delay per
-#: cluster-year — ~158 h across 72 cluster-years — for no additional safety.
+#: already pays. Five hours crosses to the next landing and costs ~4.1 h per cluster-year of
+#: FINISH time for no additional safety.
+#:
+#: "Delay" here is ``start_h``: when this cluster's GPU fleet boots, measured from the start of
+#: its own ingest. Two things follow that are easy to get wrong:
+#:
+#: * **It is not lost time.** At 4.25 the finish moves by ~10 MINUTES against booting on the
+#:   first mosaic, because the 6.1 h of mid-run idle it removes nearly cancels the 6.3 h of
+#:   later start. The bank RELOCATES waiting from mid-run, where the fleet is up and billed, to
+#:   pre-boot, where it is not. That is the whole point of it.
+#: * **It propagates ~1:1 to the finish once the fleet is the binding constraint**, which it is
+#:   here — so past the threshold, extra bank is straightforwardly schedule lost.
+#:
+#: At campaign level: the 8 clusters run CONCURRENTLY within a year and years run serially, and
+#: the partitioner balances cluster totals to 0.0% so they finish together. So a per-cluster-year
+#: figure multiplies by 9 YEARS, not by 72 cluster-years — ~37 h of campaign wall clock for the
+#: 4.25-to-5.0 step. And it is schedule, never cost: the fleet is not up during it.
 #:
 #: 4.25 is the threshold itself — the lowest value that clears the envelope. Set deliberately
 #: at the edge rather than mid-plateau: anywhere in the band costs the same delay, so the only
