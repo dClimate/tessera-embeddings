@@ -66,6 +66,8 @@ shipped defaults.**
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
 | **`allow_s2_only`** | **`false` → `true`** ★ | ON for the global campaign. A fifth of the land has no radar for 2022–24 (§4); without this those pixels produce nothing. ADR 013 does not consider the combination validated — see §8 |
+| **`overlap_years`** | **`false`** | drops the year barrier — every requested year dispatched as ONE batch, so year N+1's ingest overlaps year N's inference. Shipped but **not fleet-validated**; leave off until Phase 4 clears it (§8) |
+| `max_cell_attempts` | 2 | attempts per cell WITHIN a cluster (one retry on the still-provisioned fleet). Distinct from `max_zone_attempts`, which counts whole dispatches |
 | `force_staging_reuse` | `false` | escape hatch: reuse staged tiles across an inference-code change you know is output-neutral |
 | `force_staging_restage` | `""` | escape hatch: any new token forces a fresh staging prefix, for a change the source hash cannot see (a library upgrade) |
 | commit limit | derived, `min(clusters, 8)` | never set by hand — and it bounds commits IN FLIGHT (~1 s each), not concurrent assemblies |
@@ -285,8 +287,12 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
    Measured on the real coverage census at 8 clusters, true-work spread falls from **9.43%
    to 0.04%**. The within-cluster order is unchanged and still sorts on tile counts, which
    is correct: ordering and actor clamping are properties of area, not of work.
-7. **Remove the year barrier, and rework the retry loop with it.** Years are serial only
-   because two years of one zone rewrite that group's `years_complete`/`runs` attrs. **Both
+7. **Turn the year barrier OFF, once Phase 4 validates it.** The code shipped 2026-07-30
+   behind `overlap_years` (default off); what remains is a deployment re-registration and a
+   real-fleet run. Years were serial only because two years of one zone rewrote that group's
+   `years_complete`/`runs` attrs — **now fixed**: those attrs commit separately and retry
+   (`commit_year_attrs`), so a same-zone collision costs a sub-second retry instead of a whole
+   assembly. **Both
    attrs are keyed by year and each writer inserts only its own key**, so there is no semantic
    conflict — icechunk's `ConflictDetector` simply treats attrs as opaque. And nothing else
    requires the barrier: chunks and shards are 1 in the time dimension, so different years of
@@ -316,31 +322,31 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
      is "kept its mosaic", not "failed": two paths delete the mosaic deliberately, and
      retrying one of those runs against nothing.
 
-   **BLOCKED, and the blocker is in the inference layer rather than the driver
-   (found 2026-07-30).** The intended shape — 8 clusters each streaming a multi-year list —
-   does not work as the code stands, because **a shared inference session has exactly one
-   time window**. The actors read `self.config.time_window`, the config is bound once at
-   session creation, and `ZoneContext` (the per-cell data carried on every work item) holds
-   `mosaic_base`/`staging_base`/`run_id` but no window. Streaming a cell from another year
-   through those actors would silently read the wrong months — the actor's window, not the
-   cell's. The runner's existing mismatch check covers `s1_orbit` only, so nothing would
-   catch it.
+   **SHIPPED 2026-07-30 behind `overlap_years` (default OFF).** Option A was taken: the
+   inference window is now a PER-CELL value carried on every work item
+   (`ZoneContext.time_window`) rather than read from the actor's config. That was the
+   blocker — an actor is built once with one config, so a cell of another year streamed
+   through it would silently have been inferred over the wrong months, and the session's
+   only mismatch check is on `s1_orbit`.
 
-   Three ways forward, and they differ enough that the choice is not obvious:
+   Three pieces, all unit-tested:
 
-   | option | inference change | cluster boots | gets the schedule win? |
-   |---|---|---|---|
-   | **A** thread the window per work item (`ZoneContext.time_window`) | yes — hot path | 8 | fully |
-   | **B** 8 cluster *slots*, each one year at a time | none | 72 | mostly not — each slot re-waits for its own opening ingest |
-   | **C** overlap whole years at the driver, bounded | none | 72 | mostly |
+   - **The window travels with the cell.** Bit-identity was the risk, since three loader
+     call sites must receive identical kwargs; the fallback is resolved ONCE into a local
+     and that value passed to all three, so they cannot drift. A test asserts passing the
+     config's own window explicitly is byte-for-byte identical at `atol=0`, and a second
+     asserts a *different* window genuinely changes what is read — the failure the first
+     cannot see.
+   - **A cluster takes `(zone, year)` pairs**, with windows and configs derived per year.
+     A literal `time_window_end` override is refused for a multi-year list rather than
+     applied to every year.
+   - **The driver iterates BATCHES**: one per year (default) or one for everything
+     (`overlap_years=True`). The partition is over ZONES, so a zone's every year lands in
+     one cluster and its assemblies serialize on that cluster's single trailing thread.
 
-   **A** is mechanically small and idiomatic — `mosaic_base` is already threaded per item
-   exactly this way — but it lands in the most performance-critical code in the repo, where
-   three loader call sites are documented as needing identical kwargs for bit-identity.
-   **C** is now viable *because* the attr commit was split: overlapping years no longer needs
-   a zone-disjointness guarantee, since a same-zone collision retries. It needs a bound on
-   how many clusters of the next year may start early, because 16 concurrent clusters at 228
-   actors is 3,648 and over quota; two early starts (10 clusters, 2,280 actors) fits.
+   **Still to do:** re-register the deployments (the child's parameter schema changed), and
+   validate against a real fleet — Phase 4 carries the drills. Do not turn `overlap_years`
+   on for a campaign before that.
 
 
 ---
