@@ -232,10 +232,12 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
    `max_workers` to 60. Quota has lead time; start it first.
 5. **Public release.** The store is 0.9–1.8 PB. AWS Open Data has lead time and the size
    figure is what the application asks for.
-6. **Weight the zone-to-cluster split by work rather than area.** `_partition_by_live_tiles`
-   balances on tile counts, but cost scales with tiles × observations and observation count
-   varies about twofold with latitude. Not a blocker; it makes cluster finish times
-   uneven rather than wrong.
+6. ~~**Weight the zone-to-cluster split by work rather than area.**~~ **DONE 2026-07-30.**
+   `_partition_by_live_tiles` now balances on `zone_work_weight` — live tiles weighted by
+   their latitude band's observation count from §9's census — at the same one-GET cost.
+   Measured on the real coverage census at 8 clusters, true-work spread falls from **9.43%
+   to 0.04%**. The within-cluster order is unchanged and still sorts on tile counts, which
+   is correct: ordering and actor clamping are properties of area, not of work.
 
 ---
 
@@ -272,9 +274,13 @@ in the table below is a *chosen setting*, not a computed one.
    ingest configuration decides only how fast mosaics arrive, and therefore how large a GPU
    fleet stays busy.
 
-**Known to be wrong, not yet fixed:** `_partition_by_live_tiles` balances clusters on tile
-counts, which is area. Cost scales with area × observations, so clusters can finish at
-materially different times even with equal tile counts.
+**Fixed 2026-07-30.** `_partition_by_live_tiles` balanced clusters on tile counts, which is
+area, while cost scales with area × observations — so clusters could finish at materially
+different times with equal tile counts. It now balances on work (§8 item 6). Two properties
+worth keeping in mind if this is ever revisited: the imbalance was **not random**, because
+latitude drives it, so a cluster drawing high-latitude zones was heavy in *every* year; and
+clusters are long-lived, so the last to finish sets the campaign date and a heavy cluster is
+never averaged away.
 
 ---
 
