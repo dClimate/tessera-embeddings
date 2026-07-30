@@ -1,9 +1,10 @@
 # Tessera v2 on AWS-sourced input: how much does the MPC/AWS split cost us?
 
-Companion to [`v2_large_rollout_2026_07.md`](v2_large_rollout_2026_07.md) (what the
-v2 Large run measured) and
-[`v2_large_readback_gate_2026_07.md`](v2_large_readback_gate_2026_07.md) (how a
-model swap is validated). This doc answers a different question: our ingest reads
+Companion to `v2_large_rollout_2026_07.md` (what the v2 Large run measured) and
+`v2_large_readback_gate_2026_07.md` (how a model swap is validated). **Both of those
+live on the `feature/v2-large-model` branch, not on this one** — the links are left
+unhyperlinked deliberately so they do not read as broken here. This doc answers a
+different question: our ingest reads
 AWS sources, and Cambridge confirms v2 was normalised on Microsoft Planetary
 Computer output. **How much does that mismatch cost, and what should we do about
 it?**
