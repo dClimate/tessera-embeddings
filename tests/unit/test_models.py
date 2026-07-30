@@ -302,21 +302,41 @@ class TestPositionalEncoderBitIdentity:
 
 
 class TestEncoderComputeDtype:
-    """Backbones cast bands to the weight dtype and leave DOY alone."""
+    """Backbones cast bands to the weight dtype and leave DOY alone.
 
-    def test_bf16_backbone_accepts_fp32_input(self):
-        """A BF16 encoder fed the FP32 sampler tensor runs entirely in BF16."""
-        enc = V11TransformerEncoder(band_num=10, latent_dim=8, nhead=2, num_encoder_layers=1).bfloat16().eval()
-        x = torch.randn(2, 6, 11)
-        x[:, :, -1] = torch.randint(1, 366, (2, 6)).float()  # raw integer DOY
-        with torch.no_grad():
-            out = enc(x)
-        assert out.dtype == torch.bfloat16
+    The output dtype alone is NOT sufficient evidence: an encoder that cast the
+    whole input to BF16 before splitting off DOY would also return BF16, having
+    silently collapsed day 257 onto 256. So each test intercepts the tensor the
+    temporal encoder actually receives and checks it is still exact FP32.
+    """
 
-    def test_v2_bf16_backbone_accepts_fp32_input(self):
-        enc = StudentTransformerEncoder(band_num=2, latent_dim=8, nhead=2, num_encoder_layers=1).bfloat16().eval()
-        x = torch.randn(2, 6, 3)
-        x[:, :, -1] = torch.randint(1, 366, (2, 6)).float()
-        with torch.no_grad():
-            out = enc(x)
-        assert out.dtype == torch.bfloat16
+    @staticmethod
+    def _captured_doy(enc: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """Run *enc* on *x*, returning the DOY tensor its temporal encoder saw."""
+        seen: list[torch.Tensor] = []
+        handle = enc.temporal_encoder.register_forward_pre_hook(
+            lambda _module, args: seen.append(args[0].detach().clone()) and None
+        )
+        try:
+            with torch.no_grad():
+                out = enc(x)
+        finally:
+            handle.remove()
+        assert len(seen) == 1
+        assert out.dtype == torch.bfloat16, "reduced-precision compute dtype must survive to the output"
+        return seen[0]
+
+    def _assert_doy_survives(self, enc: torch.nn.Module, band_num: int) -> None:
+        # 257 and 258 straddle the BF16 integer-exactness boundary: BF16 steps by
+        # 2 above 256, so a whole-tensor cast would deliver 256 and 258.
+        x = torch.randn(1, 2, band_num + 1)
+        x[0, :, -1] = torch.tensor([257.0, 258.0])
+        doy = self._captured_doy(enc.bfloat16().eval(), x)
+        assert doy.dtype == torch.float32
+        torch.testing.assert_close(doy, torch.tensor([[257.0, 258.0]]), atol=0.0, rtol=0.0)
+
+    def test_v11_backbone_hands_the_encoder_exact_fp32_doy(self):
+        self._assert_doy_survives(V11TransformerEncoder(band_num=10, latent_dim=8, nhead=2, num_encoder_layers=1), 10)
+
+    def test_v2_backbone_hands_the_encoder_exact_fp32_doy(self):
+        self._assert_doy_survives(StudentTransformerEncoder(band_num=2, latent_dim=8, nhead=2, num_encoder_layers=1), 2)

@@ -35,10 +35,26 @@ batch-size and library-stack differences, not different weights.
 
 ## 2. What replaces it
 
-The invariant that survives a model swap is that **only the model changed**.
-Everything upstream of the encoder is model independent, so it must match the
-reference exactly, while the values must not match at all. The gate asserts both
-halves, then judges the values on structure rather than on agreement.
+The invariant that survives a model swap is that **only the model changed**. So
+everything model independent must match the reference exactly, while the values
+must not match at all. The gate asserts both halves, then judges the values on
+structure rather than on agreement.
+
+**Where that boundary actually falls.** It is not "the encoder" — it sits one
+stage earlier, at band standardisation. Selection, geometry and sampling are
+shared: the mosaic reads, the SCL validity mask and per-pixel validity gate, the
+observation counts, the band order, the `{8,16,…,256}` bucket schedule, and the
+raw integer DOY are identical code driven by identical config for both models
+(`MODEL_ARCHS["v2-large"]` overrides only the architecture fields — it does not
+touch `num_obs_checkpoints`). Standardisation is *deliberately* model specific:
+`band_stats(model_version, norm_source)` returns v2's single hard-coded set for
+v2 and the AWS/MPC set for v1.1. So the normalised tensors the encoder consumes
+differ between the two models even for byte-identical input pixels, and requiring
+them to match would assert something false.
+
+Hence the exact-match half of the gate is scoped to the shared stages above —
+which is precisely why applying the wrong statistics is a *blind spot* the
+structural checks have to cover, not something the exact-match half catches.
 
 ### The blind spot that motivates the structural checks
 
