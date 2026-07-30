@@ -16,17 +16,17 @@ as derived). Two things are neither, and they are called out in §9 rather than 
 | | |
 |---|---|
 | Ingest (Fargate) | $115,000 – $126,000 |
-| **Inference (GPU, on-demand)** | **$526,000 – $607,000**, plan on **$563,000** |
+| **Inference (GPU, on-demand)** | **$503,000 – $579,000**, plan on **$538,000** |
 | Assembly | ~$200 |
 | Mosaic storage (transient) | ~$3,000 |
 | Ray cluster ramp (72 boots, §4) | ~$9,000 |
-| **Campaign total** | **$660,000 – $742,000**, plan on **$698,000** |
+| **Campaign total** | **$638,000 – $712,000**, plan on **$672,000** |
 
-The "plan on" figure is the **12.5K px/s basis** (§6) with ingest at its midpoint. Both
+The "plan on" figure is the **13.1K px/s basis** (§6) with ingest at its midpoint. Both
 halves of that rate are now **counted rather than assumed** — OPERA radar granules from CMR
 and Sentinel-2 acquisition dates and cloud cover from STAC, on a global land grid. The
-campaign carries **1.12× the tokens per pixel of the Iowa ROI every throughput figure comes
-from**, so it runs at 0.89× that rate. The largest single correction was that **Iowa is a
+campaign carries **1.07× the tokens per pixel of the Iowa ROI every throughput figure comes
+from**, so it runs at 0.94× that rate. The largest single correction was that **Iowa is a
 single-orbit site**: the anchor sits at the cheap end of the radar distribution. The range is
 Iowa's own 13–15K band carried through.
 
@@ -50,11 +50,12 @@ that stalls on capacity is worse than one that costs more. Settled; do not re-op
 2. **Inference cost is invariant to the ingest scenario.** Same pixels, same throughput,
    same GPU-hours whether you run 40 cells or 71. What the ingest scenario changes is
    whether the GPU fleet has anything to do.
-3. **A fifth of the land has no radar for three of the nine years.** OPERA coverage was
-   withdrawn after Sentinel-1B failed in December 2021 and restored with Sentinel-1C in
-   2025. With `allow_s2_only=False` those pixels produce no embedding at all. That is a
-   feasibility decision rather than a cost line, and it is the most consequential thing in
-   this document (§6).
+3. **A fifth of the land has no radar for three of the nine years**, because OPERA coverage
+   was withdrawn after Sentinel-1B failed in December 2021 and restored with Sentinel-1C in
+   2025. **`allow_s2_only` is ON for this campaign**, so those pixels still get embeddings
+   from a neutral radar input rather than being dropped — which is what turns a coverage hole
+   into a quality caveat. It also makes them *cheaper*: a minimal radar sequence instead of a
+   full one, worth about $26,000 (§6).
 4. **Fleet sizing is the largest cost lever.** Provision UNDER what ingest can feed, which
    makes idle burn structurally zero and leaves headroom for ingest restarts (§5). The
    2,500-actor quota fits every configuration here, but only just at the widest — it is
@@ -100,7 +101,7 @@ transfer (everything is in us-west-2, so there is no egress); engineering time.
 | Fargate | $0.04048/vCPU-h, $0.004445/GB-h | ingest estimate §6 |
 | Worker | 4 vCPU, 16 GiB → **$0.2330/worker-hour** | derived |
 | g6e.xlarge | $1.861/h **on-demand** (spot excluded by decision) | `docs/providers/aws.md` |
-| Inference throughput | **12.5K** planning basis; 11.6K / 13.4K as bounds | measured, §6 |
+| Inference throughput | **13.1K** planning basis; 12.2K / 14.0K as bounds | measured, §6 |
 | Embedding output | int8, 128 dims | `config/store_layout.py` |
 
 ---
@@ -238,17 +239,17 @@ All costs on-demand at $1.861/GPU-hour, v1.1. The basis is derived in §6.
 
 | basis | GPU-hours | **cost** |
 |---|---|---|
-| 13.4K px/s — from Iowa's 15K | 282,100 | **$525,100** |
-| **12.5K px/s — planning basis, from Iowa's 14K** | **302,800** | **$563,500** |
-| 11.6K px/s — from Iowa's 13K | 325,500 | **$605,800** |
+| 14.0K px/s — from Iowa's 15K | 269,600 | **$501,700** |
+| **13.1K px/s — planning basis, from Iowa's 14K** | **288,900** | **$537,700** |
+| 12.2K px/s — from Iowa's 13K | 311,100 | **$578,900** |
 
 **None of this varies with the ingest configuration.** The same pixels are inferred at the
 same rate either way. What the ingest configuration decides is whether the fleet has work.
 
 ### Size the fleet UNDER what ingest can feed
 
-A zone-year costs **303.1 GPU-hours** at the planning basis. The *matched* fleet — the size
-at which the fleet exactly consumes what ingest produces — is `supply × 303.1`. Running at
+A zone-year costs **289.2 GPU-hours** at the planning basis. The *matched* fleet — the size
+at which the fleet exactly consumes what ingest produces — is `supply × 289.2`. Running at
 the matched size is the wrong target for two reasons: it leaves no absorber when supply dips,
 and any dip below it is billed as idle.
 
@@ -260,19 +261,18 @@ run — the "slightly slower start" that buys the guarantee.
 
 | ingest config | Fargate vCPU | ingest | supply | matched | **provision (85%)** | actors/cluster | inference | **campaign** |
 |---|---|---|---|---|---|---|---|---|
-| 40 × 50w — shipped | 12,640 | 7.2 d | 5.76/h | 1,746 | 1,484 | 185 | 8.5 d | ~8.7 d |
-| 45 × 50w — the knee | 14,220 | 6.5 d | 6.41/h | 1,943 | 1,651 | 206 | 7.6 d | ~7.8 d |
-| **45 × 60w — recommended** | **16,740** | **5.6 d** | **7.42/h** | **2,249** | **1,912** | **239** | **6.6 d** | **~6.8 d** |
-| 45 × 80w — if the width holds | 22,140 | 4.5 d | 9.22/h | 2,795 | 2,375 | 297 | 5.3 d | ~5.5 d |
+| 40 × 50w — shipped | 12,640 | 7.2 d | 5.76/h | 1,666 | 1,416 | 177 | 8.5 d | ~8.7 d |
+| 45 × 50w — the knee | 14,220 | 6.5 d | 6.41/h | 1,854 | 1,576 | 197 | 7.6 d | ~7.8 d |
+| **45 × 60w — recommended** | **16,740** | **5.6 d** | **7.42/h** | **2,146** | **1,824** | **228** | **6.6 d** | **~6.8 d** |
+| 45 × 80w — if the width holds | 22,140 | 4.5 d | 9.22/h | 2,667 | 2,267 | 283 | 5.3 d | ~5.5 d |
 
 **Idle burn is $0 in every row**, by construction. The number that used to sit here — up to
 $304,000 of idle at a quota-sized fleet — is what this policy exists to avoid, and it is now
 avoided by choosing the fleet rather than by hoping supply keeps up.
 
 **The 2,500-actor quota fits every configuration here, but not by much at the widest.** The
-recommended 45 × 60w provisions 1,912; even 45 × 80w provisions 2,375, inside the quota. The
-quota is adequate rather than generous — a throughput 10% below the measured basis would push
-the widest configuration past it.
+recommended 45 × 60w provisions 1,824; even 45 × 80w provisions 2,267, inside the quota with
+margin. The quota is adequate for every configuration considered here.
 
 **Do not mix throughput bases.** Sizing the fleet on a while-processing rate (21–24K) and
 then running at the campaign rate leaves the fleet short by a third: GPU-hours are unchanged
@@ -288,7 +288,7 @@ campaign's duration.
 
 ## 6. Throughput
 
-**Cost the campaign at ~12.5K px/s.** Every earlier version of this section argued about
+**Cost the campaign at ~13.1K px/s.** Every earlier version of this section argued about
 which of someone else's measured rates to borrow. This one counts the thing that actually
 drives the rate.
 
@@ -318,8 +318,9 @@ per date, which is the expected probability that a given pixel is clear.
 | **campaign, land-weighted** | | **52** | **91** | **152** |
 | **Iowa — the ROI every rate comes from** | | 70 | 61 | **136** |
 
-**The campaign carries 1.12× the tokens per pixel of the reference ROI, so it runs at
-0.89× its rate.** What drives it:
+**The campaign carries 1.07× the tokens per pixel of the reference ROI, so it runs at
+0.94× its rate** — 145 against Iowa's 136, once the optical-only cells below are counted at
+their minimal radar sequence (152 without them). What drives it:
 
 1. **Iowa is a SINGLE-orbit site.** Every sample point across the ROI returns hundreds of
    ascending granules and **zero** descending, in both eras. The anchor sits at the cheap end
@@ -330,9 +331,9 @@ per date, which is the expected probability that a given pixel is clear.
 
 | | rate | GPU-hours | cost |
 |---|---|---|---|
-| Iowa 15K → campaign | 13.4K | 282,100 | $525,100 |
-| **Iowa 14K → campaign — planning basis** | **12.5K** | **302,800** | **$563,500** |
-| Iowa 13K → campaign | 11.6K | 325,500 | $605,800 |
+| Iowa 15K → campaign | 14.0K | 269,600 | $501,700 |
+| **Iowa 14K → campaign — planning basis** | **13.1K** | **288,900** | **$537,700** |
+| Iowa 13K → campaign | 12.2K | 311,100 | $578,900 |
 
 > **Cloud cover understates invalidity, and both sides of the ratio are affected.** The SCL
 > classes this pipeline rejects are cloud (8, 9), cloud shadow (3), dark/defective (0, 1, 2);
@@ -350,11 +351,11 @@ per date, which is the expected probability that a given pixel is clear.
 > which is exactly why guessing either one was unsafe. **An anchor is not a typical case just
 > because it is the case you measured.**
 
-### The 2022–2024 coverage gap — a feasibility problem, not a cost one
+### The 2022–2024 radar gap, and what `allow_s2_only` does to it
 
-The same census found something that does not belong in a cost table. **OPERA RTC-S1
-coverage was withdrawn from about a fifth of the land it served after Sentinel-1B failed in
-December 2021, and restored when Sentinel-1C came online in 2025:**
+The same census found something that is not really a cost question. **OPERA RTC-S1 coverage
+was withdrawn from about a fifth of the land it served after Sentinel-1B failed in December
+2021, and largely restored when Sentinel-1C came online in 2025:**
 
 | era | covered land (area-weighted) | dual-orbit fraction |
 |---|---|---|
@@ -363,41 +364,25 @@ December 2021, and restored when Sentinel-1C came online in 2025:**
 | 2025 — S1A + S1C | 96% | 0.57 |
 
 Interior Australia and large parts of Siberia return **zero** OPERA granules for 2022, 2023
-and 2024 having returned thousands in 2017–2021. The loss is concentrated at high latitude
-(64% coverage above 60°N) and in the southern mid-latitudes.
+and 2024 having returned thousands in 2017–2021. The loss concentrates at high latitude (64%
+coverage above 60°N) and in the southern mid-latitudes.
 
-**With `allow_s2_only=False`, a pixel with no radar gets no embedding**, and a zone with no
-radar at all fails its coverage gate outright. So roughly **a fifth of the land surface has
-no usable output for three of the nine campaign years** unless something changes. The
-options are to enable the S2-only path for those cells, to accept the gap and document it,
-or to drop 2022–2024 for the affected zones. **This needs a decision before the campaign
-runs**, and it is not a decision this document should make.
+**`allow_s2_only` is ON for this campaign**, which is what keeps this from being a hole in
+the output. A pixel with no radar is embedded from its optical sequence with a neutral
+all-zeros radar input rather than being dropped, so those cells produce data. Across the nine
+years, **6.8% of pixel-years are optical-only** on this basis.
 
-The measured dual-orbit fraction, campaign-weighted, is **0.558** — against the 0.70 that an
-earlier version of this section assumed.
+It also makes them cheaper. A radar-less pixel carries the smallest sequence bucket instead
+of a full one, which pulls the campaign's tokens per pixel from 152 down to **145** and is
+worth about **$26,000**. That saving is real but incidental — the reason to enable the flag
+is coverage, not cost.
 
-### v2 Large: evaluated, not used
-
-**The campaign runs v1.1.** v2 Large was costed and is not being taken forward. The
-evaluation is kept here so it is not repeated, and because one of its conclusions is a
-reasoning error worth remembering.
-
-`feature/v2-large-model` carries a per-model planning rate in `inference/actors.py` —
-`{"v1.1": 16_000.0, "v2-large": 22_000.0}`, a ratio of **1.375×** — which would have been
-worth roughly **$137,000** at the capacity-planning basis and would have cut the matched
-fleet by about a quarter. Two things made it a weak number to spend against: the constants
-are labelled a *strategy-only estimator* ("never a correctness value"), and the commit that
-added them points at a calibration in `context_docs` that does not exist on that branch.
-
-**The reasoning error, which generalises.** An earlier version of this document derived the
-ratio from the two `ModelArch` definitions — v2 Large is 0.89× the per-token arithmetic of
-v1.1 — and then argued the real gain would be *smaller* still, because inference is not
-tensor-bound. That was wrong twice over: wrong by a factor of 1.22 against the branch's own
-figure, and wrong in its logic. Not being tensor-bound does not mean a smaller model gains
-less; it means arithmetic is not what it gains on. A narrower model also moves less weight
-and activation traffic, launches smaller kernels, and does less host-side work per token —
-precisely the things the profiling run named as the bottleneck. **Do not use a FLOP ratio to
-predict throughput on a pipeline measured at 0.12–0.26 tensor-pipe utilisation.**
+**What it does not do is make those embeddings equivalent.** ADR 013 records that S2-only
+output is not scientifically validated against S1-informed output, and lists that validation
+as a prerequisite it did not consider met. The campaign is proceeding with the flag on
+regardless; the honest position is that 6.8% of pixel-years carry a documented quality
+caveat, identifiable after the fact because `s1_asc_obs_count + s1_desc_obs_count == 0`
+marks every one of them.
 
 ---
 
@@ -435,19 +420,19 @@ Open Data application asks how large the dataset is.
 
 ## 8. Scenario summary
 
-Ingest at its cost midpoint; inference at the **12.5K measured basis** (§6), v1.1, with the
+Ingest at its cost midpoint; inference at the **13.1K measured basis** (§6), v1.1, with the
 fleet provisioned at 85% of matched so idle burn is zero (§5).
 
 | | 40 × 50w<br>shipped | 45 × 50w<br>the knee | 45 × 60w<br>**recommended** | 45 × 80w<br>if the width holds |
 |---|---|---|---|---|
 | Fargate vCPU | 12,640 | 14,220 | **16,740** | 22,140 |
-| GPU fleet to provision | 1,484 | 1,651 | **1,912** | 2,375 |
-| — actors per cluster (÷8) | 185 | 206 | **239** | 297 |
+| GPU fleet to provision | 1,416 | 1,576 | **1,824** | 2,267 |
+| — actors per cluster (÷8) | 177 | 197 | **228** | 283 |
 | Ingest | $121,000 | $121,000 | $121,000 | $121,000 |
-| Inference | $563,500 | $563,500 | $563,500 | $563,500 |
+| Inference | $537,700 | $537,700 | $537,700 | $537,700 |
 | Assembly + S3 + mosaics | $4,800 | $4,800 | $4,800 | $4,800 |
 | Cluster ramp (72 boots) | ~$7,000 | ~$8,000 | ~$9,000 | ~$11,000 |
-| **Total** | **$696,000** | **$697,000** | **$698,000** | **$700,000** |
+| **Total** | **$670,000** | **$671,000** | **$672,000** | **$674,000** |
 | Ingest wall clock (9 yr) | 7.2 d | 6.5 d | **5.6 d** | 4.5 d |
 | **Campaign wall clock** | **~8.7 d** | ~7.8 d | **~6.8 d** | ~5.5 d |
 | Idle burn | $0 | $0 | **$0** | $0 |
@@ -462,13 +447,12 @@ width model was fitted over, and the widest whose matched fleet still fits under
 2,500-actor GPU quota. It also needs *less* Fargate quota than the 71-cell plan an earlier
 version recommended (16,740 against 22,436) while finishing nearly two days sooner.
 
-**80 workers is viable at the measured rate** — 2,375 provisioned against a 2,500 quota —
-and buys another 1.3 days for 5,400 more vCPU. It stays a target rather than a
-recommendation only because the width model is extrapolated there (§4), and because the
-margin against the quota is thin: a throughput 10% below the measured basis pushes it over.
+**80 workers is viable at the measured rate** — 2,267 provisioned against a 2,500 quota —
+and buys another 1.3 days for 5,400 more vCPU. It stays a target rather than a recommendation
+only because the width model is extrapolated there (§4).
 
-At the optimistic 13.4K basis subtract **$38,000** from every column; at the pessimistic
-11.6K add **$42,000**.
+At the optimistic 14.0K basis subtract **$36,000** from every column; at the pessimistic
+12.2K add **$41,000**.
 
 **One consequence for the deadline.** All years must be validated by **2026-09-11**. Every
 column is 5.5 to 8.7 days of campaign wall clock, so compute is not what threatens that
@@ -550,10 +534,11 @@ the nine year-barriers at which one stalled zone holds up everything behind it.
    worthless, and below 60 workers the longest zone gets no shorter. Both halves of that
    sentence are the same finding (§4).
 
-2. **Decide what happens to 2022–2024 over the fifth of the land with no radar.** This is
-   the one item here that is not about money. Enable `allow_s2_only` for those cells, accept
-   and document the gap, or drop those zone-years. It needs deciding before the store is
-   seeded, because the coverage the campaign claims is part of what it publishes (§6).
+2. **Document the 2022–2024 optical-only cells in whatever ships with the data.**
+   `allow_s2_only` is on, so they exist rather than being holes — but 6.8% of pixel-years are
+   embedded without radar and ADR 013 does not consider that combination validated. They are
+   identifiable from the store (`s1_asc_obs_count + s1_desc_obs_count == 0`), so the work is
+   describing them, not finding them (§6).
 
 3. **Provision about 2,100 GPU actors — 264 per cluster.** Sizing at 85% of what ingest can
    feed makes idle burn structurally zero and leaves 15% headroom for an ingest cell to fail

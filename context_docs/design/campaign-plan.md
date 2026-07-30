@@ -31,11 +31,11 @@ and model load once for its whole set rather than once per zone-year.
 
 ```
    campaign
-   ├── year 2016 ─┬── cluster 1 ── zones: 35N → 12S → 04N → …   (densest first)
+   ├── year 2017 ─┬── cluster 1 ── zones: 35N → 12S → 04N → …   (densest first)
    │              ├── cluster 2 ── zones: 38N → …
    │              └── … 8 clusters, each opening on one of the 8 densest zones
-   ├── year 2017 ─── (same, after 2016 completes)
-   └── … 9 years, serial
+   ├── year 2018 ─── (same, after 2017 completes)
+   └── … 2017–2025, serial
 ```
 
 **Years run serially.** Concurrent zone-years are safe — different groups rebase cleanly —
@@ -47,7 +47,8 @@ zone-disjointness scheduler and is not planned.
 
 ## 2. Settings
 
-Defaults are in `run_global_campaign`. Only the starred row needs changing.
+Defaults are in `run_global_campaign`. **★ marks the four that need changing from their
+shipped defaults.**
 
 | parameter | value | why |
 |---|---|---|
@@ -58,11 +59,11 @@ Defaults are in `run_global_campaign`. Only the starred row needs changing.
 | **`ingest_settings.max_workers`** | **50 → 60** ★ | S2 fleet width. Past the knee this is the ONLY thing that shortens the campaign, because the longest single zone sets the floor (§4) |
 | `ingest_settings.s1_worker_fraction` | 0.22 | → 13 workers per S1 orbit at the recommended 60w, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
-| **`num_actors`** | **20 → ~199** ★ | GPU actors per cluster: 85% of what ingest can feed, so the fleet never idles and keeps headroom for a restart (§4) |
+| **`num_actors`** | **20 → ~228** ★ | GPU actors per cluster: 85% of what ingest can feed, so the fleet never idles and keeps headroom for a restart (§4) |
 | `s1_orbit` | `"both"` | downgrades per zone when an orbit has no imagery |
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
-| `allow_s2_only` | `false` | not validated for production; see the ADR |
+| **`allow_s2_only`** | **`false` → `true`** ★ | ON for the global campaign. A fifth of the land has no radar for 2022–24 (§4); without this those pixels produce nothing. ADR 013 does not consider the combination validated — see §8 |
 | commit limit | derived, `min(clusters, 8)` | never set by hand |
 
 The commit gate and the ingest gate are **Prefect global concurrency limits**, because
@@ -86,13 +87,13 @@ cluster-year with finished mosaics already on disk.
 
 ## 4. Sizing, cost, and the two things that actually bind
 
-Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md). Costed at the **12.5K
+Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md). Costed at the **13.1K
 px/s basis**, measured rather than borrowed: a CMR census of OPERA radar granules and a
 Sentinel-2 STAC census of acquisition dates and cloud cover, over a global land grid. The
-campaign carries **1.12× the tokens per pixel** of the Iowa region every throughput figure
+campaign carries **1.07× the tokens per pixel** of the Iowa region every throughput figure
 comes from — **Iowa is a single-orbit site**, so it sits at the cheap end of the radar
-distribution, partly offset by its high optical revisit. The campaign runs at 0.89× its
-rate.
+distribution, partly offset by its high optical revisit and by the optical-only cells running
+a minimal radar sequence. The campaign runs at 0.94× its rate.
 
 **Years run serially, so a year cannot finish faster than its longest single zone** — about
 17.3 hours at 50 workers, 15.0 at 60. That floor is what shapes everything:
@@ -108,10 +109,10 @@ rate.
 | Fargate vCPU | 12,640 | 14,220 | **16,740** | 22,140 |
 | Ingest wall clock (9 yr) | 7.2 d | 6.5 d | **5.6 d** | 4.5 d |
 | Mosaic supply | 5.76/h | 6.41/h | **7.42/h** | 9.22/h |
-| GPU fleet to provision | 1,484 | 1,651 | **1,912** | 2,375 |
-| — actors per cluster | 185 | 206 | **239** | 297 |
+| GPU fleet to provision | 1,416 | 1,576 | **1,824** | 2,267 |
+| — actors per cluster | 177 | 197 | **228** | 283 |
 | **Campaign wall clock** | ~8.7 d | ~7.8 d | **~6.8 d** | ~5.5 d |
-| **Campaign cost** | $696,000 | $697,000 | **$698,000** | $700,000 |
+| **Campaign cost** | $670,000 | $671,000 | **$672,000** | $674,000 |
 
 **Every configuration costs the same to within 0.5%.** Inference is the same pixels at the
 same rate; ingest worker-hours are width-neutral. The decision is wall clock, bought with
@@ -125,10 +126,8 @@ nearly two days faster on 16,740.
 not an accident of rounding. It keeps a standing queue of finished mosaics so the fleet is
 never idle, and the 15% margin absorbs an ingest cell failing and restarting without the GPUs
 noticing. Inference then trails ingest by roughly 18% of the run, which is the "slightly
-slower start" that buys the guarantee. The recommended configuration wants **1,912 actors**,
-comfortably inside the 2,500 quota. Eighty workers would want 2,375 — still inside, but with
-thin margin: a throughput 10% below the measured basis pushes it over, and inference would
-then set the campaign's duration instead of trailing ingest.
+slower start" that buys the guarantee. The recommended configuration wants **1,824 actors**,
+comfortably inside the 2,500 quota; even 80 workers wants only 2,267.
 
 **GPUs are on-demand.** Spot is excluded by decision: sustaining this many g6e instances for
 days makes interruption a certainty, and a campaign that stalls on capacity is worse than one
@@ -139,9 +138,10 @@ that costs more. Settled; do not re-open.
 > **A fifth of the land has no radar for 2022–2024.** OPERA RTC-S1 coverage was withdrawn
 > after Sentinel-1B failed in December 2021 — interior Australia and much of Siberia return
 > *zero* granules for those years — and was restored when Sentinel-1C came online in 2025.
-> With `allow_s2_only=false` those pixels produce no embedding at all, and a zone with no
-> radar anywhere fails its coverage gate outright. **This is a decision, not a cost line**,
-> and it must be made before the store is seeded. See §8.
+> **`allow_s2_only` is on**, so those pixels are embedded from their optical sequence with a
+> neutral radar input instead of being dropped: 6.8% of pixel-years across the campaign.
+> They are cheaper too, which is where part of the rate above comes from. What remains is a
+> quality caveat rather than a coverage hole — see §8.
 
 ---
 
@@ -203,16 +203,15 @@ There are **no Prefect-level retries** on any ingest flow, deliberately.
 Settled since the last revision, and not to be re-opened: **the model is v1.1**, **GPUs are
 on-demand**, and the permanent store goes to **AWS Open Data**.
 
-1. **Decide what 2022–2024 looks like over the land with no radar.** OPERA RTC-S1 coverage
-   was withdrawn from about a fifth of the land it served after Sentinel-1B failed in
-   December 2021 and largely restored with Sentinel-1C in 2025; interior Australia and much
-   of Siberia return *zero* granules for those three years. With `allow_s2_only=false` those
-   pixels produce no embedding, and a zone with no radar anywhere fails its coverage gate
-   outright. Three options: enable the S2-only path for the affected cells (it exists but is
-   unvalidated for production — see ADR 013), accept the gap and document it in what we
-   publish, or drop those zone-years. **This is the one open item that is not about money,
-   and it has to be settled before the store is seeded**, because the coverage the campaign
-   claims is part of the artefact. `scripts/census_s1_coverage.py` maps the affected area.
+1. **Describe the optical-only cells in whatever ships with the data.** OPERA RTC-S1
+   coverage was withdrawn from about a fifth of the land after Sentinel-1B failed in December
+   2021 and largely restored with Sentinel-1C in 2025 — interior Australia and much of
+   Siberia return *zero* granules for 2022–2024. `allow_s2_only` is on, so **6.8% of
+   pixel-years across the campaign are embedded without radar** rather than missing. ADR 013
+   does not consider that combination scientifically validated, so this is a documentation
+   and caveat question, not a coverage hole. Every affected pixel is identifiable after the
+   fact (`s1_asc_obs_count + s1_desc_obs_count == 0`), and
+   `scripts/census_s1_coverage.py` maps the area in advance.
 2. **Measure the densest zone at two fleet widths (60 and 80).** It decides whether the
    campaign is 5.6 days or 4.5, and it is the only remaining question about the schedule. The
    width model is fitted over roughly 30–60 workers, so 80 is currently an extrapolation.
@@ -248,8 +247,9 @@ the throughput basis — is robust even where the absolutes are not.
 | dates per zone-year | 365 | ingest duration |
 | per-zone ingest fit | `s/date = 10.16 + 0.06022 × live_4096_chunks` (R² 0.954, 5 regions) | zone durations, and so the wall-clock floor |
 | fleet width model | `T(W) = 36.3 + 7896/W` — **fitted over ~30–60 workers only** | whether 80w reaches 4.5 days |
-| inference rate, reference ROI | 13–15K px/s fleet-overall (Iowa) | the anchor the 12.5K basis scales from |
-| tokens/pixel, campaign vs Iowa | 152 vs 136 → **1.12×** | the whole throughput basis |
+| inference rate, reference ROI | 13–15K px/s fleet-overall (Iowa) | the anchor the 13.1K basis scales from |
+| tokens/pixel, campaign vs Iowa | 145 vs 136 → **1.07×** | the whole throughput basis |
+| optical-only pixel-years | **6.8%** (no radar 2022–24) | those cells run a minimal radar sequence |
 | S1 obs/pixel/yr | 47–156 by band; campaign 91, Iowa 61 | the radar half of that |
 | S2 obs/pixel/yr | 44–72 by band; campaign 52, Iowa 70 | the optical half |
 | OPERA coverage, 2022–24 | **81%** of the S1A+B baseline | which cells can produce output at all |
