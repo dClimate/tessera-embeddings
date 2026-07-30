@@ -276,9 +276,8 @@ avoided by choosing the fleet rather than by hoping supply keeps up.
 ### Which quota actually binds, and the answer flips when the year barrier goes
 
 Every row above is **year-serial**, so its makespan is `max(longest zone, work / cells)` per
-year and the cell count stops helping at ~45. Remove the year barrier (`campaign-plan.md` §8
-item 7) and the makespan is simply `total work / cells`, which moves the constraint onto the
-GPU fleet:
+year and the cell count stops helping at ~45. Without the barrier the makespan is simply
+`total work / cells`, which moves the constraint onto the GPU fleet:
 
 | cells | Fargate vCPU | ingest | provisioning at 2,500 actors | **campaign** |
 |---|---|---|---|---|
@@ -304,6 +303,14 @@ Fargate when the binding resource is GPU.
 
 The cheapest useful ask is **2,704 actors**, which is 66 cells at proper 85% provisioning — an
 ~8% quota bump for about half a day.
+
+> **Status of the barrier removal (2026-07-30): the code is shipped, the validation is not.**
+> `overlap_years` exists and defaults OFF; the three pieces it needed — a per-cell inference
+> window, a child flow taking `(zone, year)` pairs, and a driver that batches instead of
+> looping years — are in and unit-tested. Nothing has run on a real fleet, so **cost and
+> schedule planning should still use the year-serial rows above** until Phase 4's P3c rung
+> clears it. Two figures move when it does: the campaign floor from ~6.8 d to ~4.8 d at 61
+> cells, and the cluster-ramp line from ~$9,000 to ~$1,000.
 
 **The 2,500-actor quota fits every configuration here, but not by much at the widest.** The
 recommended 45 × 60w provisions 1,824; even 45 × 80w provisions 2,267, inside the quota with
@@ -452,7 +459,10 @@ than a worker fleet. Eight runners at 4 vCPU across a five-day campaign is rough
 vCPU-hours. It is a rounding error and does not need a scenario.
 
 **S3 requests — about $1,600, essentially all of it ingest.** The ingest estimate counts
-~316M chunk writes at $5/M. Inference adds staged-tile writes and shard writes (~6.5M
+~316M chunk writes at $5/M. (The zone-year attribute commit was split out of the shard
+commit on 2026-07-30, doubling the campaign's *commit* count from ~1,100 to ~2,200. Those
+are metadata commits, not chunk writes, so this figure is unmoved — noted only so the
+arithmetic is followable.) Inference adds staged-tile writes and shard writes (~6.5M
 PUTs, $33) and mosaic reads (~316M GETs at $0.40/M, $126).
 
 **Transient mosaic storage — about $3,000, flat across every scenario.** More cells hold
@@ -490,11 +500,20 @@ fleet provisioned at 85% of matched so idle burn is zero (§5).
 | Ingest | $121,000 | $121,000 | $121,000 | $121,000 |
 | Inference | $537,700 | $537,700 | $537,700 | $537,700 |
 | Assembly + S3 + mosaics | $4,800 | $4,800 | $4,800 | $4,800 |
-| Cluster ramp (72 boots) | ~$7,000 | ~$8,000 | ~$9,000 | ~$11,000 |
+| Cluster ramp (72 boots — see below) | ~$7,000 | ~$8,000 | ~$9,000 | ~$11,000 |
 | **Total** | **$670,000** | **$671,000** | **$672,000** | **$674,000** |
 | Ingest wall clock (9 yr) | 7.2 d | 6.5 d | **5.6 d** | 4.5 d |
 | **Campaign wall clock** | **~8.7 d** | ~7.8 d | **~6.8 d** | ~5.5 d |
 | Idle burn | $0 | $0 | **$0** | $0 |
+
+> **The 72-boot ramp line is a cost of the YEAR BARRIER, and it is now optional.** Clusters
+> are dispatched per year, so 8 clusters x 9 years is 72 `ray up` cycles plus 72 model-load
+> cold starts. With `overlap_years` (shipped 2026-07-30, default off — see
+> `campaign-plan.md` §8 item 7) a cluster works a multi-year list, so the campaign pays **8
+> boots**, taking this line from about $9,000 to roughly $1,000. That is a small number
+> against $672,000 and is NOT the reason to drop the barrier — the schedule is (§"Which
+> quota actually binds") — but it is the one line item that moves, so it belongs here rather
+> than being discovered later.
 
 **Every column costs the same to within 0.5%.** Inference is the same pixels at the same
 rate in all four; ingest worker-hours are width-neutral; and the fleet policy removes idle

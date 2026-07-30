@@ -236,11 +236,28 @@ open a single zone group, never the datatree (icechunk #1462). With D2/D3
 settled by the T1/d3/d3v2 sweeps, the one-repo layout is the decision — capped
 committers, single-group readers; the naive-concurrency question is settled.
 
-### D6 — Commit strategy: cooperative fork/merge, one commit per zone-year (FIRM shape; pacing cap FIRM from run 1)
+### D6 — Commit strategy: cooperative fork/merge, TWO commits per zone-year (FIRM shape; pacing cap FIRM from run 1)
 
 Within a zone-year: `session.fork()` → pickled ForkSessions to workers →
-`merge(*sessions)` → **one commit** (multiprocessing start method must be
-spawn/forkserver — fork deadlocks icechunk's runtime). Across zones: commits
+`merge(*sessions)` → **one commit for the shards**, then a **second, small commit for
+that year's `years_complete`/`runs` attrs** (multiprocessing start method must be
+spawn/forkserver — fork deadlocks icechunk's runtime).
+
+> **Amended 2026-07-30: the attrs were split out of the shard commit.** They were
+> bundled in, which made two years of the SAME zone uncommittable concurrently —
+> `ConflictDetector` treats group attributes as an opaque value and cannot merge them,
+> so the loser raised `RebaseFailedError` and lost its entire assembly. That is what
+> made the campaign's years serial. Chunk data was never the obstacle: every chunk and
+> shard is 1 in the time dimension, so different years of one zone are strictly
+> disjoint. `shard_writer.commit_year_attrs` now owns both attrs, in its own commit,
+> with a bounded retry — and the retry is CORRECT rather than hopeful, because each
+> writer only ever inserts its own year's key (`years_complete` is a set union, `runs`
+> a per-year dict insert), so re-reading the winner's value and re-applying yields what
+> both writers intended in either order. Consequence for this decision's budget: about
+> **2,200 commits** for the campaign rather than 1,100, still far below icechunk's
+> "tens of thousands" target. Consequence for a crash: dying between the two leaves a
+> year holding DATA that nothing marks complete, which the work list reads as pending,
+> so a retry rewrites the same shards and re-marks. Across zones: commits
 to distinct groups with a bounded rebase-retry loop (`ConflictDetector`;
 cross-group commits auto-rebase cleanly — confirmed in run 1 T0), **paced
 behind a concurrency cap** so the branch-tip CAS isn't slammed.
@@ -430,7 +447,9 @@ to this:
   2025 first and backfill as region-inserts; never prepend during fills. (D1)
 - **Manifest split time@1** (one manifest per year per array), spatial split only
   if a year-manifest exceeds ~2–4 M refs. (D4)
-- **Writer: cooperative fork/merge, one commit per (zone, year)**, shard-aligned
+- **Writer: cooperative fork/merge, TWO commits per (zone, year)** — shards, then that
+  year's attrs (D6, amended 2026-07-30; this is what lets two years of one zone be
+  written concurrently) — shard-aligned
   + land-masked (whole lean shards, ocean elided), spawn/forkserver only. Cap
   simultaneous zone-year committers to ~4–8 (uncoordinated commits storm,
   O(N²)). (D6)
