@@ -275,10 +275,10 @@ class TestPositionalEncoderBitIdentity:
         """``.bfloat16()`` must not reach the frequencies or the DOY arithmetic.
 
         The production path calls ``model.bfloat16()``. If ``div_term`` were a
-        registered buffer it would be swept into BF16 and every sin/cos argument
-        would shift by up to ~0.4 rad at DOY 365 — a silent divergence from the
-        FP32 graph the checkpoints were trained and golden-tested against. The
-        only permitted loss is the final cast of the result.
+        registered buffer it would be swept into BF16 and sin/cos arguments would
+        shift by up to ~0.70 rad at DOY 365 — a silent divergence from the FP32
+        graph the checkpoints were trained and golden-tested against. The only
+        permitted loss is the final cast of the result.
         """
         enc = TemporalPositionalEncoder(d_model=64).bfloat16()
         doy = torch.randint(1, 366, (2, 9)).float()

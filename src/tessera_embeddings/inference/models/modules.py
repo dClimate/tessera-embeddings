@@ -211,10 +211,10 @@ class TemporalPositionalEncoder(nn.Module):
         # every forward call wastes ~18ms per backbone. It is cached per device
         # rather than held as a registered buffer *on purpose*: a buffer is swept
         # by ``nn.Module.bfloat16()``, which would round these frequencies to 8
-        # mantissa bits and change every sin/cos argument by up to ~0.4 rad at
-        # DOY 365 — a silent divergence from the FP32 path the models were
-        # trained and golden-tested on. A plain fp32 cache cannot be downcast by
-        # a module-level dtype conversion.
+        # mantissa bits and shift sin/cos arguments by up to ~0.70 rad at DOY 365
+        # (measured over d_model=640; ~0.65 for v1.1's 768) — a silent divergence
+        # from the FP32 path the models were trained and golden-tested on. A plain
+        # fp32 cache cannot be downcast by a module-level dtype conversion.
         self._div_term_cache: dict[torch.device, torch.Tensor] = {}
 
     def _div_term(self, device: torch.device) -> torch.Tensor:
