@@ -1024,7 +1024,7 @@ def test_overlap_years_dispatches_every_year_in_one_batch(wired, monkeypatch):
     assert cells == {("01N", 2025), ("01N", 2024), ("02N", 2025), ("02N", 2024)}
 
 
-def test_overlap_years_keeps_a_zone_ALL_years_in_one_cluster(wired, monkeypatch):
+def test_overlap_years_keeps_every_year_of_a_zone_in_one_cluster(wired, monkeypatch):
     """The safety property the whole design rests on.
 
     Two clusters writing two years of the SAME zone would contend on that group's
