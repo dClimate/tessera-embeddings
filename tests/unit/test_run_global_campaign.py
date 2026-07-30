@@ -974,3 +974,111 @@ class TestFailedZonesAreRetried:
     def test_zero_attempts_is_rejected(self, wired):
         with pytest.raises(ValueError, match="max_zone_attempts"):
             asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_zone_attempts=0))
+
+
+# --- overlap_years: dropping the year barrier -------------------------------------------
+
+
+def _multi_year(monkeypatch, zones, years):
+    """Wire a work list of every (zone, year) pair, with nothing yet complete."""
+    status = SimpleNamespace(zones=dict.fromkeys(zones, ()), has=lambda z, y: False, years=tuple(years))
+    monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+    monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [(z, y) for y in years for z in zones])
+    monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: 100.0)
+    return status
+
+
+def test_year_serial_is_still_the_default(wired, monkeypatch):
+    """The flag is opt-in: without it the driver dispatches one batch PER YEAR.
+
+    Pinned because the year-serial path is the one that has actually been run, and a
+    default flip would change the campaign's shape silently.
+    """
+    _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024])
+    asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", max_parallel_clusters=1
+        )
+    )
+    # One dispatch per year, each carrying exactly one year's cells.
+    years_per_dispatch = [{y for _z, y in p["cells"]} for _, p in wired["arun"]]
+    assert years_per_dispatch == [{2025}, {2024}], years_per_dispatch
+
+
+def test_overlap_years_dispatches_every_year_in_one_batch(wired, monkeypatch):
+    """The barrier gone: one round covering all requested years, so year N+1's ingest
+    can overlap year N's inference instead of waiting for it.
+    """
+    _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024])
+    asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS,
+            ami_ssm_name="ami",
+            fill_strategy="chained-clusters",
+            max_parallel_clusters=1,
+            overlap_years=True,
+        )
+    )
+    assert len(wired["arun"]) == 1, [d for d, _ in wired["arun"]]
+    cells = {(z, y) for z, y in wired["arun"][0][1]["cells"]}
+    assert cells == {("01N", 2025), ("01N", 2024), ("02N", 2025), ("02N", 2024)}
+
+
+def test_overlap_years_keeps_a_zone_ALL_years_in_one_cluster(wired, monkeypatch):
+    """The safety property the whole design rests on.
+
+    Two clusters writing two years of the SAME zone would contend on that group's
+    attributes. The partition is over ZONES rather than cells precisely so a zone's every
+    year lands in one cluster, where the runner's single trailing-assembly thread
+    serializes them. If the partition were ever over cells, this fails.
+    """
+    _multi_year(monkeypatch, ["01N", "02N", "03N", "04N"], [2025, 2024, 2023])
+    asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS,
+            ami_ssm_name="ami",
+            fill_strategy="chained-clusters",
+            max_parallel_clusters=4,
+            overlap_years=True,
+        )
+    )
+    owner: dict[str, int] = {}
+    for i, (_d, p) in enumerate(wired["arun"]):
+        for z, _y in p["cells"]:
+            assert owner.setdefault(z, i) == i, f"zone {z} was split across clusters"
+    # Every zone placed, and each cluster carries all three years of the zones it owns.
+    assert set(owner) == {"01N", "02N", "03N", "04N"}
+    for _d, p in wired["arun"]:
+        by_zone: dict[str, set[int]] = {}
+        for z, y in p["cells"]:
+            by_zone.setdefault(z, set()).add(y)
+        assert all(yrs == {2025, 2024, 2023} for yrs in by_zone.values()), by_zone
+
+
+def test_overlap_years_still_reports_unfilled_cells_per_year(wired, monkeypatch):
+    """The failure report stays YEAR-keyed, so an operator reads it the same way.
+
+    A batch spanning years must not collapse into one undifferentiated list — the whole
+    point of the report is telling you which zone-years to look at.
+    """
+    _multi_year(monkeypatch, ["01N"], [2025, 2024])
+
+    async def arun(dep, parameters=None, tags=None):
+        wired["arun"].append((dep, parameters))
+        if "fill-zones-sequential" in dep:
+            raise RuntimeError("cluster failed")
+        return _completed_run()
+
+    monkeypatch.setattr(mod, "arun_deployment", arun)
+    with pytest.raises(RuntimeError, match="unfilled cell") as exc:
+        asyncio.run(
+            mod.run_global_campaign.fn(
+                paths=_PATHS,
+                ami_ssm_name="ami",
+                fill_strategy="chained-clusters",
+                max_parallel_clusters=1,
+                overlap_years=True,
+            )
+        )
+    # Both years named separately, newest first, each with its zone.
+    assert "2025: 01N" in str(exc.value) and "2024: 01N" in str(exc.value), str(exc.value)

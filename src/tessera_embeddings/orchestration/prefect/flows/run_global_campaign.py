@@ -487,6 +487,7 @@ async def run_global_campaign(
     # Staging-reuse escape hatches. Both default off; see `_staging_code_identity`.
     force_staging_reuse: bool = False,
     force_staging_restage: str = "",
+    overlap_years: bool = False,
     ingest_limit_name: str = "tessera-global-ingests",
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
@@ -598,6 +599,15 @@ async def run_global_campaign(
             for is a deliberate dependency upgrade mid-campaign — a new torch changes the
             numbers without changing our source. Any new value starts fresh; reusing the
             same value resumes.
+        overlap_years: Drop the YEAR BARRIER — dispatch every requested year as one
+            batch instead of one batch per year, so a cluster works a multi-year list and
+            year N+1's ingest overlaps year N's inference. Default off; the year-serial
+            path is what has been run. What makes it safe is not this flag but two things
+            underneath it: each cell carries its own inference window to the actors, and
+            the zone-group attribute commit is separate and retried, so two years of one
+            zone no longer collide. The partition is over ZONES, so a zone's every year
+            lands in one cluster and its assemblies serialize on that cluster's single
+            trailing thread. **Untested against a real fleet — see the Phase 4 plan.**
         max_zone_attempts: How many times a year's remaining cells are dispatched
             before the campaign gives up on them. A failed zone must not cost the
             campaign: interruptions are EXPECTED (the orphan sweeper cancels child
@@ -982,22 +992,32 @@ async def run_global_campaign(
     #: Cells still missing after every attempt, per year. Collected rather than
     #: raised on, so one bad zone cannot cost the years that follow it.
     unfilled: dict[int, list[str]] = {}
-    for year in sorted(set(campaign_years), reverse=True):
+    # Descending, so the campaign delivers the most recent year soonest (ADR-008 D1).
+    # `overlap_years` chooses only the BATCHING: one batch per year keeps the historical
+    # year-serial shape, one batch for everything drops the year barrier. Everything
+    # inside is identical, which is the point — the two paths cannot drift.
+    ordered_years = sorted(set(campaign_years), reverse=True)
+    batches: list[list[int]] = [ordered_years] if overlap_years else [[y] for y in ordered_years]
+    for batch_years in batches:
         # BOUNDED RE-DISPATCH. A failed zone must not cost the campaign the rest of
-        # the year, nor the years after it — interruptions are EXPECTED here, because
+        # the batch, nor the batches after it — interruptions are EXPECTED here, because
         # the orphan sweeper cancels child runs by design. Every round re-reads the
         # STORE (not our bookkeeping) for what is still missing, so a retry can only
         # ever target genuinely unfilled cells and an interrupted mosaic is resumed
         # rather than rebuilt.
-        remaining = [z for z, y in work if y == year]
+        remaining = [(z, y) for z, y in work if y in set(batch_years)]
         for attempt in range(1, max_zone_attempts + 1):
             if not remaining:
                 break
-            year_zones = list(remaining)
+            batch_cells = list(remaining)
+            # Distinct zones, order-preserving. A zone with several years in this batch
+            # appears ONCE, so the partition assigns all of its years to one cluster —
+            # which is what keeps a zone's years off two clusters at once.
+            batch_zones = list(dict.fromkeys(z for z, _y in batch_cells))
             round_failures: list[str] = []
             round_runs: list[str] = []
 
-            if year_zones and fill_strategy == "chained-clusters":
+            if batch_zones and fill_strategy == "chained-clusters":
                 # Up to max_parallel_clusters child runs fill the year, each owning
                 # ONE shared Ray cluster and draining its own list of zones strictly
                 # sequentially — clusters take up their next zone without actor
@@ -1009,19 +1029,26 @@ async def run_global_campaign(
                 # per-cell _process chain is bypassed; the global ingest bound is
                 # preserved by dividing max_parallel_ingest across the clusters.
                 clusters = _partition_by_live_tiles(
-                    year_zones,
-                    min(max_parallel_clusters, len(year_zones)),
+                    batch_zones,
+                    min(max_parallel_clusters, len(batch_zones)),
                     land_mask_path=paths.land_mask_store(mask_name),
-                    known_complete={z for z in year_zones if status.has(z, year)},
+                    # Weightless only if EVERY year of this zone in the batch is already
+                    # done — otherwise the zone still carries real GPU work and must count.
+                    known_complete={
+                        z for z in batch_zones if all(status.has(z, y) for zz, y in batch_cells if zz == z)
+                    },
                     get_credentials=iam_icechunk_credentials,
                     s3_region=s3_region,
                 )
+                # Each cluster's own cells: every (zone, year) pair whose zone it owns.
+                cells_for = {id(cl): [[z, y] for z, y in batch_cells if z in set(cl)] for cl in clusters}
                 log.info(
-                    "Year %d: dispatching %d chained fill(s) for %d zone(s): %s",
-                    year,
+                    "Year(s) %s: dispatching %d chained fill(s) for %d zone(s), %d cell(s): %s",
+                    batch_years,
                     len(clusters),
-                    len(year_zones),
-                    [len(cl) for cl in clusters],
+                    len(batch_zones),
+                    len(batch_cells),
+                    [len(cells_for[id(cl)]) for cl in clusters],
                 )
                 # Each cluster's EVEN SHARE of the fleet-wide ingest cap, so the clusters
                 # divide it by construction rather than racing for slots on the global
@@ -1043,27 +1070,25 @@ async def run_global_campaign(
                 # `status` is re-read between retry rounds, so it is bound as a default
                 # rather than captured: a closure that outlived its round would otherwise
                 # read whichever snapshot the loop left behind.
-                def _needs_ray(cluster: list[str], chained_year: int, snapshot: CampaignStatus = status) -> bool:
+                def _needs_ray(cells: list[list[Any]], snapshot: CampaignStatus = status) -> bool:
                     """True if any UTM zone in this cluster will actually provision Ray."""
                     return any(
-                        not snapshot.has(z, chained_year)
+                        not snapshot.has(z, y)
                         and zone_has_live_tiles(
                             land_mask_path, z, get_credentials=iam_icechunk_credentials, s3_region=s3_region
                         )
-                        for z in cluster
+                        for z, y in cells
                     )
 
                 # Every per-year value this closure reads is passed IN rather than captured:
                 # it is defined inside the year loop, so a captured name would be whatever
                 # the last iteration left behind if the call ever outlived its iteration.
-                def _chained_params(
-                    cluster: list[str], n_clusters: int, chained_year: int, cell_look_ahead: int
-                ) -> dict[str, Any]:
+                def _chained_params(cells: list[list[Any]], n_clusters: int, cell_look_ahead: int) -> dict[str, Any]:
                     return {
-                        # The child takes (zone, year) PAIRS, so a cluster can span years.
-                        # This driver is still year-serial, so every pair here shares one
-                        # year; the shape is what lets that change without a child change.
-                        "cells": [[z, chained_year] for z in cluster],
+                        # (zone, year) PAIRS. With `overlap_years` a cluster's pairs span
+                        # years; without it they all share one. Either way a zone's years
+                        # are all in ONE cluster, because the partition is over zones.
+                        "cells": cells,
                         "paths": paths.model_dump(),
                         "ami_ssm_name": ami_ssm_name,
                         # Pin the fingerprinted image (see _ami_id / _fill_params) — but
@@ -1074,7 +1099,7 @@ async def run_global_campaign(
                         # access. The ocean probe is one small bitmap GET per zone — the
                         # same price the per-cell path already pays — and it runs only
                         # for cells that are not already complete.
-                        "ami_id": _ami_id() if _needs_ray(cluster, chained_year) else None,
+                        "ami_id": _ami_id() if _needs_ray(cells) else None,
                         "store_name": store_name,
                         "mask_name": mask_name,
                         "num_actors": num_actors,
@@ -1111,7 +1136,7 @@ async def run_global_campaign(
                     *(
                         arun_deployment(
                             chained_fill_deployment,
-                            parameters=_chained_params(cl, len(clusters), year, look_ahead),
+                            parameters=_chained_params(cells_for[id(cl)], len(clusters), look_ahead),
                             tags=_tags,
                         )
                         for cl in clusters
@@ -1128,30 +1153,36 @@ async def run_global_campaign(
                         round_failures.append(f"chained fill {cl[0]}..({len(cl)} zones): {r!r}")
                         continue
                     try:
-                        _check_completed(r, f"chained fill year {year}")
+                        _check_completed(r, f"chained fill year(s) {batch_years}")
                     except Exception as exc:  # a returned-but-not-COMPLETED terminal state
                         round_failures.append(str(exc))
                         continue
                     round_runs.append(str(r.id))
                 log.info(
-                    "Year %d: %d/%d chained fill(s) landed", year, len(clusters) - len(round_failures), len(clusters)
+                    "Year(s) %s: %d/%d chained fill(s) landed",
+                    batch_years,
+                    len(clusters) - len(round_failures),
+                    len(clusters),
                 )
-            elif year_zones:
-                log.info("Year %d: dispatching %d zone fill(s)", year, len(year_zones))
+            elif batch_cells:
+                log.info("Year(s) %s: dispatching %d zone fill(s)", batch_years, len(batch_cells))
                 # All zones in a year are distinct groups → safe to fill concurrently.
                 # The outer loop is serial, so the SAME zone never fills two years at once.
                 # return_exceptions=True so a single zone's failure doesn't abandon its
                 # siblings mid-flight (default gather() would leave them running orphaned);
                 # we let the whole year settle, then fail loudly with every failure.
-                cell_results = await asyncio.gather(*(_process(z, year) for z in year_zones), return_exceptions=True)
-                for z, cr in zip(year_zones, cell_results, strict=True):
+                cell_results = await asyncio.gather(*(_process(z, y) for z, y in batch_cells), return_exceptions=True)
+                for (z, y), cr in zip(batch_cells, cell_results, strict=True):
                     if isinstance(cr, BaseException):
-                        round_failures.append(f"{z}-{year}: {cr!r}")
+                        round_failures.append(f"{z}-{y}: {cr!r}")
                     else:
                         round_runs.append(str(cr))
-                log.info("Year %d: %d/%d fill(s) landed", year, len(round_runs), len(year_zones))
+                log.info("Year(s) %s: %d/%d fill(s) landed", batch_years, len(round_runs), len(batch_cells))
 
-            runs_by_year.setdefault(year, []).extend(round_runs)
+            # Attributed to every year the batch covered: with one batch per year that is
+            # exactly the old behaviour, and with overlap a run genuinely spans them.
+            for y in batch_years:
+                runs_by_year.setdefault(y, []).extend(round_runs)
             if not round_failures:
                 remaining = []
                 break
@@ -1160,14 +1191,13 @@ async def run_global_campaign(
             # measurable rather than inferred from the failure list.
             before = set(remaining)
             status = campaign_status(repo, years=campaign_years)
-            remaining = [
-                z
-                for z, _y in campaign_work_list(
-                    status, set(repo.list_tags()), expected_zones=expected_zones, years=(year,)
+            remaining = list(
+                campaign_work_list(
+                    status, set(repo.list_tags()), expected_zones=expected_zones, years=tuple(batch_years)
                 )
-            ]
+            )
             for f in round_failures:
-                log.warning("Year %d attempt %d/%d: %s", year, attempt, max_zone_attempts, f)
+                log.warning("Year(s) %s attempt %d/%d: %s", batch_years, attempt, max_zone_attempts, f)
             if not remaining:
                 break
             if attempt >= max_zone_attempts:
@@ -1178,23 +1208,24 @@ async def run_global_campaign(
                 # mismatch, an unseeded group — and it wants a human, not another
                 # cluster. Stop spending fleets on it.
                 log.error(
-                    "Year %d: attempt %d made no progress on %d cell(s) — treating as deterministic "
-                    "and stopping retries for this year. Investigate before re-running: %s",
-                    year,
+                    "Year(s) %s: attempt %d made no progress on %d cell(s) — treating as deterministic "
+                    "and stopping retries for this batch. Investigate before re-running: %s",
+                    batch_years,
                     attempt,
                     len(remaining),
-                    ", ".join(sorted(remaining)[:10]),
+                    ", ".join(f"{z}-{y}" for z, y in sorted(remaining)[:10]),
                 )
                 break
             log.warning(
-                "Year %d: %d cell(s) still unfilled after attempt %d — re-dispatching (%d attempt(s) left)",
-                year,
+                "Year(s) %s: %d cell(s) still unfilled after attempt %d — re-dispatching (%d attempt(s) left)",
+                batch_years,
                 len(remaining),
                 attempt,
                 max_zone_attempts - attempt,
             )
-        if remaining:
-            unfilled[year] = sorted(remaining)
+        for z, y in remaining:
+            if z not in unfilled.setdefault(y, []):
+                unfilled[y].append(z)
 
         # Backfill the year-complete milestone/retention tag even when NO fills
         # ran this pass — a prior run may have completed every zone for the year
@@ -1202,11 +1233,16 @@ async def run_global_campaign(
         # (expected_zones defaults to the full set, NOT this run's `zones` subset,
         # so a subset/repair run never stamps the global tag prematurely — and
         # tags are write-once). ValueError = not yet all-120 complete → defer.
-        try:
-            year_tag = tag_year_complete(repo, year)
-            log.info("Year %d tagged complete (all 120 zones): %s", year, year_tag)
-        except ValueError as exc:
-            log.debug("Year %d not yet complete across all 120 zones (%s) — milestone tag deferred", year, exc)
+        # Attempted for EVERY year in the batch. `tag_year_complete` raises ValueError
+        # when the year is not yet complete across all 120 zones, so attempting it for an
+        # unfinished year is free — which is what lets the overlapping path use the same
+        # code as the year-serial one instead of detecting "was that the year's last cell".
+        for y in batch_years:
+            try:
+                year_tag = tag_year_complete(repo, y)
+                log.info("Year %d tagged complete (all 120 zones): %s", y, year_tag)
+            except ValueError as exc:
+                log.debug("Year %d not yet complete across all 120 zones (%s) — milestone tag deferred", y, exc)
 
     dispatched = sum(len(v) for v in runs_by_year.values())
     log.info("Campaign dispatch complete: %d fill run(s) across %d year(s)", dispatched, len(runs_by_year))
