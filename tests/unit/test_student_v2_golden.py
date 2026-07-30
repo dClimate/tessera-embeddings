@@ -15,6 +15,7 @@ The 175 MB checkpoint is not in git, so the whole module skips unless
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 import sys
@@ -35,6 +36,19 @@ _REFERENCE_PATH = Path(__file__).parents[1] / "fixtures" / "upstream" / "v2_stud
 # cross-platform kernel/threading differences, not structural divergence.
 _ATOL = 1e-5
 
+# Published digest of ``ckpt/student_large.pt`` in the Hugging Face repo
+# ``geotessera/TESSERA-V-2.0-2B-L`` — this is the LFS object id the Hub serves
+# from its model API, so it pins the artifact, not just a local copy of it.
+#
+# Verified BEFORE the file is handed to any loader. Our own production loader
+# uses ``weights_only=True``, but the vendored upstream ``load_model`` — which
+# has to stay byte-identical to upstream to be a credible reference — calls
+# ``torch.load(..., weights_only=False)``, i.e. the arbitrary-object unpickler.
+# TESSERA_V2_CKPT is a path the developer supplies, so without this gate a
+# swapped or truncated file would execute at fixture-setup time.
+_CHECKPOINT_SHA256 = "b5f20239dbb1849c01a3e407b095aafe39b0bf764300206af78cb9b85f9ec1e1"
+_CHECKPOINT_SIZE_BYTES = 175363923
+
 
 def _checkpoint_path() -> Path | None:
     """Local v2 Large checkpoint from ``TESSERA_V2_CKPT``, if it exists."""
@@ -49,6 +63,31 @@ pytestmark = pytest.mark.skipif(
     _checkpoint_path() is None,
     reason="set TESSERA_V2_CKPT to the v2 Large checkpoint (geotessera/TESSERA-V-2.0-2B-L) to run",
 )
+
+
+@pytest.fixture(scope="module")
+def checkpoint() -> Path:
+    """The checkpoint path, refused unless it matches the published digest."""
+    path = _checkpoint_path()
+    assert path is not None  # guaranteed by pytestmark
+
+    size = path.stat().st_size
+    if size != _CHECKPOINT_SIZE_BYTES:
+        pytest.fail(
+            f"TESSERA_V2_CKPT is {size} bytes, expected {_CHECKPOINT_SIZE_BYTES} "
+            f"for geotessera/TESSERA-V-2.0-2B-L ckpt/student_large.pt: {path}"
+        )
+
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    if digest.hexdigest() != _CHECKPOINT_SHA256:
+        pytest.fail(
+            f"TESSERA_V2_CKPT sha256 {digest.hexdigest()} != published "
+            f"{_CHECKPOINT_SHA256}. Refusing to unpickle it: {path}"
+        )
+    return path
 
 
 def _load_reference_module():
@@ -67,19 +106,19 @@ def upstream():
 
 
 @pytest.fixture(scope="module")
-def upstream_model(upstream):
+def upstream_model(upstream, checkpoint):
     """Upstream ``PixelStudent`` built by upstream's own ``load_model``."""
-    return upstream.load_model(str(_checkpoint_path()), torch.device("cpu"))
+    return upstream.load_model(str(checkpoint), torch.device("cpu"))
 
 
 @pytest.fixture(scope="module")
-def ported_model():
+def ported_model(checkpoint):
     """Our model, built through the production builder (strict=True load)."""
     config = InferenceConfig(
         time_window=parse_time_window("June 2025"),
         model_version="v2-large",
         dropout=0.0,
-        checkpoint_path=str(_checkpoint_path()),
+        checkpoint_path=str(checkpoint),
     )
     return build_inference_model(config, torch.device("cpu"))
 
@@ -97,18 +136,25 @@ def _synthetic_batch(
     Raw reflectance / backscatter are drawn in plausible ranges and standardised
     with the v2 stats, then a raw integer DOY in [1, 365] is appended as the last
     channel — exactly the contract ``sampling.py`` produces.
+
+    The S1 stream is the *merged* one the model consumes: ascending and
+    descending observations concatenated time-wise, each normalised with its own
+    stats beforehand. The first ``ceil(t_s1 / 2)`` steps use the ascending stats
+    and the rest the descending ones, so for any ``t_s1 > 1`` all four S1 arrays
+    reach the model — a regression in either descending array would otherwise
+    never show up here.
     """
     gen = torch.Generator().manual_seed(seed)
     stats = band_stats("v2-large")
     assert stats["s2_mean"] == pytest.approx(upstream_module.S2_BAND_MEAN.tolist())
     assert stats["s2_std"] == pytest.approx(upstream_module.S2_BAND_STD.tolist())
     assert stats["s1_asc_mean"] == pytest.approx(upstream_module.S1A_BAND_MEAN.tolist())
+    assert stats["s1_asc_std"] == pytest.approx(upstream_module.S1A_BAND_STD.tolist())
+    assert stats["s1_desc_mean"] == pytest.approx(upstream_module.S1D_BAND_MEAN.tolist())
     assert stats["s1_desc_std"] == pytest.approx(upstream_module.S1D_BAND_STD.tolist())
 
     s2_mean = torch.tensor(stats["s2_mean"])
     s2_std = torch.tensor(stats["s2_std"])
-    s1_mean = torch.tensor(stats["s1_asc_mean"])
-    s1_std = torch.tensor(stats["s1_asc_std"])
 
     s2_raw = torch.randint(0, 10000, (batch, t_s2, 10), generator=gen).float()
     s1_raw = torch.randint(0, 12000, (batch, t_s1, 2), generator=gen).float()
@@ -117,8 +163,15 @@ def _synthetic_batch(
     s2[..., :10] = (s2_raw - s2_mean) / (s2_std + 1e-9)
     s2[..., 10] = torch.randint(1, 366, (batch, t_s2), generator=gen).float()
 
+    # Per-orbit normalisation, then merge — the dataset's own S1 contract.
+    t_asc = (t_s1 + 1) // 2
     s1 = torch.empty(batch, t_s1, 3)
-    s1[..., :2] = (s1_raw - s1_mean) / (s1_std + 1e-9)
+    for lo, hi, orbit in ((0, t_asc, "asc"), (t_asc, t_s1, "desc")):
+        if hi <= lo:
+            continue
+        mean = torch.tensor(stats[f"s1_{orbit}_mean"])
+        std = torch.tensor(stats[f"s1_{orbit}_std"])
+        s1[:, lo:hi, :2] = (s1_raw[:, lo:hi] - mean) / (std + 1e-9)
     s1[..., 2] = torch.randint(1, 366, (batch, t_s1), generator=gen).float()
     return s2, s1
 

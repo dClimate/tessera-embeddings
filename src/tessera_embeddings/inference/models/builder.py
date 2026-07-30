@@ -2,7 +2,7 @@
 
 ``build_inference_model`` dispatches on ``config.model_version``:
 
-* **v1.1** — two ``modules.TransformerEncoder`` backbones (GRU-based
+* **v1.1** — two ``modules.V11TransformerEncoder`` backbones (GRU-based
   ``TemporalAwarePooling``) + the MLP ``build_dim_reducer``. Loads the encoder
   checkpoint (``model_state`` / ``model_state_dict``), strips FSDP/compile
   prefixes and training-only keys (projector, segmented-matryoshka-projector) so
@@ -29,7 +29,7 @@ import torch
 
 from tessera_embeddings.config.inference import MODEL_ARCHS
 
-from .modules import CustomGRU, TemporalAwarePooling, TransformerEncoder
+from .modules import CustomGRU, TemporalAwarePooling, V11TransformerEncoder
 from .ssl_model import MultimodalBTInferenceModel, build_dim_reducer
 from .student_v2 import StudentTransformerEncoder, build_v2_dim_reducer
 
@@ -98,7 +98,7 @@ def _build_inference_model(config: InferenceConfig, device: torch.device) -> Mul
     """
     max_seq_len = max(config.num_obs_checkpoints)
 
-    s2_backbone = TransformerEncoder(
+    s2_backbone = V11TransformerEncoder(
         band_num=10,
         latent_dim=config.latent_dim,
         nhead=config.nhead,
@@ -108,7 +108,7 @@ def _build_inference_model(config: InferenceConfig, device: torch.device) -> Mul
         max_seq_len=max_seq_len,
     )
 
-    s1_backbone = TransformerEncoder(
+    s1_backbone = V11TransformerEncoder(
         band_num=2,
         latent_dim=config.latent_dim,
         nhead=config.nhead,
@@ -185,17 +185,24 @@ def load_v2_checkpoint(
     ``nhead``, ``dim_feedforward``, ``max_seq_len``, ``matryoshka_dims``,
     ``enable_qk_norm``).
 
+    Loaded with ``weights_only=True``: the whole documented payload is tensors
+    and a plain dict, so nothing needs the arbitrary-object unpickler. Checkpoints
+    are fetched over the network onto every inference worker
+    (``actors.download_checkpoint``), so a tampered file would otherwise get
+    arbitrary code execution at model-build time. A payload that stores ``args``
+    as an ``argparse.Namespace`` is therefore *not* loadable — it raises here
+    rather than being silently allowlisted.
+
     Args:
         checkpoint_path: Path to the .pt checkpoint file.
         device: Device to map tensors to.
 
     Returns:
-        ``(state_dict, args)``. ``args`` is a plain dict (an ``argparse.Namespace``
-        payload is converted).
+        ``(state_dict, args)`` — ``args`` is a plain dict, possibly empty.
     """
     logger.info("Loading v2 checkpoint: %s (map_location=%s)", checkpoint_path, device)
     t0 = time.monotonic()
-    payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    payload = torch.load(checkpoint_path, map_location=device, weights_only=True)
     logger.info("torch.load completed in %.1fs", time.monotonic() - t0)
 
     if not isinstance(payload, dict) or "model" not in payload:
@@ -204,7 +211,13 @@ def load_v2_checkpoint(
         raise KeyError(msg)
 
     raw_args = payload.get("args") or {}
-    args = dict(raw_args) if isinstance(raw_args, dict) else dict(vars(raw_args))
+    if not isinstance(raw_args, dict):
+        msg = (
+            f"v2 checkpoint 'args' must be a plain dict, got {type(raw_args).__name__}. "
+            "Convert it (e.g. vars(namespace)) and re-save the checkpoint."
+        )
+        raise TypeError(msg)
+    args = dict(raw_args)
     logger.info("v2 checkpoint: %d params, stored args=%s", len(payload["model"]), args)
     return payload["model"], args
 
@@ -240,7 +253,7 @@ def _verify_v2_args(config: InferenceConfig, args: dict[str, Any]) -> None:
         raise ValueError(msg)
 
 
-def load_checkpoint(
+def load_v11_checkpoint(
     checkpoint_path: str,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
@@ -287,7 +300,7 @@ def build_inference_model(
     """Build the inference model for ``config.model_version`` from its checkpoint.
 
     Constructs the model on CPU, loads the checkpoint (v1.1: ``strict=False``,
-    since projector/matryoshka keys are filtered in ``load_checkpoint``; v2:
+    since projector/matryoshka keys are filtered in ``load_v11_checkpoint``; v2:
     ``strict=True``), fuses CustomGRU to nn.GRU where one exists (v1.1 only),
     freezes, zeros TransformerEncoderLayer dropouts for the fused-attention fast
     path, and moves to *device* in eval mode.
@@ -316,7 +329,7 @@ def build_inference_model(
         _verify_v2_args(config, args)
         model.load_state_dict(state_dict, strict=True)
     else:
-        state_dict = load_checkpoint(ckpt_path, cpu)
+        state_dict = load_v11_checkpoint(ckpt_path, cpu)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
             logger.warning("Checkpoint missing %d expected params (first few): %s", len(missing), list(missing)[:5])

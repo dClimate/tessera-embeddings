@@ -129,8 +129,3 @@ def test_inference_config_default_model_version_is_v11() -> None:
 def test_inference_config_invalid_model_version_raises() -> None:
     with pytest.raises(ValueError, match="Invalid model_version"):
         _minimal_config(model_version="v3")
-
-
-def test_inference_config_compute_std_forced_false() -> None:
-    cfg = _minimal_config(compute_std=True)  # type: ignore[call-arg]
-    assert cfg.compute_std is False

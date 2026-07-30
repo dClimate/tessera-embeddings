@@ -263,7 +263,6 @@ def test_v2_runs_the_unmodified_inference_loop(v2_model, sample_chunk_data) -> N
     assert result.embeddings.shape == (4, 4, 128)
     assert result.embeddings.dtype.name == "int8"
     assert result.scales.shape == (4, 4)
-    assert result.embeddings_std is None
     assert not any(np.isnan(result.scales.ravel()))
 
 

@@ -1277,7 +1277,6 @@ class InferenceActor:
                         chunk,
                         embeddings,
                         run_id,
-                        embeddings_std=None,
                         scales=scales,
                         obs_counts=obs_buffers,
                     )

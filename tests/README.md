@@ -44,6 +44,13 @@ environment variable and skip without it:
 TESSERA_V2_CKPT=/path/to/student_large.pt uv run pytest tests/unit/test_student_v2_golden.py
 ```
 
+The golden test verifies the file's SHA-256 against the digest the Hugging Face
+Hub publishes for that object before anything loads it. The vendored upstream
+`load_model()` has to stay byte-identical to upstream, which means it calls
+`torch.load(..., weights_only=False)`, so the digest is what stands between a
+developer-supplied path and arbitrary code execution at fixture setup. A file of
+the wrong size or digest fails the test instead of being loaded.
+
 ## Running subsets
 
 ```bash

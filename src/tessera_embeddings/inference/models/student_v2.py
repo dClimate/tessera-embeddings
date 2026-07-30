@@ -131,7 +131,7 @@ class StudentTransformerEncoder(nn.Module):
     """Per-pixel band embedding + DOY positional encoding + transformer + attention pool.
 
     Upstream calls this ``TransformerEncoder``; renamed here only to keep it
-    distinguishable from the v1.1 :class:`modules.TransformerEncoder` (which
+    distinguishable from the v1.1 :class:`modules.V11TransformerEncoder` (which
     differs in its pooling head).
 
     ``enable_qk_norm=False`` (default) uses the standard
@@ -180,12 +180,18 @@ class StudentTransformerEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Encode ``(B, T, band_num + 1)`` — last channel is raw integer DOY.
 
+        Pass ``x`` as FP32 even under reduced-precision inference: the bands are
+        cast to the weights' compute dtype here, while the DOY column stays FP32
+        so integer days above 256 survive the BF16 path (see
+        :class:`~tessera_embeddings.inference.models.modules.TemporalPositionalEncoder`).
+
         Returns:
             Pooled representation of shape ``(B, latent_dim * 4)``.
         """
         bands = x[:, :, :-1]
         doy = x[:, :, -1]
-        x = self.embedding(bands) + self.temporal_encoder(doy)
+        compute_dtype = cast("nn.Linear", self.embedding[0]).weight.dtype
+        x = self.embedding(bands.to(compute_dtype)) + self.temporal_encoder(doy, out_dtype=compute_dtype)
         if self.enable_qk_norm:
             for layer in cast("nn.ModuleList", self.transformer_encoder):
                 x = layer(x)

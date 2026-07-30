@@ -404,7 +404,6 @@ class InferenceConfig:
                 field resolves to ``None`` there.
             num_workers: GPU workers.
             s1_orbit: Which S1 orbit(s) — "ascending", "descending", or "both".
-            compute_std: No-op (deterministic sampling); always False.
 
         I/O:
             checkpoint_path: Path to model checkpoint (.pt file).
@@ -449,8 +448,6 @@ class InferenceConfig:
     # has no norm_source split — an explicit value is rejected in __post_init__).
     norm_source: Literal["mpc", "aws"] | None = None
     s1_orbit: Literal["ascending", "descending", "both"] = "both"
-    # Deterministic sampling — no repeat variance; forced False in __post_init__.
-    compute_std: bool = False
 
     # Ray actor resource reservation. num_gpus=1 is production default (one GPU per
     # actor — L40S on g6e.xlarge workers);
@@ -503,9 +500,6 @@ class InferenceConfig:
         if self.s1_orbit not in {"ascending", "descending", "both"}:
             raise ValueError(f"Invalid s1_orbit: {self.s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
         self.num_obs_checkpoints = _normalize_obs_checkpoints(self.num_obs_checkpoints)
-
-        # Sampling is deterministic in both versions — no repeat variance to measure.
-        self.compute_std = False
 
     def _apply_arch_defaults(self) -> None:
         """Adopt the selected version's architecture spec where fields are unset.

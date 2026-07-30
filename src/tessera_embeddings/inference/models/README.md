@@ -12,10 +12,10 @@ upstream of the model (loading, sampling, bucketing) is version-agnostic.
 
 | File | Ported from | Changes from original |
 |---|---|---|
-| `modules.py` | `tessera_infer/src/models/modules.py` | Type hints, ruff formatting only. No logic changes. |
+| `modules.py` | `tessera_infer/src/models/modules.py` | Type hints, ruff formatting. Upstream's `TransformerEncoder` renamed `V11TransformerEncoder` (upstream v2 has a same-named class; see `student_v2.py`). `TemporalPositionalEncoder` caches `div_term` per device in FP32 and takes an explicit output dtype, and the encoder casts bands (not DOY) to the weights' dtype — see "Reduced precision" in `../README.md`. Layer shapes and forward-pass math are unchanged. |
 | `ssl_model.py` | `tessera_infer/src/models/ssl_model.py` | Type hints, ruff formatting. Backbone annotations widened to `nn.Module` so the wrapper hosts either version's backbones. |
-| `student_v2.py` | `geotessera/TESSERA-V-2.0-2B-L` (Hugging Face) `model.py`, = `ucam-eo/tessera` `tessera_infer_v2/student/model.py` | Type hints, ruff formatting; `TransformerEncoder` renamed `StudentTransformerEncoder`; upstream's inline positional encoder replaced by the shared `modules.TemporalPositionalEncoder` (bit-identical at fp32, plus dtype-cast + cached `div_term`); the top-level `PixelStudent` assembly is not duplicated — see below. |
-| `builder.py` | `tessera_infer/src/models/builder.py` | Type hints, ruff formatting. Added FSDP prefix stripping in `load_checkpoint()`, plus the v2 build/load path (`_build_v2_inference_model`, `load_v2_checkpoint`, `_verify_v2_args`). |
+| `student_v2.py` | `geotessera/TESSERA-V-2.0-2B-L` (Hugging Face) `model.py`, = `ucam-eo/tessera` `tessera_infer_v2/student/model.py` | Type hints, ruff formatting; upstream's `TransformerEncoder` renamed `StudentTransformerEncoder`; upstream's inline positional encoder replaced by the shared `modules.TemporalPositionalEncoder` (bit-identical at fp32, plus an explicit output-dtype cast and a per-device FP32 `div_term` cache); the top-level `PixelStudent` assembly is not duplicated — see below. |
+| `builder.py` | `tessera_infer/src/models/builder.py` | Type hints, ruff formatting. Added FSDP prefix stripping in `load_v11_checkpoint()`, plus the v2 build/load path (`_build_v2_inference_model`, `load_v2_checkpoint`, `_verify_v2_args`). |
 
 `tests/fixtures/upstream/v2_student_reference.py` is a **verbatim** copy of
 upstream's v2 `model.py`; `tests/unit/test_student_v2_golden.py` runs it beside
@@ -52,7 +52,7 @@ documented in its docstring).
 
 ## What not to touch
 
-- **`modules.py`**: `TransformerEncoder`, `TemporalPositionalEncoder`, `AttentionPooling`,
+- **`modules.py`**: `V11TransformerEncoder`, `TemporalPositionalEncoder`, `AttentionPooling`,
   `TemporalAwarePooling`, `ProjectionHead` — these define the exact architecture the
   v1.1 checkpoint was trained with. Changing layer dimensions, activation functions, or the
   forward pass will break checkpoint loading.
@@ -71,9 +71,13 @@ documented in its docstring).
 ## What can be adjusted
 
 - **`builder.py`**: Checkpoint paths can be updated when new checkpoints are
-  trained. `load_checkpoint()` handles v1.1 FSDP prefix stripping and
+  trained. `load_v11_checkpoint()` handles v1.1 FSDP prefix stripping and
   `load_v2_checkpoint()` the v2 payload — if either format changes, they need
-  updating.
+  updating. `load_v2_checkpoint()` reads with `weights_only=True`: the documented
+  v2 payload is tensors plus a plain dict, and checkpoints are fetched over the
+  network onto every worker, so the arbitrary-object unpickler is not an option.
+  A payload storing `args` as an `argparse.Namespace` is rejected rather than
+  allowlisted — convert it to a dict and re-save.
 
 - **`InferenceConfig`** (in `../../config/inference.py`): per-version architecture
   defaults live in `MODEL_ARCHS`; fields left at their v1.1 defaults adopt the

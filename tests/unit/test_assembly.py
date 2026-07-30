@@ -271,35 +271,6 @@ class TestAssembly:
         np.testing.assert_array_equal(ds.coords["easting"].values, np.arange(10))
         np.testing.assert_array_equal(ds.coords["band"].values, np.arange(EMBEDDING_DIM))
 
-    def test_assemble_with_std(self, tmp_path, dask_client):
-        """Assembly includes embedding_std when compute_std=True."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
-
-        rng = np.random.default_rng(42)
-        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
-
-        emb, scales = _quantized_embeddings(rng, 4, 4)
-        std = rng.random((4, 4, EMBEDDING_DIM)).astype(np.float32)
-        writer.write_chunk(chunk, emb, run_id="run1", scales=scales, embeddings_std=std)
-        writer.assemble(
-            [chunk],
-            total_y=4,
-            total_x=4,
-            run_id="run1",
-            output_path=output,
-            compute_std=True,
-            roi_zarr_path=_make_full_roi_mask(tmp_path, 4, 4),
-            n_workers=1,
-        )
-
-        ds = open_store(output)
-        assert ds["embeddings"].shape == (1, 4, 4, EMBEDDING_DIM)
-        assert ds["embedding_std"].shape == (1, 4, 4, EMBEDDING_DIM)
-        np.testing.assert_array_equal(ds["embeddings"].values[0, ...], emb)
-        np.testing.assert_array_almost_equal(ds["embedding_std"].values[0, ...], std, decimal=5)
-
     def test_assemble_appends_to_existing_store(self, tmp_path, dask_client):
         """Second assemble call appends along time dimension instead of overwriting."""
         staging = str(tmp_path / "staging")
@@ -334,53 +305,6 @@ class TestAssembly:
         assert ds.sizes["time"] == 2
         np.testing.assert_array_equal(ds["embeddings"].values[0, ...], emb1)
         np.testing.assert_array_equal(ds["embeddings"].values[1, ...], emb2)
-
-    def test_assemble_append_with_std(self, tmp_path, dask_client):
-        """Append preserves both embedding and embedding_std across runs."""
-        staging = str(tmp_path / "staging")
-        output = str(tmp_path / "output.zarr")
-        writer = ZarrWriter(staging)
-
-        rng = np.random.default_rng(42)
-        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
-
-        roi = _make_full_roi_mask(tmp_path, 4, 4)
-
-        # Run 1 with std
-        emb1, scales1 = _quantized_embeddings(rng, 4, 4)
-        std1 = rng.random((4, 4, EMBEDDING_DIM)).astype(np.float32)
-        writer.write_chunk(chunk, emb1, run_id="run1", scales=scales1, embeddings_std=std1)
-        writer.assemble(
-            [chunk],
-            total_y=4,
-            total_x=4,
-            run_id="run1",
-            output_path=output,
-            compute_std=True,
-            roi_zarr_path=roi,
-            n_workers=1,
-        )
-
-        # Run 2 with std
-        emb2, scales2 = _quantized_embeddings(rng, 4, 4)
-        std2 = rng.random((4, 4, EMBEDDING_DIM)).astype(np.float32)
-        writer.write_chunk(chunk, emb2, run_id="run2", scales=scales2, embeddings_std=std2)
-        writer.assemble(
-            [chunk],
-            total_y=4,
-            total_x=4,
-            run_id="run2",
-            output_path=output,
-            compute_std=True,
-            roi_zarr_path=roi,
-            n_workers=1,
-        )
-
-        ds = open_store(output)
-        assert ds["embeddings"].shape == (2, 4, 4, EMBEDDING_DIM)
-        assert ds["embedding_std"].shape == (2, 4, 4, EMBEDDING_DIM)
-        np.testing.assert_array_almost_equal(ds["embedding_std"].values[0, ...], std1, decimal=5)
-        np.testing.assert_array_almost_equal(ds["embedding_std"].values[1, ...], std2, decimal=5)
 
     def test_append_preserves_time_windows_across_runs(self, tmp_path, dask_client):
         """Regression: appending a second time window must merge into existing time_windows, not overwrite."""
@@ -1174,15 +1098,6 @@ class TestScanExistingStagedChunks:
 
         with pytest.raises(RuntimeError, match="no matching ChunkSpec"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
-
-    def test_compute_std_validation(self, tmp_path):
-        """With compute_std=True, missing embedding_std raises RuntimeError."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        # Write chunk WITHOUT std
-        self._stage_chunk(writer, self.CHUNKS[0], "run1")
-
-        with pytest.raises(RuntimeError, match="missing variable 'embedding_std'"):
-            writer.scan_existing_staged_chunks("run1", self.CHUNKS, compute_std=True)
 
     def test_reports_all_invalid(self, tmp_path):
         """Error message includes ALL invalid chunks, not just the first."""

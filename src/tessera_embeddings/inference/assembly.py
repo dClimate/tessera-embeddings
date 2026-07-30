@@ -27,7 +27,7 @@ import zarr
 from icechunk.xarray import to_icechunk
 from zarr.codecs.numcodecs import PCodec as PCodecZarr3
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM, TimeWindow
+from tessera_embeddings.config.inference import EMBEDDING_DIM, ModelVersion, TimeWindow
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
@@ -282,13 +282,12 @@ class ZarrWriter:
         embeddings: np.ndarray,
         run_id: str,
         scales: np.ndarray,
-        embeddings_std: np.ndarray | None = None,
         obs_counts: Mapping[str, np.ndarray | None] | None = None,
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
-        Creates an xarray Dataset with an 'embedding' variable (mean) and
-        optionally 'embedding_std' and 'scale' variables.
+        Creates an xarray Dataset with an ``embeddings`` variable, a ``scales``
+        variable, and any supplied observation counts.
 
         Args:
             chunk: Chunk specification.
@@ -296,7 +295,6 @@ class ZarrWriter:
             run_id: Unique run identifier.
             scales: Per-pixel scale factors of shape (H, W), float32.
                 Used to dequantize int8 embeddings.
-            embeddings_std: Optional std array, same shape as embeddings, float32.
             obs_counts: Optional dict mapping obs count variable names to (H, W)
                 uint16 arrays. Keys should be from ``OBS_COUNT_VARS``.
 
@@ -322,16 +320,6 @@ class ZarrWriter:
                 "compressors": None,
             },
         }
-
-        if embeddings_std is not None:
-            if embeddings_std.shape != expected_shape:
-                msg = f"Expected std shape {expected_shape}, got {embeddings_std.shape}"
-                raise ValueError(msg)
-            data_vars["embedding_std"] = (["northing", "easting", "band"], embeddings_std)
-            encoding["embedding_std"] = {
-                "chunks": staged_chunks,
-                "compressors": None,
-            }
 
         expected_scale_shape = (chunk.height, chunk.width)
         if scales.shape != expected_scale_shape:
@@ -529,7 +517,6 @@ class ZarrWriter:
         run_id: str,
         chunks: list[ChunkSpec],
         *,
-        compute_std: bool = False,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     ) -> set[str]:
         """Scan staging for already-written chunks, validate each, return valid labels.
@@ -537,7 +524,6 @@ class ZarrWriter:
         Args:
             run_id: Run identifier (locates the staging directory).
             chunks: Full list of chunk specs for this ROI.
-            compute_std: If True, also require ``embedding_std`` in each staged Zarr.
             log: Optional logger.
 
         Returns:
@@ -561,7 +547,7 @@ class ZarrWriter:
         )
 
         chunk_by_label = {c.label: c for c in chunks}
-        required_vars = ["embeddings"] + (["embedding_std"] if compute_std else [])
+        required_vars = ["embeddings"]
         valid: set[str] = set()
         invalid_paths: list[tuple[str, str]] = []
 
@@ -754,7 +740,6 @@ class ZarrWriter:
         chunks: list[ChunkSpec],
         live_labels: set[str],
         run_id: str,
-        compute_std: bool,
         run_started_at: datetime.datetime,
         y_coords: np.ndarray | None = None,
         x_coords: np.ndarray | None = None,
@@ -770,7 +755,6 @@ class ZarrWriter:
             live_labels: Labels of chunks with a staged Zarr; others are
                 filled with zeros/NaN in the Dask graph.
             run_id: Run identifier for locating staged files.
-            compute_std: Whether to include embedding_std variable.
             run_started_at: Flow trigger time used as the time coordinate.
                 Ignored when *time_window* is provided.
             y_coords: Projected y coordinates from the input store. Falls back
@@ -805,12 +789,6 @@ class ZarrWriter:
         if time_window:
             ds.attrs["time_convention"] = "12mo_window_end"
 
-        if compute_std:
-            ds["embedding_std"] = (
-                ["time", "northing", "easting", "band"],
-                self._build_var_grid(chunks, live_labels, run_id, "embedding_std"),
-            )
-
         ds["scales"] = (
             ["time", "northing", "easting"],
             self._build_var_grid_2d(chunks, live_labels, run_id, "scales"),
@@ -834,14 +812,13 @@ class ZarrWriter:
         output_path: str,
         *,
         roi_zarr_path: str,
-        compute_std: bool = False,
         run_started_at: datetime.datetime | None = None,
         mosaic_base: str | None = None,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
         time_window: TimeWindow | None = None,
         tile_id: str | None = None,
         model_version: str | None = None,
-        encoder_version: str | None = None,
+        encoder_version: ModelVersion | None = None,
         manifest: EmbeddingManifest | None = None,
         n_workers: int,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
@@ -870,7 +847,6 @@ class ZarrWriter:
             output_path: Final output Icechunk store path.
             roi_zarr_path: Path to the ROI boolean zarr. Assembly re-enumerates
                 live chunks from this to avoid marshaling the list through Prefect.
-            compute_std: Whether staged chunks contain embedding_std data.
             run_started_at: Flow trigger time for the time coordinate.
                 Falls back to now if not provided. Ignored when *time_window*
                 is provided.
@@ -940,7 +916,6 @@ class ZarrWriter:
             chunks,
             live_labels,
             run_id,
-            compute_std,
             run_started_at=started,
             y_coords=spatial.northing if spatial else None,
             x_coords=spatial.easting if spatial else None,
@@ -1039,13 +1014,6 @@ class ZarrWriter:
                 # no object on write (zarr's write_empty_chunks=False default) and
                 # don't inflate the S3 prefix. The default 0.0 fill would never
                 # match the NaN footprint, forcing a real object per empty chunk.
-                if compute_std:
-                    encoding_ic["embedding_std"] = {
-                        "chunks": (1, sub_h, sub_w, sub_band),
-                        "fill_value": float("nan"),
-                        "serializer": pcodec_serializer(),
-                        "compressors": None,
-                    }
                 encoding_ic["scales"] = {
                     "chunks": (1, sub_h, sub_w),
                     "fill_value": float("nan"),

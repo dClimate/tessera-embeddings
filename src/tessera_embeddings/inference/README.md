@@ -388,6 +388,18 @@ target is reached. Over-sampled pixels are uniformly sub-sampled.
 ```
 - **BF16** — the model is cast to BF16 on CUDA (`_prepare_gpu`); FP16 is a best-effort
   fallback for pre-Ampere GPUs only (overflow risk above 65504).
+- **Inputs stay FP32; each backbone casts its own bands.** The sampler's tensor is
+  `(B, T, band_num + 1)` — bands plus a raw integer DOY in the last channel — and the
+  loop hands it to the model as FP32. `V11TransformerEncoder.forward` /
+  `StudentTransformerEncoder.forward` cast only the band slice to the weights' dtype;
+  the DOY column reaches `TemporalPositionalEncoder` in FP32, and so do the sinusoidal
+  frequencies (`div_term` is a per-device FP32 cache, deliberately not a registered
+  buffer, so `model.bfloat16()` cannot sweep it). Casting the whole tensor up front
+  instead would round DOY 257 to 256 — BF16 has 8 mantissa bits, so it steps by 2 above
+  256 and the last third of the year loses one-day resolution. Measured on the v2 Large
+  checkpoint, per-channel deviation from the FP32 graph drops ~3× (mean 0.0075 → 0.0027)
+  once the split is in place. The H2D transfer was already FP32, so this costs no
+  extra bandwidth.
 - **`torch.compile` is disabled** — in a historical experiment on a g5-class worker
   (15.4 GB VRAM), CUDA graph capture consumed 11.6 GB and slowed forward passes
   (3,770 ms vs. 1,944 ms) due to GRU recompilation per unique sequence length.
@@ -444,8 +456,6 @@ with a `ValueError`.
 **Output variables:**
 - `embeddings`: int8, shape (H, W, 128)
 - `scales`: float32, shape (H, W)
-- `embedding_std`: float32, shape (H, W, 128) — unaffected by quantization, present only
-  when `compute_std=True`
 
 **Safety checks:** Assembly validates that staged chunks have the expected int8 dtype
 for embeddings and float32 for scales. Dtype mismatches are rejected to prevent data
@@ -847,7 +857,7 @@ Two versions are selectable via `config.model_version`; `models/builder.py` disp
 | Band stats | MPC/AWS pair, chosen by `norm_source` | one fixed set baked into v2 (`norm_source` rejected) |
 | Checkpoint | `tessera_v1_1_{aws,mpc}_encoder.pt` | `student_large.pt` (from `geotessera/TESSERA-V-2.0-2B-L` on Hugging Face, `ckpt/student_large.pt`), staged in the same model directory |
 
-If either checkpoint format changes, `load_checkpoint()` / `load_v2_checkpoint()` need
+If either checkpoint format changes, `load_v11_checkpoint()` / `load_v2_checkpoint()` need
 updating. The data plane (loading, sampling, bucketing, quantization, assembly) is
 version-agnostic — the input contract and the int8 output format are identical.
 `_fuse_custom_gru` runs on v1.1 only; v2 has no GRU to fuse. Full comparison and

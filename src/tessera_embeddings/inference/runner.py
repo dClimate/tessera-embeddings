@@ -87,12 +87,7 @@ def run_inference(
 
     # --- Resume check: skip chunks already staged from a prior run ---
     writer = ZarrWriter(staging_base)
-    already_done = writer.scan_existing_staged_chunks(
-        run_id,
-        chunks,
-        compute_std=config.compute_std,
-        log=log,
-    )
+    already_done = writer.scan_existing_staged_chunks(run_id, chunks, log=log)
     if already_done:
         remaining = len(chunks) - len(already_done)
         log.info(

@@ -6,8 +6,6 @@ a single forward pass; the model's representation is sliced to the canonical
 128-D downstream width (a real slice for v1.1's 192-D output, a no-op for v2
 Large's native 128-D) and written into a flat per-pixel output array.
 
-Sampling is deterministic (no random repeats), so ``compute_std`` from v1.0 is
-a no-op and the ``embeddings_std`` field is always ``None``.
 """
 
 from __future__ import annotations
@@ -84,16 +82,14 @@ class InferenceResult:
 
     Attributes:
         embeddings: ``(H, W, 128)`` int8 quantized array.
-        embeddings_std: Always ``None`` under v1.1 (deterministic sampling).
         scales: ``(H, W)`` float32 per-pixel scale factors for dequantization.
     """
 
     embeddings: np.ndarray
-    embeddings_std: np.ndarray | None
     scales: np.ndarray
 
 
-def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> torch.dtype | None:
+def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> None:
     """Configure model and GPU for inference.
 
     On CUDA: converts to BF16 (preferred) and enables cuDNN benchmark mode.
@@ -108,15 +104,16 @@ def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> tor
     the target dtype and we skip the (non-trivial) re-cast. This hoists the
     one-time conversion cost to the first strip instead of paying it per strip.
 
-    Returns:
-        The reduced-precision dtype to use for inputs (bfloat16 or float16), or None
-        on CPU (inputs stay float32).
+    The model's own weights are the single source of the compute dtype from here
+    on: inputs stay FP32 and each backbone casts its band channels itself, which
+    is what keeps the DOY channel out of BF16 (see
+    :class:`~tessera_embeddings.inference.models.modules.TemporalPositionalEncoder`).
     """
     log_cuda_diagnostics(device)
 
     if device.type != "cuda":
         log_autocast_dtype_probe(device, dtype=None)
-        return None
+        return
 
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     current_dtype = next(model.parameters()).dtype
@@ -137,7 +134,6 @@ def _prepare_gpu(model: MultimodalBTInferenceModel, device: torch.device) -> tor
     torch.backends.cudnn.benchmark = False
     logger.debug("cuDNN benchmark mode disabled (variable input shapes)")
     log_autocast_dtype_probe(device, dtype=dtype)
-    return dtype
 
 
 def _prepare_batch(
@@ -157,7 +153,6 @@ def _transfer_and_forward(
     batch: dict[str, np.ndarray],
     bucket_key: tuple[int, int],
     device: torch.device,
-    reduced_precision_dtype: torch.dtype | None,
     save_dim: int,
     *,
     profile: bool = False,
@@ -186,11 +181,12 @@ def _transfer_and_forward(
     tb1 = time.monotonic()
 
     global_idxs = batch["global_idxs"]
+    # Transferred and handed to the model as FP32. The backbones cast their band
+    # channels to the weights' dtype internally, which leaves the DOY channel in
+    # FP32 — a whole-tensor BF16 cast here would round DOY 257 to 256 and lose
+    # one-day resolution for the last third of the year.
     s2_input = torch.from_numpy(batch["s2"]).to(device, non_blocking=True)
     s1_input = torch.from_numpy(batch["s1"]).to(device, non_blocking=True)
-    if reduced_precision_dtype is not None:
-        s2_input = s2_input.to(reduced_precision_dtype)
-        s1_input = s1_input.to(reduced_precision_dtype)
     tb2 = time.monotonic()
 
     if profile:
@@ -335,7 +331,6 @@ def _serial_loop(
     batches: _BatchIter,
     config: InferenceConfig,
     device: torch.device,
-    reduced_precision_dtype: torch.dtype | None,
     save_dim: int,
     flat_q: np.ndarray,
     flat_scales: np.ndarray,
@@ -354,7 +349,6 @@ def _serial_loop(
             get_batch_secs,
             config,
             device,
-            reduced_precision_dtype,
             save_dim,
             flat_q,
             flat_scales,
@@ -371,7 +365,6 @@ def _run_sync_batch(
     get_batch_secs: float,
     config: InferenceConfig,
     device: torch.device,
-    reduced_precision_dtype: torch.dtype | None,
     save_dim: int,
     flat_q: np.ndarray,
     flat_scales: np.ndarray,
@@ -386,7 +379,7 @@ def _run_sync_batch(
     """
     tb0 = time.monotonic()
     q_host, scales_host, global_idxs, transfer_secs, forward_secs = _transfer_and_forward(
-        model, batch, bucket_key, device, reduced_precision_dtype, save_dim, profile=profile, config=config
+        model, batch, bucket_key, device, save_dim, profile=profile, config=config
     )
     _write_quantized_rows(q_host, scales_host, global_idxs, flat_q, flat_scales)
     progress.record(
@@ -442,7 +435,6 @@ def _pipelined_gpu_loop(
     batches: _BatchIter,
     config: InferenceConfig,
     device: torch.device,
-    reduced_precision_dtype: torch.dtype | None,
     save_dim: int,
     flat_q: np.ndarray,
     flat_scales: np.ndarray,
@@ -498,7 +490,6 @@ def _pipelined_gpu_loop(
                 get_batch_secs,
                 config,
                 device,
-                reduced_precision_dtype,
                 save_dim,
                 flat_q,
                 flat_scales,
@@ -517,11 +508,10 @@ def _pipelined_gpu_loop(
         s1_pin = slot.s1[: s1_np.size].view(s1_np.shape)
         s2_pin.copy_(torch.from_numpy(s2_np))
         s1_pin.copy_(torch.from_numpy(s1_np))
+        # FP32 all the way into the model — see _transfer_and_forward on why the
+        # band/DOY split has to happen inside the backbones, not here.
         s2_dev = s2_pin.to(device, non_blocking=True)
         s1_dev = s1_pin.to(device, non_blocking=True)
-        if reduced_precision_dtype is not None:
-            s2_dev = s2_dev.to(reduced_precision_dtype)
-            s1_dev = s1_dev.to(reduced_precision_dtype)
         tb2 = time.monotonic()
 
         z = model(s2_dev, s1_dev)
@@ -573,7 +563,6 @@ def run_inference(
           - embeddings: (H, W, 128) int8 quantized. Zeros for pixels whose
             embeddings can't be generated (failed validity, or outside the ROI
             but inside the bbox).
-          - embeddings_std: Always None under v1.1.
           - scales: (H, W) float32 per-pixel scale factors. NaN for those same
             can't-generate pixels.
     """
@@ -611,7 +600,7 @@ def run_inference(
         n_valid,
         batch_size,
     )
-    reduced_precision_dtype = _prepare_gpu(model, device)
+    _prepare_gpu(model, device)
 
     # px/s conflates sequence length across chunks (a sparse chunk's pixel is
     # ~10x cheaper than a dense one's), so _LoopProgress also tracks tokens
@@ -667,7 +656,6 @@ def run_inference(
                 _batches(),
                 config,
                 device,
-                reduced_precision_dtype,
                 save_dim,
                 flat_q,
                 flat_scales,
@@ -680,7 +668,6 @@ def run_inference(
                 _batches(),
                 config,
                 device,
-                reduced_precision_dtype,
                 save_dim,
                 flat_q,
                 flat_scales,
@@ -713,4 +700,4 @@ def run_inference(
             " ".join(f"({k[0]},{k[1]}):{px}px/{nb}sb" for k, (px, nb) in sorted(progress.bucket_px.items())),
         )
 
-    return InferenceResult(embeddings=out, embeddings_std=None, scales=scales)
+    return InferenceResult(embeddings=out, scales=scales)

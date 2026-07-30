@@ -2,9 +2,9 @@
 
 Architecture::
 
-    S2 stream ──► TransformerEncoder (latent_dim=192) ─┐
+    S2 stream ──► V11TransformerEncoder (latent_dim=192) ─┐
                                                        ├─ concat ─► dim_reducer ──► (B, 192)
-    S1 merged ──► TransformerEncoder (latent_dim=192) ─┘
+    S1 merged ──► V11TransformerEncoder (latent_dim=192) ─┘
 
 The S1 "merged" stream is ascending + descending concatenated time-wise, each
 pre-normalised with its own per-modality mean/std (done at the dataset level).
