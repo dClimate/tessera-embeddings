@@ -25,6 +25,7 @@ from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
     fixed_day_ranges,
     month_ranges,
+    normalize_to_solar_day,
     owned_items,
     solar_day_of,
     solar_day_offset_seconds,
@@ -152,17 +153,18 @@ def test_a_straddling_day_is_owned_by_exactly_one_batch_and_owned_whole(longitud
         for h in range(0, 24, 3)
     ]
 
+    normalize_to_solar_day(items, mid_longitude=longitude)
     claimed: dict[str, set[str]] = {}
     for rng in ranges:
-        for it in owned_items(items, rng, mid_longitude=longitude):
-            claimed.setdefault(solar_day_of(it, mid_longitude=longitude), set()).add(rng.own_start)
+        for it in owned_items(items, rng):
+            claimed.setdefault(solar_day_of(it), set()).add(rng.own_start)
 
     multi = {day: owners for day, owners in claimed.items() if len(owners) > 1}
     assert not multi, f"a solar day was claimed by more than one batch: {multi}"
 
     # ...and every day the window owns got all eight of its acquisitions.
     for day in _dates("2024-01-01", "2024-02-29"):
-        got = [it for it in items if solar_day_of(it, mid_longitude=longitude) == day]
+        got = [it for it in items if solar_day_of(it) == day]
         assert len(got) == 8, f"{day} at longitude {longitude} has {len(got)} acquisitions in the fixture"
         assert day in claimed, f"{day} was owned by no batch at all"
 
@@ -172,9 +174,8 @@ def test_items_outside_the_window_are_owned_by_nobody() -> None:
     ranges = fixed_day_ranges("2024-02-01", "2024-02-29", 7)
     items = [_Item(datetime.datetime.fromisoformat(f"{d}T12:00:00")) for d in _dates("2024-01-20", "2024-03-10")]
 
-    claimed = {
-        solar_day_of(it, mid_longitude=0.0) for rng in ranges for it in owned_items(items, rng, mid_longitude=0.0)
-    }
+    normalize_to_solar_day(items, mid_longitude=0.0)
+    claimed = {solar_day_of(it) for rng in ranges for it in owned_items(items, rng)}
     assert claimed == set(_dates("2024-02-01", "2024-02-29"))
 
 
@@ -207,6 +208,27 @@ def test_a_non_positive_batch_length_raises() -> None:
 
 def test_no_longitude_falls_back_to_the_utc_date() -> None:
     """A caller not grouping by solar day must be left alone, not silently shifted."""
-    item = _Item(datetime.datetime.fromisoformat("2024-01-01T23:00:00"))
-    assert solar_day_of(item, mid_longitude=None) == "2024-01-01"
-    assert solar_day_of(item, mid_longitude=99.0) == "2024-01-02"
+    raw = "2024-01-01T23:00:00"
+    assert (
+        solar_day_of(normalize_to_solar_day([_Item(datetime.datetime.fromisoformat(raw))], mid_longitude=None)[0])
+        == "2024-01-01"
+    )
+    assert (
+        solar_day_of(normalize_to_solar_day([_Item(datetime.datetime.fromisoformat(raw))], mid_longitude=99.0)[0])
+        == "2024-01-02"
+    )
+
+
+def test_normalisation_is_idempotent() -> None:
+    """The property the defensive re-normalisation at each consumption point relies on.
+
+    `stream_stac_months` and `has_new_stac_dates` both normalise again rather than trust
+    whoever supplied their items. That is only safe because a second pass recomputes the
+    same solar day — noon plus any offset the grid produces stays inside the same day.
+    """
+    for lon in (-179.0, -99.0, 0.0, 99.0, 179.0):
+        for hour in (0, 1, 11, 12, 13, 23):
+            item = _Item(datetime.datetime(2024, 1, 15, hour, 30))
+            once = normalize_to_solar_day([item], mid_longitude=lon)[0].datetime
+            twice = normalize_to_solar_day([item], mid_longitude=lon)[0].datetime
+            assert once == twice, f"lon {lon}, hour {hour}: {once} != {twice}"

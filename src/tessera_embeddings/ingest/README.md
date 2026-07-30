@@ -250,7 +250,7 @@ These happen before `odc.stac.load` is called:
 | **Item sort** | `stac.query_stac_items` | For S2: sorts by `(date, cloud_cover)` so mosaicking picks the clearest tile. |
 | **Item provider** | `opera_query.make_s1_item_provider` | Builds orbit-filtered OPERA items directly from the native CMR granule API (bypasses CMR-STAC search). |
 | **URL rewriting** | `auth.rewrite_assets_to_s3` | Rewrites HTTPS datapool/earthdatacloud URLs to `s3://` URIs. |
-| **Timestamp normalisation** | `opera_query.normalize_opera_timestamps` | Sets all OPERA burst timestamps on the same date to noon UTC so `odc.stac.load` groups them into a single mosaic. |
+| **Timestamp normalisation** | `solar_days.normalize_to_solar_day` | Stamps every item with noon UTC of its **solar day**. The single place the solar offset is applied; also what makes `odc.stac.load` mosaic OPERA's per-burst granules into one time slice. |
 
 ### Load-time (`odc.stac.load`)
 
@@ -589,6 +589,28 @@ and a group we believe is one day then loads as TWO time slices against a cloud 
 ```
 
 ### Solar days versus UTC queries (`solar_days.py`)
+
+**One rule, and everything else follows: the solar offset is applied exactly once, by
+`normalize_to_solar_day`, at the catalogue chokepoint. After that an item's `datetime` IS
+its solar day (at noon UTC), and every date derivation downstream is a plain
+`strftime("%Y-%m-%d")` with no offset.**
+
+That rule exists because the alternative was tried and drifted. The offset used to be
+applied independently at six sites, and two of them disagreed with the rest: the
+painter's-algorithm pre-sort and the baseline map both keyed on the UTC date while the
+loader grouped by solar day. On a day straddling UTC midnight that meant the group was not
+actually sorted clearest-last, and half its baseline entries never matched. A seventh
+application would have been one more chance to disagree; applying it once cannot.
+
+Two consequences worth knowing:
+
+- **`normalize_to_solar_day` is idempotent**, so the consumption points (`stream_stac_months`,
+  `has_new_stac_dates`) call it defensively rather than trusting whoever supplied their
+  items — `query_fn` and `item_provider_fn` are both injectable.
+- **Noon, not midnight.** The canonical timestamp has to read as the solar day both directly
+  and after `odc.stac.load` groups on it. Noon has half a day of margin either side, so
+  neither reading crosses midnight for any offset the grid produces (±11 h at the zones
+  nearest the antimeridian).
 
 The same disagreement decides how every query window is bounded, on every path, which is why
 it lives in one module — `ingest/solar_days.py` — instead of being re-derived per sensor.
@@ -1171,8 +1193,12 @@ different sub-second UTC timestamp (reflecting actual acquisition time). If pass
 `odc.stac.load` as-is, each burst becomes a separate time step instead of being mosaicked
 together.
 
-`normalize_opera_timestamps` groups bursts by calendar date and sets all timestamps in each
-group to noon UTC of that date. `odc.stac.load` then treats them as concurrent acquisitions
+`normalize_opera_timestamps` delegates to `solar_days.normalize_to_solar_day`: it groups
+bursts by **solar day** and sets all timestamps in each group to noon UTC of that day.
+It grouped by UTC *date* until 2026-07-30, which made the whole solar-day apparatus on the
+S1 path inert — everything downstream derived its "solar day" from a timestamp already
+flattened to the UTC date, so radar was labelled in UTC while optical was labelled in solar
+days. `odc.stac.load` then treats them as concurrent acquisitions
 and spatially mosaics them into a single time slice.
 
 ### UTM CRS Derivation

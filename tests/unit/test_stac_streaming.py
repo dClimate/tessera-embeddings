@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tessera_embeddings.ingest.solar_days import month_ranges
+from tessera_embeddings.ingest.solar_days import month_ranges, normalize_to_solar_day
 from tessera_embeddings.ingest.stac import (
     _filter_existing_dates,
     _prefetch,
@@ -380,13 +380,21 @@ class TestSolarDayOwnership:
         return seen
 
     def test_an_eastern_acquisition_is_owned_by_its_solar_month(self):
-        assert self._months(150.0) == {"2024-02-01": ["2024-01-31"]}
+        """And carries its solar day afterwards — the two are now the same statement.
+
+        A 31 January 22:00 UTC acquisition at +150° is 1 February locally. It is owned by
+        February, and because ownership works by stamping the item with noon of its solar
+        day (see solar_days.normalize_to_solar_day), the item's own timestamp reads
+        2024-02-01 from here on. Everything downstream therefore gets the solar day from a
+        plain strftime, with no offset to reapply and no chance to disagree.
+        """
+        assert self._months(150.0) == {"2024-02-01": ["2024-02-01"]}
 
     def test_the_same_acquisition_stays_in_january_without_a_longitude(self):
         """Omitting the longitude keeps UTC ownership — correct for callers that do
         not group by solar day, and the reason this cannot be applied unconditionally.
         """
-        assert self._months(None) == {"2024-01-01": ["2024-01-31"]}
+        assert self._months(None) == {"2024-01-01": ["2024-01-31"]}  # unshifted
 
     def test_it_is_owned_exactly_once_either_way(self):
         for lon in (150.0, -150.0, 0.0, None):
@@ -400,11 +408,15 @@ class TestSolarDayOwnership:
         every item on the far side of midnight — the committed group's other half — which
         then loads, regroups onto the day already present, and is written a second time.
         """
-        item = SimpleNamespace(datetime=datetime.datetime(2024, 1, 31, 22, 0), properties={})
+
+        def at_150(hour: int = 22):
+            it = SimpleNamespace(datetime=datetime.datetime(2024, 1, 31, hour, 0), properties={})
+            return normalize_to_solar_day([it], mid_longitude=150.0)
+
         # Committed as 1 February (its solar day at +150°), so a resume must drop it.
-        assert _filter_existing_dates([item], {"2024-02-01"}, 150.0) == []
+        assert _filter_existing_dates(at_150(), {"2024-02-01"}) == []
         # ...and its UTC date being absent from the store is not a reason to keep it.
-        assert _filter_existing_dates([item], {"2024-01-31"}, 150.0) == [item]
+        assert len(_filter_existing_dates(at_150(), {"2024-01-31"})) == 1
 
     def test_the_filter_keeps_utc_keying_without_a_longitude(self):
         """The same reason ownership cannot shift unconditionally: a caller grouping by

@@ -41,7 +41,6 @@ import operator
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import timedelta
 from functools import partial, reduce
 from typing import final
 
@@ -64,7 +63,6 @@ from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.solar_days import (
     owned_items,
-    solar_day_offset_seconds,
     solar_grouping_longitude,
     whole_window_range,
 )
@@ -389,8 +387,10 @@ def ingest_s2_roi_reflectance(
         # BEFORE the solar day — so two consecutive solar days can normalise onto the same
         # date and collide. Measured on 56N (+10 h): six of twenty-two days landed on the
         # previous date, and which six depended on cloud cover, not geography.
-        solar_offset = timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
-        date = (day_items[0].datetime + solar_offset).strftime("%Y-%m-%d")
+        # Items are solar-day-normalised at the query chokepoint, so every item in the
+        # group carries the same canonical timestamp and this is the solar day itself —
+        # no offset here, and no dependence on WHICH item the sort left first.
+        date = day_items[0].datetime.strftime("%Y-%m-%d")
 
         # ONE load per date, serving both the coverage gate and the write. SCL is
         # among the written bands, so a separate gate-only load re-read it and paid
@@ -631,14 +631,13 @@ def ingest_s2_roi_reflectance(
         # two solar days arrive as two time slices, against a cloud mask reduced to one —
         # a dimension conflict, and one that fires only where the solar offset is large
         # enough to cross UTC midnight (the far-eastern and far-western zones).
-        day_offset = timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
         items.sort(
             key=lambda it: (
-                (it.datetime + day_offset).strftime("%Y-%m-%d"),
+                it.datetime.strftime("%Y-%m-%d"),
                 -float(it.properties.get("eo:cloud_cover", 100)),
             )
         )
-        by_date = group_items_by_date(items, mid_longitude=mid_longitude)
+        by_date = group_items_by_date(items)
         total_seen += len(by_date)
         prepare = partial(_prepare_date, baselines=baselines)
         if batch_dates > 1:
@@ -727,7 +726,7 @@ def ingest_s2_roi_reflectance(
             # passes the same value for the same reason.
             mid_longitude=mid_longitude,
         )
-        owned = owned_items(items, window, mid_longitude=mid_longitude)
+        owned = owned_items(items, window)
         if owned:
             _drive(owned, baselines)
 

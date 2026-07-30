@@ -32,7 +32,7 @@ import logging
 import time
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from typing import Literal, cast, final
 
 import dask.distributed
@@ -55,7 +55,6 @@ from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
     fixed_day_ranges,
     owned_items,
-    solar_day_offset_seconds,
     solar_grouping_longitude,
 )
 from tessera_embeddings.ingest.stac import ingest_tile
@@ -357,14 +356,14 @@ def ingest_s1_roi_sar(
         """
         if not run_windows or mid_longitude is None or not items:
             return {}
-        offset = timedelta(seconds=solar_day_offset_seconds(mid_longitude))
-        # Keyed on the SOLAR date, which is what `solar_day.isoformat()` writes below.
+        # Items arrive solar-day-normalised from the provider, so their own date IS the
+        # solar day — no offset here. Applying one would shift the key a second time.
         by_day: dict[date, list] = {}
         for item in items:
             when = getattr(item, "datetime", None)
             if when is None:
                 return {}  # cannot group reliably; fall back for the whole batch
-            by_day.setdefault((when + offset).date(), []).append(item)
+            by_day.setdefault(when.date(), []).append(item)
 
         out: dict[str, tuple[str, list[tuple[int, int, int, int]]]] = {}
         for solar_day, day_items in by_day.items():
@@ -463,6 +462,7 @@ def ingest_s1_roi_sar(
             rng.query_start,
             rng.query_end,
             use_s3_direct=use_s3_direct,
+            mid_longitude=mid_longitude,
         )
         seen_items: list = []
 
@@ -473,7 +473,7 @@ def ingest_s1_roi_sar(
             # items to the loader as well would have it build a partial group for the
             # NEIGHBOUR's day, which the write loop would then commit. Filtering first
             # means the loader only ever sees whole days that are ours.
-            items = owned_items(base_provider(), rng, mid_longitude=mid_longitude)
+            items = owned_items(base_provider(), rng)
             seen_items.extend(items)
             return items
 

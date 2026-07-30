@@ -12,9 +12,8 @@ import logging
 import re
 import time
 import warnings
-from collections import Counter, defaultdict
+from collections import Counter
 from collections.abc import Callable
-from datetime import UTC, datetime
 from typing import Any
 
 import mgrs
@@ -26,6 +25,7 @@ from requests.adapters import HTTPAdapter
 from tessera_embeddings.config import S1_OPERA_BANDS
 from tessera_embeddings.ingest._http import make_logging_retry
 from tessera_embeddings.ingest.auth import get_edl_session, resolve_item_assets, rewrite_assets_to_s3
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 
 logger = logging.getLogger(__name__)
 
@@ -123,37 +123,25 @@ def mgrs_tile_to_utm_epsg(tile_id: str) -> str:
         return f"EPSG:327{zone_number:02d}"
 
 
-def normalize_opera_timestamps(items: list[Any]) -> list[Any]:
-    """Normalize OPERA item datetimes so bursts on the same date share a timestamp.
+def normalize_opera_timestamps(items: list[Any], *, mid_longitude: float | None = None) -> list[Any]:
+    """Stamp OPERA burst granules with noon UTC of the **solar day** they belong to.
 
-    OPERA RTC-S1 products are individual burst granules. A single MGRS tile
-    bbox query returns ~10 bursts per date, each with a slightly different
-    sub-second timestamp. When passed to odc.stac.load, each burst becomes
-    a separate time step instead of being mosaicked into one.
+    A thin wrapper over
+    :func:`~tessera_embeddings.ingest.solar_days.normalize_to_solar_day`, kept because the
+    OPERA reason for normalising is its own: a single bbox query returns ~10 burst granules
+    per pass, each with a slightly different sub-second timestamp, and ``odc.stac.load``
+    would make every burst its own time step instead of mosaicking them. Sharing one
+    timestamp is what merges them.
 
-    This function groups items by date (YYYY-MM-DD) and sets all items in
-    each group to noon UTC of that date. odc.stac.load then auto-mosaics
-    spatially overlapping items sharing the same timestamp into a single
-    time step.
-
-    Args:
-        items: List of pystac Items with datetime attributes.
-
-    Returns:
-        The same items with datetimes normalized (modified in-place).
+    **This grouped by UTC DATE until 2026-07-30, and that made the whole solar-day
+    apparatus on the S1 path inert.** Everything downstream — ownership, footprint
+    derivation, the written label — derived its "solar day" from a timestamp that had
+    already been flattened to noon of the UTC date, so it recovered the UTC date and
+    nothing else. Radar was therefore labelled in UTC while optical was labelled in solar
+    days, and in a high-offset zone the same calendar label in the two stores meant
+    different 24-hour windows that inference then paired per pixel.
     """
-    groups: dict[str, list[Any]] = defaultdict(list)
-    for item in items:
-        date_key = item.datetime.strftime("%Y-%m-%d")
-        groups[date_key].append(item)
-
-    for date_str, group in groups.items():
-        year, month, day = (int(p) for p in date_str.split("-"))
-        canonical = datetime(year, month, day, 12, 0, 0, tzinfo=UTC)
-        for item in group:
-            item.datetime = canonical
-
-    return items
+    return normalize_to_solar_day(items, mid_longitude=mid_longitude)
 
 
 def _granule_to_item(entry: dict[str, Any], skip_counts: Counter[str] | None = None) -> Item | None:
@@ -365,6 +353,8 @@ def make_s1_item_provider(
     start_date: str,
     end_date: str,
     use_s3_direct: bool = True,
+    *,
+    mid_longitude: float | None = None,
 ) -> Callable[[], list[Item]]:
     """Create an item_provider_fn that builds OPERA items from the native CMR granule API.
 
@@ -394,6 +384,9 @@ def make_s1_item_provider(
             URIs for direct in-region bucket access. When False, resolve each
             asset through ASF's OAuth redirect chain to obtain a CloudFront
             signed URL.
+        mid_longitude: ROI geobox centroid longitude, used to stamp each granule with
+            the SOLAR day it belongs to. Supply it whenever the loader groups by solar
+            day — which the campaign always does. Omitting it groups by UTC date.
 
     Returns:
         Zero-argument callable that returns a list of ready-to-load pystac Items.
@@ -421,7 +414,7 @@ def make_s1_item_provider(
             for item in items:
                 resolve_item_assets(session, item, S1_OPERA_BANDS)
 
-        normalize_opera_timestamps(items)
+        normalize_opera_timestamps(items, mid_longitude=mid_longitude)
         return items
 
     return provide_items

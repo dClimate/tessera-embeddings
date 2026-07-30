@@ -32,8 +32,8 @@ the above.
 
     ranges = fixed_day_ranges("2024-01-01", "2024-12-31", 30)
     for rng in ranges:
-        items = catalogue_query(rng.query_start, rng.query_end)
-        mine = owned_items(items, rng, mid_longitude=lon)   # hand only these to the loader
+        items = normalize_to_solar_day(catalogue_query(rng.query_start, rng.query_end), mid_longitude=lon)
+        mine = owned_items(items, rng)                      # hand only these to the loader
 
 Filtering the ITEMS, before the loader sees them, is what makes this work for both
 paths at once. The loader then builds a group only for a day the chunk owns, and every
@@ -51,6 +51,7 @@ __all__ = [
     "SolarDayRange",
     "fixed_day_ranges",
     "month_ranges",
+    "normalize_to_solar_day",
     "owned_items",
     "solar_day_of",
     "solar_day_offset_seconds",
@@ -109,15 +110,56 @@ def solar_grouping_longitude(roi: object) -> float | None:
     return None
 
 
-def solar_day_of(item: Any, *, mid_longitude: float | None) -> str:  # noqa: ANN401 — any STAC-like item
-    """The ``YYYY-MM-DD`` solar day ``item`` belongs to.
+def normalize_to_solar_day(items: list[Any], *, mid_longitude: float | None) -> list[Any]:
+    """Stamp every item with **noon UTC of the solar day it belongs to**. In place.
 
-    ``mid_longitude`` of ``None`` means the caller is not grouping by solar day, and
-    the UTC date is returned unchanged — the same degradation
-    :func:`solar_grouping_longitude` describes.
+    **This is the only place in the package that applies the solar offset.** Call it once,
+    as early as possible — immediately after the catalogue query — and from then on an
+    item's ``datetime`` *is* its solar day: every downstream date derivation is a plain
+    ``strftime("%Y-%m-%d")`` with no offset. That invariant is the point. When the offset
+    was applied independently at six sites, two of them disagreed with the rest (the
+    painter's-algorithm pre-sort and the baseline map both keyed on the UTC date while the
+    loader grouped by solar day), and adding a seventh application would have been one more
+    chance to disagree. Applying it once and then never again cannot drift.
+
+    **Noon, specifically.** The canonical timestamp has to survive two different readings:
+    ``item.datetime.strftime`` must give the solar day, and so must the loaded slice's
+    coordinate after ``odc.stac.load`` groups on it. Noon is the only choice with half a
+    day of margin on both sides, so neither reading crosses a midnight for any offset the
+    grid produces (the extreme is ±11 h, at the zones nearest the antimeridian).
+
+    Grouping identical timestamps is also what makes ``odc.stac.load`` mosaic same-day
+    granules into ONE time slice instead of one slice per granule — the original reason
+    this existed for OPERA's burst products, now serving both sensors.
+
+    **Idempotent**, which is what lets the consumption points below call it defensively
+    rather than trusting whoever supplied the items: re-normalising an already-normalised
+    item recomputes the same solar day, because noon plus any offset the grid produces
+    stays inside the same day.
+
+    ``mid_longitude`` of ``None`` groups by UTC date instead, for callers that genuinely
+    are not working in solar days.
     """
     offset = datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
-    return (item.datetime + offset).strftime("%Y-%m-%d")
+    groups: dict[datetime.date, list[Any]] = {}
+    for item in items:
+        groups.setdefault((item.datetime + offset).date(), []).append(item)
+    for day, group in groups.items():
+        canonical = datetime.datetime(day.year, day.month, day.day, 12, 0, 0, tzinfo=datetime.UTC)
+        for item in group:
+            item.datetime = canonical
+    return items
+
+
+def solar_day_of(item: Any) -> str:  # noqa: ANN401 — any STAC-like item
+    """The ``YYYY-MM-DD`` solar day of an item ALREADY normalised by
+    :func:`normalize_to_solar_day`.
+
+    No offset is applied here, deliberately — see that function. Passing a raw item
+    returns its UTC date, which is why normalisation belongs at the query chokepoint
+    rather than being left to each consumer.
+    """
+    return item.datetime.strftime("%Y-%m-%d")
 
 
 @final
@@ -224,7 +266,7 @@ def whole_window_range(start_date: str, end_date: str) -> SolarDayRange:
     return _padded([(start, end)])[0]
 
 
-def owned_items(items: list[Any], rng: SolarDayRange, *, mid_longitude: float | None) -> list[Any]:
+def owned_items(items: list[Any], rng: SolarDayRange) -> list[Any]:
     """The subset of ``items`` whose solar day ``rng`` owns.
 
     Apply this between the catalogue query and the loader, never after loading. Filtered
@@ -233,4 +275,4 @@ def owned_items(items: list[Any], rng: SolarDayRange, *, mid_longitude: float | 
     straddling day has already been split into two partial groups and the information
     needed to rejoin them is gone.
     """
-    return [it for it in items if rng.owns(solar_day_of(it, mid_longitude=mid_longitude))]
+    return [it for it in items if rng.owns(solar_day_of(it))]

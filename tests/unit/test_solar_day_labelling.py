@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from tessera_embeddings.ingest.solar_days import solar_day_offset_seconds
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day, solar_day_offset_seconds
 from tessera_embeddings.ingest.stac import group_items_by_date
 
 #: 56N's centroid: 153 E, a +10 h offset, the zone where this actually fired.
@@ -79,7 +79,7 @@ def test_every_item_in_a_group_yields_the_same_solar_day() -> None:
     be derived from any one item instead of threading the key through the pipeline.
     """
     items = [_Item("2024-01-20T23:45:00"), _Item("2024-01-21T01:10:00"), _Item("2024-01-21T13:00:00")]
-    groups = group_items_by_date(items, mid_longitude=FAR_EAST_LON)
+    groups = group_items_by_date(normalize_to_solar_day(items, mid_longitude=FAR_EAST_LON))
     assert len(groups) == 1, groups
     assert {_solar_day_of(i, FAR_EAST_LON) for i in items} == {"2024-01-21"}
 

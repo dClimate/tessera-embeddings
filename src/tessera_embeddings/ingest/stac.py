@@ -8,7 +8,6 @@ Supports multiple providers (Earth Search, Planetary Computer) and collections
 (Sentinel-2 L2A, Sentinel-1 GRD, Landsat).
 """
 
-import datetime
 import logging
 import threading
 import time
@@ -35,8 +34,8 @@ from tessera_embeddings.ingest._http import make_logging_retry
 from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
     month_ranges,
+    normalize_to_solar_day,
     owned_items,
-    solar_day_offset_seconds,
 )
 
 # =============================================================================
@@ -243,32 +242,31 @@ def _extract_baselines(items: list[Any]) -> dict[str, int]:
 def _filter_existing_dates(
     items: list[Any],
     existing_dates: set[str],
-    mid_longitude: float | None = None,
 ) -> list[Any]:
     """Filter STAC items to exclude dates already in the store.
 
-    ``mid_longitude`` must be supplied whenever the load groups by solar day, because
-    the store's dates are then SOLAR days and an item's UTC date is not the key they
-    were written under. Comparing a UTC date against a solar-day set matches only the
-    items on the near side of midnight: the rest of an already-committed group survives
-    the filter, loads, regroups onto the same solar day, and is written a second time.
-    Only the far-eastern and far-western zones have an offset large enough to cross
-    midnight, which is exactly where the group splits.
+    Items must already be normalised by
+    :func:`~tessera_embeddings.ingest.solar_days.normalize_to_solar_day`, which happens at
+    the query chokepoint. No offset is applied here, deliberately — that function is the
+    single place it is applied, and a second application would silently shift the key.
+
+    Both sides of the comparison are therefore SOLAR days: the store's dates are the days
+    it was written under. Keying this on the UTC date instead matched only the items on the
+    near side of midnight, so the rest of an already-committed group survived the filter,
+    loaded, regrouped onto the same solar day and was written a second time — reachable
+    only in the far-eastern and far-western zones, which is exactly where a group splits.
 
     Args:
-        items: List of pystac Items
-        existing_dates: Set of date strings (YYYY-MM-DD) already processed
-        mid_longitude: ROI centroid longitude for solar-day keying; omit for callers
-            that group by UTC date.
+        items: Solar-day-normalised pystac Items.
+        existing_dates: Set of date strings (YYYY-MM-DD) already processed.
 
     Returns:
         Filtered list of items not in existing_dates
     """
-    offset = datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
     filtered = []
     for item in items:
         try:
-            date_str = (item.datetime + offset).strftime("%Y-%m-%d")
+            date_str = item.datetime.strftime("%Y-%m-%d")
             if date_str not in existing_dates:
                 filtered.append(item)
             else:
@@ -615,6 +613,7 @@ def has_new_stac_dates(
     bbox: tuple[float, float, float, float] | None = None,
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
+    mid_longitude: float | None = None,
 ) -> bool:
     """Check whether a STAC catalog has new dates not yet in the store.
 
@@ -647,6 +646,9 @@ def has_new_stac_dates(
         item_filter_fn: Optional pre-filter (e.g., orbit direction filtering)
         item_provider_fn: Optional callable returning items directly,
             bypassing CMR-STAC search (OPERA native-granule path).
+        mid_longitude: ROI geobox centroid longitude. Supply it whenever the store was
+            written in solar days — which the campaign always is — so the comparison is
+            keyed the same way. Omitting it compares UTC dates.
 
     Returns:
         True if at least one new date is available
@@ -675,6 +677,11 @@ def has_new_stac_dates(
             logger.debug(f"No items remaining after filtering for {query_label}")
             return False
 
+    # Solar-day stamp before comparing: the store's dates are solar days, so matching a
+    # raw UTC date against them under-reports new data in exactly the high-offset zones
+    # where a day straddles midnight. Same reason as the ingest path — see
+    # ingest.solar_days — and cheap here because nothing is loaded.
+    items = normalize_to_solar_day(items, mid_longitude=mid_longitude)
     new_items = _filter_existing_dates(items, existing_dates)
     has_new = len(new_items) > 0
     logger.debug(f"{query_label}: {len(new_items)} new dates (of {len(items)} total)")
@@ -751,6 +758,15 @@ def query_stac_items(
             logger.info("No items remaining after item_filter_fn")
             return [], {}
 
+    # THE single solar-offset application for this path. Everything below — the
+    # painter's-algorithm sort, the baseline map, the existing-date dedup, and every
+    # consumer of the returned items — then reads the solar day straight off
+    # `item.datetime` with no offset of its own. Before this, the sort and the baseline
+    # map keyed on the UTC date while the loader grouped by solar day, so on a day
+    # straddling UTC midnight the group was not actually sorted clearest-last and half
+    # its baseline entries never matched.
+    items = normalize_to_solar_day(items, mid_longitude=mid_longitude)
+
     # Sort by (date, cloud_cover) so same-day tiles are adjacent and the
     # clearest tile comes first for SCL-based mosaicking.
     if collection_config.has_scl:
@@ -764,7 +780,7 @@ def query_stac_items(
     baselines = _extract_baselines(items)
 
     if existing_dates:
-        items = _filter_existing_dates(items, existing_dates, mid_longitude)
+        items = _filter_existing_dates(items, existing_dates)
 
     return items, baselines
 
@@ -844,7 +860,7 @@ def load_stac_items(
     return data
 
 
-def group_items_by_date(items: list[Any], *, mid_longitude: float | None = None) -> dict[str, list[Any]]:
+def group_items_by_date(items: list[Any]) -> dict[str, list[Any]]:
     """Group STAC items by day, matching how the loader will group them.
 
     Pass ``mid_longitude`` — the ROI geobox centroid's longitude in WGS84 — whenever the
@@ -869,14 +885,9 @@ def group_items_by_date(items: list[Any], *, mid_longitude: float | None = None)
         Dict mapping ``YYYY-MM-DD`` to lists of items, preserving insertion order and
         within-group order.
     """
-    offset = (
-        datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude))
-        if mid_longitude is not None
-        else datetime.timedelta(0)
-    )
     groups: dict[str, list[Any]] = {}
     for item in items:
-        date_str = (item.datetime + offset).strftime("%Y-%m-%d")
+        date_str = item.datetime.strftime("%Y-%m-%d")
         groups.setdefault(date_str, []).append(item)
     return groups
 
@@ -1131,9 +1142,14 @@ def stream_stac_months(
         items, baselines = pending()  # type: ignore[misc]
         if i + 1 < len(months):
             pending = _prefetch(run, months[i + 1])
+        # Normalise HERE as well as in query_stac_items: `query_fn` is injectable, so this
+        # is the last point that can guarantee the items are solar-day stamped before
+        # ownership reads their dates. normalize_to_solar_day is idempotent, so paying it
+        # twice on the default path costs a dict build and nothing else.
+        items = normalize_to_solar_day(items, mid_longitude=mid_longitude)
         # Ownership by SOLAR day, applied BEFORE the loader sees an item — see
         # ingest.solar_days for why the queried range and the owned range differ.
-        owned = owned_items(items, mr, mid_longitude=mid_longitude)
+        owned = owned_items(items, mr)
         dropped = len(items) - len(owned)
         if not owned:
             log.info("Month %s..%s: no new items", mr.own_start, mr.own_end)
