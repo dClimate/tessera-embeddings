@@ -28,6 +28,7 @@ import ray
 import requests
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM, PREFETCH_DEPTH, S2_BAND_ORDER, InferenceConfig
+from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
@@ -613,11 +614,11 @@ class InferenceActor:
         logger.info("InferenceActor ready on instance %s", self.instance_id)
 
     def _open_and_plan(
-        self, chunk: ChunkSpec, mosaic_base: str
+        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow
     ) -> tuple[StoreOpener, S2MaskBundle, slice | None, int, _StripPlan]:
         """Open stores, load the SCL bundle, and derive the chunk read plan."""
         store_opener = make_store_opener(region=self._s3_region)
-        mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, self.config.time_window, store_opener=store_opener)
+        mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
         x_sub, valid_px, plan = _chunk_read_plan(chunk, mask_bundle)
         return store_opener, mask_bundle, x_sub, valid_px, plan
 
@@ -625,6 +626,7 @@ class InferenceActor:
         self,
         chunk: ChunkSpec,
         mosaic_base: str,
+        time_window: TimeWindow,
         *,
         y_sub: slice,
         store_opener: StoreOpener,
@@ -643,7 +645,7 @@ class InferenceActor:
         data = load_chunk(
             chunk,
             mosaic_base,
-            time_window=self.config.time_window,
+            time_window=time_window,
             s1_orbit=self.config.s1_orbit,
             y_sub=y_sub,
             store_opener=store_opener,
@@ -659,7 +661,7 @@ class InferenceActor:
         )
         return data, dataset
 
-    def _load_chunk_prologue(self, chunk: ChunkSpec, mosaic_base: str) -> _ChunkPrologue:
+    def _load_chunk_prologue(self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow) -> _ChunkPrologue:
         """Load everything _process_chunk needs before its first forward pass.
 
         Runs inline (serially, GPU idle) at the top of every chunk, UNLESS the
@@ -682,12 +684,13 @@ class InferenceActor:
             # re-open, matching the serial path's per-chunk opener).
             prologue.store_opener = make_store_opener(region=self._s3_region)
         else:
-            store_opener, mask_bundle, x_sub, _valid_px, plan = self._open_and_plan(chunk, mosaic_base)
+            store_opener, mask_bundle, x_sub, _valid_px, plan = self._open_and_plan(chunk, mosaic_base, time_window)
             prologue = _ChunkPrologue(store_opener, mask_bundle, plan, x_sub, first_strip=None)
         if prologue.first_strip is None:
             prologue.first_strip = self._load_strip_dataset(
                 chunk,
                 mosaic_base,
+                time_window,
                 y_sub=prologue.plan.strips[0],
                 store_opener=prologue.store_opener,
                 mask_bundle=prologue.mask_bundle,
@@ -709,7 +712,7 @@ class InferenceActor:
             self._xchunk_prefetched: dict[str, Future[_ChunkPrologue]] = {}
         return self._xchunk_prefetch_pool, self._xchunk_prefetched
 
-    def _load_prefetched_starter(self, chunk: ChunkSpec, mosaic_base: str) -> _ChunkPrologue:
+    def _load_prefetched_starter(self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow) -> _ChunkPrologue:
         """Load the capped prefetch payload for ``chunk`` (prefetch thread).
 
         Store opens normally land inside the calling process_chunk's scoped
@@ -718,7 +721,7 @@ class InferenceActor:
         consumer falls back to an inline (in-scope) reload, so a
         credential-window miss degrades to the unprefetched behaviour.
         """
-        store_opener, mask_bundle, x_sub, valid_px, plan = self._open_and_plan(chunk, mosaic_base)
+        store_opener, mask_bundle, x_sub, valid_px, plan = self._open_and_plan(chunk, mosaic_base, time_window)
         rung = _xchunk_rung(chunk, int(mask_bundle.mask.shape[0]), x_sub, valid_px, plan)
 
         first_strip = None
@@ -738,6 +741,7 @@ class InferenceActor:
             first_strip = self._load_strip_dataset(
                 chunk,
                 mosaic_base,
+                time_window,
                 y_sub=plan.strips[0],
                 store_opener=store_opener,
                 mask_bundle=mask_bundle,
@@ -746,7 +750,7 @@ class InferenceActor:
             )
         return _ChunkPrologue(store_opener, mask_bundle, plan, x_sub, first_strip, rung=rung)
 
-    def _start_chunk_prefetch(self, chunk: ChunkSpec, mosaic_base: str) -> None:
+    def _start_chunk_prefetch(self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow) -> None:
         """Kick off the next chunk's capped prefetch on the prefetch thread.
 
         Called from the strip loop at the top of the CURRENT chunk's last
@@ -766,7 +770,7 @@ class InferenceActor:
         if chunk.label in stash:
             return
         logger.info("xchunk prefetch: starting for %s", chunk.label)
-        stash[chunk.label] = pool.submit(self._load_prefetched_starter, chunk, mosaic_base)
+        stash[chunk.label] = pool.submit(self._load_prefetched_starter, chunk, mosaic_base, time_window)
 
     def _take_prefetched(self, label: str) -> _ChunkPrologue | None:
         """Consume the stash for ``label``; evict stale entries.
@@ -913,6 +917,7 @@ class InferenceActor:
         run_id: str,
         tracker: ray.actor.ActorHandle | None = None,
         prefetch_hint: ChunkSpec | None = None,
+        time_window: TimeWindow | None = None,
     ) -> dict[str, Any]:
         """Process a single spatial chunk: load data, run inference, write output.
 
@@ -937,6 +942,13 @@ class InferenceActor:
             prefetch_hint: The chunk the scheduler has reserved as this actor's
                 next assignment; its capped starter payload is prefetched
                 during this chunk's last strip (see ``_XCHUNK_*`` constants).
+            time_window: This CELL's inference window, overriding the actor's own
+                config. Required for a chained session whose cells span campaign
+                years: an actor is built once with one config, so reading the
+                window from it would make every cell of a different year read the
+                wrong months — and the session's only mismatch check is on
+                ``s1_orbit``, so nothing would catch it. ``None`` uses the actor's
+                config, which is what the single-ROI path does.
 
         Returns:
             Result dict with chunk label, status, pixel count, and timing.
@@ -947,7 +959,7 @@ class InferenceActor:
             else contextlib.nullcontext()
         )
         with cred_scope:
-            return self._process_chunk(chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint)
+            return self._process_chunk(chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint, time_window)
 
     def _process_chunk(
         self,
@@ -957,12 +969,18 @@ class InferenceActor:
         run_id: str,
         tracker: ray.actor.ActorHandle | None = None,
         prefetch_hint: ChunkSpec | None = None,
+        time_window: TimeWindow | None = None,
     ) -> dict[str, Any]:
         """Run the load → inference → write pipeline for one chunk.
 
         Always invoked through :meth:`process_chunk`, which establishes the
         scoped icechunk credential provider this body's S3 opens depend on.
         """
+        # Resolve the cell's window ONCE, here, and pass the resolved value down. The
+        # three loader call sites (serial prologue, cross-chunk prefetch, strip loop)
+        # must receive identical kwargs for bit-identity, so the fallback must not be
+        # re-evaluated at each of them — one resolution, one value, no chance of drift.
+        window = time_window if time_window is not None else self.config.time_window
         from tessera_embeddings.inference.inference import run_inference
 
         t0 = time.monotonic()
@@ -983,7 +1001,7 @@ class InferenceActor:
             # loads serially here (GPU idle) unless the bounded cross-chunk
             # prefetch staged part of it during the PREVIOUS chunk's tail; see
             # _load_chunk_prologue and the _XCHUNK_* constants.
-            prologue = self._load_chunk_prologue(chunk, mosaic_base)
+            prologue = self._load_chunk_prologue(chunk, mosaic_base, window)
             store_opener = prologue.store_opener
             mask_bundle = prologue.mask_bundle
             plan = prologue.plan
@@ -1033,6 +1051,7 @@ class InferenceActor:
                 return self._load_strip_dataset(
                     chunk,
                     mosaic_base,
+                    window,
                     y_sub=y_sub,
                     store_opener=store_opener,
                     mask_bundle=bundle,
@@ -1135,7 +1154,7 @@ class InferenceActor:
                     # here — no room for the stash — so they take a serial
                     # prologue instead.
                     if i + 1 == len(strips) and prefetch_hint is not None and not plan.pair_budget:
-                        self._start_chunk_prefetch(prefetch_hint, mosaic_base)
+                        self._start_chunk_prefetch(prefetch_hint, mosaic_base, window)
 
                     if x_sub is None:
                         for var in OBS_COUNT_VARS:

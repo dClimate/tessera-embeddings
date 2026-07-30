@@ -870,3 +870,84 @@ class TestAllowS2Only:
 
         # S1-informed pixels are unaffected by the flag: identical int8 embeddings.
         np.testing.assert_array_equal(write_on["embeddings"][:, :half], write_off["embeddings"][:, :half])
+
+
+class TestPerCellTimeWindow:
+    """The window is a PER-CELL value carried on the work item, not an actor constant.
+
+    A chained session's cells may span campaign years, and an actor is built once with one
+    config. Reading the window from that config would make every cell of a different year
+    read the wrong months, and the session's only mismatch check is on `s1_orbit`, so
+    nothing would catch it. These tests pin both halves: threading it changed nothing when
+    the value matches, and it genuinely takes effect when it does not.
+    """
+
+    @staticmethod
+    def _run(inference_config, test_model, *, time_window=None):
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+        actor = _make_actor(inference_config, test_model)
+        _CapturingWriter.last_write = None
+        _CapturingWriter.last_skip = None
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
+            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+        ):
+            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1", time_window=time_window)
+            flushed = actor.flush_writes()
+            assert flushed is None or flushed["ok"], f"deferred write failed: {flushed}"
+        return result, _CapturingWriter.last_write
+
+    def test_passing_the_config_window_explicitly_is_bit_identical(self, inference_config, test_model):
+        """The safety property: threading the window must not have changed the numbers.
+
+        The window reaches three loader call sites — the serial prologue, the cross-chunk
+        prefetch starter, and the strip loop — which are documented as needing identical
+        kwargs for bit-identity. `_process_chunk` resolves the fallback ONCE into a local and
+        passes that value to all three, so they cannot drift; this asserts the outcome.
+        """
+        res_default, write_default = self._run(inference_config, test_model)
+        res_explicit, write_explicit = self._run(
+            inference_config, test_model, time_window=parse_time_window("December 2024")
+        )
+        assert res_default["status"] == res_explicit["status"] == "success"
+        assert res_default["valid_pixels"] == res_explicit["valid_pixels"] > 0
+        np.testing.assert_array_equal(write_default["embeddings"], write_explicit["embeddings"])
+        np.testing.assert_allclose(write_default["scales"], write_explicit["scales"], rtol=0, atol=0, equal_nan=True)
+        for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
+            np.testing.assert_array_equal(
+                write_default["obs_counts"][var], write_explicit["obs_counts"][var], err_msg=var
+            )
+
+    def test_a_different_window_actually_changes_what_is_read(self, inference_config, test_model):
+        """The liveness property, and the one that would catch the override being ignored.
+
+        A silently-dropped `time_window` argument would leave every test above passing while
+        the multi-year campaign read the wrong months. The synthetic stores carry 2024 dates,
+        so a 2022 window must filter them all out — a visibly different result rather than
+        merely a different number.
+        """
+        res_2024, write_2024 = self._run(inference_config, test_model, time_window=parse_time_window("December 2024"))
+        assert res_2024["valid_pixels"] > 0 and write_2024 is not None
+
+        # The 2022 window filters every date out, and the loader raises rather than
+        # quietly embedding nothing — which is a stronger liveness signal than a zero
+        # count, because it can only come from the passed window reaching the loader.
+        res_2022, _ = self._run(inference_config, test_model, time_window=parse_time_window("December 2022"))
+        assert res_2022["status"] == "failed", res_2022
+        assert "time window (2022" in res_2022.get("error", ""), res_2022
+
+    def test_the_zone_context_carries_the_window_to_the_dispatch(self):
+        """The wiring, unit-tested without a fleet: ZoneContext holds it and defaults to None.
+
+        `None` is what the single-ROI path passes, which is what keeps that path unchanged.
+        """
+        from tessera_embeddings.inference.scheduling import ZoneContext
+
+        assert ZoneContext("m", "s", "r").time_window is None
+        window = parse_time_window("December 2024")
+        assert ZoneContext("m", "s", "r", window).time_window is window
+        # Frozen + value-based equality still works, and two years of one zone differ —
+        # which is what stops a cross-cell prefetch hint reading the wrong window.
+        assert ZoneContext("m", "s", "r", window) == ZoneContext("m", "s", "r", window)
+        assert ZoneContext("m", "s", "r", window) != ZoneContext("m", "s", "r", parse_time_window("December 2023"))

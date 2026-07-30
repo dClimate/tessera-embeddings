@@ -22,6 +22,7 @@ from typing import Any, cast
 import ray
 
 from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.actors import InferenceActor
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.diagnostics import log_worker_failure_diagnostic
@@ -39,11 +40,20 @@ class ZoneContext:
     equality is value-based — the reservation path uses ``ctx == ctx`` to
     restrict prefetch hints to same-zone successors (a cross-zone hint would
     make the actor prefetch from the wrong mosaic).
+
+    ``time_window`` is the cell's OWN inference window, and it lives here rather
+    than on the actor's config because a chained session's cells may span campaign
+    YEARS. An actor is built once with one config; reading the window from that
+    config would make every cell of a different year read the wrong months, and the
+    session's only mismatch check is on ``s1_orbit``, so nothing would catch it.
+    ``None`` means "use the actor's own config" — what the single-ROI path passes,
+    and what keeps that path byte-for-byte unchanged.
     """
 
     mosaic_base: str
     staging_base: str
     run_id: str
+    time_window: TimeWindow | None = None
 
 
 @dataclass(frozen=True)
@@ -305,6 +315,7 @@ class ActorPool:
             item.ctx.run_id,
             tracker=tracker,
             prefetch_hint=hint.chunk if hint is not None else None,
+            time_window=item.ctx.time_window,
         )
         self.pending[ref] = (item, actor_idx)
         self.chunk_attempts[item.uid] = self.chunk_attempts.get(item.uid, 0) + 1
