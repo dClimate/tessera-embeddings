@@ -258,6 +258,20 @@ zone-year committers to ~4–8 (measured: N=2 → ~0.5 retries/0.5 s commit; N=8
 ~3.5/1.3 s; N=16 → ~7.5/2.2 s; N=120 → ~58/15 s). Cross-group conflict-freedom
 held: zero unresolvable conflicts at every N.
 
+> **The cap does NOT bound assembly throughput, and reading it that way cost real
+> effort (noted 2026-07-30).** The gate wraps `session.commit` only — not the shard
+> writing that precedes it — so it limits how many commits are *in flight*, each about
+> 0.5-1.3 s, not how many zone-years may assemble at once. At a campaign supply of ~11
+> zone-years/hour that is one commit every five minutes against eight slots: under 0.1%
+> utilisation. Two consequences. Any argument of the form "assembly is capped at 8
+> concurrent, therefore throughput is limited to 8/duration" is wrong. And at the shipped
+> 8 clusters the limit equals the number of possible committers, so **it cannot bind at
+> all** — its value is protecting the configurations we do not currently run (balance
+> holds to ~16 clusters, where the measured cost is 7.5 retries and 2.2 s commits) and
+> the mixed case, since `mark_zone_year_empty` and the year-milestone tags commit through
+> the same gate and so concurrent committers can exceed the cluster count. Kept for those
+> reasons, not for throughput.
+
 **Enforced in code since 2026-07-28.** The cap is a Prefect global concurrency
 limit (`commit_limit_name`) held around each commit, and `run_global_campaign`
 upserts its VALUE at preflight to
