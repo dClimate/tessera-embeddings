@@ -86,11 +86,13 @@ cluster-year with finished mosaics already on disk.
 
 ## 4. Sizing, cost, and the two things that actually bind
 
-Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md). Costed at the **15K
-px/s basis**, which is derived from observation counts rather than borrowed from a single
-ROI: the world's land is weighted toward the cloudy tropics, so the campaign carries about
-**0.87× the tokens per pixel** of the Iowa region every measured rate comes from, and
-therefore runs slightly faster than it.
+Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md). Costed at the **12.5K
+px/s basis**, measured rather than borrowed: a CMR census of OPERA radar granules and a
+Sentinel-2 STAC census of acquisition dates and cloud cover, over a global land grid. The
+campaign carries **1.12× the tokens per pixel** of the Iowa region every throughput figure
+comes from — **Iowa is a single-orbit site**, so it sits at the cheap end of the radar
+distribution, partly offset by its high optical revisit. The campaign runs at 0.89× its
+rate.
 
 **Years run serially, so a year cannot finish faster than its longest single zone** — about
 17.3 hours at 50 workers, 15.0 at 60. That floor is what shapes everything:
@@ -106,12 +108,12 @@ therefore runs slightly faster than it.
 | Fargate vCPU | 12,640 | 14,220 | **16,740** | 22,140 |
 | Ingest wall clock (9 yr) | 7.2 d | 6.5 d | **5.6 d** | 4.5 d |
 | Mosaic supply | 5.76/h | 6.41/h | **7.42/h** | 9.22/h |
-| GPU fleet to provision | 1,237 | 1,376 | **1,592** | 1,980 |
-| — actors per cluster | 155 | 172 | **199** | 247 |
+| GPU fleet to provision | 1,484 | 1,651 | **1,912** | 2,375 |
+| — actors per cluster | 185 | 206 | **239** | 297 |
 | **Campaign wall clock** | ~8.7 d | ~7.8 d | **~6.8 d** | ~5.5 d |
-| **Campaign cost** | $602,000 | $603,000 | **$604,000** | $606,000 |
+| **Campaign cost** | $696,000 | $697,000 | **$698,000** | $700,000 |
 
-**Every configuration costs the same to within 0.7%.** Inference is the same pixels at the
+**Every configuration costs the same to within 0.5%.** Inference is the same pixels at the
 same rate; ingest worker-hours are width-neutral. The decision is wall clock, bought with
 Fargate quota — nothing here is a cost trade.
 
@@ -123,15 +125,23 @@ nearly two days faster on 16,740.
 not an accident of rounding. It keeps a standing queue of finished mosaics so the fleet is
 never idle, and the 15% margin absorbs an ingest cell failing and restarting without the GPUs
 noticing. Inference then trails ingest by roughly 18% of the run, which is the "slightly
-slower start" that buys the guarantee. **Do not provision against the 2,500-actor quota**:
-the largest fleet any configuration here can keep busy is 1,980, and the recommended one
-wants 1,592.
+slower start" that buys the guarantee. The recommended configuration wants **1,912 actors**,
+comfortably inside the 2,500 quota. Eighty workers would want 2,375 — still inside, but with
+thin margin: a throughput 10% below the measured basis pushes it over, and inference would
+then set the campaign's duration instead of trailing ingest.
 
 **GPUs are on-demand.** Spot is excluded by decision: sustaining this many g6e instances for
 days makes interruption a certainty, and a campaign that stalls on capacity is worse than one
 that costs more. Settled; do not re-open.
 
 **The model is v1.1.** v2 Large was evaluated and is not being used.
+
+> **A fifth of the land has no radar for 2022–2024.** OPERA RTC-S1 coverage was withdrawn
+> after Sentinel-1B failed in December 2021 — interior Australia and much of Siberia return
+> *zero* granules for those years — and was restored when Sentinel-1C came online in 2025.
+> With `allow_s2_only=false` those pixels produce no embedding at all, and a zone with no
+> radar anywhere fails its coverage gate outright. **This is a decision, not a cost line**,
+> and it must be made before the store is seeded. See §8.
 
 ---
 
@@ -219,6 +229,12 @@ what moves and by how much — and what to say about *why* it moved.
 
 **Measured. Changing one of these means the world changed, or we re-measured it.**
 
+Two of these were assumptions until 2026-07-30 and are now counted from public catalogues:
+the radar observation rate (CMR granule census of OPERA RTC-S1) and the optical one
+(Sentinel-2 STAC, distinct acquisition dates × mean clear fraction). Both are measured on the
+same global land grid as the reference ROI, so the *ratio* between them — which is what sets
+the throughput basis — is robust even where the absolutes are not.
+
 | input | value | drives |
 |---|---|---|
 | live 2048-tiles | 360,953/yr → 1.363 × 10¹³ px over 9 yr | every cost; pixels are the volume term |
@@ -226,7 +242,11 @@ what moves and by how much — and what to say about *why* it moved.
 | dates per zone-year | 365 | ingest duration |
 | per-zone ingest fit | `s/date = 10.16 + 0.06022 × live_4096_chunks` (R² 0.954, 5 regions) | zone durations, and so the wall-clock floor |
 | fleet width model | `T(W) = 36.3 + 7896/W` — **fitted over ~30–60 workers only** | whether 80w reaches 4.5 days |
-| inference rate, reference ROI | 13–15K px/s fleet-overall (Iowa) | the anchor the 15K basis scales from |
+| inference rate, reference ROI | 13–15K px/s fleet-overall (Iowa) | the anchor the 12.5K basis scales from |
+| tokens/pixel, campaign vs Iowa | 152 vs 136 → **1.12×** | the whole throughput basis |
+| S1 obs/pixel/yr | 47–156 by band; campaign 91, Iowa 61 | the radar half of that |
+| S2 obs/pixel/yr | 44–72 by band; campaign 52, Iowa 70 | the optical half |
+| OPERA coverage, 2022–24 | **81%** of the S1A+B baseline | which cells can produce output at all |
 | Fargate | $0.04048/vCPU-h, $0.004445/GB-h | ingest cost |
 | g6e.xlarge | $1.861/h on-demand | inference cost — the largest line |
 
@@ -245,10 +265,8 @@ what moves and by how much — and what to say about *why* it moved.
 
 | assumption | value | worth | how to retire it |
 |---|---|---|---|
-| **dual-orbit fraction** | **0.70** | **~$150,000** | count it — `resolve_s1_orbit` already knows |
-| cloud-free fraction | 0.25 tropics → 0.55 subtropics | ~$40,000 | per-pixel `s2_obs_count` in the store |
-| S2 revisit | `73 / cos(lat)` acquisitions/yr | small | as above |
-| S1 cadence | 50.7 passes/direction/yr (6-day to Dec 2021, 12-day after) | small | `s1_*_obs_count` in the store |
+| sampling error in the census | 5 points/band, 1 yr optical / 5 yr radar | ~$40,000 | more points, or the store's own counts |
+| `eo:cloud_cover` omits shadow | inflates both sides ~20–30% | small — it cancels in the ratio | per-pixel `s2_obs_count` in the store |
 | ingest interference above 20 cells | assumed flat | schedule only | measured flat to 20; 45 is an extrapolation |
 
 **Four mechanisms. If a number moves and you cannot explain it with one of these, something
