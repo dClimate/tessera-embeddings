@@ -19,8 +19,8 @@ Fargate; inference consumes it on GPU and the mosaic is deleted. The two use dif
 resource pools, so overlapping them costs neither side.
 
 ```
-   sequential :  ingest  +  inference          ~13 days, and 5.6 PB held at once
-   staged     :  max(ingest, inference) + lag  ~5 days,  and ~330 TB held at once
+   sequential :  ingest  +  inference          ~12 days, and 5.6 PB held at once
+   staged     :  max(ingest, inference) + lag  ~6.8 days, and ~330 TB held at once
 ```
 
 Staging is **not an optimisation on top of the plan — it is the plan.** Without it the
@@ -154,7 +154,8 @@ that costs more. Settled; do not re-open.
 
 1. **Fargate quota ≥ 17,000 vCPU** in us-west-2. The existing 2,500-actor GPU quota is
    already more than enough — the recommended fleet is ~1,600, and no configuration in §4
-   can keep more than 1,980 busy. Fargate quota has lead time; start there.
+   can keep more than 2,267 busy — the widest configuration in §4. Fargate quota has lead
+   time; start there.
 2. **Prefect concurrency limits provisioned** — `tessera-global-ingests` and
    `tessera-global-commits`. Both gates are strict and fail closed on a missing limit.
 3. **Coverage/land mask built** for all 120 zones, and its `registry_sha256` frozen. A
@@ -222,7 +223,7 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
    length (the assumption the cost model now rests on), how large the per-chunk read floor is,
    and whether optical-only embeddings are comparable — the ADR-013 gap that
    `allow_s2_only=true` makes live for 6.8% of pixel-years. Site list and rationale in
-   `yield-embeddings/temp/phase_4_test_geograhpies.md`.
+   `yield-embeddings/docs/global-tessera-test-plan.md`, the **P1b rung**.
 3. **Measure the densest zone at two fleet widths (60 and 80).** It decides whether the
    campaign is 5.6 days or 4.5, and it is the only remaining question about the schedule. The
    width model is fitted over roughly 30–60 workers, so 80 is currently an extrapolation.
@@ -290,6 +291,8 @@ materially different times even with equal tile counts.
 - [`../decisions/008-global-store-architecture.md`](../decisions/008-global-store-architecture.md)
   — the store layout, write model, and commit behaviour.
 - [`../decisions/013-optional-s1-s2-only-pixels.md`](../decisions/013-optional-s1-s2-only-pixels.md)
-  — the `allow_s2_only` flag and why it is off.
+  — what the `allow_s2_only` flag does, the neutral-input convention, and the scientific
+  validation it left open. **The flag is ON for this campaign** (§2); that validation is the
+  P1b rung's job.
 - `tests/unit/test_cluster_balance.py` — the runnable diagnostic behind §3; rerun it rather
   than trusting the figures if the mask is rebuilt.
