@@ -6,6 +6,9 @@ a single forward pass; the model's representation is sliced to the canonical
 128-D downstream width (a real slice for v1.1's 192-D output, a no-op for v2
 Large's native 128-D) and written into a flat per-pixel output array.
 
+Inputs reach the model as FP32; each backbone casts its own band channels to the
+weights' dtype so the raw integer DOY channel is never rounded. See "Reduced
+precision" in ``README.md``.
 """
 
 from __future__ import annotations

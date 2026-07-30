@@ -33,8 +33,10 @@ Ported from ``geotessera/TESSERA-V-2.0-2B-L`` (Hugging Face), ``model.py``
 — identical to ``ucam-eo/tessera``'s ``tessera_infer_v2/student/model.py``.
 Changes: type hints, ruff formatting, and the positional encoder is the shared
 :class:`~tessera_embeddings.inference.models.modules.TemporalPositionalEncoder`
-(bit-identical in fp32; it caches ``div_term`` and casts its output back to the
-input dtype so a BF16 model does not silently upcast the whole transformer).
+— bit-identical in fp32, and it adds two things upstream's inline version does
+not need. It caches ``div_term`` per device in FP32, out of reach of
+``model.bfloat16()``, and it casts its output to an explicit compute dtype so a
+BF16 model neither loses DOY precision nor silently upcasts the transformer.
 """
 
 from __future__ import annotations
