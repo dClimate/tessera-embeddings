@@ -290,32 +290,57 @@ def test_fill_run_id_changes_with_allow_s2_only(wired):
     assert fill_params["allow_s2_only"] is True
 
 
-def test_fill_run_id_tracks_resolved_code_artifact_not_suffix(wired, monkeypatch):
-    """The staging fingerprint keys on the RESOLVED code artifact (AMI ID + tarball
-    ETag), not the mutable `code_suffix`. So overwriting the tarball / re-baking the AMI
-    (a new resolved identity) yields a fresh prefix, while a `code_suffix` label change
-    that resolves to the same artifact does NOT — closing the mixed-version-year hole.
+def test_fill_run_id_ignores_the_build_and_keys_on_inference_code(wired, monkeypatch):
+    """NARROWED 2026-07-30: staging reuse keys on the INFERENCE SOURCE, not the build.
+
+    The fingerprint used to be the resolved AMI ID plus the tarball ETag, so re-baking the
+    AMI or a hotfix anywhere in the repo abandoned every staged tile. Neither should move
+    it now — only a change to the code that decides what a staged tile contains.
     """
     base = _fill_run_id(wired)
-    # A different code_suffix that resolves to the SAME artifact keeps the prefix stable
-    # (the mock ignores its args) — the fingerprint no longer keys on the raw suffix.
+    # A `code_suffix` label change: never mattered, still doesn't.
     assert _fill_run_id(wired, code_suffix="-branchB") == base
-    # A changed resolved artifact (re-baked AMI / overwritten tarball) → fresh prefix.
+    # A RE-BAKED AMI now REUSES the prefix. This assertion is the inverse of the one it
+    # replaces, and that inversion is the whole point of the change.
     monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a, **k: "ami=ami-REBAKED")
+    assert _fill_run_id(wired) == base
+    # A change to the inference source DOES start a fresh prefix.
+    monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-DIFFERENT")
     changed = _fill_run_id(wired)
     assert changed.startswith("33N-2025-") and changed != base
 
 
-def test_code_identity_resolves_in_ray_region_not_storage_region(wired, monkeypatch):
-    """The code-artifact lookup must use the RAY provisioning region (None → us-west-2,
-    the fill's ray_cluster default), NOT the storage s3_region — the AMI SSM param and
-    tarball live where Ray provisions, which may differ from a non-default-region store.
+def test_force_staging_reuse_survives_an_inference_change(wired, monkeypatch):
+    """The escape hatch for a change the author knows is output-neutral."""
+    base = _fill_run_id(wired, force_staging_reuse=True)
+    monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-DIFFERENT")
+    assert _fill_run_id(wired, force_staging_reuse=True) == base
+    # ...and it really is an override, not a no-op: without it the same change moves it.
+    assert _fill_run_id(wired) != base
+
+
+def test_force_staging_restage_forces_a_fresh_prefix(wired) -> None:
+    """The escape hatch for a change the source hash cannot see — a torch upgrade."""
+    base = _fill_run_id(wired)
+    bumped = _fill_run_id(wired, force_staging_restage="torch-2.9")
+    assert bumped != base
+    # Same token → same prefix, so a retry after the upgrade still resumes.
+    assert _fill_run_id(wired, force_staging_restage="torch-2.9") == bumped
+    assert _fill_run_id(wired, force_staging_restage="torch-3.0") not in {base, bumped}
+
+
+def test_the_ami_is_still_pinned_even_though_it_no_longer_fingerprints(wired, monkeypatch):
+    """Narrowing the fingerprint must not stop the AMI being resolved once and pinned.
+
+    One campaign must never straddle two images: the fingerprint no longer notices, so the
+    pinning is now the ONLY thing preventing it. Also pins the region — the AMI SSM param
+    lives where Ray provisions (None → us-west-2), not in a non-default storage region.
     """
     calls: list = []
-    monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a: calls.append(a) or "ami=ami-test")
+    monkeypatch.setattr(mod, "_resolve_ami_id", lambda *a, **k: calls.append(a) or "ami-test")
     _per_cell(s3_region="eu-west-1")
-    # Called once (memoized) with region (4th positional arg) = None, NOT "eu-west-1".
-    assert calls and calls[0][3] is None
+    assert calls, "the AMI must still be resolved"
+    assert all(c[-1] != "eu-west-1" for c in calls), calls
 
 
 def test_mosaic_identity_fingerprints_only_active_orbits(wired, monkeypatch):

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, final
 
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -30,6 +32,65 @@ def checkpoint_filename(norm_source: str = "aws") -> str:
         valid = ", ".join(repr(k) for k in _CHECKPOINT_NAMES)
         raise ValueError(f"Unknown norm_source: {norm_source!r}. Must be one of {valid}.")
     return _CHECKPOINT_NAMES[norm_source]
+
+
+# ---------------------------------------------------------------------------
+# Staged-output code identity
+# ---------------------------------------------------------------------------
+
+#: The source whose behaviour determines what a staged tile CONTAINS.
+#:
+#: Anything listed here changing means already-staged tiles were produced by different
+#: logic and must not be mixed with new ones. Anything OUTSIDE it changing is
+#: orchestration, ingest, storage, provider or tooling code, and must not invalidate
+#: staging — that is the whole point of the narrowing.
+#:
+#: The whole ``inference`` package is taken rather than a hand-picked module list. That
+#: OVER-includes: ``assembly.py`` reads staged tiles rather than producing them, and
+#: ``diagnostics.py``/``profiling.py`` affect nothing. The over-inclusion is deliberate,
+#: because the two errors are not symmetric — over-including costs a spurious re-inference
+#: (exactly what the previous whole-build fingerprint did on every change), while
+#: under-including silently assembles tiles from two code versions into one write-once
+#: zone-year. Err toward the expensive failure, never the silent one.
+_STAGED_OUTPUT_SOURCES: tuple[str, ...] = ("inference", "config/inference.py")
+
+
+def inference_code_identity() -> str:
+    """Fingerprint of the code that determines staged tile CONTENT, not of the whole build.
+
+    Replaces the AMI-ID-plus-tarball-ETag identity that used to feed the campaign's staging
+    ``run_id``. That identity was correct but far too wide: re-baking the worker AMI, or a
+    hotfix anywhere in the repo, changed it and so abandoned every staged tile and re-ran
+    inference for no semantic reason. At campaign scale that is the difference between a
+    hotfix costing minutes and costing a re-run.
+
+    **What this deliberately no longer covers: dependency drift.** The old AMI-based identity
+    changed when the image changed, so a re-bake onto a new torch was caught; a source hash is
+    blind to it. Two things bound that gap — the AMI is resolved once and PINNED into every
+    fill of a campaign (so one run cannot straddle two images), and a model change ships under
+    a new checkpoint filename, which is still in the fingerprint. A deliberate library upgrade
+    mid-campaign is the residual case, and it wants the force-new escape hatch rather than a
+    silent reuse.
+    """
+    root = Path(__file__).resolve().parent.parent
+    files: list[Path] = []
+    for entry in _STAGED_OUTPUT_SOURCES:
+        target = root / entry
+        if target.is_dir():
+            files.extend(p for p in target.rglob("*.py") if "__pycache__" not in p.parts)
+        elif target.is_file():
+            files.append(target)
+        else:  # pragma: no cover - a rename must fail loudly, not fingerprint nothing
+            raise FileNotFoundError(
+                f"{target} is listed in _STAGED_OUTPUT_SOURCES but does not exist. A moved or "
+                f"renamed module must update that list — silently fingerprinting fewer files "
+                f"would let two code versions share one staging prefix."
+            )
+    digest = hashlib.sha256()
+    for path in sorted(files):
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode())
+    return f"infcode-{digest.hexdigest()[:16]}"
 
 
 def _normalize_obs_checkpoints(checkpoints: tuple[int, ...]) -> tuple[int, ...]:

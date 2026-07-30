@@ -61,7 +61,7 @@ from prefect.client.orchestration import get_client
 from prefect.deployments import arun_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 
-from tessera_embeddings.config.inference import checkpoint_filename
+from tessera_embeddings.config.inference import checkpoint_filename, inference_code_identity
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
@@ -268,14 +268,20 @@ def _staging_run_id(
 ) -> str:
     """Deterministic staging run_id fingerprinting everything that determines the embeddings.
 
-    Covers the config (threshold/orbit/window/checkpoint/S2-only), the CODE the
-    fill runs (``code_identity`` — the resolved AMI ID + tarball ETag from
-    :func:`_resolve_code_identity`, NOT the mutable ``code_suffix`` label, so a
-    re-baked AMI or overwritten tarball starts a fresh prefix), and the
-    per-(zone,year) mosaic identity (:func:`_mosaic_identity`). A retry with
-    identical inputs resumes the same prefix (findable for cleanup); ANY change
-    starts a fresh prefix, so old tiles are never resumed under new inputs.
-    Call AFTER ingest so ingest=True reads the freshly-written marker.
+    Covers the config (threshold/orbit/window/checkpoint/S2-only), the INFERENCE CODE
+    the fill runs (``code_identity``), and the per-(zone,year) mosaic identity
+    (:func:`_mosaic_identity`). A retry with identical inputs resumes the same prefix
+    (findable for cleanup); a change to any of them starts a fresh prefix, so old tiles
+    are never resumed under new inputs. Call AFTER ingest so ingest=True reads the
+    freshly-written marker.
+
+    **``code_identity`` was narrowed on 2026-07-30.** It used to be the resolved AMI ID
+    plus the source tarball's ETag — the whole build. That was correct but far wider than
+    the invariant needs: a re-baked AMI, or a hotfix anywhere in the repo, abandoned every
+    staged tile and re-ran inference for no semantic reason. It is now
+    :func:`~tessera_embeddings.config.inference.inference_code_identity`, a hash of only
+    the source that determines what a staged tile CONTAINS. The AMI is still resolved and
+    pinned into every fill's provisioning — it just no longer decides staging reuse.
     """
     key = (
         year,
@@ -478,6 +484,9 @@ async def run_global_campaign(
     mask_name: str = "global",
     max_parallel_ingest: int = 40,
     max_zone_attempts: int = 2,
+    # Staging-reuse escape hatches. Both default off; see `_staging_code_identity`.
+    force_staging_reuse: bool = False,
+    force_staging_restage: str = "",
     ingest_limit_name: str = "tessera-global-ingests",
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
@@ -577,6 +586,18 @@ async def run_global_campaign(
             clusters are separate flow runs, so the cap has to live server-side);
             under ``"cluster-per-zone"`` an in-process semaphore is equivalent,
             because that strategy has one driver.
+        force_staging_reuse: Reuse staged tiles even across an INFERENCE code change.
+            The staging fingerprint normally includes a hash of the inference source, so a
+            change there starts a fresh prefix. Set this when you know a change does not
+            alter staged output (a log line, a comment) and want the hours back. Unsafe if
+            that judgement is wrong: it mixes two code versions into one write-once
+            zone-year, and `assemble_global` probes the variable set from a single tile on
+            the assumption that a staging prefix is homogeneous.
+        force_staging_restage: An arbitrary token mixed into the staging fingerprint, so a
+            change the source hash CANNOT see forces a fresh prefix. The case this exists
+            for is a deliberate dependency upgrade mid-campaign — a new torch changes the
+            numbers without changing our source. Any new value starts fresh; reusing the
+            same value resumes.
         max_zone_attempts: How many times a year's remaining cells are dispatched
             before the campaign gives up on them. A failed zone must not cost the
             campaign: interruptions are EXPECTED (the orphan sweeper cancels child
@@ -768,6 +789,27 @@ async def run_global_campaign(
 
     code_identity_cache: list[str] = []
 
+    def _staging_code_identity() -> str:
+        """The staging fingerprint's code component — narrowed, with two escape hatches.
+
+        Default: the inference-source hash, so an orchestration or ingest hotfix reuses
+        staged tiles instead of abandoning them.
+
+        ``force_staging_reuse`` collapses this to a constant, so even an INFERENCE change
+        reuses the prefix. That is deliberately unsafe and exists for the one case the
+        narrowing cannot judge: a change inside the inference package that the author knows
+        does not alter staged output (a log line, a comment, a type annotation). It mixes
+        code versions in one write-once zone-year if that judgement is wrong.
+
+        ``force_staging_restage`` mixes in a caller-supplied token, so a change the hash
+        CANNOT see starts a fresh prefix. The case that needs it is a deliberate library
+        upgrade mid-campaign — a new torch changes the numbers without changing our source.
+        """
+        if force_staging_reuse:
+            return "infcode-forced-reuse"
+        identity = inference_code_identity()
+        return f"{identity}+{force_staging_restage}" if force_staging_restage else identity
+
     def _code_identity() -> str:
         # Resolve the immutable code artifact (AMI ID + optional tarball ETag) once and
         # reuse it for every cell — the AMI/tarball are campaign-wide constants, so a
@@ -912,7 +954,7 @@ async def run_global_campaign(
                 s1_orbit=s1_orbit,
                 allow_partial_window=allow_partial_window,
                 allow_s2_only=allow_s2_only,
-                code_identity=_code_identity(),
+                code_identity=_staging_code_identity(),
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
             )
