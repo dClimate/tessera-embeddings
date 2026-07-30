@@ -87,13 +87,14 @@ cluster-year with finished mosaics already on disk.
 
 ## 4. Sizing, cost, and the two things that actually bind
 
-Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md). Costed at the **13.1K
-px/s basis**, measured rather than borrowed: a CMR census of OPERA radar granules and a
-Sentinel-2 STAC census of acquisition dates and cloud cover, over a global land grid. The
-campaign carries **1.07× the tokens per pixel** of the Iowa region every throughput figure
-comes from — **Iowa is a single-orbit site**, so it sits at the cheap end of the radar
-distribution, partly offset by its high optical revisit and by the optical-only cells running
-a minimal radar sequence. The campaign runs at 0.94× its rate.
+Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md).
+
+**Costed in tokens.** Inference consumes a sequence per pixel, so cost scales with
+`tokens = pixels × observations`, not with pixels. The campaign is **1.98 × 10¹⁵ tokens** —
+1.363 × 10¹³ pixels at a land-weighted 145 observations each, censused from CMR (radar) and
+Sentinel-2 STAC (optical) — at a reference **≈1.9M tok/sec** per worker. **Quote tok/sec, not
+px/s**: pixels-per-second mixes machine speed with geography, and the pipeline has been
+logging tok/sec all along for exactly this reason. The equivalent px/s here is 13.1K.
 
 **Years run serially, so a year cannot finish faster than its longest single zone** — about
 17.3 hours at 50 workers, 15.0 at 60. That floor is what shapes everything:
@@ -212,15 +213,21 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
    and caveat question, not a coverage hole. Every affected pixel is identifiable after the
    fact (`s1_asc_obs_count + s1_desc_obs_count == 0`), and
    `scripts/census_s1_coverage.py` maps the area in advance.
-2. **Measure the densest zone at two fleet widths (60 and 80).** It decides whether the
+2. **Run the Phase-4 test geographies.** Four sites spanning 120–200 tokens per pixel,
+   chosen so one set of runs settles three things: whether tok/sec is flat across sequence
+   length (the assumption the cost model now rests on), how large the per-chunk read floor is,
+   and whether optical-only embeddings are comparable — the ADR-013 gap that
+   `allow_s2_only=true` makes live for 6.8% of pixel-years. Site list and rationale in
+   `yield-embeddings/temp/phase_4_test_geograhpies.md`.
+3. **Measure the densest zone at two fleet widths (60 and 80).** It decides whether the
    campaign is 5.6 days or 4.5, and it is the only remaining question about the schedule. The
    width model is fitted over roughly 30–60 workers, so 80 is currently an extrapolation.
    This is the last preflight gate.
-3. **Fargate quota to ~17,000 vCPU**, then set `max_parallel_ingest` to 45 and
+4. **Fargate quota to ~17,000 vCPU**, then set `max_parallel_ingest` to 45 and
    `max_workers` to 60. Quota has lead time; start it first.
-4. **Public release.** The store is 0.9–1.8 PB. AWS Open Data has lead time and the size
+5. **Public release.** The store is 0.9–1.8 PB. AWS Open Data has lead time and the size
    figure is what the application asks for.
-5. **Weight the zone-to-cluster split by work rather than area.** `_partition_by_live_tiles`
+6. **Weight the zone-to-cluster split by work rather than area.** `_partition_by_live_tiles`
    balances on tile counts, but cost scales with tiles × observations and observation count
    varies about twofold with latitude. Not a blocker; it makes cluster finish times
    uneven rather than wrong.
@@ -247,8 +254,10 @@ the throughput basis — is robust even where the absolutes are not.
 | dates per zone-year | 365 | ingest duration |
 | per-zone ingest fit | `s/date = 10.16 + 0.06022 × live_4096_chunks` (R² 0.954, 5 regions) | zone durations, and so the wall-clock floor |
 | fleet width model | `T(W) = 36.3 + 7896/W` — **fitted over ~30–60 workers only** | whether 80w reaches 4.5 days |
-| inference rate, reference ROI | 13–15K px/s fleet-overall (Iowa) | the anchor the 13.1K basis scales from |
-| tokens/pixel, campaign vs Iowa | 145 vs 136 → **1.07×** | the whole throughput basis |
+| inference rate, reference ROI | 13–15K px/s fleet-overall (Iowa, single-orbit) | historical anchor; convert via tokens |
+| **campaign tokens** | **1.98 × 10¹⁵** (1.363e13 px × 145 tok/px) | the volume term — cost scales with THIS, not pixels |
+| **inference rate** | **≈1.9M tok/sec** per worker | the machine term |
+| per-chunk read floor | ~6 s median hidden; ~13 s fixed read amplification | why the model is two-term, not one |
 | optical-only pixel-years | **6.8%** (no radar 2022–24) | those cells run a minimal radar sequence |
 | S1 obs/pixel/yr | 47–156 by band; campaign 91, Iowa 61 | the radar half of that |
 | S2 obs/pixel/yr | 44–72 by band; campaign 52, Iowa 70 | the optical half |
@@ -282,8 +291,11 @@ else changed.**
    cells stop helping at 45 and why width is the only lever past it. Break the year barrier
    and the whole shape changes.
 2. **Inference cost scales with tokens, not pixels** — `tokens = pixels × observations per
-   pixel`. Observation count varies about twofold with latitude and orbit count, which is
-   what makes the campaign cheaper per pixel than the region we measured on.
+   pixel`, and observation count varies about twofold with latitude and orbit count.
+   **Measure and quote tok/sec.** px/s is a property of the machine *and* the geography it
+   ran over; treating it as a machine constant is what made the cost model's throughput basis
+   wrong three times. It is not purely token-bound either — a per-chunk read floor scales
+   with pixels and bytes, and it stops being hidden where sequences are short.
 3. **Ingest worker-hours are width-neutral.** Halve the fleet, double the duration, same
    bill — so fleet width is schedule bought for free, and cost is nearly flat across every
    configuration in §4.

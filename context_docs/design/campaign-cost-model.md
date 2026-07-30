@@ -22,13 +22,12 @@ as derived). Two things are neither, and they are called out in §9 rather than 
 | Ray cluster ramp (72 boots, §4) | ~$9,000 |
 | **Campaign total** | **$638,000 – $712,000**, plan on **$672,000** |
 
-The "plan on" figure is the **13.1K px/s basis** (§6) with ingest at its midpoint. Both
-halves of that rate are now **counted rather than assumed** — OPERA radar granules from CMR
-and Sentinel-2 acquisition dates and cloud cover from STAC, on a global land grid. The
-campaign carries **1.07× the tokens per pixel of the Iowa ROI every throughput figure comes
-from**, so it runs at 0.94× that rate. The largest single correction was that **Iowa is a
-single-orbit site**: the anchor sits at the cheap end of the radar distribution. The range is
-Iowa's own 13–15K band carried through.
+**Costed in tokens.** The campaign is **1.98 × 10¹⁵ tokens** — 1.363 × 10¹³ pixels at a
+land-weighted 145 observations per pixel, both halves censused from public catalogues — run
+at a reference **≈1.9M tok/sec** per worker. Pixels-per-second is a derived figure from here
+on: it mixes machine speed with geography, which is why this document rewrote its throughput
+basis three times before switching units (§6). The range carried through is the reference
+ROI's own 13–15K px/s band.
 
 **The model is v1.1.** v2 Large was evaluated and is not being used. Its figures have been
 removed rather than kept alongside, because carrying two columns through every table was
@@ -55,7 +54,7 @@ that stalls on capacity is worse than one that costs more. Settled; do not re-op
    2025. **`allow_s2_only` is ON for this campaign**, so those pixels still get embeddings
    from a neutral radar input rather than being dropped — which is what turns a coverage hole
    into a quality caveat. It also makes them *cheaper*: a minimal radar sequence instead of a
-   full one, worth about $26,000 (§6).
+   full one, worth about $15,000–$18,000 once the per-chunk read floor is allowed for (§6).
 4. **Fleet sizing is the largest cost lever.** Provision UNDER what ingest can feed, which
    makes idle burn structurally zero and leaves headroom for ingest restarts (§5). The
    2,500-actor quota fits every configuration here, but only just at the widest — it is
@@ -101,7 +100,8 @@ transfer (everything is in us-west-2, so there is no egress); engineering time.
 | Fargate | $0.04048/vCPU-h, $0.004445/GB-h | ingest estimate §6 |
 | Worker | 4 vCPU, 16 GiB → **$0.2330/worker-hour** | derived |
 | g6e.xlarge | $1.861/h **on-demand** (spot excluded by decision) | `docs/providers/aws.md` |
-| Inference throughput | **13.1K** planning basis; 12.2K / 14.0K as bounds | measured, §6 |
+| **Campaign tokens** | **1.98 × 10¹⁵** (1.363e13 px × 145 tok/px) | token census, §6 |
+| **Inference rate** | **≈1.9M tok/sec** per worker (13.1K px/s equivalent) | measured, §6 |
 | Embedding output | int8, 128 dims | `config/store_layout.py` |
 
 ---
@@ -288,23 +288,43 @@ campaign's duration.
 
 ## 6. Throughput
 
-**Cost the campaign at ~13.1K px/s.** Every earlier version of this section argued about
-which of someone else's measured rates to borrow. This one counts the thing that actually
-drives the rate.
+**Cost the campaign in tokens: 1.98 × 10¹⁵ of them, at ≈1.9M tok/sec per worker.** Every
+earlier version of this section argued about which region's pixels-per-second to borrow. That
+argument only existed because the unit was wrong.
 
-### What sets the rate: observations per pixel, not pixels
+### Cost is denominated in TOKENS, not pixels
 
-The encoder consumes a **sequence per pixel**, so cost scales with total tokens and
-`tokens = pixels × observations per pixel`. Pixels-per-second is therefore a property of the
-pipeline *and the geography*, and it falls as observation count rises. That is what the
-profiling doc's "mid-density" and "dense" chunk classes are measuring.
+The encoder consumes a **sequence per pixel**, so its cost scales with
+`tokens = pixels × (T_s2 + T_s1)`. Pixels-per-second is therefore not a property of the
+pipeline: it is a property of the pipeline *and the geography it ran over*, and it falls as
+observation count rises — a sparsely-observed pixel costs roughly **10× less** than a densely
+observed one.
 
-**Both halves are counted, on the same global land grid.** Radar: a CMR granule census of
-`OPERA_L2_RTC-S1_V1` across five campaign years (2017, 2019, 2022, 2024, 2025), with each
-count normalised by `cos(lat)` to turn granules-per-box into observations-per-pixel. Optical:
-a Sentinel-2 L2A STAC census over the same points, counting **distinct acquisition dates**
-(not scenes — overlapping MGRS tiles would double-count) and averaging `1 − eo:cloud_cover`
-per date, which is the expected probability that a given pixel is clear.
+```
+   GPU-hours  =  total tokens  ÷  tok/sec
+                 ^ geography       ^ machine
+                 censused below    measured once, logged already
+```
+
+**The campaign is 1.98 × 10¹⁵ tokens** — 1.363 × 10¹³ pixels at a land-weighted **145 tokens
+per pixel**. At the reference worker rate of **≈1.9M tok/sec** that is 289,000 GPU-hours.
+
+> **This document quoted px/s for three revisions and rewrote the throughput basis three
+> times because of it.** Each rewrite was really an argument about how to convert one
+> region's px/s into another's, which is a conversion that only exists because the unit was
+> wrong. `inference/README.md` already said so — "px/sec is density-dependent … so the
+> summaries also log **tok/sec** … for density-neutral comparison" — and the pipeline has
+> been emitting `tok/sec` and effective TFLOPS per sub-batch and per chunk the whole time.
+> **Quote tok/sec going forward.** px/s figures below are retained only because the
+> historical measurements were recorded that way.
+
+### The token census
+
+Both halves counted on the same global land grid. Radar: a CMR granule census of
+`OPERA_L2_RTC-S1_V1` across five campaign years, each count normalised by `cos(lat)` to turn
+granules-per-box into observations-per-pixel. Optical: a Sentinel-2 L2A STAC census over the
+same points, counting **distinct acquisition dates** (not scenes — overlapping MGRS tiles
+would double-count) and averaging `1 − eo:cloud_cover` per date.
 
 | band | land Mkm² | **S2 obs/yr** | **S1 obs/yr** | tokens/px |
 |---|---|---|---|---|
@@ -316,40 +336,43 @@ per date, which is the expected probability that a given pixel is clear.
 | −40 to −20 | 12.5 | 72 | 48 | 128 |
 | −60 to −40 | 1.3 | 54 | 47 | 104 |
 | **campaign, land-weighted** | | **52** | **91** | **152** |
+| — after optical-only cells (below) | | | | **145** |
 | **Iowa — the ROI every rate comes from** | | 70 | 61 | **136** |
 
-**The campaign carries 1.07× the tokens per pixel of the reference ROI, so it runs at
-0.94× its rate** — 145 against Iowa's 136, once the optical-only cells below are counted at
-their minimal radar sequence (152 without them). What drives it:
+Two things this makes visible that the px/s framing hid:
 
-1. **Iowa is a SINGLE-orbit site.** Every sample point across the ROI returns hundreds of
-   ascending granules and **zero** descending, in both eras. The anchor sits at the cheap end
-   of the radar distribution, and the campaign has **1.49× its radar observations per pixel**.
-2. **The optical half pushes the other way.** Iowa's 152 acquisition dates a year at 46%
-   clear give 70 usable observations — *above* the campaign's 52 — because mid-latitude
-   revisit is high and its cloud is moderate. That partly offsets the radar gap.
+1. **Iowa is a SINGLE-orbit site** — hundreds of ascending granules and *zero* descending at
+   every sample point, in both eras. Every throughput figure we hold comes from a site at the
+   cheap end of the radar distribution.
+2. **The optical half pushes back.** Iowa's 152 acquisition dates a year at 46% clear give 70
+   usable optical observations, *above* the campaign's 52. Mid-latitude revisit is high and
+   its cloud is moderate.
 
-| | rate | GPU-hours | cost |
+Net, the campaign is **1.07× Iowa's tokens per pixel**, so at equal tok/sec it runs at 0.94×
+its px/s. That ratio is now bookkeeping rather than an assumption — it exists only to reuse
+historical px/s measurements.
+
+| | px/s equivalent | GPU-hours | cost |
 |---|---|---|---|
 | Iowa 15K → campaign | 14.0K | 269,600 | $501,700 |
 | **Iowa 14K → campaign — planning basis** | **13.1K** | **288,900** | **$537,700** |
 | Iowa 13K → campaign | 12.2K | 311,100 | $578,900 |
 
-> **Cloud cover understates invalidity, and both sides of the ratio are affected.** The SCL
-> classes this pipeline rejects are cloud (8, 9), cloud shadow (3), dark/defective (0, 1, 2);
-> `eo:cloud_cover` covers only the first pair, so true valid-observation counts are lower
-> than the table by perhaps 20–30%. It is applied identically to campaign and reference, so
-> the **ratio** — which is what sets the rate — is largely insensitive to it. Snow is *not*
-> rejected (class 11 is valid), so high-latitude winter is not excluded.
+### Throughput is not purely token-bound, and the floor bites where tokens are fewest
 
-> **This section was wrong twice before this, both times by reasoning about the reference
-> instead of measuring it.** First 21K, a mid-density while-processing rate. Then 15K, on an
-> assumed observation model in which Iowa was dual-orbit and heavy tropical cloud dominated —
-> concluding the campaign was 0.87× Iowa's tokens and therefore *faster*. Counting reversed
-> the sign twice over: Iowa is single-orbit (campaign radar 1.49× higher), but the tropics
-> are far less cloudy than assumed (0.50 clear, not 0.28). The two corrections partly cancel,
-> which is exactly why guessing either one was unsafe. **An anchor is not a typical case just
-> because it is the case you measured.**
+There is a per-chunk cost that scales with **pixels and bytes**, not sequence length: roughly
+13 s of fixed read amplification from the 4000-px storage chunking, plus the prologue. The
+striping work cut the visible part from 50–60 s of GPU-idle per chunk to about **6 s median
+on prefetch-hit chunks** — but it did so by *overlapping the read with compute*. Less compute
+means less to hide behind, and `_strip_plan` already disables prefetch for chunks that are
+wide but sparse.
+
+So the honest form is two-term, `time = fixed_per_chunk + tokens / rate`, combined as a
+maximum per strip rather than a sum. At campaign-average token counts the fixed term is
+~2% of a chunk; on the optical-only cells (56 tokens/px against Iowa's 136) it rises to
+perhaps 8–10%. **That is why the saving credited to `allow_s2_only` below is quoted as
+$15,000–$18,000 rather than the $26,000 a pure token model gives.** Measuring the fixed term
+is one of the three things the Phase-4 test geographies are chosen to settle.
 
 ### The 2022–2024 radar gap, and what `allow_s2_only` does to it
 
@@ -372,10 +395,11 @@ the output. A pixel with no radar is embedded from its optical sequence with a n
 all-zeros radar input rather than being dropped, so those cells produce data. Across the nine
 years, **6.8% of pixel-years are optical-only** on this basis.
 
-It also makes them cheaper. A radar-less pixel carries the smallest sequence bucket instead
-of a full one, which pulls the campaign's tokens per pixel from 152 down to **145** and is
-worth about **$26,000**. That saving is real but incidental — the reason to enable the flag
-is coverage, not cost.
+It also makes them cheaper, though less than a pure token count suggests. A radar-less pixel
+carries the smallest sequence bucket instead of a full one, pulling campaign tokens per pixel
+from 152 to **145** — worth $26,000 on tokens alone, but those same cells are the ones where
+the per-chunk read floor stops being hidden, which gives perhaps a third of it back. Call it
+**$15,000–$18,000**, and treat it as incidental: the reason to enable the flag is coverage.
 
 **What it does not do is make those embeddings equivalent.** ADR 013 records that S2-only
 output is not scientifically validated against S1-informed output, and lists that validation
