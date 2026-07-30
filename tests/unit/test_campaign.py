@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import icechunk
 import numpy as np
 import pytest
 import zarr
 
+import tessera_embeddings.storage.shard_writer as shard_writer
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import campaign, global_store
-from tessera_embeddings.storage.shard_writer import write_year_shards
+from tessera_embeddings.storage.shard_writer import commit_with_rebase, write_year_shards
 from tessera_embeddings.storage.zone_grid import ZONES, ZoneSpec
 
 _BAND = 8
@@ -301,3 +303,100 @@ def test_year_tag_refuses_an_empty_completion_scope(tmp_path):
     _, repo = _seed(tmp_path)
     with pytest.raises(ValueError, match="expected_zones is empty"):
         campaign.tag_year_complete(repo, _YEARS[0], expected_zones=[])
+
+
+# --- concurrent same-zone, different-year writes (the year barrier's whole content) ---
+
+
+def test_a_stale_group_attr_commit_really_does_conflict(tmp_path):
+    """The precondition the whole design rests on, pinned rather than assumed.
+
+    Two sessions forked from one tip, each inserting its own year, the second raises
+    RebaseFailedError — icechunk's ConflictDetector treats group attributes as an opaque
+    value and will not merge them. This is what made the campaign's years serial, and it is
+    worth a test because the alternative behaviour (a silent last-writer-wins clobber) would
+    make `commit_year_attrs`'s retry loop pointless and the lost update invisible.
+
+    NOT tested with threads: icechunk warns that local-filesystem storage is unsafe for
+    concurrent commits, so a threaded test here would be measuring that rather than our
+    logic. Forking two sessions from one tip reproduces the same race deterministically.
+    """
+    _, repo = _seed(tmp_path)
+    s1, s2 = repo.writable_session("main"), repo.writable_session("main")
+    zarr.open_group(s1.store, mode="a")["01N"].attrs["years_complete"] = [_YEARS[0]]
+    zarr.open_group(s2.store, mode="a")["01N"].attrs["years_complete"] = [_YEARS[1]]
+    commit_with_rebase(s1, "writer A")
+    with pytest.raises(icechunk.RebaseFailedError):
+        commit_with_rebase(s2, "writer B")
+
+
+def test_commit_year_attrs_retries_a_conflict_and_produces_the_union(tmp_path, monkeypatch):
+    """The retry is correct, not merely bounded: the loser must re-read and re-apply.
+
+    Because each writer inserts only its OWN year's key, re-reading the winner's value and
+    adding your own yields exactly what both writers intended. A retry that re-applied a
+    STALE read would instead drop the winner's year, which is the silent failure this
+    replaces — so the assertion is on the union, not just on the absence of an exception.
+    """
+    _, repo = _seed(tmp_path)
+    shard_writer.commit_year_attrs(repo, "01N", _YEARS[0])  # the "winner" lands first
+
+    real = shard_writer.commit_with_rebase
+    calls: list[int] = []
+
+    def flaky(session, message, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise icechunk.RebaseFailedError("synthetic", [])
+        return real(session, message, **kw)
+
+    monkeypatch.setattr(shard_writer, "commit_with_rebase", flaky)
+    shard_writer.commit_year_attrs(repo, "01N", _YEARS[1])
+    assert len(calls) == 2, "the first attempt must have been retried"
+
+    node = zarr.open_group(repo.readonly_session("main").store, mode="r")["01N"]
+    assert shard_writer.read_years_complete(node) == [_YEARS[0], _YEARS[1]]
+
+
+def test_commit_year_attrs_gives_up_after_its_bound(tmp_path, monkeypatch):
+    """A persistent conflict must surface, not spin — a defect is not a race."""
+    _, repo = _seed(tmp_path)
+    monkeypatch.setattr(
+        shard_writer,
+        "commit_with_rebase",
+        lambda *a, **k: (_ for _ in ()).throw(icechunk.RebaseFailedError("always", [])),
+    )
+    with pytest.raises(icechunk.RebaseFailedError):
+        shard_writer.commit_year_attrs(repo, "01N", _YEARS[0], tries=3)
+
+
+def test_two_years_of_one_zone_both_land_with_neither_mark_lost(tmp_path):
+    """End to end through the real fill path: the union survives, both years are complete."""
+    _, repo = _seed(tmp_path)
+    _fill(repo, "01N", 0)
+    _fill(repo, "01N", 1)
+    status = campaign.campaign_status(repo, years=_YEARS)
+    assert status.has("01N", _YEARS[0]) and status.has("01N", _YEARS[1])
+
+
+def test_a_no_land_mark_composes_with_a_real_fill_of_another_year(tmp_path):
+    """The other attr writer takes the same path, so the two compose."""
+    _, repo = _seed(tmp_path)
+    _fill(repo, "01N", 0)
+    campaign.mark_zone_year_empty(repo, "01N", _YEARS[1])
+    status = campaign.campaign_status(repo, years=_YEARS)
+    assert status.has("01N", _YEARS[0]) and status.has("01N", _YEARS[1])
+
+
+def test_the_attr_commit_is_separate_from_the_shard_commit(tmp_path):
+    """Two commits per fill, not one — the mechanism the tests above rely on.
+
+    Pinned because collapsing them back into one commit would silently restore the
+    year barrier, and the concurrency tests above are timing-dependent enough that they
+    might not catch it.
+    """
+    _, repo = _seed(tmp_path)
+    before = len(list(repo.ancestry(branch="main")))
+    _fill(repo, "01N", 0)
+    after = len(list(repo.ancestry(branch="main")))
+    assert after - before == 2, f"expected a shard commit and an attr commit, got {after - before}"

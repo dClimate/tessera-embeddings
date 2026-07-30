@@ -30,9 +30,7 @@ import zarr
 
 from tessera_embeddings.storage.shard_writer import (
     CommitGate,
-    commit_with_rebase,
-    read_years_complete,
-    run_provenance,
+    commit_year_attrs,
 )
 from tessera_embeddings.storage.zarr_store import time_index_of
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES, year_timestamp
@@ -159,21 +157,18 @@ def mark_zone_year_empty(
     the original mark commit (which remains a protected ancestor). Returns the
     snapshot id to tag.
     """
-    session = repo.writable_session("main")
-    root = zarr.open_group(session.store, mode="a")
-    node = cast(zarr.Group, root[zone])
+    # Axis check on a read-only view: it must fail before any session is opened, so a
+    # rejected year cannot leave a writable session dangling.
+    node = cast(zarr.Group, zarr.open_group(repo.readonly_session("main").store, mode="r")[zone])
     if time_index_of(node, year_timestamp(year)) is None:
         raise ValueError(
             f"Year {year} is not on {zone}'s pre-allocated time axis — refusing to mark an "
             "off-axis year complete (ADR-008 D1: the axis is fixed at seeding)."
         )
-    done = read_years_complete(node)
-    if year in done:
-        return repo.lookup_branch("main")
-    node.attrs["years_complete"] = sorted([*done, year])
-    if run_id is not None:
-        node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year, run_id, empty=True)
-    return commit_with_rebase(session, f"mark {zone} year {year} complete (no land)", gate=gate)
+    # Delegated so there is exactly ONE writer of years_complete/runs, with one
+    # retry-on-conflict policy. That is what makes a no-land mark safe to run
+    # concurrently with another year of the same zone.
+    return commit_year_attrs(repo, zone, year, run_id=run_id, empty=True, gate=gate, skip_if_marked=True)
 
 
 @dataclass(frozen=True)

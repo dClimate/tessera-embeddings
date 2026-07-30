@@ -148,6 +148,68 @@ def run_provenance(existing: object, year: int, run_id: str, *, empty: bool = Fa
     return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
 
 
+def commit_year_attrs(
+    repo: icechunk.Repository,
+    group: str,
+    year_label: int,
+    *,
+    run_id: str | None = None,
+    empty: bool = False,
+    gate: CommitGate | None = None,
+    tries: int = 8,
+    skip_if_marked: bool = False,
+) -> str:
+    """Advance one year's ``years_complete``/``runs`` in its own small commit, retrying.
+
+    The single writer of those two attrs, and the reason concurrent fills of the SAME
+    zone group are safe.
+
+    **Why a separate commit.** Chunk data for different years of one zone is strictly
+    disjoint — every chunk and shard is 1 in the time dimension — so those writes always
+    rebase cleanly. The only thing that ever collided was these two attrs, because
+    icechunk's :class:`~icechunk.ConflictDetector` treats attributes as an opaque value
+    and cannot merge them. Bundling them into the shard commit meant a collision threw
+    away the whole assembly; here it throws away a sub-second commit.
+
+    **Why re-reading and retrying is CORRECT rather than hopeful.** Both attrs are keyed
+    by year and each writer only ever inserts its OWN key — ``years_complete`` is a set
+    union, ``runs`` a per-year dict insert. So there is no semantic conflict to resolve:
+    a loser that re-reads the winner's value and re-applies its own key produces exactly
+    the state both writers intended, in either order. That is what makes this a plain
+    optimistic-concurrency loop rather than a lossy merge. Each attempt opens a FRESH
+    session, so it cannot re-apply onto a stale read.
+
+    **The two callers want different idempotency, and the difference is deliberate.**
+    ``skip_if_marked=True`` returns the branch tip untouched when the year is already in
+    ``years_complete``, EVEN IF a different ``run_id`` was passed — that is what
+    ``mark_zone_year_empty`` needs, because a re-mark of an empty cell must not mint a new
+    snapshot: :func:`~tessera_embeddings.storage.campaign.tag_zone_year` refuses to move a
+    tag, so a new snapshot would leave the existing zone-year tag pointing at an ancestor
+    and the original provenance is the one worth keeping. The default (``False``) records
+    the new run, which is what a genuine refill through :func:`write_year_shards` means:
+    shards were rewritten, so the provenance should say by which run.
+    """
+    for attempt in range(1, tries + 1):
+        session = repo.writable_session("main")
+        node = _group_node(session.store, group)
+        done = read_years_complete(node)
+        if year_label in done and (run_id is None or skip_if_marked):
+            return repo.lookup_branch("main")
+        if year_label not in done:
+            node.attrs["years_complete"] = sorted([*done, year_label])
+        if run_id is not None:
+            node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year_label, run_id, empty=empty)
+        try:
+            return commit_with_rebase(session, f"mark {group} year {year_label} complete", gate=gate)
+        except icechunk.RebaseFailedError:
+            if attempt == tries:
+                raise
+            # Another year of THIS group committed between our read and our commit. Re-read
+            # and re-apply; the loop is bounded so a genuine defect still surfaces.
+            continue
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def _year_label(node: zarr.Group, year_index: int) -> int:
     """Read the calendar year at ``year_index`` from a group's time coordinate.
 
@@ -209,13 +271,26 @@ def write_year_shards(
     written inside THIS writable session, so a commit landing between a
     caller's earlier probe and this write cannot be silently clobbered.
 
-    Concurrency contract: concurrent commits to *different* groups rebase
-    cleanly (disjoint nodes), but two concurrent fills of the *same* group both
-    rewrite its ``years_complete``/``runs`` attrs and
-    :class:`icechunk.ConflictDetector` cannot auto-merge attribute conflicts —
-    the loser fails with ``RebaseFailedError`` (loud, retriable) rather than
-    silently dropping an update. Orchestrate one fill per zone at a time.
-    Returns the commit snapshot id.
+    Concurrency contract (RELAXED 2026-07-30): concurrent fills of different groups
+    rebase cleanly, and concurrent fills of the SAME group but different years are
+    now safe too. This used to require "one fill per zone at a time", which is what
+    made the campaign's years serial. Two changes to that reasoning:
+
+    * Chunk data was never the problem — every chunk and shard is 1 in the time
+      dimension, so different years of one zone write strictly disjoint objects.
+    * The two group attrs that DID collide now commit separately and retry, via
+      :func:`commit_year_attrs`, which is correct because each writer only inserts
+      its own year's key.
+
+    So this issues TWO commits: the shards, then the year's attrs. A consequence
+    worth knowing: if the shard commit lands and the attr commit then exhausts its
+    retries, the year holds data but is not marked complete. The work list reads the
+    marks, so that cell simply looks pending and a retry re-writes the same shards
+    (a whole-shard overwrite) and re-marks. That is strictly better than the previous
+    behaviour, where a collision discarded the shards as well.
+
+    Returns the ATTR commit's snapshot id — a tag must point at a state where the
+    year is both written and marked.
     """
     session = repo.writable_session("main")
     shards = list(source.live_shards())
@@ -228,12 +303,10 @@ def write_year_shards(
     ]
     run_forked(session, _write_shards_worker, payloads)
 
-    node = _group_node(session.store, group)
-    year_label = _year_label(node, year_index)
-    done = read_years_complete(node)
-    if year_label not in done:
-        node.attrs["years_complete"] = sorted([*done, year_label])
-    if run_id is not None:
-        node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year_label, run_id)
-
-    return commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}", gate=gate)
+    year_label = _year_label(_group_node(session.store, group), year_index)
+    commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}", gate=gate)
+    # The per-year attrs go in their OWN commit (see `commit_year_attrs`), so a same-zone
+    # collision costs a sub-second retry instead of this whole assembly. Return that
+    # snapshot rather than the shard one: a tag must point at a state where the year is
+    # both written AND marked.
+    return commit_year_attrs(repo, group, year_label, run_id=run_id, gate=gate)
