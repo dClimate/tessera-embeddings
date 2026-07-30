@@ -40,10 +40,23 @@ and model load once for its whole set rather than once per zone-year.
    └── … 2017–2025, serial
 ```
 
-**Years run serially.** Concurrent zone-years are safe — different groups rebase cleanly —
-but two *years of the same zone* write the same group's attributes and cannot auto-merge.
-Year-serial guarantees that more strongly than necessary; relaxing it needs a
-zone-disjointness scheduler and is not planned.
+**Years run serially — for now.** A cluster is dispatched per year, so the campaign pays 72
+`ray up` cycles and each year waits out its predecessor.
+
+> **Why they were serial, and what changed (2026-07-30).** The reason was never that
+> concurrent zone-years are unsafe: different groups rebase cleanly, and even two years of
+> the SAME zone write strictly disjoint objects, because every chunk and shard is 1 in the
+> time dimension. The obstacle was two group *attributes* — `years_complete` and `runs` —
+> which both writers rewrote in the same commit as their shards, and which
+> `ConflictDetector` cannot merge. **Those now commit separately and retry**
+> (`shard_writer.commit_year_attrs`), so the obstacle is gone.
+>
+> `overlap_years` drops the barrier: every requested year dispatched as one batch, so a
+> cluster works a multi-year list, year N+1's ingest overlaps year N's inference, and the
+> campaign pays 8 boots instead of 72. It is **shipped and default OFF** — see §8 item 7 for
+> what it still needs. Note it required no "zone-disjointness scheduler", which an earlier
+> version of this paragraph assumed: the partition is over ZONES, so a zone's every year
+> lands in one cluster, where assemblies serialize on that cluster's single trailing thread.
 
 ---
 
@@ -204,24 +217,27 @@ Three mechanisms, all shipped.
 slot atomically with its pixels, so a date present is complete and a date absent was never
 started. Resume assumes the same land mask, which the manifest enforces on every write.
 
-**Retry.** A failed zone does not sink the campaign. Each year gets up to
-`max_zone_attempts` rounds, and every round re-reads the *store* for what is still missing,
-so a retry never repeats a zone that landed.
+**Retry, at two levels (the second added 2026-07-30).**
 
-> **The year is the retry UNIT, which is why removing the barrier (§8 item 7) is not just a
-> loop change.** Drop the year and there is no unit left, and a naive whole-run round is much
-> worse granularity: a cell failing on day one would not be retried until every cluster had
-> finished its entire multi-year list. The intended fix is a **child-level retry pass** — the
-> chained fill already records per-cell failures and retains their mosaics for staged resume,
-> but does not retry; giving it one pass over its own failures keeps recovery local, and
-> because a child owns its zones and works them in order that retry cannot collide with
-> itself. The parent's rounds then handle only what a child could not.
->
-> Note this needs two distinct bounds rather than today's one: attempts *within* a child and
-> attempts *across* the run. Overloading `max_zone_attempts` for both would silently change
-> what it means. Rounds stop early when one makes no progress
-— that is what a deterministic failure looks like from the driver, and it wants a human
-rather than another fleet. The campaign raises at the very end listing every unfilled cell.
+*Inside a cluster.* A failed cell is re-attempted on the still-provisioned fleet —
+`max_cell_attempts`, default 2, so one retry. The cluster is already up, the failed cell's
+mosaic was deliberately retained, and its staged tiles resume, so this is normally minutes
+rather than a fresh zone-year. **Eligibility is "kept its mosaic", not "failed"**: two paths
+delete the mosaic on purpose (the orbit-mismatch deferral cap, a terminal plan) so a
+systematic failure cannot stack multi-terabyte inputs, and retrying one of those would run
+against nothing.
+
+*Across dispatches.* A failed zone does not sink the campaign. Each dispatch gets up to
+`max_zone_attempts` rounds, and every round re-reads the *store* for what is still missing,
+so a retry never repeats a zone that landed. Rounds stop early when one makes no progress —
+that is what a deterministic failure looks like from the driver, and it wants a human rather
+than another fleet. The campaign raises at the very end listing every unfilled cell.
+
+**The two bounds are deliberately separate.** `max_cell_attempts` counts attempts per cell;
+`max_zone_attempts` counts whole dispatches. Overloading one knob for both would silently
+change what either means. The in-cluster level exists because the driver's unit is a whole
+dispatch: without it, a cell failing early under `overlap_years` would wait for every cluster
+to finish its entire multi-year list before being re-attempted.
 
 **Re-run.** A fresh campaign run recomputes nothing already done: completed work is
 filtered at the work list, at the per-zone ingest marker, at date-level resume inside
