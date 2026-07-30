@@ -442,6 +442,7 @@ def fill_zones_sequential_flow(
     ingest_deployment: str = "ingest-zone-year/ingest-zone-year",
     branch: str | None = None,
     look_ahead: int = 2,
+    max_cell_attempts: int = 2,
     ingest_limit_name: str | None = None,
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
@@ -509,6 +510,10 @@ def fill_zones_sequential_flow(
             fleet-wide cap and the rest queue. ``None`` disables the gate — every
             submitted zone starts immediately, which suits a direct single-cluster
             run and not a campaign.
+        max_cell_attempts: Attempts per cell within THIS cluster, including the
+            first; 2 means one retry on the still-provisioned fleet. Distinct from
+            the campaign driver's `max_zone_attempts`, which counts whole-dispatch
+            rounds — see `sequential_fill.fill_zones_sequential`.
         look_ahead: Cells beyond the current one kept in ingest flight (bounds
             concurrent ingest Dask clusters AND in-flight mosaics, ADR-011).
         cleanup_mosaics: Delete each campaign-ingested mosaic after its cell
@@ -531,6 +536,8 @@ def fill_zones_sequential_flow(
     # has launched ingests and the GPU cluster is up. Fail fast instead.
     if look_ahead < 0:
         raise ValueError(f"look_ahead must be >= 0, got {look_ahead}")
+    if max_cell_attempts < 1:
+        raise ValueError(f"max_cell_attempts must be >= 1, got {max_cell_attempts} (no cell would be attempted)")
     # Same rule, same reason: on a direct invocation nothing else rejects this until
     # run_inference validates `session_actors`, by which point triage has run, the
     # look-ahead ingests are away and the shared Ray cluster is up.
@@ -931,6 +938,7 @@ def fill_zones_sequential_flow(
                 log=log,
                 inputs=inputs,
                 look_ahead=look_ahead,
+                max_cell_attempts=max_cell_attempts,
             )
     finally:
         if inputs is not None:

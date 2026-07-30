@@ -595,3 +595,119 @@ def test_only_the_started_window_is_eligible():
     _run(_cells(5), inputs=inputs, look_ahead=1)
     order = [e.split(":")[1] for e in events if e.startswith("wait:")]
     assert order[0] == "01N", f"reached outside its window: {order}"
+
+
+# --- in-child retry (max_cell_attempts) -----------------------------------------------
+
+
+def _recovering_single(attempts: list[str], fail_zones: set[str] | None = None):
+    """A per-cell path that records each attempt and succeeds unless told otherwise."""
+
+    def infer_single(cell, prep, final):
+        attempts.append(cell.zone)
+        if fail_zones and cell.zone in fail_zones:
+            raise RuntimeError(f"{cell.zone} is deterministically broken")
+        return ZoneFillHandoff(
+            zone=cell.zone, year=cell.year, run_id=prep.run_id, t0=0.0, summary={}, live=[], results=[]
+        )
+
+    return infer_single
+
+
+def test_a_failed_cell_is_retried_in_child_and_recovers():
+    """The whole point: recovery is LOCAL, without the driver dispatching anything.
+
+    Without this the driver's retry unit is a whole dispatch, so a cell failing early
+    waits for every cluster to finish its entire list before being re-attempted.
+    """
+    events: list[str] = []
+    attempts: list[str] = []
+    inputs = RecordingInputs(events)
+    summary = _run(
+        _cells(3),
+        session=_sync_session(fail={"02N"}),
+        inputs=inputs,
+        infer_single=_recovering_single(attempts),
+    )
+    assert attempts == ["02N"], attempts
+    assert summary["failed"] == 0 and summary["succeeded"] == 3
+    # The recovered cell's mosaic is cleaned, like any cell that landed.
+    assert "cleanup:02N" in events
+
+
+def test_a_deterministic_failure_survives_its_retries_and_still_raises():
+    """A retry that cannot help must not swallow the failure."""
+    attempts: list[str] = []
+    with pytest.raises(RuntimeError, match="1/3 cell"):
+        _run(
+            _cells(3),
+            session=_sync_session(fail={"02N"}),
+            inputs=RecordingInputs([]),
+            infer_single=_recovering_single(attempts, fail_zones={"02N"}),
+            max_cell_attempts=3,
+        )
+    # Attempted once per retry round (2 of 3 attempts are retries), not once forever.
+    assert attempts == ["02N", "02N"], attempts
+
+
+def test_max_cell_attempts_one_disables_the_retry():
+    """The bound is real, and 1 means the previous behaviour exactly."""
+    attempts: list[str] = []
+    with pytest.raises(RuntimeError, match="1/2 cell"):
+        _run(
+            _cells(2),
+            session=_sync_session(fail={"01N"}),
+            inputs=RecordingInputs([]),
+            infer_single=_recovering_single(attempts),
+            max_cell_attempts=1,
+        )
+    assert attempts == [], "no retry may run at max_cell_attempts=1"
+
+
+def test_a_cell_whose_mosaic_was_deleted_is_not_retried():
+    """The bug this caught in review, pinned so it cannot come back.
+
+    Two failure paths delete the mosaic on purpose — the orbit-mismatch deferral cap and
+    a terminal plan — so that a systematic failure cannot stack multi-terabyte inputs.
+    Retrying one of those runs against nothing. Eligibility is "kept its mosaic", which is
+    NOT the same as "failed": a first version of the retry pass used the failure list and
+    silently "recovered" cells whose input had been deleted.
+    """
+    events: list[str] = []
+    attempts: list[str] = []
+    inputs = BudgetProbeInputs(events)
+    # Every cell mismatches the session orbit and look_ahead=0 caps deferrals at 1, so the
+    # cells past the cap fail with their mosaics CLEANED.
+    with pytest.raises(RuntimeError, match="deferral cap reached"):
+        _run(
+            _cells(4),
+            orbits=dict.fromkeys(("01N", "02N", "03N", "04N"), "ascending"),
+            inputs=inputs,
+            look_ahead=0,
+            infer_single=_recovering_single(attempts),
+        )
+    # The capped cells were cleaned, so they must NOT appear as retry attempts. Only the
+    # one legitimately-deferred cell may reach infer_single, via the fallback pass.
+    assert len(attempts) <= 1, attempts
+
+
+def test_retry_runs_before_the_fallback_so_actors_are_still_alive():
+    """Ordering is load-bearing: the fallback marks its last cell `final`, which retires
+    idle actors. A retry scheduled after that would need actors the fallback released.
+    """
+    order: list[str] = []
+
+    def infer_single(cell, prep, final):
+        order.append(f"{cell.zone}:final={final}")
+        return ZoneFillHandoff(
+            zone=cell.zone, year=cell.year, run_id=prep.run_id, t0=0.0, summary={}, live=[], results=[]
+        )
+
+    _run(
+        _cells(2),
+        orbits={"02N": "ascending"},  # 02N defers to the fallback
+        session=_sync_session(fail={"01N"}),  # 01N fails in the stream → retried
+        inputs=RecordingInputs([]),
+        infer_single=infer_single,
+    )
+    assert order == ["01N:final=False", "02N:final=True"], order
