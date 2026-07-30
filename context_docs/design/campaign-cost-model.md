@@ -7,7 +7,7 @@ store. Nine years × 111 land zones. The ingest measurements it rests on are rec
 section references below of the form "ingest estimate §N" point at that working note.
 
 Every input is either measured (and cited) or derived from a measured input (and marked
-as derived). Two things are neither, and they are called out in §8 rather than buried.
+as derived). Two things are neither, and they are called out in §9 rather than buried.
 
 ---
 
@@ -16,31 +16,40 @@ as derived). Two things are neither, and they are called out in §8 rather than 
 | | |
 |---|---|
 | Ingest (Fargate) | $115,000 – $126,000 |
-| **Inference (GPU, on-demand) — v1.1** | **$293,000 – $470,000** |
-| **Inference (GPU, on-demand) — v2 Large** | **$213,000 – $342,000** |
+| **Inference (GPU, on-demand) — v1.1** | **$294,000 – $503,000**, plan on **$503,000** |
+| **Inference (GPU, on-demand) — v2 Large** | **$214,000 – $366,000**, plan on **$366,000** |
 | Assembly | ~$200 |
 | Mosaic storage (transient) | ~$3,000 |
-| **Campaign total, v1.1** | **$411,000 – $599,000** |
-| **Campaign total, v2 Large** | **$331,000 – $471,000** |
+| **Campaign total, v1.1** | **$412,000 – $632,000**, plan on **$629,000** |
+| **Campaign total, v2 Large** | **$332,000 – $495,000**, plan on **$492,000** |
+
+The "plan on" column is the **14K px/s capacity-planning basis** (§6). The low end of each
+range is the best rate ever observed on one ROI and should not be budgeted against.
 
 The permanent embeddings store (0.9–1.8 PB) is **not costed here**: it goes to AWS Open
 Data, which sponsors the storage. Sizing it still matters for bucket planning — see §7 —
 but it is not a line on this bill.
 
-**GPUs are on-demand. Spot is not costed here and is not an option** — sustaining ~1,700
-g6e instances for days makes interruption a certainty rather than a risk, and a campaign
+**GPUs are on-demand. Spot is not costed here and is not an option** — sustaining 1,400 to
+2,500 g6e instances for days makes interruption a certainty rather than a risk, and a campaign
 that stalls on capacity is worse than one that costs more. Settled; do not re-open.
 
-**Three findings worth acting on.**
+**Four findings worth acting on.**
 
 1. **Inference, not ingest, is where the money is** — two-and-a-half to four times the
    ingest bill. Every optimisation effort so far has gone into the cheaper half.
 2. **Inference cost is invariant to the ingest scenario.** Same pixels, same throughput,
    same GPU-hours whether you run 40 cells or 71. What the ingest scenario changes is
    whether the GPU fleet has anything to do.
-3. **Fleet sizing is the largest lever, worth up to $550,000** — the cost of provisioning
-   to the GPU quota rather than to what ingest can actually feed (§5). **Running v2 Large
-   is the second, at $91,000–$128,000** (§6). Both are within our control.
+3. **Fleet sizing is the largest lever, worth up to $407,000** — the cost of provisioning to
+   the GPU quota rather than to what ingest can actually feed (§5). **But it is now
+   scenario-dependent:** at the corrected throughput basis and 71 ingest cells, v1.1's
+   matched fleet *exceeds* the quota, so there is nothing to oversize. The lever is real at
+   40 cells, and on v2 in every scenario. **Running v2 Large is the second, at
+   $137,000** (§6). Both are within our control.
+4. **Two throughput rates in this document are not interchangeable, and mixing them costs
+   schedule rather than money.** Size the fleet on 21K and run at 14K and inference stretches
+   from 4.5 days to 6.7 for the same bill. §6 says which to use and why.
 
 ---
 
@@ -75,7 +84,7 @@ transfer (everything is in us-west-2, so there is no egress); engineering time.
 | Fargate | $0.04048/vCPU-h, $0.004445/GB-h | ingest estimate §6 |
 | Worker | 4 vCPU, 16 GiB → **$0.2330/worker-hour** | derived |
 | g6e.xlarge | $1.861/h **on-demand** (spot excluded by decision) | `docs/providers/aws.md` |
-| Inference throughput | 15K / 21K / 24K px/s/worker | see §6 |
+| Inference throughput | **14K** capacity-planning; 15K / 21K / 24K carried as bounds | see §6 |
 | Embedding output | int8, 128 dims | `config/store_layout.py` |
 
 ---
@@ -96,6 +105,16 @@ width is derived, not set: `s1_worker_fraction = 0.22` of the S2 fleet.
 > not the one that will run. Both are given below so the comparison is honest either way;
 > the duration basis of 6,354 cell-hours was measured at 60w and is scaled by 60/S2w for
 > other widths, which is width-neutral and therefore the conservative direction.
+
+> **How conservative, quantified.** Scaling by `60/W` assumes duration is inversely
+> proportional to width. It is not: the canonical width model (ingest estimate §3.10) is
+> `T(W) = 36.3 + 7896/W` s/date, whose **36.3 s width-independent residual** means a
+> narrower fleet loses less than proportionally. `T(50)/T(60) = 1.157`, against the 1.200
+> this table applies. Every wall clock below is therefore **3.6% pessimistic** and every
+> supply rate 3.6% low: the 7.9-day row is really ~7.6 days and the 4.5-day row ~4.3, with
+> supply 5.44 and 9.65 zone-yr/h. The table is left on `60/W` deliberately — one
+> conservative scaling is easier to reason about than two — but the matched-fleet figures in
+> §5 inherit the same 3.6% understatement and should not be treated as tight.
 
 | scenario | S1/orbit | vCPU/cell | total vCPU | wall clock | supply rate | ingest cost |
 |---|---|---|---|---|---|---|
@@ -125,6 +144,24 @@ trade on its own terms, and a much better one once §5 is taken into account.
 > zone sets, so it is a hint rather than a curve. If it holds at 50w it is worth roughly
 > $6,000, and it would make the optimal scenario cheaper as well as faster.
 
+**The duration basis and the per-zone density fit agree, and this is worth recording because
+the apparent disagreement between them wasted real effort.** The 6,354 cell-hour basis is a
+campaign aggregate; the ingest estimate also carries a per-zone fit,
+`s/date = 10.16 + 0.06022 × live_4096_chunks` (five regions, R² 0.954). Evaluating that fit
+over the 111 real per-zone tile counts from the coverage census and summing gives **5.95
+h/zone-year at 60 workers, against the basis's 6.36 — a 6.5% agreement.** They were never in
+conflict, and neither was the "~10 h versus ~21 h" spread seen elsewhere in these documents:
+that is one dense zone at 120 workers and at 50, via the same width model.
+
+Two properties of the fit matter for anything that reasons about *individual* zones rather
+than the aggregate, and the aggregate basis hides both:
+
+- **A fixed floor of about 1.0 h per zone-year** (the 10.16 s/date intercept × 365 dates).
+  An all-but-empty zone costs an hour, not minutes.
+- **Per-zone residuals of ±35%.** Area does not determine duration tightly — 35N and 47N
+  differ by 3 chunks in 2,418 and by 27% in per-date time. Any per-zone schedule built on
+  this fit needs that much slack.
+
 ---
 
 ## 5. Inference — the cost is fixed; the waste is not
@@ -140,9 +177,10 @@ Both models, at all three throughput bases. v2 Large's column is the v1.1 rate �
 
 | basis (v1.1 rate) | v1.1 GPU-h | **v1.1 cost** | v2 rate | v2 GPU-h | **v2 cost** |
 |---|---|---|---|---|---|
-| 15K px/s — fleet-overall, incl. cold starts | 252,300 | **$469,600** | 20.6K | 183,500 | **$341,500** |
-| **21K px/s — measured, while processing** | **180,200** | **$335,400** | **28.9K** | **131,100** | **$243,900** |
-| 24K px/s — best observed | 157,700 | **$293,500** | 33.0K | 114,700 | **$213,400** |
+| 15K px/s — fleet-overall, upper end | 252,400 | **$469,700** | 20.6K | 183,600 | **$341,600** |
+| **14K px/s — capacity-planning basis** | **270,400** | **$503,300** | **19.3K** | **196,700** | **$366,000** |
+| 21K px/s — mid-density, while processing | 180,300 | **$335,500** | 28.9K | 131,100 | **$244,000** |
+| 24K px/s — best observed | 157,800 | **$293,600** | 33.0K | 114,700 | **$213,500** |
 
 **None of this varies with the ingest scenario.** The same pixels are inferred at the same
 rate either way. It varies only with the model and with which throughput basis turns out
@@ -154,41 +192,63 @@ making before committing.
 An idle GPU bills. So the question is not how many GPUs the quota allows, it is **how many
 GPUs the ingest rate can keep fed**.
 
-A zone-year costs **180.4 GPU-hours on v1.1** and **131.2 on v2 Large**. Multiply by the
-supply rate:
+A zone-year costs **270.7 GPU-hours on v1.1** at the capacity-planning basis and **196.9 on
+v2 Large**. Multiply by the supply rate:
 
 ```
   matched fleet  =  zone-years per hour from ingest  ×  GPU-hours per zone-year
 ```
 
-| ingest scenario | supply | **matched fleet, v1.1** | **matched fleet, v2** |
-|---|---|---|---|
-| **shipped — 40 × 50w** | 5.24 zone-yr/h | **946** | **688** |
-| 40 × 60w | 6.29 zone-yr/h | 1,135 | 825 |
-| **optimal — 71 × 50w** | 9.30 zone-yr/h | **1,678** | **1,220** |
-| 80 × 50w | 10.48 zone-yr/h | 1,891 | 1,375 |
+| ingest scenario | supply | **matched, v1.1 @14K** | **matched, v2 @19.3K** | v1.1 @21K | v2 @28.9K |
+|---|---|---|---|---|---|
+| **shipped — 40 × 50w** | 5.24 zone-yr/h | **1,419** | **1,032** | 946 | 688 |
+| 40 × 60w | 6.29 zone-yr/h | 1,703 | 1,239 | 1,135 | 825 |
+| **optimal — 71 × 50w** | 9.30 zone-yr/h | **2,518** | **1,831** | 1,678 | 1,221 |
+| 80 × 50w | 10.48 zone-yr/h | 2,837 | 2,064 | 1,891 | 1,375 |
 
-**This is the expensive mistake available in this campaign** — provisioning to the quota
-instead of to that column. Idle burn at the full 2,500-actor fleet:
+**The correction to the throughput basis (§6) changes what this section recommends, and the
+change is large enough to state plainly.** At the capacity-planning rate, the matched fleet
+at 71 cells on v1.1 is **2,518 GPUs — at or slightly above the 2,500-actor quota.** The
+quota is therefore *approximately correctly sized* for the configuration we intend to run,
+not wildly oversized.
 
-| ingest scenario | v1.1 duty | **v1.1 idle burn** | v2 duty | **v2 idle burn** |
+An earlier version of this section said provisioning to the quota was a **$550,000
+mistake** in every scenario. That claim survives only in two of the four corners:
+
+| ingest scenario | v1.1 @14K duty | v1.1 @14K idle burn | v1.1 @21K duty | v1.1 @21K idle burn |
 |---|---|---|---|---|
-| shipped — 40 × 50w | 38% | **$552,000** | 28% | **$643,000** |
-| optimal — 71 × 50w | 67% | **$164,000** | 49% | **$256,000** |
+| shipped — 40 × 50w | 57% | **$407,000** | 38% | $552,000 |
+| **optimal — 71 × 50w** | **101% — quota-bound** | **$0** | 67% | $164,000 |
 
-Against ingest as shipped, an oversized fleet wastes more than four times the entire
-ingest bill, and more than the inference it is trying to do. Neither row is a throughput
-problem; both are a scheduling mismatch.
+So the standing advice inverts by scenario. **At 40 cells, an oversized fleet is still the
+largest waste in the campaign.** At 71 cells on v1.1 at the capacity-planning rate there is
+no idle burn to save, because ingest can feed everything the quota allows — and the quota,
+not ingest, becomes the constraint on schedule.
+
+**On v2 the original warning survives everywhere**, because a faster model needs less fleet:
+1,831 matched against a 2,500 quota is a 27% overprovision worth about **$124,000**. This is
+the same coupling noted below — a faster model makes oversizing worse — now with the
+correction that on v1.1 at 71 cells there is nothing left to oversize.
+
+**Do not mix the two bases: it costs schedule, not money.** Sizing the fleet on 21K (1,678
+GPUs) and then running at the real 14K rate leaves the fleet at two thirds of what the work
+needs. GPU-hours are unchanged, so the bill does not move — but inference stretches from
+**4.5 days to 6.7**, and the campaign becomes inference-bound rather than ingest-bound. This
+is the single easiest error to make from this document, because 1,678 and 21K each look
+defensible in isolation.
 
 **Note which way v2 pushes this.** A faster model makes oversizing *worse*, not better:
 each zone-year is consumed more quickly, so the same fleet starves sooner and idles
-longer. Choosing v2 saves $91,500 on the work and would lose $91,000 more to idle if the
-fleet were left at the quota. The two decisions are coupled and must be made together.
+longer. Choosing v2 saves $137,000 on the work and would lose $124,000 of it back to idle if
+the fleet were then left at the quota. The two decisions are coupled and must be made
+together — and on v1.1 at 71 cells the coupling disappears only because the matched fleet has
+grown past the quota, not because the effect stopped existing.
 
 So the case for the optimal ingest configuration is not the $1,700 it costs, nor the 3.4
-days it saves, but this: **it raises the fleet you can keep busy from 946 to 1,678 GPUs on
-v1.1, or 688 to 1,220 on v2** — which is what converts GPU quota into finished work rather
-than idle time.
+days it saves, but this: **it raises the fleet you can keep busy from 1,419 GPUs to the full
+2,500 quota on v1.1, or from 1,032 to 1,831 on v2** — which is what converts GPU quota into
+finished work rather than idle time. At 40 cells, more than a thousand actors of quota cannot
+be used no matter how much is granted.
 
 > The GPU fleet already boots only when a finished mosaic is waiting, and the feeder takes
 > whichever mosaic lands first, so the pipeline does not idle *within* a cluster. What the
@@ -199,13 +259,38 @@ than idle time.
 
 ## 6. Throughput, and the v2 Large model
 
-**The 21K figure is a while-processing rate**; the profiling doc's 13–15K is total pixels
-over total GPU-hours for a complete run, and so absorbs cold starts and the dense-chunk
-mix. For a campaign average the truth is between them and probably nearer 21K, since cold
-starts amortise over a 999-zone-year run far better than over one ROI. The range is
-carried through rather than collapsed: it is worth **$176,000** on-demand.
+**Cost the campaign at ~14K px/s. An earlier version of this section costed it at 21K and
+that was wrong** — wrong on two independent counts, and the correction moves the matched
+fleet enough to change what §5 recommends.
 
-### v2 Large is materially faster — worth $91,000 – $128,000
+The profiling doc reports three rates, and they are not three estimates of one quantity:
+
+| rate | what it measures | profiling doc's own label |
+|---|---|---|
+| **21–24K px/s** | while processing a **mid-density** chunk | — |
+| **10–18K px/s** | while processing a **dense** chunk | — |
+| **~13–15K px/s** | total pixels ÷ total GPU-hours, whole run | **"the capacity-planning number"** |
+
+The superseded argument was that the truth lies between the while-processing and
+fleet-overall figures and sits "probably nearer 21K, since cold starts amortise over a
+999-zone-year run far better than over one ROI". Both halves fail:
+
+1. **21–24K is the MID-density rate, and this campaign is dense-weighted.** Zones are dealt
+   densest-first and dense zones dominate the pixel volume, so the applicable
+   while-processing band is the dense one, **10–18K** — which straddles 14K rather than
+   sitting above it. Cold-start amortisation cannot move a dense zone onto the mid-density
+   rate; those are different axes, and the earlier argument conflated them.
+2. **13–15K is the only rate derived the way a campaign consumes GPUs** — pixels delivered
+   per GPU-hour paid, over a complete run. That is the quantity a bill and a schedule are
+   both denominated in, which is why the profiling doc calls it the capacity-planning
+   number. Costing against a while-processing rate silently assumes the fleet is never
+   between chunks.
+
+The range is still carried rather than collapsed — it is worth **$176,000** on-demand — but
+the **primary basis is 14K**, with 21K retained as the optimistic bound and 24K as the
+best-observed ceiling.
+
+### v2 Large is materially faster — worth $122,000 – $137,000
 
 `feature/v2-large-model` carries a **per-model inference rate**, in
 `inference/actors.py`:
@@ -218,8 +303,9 @@ _EST_PX_PER_SEC_BY_MODEL = {"v1.1": 16_000.0, "v2-large": 22_000.0}
 
 | basis | v1.1 | v2 Large | inference cost, v1.1 → v2 | saving |
 |---|---|---|---|---|
-| optimistic — 21K while-processing | 21,000 px/s | 28,900 px/s | $335,400 → $243,900 | **$91,500** |
-| pessimistic — 15K fleet-overall | 15,000 px/s | 20,600 px/s | $469,600 → $341,500 | **$128,100** |
+| **capacity-planning — 14K** | **14,000 px/s** | **19,250 px/s** | **$503,300 → $366,000** | **$137,300** |
+| 15K fleet-overall, upper end | 15,000 px/s | 20,625 px/s | $469,700 → $341,600 | $128,100 |
+| optimistic — 21K mid-density | 21,000 px/s | 28,875 px/s | $335,500 → $244,000 | $91,500 |
 
 **Two caveats on that number, both real.** The constants are labelled a *strategy-only
 estimator* — they exist so the striping planner can ask "will the GPU stay busy long
@@ -234,8 +320,10 @@ GPU-hours per zone-year:
 
 | | GPU-h per zone-year | matched fleet, 40 cells | matched fleet, 71 cells |
 |---|---|---|---|
-| v1.1 @ 21K | 180.4 | 946 | 1,678 |
-| **v2 Large @ 28.9K** | **131.2** | **688** | **1,220** |
+| **v1.1 @ 14K** | **270.7** | **1,419** | **2,518 — over quota** |
+| **v2 Large @ 19.3K** | **196.9** | **1,032** | **1,831** |
+| v1.1 @ 21K (optimistic) | 180.5 | 946 | 1,678 |
+| v2 Large @ 28.9K (optimistic) | 131.3 | 688 | 1,221 |
 
 ### Correcting my own earlier estimate
 
@@ -314,50 +402,85 @@ Open Data application asks how large the dataset is.
 
 ## 8. Scenario summary
 
-Ingest at its cost midpoint; inference at the 21K basis with a **matched** GPU fleet, so
-no idle burn in any column. All four combinations of the two decisions still open.
+Ingest at its cost midpoint; inference at the **14K capacity-planning basis** (§6) with a
+**matched** GPU fleet, so no idle burn in any column. All four combinations of the two
+decisions still open. An earlier version of this table was built on the 21K basis; those
+figures are kept as a final row so the difference is visible rather than silently replaced.
 
 | | shipped 40×50w<br>**v1.1** | shipped 40×50w<br>**v2 Large** | optimal 71×50w<br>**v1.1** | optimal 71×50w<br>**v2 Large** |
 |---|---|---|---|---|
 | Fargate vCPU required | 12,640 | 12,640 | 22,436 | 22,436 |
-| Matched GPU fleet | 946 | 688 | 1,678 | 1,220 |
+| Matched GPU fleet | 1,419 | 1,032 | **2,518 — exceeds quota** | 1,831 |
 | Ingest | $121,000 | $121,000 | $121,000 | $121,000 |
-| Inference | $335,400 | $243,900 | $335,400 | $243,900 |
+| Inference | $503,300 | $366,000 | $503,300 | $366,000 |
 | Assembly + S3 + mosaics | $4,800 | $4,800 | $4,800 | $4,800 |
-| **Total** | **$461,000** | **$370,000** | **$461,000** | **$370,000** |
+| **Total** | **$629,000** | **$492,000** | **$629,000** | **$492,000** |
 | Ingest wall clock | 7.9 d | 7.9 d | 4.5 d | 4.5 d |
+| Inference wall clock at the matched fleet | 7.9 d | 7.9 d | 4.5 d | 4.5 d |
 | Campaign wall clock (staged) | ~8.1 d | ~8.1 d | ~4.6 d | ~4.6 d |
-| Idle burn if you run 2,500 GPUs anyway | +$552,000 | +$643,000 | +$164,000 | +$256,000 |
+| Idle burn if you run 2,500 GPUs anyway | +$407,000 | +$538,000 | **$0 — quota-bound** | +$124,000 |
+| *same row on the superseded 21K basis* | *$461,000 total* | *$370,000* | *$461,000* | *$370,000* |
 
-Read the columns in pairs. **Choosing v2 Large is worth $91,000 and is independent of the
-ingest configuration.** **Choosing 71 cells is worth 3.4 days and costs nothing** — its
-value is entirely in wall clock and in the fleet it lets you keep busy. The bottom row is
-what either choice costs if the fleet is then sized to the quota instead of to the work.
+Read the columns in pairs. **Choosing v2 Large is worth $137,000 at this basis and is
+independent of the ingest configuration.** **Choosing 71 cells is worth 3.4 days and costs
+nothing.** What has changed from the earlier version is the bottom pair of rows: at 71 cells
+on v1.1 the matched fleet now *exceeds* the quota, so there is no idle burn to avoid and the
+value of the 71-cell configuration is entirely schedule.
 
-At the pessimistic 15K basis rather than 21K, add **$134,000** to the v1.1 columns and
-**$98,000** to the v2 columns.
+At the optimistic 21K basis instead, subtract **$168,000** from the v1.1 columns and
+**$122,000** from the v2 columns.
 
-**The two scenarios cost the same to within a rounding error.** The decision between them
-is about wall clock — 7.9 days against 4.5 — and about how much GPU quota you can convert
-into work rather than idle: 946 GPUs against 1,678. It is not about money spent on ingest.
+**The two ingest scenarios cost the same to within a rounding error.** The decision between
+them is about wall clock — 7.9 days against 4.5 — and about how much GPU quota you can
+convert into work rather than idle: 1,419 GPUs against the full 2,500. It is not about money
+spent on ingest.
+
+**One consequence for the deadline.** All years must be validated by **2026-09-11**. Every
+column above is 4.6 to 8.1 days of campaign wall clock, so the compute is not what threatens
+that date; the schedule risk lives in the preflight gates (§10) and in the Fargate quota
+lead time, not in the run.
 
 ---
 
 ## 9. Assumptions and uncertainties, largest first
 
-1. **Throughput, 15K versus 21K px/s.** Worth $134,000, and now the largest open number
-   in the model. Resolvable with one instrumented dense-zone run.
+1. **Throughput, 14K versus 21K px/s.** Worth **$168,000**, and the largest open number in
+   the model. §6 argues for 14K on the profiling doc's own labelling, but that is a reading
+   of someone else's measurement, not a measurement of this campaign. Resolvable with one
+   instrumented dense-zone run — which also settles whether the *dense* while-processing
+   band (10–18K) or the fleet-overall figure is the better predictor at campaign scale.
+2. **The matched fleet at 71 cells sits within 1% of the 2,500-actor quota** (2,518). A
+   figure that close to a hard limit should not be treated as showing the quota suffices:
+   the supply rates feeding it are themselves 3.6% understated (§4), and per-zone ingest
+   durations carry ±35%. Treat 71 cells on v1.1 as *quota-bound*, and expect to be deciding
+   between raising the GPU quota and accepting a longer inference tail.
 3. **No measured v2 Large throughput exists.** The 0.89× compute ratio is derived from the
    architectures, and the pipeline is not compute-bound, so it may not appear at all.
-4. **Fleet-matching assumes ingest and inference stay in lockstep.** The duty-cycle
-   arithmetic treats supply as smooth. It is not: dense zones take far longer than sparse
-   ones, and the campaign deals the densest zones first, so early supply is slower than
-   average and late supply faster. Expect real duty to be somewhat below the table.
+4. **Fleet-matching assumes ingest and inference stay in lockstep, and they do not.** The
+   duty-cycle arithmetic treats supply as smooth. It is not: dense zones take far longer than
+   sparse ones, and the campaign deals the densest first, so early supply is slower than
+   average and late supply faster. **This is now modelled rather than hand-waved** —
+   `tests/unit/test_gpu_starvation.py` runs the real per-zone tile counts through one
+   cluster's ingest look-ahead and matched actor pool. At 71 cells, a fleet that boots on its
+   first mosaic idles about **4.8 GPU-hours per cluster-year** — **108,400 idle GPU-hours,
+   about $202,000**, across the campaign. Holding the boot until the queue contains **3.25
+   work-hours** of pixels removes it entirely, for **25.5 hours** of added schedule over nine
+   years. That is the second-largest cost lever in this document after fleet sizing itself,
+   and unlike fleet sizing it is not scenario-dependent: it appears in all 96 combinations
+   the model scans. **It is a recommendation, not shipped behaviour.**
+
+   The 3.25 figure is a threshold, not a preference — 3.0 starves in 2 of 96 combinations and
+   3.25 in none — and it holds for **both models on one number**, because it is denominated in
+   work-hours for the fleet that will consume them. A matched fleet shrinks in inverse
+   proportion to the model's rate (315 actors at 14K and 229 at 19.25K both consume 4.41
+   Mpx/s, within 0.05%), so the same work-hours means the same pixels. A mosaic count or a
+   pixel threshold would each need re-deriving per model.
 5. **Ingest carries the ±10% per-date fit** from its own estimate, plus the untested
-   assumption that cell interference stays flat above 20 concurrent cells.
+   assumption that cell interference stays flat above 20 concurrent cells. Per-zone
+   durations additionally carry **±35%** (§4), which the aggregate basis hides.
 6. **The v2 rate's provenance is undocumented.** 22,000 against 16,000 px/s is the
    branch's own planning estimator, labelled strategy-only, and the calibration its
-   comment points at is not on the branch. The 1.375× ratio is worth $91,000–$128,000 and
+   comment points at is not on the branch. The 1.375× ratio is worth $122,000–$137,000 and
    currently rests on a constant nobody has shown their working for.
 7. **Pixel count.** The 2048-tile census gives 1.363 × 10¹³; the ingest estimate's
    4096-chunk census implies 1.459 × 10¹³, about 7% higher. The larger figure would add
@@ -367,17 +490,24 @@ into work rather than idle: 946 GPUs against 1,678. It is not about money spent 
 
 ## 10. What to do about it
 
-1. **Size the GPU fleet to the ingest supply rate, not to the quota** — 946 GPUs at 40
-   cells, 1,678 at 71. Provisioning the full 2,500-actor quota against 40-cell ingest is
-   a $550,000 mistake, and with spot excluded it is the only six-figure lever left.
+1. **Size the GPU fleet to the ingest supply rate, not to the quota** — at the
+   capacity-planning basis that is **1,419 GPUs at 40 cells and 2,518 at 71**. Provisioning
+   the full 2,500-actor quota against 40-cell ingest is a **$407,000** mistake, and with spot
+   excluded it is the only six-figure lever left. At 71 cells on v1.1 the mistake is not
+   available: the matched fleet already exceeds the quota. **Decide the ingest cap first** —
+   it determines whether fleet sizing is a lever at all.
 2. **Raise the Fargate quota to ~23,000 vCPU and raise `max_parallel_ingest` from 40 to
    71.** No width change is needed — 50 workers is already the shipped default. It costs
    nothing measurable, halves ingest wall clock from 7.9 days to 4.5, and raises the GPU
-   fleet you can keep busy from 946 to 1,678.
+   fleet you can keep busy from 1,419 to the full 2,500-actor quota.
 3. **Run v2 Large, and measure one dense zone end to end on it.** The branch's own rate
-   makes it worth $91,000–$128,000, which is second only to fleet sizing — and the same
-   run settles the 15K-versus-21K question ($134,000) and puts a documented number behind
+   makes it worth $122,000–$137,000, which is second only to fleet sizing — and the same
+   run settles the 14K-versus-21K question ($168,000) and puts a documented number behind
    the 1.375× ratio. One run, three answers.
+
+4. **Do not carry the 21K basis and the 1,678-GPU fleet together into any plan.** They came
+   from the same superseded version of §6 and each looks defensible alone; together they
+   under-provision by a third and stretch inference from 4.5 days to 6.7.
 
 ---
 

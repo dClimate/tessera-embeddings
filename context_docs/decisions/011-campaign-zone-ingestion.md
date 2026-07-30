@@ -54,14 +54,39 @@ attr `ingest_marker`, a fingerprint of window + `min_valid_coverage` + requested
 short-circuits, and the marker is written **only after coverage is verified**, so
 it can never bless an incomplete mosaic. The probe runs over the **maximal**
 candidate set (reflectance + both SAR orbits) keyed on physical existence, not
-just the resolved-orbit set — so a half-written prior attempt (one store written,
-crashed before any marker, or a SAR crash the orbit-resolver can't see) is
-**cleared and rebuilt** rather than appended onto, which would dedupe against
-stale dates and then stamp the new fingerprint over mixed inputs. A changed input
-(rebuilt coverage, new threshold, ascending-only → both) changes the fingerprint
-and likewise forces a clean rebuild. The clearing delete is `strict` so a failed
-delete aborts rather than ingesting onto stale data. An unreadable store (transient
-/ auth `IcechunkError`) re-raises rather than being mistaken for "absent".
+just the resolved-orbit set, so a SAR crash the orbit-resolver can't see is still
+seen. A changed input (rebuilt coverage, new threshold, ascending-only → both)
+changes the fingerprint. An unreadable store (transient / auth `IcechunkError`)
+re-raises rather than being mistaken for "absent".
+
+**Amended 2026-07-29 — an interrupted store is RESUMED, not rebuilt.** This ADR
+originally specified that a half-written prior attempt be **cleared and rebuilt**,
+on the reasoning that appending to it would dedupe against stale dates and then
+stamp a fresh fingerprint over mixed inputs. That is now superseded, because at
+campaign scale a crash is expected rather than exceptional and discarding a
+part-built dense mosaic can throw away most of a day's ingest.
+
+Three properties make resuming safe, and the third is what the original reasoning
+was missing:
+
+- **Icechunk commits a date's time slot atomically with its pixels**, so a date
+  present is complete and a date absent was never started. There is no partial
+  date to detect. This is a property of the format, not of our code.
+- **The dates already present are not "stale"** unless an input that decides
+  *which* dates qualify has changed — and every such input is in the fingerprint,
+  including the coverage mask (`IngestManifest.coverage_sha256`, validated on
+  every write). A store whose marker matches the current fingerprint was built
+  under the same admission rules the resume would apply.
+- **An unmarked store carries no fingerprint to compare**, which is exactly the
+  crash case. It is adopted: the flow logs `RESUMING`, ingests only the missing
+  dates, and stamps the marker at the end. A store whose marker is *present and
+  different* is the genuinely unsafe case and raises `ConfigMismatchError` rather
+  than being silently mixed or silently discarded.
+
+The clearing delete remains for the mismatch path and is still `strict`, so a
+failed delete aborts rather than ingesting onto stale data. It threads credentials
+explicitly: a delete that fails on permissions must not be mistakable for a
+corrupted store.
 
 **Mosaics are transient** (`cleanup_mosaics`, default on): they are re-derivable
 inputs at ~5–15 TB per zone-year, so retention across 120 zones × 9 years is

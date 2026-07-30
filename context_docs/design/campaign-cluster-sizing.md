@@ -55,6 +55,20 @@ densest-first sort in `fill_zones_sequential`. They are asserted in
    still puts the island tail last. At 20 actors this was worth ~6 h a year; on a
    2,500-actor fleet, where a whole cluster's inference is 8 h, it is most of the
    run.
+
+   > **Both figures above are at 120 S2 workers, not the shipped 50.** The campaign
+   > default is `max_workers = 50`, at which the same densest zone takes **~17 h**
+   > rather than ~10 (`T(W) = 36.3 + 7896/W` s/date, ingest estimate §3.10). Read
+   > ~10 h and ~4 h as a *ratio*: the argument for not blocking is about the gap
+   > between the densest mosaic and a smaller one, and that gap widens at the
+   > shipped width. Where an absolute number is needed, take it at 50w.
+
+   > **Not blocking has a cost of its own, found later.** A wider ingest look-ahead
+   > pulls smaller zones into the opening window, so the first mosaic to land is
+   > *shallower* and the fleet boots against a thinner queue — which makes GPU duty
+   > cycle **worse**, not better. Modelled in `tests/unit/test_gpu_starvation.py`.
+   > The fix is a work-hour bank at boot, not a return to blocking; see
+   > `campaign-cost-model.md` §9.
 2. **Every cluster runs dense → sparse.** The autoscaled fleet then only ever
    shrinks (no mid-run worker relaunch) and the cheap island zones land at the tail.
 3. **Clusters finish together.** Near-even total work, so no cluster is still

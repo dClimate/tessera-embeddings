@@ -391,10 +391,18 @@ def test_the_fleet_size_supply_can_feed_depends_on_the_ingest_width(opener_clust
 #: `inference/actors.py` (22,000 against 16,000 px/s). Strategy-only and its calibration is
 #: undocumented, so the RATIO is what is defensible, not the absolutes.
 V2_SPEEDUP = 1.375
-#: Matched fleets per cluster from `campaign-cost-model.md`: 1,678 GPUs on v1.1 and 1,220 on
-#: v2, over 8 clusters. The fleet shrinks because a faster model needs less of it to keep pace.
-ACTORS_V11 = 210
-ACTORS_V2 = 153
+#: Matched fleets per cluster from `campaign-cost-model.md` §5, at the **14K capacity-planning
+#: basis** and 71 ingest cells: 2,518 GPUs on v1.1 and 1,831 on v2, over 8 clusters. The fleet
+#: shrinks because a faster model needs less of it to keep pace with the same ingest.
+#:
+#: These were 210 and 153 until the cost model's throughput basis was corrected. That pairing was
+#: WRONG in a specific way worth naming, because it is the error the cost model now warns about:
+#: 210 is the fleet matched to a 21K px/s rate, while `RATE_CAPACITY_PLANNING` below is 14K. A
+#: fleet sized on one rate and run at another is not matched to anything, and it understated the
+#: fleet by a third — which made starvation LOOK less likely than it is. Keep these two constants
+#: consistent: `n_actors x rate` must equal the per-cluster supply the scenario claims.
+ACTORS_V11 = 315
+ACTORS_V2 = 229
 
 #: The recommended bank: 3.25 work-hours, the lowest value that clears the envelope.
 #:

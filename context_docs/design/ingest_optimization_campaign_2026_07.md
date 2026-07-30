@@ -146,11 +146,42 @@ own. Fleet width more than accounts for the slowdown, so no contention term surv
 forecast multiplied out a 1.04-per-cell penalty, implying 2.56× at 40 cells; that is **withdrawn**.
 **The binding constraint on schedule is the Fargate quota, not interference between cells.**
 
-### Two corrections worth reading before planning
+### Three corrections worth reading before planning
 
 > **Do not size cells against the dispatch-rate model in §2.** Its shape still holds but its
 > constant is stale, and the advice it produced — keep cells narrow — is **withdrawn**. §2 has
 > the detail.
+
+> **How to get an ingest duration out of this document, because getting it wrong is easy.**
+> Three tables here report per-date seconds and they answer different questions. Taking the
+> wrong one cost real effort in July, so the mapping is written down:
+>
+> | you want | use | not |
+> |---|---|---|
+> | duration for a zone of known density | the **five-region k=1 column** (§3.16) | the k=4 column — that is a batching A/B |
+> | how duration moves with fleet width | the **width model** `T(W) = 36.3 + 7896/W` (§3.10) | any single row, which is one width |
+> | what overlapping bought S1 | the **three-ROI table** (§4.9) | anything about whole-cell duration |
+>
+> The five-region k=1 column fits `s/date = 10.16 + 0.06022 × live_4096_chunks`, R² 0.954, and
+> those measurements sit at **~60 workers** — its 35N row (175.6 s) is within 5% of the width
+> model at 60w (167.9 s), which is how the width is established rather than assumed. Two
+> checks that the fit is sound: summed over the 111 real per-zone tile counts it gives **5.95
+> h/zone-year at 60w against the campaign basis's 6.36, a 6.5% agreement**; and the apparent
+> "~10 h versus ~21 h" disagreement between planning documents is the same dense zone at 120
+> workers and at 50, via this model. **Nothing here was ever in conflict.**
+>
+> Two limits to carry with the fit. The intercept is a real fixed cost of about **1.0 h per
+> zone-year**, so an all-but-empty zone costs an hour rather than minutes. And per-zone
+> residuals run to **±35%** — 35N and 47N differ by 3 chunks in 2,418 and by 27% in per-date
+> time, so area does not determine duration tightly.
+>
+> **The S1 table is a precondition, not an addend.** A cell runs S2 and both S1 orbits
+> concurrently, so a cell's per-date cost is the MAX of the three arms, and the fit above is
+> the S2 arm alone. Using it as the cell duration is legitimate *only* because §4.9 took S1's
+> per-date write time down 2.4–3.9×, which is what brought S1's work to 15.5–18.1% of S2's and
+> lets `s1_worker_fraction = 0.22` hide it inside S2's runtime with 20–40% to spare. Before
+> that change S1 was the critical path on sparse zones and this substitution would have been
+> wrong. If S1's per-date cost ever regresses, the substitution fails before the ratio does.
 
 > **Dates per zone-year is 365, not the ~250 once assumed.** A full-height zone sees imagery
 > every day. The earlier figure came from a region spanning about 3° of latitude, which
