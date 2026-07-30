@@ -212,7 +212,68 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
 
 ---
 
-## 9. Evidence
+## 9. What drives the numbers
+
+Every figure in §4 comes from the inputs below. If one changes, this is the table that says
+what moves and by how much — and what to say about *why* it moved.
+
+**Measured. Changing one of these means the world changed, or we re-measured it.**
+
+| input | value | drives |
+|---|---|---|
+| live 2048-tiles | 360,953/yr → 1.363 × 10¹³ px over 9 yr | every cost; pixels are the volume term |
+| land zones × years | 111 × 9 = 999 zone-years | per-zone-year unit costs |
+| dates per zone-year | 365 | ingest duration |
+| per-zone ingest fit | `s/date = 10.16 + 0.06022 × live_4096_chunks` (R² 0.954, 5 regions) | zone durations, and so the wall-clock floor |
+| fleet width model | `T(W) = 36.3 + 7896/W` — **fitted over ~30–60 workers only** | whether 80w reaches 4.5 days |
+| inference rate, reference ROI | 13–15K px/s fleet-overall (Iowa) | the anchor the 15K basis scales from |
+| Fargate | $0.04048/vCPU-h, $0.004445/GB-h | ingest cost |
+| g6e.xlarge | $1.861/h on-demand | inference cost — the largest line |
+
+**Derived. These are arithmetic on the row above; recompute, do not re-estimate.**
+
+| figure | value | from |
+|---|---|---|
+| longest zone-year | 17.3 h @50w · **15.0 h @60w** · 12.0 h @80w | the per-zone fit + width model |
+| the knee | **45 cells** | total work ÷ longest zone |
+| tokens per pixel | campaign **167** vs Iowa 192 → ratio **0.87** | the observation model below |
+| planning rate | **15K px/s** | Iowa's 13K × 1.15 |
+| GPU-h per zone-year | **252.6** | pixels ÷ rate ÷ 999 |
+| fleet to provision | **85% of matched** | policy, not measurement — see §4 |
+
+**Estimated. These are the soft ones, and the first dominates.**
+
+| assumption | value | worth | how to retire it |
+|---|---|---|---|
+| **dual-orbit fraction** | **0.70** | **~$150,000** | count it — `resolve_s1_orbit` already knows |
+| cloud-free fraction | 0.25 tropics → 0.55 subtropics | ~$40,000 | per-pixel `s2_obs_count` in the store |
+| S2 revisit | `73 / cos(lat)` acquisitions/yr | small | as above |
+| S1 cadence | 50.7 passes/direction/yr (6-day to Dec 2021, 12-day after) | small | `s1_*_obs_count` in the store |
+| ingest interference above 20 cells | assumed flat | schedule only | measured flat to 20; 45 is an extrapolation |
+
+**Four mechanisms. If a number moves and you cannot explain it with one of these, something
+else changed.**
+
+1. **Years are serial, so the longest single zone is a floor on each year.** This is why
+   cells stop helping at 45 and why width is the only lever past it. Break the year barrier
+   and the whole shape changes.
+2. **Inference cost scales with tokens, not pixels** — `tokens = pixels × observations per
+   pixel`. Observation count varies about twofold with latitude and orbit count, which is
+   what makes the campaign cheaper per pixel than the region we measured on.
+3. **Ingest worker-hours are width-neutral.** Halve the fleet, double the duration, same
+   bill — so fleet width is schedule bought for free, and cost is nearly flat across every
+   configuration in §4.
+4. **Inference cost is invariant to the ingest configuration.** Same pixels, same rate. The
+   ingest configuration decides only how fast mosaics arrive, and therefore how large a GPU
+   fleet stays busy.
+
+**Known to be wrong, not yet fixed:** `_partition_by_live_tiles` balances clusters on tile
+counts, which is area. Cost scales with area × observations, so clusters can finish at
+materially different times even with equal tile counts.
+
+---
+
+## 10. Evidence
 
 - [`campaign-cost-model.md`](campaign-cost-model.md) — costs, GPU fleet sizing, the idle-burn
   arithmetic, and the observation-count model behind the throughput basis.
