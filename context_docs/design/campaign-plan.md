@@ -53,12 +53,12 @@ Defaults are in `run_global_campaign`. Only the starred row needs changing.
 |---|---|---|
 | `fill_strategy` | `"chained-clusters"` | one cluster per zone-set, not per zone-year |
 | `max_parallel_clusters` | 8 | balance holds to ~16; 8 keeps each cluster opening on a top-8 zone |
-| **`max_parallel_ingest`** | **40 → 71** ★ | fleet-wide cap on simultaneous zone-ingests; see §4 |
+| **`max_parallel_ingest`** | **40 → 45** ★ | fleet-wide cap on simultaneous zone-ingests. 45 is the knee: past it the year barrier makes extra cells worthless (§4) |
 | `max_zone_attempts` | 2 | bounded re-dispatch per year |
-| `ingest_settings.max_workers` | 50 | S2 fleet width; **already the default, do not raise to 60** |
-| `ingest_settings.s1_worker_fraction` | 0.22 | → 11 workers per S1 orbit, sized to finish inside S2 |
+| **`ingest_settings.max_workers`** | **50 → 60** ★ | S2 fleet width. Past the knee this is the ONLY thing that shortens the campaign, because the longest single zone sets the floor (§4) |
+| `ingest_settings.s1_worker_fraction` | 0.22 | → 13 workers per S1 orbit at the recommended 60w, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
-| `num_actors` | 20 → **~313 (v1.1) or ~229 (v2)** | GPU actors per cluster; match the fleet to ingest supply, see §4 |
+| **`num_actors`** | **20 → ~199** ★ | GPU actors per cluster: 85% of what ingest can feed, so the fleet never idles and keeps headroom for a restart (§4) |
 | `s1_orbit` | `"both"` | downgrades per zone when an orbit has no imagery |
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
@@ -84,69 +84,62 @@ cluster-year with finished mosaics already on disk.
 
 ---
 
-## 4. Sizing, cost, and the one expensive mistake
+## 4. Sizing, cost, and the two things that actually bind
 
-Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md).
+Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md). Costed at the **15K
+px/s basis**, which is derived from observation counts rather than borrowed from a single
+ROI: the world's land is weighted toward the cloudy tropics, so the campaign carries about
+**0.87× the tokens per pixel** of the Iowa region every measured rate comes from, and
+therefore runs slightly faster than it.
 
-Costed at the **14K px/s capacity-planning basis**. An earlier version of this table used
-21K, a mid-density while-processing rate that this dense-weighted campaign does not earn;
-the cost model's §6 explains the correction. Every fleet figure below is larger as a result.
+**Years run serially, so a year cannot finish faster than its longest single zone** — about
+17.3 hours at 50 workers, 15.0 at 60. That floor is what shapes everything:
 
-| | shipped (40 cells) | **recommended (71 cells)** |
-|---|---|---|
-| Fargate vCPU | 12,640 | **22,436** |
-| Ingest wall clock | 7.9 days | **4.5 days** |
-| Mosaic supply | 5.24 zone-yr/h | **9.30 zone-yr/h** |
-| **GPU fleet that stays busy — v1.1** | **1,419** | **2,518 — over the 2,500 quota** |
-| **GPU fleet that stays busy — v2 Large** | **1,032** | **1,831** |
-| Ingest cost | ~$121,000 | ~$121,000 |
-| Inference cost — v1.1 | $503,000 | $503,000 |
-| Inference cost — v2 Large | $366,000 | $366,000 |
-| **Campaign total — v1.1** | **$629,000** | **$629,000** |
-| **Campaign total — v2 Large** | **$492,000** | **$492,000** |
+```
+   makespan per year = max( longest zone ,  total work / cells )
+                            ^ only WIDTH     ^ only CELLS shorten
+                              shortens this    this, and only up to 45
+```
 
-Both models are carried because the model choice is still open (§8) and it must be settled
-before the store is seeded — a store's advertised model identity is write-once.
+| | 40 × 50w<br>shipped | 45 × 50w<br>the knee | **45 × 60w**<br>**recommended** | 45 × 80w<br>target |
+|---|---|---|---|---|
+| Fargate vCPU | 12,640 | 14,220 | **16,740** | 22,140 |
+| Ingest wall clock (9 yr) | 7.2 d | 6.5 d | **5.6 d** | 4.5 d |
+| Mosaic supply | 5.76/h | 6.41/h | **7.42/h** | 9.22/h |
+| GPU fleet to provision | 1,237 | 1,376 | **1,592** | 1,980 |
+| — actors per cluster | 155 | 172 | **199** | 247 |
+| **Campaign wall clock** | ~8.7 d | ~7.8 d | **~6.8 d** | ~5.5 d |
+| **Campaign cost** | $602,000 | $603,000 | **$604,000** | $606,000 |
 
-**GPUs are on-demand.** Spot is excluded by decision, not by oversight: sustaining ~1,700
-g6e instances for days makes interruption a certainty, and a campaign that stalls on
-capacity is worse than one that costs more. Settled; do not re-open.
+**Every configuration costs the same to within 0.7%.** Inference is the same pixels at the
+same rate; ingest worker-hours are width-neutral. The decision is wall clock, bought with
+Fargate quota — nothing here is a cost trade.
 
-**Size the GPU fleet to the ingest supply rate, never to the quota.** A zone-year costs
-about **271 GPU-hours** on v1.1. Provisioning the full 2,500-actor quota against 40-cell
-ingest runs the fleet at 57% duty and burns roughly **$407,000 of idle GPU time** — more
-than three times the ingest bill.
+**Above 45 cells, extra Fargate quota buys nothing.** Not schedule, not supply, not usable
+GPU fleet. An earlier version of this plan asked for 71 cells and 23,000 vCPU; 45 × 60w is
+nearly two days faster on 16,740.
 
-**At 71 cells on v1.1 the matched fleet is 2,518 GPUs (~313 actors across 8 clusters), which
-is above the 2,500-actor quota.** In that configuration the quota, not ingest, is the
-constraint, and there is no idle burn to avoid. On v2 Large the matched fleet is 1,831
-(**~229 actors**) — v2 is 1.375× faster and so needs less fleet for the same ingest, which
-leaves 27% of the quota idle if it is provisioned anyway, worth **$124,000**.
+**Provision the GPU fleet UNDER what ingest can feed — about 85% of it.** That is the policy,
+not an accident of rounding. It keeps a standing queue of finished mosaics so the fleet is
+never idle, and the 15% margin absorbs an ingest cell failing and restarting without the GPUs
+noticing. Inference then trails ingest by roughly 18% of the run, which is the "slightly
+slower start" that buys the guarantee. **Do not provision against the 2,500-actor quota**:
+the largest fleet any configuration here can keep busy is 1,980, and the recommended one
+wants 1,592.
 
-Note the direction that pushes: a faster model makes an oversized fleet **worse**, because
-each zone-year is consumed sooner and the fleet starves longer. The model choice and the
-fleet size are coupled and must be decided together — and which of them binds depends on the
-ingest cap, so **decide the cap first.**
+**GPUs are on-demand.** Spot is excluded by decision: sustaining this many g6e instances for
+days makes interruption a certainty, and a campaign that stalls on capacity is worse than one
+that costs more. Settled; do not re-open.
 
-**A matched fleet is necessary but not sufficient.** Matching balances supply against demand
-*on average*; it does not stop a fleet idling at the start of a cluster-year, when the
-opening window has produced only one shallow mosaic. Modelled in
-`tests/unit/test_gpu_starvation.py`: booting on the first mosaic wastes about **108,400
-GPU-hours (~$202,000)** across the campaign, and holding the boot until **3.25 work-hours** of
-pixels are queued removes it for about **26 hours** of added schedule. One figure serves both
-models, because a matched fleet's consumption rate is what the unit is denominated in.
-Recommended, **not yet shipped.**
-
-Raising the ingest cap costs nothing measurable and is worth 3.4 days and 732 GPUs of
-usable fleet. It is the single highest-value setting in this document.
+**The model is v1.1.** v2 Large was evaluated and is not being used.
 
 ---
 
 ## 5. Before launch
 
-1. **Fargate quota ≥ 23,000 vCPU** in us-west-2, and **GPU quota** for the chosen fleet —
-   which on v1.1 at 71 cells means **more than the current 2,500 actors**. Quota increases
-   have lead time; start here.
+1. **Fargate quota ≥ 17,000 vCPU** in us-west-2. The existing 2,500-actor GPU quota is
+   already more than enough — the recommended fleet is ~1,600, and no configuration in §4
+   can keep more than 1,980 busy. Fargate quota has lead time; start there.
 2. **Prefect concurrency limits provisioned** — `tessera-global-ingests` and
    `tessera-global-commits`. Both gates are strict and fail closed on a missing limit.
 3. **Coverage/land mask built** for all 120 zones, and its `registry_sha256` frozen. A
@@ -197,26 +190,32 @@ There are **no Prefect-level retries** on any ingest flow, deliberately.
 
 ## 8. Open before launch
 
-1. **Which model.** v2 Large runs **1.375× faster** on the branch's own per-model rate
-   (22,000 against 16,000 px/s in `inference/actors.py`), which is worth
-   **$122,000–$137,000** and cuts the matched fleet from 2,518 to 1,831. It also emits 128-D
-   natively rather than truncating 192-D. Against that: the rate is a strategy-only
-   planning constant whose calibration is not written down anywhere, and the model identity
-   a store advertises is write-once — so this must be decided *before* seeding, not after.
-2. **One instrumented dense-zone run.** Settles the throughput question (14K vs 21K px/s,
-   worth $168,000 — and it decides whether the GPU quota binds at all) and puts a documented
-   number behind the 1.375× ratio, in one run. This is the last preflight gate.
-3. **Public release.** The permanent store is 0.9–1.8 PB and goes to AWS Open Data, which
-   sponsors the storage — so it is not costed. It has lead time, and the size figure is
-   what the application will ask for.
-4. **Ingest cap 40 → 71**, conditional on the Fargate quota landing.
+Settled since the last revision, and not to be re-opened: **the model is v1.1**, **GPUs are
+on-demand**, and the permanent store goes to **AWS Open Data**.
+
+1. **Count the dual-orbit zones.** The single largest input to the cost model, worth about
+   $150,000 across its plausible range, and it needs a count rather than an experiment —
+   `resolve_s1_orbit` already knows which orbits each zone-year has. Do this before the
+   budget is signed off.
+2. **Measure the densest zone at two fleet widths (60 and 80).** It decides whether the
+   campaign is 5.6 days or 4.5, and it is the only remaining question about the schedule. The
+   width model is fitted over roughly 30–60 workers, so 80 is currently an extrapolation.
+   This is the last preflight gate.
+3. **Fargate quota to ~17,000 vCPU**, then set `max_parallel_ingest` to 45 and
+   `max_workers` to 60. Quota has lead time; start it first.
+4. **Public release.** The store is 0.9–1.8 PB. AWS Open Data has lead time and the size
+   figure is what the application asks for.
+5. **Weight the zone-to-cluster split by work rather than area.** `_partition_by_live_tiles`
+   balances on tile counts, but cost scales with tiles × observations and observation count
+   varies about twofold with latitude. Not a blocker; it makes cluster finish times
+   uneven rather than wrong.
 
 ---
 
 ## 9. Evidence
 
 - [`campaign-cost-model.md`](campaign-cost-model.md) — costs, GPU fleet sizing, the idle-burn
-  arithmetic, and the v2 comparison.
+  arithmetic, and the observation-count model behind the throughput basis.
 - [`campaign-cluster-sizing.md`](campaign-cluster-sizing.md) — the coverage census, how zones
   divide across N clusters, and why commit concurrency is a non-issue.
 - [`ingest_optimization_campaign_2026_07.md`](ingest_optimization_campaign_2026_07.md) — every
