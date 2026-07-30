@@ -189,12 +189,17 @@ def plan(n_clusters: int, tiles: dict[str, int] | None = None) -> list[ClusterPl
     # The partitioner reads the coverage store; feed it the snapshot instead.
     import tessera_embeddings.orchestration.prefect.flows.run_global_campaign as campaign
 
-    real = campaign.zone_live_tile_count
-    campaign.zone_live_tile_count = lambda _mask, z, **_k: tiles[z]
+    # The partitioner now weights tiles by their latitude band's observation count
+    # (`zone_work_weight`). This diagnostic feeds it RAW TILE COUNTS on purpose: its
+    # subject is the LPT dealing and the density ordering, and holding the weights equal
+    # to tiles keeps those properties comparable against the counts the snapshot records.
+    # The weighting itself is covered by `test_zone_work_weight`.
+    real = campaign.zone_work_weight
+    campaign.zone_work_weight = lambda _mask, z, **_k: float(tiles[z])
     try:
         groups = _partition_by_live_tiles(live, n_clusters, land_mask_path="<snapshot>")
     finally:
-        campaign.zone_live_tile_count = real
+        campaign.zone_work_weight = real
     return [
         ClusterPlan(zones=ordered, tiles=[tiles[z] for z in ordered])
         for ordered in (sorted(g, key=lambda z: tiles[z], reverse=True) for g in groups)

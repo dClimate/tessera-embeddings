@@ -72,7 +72,7 @@ from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import Inge
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_has_live_tiles,
-    zone_live_tile_count,
+    zone_work_weight,
     zone_year_on_axis,
 )
 from tessera_embeddings.storage.campaign import (
@@ -360,11 +360,31 @@ def _partition_by_live_tiles(
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
 ) -> list[list[str]]:
-    """Split ``zones`` into ``n_clusters`` lists of ~equal total live-tile count.
+    """Split ``zones`` into ``n_clusters`` lists of ~equal total inference WORK.
 
-    Longest-processing-time greedy: zones descending by coverage-bitmap tile
-    count, each assigned to the currently-lightest cluster — so the sequential
-    fill's clusters finish their zone lists at roughly the same time.
+    Longest-processing-time greedy: zones descending by work, each assigned to the
+    currently-lightest cluster — so the sequential fill's clusters finish their zone
+    lists at roughly the same time.
+
+    **Work, not area (changed 2026-07-30).** This balanced on raw live-tile counts,
+    which balances AREA. Inference consumes one sequence per pixel, so its cost scales
+    with `pixels x observations`, and observation count varies about twofold with
+    latitude — so two clusters with identical tile counts could carry materially
+    different work and finish at different times. :func:`zone_work_weight` weights each
+    live tile row by its latitude band's observation count, at the same one-GET cost.
+
+    Two reasons this mattered more than it looks. Clusters are long-lived and their
+    finish times set the campaign's, so a systematically heavy cluster is not averaged
+    away. And the imbalance is not random: observation count varies with latitude, so a
+    cluster that happens to draw high-latitude zones is heavy in every year, not just
+    one.
+
+    The within-cluster ORDER is deliberately untouched: the chained fill re-sorts its
+    own zones by tile count (``fill_zones_sequential``), because ordering and actor
+    clamping are properties of area — a zone needs one actor per tile however many
+    observations each pixel has, and the descending sort is what lets an autoscaled
+    fleet only ever shrink. This function decides *which* cluster gets a zone; the
+    child decides *when*.
 
     A second property falls out of the same ordering and is load-bearing: the
     first ``n_clusters`` zones are the densest in the year and every cluster gets
@@ -383,13 +403,13 @@ def _partition_by_live_tiles(
     if n_clusters <= 1:
         return [zones]
     weight = {
-        z: 0
+        z: 0.0
         if z in known_complete
-        else zone_live_tile_count(land_mask_path, z, get_credentials=get_credentials, s3_region=s3_region)
+        else zone_work_weight(land_mask_path, z, get_credentials=get_credentials, s3_region=s3_region)
         for z in zones
     }
     clusters: list[list[str]] = [[] for _ in range(n_clusters)]
-    totals = [0] * n_clusters
+    totals = [0.0] * n_clusters
     for z in sorted(zones, key=lambda z: weight[z], reverse=True):
         i = totals.index(min(totals))
         clusters[i].append(z)

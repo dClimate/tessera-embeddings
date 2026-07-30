@@ -172,6 +172,26 @@ def northing_coords(spec: ZoneSpec) -> np.ndarray:
     return spec.northing[1] - (np.arange(spec.height, dtype="float64") + 0.5) * PIXEL_M
 
 
+def tile_row_latitudes(spec: ZoneSpec, n_rows: int) -> np.ndarray:
+    """Approximate latitude of each 2048-px tile row's centre, row 0 at the top.
+
+    For bucketing tile rows into wide latitude bands: satellite observation counts
+    vary about twofold with latitude, so anything sizing WORK rather than AREA needs
+    to know roughly where a zone's live tiles sit, not just how many there are.
+
+    Deliberately arithmetic rather than a pyproj transform. A degree of latitude is
+    ~111.32 km everywhere to within 0.3%, three orders of magnitude finer than the
+    20-degree bands this feeds, and it keeps the caller free of a projection
+    round-trip per tile row. Southern zones carry UTM's 10,000,000 m false northing,
+    so their northings are shifted first; both hemispheres' extents confirm the
+    convention (north tops out at 83.9 degrees, south bottoms at -79.9).
+    """
+    northing = spec.northing[1] - (np.arange(n_rows, dtype="float64") + 0.5) * PITCH_M
+    if spec.hemisphere == "S":
+        northing = northing - 10_000_000.0
+    return northing / 111_320.0
+
+
 def year_timestamp(year: int) -> np.datetime64:
     """The Q2 calendar-year convention, encoded once: ``year`` → ``YYYY-01-01`` ns."""
     return np.datetime64(f"{year}-01-01", "ns")

@@ -77,7 +77,13 @@ from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_y
 from tessera_embeddings.storage.global_store import open_global_repo
 from tessera_embeddings.storage.shard_writer import CommitGate, read_years_complete, shard_pitch
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, time_index_of
-from tessera_embeddings.storage.zone_grid import PIXEL_M, year_timestamp
+from tessera_embeddings.storage.zone_grid import (
+    PIXEL_M,
+    canonicalize_zone,
+    tile_row_latitudes,
+    year_timestamp,
+)
+from tessera_embeddings.storage.zone_grid import zone as zone_spec
 
 
 def assert_calendar_year_window(time_window: TimeWindow, year: int) -> None:
@@ -124,6 +130,74 @@ def zone_live_tile_count(
     """
     cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
     return int(np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool).sum())
+
+
+#: Observations per pixel-year by 20-degree latitude band — the campaign census, from
+#: `context_docs/design/campaign-cost-model.md`. Radar is a CMR granule census of
+#: OPERA RTC-S1 normalised by cos(lat); optical is a Sentinel-2 STAC census of distinct
+#: acquisition dates weighted by mean clear fraction. The value is `S2 + S1`, which is
+#: the token count per pixel and therefore proportional to inference cost.
+#:
+#: The bands are wide and the absolutes carry sampling error (five points per band), but
+#: cluster balancing only needs the RATIOS between bands, which are the robust part —
+#: both halves were counted on the same grid. The final band runs to -80 rather than -60
+#: because there is negligible land below -60 and no reason for a zone to fall outside
+#: the table.
+TOKENS_PER_PX_BY_BAND: tuple[tuple[float, float], ...] = (
+    # (band's lower latitude bound, tokens per pixel-year)
+    (60.0, 208.0),
+    (40.0, 176.0),
+    (20.0, 168.0),
+    (0.0, 120.0),
+    (-20.0, 104.0),
+    (-40.0, 128.0),
+    (-80.0, 104.0),
+)
+
+
+def tokens_per_px(latitudes: np.ndarray) -> np.ndarray:
+    """Tokens per pixel-year for each latitude, bucketed into :data:`TOKENS_PER_PX_BY_BAND`."""
+    # Ascending by lower bound, so a higher band overwrites the ones it contains and the
+    # highest match wins. Iterating the table as written would let every band above -80
+    # be overwritten by the last row, which is why the order is explicit rather than
+    # incidental.
+    out = np.full(latitudes.shape, TOKENS_PER_PX_BY_BAND[-1][1], dtype="float64")
+    for lower, tokens in sorted(TOKENS_PER_PX_BY_BAND):
+        out = np.where(latitudes >= lower, tokens, out)
+    return out
+
+
+def zone_work_weight(
+    land_mask_path: str,
+    zone: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> float:
+    """A zone's inference WORK, in tile-token units, for balancing clusters.
+
+    The same one-GET read as :func:`zone_live_tile_count`, but weighted: each live
+    tile row is multiplied by the tokens-per-pixel of its latitude band before
+    summing. Returns tiles x tokens-per-px, so it is proportional to a zone-year's
+    GPU-hours and directly comparable between zones.
+
+    **Why not just count tiles.** Inference consumes one sequence per pixel, so its
+    cost scales with `pixels x observations`, and observation count varies about
+    twofold with latitude — a boreal tile is worth roughly twice an equatorial one.
+    Balancing on tile counts therefore balances AREA and leaves the real work uneven,
+    which shows up as clusters finishing at materially different times. Two zones
+    with identical tile counts can differ by ~2x in work.
+
+    **This is not a substitute for the tile count.** The chained fill still orders its
+    zones by :func:`zone_live_tile_count` and still clamps actor requests to it,
+    because those are properties of AREA: a zone needs one actor per tile regardless
+    of how many observations each pixel has, and the ordering exists so an autoscaled
+    fleet only ever shrinks. Use tiles for capacity, this for scheduling.
+    """
+    cov = open_store_as_zarr_group(land_mask_path, group=zone, get_credentials=get_credentials, region=s3_region)
+    live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
+    latitudes = tile_row_latitudes(zone_spec(canonicalize_zone(zone)), live.shape[0])
+    return float((live.sum(axis=1) * tokens_per_px(latitudes)).sum())
 
 
 def zone_has_live_tiles(

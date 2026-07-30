@@ -523,14 +523,14 @@ def test_invalid_fill_strategy_rejected(wired):
 
 def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
     """max_parallel_clusters > 1 in sequential mode = that many chained clusters:
-    zones are LPT-partitioned by live-tile count and each cluster's child divides
-    the global ingest look-ahead bound.
+    zones are LPT-partitioned by WORK (tiles weighted by the latitude band's observation
+    count) and each cluster's child divides the global ingest look-ahead bound.
     """
     status = SimpleNamespace(zones={"33N": (), "34N": (), "35N": ()}, has=lambda z, y: False)
     monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
     monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("33N", 2025), ("34N", 2025), ("35N", 2025)])
     counts = {"33N": 500, "34N": 300, "35N": 250}
-    monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: counts[zone])
+    monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: float(counts[zone]))
 
     asyncio.run(
         mod.run_global_campaign.fn(
@@ -560,7 +560,7 @@ class TestIngestBoundAcrossClusters:
         status = SimpleNamespace(zones=dict.fromkeys(names, ()), has=lambda z, y: False)
         monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
         monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [(z, 2025) for z in names])
-        monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: 100)
+        monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: 100.0)
         wired["arun"].clear()
         asyncio.run(
             mod.run_global_campaign.fn(
@@ -609,7 +609,7 @@ def test_every_cluster_opens_on_one_of_the_densest_zones(wired, monkeypatch):
     status = SimpleNamespace(zones=dict.fromkeys(counts, ()), has=lambda z, y: False)
     monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
     monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [(z, 2025) for z in counts])
-    monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: counts[zone])
+    monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: float(counts[zone]))
 
     asyncio.run(
         mod.run_global_campaign.fn(
@@ -628,9 +628,9 @@ def test_sequential_single_shard_reads_no_tile_counts(wired, monkeypatch):
     """One work zone → one cluster → the partitioner must not read the mask."""
 
     def boom(*a, **k):
-        raise AssertionError("tile counts must not be read for a single cluster")
+        raise AssertionError("zone weights must not be read for a single cluster")
 
-    monkeypatch.setattr(mod, "zone_live_tile_count", boom)
+    monkeypatch.setattr(mod, "zone_work_weight", boom)
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
     assert len(wired["arun"]) == 1
 
@@ -643,10 +643,10 @@ def test_partition_zero_weights_known_complete_cells(monkeypatch):
 
     def count(mask, zone, **k):
         if zone not in counts:
-            raise AssertionError(f"tile count read for known-complete zone {zone}")
-        return counts[zone]
+            raise AssertionError(f"zone weight read for known-complete zone {zone}")
+        return float(counts[zone])
 
-    monkeypatch.setattr(mod, "zone_live_tile_count", count)
+    monkeypatch.setattr(mod, "zone_work_weight", count)
     clusters = mod._partition_by_live_tiles(
         ["01N", "02N", "03N", "04N"], 2, land_mask_path="mask", known_complete={"04N"}
     )

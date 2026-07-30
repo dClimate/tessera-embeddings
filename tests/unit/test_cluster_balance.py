@@ -29,9 +29,12 @@ from __future__ import annotations
 import inspect
 import os
 
+import numpy as np
 import pytest
 
 import tessera_embeddings.orchestration.prefect.flows.run_global_campaign as campaign
+import tessera_embeddings.orchestration.runners.zone_fill as zone_fill
+import tessera_embeddings.storage.zone_grid as zone_grid
 from tests.unit.zone_density import LIVE_ZONES, ZONE_TILES, plan
 
 #: The shipped default, read from the flow so this file cannot drift from it.
@@ -131,3 +134,80 @@ def test_report(capsys: pytest.CaptureFixture[str]) -> None:
                 sorted((c.opener for c in clusters), reverse=True)
                 == sorted(ZONE_TILES.values(), reverse=True)[: len(clusters)]
             )
+
+
+# --- the work weight itself -----------------------------------------------------------
+#
+# `test_clusters_finish_together` above feeds the partitioner raw tile counts, because its
+# subject is the LPT dealing. These tests cover the other half: that the weight the
+# partitioner actually uses reflects WORK rather than AREA.
+
+
+def _fake_coverage(tile_live: np.ndarray) -> object:
+    """The one thing `zone_work_weight` reads: a group with a `tile_live_2048` array."""
+    return {"tile_live_2048": tile_live}
+
+
+def test_zone_work_weight_prices_a_boreal_tile_above_an_equatorial_one(monkeypatch) -> None:
+    """The defect this fixes: identical tile COUNTS, materially different work.
+
+    Two synthetic zones with the same number of live tiles, one packed at the top of a
+    northern zone (boreal) and one at the bottom (equatorial). Balancing on counts calls
+    these equal; they are not, because a boreal pixel carries about twice the
+    observations and therefore about twice the tokens.
+    """
+    spec = zone_grid.zone("35N")
+    rows = spec.height // 2048
+    boreal, equatorial = np.zeros((rows, 4), bool), np.zeros((rows, 4), bool)
+    boreal[:10] = True  # row 0 is the TOP = max northing = highest latitude
+    equatorial[-10:] = True
+    assert boreal.sum() == equatorial.sum()
+
+    weights = {}
+    for name, bitmap in (("boreal", boreal), ("equatorial", equatorial)):
+        monkeypatch.setattr(zone_fill, "open_store_as_zarr_group", lambda *_a, _b=bitmap, **_k: _fake_coverage(_b))
+        weights[name] = zone_fill.zone_work_weight("<mask>", "35N")
+
+    assert weights["boreal"] > weights["equatorial"], weights
+    # 208 tok/px at the top band against 120 at the equatorial one.
+    assert weights["boreal"] / weights["equatorial"] == pytest.approx(208 / 120, rel=0.01)
+
+
+def test_zone_work_weight_reduces_to_tokens_times_tiles(monkeypatch) -> None:
+    """Sanity on the units: the weight is tiles x tokens-per-px, not a rescaled count."""
+    spec = zone_grid.zone("35N")
+    rows = spec.height // 2048
+    bitmap = np.zeros((rows, 7), bool)
+    bitmap[0] = True  # one whole row at the very top: 7 tiles, all in the 60-84 band
+    monkeypatch.setattr(zone_fill, "open_store_as_zarr_group", lambda *_a, **_k: _fake_coverage(bitmap))
+    assert zone_fill.zone_work_weight("<mask>", "35N") == pytest.approx(7 * 208)
+
+
+def test_the_band_table_is_ordered_and_covers_every_zone_row() -> None:
+    """No zone row may fall outside the table, in either hemisphere.
+
+    A row that fell through would silently take the table's fallback value, which is the
+    kind of default that goes unnoticed until a cluster finishes hours late.
+    """
+    lowers = [lo for lo, _ in zone_fill.TOKENS_PER_PX_BY_BAND]
+    assert lowers == sorted(lowers, reverse=True), "table is written top-down; keep it that way"
+    for name in ("35N", "20S"):
+        spec = zone_grid.zone(name)
+        lat = zone_grid.tile_row_latitudes(spec, spec.height // 2048)
+        assert lat.min() >= min(lowers), (name, lat.min())
+        assert lat.max() <= 84.0, (name, lat.max())
+
+
+def test_southern_zones_get_southern_latitudes() -> None:
+    """The 10,000,000 m false northing, which is the easy thing to get backwards.
+
+    Without the shift a southern zone reads as +10 to +90 degrees and would be priced as
+    boreal — the most expensive band — inverting the very imbalance this fixes.
+    """
+    south = zone_grid.zone("20S")
+    lat = zone_grid.tile_row_latitudes(south, south.height // 2048)
+    assert lat.max() <= 0.1, lat.max()
+    assert -80.5 <= lat.min() <= -79.0, lat.min()
+    north = zone_grid.zone("20N")
+    lat_n = zone_grid.tile_row_latitudes(north, north.height // 2048)
+    assert lat_n.min() >= -0.1 and 83.0 <= lat_n.max() <= 84.0
