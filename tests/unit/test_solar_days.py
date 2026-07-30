@@ -232,3 +232,27 @@ def test_normalisation_is_idempotent() -> None:
             once = normalize_to_solar_day([item], mid_longitude=lon)[0].datetime
             twice = normalize_to_solar_day([item], mid_longitude=lon)[0].datetime
             assert once == twice, f"lon {lon}, hour {hour}: {once} != {twice}"
+
+
+def test_deriving_a_date_from_an_unnormalised_item_raises() -> None:
+    """The guard that stops the whole convention degrading into a convention.
+
+    A raw item's UTC date is a *plausible-looking wrong answer*: identical to the solar day
+    at central longitudes, wrong only where the offset crosses midnight. So a path that
+    skips the chokepoint produces correct output everywhere anyone would notice and
+    mislabelled mosaics in the far east and far west. Failing loudly is the only way that
+    class of bug surfaces before the data does.
+    """
+    raw = _Item(datetime.datetime(2024, 1, 15, 23, 30))
+    with pytest.raises(ValueError, match="not the canonical noon-UTC solar-day timestamp"):
+        solar_day_of(raw)
+
+    # ...and it is happy the moment the item has been through the chokepoint.
+    assert solar_day_of(normalize_to_solar_day([raw], mid_longitude=150.0)[0]) == "2024-01-16"
+
+
+def test_owned_items_inherits_the_guard() -> None:
+    """Ownership is the busiest consumer, so it must not be the one that degrades quietly."""
+    rng = whole_window_range("2024-01-01", "2024-01-31")
+    with pytest.raises(ValueError, match="normalize_to_solar_day"):
+        owned_items([_Item(datetime.datetime(2024, 1, 15, 23, 30))], rng)

@@ -54,6 +54,7 @@ from tessera_embeddings.ingest.roi_processing import apply_roi_mask
 from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
     fixed_day_ranges,
+    normalize_to_solar_day,
     owned_items,
     solar_grouping_longitude,
 )
@@ -473,7 +474,9 @@ def ingest_s1_roi_sar(
             # items to the loader as well would have it build a partial group for the
             # NEIGHBOUR's day, which the write loop would then commit. Filtering first
             # means the loader only ever sees whole days that are ours.
-            items = owned_items(base_provider(), rng)
+            # Normalise defensively: the provider already does it, but it is injectable
+            # and this is the last point before ownership reads a date. Idempotent.
+            items = owned_items(normalize_to_solar_day(base_provider(), mid_longitude=mid_longitude), rng)
             seen_items.extend(items)
             return items
 

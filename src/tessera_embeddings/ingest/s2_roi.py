@@ -62,6 +62,7 @@ from tessera_embeddings.ingest.live_windows import (
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.solar_days import (
+    normalize_to_solar_day,
     owned_items,
     solar_grouping_longitude,
     whole_window_range,
@@ -606,8 +607,15 @@ def ingest_s2_roi_reflectance(
         )
 
     def _drive(items: list, baselines: dict[str, int]) -> None:
-        """Sort one supply of items cloudiest-first, group by date, and ingest each."""
+        """Sort one supply of items cloudiest-first, group by date, and ingest each.
+
+        Normalises defensively on the way in. Both suppliers — the streamed months and the
+        single whole-window query — already do it, but both are injectable, and this is the
+        last point before a date is derived. The operation is idempotent, so the honest
+        cost of the guarantee is one dict build per supply.
+        """
         nonlocal total_seen
+        items = normalize_to_solar_day(items, mid_longitude=mid_longitude)
 
         def _consume(prepared: _PreparedDate, stall_s: float) -> None:
             """Count or write one prepared date — the ONE consume path both modes take.
@@ -726,7 +734,7 @@ def ingest_s2_roi_reflectance(
             # passes the same value for the same reason.
             mid_longitude=mid_longitude,
         )
-        owned = owned_items(items, window)
+        owned = owned_items(normalize_to_solar_day(items, mid_longitude=mid_longitude), window)
         if owned:
             _drive(owned, baselines)
 

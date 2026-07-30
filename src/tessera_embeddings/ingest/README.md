@@ -602,6 +602,36 @@ loader grouped by solar day. On a day straddling UTC midnight that meant the gro
 actually sorted clearest-last, and half its baseline entries never matched. A seventh
 application would have been one more chance to disagree; applying it once cannot.
 
+**Every date modality in the pipeline, and which convention it uses.** The whole point of
+one chokepoint is that this table has no exceptions:
+
+| where a date lives | form | convention |
+|---|---|---|
+| catalogue item, before the chokepoint | real acquisition instant | UTC — the only place a raw timestamp exists |
+| catalogue item, after `normalize_to_solar_day` | **noon UTC of its solar day** | solar |
+| loaded array coordinate (`odc.stac.load` output) | inherits the item stamp | solar (noon) |
+| written store coordinate | `np.datetime64(solar_day)` | solar (midnight) |
+| `existing_dates`, `written_dates`, baseline keys, `assessed_window` | `YYYY-MM-DD` strings | solar |
+| chunk `own_start` / `own_end` | `YYYY-MM-DD` strings | solar |
+| chunk `query_start` / `query_end` | `YYYY-MM-DD` strings | **UTC** — the only thing a catalogue understands |
+
+The two timestamp forms differ (noon in flight, midnight in the store) and never meet as
+numbers: everything that crosses that boundary compares `YYYY-MM-DD` strings. The one row
+that is deliberately UTC is the query bound, because a catalogue has no other vocabulary —
+which is exactly why ownership, not the query bound, decides what gets written.
+
+**Three things enforce this rather than describing it:**
+
+- `solar_day_of` **raises** on an item that is not stamped noon UTC. A raw item's UTC date
+  is a plausible-looking wrong answer — right at central longitudes, wrong only where the
+  offset crosses midnight — so a path that skips the chokepoint would look correct
+  everywhere anyone checks interactively.
+- An **architecture rule** (`solar-offset-applied-only-in-solar-days`) fails CI if
+  `solar_day_offset_seconds` is called outside this module. One application is the
+  invariant; a second is a bug in the opposite direction.
+- Every consumption point **re-normalises defensively** rather than trusting call order,
+  because every supplier (`query_fn`, `item_provider_fn`) is injectable.
+
 Two consequences worth knowing:
 
 - **`normalize_to_solar_day` is idempotent**, so the consumption points (`stream_stac_months`,

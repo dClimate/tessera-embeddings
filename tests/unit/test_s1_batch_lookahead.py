@@ -237,9 +237,14 @@ def _run_with_footprints(
     def fake_ingest_tile(*, start_date: str, item_provider_fn=None, **_):
         if item_provider_fn is not None:
             item_provider_fn()  # let the capture wrapper see the items
+        # Coordinates at NOON of each solar day, which is what odc returns once items have
+        # passed normalize_to_solar_day. Building them from the raw strings instead would
+        # model a state production cannot reach — the footprint join keys on the exact
+        # timestamp, so the two sides have to agree.
+        coords = np.array([f"{d[:10]}T12:00:00" for d in dates], dtype="datetime64[ns]")
         ds = xr.Dataset(
             {"VV": (("time", "y", "x"), np.zeros((len(dates), 1, 1), dtype="float32"))},
-            coords={"time": np.array(dates, dtype="datetime64[ns]")},
+            coords={"time": coords},
         )
         return ds, {}
 

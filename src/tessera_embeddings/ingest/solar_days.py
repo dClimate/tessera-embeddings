@@ -155,11 +155,24 @@ def solar_day_of(item: Any) -> str:  # noqa: ANN401 — any STAC-like item
     """The ``YYYY-MM-DD`` solar day of an item ALREADY normalised by
     :func:`normalize_to_solar_day`.
 
-    No offset is applied here, deliberately — see that function. Passing a raw item
-    returns its UTC date, which is why normalisation belongs at the query chokepoint
-    rather than being left to each consumer.
+    No offset is applied here, deliberately — see that function.
+
+    **Raises rather than guessing** if the item is not normalised. A raw item's UTC date
+    is a plausible-looking wrong answer: it is right at central longitudes and wrong only
+    where the offset crosses midnight, so the failure hides in exactly the zones nobody
+    tests interactively. The canonical stamp is noon UTC, so anything else means the item
+    reached here without passing the chokepoint — an ordering bug, and one worth failing
+    loudly on because the alternative is a silently mislabelled mosaic.
     """
-    return item.datetime.strftime("%Y-%m-%d")
+    when = item.datetime
+    if (when.hour, when.minute, when.second, when.microsecond) != (12, 0, 0, 0):
+        raise ValueError(
+            f"solar_day_of() received an item stamped {when!r}, which is not the canonical "
+            "noon-UTC solar-day timestamp. Items must pass through normalize_to_solar_day() "
+            "at the catalogue chokepoint before any date is derived from them — see this "
+            "module's docstring for why the offset is applied exactly once."
+        )
+    return when.strftime("%Y-%m-%d")
 
 
 @final

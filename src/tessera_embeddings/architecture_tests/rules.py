@@ -59,6 +59,25 @@ class Violation:
 # allowed-path tuples via a TOML allowlist; see :func:`run`.
 DEFAULT_RULES: tuple[Rule, ...] = (
     Rule(
+        name="solar-offset-applied-only-in-solar-days",
+        forbidden_call_names=frozenset({"solar_day_offset_seconds"}),
+        # The UTC-to-solar offset must be applied EXACTLY ONCE per item, by
+        # `solar_days.normalize_to_solar_day`, at the catalogue chokepoint. After that an
+        # item's timestamp IS its solar day and every date derivation is a plain strftime.
+        #
+        # This rule exists because the alternative was tried and drifted. The offset used
+        # to be applied independently at six sites and two of them disagreed with the
+        # rest: the painter's-algorithm pre-sort and the baseline map both keyed on the
+        # UTC date while the loader grouped by solar day, so on a day straddling UTC
+        # midnight the group was not sorted clearest-last and half its baseline entries
+        # never matched. Both failures are invisible in the output.
+        #
+        # A second application is also a bug in the other direction — it shifts an
+        # already-shifted timestamp. Confining the call to the one module that owns the
+        # concept makes both impossible rather than merely discouraged.
+        allowed_path_prefixes=("ingest/solar_days.py",),
+    ),
+    Rule(
         name="no-prefect-outside-prefect-layer",
         forbidden_import_prefix="prefect",
         allowed_path_prefixes=("orchestration/prefect/",),
