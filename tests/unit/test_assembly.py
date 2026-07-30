@@ -14,6 +14,7 @@ import pickle
 from importlib.metadata import version as _dist_version
 from unittest.mock import MagicMock, patch
 
+import fsspec
 import numpy as np
 import pytest
 import xarray as xr
@@ -138,8 +139,13 @@ class TestClaimRun:
         writer.claim_run("run1", _FP_V2)
         writer.claim_run("run2", _FP_V11)  # unrelated run, different model — fine
 
-    def test_legacy_staging_without_manifest_warns_but_proceeds(self, tmp_path, caplog):
-        """Runs staged by older code have no manifest; strand them and nothing resumes."""
+    def test_legacy_staging_without_manifest_fails_closed(self, tmp_path):
+        """An unclaimed run's model is unknowable — adopting it reopens the bug.
+
+        This is the original defect surviving in the legacy path: a v2 run staged
+        before claim_run existed, then retried with the default v1.1, would be
+        accepted, mixed and stamped v1.1.
+        """
         staging = str(tmp_path / "staging")
         writer = ZarrWriter(staging)
         # Stand in for a run staged by code that predates claim_run: chunks
@@ -149,15 +155,65 @@ class TestClaimRun:
         (tmp_path / "staging" / "legacy").mkdir(parents=True)
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         writer.write_skip_marker(chunk, run_id="legacy")
-        with caplog.at_level(logging.WARNING):
+        with pytest.raises(ValueError, match="no identity manifest"):
             writer.claim_run("legacy", _FP_V2)
-        assert "no identity manifest" in caplog.text
 
-    def test_fresh_run_does_not_warn(self, tmp_path, caplog):
-        writer = ZarrWriter(str(tmp_path / "staging"))
+    def test_legacy_staging_adoptable_with_explicit_override(self, tmp_path, caplog):
+        """The escape hatch exists, is off by default, and says what it cannot verify."""
+        staging = str(tmp_path / "staging")
+        writer = ZarrWriter(staging)
+        (tmp_path / "staging" / "legacy").mkdir(parents=True)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
+        writer.write_skip_marker(chunk, run_id="legacy")
         with caplog.at_level(logging.WARNING):
-            writer.claim_run("brand-new", _FP_V2)
-        assert "no identity manifest" not in caplog.text
+            writer.claim_run("legacy", _FP_V2, allow_unclaimed_legacy=True)
+        assert "nothing verifies" in caplog.text
+        writer.claim_run("legacy", _FP_V2)  # now claimed, resumes cleanly
+
+    def test_concurrent_claim_loser_validates_against_winner(self, tmp_path, monkeypatch):
+        """Two resumes of one run_id: the claim is atomic, and the loser checks.
+
+        Simulates the interleaving by making our exists() probe miss a manifest
+        the other flow has already written. Our exclusive create then loses, and
+        the winner's fingerprint — not ours — decides the outcome.
+        """
+        staging = str(tmp_path / "staging")
+        writer, other = ZarrWriter(staging), ZarrWriter(staging)
+        other.claim_run("raced", _FP_V11)
+
+        real_exists = fsspec.filesystem("file").exists
+        monkeypatch.setattr(
+            type(fsspec.filesystem("file")),
+            "exists",
+            lambda self, p, **kw: False if p.endswith("_run.json") else real_exists(p, **kw),
+        )
+        with pytest.raises(ValueError, match="different configuration"):
+            writer.claim_run("raced", _FP_V2)
+
+    def test_concurrent_claim_with_identical_config_is_fine(self, tmp_path, monkeypatch):
+        """Losing the race to an IDENTICAL configuration is not an error."""
+        staging = str(tmp_path / "staging")
+        writer, other = ZarrWriter(staging), ZarrWriter(staging)
+        other.claim_run("raced", _FP_V2)
+
+        real_exists = fsspec.filesystem("file").exists
+        monkeypatch.setattr(
+            type(fsspec.filesystem("file")),
+            "exists",
+            lambda self, p, **kw: False if p.endswith("_run.json") else real_exists(p, **kw),
+        )
+        writer.claim_run("raced", _FP_V2)  # loses the create, matches the winner
+
+    def test_manifest_write_is_exclusive(self, tmp_path):
+        """The atomicity this relies on: a second exclusive create must fail."""
+        fs = fsspec.filesystem("file")
+        d = tmp_path / "excl"
+        d.mkdir()
+        target = str(d / "_run.json")
+        with fs.open(target, "xb") as f:
+            f.write(b"{}")
+        with pytest.raises(FileExistsError), fs.open(target, "xb") as f:
+            f.write(b"{}")
 
 
 class TestWriteChunk:

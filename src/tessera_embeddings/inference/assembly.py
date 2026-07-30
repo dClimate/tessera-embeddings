@@ -281,7 +281,13 @@ class ZarrWriter:
         """Path of the per-run identity marker inside the staging directory."""
         return f"{self.staging_base}/{run_id}/_run.json"
 
-    def claim_run(self, run_id: str, fingerprint: dict[str, object]) -> None:
+    def claim_run(
+        self,
+        run_id: str,
+        fingerprint: dict[str, object],
+        *,
+        allow_unclaimed_legacy: bool = False,
+    ) -> None:
         """Bind a staging run to the model that produced it, or refuse to touch it.
 
         Staged chunks are plain (H, W, 128) int8 arrays. v1.1 saves the first
@@ -294,44 +300,78 @@ class ZarrWriter:
         that afterwards.
 
         So the first writer records the fingerprint and every later toucher of
-        the same ``run_id`` must match it. Absent manifest on a run that already
-        has staged chunks means legacy staging from before this check: that is
-        warned about rather than failed, because refusing would strand runs
-        staged by older code, and the operator can still read the store's own
-        provenance attrs.
+        the same ``run_id`` must match it.
+
+        A run with staged chunks but no manifest predates this check, and its
+        model is **unknowable** — that is exactly the hole the manifest closes,
+        so proceeding on a warning would leave the original defect intact for
+        precisely the runs that carry it. It therefore fails closed. Staging is
+        transient (``cleanup_staging`` defaults to True, so only failed runs
+        leave any behind) and starting fresh is nearly always correct; an
+        operator who does know what is staged can pass
+        ``allow_unclaimed_legacy=True`` to adopt it.
+
+        Args:
+            run_id: Staging run identifier.
+            fingerprint: Identity of the configuration doing the staging.
+            allow_unclaimed_legacy: Adopt a manifest-less staging run instead of
+                refusing it. Only correct when the caller knows what produced it.
         """
         path = self._run_manifest_path(run_id)
         fs = _fs_for(path)
         want = {k: fingerprint[k] for k in sorted(fingerprint)}
-        if fs.exists(path):
-            with fs.open(path, "rb") as f:
-                have = json.loads(f.read().decode())
-            if have != want:
-                differing = sorted(set(have) | set(want))
-                detail = ", ".join(
-                    f"{k}: staged={have.get(k)!r} requested={want.get(k)!r}"
-                    for k in differing
-                    if have.get(k) != want.get(k)
-                )
+
+        claimed = fs.exists(path)
+        if not claimed and (self._list_staged_labels(run_id) or self._list_skip_marker_labels(run_id)):
+            if not allow_unclaimed_legacy:
                 msg = (
-                    f"Staging run '{run_id}' was produced by a different configuration "
-                    f"({detail}). Resuming would mix encoders in one store. Re-run with the "
-                    f"original settings, or start a fresh run without previous_run_id."
+                    f"Staging run '{run_id}' has chunks but no identity manifest, so the model "
+                    f"that produced them cannot be verified against the requested {want}. "
+                    f"Start a fresh run (drop previous_run_id), or set "
+                    f"dev_params.allow_unclaimed_legacy=True if you know what is staged."
                 )
                 raise ValueError(msg)
-            return
-        if self._list_staged_labels(run_id) or self._list_skip_marker_labels(run_id):
             logger.warning(
-                "Staging run '%s' has chunks but no identity manifest (staged by older code); "
-                "cannot verify it was produced by %s",
+                "Adopting manifest-less staging run '%s' as %s on an explicit override; "
+                "nothing verifies the staged chunks came from that model",
                 run_id,
                 want,
             )
-        # claim_run is the FIRST thing to touch the staging dir, so on a local
-        # filesystem the parent does not exist yet (on S3 this is a no-op).
-        fs.makedirs(f"{self.staging_base}/{run_id}", exist_ok=True)
-        with fs.open(path, "wb") as f:
-            f.write(json.dumps(want, sort_keys=True).encode())
+
+        if not claimed:
+            # claim_run is the FIRST thing to touch the staging dir, so on a
+            # local filesystem the parent does not exist yet (no-op on S3).
+            fs.makedirs(f"{self.staging_base}/{run_id}", exist_ok=True)
+            try:
+                # Exclusive create, so the claim is atomic rather than a
+                # check-then-write race: two flow runs resuming the same run_id
+                # can both see no manifest, and without this both would write and
+                # both would proceed, mixing encoders under one run. s3fs maps
+                # "x" onto an S3 conditional write (If-None-Match) and the local
+                # filesystem onto O_EXCL, so exactly one writer wins on both.
+                with fs.open(path, "xb") as f:
+                    f.write(json.dumps(want, sort_keys=True).encode())
+            except FileExistsError:
+                # Lost the race. The winner's manifest is authoritative; the
+                # comparison below decides whether it is compatible with us.
+                logger.info("Staging run %s was claimed concurrently; validating against the winner", run_id)
+
+        with fs.open(path, "rb") as f:
+            have = json.loads(f.read().decode())
+        if have != want:
+            differing = sorted(set(have) | set(want))
+            detail = ", ".join(
+                f"{k}: staged={have.get(k)!r} requested={want.get(k)!r}"
+                for k in differing
+                if have.get(k) != want.get(k)
+            )
+            msg = (
+                f"Staging run '{run_id}' is claimed by a different configuration "
+                f"({detail}). Resuming or racing it would mix encoders in one store. "
+                f"Re-run with the original settings, or start a fresh run without "
+                f"previous_run_id."
+            )
+            raise ValueError(msg)
         logger.info("Claimed staging run %s for %s", run_id, want)
 
     def write_chunk(

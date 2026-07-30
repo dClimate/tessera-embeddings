@@ -88,6 +88,10 @@ class EmbeddingsDevParams(BaseModel):
     # None (default) = no upload: workers use AMI-baked source, or a tarball a
     # CI workflow already put in code_bucket. See providers/aws/gotchas.md.
     sync_source_path: str | None = None
+    # Adopt a staging run that has chunks but no identity manifest (staged
+    # before claim_run existed). Off by default: an unclaimed run's model is
+    # unknowable, and guessing it is the exact defect the manifest closes.
+    allow_unclaimed_legacy: bool = False
 
 
 def _cluster_name_for_flow_run(flow_run_id: object) -> str:
@@ -255,6 +259,7 @@ def tessera_embeddings(
             "representation_dim": config.representation_dim,
             "s1_orbit": resolved_s1_orbit,
         },
+        allow_unclaimed_legacy=dev_params.allow_unclaimed_legacy,
     )
 
     # Detect staged chunk size from prior runs — chunk_size may differ
