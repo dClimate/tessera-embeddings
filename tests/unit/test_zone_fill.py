@@ -738,6 +738,9 @@ def test_non_affine_mosaic_axis_raises(tmp_path, monkeypatch):
     mosaic_base = str(tmp_path / "scrambled-mosaics")
     scrambled = easting_coords(_SPEC).copy()
     # Swap two interior samples: same endpoints, same length, same CRS, wrong order.
+    # Note this ALSO defeats a per-step spacing test that allows half a pixel of slack —
+    # the two bad steps are +/- one pixel, and a wander-and-return pattern would defeat it
+    # entirely. Comparing whole vectors against the seeded axis has no such gap.
     scrambled[1], scrambled[2] = scrambled[2], scrambled[1]
     _make_mosaic_store(f"{mosaic_base}/reflectance.zarr", northing_coords(_SPEC), scrambled, _NY, _NX, _SPEC.crs)
     for orbit in ("ascending", "descending"):
@@ -749,5 +752,5 @@ def test_non_affine_mosaic_axis_raises(tmp_path, monkeypatch):
         raise AssertionError("inference must not run on a non-affine mosaic grid")
 
     monkeypatch.setattr(zone_fill, "run_inference", fail_if_called)
-    with pytest.raises(ValueError, match="not a uniform"):
+    with pytest.raises(ValueError, match=r"does not match zone .* seeded axis"):
         _fill(tmp_path, store, land_mask_path=_make_mask(tmp_path, [(0, 0)]), mosaic_base=mosaic_base)
