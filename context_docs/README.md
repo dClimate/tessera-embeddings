@@ -29,7 +29,6 @@ context_docs/
     ├── campaign-cost-model.md
     ├── campaign-cluster-sizing.md
     ├── d3-sharding-plan.md
-    ├── global-store-implementation-plan.md
     ├── global-store-test-impl-spec.md
     ├── global-store-test-plan.md
     ├── inference-perf-run-ledger.md
@@ -38,8 +37,6 @@ context_docs/
     ├── ingest-live-tile-cropping.md
     ├── ingest-live-tile-cropping-icechunk-experiment.md
     ├── ingest_optimization_campaign_2026_07.md
-    ├── open_sourcing_conceptual_background.md
-    ├── orchestration_infra_leakage_audit.md
     └── region-writes.md
 ```
 

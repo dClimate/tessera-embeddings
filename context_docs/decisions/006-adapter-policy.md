@@ -83,6 +83,7 @@ slow down core development.
 - README.md "Contributing" section — user-facing summary.
 - [`tests/parity/adapter_template/`](../../tests/parity/adapter_template/) —
   the contract in code form.
-- [`design/orchestration_infra_leakage_audit.md`](../design/orchestration_infra_leakage_audit.md) —
-  the audit informing what counts as "leakage" vs "expected" in an
-  adapter.
+- The line between "leakage" and "expected" here came from an audit of the
+  pre-rename layout: an orchestrator import inside the flows layer is expected, the
+  same import inside a domain layer is leakage. That audit is deleted (its paths
+  predate the package rename); the rule it produced is the sentence above.

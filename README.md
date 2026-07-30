@@ -312,9 +312,9 @@ groups — one per UTM zone, named by its **common name** (`01N`–`60N`,
 `01S`–`60S`; the EPSG:326xx/327xx code is retained only as the CRS) — each
 pre-allocated with a 2017–2025 annual time axis and filled one
 (zone, year) at a time. The architecture is settled in
-[ADR-008](context_docs/decisions/008-global-store-architecture.md); the
-build plan is
-[`context_docs/design/global-store-implementation-plan.md`](context_docs/design/global-store-implementation-plan.md).
+[ADR-008](context_docs/decisions/008-global-store-architecture.md), and the
+operational plan for running the campaign is
+[`context_docs/design/campaign-plan.md`](context_docs/design/campaign-plan.md).
 
 ```
 one Icechunk repo (BucketPaths.global_store())

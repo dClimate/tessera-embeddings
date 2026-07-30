@@ -1,8 +1,13 @@
 # Cropping ingest to live tiles
 
-**Status:** implemented behind `IngestSettings.crop_to_live_windows` (default off).
-Validated on a live `03S` cell, which also surfaced a second extent-scaled cost in
-the coverage denominator — see "What the first cropped run found" below.
+**Status:** shipped, **unconditional, and no longer behind a flag** (amended 2026-07-29).
+It was `IngestSettings.crop_to_live_windows`, defaulting off; the flag was removed
+outright once no scenario wanted cropping disabled, and the one validation that
+depended on it (`batch_dates > 1 requires crop_to_live_windows`) went with it, its
+precondition now holding by construction. Validated on a live `03S` cell, which also
+surfaced a second extent-scaled cost in the coverage denominator — see "What the first
+cropped run found" below. Anywhere below that names the flag, or shows it being set, is
+describing how a measurement was taken rather than a switch that still exists.
 
 ## Problem
 

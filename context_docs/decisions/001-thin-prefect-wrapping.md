@@ -66,5 +66,7 @@ LOC increase isn't worth it.
 
 - [`docs/orchestrator-swap.md`](../../docs/orchestrator-swap.md) —
   worked example of swapping in Dagster.
-- [`design/open_sourcing_conceptual_background.md`](../design/open_sourcing_conceptual_background.md) —
-  the broader OSS-strategy framing this fits into.
+- The broader framing is ports-and-adapters (hexagonal architecture): the domain
+  declares the interfaces it needs and infrastructure implements them. ADR-004
+  (duck-typed providers) and ADR-006 (adapter policy) are where that is actually
+  decided for this repo.

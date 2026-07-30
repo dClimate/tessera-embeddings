@@ -70,5 +70,8 @@ within weeks.
 
 - [`docs/orchestrator-swap.md`](../../docs/orchestrator-swap.md) —
   applying Shape C to non-Prefect orchestrators.
-- [`design/orchestration_infra_leakage_audit.md`](../design/orchestration_infra_leakage_audit.md) —
-  the audit that informed this decision.
+- The audit that informed this decision found `import prefect` in **zero** files
+  under the ingest, inference, config and storage layers — every Prefect import
+  already lived in the flows layer. So this ADR ratified an existing property
+  rather than requiring a refactor. (The audit itself is deleted: it was a grep of
+  the pre-package-rename layout and cannot be re-run against today's paths.)
