@@ -6,8 +6,11 @@ store. Nine years × 111 land zones. The ingest measurements it rests on are rec
 [`ingest_optimization_campaign_2026_07.md`](ingest_optimization_campaign_2026_07.md);
 section references below of the form "ingest estimate §N" point at that working note.
 
-Every input is either measured (and cited) or derived from a measured input (and marked
-as derived). Two things are neither, and they are called out in §9 rather than buried.
+**This is the figures annex to [`campaign-plan.md`](campaign-plan.md).** That document owns
+operations — what runs and with what settings; this one owns every number in it and the
+arithmetic behind it. Every input here is either measured (and cited) or derived from a
+measured input (and marked as derived); the ones that are neither are called out in §9
+rather than buried.
 
 ---
 

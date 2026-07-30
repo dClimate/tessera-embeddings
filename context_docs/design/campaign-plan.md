@@ -4,9 +4,11 @@
 embeddings into one Icechunk store. Everything here is settled unless it appears in §8,
 which is the list of decisions still open before launch.
 
-This document is the entry point. It states *what will run and with what settings*; the
-evidence behind each choice lives in the documents linked at the bottom, and is not
-repeated here.
+This document is the entry point and the source of truth for **operations** — what runs,
+with what settings, in what order, and what to do when it breaks.
+[`campaign-cost-model.md`](campaign-cost-model.md) is the source of truth for **figures**:
+every cost, rate, fleet size and the arithmetic behind them. Numbers appear here as results
+with a pointer, never as derivations; where the two disagree, the cost model is right.
 
 ---
 
@@ -87,7 +89,9 @@ cluster-year with finished mosaics already on disk.
 
 ## 4. Sizing, cost, and the two things that actually bind
 
-Full derivation in [`campaign-cost-model.md`](campaign-cost-model.md).
+**Figures below are results, not derivations.** [`campaign-cost-model.md`](campaign-cost-model.md)
+is the source of truth for every number here and the arithmetic behind it; this section states
+what to run and what it costs. Where the two disagree, the cost model is right.
 
 **Costed in tokens.** Inference consumes a sequence per pixel, so cost scales with
 `tokens = pixels × observations`, not with pixels. The campaign is **1.98 × 10¹⁵ tokens** —
@@ -234,68 +238,32 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
 
 ---
 
-## 9. What drives the numbers
+## 9. What moves the numbers
 
-Every figure in §4 comes from the inputs below. If one changes, this is the table that says
-what moves and by how much — and what to say about *why* it moved.
+**The figures in §4 are not derived here.** `campaign-cost-model.md` is the source of truth
+for every number and the arithmetic behind it; this section is the index — what to look at
+when something changes, and roughly what it moves. Anything quoted in this plan that is not
+in the table below is a *chosen setting*, not a computed one.
 
-**Measured. Changing one of these means the world changed, or we re-measured it.**
-
-Two of these were assumptions until 2026-07-30 and are now counted from public catalogues:
-the radar observation rate (CMR granule census of OPERA RTC-S1) and the optical one
-(Sentinel-2 STAC, distinct acquisition dates × mean clear fraction). Both are measured on the
-same global land grid as the reference ROI, so the *ratio* between them — which is what sets
-the throughput basis — is robust even where the absolutes are not.
-
-| input | value | drives |
+| if this changes | it moves | look in the cost model |
 |---|---|---|
-| live 2048-tiles | 360,953/yr → 1.363 × 10¹³ px over 9 yr | every cost; pixels are the volume term |
-| land zones × years | 111 × 9 = 999 zone-years | per-zone-year unit costs |
-| dates per zone-year | 365 | ingest duration |
-| per-zone ingest fit | `s/date = 10.16 + 0.06022 × live_4096_chunks` (R² 0.954, 5 regions) | zone durations, and so the wall-clock floor |
-| fleet width model | `T(W) = 36.3 + 7896/W` — **fitted over ~30–60 workers only** | whether 80w reaches 4.5 days |
-| inference rate, reference ROI | 13–15K px/s fleet-overall (Iowa, single-orbit) | historical anchor; convert via tokens |
-| **campaign tokens** | **1.98 × 10¹⁵** (1.363e13 px × 145 tok/px) | the volume term — cost scales with THIS, not pixels |
-| **inference rate** | **≈1.9M tok/sec** per worker | the machine term |
-| per-chunk read floor | ~6 s median hidden; ~13 s fixed read amplification | why the model is two-term, not one |
-| optical-only pixel-years | **6.8%** (no radar 2022–24) | those cells run a minimal radar sequence |
-| S1 obs/pixel/yr | 47–156 by band; campaign 91, Iowa 61 | the radar half of that |
-| S2 obs/pixel/yr | 44–72 by band; campaign 52, Iowa 70 | the optical half |
-| OPERA coverage, 2022–24 | **81%** of the S1A+B baseline | which cells can produce output at all |
-| Fargate | $0.04048/vCPU-h, $0.004445/GB-h | ingest cost |
-| g6e.xlarge | $1.861/h on-demand | inference cost — the largest line |
+| the coverage mask is rebuilt | tile count → every cost; zone durations → the wall-clock floor | §3, §4 |
+| the longest zone gets faster or slower | the per-year floor, and therefore the whole schedule | §4 |
+| S1 or S2 revisit changes (a satellite fails or launches) | tokens/pixel → inference cost and fleet size | §6 |
+| cloud climatology or the SCL class set changes | the optical half of tokens/pixel | §6 |
+| a measured `tok/sec` arrives from a real run | the inference rate directly — replaces the borrowed anchor | §6 |
+| GPU or Fargate pricing | the totals, nothing structural | §3 |
+| `allow_s2_only` is switched off | 6.8% of pixel-years stop producing output | §6 |
 
-**Derived. These are arithmetic on the row above; recompute, do not re-estimate.**
+**Four mechanisms. If a number moves and none of these explains it, something else changed.**
 
-| figure | value | from |
-|---|---|---|
-| longest zone-year | 17.3 h @50w · **15.0 h @60w** · 12.0 h @80w | the per-zone fit + width model |
-| the knee | **45 cells** | total work ÷ longest zone |
-| tokens per pixel | campaign **167** vs Iowa 192 → ratio **0.87** | the observation model below |
-| planning rate | **15K px/s** | Iowa's 13K × 1.15 |
-| GPU-h per zone-year | **252.6** | pixels ÷ rate ÷ 999 |
-| fleet to provision | **85% of matched** | policy, not measurement — see §4 |
-
-**Estimated. These are the soft ones, and the first dominates.**
-
-| assumption | value | worth | how to retire it |
-|---|---|---|---|
-| sampling error in the census | 5 points/band, 1 yr optical / 5 yr radar | ~$40,000 | more points, or the store's own counts |
-| `eo:cloud_cover` omits shadow | inflates both sides ~20–30% | small — it cancels in the ratio | per-pixel `s2_obs_count` in the store |
-| ingest interference above 20 cells | assumed flat | schedule only | measured flat to 20; 45 is an extrapolation |
-
-**Four mechanisms. If a number moves and you cannot explain it with one of these, something
-else changed.**
-
-1. **Years are serial, so the longest single zone is a floor on each year.** This is why
-   cells stop helping at 45 and why width is the only lever past it. Break the year barrier
-   and the whole shape changes.
-2. **Inference cost scales with tokens, not pixels** — `tokens = pixels × observations per
-   pixel`, and observation count varies about twofold with latitude and orbit count.
-   **Measure and quote tok/sec.** px/s is a property of the machine *and* the geography it
-   ran over; treating it as a machine constant is what made the cost model's throughput basis
-   wrong three times. It is not purely token-bound either — a per-chunk read floor scales
-   with pixels and bytes, and it stops being hidden where sequences are short.
+1. **Years are serial, so the longest single zone floors each year.** This is why cells stop
+   helping at 45 and why width is the only lever past it.
+2. **Inference cost scales with tokens, not pixels.** Quote `tok/sec`. Pixels-per-second
+   mixes machine speed with geography, which made the cost model's throughput basis wrong
+   three times before the unit was changed. It is not purely token-bound either — a
+   per-chunk read floor scales with pixels and bytes, and stops being hidden where sequences
+   are short.
 3. **Ingest worker-hours are width-neutral.** Halve the fleet, double the duration, same
    bill — so fleet width is schedule bought for free, and cost is nearly flat across every
    configuration in §4.
