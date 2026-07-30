@@ -31,7 +31,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, CancelledError, Future, ThreadPoolExecutor, wait
-from functools import partial
+from functools import cache, partial
 from typing import TYPE_CHECKING, Any
 
 from prefect import flow, get_run_logger
@@ -45,7 +45,7 @@ from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
-from tessera_embeddings.config.time_windows import parse_time_window
+from tessera_embeddings.config.time_windows import TimeWindow, parse_time_window
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
 from tessera_embeddings.inference.runner import run_inference
@@ -557,18 +557,31 @@ def fill_zones_sequential_flow(
     zones = list(dict.fromkeys(canonicalize_zone(z) for z in zones))
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
-    window = parse_time_window(time_window_end or f"December {year}")
-    # Before any ingest dispatch or ray_cluster: planning would reject an
-    # offset/partial window, but only after look-ahead ingests have started and
-    # the shared fleet is up.
-    assert_calendar_year_window(window, year)
     checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}"
     gate = _PrefectCommitGate(commit_limit_name) if commit_limit_name else None
 
-    def _config_for(resolved_orbit: str) -> InferenceConfig:
+    @cache
+    def _window_for(cell_year: int) -> TimeWindow:
+        """The cell's calendar-year window, one per YEAR rather than one per run.
+
+        Cached because a cluster's cells share few distinct years and each cell's
+        `prepare` asks for its own; the assertion runs before any ingest dispatch or
+        ray_cluster, so an offset/partial window is rejected while it is still free
+        rather than after the look-ahead ingests are away and the fleet is up.
+        """
+        w = parse_time_window(time_window_end or f"December {cell_year}")
+        assert_calendar_year_window(w, cell_year)
+        return w
+
+    # Validate the flow's own year up front, so a bad `time_window_end` is rejected
+    # before any ingest is dispatched rather than at the first cell's prepare.
+    _window_for(year)
+
+    @cache
+    def _config_for(resolved_orbit: str, cell_year: int) -> InferenceConfig:
         return build_inference_config(
             s1_orbit=resolved_orbit,
-            time_window=window,
+            time_window=_window_for(cell_year),
             checkpoint_path=checkpoint_path,
             inputs_bucket=paths.inputs,
             output_bucket=paths.outputs,
@@ -598,7 +611,7 @@ def fill_zones_sequential_flow(
             land_mask_path=land_mask_path,
             mosaic_base=f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}",
             staging_base=f"{paths.outputs.rstrip('/')}/staging/{zone}/{year}",
-            config=_config_for(s1_orbit),
+            config=_config_for(s1_orbit, year),
             num_actors=1,
             log=log,
             run_id=run_id,
@@ -725,7 +738,7 @@ def fill_zones_sequential_flow(
         )
         check_time_window_coverage(
             mosaic_base,
-            window,
+            _window_for(cell.year),
             s1_orbit=resolved,
             skip_coverage_check=allow_partial_window,
             get_credentials=iam_icechunk_credentials,
@@ -746,7 +759,7 @@ def fill_zones_sequential_flow(
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,
             ),
-            config=_config_for(resolved),
+            config=_config_for(resolved, cell.year),
         )
 
     # One assembly at a time trails the live cell's staging writes, so split
@@ -796,7 +809,7 @@ def fill_zones_sequential_flow(
     # single-orbit whole zone, which does not occur; the orbit-mismatch
     # deferral + fallback below remains as a safety net for an explicit
     # single-orbit request (or that non-scenario), bounded by the deferral cap.
-    session_config = _config_for(s1_orbit)
+    session_config = _config_for(s1_orbit, year)
 
     # Size the shared session by the LARGEST cell's clamped request, not the raw
     # fleet ceiling: the session provisions its first actor batch before any

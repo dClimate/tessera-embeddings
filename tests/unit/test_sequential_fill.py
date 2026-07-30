@@ -16,6 +16,7 @@ import time
 import pytest
 
 import tessera_embeddings.orchestration.runners.sequential_fill as mod
+from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import StagedResume
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.orchestration.runners.sequential_fill import (
@@ -33,11 +34,14 @@ def _cells(n: int) -> list[SequentialCell]:
 
 
 class _Config:
-    """Minimal config stand-in (orbit + the scan's compute_std probe)."""
+    """Minimal config stand-in (orbit, the scan's compute_std probe, the cell's window)."""
 
-    def __init__(self, s1_orbit: str = "both") -> None:
+    def __init__(self, s1_orbit: str = "both", time_window: object | None = None) -> None:
         self.s1_orbit = s1_orbit
         self.compute_std = False
+        # Carried onto every work item as ZoneContext.time_window, so a chained session's
+        # cells can span campaign years without being inferred over the session's months.
+        self.time_window = time_window if time_window is not None else parse_time_window("December 2025")
 
 
 def _prepare_for(orbits: dict[str, str] | None = None):

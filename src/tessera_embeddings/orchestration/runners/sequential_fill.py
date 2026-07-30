@@ -82,9 +82,13 @@ fleet-fill parallelism is a possible future refinement — measure first.
 Contracts: Prefect-free (the deployment-backed ingest adapter, the
 input-fingerprinted run_id, the per-cell config/plan, and the session itself
 all arrive as callables from the flow layer); the caller is already inside a
-Ray context; cells are one year's distinct zones, so no two commits for the
-same zone group can ever be in flight (assemblies serialize; zones are
-distinct).
+Ray context; and cells may span campaign YEARS as well as zones. Two commits for
+the same zone group are still never in flight, for a reason that no longer depends
+on the caller: assemblies serialize on the single trailing thread, so even a
+multi-year list of one zone commits its years one after another. Each cell carries
+its OWN inference window on its work items (``ZoneContext.time_window``) — actors are
+built once from the session config, so a cell of another year read through that
+config would silently be inferred over the wrong months.
 """
 
 from __future__ import annotations
@@ -285,8 +289,9 @@ def fill_zones_sequential(
     actor-death storms.)
 
     Args:
-        cells: Ordered (zone, year) work items — one year's distinct zones,
-            largest-first.
+        cells: Ordered (zone, year) work items, largest-first. May span years; a
+            zone's years must appear in list order, which the single serialized
+            assembly thread then makes commit-safe without any caller guarantee.
         prepare: Resolves a cell's :class:`PreparedCell` once its inputs are
             ready. Raising here fails the cell, not the run.
         plan: Resolves the cell's :class:`~.zone_fill.ZonePlan` (validation,
@@ -615,7 +620,11 @@ def fill_zones_sequential(
                     for label in already
                 ]
                 tally = _ZoneTally(cell=cell, prep=prep, plan=zplan, remaining=len(live), results=resumed)
-                ctx = ZoneContext(prep.mosaic_base, prep.staging_base, prep.run_id)
+                # The cell's OWN window travels with its work items. Actors are built
+                # once from the session config, so a cell of a different campaign year
+                # would otherwise be inferred over the session's months rather than its
+                # own — silently, since the session only checks s1_orbit.
+                ctx = ZoneContext(prep.mosaic_base, prep.staging_base, prep.run_id, prep.config.time_window)
                 with lock:
                     tallies[prep.run_id] = tally
                     if live:
