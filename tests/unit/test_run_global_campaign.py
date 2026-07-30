@@ -234,6 +234,18 @@ def test_driver_reads_are_credentialed(wired, monkeypatch):
     assert onaxis.get("get_credentials") is not None
 
 
+def _dispatched_zones(params: dict) -> list[str]:
+    """The zones of a chained dispatch, from its `(zone, year)` pairs.
+
+    The child takes pairs so a cluster can span years. This driver is still year-serial,
+    so every pair in one dispatch shares a year; asserting on zones keeps these tests
+    about the PARTITION rather than about the parameter shape.
+    """
+    years = {y for _, y in params["cells"]}
+    assert len(years) == 1, f"a year-serial driver must dispatch one year per cluster, got {years}"
+    return [z for z, _ in params["cells"]]
+
+
 def _fill_run_id(rec: dict, **kwargs) -> str:
     rec["arun"].clear()
     _per_cell(**kwargs)
@@ -518,13 +530,13 @@ def test_duplicate_years_dispatch_once(wired):
 def test_sequential_strategy_dispatches_one_run_per_year(wired):
     """fill_strategy="chained-clusters" replaces the per-cell chain with ONE
     fill-zones-sequential run per year: no driver-side ingest (the child's
-    look-ahead owns it), no driver-side mosaic cleanup, zones passed as a list.
+    look-ahead owns it), no driver-side mosaic cleanup, cells passed as (zone, year) pairs.
     """
     result = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["fill-zones-sequential/fill-zones-sequential"]
     params = wired["arun"][0][1]
-    assert params["zones"] == ["33N"] and params["year"] == 2025
+    assert _dispatched_zones(params) == ["33N"] and params["cells"] == [["33N", 2025]]
     # One cluster, so it carries the whole ingest bound as its window.
     assert params["ingest"] is True and params["look_ahead"] == 40
     assert params["ingest_deployment"] == "ingest-zone-year/ingest-zone-year"
@@ -567,7 +579,7 @@ def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
         )
     )
     assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential"] * 2
-    clusters = [p["zones"] for _, p in wired["arun"]]
+    clusters = [_dispatched_zones(p) for _, p in wired["arun"]]
     # LPT: 500 alone; 300+250 together — balanced totals (500 vs 550).
     assert sorted(map(sorted, clusters)) == [["33N"], ["34N", "35N"]]
     # The global ingest bound is divided across clusters: 6 over 2 clusters = 3 each.
@@ -641,7 +653,7 @@ def test_every_cluster_opens_on_one_of_the_densest_zones(wired, monkeypatch):
             paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", max_parallel_clusters=3
         )
     )
-    dispatched = [p["zones"] for _, p in wired["arun"]]
+    dispatched = [_dispatched_zones(p) for _, p in wired["arun"]]
     assert {zs[0] for zs in dispatched} == {"01N", "02N", "03N"}, dispatched
     # ...and each cluster tapers from dense to sparse rather than the reverse.
     for zs in dispatched:
@@ -896,7 +908,7 @@ class TestFailedZonesAreRetried:
             if "fill-zones-sequential" in dep:
                 rounds["n"] += 1
                 state.update(complete_after.get(rounds["n"], ()))
-                if any(z not in state for z in parameters["zones"]):
+                if any(z not in state for z, _y in parameters["cells"]):
                     raise RuntimeError("cluster failed")
             return _completed_run()
 
@@ -921,7 +933,7 @@ class TestFailedZonesAreRetried:
             complete_after={1: {"01N", "02N"}, 2: {"01N", "02N", "03N"}},
         )
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
-        dispatched = [p["zones"] for d, p in wired["arun"] if "fill-zones-sequential" in d]
+        dispatched = [_dispatched_zones(p) for d, p in wired["arun"] if "fill-zones-sequential" in d]
         assert dispatched[0] == ["01N", "02N", "03N"]
         assert dispatched[1] == ["03N"], f"second round re-dispatched landed zones: {dispatched[1]}"
 

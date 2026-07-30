@@ -1060,8 +1060,10 @@ async def run_global_campaign(
                     cluster: list[str], n_clusters: int, chained_year: int, cell_look_ahead: int
                 ) -> dict[str, Any]:
                     return {
-                        "zones": cluster,
-                        "year": chained_year,
+                        # The child takes (zone, year) PAIRS, so a cluster can span years.
+                        # This driver is still year-serial, so every pair here shares one
+                        # year; the shape is what lets that change without a child change.
+                        "cells": [[z, chained_year] for z in cluster],
                         "paths": paths.model_dump(),
                         "ami_ssm_name": ami_ssm_name,
                         # Pin the fingerprinted image (see _ami_id / _fill_params) — but

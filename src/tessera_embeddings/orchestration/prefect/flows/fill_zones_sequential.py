@@ -416,8 +416,7 @@ _cancel_child_ingests_on_cancellation = make_child_cancel_hook(_INGEST_TAG_PREFI
 )
 def fill_zones_sequential_flow(
     *,
-    zones: list[str],
-    year: int,
+    cells: list[tuple[str, int]],
     paths: BucketPaths,
     ami_ssm_name: str,
     ami_id: str | None = None,
@@ -447,14 +446,17 @@ def fill_zones_sequential_flow(
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
 ) -> dict[str, Any]:
-    """Fill one year's zones sequentially on a single shared Ray cluster.
+    """Fill many (zone, year) cells sequentially on a single shared Ray cluster.
 
     Args:
-        zones: Zone group names for THIS year (UTM common names, e.g.
-            ``["33N", "15S"]``). One year per flow run — the driver stays
-            year-serial, and single-year cells are all distinct zone groups,
-            which is what makes the runner's trailing assembly conflict-free.
-        year: Campaign calendar year to fill (must be on the seeded axis).
+        cells: ``(zone, year)`` pairs for this cluster — zone as a UTM common name,
+            e.g. ``[("33N", 2025), ("15S", 2025)]``. **May span campaign years**, which
+            is what lets the driver drop the year barrier. Two properties make that
+            safe, and neither asks anything of the caller: each cell carries its OWN
+            inference window to the actors (``ZoneContext.time_window``, so a cell is
+            never inferred over another year's months), and assemblies serialize on the
+            runner's single trailing thread, so two years of one zone commit one after
+            another rather than colliding on the group's attrs.
         paths: Deployment storage contract (global store, land mask, mosaics).
         ami_ssm_name: SSM parameter name for the Ray GPU AMI ID (used only when
             ``ami_id`` is not given).
@@ -463,7 +465,10 @@ def fill_zones_sequential_flow(
             mid-campaign re-bake can't split them. ``None`` (direct calls) resolves
             ``ami_ssm_name`` as before.
         time_window_end: End month of the inference window as ``"Month Year"``;
-            defaults to ``"December {year}"`` (the calendar-year window).
+            defaults to ``"December {year}"`` per cell (the calendar-year window).
+            Only valid for a SINGLE-year ``cells`` list — one literal override cannot
+            describe several years, so a multi-year list with this set is rejected
+            rather than silently applying one year's window to all of them.
         store_name: Global-store repo basename (``paths.global_store``).
         mask_name: Coverage-store repo basename (``paths.land_mask_store``).
         ssm_prefix: SSM prefix for the Ray cluster resource IDs.
@@ -553,8 +558,17 @@ def fill_zones_sequential_flow(
         ray_cluster,
     )
 
-    # Canonicalize + dedupe, preserving caller order until the size sort.
-    zones = list(dict.fromkeys(canonicalize_zone(z) for z in zones))
+    # Canonicalize + dedupe, preserving caller order until the size sort. Dedupe on the
+    # PAIR: the same zone may legitimately appear for several years, and only an exact
+    # repeat is a caller mistake (it would dispatch one cell twice).
+    cells = list(dict.fromkeys((canonicalize_zone(z), int(y)) for z, y in cells))
+    cell_years = sorted({y for _, y in cells})
+    if time_window_end is not None and len(cell_years) > 1:
+        raise ValueError(
+            f"time_window_end={time_window_end!r} was given with cells spanning years {cell_years}. "
+            "One literal window cannot describe several years; drop the override (each cell then "
+            "takes its own calendar year) or dispatch one year per flow run."
+        )
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}"
@@ -573,9 +587,10 @@ def fill_zones_sequential_flow(
         assert_calendar_year_window(w, cell_year)
         return w
 
-    # Validate the flow's own year up front, so a bad `time_window_end` is rejected
-    # before any ingest is dispatched rather than at the first cell's prepare.
-    _window_for(year)
+    # Validate EVERY year up front, so a bad `time_window_end` or an off-convention year
+    # is rejected before any ingest is dispatched rather than at some later cell's prepare.
+    for cell_year in cell_years:
+        _window_for(cell_year)
 
     @cache
     def _config_for(resolved_orbit: str, cell_year: int) -> InferenceConfig:
@@ -600,7 +615,7 @@ def fill_zones_sequential_flow(
     empty: list[dict[str, Any]] = []
     live: list[SequentialCell] = []
 
-    def _fill_no_cluster(zone: str, run_id: str) -> dict[str, Any]:
+    def _fill_no_cluster(zone: str, year: int, run_id: str) -> dict[str, Any]:
         # fill_zone_year's no-Ray paths: repo metadata + coverage bitmap only.
         # s1_orbit is never resolved against a mosaic on these paths, so the
         # unresolved value is fine.
@@ -620,9 +635,9 @@ def fill_zones_sequential_flow(
             s3_region=s3_region,
         )
 
-    for zone in zones:
+    for zone, year in cells:
         if zone_year_complete(store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region):
-            retagged.append(_fill_no_cluster(zone, f"{zone}-{year}-retag"))
+            retagged.append(_fill_no_cluster(zone, year, f"{zone}-{year}-retag"))
             continue
         if not zone_year_on_axis(store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region):
             raise ValueError(
@@ -635,7 +650,7 @@ def fill_zones_sequential_flow(
         if n_tiles == 0:
             # No mosaic exists or is needed; run_id is provenance-only here
             # (there is no staging to fingerprint and no mosaic to read).
-            empty.append(_fill_no_cluster(zone, f"{zone}-{year}-empty"))
+            empty.append(_fill_no_cluster(zone, year, f"{zone}-{year}-empty"))
             continue
         live.append(SequentialCell(zone=zone, year=year, num_actors=min(num_actors, n_tiles), n_tiles=n_tiles))
 
@@ -650,17 +665,17 @@ def fill_zones_sequential_flow(
     # of the list in arbitrary order — precisely the part this ordering is for.
     live.sort(key=lambda c: c.n_tiles, reverse=True)
     log.info(
-        "Triage for year %d: %d retagged, %d empty, %d live cell(s) — order: %s",
-        year,
+        "Triage for year(s) %s: %d retagged, %d empty, %d live cell(s) — order: %s",
+        cell_years,
         len(retagged),
         len(empty),
         len(live),
-        [c.zone for c in live],
+        [f"{c.zone}-{c.year}" for c in live],
     )
 
     summary: dict[str, Any] = {
-        "year": year,
-        "zones": zones,
+        "years": cell_years,
+        "cells": [[c.zone, c.year] for c in live],
         "retagged": len(retagged),
         "empty": len(empty),
         "live": len(live),
@@ -809,7 +824,12 @@ def fill_zones_sequential_flow(
     # single-orbit whole zone, which does not occur; the orbit-mismatch
     # deferral + fallback below remains as a safety net for an explicit
     # single-orbit request (or that non-scenario), bounded by the deferral cap.
-    session_config = _config_for(s1_orbit, year)
+    # The densest live cell's year, NOT a leaked triage loop variable. This config sizes
+    # the shared session and builds its actors; its window is only a DEFAULT now, because
+    # every work item carries its own cell's window (ZoneContext.time_window) and the
+    # actors prefer that. Pinning it to live[0] keeps it deterministic and matches the cell
+    # the session is sized for.
+    session_config = _config_for(s1_orbit, live[0].year)
 
     # Size the shared session by the LARGEST cell's clamped request, not the raw
     # fleet ceiling: the session provisions its first actor batch before any

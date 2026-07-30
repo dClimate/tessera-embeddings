@@ -99,7 +99,19 @@ def wired(monkeypatch):
 
 
 def _run(**overrides):
-    kwargs = {"zones": ["33N"], "year": 2025, "paths": _PATHS, "ami_ssm_name": "ami"}
+    """Invoke the flow, translating the readable `zones=`/`year=` form into `cells`.
+
+    The flow takes `(zone, year)` pairs so a cluster can span campaign years. Most tests
+    below are about something else entirely, so they keep saying `zones=[...]` and this
+    does the conversion in one place; `cells=` is passed straight through for the tests
+    that ARE about multi-year lists.
+    """
+    kwargs = {"paths": _PATHS, "ami_ssm_name": "ami"}
+    if "cells" in overrides:
+        kwargs["cells"] = overrides.pop("cells")
+    else:
+        year = overrides.pop("year", 2025)
+        kwargs["cells"] = [(z, year) for z in overrides.pop("zones", ["33N"])]
     kwargs.update(overrides)
     return mod.fill_zones_sequential_flow.fn(**kwargs)
 
@@ -696,3 +708,67 @@ def test_a_failure_while_priming_still_cancels_the_ingests_it_started(wired, mon
     assert "start:01N" in order, "the window was primed, so its children must be cancelled"
     assert "inputs_shutdown" in order, "shutdown never ran; the started ingests are orphans"
     assert "ray_up" not in order, "no cluster should be requested once the wait failed"
+
+
+# --- multi-year cells ------------------------------------------------------------------
+
+
+def test_a_cluster_can_span_years_and_each_cell_keeps_its_own_window(wired):
+    """The point of the change: one cluster, cells from different campaign years.
+
+    Each cell must carry ITS year's window to the actors. The actors are built once from
+    the session config, so a cell read through that config would be inferred over another
+    year's months — silently, since the session only checks `s1_orbit`.
+    """
+    _run(cells=[("33N", 2025), ("34N", 2024)])
+    prepare = wired["seq_kwargs"]["prepare"]
+    windows = {}
+    for zone, year in (("33N", 2025), ("34N", 2024)):
+        prep = prepare(SimpleNamespace(zone=zone, year=year, num_actors=5))
+        windows[(zone, year)] = prep.config.time_window
+    assert windows[("33N", 2025)] != windows[("34N", 2024)]
+    assert windows[("33N", 2025)].months[-1] == (2025, 12)
+    assert windows[("34N", 2024)].months[-1] == (2024, 12)
+
+
+def test_the_same_zone_may_appear_for_several_years(wired):
+    """Two years of one zone in one cluster — the case the year barrier forbade.
+
+    Safe without any caller guarantee: assemblies serialize on the runner's single
+    trailing thread, so the two years commit one after another rather than colliding on
+    the zone group's attrs.
+    """
+    result = _run(cells=[("33N", 2025), ("33N", 2024)])
+    assert result["years"] == [2024, 2025]
+    assert result["live"] == 2
+
+
+def test_an_exact_duplicate_cell_is_deduped_but_a_repeated_zone_is_not(wired):
+    """Dedupe on the PAIR. A repeated zone across years is legitimate; an exact repeat
+    would dispatch one cell twice.
+    """
+    result = _run(cells=[("33N", 2025), ("33n", 2025), ("33N", 2024)])
+    assert result["live"] == 2, result
+    assert result["years"] == [2024, 2025]
+
+
+def test_a_literal_window_override_is_rejected_for_a_multi_year_list(wired):
+    """One literal window cannot describe several years, so it must not be applied to all.
+
+    Silently reusing 2025's window for a 2024 cell is precisely the failure this whole
+    change exists to prevent, so the ambiguous request is refused instead.
+    """
+    with pytest.raises(ValueError, match="cannot describe several years"):
+        _run(cells=[("33N", 2025), ("34N", 2024)], time_window_end="December 2025")
+    # Still allowed for a single-year list, where it is unambiguous.
+    _run(cells=[("33N", 2025)], time_window_end="December 2025")
+
+
+def test_every_year_is_validated_before_any_ingest_is_dispatched(wired):
+    """A bad year must fail while that is still free — not after the look-ahead ingests
+    are away and the shared fleet is up.
+    """
+    with pytest.raises(ValueError):
+        _run(cells=[("33N", 2025), ("34N", 2024)], time_window_end="June 2025")
+    assert wired["ray_kwargs"] is None
+    assert not wired.get("ingest_dispatches"), wired.get("ingest_dispatches")
