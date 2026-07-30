@@ -56,8 +56,8 @@ shipped defaults.**
 |---|---|---|
 | `fill_strategy` | `"chained-clusters"` | one cluster per zone-set, not per zone-year |
 | `max_parallel_clusters` | 8 | balance holds to ~16; 8 keeps each cluster opening on a top-8 zone |
-| **`max_parallel_ingest`** | **40 → 45** ★ | fleet-wide cap on simultaneous zone-ingests. 45 is the knee: past it the year barrier makes extra cells worthless (§4) |
-| `max_zone_attempts` | 2 | bounded re-dispatch per year |
+| **`max_parallel_ingest`** | **40 → 45** ★ | fleet-wide cap on simultaneous zone-ingests. 45 is the knee *while years are serial*: past it the year barrier makes extra cells worthless. Without the barrier it becomes 61 (§4, §8) |
+| `max_zone_attempts` | 2 | bounded re-dispatch **per year** — the year is the retry unit, see §6 |
 | **`ingest_settings.max_workers`** | **50 → 60** ★ | S2 fleet width. Past the knee this is the ONLY thing that shortens the campaign, because the longest single zone sets the floor (§4) |
 | `ingest_settings.s1_worker_fraction` | 0.22 | → 13 workers per S1 orbit at the recommended 60w, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
@@ -66,7 +66,9 @@ shipped defaults.**
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
 | **`allow_s2_only`** | **`false` → `true`** ★ | ON for the global campaign. A fifth of the land has no radar for 2022–24 (§4); without this those pixels produce nothing. ADR 013 does not consider the combination validated — see §8 |
-| commit limit | derived, `min(clusters, 8)` | never set by hand |
+| `force_staging_reuse` | `false` | escape hatch: reuse staged tiles across an inference-code change you know is output-neutral |
+| `force_staging_restage` | `""` | escape hatch: any new token forces a fresh staging prefix, for a change the source hash cannot see (a library upgrade) |
+| commit limit | derived, `min(clusters, 8)` | never set by hand — and it bounds commits IN FLIGHT (~1 s each), not concurrent assemblies |
 
 The commit gate and the ingest gate are **Prefect global concurrency limits**, because
 clusters are separate flow runs on separate machines and only a server-side gate can bound
@@ -123,9 +125,31 @@ logging tok/sec all along for exactly this reason. The equivalent px/s here is 1
 same rate; ingest worker-hours are width-neutral. The decision is wall clock, bought with
 Fargate quota — nothing here is a cost trade.
 
-**Above 45 cells, extra Fargate quota buys nothing.** Not schedule, not supply, not usable
-GPU fleet. An earlier version of this plan asked for 71 cells and 23,000 vCPU; 45 × 60w is
-nearly two days faster on 16,740.
+**Above 45 cells, extra Fargate quota buys nothing — *while years run serially*.** Not
+schedule, not supply, not usable GPU fleet. An earlier version of this plan asked for 71 cells
+and 23,000 vCPU; 45 × 60w is nearly two days faster on 16,740.
+
+> **The knee is a consequence of the year barrier, not of ingest (established 2026-07-30).**
+> Years are serial only because two years of one zone rewrite that zone group's
+> `years_complete`/`runs` attrs and cannot auto-merge (§6). Nothing else requires it: every
+> chunk and shard is **1 in the time dimension**, so different years of one zone write
+> strictly disjoint objects. **Remove the barrier and the knee moves from ingest to the GPU
+> fleet** — see §8 item 7 for the payoff and what it depends on.
+>
+> The second-order consequence is worth knowing before asking for quota. **Past ~52 cells the
+> 2,500-actor fleet, not ingest, sets the schedule**, so extra cells buy *buffer* rather than
+> speed:
+>
+> | cells | vCPU | ingest | provisioning | campaign |
+> |---|---|---|---|---|
+> | 52 | 19,344 | 4.80 d | 100% | ~4.8 d |
+> | **61** | **22,692** | **4.09 d** | **85%** | **~4.8 d** |
+> | 66 | 24,552 | 3.78 d | 79% | ~4.8 d |
+> | 80 | 29,760 | 3.12 d | 65% | ~4.8 d |
+>
+> A deeper buffer is worth having — it is what absorbs a failed ingest cell — but it is not a
+> speed-up. **To go faster, ask for ACTORS, not cells:** 2,750 actors (67 cells) is ~4.4 d,
+> 3,000 (73 cells) ~4.0 d. 66 cells at proper 85% provisioning wants 2,704 actors, an ~8% bump.
 
 **Provision the GPU fleet UNDER what ingest can feed — about 85% of it.** That is the policy,
 not an accident of rounding. It keeps a standing queue of finished mosaics so the fleet is
@@ -152,10 +176,12 @@ that costs more. Settled; do not re-open.
 
 ## 5. Before launch
 
-1. **Fargate quota ≥ 17,000 vCPU** in us-west-2. The existing 2,500-actor GPU quota is
-   already more than enough — the recommended fleet is ~1,600, and no configuration in §4
-   can keep more than 2,267 busy — the widest configuration in §4. Fargate quota has lead
-   time; start there.
+1. **Fargate quota ≥ 17,000 vCPU** in us-west-2. The existing 2,500-actor GPU quota covers
+   every year-serial configuration in §4 — the recommended fleet is 1,824 and even 80 workers
+   wants only 2,267. **It stops being slack if the year barrier is removed** (§8 item 7): that
+   configuration provisions the full 2,500 at 61 cells and wants ~22,700 vCPU, so the two quota
+   asks are coupled and the barrier decision should come first. Fargate quota has lead time;
+   start there.
 2. **Prefect concurrency limits provisioned** — `tessera-global-ingests` and
    `tessera-global-commits`. Both gates are strict and fail closed on a missing limit.
 3. **Coverage/land mask built** for all 120 zones, and its `registry_sha256` frozen. A
@@ -178,15 +204,36 @@ started. Resume assumes the same land mask, which the manifest enforces on every
 
 **Retry.** A failed zone does not sink the campaign. Each year gets up to
 `max_zone_attempts` rounds, and every round re-reads the *store* for what is still missing,
-so a retry never repeats a zone that landed. Rounds stop early when one makes no progress
+so a retry never repeats a zone that landed.
+
+> **The year is the retry UNIT, which is why removing the barrier (§8 item 7) is not just a
+> loop change.** Drop the year and there is no unit left, and a naive whole-run round is much
+> worse granularity: a cell failing on day one would not be retried until every cluster had
+> finished its entire multi-year list. The intended fix is a **child-level retry pass** — the
+> chained fill already records per-cell failures and retains their mosaics for staged resume,
+> but does not retry; giving it one pass over its own failures keeps recovery local, and
+> because a child owns its zones and works them in order that retry cannot collide with
+> itself. The parent's rounds then handle only what a child could not.
+>
+> Note this needs two distinct bounds rather than today's one: attempts *within* a child and
+> attempts *across* the run. Overloading `max_zone_attempts` for both would silently change
+> what it means. Rounds stop early when one makes no progress
 — that is what a deterministic failure looks like from the driver, and it wants a human
 rather than another fleet. The campaign raises at the very end listing every unfilled cell.
 
 **Re-run.** A fresh campaign run recomputes nothing already done: completed work is
 filtered at the work list, at the per-zone ingest marker, at date-level resume inside
 ingest, and at staged-tile resume inside inference. Two deliberate exceptions — a changed
-parameter raises rather than silently mixing configurations, and a code change invalidates
-staged tiles by design.
+parameter raises rather than silently mixing configurations, and a change to the **inference
+code** invalidates staged tiles by design.
+
+> **Narrowed 2026-07-30.** That last exception used to fire on any change to the *build* — the
+> staging fingerprint was the resolved AMI ID plus the source tarball's ETag, so re-baking the
+> AMI or a hotfix anywhere in the repo abandoned every staged tile. It is now a hash of the
+> inference source only (`inference_code_identity`), so an orchestration or ingest fix reuses
+> staging. The AMI is still resolved once and pinned into every fill, which is now the only
+> thing stopping one run straddling two images. Two overrides exist for the judgement calls the
+> hash cannot make (§2).
 
 There are **no Prefect-level retries** on any ingest flow, deliberately.
 
@@ -238,6 +285,33 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
    Measured on the real coverage census at 8 clusters, true-work spread falls from **9.43%
    to 0.04%**. The within-cluster order is unchanged and still sorts on tile counts, which
    is correct: ordering and actor clamping are properties of area, not of work.
+7. **Remove the year barrier, and rework the retry loop with it.** Years are serial only
+   because two years of one zone rewrite that group's `years_complete`/`runs` attrs. **Both
+   attrs are keyed by year and each writer inserts only its own key**, so there is no semantic
+   conflict — icechunk's `ConflictDetector` simply treats attrs as opaque. And nothing else
+   requires the barrier: chunks and shards are 1 in the time dimension, so different years of
+   one zone are strictly disjoint on disk.
+
+   Payoff: the knee moves from ingest (45 cells) to the GPU fleet, giving **~4.8 days against
+   ~6.8** at 61 cells and the full 2,500-actor quota, plus 8 Ray cluster boots instead of 72
+   (~$8,000 of the ramp line). It also unblocks buying schedule with GPU quota again.
+
+   Three things it depends on, and the third is the real work:
+
+   - **Same-zone serialisation must still hold.** The intended shape gets it structurally:
+     dispatch 8 children once for the whole run, each owning a zone-set and working a
+     concatenated multi-year list. The partition is deterministic given the frozen mask, so
+     cluster *k* owns 35N in every year and works its list in order — two years of 35N are
+     never concurrent, and no storage change is needed.
+   - **Optionally, make the attrs conflict-free anyway** so the constraint stops being
+     something every future change must reason about. Cheapest is to split the commit: chunk
+     data first (disjoint, always rebases), then a small second commit that re-reads and merges
+     the attrs in its own session, retried on conflict. Two commits per zone-year instead of
+     one — ~2,000 total, far under icechunk's "tens of thousands" — and it independently fixes
+     a real defect: today an attr collision discards an entire assembly rather than retrying a
+     one-second commit.
+   - **The retry loop must be rebuilt**, because the year IS the current retry unit. See §6.
+
 
 ---
 

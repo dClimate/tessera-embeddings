@@ -273,6 +273,38 @@ run — the "slightly slower start" that buys the guarantee.
 $304,000 of idle at a quota-sized fleet — is what this policy exists to avoid, and it is now
 avoided by choosing the fleet rather than by hoping supply keeps up.
 
+### Which quota actually binds, and the answer flips when the year barrier goes
+
+Every row above is **year-serial**, so its makespan is `max(longest zone, work / cells)` per
+year and the cell count stops helping at ~45. Remove the year barrier (`campaign-plan.md` §8
+item 7) and the makespan is simply `total work / cells`, which moves the constraint onto the
+GPU fleet:
+
+| cells | Fargate vCPU | ingest | provisioning at 2,500 actors | **campaign** |
+|---|---|---|---|---|
+| 52 | 19,344 | 4.80 d | 100% — no buffer | ~4.8 d |
+| **61** | **22,692** | **4.09 d** | **85% — the policy** | **~4.8 d** |
+| 66 | 24,552 | 3.78 d | 79% | ~4.8 d |
+| 80 | 29,760 | 3.12 d | 65% | ~4.8 d |
+
+**Past ~52 cells the campaign is flat at ~4.8 days**, because the 2,500-actor fleet consumes at
+a fixed rate no matter how fast mosaics arrive. Extra cells buy the **buffer** the 85% policy is
+made of — which is worth having, since it is what absorbs a failed ingest cell — but they buy no
+schedule at all. This is the easiest wrong quota request to make from this document: asking for
+Fargate when the binding resource is GPU.
+
+**To buy schedule, buy actors.** Cells shown are what keeps 85% provisioning:
+
+| actors | cells | Fargate vCPU | **campaign** | vs 2,500 |
+|---|---|---|---|---|
+| 2,500 | 61 | 22,700 | ~4.8 d | 1.00× |
+| 2,750 | 67 | 24,969 | **~4.4 d** | 0.91× |
+| 3,000 | 73 | 27,239 | **~4.0 d** | 0.83× |
+| 3,500 | 85 | 31,779 | ~3.4 d | 0.71× |
+
+The cheapest useful ask is **2,704 actors**, which is 66 cells at proper 85% provisioning — an
+~8% quota bump for about half a day.
+
 **The 2,500-actor quota fits every configuration here, but not by much at the widest.** The
 recommended 45 × 60w provisions 1,824; even 45 × 80w provisions 2,267, inside the quota with
 margin. The quota is adequate for every configuration considered here.
@@ -514,9 +546,13 @@ the nine year-barriers at which one stalled zone holds up everything behind it.
    applies one rate to every pixel. This is the mechanism underneath uncertainty 1 rather
    than a separate risk, but it is the tractable way to resolve it: the store writes
    `s2_obs_count` and `s1_*_obs_count` per pixel, so the first completed zone-years measure
-   it directly. It also means `_partition_by_live_tiles` balances clusters on **area, not
+   it directly. It also meant `_partition_by_live_tiles` balanced clusters on **area, not
    work**, which is only sound if observation count is uncorrelated with zone — and latitude
-   says it is not.
+   says it is not. **Fixed 2026-07-30:** the partition now weights each live tile row by its
+   latitude band's observation count (`zone_work_weight`), which takes true-work spread across
+   8 clusters from **9.43% to 0.04%**. The band table is this section's census, so the fix
+   inherits its sampling error — but balancing needs only the RATIOS between bands, which is
+   the robust part.
 4. **Fleet-matching assumes ingest and inference stay in lockstep, and they do not.** The
    duty-cycle arithmetic treats supply as smooth. It is not: dense zones take far longer than
    sparse ones, and the campaign deals the densest first, so early supply is slower than
@@ -578,10 +614,12 @@ the nine year-barriers at which one stalled zone holds up everything behind it.
    sample and through a cloud proxy that omits shadow. The store measures the real thing per
    pixel, and reading it costs nothing (§9).
 
-5. **Weight the zone-to-cluster split by work, not area.** `_partition_by_live_tiles`
-   balances on live-tile counts while cost scales with tiles × observations, and observation
-   count varies about twofold with latitude. Two clusters with equal tile counts can carry
-   materially unequal work (§6).
+5. ~~**Weight the zone-to-cluster split by work, not area.**~~ **DONE 2026-07-30.** True-work
+   spread across 8 clusters falls from 9.43% to 0.04%. Worth recording why it mattered more
+   than "uneven finish times" suggested: clusters are long-lived so the last to finish sets the
+   campaign date and a heavy cluster is never averaged away, and the imbalance was **not
+   random** — latitude drives it, so a cluster drawing high-latitude zones was heavy in *every*
+   year.
 
 6. **Replace the whole throughput model with measurement after the first zone-years land.**
    The store writes `s2_obs_count` and `s1_*_obs_count` per pixel. That converts §6 from a
