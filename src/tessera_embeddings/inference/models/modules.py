@@ -218,7 +218,15 @@ class TemporalPositionalEncoder(nn.Module):
         self._div_term_cache: dict[torch.device, torch.Tensor] = {}
 
     def _div_term(self, device: torch.device) -> torch.Tensor:
-        """FP32 sinusoidal frequencies for *device*, computed once per device."""
+        """FP32 sinusoidal frequencies for *device*, computed once per device.
+
+        Filled on whichever CUDA stream runs the first forward (a backbone side
+        stream under the pipelined loop) and read from that same stream on every
+        later call, since each backbone owns its own encoder. It is never freed —
+        the cache holds the only reference for the module's life — so it needs no
+        ``record_stream``, and the profile batch's default-stream read is ordered
+        behind the pipeline drain that precedes it.
+        """
         cached = self._div_term_cache.get(device)
         if cached is None:
             cached = torch.exp(
