@@ -203,10 +203,16 @@ There are **no Prefect-level retries** on any ingest flow, deliberately.
 Settled since the last revision, and not to be re-opened: **the model is v1.1**, **GPUs are
 on-demand**, and the permanent store goes to **AWS Open Data**.
 
-1. **Count the dual-orbit zones.** The single largest input to the cost model, worth about
-   $150,000 across its plausible range, and it needs a count rather than an experiment —
-   `resolve_s1_orbit` already knows which orbits each zone-year has. Do this before the
-   budget is signed off.
+1. **Decide what 2022–2024 looks like over the land with no radar.** OPERA RTC-S1 coverage
+   was withdrawn from about a fifth of the land it served after Sentinel-1B failed in
+   December 2021 and largely restored with Sentinel-1C in 2025; interior Australia and much
+   of Siberia return *zero* granules for those three years. With `allow_s2_only=false` those
+   pixels produce no embedding, and a zone with no radar anywhere fails its coverage gate
+   outright. Three options: enable the S2-only path for the affected cells (it exists but is
+   unvalidated for production — see ADR 013), accept the gap and document it in what we
+   publish, or drop those zone-years. **This is the one open item that is not about money,
+   and it has to be settled before the store is seeded**, because the coverage the campaign
+   claims is part of the artefact. `scripts/census_s1_coverage.py` maps the affected area.
 2. **Measure the densest zone at two fleet widths (60 and 80).** It decides whether the
    campaign is 5.6 days or 4.5, and it is the only remaining question about the schedule. The
    width model is fitted over roughly 30–60 workers, so 80 is currently an extrapolation.
