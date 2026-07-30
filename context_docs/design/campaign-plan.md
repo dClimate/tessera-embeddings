@@ -304,39 +304,12 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
    to 0.04%**. The within-cluster order is unchanged and still sorts on tile counts, which
    is correct: ordering and actor clamping are properties of area, not of work.
 7. **Turn the year barrier OFF, once Phase 4 validates it.** The code shipped 2026-07-30
-   behind `overlap_years` (default off); what remains is a deployment re-registration and a
-   real-fleet run. Years were serial only because two years of one zone rewrote that group's
-   `years_complete`/`runs` attrs — **now fixed**: those attrs commit separately and retry
-   (`commit_year_attrs`), so a same-zone collision costs a sub-second retry instead of a whole
-   assembly. **Both
-   attrs are keyed by year and each writer inserts only its own key**, so there is no semantic
-   conflict — icechunk's `ConflictDetector` simply treats attrs as opaque. And nothing else
-   requires the barrier: chunks and shards are 1 in the time dimension, so different years of
-   one zone are strictly disjoint on disk.
+   behind `overlap_years` (default off). What remains is a deployment re-registration and a
+   real-fleet run — Phase 4's P3c rung.
 
    Payoff: the knee moves from ingest (45 cells) to the GPU fleet, giving **~4.8 days against
    ~6.8** at 61 cells and the full 2,500-actor quota, plus 8 Ray cluster boots instead of 72
-   (~$8,000 of the ramp line). It also unblocks buying schedule with GPU quota again.
-
-   Three things it depends on, and the third is the real work:
-
-   - **Same-zone serialisation must still hold.** The intended shape gets it structurally:
-     dispatch 8 children once for the whole run, each owning a zone-set and working a
-     concatenated multi-year list. The partition is deterministic given the frozen mask, so
-     cluster *k* owns 35N in every year and works its list in order — two years of 35N are
-     never concurrent, and no storage change is needed.
-   - **Optionally, make the attrs conflict-free anyway** so the constraint stops being
-     something every future change must reason about. Cheapest is to split the commit: chunk
-     data first (disjoint, always rebases), then a small second commit that re-reads and merges
-     the attrs in its own session, retried on conflict. Two commits per zone-year instead of
-     one — ~2,000 total, far under icechunk's "tens of thousands" — and it independently fixes
-     a real defect: today an attr collision discards an entire assembly rather than retrying a
-     one-second commit.
-   - ~~**The retry loop must be rebuilt**~~ — **DONE 2026-07-30.** The chained fill now
-     retries a failed cell on its own still-provisioned cluster (`max_cell_attempts`,
-     default 2), so recovery is local rather than waiting on a whole dispatch. Eligibility
-     is "kept its mosaic", not "failed": two paths delete the mosaic deliberately, and
-     retrying one of those runs against nothing.
+   (~$8,000 of the ramp line). It also makes GPU quota buy schedule again.
 
    **SHIPPED 2026-07-30 behind `overlap_years` (default OFF).** Option A was taken: the
    inference window is now a PER-CELL value carried on every work item

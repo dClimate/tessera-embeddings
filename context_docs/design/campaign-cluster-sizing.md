@@ -276,7 +276,8 @@ the scoped `T201` exemption in `ruff.toml` alongside the profiling tools'.
 
 - [ADR-008 — global store architecture](../decisions/008-global-store-architecture.md),
   D5/D6: the run-1 commit-storm experiment the concurrency numbers above come from,
-  and why one commit per zone-year is the unit.
+  and why a zone-year is the commit unit (two commits since 2026-07-30 — the shards, then
+  that year's attrs, which is what lets two years of one zone be written concurrently).
 - [ADR-011 — campaign-triggered per-zone ingestion](../decisions/011-campaign-zone-ingestion.md):
   the ingest cap, the GPU-start rule, and why the density ordering is load-bearing.
 - [`orchestration/prefect/README.md`](../../src/tessera_embeddings/orchestration/prefect/README.md):
