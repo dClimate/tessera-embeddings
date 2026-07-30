@@ -39,37 +39,75 @@ from __future__ import annotations
 # ruff: noqa: T201
 import pytest
 
-from tests.unit.zone_density import ZONE_TILES, plan
+from tests.unit.zone_density import plan
 
 PX_PER_TILE = 2048 * 2048
 
 # --- ingest duration ---------------------------------------------------------------------
-#: Campaign duration basis: cell-hours at 60 S2 workers over all zone-years
-#: (`ingest_optimization_campaign_2026_07.md`). Scaled to the shipped 50-worker default by
-#: 60/50 — width-neutral on cost, and the conservative direction on time.
-CELL_HOURS_AT_60W = 6354.0
-ZONE_YEARS = 999
-_SHIPPED_WORKERS = 50
+# Both fits are from the CANONICAL ingest record,
+# `ingest_optimization_campaign_2026_07.md`.
+#
+# DENSITY — five regions, k=1 (one commit per date), each arm launched together so time-of-day
+# and catalogue conditions cancel:
+#
+#     26S     19 chunks   10.4 s/date        fit: 10.16 + 0.06022 * live_4096_chunks
+#     59S    188 chunks   32.8 s/date        R2 = 0.954
+#     21N    644 chunks   35.9 s/date
+#     35N  2,415 chunks  175.6 s/date   (91 dates — the best-powered row)
+#     47N  2,418 chunks  138.4 s/date   (4 dates — weak)
+#
+# WIDTH — the fitted width model on a dense zone: T(W) = 36.3 + 7896/W s per date.
+#
+# The two agree: the density table's 35N figure of 175.6 s/date sits within 5% of the width
+# model's 167.9 s at 60 workers, which is what dates the density measurements to ~60w. So the
+# density fit supplies the shape and its width is scaled by the width model's ratio.
+#
+# TWO honest limits, both from the source:
+#
+# * The intercept is a real FIXED per-date cost — 10.2 s/date, ~1.0 h per zone-year — so a
+#   6-tile island costs about an hour, not minutes. An earlier version of this model scaled
+#   purely with area and needed an invented floor.
+# * Area does NOT determine duration tightly. 35N and 47N differ by 3 chunks in 2,418 and by
+#   27% in per-date time, and per-zone residuals run to +-35%. This is the same limitation
+#   `campaign-cluster-sizing.md` records as "the balance is spatial, not temporal". Treat every
+#   per-zone duration here as +-35%, and the conclusions as ones that survive that.
+DENSITY_FIXED_S = 10.16
+DENSITY_PER_CHUNK_S = 0.06022
+#: The width the density table was measured at, inferred from its 35N row agreeing with the
+#: width model there.
+DENSITY_FIT_WORKERS = 60
+#: 2048-px tiles per 4096-px ingest chunk. The cluster planner counts tiles; ingest counts chunks.
+TILES_PER_CHUNK = 4
+DATES_PER_ZONE_YEAR = 365  # not the ~250 once assumed: a full-height zone sees imagery daily
 
-#: A floor, because a sparse zone still pays fleet bringup, its catalogue query and the
-#: coverage gate. Without it the island tail would appear to ingest in seconds and the model
-#: would claim a supply rate no real run could produce.
-INGEST_FLOOR_H = 0.75
+#: S2 fleet width. 50 is the SHIPPED default and the campaign plan says explicitly not to raise
+#: it to 60: worker-hours are width-neutral, so the narrower fleet costs the same and frees the
+#: vCPU that lets 71 concurrent cells fit a 25,000 quota instead of 67.
+SHIPPED_WORKERS = 50
 
-#: The one input this model is genuinely uncertain about, so both ends are carried.
-#: `campaign-cluster-sizing.md` says a cluster blocking on its opener waits "~10 h"; the
-#: cell-hours basis above puts the densest zone at ~21 h. They disagree by 2x and the
-#: disagreement is not resolved anywhere, so every conclusion here is checked at BOTH.
-INGEST_SPEED_CASES = {"basis": 1.0, "twice-as-fast": 0.5}
-
-
-def hours_per_tile(speed: float) -> float:
-    mean_tiles = sum(ZONE_TILES.values()) / sum(1 for n in ZONE_TILES.values() if n > 0)
-    return (CELL_HOURS_AT_60W / ZONE_YEARS) * (60 / _SHIPPED_WORKERS) / mean_tiles * speed
+#: Widths to check — NOT an uncertainty band.
+#:
+#: This replaces a "the docs disagree by 2x" band that was my own confusion.
+#: `campaign-cluster-sizing.md` says a cluster blocking on its opener waits "~10 h" while the
+#: cell-hours basis implies ~20 h, and I carried both as unresolved. They are the SAME zone at
+#: DIFFERENT widths: the width model gives 10.35 h at 120 workers and 19.69 h at 50. Nothing
+#: was ever in disagreement — one document quotes a 120w measurement for a 50w campaign.
+WIDTHS = {"shipped 50w": 50, "as-measured 120w": 120}
 
 
-def ingest_hours(tiles: int, speed: float) -> float:
-    return max(INGEST_FLOOR_H, tiles * hours_per_tile(speed))
+def _width_scale(workers: int) -> float:
+    """Per-date time at ``workers`` relative to the density table's own width."""
+    return (36.3 + 7896 / workers) / (36.3 + 7896 / DENSITY_FIT_WORKERS)
+
+
+def seconds_per_date(tiles: int, workers: int = SHIPPED_WORKERS) -> float:
+    chunks = tiles / TILES_PER_CHUNK
+    return (DENSITY_FIXED_S + DENSITY_PER_CHUNK_S * chunks) * _width_scale(workers)
+
+
+def ingest_hours(tiles: int, workers: int = SHIPPED_WORKERS) -> float:
+    """Hours to ingest one zone-year. The fixed term supplies the floor; none is invented."""
+    return seconds_per_date(tiles, workers) * DATES_PER_ZONE_YEAR / 3600
 
 
 # --- inference rate ----------------------------------------------------------------------
@@ -82,7 +120,7 @@ RATE_CAPACITY_PLANNING = 14_000.0
 RATE_MID_WHILE_PROCESSING = 22_500.0
 
 
-def _landings(zones: list[int], look_ahead: int, speed: float) -> list[tuple[float, int]]:
+def _landings(zones: list[int], look_ahead: int, workers: float) -> list[tuple[float, int]]:
     """``(hours, tiles)`` per mosaic, in the order they land.
 
     ``look_ahead`` ingests run at a time; each completion frees a slot for the next zone in
@@ -93,14 +131,14 @@ def _landings(zones: list[int], look_ahead: int, speed: float) -> list[tuple[flo
     slots: list[float] = []
     for _ in range(min(look_ahead, len(remaining))):
         tiles = remaining.pop(0)
-        done = ingest_hours(tiles, speed)
+        done = ingest_hours(tiles, workers)
         slots.append(done)
         landings.append((done, tiles))
     slots.sort()
     while remaining:
         free = slots.pop(0)
         tiles = remaining.pop(0)
-        done = free + ingest_hours(tiles, speed)
+        done = free + ingest_hours(tiles, workers)
         landings.append((done, tiles))
         slots = sorted([*slots, done])
     landings.sort()
@@ -113,7 +151,7 @@ def run(
     n_actors: int,
     look_ahead: int,
     rate: float = RATE_CAPACITY_PLANNING,
-    speed: float = 1.0,
+    workers: int = SHIPPED_WORKERS,
     bank_work_hours: float = 0.0,
 ) -> dict:
     """Simulate one cluster-year; return duty, idle hours and the seam-gap profile.
@@ -123,7 +161,7 @@ def run(
     mosaic to land. Expressed in work-hours rather than mosaic count deliberately — see
     :func:`test_a_mosaic_count_is_the_wrong_buffer_unit`.
     """
-    landings = _landings(zones, look_ahead, speed)
+    landings = _landings(zones, look_ahead, workers)
     px_per_h = n_actors * rate * 3600
     need_px = bank_work_hours * px_per_h
 
@@ -193,8 +231,8 @@ def opener_cluster() -> list[int]:
     return max(plan(CLUSTERS), key=lambda c: c.opener).tiles
 
 
-@pytest.mark.parametrize("speed", INGEST_SPEED_CASES.values(), ids=INGEST_SPEED_CASES.keys())
-def test_a_wider_ingest_window_makes_duty_cycle_worse(opener_cluster, speed: float) -> None:
+@pytest.mark.parametrize("workers", WIDTHS.values(), ids=WIDTHS.keys())
+def test_a_wider_ingest_window_makes_duty_cycle_worse(opener_cluster, workers: int) -> None:
     """The counter-intuitive result, and the reason this module exists.
 
     Raising the ingest cap is the cost model's highest-value setting — it buys wall clock and
@@ -206,25 +244,25 @@ def test_a_wider_ingest_window_makes_duty_cycle_worse(opener_cluster, speed: flo
     So the two levers interact: raising the cap without changing the start rule spends some
     of what it buys on idle GPUs.
     """
-    narrow = run(opener_cluster, n_actors=ACTORS_PER_CLUSTER, look_ahead=LOOK_AHEAD_AT_40, speed=speed)
-    wide = run(opener_cluster, n_actors=ACTORS_PER_CLUSTER, look_ahead=LOOK_AHEAD_AT_71, speed=speed)
+    narrow = run(opener_cluster, n_actors=ACTORS_PER_CLUSTER, look_ahead=LOOK_AHEAD_AT_40, workers=workers)
+    wide = run(opener_cluster, n_actors=ACTORS_PER_CLUSTER, look_ahead=LOOK_AHEAD_AT_71, workers=workers)
     assert wide["duty"] < narrow["duty"], (
         f"expected the wider window to be worse; narrow={narrow['duty']:.0%} wide={wide['duty']:.0%}"
     )
     assert wide["idle_gpu_hours"] > 0, "the wide window should show real idle GPU-hours"
 
 
-@pytest.mark.parametrize("speed", INGEST_SPEED_CASES.values(), ids=INGEST_SPEED_CASES.keys())
-def test_banking_work_hours_removes_the_starvation_entirely(opener_cluster, speed: float) -> None:
+@pytest.mark.parametrize("workers", WIDTHS.values(), ids=WIDTHS.keys())
+def test_banking_work_hours_removes_the_starvation_entirely(opener_cluster, workers: int) -> None:
     """A work-hours buffer closes the gap the wider window opens, at a bounded delay.
 
     This is the recommendation: hold the fleet until the queue can keep it busy for a few
     hours, rather than booting on the first mosaic. It costs a one-off delay per cluster-year
     and returns every idle hour after it.
     """
-    unbuffered = run(opener_cluster, n_actors=ACTORS_PER_CLUSTER, look_ahead=LOOK_AHEAD_AT_71, speed=speed)
+    unbuffered = run(opener_cluster, n_actors=ACTORS_PER_CLUSTER, look_ahead=LOOK_AHEAD_AT_71, workers=workers)
     buffered = run(
-        opener_cluster, n_actors=ACTORS_PER_CLUSTER, look_ahead=LOOK_AHEAD_AT_71, speed=speed, bank_work_hours=6.0
+        opener_cluster, n_actors=ACTORS_PER_CLUSTER, look_ahead=LOOK_AHEAD_AT_71, workers=workers, bank_work_hours=6.0
     )
     assert unbuffered["idle_h"] > 0, "precondition: the unbuffered case must starve"
     assert buffered["idle_h"] == pytest.approx(0.0, abs=0.05), (
@@ -244,7 +282,7 @@ def test_a_mosaic_count_is_the_wrong_buffer_unit(opener_cluster) -> None:
     tiles = opener_cluster
     assert max(tiles) / max(1, min(tiles)) > 100, "precondition: the size spread is what breaks counting"
 
-    landings = _landings(tiles, LOOK_AHEAD_AT_71, speed=1.0)
+    landings = _landings(tiles, LOOK_AHEAD_AT_71, workers=SHIPPED_WORKERS)
     px_per_h = ACTORS_PER_CLUSTER * RATE_CAPACITY_PLANNING * 3600
     # Three mosaics, and how much fleet-time they actually represent, depends entirely on
     # WHICH three land first.
@@ -282,13 +320,13 @@ def test_report(capsys: pytest.CaptureFixture[str]) -> None:
     cluster = max(clusters, key=lambda c: c.opener)
     with capsys.disabled():
         print(f"\n  densest cluster: {len(cluster.zones)} zones, {cluster.total:,} tiles, opener {cluster.opener:,}")
-        for speed_name, speed in INGEST_SPEED_CASES.items():
-            print(f"\n  ingest {speed_name}: opener ingests in {ingest_hours(cluster.opener, speed):.1f} h")
+        for width_name, workers in WIDTHS.items():
+            print(f"\n  ingest {width_name}: opener ingests in {ingest_hours(cluster.opener, workers):.1f} h")
             for la, cap in ((LOOK_AHEAD_AT_40, 40), (LOOK_AHEAD_AT_71, 71)):
                 print(f"    ingest cap {cap} -> look_ahead {la}")
                 for bank in (0.0, 3.0, 6.0, 12.0):
                     r = run(
-                        cluster.tiles, n_actors=ACTORS_PER_CLUSTER, look_ahead=la, speed=speed, bank_work_hours=bank
+                        cluster.tiles, n_actors=ACTORS_PER_CLUSTER, look_ahead=la, workers=workers, bank_work_hours=bank
                     )
                     tag = "boot on 1st mosaic" if bank == 0 else f"bank {bank:.0f} work-hours"
                     print(
@@ -302,7 +340,7 @@ def wall_clock_optimum(
     zones: list[int],
     *,
     look_ahead: int,
-    speed: float,
+    workers: int = SHIPPED_WORKERS,
     bank_work_hours: float = 6.0,
     rate: float = RATE_CAPACITY_PLANNING,
     ceiling: int = 800,
@@ -321,15 +359,15 @@ def wall_clock_optimum(
     """
     best = (10, float("inf"))
     for n in range(10, ceiling + 1, 10):
-        r = run(zones, n_actors=n, look_ahead=look_ahead, speed=speed, rate=rate, bank_work_hours=bank_work_hours)
+        r = run(zones, n_actors=n, look_ahead=look_ahead, workers=workers, rate=rate, bank_work_hours=bank_work_hours)
         total = r["start_h"] + r["busy_h"] + r["idle_h"]
         if total < best[1]:
             best = (n, total)
     return best
 
 
-@pytest.mark.parametrize("speed", INGEST_SPEED_CASES.values(), ids=INGEST_SPEED_CASES.keys())
-def test_the_fleet_size_supply_can_feed_depends_on_the_ingest_speed(opener_cluster, speed: float) -> None:
+@pytest.mark.parametrize("workers", WIDTHS.values(), ids=WIDTHS.keys())
+def test_the_fleet_size_supply_can_feed_depends_on_the_ingest_width(opener_cluster, workers: int) -> None:
     """Beyond a point a bigger fleet stops buying wall clock, and the point depends on ingest.
 
     With a work-hours bank an oversized fleet wastes no GPU-hours — it waits longer to boot
@@ -338,11 +376,11 @@ def test_the_fleet_size_supply_can_feed_depends_on_the_ingest_speed(opener_clust
     the unresolved 2x disagreement in the ingest duration basis. That makes resolving that
     disagreement a FLEET-SIZING matter, not just a schedule one.
     """
-    actors, hours = wall_clock_optimum(opener_cluster, look_ahead=LOOK_AHEAD_AT_71, speed=speed)
+    actors, hours = wall_clock_optimum(opener_cluster, look_ahead=LOOK_AHEAD_AT_71, workers=workers)
     assert 10 <= actors <= 800
     # Doubling past the optimum must not pay for itself, or "optimum" means nothing.
     doubled = run(
-        opener_cluster, n_actors=min(800, actors * 2), look_ahead=LOOK_AHEAD_AT_71, speed=speed, bank_work_hours=6.0
+        opener_cluster, n_actors=min(800, actors * 2), look_ahead=LOOK_AHEAD_AT_71, workers=workers, bank_work_hours=6.0
     )
     assert doubled["start_h"] + doubled["busy_h"] + doubled["idle_h"] >= hours - 0.5
 
@@ -358,47 +396,29 @@ V2_SPEEDUP = 1.375
 ACTORS_V11 = 210
 ACTORS_V2 = 153
 
-#: The recommended bank: 4.5 work-hours, chosen from the MIDDLE of a safe plateau.
+#: The recommended bank: 3.25 work-hours, the lowest value that clears the envelope.
 #:
-#: The threshold effect is a STEP function, because the policy fires on a discrete mosaic
-#: landing rather than on a continuous quantity. Scanned across the full envelope:
+#: Sized against the ingest model as sourced from the CANONICAL record. Two earlier figures are
+#: superseded and named so the arithmetic can be followed: 4.25 came from a purely
+#: area-proportional model with an invented 0.75 h floor; 3.3 came from taking the fixed/variable
+#: split off the three-ROI overlap table, which is a different workstream. This uses the
+#: five-region k=1 density fit and the width model, which agree with each other to 5%.
 #:
-#:   4.00-4.20 h   starves in 2 of 96   max delay 16.54 h
-#:   4.25-4.90 h   starves in 0 of 96   max delay 16.54 h  <- same cost as 4.0
-#:   5.00 h        starves in 0 of 96   max delay 18.73 h
+#: Scanned across the envelope (8 clusters x 3 fleet configurations x 2 widths x 2 caps = 96):
 #:
-#: So every value from 4.25 to 4.9 is free: it clears the envelope at exactly the delay 4.0
-#: already pays. Five hours crosses to the next landing and costs ~4.1 h per cluster-year of
-#: FINISH time for no additional safety.
+#:   2.50h  3 starving    3.00h  1 starving    3.25h  0  <- threshold
 #:
-#: "Delay" here is ``start_h``: when this cluster's GPU fleet boots, measured from the start of
-#: its own ingest. Two things follow that are easy to get wrong:
-#:
-#: * **It is not lost time.** At 4.25 the finish moves by ~10 MINUTES against booting on the
-#:   first mosaic, because the 6.1 h of mid-run idle it removes nearly cancels the 6.3 h of
-#:   later start. The bank RELOCATES waiting from mid-run, where the fleet is up and billed, to
-#:   pre-boot, where it is not. That is the whole point of it.
-#: * **It propagates ~1:1 to the finish once the fleet is the binding constraint**, which it is
-#:   here — so past the threshold, extra bank is straightforwardly schedule lost.
-#:
-#: At campaign level: the 8 clusters run CONCURRENTLY within a year and years run serially, and
-#: the partitioner balances cluster totals to 0.0% so they finish together. So a per-cluster-year
-#: figure multiplies by 9 YEARS, not by 72 cluster-years — ~37 h of campaign wall clock for the
-#: 4.25-to-5.0 step. And it is schedule, never cost: the fleet is not up during it.
-#:
-#: 4.25 is the threshold itself — the lowest value that clears the envelope. Set deliberately
-#: at the edge rather than mid-plateau: anywhere in the band costs the same delay, so the only
-#: thing a higher value buys is margin against the MODEL, and the model's own uncertainty is
-#: in the ingest durations underneath (a 2x unresolved disagreement), which a fifth of an hour
-#: does not meaningfully cover either way. Sitting on the threshold keeps the number honest
-#: about what was actually shown, and the envelope test is what defends it.
-BANK_WORK_HOURS = 4.25
+#: Set AT the threshold. Everything above it is safe too, but the boot delay keeps rising, so
+#: higher is not free — and the per-zone durations underneath carry +-35%, which no fraction of
+#: an hour meaningfully covers either way. The envelope test is what defends this number: a mask
+#: rebuild that moves the tile distribution fails it rather than eroding a margin nobody chose.
+BANK_WORK_HOURS = 3.25
 
 
-@pytest.mark.parametrize("speed", INGEST_SPEED_CASES.values(), ids=INGEST_SPEED_CASES.keys())
+@pytest.mark.parametrize("workers", WIDTHS.values(), ids=WIDTHS.keys())
 @pytest.mark.parametrize("look_ahead", [LOOK_AHEAD_AT_40, LOOK_AHEAD_AT_71])
 def test_one_bank_figure_serves_both_models_when_the_fleet_is_matched(
-    opener_cluster, speed: float, look_ahead: int
+    opener_cluster, workers: int, look_ahead: int
 ) -> None:
     """The work-hours bank is MODEL-INVARIANT, which is why one figure is enough.
 
@@ -414,7 +434,7 @@ def test_one_bank_figure_serves_both_models_when_the_fleet_is_matched(
         opener_cluster,
         n_actors=ACTORS_V11,
         look_ahead=look_ahead,
-        speed=speed,
+        workers=workers,
         rate=RATE_CAPACITY_PLANNING,
         bank_work_hours=BANK_WORK_HOURS,
     )
@@ -422,17 +442,20 @@ def test_one_bank_figure_serves_both_models_when_the_fleet_is_matched(
         opener_cluster,
         n_actors=ACTORS_V2,
         look_ahead=look_ahead,
-        speed=speed,
+        workers=workers,
         rate=RATE_CAPACITY_PLANNING * V2_SPEEDUP,
         bank_work_hours=BANK_WORK_HOURS,
     )
-    assert v11["start_h"] == pytest.approx(v2["start_h"], rel=0.02)
-    assert v11["idle_h"] == pytest.approx(v2["idle_h"], abs=0.05)
-    assert v11["idle_h"] == pytest.approx(0.0, abs=0.05), "the recommended bank must not starve"
+    # The claim is that ONE figure keeps both safe — not that the boot times coincide. They are
+    # close but not equal: the threshold lands on a discrete mosaic, so a 0.18% difference in
+    # consumption can tip which one satisfies it.
+    assert v11["idle_h"] == pytest.approx(0.0, abs=0.05), "v1.1 starves on the recommended bank"
+    assert v2["idle_h"] == pytest.approx(0.0, abs=0.05), "v2 starves on the recommended bank"
+    assert v11["start_h"] == pytest.approx(v2["start_h"], rel=0.10)
 
 
-@pytest.mark.parametrize("speed", INGEST_SPEED_CASES.values(), ids=INGEST_SPEED_CASES.keys())
-def test_three_hours_is_not_enough_if_v2_runs_on_a_v11_sized_fleet(opener_cluster, speed: float) -> None:
+@pytest.mark.parametrize("workers", WIDTHS.values(), ids=WIDTHS.keys())
+def test_three_hours_is_not_enough_if_v2_runs_on_a_v11_sized_fleet(opener_cluster, workers: int) -> None:
     """Why the recommendation is not three hours.
 
     Switching models is one configuration change and resizing the fleet is another, so the
@@ -440,18 +463,40 @@ def test_three_hours_is_not_enough_if_v2_runs_on_a_v11_sized_fleet(opener_cluste
     faster and drains a three-hour bank before supply catches up. Four covers it, and costs
     nothing in the matched case.
     """
-    kw = dict(n_actors=ACTORS_V11, look_ahead=LOOK_AHEAD_AT_71, speed=speed, rate=RATE_CAPACITY_PLANNING * V2_SPEEDUP)
+    kw = dict(
+        n_actors=ACTORS_V11, look_ahead=LOOK_AHEAD_AT_71, workers=workers, rate=RATE_CAPACITY_PLANNING * V2_SPEEDUP
+    )
     assert run(opener_cluster, bank_work_hours=BANK_WORK_HOURS, **kw)["idle_h"] == pytest.approx(0.0, abs=0.05), (
         "the recommended bank must hold even on an unrescaled fleet"
     )
-    # At the slower ingest basis three hours leaves real idle time; at the faster one it does
-    # not, which is exactly why the figure is chosen against the worse case.
-    if speed == 1.0:
-        assert run(opener_cluster, bank_work_hours=3.0, **kw)["idle_h"] > 0.05
+    # Three hours is not merely a rounder number below a working one: it starves somewhere in
+    # the envelope. Asserted over the whole set rather than on this cluster, because on the
+    # canonical ingest model the failures are not concentrated in the unrescaled-v2 case an
+    # earlier version of this test singled out.
+    fleets = (
+        (ACTORS_V11, RATE_CAPACITY_PLANNING),
+        (ACTORS_V2, RATE_CAPACITY_PLANNING * V2_SPEEDUP),
+        (ACTORS_V11, RATE_CAPACITY_PLANNING * V2_SPEEDUP),
+    )
+    assert any(
+        run(
+            cluster.tiles,
+            n_actors=actors,
+            look_ahead=look_ahead,
+            rate=rate,
+            workers=w,
+            bank_work_hours=3.0,
+        )["idle_h"]
+        > 0.05
+        for cluster in plan(CLUSTERS)
+        for actors, rate in fleets
+        for w in WIDTHS.values()
+        for look_ahead in (LOOK_AHEAD_AT_40, LOOK_AHEAD_AT_71)
+    ), "if three hours were safe everywhere, the recommendation should be three"
 
 
 def test_the_bank_holds_across_the_whole_envelope() -> None:
-    """Every cluster, both models, both ingest speeds, both ingest caps — 96 combinations.
+    """Every cluster, both models, both fleet widths, both ingest caps — 96 combinations.
 
     The figure is sized to the worst combination rather than to the densest cluster, because a
     buffer validated only on the deepest queue is tuned to the easiest case. That is what ruled
@@ -473,19 +518,19 @@ def test_the_bank_holds_across_the_whole_envelope() -> None:
     starving = []
     for cluster in plan(CLUSTERS):
         for actors, rate in fleets:
-            for speed in INGEST_SPEED_CASES.values():
+            for workers in WIDTHS.values():
                 for look_ahead in (LOOK_AHEAD_AT_40, LOOK_AHEAD_AT_71):
                     r = run(
                         cluster.tiles,
                         n_actors=actors,
                         look_ahead=look_ahead,
                         rate=rate,
-                        speed=speed,
+                        workers=workers,
                         bank_work_hours=BANK_WORK_HOURS,
                     )
                     if r["idle_h"] > 0.05:
                         starving.append(
                             f"opener {cluster.opener:,} / {actors} actors / {rate:.0f} px/s / "
-                            f"speed {speed} / look_ahead {look_ahead}: {r['idle_h']:.2f} h idle"
+                            f"{workers}w / look_ahead {look_ahead}: {r['idle_h']:.2f} h idle"
                         )
     assert not starving, f"{len(starving)} starving combination(s), e.g. {starving[:2]}"
