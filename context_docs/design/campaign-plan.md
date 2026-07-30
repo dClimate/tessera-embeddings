@@ -310,7 +310,37 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
      one — ~2,000 total, far under icechunk's "tens of thousands" — and it independently fixes
      a real defect: today an attr collision discards an entire assembly rather than retrying a
      one-second commit.
-   - **The retry loop must be rebuilt**, because the year IS the current retry unit. See §6.
+   - ~~**The retry loop must be rebuilt**~~ — **DONE 2026-07-30.** The chained fill now
+     retries a failed cell on its own still-provisioned cluster (`max_cell_attempts`,
+     default 2), so recovery is local rather than waiting on a whole dispatch. Eligibility
+     is "kept its mosaic", not "failed": two paths delete the mosaic deliberately, and
+     retrying one of those runs against nothing.
+
+   **BLOCKED, and the blocker is in the inference layer rather than the driver
+   (found 2026-07-30).** The intended shape — 8 clusters each streaming a multi-year list —
+   does not work as the code stands, because **a shared inference session has exactly one
+   time window**. The actors read `self.config.time_window`, the config is bound once at
+   session creation, and `ZoneContext` (the per-cell data carried on every work item) holds
+   `mosaic_base`/`staging_base`/`run_id` but no window. Streaming a cell from another year
+   through those actors would silently read the wrong months — the actor's window, not the
+   cell's. The runner's existing mismatch check covers `s1_orbit` only, so nothing would
+   catch it.
+
+   Three ways forward, and they differ enough that the choice is not obvious:
+
+   | option | inference change | cluster boots | gets the schedule win? |
+   |---|---|---|---|
+   | **A** thread the window per work item (`ZoneContext.time_window`) | yes — hot path | 8 | fully |
+   | **B** 8 cluster *slots*, each one year at a time | none | 72 | mostly not — each slot re-waits for its own opening ingest |
+   | **C** overlap whole years at the driver, bounded | none | 72 | mostly |
+
+   **A** is mechanically small and idiomatic — `mosaic_base` is already threaded per item
+   exactly this way — but it lands in the most performance-critical code in the repo, where
+   three loader call sites are documented as needing identical kwargs for bit-identity.
+   **C** is now viable *because* the attr commit was split: overlapping years no longer needs
+   a zone-disjointness guarantee, since a same-zone collision retries. It needs a bound on
+   how many clusters of the next year may start early, because 16 concurrent clusters at 228
+   actors is 3,648 and over quota; two early starts (10 clusters, 2,280 actors) fits.
 
 
 ---
