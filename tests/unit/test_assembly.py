@@ -9,6 +9,7 @@ decision instead of error propagation.
 
 from __future__ import annotations
 
+import logging
 import pickle
 from importlib.metadata import version as _dist_version
 from unittest.mock import MagicMock, patch
@@ -96,6 +97,67 @@ class TestStagedStorageOptions:
     )
     def test_non_s3_path_gets_no_options(self, path):
         assert _staged_storage_options(path) is None
+
+
+_FP_V2 = {"model_version": "v2-large", "checkpoint": "student_large.pt", "representation_dim": 128}
+_FP_V11 = {"model_version": "v1.1", "checkpoint": "tessera_v1_1_aws_encoder.pt", "representation_dim": 192}
+
+
+class TestClaimRun:
+    """Binding a staging run to the model that produced it.
+
+    Staged chunks are (H, W, 128) int8 for BOTH models — v1.1 saves the first
+    128 of its 192-d representation, v2 emits 128 natively — so shape and dtype
+    cannot tell them apart. Without an identity marker, a resume that omits
+    ``model_version`` silently defaults to v1.1 and finishes a v2 run with the
+    wrong encoder.
+    """
+
+    def test_claim_then_reclaim_same_config_is_idempotent(self, tmp_path):
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        writer.claim_run("run1", _FP_V2)
+        writer.claim_run("run1", _FP_V2)  # a resume with matching settings
+
+    def test_reclaim_with_different_model_raises(self, tmp_path):
+        """The bug this exists for: resuming a v2 run as v1.1."""
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        writer.claim_run("run1", _FP_V2)
+        with pytest.raises(ValueError, match="different configuration"):
+            writer.claim_run("run1", _FP_V11)
+
+    def test_error_names_the_differing_keys(self, tmp_path):
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        writer.claim_run("run1", _FP_V2)
+        with pytest.raises(ValueError) as exc:
+            writer.claim_run("run1", _FP_V11)
+        assert "model_version" in str(exc.value)
+        assert "v2-large" in str(exc.value) and "v1.1" in str(exc.value)
+
+    def test_distinct_run_ids_do_not_collide(self, tmp_path):
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        writer.claim_run("run1", _FP_V2)
+        writer.claim_run("run2", _FP_V11)  # unrelated run, different model — fine
+
+    def test_legacy_staging_without_manifest_warns_but_proceeds(self, tmp_path, caplog):
+        """Runs staged by older code have no manifest; strand them and nothing resumes."""
+        staging = str(tmp_path / "staging")
+        writer = ZarrWriter(staging)
+        # Stand in for a run staged by code that predates claim_run: chunks
+        # present, no identity manifest. (The dir is made by hand because on a
+        # local FS write_skip_marker assumes it already exists — on S3, where
+        # actors actually run, there are no directories to create.)
+        (tmp_path / "staging" / "legacy").mkdir(parents=True)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
+        writer.write_skip_marker(chunk, run_id="legacy")
+        with caplog.at_level(logging.WARNING):
+            writer.claim_run("legacy", _FP_V2)
+        assert "no identity manifest" in caplog.text
+
+    def test_fresh_run_does_not_warn(self, tmp_path, caplog):
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        with caplog.at_level(logging.WARNING):
+            writer.claim_run("brand-new", _FP_V2)
+        assert "no identity manifest" not in caplog.text
 
 
 class TestWriteChunk:

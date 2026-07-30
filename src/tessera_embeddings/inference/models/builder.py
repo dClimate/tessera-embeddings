@@ -228,8 +228,28 @@ def _verify_v2_args(config: InferenceConfig, args: dict[str, Any]) -> None:
     The config drives model construction (and the FLOPs accounting in
     ``profiling``), so a mismatch would otherwise surface as an opaque
     ``load_state_dict`` shape error — or, for ``max_seq_len``, not at all.
-    Keys absent from ``args`` are not checked.
+
+    Most keys here are belt-and-braces: ``latent_dim``, ``repr_dim``,
+    ``num_layers``, ``dim_feedforward`` and ``enable_qk_norm`` all change
+    parameter shapes or names, so a ``strict=True`` load already rejects a
+    mismatch — this check only turns that into a legible error. Absent keys are
+    therefore tolerated for those.
+
+    **``nhead`` is the exception and is required.** ``nn.MultiheadAttention``
+    stores ``in_proj_weight`` as ``(3*d_model, d_model)`` and ``out_proj`` as
+    ``(d_model, d_model)``; neither encodes the head count. A checkpoint trained
+    with a different ``nhead`` therefore loads cleanly under ``strict=True`` and
+    silently produces wrong embeddings — the attention is computed over a
+    different head partition of the same weights. Nothing downstream detects it.
     """
+    if "nhead" not in args:
+        msg = (
+            "v2 checkpoint 'args' does not record 'nhead'. It is the one architecture "
+            "value not recoverable from parameter shapes, so a head-count mismatch would "
+            "load successfully and produce silently wrong embeddings. Re-save the "
+            "checkpoint with its architecture args intact."
+        )
+        raise ValueError(msg)
     expected = {
         "latent_dim": config.latent_dim,
         "repr_dim": config.representation_dim,

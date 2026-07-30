@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import json
 import logging
 import subprocess
 import warnings
@@ -275,6 +276,63 @@ class ZarrWriter:
             f.write(b"")
         logger.info("Wrote skip marker for %s to %s", chunk.label, path)
         return path
+
+    def _run_manifest_path(self, run_id: str) -> str:
+        """Path of the per-run identity marker inside the staging directory."""
+        return f"{self.staging_base}/{run_id}/_run.json"
+
+    def claim_run(self, run_id: str, fingerprint: dict[str, object]) -> None:
+        """Bind a staging run to the model that produced it, or refuse to touch it.
+
+        Staged chunks are plain (H, W, 128) int8 arrays. v1.1 saves the first
+        128 of its 192-d representation and v2 emits 128 natively, so chunks
+        from the two models are **indistinguishable by shape or dtype**. A
+        resume or assembly-only retry that omits ``model_version`` silently
+        falls back to the default, which means a v2 run can be finished with
+        v1.1 — mixing chunks from two encoders into one store and stamping the
+        result with the wrong ``geoemb:model``. Nothing downstream can detect
+        that afterwards.
+
+        So the first writer records the fingerprint and every later toucher of
+        the same ``run_id`` must match it. Absent manifest on a run that already
+        has staged chunks means legacy staging from before this check: that is
+        warned about rather than failed, because refusing would strand runs
+        staged by older code, and the operator can still read the store's own
+        provenance attrs.
+        """
+        path = self._run_manifest_path(run_id)
+        fs = _fs_for(path)
+        want = {k: fingerprint[k] for k in sorted(fingerprint)}
+        if fs.exists(path):
+            with fs.open(path, "rb") as f:
+                have = json.loads(f.read().decode())
+            if have != want:
+                differing = sorted(set(have) | set(want))
+                detail = ", ".join(
+                    f"{k}: staged={have.get(k)!r} requested={want.get(k)!r}"
+                    for k in differing
+                    if have.get(k) != want.get(k)
+                )
+                msg = (
+                    f"Staging run '{run_id}' was produced by a different configuration "
+                    f"({detail}). Resuming would mix encoders in one store. Re-run with the "
+                    f"original settings, or start a fresh run without previous_run_id."
+                )
+                raise ValueError(msg)
+            return
+        if self._list_staged_labels(run_id) or self._list_skip_marker_labels(run_id):
+            logger.warning(
+                "Staging run '%s' has chunks but no identity manifest (staged by older code); "
+                "cannot verify it was produced by %s",
+                run_id,
+                want,
+            )
+        # claim_run is the FIRST thing to touch the staging dir, so on a local
+        # filesystem the parent does not exist yet (on S3 this is a no-op).
+        fs.makedirs(f"{self.staging_base}/{run_id}", exist_ok=True)
+        with fs.open(path, "wb") as f:
+            f.write(json.dumps(want, sort_keys=True).encode())
+        logger.info("Claimed staging run %s for %s", run_id, want)
 
     def write_chunk(
         self,

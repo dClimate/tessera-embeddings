@@ -241,6 +241,22 @@ def tessera_embeddings(
 
     staging_base = f"{output_bucket.rstrip('/')}/staging"
 
+    # Bind this staging run to the model producing it, BEFORE anything is staged
+    # or assembled. Staged chunks are (H, W, 128) int8 for both models — v1.1
+    # saves the first 128 of its 192-d representation, v2 emits 128 natively —
+    # so a resume that omits model_version would silently default to v1.1,
+    # finish a v2 run with the wrong encoder, and stamp the store v1.1. Shape
+    # and dtype cannot catch it; only a recorded identity can.
+    ZarrWriter(staging_base).claim_run(
+        run_id,
+        {
+            "model_version": model_version,
+            "checkpoint": checkpoint_filename(model_version=model_version),
+            "representation_dim": config.representation_dim,
+            "s1_orbit": resolved_s1_orbit,
+        },
+    )
+
     # Detect staged chunk size from prior runs — chunk_size may differ
     # between a resumed run and the current config.
     chunk_size = config.chunk_size

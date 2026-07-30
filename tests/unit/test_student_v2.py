@@ -98,6 +98,28 @@ def test_verify_v2_args_rejects_mismatched_checkpoint() -> None:
         _verify_v2_args(cfg, {**V2_LARGE_ARGS, "latent_dim": 96})
 
 
+def test_verify_v2_args_requires_nhead() -> None:
+    """Require nhead: the one arch value not recoverable from parameter shapes.
+
+    ``nn.MultiheadAttention`` stores ``in_proj_weight`` as (3*d_model, d_model)
+    and ``out_proj`` as (d_model, d_model) — neither depends on the head count.
+    A checkpoint omitting ``nhead`` would otherwise load under ``strict=True``
+    with whatever head count the config happened to carry, and silently produce
+    embeddings computed over the wrong head partition.
+    """
+    cfg = v2_config()
+    args = {k: v for k, v in V2_LARGE_ARGS.items() if k != "nhead"}
+    with pytest.raises(ValueError, match="nhead"):
+        _verify_v2_args(cfg, args)
+
+
+def test_verify_v2_args_still_tolerates_shape_recoverable_absences() -> None:
+    """Keys a strict load would already catch stay optional — no new brittleness."""
+    cfg = v2_config()
+    for key in ("latent_dim", "repr_dim", "num_layers", "dim_feedforward"):
+        _verify_v2_args(cfg, {k: v for k, v in V2_LARGE_ARGS.items() if k != key})
+
+
 def test_verify_v2_args_rejects_buckets_over_max_seq_len() -> None:
     cfg = v2_config(num_obs_checkpoints=(8, 512))
     with pytest.raises(ValueError, match="max_seq_len"):
