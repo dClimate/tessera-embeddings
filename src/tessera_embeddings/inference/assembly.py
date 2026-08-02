@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import logging
+import math
 import subprocess
 import warnings
 from collections.abc import Callable, Mapping
@@ -92,6 +93,47 @@ class SpatialCoords:
 
 
 OBS_COUNT_VARS = ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count")
+
+MAX_OUTPUT_SUB_CHUNK_PX = 500
+"""Upper bound on the output store's spatial chunk edge, in pixels.
+
+Caps the buffer a partial read has to decompress. The chunk actually used is the
+largest divisor of the dask block grid at or below this, so alignment is never
+traded away to hit the bound exactly — see :func:`_aligned_sub_chunk`.
+"""
+
+
+def _aligned_sub_chunk(extents: tuple[int, ...], max_px: int = MAX_OUTPUT_SUB_CHUNK_PX) -> int:
+    """The largest spatial chunk <= ``max_px`` that the dask block grid divides evenly.
+
+    ``extents`` is one axis's dask block sizes — the ChunkSpec extents, uniform in
+    the interior and ragged at the ROI edge. Every interior block boundary is a
+    position the output chunk grid MUST land on. ``to_icechunk(align_chunks=True)``
+    reconciles any mismatch by rechunking, and a store chunk straddling two dask
+    blocks makes its write depend on both, which turns a pure per-block fan-out
+    into a cross-block shuffle: the scheduler co-locates every contributing block
+    on the worker holding the merge, so one worker inherits the whole assembly and
+    spills until its disk fills.
+
+    Hence the chunk must divide the gcd of the interior boundaries. Taking the
+    largest such divisor also keeps the object count down. The trailing partial
+    chunk where the array ends is legitimate and costs nothing, so the final
+    block's extent is excluded.
+    """
+    boundary_gcd = 0
+    running = 0
+    for extent in extents[:-1]:
+        running += extent
+        boundary_gcd = math.gcd(boundary_gcd, running)
+    if boundary_gcd == 0:
+        # One block spans the whole axis, so there is no interior boundary and
+        # every chunk size is a pure fan-out of that block. Nothing to divide.
+        return min(max_px, extents[0]) if extents else max_px
+    for candidate in range(min(max_px, boundary_gcd), 0, -1):
+        if boundary_gcd % candidate == 0:
+            return candidate
+    return 1
+
 
 BAND_CHUNK_DIVISOR = 32
 """
@@ -1019,14 +1061,32 @@ class ZarrWriter:
                 prev_time_windows = dict(prev_root.attrs.get("time_windows", {}))  # type: ignore[arg-type]
 
             if is_new:
-                # Output zarr sub-chunking is read from the staged files directly,
-                # not from dask block size: dask blocks are ChunkSpec-sized (one
-                # task per ChunkSpec, keeps the scheduler graph small), but on-disk
-                # zarr chunks must remain 500x500x(embedding_dim/BAND_CHUNK_DIVISOR)
-                # for downstream partial-read performance. to_icechunk handles the
-                # per-dask-block fan-out into smaller zarr chunks via align_chunks=True.
-                sub_h, sub_w, sub_band = self._detect_staged_chunk_size(run_id, live_chunks, "embeddings")
-                _log.info("Output zarr sub-chunks: (%d, %d, %d) from staged files", sub_h, sub_w, sub_band)
+                # Output zarr sub-chunking, per axis by a different rule.
+                #
+                # SPATIAL comes from the dask block grid, because those chunks must
+                # divide it (:func:`_aligned_sub_chunk`). Taking the spatial size from
+                # the staged files instead is what serialised a continental assembly
+                # onto a single worker: a staged tile is 2000 px wide and sub-chunked
+                # at 256, 256 does not divide 2000, and align_chunks=True answered the
+                # mismatch with a cross-block rechunk.
+                #
+                # BAND still comes from the staged files. A staged tile carries the
+                # whole band axis and so does a dask block, so any band chunking is a
+                # pure fan-out that no rechunk can arise from — and honouring the
+                # staged value keeps the full-band chunks that make the embeddings
+                # array one object per spatial position instead of
+                # BAND_CHUNK_DIVISOR of them.
+                row_heights, col_widths = self._chunk_grid_sizes(chunks)
+                *_, sub_band = self._detect_staged_chunk_size(run_id, live_chunks, "embeddings")
+                sub_h = _aligned_sub_chunk(row_heights)
+                sub_w = _aligned_sub_chunk(col_widths)
+                _log.info(
+                    "Output zarr sub-chunks: (%d, %d, %d) — spatial aligned to the dask block grid, "
+                    "band from staged files",
+                    sub_h,
+                    sub_w,
+                    sub_band,
+                )
                 encoding_ic: dict[str, dict] = {
                     "embeddings": {"chunks": (1, sub_h, sub_w, sub_band)},
                     "time": {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"},

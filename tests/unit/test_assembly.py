@@ -24,10 +24,12 @@ from tessera_embeddings.config.inference import EMBEDDING_DIM
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     BAND_CHUNK_DIVISOR,
+    MAX_OUTPUT_SUB_CHUNK_PX,
     OBS_COUNT_VARS,
     STAGED_READ_CONFIG_KWARGS,
     IncompleteStageError,
     ZarrWriter,
+    _aligned_sub_chunk,
     _staged_storage_options,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -1273,3 +1275,66 @@ class TestVerifyStagedCompleteness:
 
         with pytest.raises(IncompleteStageError, match="1 unexpected"):
             writer.verify_staged_completeness("run1", list(self.CHUNKS))
+
+
+class TestAlignedSubChunk:
+    """Tests for :func:`_aligned_sub_chunk`.
+
+    The invariant under test is that the output chunk grid lands on every interior
+    dask block boundary. Violating it makes ``to_icechunk(align_chunks=True)``
+    rechunk across blocks, which co-locates a whole assembly onto one worker.
+    """
+
+    @staticmethod
+    def _boundaries(extents: tuple[int, ...]) -> list[int]:
+        """Interior block boundaries — the positions the chunk grid must divide."""
+        out, running = [], 0
+        for extent in extents[:-1]:
+            running += extent
+            out.append(running)
+        return out
+
+    @pytest.mark.parametrize(
+        "extents",
+        [
+            tuple([2000] * 130 + [1977]),  # the northing axis of a CONUS-scale ROI
+            tuple([2000] * 148 + [1990]),  # its easting axis
+            (2048,) * 5 + (1000,),  # a shard-pitch grid
+            (2000, 1500, 2000, 300),  # ragged interior, not just a ragged edge
+            (500, 500, 500),
+            (300,),  # single block, smaller than the cap
+            (1700,),  # single block whose size has no large divisor
+        ],
+    )
+    def test_divides_every_interior_boundary(self, extents):
+        """The chosen chunk divides each interior boundary and respects the cap."""
+        sub = _aligned_sub_chunk(extents)
+        assert 1 <= sub <= MAX_OUTPUT_SUB_CHUNK_PX
+        for boundary in self._boundaries(extents):
+            assert boundary % sub == 0, f"chunk {sub} straddles block boundary {boundary}"
+
+    def test_prefers_the_largest_aligned_chunk(self):
+        """Of the divisors under the cap, the largest wins — fewer objects."""
+        assert _aligned_sub_chunk(tuple([2000] * 4 + [1000])) == 500
+        # 2048 has no divisor in (256, 500], so it settles on the next one down.
+        assert _aligned_sub_chunk((2048, 2048, 500)) == 256
+
+    def test_single_block_is_unconstrained(self):
+        """One block spans the axis, so any chunk is a fan-out — take the cap."""
+        assert _aligned_sub_chunk((1700,)) == MAX_OUTPUT_SUB_CHUNK_PX
+        assert _aligned_sub_chunk((300,)) == 300
+
+    def test_no_extents_returns_the_cap(self):
+        assert _aligned_sub_chunk(()) == MAX_OUTPUT_SUB_CHUNK_PX
+
+    def test_cap_is_honoured(self):
+        """A smaller cap still yields an aligned chunk, not a truncated one."""
+        sub = _aligned_sub_chunk(tuple([2000] * 5 + [1000]), max_px=300)
+        assert sub <= 300
+        assert 2000 % sub == 0
+
+    def test_the_staged_geometry_that_broke_assembly(self):
+        """Regression: 256 (the staged sub-chunk) must not reach a 2000-px block grid."""
+        extents = tuple([2000] * 130 + [1977])
+        assert 2000 % 256 != 0, "premise: the staged sub-chunk did not divide the block"
+        assert _aligned_sub_chunk(extents) == 500
