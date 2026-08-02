@@ -499,6 +499,11 @@ def _log_ray_dashboard_ssm_command(
     ``AmazonSSMManagedInstanceCore``, so the port-forward works against the
     instance ID.
 
+    Uses ``AWS-StartPortForwardingSession``, which targets a port on the
+    managed instance itself. The ``...ToRemoteHost`` variant addresses hosts
+    reachable *from* the instance, and the SSM agent rejects loopback
+    destinations for it.
+
     Best-effort: warns and returns on any failure, never raises. No
     ``--profile`` is printed — credentials come from the operator's
     environment (``AWS_PROFILE`` or their default).
@@ -528,8 +533,8 @@ def _log_ray_dashboard_ssm_command(
             "To view the Ray dashboard, run:\n\n"
             "aws ssm start-session \\\n"
             f"  --target {instance_id} \\\n"
-            "  --document-name AWS-StartPortForwardingSessionToRemoteHost \\\n"
-            '  --parameters \'{"host":["localhost"],"portNumber":["8265"],"localPortNumber":["8265"]}\'\n\n'
+            "  --document-name AWS-StartPortForwardingSession \\\n"
+            '  --parameters \'{"portNumber":["8265"],"localPortNumber":["8265"]}\'\n\n'
             "Then open http://localhost:8265"
         )
     except Exception:
