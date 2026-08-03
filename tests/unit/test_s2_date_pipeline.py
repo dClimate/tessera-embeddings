@@ -24,11 +24,11 @@ from types import SimpleNamespace
 import dask.array as da
 import numpy as np
 import pytest
-import tenacity
 import xarray as xr
 
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest import s2_roi
+from tessera_embeddings.storage.zarr_store import store_write_retrying
 
 BOTH_MODES = pytest.mark.parametrize("pipeline_dates", [False, True], ids=["serial", "pipelined"])
 
@@ -110,9 +110,17 @@ def run_ingest(monkeypatch):
     date the coverage gate drops. ``fail_on`` makes that date's write raise, and
     ``write_s`` slows the write so overlap is observable.
     """
-    # Retries keep their COUNT (three attempts, then reraise) and lose only their
-    # backoff, which would otherwise cost the suite six seconds per failure case.
-    monkeypatch.setattr(s2_roi, "wait_exponential", lambda **_kwargs: tenacity.wait_none())
+    # Retries keep their COUNT (three attempts, then reraise) and their concurrent-writer
+    # exclusion, and lose only the SLEEP, which would otherwise cost the suite six seconds
+    # per failure case. Stubbing the policy's sleep rather than its wait strategy keeps this
+    # independent of how the backoff is expressed — the strategy used to be built inline
+    # here and now comes from storage.zarr_store.store_write_retrying.
+    def _no_sleep(log):
+        retrying = store_write_retrying(log)
+        retrying.sleep = lambda _seconds: None
+        return retrying
+
+    monkeypatch.setattr(s2_roi, "store_write_retrying", _no_sleep)
 
     # Cropping is unconditional, so window derivation runs on every path and needs a mask
     # these tests do not have. One window covering the whole ROI keeps the date pipeline —

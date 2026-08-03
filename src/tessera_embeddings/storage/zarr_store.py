@@ -61,8 +61,9 @@ import numpy as np
 import xarray as xr
 import zarr
 from icechunk.xarray import to_icechunk
+from tenacity import Retrying, before_sleep_log, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
-from tessera_embeddings.errors import CorruptedStoreError
+from tessera_embeddings.errors import CorruptedStoreError, DuplicateDateError
 from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (
     _drop_region_coords,
@@ -74,6 +75,51 @@ logger = logging.getLogger(__name__)
 
 # Standard time encoding for all stores
 TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic_gregorian"}
+
+#: Write failures that mean **another writer holds this store**, and so must never be
+#: retried. Pass to ``tenacity``'s ``retry_if_not_exception_type`` wherever a store write
+#: is retried.
+#:
+#: Retrying either one is worse than failing. The ingest path commits WITHOUT
+#: ``rebase_with`` precisely so a second writer's commit fails against a moved branch tip
+#: rather than merging silently, and a retry re-opens the session from the NEW tip — which
+#: turns that refusal back into a success and lets two writers interleave dates on one
+#: axis, the exact outcome the no-rebase choice exists to prevent. When the two writers
+#: collide on the SAME date the retry instead fails as a duplicate, so the visible error
+#: names a date rather than the collision, which is a long way from the cause.
+#:
+#: Everything else a store write can raise — throttling, expired credentials, a transient
+#: GDAL read — is worth retrying, and a failed attempt commits nothing, so the retry
+#: starts from clean committed state.
+CONCURRENT_WRITER_ERRORS: tuple[type[BaseException], ...] = (icechunk.ConflictError, DuplicateDateError)
+
+#: Attempts per store write. Three has been enough for the transient failures this path
+#: actually sees (throttling, a credential rolling over mid-write, a flaky COG read).
+STORE_WRITE_ATTEMPTS = 3
+
+
+def store_write_retrying(log: "logging.Logger | logging.LoggerAdapter[logging.Logger]") -> Retrying:
+    """The retry policy for ONE store write, shared by every ingest write site.
+
+    Three attempts with exponential backoff, re-raising the last failure, and
+    **never retrying** a :data:`CONCURRENT_WRITER_ERRORS` member.
+
+    Shared rather than constructed per site because it was constructed per site: S1's
+    per-date write, S2's per-date write and S2's per-batch write each had their own copy,
+    which is how the exclusion came to be missing from all three at once. One policy in one
+    place cannot half-apply.
+
+    Retrying is safe precisely because a failed write commits NOTHING — every write site
+    goes through a single-session commit, so an abandoned attempt is invisible to readers
+    and the next attempt starts from the last committed state.
+    """
+    return Retrying(
+        stop=stop_after_attempt(STORE_WRITE_ATTEMPTS),
+        wait=wait_exponential(multiplier=1, min=2, max=8),
+        before_sleep=before_sleep_log(cast("logging.Logger", log), logging.WARNING),
+        retry=retry_if_not_exception_type(CONCURRENT_WRITER_ERRORS),
+        reraise=True,
+    )
 
 
 def read_time_values(node: zarr.Group) -> np.ndarray:
@@ -1217,13 +1263,26 @@ class RegionWriteBatch:
         icechunk arrays are sparse, so the new slot costs no chunks until written.
         The session sees its own uncommitted resize, so window writes into the
         returned index work immediately (verified by experiment; see the design
-        note). A date already on the axis raises: the callers dedupe upstream, so
-        a duplicate here means a retry bug about to double-stamp one date.
+        note).
+
+        A date already on the axis raises :class:`~tessera_embeddings.errors.DuplicateDateError`.
+        **The likeliest cause is a SECOND WRITER on this store**, not a bug in the
+        caller: the ingest paths read the committed dates and skip what they find, so
+        the only way a date they decided to write is already present is that another
+        process committed it after that read. Chasing it as a date-derivation bug is a
+        long detour past the actual problem — the second-writer reading is what a
+        2026-08-03 failure turned out to be. A retry bug double-stamping one date is
+        the remaining possibility, and the rarer one.
         """
         when_ns = np.asarray(when, dtype="datetime64[ns]")
         existing = read_time_values(self.group)
         if (existing == when_ns).any():
-            raise ValueError(f"date {when_ns} is already on the time axis; refusing a duplicate slot")
+            raise DuplicateDateError(
+                f"date {when_ns} is already on the time axis; refusing a duplicate slot. "
+                "Another writer has almost certainly committed this date to this store — "
+                "check for a second run ingesting the same zone/year/orbit before looking "
+                "for a date-derivation bug."
+            )
         t_index = len(existing)
         time_arr = self.group["time"]
         assert isinstance(time_arr, zarr.Array)

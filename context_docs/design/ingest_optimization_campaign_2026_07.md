@@ -1731,13 +1731,57 @@ deliveries hash IDENTICALLY. So `IngestManifest` now carries `coverage_sha256`, 
 ROI store `export_zone_roi` already stamps it on. The manifest is validated on EVERY write, so
 a changed mask fails at the first append rather than at a comparison somebody has to remember.
 
-**Two writers is the hazard resume makes reachable, and Icechunk guards it for free.** These
+**Two writers is the hazard resume makes reachable, and Icechunk guards it.** These
 commits pass no `rebase_with`, so a second writer's commit fails with `ConflictError` against a
 moved branch tip instead of merging. Verified directly: two sessions from one tip, the second
 refused, the time axis left holding only the winner's date. **That protection is the ABSENCE
 of a call**, and `storage.shard_writer.commit_with_rebase` deliberately does the opposite for
 disjoint groups — so a test pins the absence, because unifying two commit paths that look
 alike would silently interleave two ingests of one store. TE `3878827`, `38d5603`.
+
+> **Correction, 2026-08-03.** This paragraph said Icechunk guarded two writers "**for free**".
+> It did not. The write retry had no exception predicate, so it retried the `ConflictError` and
+> re-opened the session from the moved tip — `rebase_with` by another route. Protection that is
+> the absence of a call is only free if nothing else re-attempts the call. See 4.16.
+
+### 4.16 Two writers, observed: what the guard caught and what it did not
+
+47S/2021 was dispatched **four times** as four independent top-level `ingest-zone-year` runs
+(16:20, 17:46, 18:36, 18:53 UTC), each with `retries=0` and no parent — four manual dispatches,
+not retries. Generations 1→2→3 never overlapped and each resumed correctly from the previous
+one's commits, which is 4.15 working as designed. Generation 4 was dispatched **17 minutes into
+a healthy generation 3** and collided with it.
+
+**What the guard caught.** Generation 3 committed 2021-04-12 (ascending) at 18:56:31;
+generation 4 attempted the same date at 18:56:40, nine seconds later, and was refused. On
+descending, generation 4 hit `ConflictError: expected parent Q8BAVXYY, actual parent AV8HGF6Q`,
+where the actual parent is generation 3's 2021-06-25 commit seven seconds earlier. All three
+stores came through **clean**: no duplicate dates, strictly increasing axes, no orphan
+snapshots, and generation 4 committed nothing. Its cells were wasted; nothing was corrupted.
+
+**What the guard did not catch, and the fix.** Both retry sites retried the refusal. On a
+same-date collision the retry then failed as a duplicate — so the operator sees *a date*, not
+*a collision*, which is a long way from the cause and cost an hour of investigating solar-day
+grouping that turned out to be correct. On a **different-date** collision the retry would have
+SUCCEEDED, because it re-reads the tip the other writer moved: two writers interleaving dates
+onto one axis, silently. `store_write_retrying` now excludes `icechunk.ConflictError` and the
+new `DuplicateDateError` by type. It is one shared policy because it was three hand-built ones
+(S1 per-date, S2 per-date, S2 per-batch) and the exclusion was missing from all three at once —
+the triplication *was* the defect. A source-level test now fails if any ingest module builds
+its own `Retrying` again.
+
+**Prevention sits on the dispatch side, not in the flow.** `scripts/run_campaign_cell.py`
+(yield-embeddings) refuses to dispatch when a run of the same deployment with identical
+parameters is still live, `CANCELLING` included — the ECS task and its Dask cluster outlive the
+state change, so a cancelled cell can still be committing. Deliberately not in
+`ingest_zone_year`: a flow-level refusal would strand a crashed run that Prefect still reports
+as `RUNNING`, turning a recoverable crash into a lost cell. Prevention where a human can
+override it, a loud failure everywhere else.
+
+**The misdiagnosis is worth recording too.** I asserted that 2021-04-12 was absent from the
+store and built a solar-day regression hypothesis on that absence. It was present all along,
+in a snapshot I could have read in one command. Walking the Icechunk ancestry is cheap and
+dates every commit; it should come before any theory about how a date was derived.
 
 ## 5. Claims made and withdrawn
 

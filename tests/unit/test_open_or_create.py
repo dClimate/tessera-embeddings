@@ -294,13 +294,19 @@ def test_the_ingest_commit_path_never_rebases() -> None:
 
     So this pins the absence of a call, which is unusual and deliberate: the failure it
     guards against is someone unifying two commit paths that look alike and are not.
+
+    Matches ``rebase_with=`` rather than the bare name, so the module can EXPLAIN why it
+    does not rebase — which it now does at length, since a retry that re-opens the session
+    from a moved tip is the same mistake by another route. ``icechunk``'s ``commit`` takes
+    ``rebase_with`` keyword-only, so the ``=`` form is the only way to pass it and nothing
+    is given up by allowing the word in prose.
     """
     import inspect
 
     from tessera_embeddings.storage import zarr_store
 
     source = inspect.getsource(zarr_store)
-    assert "rebase_with" not in source, (
+    assert "rebase_with=" not in source, (
         "zarr_store now rebases on commit. The ingest path must not: rebasing merges a "
         "second concurrent writer into the store instead of refusing it, which is the one "
         "thing standing between a resumed ingest and a silently interleaved one. If this is "

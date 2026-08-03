@@ -38,7 +38,6 @@ from typing import Literal, cast, final
 import dask.distributed
 import numpy as np
 import xarray as xr
-from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS
 from tessera_embeddings.ingest._pipeline import pipelined
@@ -64,6 +63,7 @@ from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
     get_existing_dates,
     record_assessed_window,
+    store_write_retrying,
     write_day_windows,
 )
 
@@ -545,14 +545,6 @@ def ingest_s1_roi_sar(
             write_total_s = 0.0
             written_this_batch = 0
 
-            def _retrying() -> Retrying:
-                return Retrying(
-                    stop=stop_after_attempt(3),
-                    wait=wait_exponential(multiplier=1, min=2, max=8),
-                    before_sleep=before_sleep_log(log, logging.WARNING),
-                    reraise=True,
-                )
-
             # A batch holds many NON-contiguous dates, each its own atomic
             # commit — so the retry scope is PER DATE. One retry around the
             # whole loop would restart at a date an earlier attempt already
@@ -598,7 +590,7 @@ def ingest_s1_roi_sar(
                 # credential, so renewing only at batch boundaries is what failed.
                 refresh_credentials_if_stale()
                 date_started = time.monotonic()
-                for attempt in _retrying():
+                for attempt in store_write_retrying(log):
                     with attempt:
                         write_day_windows(
                             orbit_store,

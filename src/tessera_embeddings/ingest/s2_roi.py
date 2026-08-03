@@ -48,7 +48,6 @@ import dask.array as da
 import dask.distributed
 import numpy as np
 import xarray as xr
-from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS, auto_batch_dates
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
@@ -77,6 +76,7 @@ from tessera_embeddings.storage.manifest import IngestManifest
 from tessera_embeddings.storage.zarr_store import (
     get_existing_dates,
     record_assessed_window,
+    store_write_retrying,
     write_day_windows,
     write_days_windows,
 )
@@ -497,16 +497,11 @@ def ingest_s2_roi_reflectance(
         assert day_ds is not None, f"date {prepared.date} was skipped ({prepared.skip_reason}); nothing to write"
         write_started = time.monotonic()
 
-        # Tenacity retry on intermittent GDAL errors under high parallelism.
-        # Icechunk writes are atomic, so retry is safe — a failed cropped date
-        # commits nothing (batched_region_writes) and the retry starts clean.
-        # A retry re-runs only the write, from the graph preparation already built.
-        for attempt in Retrying(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=1, min=2, max=8),
-            before_sleep=before_sleep_log(log, logging.WARNING),
-            reraise=True,
-        ):
+        # Retries intermittent GDAL errors under high parallelism; a failed cropped date
+        # commits nothing, so the retry re-runs only the write, from the graph preparation
+        # already built. A second writer is excluded from the retry — see
+        # store_write_retrying.
+        for attempt in store_write_retrying(log):
             with attempt:
                 write_day_windows(
                     reflectance_store,
@@ -558,12 +553,7 @@ def ingest_s2_roi_reflectance(
         batch cleanly from the graphs already prepared.
         """
         write_started = time.monotonic()
-        for attempt in Retrying(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=1, min=2, max=8),
-            before_sleep=before_sleep_log(log, logging.WARNING),
-            reraise=True,
-        ):
+        for attempt in store_write_retrying(log):
             with attempt:
                 days: list[tuple[xr.Dataset, list[tuple[int, int, int, int]]]] = []
                 for p in batch:

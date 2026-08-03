@@ -12,8 +12,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from tessera_embeddings.errors import DuplicateDateError
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
 from tessera_embeddings.storage.zarr_store import (
+    CONCURRENT_WRITER_ERRORS,
     batched_region_writes,
     get_existing_dates,
     open_repo,
@@ -73,11 +75,17 @@ def test_failed_batch_commits_nothing(store):
 
 
 def test_duplicate_date_refused(store):
+    """And as ``DuplicateDateError`` specifically, which is what excludes it from the
+    write retry — a plain ``ValueError`` would be retried, and retrying is what let a
+    second writer succeed. It stays a ``ValueError`` subclass for existing callers.
+    """
     with (
-        pytest.raises(ValueError, match="already on the time axis"),
+        pytest.raises(DuplicateDateError, match="already on the time axis"),
         batched_region_writes(store, message="dup") as batch,
     ):
         batch.append_time_slot(D1)
+    assert issubclass(DuplicateDateError, ValueError)
+    assert DuplicateDateError in CONCURRENT_WRITER_ERRORS
 
 
 def test_appended_date_reaches_the_dedupe_reader(store):

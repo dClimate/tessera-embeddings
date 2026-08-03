@@ -453,6 +453,17 @@ per passing date (one writable session ── one commit)
   The empty-axis seed matters: the time axis only ever contains dates whose pixels
   committed, which is what keeps `get_existing_dates` (the STAC dedupe),
   `check_time_window_coverage`, and the empty-timestep prunes truthful.
+- **The retry must not retry a second writer** — the one exception to "a failed write
+  commits nothing, so retrying is safe". One store has exactly one writer: these commits
+  pass no `rebase_with`, so a concurrent commit is *refused* rather than merged
+  (`icechunk.ConflictError`), and a date the other writer reached first is refused by the
+  append guard (`DuplicateDateError`). A retry re-opens the session from the tip that
+  writer moved, which turns the refusal into a success and lets two writers interleave
+  dates onto one axis — the outcome the no-rebase choice exists to prevent. Both errors are
+  excluded by type in `storage.zarr_store.store_write_retrying`, the single policy all
+  three write sites use (S1 per-date, S2 per-date, S2 per-batch). It is shared because it
+  was not: each site had built its own `Retrying`, and the exclusion was missing from all
+  three at once.
 - **Each date narrows further, to the land its own imagery reaches.** A run's windows
   say where the ROI has land, and are the same on every date; a single date is not, because
   an optical satellite images a fraction of a wide ROI per pass. Windows a date does not

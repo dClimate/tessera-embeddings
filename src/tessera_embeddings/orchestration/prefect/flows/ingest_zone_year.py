@@ -35,7 +35,14 @@ mask fails at the first append.
 
 **Two writers** is the hazard resume makes reachable, and Icechunk guards it: these commits
 do not rebase, so a second writer's commit fails with ``ConflictError`` against a moved
-branch tip instead of merging silently.
+branch tip instead of merging silently. **The write retry must exclude that error for the
+guard to hold** — retrying re-opens the session from the moved tip and so converts the
+refusal into a success; see ``storage.zarr_store.store_write_retrying``. Nothing here
+prevents a second run from starting, so the outcome is a wasted cell rather than a corrupt
+store: it fails, and a later attempt resumes from what the surviving writer committed. The
+dispatch-side guard against launching the duplicate at all lives in
+``scripts/run_campaign_cell.py`` in yield-embeddings, deliberately not in this flow — a
+refusal here would strand a crashed run that Prefect still reports as ``RUNNING``.
 
 **Coverage gate (ADR-011).** After ingestion, :func:`check_time_window_coverage`
 requires the mosaics' months to span the window; ``allow_partial_window`` relaxes
@@ -360,7 +367,9 @@ async def ingest_zone_year(
     # against a moved branch tip rather than merging silently. That protection is a
     # property of NOT passing `rebase_with` — see `storage.shard_writer.commit_with_rebase`,
     # which deliberately does the opposite for disjoint groups. The ingest path must never
-    # adopt it.
+    # adopt it, and the write RETRY must never retry the resulting error: retrying re-opens
+    # the session from the tip the other writer moved, which is `rebase_with` by another
+    # route. `storage.zarr_store.store_write_retrying` excludes it by type.
     if unmarked:
         log.info(
             "Zone %s year %d: RESUMING %d interrupted store(s) — dates already committed are "
