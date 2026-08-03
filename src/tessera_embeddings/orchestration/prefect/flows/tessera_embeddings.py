@@ -314,8 +314,9 @@ def tessera_embeddings(
     }
 
     if dev_params.assembly_only:
-        log.info("Assembly-only mode: verifying staged chunks from run %s", dev_params.previous_run_id)
-        ZarrWriter(staging_base).verify_staged_completeness(run_id, live_chunks, log=log)
+        # Staged completeness is verified by `assemble` itself, against the same live
+        # set it derives from the ROI mask — so it holds however assembly is entered.
+        log.info("Assembly-only mode: assembling staged chunks from run %s", dev_params.previous_run_id)
         return _run_assembly(log=log, result_stats=None, **assemble_kwargs)
 
     # Deterministic, flow-run-derived cluster name so the cancellation/crash hook can
@@ -378,7 +379,6 @@ def tessera_embeddings(
             "inference_only": True,
         }
 
-    ZarrWriter(staging_base).verify_staged_completeness(run_id, live_chunks, log=log)
     result_stats = {
         "succeeded": len(succeeded),
         "skipped": len(skipped),

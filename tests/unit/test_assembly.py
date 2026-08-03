@@ -186,40 +186,52 @@ class TestWriteChunk:
         assert Path(writer._done_marker_path("run1", chunk)).exists()
         assert writer._list_staged_labels("run1") == [chunk.label]
 
-    def test_done_marker_is_written_after_the_attribute(self, tmp_path):
-        """The ordering invariant both completeness checks rest on.
+    @pytest.mark.parametrize("rewrite", [False, True])
+    def test_the_completion_protocol_runs_in_order(self, tmp_path, rewrite):
+        """The write order every completeness check rests on, pinned end to end.
 
-        ``.done`` present must imply the attribute is set, which implies ``to_zarr``
-        returned. If the marker landed first, a crash in between would leave a tile
-        the listing calls complete but every reader rejects — unresumable without
-        manual deletion, because re-inference would never be triggered for it.
+        Two properties, and reordering any step breaks one of them:
+
+        * ``.done`` LAST — so its presence implies the attribute is set, which implies
+          ``to_zarr`` returned. Were it first, a crash in between would leave a tile the
+          listing calls complete but every reader rejects: unresumable without manual
+          deletion, because re-inference would never be triggered for it.
+        * the previous ``.done`` retracted FIRST — so a tile being rewritten never has a
+          marker vouching for it. Retracting after the rewrite (or not at all) leaves a
+          window in which a listing reports a half-replaced tile as complete.
         """
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
         emb, scales = _quantized_embeddings(np.random.default_rng(0), 4, 4)
+        if rewrite:
+            # The case the retraction exists for: a marker is already there.
+            writer.write_chunk(chunk, emb, run_id="run1", scales=scales)
+            assert Path(writer._done_marker_path("run1", chunk)).exists()
 
         seen: list[str] = []
-        real_open = zarr.open_group
+        real_open_group, real_to_zarr, real_fs_for = zarr.open_group, xr.Dataset.to_zarr, _assembly_mod._fs_for
 
         def spy_open_group(*args, **kwargs):
             if kwargs.get("mode") == "a" or (len(args) > 1 and args[1] == "a"):
                 seen.append("attribute")
-            return real_open(*args, **kwargs)
+            return real_open_group(*args, **kwargs)
 
-        real_fs_for = _assembly_mod._fs_for
+        def spy_to_zarr(self, *args, **kwargs):
+            seen.append("tile")
+            return real_to_zarr(self, *args, **kwargs)
 
         def spy_fs_for(uri, *args, **kwargs):
-            if uri.endswith(".done"):
-                seen.append("done")
-            return real_fs_for(uri, *args, **kwargs)
+            fs = real_fs_for(uri, *args, **kwargs)
+            return _RecordingMarkerFS(fs, seen) if uri.endswith(".done") else fs
 
         with (
             patch.object(_assembly_mod.zarr, "open_group", spy_open_group),
+            patch.object(xr.Dataset, "to_zarr", spy_to_zarr),
             patch.object(_assembly_mod, "_fs_for", spy_fs_for),
         ):
             writer.write_chunk(chunk, emb, run_id="run1", scales=scales)
 
-        assert seen == ["attribute", "done"]
+        assert seen == ["retract", "tile", "attribute", "done"]
 
     def test_write_chunk_wrong_shape_raises(self, tmp_path):
         staging = str(tmp_path / "staging")
@@ -1053,6 +1065,24 @@ class TestDetectStagedChunkSize:
         assert result == 2000
 
 
+class _RecordingMarkerFS:
+    """Filesystem proxy that records the completion-marker operations, in order."""
+
+    def __init__(self, inner, seen: list[str]) -> None:
+        self._inner, self._seen = inner, seen
+
+    def rm(self, *args, **kwargs):
+        self._seen.append("retract")
+        return self._inner.rm(*args, **kwargs)
+
+    def open(self, *args, **kwargs):
+        self._seen.append("done")
+        return self._inner.open(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def _mark_staged_complete(path: str) -> None:
     """Record a hand-built staged tile as a COMPLETED write, both ways.
 
@@ -1158,26 +1188,51 @@ class TestStagedLayout:
         np.testing.assert_array_equal(result, expected)
         assert ds["embeddings"].shape == (1, 14, 16, EMBEDDING_DIM)
 
-    def test_assemble_rejects_markerless_staged_tile(self, tmp_path):
-        """Single-ROI assembly rejects a crash-partial (markerless) staged tile rather
-        than reading its missing chunks as fill and committing silent holes.
+    def _assemble_one_chunk(self, writer, chunk, tmp_path):
+        writer.assemble(
+            [chunk],
+            total_y=8,
+            total_x=8,
+            run_id="run1",
+            output_path=str(tmp_path / "output.zarr"),
+            roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 8),
+            n_workers=1,
+        )
+
+    def test_assemble_verifies_staged_completeness_itself(self, tmp_path):
+        """`assemble` gates on the staging listing without being asked to.
+
+        It derives its own live set from the ROI mask, and it is called directly — an
+        assembly-only re-run, a test — not only through the flow that used to verify
+        first. So the gate has to live here, or a half-written tile reaches the workers
+        and the run fails after the schema commit instead of before any work starts.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=8, x_start=0, x_stop=8)
+        emb, _ = _quantized_embeddings(np.random.default_rng(1), 8, 8)
+        _write_monolithic_staged_zarr(writer._staging_path("run1", chunk), emb, 0, 0)
+        Path(writer._done_marker_path("run1", chunk)).unlink()  # crash before the marker
+
+        with pytest.raises(IncompleteStageError, match="1 interrupted"):
+            self._assemble_one_chunk(writer, chunk, tmp_path)
+
+    def test_assemble_rejects_a_tile_the_listing_calls_complete(self, tmp_path):
+        """The in-store check, on the one state the listing gate cannot see.
+
+        The tile keeps its ``.done`` marker, so verification passes it — exactly the
+        position a reader is in when a tile is rewritten after the listing was taken.
+        Only the attribute, absent until a write finishes, reports it as partial.
         """
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=8, x_start=0, x_stop=8)
         emb, _ = _quantized_embeddings(np.random.default_rng(1), 8, 8)
         path = writer._staging_path("run1", chunk)
         _write_monolithic_staged_zarr(path, emb, 0, 0)
-        del zarr.open_group(path, mode="a").attrs["staged_complete"]  # crash before the marker
+        del zarr.open_group(path, mode="a").attrs["staged_complete"]
+        assert writer._list_staged_labels("run1") == [chunk.label]
+
         with pytest.raises(IncompleteStageError, match="staged_complete"):
-            writer.assemble(
-                [chunk],
-                total_y=8,
-                total_x=8,
-                run_id="run1",
-                output_path=str(tmp_path / "output.zarr"),
-                roi_zarr_path=_make_full_roi_mask(tmp_path, 8, 8),
-                n_workers=1,
-            )
+            self._assemble_one_chunk(writer, chunk, tmp_path)
 
 
 class TestPartitionBands:

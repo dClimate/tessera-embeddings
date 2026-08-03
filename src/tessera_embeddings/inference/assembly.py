@@ -113,6 +113,42 @@ class IncompleteStageError(RuntimeError):
     """Raised when assembly is attempted before all chunks have been staged."""
 
 
+def _open_staged_tile(path: str) -> zarr.Group:
+    """Open a staged tile, refusing one whose write never finished.
+
+    The single in-store completeness check. ``write_chunk`` sets
+    ``staged_complete`` only after ``to_zarr`` returns, so its absence means a
+    crash left array metadata over missing data chunks — which Zarr reads back as
+    fill values rather than as an error, the one failure that would otherwise
+    reach the published store looking like legitimate data.
+
+    The listing gate (``.done`` markers, see :meth:`ZarrWriter._done_marker_path`)
+    normally excludes such a tile long before any reader sees it, and this check is
+    free for a reader that has to open the group anyway. It earns its place on one
+    case the listing cannot cover: a listing is taken once, in the driver, while
+    tiles are read minutes to hours later in worker processes. A tile REWRITTEN in
+    that window keeps its old ``.done`` marker throughout — the run identifier is
+    derived from the inputs and so is stable across attempts, which means two
+    attempts at one zone-year share a staging prefix — and only the in-store
+    attribute, absent until the rewrite finishes, reports the tile as it is now
+    rather than as the listing last saw it.
+
+    Raises:
+        IncompleteStageError: If the tile's write never completed.
+        FileNotFoundError: If there is no tile at *path* (also raised by zarr as
+            ``GroupNotFoundError``, a subclass). Any other open error — auth,
+            throttling, transient network — propagates untouched, so a valid tile
+            is never mistaken for a partial one because of a bad moment on S3.
+    """
+    group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
+    if not group.attrs.get("staged_complete"):
+        raise IncompleteStageError(
+            f"Staged tile {path} lacks the staged_complete marker — a crashed write_chunk left partial "
+            "chunks, which read back as fill values. Using it would publish silent holes; re-infer the tile."
+        )
+    return group
+
+
 class AllChunksSkippedError(RuntimeError):
     """Every chunk of a run resolved to a skip marker, so no staged tile exists.
 
@@ -324,16 +360,7 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
             arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = arr.fill_value
     for tile, path in payload["tiles"]:
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
-        staged = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
-        # Require the completion attribute here too (the single-ROI assemble path): a
-        # crash-partial tile has array metadata but missing chunks that read as fill.
-        # The .done listing gate normally catches those; this is the in-store check
-        # that cannot be bypassed by a path that skips it. The open already happens.
-        if not staged.attrs.get("staged_complete"):
-            raise IncompleteStageError(
-                f"Staged tile {path} lacks the staged_complete marker — a crashed write_chunk left partial "
-                "chunks (read as fill). Assembling it would publish silent holes; re-infer the tile first."
-            )
+        staged = _open_staged_tile(path)
         for var, arr in arrays.items():
             staged_arr = cast(zarr.Array, staged[var])
             # Validate dtype before assigning: zarr would silently CAST a float
@@ -462,19 +489,7 @@ class StagedShardSource:
         """Read one staged tile whole and return ``{var: (1, h, w[, band]) block}``."""
         sy, sx = shard
         path = f"{self.staging_base}/{self.run_id}/{chunk_label(sy, sx)}.zarr"
-        group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
-        # Require the completion attribute at ASSEMBLY read too, not only on resume.
-        # The listing gate (verify_staged_completeness / _list_staged_labels, keyed on
-        # the sibling .done marker) already excludes crash-partial tiles, so this is
-        # the guard against a caller that reaches a tile without going through that
-        # gate — a hand-passed label set, a future read path — and the last line of
-        # defence before fill-valued holes are committed and tagged complete. The open
-        # already happened, so it is free.
-        if not group.attrs.get("staged_complete"):
-            raise IncompleteStageError(
-                f"Staged tile {path} lacks the staged_complete marker — a crashed write_chunk left partial "
-                "chunks (read as fill). Assembling it would publish silent holes; re-infer the tile first."
-            )
+        group = _open_staged_tile(path)
         expected_dtypes = dict(self.dtypes)
         blocks: dict[str, np.ndarray] = {}
         for var in self.variables:
@@ -702,6 +717,17 @@ class ZarrWriter:
             },
         )
 
+        # Retract the previous attempt's completion marker BEFORE overwriting the tile.
+        # to_zarr replaces the tile in place, so a marker left from an earlier write
+        # would keep vouching for it all the way through the rewrite, and a listing
+        # taken in that window would report a tile that is currently incomplete as
+        # complete. Retracting first makes the window read as interrupted, which is
+        # the truth. No-op on a first write.
+        done_path = self._done_marker_path(run_id, chunk)
+        done_fs = _fs_for(done_path)
+        with contextlib.suppress(FileNotFoundError):
+            done_fs.rm(done_path)
+
         ds.to_zarr(path, mode="w", encoding=encoding)
         # --- Completion markers, written LAST, in SEPARATE ops after to_zarr returns.
         # to_zarr can create every array's metadata before all its chunk objects, so a
@@ -710,8 +736,9 @@ class ZarrWriter:
         # own signal, and it is recorded twice because two kinds of consumer need it:
         #
         #   1. `staged_complete` in-store attribute — free to check for a reader that
-        #      already has the group open (assembly's per-tile reads), and impossible
-        #      to bypass: you cannot read the tile without being able to see it.
+        #      already has the group open (assembly's per-tile reads), and the only
+        #      signal that reflects the tile as it is NOW rather than as the last
+        #      listing saw it (see _open_staged_tile).
         #   2. `<label>.done` sibling object — visible in the staging prefix LISTING,
         #      so verification and the resume scan classify every tile of a run from
         #      one listing without opening any of them.
@@ -722,8 +749,7 @@ class ZarrWriter:
         # resume scan re-infers (write_chunk's mode="w" overwrites it).
         marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
         marker.attrs["staged_complete"] = True
-        done_path = self._done_marker_path(run_id, chunk)
-        with _fs_for(done_path).open(done_path, "wb") as f:
+        with done_fs.open(done_path, "wb") as f:
             f.write(b"")
         logger.info("Wrote %s to %s", chunk.label, path)
         return path
@@ -930,18 +956,17 @@ class ZarrWriter:
         Returns ``None`` if the tile is complete and valid, else ``(kind, reason)``:
 
         - ``("incomplete", ...)`` — a crash artifact: genuinely absent
-          (``FileNotFoundError``), or missing the ``staged_complete`` attribute
-          (to_zarr can create array metadata before all chunk objects, so a crash
-          leaves gaps read as fill). The caller RE-INFERS it (``write_chunk``'s
+          (``FileNotFoundError``), or rejected by :func:`_open_staged_tile` because
+          its write never finished. The caller RE-INFERS it (``write_chunk``'s
           ``mode="w"`` overwrites) rather than raising — with the stable,
           input-fingerprinted run_id a raise would wedge every retry on the same
-          partial artifact. Callers reach this only for tiles the listing already
-          classed ``complete``, so the attribute check here is the guard against a
-          path that reads a tile without consulting its ``.done`` marker, plus the
-          narrow race where the tile disappears between the LIST and the open.
-        - ``("invalid", ...)`` — a COMPLETE tile (marker present) that is
-          structurally wrong (missing var / shape / dtype). The caller raises: this
-          is a real anomaly (e.g. a stale wrong-grid store), not a resumable crash.
+          partial artifact. This is the one caller that treats an unfinished tile
+          as routine, which is why it catches what the shared opener raises instead
+          of letting it through: on resume an unfinished tile is the expected input,
+          not an anomaly.
+        - ``("invalid", ...)`` — a COMPLETE tile that is structurally wrong (missing
+          var / shape / dtype). The caller raises: this is a real anomaly (e.g. a
+          stale wrong-grid store), not a resumable crash.
 
         Any OTHER open error (auth, throttling, transient network, corrupt metadata)
         propagates — a valid completed tile must not be silently re-inferred because
@@ -949,17 +974,15 @@ class ZarrWriter:
         """
         path = self._staging_path(run_id, chunk)
         try:
-            group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
+            group = _open_staged_tile(path)
         except FileNotFoundError:
             # The artifact is genuinely gone (partial/removed) → self-heal by re-inference.
             # Other open errors (auth, throttling, transient network, corrupt metadata)
             # must NOT be treated as "partial" — silently excluding + re-inferring a valid
             # completed tile on a transient read failure is expensive and wrong; propagate.
             return ("incomplete", "staged zarr not found (partial or removed) — re-infer")
-        # The completion marker (written last by write_chunk) is the authority on
-        # whether every chunk landed. Absent → a crashed write → re-infer.
-        if not group.attrs.get("staged_complete"):
-            return ("incomplete", "no staged_complete marker — a crash mid-write_chunk left partial chunks")
+        except IncompleteStageError as exc:
+            return ("incomplete", str(exc))
         for var in required_vars:
             if var not in group:
                 return ("invalid", f"missing variable '{var}'")
@@ -1114,19 +1137,15 @@ class ZarrWriter:
         for chunk in chunks:
             path = self._staging_path(run_id, chunk)
             try:
-                group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
+                # Rejects a crash-partial tile up front, before the schema commit —
+                # the same check the band fill will make when it reads the data, but
+                # cheaper to fail here than part-way through a created store.
+                group = _open_staged_tile(path)
             except FileNotFoundError as exc:  # GroupNotFoundError subclasses this
                 # A silent empty set here would quietly drop every obs-count
                 # variable from the output; a chunk that should exist but can't be
                 # opened is a corrupt/partial stage and must be loud.
                 raise IncompleteStageError(f"Cannot open staged chunk {path}: {exc}") from exc
-            # Reject a crash-partial tile up front (same marker the data read requires):
-            # array metadata can exist before all chunks, so a markerless tile would
-            # otherwise pass this probe and be assembled with fill-value holes.
-            if not group.attrs.get("staged_complete"):
-                raise IncompleteStageError(
-                    f"Staged chunk {path} lacks the staged_complete marker — re-infer it before assembly."
-                )
             found = {v for v in var_names if v in group}
             if present is None:
                 present, first_label = found, chunk.label
@@ -1263,12 +1282,19 @@ class ZarrWriter:
         """
         _log = log or logger
 
-        # Determine which chunks have staged zarrs. A chunk that intersects the
-        # ROI but was skipped during inference (all pixels failed validity) has
-        # a skip marker instead of a zarr — its footprint stays at fill.
+        # Determine which chunks have COMPLETED staged zarrs. A chunk that intersects
+        # the ROI but was skipped during inference (all pixels failed validity) has a
+        # skip marker instead of a zarr — its footprint stays at fill.
+        #
+        # The gate runs here rather than only in the calling flow, because this method
+        # derives its own live set from the ROI mask and is called directly (an
+        # assembly-only re-run, a test). Without it, the only thing standing between a
+        # crash-partial tile and a published timestep of fill values would be the
+        # per-tile check inside the workers — a correct backstop, but one that fires
+        # after the schema commit rather than before any work starts.
         roi_live_chunks = filter_chunks_by_roi_mask(chunks, roi_zarr_path)
-        skipped_labels = set(self._list_skip_marker_labels(run_id))
-        live_chunks = [c for c in roi_live_chunks if c.label not in skipped_labels]
+        staged_labels = self.verify_staged_completeness(run_id, roi_live_chunks, log=_log)
+        live_chunks = [c for c in roi_live_chunks if c.label in staged_labels]
         if not live_chunks:
             # Every ROI-intersecting chunk was skipped (no valid pixels). Publish
             # an all-fill timestep anyway rather than aborting: a create/append
