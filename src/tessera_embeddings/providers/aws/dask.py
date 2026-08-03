@@ -558,6 +558,12 @@ class FargateConfig:
     worker_mem: int
     cloudwatch_logs_group: str
     environment: dict[str, str] = field(default_factory=dict)
+    #: STABLE Dask task-definition ARNs. When both are set the provider reuses them and
+    #: registers NOTHING; when either is unset it falls back to registering a fresh pair
+    #: per cluster (the historical behaviour), so this is safe to ship before the
+    #: infrastructure that supplies them exists.
+    scheduler_task_definition_arn: str = ""
+    worker_task_definition_arn: str = ""
 
     def to_cluster_kwargs(self) -> dict[str, Any]:
         """Translate to kwargs accepted by :class:`FargateCluster`."""
@@ -569,8 +575,15 @@ class FargateConfig:
             "security_groups": self.security_groups,
             "execution_role_arn": self.execution_role_arn,
             "task_role_arn": self.task_role_arn,
-            # Let dask-cloudprovider create task definitions dynamically so
-            # the scheduler address is injected into worker commands.
+            # NOTE (corrected 2026-08-03): an earlier comment here said definitions had
+            # to be created dynamically "so the scheduler address is injected into worker
+            # commands". That is not how the library works. The scheduler address, worker
+            # name, --nthreads and --memory-limit all travel as per-run CONTAINER
+            # OVERRIDES (`Task._overrides["command"]`, sent on every run_task), so the
+            # command baked into a registered definition is never used. Pinning stable
+            # definitions therefore loses nothing — and it takes RegisterTaskDefinition
+            # calls to zero, which is what tripped the account-wide rate limit at 37
+            # concurrent cells (ThrottlingException: Rate exceeded).
             "scheduler_cpu": self.scheduler_cpu,
             "scheduler_mem": self.scheduler_mem,
             "worker_cpu": self.worker_cpu,
@@ -600,6 +613,12 @@ class FargateConfig:
         }
         if self.environment:
             kwargs["environment"].update(self.environment)
+        # BOTH or NEITHER. The library takes one ARN per role and registers whichever it
+        # was not given, so pinning only one would still leave a registration per cluster
+        # — the exact thing this removes. Unset means the historical dynamic path.
+        if self.scheduler_task_definition_arn and self.worker_task_definition_arn:
+            kwargs["scheduler_task_definition_arn"] = self.scheduler_task_definition_arn
+            kwargs["worker_task_definition_arn"] = self.worker_task_definition_arn
         return kwargs
 
 
@@ -645,6 +664,8 @@ def get_fargate_config(
         security_groups=security_groups,
         execution_role_arn=os.environ.get("ECS_EXECUTION_ROLE_ARN", ""),
         task_role_arn=os.environ.get("DASK_TASK_ROLE_ARN", ""),
+        scheduler_task_definition_arn=os.environ.get("DASK_SCHEDULER_TASK_DEFINITION_ARN", ""),
+        worker_task_definition_arn=os.environ.get("DASK_WORKER_TASK_DEFINITION_ARN", ""),
         scheduler_cpu=scheduler_cpu,
         scheduler_mem=scheduler_mem,
         worker_cpu=worker_cpu,

@@ -777,3 +777,78 @@ class TestDashboardSsmCommand:
         with caplog.at_level(logging.WARNING):
             dask_mod.log_dashboard_ssm_command(logging.getLogger("t"), SimpleNamespace(scheduler=None))
         assert "Could not build SSM dashboard command" in caplog.records[-1].getMessage()
+
+
+# --- stable Dask task definitions ------------------------------------------------------
+
+
+def _fargate_config(**overrides):
+    from tessera_embeddings.providers.aws.dask import FargateConfig
+
+    base = dict(
+        cluster_arn="arn:cluster",
+        image="img:dev",
+        vpc="vpc-1",
+        subnets=["subnet-1"],
+        security_groups=["sg-1"],
+        execution_role_arn="arn:exec",
+        task_role_arn="arn:task",
+        scheduler_cpu=4096,
+        scheduler_mem=8192,
+        worker_cpu=4096,
+        worker_mem=16384,
+        cloudwatch_logs_group="/ecs/tessera/dask",
+    )
+    return FargateConfig(**{**base, **overrides})
+
+
+class TestStableDaskTaskDefinitions:
+    """Pinned task definitions take RegisterTaskDefinition calls to zero.
+
+    `dask_cloudprovider` registers a scheduler AND a worker definition per cluster
+    unless given ARNs for both. At campaign width that burst trips the account-wide
+    `RegisterTaskDefinition` rate limit — observed at 37 concurrent cells.
+    """
+
+    def test_unset_falls_back_to_dynamic_registration(self):
+        """The historical path must survive, so this ships safely before the CDK does."""
+        kw = _fargate_config().to_cluster_kwargs()
+        assert "scheduler_task_definition_arn" not in kw
+        assert "worker_task_definition_arn" not in kw
+
+    def test_both_set_are_passed_through(self):
+        kw = _fargate_config(
+            scheduler_task_definition_arn="arn:sched", worker_task_definition_arn="arn:work"
+        ).to_cluster_kwargs()
+        assert kw["scheduler_task_definition_arn"] == "arn:sched"
+        assert kw["worker_task_definition_arn"] == "arn:work"
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"scheduler_task_definition_arn": "arn:sched"},
+            {"worker_task_definition_arn": "arn:work"},
+        ],
+        ids=["scheduler only", "worker only"],
+    )
+    def test_only_one_set_pins_neither(self, kwargs):
+        """Both or neither, deliberately.
+
+        The library takes one ARN per role and registers whichever it was not given, so
+        pinning half would still leave one registration per cluster — the exact thing this
+        removes. Half-pinning is therefore treated as not pinning, rather than as a
+        partial win that quietly keeps the burst.
+        """
+        kw = _fargate_config(**kwargs).to_cluster_kwargs()
+        assert "scheduler_task_definition_arn" not in kw
+        assert "worker_task_definition_arn" not in kw
+
+    def test_env_vars_are_read(self, monkeypatch):
+        """The CDK injects these onto every runner family; match that contract."""
+        from tessera_embeddings.providers.aws import dask as mod
+
+        monkeypatch.setenv("DASK_SCHEDULER_TASK_DEFINITION_ARN", "arn:sched-env")
+        monkeypatch.setenv("DASK_WORKER_TASK_DEFINITION_ARN", "arn:work-env")
+        cfg = mod.get_fargate_config()
+        assert cfg.scheduler_task_definition_arn == "arn:sched-env"
+        assert cfg.worker_task_definition_arn == "arn:work-env"
