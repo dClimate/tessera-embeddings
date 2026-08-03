@@ -325,9 +325,10 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     for tile, path in payload["tiles"]:
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
         staged = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
-        # Require the completion marker here too (the single-ROI assemble path): a
-        # crash-partial tile has array metadata but missing chunks that read as fill,
-        # and the listing-based verification can't see that. The open already happens.
+        # Require the completion attribute here too (the single-ROI assemble path): a
+        # crash-partial tile has array metadata but missing chunks that read as fill.
+        # The .done listing gate normally catches those; this is the in-store check
+        # that cannot be bypassed by a path that skips it. The open already happens.
         if not staged.attrs.get("staged_complete"):
             raise IncompleteStageError(
                 f"Staged tile {path} lacks the staged_complete marker — a crashed write_chunk left partial "
@@ -383,6 +384,33 @@ def _extend_time_axis(node: zarr.Group, time_date: np.datetime64) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
+class StagedListing:
+    """What one LIST of a run's staging prefix says about each chunk's artifacts.
+
+    The three states are mutually exclusive and each has exactly one remedy, which
+    is what lets every caller agree on how to treat a resumed run:
+
+    * ``complete`` — a staged ``.zarr`` and its ``.done`` marker both landed, so
+      the write finished. **Skip it** (after :meth:`ZarrWriter._validate_staged_chunk`
+      confirms its shape and dtype).
+    * ``interrupted`` — one of the pair is missing, so a crash caught the write
+      part-way and the ``.zarr``'s data chunks may be absent (Zarr reads those back
+      as fill values, silently). **Re-infer it** — ``write_chunk``'s ``mode="w"``
+      overwrites, so no cleanup is needed first.
+    * ``skipped`` — a ``.skipped`` marker: a previous attempt found the chunk had no
+      valid pixels at all. **Skip it**, but report it as a skip rather than a
+      success (see :class:`StagedResume`).
+
+    Labels are sorted: ``fs.ls`` order is backend-dependent and downstream probes
+    take ``complete[0]``, so the probe tile must not depend on the filesystem.
+    """
+
+    complete: list[str]
+    interrupted: list[str]
+    skipped: list[str]
+
+
+@dataclasses.dataclass(frozen=True)
 class StagedResume:
     """What a resume scan found in staging, with the two artifact kinds kept apart.
 
@@ -435,12 +463,13 @@ class StagedShardSource:
         sy, sx = shard
         path = f"{self.staging_base}/{self.run_id}/{chunk_label(sy, sx)}.zarr"
         group = zarr.open_group(path, mode="r", storage_options=_staged_storage_options(path))
-        # Require the completion marker at ASSEMBLY read too, not only on resume: the
-        # listing paths (verify_staged_completeness / _list_staged_labels) count a
-        # crash-partial .zarr as a valid staged tile, and to_zarr can write array
-        # metadata before all chunk objects. Without this, an assembly-only run (or a
-        # partial that slipped past inference) would read missing chunks as fill and
-        # commit+tag silent holes. The open already happened, so this is free.
+        # Require the completion attribute at ASSEMBLY read too, not only on resume.
+        # The listing gate (verify_staged_completeness / _list_staged_labels, keyed on
+        # the sibling .done marker) already excludes crash-partial tiles, so this is
+        # the guard against a caller that reaches a tile without going through that
+        # gate — a hand-passed label set, a future read path — and the last line of
+        # defence before fill-valued holes are committed and tagged complete. The open
+        # already happened, so it is free.
         if not group.attrs.get("staged_complete"):
             raise IncompleteStageError(
                 f"Staged tile {path} lacks the staged_complete marker — a crashed write_chunk left partial "
@@ -528,6 +557,27 @@ class ZarrWriter:
         """
         return f"{self.staging_base}/{run_id}/{chunk.label}.skipped"
 
+    def _done_marker_path(self, run_id: str, chunk: ChunkSpec) -> str:
+        """Get the completion-marker path for a staged chunk.
+
+        A zero-byte object written by :meth:`write_chunk` **after** the staged
+        Zarr is fully uploaded. A staged ``.zarr`` is many objects (group and
+        array metadata plus one per data chunk) written with no atomic
+        multi-object commit, so a crash mid-upload leaves a ``.zarr`` with valid
+        metadata but missing data chunks — which Zarr reads back as *fill
+        values*, not an error.
+
+        This marker is the LIST-visible completeness signal: every consumer that
+        learns what a run staged from one prefix listing (:meth:`_list_staged`,
+        and through it :meth:`verify_staged_completeness` and
+        :meth:`scan_existing_staged_artifacts`) keys on it, so an interrupted
+        write is recognised without opening anything. The in-store
+        ``staged_complete`` attribute written just before it (see
+        :meth:`write_chunk`) is the same fact in a form a reader that already has
+        the group open can check for free — see :meth:`_validate_staged_chunk`.
+        """
+        return f"{self.staging_base}/{run_id}/{chunk.label}.done"
+
     def write_skip_marker(self, chunk: ChunkSpec, run_id: str) -> str:
         """Write a zero-byte skip marker for a chunk.
 
@@ -541,14 +591,16 @@ class ZarrWriter:
         # directory-backed filesystems (write_chunk's to_zarr creates it as a
         # side effect; a bare open() does not). No-op on object stores.
         fs.makedirs(path.rsplit("/", 1)[0], exist_ok=True)
-        # Drop any staged zarr for this chunk first. It can only be a crash artifact
-        # the resume scan excluded — the chunk is skipping, so nothing valid can be
-        # staged for it — and leaving the pair behind makes verify_staged_completeness
-        # raise "BOTH a staged zarr and a skip marker" on every retry under the stable
-        # run_id, wedging the cell until someone deletes it by hand.
-        staged = self._staging_path(run_id, chunk)
-        with contextlib.suppress(FileNotFoundError):
-            fs.rm(staged, recursive=True)
+        # Drop any staged zarr for this chunk first, and its completion marker with
+        # it. Both can only be crash/stale artifacts — the chunk is skipping, so
+        # nothing valid can be staged for it — and leaving the pair behind makes
+        # verify_staged_completeness raise "BOTH a staged zarr and a skip marker" on
+        # every retry under the stable run_id, wedging the cell until someone deletes
+        # it by hand. The marker goes FIRST so an interruption here can never leave a
+        # .done vouching for a .zarr that is already gone.
+        for stale in (self._done_marker_path(run_id, chunk), self._staging_path(run_id, chunk)):
+            with contextlib.suppress(FileNotFoundError):
+                fs.rm(stale, recursive=True)
         with fs.open(path, "wb") as f:
             f.write(b"")
         logger.info("Wrote skip marker for %s to %s", chunk.label, path)
@@ -567,6 +619,12 @@ class ZarrWriter:
 
         Creates an xarray Dataset with an 'embedding' variable (mean) and
         optionally 'embedding_std' and 'scale' variables.
+
+        Records completion **after** the store is fully written — the
+        ``staged_complete`` in-store attribute and then the ``<label>.done``
+        sibling marker (see :meth:`_done_marker_path`) — so an interrupted upload
+        leaves a tile that resume re-infers rather than assembly trusting its
+        fill-valued holes.
 
         Args:
             chunk: Chunk specification.
@@ -645,14 +703,28 @@ class ZarrWriter:
         )
 
         ds.to_zarr(path, mode="w", encoding=encoding)
-        # Completion marker, written LAST in a SEPARATE op after to_zarr returns:
-        # to_zarr can create every array's metadata before all its chunk objects, so
-        # a crash mid-write leaves a tile with correct vars/shape/dtype but MISSING
-        # chunks (read back as fill). The resume scan requires this marker, so such a
-        # partial tile is rejected + re-inferred instead of skipped and silently
-        # assembled with holes. A crash before this line leaves no marker.
+        # --- Completion markers, written LAST, in SEPARATE ops after to_zarr returns.
+        # to_zarr can create every array's metadata before all its chunk objects, so a
+        # crash mid-write leaves a tile with correct vars/shape/dtype but MISSING
+        # chunks (read back as fill, not as an error). Completeness is therefore its
+        # own signal, and it is recorded twice because two kinds of consumer need it:
+        #
+        #   1. `staged_complete` in-store attribute — free to check for a reader that
+        #      already has the group open (assembly's per-tile reads), and impossible
+        #      to bypass: you cannot read the tile without being able to see it.
+        #   2. `<label>.done` sibling object — visible in the staging prefix LISTING,
+        #      so verification and the resume scan classify every tile of a run from
+        #      one listing without opening any of them.
+        #
+        # ORDER MATTERS and is the invariant the two checks rely on: .done last, so
+        # `.done present` implies `attribute set` implies `to_zarr returned`. A crash
+        # anywhere earlier leaves a tile the listing reports as interrupted, which the
+        # resume scan re-infers (write_chunk's mode="w" overwrites it).
         marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
         marker.attrs["staged_complete"] = True
+        done_path = self._done_marker_path(run_id, chunk)
+        with _fs_for(done_path).open(done_path, "wb") as f:
+            f.write(b"")
         logger.info("Wrote %s to %s", chunk.label, path)
         return path
 
@@ -702,18 +774,26 @@ class ZarrWriter:
         expected_chunks: list[ChunkSpec],
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
     ) -> set[str]:
-        """Verify all expected chunks have either a staged zarr or a skip marker.
+        """Verify all expected chunks have either a completed staged zarr or a skip marker.
 
-        Returns the labels that have staged zarrs (an empty set means every
-        live chunk resolved to a skip marker), so callers don't re-LIST the
+        Returns the labels that have completed staged zarrs (an empty set means
+        every live chunk resolved to a skip marker), so callers don't re-LIST the
         staging prefix to learn what verification already read.
 
         A live (ROI-intersecting) chunk can resolve in two ways: inference
-        produced embeddings (staged zarr), or every pixel failed the validity
-        filter (skip marker). Any live chunk with neither indicates a silent
-        failure — Ray worker died mid-chunk, a bug in the actor, etc. — and
-        assembly must fail loudly rather than produce a zero-filled output
-        that looks identical to a legitimate skip.
+        produced embeddings (a staged zarr whose ``.done`` marker confirms the
+        many-object write finished — see :meth:`_done_marker_path`), or every
+        pixel failed the validity filter (skip marker). Any live chunk with
+        neither — including one left half-written by a crash — indicates a silent
+        failure and must stop assembly here rather than produce an output that
+        looks identical to a legitimate skip.
+
+        Interrupted tiles are reported as their own category rather than folded
+        into "missing". Reaching assembly is what makes them anomalous: the resume
+        scan re-infers an interrupted tile, so one that survives to here means
+        either inference did not run at all (an assembly-only run) or it crashed
+        the same way twice — and the remedy differs from a chunk that was never
+        attempted.
 
         Args:
             run_id: Run identifier (locates the staging directory).
@@ -723,21 +803,25 @@ class ZarrWriter:
             log: Optional logger.
 
         Raises:
-            IncompleteStageError: If any live chunk has neither a staged
-                zarr nor a skip marker, or if there are extra labels that
+            IncompleteStageError: If any live chunk has neither a completed
+                staged zarr nor a skip marker, or if there are extra labels that
                 don't match any expected chunk.
         """
         _log = log or logger
-        staged_list, skipped_list = self._list_run_labels(run_id)
-        staged, skipped = set(staged_list), set(skipped_list)
+        listing = self._list_staged(run_id)
+        staged, skipped = set(listing.complete), set(listing.skipped)
         resolved = staged | skipped
         expected = {c.label for c in expected_chunks}
 
-        missing = expected - resolved
-        extra = resolved - expected
+        # A skip marker resolves the chunk on its own, so a leftover half-written
+        # pair alongside one is inert (write_skip_marker clears both, but a crash
+        # between the two removals could leave one behind).
+        interrupted = set(listing.interrupted) - resolved
+        missing = expected - resolved - interrupted
+        extra = (resolved | interrupted) - expected
         both = staged & skipped
 
-        if missing or extra or both:
+        if missing or extra or both or interrupted:
             parts = [f"Staged chunks for run '{run_id}' do not match the expected chunk grid."]
             parts.append(f"Expected {len(expected)} chunks, found {len(staged)} staged + {len(skipped)} skipped.")
             if missing:
@@ -745,6 +829,13 @@ class ZarrWriter:
                 parts.append(
                     f"{len(missing)} missing (neither zarr nor skip marker): "
                     f"{sample}{'...' if len(missing) > 10 else ''}"
+                )
+            if interrupted:
+                sample = sorted(interrupted)[:10]
+                parts.append(
+                    f"{len(interrupted)} interrupted (staged zarr and .done marker did not both land — a crash "
+                    f"mid-write, whose data chunks would read as fill): "
+                    f"{sample}{'...' if len(interrupted) > 10 else ''}"
                 )
             if extra:
                 sample = sorted(extra)[:10]
@@ -788,25 +879,45 @@ class ZarrWriter:
         # probe tile must not depend on which OS listed the directory.
         return sorted(entry.rstrip("/").rsplit("/", 1)[-1] for entry in entries)
 
-    def _list_run_labels(self, run_id: str) -> tuple[list[str], list[str]]:
-        """``(staged zarr labels, skip-marker labels)`` from one staging LIST."""
+    def _list_staged(self, run_id: str) -> StagedListing:
+        """Classify every artifact of a run from one staging LIST.
+
+        The single place the three-way split is derived, so verification and the
+        resume scan can never disagree about what a run staged. See
+        :class:`StagedListing` for what each bucket means and
+        :meth:`_done_marker_path` for why completeness is its own signal.
+        """
         names = self._list_run_names(run_id)
-        staged = [n.removesuffix(".zarr") for n in names if n.endswith(".zarr")]
-        skipped = [n.removesuffix(".skipped") for n in names if n.endswith(".skipped")]
-        return staged, skipped
+        staged = {n.removesuffix(".zarr") for n in names if n.endswith(".zarr")}
+        done = {n.removesuffix(".done") for n in names if n.endswith(".done")}
+        skipped = sorted(n.removesuffix(".skipped") for n in names if n.endswith(".skipped"))
+        # Symmetric difference, not `staged - done`: a .done whose .zarr is absent is
+        # equally a half-landed pair (an interrupted cleanup, or a marker that outlived
+        # the tile it vouches for), and it has the same remedy — re-infer, which
+        # rewrites both. Collapsing the two cases keeps one bucket with one fix.
+        return StagedListing(
+            complete=sorted(staged & done),
+            interrupted=sorted(staged ^ done),
+            skipped=skipped,
+        )
 
     def _list_staged_labels(self, run_id: str) -> list[str]:
-        """List chunk labels that have staged Zarrs in the run directory.
+        """List chunk labels whose staged write COMPLETED in the run directory.
+
+        Keyed on the ``.done`` completion marker, not the ``.zarr`` directory: a
+        ``.zarr`` present without its marker is an interrupted write, deliberately
+        excluded so resume re-runs it rather than assembling its partial
+        (fill-valued) contents. See :meth:`_done_marker_path`.
 
         Returns:
             List of chunk label strings (e.g. ``["chunk_0_0", "chunk_0_1"]``).
             Empty list if the staging directory doesn't exist.
         """
-        return self._list_run_labels(run_id)[0]
+        return self._list_staged(run_id).complete
 
     def _list_skip_marker_labels(self, run_id: str) -> list[str]:
         """List chunk labels that have skip markers in the run directory."""
-        return self._list_run_labels(run_id)[1]
+        return self._list_staged(run_id).skipped
 
     def _validate_staged_chunk(
         self,
@@ -819,11 +930,15 @@ class ZarrWriter:
         Returns ``None`` if the tile is complete and valid, else ``(kind, reason)``:
 
         - ``("incomplete", ...)`` — a crash artifact: genuinely absent
-          (``FileNotFoundError``), or missing the ``staged_complete`` marker (to_zarr
-          can create array metadata before all chunk objects, so a crash leaves gaps
-          read as fill). The caller RE-INFERS it (``write_chunk``'s ``mode="w"``
-          overwrites) rather than raising — with the stable, input-fingerprinted
-          run_id a raise would wedge every retry on the same partial artifact.
+          (``FileNotFoundError``), or missing the ``staged_complete`` attribute
+          (to_zarr can create array metadata before all chunk objects, so a crash
+          leaves gaps read as fill). The caller RE-INFERS it (``write_chunk``'s
+          ``mode="w"`` overwrites) rather than raising — with the stable,
+          input-fingerprinted run_id a raise would wedge every retry on the same
+          partial artifact. Callers reach this only for tiles the listing already
+          classed ``complete``, so the attribute check here is the guard against a
+          path that reads a tile without consulting its ``.done`` marker, plus the
+          narrow race where the tile disappears between the LIST and the open.
         - ``("invalid", ...)`` — a COMPLETE tile (marker present) that is
           structurally wrong (missing var / shape / dtype). The caller raises: this
           is a real anomaly (e.g. a stale wrong-grid store), not a resumable crash.
@@ -905,17 +1020,30 @@ class ZarrWriter:
         resumed zone that reports its skips as successes misstates what the run did.
         """
         _log = log or logger
-        staged_labels, skip_list = self._list_run_labels(run_id)
-        skip_marker_labels = set(skip_list)
-        if not staged_labels and not skip_marker_labels:
+        listing = self._list_staged(run_id)
+        staged_labels = listing.complete
+        skip_marker_labels = set(listing.skipped)
+        if not staged_labels and not skip_marker_labels and not listing.interrupted:
             _log.info("No staged chunks or skip markers found for run %s — starting fresh", run_id)
             return StagedResume(done=set(), skipped=set())
 
         _log.info(
-            "Found %d staged chunk Zarrs and %d skip markers — validating",
+            "Found %d completed staged chunk Zarrs and %d skip markers — validating",
             len(staged_labels),
             len(skip_marker_labels),
         )
+        if listing.interrupted:
+            # Not an error: these are exactly what resume exists for. They are simply
+            # absent from `done`, so run_inference re-runs them (write_chunk's
+            # mode="w" overwrites the partial). Logged because a tile appearing here
+            # run after run means the crash is reproducible, not incidental.
+            _log.warning(
+                "%d staged tile(s) are interrupted (staged zarr and .done marker did not both land) — "
+                "re-inferring: %s%s",
+                len(listing.interrupted),
+                listing.interrupted[:10],
+                "..." if len(listing.interrupted) > 10 else "",
+            )
 
         chunk_by_label = {c.label: c for c in chunks}
         # `scales` is mandatory (dequantization needs it) and staged Zarr writes are

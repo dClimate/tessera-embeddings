@@ -358,7 +358,9 @@ When every pixel in a live (ROI-intersecting) chunk fails the validity filter, t
 takes the `"skipped"` path. The actor writes a zero-byte `{chunk.label}.skipped` marker
 and returns. Assembly fills the footprint with constant-zero/NaN fill tasks. The marker
 distinguishes a legitimate skip from a silently-failed chunk; `verify_staged_completeness`
-requires every live chunk to have either a staged zarr or a skip marker.
+requires every live chunk to have either a **completed** staged zarr (see §5) or a skip
+marker. A chunk that staged on one attempt and skipped on a retry must not look like both,
+so `write_skip_marker` deletes the sibling zarr and its completion marker first.
 
 #### 4c. Temporal Sampling (`sampling.py`)
 
@@ -485,6 +487,56 @@ count** layers (`s2_obs_count`, `s1_asc_obs_count`, `s1_desc_obs_count`) — uin
 arrays recording how many valid timesteps contributed to each pixel. These are carried
 through assembly into the final store as 2D spatial variables (dims: `time, northing,
 easting`).
+
+#### Completion markers: how a resume tells finished from interrupted
+
+A staged `.zarr` is **many objects** (group and array metadata plus one per data chunk)
+written with no atomic multi-object commit. So a crash mid-upload leaves a `.zarr` with
+valid metadata but missing data chunks — and Zarr reads those back as **fill values, not an
+error**. Presence of the directory therefore proves nothing, which is why completeness is
+recorded as its own signal, twice, *after* the store is fully written:
+
+```text
+  write_chunk:  ds.to_zarr(…, mode="w")           many objects, no atomic commit
+                    ↓
+                staged_complete = True            in-store attribute
+                    ↓                             ← free for a reader holding the group
+                <label>.done  (zero bytes)        sibling object
+                                                  ← visible in a prefix LIST
+
+  ORDER IS THE INVARIANT:  .done  ⟹  attribute  ⟹  to_zarr returned
+```
+
+Two signals because two kinds of consumer need the same fact in different forms. The
+sibling `.done` is visible to a **listing**, so one LIST of the run prefix classifies every
+tile without opening any of them — that is what keeps resume cheap at zone scale (~15k
+objects). The in-store attribute is free for a reader that **already has the group open**
+(each per-tile assembly read), and it cannot be bypassed: you cannot read a tile without
+being able to see it.
+
+`_list_staged` derives the three-way split from that one listing, and it is the only place
+the split is made, so verification and resume can never disagree:
+
+| state | listing shows | meaning | what happens |
+|---|---|---|---|
+| **complete** | `.zarr` + `.done` | the write finished | validate shape/dtype, then skip |
+| **interrupted** | one of the pair only | a crash caught it part-way | re-infer (`mode="w"` overwrites; no cleanup needed) |
+| **skipped** | `.skipped` | no valid pixels at all | skip, and report as a skip, not a success |
+
+Interrupted tiles are excluded from the resume set rather than raising — under the stable,
+input-fingerprinted `run_id` a raise would re-fire on the same artifact every retry and
+wedge the cell until someone deleted it by hand. `verify_staged_completeness` does raise if
+one survives to assembly, and names it as *interrupted* rather than *missing*: the resume
+scan re-infers interrupted tiles, so one reaching assembly means either inference never ran
+(an assembly-only run) or it crashed the same way twice, and the remedy differs from a
+chunk that was never attempted.
+
+Both paths get this from the same code. `run_inference` runs the resume scan for the
+single-ROI and global zone-fill paths alike, and every per-tile assembly read
+(`StagedShardSource.load` for global, `_staged_vars_present` and `_fill_band_worker` for
+single-ROI) checks the attribute. (This guards the *staging* layer; the final store is
+Icechunk, whose transactional commit already rolls back cleanly on a crash *during*
+assembly.)
 
 ### 6. Raw-Zarr Assembly (fork/merge, no Dask)
 

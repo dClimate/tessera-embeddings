@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import itertools
 from importlib.metadata import version as _dist_version
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -167,6 +168,58 @@ class TestWriteChunk:
         result = ds["embeddings"].values
         np.testing.assert_array_almost_equal(result, embeddings, decimal=5)
         assert result.shape == (10, 10, EMBEDDING_DIM)
+
+    def test_write_chunk_records_completion_both_ways(self, tmp_path):
+        """A finished write is recorded in-store AND in the staging listing.
+
+        The two signals serve different readers — the attribute is free for anyone
+        holding the group open and cannot be bypassed, the sibling marker is visible
+        to a prefix LIST — so both must land, and the listing must key on the marker.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=10, x_start=0, x_stop=10)
+        embeddings = np.random.default_rng(0).random((10, 10, EMBEDDING_DIM)).astype(np.float32)
+
+        path = writer.write_chunk(chunk, embeddings, run_id="run1", scales=_dummy_scales(10, 10))
+
+        assert zarr.open_group(path, mode="r").attrs["staged_complete"] is True
+        assert Path(writer._done_marker_path("run1", chunk)).exists()
+        assert writer._list_staged_labels("run1") == [chunk.label]
+
+    def test_done_marker_is_written_after_the_attribute(self, tmp_path):
+        """The ordering invariant both completeness checks rest on.
+
+        ``.done`` present must imply the attribute is set, which implies ``to_zarr``
+        returned. If the marker landed first, a crash in between would leave a tile
+        the listing calls complete but every reader rejects — unresumable without
+        manual deletion, because re-inference would never be triggered for it.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
+        emb, scales = _quantized_embeddings(np.random.default_rng(0), 4, 4)
+
+        seen: list[str] = []
+        real_open = zarr.open_group
+
+        def spy_open_group(*args, **kwargs):
+            if kwargs.get("mode") == "a" or (len(args) > 1 and args[1] == "a"):
+                seen.append("attribute")
+            return real_open(*args, **kwargs)
+
+        real_fs_for = _assembly_mod._fs_for
+
+        def spy_fs_for(uri, *args, **kwargs):
+            if uri.endswith(".done"):
+                seen.append("done")
+            return real_fs_for(uri, *args, **kwargs)
+
+        with (
+            patch.object(_assembly_mod.zarr, "open_group", spy_open_group),
+            patch.object(_assembly_mod, "_fs_for", spy_fs_for),
+        ):
+            writer.write_chunk(chunk, emb, run_id="run1", scales=scales)
+
+        assert seen == ["attribute", "done"]
 
     def test_write_chunk_wrong_shape_raises(self, tmp_path):
         staging = str(tmp_path / "staging")
@@ -1000,6 +1053,19 @@ class TestDetectStagedChunkSize:
         assert result == 2000
 
 
+def _mark_staged_complete(path: str) -> None:
+    """Record a hand-built staged tile as a COMPLETED write, both ways.
+
+    ``write_chunk`` records completion twice — the in-store ``staged_complete``
+    attribute (checked by readers that already have the group open) and the
+    sibling ``<label>.done`` object (visible in the staging listing). A test that
+    hand-rolls a tile and sets only one of them is not simulating a completed
+    write; it is simulating a crash between the two.
+    """
+    zarr.open_group(path, mode="a").attrs["staged_complete"] = True
+    Path(path.removesuffix(".zarr") + ".done").write_bytes(b"")
+
+
 def _write_monolithic_staged_zarr(path: str, embeddings: np.ndarray, y_start: int, x_start: int) -> None:
     """Write a staged Zarr with monolithic chunks (no sub-chunking).
 
@@ -1029,7 +1095,7 @@ def _write_monolithic_staged_zarr(path: str, embeddings: np.ndarray, y_start: in
         },
     }
     ds.to_zarr(path, mode="w", encoding=encoding)
-    zarr.open_group(path, mode="a").attrs["staged_complete"] = True  # assembly requires the marker
+    _mark_staged_complete(path)
 
 
 class TestStagedLayout:
@@ -1321,20 +1387,57 @@ class TestScanExistingStagedChunks:
         with pytest.raises(RuntimeError, match="missing variable 'scales'"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
 
-    def test_missing_completion_marker_triggers_reinference(self, tmp_path):
-        """A markerless tile (crash before the completion marker) is EXCLUDED from
-        the valid set — so run_inference regenerates it (write_chunk's mode="w"
-        overwrites the partial) — rather than raising, which, with the stable
-        input-fingerprinted run_id, would re-fire on the same artifact every retry
-        and wedge the cell until manual deletion.
+    def test_missing_done_marker_triggers_reinference(self, tmp_path):
+        """A tile whose ``.done`` never landed is not resumed — no tile is opened.
+
+        This is the cheap half of the mechanism: the crash is recognised from the
+        staging listing alone, so a run with thousands of tiles does not pay a
+        metadata read per tile to find the interrupted ones.
         """
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = self.CHUNKS[0]
         self._stage_chunk(writer, chunk, "run1")
-        # Strip only the completion marker — the arrays still look complete.
+        Path(writer._done_marker_path("run1", chunk)).unlink()  # crash before the marker
+
+        # The .zarr is still there and still looks complete inside — but the write
+        # never finished, so resume must re-run it rather than trust it.
+        assert writer.scan_existing_staged_chunks("run1", self.CHUNKS) == set()
+
+    def test_orphan_done_marker_triggers_reinference(self, tmp_path):
+        """A ``.done`` whose tile is gone is a half-landed pair too, with the same fix.
+
+        Reached by an interrupted cleanup or manual surgery. Trusting the marker
+        would skip the chunk and assemble nothing for its footprint.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = self.CHUNKS[0]
+        self._stage_chunk(writer, chunk, "run1")
+        _assembly_mod._fs_for(writer._staging_path("run1", chunk)).rm(
+            writer._staging_path("run1", chunk), recursive=True
+        )
+
+        assert writer.scan_existing_staged_chunks("run1", self.CHUNKS) == set()
+
+    def test_missing_completion_attribute_triggers_reinference(self, tmp_path):
+        """The in-store half of the check, exercised on its own.
+
+        The tile keeps its ``.done`` marker, so the listing hands it over as
+        complete and only the attribute can reject it — which is the state a
+        reader reaching a tile without consulting the listing would be in. It is
+        EXCLUDED from the valid set, so run_inference regenerates it (write_chunk's
+        ``mode="w"`` overwrites the partial), rather than raising: with the stable
+        input-fingerprinted run_id a raise would re-fire on the same artifact every
+        retry and wedge the cell until manual deletion.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = self.CHUNKS[0]
+        self._stage_chunk(writer, chunk, "run1")
+        # Strip only the in-store attribute — the arrays and the .done marker
+        # still look complete from outside.
         group = zarr.open_group(writer._staging_path("run1", chunk), mode="a")
         del group.attrs["staged_complete"]
-        # Does NOT raise; the markerless tile is simply not counted valid.
+        assert writer._list_staged_labels("run1") == [chunk.label]
+        # Does NOT raise; the tile is simply not counted valid.
         result = writer.scan_existing_staged_chunks("run1", self.CHUNKS)
         assert chunk.label not in result
 
@@ -1353,7 +1456,7 @@ class TestScanExistingStagedChunks:
             coords={"northing": np.arange(5), "easting": np.arange(5), "band": np.arange(EMBEDDING_DIM)},
         )
         ds.to_zarr(path, mode="w")
-        zarr.open_group(path, mode="a").attrs["staged_complete"] = True
+        _mark_staged_complete(path)
 
         with pytest.raises(RuntimeError, match="invalid staged chunk"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
@@ -1369,7 +1472,7 @@ class TestScanExistingStagedChunks:
             coords={"northing": np.arange(10), "easting": np.arange(10), "band": np.arange(EMBEDDING_DIM)},
         )
         ds.to_zarr(path, mode="w")
-        zarr.open_group(path, mode="a").attrs["staged_complete"] = True  # a COMPLETE-but-invalid tile
+        _mark_staged_complete(path)  # a COMPLETE-but-invalid tile
 
         with pytest.raises(RuntimeError, match="missing variable 'embeddings'"):
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
@@ -1405,7 +1508,7 @@ class TestScanExistingStagedChunks:
                 coords={"northing": np.arange(5), "easting": np.arange(5), "band": np.arange(EMBEDDING_DIM)},
             )
             ds.to_zarr(path, mode="w")
-            zarr.open_group(path, mode="a").attrs["staged_complete"] = True  # COMPLETE but wrong shape
+            _mark_staged_complete(path)  # COMPLETE but wrong shape
 
         with pytest.raises(RuntimeError, match="2 invalid staged chunk") as exc_info:
             writer.scan_existing_staged_chunks("run1", self.CHUNKS)
@@ -1446,6 +1549,24 @@ class TestVerifyStagedCompleteness:
             writer.verify_staged_completeness("run1", list(self.CHUNKS))
         assert "Expected 3 chunks, found 1 staged + 0 skipped" in str(exc_info.value)
 
+    def test_interrupted_chunk_is_reported_as_its_own_category(self, tmp_path):
+        """A half-written tile fails verification, named for what it is.
+
+        Reaching assembly is what makes it anomalous — the resume scan re-infers
+        interrupted tiles — so it means either inference never ran (an assembly-only
+        run) or it crashed the same way twice. Calling it "missing" would send the
+        operator looking for a chunk that was never attempted; the remedy differs.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        for chunk in self.CHUNKS:
+            self._stage_chunk(writer, chunk, "run1")
+        Path(writer._done_marker_path("run1", self.CHUNKS[1])).unlink()
+
+        with pytest.raises(IncompleteStageError, match="1 interrupted") as exc_info:
+            writer.verify_staged_completeness("run1", list(self.CHUNKS))
+        assert "0 missing" not in str(exc_info.value)
+        assert self.CHUNKS[1].label in str(exc_info.value)
+
     def test_skip_marker_counts_as_resolved(self, tmp_path):
         """A chunk with a skip marker instead of a staged zarr passes verification."""
         writer = ZarrWriter(str(tmp_path / "staging"))
@@ -1453,6 +1574,24 @@ class TestVerifyStagedCompleteness:
         self._stage_chunk(writer, self.CHUNKS[1], "run1")
         writer.write_skip_marker(self.CHUNKS[2], "run1")
 
+        writer.verify_staged_completeness("run1", list(self.CHUNKS))
+
+    def test_skip_marker_clears_a_stale_done_marker(self, tmp_path):
+        """A chunk that staged, then skipped on a retry, must not look like both.
+
+        ``write_skip_marker`` drops the sibling zarr; it has to drop the completion
+        marker too. Leaving it behind would make the chunk both complete and skipped
+        on the next verification, which raises — and under the stable run_id it
+        raises on every retry, wedging the cell until someone deletes it by hand.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        self._stage_chunk(writer, self.CHUNKS[0], "run1")
+        self._stage_chunk(writer, self.CHUNKS[1], "run1")
+        self._stage_chunk(writer, self.CHUNKS[2], "run1")
+
+        writer.write_skip_marker(self.CHUNKS[2], "run1")
+
+        assert not Path(writer._done_marker_path("run1", self.CHUNKS[2])).exists()
         writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
     def test_both_staged_and_skipped_raises(self, tmp_path):
@@ -1589,7 +1728,7 @@ class TestAssembleGlobal:
         g.create_array("scales", data=np.ones((self.TILE, self.TILE), dtype="float32"))
         for name, arr in (extra or {}).items():
             g.create_array(name, data=arr)
-        g.attrs["staged_complete"] = True  # assembly now requires the completion marker
+        _mark_staged_complete(path)  # assembly requires both completion signals
 
     def test_fills_year_from_staged_tiles(self, tmp_path):
         """Staged tiles land as whole shards at the right year index; provenance attrs update."""
@@ -1670,6 +1809,7 @@ class TestAssembleGlobal:
         path = str(staging / "runC" / "chunk_0_0.zarr")
         g = zarr.open_group(path, mode="w")
         g.create_array("embeddings", data=np.ones((self.TILE, self.TILE, dim), dtype="int8"))
+        _mark_staged_complete(path)  # a COMPLETED write whose CONTENT is wrong
         writer = ZarrWriter(str(staging), embedding_dim=dim)
 
         with pytest.raises(IncompleteStageError, match="missing required variable"):

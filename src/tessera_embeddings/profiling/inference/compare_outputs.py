@@ -232,23 +232,32 @@ def compare_chunk(ref_path: str, test_path: str, label: str, *, cross_config: bo
 
 
 def _staged_labels(run_dir: str) -> tuple[set[str], set[str]]:
-    """Return (zarr labels, skip-marker labels) staged under a run directory.
+    """Return (completed zarr labels, skip-marker labels) staged under a run directory.
 
     Skip markers (``<label>.skipped``) are returned separately so a chunk that
     produced embeddings in one run but was skip-marked in the other counts as a
     label-set difference, not a silent omission.
+
+    Zarr labels are keyed on the ``<label>.done`` completion marker, matching
+    ``ZarrWriter._list_staged``: a ``.zarr`` whose write was interrupted has data
+    chunks missing that read back as fill values, so comparing it would measure
+    the crash rather than the code under test. Without its marker the label is
+    absent here, which surfaces as a label-set difference (or as an explicit
+    ``--allow-partial`` opt-out) instead of a bogus PASS.
     """
     fs, _, (path,) = fsspec.get_fs_token_paths(run_dir)
     # detail=False so s3fs returns path strings, not entry dicts (its default);
     # refresh so a listing cached from before the run staged isn't reused.
-    zarr_labels, skip_labels = set(), set()
+    zarr_labels, done_labels, skip_labels = set(), set(), set()
     for entry in fs.ls(path, detail=False, refresh=True):
         name = entry.rstrip("/").rsplit("/", 1)[-1]
         if name.endswith(".zarr"):
             zarr_labels.add(name.removesuffix(".zarr"))
+        elif name.endswith(".done"):
+            done_labels.add(name.removesuffix(".done"))
         elif name.endswith(".skipped"):
             skip_labels.add(name.removesuffix(".skipped"))
-    return zarr_labels, skip_labels
+    return zarr_labels & done_labels, skip_labels
 
 
 def main(argv: list[str] | None = None) -> int:
