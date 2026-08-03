@@ -292,9 +292,14 @@ def tessera_embeddings(
     # Same structural check `assemble` makes before extending an existing store —
     # model, sampler checkpoints, upstream ingest identity — run HERE, on metadata
     # only, so an append that can never be accepted is rejected before a GPU fleet
-    # is provisioned rather than after the whole inference is paid for. Skipped in
-    # assembly-only mode, where assemble runs immediately anyway.
-    if not dev_params.assembly_only:
+    # is provisioned rather than after the whole inference is paid for.
+    #
+    # Only on runs that will actually append. `assembly_only` reaches assemble
+    # immediately, which validates for itself; `inference_only` returns after
+    # staging and never touches the output store, so gating it would block a
+    # legitimate dev run — staging a new checkpoint against an ROI whose published
+    # store was written by a different one — over an append it is not making.
+    if not (dev_params.assembly_only or dev_params.inference_only):
         assert_output_store_accepts(
             output_bucket=output_bucket,
             roi_name=roi_name,

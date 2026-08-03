@@ -59,9 +59,31 @@ missing from one, is created — never to reshape an array that already exists �
 append-safety manifest (`EmbeddingManifest`) records model and upstream identity, not
 geometry. An old 500-px store keeps its geometry and still accepts appends.
 
-One wrinkle, accepted rather than fixed: a variable added to an old store later arrives
-at the new geometry, so a long-lived store can end up with mixed chunking across
-variables. That is legal and readable. Re-create the store if uniformity matters.
+A variable **added** to such a store takes the store's geometry, not the current
+preset's (`_layout_matching_store`, copying chunks and shards from an existing array of
+the same rank while keeping the layout's dtype, fill and codec).
+
+That is not cosmetic, and the first draft of this change got it wrong by assuming it
+was. Two reviewers caught it independently on PR #100. `_write_granularity` requires
+every data variable to agree on a write granularity — two disagreeing arrays would let
+separate forks share an output object — so an obs-count array created at 2048 inside a
+500-px store makes the store **unassemblable**, not merely mixed:
+
+```
+ValueError: Data variables disagree on northing write granularity:
+            {'embeddings': 500, 'scales': 500, 's2_obs_count': 2048}
+```
+
+and it surfaces after inference has already run. Reproduced before fixing, and pinned by
+`TestVariablesAddedToAnExistingStore`.
+
+**Still true of legacy stores:** a 2048-px tile cuts across their 500-px output chunks,
+so assembly read-modify-writes boundary chunks where the old 2000-px tile (exactly
+4 x 500) did not. That is a cost, not a failure — the merge is sequential within one
+fork and correct. Selecting the tile size from the existing store's geometry was
+considered and rejected: it would make the read tile a property of the output store
+rather than of the pipeline, reintroducing exactly the per-path divergence this change
+removes, to optimise appends to stores that should be re-created.
 
 ## Also aligned in the same pass
 

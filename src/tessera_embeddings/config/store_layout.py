@@ -17,7 +17,10 @@ One shard is one inference tile is a quarter of one ingest chunk, so the chain
 divides evenly end to end and nothing rechunks.
 
 A layout is read only when a store — or a variable missing from one — is CREATED,
-never to reshape an array that already exists.
+never to reshape an array that already exists. A variable joining an EXISTING store
+takes that store's chunk and shard geometry rather than the preset's (see
+``inference.assembly._layout_matching_store``): every data variable must agree on a
+write granularity, so a store tiled by an older preset stays appendable.
 """
 
 from __future__ import annotations
