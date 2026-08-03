@@ -310,7 +310,7 @@ def tessera_embeddings(
     # can be inspected (for arch tests) on machines without ray
     # installed. The provider is only needed when the flow actually
     # runs.
-    from tessera_embeddings.providers.aws.ray import ray_cluster
+    from tessera_embeddings.providers.aws.ray import make_instance_terminator, ray_cluster
 
     assemble_kwargs: dict[str, Any] = {
         "chunk_size": chunk_size or INFERENCE_CHUNK_SIZE,
@@ -369,6 +369,14 @@ def tessera_embeddings(
             t0=t0,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
+            # Terminate the EC2 instance behind each retired idle actor at once,
+            # rather than holding idle GPU nodes to the end of the run on the Ray
+            # autoscaler's idle timeout, which is unreliable after ray.kill()
+            # (providers/aws/gotchas.md). Actors go idle at the tail, while the
+            # last chunks finish, so this is where a run stops paying for GPUs it
+            # is done with. The callback runs driver-side; its boto3 client never
+            # ships to a worker. Matches fill_zone_year.
+            on_actor_retire=make_instance_terminator(log=log),
         )
     deactivate()
 

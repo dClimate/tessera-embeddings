@@ -10,6 +10,7 @@ node exactly like a cancelled one.
 
 from __future__ import annotations
 
+import inspect
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -143,3 +144,18 @@ def test_tessera_embeddings_registers_teardown_on_cancel_and_crash() -> None:
     flow = flows_mod.tessera_embeddings
     assert lifecycle_mod.ray_cleanup_on_cancellation in flow.on_cancellation_hooks
     assert lifecycle_mod.ray_cleanup_on_cancellation in flow.on_crashed_hooks
+
+
+def test_both_gpu_flows_terminate_retired_actors_instances() -> None:
+    """Idle actors must take their EC2 instance with them, on either GPU path.
+
+    End-of-run teardown covers the fleet, but actors go idle at the TAIL, while the
+    last chunks finish — and after ``ray.kill()`` the autoscaler's idle timeout is
+    unreliable, because it relies on the node self-reporting empty
+    (providers/aws/gotchas.md). Without the retire hook those nodes bill until the
+    run ends. Asserted as source, since wiring it requires a live Ray context.
+    """
+    for module in (fill_mod, flows_mod):
+        source = inspect.getsource(module)
+        assert "on_actor_retire" in source, module.__name__
+        assert "make_instance_terminator" in source, module.__name__

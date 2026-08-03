@@ -242,21 +242,20 @@ sub-tile out of them — small enough to keep peak GPU-node RAM in check.
 Zarr's `oindex` reads a sub-tile out of a 4096 chunk with no alignment
 requirement, so the two sizes are independent.
 
-The read tile is chosen to divide the OUTPUT chunking, and the two paths
-differ. The global campaign passes **2048** explicitly, because one
-inference tile must equal one 2048-px shard (ADR-008 D3). The single-ROI
-default, `INFERENCE_CHUNK_SIZE = 2000`, divides that path's 500-px output
-chunks — 2048 would leave a partial chunk at every tile boundary for
-assembly to read-modify-write. Go smaller on the ingest chunk and the
-satellite-ingest Dask scheduler drowns in tasks; go larger on the read
-tile and you OOM on a g6e.xlarge. If you change either, profile.
+The read tile divides the OUTPUT chunking, and both paths use the same
+one: `INFERENCE_CHUNK_SIZE = 2048`, so one inference tile is exactly one
+2048-px shard (ADR-008 D3). The global campaign also passes it explicitly,
+since that path requires the identity rather than merely matching it. Go
+smaller on the ingest chunk and the satellite-ingest Dask scheduler drowns
+in tasks; go larger on the read tile and you OOM on a g6e.xlarge. If you
+change either, profile.
 
 The powers of two are not cosmetic — they align every stage of the
-pipeline on one grid (see the global store below):
+pipeline on one grid, so no stage rechunks its input:
 
 ```
 ingest chunk    4096 px  = 2×2 inference tiles
-inference tile  2048 px  = 1 output shard (global store)
+inference tile  2048 px  = 1 output shard
 shard           2048 px  = 8×8 inner chunks
 inner chunk      256 px  = the unit downstream readers decode
 
@@ -369,7 +368,7 @@ WRITE  1 staged inference tile (2048²) == 1 shard: the assembly worker
        an all-ocean tile costs nothing (never staged, never written).
 READ   a point/window read GETs the shard index, then ranged-GETs only
        the inner chunks it overlaps — ~8 MB per point, not 0.5 GB.
-       (SINGLE single-ROI stores are unsharded: chunk == object.)
+       (Single-ROI stores use this same geometry — one preset, two names.)
 ```
 
 ### Manifest splitting: why a commit costs one year, not the store
