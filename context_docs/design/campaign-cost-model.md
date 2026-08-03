@@ -308,7 +308,7 @@ The cheapest useful ask is **2,704 actors**, which is 66 cells at proper 85% pro
 > `overlap_years` exists and defaults OFF; the three pieces it needed — a per-cell inference
 > window, a child flow taking `(zone, year)` pairs, and a driver that batches instead of
 > looping years — are in and unit-tested. Nothing has run on a real fleet, so **cost and
-> schedule planning should still use the year-serial rows above** until Phase 4's P3c rung
+> schedule planning should still use the year-serial rows above** until Phase 4's **P4** rung
 > clears it. Two figures move when it does: the campaign floor from ~6.8 d to ~4.8 d at 61
 > cells, and the cluster-ramp line from ~$9,000 to ~$1,000.
 
@@ -414,7 +414,7 @@ maximum per strip rather than a sum. At campaign-average token counts the fixed 
 ~2% of a chunk; on the optical-only cells (56 tokens/px against Iowa's 136) it rises to
 perhaps 8–10%. **That is why the saving credited to `allow_s2_only` below is quoted as
 $15,000–$18,000 rather than the $26,000 a pure token model gives.** Measuring the fixed term
-is one of the three things the Phase-4 test geographies are chosen to settle.
+is one of the two things the Phase-4 test geographies (the **P2** rung) are chosen to settle.
 
 ### The 2022–2024 radar gap, and what `allow_s2_only` does to it
 

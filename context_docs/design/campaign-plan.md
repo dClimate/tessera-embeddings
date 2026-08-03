@@ -295,7 +295,7 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
    two had to run twice, because validating optical-only output meant masking radar and
    comparing the same pixels. Cambridge validated radar-free embeddings, so that constraint is
    gone and what remains needs neither dual orbits nor paired runs. Site list and rationale in
-   `yield-embeddings/docs/global-tessera-test-plan.md`, the **P1b rung**.
+   `yield-embeddings/docs/global-tessera-test-plan.md`, the **P2 rung**.
 3. **Measure the densest zone at two fleet widths (60 and 80).** It decides whether the
    campaign is 5.6 days or 4.5, and it is the only remaining question about the schedule. The
    width model is fitted over roughly 30–60 workers, so 80 is currently an extrapolation.
@@ -312,7 +312,7 @@ on-demand**, and the permanent store goes to **AWS Open Data**.
    is correct: ordering and actor clamping are properties of area, not of work.
 7. **Turn the year barrier OFF, once Phase 4 validates it.** The code shipped 2026-07-30
    behind `overlap_years` (default off). What remains is a deployment re-registration and a
-   real-fleet run — Phase 4's P3c rung.
+   real-fleet run — Phase 4's **P4** rung.
 
    Payoff: the knee moves from ingest (45 cells) to the GPU fleet, giving **~4.8 days against
    ~6.8** at 61 cells and the full 2,500-actor quota, plus 8 Ray cluster boots instead of 72
@@ -405,6 +405,6 @@ never averaged away.
 - [`../decisions/013-optional-s1-s2-only-pixels.md`](../decisions/013-optional-s1-s2-only-pixels.md)
   — what the `allow_s2_only` flag does, the neutral-input convention, and the scientific
   validation it left open. **The flag is ON for this campaign** (§2); that validation is the
-  P1b rung's job.
+  **P2** rung's job.
 - `tests/unit/test_cluster_balance.py` — the runnable diagnostic behind §3; rerun it rather
   than trusting the figures if the mask is rebuilt.
