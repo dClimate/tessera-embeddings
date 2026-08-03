@@ -110,6 +110,7 @@ def run_ingest(monkeypatch):
     date the coverage gate drops. ``fail_on`` makes that date's write raise, and
     ``write_s`` slows the write so overlap is observable.
     """
+
     # Retries keep their COUNT (three attempts, then reraise) and their concurrent-writer
     # exclusion, and lose only the SLEEP, which would otherwise cost the suite six seconds
     # per failure case. Stubbing the policy's sleep rather than its wait strategy keeps this

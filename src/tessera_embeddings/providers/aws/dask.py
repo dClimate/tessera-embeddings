@@ -920,7 +920,7 @@ def _region_from_arn(arn: str) -> str | None:
     return parts[3] if len(parts) > 4 and parts[3] else None
 
 
-def ecs_inventory_client(region: str | None = None):  # noqa: ANN201 — botocore client, untyped
+def ecs_inventory_client(region: str | None = None) -> Any:  # noqa: ANN401 — botocore client, untyped
     """A boto3 ECS client configured to survive a cluster-wide task enumeration.
 
     **Use this for any code that paginates ``list_tasks``/``describe_tasks``**, in either
