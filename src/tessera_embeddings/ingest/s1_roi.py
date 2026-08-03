@@ -328,6 +328,18 @@ def ingest_s1_roi_sar(
     live_windows: list[tuple[int, int, int, int]] = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
     log.info("Writing %d live window(s)", len(live_windows))
 
+    # An ROI with no live window at all — an all-ocean mask — has nowhere to put a
+    # pixel, and every date would otherwise be COMMITTED with zero windows written:
+    # a time slot holding nothing, which `get_existing_dates` then reports as
+    # ingested, so no later run ever revisits it. Stop before the query rather than
+    # bank empty dates. The per-date `{}` fallback cannot cover this, because the set
+    # it falls back TO is the empty one. The campaign screens these cells out with
+    # `zone_has_live_tiles`; the public ROI path has no such preflight, which is why
+    # the S2 path guards its own coverage denominator the same way.
+    if not live_windows:
+        log.warning("ROI %s has no live window — no SAR date can store a pixel; skipping ingest", roi_zarr_path)
+        return SarIngestResult(roi_path=roi_zarr_path, status="skipped", dates_processed={orbit: 0})
+
     # A date's own footprint, keyed so it can be matched back to the loaded time slice.
     #
     # THE JOIN IS ON AN EXACT TIMESTAMP, not a date string, and that is what makes this

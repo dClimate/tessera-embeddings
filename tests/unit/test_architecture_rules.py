@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from tessera_embeddings.architecture_tests import (
     DEFAULT_RULES,
     Rule,
@@ -202,3 +204,31 @@ def test_importing_the_subpackage_by_name_is_flagged(tmp_path: Path) -> None:
     # An unrelated name from the same package is still fine.
     _write(pkg / "inference" / "ok.py", "from tessera_embeddings import storage\n")
     assert "ok.py" not in {v.path.name for v in run(pkg) if v.rule == "no-profiling-imports-outside-profiling"}
+
+
+def test_scanning_a_src_wrapper_is_refused(tmp_path: Path) -> None:
+    """A non-package root must fail loudly, not silently approve everything.
+
+    The scanned root's NAME is what relative imports resolve against, so pointing the
+    checker at a `src/` wrapper turns `from ..profiling import x` inside
+    `src/pkg/inference/` into `src.pkg.profiling` — matching no absolute forbidden
+    prefix, so every relative-import rule passes on the imports it exists to forbid.
+    A checker that approves by accident is worse than no checker.
+    """
+    src = tmp_path / "src"
+    _write(src / "tessera_embeddings" / "__init__.py", "")
+    _write(
+        src / "tessera_embeddings" / "inference" / "actors.py",
+        "from ..profiling.ingest import report\n",
+    )
+
+    with pytest.raises(ValueError, match="one level above the package root"):
+        run(src)
+
+    # The message names the package it found, since one directory down is the fix.
+    with pytest.raises(ValueError, match="tessera_embeddings"):
+        run(src)
+
+    # And pointed at the package itself, the rule fires as it should.
+    flagged = {v.rule for v in run(src / "tessera_embeddings")}
+    assert "no-profiling-imports-outside-profiling" in flagged

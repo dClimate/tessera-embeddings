@@ -262,6 +262,23 @@ def run(
     )
 
     source_path = source_path.resolve()
+    # The scanned root's NAME is what relative imports resolve against, so a `src/`
+    # wrapper one level above the package resolves `from ..profiling import x` inside
+    # `src/pkg/inference/` to `src.pkg.profiling` — matching no absolute forbidden
+    # prefix, so every relative-import rule passes on exactly the imports it forbids.
+    # A checker that approves by accident is worse than no checker.
+    #
+    # Detected narrowly, by the shape that mistake has: nothing importable at the root
+    # and a single package directly beneath it. A root with its own modules is somebody
+    # scanning a plain tree, which is supported and resolves correctly.
+    if not any(p.suffix == ".py" for p in source_path.iterdir() if p.is_file()):
+        nested = sorted(p for p in source_path.iterdir() if p.is_dir() and (p / "__init__.py").exists())
+        if len(nested) == 1:
+            raise ValueError(
+                f"{source_path} holds no modules of its own and wraps a single package, so it is one "
+                f"level above the package root. Its name is what relative imports resolve against, so "
+                f"scanning it would silently pass every relative-import rule. Scan {nested[0]} instead."
+            )
     violations: list[Violation] = []
     for path in sorted(source_path.rglob("*.py")):
         rel = _path_to_subtree(source_path, path)

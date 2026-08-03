@@ -445,3 +445,52 @@ def test_no_assessed_window_is_recorded_when_the_orbit_store_does_not_exist(monk
 
     assert written == []
     assert recorded == []
+
+
+def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
+    """An ROI with no live window must ingest nothing rather than commit empty dates.
+
+    With no window there is nowhere to put a pixel, and each date would still be
+    COMMITTED — a time slot holding nothing, which `get_existing_dates` then reports as
+    ingested, so no later run revisits it. The per-date footprint fallback cannot help:
+    the set it falls back to is the empty one. The campaign screens these cells out
+    up front; the public ROI path has no such preflight.
+    """
+    from types import SimpleNamespace
+
+    from tessera_embeddings.ingest import s1_roi
+
+    written: list[str] = []
+    queried: list[str] = []
+
+    def fake_ingest_tile(**_kwargs):
+        queried.append("query")
+        return None, {}
+
+    monkeypatch.setattr(s1_roi, "ingest_tile", fake_ingest_tile)
+    monkeypatch.setattr(s1_roi, "write_day_windows", lambda *a, **k: written.append("write"))
+    monkeypatch.setattr(s1_roi, "get_existing_dates", lambda _store, **_kw: set())
+    monkeypatch.setattr(s1_roi, "read_roi_mask", lambda *a, **k: object())
+    monkeypatch.setattr(
+        s1_roi,
+        "read_roi_metadata",
+        lambda *a, **k: SimpleNamespace(bbox_wgs84=(0.0, 0.0, 1.0, 1.0), geobox=object(), crs="EPSG:32615"),
+    )
+    monkeypatch.setattr(s1_roi, "live_windows_for_mask", lambda *a, **k: [])  # all ocean
+    monkeypatch.setattr(s1_roi, "solar_grouping_longitude", lambda *a, **k: 0.0)
+    monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
+    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p: object()))
+
+    result = s1_roi.ingest_s1_roi_sar(
+        roi_zarr_path="s3://bucket/ocean.zarr",
+        start_date="2024-01-01",
+        end_date="2024-01-04",
+        store_path="s3://bucket/mosaics",
+        client=type("C", (), {"persist": staticmethod(lambda x: x)})(),
+        orbit="ascending",
+    )
+
+    assert result.status == "skipped"
+    assert result.dates_processed == {"ascending": 0}
+    assert written == [], "no date may be committed when nothing can be stored"
+    assert queried == [], "and the catalogue need not be queried at all"
