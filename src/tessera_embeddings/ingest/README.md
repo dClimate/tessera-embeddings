@@ -1248,10 +1248,18 @@ Use SSM port forwarding to reach the Bokeh dashboard:
 # Look up TASK_ID and RUNTIME_ID for the Dask scheduler task in the ECS console
 aws ssm start-session \
   --target ecs:yield-cluster_${TASK_ID}_${RUNTIME_ID} \
-  --document-name AWS-StartPortForwardingSessionToRemoteHost \
-  --parameters '{"host":["localhost"],"portNumber":["8787"],"localPortNumber":["8787"]}'
+  --document-name AWS-StartPortForwardingSession \
+  --region <aws-region> \
+  --parameters '{"portNumber":["8787"],"localPortNumber":["8787"]}'
 ```
 
-Then open http://localhost:8787 in your browser.
+Then open http://localhost:8787 in your browser. `log_dashboard_ssm_command` (in
+`providers/aws/dask.py`) logs the same command with the target and region already filled in
+once the cluster is up.
+
+`AWS-StartPortForwardingSession` forwards a port on the scheduler container itself. The
+`AWS-StartPortForwardingSessionToRemoteHost` variant is for hosts reachable *from* the
+container (RDS, an internal ALB); current SSM agents refuse loopback destinations for it and
+fail with `Forwarding to IP address localhost is forbidden`.
 
 Requires the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (`brew install session-manager-plugin`).

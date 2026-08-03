@@ -499,9 +499,17 @@ def _log_ray_dashboard_ssm_command(
     ``AmazonSSMManagedInstanceCore``, so the port-forward works against the
     instance ID.
 
-    Best-effort: warns and returns on any failure, never raises. No
-    ``--profile`` is printed — credentials come from the operator's
-    environment (``AWS_PROFILE`` or their default).
+    Uses ``AWS-StartPortForwardingSession``, which targets a port on the
+    managed instance itself. The ``...ToRemoteHost`` variant addresses hosts
+    reachable *from* the instance, and the SSM agent rejects loopback
+    destinations for it.
+
+    ``--region`` is filled in from the region the head node was looked up in,
+    so an operator whose default region differs doesn't get a "target not
+    connected" from SSM. No ``--profile`` is printed — credentials come from
+    the operator's environment (``AWS_PROFILE`` or their default).
+
+    Best-effort: warns and returns on any failure, never raises.
 
     Args:
         cluster_name: Resolved, unique ``ray-cluster-name`` tag value (with
@@ -528,8 +536,9 @@ def _log_ray_dashboard_ssm_command(
             "To view the Ray dashboard, run:\n\n"
             "aws ssm start-session \\\n"
             f"  --target {instance_id} \\\n"
-            "  --document-name AWS-StartPortForwardingSessionToRemoteHost \\\n"
-            '  --parameters \'{"host":["localhost"],"portNumber":["8265"],"localPortNumber":["8265"]}\'\n\n'
+            "  --document-name AWS-StartPortForwardingSession \\\n"
+            f"  --region {region} \\\n"
+            '  --parameters \'{"portNumber":["8265"],"localPortNumber":["8265"]}\'\n\n'
             "Then open http://localhost:8265"
         )
     except Exception:

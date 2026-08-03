@@ -347,6 +347,69 @@ def test_ray_cluster_finalizer_skips_ray_down_when_resolve_fails(
     assert cleaned == [None]  # cleanup called with None (no resolved YAML) — a safe no-op
 
 
+class TestRayDashboardSsmCommand:
+    """The copy-pasteable port-forward command logged once the head node is up."""
+
+    def _launch_head(self, cluster_name: str) -> str:
+        """Run a tagged head instance in moto and return its instance ID."""
+        ec2 = boto3.client("ec2", region_name=REGION)
+        resp = ec2.run_instances(
+            ImageId="ami-0123456789abcdef0",
+            MinCount=1,
+            MaxCount=1,
+            TagSpecifications=[
+                {
+                    "ResourceType": "instance",
+                    "Tags": [
+                        {"Key": "ray-cluster-name", "Value": cluster_name},
+                        {"Key": "ray-node-type", "Value": "head"},
+                    ],
+                }
+            ],
+        )
+        return str(resp["Instances"][0]["InstanceId"])
+
+    @mock_aws
+    def test_forwards_a_port_on_the_instance_not_a_remote_host(self, caplog) -> None:
+        """The ``...ToRemoteHost`` document cannot reach the head's own port.
+
+        That variant addresses hosts reachable *from* the instance, and current
+        ``amazon-ssm-agent`` versions refuse loopback destinations for it
+        ("Forwarding to IP address localhost is forbidden"). The dashboard runs
+        on the head itself, so the plain document is the right one — and it takes
+        no ``host`` parameter.
+        """
+        instance_id = self._launch_head("tessera-ray-abc123")
+        with caplog.at_level(logging.INFO):
+            ray_mod._log_ray_dashboard_ssm_command("tessera-ray-abc123", _LOG, region=REGION)
+        msg = caplog.records[-1].getMessage()
+        assert "--document-name AWS-StartPortForwardingSession \\" in msg  # trailing \ excludes ...ToRemoteHost
+        assert "ToRemoteHost" not in msg
+        assert '"host"' not in msg
+        assert f"--target {instance_id}" in msg
+        assert '{"portNumber":["8265"],"localPortNumber":["8265"]}' in msg
+
+    @mock_aws
+    def test_region_is_printed_so_a_differing_default_does_not_bite(self, caplog) -> None:
+        """SSM resolves the target within one region.
+
+        An operator whose default region differs from the cluster's gets a
+        target-not-connected failure rather than a tunnel, so the region the head
+        was found in is baked into the command.
+        """
+        self._launch_head("tessera-ray-abc123")
+        with caplog.at_level(logging.INFO):
+            ray_mod._log_ray_dashboard_ssm_command("tessera-ray-abc123", _LOG, region=REGION)
+        assert f"  --region {REGION} \\\n" in caplog.records[-1].getMessage()
+
+    @mock_aws
+    def test_missing_head_warns_without_raising(self, caplog) -> None:
+        """Best-effort: no head found is a warning, never a failed cluster start."""
+        with caplog.at_level(logging.WARNING):
+            ray_mod._log_ray_dashboard_ssm_command("no-such-cluster", _LOG, region=REGION)
+        assert "Could not find Ray head node" in caplog.records[-1].getMessage()
+
+
 def test_cleanup_ray_tempfiles_handles_missing_path() -> None:
     """``cleanup_ray_tempfiles(None)`` and a missing path are both no-ops."""
     cleanup_ray_tempfiles(None)
