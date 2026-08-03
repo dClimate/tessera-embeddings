@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,21 +39,77 @@ def checkpoint_filename(norm_source: str = "aws") -> str:
 # Staged-output code identity
 # ---------------------------------------------------------------------------
 
-#: The source whose behaviour determines what a staged tile CONTAINS.
+#: SEED for the source whose behaviour determines what a staged tile CONTAINS.
 #:
-#: Anything listed here changing means already-staged tiles were produced by different
-#: logic and must not be mixed with new ones. Anything OUTSIDE it changing is
-#: orchestration, ingest, storage, provider or tooling code, and must not invalidate
-#: staging — that is the whole point of the narrowing.
+#: The fingerprint covers this plus everything it imports, transitively
+#: (:func:`_first_party_import_closure`) — a hand-maintained list cannot keep up with
+#: the imports, and it fails in the silent direction when it falls behind.
 #:
-#: The whole ``inference`` package is taken rather than a hand-picked module list. That
-#: OVER-includes: ``assembly.py`` reads staged tiles rather than producing them, and
-#: ``diagnostics.py``/``profiling.py`` affect nothing. The over-inclusion is deliberate,
-#: because the two errors are not symmetric — over-including costs a spurious re-inference
-#: (exactly what the previous whole-build fingerprint did on every change), while
+#: A change anywhere in that closure means already-staged tiles were produced by
+#: different logic and must not be mixed with new ones. Code outside it — orchestration,
+#: provider and tooling code, and the ingest and storage modules inference never reaches
+#: — does not invalidate staging, which is the point of narrowing away from the old
+#: whole-build identity.
+#:
+#: The whole ``inference`` package seeds it rather than a hand-picked module list, and
+#: the closure then pulls in what those modules import (about a third of the package).
+#: Both OVER-include: ``assembly.py`` reads staged tiles rather than producing them, and
+#: ``storage.zarr_store`` arrives for ``compute_doy`` but brings its own dependencies
+#: with it. Deliberate, because the two errors are not symmetric — over-including costs
+#: a spurious re-inference, and ``force_staging_reuse`` exists to wave one through, while
 #: under-including silently assembles tiles from two code versions into one write-once
-#: zone-year. Err toward the expensive failure, never the silent one.
+#: zone-year and has no escape hatch at all. Err toward the expensive failure, never the
+#: silent one.
 _STAGED_OUTPUT_SOURCES: tuple[str, ...] = ("inference", "config/inference.py")
+
+
+def _first_party_import_closure(seed: list[Path], root: Path) -> set[Path]:
+    """Every in-package module reachable from *seed*, following imports transitively.
+
+    The seed names the code that OBVIOUSLY produces a staged tile; this finds the code
+    it delegates to. Without it the identity misses exactly the dependencies that matter
+    most — ``data_loading`` calls ``compute_doy`` from ``storage.zarr_store`` to build a
+    model input, and reads ``TimeWindow`` from ``config.time_windows`` to choose which
+    observations are used. A change to either alters a staged tile's CONTENT while
+    leaving a hand-listed identity unmoved, so a retry mixes tiles from two code
+    versions into one write-once zone-year.
+
+    A closure rather than a longer list, because a list only covers the dependencies
+    someone remembered: it goes stale the first time an import is added, and it goes
+    stale silently, in the direction that loses data.
+
+    Parses rather than imports — this runs on a flow runner that has no torch, and
+    importing to inspect would execute module bodies for a hash. ``from x import y``
+    contributes both ``x`` and ``x.y`` as candidates, since either may name the module.
+    Non-package imports and names that resolve to no file are skipped.
+    """
+    package = __name__.split(".")[0]
+
+    def module_file(dotted: str) -> Path | None:
+        rel = dotted.removeprefix(package + ".").replace(".", "/")
+        for candidate in (root / f"{rel}.py", root / rel / "__init__.py"):
+            if candidate.exists():
+                return candidate
+        return None
+
+    def imported_modules(path: Path) -> set[str]:
+        found: set[str] = set()
+        for node in ast.walk(ast.parse(path.read_bytes())):
+            if isinstance(node, ast.Import):
+                found.update(a.name for a in node.names if a.name.startswith(package))
+            elif isinstance(node, ast.ImportFrom) and node.module and node.module.startswith(package):
+                found.add(node.module)
+                found.update(f"{node.module}.{a.name}" for a in node.names)
+        return found
+
+    reached, stack = set(seed), list(seed)
+    while stack:
+        for dotted in imported_modules(stack.pop()):
+            path = module_file(dotted)
+            if path is not None and path not in reached:
+                reached.add(path)
+                stack.append(path)
+    return reached
 
 
 def inference_code_identity() -> str:
@@ -64,6 +121,11 @@ def inference_code_identity() -> str:
     inference for no semantic reason. At campaign scale that is the difference between a
     hotfix costing minutes and costing a re-run.
 
+    Hashes :data:`_STAGED_OUTPUT_SOURCES` **and everything it imports**, transitively —
+    the seed alone misses the code it delegates the tile's contents to. Contents are
+    hashed with their package-relative paths, sorted, so the digest is stable across
+    machines and checkouts.
+
     **What this deliberately no longer covers: dependency drift.** The old AMI-based identity
     changed when the image changed, so a re-bake onto a new torch was caught; a source hash is
     blind to it. Two things bound that gap — the AMI is resolved once and PINNED into every
@@ -73,19 +135,20 @@ def inference_code_identity() -> str:
     silent reuse.
     """
     root = Path(__file__).resolve().parent.parent
-    files: list[Path] = []
+    seed: list[Path] = []
     for entry in _STAGED_OUTPUT_SOURCES:
         target = root / entry
         if target.is_dir():
-            files.extend(p for p in target.rglob("*.py") if "__pycache__" not in p.parts)
+            seed.extend(p for p in target.rglob("*.py") if "__pycache__" not in p.parts)
         elif target.is_file():
-            files.append(target)
+            seed.append(target)
         else:  # pragma: no cover - a rename must fail loudly, not fingerprint nothing
             raise FileNotFoundError(
                 f"{target} is listed in _STAGED_OUTPUT_SOURCES but does not exist. A moved or "
                 f"renamed module must update that list — silently fingerprinting fewer files "
                 f"would let two code versions share one staging prefix."
             )
+    files = _first_party_import_closure(seed, root)
     digest = hashlib.sha256()
     for path in sorted(files):
         digest.update(str(path.relative_to(root)).encode())
