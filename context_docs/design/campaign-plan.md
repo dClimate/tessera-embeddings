@@ -274,20 +274,27 @@ There are **no Prefect-level retries** on any ingest flow, deliberately.
 Settled since the last revision, and not to be re-opened: **the model is v1.1**, **GPUs are
 on-demand**, and the permanent store goes to **AWS Open Data**.
 
-1. **Describe the optical-only cells in whatever ships with the data.** OPERA RTC-S1
-   coverage was withdrawn from about a fifth of the land after Sentinel-1B failed in December
-   2021 and largely restored with Sentinel-1C in 2025 — interior Australia and much of
-   Siberia return *zero* granules for 2022–2024. `allow_s2_only` is on, so **6.8% of
-   pixel-years across the campaign are embedded without radar** rather than missing. ADR 013
-   does not consider that combination scientifically validated, so this is a documentation
-   and caveat question, not a coverage hole. Every affected pixel is identifiable after the
-   fact (`s1_asc_obs_count + s1_desc_obs_count == 0`), and
-   `scripts/census_s1_coverage.py` maps the area in advance.
-2. **Run the Phase-4 test geographies.** Four sites spanning 120–200 tokens per pixel,
-   chosen so one set of runs settles three things: whether tok/sec is flat across sequence
-   length (the assumption the cost model now rests on), how large the per-chunk read floor is,
-   and whether optical-only embeddings are comparable — the ADR-013 gap that
-   `allow_s2_only=true` makes live for 6.8% of pixel-years. Site list and rationale in
+1. **Report the optical-only cells in whatever ships with the data.** OPERA RTC-S1 coverage was
+   withdrawn from about a fifth of the land after Sentinel-1B failed in December 2021 and largely
+   restored with Sentinel-1C in 2025 — interior Australia and much of Siberia return *zero*
+   granules for 2022–2024. `allow_s2_only` is on, so **6.8% of pixel-years across the campaign
+   are embedded without radar** rather than missing.
+
+   **No longer a decision.** The Cambridge team validated radar-free embeddings (2026-08-03), so
+   ADR 013's blocking follow-up is satisfied and we are not weighing whether to produce them.
+   What is left is DESCRIPTIVE: every affected pixel is identifiable after the fact
+   (`s1_asc_obs_count + s1_desc_obs_count == 0`) and `scripts/census_s1_coverage.py` maps the
+   area in advance, so the campaign reports the share and how those embeddings compare — a
+   statistic that ships with the data, not a gate on shipping it. **Attach Cambridge's study
+   when available**: a cleared gate whose only evidence is a sentence in a chat log is one
+   re-litigation away from being open again.
+2. **Run the Phase-4 test geographies.** **Three** sites spanning 120–200 tokens per pixel,
+   settling the two remaining throughput questions: whether tok/sec is flat across sequence
+   length (the assumption the cost model now rests on) and how large the per-chunk read floor
+   is. It was four sites and six runs until 2026-08-03 — every site had to be dual-orbit and
+   two had to run twice, because validating optical-only output meant masking radar and
+   comparing the same pixels. Cambridge validated radar-free embeddings, so that constraint is
+   gone and what remains needs neither dual orbits nor paired runs. Site list and rationale in
    `yield-embeddings/docs/global-tessera-test-plan.md`, the **P1b rung**.
 3. **Measure the densest zone at two fleet widths (60 and 80).** It decides whether the
    campaign is 5.6 days or 4.5, and it is the only remaining question about the schedule. The

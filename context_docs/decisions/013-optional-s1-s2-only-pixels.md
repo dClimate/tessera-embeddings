@@ -114,16 +114,31 @@ No new store fields. The per-pixel record already exists and is exact:
 Both obs-count arrays are written for every pixel in the GLOBAL and SINGLE
 layouts, flag on or off.
 
-## Quality caveat (REQUIRED follow-up before production use)
+## Quality caveat — CLEARED UPSTREAM (2026-08-03)
 
-There is no evidence the v1.1 checkpoint was trained with S1
-dropout/modality masking — the all-zeros input, while upstream-sanctioned, is
-out-of-distribution as a *sequence*. S2-only embeddings are therefore **not
-validated as comparable** to S1-informed ones. Before enabling
-`allow_s2_only` in a production campaign, run a mask-S1 comparison study on a
-dual-modality region (embed with and without S1; quantify drift and any
-downstream-task impact). Until then the flag is for coverage-critical /
-experimental work.
+**The Cambridge team has validated radar-free embeddings.** This ADR's blocking
+follow-up is therefore satisfied by upstream work rather than by us, and
+`allow_s2_only` is cleared for production use. The global campaign runs with it
+**on** — a fifth of the land has no OPERA radar for 2022–2024, so the choice is
+radar-free embeddings or no embeddings for those pixel-years, and that is settled.
+
+> **Provenance to fill in.** Recorded here on Robert's word; the specific study,
+> its metrics and its scope are not yet cited. Attach them when available — a
+> cleared gate whose evidence is a sentence in a chat log is one re-litigation
+> away from being an open question again.
+
+*The original caveat, retained because the reasoning still describes what was
+uncertain and why:* there is no evidence the v1.1 checkpoint was trained with S1
+dropout/modality masking, so the all-zeros input, while upstream-sanctioned, is
+out-of-distribution as a *sequence*. The prescribed remedy was a mask-S1
+comparison study on a dual-modality region — embed with and without S1, quantify
+drift and downstream-task impact. **We no longer need to run that study.**
+
+**What we still owe is DESCRIPTIVE, not decisive.** Every affected pixel is
+identifiable after the fact (`s1_asc_obs_count + s1_desc_obs_count == 0`), so the
+campaign should report how many pixel-years ran radar-free and what their
+embeddings look like relative to radar-informed ones. That is a statistic shipped
+with the data, not a gate on shipping it.
 
 ## Alternatives considered
 

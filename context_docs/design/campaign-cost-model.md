@@ -443,12 +443,13 @@ from 152 to **145** — worth $26,000 on tokens alone, but those same cells are 
 the per-chunk read floor stops being hidden, which gives perhaps a third of it back. Call it
 **$15,000–$18,000**, and treat it as incidental: the reason to enable the flag is coverage.
 
-**What it does not do is make those embeddings equivalent.** ADR 013 records that S2-only
-output is not scientifically validated against S1-informed output, and lists that validation
-as a prerequisite it did not consider met. The campaign is proceeding with the flag on
-regardless; the honest position is that 6.8% of pixel-years carry a documented quality
-caveat, identifiable after the fact because `s1_asc_obs_count + s1_desc_obs_count == 0`
-marks every one of them.
+**Whether those embeddings are equivalent is settled, and not by us.** ADR 013 required a
+mask-S1 comparison study before `allow_s2_only` could be used in production; **the Cambridge
+team validated radar-free embeddings (2026-08-03)**, so that prerequisite is met upstream and
+the flag is cleared. What the campaign still owes is a *description* rather than a defence:
+6.8% of pixel-years are radar-free, every one identifiable after the fact because
+`s1_asc_obs_count + s1_desc_obs_count == 0` marks it, so the share and its embedding
+statistics ship alongside the data. Cambridge's study should be cited here once we have it.
 
 ---
 
@@ -616,11 +617,12 @@ the nine year-barriers at which one stalled zone holds up everything behind it.
    worthless, and below 60 workers the longest zone gets no shorter. Both halves of that
    sentence are the same finding (§4).
 
-2. **Document the 2022–2024 optical-only cells in whatever ships with the data.**
-   `allow_s2_only` is on, so they exist rather than being holes — but 6.8% of pixel-years are
-   embedded without radar and ADR 013 does not consider that combination validated. They are
-   identifiable from the store (`s1_asc_obs_count + s1_desc_obs_count == 0`), so the work is
-   describing them, not finding them (§6).
+2. **Report the 2022–2024 optical-only cells in whatever ships with the data.**
+   `allow_s2_only` is on, so they exist rather than being holes, and radar-free embeddings were
+   validated upstream by Cambridge (2026-08-03) — so this is no longer a caveat to defend, just
+   6.8% of pixel-years to characterise. They are identifiable from the store
+   (`s1_asc_obs_count + s1_desc_obs_count == 0`), so the work is describing them, not finding
+   them (§6).
 
 3. **Provision about 2,100 GPU actors — 264 per cluster.** Sizing at 85% of what ingest can
    feed makes idle burn structurally zero and leaves 15% headroom for an ingest cell to fail
