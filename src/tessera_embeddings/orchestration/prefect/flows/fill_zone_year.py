@@ -311,9 +311,9 @@ def fill_zone_year_flow(
         output_bucket=paths.outputs,
         # 1 inference tile == 1 output shard == 2x2 tiles per 4096-px ingest chunk
         # (D3), so assembly writes whole, lean shards with no read-modify-write.
-        # Explicit, NOT the INFERENCE_CHUNK_SIZE default: that default belongs to
-        # the single-ROI output geometry (500-px chunks) and must not be retuned
-        # for this path.
+        # Passed explicitly even though INFERENCE_CHUNK_SIZE now equals SHARD_PX:
+        # this path REQUIRES the identity, and stating it keeps a retune of the
+        # default from silently unaligning the campaign.
         chunk_size=SHARD_PX,
         allow_s2_only=allow_s2_only,
     )

@@ -29,11 +29,11 @@ from tessera_embeddings.config.inference import InferenceConfig, TimeWindow
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks
 from tessera_embeddings.inference.orchestration_helpers import (
+    build_embedding_manifest,
     checkpoint_to_version,
-    read_upstream_manifests,
+    embedding_store_path,
 )
 from tessera_embeddings.inference.runner import run_inference
-from tessera_embeddings.storage.manifest import EmbeddingManifest
 
 
 @task(name="run-inference")
@@ -146,21 +146,15 @@ def assemble_embeddings_task(
 
     chunks = enumerate_chunks(total_y, total_x, chunk_size)
 
-    zarr_name = f"{roi_name}{output_name_suffix}"
-    output_path = f"{output_bucket.rstrip('/')}/embeddings/{zarr_name}.zarr"
+    output_path = embedding_store_path(output_bucket, roi_name, output_name_suffix)
     log.info("Assembling %d chunks into %s", len(chunks), output_path)
     writer = ZarrWriter(staging_base)
 
     model_version = checkpoint_to_version(config.checkpoint_path)
-    upstream_manifests = (
-        read_upstream_manifests(mosaic_base, config.s1_orbit, get_credentials=get_credentials, s3_region=s3_region)
-        if mosaic_base
-        else {}
-    )
-    embedding_manifest = EmbeddingManifest.from_upstream_stores(
-        model_checkpoint=model_version,
-        num_obs_checkpoints=config.num_obs_checkpoints,
-        upstream_manifests=upstream_manifests,
+    # Same builder the flow's preflight gate uses, so the manifest validated
+    # before the cluster is the manifest written here.
+    embedding_manifest = build_embedding_manifest(
+        config=config, mosaic_base=mosaic_base, get_credentials=get_credentials, s3_region=s3_region
     )
 
     writer.assemble(

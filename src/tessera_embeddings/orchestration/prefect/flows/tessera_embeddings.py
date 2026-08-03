@@ -41,6 +41,7 @@ from tessera_embeddings.inference.assembly import AllChunksSkippedError, ZarrWri
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
+    assert_output_store_accepts,
     build_inference_config,
     enumerate_mosaic_chunks,
 )
@@ -196,6 +197,11 @@ def tessera_embeddings(
         raise ValueError("Only one of assembly_only, inference_only can be True")
     if dev_params.assembly_only and not dev_params.previous_run_id:
         raise ValueError("assembly_only=True requires previous_run_id")
+    # Decidable from parameters, so decide it before anything is provisioned:
+    # run_inference rejects this too, but only from inside the Ray context, after
+    # a GPU cluster has been paid for. Mirrors fill_zone_year.
+    if not dev_params.assembly_only and num_actors < 1:
+        raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
 
     run_id = _resolve_run_id(
         dev_params.previous_run_id, allow_s2_only=allow_s2_only, assembly_only=dev_params.assembly_only
@@ -282,6 +288,23 @@ def tessera_embeddings(
         get_credentials=iam_icechunk_credentials,
         s3_region=s3_region,
     )
+
+    # Same structural check `assemble` makes before extending an existing store —
+    # model, sampler checkpoints, upstream ingest identity — run HERE, on metadata
+    # only, so an append that can never be accepted is rejected before a GPU fleet
+    # is provisioned rather than after the whole inference is paid for. Skipped in
+    # assembly-only mode, where assemble runs immediately anyway.
+    if not dev_params.assembly_only:
+        assert_output_store_accepts(
+            output_bucket=output_bucket,
+            roi_name=roi_name,
+            output_name_suffix=dev_params.output_name_suffix,
+            config=config,
+            mosaic_base=mosaic_base,
+            log=log,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+        )
 
     # Lazily import the AWS Ray provider so the embeddings flow file
     # can be inspected (for arch tests) on machines without ray
