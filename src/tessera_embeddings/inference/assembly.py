@@ -14,16 +14,19 @@ plain zarr assignment, and the coordinator merges the forks and commits once
 :mod:`tessera_embeddings.storage.shard_writer`). No task graph is ever built
 over the store, so assembly cost scales with the *live* pixels, not the grid.
 
-Two write-conflict regimes, one engine:
+One inference tile is one 2048-px output shard on both paths (ADR-008 D3), so
+nothing rechunks. Two write strategies:
 
-* **Single-ROI** (``assemble``): output chunks (500 px) don't align with the
-  2048-px inference tiles, so workers partition the mosaic into *northing bands
-  aligned to the output write granularity* — no two forks ever touch the same
-  output chunk, and x-boundary partial chunks are read-modify-written
-  sequentially inside one fork (icechunk sessions are read-your-writes).
-* **Global** (``assemble_global``): one inference tile == one 2048-px shard
-  (ADR-008 D3), so whole tiles round-robin across workers via
-  :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` — every
+* **Single-ROI** (``assemble``): workers partition the mosaic into *northing
+  bands aligned to the output write granularity*, so no two forks ever touch the
+  same output object and each tile is read by exactly one band. A mosaic whose
+  extent is not a whole number of shards has ragged edge tiles; their partial
+  chunks are read-modify-written sequentially inside one fork (icechunk sessions
+  are read-your-writes).
+* **Global** (``assemble_global``): the zone grid is seeded to whole shards, so
+  there are no ragged edges and no banding is needed — whole tiles round-robin
+  across workers via
+  :func:`~tessera_embeddings.storage.shard_writer.write_year_shards`, and every
   shard object is emitted once, lean, with ocean inner chunks elided.
 """
 
@@ -1347,10 +1350,13 @@ class ZarrWriter:
         # the pickled session, so no save_config round-trip is needed.
         per_worker_cap = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // max(1, n_workers))
 
-        # Manifest split (same tiling as the old engine): each spatial axis at
-        # 32 chunks/shard (~16k px at 500-px chunks) and time at 1 shard per
-        # timestep, so a one-timestep write rewrites no prior year's manifests.
-        with manifest_split({"northing": 32, "easting": 32, "time": 1}):
+        # Time-only, matching the global store (zarr_store.global_store_config)
+        # and the rule documented there: split the axis along which a single
+        # commit is NARROW. An assemble writes ONE timestep across the whole
+        # spatial extent, so time@1 keeps a write off every prior timestep's
+        # manifests, while a spatial split would only shard the axis this commit
+        # rewrites in full — more manifest objects for the same refs.
+        with manifest_split({"time": 1}):
             repo, is_new = open_or_create_repo(
                 output_path,
                 max_concurrent_requests=per_worker_cap,

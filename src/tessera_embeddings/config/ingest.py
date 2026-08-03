@@ -5,13 +5,14 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, model_validator
 
 # Spatial chunk size for storage (written at ingest). 4096 aligns with the
-# global store's 2048-px shard grid: one ingest chunk is exactly 2x2 shards
+# embedding store's 2048-px shard grid: one ingest chunk is exactly 2x2 shards
 # (and 16x16 of the 256-px inner chunks). Still larger than the inference
-# read-tile size to keep the satellite-ingest Dask graph small. Inference reads
-# sub-tiles out of these chunks via .oindex, so storage chunk size and inference
-# tile size stay independent: the global fill uses a 2048-px tile (2x2 per ingest
-# chunk), the single-ROI default is 2000 to divide that output's 500-px chunks
-# (see config.inference.INFERENCE_CHUNK_SIZE).
+# read-tile size to keep the satellite-ingest Dask graph small. Both pipelines
+# now read the same 2048-px tile (config.inference.INFERENCE_CHUNK_SIZE), so the
+# whole chain divides evenly end to end: 4096 ingest chunk -> 2048 inference tile
+# -> 2048 output shard -> 256 inner chunk, with no rechunk at any hop. Inference
+# still reads sub-tiles via .oindex and imposes no alignment requirement of its
+# own; the alignment is what makes every read whole-object rather than partial.
 #
 # NOTE: this changed 4000 -> 4096. Existing 4000-px stores stay readable, but
 # appends to them under this config are rejected by the RoiManifest chunk-size
