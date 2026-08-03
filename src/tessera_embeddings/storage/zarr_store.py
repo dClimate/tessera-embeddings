@@ -63,7 +63,7 @@ import zarr
 from icechunk.xarray import to_icechunk
 from tenacity import Retrying, before_sleep_log, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
-from tessera_embeddings.errors import CorruptedStoreError, DuplicateDateError
+from tessera_embeddings.errors import CorruptedStoreError, DuplicateDateError, StoreHoldsCommittedDataError
 from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (
     _drop_region_coords,
@@ -233,6 +233,12 @@ def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
             raise ValueError("cleanup_on_failure requires store_path as first argument")
         try:
             return func(*args, **kwargs)
+        except StoreHoldsCommittedDataError:
+            # NOT ours to delete. Every other failure here leaves a half-written store
+            # worth removing; this one fired BEFORE writing anything, because the store
+            # already held data. Cleaning up would destroy exactly what the guard
+            # refused to overwrite.
+            raise
         except Exception:
             logger.warning(f"Store creation failed, cleaning up {store_path}")
             _delete_store(
@@ -810,6 +816,39 @@ def _open_readonly(
     return xr.open_zarr(session.store, consolidated=False, chunks=chunks, group=group)
 
 
+def _assert_no_committed_dates(repo: "icechunk.Repository", store_path: str) -> None:
+    """Refuse to adopt a repo that already holds committed dates.
+
+    The last thing standing between a failed date probe and a destroyed mosaic. The
+    create path adopts an existing repo and writes ``mode="w"``, which is right for the
+    empty shell an interrupted first write leaves behind and catastrophic for a store
+    with data in it. Which one it is comes from :func:`get_existing_dates`, a network
+    read; this asks the repo directly, from the session about to be overwritten.
+
+    Reads the time axis, not the manifest or attrs: dates are what the caller claimed
+    were absent, so dates are what gets checked. A repo with no root group at all is
+    the canonical thing this path adopts — an interrupted first write commits the
+    repo's initialization snapshot and nothing else — so that reads as zero dates
+    rather than as an error.
+
+    Raises:
+        StoreHoldsCommittedDataError: If the repo holds one or more committed dates.
+            A dedicated type because ``cleanup_on_failure`` must NOT delete this store.
+    """
+    try:
+        root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
+    except FileNotFoundError:  # GroupNotFoundError: initialized, never written
+        return
+    time_array = root.get("time")
+    n_dates = 0 if time_array is None else int(cast("zarr.Array", time_array).shape[0])
+    if n_dates:
+        raise StoreHoldsCommittedDataError(
+            f"Refusing to create over {store_path}: it already holds {n_dates} committed date(s). "
+            "The caller reached the create path, so its date probe reported none — which means the "
+            "probe failed rather than the store being empty. Retry; this store is intact."
+        )
+
+
 @cleanup_on_failure
 def _write_new(
     store_path: str,
@@ -833,9 +872,14 @@ def _write_new(
     ``mode="w"`` over whatever the interrupted attempt staged is correct: there is no
     committed data to lose. The complementary half is that a store WITH dates takes the
     append path and is never handed here.
+
+    That premise is RE-CHECKED here rather than trusted, because it is the difference
+    between adopting an empty shell and destroying a finished mosaic, and the caller
+    establishes it with a probe that has to read the network to answer.
     """
     repo, is_new = open_or_create_repo(store_path, get_credentials=get_credentials, region=s3_region)
     if not is_new:
+        _assert_no_committed_dates(repo, store_path)
         logger.info("Adopting existing repo at %s — an earlier attempt left it uncommitted", store_path)
     session = repo.writable_session("main")
     to_icechunk(data, session, mode="w", encoding=encoding, align_chunks=True)
@@ -1098,7 +1142,18 @@ def get_existing_dates(
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
 ) -> set[str]:
-    """Get dates already present in a store. Returns empty set if store doesn't exist."""
+    """Get dates already present in a store. Returns an empty set only if it has none.
+
+    **Fails closed.** An empty return means "this store holds no dates", and callers
+    act on that: :func:`write_dataset` routes an empty result to the CREATE path, which
+    adopts an existing repo and writes ``mode="w"``. So an empty set produced by a
+    transient read failure is not a missed optimisation, it is a request to overwrite
+    committed data. Only genuine absence answers empty; everything else — auth,
+    throttling, timeout, corrupt metadata, a decode failure — propagates.
+
+    Absence covers both a missing repo and a repo with no root group (an interrupted
+    first write), which is the state ``_write_new`` exists to adopt.
+    """
     t0 = time.monotonic()
     logger.debug(f"Opening store: {store_path}")
     try:
@@ -1107,12 +1162,14 @@ def get_existing_dates(
         ds.close()
         logger.debug(f"Store has {len(dates)} existing dates ({time.monotonic() - t0:.1f}s)")
         return dates
-    except (FileNotFoundError, icechunk.IcechunkError):
+    except FileNotFoundError:  # GroupNotFoundError (rootless repo) subclasses this
         logger.debug(f"Store not found ({time.monotonic() - t0:.1f}s): {store_path}")
         return set()
-    except Exception as e:
-        logger.warning(f"Could not read dates from {store_path}: {e}")
-        return set()
+    except icechunk.IcechunkError as exc:
+        if is_missing_repo(exc):
+            logger.debug(f"Repo absent ({time.monotonic() - t0:.1f}s): {store_path}")
+            return set()
+        raise
 
 
 def resolve_region(

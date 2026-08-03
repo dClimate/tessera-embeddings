@@ -83,6 +83,17 @@ from tessera_embeddings.storage.zarr_store import (
 
 logger = logging.getLogger(__name__)
 
+#: Assets this ingest loads beyond the collection's primary bands.
+#:
+#: Named in ONE place because it has to reach two very different calls: the loader,
+#: which reads SCL to build the cloud mask, and the STAC query, which prunes assets
+#: off each item before the loader ever runs (see ``stac._loadable_assets``). The
+#: query keeps ``scl`` on its own only for collections configured ``has_scl=True``;
+#: a provider without that flag — Planetary Computer's ``sentinel-2-l2a`` — drops
+#: the asset at query time and the load then fails on a band that was there in the
+#: catalogue. Passing the same tuple to both is what makes the two agree.
+_LOADED_EXTRA_BANDS = ["scl"]
+
 
 @final
 @dataclass(frozen=True)
@@ -407,7 +418,7 @@ def ingest_s2_roi_reflectance(
                 baselines=baselines,
                 bbox=roi.bbox_wgs84,
                 chunks=INGEST_CHUNKS,
-                extra_bands=["scl"],
+                extra_bands=_LOADED_EXTRA_BANDS,
                 resampling="bilinear",
                 groupby="solar_day",
                 geobox=roi.geobox,
@@ -697,6 +708,9 @@ def ingest_s2_roi_reflectance(
             end_date=end_date,
             bbox=roi.bbox_wgs84,
             existing_dates_fn=lambda: get_existing_dates(reflectance_store, s3_region=s3_region),
+            # Same assets _drive will load: pruning happens in the query, so a band
+            # named only at load time is already gone by then.
+            extra_bands=_LOADED_EXTRA_BANDS,
             # The loader groups by solar day, so the month partition must too — see
             # stream_stac_months. Without it a solar day straddling a month boundary
             # is written twice, once per half.
@@ -719,6 +733,8 @@ def ingest_s2_roi_reflectance(
             end_date=window.query_end,
             existing_dates=get_existing_dates(reflectance_store, s3_region=s3_region),
             bbox=roi.bbox_wgs84,
+            # As in the streamed branch: the query prunes, so it must be told.
+            extra_bands=_LOADED_EXTRA_BANDS,
             # The committed dates are SOLAR days (that is what _drive groups and writes),
             # so the filter has to key on solar days too — see stream_stac_months, which
             # passes the same value for the same reason.

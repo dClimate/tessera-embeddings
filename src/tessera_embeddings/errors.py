@@ -24,3 +24,16 @@ class DuplicateDateError(ValueError):
     something outside this process moved the branch. See
     :data:`~tessera_embeddings.storage.zarr_store.CONCURRENT_WRITER_ERRORS`.
     """
+
+
+class StoreHoldsCommittedDataError(Exception):
+    """Raised when the create path is handed a store that already holds committed data.
+
+    Exempt from ``cleanup_on_failure``'s delete, and that exemption is the whole point
+    of having a type here. The decorator removes the half-written store a failed create
+    leaves behind, which is right for every other failure on that path. This one means
+    the opposite: the store was NOT written by this attempt, it was already there and
+    intact, and the create was reached because a date probe misreported it as empty.
+    Deleting it would turn a refusal to overwrite data into the deletion of that same
+    data — the guard destroying what it exists to protect.
+    """

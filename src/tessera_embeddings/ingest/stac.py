@@ -1062,6 +1062,7 @@ def stream_stac_months(
     existing_dates_fn: Callable[[], set[str]],
     query_fn: Callable[..., tuple[list[Any], dict[str, int]]] | None = None,
     mid_longitude: float | None = None,
+    extra_bands: list[str] | None = None,
     log: logging.Logger | logging.LoggerAdapter | None = None,
 ) -> Iterator[tuple[SolarDayRange, list[Any], dict[str, int]]]:
     """Yield one calendar month of STAC items at a time, prefetching the next.
@@ -1102,6 +1103,9 @@ def stream_stac_months(
             :func:`group_items_by_date`; without it a solar day straddling a month
             boundary is split across two slices and written twice. Omit for callers
             that group by UTC date.
+        extra_bands: Additional assets the caller will load. Forwarded to the query
+            because pruning runs THERE — an asset the caller loads but does not
+            name here is dropped before the loader ever sees it.
         log: Optional logger.
 
     Yields:
@@ -1132,6 +1136,9 @@ def stream_stac_months(
             # dates would drop only the half of a committed group that falls on the
             # matching side of midnight and rewrite the rest as a duplicate slice.
             mid_longitude=mid_longitude,
+            # Asset pruning happens HERE, at query time. A band the caller will load but
+            # does not name is gone before the loader runs — see _loadable_assets.
+            extra_bands=extra_bands,
         )
         log.info("Queried %s..%s in %.1fs", mr.query_start, mr.query_end, time.monotonic() - t0)
         return result

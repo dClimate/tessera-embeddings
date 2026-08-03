@@ -34,6 +34,7 @@ import xarray as xr
 import zarr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
+from tessera_embeddings.errors import StoreHoldsCommittedDataError
 from tessera_embeddings.storage import zarr_store
 from tessera_embeddings.storage.zarr_store import (
     CorruptedStoreError,
@@ -242,6 +243,54 @@ def test_write_dataset_adopts_a_store_an_interrupted_attempt_left(tmp_path: Path
     # Attempt 2: the retry. It must succeed, not raise CorruptedStoreError.
     write_dataset(path, data, tile_id="t", baselines={}, chunks=INGEST_CHUNKS, crs="EPSG:32715")
     assert get_existing_dates(path) == {"2024-01-01", "2024-01-02"}
+
+
+# --- and the other side of adoption: never adopt a store that HAS data ------------------
+
+
+def test_a_failed_date_probe_does_not_become_an_overwrite(tmp_path: Path) -> None:
+    """The create path must not destroy a finished mosaic when the probe misreports.
+
+    Adoption is right for the empty shell an interrupted first write leaves, and
+    catastrophic one step further on: the same `mode="w"` over a populated store erases
+    committed dates. Which case it is comes from a probe that reads the network, so the
+    write re-checks it against the repo itself rather than trusting the answer.
+    """
+    path = str(tmp_path / "populated")
+    data = _sar_like()
+    write_dataset(path, data, tile_id="t", baselines={}, chunks=INGEST_CHUNKS, crs="EPSG:32715")
+    assert get_existing_dates(path) == {"2024-01-01", "2024-01-02"}
+
+    # A probe that wrongly reports an empty store — a transient read failure, before
+    # `get_existing_dates` was made to fail closed, produced exactly this.
+    with (
+        mock.patch.object(zarr_store, "get_existing_dates", return_value=set()),
+        pytest.raises(StoreHoldsCommittedDataError, match="already holds 2 committed date"),
+    ):
+        write_dataset(path, data, tile_id="t", baselines={}, chunks=INGEST_CHUNKS, crs="EPSG:32715")
+
+    # Intact: the refusal is worth nothing if the store is gone anyway.
+    assert get_existing_dates(path) == {"2024-01-01", "2024-01-02"}
+
+
+def test_the_date_probe_fails_closed_on_a_non_absence_error(tmp_path: Path) -> None:
+    """A store that cannot be READ must not be reported as a store with no dates.
+
+    An empty return routes the caller to the create path, so swallowing errors here
+    turns a transient failure into a request to overwrite. Absence answers empty;
+    everything else propagates.
+    """
+    path = str(tmp_path / "unreadable")
+    write_dataset(path, _sar_like(), tile_id="t", baselines={}, chunks=INGEST_CHUNKS, crs="EPSG:32715")
+
+    with (
+        mock.patch.object(zarr_store, "_open_readonly", side_effect=OSError("connection reset")),
+        pytest.raises(OSError, match="connection reset"),
+    ):
+        get_existing_dates(path)
+
+    # Genuine absence still answers empty, or every first write would fail.
+    assert get_existing_dates(str(tmp_path / "nothing-here")) == set()
 
 
 def test_cleanup_forwards_credentials_to_the_delete(tmp_path: Path, monkeypatch) -> None:
