@@ -18,6 +18,7 @@ import logging
 import subprocess
 import warnings
 from collections.abc import Callable, Mapping
+from pathlib import PurePosixPath
 
 import dask.array as da
 import fsspec
@@ -28,7 +29,7 @@ import zarr
 from icechunk.xarray import to_icechunk
 from zarr.codecs.numcodecs import PCodec as PCodecZarr3
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM, ModelVersion, TimeWindow
+from tessera_embeddings.config.inference import EMBEDDING_DIM, InferenceConfig, ModelVersion, TimeWindow
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
@@ -227,6 +228,52 @@ def read_spatial_coords(mosaic_base: str) -> SpatialCoords:
     return coords
 
 
+def staging_fingerprint(config: InferenceConfig, mosaic_base: str) -> dict[str, object]:
+    """Identity of everything that changes what a staged chunk CONTAINS.
+
+    Single source of truth, because the fingerprint is claimed from two places —
+    the library runner and the Prefect flow's assembly-only path — and a claim is
+    an exact-match check: two callers computing the set differently would reject
+    each other on a legitimate resume.
+
+    Included are the fields that alter chunk *contents*, so reusing a ``run_id``
+    across a change to any of them would blend incompatible chunks into one
+    store:
+
+    * ``model_version`` / ``checkpoint`` / ``representation_dim`` — which encoder.
+      The chunks are (H, W, 128) int8 either way, so shape cannot tell them apart.
+    * ``norm_source`` — v1.1's AWS and MPC checkpoints differ in band statistics
+      as well as weights.
+    * ``s1_orbit`` — which SAR streams were fused.
+    * ``num_obs_checkpoints`` — the bucket ladder, which sets each pixel's
+      sequence length.
+    * ``mosaic_base`` — the input identity, and therefore the ROI. Chunk labels
+      are grid positions, so a different ROI's ``chunk_0_0`` is a name collision,
+      not a match.
+    * ``time_window`` — the months encoded. Same ROI, different year gives
+      *identical* labels, so nothing else would catch it.
+
+    Deliberately excluded: ``chunk_size`` (a resume is explicitly allowed to
+    adapt to the staged size — see ``detect_staged_chunk_size``), and
+    ``batch_size`` / ``num_actors`` / ``num_gpus`` / ``num_workers``, which change
+    throughput but not output.
+
+    Values are JSON-native so a written manifest compares equal to the dict that
+    produced it.
+    """
+    months = config.time_window.months
+    return {
+        "model_version": config.model_version,
+        "checkpoint": PurePosixPath(config.checkpoint_path).name,
+        "representation_dim": config.representation_dim,
+        "norm_source": config.norm_source,
+        "s1_orbit": config.s1_orbit,
+        "num_obs_checkpoints": list(config.num_obs_checkpoints),
+        "mosaic_base": mosaic_base.rstrip("/"),
+        "time_window": f"{months[0][0]:04d}-{months[0][1]:02d}..{months[-1][0]:04d}-{months[-1][1]:02d}",
+    }
+
+
 class ZarrWriter:
     """Write embeddings to Zarr stores with pcodec compression.
 
@@ -319,7 +366,10 @@ class ZarrWriter:
         """
         path = self._run_manifest_path(run_id)
         fs = _fs_for(path)
-        want = {k: fingerprint[k] for k in sorted(fingerprint)}
+        # Round-trip through JSON so the comparison below is against what a
+        # manifest can actually hold: a tuple written out comes back a list,
+        # and would otherwise fail an exact-match check against itself.
+        want = json.loads(json.dumps({k: fingerprint[k] for k in sorted(fingerprint)}, sort_keys=True))
 
         claimed = fs.exists(path)
         if not claimed and (self._list_staged_labels(run_id) or self._list_skip_marker_labels(run_id)):

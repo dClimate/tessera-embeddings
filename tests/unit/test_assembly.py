@@ -9,6 +9,7 @@ decision instead of error propagation.
 
 from __future__ import annotations
 
+import json
 import logging
 import pickle
 from importlib.metadata import version as _dist_version
@@ -22,8 +23,8 @@ import zarr
 from dask.distributed import Client
 
 import tessera_embeddings.inference.assembly as _assembly_mod
-from tessera_embeddings.config.inference import EMBEDDING_DIM
-from tessera_embeddings.config.time_windows import TimeWindow
+from tessera_embeddings.config.inference import EMBEDDING_DIM, InferenceConfig
+from tessera_embeddings.config.time_windows import TimeWindow, parse_time_window
 from tessera_embeddings.inference.assembly import (
     BAND_CHUNK_DIVISOR,
     OBS_COUNT_VARS,
@@ -31,6 +32,7 @@ from tessera_embeddings.inference.assembly import (
     IncompleteStageError,
     ZarrWriter,
     _staged_storage_options,
+    staging_fingerprint,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.conventions import ENCODER_VERSION
@@ -214,6 +216,97 @@ class TestClaimRun:
             f.write(b"{}")
         with pytest.raises(FileExistsError), fs.open(target, "xb") as f:
             f.write(b"{}")
+
+
+class TestStagingFingerprint:
+    """What goes into the staging claim, and what deliberately does not."""
+
+    @staticmethod
+    def _cfg(**over):
+        kwargs = dict(
+            time_window=parse_time_window("October 2025"),
+            model_version="v2-large",
+            # representation_dim is deliberately not pinned: v2 has it forced by
+            # MODEL_ARCHS while v1.1 keeps the dataclass default, and the test
+            # below asserts exactly that asymmetry.
+            checkpoint_path="s3://bucket/models/student_large.pt",
+            s1_orbit="both",
+            num_obs_checkpoints=(8, 16),
+        )
+        kwargs.update(over)
+        return InferenceConfig(**kwargs)  # type: ignore[arg-type]
+
+    def test_is_json_native_so_it_round_trips(self):
+        """A tuple written to the manifest returns a list; the claim is exact-match."""
+        fp = staging_fingerprint(self._cfg(), "s3://in/mosaics/roi")
+        assert json.loads(json.dumps(fp, sort_keys=True)) == fp
+
+    def test_checkpoint_is_the_filename_not_the_path(self):
+        """The model identity is the file; the bucket is deployment config."""
+        a = staging_fingerprint(self._cfg(checkpoint_path="s3://one/models/student_large.pt"), "s3://in/m/r")
+        b = staging_fingerprint(self._cfg(checkpoint_path="s3://two/models/student_large.pt"), "s3://in/m/r")
+        assert a == b
+        assert a["checkpoint"] == "student_large.pt"
+
+    def test_same_config_same_fingerprint(self):
+        m = "s3://in/mosaics/roi"
+        assert staging_fingerprint(self._cfg(), m) == staging_fingerprint(self._cfg(), m)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("model_version", "v1.1"),
+            ("s1_orbit", "ascending"),
+            ("num_obs_checkpoints", (8, 16, 24)),
+            ("time_window", parse_time_window("June 2025")),
+        ],
+    )
+    def test_content_affecting_fields_change_it(self, field, value):
+        m = "s3://in/mosaics/roi"
+        assert staging_fingerprint(self._cfg(), m) != staging_fingerprint(self._cfg(**{field: value}), m)
+
+    def test_norm_source_changes_it_within_v11(self):
+        """v1.1's AWS and MPC variants differ in band statistics, not just weights.
+
+        Tested on v1.1 configs because InferenceConfig rejects norm_source on v2
+        (one hard-coded stat set), and with the checkpoint path held equal so the
+        norm_source field is doing the work on its own.
+        """
+        m = "s3://in/mosaics/roi"
+        common = dict(model_version="v1.1", checkpoint_path="s3://b/models/enc.pt")
+        aws = staging_fingerprint(self._cfg(**common, norm_source="aws"), m)
+        mpc = staging_fingerprint(self._cfg(**common, norm_source="mpc"), m)
+        assert aws != mpc
+        assert (aws["norm_source"], mpc["norm_source"]) == ("aws", "mpc")
+
+    def test_representation_dim_tracks_model_version(self):
+        """It is derived from model_version, so it cannot vary independently.
+
+        Kept in the fingerprint as a redundant cross-check rather than as an
+        independent key — this pins that it moves with the model.
+        """
+        m = "s3://in/mosaics/roi"
+        v2 = staging_fingerprint(self._cfg(), m)
+        v11 = staging_fingerprint(self._cfg(model_version="v1.1"), m)
+        assert (v2["representation_dim"], v11["representation_dim"]) == (128, 192)
+
+    def test_different_roi_changes_it(self):
+        """Chunk labels are grid positions, so a different ROI's chunk_0_0 collides."""
+        base = self._cfg()
+        assert staging_fingerprint(base, "s3://in/mosaics/alps") != staging_fingerprint(base, "s3://in/mosaics/iowa")
+
+    def test_different_year_same_roi_changes_it(self):
+        """Same ROI, different window gives IDENTICAL labels — nothing else catches it."""
+        m = "s3://in/mosaics/roi"
+        assert staging_fingerprint(self._cfg(), m) != staging_fingerprint(
+            self._cfg(time_window=parse_time_window("October 2024")), m
+        )
+
+    @pytest.mark.parametrize(("field", "value"), [("chunk_size", 1000), ("batch_size", 512), ("num_workers", 1)])
+    def test_throughput_only_fields_are_excluded(self, field, value):
+        """chunk_size especially: a resume is explicitly allowed to adapt to it."""
+        m = "s3://in/mosaics/roi"
+        assert staging_fingerprint(self._cfg(), m) == staging_fingerprint(self._cfg(**{field: value}), m)
 
 
 class TestWriteChunk:

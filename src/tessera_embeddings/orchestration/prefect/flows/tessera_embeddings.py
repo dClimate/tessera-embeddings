@@ -44,7 +44,7 @@ from tessera_embeddings.config.inference import (
 )
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.assembly import ZarrWriter
+from tessera_embeddings.inference.assembly import ZarrWriter, staging_fingerprint
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
@@ -245,20 +245,18 @@ def tessera_embeddings(
 
     staging_base = f"{output_bucket.rstrip('/')}/staging"
 
-    # Bind this staging run to the model producing it, BEFORE anything is staged
-    # or assembled. Staged chunks are (H, W, 128) int8 for both models — v1.1
-    # saves the first 128 of its 192-d representation, v2 emits 128 natively —
-    # so a resume that omits model_version would silently default to v1.1,
-    # finish a v2 run with the wrong encoder, and stamp the store v1.1. Shape
-    # and dtype cannot catch it; only a recorded identity can.
+    # Bind this staging run to everything that decides what a staged chunk
+    # CONTAINS, before anything is staged or assembled. Chunks are (H, W, 128)
+    # int8 whichever encoder produced them, and chunk labels are grid positions,
+    # so neither shape nor name distinguishes a v2 chunk from a v1.1 one, nor
+    # last year's chunk_0_0 from this year's. Only a recorded identity does.
+    #
+    # ``run_inference`` claims the same fingerprint at the library boundary, from
+    # the same helper so the two agree exactly. This call is not redundant: it
+    # covers assembly_only, which never reaches the runner.
     ZarrWriter(staging_base).claim_run(
         run_id,
-        {
-            "model_version": model_version,
-            "checkpoint": checkpoint_filename(model_version=model_version),
-            "representation_dim": config.representation_dim,
-            "s1_orbit": resolved_s1_orbit,
-        },
+        staging_fingerprint(config, mosaic_base),
         allow_unclaimed_legacy=dev_params.allow_unclaimed_legacy,
     )
 
@@ -347,6 +345,7 @@ def tessera_embeddings(
             staging_base=staging_base,
             run_id=run_id,
             t0=t0,
+            allow_unclaimed_legacy=dev_params.allow_unclaimed_legacy,
             get_credentials=iam_icechunk_credentials,
         )
     _active_resolved_yaml = None
