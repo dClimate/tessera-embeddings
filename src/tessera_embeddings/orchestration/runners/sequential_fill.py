@@ -513,6 +513,22 @@ def fill_zones_sequential(
                         n_failed,
                         len(pending),
                     )
+                    # Record them as failures, not just in the log. The cells that
+                    # triggered this cap can RECOVER in the in-child retry pass, and if
+                    # every one does, `failures` empties and this run reports clean —
+                    # while these cells were never started. The driver re-reads the
+                    # store either way, so this is not the only protection, but a child
+                    # that under-reports its own outcome is worth not shipping.
+                    with lock:
+                        failures.extend(
+                            {
+                                "zone": cell.zone,
+                                "year": cell.year,
+                                "phase": "unattempted",
+                                "error": "never admitted: the feeder stopped at the retained-failure cap",
+                            }
+                            for cell in pending
+                        )
                     return
                 # Start ingests for the window BEFORE choosing, so a cell can only
                 # be picked once its start has been admitted through the budget.

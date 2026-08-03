@@ -42,6 +42,36 @@ def _defer_milestone(*_a, **_k):
     raise ValueError("not all 120 zones complete yet")  # tag_year_complete stub → milestone deferred
 
 
+def _shrinking(cells: list[tuple[str, int]], wired: dict):
+    """A `campaign_work_list` stub that drops cells as their fills land.
+
+    The real one is re-derived from the store every round, and the campaign now trusts
+    it over a child's failure list — a child can report success having never attempted
+    a cell. A constant stub models a store that records nothing, so the campaign would
+    re-dispatch the same work until it ran out of attempts.
+    """
+
+    def _work(_status=None, _tags=None, *, expected_zones=None, years=None):
+        wanted = set(years) if years else None
+        return [c for c in cells if c not in wired["landed"] and (wanted is None or c[1] in wanted)]
+
+    return _work
+
+
+def _dispatched_cells(params: dict) -> list[tuple[str, int]]:
+    """The (zone, year) cells one dispatch covers, for either fill strategy.
+
+    ``cluster-per-zone`` and ``ingest-zone-year`` pass a single ``zone``/``year``;
+    ``chained-clusters`` passes a ``cells`` list. Anything else (a milestone tag, say)
+    covers no cells.
+    """
+    if "cells" in params:
+        return [(z, y) for z, y in params["cells"]]
+    if "zone" in params and "year" in params:
+        return [(params["zone"], params["year"])]
+    return []
+
+
 @pytest.fixture()
 def wired(monkeypatch):
     """Mock the store + dispatch; return records of what the flow did."""
@@ -53,7 +83,25 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)  # requested years are on-axis
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)  # default: a live (non-ocean) cell
-    monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("33N", 2025)])
+    # The work list must SHRINK as fills land, because that is what the real one does —
+    # it is re-derived from the store every round, and the campaign now trusts it rather
+    # than a child's failure list (a child can report success having skipped cells). A
+    # constant stub models a store that never records anything, so every round would
+    # find the same work and the campaign would exhaust its attempts.
+    _landed: set[tuple[str, int]] = set()
+    rec["landed"] = _landed
+
+    def _land(parameters: dict | None) -> None:
+        """Record a completed dispatch's cells as present in the store.
+
+        Exposed on the fixture because tests that install their OWN `arun_deployment`
+        replace the default wholesale, and a dispatch that lands nothing makes the
+        campaign re-read an unchanged store and re-dispatch forever.
+        """
+        _landed.update(_dispatched_cells(parameters or {}))
+
+    rec["land"] = _land
+    monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [c for c in [("33N", 2025)] if c not in _landed])
     monkeypatch.setattr(mod, "tag_year_complete", _defer_milestone)
     # Immutable code identity (AMI ID + optional tarball ETag) — mocked so tests make no
     # SSM/S3 call; resolved once per campaign and folded into the staging fingerprint.
@@ -78,6 +126,9 @@ def wired(monkeypatch):
     async def fake_arun(dep, parameters=None, tags=None):
         rec["arun"].append((dep, parameters))
         rec.setdefault("tags", []).append(tags)
+        # A completed fill puts its cell(s) in the store, which is what the next
+        # round's work list is derived from.
+        _land(parameters)
         return _completed_run()
 
     monkeypatch.setattr(mod, "arun_deployment", fake_arun)
@@ -172,7 +223,7 @@ class TestCampaignDefaults:
         names = [f"{i + 1:02d}N" for i in range(12)]
         status = SimpleNamespace(zones=dict.fromkeys(names, ()), has=lambda z, y: False)
         monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
-        monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [(z, 2025) for z in names])
+        monkeypatch.setattr(mod, "campaign_work_list", _shrinking([(z, 2025) for z in names], wired))
 
         alive = 0
         peak = 0
@@ -195,6 +246,7 @@ class TestCampaignDefaults:
                     await asyncio.wait_for(all_ingested.wait(), timeout=2)
                 except TimeoutError:
                     pass  # regression: report the peak reached instead of hanging
+            wired["land"](parameters)
             return _completed_run()
 
         monkeypatch.setattr(mod, "arun_deployment", gated_arun)
@@ -248,6 +300,7 @@ def _dispatched_zones(params: dict) -> list[str]:
 
 def _fill_run_id(rec: dict, **kwargs) -> str:
     rec["arun"].clear()
+    rec["landed"].clear()  # a fresh campaign, not a second round
     _per_cell(**kwargs)
     return next(p for d, p in rec["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
 
@@ -415,6 +468,7 @@ def test_ingest_false_run_id_tracks_prebuilt_mosaic_identity(wired, monkeypatch)
             lambda *a, **k: (SimpleNamespace(attrs={"registry_sha256": "cov", "last_appended": ts}), "SNAPSHOT0"),
         )
         wired["arun"].clear()
+        wired["landed"].clear()
         _per_cell(ingest=False, cleanup_mosaics=False)
         return next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
 
@@ -445,6 +499,7 @@ def _prebuilt_run_id(wired, monkeypatch, *, attrs: dict, tip: str) -> str:
     """run_id of the ingest=False fill for a prebuilt mosaic with these attrs/tip."""
     monkeypatch.setattr(mod, "open_store_group_and_tip", lambda *a, **k: (SimpleNamespace(attrs=attrs), tip))
     wired["arun"].clear()
+    wired["landed"].clear()
     _per_cell(ingest=False, cleanup_mosaics=False)
     return next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
 
@@ -565,7 +620,7 @@ def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
     """
     status = SimpleNamespace(zones={"33N": (), "34N": (), "35N": ()}, has=lambda z, y: False)
     monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
-    monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("33N", 2025), ("34N", 2025), ("35N", 2025)])
+    monkeypatch.setattr(mod, "campaign_work_list", _shrinking([("33N", 2025), ("34N", 2025), ("35N", 2025)], wired))
     counts = {"33N": 500, "34N": 300, "35N": 250}
     monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: float(counts[zone]))
 
@@ -596,9 +651,10 @@ class TestIngestBoundAcrossClusters:
         names = [f"{i + 1:02d}N" for i in range(zones)]
         status = SimpleNamespace(zones=dict.fromkeys(names, ()), has=lambda z, y: False)
         monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
-        monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [(z, 2025) for z in names])
+        monkeypatch.setattr(mod, "campaign_work_list", _shrinking([(z, 2025) for z in names], wired))
         monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: 100.0)
         wired["arun"].clear()
+        wired["landed"].clear()
         asyncio.run(
             mod.run_global_campaign.fn(
                 paths=_PATHS,
@@ -645,7 +701,7 @@ def test_every_cluster_opens_on_one_of_the_densest_zones(wired, monkeypatch):
     counts = {"01N": 900, "02N": 800, "03N": 700, "04N": 50, "05N": 40, "06N": 30}
     status = SimpleNamespace(zones=dict.fromkeys(counts, ()), has=lambda z, y: False)
     monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
-    monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [(z, 2025) for z in counts])
+    monkeypatch.setattr(mod, "campaign_work_list", _shrinking([(z, 2025) for z in counts], wired))
     monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: float(counts[zone]))
 
     asyncio.run(
@@ -767,6 +823,7 @@ def test_both_strategies_pin_the_resolved_ami_id(wired):
     assert fill["ami_id"] == "ami-test-id"
 
     wired["arun"].clear()
+    wired["landed"].clear()
     asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
     chained = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
     assert chained["ami_id"] == "ami-test-id"
@@ -910,6 +967,7 @@ class TestFailedZonesAreRetried:
                 state.update(complete_after.get(rounds["n"], ()))
                 if any(z not in state for z, _y in parameters["cells"]):
                     raise RuntimeError("cluster failed")
+            wired["land"](parameters)
             return _completed_run()
 
         monkeypatch.setattr(mod, "arun_deployment", arun)
@@ -979,11 +1037,11 @@ class TestFailedZonesAreRetried:
 # --- overlap_years: dropping the year barrier -------------------------------------------
 
 
-def _multi_year(monkeypatch, zones, years):
+def _multi_year(monkeypatch, zones, years, wired):
     """Wire a work list of every (zone, year) pair, with nothing yet complete."""
     status = SimpleNamespace(zones=dict.fromkeys(zones, ()), has=lambda z, y: False, years=tuple(years))
     monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
-    monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [(z, y) for y in years for z in zones])
+    monkeypatch.setattr(mod, "campaign_work_list", _shrinking([(z, y) for y in years for z in zones], wired))
     monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: 100.0)
     return status
 
@@ -994,7 +1052,7 @@ def test_year_serial_is_still_the_default(wired, monkeypatch):
     Pinned because the year-serial path is the one that has actually been run, and a
     default flip would change the campaign's shape silently.
     """
-    _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024])
+    _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024], wired)
     asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", max_parallel_clusters=1
@@ -1009,7 +1067,7 @@ def test_overlap_years_dispatches_every_year_in_one_batch(wired, monkeypatch):
     """The barrier gone: one round covering all requested years, so year N+1's ingest
     can overlap year N's inference instead of waiting for it.
     """
-    _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024])
+    _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024], wired)
     asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS,
@@ -1032,7 +1090,7 @@ def test_overlap_years_keeps_every_year_of_a_zone_in_one_cluster(wired, monkeypa
     year lands in one cluster, where the runner's single trailing-assembly thread
     serializes them. If the partition were ever over cells, this fails.
     """
-    _multi_year(monkeypatch, ["01N", "02N", "03N", "04N"], [2025, 2024, 2023])
+    _multi_year(monkeypatch, ["01N", "02N", "03N", "04N"], [2025, 2024, 2023], wired)
     asyncio.run(
         mod.run_global_campaign.fn(
             paths=_PATHS,
@@ -1061,7 +1119,7 @@ def test_overlap_years_still_reports_unfilled_cells_per_year(wired, monkeypatch)
     A batch spanning years must not collapse into one undifferentiated list — the whole
     point of the report is telling you which zone-years to look at.
     """
-    _multi_year(monkeypatch, ["01N"], [2025, 2024])
+    _multi_year(monkeypatch, ["01N"], [2025, 2024], wired)
 
     async def arun(dep, parameters=None, tags=None):
         wired["arun"].append((dep, parameters))

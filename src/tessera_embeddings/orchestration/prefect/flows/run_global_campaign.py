@@ -1183,12 +1183,13 @@ async def run_global_campaign(
             # exactly the old behaviour, and with overlap a run genuinely spans them.
             for y in batch_years:
                 runs_by_year.setdefault(y, []).extend(round_runs)
-            if not round_failures:
-                remaining = []
-                break
-            # Re-read the store: a cluster can fail having landed most of its zones,
-            # and those must not be re-dispatched. This is also what makes "progress"
-            # measurable rather than inferred from the failure list.
+            # Re-read the STORE, every round, including the rounds that reported no
+            # failures. What landed is a property of the store, never of a child's
+            # return value: a child can report success having silently not attempted
+            # cells at all — `sequential_fill`'s feeder stops admitting work when too
+            # many failures are retaining mosaics, and if those failures then recover
+            # in its retry pass it returns clean with cells still pending. Concluding
+            # from an empty failure list marked those as landed and ended the campaign.
             before = set(remaining)
             status = campaign_status(repo, years=campaign_years)
             remaining = list(
@@ -1196,6 +1197,16 @@ async def run_global_campaign(
                     status, set(repo.list_tags()), expected_zones=expected_zones, years=tuple(batch_years)
                 )
             )
+            if not round_failures and remaining:
+                log.warning(
+                    "Year(s) %s attempt %d/%d: the fill(s) reported no failures, but %d cell(s) are still "
+                    "missing from the store — they were never attempted. Re-dispatching: %s",
+                    batch_years,
+                    attempt,
+                    max_zone_attempts,
+                    len(remaining),
+                    ", ".join(f"{z}-{y}" for z, y in remaining[:10]),
+                )
             for f in round_failures:
                 log.warning("Year(s) %s attempt %d/%d: %s", batch_years, attempt, max_zone_attempts, f)
             if not remaining:
