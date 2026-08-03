@@ -245,6 +245,12 @@ ingest, and at staged-tile resume inside inference. Two deliberate exceptions �
 parameter raises rather than silently mixing configurations, and a change to the **inference
 code** invalidates staged tiles by design.
 
+Staged-tile resume distinguishes a *finished* tile from one a crash caught mid-upload: a
+staged tile is many objects with no atomic commit, and its missing pieces would read back as
+fill values rather than as an error. A tile counts as done only if its completion marker
+landed, so an interrupted one is re-inferred instead of assembled with silent holes. Nothing
+has to be cleaned up by hand first — the re-run overwrites it.
+
 > **Narrowed 2026-07-30.** That last exception used to fire on any change to the *build* — the
 > staging fingerprint was the resolved AMI ID plus the source tarball's ETag, so re-baking the
 > AMI or a hotfix anywhere in the repo abandoned every staged tile. It is now a hash of the
