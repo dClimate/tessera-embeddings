@@ -427,6 +427,7 @@ def fill_zones_sequential_flow(
     cloudwatch_log_group: str = "/ec2/tessera/ray",
     code_bucket: str | None = None,
     code_suffix: str = "",
+    staging_code_identity: str | None = None,
     num_actors: int = 20,
     s1_orbit: str = "both",
     s3_region: str | None = None,
@@ -476,6 +477,12 @@ def fill_zones_sequential_flow(
         code_bucket: S3 bucket workers pull the source tarball from (``None`` =
             AMI-baked source).
         code_suffix: Source-tarball filename suffix (lets branches coexist).
+        staging_code_identity: The campaign's code component for the staging
+            fingerprint — the narrowed inference-source hash, with its
+            ``force_staging_reuse`` / ``force_staging_restage`` overrides already
+            applied. Passed by ``run_global_campaign`` so both fill strategies resume
+            and restage identically. ``None`` (a direct call) falls back to the
+            AMI-plus-tarball artifact identity.
         num_actors: Fleet-size ceiling; each cell requests
             ``min(num_actors, its live tiles)``.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"`` (resolved
@@ -739,7 +746,16 @@ def fill_zones_sequential_flow(
     # SSM pointer twice — here and again in ray_cluster — so a re-bake landing between
     # them boots a different image than the prefix was fingerprinted against.
     ami_id = ami_id or _resolve_ami_id(ami_ssm_name, None)
-    code_identity = _resolve_code_identity(ami_ssm_name, code_bucket, code_suffix, None, ami_id)
+    # The campaign's staging identity when it supplied one, and only otherwise the
+    # AMI-plus-tarball artifact identity. This is the DEFAULT fill strategy, so
+    # recomputing the artifact identity here undid the narrowing for the path that
+    # actually runs: an AMI re-bake or any tarball change abandoned every staged tile,
+    # and `force_staging_reuse` / `force_staging_restage` — parameters the campaign
+    # documents — reached the per-zone path only and did nothing here. The fallback is
+    # for a direct call, which has no parent to inherit from.
+    code_identity = staging_code_identity or _resolve_code_identity(
+        ami_ssm_name, code_bucket, code_suffix, None, ami_id
+    )
 
     def _prepare(cell: SequentialCell) -> PreparedCell:
         # Everything here needs the cell's mosaic, so it runs only after the

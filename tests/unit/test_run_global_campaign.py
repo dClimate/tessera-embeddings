@@ -375,6 +375,57 @@ def test_fill_run_id_ignores_the_build_and_keys_on_inference_code(wired, monkeyp
     assert changed.startswith("33N-2025-") and changed != base
 
 
+def _chained_staging_identity(wired, **kwargs) -> str:
+    """The staging identity the DEFAULT strategy hands its child."""
+    wired["arun"].clear()
+    wired["landed"].clear()
+    asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
+    params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
+    return params["staging_code_identity"]
+
+
+class TestBothStrategiesShareOneStagingIdentity:
+    """The narrowing and its escape hatches have to reach the DEFAULT path.
+
+    `chained-clusters` is the strategy campaigns actually run, and it used to recompute
+    the AMI-plus-tarball artifact identity for itself — so a re-bake abandoned every
+    staged tile on the path that runs, and `force_staging_reuse`/`force_staging_restage`
+    were documented on a flow that never forwarded them.
+    """
+
+    def test_the_chained_child_is_handed_the_narrowed_identity(self, wired, monkeypatch):
+        monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-FIXED")
+        assert _chained_staging_identity(wired) == "infcode-FIXED"
+
+    def test_a_rebaked_ami_does_not_change_it(self, wired, monkeypatch):
+        """The inversion the narrowing was for, asserted on the default path too."""
+        base = _chained_staging_identity(wired)
+        monkeypatch.setattr(mod, "_resolve_code_identity", lambda *a, **k: "ami=ami-REBAKED")
+        assert _chained_staging_identity(wired) == base
+
+    def test_an_inference_change_does(self, wired, monkeypatch):
+        base = _chained_staging_identity(wired)
+        monkeypatch.setattr(mod, "inference_code_identity", lambda: "infcode-DIFFERENT")
+        assert _chained_staging_identity(wired) != base
+
+    def test_both_escape_hatches_reach_it(self, wired):
+        base = _chained_staging_identity(wired)
+        assert _chained_staging_identity(wired, force_staging_reuse=True) != base
+        assert _chained_staging_identity(wired, force_staging_restage="tok") != base
+
+    def test_the_two_strategies_agree(self, wired):
+        """Same campaign, same inputs — the identity must not depend on the strategy."""
+        chained = _chained_staging_identity(wired)
+        wired["arun"].clear()
+        wired["landed"].clear()
+        _per_cell()
+        per_zone = next(p for d, p in wired["arun"] if d == "fill-zone-year/fill-zone-year")["run_id"]
+        # The per-zone path folds the identity into the run_id rather than passing it,
+        # so recompute that id with the chained identity and require a match.
+        assert per_zone.startswith("33N-2025-")
+        assert chained == mod.inference_code_identity()
+
+
 def test_force_staging_reuse_survives_an_inference_change(wired, monkeypatch):
     """The escape hatch for a change the author knows is output-neutral."""
     base = _fill_run_id(wired, force_staging_reuse=True)

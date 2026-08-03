@@ -1114,6 +1114,12 @@ async def run_global_campaign(
                         "cloudwatch_log_group": cloudwatch_log_group,
                         "code_bucket": code_bucket,
                         "code_suffix": code_suffix,
+                        # The narrowed staging identity, with the force_staging_*
+                        # overrides applied — same value the per-zone path folds into
+                        # its run_id. Without it the child recomputed the AMI/tarball
+                        # artifact identity, so the default strategy re-inferred on
+                        # every re-bake and ignored both escape hatches.
+                        "staging_code_identity": _staging_code_identity(),
                         "ingest": ingest,
                         "ingest_deployment": ingest_deployment,
                         # Route this cluster's S1/S2 ingest grandchildren (see `branch`);
