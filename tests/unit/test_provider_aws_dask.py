@@ -745,6 +745,28 @@ class TestStopEcsTasksByTag:
         assert n == 0  # the hook must never mask the flow's own terminal state
         assert any("ECS_CLUSTER_ARN" in r.getMessage() for r in caplog.records)
 
+    def test_the_sweep_paces_itself_into_the_ecs_read_throttle(self, monkeypatch):
+        """Enumerating a wide cluster is ~2 calls per 100 tasks into ECS's TIGHTEST
+        bucket — cluster service resource read, 1 request/second refill, burst 10 — and
+        boto3's default four legacy retries give up partway. The orphan sweep failed on
+        every scheduled run during a 36-cell ingest that way: a safety mechanism going
+        down under exactly the load it exists to clean up.
+
+        Asserts the config reaches the client, so reverting to a bare ``boto3.client``
+        fails here rather than silently at fleet width.
+        """
+        self._sweep(monkeypatch, {})
+        retries = self.client_kwargs["config"].retries
+        assert retries["mode"] == "adaptive", "adaptive PACES into the bucket; more retries alone do not"
+        assert retries["max_attempts"] >= 10
+
+    def test_botocore_actually_resolves_that_retry_mode(self):
+        """``Config`` carries the request unvalidated, so a typo'd mode would satisfy the
+        assertions above and configure nothing. Checked on a real client, hence no
+        ``boto3.client`` monkeypatch here.
+        """
+        assert dask_mod.ecs_inventory_client("us-west-2").meta.config.retries["mode"] == "adaptive"
+
 
 class TestDashboardSsmCommand:
     """The copy-pasteable port-forward command logged at cluster start."""

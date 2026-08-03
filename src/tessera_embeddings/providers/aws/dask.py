@@ -920,6 +920,38 @@ def _region_from_arn(arn: str) -> str | None:
     return parts[3] if len(parts) > 4 and parts[3] else None
 
 
+def ecs_inventory_client(region: str | None = None):  # noqa: ANN201 — botocore client, untyped
+    """A boto3 ECS client configured to survive a cluster-wide task enumeration.
+
+    **Use this for any code that paginates ``list_tasks``/``describe_tasks``**, in either
+    repo. Walking a wide cluster is ~2 calls per 100 tasks, and both land in ECS's
+    *cluster service resource read* bucket, which refills at **one request per second**
+    with a burst of ten — the tightest bucket ECS has. At 36 concurrent cells (~1,200
+    tasks) one walk is ~24 calls, and boto3's default of four legacy retries gives up
+    partway with ``ThrottlingException: Rate exceeded``.
+
+    ``adaptive`` mode is the fix rather than a bigger ``max_attempts``: it adds
+    client-side rate limiting that learns the throttle and paces requests into it,
+    instead of retrying into a bucket that is still empty. Slower is the intended
+    outcome — an enumeration that takes a minute is worth far more than one that fails.
+
+    This mattered because the orphan-fleet sweep is what enumerates: it failed on every
+    scheduled run during a 36-cell ingest (2026-08-03), which is exactly when a leaked
+    fleet is most likely and most expensive. A safety mechanism that fails under load is
+    worse than a slow one. The durable fix is also filed as a quota raise — see
+    ``docs/aws-quota-requests.md`` in yield-embeddings — but the client must not depend
+    on that being granted.
+    """
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "ecs",
+        region_name=region,
+        config=Config(retries={"max_attempts": 10, "mode": "adaptive"}),
+    )
+
+
 def stop_ecs_tasks_by_tag(
     tag_key: str,
     tag_value: str,
@@ -942,8 +974,6 @@ def stop_ecs_tasks_by_tag(
     absent (nothing to sweep against) rather than raising — the hook must never
     mask the flow's own terminal state.
     """
-    import boto3
-
     arn = cluster_arn or os.environ.get("ECS_CLUSTER_ARN", "")
     if not arn:
         log.warning("ECS_CLUSTER_ARN unset — cannot sweep tasks for %s=%s", tag_key, tag_value)
@@ -952,7 +982,7 @@ def stop_ecs_tasks_by_tag(
     # region, and passing one to a default-region client does not redirect the call —
     # so a cross-region sweep would fail to list anything and leave the fleet running
     # and billing, at exactly the moment this hook exists to prevent that.
-    ecs = boto3.client("ecs", region_name=_region_from_arn(arn))
+    ecs = ecs_inventory_client(_region_from_arn(arn))
     task_arns: list[str] = []
     paginator = ecs.get_paginator("list_tasks")
     for page in paginator.paginate(cluster=arn):
