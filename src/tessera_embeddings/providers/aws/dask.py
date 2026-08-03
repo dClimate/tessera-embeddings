@@ -665,6 +665,11 @@ def log_dashboard_ssm_command(
     "instance not found" from SSM. ``--profile`` stays a placeholder: it is a
     property of the caller's credentials, not of the cluster.
 
+    Uses ``AWS-StartPortForwardingSession``, which targets a port on the
+    scheduler container itself. The ``...ToRemoteHost`` variant addresses hosts
+    reachable *from* the container, and current SSM agents reject loopback
+    destinations for it ("Forwarding to IP address localhost is forbidden").
+
     Best-effort: if the scheduler task metadata isn't shaped as expected
     (e.g. an EC2 scheduler), logs a warning and returns without raising.
     """
@@ -687,9 +692,9 @@ def log_dashboard_ssm_command(
         "To view the Dask dashboard, run (supply your own --profile):\n\n"
         "aws ssm start-session \\\n"
         f"  --target {ssm_target} \\\n"
-        "  --document-name AWS-StartPortForwardingSessionToRemoteHost \\\n"
-        '  --parameters \'{"host":["localhost"],"portNumber":["8787"],"localPortNumber":["8787"]}\' \\\n'
+        "  --document-name AWS-StartPortForwardingSession \\\n"
         f"  --region {region} \\\n"
+        '  --parameters \'{"portNumber":["8787"],"localPortNumber":["8787"]}\' \\\n'
         "  --profile <your-aws-profile>\n\n"
         "Then open http://localhost:8787/status"
     )

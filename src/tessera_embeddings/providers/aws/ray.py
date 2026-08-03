@@ -504,9 +504,12 @@ def _log_ray_dashboard_ssm_command(
     reachable *from* the instance, and the SSM agent rejects loopback
     destinations for it.
 
-    Best-effort: warns and returns on any failure, never raises. No
-    ``--profile`` is printed — credentials come from the operator's
-    environment (``AWS_PROFILE`` or their default).
+    ``--region`` is filled in from the region the head node was looked up in,
+    so an operator whose default region differs doesn't get a "target not
+    connected" from SSM. No ``--profile`` is printed — credentials come from
+    the operator's environment (``AWS_PROFILE`` or their default).
+
+    Best-effort: warns and returns on any failure, never raises.
 
     Args:
         cluster_name: Resolved, unique ``ray-cluster-name`` tag value (with
@@ -534,6 +537,7 @@ def _log_ray_dashboard_ssm_command(
             "aws ssm start-session \\\n"
             f"  --target {instance_id} \\\n"
             "  --document-name AWS-StartPortForwardingSession \\\n"
+            f"  --region {region} \\\n"
             '  --parameters \'{"portNumber":["8265"],"localPortNumber":["8265"]}\'\n\n'
             "Then open http://localhost:8265"
         )

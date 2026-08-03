@@ -944,10 +944,33 @@ Assembly no longer uses Dask — only the *ingest* Dask cluster remains, in a pr
 # Look up TASK_ID and RUNTIME_ID for the Dask scheduler task in the ECS console
 aws ssm start-session \
   --target ecs:yield-cluster_${TASK_ID}_${RUNTIME_ID} \
-  --document-name AWS-StartPortForwardingSessionToRemoteHost \
-  --parameters '{"host":["localhost"],"portNumber":["8787"],"localPortNumber":["8787"]}'
+  --document-name AWS-StartPortForwardingSession \
+  --region <aws-region> \
+  --parameters '{"portNumber":["8787"],"localPortNumber":["8787"]}'
 ```
 
 Then open http://localhost:8787 in your browser.
 
-Requires the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (`brew install session-manager-plugin`).
+## Accessing the Ray Dashboard
+
+Inference runs a Ray cluster whose head node is an EC2 instance in a private subnet.
+`_log_ray_dashboard_ssm_command` (in `providers/aws/ray.py`) logs a ready-to-paste command
+once the head is up, with the instance ID and region already filled in:
+
+```bash
+# INSTANCE_ID is the head node — tagged ray-node-type=head
+aws ssm start-session \
+  --target ${INSTANCE_ID} \
+  --document-name AWS-StartPortForwardingSession \
+  --region <aws-region> \
+  --parameters '{"portNumber":["8265"],"localPortNumber":["8265"]}'
+```
+
+Then open http://localhost:8265 in your browser.
+
+Both tunnels use `AWS-StartPortForwardingSession`, which forwards a port on the target
+itself. The `AWS-StartPortForwardingSessionToRemoteHost` variant is for hosts reachable
+*from* the target (RDS, an internal ALB); current SSM agents refuse loopback destinations
+for it and fail with `Forwarding to IP address localhost is forbidden`.
+
+Both require the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (`brew install session-manager-plugin`).
