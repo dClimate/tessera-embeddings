@@ -131,6 +131,15 @@ class RecordingInputs:
         with self._lock:
             self.events.append(f"cleanup:{zone}")
 
+    def discard(self, zone: str, year: int) -> None:
+        """Forget the cell's attempt so a later `start` counts as a new one.
+
+        Recorded rather than un-recording the `start`: several tests count `start:`
+        events as "mosaics this run produced", and a discard does not un-produce one.
+        """
+        with self._lock:
+            self.events.append(f"discard:{zone}")
+
 
 class BudgetProbeInputs(RecordingInputs):
     """RecordingInputs that also tracks the started-not-cleaned high-water mark —
@@ -637,6 +646,79 @@ def test_a_failed_cell_is_retried_in_child_and_recovers():
     assert summary["failed"] == 0 and summary["succeeded"] == 3
     # The recovered cell's mosaic is cleaned, like any cell that landed.
     assert "cleanup:02N" in events
+
+
+class _FlakyIngestInputs(RecordingInputs):
+    """Inputs whose FIRST production attempt per cell fails, like a transient ingest.
+
+    Models the real adapter's memoisation: `start` is idempotent per (zone, year), so
+    without a discard the failed attempt is what every later `wait` sees.
+    """
+
+    def __init__(self, events: list[str], fail_first: set[str]) -> None:
+        super().__init__(events)
+        self._fail_first = set(fail_first)
+        self.attempts: dict[str, int] = {}
+        self._live: set[str] = set()
+
+    def start(self, zone: str, year: int) -> None:
+        """Idempotent per cell, as the real adapter is — it memoises the future."""
+        with self._lock:
+            if zone in self._live:
+                return
+            self._live.add(zone)
+            self.attempts[zone] = self.attempts.get(zone, 0) + 1
+            self.events.append(f"start:{zone}")
+
+    def ready(self, zone: str, year: int) -> bool:
+        return True
+
+    def wait(self, zone: str, year: int, stop=None) -> None:
+        with self._lock:
+            self.events.append(f"wait:{zone}")
+            failing = zone in self._fail_first and self.attempts.get(zone, 0) <= 1
+        if failing:
+            raise RuntimeError(f"ingest deployment failed for {zone}")
+
+    def discard(self, zone: str, year: int) -> None:
+        with self._lock:
+            self._live.discard(zone)
+            self.events.append(f"discard:{zone}")
+
+
+def test_an_ingest_failure_is_re_ingested_on_retry():
+    """The attempt budget has to buy a NEW ingest, not a re-read of the dead one.
+
+    `start` is idempotent, so a cell that failed while producing its inputs keeps that
+    failure cached — and a retry that only re-plans would probe the same missing mosaic
+    every time, making `max_cell_attempts` worthless for exactly the transient ingest
+    failures it exists to absorb.
+    """
+    events: list[str] = []
+    attempts: list[str] = []
+    inputs = _FlakyIngestInputs(events, fail_first={"02N"})
+
+    summary = _run(_cells(3), session=_sync_session(), inputs=inputs, infer_single=_recovering_single(attempts))
+
+    assert inputs.attempts["02N"] == 2, "the retry must submit a second ingest"
+    assert "discard:02N" in events, "the dead attempt must be dropped before restarting"
+    assert summary["failed"] == 0 and summary["succeeded"] == 3
+
+
+def test_a_retry_after_inference_does_not_re_ingest():
+    """A cell that failed AFTER its inputs landed keeps the mosaic it retained.
+
+    Retention is the whole reason those cells stay eligible, so re-running their ingest
+    would redo work already on disk and re-admit budget the retention keeps out.
+    """
+    events: list[str] = []
+    attempts: list[str] = []
+    inputs = RecordingInputs(events)
+
+    _run(_cells(3), session=_sync_session(fail={"02N"}), inputs=inputs, infer_single=_recovering_single(attempts))
+
+    assert attempts == ["02N"], "the inference retry ran"
+    assert "discard:02N" not in events, "an inference failure must not discard a good mosaic"
 
 
 def test_a_deterministic_failure_survives_its_retries_and_still_raises():

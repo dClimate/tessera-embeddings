@@ -137,6 +137,18 @@ class CellInputs(Protocol):
         """Delete the cell's mosaics (only if this adapter produced them)."""
         ...
 
+    def discard(self, zone: str, year: int) -> None:
+        """Forget a cell's production attempt so ``start`` will run a new one.
+
+        ``start`` is idempotent, which is what lets the feeder call it freely — and
+        which also means a FAILED attempt is remembered forever. A retry would then
+        re-observe the same failure without ever producing the mosaics again, so the
+        cell's attempt budget is spent re-reading one dead result. The retry path calls
+        this first; a no-op is a valid implementation for an adapter that keeps no
+        state, and discarding a cell that was never started must also be a no-op.
+        """
+        ...
+
     def ready(self, zone: str, year: int) -> bool:
         """True if :meth:`wait` would return immediately. Never blocks.
 
@@ -757,8 +769,17 @@ def fill_zones_sequential(
     # upstream and permanent, so everything is eligible.
     for attempt in range(2, max_cell_attempts + 1):
         with lock:
-            failed_keys = [(f["zone"], f["year"]) for f in failures]
+            # Cells the feeder never admitted are recorded as failures so the run
+            # REPORTS them, but they are not retry candidates: the feeder stopped
+            # because too many failures were holding mosaics off-budget, and admitting
+            # more work here is the one thing that cap exists to prevent. They stay
+            # pending for the driver's next pass, which is what their record says.
+            failed_keys = [(f["zone"], f["year"]) for f in failures if f["phase"] != "unattempted"]
             eligible = set(retained_failed)
+            # Cells whose INPUTS failed need their production re-run; every other
+            # phase failed with a usable mosaic already on disk. See the discard
+            # below for why the distinction matters.
+            reingest = {(f["zone"], f["year"]) for f in failures if f["phase"] == "inputs/prepare"}
         pending = failed_keys if budget is None else [k for k in failed_keys if k in eligible]
         if skipped := [k for k in failed_keys if k not in pending]:
             log.warning(
@@ -782,6 +803,19 @@ def fill_zones_sequential(
             if cell is None:  # pragma: no cover - a failure record always names a cell
                 continue
             try:
+                # ONLY for a cell whose inputs failed: drop the dead production attempt
+                # and run a new one. `start` is idempotent, so the failed future stays
+                # cached and the retry would otherwise re-read the same failure without
+                # ever producing the mosaics — spending the attempt budget on nothing.
+                #
+                # Not for the other phases. A cell that failed in plan, inference or
+                # assembly RETAINED its mosaic precisely so the retry could use it, so
+                # re-ingesting would redo work that is already on disk and re-admit
+                # budget the retention was designed to keep out.
+                if inputs is not None and (zone_name, year) in reingest:
+                    inputs.discard(zone_name, year)
+                    inputs.start(zone_name, year)
+                    inputs.wait(zone_name, year, stop=stop)
                 prep = prepare(cell)
                 handoff = infer_single(cell, prep, False)
                 _record_outcome(assemble(handoff, prep))

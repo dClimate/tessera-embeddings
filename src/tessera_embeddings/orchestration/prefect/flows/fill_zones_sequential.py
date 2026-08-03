@@ -354,6 +354,16 @@ class _DeploymentCellInputs:
             return
         delete_prefix(f"{self._inputs_bucket.rstrip('/')}/mosaics/{zone}/{year}", log=self._log)
 
+    def discard(self, zone: str, year: int) -> None:
+        """Forget the cell's ingest future so the next ``start`` submits a new one.
+
+        Only the memo is dropped; whatever the attempt committed to the mosaic stays,
+        and the fresh ingest resumes it rather than rebuilding. Nothing is cancelled —
+        a future still running is left to finish under its own run id, since this is
+        called on a cell whose attempt already failed.
+        """
+        self._futures.pop((zone, year), None)
+
     def shutdown(self) -> None:
         """Stop dispatching AND cancel in-flight child ingest runs (best effort).
 
