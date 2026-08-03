@@ -480,13 +480,33 @@ class StagedShardSource:
     # `variables` (the assembled set) is a heterogeneous stage whose var would be
     # silently dropped — checked per tile in load(), so EVERY tile is validated.
     optional_present: tuple[str, ...] = ()
+    # Live tiles this run RESOLVED TO A SKIP (no valid pixels), so it staged nothing
+    # for them. Written as fill rather than left alone — see `live_shards`.
+    cleared: tuple[tuple[int, int], ...] = ()
+    fill_values: tuple[tuple[str, float], ...] = ()  # (var, fill) for the cleared tiles
 
     def live_shards(self) -> list[tuple[int, int]]:
-        """The staged ``(row, col)`` tile positions — shard indices, 1:1."""
-        return list(self.shards)
+        """Every ``(row, col)`` this run is responsible for — staged AND skipped.
+
+        Skipped tiles are included so the run WRITES its whole footprint instead of
+        only the part it has data for. A year is filled in two commits (shards, then
+        the completion attrs), so a crash between them leaves shards on an unmarked
+        year that the campaign re-dispatches. If the retry's live set has shrunk — a
+        re-ingested mosaic can turn a tile that had valid pixels into one that skips
+        — then leaving skipped tiles untouched preserves the previous attempt's data
+        under the new attempt's completion mark, mixing two inputs in one write-once
+        year. Writing fill over them makes the published year exactly this run's.
+
+        Bounded by the land mask, so ocean tiles are still never written at all, and
+        an all-fill int8 shard is nearly free once zstd has seen it. The single-ROI
+        `assemble` clears its non-live footprint for the same reason.
+        """
+        return [*self.shards, *self.cleared]
 
     def load(self, shard: tuple[int, int]) -> dict[str, np.ndarray]:
         """Read one staged tile whole and return ``{var: (1, h, w[, band]) block}``."""
+        if shard in self.cleared:
+            return self._fill_block()
         sy, sx = shard
         path = f"{self.staging_base}/{self.run_id}/{chunk_label(sy, sx)}.zarr"
         group = _open_staged_tile(path)
@@ -531,6 +551,23 @@ class StagedShardSource:
                 f"Staged tile {path} carries optional var(s) {extras} absent from the assembled set "
                 f"{list(self.variables)} — heterogeneous staged run; re-stage with one config before assembling."
             )
+        return blocks
+
+    def _fill_block(self) -> dict[str, np.ndarray]:
+        """A whole tile of fill, for a position this run skipped.
+
+        Built from the DESTINATION's fill values (passed in by the caller, which read
+        them off the seeded arrays) so a cleared tile reads back identical to one that
+        was never written — not zero for a float array whose fill is NaN.
+        """
+        dtypes = dict(self.dtypes)
+        fills = dict(self.fill_values)
+        blocks: dict[str, np.ndarray] = {}
+        for var in self.variables:
+            shape: tuple[int, ...] = (1, self.shard_px, self.shard_px)
+            if self.embedding_dim and var in ("embeddings", "embedding_std"):
+                shape = (*shape, self.embedding_dim)
+            blocks[var] = np.full(shape, fills.get(var, 0), dtype=np.dtype(dtypes.get(var, "float32")))
         return blocks
 
 
@@ -1604,6 +1641,7 @@ class ZarrWriter:
         n_workers: int = 8,
         gate: CommitGate | None = None,
         staged_labels: Iterable[str] | None = None,
+        skipped_labels: Iterable[str] | None = None,
         s3_concurrency: int | None = None,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
@@ -1649,6 +1687,10 @@ class ZarrWriter:
                 process drives (fleet-wide gating is the orchestrator's job).
             staged_labels: Pre-listed staged tile labels (e.g. the return of
                 :meth:`verify_staged_completeness`); ``None`` lists the prefix.
+            skipped_labels: Live tiles this run resolved to a SKIP. Written as fill,
+                so the published year is exactly this run's output — see
+                :meth:`StagedShardSource.live_shards` for the mixed-year hazard that
+                leaving them untouched creates. ``None`` writes only staged tiles.
             s3_concurrency: This fill's slice of the fleet S3-PUT budget (divided
                 across ``n_workers`` for the per-fork cap); ``None`` uses the full
                 ``TARGET_AGGREGATE_S3_CONCURRENCY`` (a lone fill).
@@ -1761,6 +1803,16 @@ class ZarrWriter:
             list(variables),
             n_workers,
         )
+        # Fill values come off the SEEDED arrays, so a cleared tile reads back exactly
+        # as an unwritten one does (0 for int8 embeddings, NaN for float scales).
+        cleared = tuple(sorted(parse_chunk_label(label) for label in (skipped_labels or ())))
+        fill_values = tuple((v, float(cast(zarr.Array, node[v]).fill_value or 0)) for v in variables)
+        if cleared:
+            _log.info(
+                "Clearing %d skipped tile(s) to fill: this run staged nothing for them, and an "
+                "earlier unmarked attempt at this year may have.",
+                len(cleared),
+            )
         source = StagedShardSource(
             staging_base=self.staging_base,
             run_id=run_id,
@@ -1770,6 +1822,8 @@ class ZarrWriter:
             dtypes=probe_dtypes,
             embedding_dim=dest_band,
             optional_present=dest_optional,
+            cleared=cleared,
+            fill_values=fill_values,
         )
         snapshot = write_year_shards(
             repo,

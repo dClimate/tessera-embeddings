@@ -1823,6 +1823,84 @@ class TestAssembleGlobal:
         assert node.attrs["years_complete"] == [2025]
         assert node.attrs["runs"]["2025"]["run_id"] == "runG"
 
+    def _stage_tile(self, writer, row, col, dim, run_id, rng):
+        chunk = ChunkSpec(
+            row=row,
+            col=col,
+            y_start=row * self.TILE,
+            y_stop=(row + 1) * self.TILE,
+            x_start=col * self.TILE,
+            x_stop=(col + 1) * self.TILE,
+        )
+        emb = rng.integers(-100, 100, size=(self.TILE, self.TILE, dim)).astype(np.int8)
+        writer.write_chunk(chunk, emb, run_id, scales=rng.random((self.TILE, self.TILE)).astype(np.float32))
+        return emb
+
+    def test_a_retry_that_skips_a_tile_clears_the_previous_attempt(self, tmp_path):
+        """The mixed-year hazard: a year is written in TWO commits, and a crash between
+        them leaves shards on a year the campaign then re-dispatches. If the retry's
+        mosaic makes a tile skip where the first attempt produced pixels, leaving that
+        tile alone publishes the OLD attempt's data under the new attempt's completion
+        mark — two inputs in one write-once year, with nothing to show for it.
+        """
+        dim = 8
+        ny = nx = 2 * self.TILE
+        store_path = self._seed_zone_repo(tmp_path, ny, nx, dim)
+        rng = np.random.default_rng(11)
+
+        # Attempt 1 stages both tiles of the top row and lands its shards.
+        first = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        for col in (0, 1):
+            self._stage_tile(first, 0, col, dim, "runA", rng)
+        first.assemble_global(store_path, self.ZONE, year=2025, run_id="runA", n_workers=1)
+
+        # Attempt 2: (0, 1) now has no valid pixels, so it stages nothing and is
+        # reported as skipped — exactly what zone_fill passes for a live tile that
+        # resolved to a skip marker.
+        second = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        kept = self._stage_tile(second, 0, 0, dim, "runB", rng)
+        second.assemble_global(
+            store_path,
+            self.ZONE,
+            year=2025,
+            run_id="runB",
+            n_workers=1,
+            staged_labels=["chunk_0_0"],
+            skipped_labels=["chunk_0_1"],
+        )
+
+        node = zarr.open_group(open_global_repo(store_path).readonly_session(branch="main").store, mode="r")[self.ZONE]
+        result = np.asarray(node["embeddings"][1])
+        np.testing.assert_array_equal(result[: self.TILE, : self.TILE], kept)
+        assert (result[: self.TILE, self.TILE :] == 0).all(), "attempt 1's tile survived attempt 2"
+        # And the float companion is cleared to ITS fill, not to zero.
+        assert np.isnan(np.asarray(node["scales"][1])[: self.TILE, self.TILE :]).all()
+
+    def test_a_skipped_tile_is_indistinguishable_from_one_never_written(self, tmp_path):
+        """Clearing must reproduce fill exactly, or a consumer can tell them apart."""
+        dim = 8
+        ny = nx = 2 * self.TILE
+        store_path = self._seed_zone_repo(tmp_path, ny, nx, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        self._stage_tile(writer, 0, 0, dim, "runC", np.random.default_rng(12))
+
+        writer.assemble_global(
+            store_path,
+            self.ZONE,
+            year=2025,
+            run_id="runC",
+            n_workers=1,
+            staged_labels=["chunk_0_0"],
+            skipped_labels=["chunk_0_1"],  # cleared
+        )
+
+        node = zarr.open_group(open_global_repo(store_path).readonly_session(branch="main").store, mode="r")[self.ZONE]
+        emb, scales = np.asarray(node["embeddings"][1]), np.asarray(node["scales"][1])
+        cleared = (slice(0, self.TILE), slice(self.TILE, None))
+        never_written = (slice(self.TILE, None), slice(0, self.TILE))  # (1, 0): outside both sets
+        np.testing.assert_array_equal(emb[cleared], emb[never_written])
+        assert np.isnan(scales[cleared]).all() and np.isnan(scales[never_written]).all()
+
     def test_year_off_axis_raises(self, tmp_path):
         """A year outside the pre-allocated axis is a loud error (D1: never resize)."""
         dim = 8

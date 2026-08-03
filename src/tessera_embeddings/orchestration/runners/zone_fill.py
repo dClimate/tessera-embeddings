@@ -839,6 +839,12 @@ def assemble_zone_year(
         )
         return result
 
+    # Live tiles that staged nothing because every pixel failed the validity filters.
+    # Passed so assembly writes fill over them instead of leaving them alone: this year
+    # may already hold shards from an attempt that crashed between the shard commit and
+    # the completion attrs, and if THAT attempt's mosaic made a tile productive where
+    # this one skips it, its data would survive under this run's completion mark.
+    skipped_labels = sorted({c.label for c in live} - staged_labels)
     n_workers = n_assembly_workers or AssemblyConfig().compute_n_workers(len(live))
     snapshot = writer.assemble_global(
         store_path,
@@ -848,6 +854,7 @@ def assemble_zone_year(
         n_workers=n_workers,
         gate=gate,
         staged_labels=staged_labels,
+        skipped_labels=skipped_labels,
         s3_concurrency=s3_concurrency,
         get_credentials=get_credentials,
         s3_region=s3_region,
