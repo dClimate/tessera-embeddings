@@ -24,7 +24,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.inference.actors import InferenceActor
-from tessera_embeddings.inference.assembly import ZarrWriter, staging_fingerprint
+from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.lifecycle import wait_for_actors
 from tessera_embeddings.inference.progress import ProgressTracker
@@ -43,7 +43,6 @@ def run_inference(
     *,
     on_actor_retire: Callable[[str], None] | None = None,
     get_credentials: Callable[[], Any] | None = None,
-    allow_unclaimed_legacy: bool = False,
 ) -> list[dict]:
     """Create Ray actors, run work-stealing inference, return per-chunk results.
 
@@ -72,9 +71,6 @@ def run_inference(
             every actor so store opens refresh credentials. The AWS provider
             passes ``iam_icechunk_credentials``; the local provider passes
             ``None`` (icechunk's default chain). See :class:`InferenceActor`.
-        allow_unclaimed_legacy: Adopt a staging run that has chunks but no
-            identity manifest (staged before the claim existed). Off by default;
-            an unclaimed run's provenance is unknowable.
 
     Returns:
         Per-chunk result dicts (status, valid pixel count, timing, etc.),
@@ -89,22 +85,8 @@ def run_inference(
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors}")
 
-    # --- Claim the run BEFORE trusting any resume state ---
-    # The resume below adopts staged chunks on the strength of their labels
-    # alone, and staged chunks are (H, W, 128) int8 whichever encoder made them.
-    # This is the orchestrator-neutral entry point, so the claim belongs here
-    # rather than only in a wrapper: a caller reusing a run_id under a different
-    # model, ROI or time window must be stopped before it blends the two. The
-    # claim is an exact-match check and idempotent, so a Prefect flow that has
-    # already claimed the same run passes straight through.
-    writer = ZarrWriter(staging_base)
-    writer.claim_run(
-        run_id,
-        staging_fingerprint(config, mosaic_base),
-        allow_unclaimed_legacy=allow_unclaimed_legacy,
-    )
-
     # --- Resume check: skip chunks already staged from a prior run ---
+    writer = ZarrWriter(staging_base)
     already_done = writer.scan_existing_staged_chunks(run_id, chunks, log=log)
     if already_done:
         remaining = len(chunks) - len(already_done)

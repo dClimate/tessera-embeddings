@@ -9,13 +9,10 @@ decision instead of error propagation.
 
 from __future__ import annotations
 
-import json
-import logging
 import pickle
 from importlib.metadata import version as _dist_version
 from unittest.mock import MagicMock, patch
 
-import fsspec
 import numpy as np
 import pytest
 import xarray as xr
@@ -23,8 +20,8 @@ import zarr
 from dask.distributed import Client
 
 import tessera_embeddings.inference.assembly as _assembly_mod
-from tessera_embeddings.config.inference import EMBEDDING_DIM, InferenceConfig
-from tessera_embeddings.config.time_windows import TimeWindow, parse_time_window
+from tessera_embeddings.config.inference import EMBEDDING_DIM
+from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     BAND_CHUNK_DIVISOR,
     OBS_COUNT_VARS,
@@ -32,7 +29,6 @@ from tessera_embeddings.inference.assembly import (
     IncompleteStageError,
     ZarrWriter,
     _staged_storage_options,
-    staging_fingerprint,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.conventions import ENCODER_VERSION
@@ -100,213 +96,6 @@ class TestStagedStorageOptions:
     )
     def test_non_s3_path_gets_no_options(self, path):
         assert _staged_storage_options(path) is None
-
-
-_FP_V2 = {"model_version": "v2-large", "checkpoint": "student_large.pt", "representation_dim": 128}
-_FP_V11 = {"model_version": "v1.1", "checkpoint": "tessera_v1_1_aws_encoder.pt", "representation_dim": 192}
-
-
-class TestClaimRun:
-    """Binding a staging run to the model that produced it.
-
-    Staged chunks are (H, W, 128) int8 for BOTH models — v1.1 saves the first
-    128 of its 192-d representation, v2 emits 128 natively — so shape and dtype
-    cannot tell them apart. Without an identity marker, a resume that omits
-    ``model_version`` silently defaults to v1.1 and finishes a v2 run with the
-    wrong encoder.
-    """
-
-    def test_claim_then_reclaim_same_config_is_idempotent(self, tmp_path):
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        writer.claim_run("run1", _FP_V2)
-        writer.claim_run("run1", _FP_V2)  # a resume with matching settings
-
-    def test_reclaim_with_different_model_raises(self, tmp_path):
-        """The bug this exists for: resuming a v2 run as v1.1."""
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        writer.claim_run("run1", _FP_V2)
-        with pytest.raises(ValueError, match="different configuration"):
-            writer.claim_run("run1", _FP_V11)
-
-    def test_error_names_the_differing_keys(self, tmp_path):
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        writer.claim_run("run1", _FP_V2)
-        with pytest.raises(ValueError) as exc:
-            writer.claim_run("run1", _FP_V11)
-        assert "model_version" in str(exc.value)
-        assert "v2-large" in str(exc.value) and "v1.1" in str(exc.value)
-
-    def test_distinct_run_ids_do_not_collide(self, tmp_path):
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        writer.claim_run("run1", _FP_V2)
-        writer.claim_run("run2", _FP_V11)  # unrelated run, different model — fine
-
-    def test_legacy_staging_without_manifest_fails_closed(self, tmp_path):
-        """An unclaimed run's model is unknowable — adopting it reopens the bug.
-
-        This is the original defect surviving in the legacy path: a v2 run staged
-        before claim_run existed, then retried with the default v1.1, would be
-        accepted, mixed and stamped v1.1.
-        """
-        staging = str(tmp_path / "staging")
-        writer = ZarrWriter(staging)
-        # Stand in for a run staged by code that predates claim_run: chunks
-        # present, no identity manifest. (The dir is made by hand because on a
-        # local FS write_skip_marker assumes it already exists — on S3, where
-        # actors actually run, there are no directories to create.)
-        (tmp_path / "staging" / "legacy").mkdir(parents=True)
-        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
-        writer.write_skip_marker(chunk, run_id="legacy")
-        with pytest.raises(ValueError, match="no identity manifest"):
-            writer.claim_run("legacy", _FP_V2)
-
-    def test_legacy_staging_adoptable_with_explicit_override(self, tmp_path, caplog):
-        """The escape hatch exists, is off by default, and says what it cannot verify."""
-        staging = str(tmp_path / "staging")
-        writer = ZarrWriter(staging)
-        (tmp_path / "staging" / "legacy").mkdir(parents=True)
-        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
-        writer.write_skip_marker(chunk, run_id="legacy")
-        with caplog.at_level(logging.WARNING):
-            writer.claim_run("legacy", _FP_V2, allow_unclaimed_legacy=True)
-        assert "nothing verifies" in caplog.text
-        writer.claim_run("legacy", _FP_V2)  # now claimed, resumes cleanly
-
-    def test_concurrent_claim_loser_validates_against_winner(self, tmp_path, monkeypatch):
-        """Two resumes of one run_id: the claim is atomic, and the loser checks.
-
-        Simulates the interleaving by making our exists() probe miss a manifest
-        the other flow has already written. Our exclusive create then loses, and
-        the winner's fingerprint — not ours — decides the outcome.
-        """
-        staging = str(tmp_path / "staging")
-        writer, other = ZarrWriter(staging), ZarrWriter(staging)
-        other.claim_run("raced", _FP_V11)
-
-        real_exists = fsspec.filesystem("file").exists
-        monkeypatch.setattr(
-            type(fsspec.filesystem("file")),
-            "exists",
-            lambda self, p, **kw: False if p.endswith("_run.json") else real_exists(p, **kw),
-        )
-        with pytest.raises(ValueError, match="different configuration"):
-            writer.claim_run("raced", _FP_V2)
-
-    def test_concurrent_claim_with_identical_config_is_fine(self, tmp_path, monkeypatch):
-        """Losing the race to an IDENTICAL configuration is not an error."""
-        staging = str(tmp_path / "staging")
-        writer, other = ZarrWriter(staging), ZarrWriter(staging)
-        other.claim_run("raced", _FP_V2)
-
-        real_exists = fsspec.filesystem("file").exists
-        monkeypatch.setattr(
-            type(fsspec.filesystem("file")),
-            "exists",
-            lambda self, p, **kw: False if p.endswith("_run.json") else real_exists(p, **kw),
-        )
-        writer.claim_run("raced", _FP_V2)  # loses the create, matches the winner
-
-    def test_manifest_write_is_exclusive(self, tmp_path):
-        """The atomicity this relies on: a second exclusive create must fail."""
-        fs = fsspec.filesystem("file")
-        d = tmp_path / "excl"
-        d.mkdir()
-        target = str(d / "_run.json")
-        with fs.open(target, "xb") as f:
-            f.write(b"{}")
-        with pytest.raises(FileExistsError), fs.open(target, "xb") as f:
-            f.write(b"{}")
-
-
-class TestStagingFingerprint:
-    """What goes into the staging claim, and what deliberately does not."""
-
-    @staticmethod
-    def _cfg(**over):
-        kwargs = dict(
-            time_window=parse_time_window("October 2025"),
-            model_version="v2-large",
-            # representation_dim is deliberately not pinned: v2 has it forced by
-            # MODEL_ARCHS while v1.1 keeps the dataclass default, and the test
-            # below asserts exactly that asymmetry.
-            checkpoint_path="s3://bucket/models/student_large.pt",
-            s1_orbit="both",
-            num_obs_checkpoints=(8, 16),
-        )
-        kwargs.update(over)
-        return InferenceConfig(**kwargs)  # type: ignore[arg-type]
-
-    def test_is_json_native_so_it_round_trips(self):
-        """A tuple written to the manifest returns a list; the claim is exact-match."""
-        fp = staging_fingerprint(self._cfg(), "s3://in/mosaics/roi")
-        assert json.loads(json.dumps(fp, sort_keys=True)) == fp
-
-    def test_checkpoint_is_the_filename_not_the_path(self):
-        """The model identity is the file; the bucket is deployment config."""
-        a = staging_fingerprint(self._cfg(checkpoint_path="s3://one/models/student_large.pt"), "s3://in/m/r")
-        b = staging_fingerprint(self._cfg(checkpoint_path="s3://two/models/student_large.pt"), "s3://in/m/r")
-        assert a == b
-        assert a["checkpoint"] == "student_large.pt"
-
-    def test_same_config_same_fingerprint(self):
-        m = "s3://in/mosaics/roi"
-        assert staging_fingerprint(self._cfg(), m) == staging_fingerprint(self._cfg(), m)
-
-    @pytest.mark.parametrize(
-        ("field", "value"),
-        [
-            ("model_version", "v1.1"),
-            ("s1_orbit", "ascending"),
-            ("num_obs_checkpoints", (8, 16, 24)),
-            ("time_window", parse_time_window("June 2025")),
-        ],
-    )
-    def test_content_affecting_fields_change_it(self, field, value):
-        m = "s3://in/mosaics/roi"
-        assert staging_fingerprint(self._cfg(), m) != staging_fingerprint(self._cfg(**{field: value}), m)
-
-    def test_norm_source_changes_it_within_v11(self):
-        """v1.1's AWS and MPC variants differ in band statistics, not just weights.
-
-        Tested on v1.1 configs because InferenceConfig rejects norm_source on v2
-        (one hard-coded stat set), and with the checkpoint path held equal so the
-        norm_source field is doing the work on its own.
-        """
-        m = "s3://in/mosaics/roi"
-        common = dict(model_version="v1.1", checkpoint_path="s3://b/models/enc.pt")
-        aws = staging_fingerprint(self._cfg(**common, norm_source="aws"), m)
-        mpc = staging_fingerprint(self._cfg(**common, norm_source="mpc"), m)
-        assert aws != mpc
-        assert (aws["norm_source"], mpc["norm_source"]) == ("aws", "mpc")
-
-    def test_representation_dim_tracks_model_version(self):
-        """It is derived from model_version, so it cannot vary independently.
-
-        Kept in the fingerprint as a redundant cross-check rather than as an
-        independent key — this pins that it moves with the model.
-        """
-        m = "s3://in/mosaics/roi"
-        v2 = staging_fingerprint(self._cfg(), m)
-        v11 = staging_fingerprint(self._cfg(model_version="v1.1"), m)
-        assert (v2["representation_dim"], v11["representation_dim"]) == (128, 192)
-
-    def test_different_roi_changes_it(self):
-        """Chunk labels are grid positions, so a different ROI's chunk_0_0 collides."""
-        base = self._cfg()
-        assert staging_fingerprint(base, "s3://in/mosaics/alps") != staging_fingerprint(base, "s3://in/mosaics/iowa")
-
-    def test_different_year_same_roi_changes_it(self):
-        """Same ROI, different window gives IDENTICAL labels — nothing else catches it."""
-        m = "s3://in/mosaics/roi"
-        assert staging_fingerprint(self._cfg(), m) != staging_fingerprint(
-            self._cfg(time_window=parse_time_window("October 2024")), m
-        )
-
-    @pytest.mark.parametrize(("field", "value"), [("chunk_size", 1000), ("batch_size", 512), ("num_workers", 1)])
-    def test_throughput_only_fields_are_excluded(self, field, value):
-        """chunk_size especially: a resume is explicitly allowed to adapt to it."""
-        m = "s3://in/mosaics/roi"
-        assert staging_fingerprint(self._cfg(), m) == staging_fingerprint(self._cfg(**{field: value}), m)
 
 
 class TestWriteChunk:

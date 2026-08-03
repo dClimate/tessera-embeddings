@@ -13,12 +13,10 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
-import json
 import logging
 import subprocess
 import warnings
 from collections.abc import Callable, Mapping
-from pathlib import PurePosixPath
 
 import dask.array as da
 import fsspec
@@ -29,7 +27,7 @@ import zarr
 from icechunk.xarray import to_icechunk
 from zarr.codecs.numcodecs import PCodec as PCodecZarr3
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM, InferenceConfig, ModelVersion, TimeWindow
+from tessera_embeddings.config.inference import EMBEDDING_DIM, ModelVersion, TimeWindow
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
@@ -228,52 +226,6 @@ def read_spatial_coords(mosaic_base: str) -> SpatialCoords:
     return coords
 
 
-def staging_fingerprint(config: InferenceConfig, mosaic_base: str) -> dict[str, object]:
-    """Identity of everything that changes what a staged chunk CONTAINS.
-
-    Single source of truth, because the fingerprint is claimed from two places —
-    the library runner and the Prefect flow's assembly-only path — and a claim is
-    an exact-match check: two callers computing the set differently would reject
-    each other on a legitimate resume.
-
-    Included are the fields that alter chunk *contents*, so reusing a ``run_id``
-    across a change to any of them would blend incompatible chunks into one
-    store:
-
-    * ``model_version`` / ``checkpoint`` / ``representation_dim`` — which encoder.
-      The chunks are (H, W, 128) int8 either way, so shape cannot tell them apart.
-    * ``norm_source`` — v1.1's AWS and MPC checkpoints differ in band statistics
-      as well as weights.
-    * ``s1_orbit`` — which SAR streams were fused.
-    * ``num_obs_checkpoints`` — the bucket ladder, which sets each pixel's
-      sequence length.
-    * ``mosaic_base`` — the input identity, and therefore the ROI. Chunk labels
-      are grid positions, so a different ROI's ``chunk_0_0`` is a name collision,
-      not a match.
-    * ``time_window`` — the months encoded. Same ROI, different year gives
-      *identical* labels, so nothing else would catch it.
-
-    Deliberately excluded: ``chunk_size`` (a resume is explicitly allowed to
-    adapt to the staged size — see ``detect_staged_chunk_size``), and
-    ``batch_size`` / ``num_actors`` / ``num_gpus`` / ``num_workers``, which change
-    throughput but not output.
-
-    Values are JSON-native so a written manifest compares equal to the dict that
-    produced it.
-    """
-    months = config.time_window.months
-    return {
-        "model_version": config.model_version,
-        "checkpoint": PurePosixPath(config.checkpoint_path).name,
-        "representation_dim": config.representation_dim,
-        "norm_source": config.norm_source,
-        "s1_orbit": config.s1_orbit,
-        "num_obs_checkpoints": list(config.num_obs_checkpoints),
-        "mosaic_base": mosaic_base.rstrip("/"),
-        "time_window": f"{months[0][0]:04d}-{months[0][1]:02d}..{months[-1][0]:04d}-{months[-1][1]:02d}",
-    }
-
-
 class ZarrWriter:
     """Write embeddings to Zarr stores with pcodec compression.
 
@@ -323,106 +275,6 @@ class ZarrWriter:
             f.write(b"")
         logger.info("Wrote skip marker for %s to %s", chunk.label, path)
         return path
-
-    def _run_manifest_path(self, run_id: str) -> str:
-        """Path of the per-run identity marker inside the staging directory."""
-        return f"{self.staging_base}/{run_id}/_run.json"
-
-    def claim_run(
-        self,
-        run_id: str,
-        fingerprint: dict[str, object],
-        *,
-        allow_unclaimed_legacy: bool = False,
-    ) -> None:
-        """Bind a staging run to the model that produced it, or refuse to touch it.
-
-        Staged chunks are plain (H, W, 128) int8 arrays. v1.1 saves the first
-        128 of its 192-d representation and v2 emits 128 natively, so chunks
-        from the two models are **indistinguishable by shape or dtype**. A
-        resume or assembly-only retry that omits ``model_version`` silently
-        falls back to the default, which means a v2 run can be finished with
-        v1.1 — mixing chunks from two encoders into one store and stamping the
-        result with the wrong ``geoemb:model``. Nothing downstream can detect
-        that afterwards.
-
-        So the first writer records the fingerprint and every later toucher of
-        the same ``run_id`` must match it.
-
-        A run with staged chunks but no manifest predates this check, and its
-        model is **unknowable** — that is exactly the hole the manifest closes,
-        so proceeding on a warning would leave the original defect intact for
-        precisely the runs that carry it. It therefore fails closed. Staging is
-        transient (``cleanup_staging`` defaults to True, so only failed runs
-        leave any behind) and starting fresh is nearly always correct; an
-        operator who does know what is staged can pass
-        ``allow_unclaimed_legacy=True`` to adopt it.
-
-        Args:
-            run_id: Staging run identifier.
-            fingerprint: Identity of the configuration doing the staging.
-            allow_unclaimed_legacy: Adopt a manifest-less staging run instead of
-                refusing it. Only correct when the caller knows what produced it.
-        """
-        path = self._run_manifest_path(run_id)
-        fs = _fs_for(path)
-        # Round-trip through JSON so the comparison below is against what a
-        # manifest can actually hold: a tuple written out comes back a list,
-        # and would otherwise fail an exact-match check against itself.
-        want = json.loads(json.dumps({k: fingerprint[k] for k in sorted(fingerprint)}, sort_keys=True))
-
-        claimed = fs.exists(path)
-        if not claimed and (self._list_staged_labels(run_id) or self._list_skip_marker_labels(run_id)):
-            if not allow_unclaimed_legacy:
-                msg = (
-                    f"Staging run '{run_id}' has chunks but no identity manifest, so the model "
-                    f"that produced them cannot be verified against the requested {want}. "
-                    f"Start a fresh run (drop previous_run_id), or set "
-                    f"dev_params.allow_unclaimed_legacy=True if you know what is staged."
-                )
-                raise ValueError(msg)
-            logger.warning(
-                "Adopting manifest-less staging run '%s' as %s on an explicit override; "
-                "nothing verifies the staged chunks came from that model",
-                run_id,
-                want,
-            )
-
-        if not claimed:
-            # claim_run is the FIRST thing to touch the staging dir, so on a
-            # local filesystem the parent does not exist yet (no-op on S3).
-            fs.makedirs(f"{self.staging_base}/{run_id}", exist_ok=True)
-            try:
-                # Exclusive create, so the claim is atomic rather than a
-                # check-then-write race: two flow runs resuming the same run_id
-                # can both see no manifest, and without this both would write and
-                # both would proceed, mixing encoders under one run. s3fs maps
-                # "x" onto an S3 conditional write (If-None-Match) and the local
-                # filesystem onto O_EXCL, so exactly one writer wins on both.
-                with fs.open(path, "xb") as f:
-                    f.write(json.dumps(want, sort_keys=True).encode())
-            except FileExistsError:
-                # Lost the race. The winner's manifest is authoritative; the
-                # comparison below decides whether it is compatible with us.
-                logger.info("Staging run %s was claimed concurrently; validating against the winner", run_id)
-
-        with fs.open(path, "rb") as f:
-            have = json.loads(f.read().decode())
-        if have != want:
-            differing = sorted(set(have) | set(want))
-            detail = ", ".join(
-                f"{k}: staged={have.get(k)!r} requested={want.get(k)!r}"
-                for k in differing
-                if have.get(k) != want.get(k)
-            )
-            msg = (
-                f"Staging run '{run_id}' is claimed by a different configuration "
-                f"({detail}). Resuming or racing it would mix encoders in one store. "
-                f"Re-run with the original settings, or start a fresh run without "
-                f"previous_run_id."
-            )
-            raise ValueError(msg)
-        logger.info("Claimed staging run %s for %s", run_id, want)
 
     def write_chunk(
         self,

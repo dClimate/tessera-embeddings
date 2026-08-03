@@ -44,7 +44,7 @@ from tessera_embeddings.config.inference import (
 )
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.assembly import ZarrWriter, staging_fingerprint
+from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
@@ -69,6 +69,44 @@ _active_resolved_yaml: str | None = None
 _active_cluster_name: str | None = None
 
 
+#: Staging-run prefix marking chunks produced by a v2 student. v1.1 keeps the
+#: historical bare-uuid run_id, so nothing about the existing path changes.
+V2_RUN_PREFIX = "v2-"
+
+
+def _resolve_run_id(previous_run_id: str | None, *, model_version: ModelVersion) -> str:
+    """Derive the staging run_id, encoding which model version produced it.
+
+    ``run_inference()`` reuses staged ``.zarr``/``.skipped`` artifacts by run_id
+    alone, and a staged chunk is (H, W, 128) int8 whichever student wrote it —
+    v1.1 saves the first 128 of its 192-d representation, v2 emits 128 natively.
+    So nothing about the artifacts distinguishes them. Since ``model_version``
+    defaults to v1.1, a resume that simply omits it would finish a v2 run with
+    the v1.1 encoder, publish a mix, and stamp the store ``geoemb:model`` = 1.1.
+
+    Encoding the version in the run_id — which namespaces the staging directory —
+    lets a resume detect the flip and refuse. Fresh v1.1 runs keep the historical
+    bare-uuid form, so the single-model path is untouched.
+
+    Unlike the S2-only mode this mirrors, **assembly-only resumes are not
+    exempt**: assembly is what writes the provenance attrs, so an assembly-only
+    pass under the wrong version is precisely the case that mislabels a store.
+    """
+    if previous_run_id:
+        resumed_v2 = previous_run_id.startswith(V2_RUN_PREFIX)
+        wants_v2 = model_version != "v1.1"
+        if resumed_v2 != wants_v2:
+            staged = "v2" if resumed_v2 else "v1.1"
+            raise ValueError(
+                f"Cannot resume run {previous_run_id!r} (staged by {staged}) with "
+                f"model_version={model_version!r}: its staged chunks came from the other "
+                f"encoder, and continuing would publish a mix of both and stamp the store "
+                f"with one of them. Resume with the {staged} model, or start a fresh run."
+            )
+        return previous_run_id
+    return (V2_RUN_PREFIX if model_version != "v1.1" else "") + uuid.uuid4().hex[:12]
+
+
 class EmbeddingsDevParams(BaseModel):
     """Development-mode toggles for the embeddings flow.
 
@@ -88,10 +126,6 @@ class EmbeddingsDevParams(BaseModel):
     # None (default) = no upload: workers use AMI-baked source, or a tarball a
     # CI workflow already put in code_bucket. See providers/aws/gotchas.md.
     sync_source_path: str | None = None
-    # Adopt a staging run that has chunks but no identity manifest (staged
-    # before claim_run existed). Off by default: an unclaimed run's model is
-    # unknowable, and guessing it is the exact defect the manifest closes.
-    allow_unclaimed_legacy: bool = False
 
 
 def _cluster_name_for_flow_run(flow_run_id: object) -> str:
@@ -211,7 +245,7 @@ def tessera_embeddings(
     if dev_params.assembly_only and not dev_params.previous_run_id:
         raise ValueError("assembly_only=True requires previous_run_id")
 
-    run_id = dev_params.previous_run_id or uuid.uuid4().hex[:12]
+    run_id = _resolve_run_id(dev_params.previous_run_id, model_version=model_version)
     run_started_at = datetime.datetime.now(datetime.UTC)
     t0 = time.monotonic()
 
@@ -244,21 +278,6 @@ def tessera_embeddings(
     )
 
     staging_base = f"{output_bucket.rstrip('/')}/staging"
-
-    # Bind this staging run to everything that decides what a staged chunk
-    # CONTAINS, before anything is staged or assembled. Chunks are (H, W, 128)
-    # int8 whichever encoder produced them, and chunk labels are grid positions,
-    # so neither shape nor name distinguishes a v2 chunk from a v1.1 one, nor
-    # last year's chunk_0_0 from this year's. Only a recorded identity does.
-    #
-    # ``run_inference`` claims the same fingerprint at the library boundary, from
-    # the same helper so the two agree exactly. This call is not redundant: it
-    # covers assembly_only, which never reaches the runner.
-    ZarrWriter(staging_base).claim_run(
-        run_id,
-        staging_fingerprint(config, mosaic_base),
-        allow_unclaimed_legacy=dev_params.allow_unclaimed_legacy,
-    )
 
     # Detect staged chunk size from prior runs — chunk_size may differ
     # between a resumed run and the current config.
@@ -345,7 +364,6 @@ def tessera_embeddings(
             staging_base=staging_base,
             run_id=run_id,
             t0=t0,
-            allow_unclaimed_legacy=dev_params.allow_unclaimed_legacy,
             get_credentials=iam_icechunk_credentials,
         )
     _active_resolved_yaml = None
