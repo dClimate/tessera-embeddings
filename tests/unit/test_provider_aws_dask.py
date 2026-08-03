@@ -770,8 +770,28 @@ class TestDashboardSsmCommand:
         with caplog.at_level(logging.INFO):
             dask_mod.log_dashboard_ssm_command(logging.getLogger("t"), cluster)
         msg = caplog.records[-1].getMessage()
-        assert "--region eu-central-1 \\\n  --profile <your-aws-profile>" in msg
+        # Its own backslash-continued line; what follows it is free to move.
+        assert "  --region eu-central-1 \\\n" in msg
+        assert "--profile <your-aws-profile>" in msg
         assert "--target ecs:my-cluster_abc123_rt9" in msg  # container looked up by name, not order
+
+    def test_forwards_a_port_on_the_container_not_a_remote_host(self, caplog):
+        """The ``...ToRemoteHost`` document cannot reach the scheduler's own port.
+
+        That variant addresses hosts reachable *from* the container, and current
+        ``amazon-ssm-agent`` versions refuse loopback destinations for it
+        ("Forwarding to IP address localhost is forbidden"). The dashboard runs
+        in the container itself, so the plain document is the right one — and it
+        takes no ``host`` parameter.
+        """
+        cluster = self._cluster("arn:aws:ecs:eu-central-1:123456789012:task/my-cluster/abc123")
+        with caplog.at_level(logging.INFO):
+            dask_mod.log_dashboard_ssm_command(logging.getLogger("t"), cluster)
+        msg = caplog.records[-1].getMessage()
+        assert "--document-name AWS-StartPortForwardingSession \\" in msg  # trailing \ excludes ...ToRemoteHost
+        assert "ToRemoteHost" not in msg
+        assert '"host"' not in msg
+        assert '{"portNumber":["8787"],"localPortNumber":["8787"]}' in msg
 
     def test_unexpected_task_shape_warns_without_raising(self, caplog):
         with caplog.at_level(logging.WARNING):
