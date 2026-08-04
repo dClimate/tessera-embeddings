@@ -575,9 +575,9 @@ class FargateConfig:
             "security_groups": self.security_groups,
             "execution_role_arn": self.execution_role_arn,
             "task_role_arn": self.task_role_arn,
-            # NOTE (corrected 2026-08-03): an earlier comment here said definitions had
-            # to be created dynamically "so the scheduler address is injected into worker
-            # commands". That is not how the library works. The scheduler address, worker
+            # Definitions do NOT have to be created dynamically to get the scheduler
+            # address into worker commands, which is the reason usually given for it.
+            # The library does not work that way: the scheduler address, worker
             # name, --nthreads and --memory-limit all travel as per-run CONTAINER
             # OVERRIDES (`Task._overrides["command"]`, sent on every run_task), so the
             # command baked into a registered definition is never used. Pinning stable
@@ -935,12 +935,11 @@ def ecs_inventory_client(region: str | None = None) -> Any:  # noqa: ANN401 — 
     instead of retrying into a bucket that is still empty. Slower is the intended
     outcome — an enumeration that takes a minute is worth far more than one that fails.
 
-    This mattered because the orphan-fleet sweep is what enumerates: it failed on every
-    scheduled run during a 36-cell ingest (2026-08-03), which is exactly when a leaked
-    fleet is most likely and most expensive. A safety mechanism that fails under load is
-    worse than a slow one. The durable fix is also filed as a quota raise — see
-    ``docs/aws-quota-requests.md`` in yield-embeddings — but the client must not depend
-    on that being granted.
+    The orphan-fleet sweep is the caller that matters: it enumerates in order to stop
+    fleets a dead run left behind, so it runs precisely when the cluster is widest and a
+    leak is most expensive. A safety mechanism that fails under load is worse than a slow
+    one. A quota raise is tracked separately in yield-embeddings
+    ``docs/aws-quota-requests.md``, but this client must not depend on being granted one.
     """
     import boto3
     from botocore.config import Config

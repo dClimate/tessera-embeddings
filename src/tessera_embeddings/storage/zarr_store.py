@@ -104,10 +104,9 @@ def store_write_retrying(log: "logging.Logger | logging.LoggerAdapter[logging.Lo
     Three attempts with exponential backoff, re-raising the last failure, and
     **never retrying** a :data:`CONCURRENT_WRITER_ERRORS` member.
 
-    Shared rather than constructed per site because it was constructed per site: S1's
-    per-date write, S2's per-date write and S2's per-batch write each had their own copy,
-    which is how the exclusion came to be missing from all three at once. One policy in one
-    place cannot half-apply.
+    Shared rather than built per site — S1's per-date write, S2's per-date write and S2's
+    per-batch write all use it — because the exclusion is the part that is easy to omit,
+    and one policy in one place cannot half-apply.
 
     Retrying is safe precisely because a failed write commits NOTHING — every write site
     goes through a single-session commit, so an abandoned attempt is invisible to readers
@@ -1327,9 +1326,8 @@ class RegionWriteBatch:
         caller: the ingest paths read the committed dates and skip what they find, so
         the only way a date they decided to write is already present is that another
         process committed it after that read. Chasing it as a date-derivation bug is a
-        long detour past the actual problem — the second-writer reading is what a
-        2026-08-03 failure turned out to be. A retry bug double-stamping one date is
-        the remaining possibility, and the rarer one.
+        long detour past the actual problem. A retry bug double-stamping one date is the
+        remaining possibility, and the rarer one.
         """
         when_ns = np.asarray(when, dtype="datetime64[ns]")
         existing = read_time_values(self.group)
@@ -1389,7 +1387,10 @@ def batched_region_writes(
     # from the window computes it follows.
     commit_started = time.monotonic()
     session.commit(message)
-    logger.info("Committed '%s' in %.1fs", message, time.monotonic() - commit_started)
+    # DEBUG: one per commit, so one per DATE on the ingest path. The commit duration is
+    # already inside the caller's per-date/per-batch timing line, and every ingest task
+    # runs on a Dask worker whose Prefect logs are shipped to the orchestrator API.
+    logger.debug("Committed '%s' in %.1fs", message, time.monotonic() - commit_started)
 
 
 #: Fan-in of the tree reduction that merges window changesets back into the session.
@@ -1496,7 +1497,11 @@ def _write_windows_overlapped(
         # The single compute: every window's loads, masks and chunk writes in one
         # graph, reduced to one mergeable changeset.
         session.merge(session_merge_reduction(stored, split_every=_MERGE_SPLIT_EVERY))
-    logger.info(
+    # DEBUG, not INFO: emitted once per write — the chattiest line this path produces —
+    # and Prefect ships task logs to the orchestrator API from whichever Dask worker ran
+    # the task, so this scales with total worker count. Its timing is already covered by
+    # the caller's per-date/per-batch timing line.
+    logger.debug(
         "Parallel window compute: %d window(s) across %d date(s) in one graph: %.1fs",
         n_windows,
         len(writes),

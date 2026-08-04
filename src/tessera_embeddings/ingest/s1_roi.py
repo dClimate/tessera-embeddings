@@ -264,6 +264,11 @@ def ingest_s1_roi_sar(
         were written.
     """
     log = log or logging.getLogger(__name__)
+    #: Short identifier for this ROI, stamped on every per-date progress line so a
+    #: fleet-wide log query can attribute a commit to a cell. Derived from the store name
+    #: (``.../zone_47S.zarr`` -> ``zone_47S``) rather than taken as a parameter, so every
+    #: caller gets it without threading one more argument through the flows.
+    roi_label = roi_zarr_path.rstrip("/").rsplit("/", 1)[-1].removesuffix(".zarr")
     roi = read_roi_metadata(roi_zarr_path)
 
     ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path)
@@ -580,13 +585,20 @@ def ingest_s1_roi_sar(
                 # solar day shared across a UTC batch boundary could arrive twice.
                 # Writing it twice would trip the duplicate-date guard mid-run.
                 if date_str in written_dates:
-                    log.info("[%s] Skipping date %s: already written", orbit, date_str)
+                    # DEBUG: on a resume this fires for EVERY date the store already
+                    # holds, so a nearly-complete cell logs one line per committed date
+                    # and Prefect ships each from the Dask worker to the orchestrator.
+                    # The batch summary reports what was written, which is the number
+                    # that matters.
+                    log.debug("[%s] Skipping date %s: already written", orbit, date_str)
                     continue
 
                 if footprint is not None and not footprint:
                     # Reaches no live window at all. Writing it would build a full graph
                     # to store nothing, since all-fill chunks are never persisted.
-                    log.info("[%s] Skipping date %s: imagery reaches no live window", orbit, date_str)
+                    # DEBUG: per skipped date; the count is summarised per batch and in
+                    # the assessed-window record.
+                    log.debug("[%s] Skipping date %s: imagery reaches no live window", orbit, date_str)
                     empty_dates += 1
                     continue
                 date_windows = footprint if (narrow_windows_per_date and footprint) else live_windows
@@ -625,9 +637,16 @@ def ingest_s1_roi_sar(
                 # cost the SUM of its windows' critical paths rather than their
                 # maximum, which is the single largest difference between how S1
                 # and S2 write today.
+                # ``roi=`` is what makes this line attributable at fleet width. A monitor
+                # reading the whole log group cannot otherwise tell WHICH cell a commit
+                # belongs to: the log stream is the Dask worker's ECS task id, and
+                # resolving that to a zone needs a throttled ECS call. Without it the
+                # only answerable question is "is the fleet moving", not "which cell has
+                # stopped" — see yield-embeddings docs/runbooks/campaign-monitoring.md.
                 log.info(
-                    "[%s] S1 stage timings date=%s: write=%.1fs windows=%d of %d mode=%s",
+                    "[%s] S1 stage timings roi=%s date=%s: write=%.1fs windows=%d of %d mode=%s",
                     orbit,
+                    roi_label,
                     date_str,
                     date_s,
                     len(date_windows),

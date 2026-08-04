@@ -42,8 +42,10 @@ COVERAGE_THRESHOLD = 50.0
 PIPELINE_LINE = re.compile(
     r"Pipeline date=(?P<date>\S+): prepare=(?P<prepare>[\d.]+)s hidden=(?P<hidden>[\d.]+)s stall=(?P<stall>[\d.]+)s"
 )
+#: ``roi=`` is part of the contract too: a fleet-wide log query has no other way to say
+#: WHICH cell a commit belongs to, because the log stream is the Dask worker's task id.
 STAGE_LINE = re.compile(
-    r"Stage timings date=(?P<date>\S+): build=(?P<build>[\d.]+)s gate=(?P<gate>[\d.]+)s "
+    r"Stage timings roi=(?P<roi>\S+) date=(?P<date>\S+): build=(?P<build>[\d.]+)s gate=(?P<gate>[\d.]+)s "
     r"write=(?P<write>[\d.]+)s total=(?P<total>[\d.]+)s"
 )
 

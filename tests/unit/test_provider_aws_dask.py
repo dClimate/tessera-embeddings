@@ -746,11 +746,10 @@ class TestStopEcsTasksByTag:
         assert any("ECS_CLUSTER_ARN" in r.getMessage() for r in caplog.records)
 
     def test_the_sweep_paces_itself_into_the_ecs_read_throttle(self, monkeypatch):
-        """Enumerating a wide cluster is ~2 calls per 100 tasks into ECS's TIGHTEST
-        bucket — cluster service resource read, 1 request/second refill, burst 10 — and
-        boto3's default four legacy retries give up partway. The orphan sweep failed on
-        every scheduled run during a 36-cell ingest that way: a safety mechanism going
-        down under exactly the load it exists to clean up.
+        """Enumerating a wide cluster costs several calls per hundred tasks, into the
+        tightest rate bucket ECS has, and boto3's default legacy retries give up partway.
+        Without pacing, the orphan sweep fails under exactly the load it exists to clean
+        up — a safety mechanism that is unavailable when it is most needed.
 
         Asserts the config reaches the client, so reverting to a bare ``boto3.client``
         fails here rather than silently at fleet width.

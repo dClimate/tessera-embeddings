@@ -299,6 +299,9 @@ def ingest_s2_roi_reflectance(
         were returned or zero dates passed the coverage filter.
     """
     log = log or logging.getLogger(__name__)
+    #: Short identifier for this ROI, stamped on every progress line so a fleet-wide log
+    #: query can attribute a commit to a cell — see the note in ``s1_roi``.
+    roi_label = roi_zarr_path.rstrip("/").rsplit("/", 1)[-1].removesuffix(".zarr")
     if batch_dates is not None and batch_dates < 1:
         raise ValueError(f"batch_dates must be >= 1 or None for auto, got {batch_dates}")
     reflectance_store = f"{store_path}/reflectance.zarr"
@@ -474,11 +477,19 @@ def ingest_s2_roi_reflectance(
             if not narrowed:
                 # No live cell is reachable today. Nothing to write, and writing an
                 # empty window set would commit a date holding nothing.
-                log.info("Skipping date: its imagery reaches no live window")
+                # DEBUG: per skipped date; counted in the coverage-filter summary.
+                log.debug("Skipping date: its imagery reaches no live window")
                 return _PreparedDate(date, None, [], build_s, gate_s, "no-live-window")
             date_windows = [(w.y0, w.y1, w.x0, w.x1) for w in narrowed]
             if len(narrowed) != len(run_windows):
-                log.info(
+                # DEBUG, not INFO: this fires once per date, and Prefect ships every task
+                # log line to the orchestrator API from whichever DASK WORKER ran the task
+                # (logging.to_api is on by default). Every worker in every fleet is
+                # therefore an API client, so a per-date INFO line scales with total
+                # worker count rather than with cell count. The per-date TIMING line stays
+                # at INFO because it is the progress signal; this one is detail, and its
+                # numbers appear there too.
+                log.debug(
                     "Date footprint: writing %d of %d live window(s)",
                     len(narrowed),
                     len(run_windows),
@@ -535,7 +546,8 @@ def ingest_s2_roi_reflectance(
         write_s = time.monotonic() - write_started
         prepare_s = prepared.build_s + prepared.gate_s
         log.info(
-            "Stage timings date=%s: build=%.1fs gate=%.1fs write=%.1fs total=%.1fs windows=%d mode=%s",
+            "Stage timings roi=%s date=%s: build=%.1fs gate=%.1fs write=%.1fs total=%.1fs windows=%d mode=%s",
+            roi_label,
             prepared.date,
             prepared.build_s,
             prepared.gate_s,
@@ -588,8 +600,9 @@ def ingest_s2_roi_reflectance(
         write_s = time.monotonic() - write_started
         prepare_s = sum(p.build_s + p.gate_s for p in batch)
         log.info(
-            "Batch timings dates=%s..%s n=%d: build=%.1fs gate=%.1fs write=%.1fs windows=%d "
+            "Batch timings roi=%s dates=%s..%s n=%d: build=%.1fs gate=%.1fs write=%.1fs windows=%d "
             "prepare=%.1fs hidden=%.1fs stall=%.1fs",
+            roi_label,
             batch[0].date,
             batch[-1].date,
             len(batch),
