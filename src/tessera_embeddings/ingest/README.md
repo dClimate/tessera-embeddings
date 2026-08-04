@@ -464,6 +464,27 @@ per passing date (one writable session ── one commit)
   three write sites use (S1 per-date, S2 per-date, S2 per-batch). It is shared because it
   was not: each site had built its own `Retrying`, and the exclusion was missing from all
   three at once.
+- **Reads retry too, and did not used to.** `roi_processing.source_read_retrying` wraps the
+  point where a date's graph is first *computed*. The two sensors reach that point
+  differently, which is why only one of them needed the fix: S1's read happens inside its
+  write's `compute()`, already covered by the write retry, while S2's fires earlier in its
+  coverage gate and so sat outside every retry. One transient failure reading one granule
+  therefore propagated out of S2's per-date loop and failed the whole zone-year, discarding
+  the months the run had already committed. Scoped per date on purpose — a retry at the task
+  level would re-run the entire multi-day loop, which is why `tasks/ingest.py` refuses
+  `@task(retries=...)`. Unlike the write policy it is **not** narrowed by exception type:
+  reads fail through rasterio, GDAL/CPL, botocore and bare socket timeouts, a read is
+  idempotent, and enumerating those surfaces only risks a new transient class becoming fatal.
+- **A failed date must say which date, and on which ROI.** Per-date telemetry is emitted
+  *after* a date commits, so the furthest date in a log is the last one that WORKED — a
+  failure leaves no trace of what was being attempted, and the log reads as progress right up
+  to the point of death. `roi_processing.read_failure_context` closes that on both sensors'
+  per-date paths, emitting `READ FAILED roi=… date=… items=… first=…` with the traceback.
+  The `roi=` field is what makes it attributable: the exception is raised on a Dask worker
+  whose log stream is an ECS task id, so without it the same error text appears for every
+  zone in the fleet and belongs to none of them. The traceback is what recovers rasterio's
+  cause — it reports `Read failed. See previous exception for details.` and that previous
+  exception is GDAL's, discarded unless the chain is logged.
 - **Each date narrows further, to the land its own imagery reaches.** A run's windows
   say where the ROI has land, and are the same on every date; a single date is not, because
   an optical satellite images a fraction of a wide ROI per pass. Windows a date does not

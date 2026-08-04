@@ -49,7 +49,7 @@ from tessera_embeddings.ingest.live_windows import (
 )
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
-from tessera_embeddings.ingest.roi_processing import apply_roi_mask
+from tessera_embeddings.ingest.roi_processing import apply_roi_mask, read_failure_context
 from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
     fixed_day_ranges,
@@ -614,21 +614,27 @@ def ingest_s1_roi_sar(
                 # credential, so renewing only at batch boundaries is what failed.
                 refresh_credentials_if_stale()
                 date_started = time.monotonic()
-                for attempt in store_write_retrying(log):
-                    with attempt:
-                        write_day_windows(
-                            orbit_store,
-                            day_slice,
-                            date_windows,
-                            roi=roi,
-                            manifest=ingest_manifest,
-                            baselines=_baselines_for(baselines, [date_str]),
-                            tile_id=roi_zarr_path,
-                            crs=roi.native_crs,
-                            chunks=INGEST_CHUNKS,
-                            parallel_windows=overlap_window_writes,
-                            s3_region=s3_region,
-                        )
+                # S1's source read happens INSIDE this write's compute, so the write retry
+                # already covers a transient read here. The asymmetry that cost whole cells
+                # was S2's, whose read fires in its coverage gate, outside any retry. What
+                # this path lacked is attribution: once the retry is exhausted the exception
+                # names neither the zone nor the date.
+                with read_failure_context(log, roi=roi_label, date=date_str):
+                    for attempt in store_write_retrying(log):
+                        with attempt:
+                            write_day_windows(
+                                orbit_store,
+                                day_slice,
+                                date_windows,
+                                roi=roi,
+                                manifest=ingest_manifest,
+                                baselines=_baselines_for(baselines, [date_str]),
+                                tile_id=roi_zarr_path,
+                                crs=roi.native_crs,
+                                chunks=INGEST_CHUNKS,
+                                parallel_windows=overlap_window_writes,
+                                s3_region=s3_region,
+                            )
                 date_s = time.monotonic() - date_started
                 write_total_s += date_s
                 written_dates.add(date_str)

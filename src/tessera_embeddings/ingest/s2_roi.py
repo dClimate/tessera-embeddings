@@ -59,7 +59,11 @@ from tessera_embeddings.ingest.live_windows import (
     windows_for_date,
 )
 from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
-from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
+from tessera_embeddings.ingest.roi_processing import (
+    DEFAULT_MIN_VALID_COVERAGE,
+    read_failure_context,
+    source_read_retrying,
+)
 from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
@@ -440,15 +444,22 @@ def ingest_s2_roi_reflectance(
             log.warning("Dropping date: load failed on asset-incomplete STAC item(s): %s", exc)
             return _PreparedDate(date, None, [], time.monotonic() - stage_started, 0.0, "asset-incomplete")
 
+        # The gate is where the graph is first COMPUTED, so it is where a source read
+        # actually fails — `load_stac_items` above only builds. Retried per date and named
+        # on failure: an unretried read here used to propagate out of the loop and fail the
+        # whole zone-year, and its message carried neither the zone nor the date.
         built_at = time.monotonic()
-        passes, any_valid = _coverage_from_scl(
-            day_ds["scl"].isel(time=0),
-            roi_mask,
-            roi_pixel_count,
-            min_valid_coverage,
-            client,
-            windows=live_windows,
-        )
+        with read_failure_context(log, roi=roi_label, date=date, items=day_items):
+            for attempt in source_read_retrying(log):
+                with attempt:
+                    passes, any_valid = _coverage_from_scl(
+                        day_ds["scl"].isel(time=0),
+                        roi_mask,
+                        roi_pixel_count,
+                        min_valid_coverage,
+                        client,
+                        windows=live_windows,
+                    )
         build_s, gate_s = built_at - stage_started, time.monotonic() - built_at
         if not passes:
             return _PreparedDate(date, None, [], build_s, gate_s, "coverage")
