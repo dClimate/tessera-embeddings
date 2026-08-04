@@ -198,9 +198,12 @@ class TestWriteChunk:
           ``to_zarr`` returned. Were it first, a crash in between would leave a tile the
           listing calls complete but every reader rejects: unresumable without manual
           deletion, because re-inference would never be triggered for it.
-        * the previous ``.done`` retracted FIRST — so a tile being rewritten never has a
-          marker vouching for it. Retracting after the rewrite (or not at all) leaves a
-          window in which a listing reports a half-replaced tile as complete.
+        * both markers retracted FIRST — the previous ``.done``, so a tile being
+          rewritten never has one vouching for it (retracting after the rewrite, or not
+          at all, leaves a window in which a listing calls a half-replaced tile
+          complete), and any ``.skipped`` from an attempt where this chunk had no valid
+          pixels, which would otherwise sit beside the new tile and read as an
+          inconsistent artifact.
         """
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
@@ -233,7 +236,7 @@ class TestWriteChunk:
         ):
             writer.write_chunk(chunk, emb, run_id="run1", scales=scales)
 
-        assert seen == ["retract", "tile", "attribute", "done"]
+        assert seen == ["retract:done", "retract:skipped", "tile", "attribute", "done"]
 
     def test_write_chunk_wrong_shape_raises(self, tmp_path):
         staging = str(tmp_path / "staging")
@@ -1074,7 +1077,10 @@ class _RecordingMarkerFS:
         self._inner, self._seen = inner, seen
 
     def rm(self, *args, **kwargs):
-        self._seen.append("retract")
+        # Which marker, not just that one was retracted: write_chunk clears BOTH the
+        # completion marker and any stale skip marker, and the order of the pair
+        # relative to the tile write is the invariant under test.
+        self._seen.append(f"retract:{str(args[0]).rsplit('.', 1)[-1]}")
         return self._inner.rm(*args, **kwargs)
 
     def open(self, *args, **kwargs):
@@ -1811,6 +1817,28 @@ class TestVerifyStagedCompleteness:
         self._stage_chunk(writer, self.CHUNKS[1], "run1")
         writer.write_skip_marker(self.CHUNKS[2], "run1")
 
+        writer.verify_staged_completeness("run1", list(self.CHUNKS))
+
+    def test_a_chunk_that_stops_skipping_clears_its_stale_skip_marker(self, tmp_path):
+        """The mirror of the case below: whichever outcome a chunk reaches, no trace
+        of the other survives.
+
+        A chunk with no valid pixels on one attempt can produce some on the next, after
+        a re-ingested mosaic. Left alone, its old skip marker sits beside the new tile
+        and verification reads the pair as inconsistent — and under the stable,
+        input-fingerprinted run_id that refusal repeats on every retry, so the cell is
+        wedged until someone deletes the marker by hand.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = self.CHUNKS[0]
+        writer.write_skip_marker(chunk, "run1")
+        assert Path(writer._skip_marker_path("run1", chunk)).exists()
+
+        self._stage_chunk(writer, chunk, "run1")  # this attempt has pixels
+
+        assert not Path(writer._skip_marker_path("run1", chunk)).exists()
+        for other in self.CHUNKS[1:]:
+            self._stage_chunk(writer, other, "run1")
         writer.verify_staged_completeness("run1", list(self.CHUNKS))
 
     def test_skip_marker_clears_a_stale_done_marker(self, tmp_path):

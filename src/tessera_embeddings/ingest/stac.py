@@ -310,7 +310,7 @@ def _load_from_stac(
     extra_bands: list[str] | None = None,
     resampling: str = "bilinear",
     crs: str | None = None,
-    groupby: str = "time",
+    groupby: str = "solar_day",
     resolution: int | None = None,
     geobox: GeoBox | None = None,
 ) -> xr.Dataset:
@@ -339,11 +339,14 @@ def _load_from_stac(
               collections whose STAC items lack the proj extension (e.g., OPERA
               RTC-S1 on CMR-STAC). Default None uses the CRS from STAC items.
               Ignored when geobox is provided.
-        groupby: How to group STAC items into time slices. "time" (default)
-              uses each item's exact timestamp. "solar_day" groups items by
-              solar day based on longitude, merging same-pass tiles from
-              adjacent orbits into a single mosaic. Use "solar_day" for
-              ROI-based queries that span multiple tiles.
+        groupby: How to group STAC items into time slices. "solar_day" (default)
+              groups by solar day from longitude, merging same-pass tiles from
+              adjacent orbits into one mosaic — the convention this package uses
+              everywhere, for both sensors. "time" uses each item's exact
+              timestamp, and is only correct for a caller that has NOT had its
+              items solar-day normalised: `query_stac_items` stamps every item to
+              noon of its solar day, so exact-timestamp grouping over those items
+              would collapse a day's separate acquisitions into one plane.
         resolution: Override pixel resolution in metres. When None (default),
               uses collection_config.resolution. Ignored when geobox is provided.
         geobox: Optional odc.geo.geobox.GeoBox specifying the exact output
@@ -798,7 +801,7 @@ def load_stac_items(
     resolution: int | None = None,
     post_load_fn: Callable[[xr.Dataset], xr.Dataset] | None = None,
     preserve_low_values: bool = False,
-    groupby: str = "time",
+    groupby: str = "solar_day",
     geobox: GeoBox | None = None,
 ) -> xr.Dataset:
     """Load STAC items into an xarray Dataset with corrections applied.
@@ -821,7 +824,8 @@ def load_stac_items(
         resolution: Override pixel resolution in metres
         post_load_fn: Optional function applied after loading and correction
         preserve_low_values: Tessera-style baseline correction mode
-        groupby: How to group items into time slices (default "time")
+        groupby: How to group items into time slices (default "solar_day"
+              — see :func:`_load_from_stac` for why "time" is not the default)
         geobox: Optional output grid specification
 
     Returns:
@@ -909,7 +913,7 @@ def ingest_tile(
     item_filter_fn: Callable[[list[Any]], list[Any]] | None = None,
     item_provider_fn: Callable[[], list[Any]] | None = None,
     preserve_low_values: bool = False,
-    groupby: str = "time",
+    groupby: str = "solar_day",
     geobox: GeoBox | None = None,
     mid_longitude: float | None = None,
 ) -> tuple[xr.Dataset | None, dict[str, int]]:
@@ -953,9 +957,10 @@ def ingest_tile(
         preserve_low_values: When True, baseline correction only subtracts
               from pixels >= abs(offset), matching Tessera's harmonize_arr().
               When False (default), subtracts from all pixels.
-        groupby: How to group STAC items into time slices. "time" (default)
-              uses exact timestamps. "solar_day" merges same-day tiles into
-              a single mosaic — use for ROI queries spanning multiple tiles.
+        groupby: How to group STAC items into time slices. "solar_day" (default)
+              merges same-day tiles into one mosaic. "time" uses exact
+              timestamps and does not suit items this package has normalised —
+              see :func:`_load_from_stac`.
         geobox: Optional odc.geo.geobox.GeoBox specifying the exact output
               grid. When provided, overrides bbox/crs/resolution for the load
               step (bbox is still used for the STAC query).

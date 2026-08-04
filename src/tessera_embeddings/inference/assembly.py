@@ -797,10 +797,20 @@ class ZarrWriter:
         # taken in that window would report a tile that is currently incomplete as
         # complete. Retracting first makes the window read as interrupted, which is
         # the truth. No-op on a first write.
+        # The SKIP marker goes too, and for a different reason: a chunk that had no
+        # valid pixels on an earlier attempt and produces some on this one would
+        # otherwise end up carrying both, and verification reads that pair as an
+        # inconsistent artifact and refuses to assemble. Under the stable,
+        # input-fingerprinted run_id that refusal repeats on every retry, wedging the
+        # cell until someone deletes the marker by hand. `write_skip_marker` already
+        # clears a stale tile in the opposite direction; this is the other half of the
+        # same rule — whichever outcome a chunk reaches, it leaves no trace of the
+        # other one.
         done_path = self._done_marker_path(run_id, chunk)
         done_fs = _fs_for(done_path)
-        with contextlib.suppress(FileNotFoundError):
-            done_fs.rm(done_path)
+        for stale in (done_path, self._skip_marker_path(run_id, chunk)):
+            with contextlib.suppress(FileNotFoundError):
+                done_fs.rm(stale)
 
         ds.to_zarr(path, mode="w", encoding=encoding)
         # --- Completion markers, written LAST, in SEPARATE ops after to_zarr returns.

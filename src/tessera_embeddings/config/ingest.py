@@ -107,8 +107,16 @@ class IngestSettings(BaseModel):
     """
 
     # Dask worker bounds for one (zone, year) ingest.
+    #
+    # ``max_workers`` is the S2 fleet's width, and it is what the campaign's cost model is
+    # denominated in: at 60, an S2 fleet plus both S1 orbits comes to the per-cell vCPU
+    # figure every quota ask and wall-clock forecast is built from. It shipped lower than
+    # the planned figure for a while, so code and plan disagreed in opposite directions —
+    # the plan over-stated what a cell costs and therefore under-stated how many fit inside
+    # a quota. Keep this and the campaign's per-cell vCPU figure in step; changing one alone
+    # silently invalidates the other.
     min_workers: int = Field(default=1, ge=1)
-    max_workers: int = Field(default=50, ge=1)
+    max_workers: int = Field(default=60, ge=1)
     # Each S1 orbit's fleet width as a FRACTION of the S2 fleet's, because S1's work is a
     # fixed fraction of S2's rather than a fixed size: measured at 15.5-18.1% of S2 across
     # a 13x span of zone density, so one ratio holds where an absolute count would not.
