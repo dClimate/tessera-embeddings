@@ -115,7 +115,25 @@ class IngestSettings(BaseModel):
     # the plan over-stated what a cell costs and therefore under-stated how many fit inside
     # a quota. Keep this and the campaign's per-cell vCPU figure in step; changing one alone
     # silently invalidates the other.
-    min_workers: int = Field(default=1, ge=1)
+    #
+    # ``min_workers`` defaults to None meaning **follow the derived width**, i.e. a fixed-size
+    # fleet. It used to default to 1, and `cluster.adapt(minimum=1, ...)` then retired workers
+    # in every inter-date gap and relaunched them cold into the next write. Measured
+    # 2026-08-04 across a 35-cell wave: one 60-slot fleet registered **1,250 distinct workers
+    # in five hours** — full turnover roughly every 35 minutes — and the fleets held only
+    # ~85-90% of nominal width, with the scheduler's own health line showing p10 dips to 15-37
+    # workers on max-60 fleets. That is ~10-12% of the width we pay for, spent on Fargate boot
+    # latency inside writes, cold GDAL/HTTP caches, and ECS control-plane churn across the wave.
+    #
+    # Adaptivity bought nothing to offset it: these fleets are busy essentially the whole run
+    # (per-date cadence is build+gate+write+stall with a ~5-8 s remainder), so there is no idle
+    # trough for a minimum of 1 to exploit. The in-account proof is the inference-side ingest
+    # fleets, which set a real minimum and register exactly that many workers once, never
+    # churning.
+    #
+    # Set it explicitly to restore adaptive behaviour — a reference run being compared against
+    # older measurements wants ``min_workers=1`` so the churn is present in both arms.
+    min_workers: int | None = Field(default=None, ge=1)
     max_workers: int = Field(default=60, ge=1)
     # Each S1 orbit's fleet width as a FRACTION of the S2 fleet's, because S1's work is a
     # fixed fraction of S2's rather than a fixed size: measured at 15.5-18.1% of S2 across
@@ -160,9 +178,20 @@ class IngestSettings(BaseModel):
         to bound spend. The uncropped path just hands the provider a nonsense
         range. Cheaper to refuse the config than to reconcile it downstream.
         """
-        if self.max_workers < self.min_workers:
+        if self.min_workers is not None and self.max_workers < self.min_workers:
             raise ValueError(
                 f"max_workers ({self.max_workers}) is below min_workers ({self.min_workers}); "
                 "the worker bounds must be orderable."
             )
         return self
+
+    def floor_for(self, derived_max: int) -> int:
+        """The fleet's minimum, given the width actually derived for one leg.
+
+        ``None`` means follow the derived width, which is what makes a fleet fixed-size. It
+        resolves against the DERIVED max rather than ``max_workers`` because each leg gets its
+        own width — a sparse zone's S2 fleet is clamped below the configured maximum, and each
+        S1 orbit is a fraction of S2 — so resolving against the configured value would ask for
+        more workers than the leg was sized for and never reach its own minimum.
+        """
+        return derived_max if self.min_workers is None else min(self.min_workers, derived_max)

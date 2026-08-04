@@ -169,7 +169,10 @@ _WORKERS_FLOOR = 10
 
 def _scaled_max_workers(live_chunks: int, settings: IngestSettings) -> int:
     """Clamp(0.5 x live chunks) into [max(min_workers, floor), max_workers]."""
-    floor = max(settings.min_workers, min(_WORKERS_FLOOR, settings.max_workers))
+    # `or 1` keeps the pre-sentinel meaning: min_workers used to default to 1, so this
+    # max() was a no-op then and must stay one now. This is a floor on the derived WIDTH,
+    # a different question from the fleet's adaptive minimum — see IngestSettings.floor_for.
+    floor = max(settings.min_workers or 1, min(_WORKERS_FLOOR, settings.max_workers))
     return max(floor, min(settings.max_workers, round(live_chunks * _WORKERS_PER_LIVE_CHUNK)))
 
 
@@ -185,7 +188,10 @@ def _s1_max_workers(s2_max_workers: int, settings: IngestSettings) -> int:
     a 60-worker S2 fleet, and a sparse zone can scale S2 down far enough that the raw
     fraction would round below a single worker.
     """
-    return max(settings.min_workers, min(s2_max_workers, round(s2_max_workers * settings.s1_worker_fraction)))
+    return max(
+        settings.min_workers or 1,
+        min(s2_max_workers, round(s2_max_workers * settings.s1_worker_fraction)),
+    )
 
 
 #: Tag prefix for the S1/S2 ROI ingest runs this flow dispatches.
@@ -420,7 +426,7 @@ async def ingest_zone_year(
         "start_date": start_date,
         "end_date": end_date,
         "store_path": mosaic_base,
-        "min_workers": ingest_settings.min_workers,
+        "min_workers": ingest_settings.floor_for(max_workers),
         "max_workers": max_workers,
         "use_local": use_local,
         # The children open and CREATE the mosaic repos; without this they sign
@@ -453,6 +459,10 @@ async def ingest_zone_year(
                 **common,
                 "orbit": orbit,
                 "batch_days": ingest_settings.batch_days,
+                # Its OWN floor: `common` resolved against the S2 width, and an S1 orbit is a
+                # fraction of it, so inheriting that would request more workers than this leg
+                # was sized for and the fleet could never reach its minimum.
+                "min_workers": ingest_settings.floor_for(s1_workers),
                 "max_workers": s1_workers,
                 "perf_report_uri": f"{perf_base}/s1-{orbit}.html" if perf_base else None,
             },
