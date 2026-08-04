@@ -893,3 +893,30 @@ class TestStableDaskTaskDefinitions:
         cfg = mod.get_fargate_config()
         assert cfg.scheduler_task_definition_arn == "arn:sched-env"
         assert cfg.worker_task_definition_arn == "arn:work-env"
+
+
+class TestDaskContainerEnvironment:
+    """What every Dask container is told, and why one of those things is load-bearing."""
+
+    def test_task_logs_are_not_shipped_to_the_orchestrator_api(self):
+        """Prefect tasks run ON the workers, and each worker's client posts their logs to
+        the API by default — so that traffic scales with total WORKER count rather than
+        with flow-run count, which is the largest client population at campaign width.
+
+        Asserted rather than assumed because the failure is invisible: dropping this key
+        changes nothing observable in a small run and re-adds the dominant API load in a
+        wide one. The logs are still collected — these containers write to stdout, which
+        ECS ships to CloudWatch.
+        """
+        env = _fargate_config().to_cluster_kwargs()["environment"]
+        assert env["PREFECT_LOGGING_TO_API_ENABLED"] == "false"
+
+    def test_caller_supplied_environment_still_wins(self):
+        """A caller override must beat the defaults, including this one — otherwise a
+        run that genuinely wants API logging could not ask for it.
+        """
+        cfg = _fargate_config(environment={"PREFECT_LOGGING_TO_API_ENABLED": "true", "EXTRA": "1"})
+        env = cfg.to_cluster_kwargs()["environment"]
+        assert env["PREFECT_LOGGING_TO_API_ENABLED"] == "true"
+        assert env["EXTRA"] == "1"
+        assert env["AWS_NO_SIGN_REQUEST"] == "YES"  # defaults survive alongside
