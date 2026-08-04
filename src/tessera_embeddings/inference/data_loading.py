@@ -285,19 +285,32 @@ def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.nd
     return indices, compute_doy(times[indices])
 
 
+#: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
+#:
+#: Distinct from an empty request: nobody ASKS for ``"none"``, it is what ``"both"`` resolves
+#: to once probing shows neither orbit wrote a store. Some land has no dual-pol VV+VH radar in
+#: principle — over ice Sentinel-1 runs Extra Wide swath with HH/HV, which the OPERA query
+#: correctly discards — so a zone can be permanently radar-free while the catalogue holds a
+#: hundred thousand granules for it. Requiring a SAR store there fails the cell forever.
+S1_ORBIT_NONE = "none"
+
+
 def _active_orbits(s1_orbit: str) -> tuple[str, ...]:
     """Return the orbit directions active for a given ``s1_orbit`` setting."""
     if s1_orbit == "both":
         return ("ascending", "descending")
+    if s1_orbit == S1_ORBIT_NONE:
+        return ()
     if s1_orbit in {"ascending", "descending"}:
         return (s1_orbit,)
-    raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
+    raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending', 'descending', 'both', or 'none'.")
 
 
 def resolve_s1_orbit(
     mosaic_base: str,
     s1_orbit: str,
     *,
+    allow_none: bool = False,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
 ) -> str:
@@ -345,8 +358,22 @@ def resolve_s1_orbit(
             logger.info("SAR %s store not present at %s — will be excluded", orbit, path)
 
     if not present:
-        msg = f"s1_orbit='both' but no SAR stores found under {mosaic_base}"
-        raise InsufficientCoverageError(msg)
+        if not allow_none:
+            msg = f"s1_orbit='both' but no SAR stores found under {mosaic_base}"
+            raise InsufficientCoverageError(msg)
+        # Opt-in, and only the INGEST opts in. It has just run both orbits and can say in the
+        # log whether the source offered usable items, so a legitimately radar-free ROI and a
+        # lost orbit are distinguishable there. A consumer reading a finished mosaic cannot
+        # tell them apart, so for readers this stays an error: silently embedding without
+        # radar it was asked for is the failure this gate exists to prevent.
+        logger.warning(
+            "s1_orbit='both' and NO SAR store exists under %s — resolving to %r. "
+            "Legitimate where the ROI has no dual-pol VV+VH coverage; check the ingest's "
+            "per-batch item counts to confirm the source offered nothing usable.",
+            mosaic_base,
+            S1_ORBIT_NONE,
+        )
+        return S1_ORBIT_NONE
     if len(present) == 1:
         logger.warning("s1_orbit='both' requested but only %s store is present — falling back", present[0])
         return present[0]

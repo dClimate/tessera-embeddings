@@ -68,6 +68,7 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import ConfigMismatchError, InsufficientCoverageError
 from tessera_embeddings.inference.data_loading import (
+    S1_ORBIT_NONE,
     _active_orbits,
     check_time_window_coverage,
     resolve_s1_orbit,
@@ -309,7 +310,13 @@ async def ingest_zone_year(
         """
         try:
             effective = resolve_s1_orbit(
-                mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+                mosaic_base,
+                s1_orbit,
+                # Only where "both" was a request rather than a demand. An operator who named
+                # one orbit and got no store asked for something specific and must be told.
+                allow_none=(s1_orbit == "both"),
+                get_credentials=iam_icechunk_credentials,
+                s3_region=s3_region,
             )
         except InsufficientCoverageError:
             return None
@@ -490,7 +497,22 @@ async def ingest_zone_year(
     if stores is None:
         msg = f"s1_orbit={s1_orbit!r} but no SAR store was produced for zone {zone} year {year}"
         raise InsufficientCoverageError(msg)
-    effective_orbit = "both" if len(stores) == 3 else stores[-1].rsplit("sar_", 1)[-1].removesuffix(".zarr")
+    # Derived from the COUNT of resolved stores, so the radar-free case is not mistaken for a
+    # single-orbit one: with reflectance alone, `stores[-1]` is the reflectance store and the
+    # old rsplit produced "reflectance" as an orbit name.
+    if len(stores) == 3:
+        effective_orbit = "both"
+    elif len(stores) == 1:
+        effective_orbit = S1_ORBIT_NONE
+        log.warning(
+            "Zone %s year %s has NO radar store — proceeding optical-only. Legitimate where the "
+            "ROI has no dual-pol VV+VH coverage (ice is imaged HH/HV in Extra Wide mode); the "
+            "S1 legs' per-batch item counts say which case this is.",
+            zone,
+            year,
+        )
+    else:
+        effective_orbit = stores[-1].rsplit("sar_", 1)[-1].removesuffix(".zarr")
     check_time_window_coverage(
         mosaic_base,
         window,

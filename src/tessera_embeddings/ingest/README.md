@@ -464,6 +464,19 @@ per passing date (one writable session ── one commit)
   three write sites use (S1 per-date, S2 per-date, S2 per-batch). It is shared because it
   was not: each site had built its own `Retrying`, and the exclusion was missing from all
   three at once.
+- **A zone can have NO usable radar, and that is a finding rather than a failure.** Over ice
+  Sentinel-1 images in Extra Wide swath with HH/HV polarisation, and the OPERA query discards
+  anything that is not dual-pol VV+VH — so an ROI whose land is ice has a catalogue full of
+  granules and not one the ingest can use. Zone 23N (Greenland) returns ~45,000 ascending and
+  ~138,000 descending granules for 2021 and **zero** usable items. Requiring a SAR store there
+  failed the cell permanently, so `resolve_s1_orbit` gained `allow_none`, and `"both"` can now
+  resolve to `S1_ORBIT_NONE`, which activates no orbit and leaves the coverage gate checking
+  reflectance alone. **Only the ingest opts in**: it has just queried both orbits and its
+  per-batch item counts say whether the source offered anything, so it can tell a radar-free
+  ROI from a lost orbit. A consumer reading a finished mosaic cannot, so for readers a missing
+  SAR store stays an error — embedding without radar it was asked for is the failure the gate
+  exists to prevent. An operator who names one orbit is never downgraded either.
+
 - **Reads retry too, and did not used to.** `roi_processing.source_read_retrying` wraps the
   point where a date's graph is first *computed*. The two sensors reach that point
   differently, which is why only one of them needed the fix: S1's read happens inside its
