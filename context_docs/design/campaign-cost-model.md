@@ -19,11 +19,11 @@ rather than buried.
 | | |
 |---|---|
 | Ingest (Fargate) | $115,000 – $126,000 — **under review, see §4: measured velocity is 2.7–4.0× slower than the basis, which would treble this** |
-| **Inference (GPU, on-demand)** | **$503,000 – $579,000**, plan on **$538,000** — **under review DOWNWARD, see §6: measured observations per pixel are ~70 against the census's 145, which would roughly halve this** |
+| **Inference (GPU, on-demand)** | **$503,000 – $579,000**, plan on **$538,000** |
 | Assembly | ~$200 |
 | Mosaic storage (transient) | ~$3,000 |
 | Ray cluster ramp (72 boots, §4) | ~$9,000 |
-| **Campaign total** | **$638,000 – $712,000**, plan on **$672,000** — the ingest line is under review upward and the inference line may move down (§6), so treat this as the current best estimate rather than a bound in either direction |
+| **Campaign total** | **$638,000 – $712,000**, plan on **$672,000** — the ingest line is under review upward (§4); the inference line stands |
 
 **Costed in tokens.** The campaign is **1.98 × 10¹⁵ tokens** — 1.363 × 10¹³ pixels at a
 land-weighted 145 observations per pixel, both halves censused from public catalogues — run
@@ -32,11 +32,11 @@ on: it mixes machine speed with geography, which is why this document rewrote it
 basis three times before switching units (§6). The range carried through is the reference
 ROI's own 13–15K px/s band.
 
-**Two inputs are now measured rather than modelled** (2026-08-04). The inference rate of
-≈1.9M tok/sec is confirmed at three geographies to within 1% (§6), and ingest velocity is
-measured per zone at the campaign's own 60-worker fleet (§4). The tokens-per-pixel census is
-the one headline input still unvalidated, and P2 suggests it may be HIGH — which would move
-inference cost down, so treat the total as an upper bound until that is settled.
+**One input is now measured rather than modelled** (2026-08-04): the inference rate of ≈1.9M
+tok/sec is confirmed at three geographies to within 1% (§6). Ingest velocity was also measured
+and disagrees with the basis by 2.7–4.0× (§4), which is under investigation. The
+tokens-per-pixel census remains the largest unvalidated headline input; §6 records how to
+measure it directly and why P2 could not.
 
 **The model is v1.1.** v2 Large was evaluated and is not being used. Its figures have been
 removed rather than kept alongside, because carrying two columns through every table was
@@ -412,42 +412,39 @@ second is flat to ±1% while pixels per second varies 2.2×. A model denominated
 would have been wrong by up to that factor depending on which site it borrowed from; this one
 is not. The section above argued that from first principles — this is the measurement.
 
-### Observations per pixel are MEASURED, and the census looks roughly 2× high
+### Observations per pixel are measurable directly — but P2 cannot yet judge the census
 
-The runs report the quantity directly. Each `CHUNK_SUMMARY` carries **`t_kept`** — the timesteps
-the pipeline actually kept for that chunk — and `t_kept × valid_px` reproduces the measured
-token rate to within 9%, which is what confirms it is the observations-per-pixel term in
-`tokens = pixels × (T_s2 + T_s1)`.
+The runs report the quantity. Each `CHUNK_SUMMARY` carries **`t_kept`**, the timesteps the
+pipeline actually kept, and `t_kept × valid_px` reproduces the measured token rate to within
+9% — so it *is* the observations-per-pixel term in `tokens = pixels × (T_s2 + T_s1)`. That is
+the useful discovery here: the term is measured per chunk on every run, for free, and never
+needs censusing again.
 
-Over **200 chunks across all three P2 sites**:
+Over 200 chunks across all three P2 sites: `t_kept` spans **55–136**, area-weighted mean
+**69.9**, against the census's **145**.
 
-| | |
-|---|---|
-| `t_kept` range | **55 – 136** |
-| valid-px-weighted mean | **69.9** |
-| census assumption | **145** |
+**Do NOT read that as the census being 2× high.** Four reasons, and the second is disqualifying:
 
-**No single chunk reached 145**, and the weighted mean is less than half of it. The three sites
-were chosen precisely to bracket the census's 120–200 range and came in at 55–136.
+1. **The effective sample is 3, not 200.** Chunks within one ROI share an acquisition history, a
+   cloud climatology and an orbit geometry, so those 200 are heavily correlated and speak to
+   three places.
+2. **P2 ran a 50× stricter keep threshold than the campaign will.** The single-ROI path takes
+   `DEFAULT_MIN_VALID_COVERAGE` from `ingest.roi_processing` = **5.0%**; the campaign path takes
+   `IngestSettings.min_valid_coverage` = **0.1%**. A stricter gate drops more dates, so **P2's
+   `t_kept` is biased LOW relative to the campaign — in precisely the direction of the apparent
+   discrepancy.** On its own this disqualifies the comparison.
+3. **Wrong constellation year.** P2 used a window ending December 2024. Sentinel-1B failed in
+   December 2021 and 1C restored coverage during 2025, so a 2024 window carries thinner radar
+   than the campaign's target years. It matters most where radar dominates: the census gives the
+   boreal site 137 S1 observations against 48 S2.
+4. **Three sites are not land-weighted.** They were chosen to bracket the token range, not to
+   represent campaign land by area.
 
-**There is a mechanism, which is why this is more than a discrepancy.** The census estimates
-cloud-free observations *probabilistically* — distinct acquisition dates × mean `1 − eo:cloud_cover`.
-`t_kept` is what the coverage gate and cloud screening actually kept. Those are different
-quantities, and **`t_kept` is the one that costs GPU time**. A probabilistic estimate that
-assumes partial-cloud dates contribute fractionally will overcount against a pipeline that
-keeps or drops a date whole.
-
-**If 70 rather than 145 is the land-weighted truth, campaign tokens roughly halve and the
-inference line falls with them — from ~$538,000 toward ~$260,000.** That is the largest single
-correction available to this model, and it moves the total *down* by more than the ingest
-finding moves it up.
-
-**What it takes to settle.** Three ROIs cannot establish a land-weighted global mean, however
-many chunks they contribute — the weighting has to span the campaign's actual geography. But
-the measurement needs no new rung: every fill emits `t_kept` per chunk, so aggregating it,
-weighted by `valid_px`, over P3's seven zones and P6's dense zone settles it as a by-product of
-runs already scheduled. **The deliverable is a query, not an experiment.** Until it lands, treat
-145 as an upper bound and the inference line as the pessimistic end.
+**What settles what.** P3 fills seven zones through the *campaign* path, so its `t_kept` removes
+reason 2 — the threshold — and its seven zones weaken reason 1. Neither P3 (2021) nor P2 (2024)
+addresses reason 3, so **a campaign-year comparison needs a fill in a target year**, and reason 4
+needs enough zones to weight by area. Until then **145 stands as the planning figure** and this
+section records only that the term is directly measurable, not that the census is wrong.
 
 **Duty cycle, for the rung that needs it.** Twenty chunk summaries: inference 319.6 s mean
 (min 237, max 358), overhead 58.1 s, prologue 46.6 s, total 377.7 s — **inference is 84.6% of

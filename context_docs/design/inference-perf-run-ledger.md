@@ -162,17 +162,17 @@ Per-chunk duty cycle, from twenty `CHUNK_SUMMARY` records:
 **Inference is 84.6% of chunk wall-clock**, which is the supply-side input P6's duty-cycle
 criterion is a ratio against.
 
-**Observations per pixel are measured here, and the census looks ~2× high.** `t_kept` is the
-timesteps each chunk actually kept, and `t_kept × valid_px` reproduces the measured token rate
-to within 9% — so it *is* the observations-per-pixel term. Over **200 chunks across all three
-sites: range 55–136, valid-px-weighted mean 69.9**, against the census's 145. No chunk reached
-145, and these sites were chosen to bracket 120–200.
+**Observations per pixel are measurable here, but this run cannot judge the census.** `t_kept`
+is the timesteps each chunk actually kept, and `t_kept × valid_px` reproduces the measured token
+rate to within 9% — so it *is* the observations-per-pixel term, measured per chunk on every run.
+Over 200 chunks: range **55–136**, area-weighted mean **69.9**, against the census's 145.
 
-The mechanism matters: the census estimates cloud-free observations probabilistically (dates ×
-mean `1 − eo:cloud_cover`) while `t_kept` is what screening actually kept, and it is `t_kept`
-that costs GPU time. Three ROIs cannot give a land-weighted global mean, but no new rung is
-needed — aggregate `t_kept` weighted by `valid_px` over P3's seven zones and P6's dense zone.
-The query, not an experiment, is the deliverable.
+That is **not** evidence the census is high. This run used the single-ROI path, whose
+`min_valid_coverage` default is **5.0%** against the campaign's **0.1%** — a 50× stricter gate
+that drops more dates and biases `t_kept` LOW in exactly the direction of the gap. Its window
+also ends December 2024, before Sentinel-1C restored radar coverage, and three sites chosen to
+bracket a token range are not land-weighted. See `campaign-cost-model.md` §6 for what settles
+which.
 
 **Two registration bugs surfaced here and both are fixed** (`yield-embeddings`
 `_base.py` / `deploy_flow.py`). The first attempt of all three runs died instantly on
