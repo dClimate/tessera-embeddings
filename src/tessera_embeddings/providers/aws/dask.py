@@ -600,22 +600,15 @@ class FargateConfig:
                 "DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP": "120s",
                 # Use unsigned requests for public S3 buckets (e.g. sentinel-s2-l1c)
                 "AWS_NO_SIGN_REQUEST": "YES",
-                # Do NOT ship task logs to the orchestrator API from Dask containers.
-                #
-                # Prefect tasks execute on the WORKERS, and each worker's Prefect client
-                # posts their log lines to the API by default. That makes every worker in
-                # every fleet an API client, so this traffic scales with total worker count
-                # rather than with the number of flow runs — the largest client population
-                # by a wide margin at campaign width, against a single orchestrator.
-                #
-                # Nothing is lost that we read. These containers log to stdout, which ECS
-                # ships to CloudWatch, and CloudWatch is where fleet-wide monitoring reads
-                # from — the orchestrator cannot answer "which cell is quiet" at width
-                # anyway (see yield-embeddings docs/runbooks/campaign-monitoring.md). The
-                # trade is that per-task log lines no longer appear in the Prefect UI;
-                # flow-level logs still do, because the runner process is not a Dask
-                # container and does not get this variable.
-                "PREFECT_LOGGING_TO_API_ENABLED": "false",
+                # Task logs from Dask containers ship to the orchestrator API — Prefect's
+                # default, kept deliberately. Disabling it is tempting because Prefect tasks
+                # execute on the workers, making every worker an API client and so the
+                # largest client population by count. It was measured and rejected: the
+                # orchestrator's load is dominated by concurrent FLOW RUN count (heartbeats
+                # and state transitions), so removing task logging costs the per-task view
+                # in the UI and buys little. If this ever does need reducing, prefer
+                # PREFECT_LOGGING_TO_API_BATCH_INTERVAL (default 2 s) over disabling it: a
+                # longer interval keeps every line and sends proportionally fewer requests.
             },
             # Keep True. dask-cloudprovider's startup sweep for stale resources
             # from prior runs iterates all IAM roles, which fails on AWS SSO
