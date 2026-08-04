@@ -578,6 +578,16 @@ def ingest_s1_roi_sar(
 
     prepared_batches = pipelined(batch_ranges, _prepare_batch, depth=1) if pipeline_batches else _serially()
 
+    # NOT short-circuited on a run of empty batches, and the reason is worth keeping. Zone 23N
+    # paginates ~182,000 granules across a year to write nothing, so abandoning such an orbit
+    # early is worth roughly 190s -> 59s of catalogue time per zone-year. But "no usable item
+    # yet" is ALSO what a summer-only zone looks like in January, and the two are
+    # indistinguishable from the item count alone — so any threshold on it drops real radar
+    # from seasonally-covered land. The safe signal is the polarisation skip count, which
+    # separates them exactly: granules fetched and all rejected for polarisation is a permanent
+    # property of the terrain, while zero granules fetched is a window with no acquisitions and
+    # may be seasonal. That count is computed in ingest.opera_query and currently only logged;
+    # exposing it through the provider is what this optimisation is waiting on.
     for prepared, stall_s in prepared_batches:
         total_items_seen += prepared.items_seen
         batch_start_str, batch_end_str = prepared.start, prepared.end
