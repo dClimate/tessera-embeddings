@@ -174,17 +174,33 @@ class IngestManifest(StoreManifest):
     append rather than a comparison somebody has to remember to make. That matters
     more now that an interrupted store is RESUMED rather than rebuilt: resume assumes
     the existing pixels were computed from the same mask, and this is what enforces it.
+
+    ``min_valid_coverage`` is here for the same reason, one step further on. The mask
+    says WHERE a date could land; the threshold decides WHICH dates were admitted at
+    all. An interrupted store carries no other record of it, so a resume at a different
+    threshold skips the dates the old one admitted, appends new ones under the new rule,
+    and finishes with a mosaic built to two policies. Validating it turns that into a
+    refusal at the resumed run's first write, before a date commits — which is the
+    campaign's stated contract that a changed parameter raises rather than quietly
+    mixing configurations. Optical-only: the SAR stores have no admission threshold,
+    and their orbit is already in the store name.
     """
 
     roi_manifest_hash: str | None = None
     coverage_sha256: str | None = None
+    min_valid_coverage: float | None = None
 
     @classmethod
-    def from_roi_store(cls, roi_zarr_path: str) -> IngestManifest:
+    def from_roi_store(cls, roi_zarr_path: str, *, min_valid_coverage: float | None = None) -> IngestManifest:
         """Build from an ROI store, chaining the upstream ROI manifest hash.
 
         Args:
             roi_zarr_path: Path to the ROI Zarr store.
+            min_valid_coverage: The admission threshold this ingest applies, for a
+                store whose dates it decides. ``None`` (the SAR stores, which have no
+                such gate) is dropped from the manifest by ``to_dict``, so it neither
+                appears in the store nor moves the hash — which is what keeps this
+                field from invalidating manifests written before it existed.
         """
         coverage_sha: str | None = None
         try:
@@ -198,7 +214,7 @@ class IngestManifest(StoreManifest):
             logger.warning("Could not read _manifest from ROI store %s: %s", roi_zarr_path, exc)
             roi_manifest_dict = None
         roi_mhash = RoiManifest.from_dict(roi_manifest_dict).hash() if roi_manifest_dict else None
-        return cls(roi_manifest_hash=roi_mhash, coverage_sha256=coverage_sha)
+        return cls(roi_manifest_hash=roi_mhash, coverage_sha256=coverage_sha, min_valid_coverage=min_valid_coverage)
 
 
 @dataclass(frozen=True)

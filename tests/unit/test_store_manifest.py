@@ -7,6 +7,8 @@ hash chaining (ROI -> ingest -> embedding), and validation edge cases.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from tessera_embeddings.errors import ConfigMismatchError
@@ -353,3 +355,53 @@ class TestEmbeddingManifestFromUpstreamStores:
         assert m.reflectance_manifest_hash is None
         assert m.sar_manifest_hash is None
         assert m.num_obs_checkpoints == (8, 16)
+
+
+class TestAdmissionThresholdIsPartOfIngestIdentity:
+    """A resumed mosaic must be built to ONE admission policy.
+
+    The mask says where a date could land; `min_valid_coverage` decides which dates were
+    admitted at all, and an interrupted store records it nowhere else. Resuming at a
+    different threshold skips the dates the old run admitted and appends new ones under
+    the new rule, ending with a mosaic built to two policies and a marker claiming one.
+    """
+
+    BASE: ClassVar[dict[str, str]] = {"roi_manifest_hash": "roi-1", "coverage_sha256": "cov-1"}
+
+    def test_a_changed_threshold_is_refused(self):
+        built = IngestManifest(**self.BASE, min_valid_coverage=10.0)
+        resumed = IngestManifest(**self.BASE, min_valid_coverage=30.0)
+
+        with pytest.raises(ConfigMismatchError, match="min_valid_coverage"):
+            resumed.validate_against(built.to_dict(), "s3://m/reflectance.zarr")
+
+    def test_an_identical_resume_proceeds(self):
+        """The guard has to let the ordinary interruption through, or resume is dead."""
+        built = IngestManifest(**self.BASE, min_valid_coverage=10.0)
+        IngestManifest(**self.BASE, min_valid_coverage=10.0).validate_against(
+            built.to_dict(), "s3://m/reflectance.zarr"
+        )
+
+    def test_a_store_predating_the_field_is_not_retro_blocked(self):
+        """Nothing recorded means nothing to contradict — the legacy allowance."""
+        legacy = IngestManifest(**self.BASE).to_dict()
+        assert "min_valid_coverage" not in legacy
+
+        IngestManifest(**self.BASE, min_valid_coverage=30.0).validate_against(legacy, "s3://m/reflectance.zarr")
+
+    def test_the_field_does_not_move_an_existing_hash(self):
+        """What makes this safe to add: `to_dict` drops None, so the digest is unchanged.
+
+        The hash is chained into every embedding store as `reflectance_manifest_hash`, so
+        a field that shifted it would reject appends to stores that are perfectly valid.
+        """
+        before_the_field_existed = {**self.BASE, "manifest_type": "IngestManifest"}
+        round_tripped = IngestManifest.from_dict(before_the_field_existed)
+
+        assert round_tripped.min_valid_coverage is None
+        assert round_tripped.to_dict() == before_the_field_existed
+        assert round_tripped.hash() == IngestManifest(**self.BASE).hash()
+
+    def test_sar_stores_carry_no_threshold(self):
+        """Only the optical store has an admission gate; the SAR ones have no such knob."""
+        assert IngestManifest.from_dict({**self.BASE}).min_valid_coverage is None

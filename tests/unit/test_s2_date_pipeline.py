@@ -189,7 +189,7 @@ def run_ingest(monkeypatch):
         monkeypatch.setattr(s2_roi, "get_existing_dates", lambda *_a, **_k: set(existing_dates or ()))
         monkeypatch.setattr(s2_roi, "read_roi_metadata", lambda *_a, **_k: _ROI)
         monkeypatch.setattr(s2_roi, "read_roi_mask", lambda *_a, **_k: da.ones((SIZE, SIZE), dtype=bool))
-        monkeypatch.setattr(s2_roi, "IngestManifest", SimpleNamespace(from_roi_store=lambda _p: None))
+        monkeypatch.setattr(s2_roi, "IngestManifest", SimpleNamespace(from_roi_store=lambda _p, **_kw: None))
         monkeypatch.setattr(s2_roi, "write_day_windows", write_day_windows)
         monkeypatch.setattr(s2_roi, "write_days_windows", write_days_windows)
 

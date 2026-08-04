@@ -307,7 +307,12 @@ def ingest_s2_roi_reflectance(
     reflectance_store = f"{store_path}/reflectance.zarr"
     roi = read_roi_metadata(roi_zarr_path)
 
-    ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path)
+    # The coverage threshold goes in the manifest because it decides WHICH dates this
+    # store holds, and an interrupted store records it nowhere else — so a resume at a
+    # different threshold would skip the dates the old one admitted and append new ones
+    # under the new rule. Validated on every write, so that refusal lands before the
+    # resumed run commits a date.
+    ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path, min_valid_coverage=min_valid_coverage)
 
     mid_longitude = solar_grouping_longitude(roi)
 
