@@ -247,18 +247,38 @@ the cheap half of the campaign. It does not change the inference line, which §6
    catalogue and one Prefect control plane. The fit was derived on far fewer. Per-cell slowdown
    under fleet-wide load is exactly what an aggregate basis would miss, and it is the most
    likely single explanation.
-2. **Width may not be usable.** Separately measured the same day: two zones at **10** workers
-   reached 8.9 and 6.4 days/h while 53N at **60** reached 14.0 — six times the fleet for under
-   twice the rate. If a sparse zone cannot exploit 60 workers, the fit's 60/S2w width scaling
-   is wrong in the direction that matters, and the per-cell vCPU we pay for is largely idle.
-   **This is under investigation; it is the open question that decides whether the ratio above
-   is a load artefact or a sizing error.**
+2. ~~**Width may not be usable.**~~ **INVESTIGATED, LARGELY WITHDRAWN.** The "six times the
+   fleet for under twice the rate" reading compared *different zones*, and the two 10-worker
+   zones happened to be the two cheapest-per-chunk zones in the wave. **Same-zone width pairs
+   show 6x workers buying 3.7-4.9x** (23N 3.65x, 24N 3.77x, 25N 4.92x), against an Amdahl
+   prediction of 4.4-4.6x from the 7-8% serial fraction measured at 10w. Width works about as
+   well as it can.
+
+   Two real but second-order effects were found. A **per-date serial floor** — build, unhidden
+   preparation stall, gate residual — is **19-24% of every date at 60 workers**, and no width
+   touches it. And `adapt(minimum=1)` costs **~10-12% of effective width**: one 60-slot fleet
+   registered 1,250 distinct workers in five hours, retiring them in every inter-date gap and
+   relaunching them cold into the next write. `min_workers = max_workers` recovers that for free,
+   and the p2 fleets — which set a real minimum — do not churn at all.
+
+   **Width is also nearly cost-NEUTRAL**: vCPU-seconds per date at 60w versus 10w averages ~1.1x
+   over six same-zone pairs. Sixty workers costs about what ten does per date and finishes 4-5x
+   sooner, so re-scaling `max_workers` is not where the money is.
 3. **The fit's own basis** is five regions at R² 0.954, on code that has since changed.
 
-A property this reframes: the fit's per-tile cost implies sparse zones are cheap, and measured
-per-tile cost says the opposite — **53N cost ~$0.14/tile-year against 12N's ~$0.09**, because
-the fleet is sized to 60 either way and the sparse zone cannot use it. Cost per tile is
-therefore U-shaped in density, not falling, and the cheapest cells are mid-density.
+**The per-tile cost gap is intrinsic, not width waste.** 53N costs ~$0.14/tile-year against
+12N's ~$0.09, and the investigation attributes that to 53N doing **1.38x the per-tile work**
+(9.7 vs 7.0 worker-seconds per chunk-date, fewer tiles amortising the same per-date floor) — not
+to an oversized fleet. 53N at 60 workers is still ~80% write-bound, so it *can* use the fleet;
+narrowing sparse zones would recover single-digit percent of campaign ingest compute.
+
+**The unexplained factor is time, not width.** Every zone measured on 2026-08-04 ran **1.8-2.1x
+slower than the July record at the same zone and the same width** — 35N at 60w cost 300-359
+s/date against July's 167.9. That inflates the durations above at *both* widths and no width
+change addresses it. Candidates the data cannot yet separate: source-read contention above the
+~20 cells July measured to, US-daytime load on the public archive, the 2021 catalogue versus the
+2024 dates every July figure used, and post-July config drift. **This, not width, is the open
+question that decides the ingest line.**
 
 Two properties of the fit matter for anything that reasons about *individual* zones rather
 than the aggregate, and the aggregate basis hides both:
