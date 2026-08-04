@@ -120,3 +120,57 @@ Correctness: **bit-identical to phase 4** (output-preserving — the prefetch
 changes *when* the prologue loads, not the tensors), spot-checked across 8
 chunks / ~1.2B px (exact 100%, max|Δ|=0, obs-mismatch 0, cosine 1.0). So the
 phase-4 cross-config comparison vs `main` above carries over unchanged. Full.
+
+## P2 — the rate rung, three geographies — 2026-08-04
+
+Every run above is Iowa. This is the first measurement at more than one geography, and its
+purpose was to settle whether the campaign's throughput unit is tokens or pixels — see
+`campaign-cost-model.md` §6, which had already switched to tokens on argument alone.
+
+Three single-ROI runs via `tessera-full-pipeline`, dispatched at 22:0x UTC, all COMPLETED in
+~151 min. Sites chosen to bracket the token range rather than to be dual-orbit (Cambridge had
+already validated radar-free output, which is what let the rung shrink from six runs to three):
+
+| site | region built | native CRS | area |
+|---|---|---|---|
+| boreal North America (NWT/Yukon) | `p2_boreal` | EPSG:32611 | 63,500 km² |
+| Iowa — the continuity anchor | `iowa` (existing) | EPSG:5070 | 144,700 km² |
+| humid tropics (Amazon) | `p2_amazon` | EPSG:32721 | 96,500 km² |
+
+Aggregated over twelve `g6e.xlarge` actors, from the `tok/sec` line each sub-batch emits:
+
+| | mean | range |
+|---|---|---|
+| **tok/sec per actor** | **1.90 – 1.93 M** | maxima all within 1% of 1,956,110 |
+| **effective TFLOPS** | **85** | 84.7 – 86.2 |
+| px/sec per actor | — | **12,420 – 27,285 (2.2×)** |
+
+**Two results.** The reference rate of ≈1.9M tok/sec is confirmed at three geographies to
+within ~1%, so the cost model's most load-bearing input is no longer a one-ROI figure. And the
+unit question is settled empirically: tokens per second is flat to ±1% across the same twelve
+actors over which pixels per second varies 2.2-fold.
+
+Per-chunk duty cycle, from twenty `CHUNK_SUMMARY` records:
+
+| | mean | min | max |
+|---|---:|---:|---:|
+| `infer_s` | 319.6 | 236.9 | 358.1 |
+| `overhead_s` | 58.1 | 48.2 | 65.5 |
+| `prologue_s` | 46.6 | 41.2 | 52.2 |
+| `total_s` | 377.7 | 298.9 | 423.7 |
+
+**Inference is 84.6% of chunk wall-clock**, which is the supply-side input P6's duty-cycle
+criterion is a ratio against.
+
+**One number to chase, not yet a correction.** Each actor's mean tok/sec over its mean px/sec
+implies **70–153 tok/px** against the census's land-weighted 145. That is a ratio of averages
+over sub-batches of differing valid-pixel density, so it is a weaker basis than the observation
+census — but if the census is high, campaign tokens and inference cost fall with it. Settle by
+counting observations on these three ROIs directly.
+
+**Two registration bugs surfaced here and both are fixed** (`yield-embeddings`
+`_base.py` / `deploy_flow.py`). The first attempt of all three runs died instantly on
+`ObjectNotFound: None` — `tessera-full-pipeline` had no branch routing, so all four of its
+stage refs pointed at prod deployments absent from the branch account. Separately every Ray
+deployment stored an AMI parameter that does not exist, so each dispatch needed a manual
+override. Registration now verifies both.

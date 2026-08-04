@@ -18,12 +18,12 @@ rather than buried.
 
 | | |
 |---|---|
-| Ingest (Fargate) | $115,000 – $126,000 |
+| Ingest (Fargate) | $115,000 – $126,000 — **under review, see §4: measured velocity is 2.7–4.0× slower than the basis, which would treble this** |
 | **Inference (GPU, on-demand)** | **$503,000 – $579,000**, plan on **$538,000** |
 | Assembly | ~$200 |
 | Mosaic storage (transient) | ~$3,000 |
 | Ray cluster ramp (72 boots, §4) | ~$9,000 |
-| **Campaign total** | **$638,000 – $712,000**, plan on **$672,000** |
+| **Campaign total** | **$638,000 – $712,000**, plan on **$672,000** — the ingest line is under review upward and the inference line may move down (§6), so treat this as the current best estimate rather than a bound in either direction |
 
 **Costed in tokens.** The campaign is **1.98 × 10¹⁵ tokens** — 1.363 × 10¹³ pixels at a
 land-weighted 145 observations per pixel, both halves censused from public catalogues — run
@@ -31,6 +31,12 @@ at a reference **≈1.9M tok/sec** per worker. Pixels-per-second is a derived fi
 on: it mixes machine speed with geography, which is why this document rewrote its throughput
 basis three times before switching units (§6). The range carried through is the reference
 ROI's own 13–15K px/s band.
+
+**Two inputs are now measured rather than modelled** (2026-08-04). The inference rate of
+≈1.9M tok/sec is confirmed at three geographies to within 1% (§6), and ingest velocity is
+measured per zone at the campaign's own 60-worker fleet (§4). The tokens-per-pixel census is
+the one headline input still unvalidated, and P2 suggests it may be HIGH — which would move
+inference cost down, so treat the total as an upper bound until that is settled.
 
 **The model is v1.1.** v2 Large was evaluated and is not being used. Its figures have been
 removed rather than kept alongside, because carrying two columns through every table was
@@ -219,6 +225,41 @@ h/zone-year at 60 workers, against the basis's 6.36 — a 6.5% agreement.** They
 conflict, and neither was the "~10 h versus ~21 h" spread seen elsewhere in these documents:
 that is one dense zone at 120 workers and at 50, via the same width model.
 
+### MEASURED 2026-08-04, and it is 2.7–4.0× SLOWER than the fit predicts
+
+Three virgin zones ingested from scratch at the campaign's own 60-worker fleet, rate taken over
+a 47-minute steady-state window so cluster startup is excluded. Calendar-days of optical
+imagery committed per wall-clock hour, projected to a full year:
+
+| zone | live 4096-chunks | fit s/date | fit h/zone-year | **measured h** | ratio |
+|---|---:|---:|---:|---:|---:|
+| 53N | 890 | 63.8 | 6.5 | **26.1** | **4.0×** |
+| 12N | 1,551 | 103.6 | 10.5 | **28.5** | **2.7×** |
+| 37N | 2,309 | 149.2 | 15.1 | **47.4** | **3.1×** |
+
+Mean measured **34.0 h/zone-year** against the aggregate basis's **6.36**. **If this holds, the
+ingest line is not $115,000–$126,000 but roughly three times that** — and ingest stops being
+the cheap half of the campaign. It does not change the inference line, which §6 now confirms.
+
+**Do not repoint the model on this yet.** Three confounds, in the order they could matter:
+
+1. **Concurrency.** These ran while ~40 cells were live in one account, sharing S3, the source
+   catalogue and one Prefect control plane. The fit was derived on far fewer. Per-cell slowdown
+   under fleet-wide load is exactly what an aggregate basis would miss, and it is the most
+   likely single explanation.
+2. **Width may not be usable.** Separately measured the same day: two zones at **10** workers
+   reached 8.9 and 6.4 days/h while 53N at **60** reached 14.0 — six times the fleet for under
+   twice the rate. If a sparse zone cannot exploit 60 workers, the fit's 60/S2w width scaling
+   is wrong in the direction that matters, and the per-cell vCPU we pay for is largely idle.
+   **This is under investigation; it is the open question that decides whether the ratio above
+   is a load artefact or a sizing error.**
+3. **The fit's own basis** is five regions at R² 0.954, on code that has since changed.
+
+A property this reframes: the fit's per-tile cost implies sparse zones are cheap, and measured
+per-tile cost says the opposite — **53N cost ~$0.14/tile-year against 12N's ~$0.09**, because
+the fleet is sized to 60 either way and the sparse zone cannot use it. Cost per tile is
+therefore U-shaped in density, not falling, and the cheapest cells are mid-density.
+
 Two properties of the fit matter for anything that reasons about *individual* zones rather
 than the aggregate, and the aggregate basis hides both:
 
@@ -350,6 +391,39 @@ observed one.
 
 **The campaign is 1.98 × 10¹⁵ tokens** — 1.363 × 10¹³ pixels at a land-weighted **145 tokens
 per pixel**. At the reference worker rate of **≈1.9M tok/sec** that is 289,000 GPU-hours.
+
+### The rate is now measured at three geographies, not one — and it held
+
+**P2 ran 2026-08-04**: three single-ROI inference runs spanning the token range (boreal
+NWT/Yukon, Iowa, Amazon). Across twelve `g6e.xlarge` actors:
+
+| | measured |
+|---|---|
+| tok/sec per actor | **1.90 – 1.93 M**, every maximum within 1% of 1.95 M |
+| effective TFLOPS | **85**, flat across all twelve |
+| px/sec per actor | **12,420 – 27,285** — a **2.2× spread** |
+
+**The reference rate is confirmed** — the ≈1.9M this document has costed on since it switched
+units is what three geographies deliver, to within about 1%. That is the single most load-
+bearing input in the model and it is no longer a one-ROI figure.
+
+**And the units argument is settled empirically.** Over the same twelve actors, tokens per
+second is flat to ±1% while pixels per second varies 2.2×. A model denominated in pixels
+would have been wrong by up to that factor depending on which site it borrowed from; this one
+is not. The section above argued that from first principles — this is the measurement.
+
+**One figure to re-examine, NOT yet a correction.** Dividing each actor's mean tok/sec by its
+mean px/sec implies **70–153 tok/px**, below the census's land-weighted 145. That is a ratio of
+averages over sub-batches of differing valid-pixel density, so it is a weaker basis than the
+observation census and must not simply replace it — but if the census is high, campaign tokens
+and therefore inference cost fall proportionally. **Settle it by counting observations on the
+three P2 ROIs directly** and comparing against what the census predicts for those coordinates.
+
+**Duty cycle, for the rung that needs it.** Twenty chunk summaries: inference 319.6 s mean
+(min 237, max 358), overhead 58.1 s, prologue 46.6 s, total 377.7 s — **inference is 84.6% of
+chunk wall-clock**. The remaining ~15% is prologue and staged-write overhead.
+
+Raw figures and per-actor breakdown: `context_docs/design/inference-perf-run-ledger.md`.
 
 > **This document quoted px/s for three revisions and rewrote the throughput basis three
 > times because of it.** Each rewrite was really an argument about how to convert one
