@@ -20,8 +20,8 @@ import xarray as xr
 import zarr
 
 import tessera_embeddings.inference.assembly as _assembly_mod
-from tessera_embeddings.config.inference import EMBEDDING_DIM
-from tessera_embeddings.config.store_layout import INNER_PX
+from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE
+from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX, SINGLE
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     OBS_COUNT_VARS,
@@ -30,14 +30,16 @@ from tessera_embeddings.inference.assembly import (
     AllChunksSkippedError,
     IncompleteStageError,
     ZarrWriter,
+    _layout_matching_store,
     _partition_bands,
     _s3_budget_split,
     _staged_storage_options,
+    _write_granularity,
 )
-from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.conventions import ENCODER_VERSION
 from tessera_embeddings.inference.quantization import quantize_embeddings
-from tessera_embeddings.storage.global_store import create_global_repo, open_global_repo
+from tessera_embeddings.storage.global_store import create_global_repo, create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.zarr_store import TIME_ENCODING, open_or_create_repo, open_store
 
 
@@ -1271,6 +1273,186 @@ class TestPartitionBands:
         for (_, stop), (start, _) in itertools.pairwise(bands):
             assert stop == start, "bands must tile [0, total_y) with no gaps or overlap"
             assert stop % granularity == 0, "interior boundaries must land on the write granularity"
+
+
+class TestSingleRoiChainIsAligned:
+    """The single-ROI chain end to end, at the real tile size, on the real geometry.
+
+    Everything smaller than this passes whatever geometry it is handed: the assembly
+    unit tests build their own tiny grids, and nothing else drives enumerate → stage →
+    assemble together. So this is the test that would notice the chain coming
+    unaligned — a retuned tile size, a layout edit, a band split creeping back.
+    """
+
+    #: 1.5 tiles across: a whole 2048 shard AND a ragged edge in one run.
+    TOTAL = 3000
+
+    #: Band width for the staged arrays. The geometry under test is SPATIAL, and the
+    #: band axis costs 16x here — a full-width 2048x2048x128 float32 tile is ~2 GiB
+    #: before quantization, which is not a thing to allocate in a unit suite. The
+    #: property that matters (the band axis is never split) is preserved: with a
+    #: narrower array the layout's 128-wide chunk clamps to the full width, so
+    #: `chunks[3] == array width` still asserts it. `test_store_layout` pins the
+    #: nominal 128 against a full-size shape, where it costs nothing.
+    BAND = 8
+
+    def _stage_and_assemble(self, tmp_path, roi_mask: str):
+        chunks = enumerate_chunks(self.TOTAL, self.TOTAL, chunk_size=INFERENCE_CHUNK_SIZE)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=self.BAND)
+        rng = np.random.default_rng(0)
+        staged = {}
+        for chunk in filter_chunks_by_roi_mask(chunks, roi_mask):
+            emb, scales = _quantized_embeddings(rng, chunk.height, chunk.width, dim=self.BAND)
+            writer.write_chunk(chunk, emb, "run1", scales=scales)
+            staged[chunk.label] = emb
+        output = str(tmp_path / "out.zarr")
+        writer.assemble(
+            chunks,
+            total_y=self.TOTAL,
+            total_x=self.TOTAL,
+            run_id="run1",
+            output_path=output,
+            roi_zarr_path=roi_mask,
+            n_workers=1,
+        )
+        return staged, open_store(output)
+
+    @pytest.fixture(scope="class")
+    def full_roi_run(self, tmp_path_factory):
+        """One assemble over a full-coverage ROI, shared by the tests that read it.
+
+        Class-scoped because assembling a 3000-px mosaic is the expensive part and
+        three assertions do not each need their own copy of it.
+        """
+        tmp_path = tmp_path_factory.mktemp("aligned_chain")
+        return self._stage_and_assemble(tmp_path, _make_full_roi_mask(tmp_path, self.TOTAL, self.TOTAL))
+
+    def test_output_geometry_matches_the_campaign(self, full_roi_run):
+        """Chunks and shards are the campaign's, so nothing rechunks."""
+        _, ds = full_roi_run
+
+        emb = ds["embeddings"]
+        assert emb.encoding["chunks"][:3] == (1, INNER_PX, INNER_PX)
+        assert emb.encoding["shards"][:3] == (1, SHARD_PX, SHARD_PX)
+        # The band axis is one piece (D2): a pixel's whole embedding is one object.
+        assert emb.encoding["chunks"][3] == emb.shape[3]
+        assert ds["scales"].encoding["shards"] == (1, SHARD_PX, SHARD_PX)
+
+    def test_one_inference_tile_is_one_output_shard(self):
+        """The identity the alignment exists for, asserted on the enumerated grid."""
+        chunks = enumerate_chunks(self.TOTAL, self.TOTAL, chunk_size=INFERENCE_CHUNK_SIZE)
+        whole = [c for c in chunks if c.height == INFERENCE_CHUNK_SIZE and c.width == INFERENCE_CHUNK_SIZE]
+        assert whole, "expected at least one full-size tile"
+        for chunk in whole:
+            assert chunk.y_start % SHARD_PX == 0 and chunk.x_start % SHARD_PX == 0
+            assert chunk.height == SHARD_PX and chunk.width == SHARD_PX
+
+    def test_values_land_where_they_were_staged(self, full_roi_run):
+        """Whole tiles and the ragged edge both round-trip to their own footprints."""
+        staged, ds = full_roi_run
+
+        result = ds["embeddings"].values[0]
+        for chunk in enumerate_chunks(self.TOTAL, self.TOTAL, chunk_size=INFERENCE_CHUNK_SIZE):
+            got = result[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop, :]
+            np.testing.assert_array_equal(got, staged[chunk.label], err_msg=chunk.label)
+
+    def test_outside_the_roi_stays_at_fill(self, tmp_path):
+        """A chunk the ROI excludes is never staged and never written."""
+        mask = _make_partial_roi_mask(tmp_path, self.TOTAL, self.TOTAL, x_true_stop=SHARD_PX)
+        staged, ds = self._stage_and_assemble(tmp_path, mask)
+
+        assert set(staged) == {"chunk_0_0", "chunk_1_0"}, "only the left column intersects"
+        result = ds["embeddings"].values[0]
+        assert (result[:, SHARD_PX:, :] == 0).all(), "excluded footprint must read back as fill"
+
+
+class TestVariablesAddedToAnExistingStore:
+    """A variable joining an existing store adopts THAT store's geometry.
+
+    Every data variable must agree on a write granularity — `_write_granularity`
+    raises otherwise, since two disagreeing arrays would let separate forks share an
+    output object. So creating one array at the current preset's pitch inside a store
+    tiled differently does not make a merely mixed store, it makes an unassemblable
+    one. A store written before a preset changed still takes appends, and gaining a
+    variable must not be what breaks it.
+    """
+
+    LEGACY_CHUNK = 500
+    SHAPE = (1, 3000, 3000)
+
+    def _legacy_store(self, tmp_path) -> str:
+        """A store on a pitch the current preset does not use, with no obs counts."""
+        path = str(tmp_path / "legacy.zarr")
+        repo, _ = open_or_create_repo(path)
+        session = repo.writable_session("main")
+        root = zarr.open_group(session.store, mode="a")
+        root.create_array(
+            "embeddings",
+            shape=(*self.SHAPE, EMBEDDING_DIM),
+            chunks=(1, self.LEGACY_CHUNK, self.LEGACY_CHUNK, EMBEDDING_DIM // 32),
+            dtype="int8",
+            fill_value=0,
+            dimension_names=("time", "northing", "easting", "band"),
+        )
+        root.create_array(
+            "scales",
+            shape=self.SHAPE,
+            chunks=(1, self.LEGACY_CHUNK, self.LEGACY_CHUNK),
+            dtype="float32",
+            fill_value=float("nan"),
+            dimension_names=("time", "northing", "easting"),
+        )
+        session.commit("a store on the old pitch")
+        return path
+
+    def _add(self, path, variables):
+        repo, _ = open_or_create_repo(path)
+        session = repo.writable_session("main")
+        root = zarr.open_group(session.store, mode="a")
+        create_layout_arrays(
+            root,
+            _layout_matching_store(root, SINGLE, variables),
+            variables,
+            {"time": 1, "northing": 3000, "easting": 3000, "band": EMBEDDING_DIM},
+        )
+        return root
+
+    def test_added_variables_keep_the_store_assemblable(self, tmp_path):
+        """The regression: obs counts at the preset's pitch made assembly raise."""
+        root = self._add(self._legacy_store(tmp_path), list(OBS_COUNT_VARS))
+
+        assert _write_granularity(root, ["embeddings", "scales", *OBS_COUNT_VARS]) == self.LEGACY_CHUNK
+
+    def test_geometry_is_copied_per_rank(self, tmp_path):
+        """3-D vars follow `scales`, 4-D vars follow `embeddings` — including its band split."""
+        root = self._add(self._legacy_store(tmp_path), ["s2_obs_count", "embedding_std"])
+
+        assert root["s2_obs_count"].chunks == root["scales"].chunks
+        assert root["s2_obs_count"].shards is None
+        assert root["embedding_std"].chunks == root["embeddings"].chunks
+
+    def test_only_geometry_is_borrowed_not_dtype_or_fill(self, tmp_path):
+        """The donor supplies tiling; the variable keeps its own type and fill."""
+        root = self._add(self._legacy_store(tmp_path), ["s2_obs_count"])
+
+        assert root["s2_obs_count"].dtype == np.uint16  # not scales' float32
+        assert root["s2_obs_count"].fill_value == 0  # not scales' NaN
+
+    def test_a_fresh_store_still_gets_the_current_preset(self, tmp_path):
+        """With nothing to match, the layout is used unchanged."""
+        path = str(tmp_path / "fresh.zarr")
+        repo, _ = open_or_create_repo(path)
+        session = repo.writable_session("main")
+        root = zarr.open_group(session.store, mode="a")
+        create_layout_arrays(
+            root,
+            _layout_matching_store(root, SINGLE, ["embeddings"]),
+            ["embeddings"],
+            {"time": 1, "northing": 3000, "easting": 3000, "band": EMBEDDING_DIM},
+        )
+
+        assert root["embeddings"].chunks == (1, INNER_PX, INNER_PX, EMBEDDING_DIM)
+        assert root["embeddings"].shards == (1, SHARD_PX, SHARD_PX, EMBEDDING_DIM)
 
 
 class TestAssemblyValidation:

@@ -7,8 +7,9 @@ import numpy as np
 import pytest
 import zarr
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM
-from tessera_embeddings.config.store_layout import GLOBAL, OBS_COUNT_VARS, SINGLE
+from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE
+from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
+from tessera_embeddings.config.store_layout import GLOBAL, OBS_COUNT_VARS, SHARD_PX, SINGLE
 
 
 def test_global_embeddings_geometry():
@@ -29,10 +30,35 @@ def test_global_scales_is_sharded_pcodec():
     assert np.isnan(k["fill_value"])
 
 
-def test_single_embeddings_unsharded():
-    k = SINGLE.for_var("embeddings").create_kwargs((1, 500, 500, EMBEDDING_DIM))
-    assert k["chunks"] == (1, 500, 500, EMBEDDING_DIM // 32)
-    assert "shards" not in k
+def test_single_matches_global_geometry():
+    """One geometry, two names: the presets must agree, array for array.
+
+    A divergence puts the single-ROI path back to rechunking at every hop.
+    """
+    assert SINGLE.arrays.keys() == GLOBAL.arrays.keys()
+    for var in GLOBAL.arrays:
+        single, global_ = SINGLE.for_var(var), GLOBAL.for_var(var)
+        assert (single.dims, single.chunks, single.shards) == (global_.dims, global_.chunks, global_.shards), var
+        assert (single.dtype, single.codec) == (global_.dtype, global_.codec), var
+
+
+def test_single_embeddings_are_sharded_full_band():
+    k = SINGLE.for_var("embeddings").create_kwargs((1, 4096, 4096, EMBEDDING_DIM))
+    assert k["chunks"] == (1, 256, 256, EMBEDDING_DIM)  # band never split (D2)
+    assert k["shards"] == (1, 2048, 2048, EMBEDDING_DIM)
+
+
+def test_the_inference_tile_is_one_shard():
+    """`INFERENCE_CHUNK_SIZE` copies `SHARD_PX` as a literal — pin them together.
+
+    It cannot import it: `store_layout` imports `EMBEDDING_DIM` from
+    `config.inference`, so the dependency runs one way only. Drift means every
+    tile straddles a shard boundary and assembly read-modify-writes each one.
+    """
+    assert INFERENCE_CHUNK_SIZE == SHARD_PX
+    # ...and the ingest chunk is a whole number of tiles, so a tile read never
+    # spans more storage chunks than it has to.
+    assert INGEST_CHUNK_SIZE % SHARD_PX == 0
 
 
 def test_obs_vars_resolve_and_unknown_raises():

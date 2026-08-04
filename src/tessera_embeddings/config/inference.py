@@ -271,22 +271,16 @@ DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 # module scope (the Fargate flow runner has no torch).
 PREFETCH_DEPTH = 2
 
-# Default spatial read-tile size for inference. This default is the SINGLE-ROI
-# tile size only: the global campaign passes ``chunk_size=SHARD_PX`` (2048)
-# explicitly so one inference tile is exactly one output shard (ADR-008 D3), and
-# never reads this value. So the number here is chosen for the single-ROI output
-# geometry, whose chunks are 500 px (config.store_layout.SINGLE) — 2000 is 4x500,
-# so every tile covers whole output chunks and assembly writes them outright. A
-# tile size that does NOT divide 500 leaves a partial output chunk at each tile
-# boundary, which assembly must read-modify-write sequentially inside one fork;
-# do not "unify" this with the global 2048 without changing SINGLE's chunking
-# too. The *resident input working set* is bounded separately via density-sized
-# northing strips (see actors._strip_height_for_density), so a tile's peak host
-# RAM is capped by a per-strip byte budget rather than fixed by T x H x W.
-# Sparse chunks load in one full-height strip; only dense chunks split.
-# Independent of the storage chunk size written at ingest
-# (config.ingest.INGEST_CHUNK_SIZE).
-INFERENCE_CHUNK_SIZE = 2000
+# Spatial read-tile size for inference, on both paths: one tile is exactly one
+# 2048-px output shard (ADR-008 D3), so assembly writes whole shards instead of
+# read-modify-writing a partial output chunk at each tile edge. A literal rather
+# than an import of ``store_layout.SHARD_PX`` — that module imports EMBEDDING_DIM
+# from this one — and ``test_store_layout`` pins the two together.
+#
+# A tile's peak host RAM is not T x H x W: the resident input working set is
+# bounded by density-sized northing strips (actors._strip_height_for_density),
+# so sparse tiles load in one full-height strip and only dense ones split.
+INFERENCE_CHUNK_SIZE = 2048
 
 
 @final

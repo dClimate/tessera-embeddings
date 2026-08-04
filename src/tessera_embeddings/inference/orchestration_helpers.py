@@ -13,11 +13,15 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+import icechunk
+
 from tessera_embeddings.config.inference import InferenceConfig, TimeWindow
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks_from_dataset
 from tessera_embeddings.inference.data_loading import _active_orbits
-from tessera_embeddings.storage.manifest import extract_manifest
-from tessera_embeddings.storage.zarr_store import open_store, open_store_as_zarr_group
+from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
+from tessera_embeddings.storage.zarr_store import is_missing_repo, open_store, open_store_as_zarr_group
+
+logger = logging.getLogger(__name__)
 
 
 def read_upstream_manifests(
@@ -46,6 +50,75 @@ def read_upstream_manifests(
         root = open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
         manifests[name] = extract_manifest(dict(root.attrs))
     return manifests
+
+
+def embedding_store_path(output_bucket: str, roi_name: str, output_name_suffix: str = "") -> str:
+    """Where a single-ROI run's embeddings land.
+
+    One definition, because the preflight gate and the assembly task must target
+    the same store — a divergence would validate one path and write another.
+    """
+    return f"{output_bucket.rstrip('/')}/embeddings/{roi_name}{output_name_suffix}.zarr"
+
+
+def build_embedding_manifest(
+    *,
+    config: InferenceConfig,
+    mosaic_base: str | None,
+    get_credentials: Callable[[], Any] | None = None,
+    s3_region: str | None = None,
+) -> EmbeddingManifest:
+    """The append-safety manifest for a run: model, sampler, upstream ingest identity."""
+    return EmbeddingManifest.from_upstream_stores(
+        model_checkpoint=checkpoint_to_version(config.checkpoint_path),
+        num_obs_checkpoints=config.num_obs_checkpoints,
+        upstream_manifests=(
+            read_upstream_manifests(mosaic_base, config.s1_orbit, get_credentials=get_credentials, s3_region=s3_region)
+            if mosaic_base
+            else {}
+        ),
+    )
+
+
+def assert_output_store_accepts(
+    *,
+    output_bucket: str,
+    roi_name: str,
+    output_name_suffix: str,
+    config: InferenceConfig,
+    mosaic_base: str | None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+    get_credentials: Callable[[], Any] | None = None,
+    s3_region: str | None = None,
+) -> None:
+    """Reject an append the output store cannot accept, before any compute is provisioned.
+
+    ``assemble`` validates this manifest anyway, but only once inference has run —
+    so a model or upstream-ingest change against an existing store fails after the
+    GPU bill rather than before it. Metadata-only: one root-attrs read of a store
+    that may not exist yet.
+
+    A store that is absent (first run) or carries no manifest (written before
+    manifests existed) is not a failure — ``validate_against`` treats the latter as
+    a legacy store and warns.
+
+    Raises:
+        ConfigMismatchError: If the existing store's manifest disagrees.
+    """
+    _log = log or logger
+    path = embedding_store_path(output_bucket, roi_name, output_name_suffix)
+    try:
+        root = open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
+    except FileNotFoundError:
+        return  # nothing to append to yet
+    except icechunk.IcechunkError as exc:
+        if is_missing_repo(exc):
+            return
+        raise
+    build_embedding_manifest(
+        config=config, mosaic_base=mosaic_base, get_credentials=get_credentials, s3_region=s3_region
+    ).validate_against(extract_manifest(dict(root.attrs)), path)
+    _log.info("Existing output store %s accepts this run's configuration", path)
 
 
 def checkpoint_to_version(checkpoint_path: str) -> str:

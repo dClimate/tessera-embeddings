@@ -1,0 +1,56 @@
+# Laptop end-to-end at a size that exercises the output chunk grid.
+#
+# Run with:
+#     python -m tessera_embeddings.orchestration.runners.plain \
+#         examples/quickstart/config-5km.yaml
+#
+# Same AOI and settings as config.yaml, widened from ~1 km to 5.12 km.
+#
+# WHY THIS SIZE. config.yaml's ROI is 86 x 111 px — smaller than one 256-px
+# inner chunk, so every array in the output store clamps to a single chunk and
+# the run says nothing about the store's real geometry:
+#
+#     quickstart  111 x 86 px  -> chunks (1,111,86,128)   1x1 chunks, 1x1 per shard
+#     this        515 x 513 px -> chunks (1,256,256,128)  3x3 chunks, 2x2 per shard
+#                                 shards (1,512,512,128)
+#
+# So this run exercises real 256-px inner chunks at the full 128-band width,
+# more than one chunk per shard, PCodec on the sharded float arrays, and ragged
+# edge chunks (the rasterised grid lands at 515 x 513, not a round 512).
+#
+# What it still does NOT cover: FULL 2048-px shards, and assembly banding across
+# shard boundaries. A whole shard is 20.5 km at 10 m, so that needs a ~30 km ROI
+# (~9M px) — far past a laptop CPU run. `TestSingleRoiChainIsAligned` covers that
+# shape at 3000 px by staging tiles directly, without inference.
+#
+# COST. ~27x the pixels of config.yaml. Ingest grows with area; CPU inference
+# grows with pixels x observations. Budget hours, not minutes.
+
+paths:
+  inputs: file:///tmp/tessera-5km/inputs
+  outputs: file:///tmp/tessera-5km/outputs
+
+roi:
+  name: laptop_5km_denver_co
+  geojson: examples/quickstart/roi-5km.geojson
+  resolution: 10.0
+  chunk_size: 2048
+  force_crs: "EPSG:32613"
+
+time_range:
+  start: "2024-07-01"
+  end: "2024-08-01"
+
+time_window_end: "August 2024"
+
+s1_orbit: both
+
+n_workers: 2
+
+checkpoint_url: https://huggingface.co/geotessera/TESSERA-V-1.1/resolve/main/tessera_v1_1_aws_encoder.pt
+
+checkpoint_dir: null
+
+device: auto
+
+storage_options: null

@@ -14,16 +14,19 @@ plain zarr assignment, and the coordinator merges the forks and commits once
 :mod:`tessera_embeddings.storage.shard_writer`). No task graph is ever built
 over the store, so assembly cost scales with the *live* pixels, not the grid.
 
-Two write-conflict regimes, one engine:
+One inference tile is one 2048-px output shard on both paths (ADR-008 D3), so
+nothing rechunks. Two write strategies:
 
-* **Single-ROI** (``assemble``): output chunks (500 px) don't align with the
-  2048-px inference tiles, so workers partition the mosaic into *northing bands
-  aligned to the output write granularity* — no two forks ever touch the same
-  output chunk, and x-boundary partial chunks are read-modify-written
-  sequentially inside one fork (icechunk sessions are read-your-writes).
-* **Global** (``assemble_global``): one inference tile == one 2048-px shard
-  (ADR-008 D3), so whole tiles round-robin across workers via
-  :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` — every
+* **Single-ROI** (``assemble``): workers partition the mosaic into *northing
+  bands aligned to the output write granularity*, so no two forks ever touch the
+  same output object and each tile is read by exactly one band. A mosaic whose
+  extent is not a whole number of shards has ragged edge tiles; their partial
+  chunks are read-modify-written sequentially inside one fork (icechunk sessions
+  are read-your-writes).
+* **Global** (``assemble_global``): the zone grid is seeded to whole shards, so
+  there are no ragged edges and no banding is needed — whole tiles round-robin
+  across workers via
+  :func:`~tessera_embeddings.storage.shard_writer.write_year_shards`, and every
   shard object is emitted once, lean, with ocean inner chunks elided.
 """
 
@@ -329,6 +332,40 @@ def _write_granularity(node: zarr.Group, variables: Iterable[str]) -> int:
     if len(set(sizes.values())) != 1:
         raise ValueError(f"Data variables disagree on northing write granularity: {sizes}")
     return next(iter(sizes.values()))
+
+
+def _layout_matching_store(root: zarr.Group, layout: StoreLayout, variables: Iterable[str]) -> StoreLayout:
+    """*layout*, with each missing variable's geometry taken from the store it joins.
+
+    A variable added to an EXISTING store must adopt that store's chunk and shard
+    geometry, not the current preset's. Every data variable has to agree on a write
+    granularity — :func:`_write_granularity` raises otherwise, because two disagreeing
+    arrays would let separate forks share an output object — so creating one array at a
+    different pitch from its siblings does not produce a merely mixed store, it makes
+    the store unassemblable. A store written before a preset changed still accepts
+    appends, and gaining a variable must not be what breaks it.
+
+    Geometry is copied from an existing array of the same rank (there always is one:
+    ``embeddings`` and ``scales`` are mandatory, covering 4-D and 3-D). Only chunks and
+    shards are taken; dtype, fill value and codec stay the layout's, since those are
+    properties of the variable rather than of the store's tiling. Falls through to the
+    layout unchanged for a rank nothing in the store shares.
+    """
+    donors: dict[int, tuple[tuple[int, ...], tuple[int, ...] | None]] = {}
+    for name, array in root.arrays():
+        if name not in layout.arrays:
+            continue  # coordinates and time_bnds tile on their own terms
+        donors.setdefault(array.ndim, (array.chunks, array.shards))
+
+    adjusted = dict(layout.arrays)
+    for var in variables:
+        original = layout.for_var(var)
+        donor = donors.get(len(original.dims))
+        if donor is None:
+            continue
+        chunks, shards = donor
+        adjusted[var] = dataclasses.replace(original, chunks=chunks, shards=shards)
+    return dataclasses.replace(layout, arrays=adjusted)
 
 
 def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns a ForkSession
@@ -1384,10 +1421,13 @@ class ZarrWriter:
         # the pickled session, so no save_config round-trip is needed.
         per_worker_cap = max(1, TARGET_AGGREGATE_S3_CONCURRENCY // max(1, n_workers))
 
-        # Manifest split (same tiling as the old engine): each spatial axis at
-        # 32 chunks/shard (~16k px at 500-px chunks) and time at 1 shard per
-        # timestep, so a one-timestep write rewrites no prior year's manifests.
-        with manifest_split({"northing": 32, "easting": 32, "time": 1}):
+        # Time-only, matching the global store (zarr_store.global_store_config)
+        # and the rule documented there: split the axis along which a single
+        # commit is NARROW. An assemble writes ONE timestep across the whole
+        # spatial extent, so time@1 keeps a write off every prior timestep's
+        # manifests, while a spatial split would only shard the axis this commit
+        # rewrites in full — more manifest objects for the same refs.
+        with manifest_split({"time": 1}):
             repo, is_new = open_or_create_repo(
                 output_path,
                 max_concurrent_requests=per_worker_cap,
@@ -1486,7 +1526,7 @@ class ZarrWriter:
             if missing:
                 nt = cast(zarr.Array, root["time"]).shape[0]
                 sizes = {"time": nt, "northing": total_y, "easting": total_x, "band": self.embedding_dim}
-                create_layout_arrays(root, layout, missing, sizes)
+                create_layout_arrays(root, _layout_matching_store(root, layout, missing), missing, sizes)
                 _log.info("Created missing variable(s) %s in %s from layout %s", missing, output_path, layout.name)
             time_index_found = time_index_of(root, time_date)
             if time_index_found is not None:

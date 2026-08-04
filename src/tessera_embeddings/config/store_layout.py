@@ -5,17 +5,22 @@ shard shape, dtype, fill value, and codec. It is the single source of truth that
 both the empty-store seeder and the shard writer consult, so seeding and writing
 can never disagree about geometry.
 
-Two presets (ADR-008 D2/D3):
+``SINGLE`` and ``GLOBAL`` are two names for ONE geometry (ADR-008 D2/D3), built
+from one definition so they cannot drift: ``(1, 256, 256, 128)`` full-band int8
+inner chunks in ``(1, 2048, 2048, 128)`` shards for ``embeddings``, with the 3-D
+companion arrays (``scales``, ``embedding_std``, obs counts) on the same 2048²
+spatial shards. **Both `embeddings` and `scales` are sharded** — leaving `scales`
+unsharded caps the object-count win (d3v2 E4). PCodec composes with the sharding
+codec (verified: round-trip + fill on partial shards).
 
-* ``SINGLE`` — today's single-ROI output: ``(1, 500, 500, 4)`` unsharded
-  embeddings, PCodec floats. Default for existing single-ROI entry points so
-  vanilla users are unaffected (D8).
-* ``GLOBAL`` — the global campaign: ``(1, 256, 256, 128)`` full-band int8
-  inner chunks in ``(1, 2048, 2048, 128)`` shards for ``embeddings``; the 3-D
-  companion arrays (``scales``, ``embedding_std``, obs counts) share the same
-  2048² spatial shards. **Both `embeddings` and `scales` are sharded** — leaving
-  `scales` unsharded caps the object-count win (d3v2 E4). PCodec composes with
-  the sharding codec (verified: round-trip + fill on partial shards).
+One shard is one inference tile is a quarter of one ingest chunk, so the chain
+divides evenly end to end and nothing rechunks.
+
+A layout is read only when a store — or a variable missing from one — is CREATED,
+never to reshape an array that already exists. A variable joining an EXISTING store
+takes that store's chunk and shard geometry rather than the preset's (see
+``inference.assembly._layout_matching_store``): every data variable must agree on a
+write granularity, so a store tiled by an older preset stays appendable.
 """
 
 from __future__ import annotations
@@ -144,41 +149,43 @@ def _obs(chunks: tuple[int, ...], shards: tuple[int, ...] | None, codec: str) ->
     return dict.fromkeys(OBS_COUNT_VARS, layout)
 
 
-# Today's single-ROI output, reproduced exactly (D8 — vanilla users unaffected).
-# Band split into 4 (== EMBEDDING_DIM // 32), unsharded; PCodec floats; raw obs.
-# ``embedding_std`` is 4-D (per-band std, mirroring ``embeddings``) as the
-# historical engine wrote it; it is never produced under v1.1 (deterministic
-# sampling forces ``compute_std=False``) but the schema must stay faithful.
-SINGLE = StoreLayout(
-    name="single",
-    arrays={
-        "embeddings": ArrayLayout(DIMS_4D, (1, 500, 500, EMBEDDING_DIM // 32), "int8", 0, _ZSTD),
-        "scales": ArrayLayout(DIMS_3D, (1, 500, 500), "float32", float("nan"), _PCODEC),
-        "embedding_std": ArrayLayout(DIMS_4D, (1, 500, 500, EMBEDDING_DIM // 32), "float32", float("nan"), _PCODEC),
-        **_obs((1, 500, 500), None, _RAW),
-    },
-)
-
-#: The 2048-px shard pitch (also the aligned inference tile size) and the
-#: 256-px inner-chunk size — the single numeric source the GLOBAL preset
-#: is built from, so the constants and the preset cannot drift.
+#: The 2048-px shard pitch — also the inference read-tile size, so one tile is
+#: exactly one shard (ADR-008 D3; ``config.inference.INFERENCE_CHUNK_SIZE`` is
+#: pinned to this by a test, since importing it here would be circular) — and
+#: the 256-px inner-chunk size. The single numeric source both presets are built
+#: from, so the constants and the presets cannot drift.
 SHARD_PX: int = 2048
 INNER_PX: int = 256
 
-# The global campaign: 256-px full-band inner chunks in 2048² shards; scales
-# sharded the same way (D3). 8x8 = 64 inner chunks per shard. ``embedding_std``
-# mirrors ``scales``' treatment (float32 + PCodec, same spatial shards) on its
-# natural per-band 4-D dims; never produced under v1.1 (see SINGLE note).
 _INNER_4D = (1, INNER_PX, INNER_PX, EMBEDDING_DIM)
 _SHARD_4D = (1, SHARD_PX, SHARD_PX, EMBEDDING_DIM)
 _INNER_3D = (1, INNER_PX, INNER_PX)
 _SHARD_3D = (1, SHARD_PX, SHARD_PX)
-GLOBAL = StoreLayout(
-    name="global",
-    arrays={
+
+
+def _sharded_arrays() -> dict[str, ArrayLayout]:
+    """The embedding-store geometry: 256-px full-band inner chunks in 2048² shards.
+
+    8x8 = 64 inner chunks per shard; the band axis is never split (D2), so a
+    reader gets a pixel's whole 128-dimensional embedding from one object.
+    ``embedding_std`` is 4-D and mirrors ``scales``' float32 + PCodec treatment;
+    v1.1's deterministic sampling forces ``compute_std=False``, so it is declared
+    but never written.
+
+    A fresh dict per call: ``StoreLayout.arrays`` is mutable, and two presets
+    sharing one instance would let a mutation of either reach both.
+    """
+    return {
         "embeddings": ArrayLayout(DIMS_4D, _INNER_4D, "int8", 0, _ZSTD, shards=_SHARD_4D),
         "scales": ArrayLayout(DIMS_3D, _INNER_3D, "float32", float("nan"), _PCODEC, shards=_SHARD_3D),
         "embedding_std": ArrayLayout(DIMS_4D, _INNER_4D, "float32", float("nan"), _PCODEC, shards=_SHARD_4D),
         **_obs(_INNER_3D, _SHARD_3D, _ZSTD),
-    },
-)
+    }
+
+
+#: Single-ROI output. Its own name because callers pass a preset explicitly and
+#: the name lands in the store's creating commit message.
+SINGLE = StoreLayout(name="single", arrays=_sharded_arrays())
+
+#: The global campaign (ADR-008 D3).
+GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays())

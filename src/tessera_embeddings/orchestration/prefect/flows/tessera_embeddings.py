@@ -41,6 +41,7 @@ from tessera_embeddings.inference.assembly import AllChunksSkippedError, ZarrWri
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
+    assert_output_store_accepts,
     build_inference_config,
     enumerate_mosaic_chunks,
 )
@@ -196,6 +197,11 @@ def tessera_embeddings(
         raise ValueError("Only one of assembly_only, inference_only can be True")
     if dev_params.assembly_only and not dev_params.previous_run_id:
         raise ValueError("assembly_only=True requires previous_run_id")
+    # Decidable from parameters, so decide it before anything is provisioned:
+    # run_inference rejects this too, but only from inside the Ray context, after
+    # a GPU cluster has been paid for. Mirrors fill_zone_year.
+    if not dev_params.assembly_only and num_actors < 1:
+        raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
 
     run_id = _resolve_run_id(
         dev_params.previous_run_id, allow_s2_only=allow_s2_only, assembly_only=dev_params.assembly_only
@@ -283,11 +289,33 @@ def tessera_embeddings(
         s3_region=s3_region,
     )
 
+    # Same structural check `assemble` makes before extending an existing store —
+    # model, sampler checkpoints, upstream ingest identity — run HERE, on metadata
+    # only, so an append that can never be accepted is rejected before a GPU fleet
+    # is provisioned rather than after the whole inference is paid for.
+    #
+    # Only on runs that will actually append. `assembly_only` reaches assemble
+    # immediately, which validates for itself; `inference_only` returns after
+    # staging and never touches the output store, so gating it would block a
+    # legitimate dev run — staging a new checkpoint against an ROI whose published
+    # store was written by a different one — over an append it is not making.
+    if not (dev_params.assembly_only or dev_params.inference_only):
+        assert_output_store_accepts(
+            output_bucket=output_bucket,
+            roi_name=roi_name,
+            output_name_suffix=dev_params.output_name_suffix,
+            config=config,
+            mosaic_base=mosaic_base,
+            log=log,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+        )
+
     # Lazily import the AWS Ray provider so the embeddings flow file
     # can be inspected (for arch tests) on machines without ray
     # installed. The provider is only needed when the flow actually
     # runs.
-    from tessera_embeddings.providers.aws.ray import ray_cluster
+    from tessera_embeddings.providers.aws.ray import make_instance_terminator, ray_cluster
 
     assemble_kwargs: dict[str, Any] = {
         "chunk_size": chunk_size or INFERENCE_CHUNK_SIZE,
@@ -346,6 +374,14 @@ def tessera_embeddings(
             t0=t0,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
+            # Terminate the EC2 instance behind each retired idle actor at once,
+            # rather than holding idle GPU nodes to the end of the run on the Ray
+            # autoscaler's idle timeout, which is unreliable after ray.kill()
+            # (providers/aws/gotchas.md). Actors go idle at the tail, while the
+            # last chunks finish, so this is where a run stops paying for GPUs it
+            # is done with. The callback runs driver-side; its boto3 client never
+            # ships to a worker. Matches fill_zone_year.
+            on_actor_retire=make_instance_terminator(log=log),
         )
     deactivate()
 

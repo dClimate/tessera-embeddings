@@ -39,7 +39,7 @@ Input stores (Icechunk/Zarr on S3):
   reflectance.zarr / sar_ascending.zarr / sar_descending.zarr
             │
             ▼
-  enumerate_chunks_from_dataset()     ← 2048 px tiles (global) / 2000 px (single ROI)
+  enumerate_chunks_from_dataset()     ← 2048 px tiles (== one output shard)
             │
             ▼
   filter_chunks_by_roi_mask()         ← drop chunks outside the ROI
@@ -89,18 +89,25 @@ Input stores (Icechunk/Zarr on S3):
 ### 1. Chunk Enumeration and ROI Pre-Filter
 
 The input mosaic is divided into a grid of square `ChunkSpec` tiles (edge chunks may be
-smaller). ~2k px balances peak RAM during inference (~10 GB vs. ~37 GB at 3000 px) against
-scheduling overhead. **The exact size is chosen to divide the OUTPUT chunking**, so assembly
-writes whole chunks instead of read-modify-writing a partial one at every tile boundary:
+smaller). **2048 px on both paths** (`INFERENCE_CHUNK_SIZE`, equal to `SHARD_PX`; the global
+campaign also passes it explicitly): ~2k px balances peak RAM during inference (~10 GB vs.
+~37 GB at 3000 px) against scheduling overhead, and one tile is exactly one output shard
+(ADR-008 D3), so assembly writes whole shards instead of read-modify-writing a partial
+chunk at every tile boundary.
 
-| Path | Tile | Output geometry | Why |
-| --- | --- | --- | --- |
-| Global campaign | **2048** (`SHARD_PX`, passed explicitly by `fill_zone_year`) | 256-px inner chunks in 2048² shards | 1 tile = 1 whole shard (ADR-008 D3) |
-| Single ROI | **2000** (`INFERENCE_CHUNK_SIZE`, the default) | 500-px chunks (`store_layout.SINGLE`) | 2000 = 4×500, so a tile is a whole 4×4 chunk block |
+The whole chain divides evenly, so nothing rechunks between stages:
 
-The read-tile size is independent of the store's on-disk chunk size: the mosaic is written with
-larger 4096×4096 chunks at ingest (`INGEST_CHUNK_SIZE`), and `load_chunk` reads its sub-tile out
-of them via `zarr.Array.oindex` with no alignment requirement.
+```text
+  4096 px          2048 px            2048 px           256 px
+  ingest chunk  →  inference tile  →  output shard  →   inner chunk
+  (INGEST_       (INFERENCE_        (SHARD_PX)        (INNER_PX,
+   CHUNK_SIZE)    CHUNK_SIZE)                          full 128 band)
+    2×2 tiles      1 tile =                             8×8 per shard
+    per chunk      1 shard
+```
+
+`load_chunk` still reads its sub-tile via `zarr.Array.oindex` and imposes no alignment
+requirement of its own — the alignment is what makes each read cover whole objects.
 
 `filter_chunks_by_roi_mask` then drops any chunk whose footprint does not intersect the ROI
 zarr mask produced by `generate_roi`. Only the surviving **live chunks** are dispatched to
@@ -563,21 +570,24 @@ The output geometry comes from a `StoreLayout` preset (`config/store_layout.py`)
 same source of truth the global store's seeder uses — not from the staged files:
 
 ```text
-Preset       embeddings                          scales / obs / std
+Preset            embeddings                       scales / obs / std
 ──────────────────────────────────────────────────────────────────────────
-SINGLE       (1, 500, 500, 4)  int8+zstd         (1, 500, 500)  PCodec / raw
-             unsharded — today's single-ROI      unsharded
-GLOBAL    (1, 256, 256, 128) int8+zstd        (1, 256, 256)  PCodec/zstd
-             in (1, 2048, 2048, 128) shards      in (1, 2048, 2048) shards
+SINGLE + GLOBAL   (1, 256, 256, 128) int8+zstd     (1, 256, 256) PCodec/zstd
+(one geometry)    in (1, 2048, 2048, 128) shards   in (1, 2048, 2048) shards
 ```
+
+Both presets describe the same geometry and are built from one definition; the names
+survive because a caller picks one explicitly and the choice is recorded in the store's
+creating commit.
 
 #### Write-conflict discipline: northing bands
 
-Two forks writing the same output chunk would conflict at merge, and SINGLE's 500-px
-chunks don't align with 2048-px tiles. So workers partition the mosaic into **northing
-bands aligned to the output's write granularity** (shard height when sharded, chunk height
-otherwise) — bands are disjoint and span the full easting extent, so no two forks ever
-touch the same output object. Band boundaries are **work-weighted** (live tiles per
+Two forks writing the same output object would conflict at merge, so workers partition the
+mosaic into **northing bands aligned to the output's write granularity** (shard height when
+sharded, chunk height otherwise) — bands are disjoint and span the full easting extent, so
+no two forks ever touch the same object. Because the tile size equals the shard pitch, band
+boundaries fall on tile edges and each tile is read by exactly one fork. Band boundaries are
+**work-weighted** (live tiles per
 granularity unit), not equal-height: an ROI mask clusters live tiles spatially, and
 equal-height bands would leave most workers idle while one dragged the assembly:
 
@@ -683,13 +693,14 @@ TARGET_AGGREGATE_S3_CONCURRENCY // n_workers`; forks inherit it through pickling
 `save_config` round-trip needed), so fleet-wide PUT concurrency stays under S3's
 per-prefix ceiling regardless of worker count.
 
-**Manifest splitting.** `assemble` opens the repo under
-`manifest_split({"northing": 32, "easting": 32, "time": 1})`. By default icechunk keeps
-one manifest object per array, so every commit rewrites the entire chunk index — O(store
-size) regardless of how few chunks changed. Splitting tiles the manifest into
-32-chunk-per-axis spatial shards (~16k px at 500-px chunks) plus one shard per timestep,
-so a one-timestep write rewrites no prior timestep's manifests. The global store bakes
-its own split (`time@1`) into the repo config at seeding (`global_store_config`).
+**Manifest splitting.** `assemble` opens the repo under `manifest_split({"time": 1})`. By
+default icechunk keeps one manifest object per array, so every commit rewrites the entire
+chunk index — O(store size) regardless of how few chunks changed. One manifest shard per
+timestep means a one-timestep write rewrites no prior timestep's manifests. Time-only,
+because the rule is to split the axis a single commit is **narrow** along: an assemble
+writes one timestep across the full spatial extent, so a spatial split would only shard the
+axis being rewritten in full. The global store bakes the same `time@1` split into its repo
+config at seeding (`global_store_config`).
 
 The split applies to both new and pre-existing stores. A store created before this change
 has a single unsplit manifest; the first write under the `manifest_split` block re-shards
@@ -701,8 +712,8 @@ reads back unchanged), and every commit after it rewrites only the shards it tou
 a floating-point-aware serializer that models the distribution of float values directly
 and beats general-purpose codecs on this kind of data. The tradeoff is that PCodec
 decompresses the entire on-disk chunk to read any slice of it (no partial decode), which
-is why the inner chunks stay small (500 px single / 256 px global). PCodec composes with
-the sharding codec (verified: round-trip + fill on partial shards).
+is why the inner chunks stay small (256 px). PCodec composes with the sharding codec
+(verified: round-trip + fill on partial shards).
 
 **Reading the output store.** On a CONUS-scale store, open with `chunks=None` for
 interactive or selective reads:
