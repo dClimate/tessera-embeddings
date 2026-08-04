@@ -416,17 +416,24 @@ def check_time_window_coverage(
         months = times.astype("datetime64[M]").astype(int) % 12 + 1
         present_months = set(zip(years.tolist(), months.tolist(), strict=True))
 
+        # At least one timestamp INSIDE the window, whichever mode this is. A store with
+        # only out-of-window dates is non-empty but useless: the loaders filter to the
+        # window and raise on an empty index, so without this the preflight passes, a GPU
+        # fleet is provisioned, and the run fails at the first read.
+        #
+        # Applies to the STRICT mode too, which is not redundant with its every-month
+        # rule. An assessed window can explain every absent month away (see below), and
+        # that path can empty the missing list entirely — so a store the ingest examined
+        # and wrote nothing into would otherwise sail through the one gate that exists to
+        # fail before provisioning.
+        if not (present_months & required_months):
+            msg = (
+                f"{label} store at {path} has no timestamps within the window "
+                f"{earliest[0]}-{earliest[1]:02d}..{latest[0]}-{latest[1]:02d}"
+            )
+            raise InsufficientCoverageError(msg)
+
         if skip_coverage_check:
-            # Partial-window mode still requires at least one timestamp INSIDE the
-            # window — a store with only out-of-window (e.g. prior-year) dates is
-            # non-empty but useless, and must not pass the preflight / be marked
-            # ingested only for the fill to later find zero in-window observations.
-            if not (present_months & required_months):
-                msg = (
-                    f"{label} store at {path} has no timestamps within the window "
-                    f"{earliest[0]}-{earliest[1]:02d}..{latest[0]}-{latest[1]:02d}"
-                )
-                raise InsufficientCoverageError(msg)
             continue
 
         # Require EVERY month of the window to be present, not just that the

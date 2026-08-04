@@ -271,3 +271,42 @@ class TestCheckTimeWindowCoverage:
         tw = parse_time_window("July 2025")
         with pytest.raises(InsufficientCoverageError, match="no time entries"):
             check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending", skip_coverage_check=True)
+
+    def test_an_assessed_window_cannot_excuse_a_store_with_no_in_window_dates(self, monkeypatch):
+        """STRICT mode needs the in-window guard too, despite its every-month rule.
+
+        An `assessed_window` says a month was examined and held nothing reachable, which
+        is a finding rather than a gap — but it can explain away EVERY month of the
+        window, emptying the missing list. A store the ingest looked at and wrote nothing
+        into would then pass the one gate that exists to fail before a GPU fleet is
+        provisioned, and the run would die at the first read instead, because the loaders
+        raise on an empty filtered index.
+        """
+        import tessera_embeddings.inference.data_loading as dl
+
+        def _open_store(path, **kwargs):
+            # Dates from a PRIOR year only: non-empty, but nothing the window can use.
+            root = _make_time_group("2023-01-01", "2023-12-31")
+            root.attrs["assessed_window"] = ["2024-08-01", "2025-07-31"]  # the whole window
+            return root
+
+        monkeypatch.setattr(dl, "open_store_as_zarr_group", _open_store)
+        tw = parse_time_window("July 2025")
+        with pytest.raises(InsufficientCoverageError, match="no timestamps within the window"):
+            check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending")
+
+    def test_an_assessed_window_still_excuses_absent_months_when_data_exists(self, monkeypatch):
+        """The guard must not undo what the assessed window is FOR.
+
+        A store holding part of the window, with the rest examined and empty, is the
+        legitimate sparse-zone case and has to keep passing.
+        """
+        import tessera_embeddings.inference.data_loading as dl
+
+        def _open_store(path, **kwargs):
+            root = _make_time_group("2024-08-01", "2024-10-31")  # first 3 months only
+            root.attrs["assessed_window"] = ["2024-08-01", "2025-07-31"]
+            return root
+
+        monkeypatch.setattr(dl, "open_store_as_zarr_group", _open_store)
+        check_time_window_coverage("s3://fake/mosaic", parse_time_window("July 2025"), s1_orbit="ascending")

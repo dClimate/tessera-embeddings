@@ -251,8 +251,17 @@ async def ingest_zone_year(
     """
     log = get_run_logger()
 
-    # Lazy AWS import so the flow file imports on non-AWS machines (arch tests).
-    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+    # Lazy AWS import so the flow file imports on non-AWS machines (arch tests), and
+    # skipped entirely under `use_local`: the documented dev path runs against local
+    # stores that need no IAM callback, and importing the provider anyway made it
+    # require botocore — so an install without the optional `aws` extra could not reach
+    # the local branch it was told to use. `None` is what every store open below means
+    # by "no callback", so local mode simply passes that.
+    iam_icechunk_credentials: _Creds = None
+    if not use_local:
+        from tessera_embeddings.providers.aws import credentials as _aws_credentials
+
+        iam_icechunk_credentials = _aws_credentials.iam_icechunk_credentials
 
     # Validate the orbit FIRST. It is part of the ingest fingerprint, so a typo makes
     # every correctly-marked mosaic look stale — and the stale branch below deletes

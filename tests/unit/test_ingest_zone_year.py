@@ -451,3 +451,22 @@ def test_a_rootless_store_is_resumed_rather_than_wedging_every_retry(wired, monk
     # and the prefix stayed wedged. It is now skipped whenever a store is incomplete.
     assert result["status"] == "ingested"
     assert wired["arun"], "the rootless store must be resumed, which means children run"
+
+
+def test_local_mode_does_not_require_the_aws_provider() -> None:
+    """The documented dev path must be reachable without the optional `aws` extra.
+
+    `use_local=True` runs against local stores that need no IAM callback, but the flow
+    imported `providers.aws.credentials` unconditionally before reaching the branch —
+    so an install without botocore could not use the mode it was told to use. Asserted
+    as source, because the failure is an ImportError on a machine that HAS the extra
+    installed, and a test cannot uninstall it.
+    """
+    import inspect
+
+    import tessera_embeddings.orchestration.prefect.flows.ingest_zone_year as mod
+
+    source = inspect.getsource(mod.ingest_zone_year.fn)
+    line = next(i for i, ln in enumerate(source.splitlines()) if "providers.aws" in ln)
+    guard = next(i for i, ln in enumerate(source.splitlines()) if "if not use_local:" in ln)
+    assert guard < line, "the AWS provider import must sit inside the non-local branch"
