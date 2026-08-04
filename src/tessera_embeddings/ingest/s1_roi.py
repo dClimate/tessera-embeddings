@@ -761,16 +761,25 @@ def ingest_s1_roi_sar(
         # WARNING and not INFO because it is nearly always worth a human's attention — the
         # legitimate case (the source does not cover this ROI for this orbit) is rare, and
         # indistinguishable from the illegitimate one WITHOUT this line naming which it was.
-        log.warning(
-            "[%s] WROTE NO DATES roi=%s window=%s..%s: items_seen=%d empty_dates=%d — "
-            "items_seen=0 means the source covers this ROI for this orbit not at all; "
-            "items_seen>0 means they were found and none survived to a commit",
+        # ``already_held`` is what keeps this from crying wolf on a RESUME. A leg re-run over a
+        # store that already holds everything it can hold legitimately writes nothing, and a
+        # warning that fires on every such run is one the reader learns to skip — the same
+        # failure as the empty-commit warning this file's assessed-window record used to emit.
+        already_held = len(written_dates)
+        log.log(
+            logging.INFO if already_held else logging.WARNING,
+            "[%s] WROTE NO DATES roi=%s window=%s..%s: items_seen=%d empty_dates=%d "
+            "already_held=%d — items_seen=0 means the source covers this ROI for this orbit "
+            "not at all; items_seen>0 with already_held>0 is a resume that had nothing left to "
+            "add; items_seen>0 with already_held=0 means items were found and none survived to "
+            "a commit",
             orbit,
             roi_label,
             start_date,
             end_date,
             total_items_seen,
             empty_dates,
+            already_held,
         )
         return SarIngestResult(
             roi_path=roi_zarr_path,
