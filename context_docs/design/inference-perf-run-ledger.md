@@ -162,11 +162,17 @@ Per-chunk duty cycle, from twenty `CHUNK_SUMMARY` records:
 **Inference is 84.6% of chunk wall-clock**, which is the supply-side input P6's duty-cycle
 criterion is a ratio against.
 
-**One number to chase, not yet a correction.** Each actor's mean tok/sec over its mean px/sec
-implies **70–153 tok/px** against the census's land-weighted 145. That is a ratio of averages
-over sub-batches of differing valid-pixel density, so it is a weaker basis than the observation
-census — but if the census is high, campaign tokens and inference cost fall with it. Settle by
-counting observations on these three ROIs directly.
+**Observations per pixel are measured here, and the census looks ~2× high.** `t_kept` is the
+timesteps each chunk actually kept, and `t_kept × valid_px` reproduces the measured token rate
+to within 9% — so it *is* the observations-per-pixel term. Over **200 chunks across all three
+sites: range 55–136, valid-px-weighted mean 69.9**, against the census's 145. No chunk reached
+145, and these sites were chosen to bracket 120–200.
+
+The mechanism matters: the census estimates cloud-free observations probabilistically (dates ×
+mean `1 − eo:cloud_cover`) while `t_kept` is what screening actually kept, and it is `t_kept`
+that costs GPU time. Three ROIs cannot give a land-weighted global mean, but no new rung is
+needed — aggregate `t_kept` weighted by `valid_px` over P3's seven zones and P6's dense zone.
+The query, not an experiment, is the deliverable.
 
 **Two registration bugs surfaced here and both are fixed** (`yield-embeddings`
 `_base.py` / `deploy_flow.py`). The first attempt of all three runs died instantly on
