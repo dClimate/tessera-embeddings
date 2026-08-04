@@ -464,6 +464,19 @@ per passing date (one writable session ── one commit)
   three write sites use (S1 per-date, S2 per-date, S2 per-batch). It is shared because it
   was not: each site had built its own `Retrying`, and the exclusion was missing from all
   three at once.
+- **Polarisation is filtered SERVER-SIDE, and that is a cost fix rather than a correctness
+  one.** Ingest needs dual-pol VV+VH, so a granule whose `POLARIZATION` lacks VV was always
+  rejected client-side — but only after being fetched and parsed. The query now carries
+  `attribute[]=string,POLARIZATION,VV` alongside the orbit filter, which discards nothing
+  reachable (CMR matches a multi-valued attribute if ANY value matches, so VV admits every
+  VV+VH granule) and stops us paying to page the rest. Measured: the all-Greenland zone 23N
+  went from 7.9 s paging 138,276 rejected granules to 0.6 s returning none, and mixed zone 25N
+  from 11.6 s to 2.7 s returning the SAME 2,799 usable items — the unchanged count is what
+  makes it safe. The client-side check is now a safety net, and its warning means a catalogue
+  inconsistency (metadata advertising VV, bands not published) rather than a regional fact.
+  **Cross-pol granules are NOT EW-mode**: that label was a guess and was wrong — the Greenland
+  granules report `BEAM_MODE=IW`, and a `BEAM_MODE=EW` query over that region returns nothing.
+
 - **A zone can have NO usable radar, and that is a finding rather than a failure.** Over ice
   Sentinel-1 images in Extra Wide swath with HH/HV polarisation, and the OPERA query discards
   anything that is not dual-pol VV+VH — so an ROI whose land is ice has a catalogue full of

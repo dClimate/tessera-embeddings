@@ -217,22 +217,33 @@ class TestGranuleToItem:
         assert _granule_to_item(_granule_entry("g1", bands=("VV",))) is None
 
     def test_skip_reports_polarizations_found(self, caplog):
-        """The skip log + counter name WHAT was found — VV-only (partial dual-pol,
-        e.g. 2017 Tanzania/SW Brazil), EW-mode HH/HV (polar), or nothing — so
-        regional dual-pol data loss is quantifiable instead of one generic warning.
-        Behavior is unchanged: only dual-pol VV+VH granules are accepted.
+        """The counter names WHAT was published, so an anomaly is quantifiable per query.
+
+        Since the query filters POLARIZATION server-side, anything reaching here advertised VV
+        in its metadata and then published something else — a catalogue inconsistency rather
+        than a regional coverage fact, which is what the message now says.
+
+        The cross-pol label deliberately does NOT claim EW mode. It used to read
+        "(EW-mode?)", and that guess cost real investigation time: checked against CMR, the
+        Greenland granules carrying HH/HV report BEAM_MODE=IW, and a BEAM_MODE=EW query over
+        that region returns nothing. Cross-pol is a polarisation choice, not a swath mode.
         """
         skip_counts: Counter[str] = Counter()
         with caplog.at_level(logging.WARNING):
             assert _granule_to_item(_granule_entry("g-vv", bands=("VV",)), skip_counts) is None
-            assert _granule_to_item(_granule_entry("g-ew", bands=("HH", "HV")), skip_counts) is None
+            assert _granule_to_item(_granule_entry("g-xpol", bands=("HH", "HV")), skip_counts) is None
             assert _granule_to_item(_granule_entry("g-none", bands=()), skip_counts) is None
             # Dual-pol is accepted and never counted.
             assert _granule_to_item(_granule_entry("g-ok"), skip_counts) is not None
-        assert skip_counts == {"VV-only": 1, "HH/HV (EW-mode?)": 1, "no data links": 1}
-        assert "polarizations found ['VV']" in caplog.text
-        assert "polarizations found ['HH', 'HV']" in caplog.text
-        assert "polarizations found none" in caplog.text
+        assert skip_counts == {
+            "VV-only": 1,
+            "HH/HV (cross-pol, no VV+VH)": 1,
+            "no data links": 1,
+        }
+        assert "EW-mode" not in caplog.text, "the swath-mode guess must not come back"
+        assert "the published bands are ['VV']" in caplog.text
+        assert "the published bands are ['HH', 'HV']" in caplog.text
+        assert "the published bands are none" in caplog.text
 
     def test_handles_missing_polygon(self):
         item = _granule_to_item(_granule_entry("g1", with_ring=False))
@@ -255,13 +266,36 @@ class TestQueryCmrGranules:
         assert {item.id for item in items} == {"g-1", "g-2"}
         assert all(set(item.assets) == {"0_VV", "0_VH"} for item in items)
 
-    def test_passes_attribute_filter(self):
+    def test_passes_attribute_filters(self):
+        """BOTH filters, orbit and polarisation, and both server-side.
+
+        The polarisation one is a cost fix, not a correctness one: ingest needs dual-pol
+        VV+VH, so a granule whose POLARIZATION lacks VV is rejected client-side anyway. Asking
+        CMR to exclude them is what stops us paying to page them. Measured on the all-Greenland
+        zone 23N, a month's descending query went from 7.9 s over 138k rejected granules to
+        0.6 s over none, and on mixed zone 25N from 11.6 s to 2.7 s returning the SAME 2,799
+        usable items — which is the property that makes it safe.
+        """
         patcher, mock_get = _patch_cmr_session(return_value=_cmr_response([]))
         with patcher:
             _query_cmr_granules(self.BBOX, "2024-01-01", "2024-01-15", "descending")
 
-        params = mock_get.call_args.kwargs["params"]
-        assert params["attribute[]"] == "string,ASCENDING_DESCENDING,DESCENDING"
+        # A list value is how requests encodes a REPEATED query parameter; a dict cannot hold
+        # two "attribute[]" keys, so a plain string here would silently drop one filter.
+        assert mock_get.call_args.kwargs["params"]["attribute[]"] == [
+            "string,ASCENDING_DESCENDING,DESCENDING",
+            "string,POLARIZATION,VV",
+        ]
+
+    def test_requires_co_pol_only(self):
+        """Requiring VH as well would be redundant; requiring it instead would admit nothing new.
+
+        CMR matches a multi-valued attribute if ANY value matches, so VV alone admits every
+        VV+VH granule.
+        """
+        from tessera_embeddings.ingest.opera_query import _REQUIRED_POLARIZATION
+
+        assert _REQUIRED_POLARIZATION == "VV"
 
     def test_paginates_with_cmr_search_after(self):
         page1 = _cmr_response(
