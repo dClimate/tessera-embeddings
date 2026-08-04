@@ -149,6 +149,10 @@ class _PreparedBatch:
     data: xr.Dataset | None
     baselines: dict[str, int]
     query_s: float
+    #: Owned catalogue items this batch's query returned. Totalled by the consume loop so a
+    #: leg that writes nothing can say whether the source had anything to write. No default:
+    #: ``date_windows`` below has none either, and a defaulted field cannot precede it.
+    items_seen: int
     #: Solar day (keyed by the loaded slice's own timestamp) -> the live windows that day's
     #: imagery reaches. Empty list = reaches nothing, so skip. Missing key = unknown, so
     #: write everything. Empty dict = the whole batch falls back.
@@ -331,7 +335,10 @@ def ingest_s1_roi_sar(
         storage_options=storage_options,
     )
     live_windows: list[tuple[int, int, int, int]] = [(w.y0, w.y1, w.x0, w.x1) for w in run_windows]
-    log.info("Writing %d live window(s)", len(live_windows))
+    # roi= and orbit both present: this is the first line a leg emits, and at fleet width a
+    # bare count cannot be tied to a cell OR to an orbit — the log stream is the Dask
+    # worker's task id, and the two orbits of one zone are separate runs.
+    log.info("[%s] Live windows roi=%s: %d", orbit, roi_label, len(live_windows))
 
     # An ROI with no live window at all — an all-ocean mask — has nowhere to put a
     # pixel, and every date would otherwise be COMMITTED with zero windows written:
@@ -438,6 +445,9 @@ def ingest_s1_roi_sar(
     # Counted for the assessed-window record: it separates "sparse region" from
     # "the footprints are wrong", which look identical in a date count alone.
     empty_dates = 0
+    #: Owned items across every batch — the number that distinguishes "the source does not
+    #: cover this ROI for this orbit" from "we found items and committed none of them".
+    total_items_seen = 0
     # Frozen at the start so the background thread reads an object nothing mutates.
     already_present = frozenset(written_dates)
 
@@ -451,10 +461,11 @@ def ingest_s1_roi_sar(
         """
         batch_start_str, batch_end_str = rng.own_start, rng.own_end
         log.info(
-            "[%s] Batch %s..%s: querying catalog (%s..%s)",
+            "[%s] Batch %s..%s roi=%s: querying catalog (%s..%s)",
             orbit,
             batch_start_str,
             batch_end_str,
+            roi_label,
             rng.query_start,
             rng.query_end,
         )
@@ -521,6 +532,22 @@ def ingest_s1_roi_sar(
             mid_longitude=mid_longitude,
         )
         query_s = time.monotonic() - query_started
+        # THE most diagnostic line in this flow, and it did not exist. Without the item
+        # count there is no way to tell a zone the source does not cover from a zone whose
+        # items we found and then dropped — the two look identical (a leg that completes
+        # having written nothing) and they need opposite fixes. ``items`` is post-ownership,
+        # so a batch that queried granules and owned none of them says so here rather than
+        # vanishing. roi= because at fleet width nothing else identifies the cell.
+        log.info(
+            "[%s] Batch %s..%s roi=%s: %d owned item(s), loaded=%s, query=%.1fs",
+            orbit,
+            batch_start_str,
+            batch_end_str,
+            roi_label,
+            len(seen_items),
+            data is not None,
+            query_s,
+        )
         if data is not None:
             data = apply_roi_mask(data, roi_zarr_path, spatial_chunks, roi_mask=batch_mask)
         return _PreparedBatch(
@@ -529,6 +556,7 @@ def ingest_s1_roi_sar(
             data,
             baselines,
             query_s,
+            len(seen_items),
             _date_footprints(seen_items),
         )
 
@@ -551,6 +579,7 @@ def ingest_s1_roi_sar(
     prepared_batches = pipelined(batch_ranges, _prepare_batch, depth=1) if pipeline_batches else _serially()
 
     for prepared, stall_s in prepared_batches:
+        total_items_seen += prepared.items_seen
         batch_start_str, batch_end_str = prepared.start, prepared.end
         data, baselines, query_s = prepared.data, prepared.baselines, prepared.query_s
 
@@ -665,10 +694,11 @@ def ingest_s1_roi_sar(
             n = written_this_batch
             total_processed += n
             log.info(
-                "[%s] Batch %s..%s: wrote %d dates (total: %d)",
+                "[%s] Batch %s..%s roi=%s: wrote %d dates (total: %d)",
                 orbit,
                 batch_start_str,
                 batch_end_str,
+                roi_label,
                 n,
                 total_processed,
             )
@@ -679,10 +709,12 @@ def ingest_s1_roi_sar(
             # it. `hidden` is therefore the saving, and it is what to watch: if it stays
             # near zero on later batches the look-ahead is not paying.
             log.info(
-                "[%s] S1 batch timings %s..%s n=%d: query=%.1fs hidden=%.1fs stall=%.1fs write=%.1fs per_date=%.1fs",
+                "[%s] S1 batch timings %s..%s roi=%s n=%d: "
+                "query=%.1fs hidden=%.1fs stall=%.1fs write=%.1fs per_date=%.1fs",
                 orbit,
                 batch_start_str,
                 batch_end_str,
+                roi_label,
                 n,
                 query_s,
                 max(query_s - stall_s, 0.0),
@@ -713,6 +745,23 @@ def ingest_s1_roi_sar(
         )
 
     if total_processed == 0:
+        # A leg that writes nothing used to complete SILENTLY, and that silence is what made
+        # five zones undiagnosable: `status="skipped"` is a success to the parent, so the
+        # cell finished green with an orbit absent from the store and no line saying why.
+        # WARNING and not INFO because it is nearly always worth a human's attention — the
+        # legitimate case (the source does not cover this ROI for this orbit) is rare, and
+        # indistinguishable from the illegitimate one WITHOUT this line naming which it was.
+        log.warning(
+            "[%s] WROTE NO DATES roi=%s window=%s..%s: items_seen=%d empty_dates=%d — "
+            "items_seen=0 means the source covers this ROI for this orbit not at all; "
+            "items_seen>0 means they were found and none survived to a commit",
+            orbit,
+            roi_label,
+            start_date,
+            end_date,
+            total_items_seen,
+            empty_dates,
+        )
         return SarIngestResult(
             roi_path=roi_zarr_path,
             status="skipped",

@@ -1128,7 +1128,16 @@ def record_assessed_window(
         root = zarr.open_group(session.store, mode="a")
         root.attrs[ASSESSED_WINDOW_ATTR] = [start_date, end_date]
         root.attrs["assessed_empty_dates"] = int(empty_dates)
-        session.commit(f"assessed window {start_date}..{end_date} ({empty_dates} empty date(s))")
+        # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
+        # refuses a commit with no changes ("cannot commit, no changes made to the session").
+        # That refusal surfaced as a WARNING on healthy stores — every resumed leg that had
+        # already recorded its window logged one — which is the worse failure: a warning that
+        # fires routinely teaches the reader to skip the whole line, including the times it
+        # means something. The record is idempotent, so committing it again is harmless.
+        session.commit(
+            f"assessed window {start_date}..{end_date} ({empty_dates} empty date(s))",
+            allow_empty=True,
+        )
         logger.info(f"Recorded assessed window {start_date}..{end_date} on {store_path}")
     except Exception as exc:
         logger.warning(f"Could not record assessed window on {store_path}: {exc}")

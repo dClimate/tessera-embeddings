@@ -13,6 +13,7 @@ enough to attribute the failure to a cell and a date.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +22,10 @@ from tessera_embeddings.ingest.roi_processing import (
     read_failure_context,
     source_read_retrying,
 )
+
+#: Read as text rather than imported: these two tests assert on the SHAPE of log calls, which
+#: is not observable from the module object once the interpreter has compiled it.
+_SRC = Path(__file__).resolve().parents[2] / "src" / "tessera_embeddings"
 
 
 class _Item:
@@ -101,3 +106,45 @@ def test_context_is_transparent_when_nothing_fails(caplog) -> None:
     with caplog.at_level(logging.DEBUG), read_failure_context(log, roi="zone_02N", date="2021-01-01"):
         pass
     assert caplog.records == []
+
+
+class TestZeroDateOutcomeIsAttributable:
+    """A radar leg that writes nothing must say which zone, and whether the source was empty.
+
+    This is the shape that made five zones undiagnosable. ``status="skipped"`` reads as
+    success to the parent flow, so a cell finished green with an orbit missing from the
+    store — and every informational line in the leg except the per-date timing carried the
+    ORBIT but not the zone, while the per-date line only fires once a date is written. A leg
+    that wrote nothing therefore produced no line attributable to a cell at all.
+    """
+
+    def test_every_informational_line_carries_the_roi(self) -> None:
+        """A line without ``roi=`` cannot be tied to a cell: the log stream is a task id."""
+        import re
+
+        src = (_SRC / "ingest" / "s1_roi.py").read_text()
+        # Format strings passed to log.info / log.warning, excluding debug-level detail.
+        calls = re.findall(r"log\.(?:info|warning)\(\s*\n?\s*((?:\"[^\"]*\"\s*\n?\s*)+)", src)
+        missing = [c.strip() for c in calls if "roi=" not in c and "ROI %s" not in c]
+        assert not missing, f"informational line(s) with no ROI: {missing}"
+
+    def test_placeholders_match_arguments(self) -> None:
+        """A miscounted %-placeholder loses the line on a worker rather than raising here."""
+        import ast
+
+        tree = ast.parse((_SRC / "ingest" / "s1_roi.py").read_text())
+        bad = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr not in {"info", "warning", "error", "debug", "exception"}:
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            text = node.args[0].value
+            if not isinstance(text, str):
+                continue
+            placeholders = text.count("%") - 2 * text.count("%%")
+            if placeholders != len(node.args) - 1:
+                bad.append((node.lineno, text[:50]))
+        assert not bad, f"placeholder/argument mismatch: {bad}"
