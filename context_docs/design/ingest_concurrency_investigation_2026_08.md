@@ -1,11 +1,18 @@
 # Ingest throughput at fleet scale — what we know, and what we still need
 
-**Status: substantially resolved 2026-08-05.** The headline finding — a 1.8–2.1x slowdown against
-the July record — **was an artefact of comparing summer dates against a January baseline, and is
-withdrawn.** Matched on zone, width AND dates the gap is 1.12–1.17x. Six candidate explanations
-were ruled out along the way and two real effects quantified and fixed. What remains open is
-narrow: splitting that 1.17x into contention versus drift (Stage 1's quiet arm, running), and
-re-basing the campaign's duration on a **seasonally weighted** year rather than a January rate.
+**Status: resolved as posed; one narrower question left open deliberately.** The headline finding —
+a 1.8–2.1x slowdown against the July record — **was an artefact of comparing summer dates against a
+January baseline, and is withdrawn.** Matched on zone, width AND dates the gap is 1.12–1.17x. The
+paired A/B then measured the contention term at **zero** (the quiet arm came out 3.3% dearer per
+window, not cheaper), so none of that 1.17x is load at the width tested. Six candidate explanations
+were ruled out along the way and two real effects quantified and fixed.
+
+**What is left, and it is a schedule question rather than a diagnosis:** the A/B ran at 17
+concurrent fleets, which is below the ~20 cells where contention was ever hypothesised and about a
+sixth of campaign width, so **contention at 45–61 concurrent cells is still unmeasured** — Stage 3's
+ladder is the way to price it. And the campaign's duration basis needs re-fitting on a **seasonally
+weighted** year rather than a January rate, which is the one correction that genuinely raises the
+ingest line.
 Companion to `ingest_optimization_campaign_2026_07.md`, which remains the authoritative record
 for everything measured before 2026-08.
 
@@ -163,9 +170,10 @@ band and not the point. **The fix is a seasonal weighting of the basis, not a hu
 performance defect.** Pin it with per-date covered chunks (Stage 4) or one completed full-year
 60-worker cell; the seven complete 2021 zone-years cannot serve, because they ran at 10 workers.
 
-**Stage 1 still matters, and its job has narrowed.** It now splits a **1.17x** residual into
-contention versus drift rather than a 2x one. The quiet arm is running
-(`julyref-35N-feb2024-quiet-yield`).
+**Stage 1 is DONE and found no contention at the width tested.** Both arms complete: the quiet arm
+came out **3.3% dearer** per window, not cheaper, so none of the 1.17x residual is load at 17
+fleets. See the result table above, including why 17 fleets does not test the campaign-width
+question.
 
 **F and G point in opposite directions and cannot both be simple.** F says more cells is slower,
 across waves. G says fewer cells is slower, within a run. L explains most of G (windows rose as
@@ -189,10 +197,12 @@ gap is small.
 
 ## The plan
 
-**Stage 1 — separate contention from drift. LOADED ARM MEASURED; quiet arm outstanding.**
-`julyref-35N-jan2024-loaded`: zone 35N, January **2024** dates, 60 workers, churn deliberately
-left on for comparability. A second arm on February 2024 runs when the account is quiet.
-Adjacent months of one zone at one width, which is the design B used.
+**Stage 1 — separate contention from drift. ✅ DONE 2026-08-05, both arms complete.**
+`julyref-35N-jan2024-loaded` (dev, 17 fleets, n=27) against `julyref-35N-feb2024-quiet-yield`
+(yield, idle, n=28), 60 workers and `min_workers=1` in both. **Answer: the contention term at this
+width is zero** — the quiet arm was 3.3% dearer per window. Result table, comparability checks and
+the 17-fleet limitation are in §"The quiet arm runs on the yield account". The optional third arm
+is documented there as not worth running.
 
 ### The loaded arm's result, 27 dates (2026-08-05)
 
@@ -259,28 +269,68 @@ variable parity before dispatch.
 against the reference account's before trusting the run, because the accounts drift independently
 and the drift is invisible in the run's parameters.
 
-**Preliminary, n=4 of 29 — do not cite yet.** The quiet arm's first four dates: 16.0 windows/date,
-218.4 s/date median, **write per window 10.21 s** against the loaded arm's 11.04 s. The raw
-per-date figure is *higher* purely because February carries more windows per date, which is L
-again and exactly why the per-window column is the one to read. Normalised, quiet is ~8% cheaper
-than loaded — the right direction for a contention term, and a small one. Four dates is n≈4 with a
-cold-start date among them; wait for the arm to finish.
+#### Result: no contention penalty at the width tested (2026-08-05, arm COMPLETED, 29/29 dates)
 
-### A third arm removes the account confound, and dev is draining into position
+| arm | account | month | n | windows/date | s/date | **write/window** |
+|---|---|---|---:|---:|---:|---:|
+| loaded | global-tessera-dev, 17 fleets | Jan 2024 | 27 | 15.0 | 196.3 | **11.04** |
+| quiet | yield, 1 other task | Feb 2024 | 28 | 17.0 | 221.8 | **11.40** |
 
-The two-arm design cannot separate "quiet" from "yield". A third arm — **35N March 2024, 60w,
-`min_workers=1`, on global-tessera-dev once it is quiet** — closes that, because it gives two
-independent one-variable comparisons instead of one two-variable comparison:
+**The quiet arm is 3.3% DEARER per window, not cheaper.** Under the reading rule fixed before the
+arm ran — small difference means strong evidence against contention — this is that outcome, and it
+sits the wrong side of parity, so the estimate of the contention term at this width is **zero, with
+noise of a few percent**.
+
+The per-date column is a clean confirmation of L rather than a second result: cost rose **1.13x**
+while windows/date rose **1.13x**. Per-date cost tracked workload exactly, and per-window cost held
+across two adjacent months in two different accounts.
+
+**This also sharpens the correction to L.** Write per window is stable **between adjacent months**
+(11.04 → 11.40) but drifts with **season** (11.0 in winter against 16.7 in summer on this zone). So
+it is a sound normaliser for comparing nearby dates and an unsound one for comparing across a year.
+
+**Method note for the next A/B:** the n=4 interim read 10.21 s/window — 8% *cheaper*, the opposite
+sign to the final 28-date answer. It was recorded as preliminary and not cited. Four dates, one of
+them a cold fleet, is not a measurement of anything.
+
+> #### LIMITATION, and it is the important one: 17 fleets does not test the hypothesis
+>
+> Candidate 1 was **"source-read contention above ~20 cells"**, because July measured contention
+> only to 20 cells and explicitly left "aggregate source-read elasticity at large cell counts
+> unmeasured". **The loaded arm ran at 17 concurrent Dask fleets, 803 workers, ~3,200 vCPU — below
+> that 20-cell line, and about one sixth of campaign width** (45–61 concurrent cells at 372 vCPU
+> each is 16,700–22,700 vCPU).
+>
+> So this A/B does **not** test candidate 1. What it establishes is that nothing goes wrong up to
+> ~17 fleets, a range July had largely covered already. **Contention at campaign width remains
+> unmeasured.**
+>
+> What has changed is the *motivation*: with E withdrawn there is no 1.8–2.1x anomaly demanding a
+> contention term to explain it, and no sign of a knee approaching 17. The remaining 1.17x is
+> season, account and code drift, of which contention at this width contributes nothing
+> measurable. A ladder at 25/40/55 concurrent cells (Stage 3) is now the only way to close the
+> campaign-width question, and it is worth running for the schedule rather than for the diagnosis.
+
+### A third arm is now OPTIONAL — the result made it cheap to skip
+
+The two-arm design cannot separate "quiet" from "yield", so a third arm — 35N March 2024, 60w,
+`min_workers=1`, on a quiet global-tessera-dev — was planned to give two one-variable comparisons:
 
 | pair | varies | isolates |
 |---|---|---|
-| dev January (loaded) vs dev March (quiet) | load only | **the contention term** |
-| yield February (quiet) vs dev March (quiet) | account only | **the account confound itself** |
+| dev January (loaded) vs dev March (quiet) | load only | the contention term |
+| yield February (quiet) vs dev March (quiet) | account only | the account confound itself |
 
-Dev fell from 17 fleets/803 workers to 12/484 within the hour, so the window is opening on its own.
-Cost is ~$25 and one month of one zone; the arms must keep `min_workers=1` and 60 workers to stay
-comparable, and March is adjacent to February so the seasonal step between arms stays small.
-Compare on **write per window**, not per date, since windows/date rises across all three months.
+**It is no longer worth $25 and two hours, because of the direction the answer came out in.** The
+confound could only ever have *masked* a contention benefit — i.e. yield being intrinsically slower
+could hide the loaded arm being genuinely penalised. But the loaded arm came out **cheaper**, so any
+such masking would have to be undone to reveal a penalty, and the account effect is bounded at
+3.3% regardless of which way it points. There is no room left for a contention term of consequence
+at this width, whatever the account contributes.
+
+**Spend the same money on Stage 3 instead**, which addresses the question that is actually still
+open: 25, 40 and 55 concurrent cells, measured on write per window. Revisit the third arm only if
+the ladder shows a knee and the account needs eliminating as its cause.
 
 **It also contradicts L's generalisation.** Write per window was flat across 53N's four quartiles
 (16.4–18.3 s), which L used to argue it is *the* stable unit. On 35N it is not flat: within the
@@ -301,15 +351,19 @@ which is another reason to run the quiet arm rather than stop at the loaded one.
 Cost: ~2 h, ~$25 per arm. **Read windows/date in both arms** — if it is 18 rather than 13, L's
 arithmetic explains the gap before any contention term is needed.
 
-**Stage 2 — settle candidate 4 from existing data, no run required.** Compare windows/date for
-35N between the July record and today at matched date ranges. If it has risen, quantify how much
-of E that explains via write-per-window, which L shows is the stable unit. This is the cheapest
-remaining step and should precede any new experiment.
+**Stage 2 — settle candidate 4 from existing data. ✅ DONE 2026-08-05, and it withdrew E.** The
+comparison was never like-for-like: E's "today" side was May–September 2021 and its baseline was
+January 2024. Matched, 1.17x rather than 1.8–2.1x. This was the cheapest step in the plan and it
+was the one that mattered — it should have come first. See §"E IS WITHDRAWN".
 
-**Stage 3 — only if Stage 1 says contention.** A concurrency ladder: the same 3 zones at 60
-workers, run at 10, 20, 35 and 55 concurrent cells, 90 minutes per rung, measuring per-date cost
-normalised by windows/date. That normalisation is essential — without it the ladder re-measures L.
-Cost: ~4 rungs x 90 min. Gives the contention term the campaign schedule needs.
+**Stage 3 — a concurrency ladder. NOW THE ONLY OPEN QUESTION, and its purpose has changed.** It
+was conditional on Stage 1 finding contention; Stage 1 found none, but only up to 17 fleets, which
+is below the ~20 cells where contention was ever hypothesised and a sixth of campaign width. So the
+ladder is no longer a diagnosis — **it is the schedule input**, and it should start where the
+existing evidence stops rather than below it: **25, 40 and 55 concurrent cells**, 90 minutes per
+rung, on the same 3 zones at 60 workers, measuring **write per window**. Normalising is not
+optional; per-date cost re-measures L and would show a rise that is purely seasonal. Rungs below 20
+would only re-confirm what Stage 1 and July already cover. Cost ~3 rungs x 90 min.
 
 **Stage 4 — close the instrumentation gap that forced proxies throughout.** Per-date **covered
 chunks** is not logged, so every cross-zone comparison here uses the zone's live chunks as a
