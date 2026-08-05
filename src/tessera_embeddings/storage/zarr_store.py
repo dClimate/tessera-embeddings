@@ -1105,6 +1105,7 @@ def record_assessed_window(
     end_date: str,
     *,
     empty_dates: int = 0,
+    unreadable: list[dict[str, str]] | None = None,
     get_credentials: "Callable[[], icechunk.S3StaticCredentials] | None" = None,
     s3_region: str | None = None,
 ) -> None:
@@ -1118,6 +1119,12 @@ def record_assessed_window(
     how many dates were examined and skipped as reaching no live window, which is the
     difference between "sparse region" and "something is wrong with the footprints".
 
+    ``unreadable`` names dates this window DELIBERATELY gave up on because every catalogue
+    copy of some source object failed to read. It has to be recorded on the store, not only
+    logged: the assessed window makes absence inside it a finding rather than a gap, so
+    without this the two are indistinguishable and no later run revisits the date. A log line
+    is lost the moment nobody greps for it; this is the durable record of where the loss is.
+
     OPENS, never creates: this runs only against a store that was just written. Failing
     here must not be fatal — the assessment is an optimisation of the gate's judgement, and
     a store without it simply falls back to the stricter every-month-present rule.
@@ -1128,6 +1135,8 @@ def record_assessed_window(
         root = zarr.open_group(session.store, mode="a")
         root.attrs[ASSESSED_WINDOW_ATTR] = [start_date, end_date]
         root.attrs["assessed_empty_dates"] = int(empty_dates)
+        if unreadable:
+            root.attrs["assessed_unreadable_dates"] = list(unreadable)
         # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
         # refuses a commit with no changes ("cannot commit, no changes made to the session").
         # That refusal surfaced as a WARNING on healthy stores — every resumed leg that had
@@ -1135,7 +1144,8 @@ def record_assessed_window(
         # fires routinely teaches the reader to skip the whole line, including the times it
         # means something. The record is idempotent, so committing it again is harmless.
         session.commit(
-            f"assessed window {start_date}..{end_date} ({empty_dates} empty date(s))",
+            f"assessed window {start_date}..{end_date} ({empty_dates} empty date(s)"
+            f"{f', {len(unreadable)} unreadable' if unreadable else ''})",
             allow_empty=True,
         )
         logger.info(f"Recorded assessed window {start_date}..{end_date} on {store_path}")

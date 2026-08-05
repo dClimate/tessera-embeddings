@@ -12,8 +12,10 @@ The algorithm is unchanged from the reference:
    BOTH sides, giving identical numbers because the mask is False outside them, and
    neither the mask nor ``any_valid`` is persisted, so no full-extent array is ever
    materialised.
-2. Query STAC for the full date range; sort cloudiest-first so the
-   painter's-algorithm mosaic picks the clearest tile last.
+2. Query STAC for the full date range; reduce duplicate items to one copy per
+   tile-date (newest reprocessing preferred — see ``ingest.duplicates``), then
+   sort cloudiest-first so the painter's-algorithm mosaic picks the clearest
+   tile last.
 3. Group items by ``solar_day``.
 4. For each day:
 
@@ -22,7 +24,10 @@ The algorithm is unchanged from the reference:
    * Phase 2 — load all bands, mask invalid pixels via the Phase 1
      ``any_valid`` mask, apply ROI mask, write the date's live windows via
      :func:`tessera_embeddings.storage.zarr_store.write_day_windows` with a
-     narrow tenacity retry on transient GDAL errors.
+     narrow tenacity retry on transient GDAL errors. Past that retry, a source
+     object that will never read steps DOWN to the tile-date's next catalogue
+     copy; when every copy has failed the date is skipped and recorded, so the
+     loss is a finding on the store rather than an unexplained gap.
 
 Step 4 is split into a prepare half and a write half so ``pipeline_dates`` can
 overlap one date's preparation with the previous date's write, and so
@@ -52,6 +57,14 @@ import xarray as xr
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS, auto_batch_dates
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
+from tessera_embeddings.ingest.duplicates import (
+    alternates_for,
+    copies_label,
+    is_unreadable_source,
+    item_tile,
+    log_duplicate_selection,
+    select_preferred_duplicates,
+)
 from tessera_embeddings.ingest.live_windows import (
     WINDOW_COST_IN_CHUNKS,
     WINDOW_COST_IN_CHUNKS_OVERLAPPED,
@@ -67,6 +80,7 @@ from tessera_embeddings.ingest.roi_processing import (
 from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
+    solar_day_of,
     solar_grouping_longitude,
     whole_window_range,
 )
@@ -398,6 +412,12 @@ def ingest_s2_roi_reflectance(
     total_processed = 0
     total_filtered = 0
     total_seen = 0
+    #: Rejected duplicate copies, keyed by (tile, solar day) — the fallback ladder.
+    #: Accumulated across every supply because a streamed month contributes its own.
+    date_alternates: dict[tuple[str, str], list] = {}
+    #: Tile-dates whose every copy failed to read. Their pixels are absent from the mosaic,
+    #: so this is the ONLY record of where the loss is; it is re-stated at the end of the run.
+    unreadable_tile_dates: list[dict[str, str]] = []
 
     def _prepare_date(day_items: list, baselines: dict[str, int]) -> _PreparedDate:
         """Build one solar day's write-ready dataset, or the reason it has none.
@@ -669,21 +689,114 @@ def ingest_s2_roi_reflectance(
         last point before a date is derived. The operation is idempotent, so the honest
         cost of the guarantee is one dict build per supply.
         """
-        nonlocal total_seen
+        nonlocal total_seen, date_alternates
         items = normalize_to_solar_day(items, mid_longitude=mid_longitude)
+        # Duplicate items for one tile-date must be reduced to ONE copy before the loader
+        # sees them, because the loader FUSES a solar-day group: with both copies in it, an
+        # unreadable copy fails the date and there is nothing to fall back to. Reducing here
+        # also makes the baseline recorded for a date match the pixels written, which a
+        # fused pair of differing baselines cannot guarantee. Rejected copies are retained
+        # as the fallback ladder the write steps down on a persistent read failure.
+        items, alternates = select_preferred_duplicates(items)
+        log_duplicate_selection(log, roi_label, alternates)
+        date_alternates.update(alternates)
+
+        def _step_down_duplicates(items: list) -> list | None:
+            """Swap each duplicated tile-date's copy for its next alternate, or ``None``.
+
+            Steps down EVERY duplicated tile-date in the date rather than only the one that
+            failed, because the exception does not name the object — the failing URL appears
+            in the loader's own log line and not in what propagates. A date carries one or
+            two duplicated tiles in practice, so the cost of over-stepping is reading an
+            older copy of something that read fine, which is cheap and rare next to losing
+            the date.
+            """
+            remaining = alternates_for(date_alternates, items)
+            if not remaining:
+                return None
+            swap: dict[tuple[str, str], object] = {}
+            for key, copies in remaining.items():
+                swap[key] = copies[0]
+                date_alternates[key] = copies[1:]
+            out = []
+            for it in items:
+                tile = item_tile(it)
+                key = (tile, solar_day_of(it)) if tile is not None else None
+                out.append(swap.get(key, it) if key is not None else it)
+            return out
+
+        def _record_unreadable(prepared: _PreparedDate, exc: BaseException, tried: list[str]) -> None:
+            """Accept the loss for one date, as loudly as a log can manage.
+
+            Every copy of some object in this date failed to read, so its pixels cannot be
+            produced by any retry. The date is skipped rather than the leg failed — losing
+            one date beats losing every later date — which makes this line the ONLY place
+            the loss is visible, and the reason it names each copy it tried. The same set is
+            re-stated at the end of the run and recorded on the store, because a log line
+            alone is lost the moment nobody greps for it.
+            """
+            tiles = sorted({t for it in prepared.items if (t := item_tile(it)) is not None})
+            unreadable_tile_dates.append({"date": prepared.date, "tiles": ",".join(tiles), "tried": ",".join(tried)})
+            log.error(
+                "DATA LOSS roi=%s date=%s: every catalogue copy failed to read, so this date "
+                "is SKIPPED and its pixels are absent from the mosaic. tiles=%s copies_tried=%s "
+                "last_error=%s — the objects are unreadable at the provider, so no retry of "
+                "this run recovers it; re-check the catalogue for a newly reprocessed copy.",
+                roi_label,
+                prepared.date,
+                ",".join(tiles) or "unknown",
+                ",".join(tried) or "1",
+                exc,
+                exc_info=True,
+            )
 
         def _consume(prepared: _PreparedDate, stall_s: float) -> None:
             """Count or write one prepared date — the ONE consume path both modes take.
 
             Serial and pipelined differ only in where ``prepared`` came from, so the
             counters and the write cannot drift between them.
+
+            A persistent source-read failure steps DOWN the duplicate ladder here rather
+            than failing the leg: the transient retry inside the write has already been
+            exhausted by this point, so what is left is an object that does not read, and a
+            duplicated tile-date has another copy to try. Only when every copy has failed is
+            the date given up, and that is recorded rather than swallowed.
             """
             nonlocal total_processed, total_filtered
             if prepared.day_ds is None:
                 total_filtered += 1
                 return
-            _write_date(prepared, stall_s, baselines)
-            total_processed += 1
+            attempt, tried = prepared, [copies_label(prepared.items)]
+            while True:
+                try:
+                    _write_date(attempt, stall_s, baselines)
+                    total_processed += 1
+                    return
+                except Exception as exc:
+                    if not is_unreadable_source(exc):
+                        raise
+                    stepped = _step_down_duplicates(attempt.items)
+                    if stepped is None:
+                        _record_unreadable(attempt, exc, tried)
+                        total_filtered += 1
+                        return
+                    tried.append(copies_label(stepped))
+                    log.warning(
+                        "Source read failed roi=%s date=%s with copies=%s — falling back to the "
+                        "next catalogue copy (%s). The preferred copy is the newer reprocessing, "
+                        "so this trades processing baseline for a date that reads.",
+                        roi_label,
+                        attempt.date,
+                        tried[-2],
+                        tried[-1],
+                    )
+                    attempt = _prepare_date(stepped, baselines=baselines)
+                    if attempt.day_ds is None:
+                        # The fallback copy was prepared and skipped on its own merits (it
+                        # failed coverage, or reaches no live window). That is a legitimate
+                        # skip, not a read failure, and must not be recorded as data loss.
+                        total_filtered += 1
+                        return
 
         # query_stac_items sorts by (date, cloud_cover ASC). Re-sort cloudiest-first so
         # the clearest tile paints last (wins) in solar_day's painter's algorithm.
@@ -818,7 +931,26 @@ def ingest_s2_roi_reflectance(
     # month as an unexplained gap and the zone-year can never complete. The extra probe
     # runs ONLY in the zero-write case, so a normal run pays nothing for it.
     if total_processed or get_existing_dates(reflectance_store, s3_region=s3_region):
-        record_assessed_window(reflectance_store, start_date, end_date, s3_region=s3_region)
+        record_assessed_window(
+            reflectance_store,
+            start_date,
+            end_date,
+            unreadable=unreadable_tile_dates,
+            s3_region=s3_region,
+        )
+
+    if unreadable_tile_dates:
+        # Re-stated at the END, because the per-date line is thousands of lines back by now
+        # and a reader scanning a finished leg would never reach it. This is the summary that
+        # says a green leg is nonetheless missing pixels, and where.
+        log.error(
+            "DATA LOSS SUMMARY roi=%s: %d date(s) skipped because every catalogue copy was "
+            "unreadable — %s. Recorded on the store as assessed_unreadable_dates, so the gap "
+            "reads as a finding rather than as an unexamined window.",
+            roi_label,
+            len(unreadable_tile_dates),
+            "; ".join(f"{u['date']}[{u['tiles']}]" for u in unreadable_tile_dates),
+        )
 
     if total_processed == 0:
         return IngestResult(
