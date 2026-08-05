@@ -162,6 +162,18 @@ class IngestSettings(BaseModel):
     # batch_start by this much, so 0 never advances (an ingest cluster billing
     # forever) and a negative walks it backwards.
     batch_days: int = Field(default=30, ge=1)
+    # How many times ingest-zone-year will dispatch a single LEG (optical, or one radar
+    # orbit) before giving up on it. 1 disables retrying.
+    #
+    # Retrying is safe because a re-dispatch RESUMES — dates already committed are skipped,
+    # not rewritten — so the cost is only the work actually lost. It is on by default
+    # because the alternative was worse: on 2026-08-04 an expired source credential and a
+    # warp error each killed a leg hours in, and the mosaic then sat incomplete until
+    # someone noticed and re-dispatched by hand. Three zones lost a day that way.
+    #
+    # Failures that a re-dispatch cannot fix are excluded by class rather than by count —
+    # see ``_NON_RETRYABLE_LEG_MARKERS`` in the flow.
+    max_leg_attempts: int = Field(default=3, ge=1)
     # Optional base URI (an fsspec target, e.g. s3://.../perf/) for capturing a
     # Dask ``distributed.performance_report`` per child ingest. Default None =
     # off (normal runs pay nothing); set it only on a probe rung — ingest-zone-year

@@ -470,3 +470,102 @@ def test_local_mode_does_not_require_the_aws_provider() -> None:
     line = next(i for i, ln in enumerate(source.splitlines()) if "providers.aws" in ln)
     guard = next(i for i, ln in enumerate(source.splitlines()) if "if not use_local:" in ln)
     assert guard < line, "the AWS provider import must sit inside the non-local branch"
+
+
+# ===========================================================================
+# Automatic leg retry
+# ===========================================================================
+
+
+class TestLegRetryClassification:
+    """Which leg failures a re-dispatch is allowed to retry.
+
+    The polarity is the point: retry by DEFAULT, and exclude only failures that are
+    deterministic in the input. A re-dispatch resumes — committed dates are skipped, not
+    rewritten — so a wasted retry costs one leg's remaining work, while a missed retry
+    leaves a mosaic incomplete until a human notices. That is not hypothetical: on
+    2026-08-04 an expired source credential and a warp error each killed a leg hours in,
+    and 35N, 12N and 53N each needed manual re-dispatch.
+    """
+
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "ingest_s1_roi_sar (ascending): PermissionError: The provided token has expired.",
+            "ingest_s2_roi_reflectance: Exception: WarpOperationError('Chunk and warp failed')",
+            "ingest_s2_roi_reflectance did not complete successfully (state=Crashed)",
+            "ClientError: An error occurred (ThrottlingException) when calling ListTasks",
+            "KilledWorker: worker died",
+            "TimeoutError",
+        ],
+    )
+    def test_transient_failures_are_retried(self, detail: str) -> None:
+        assert mod._is_retryable_leg_failure(detail) is True
+
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "InsufficientCoverageError: s1_orbit='both' but no SAR stores found under s3://...",
+            "ObjectNotFound: None",
+            "ValidationError: 3 validation errors for IngestSettings",
+            "rejected by the calendar-year gate",
+            "zone has no live tiles in the campaign coverage mask",
+        ],
+    )
+    def test_deterministic_failures_are_not_retried(self, detail: str) -> None:
+        assert mod._is_retryable_leg_failure(detail) is False
+
+    def test_matching_is_case_insensitive(self) -> None:
+        """The marker list is matched against exception text whose casing we do not own."""
+        assert mod._is_retryable_leg_failure("insufficientcoverageerror: none") is False
+
+    def test_an_unrecognised_failure_is_retried(self) -> None:
+        """The default must be to retry: a failure nobody has classified yet is far more
+        likely to be a transient one than a deterministic one, and the cost of being wrong
+        in this direction is one resumable leg.
+        """
+        assert mod._is_retryable_leg_failure("SomeNewError: nobody has seen this before") is True
+
+
+class TestLegFailureDetail:
+    """The detail string that classification reads."""
+
+    def test_a_completed_leg_yields_no_detail(self) -> None:
+        run = SimpleNamespace(state=SimpleNamespace(type=StateType.COMPLETED, name="Completed"))
+        assert mod._leg_failure_detail(run, "s2") is None
+
+    def test_an_exception_result_is_reported_verbatim(self) -> None:
+        detail = mod._leg_failure_detail(RuntimeError("dispatch blew up"), "s2")
+        assert detail is not None
+        assert "dispatch blew up" in detail
+        assert detail.startswith("s2:")
+
+    def test_the_state_message_is_included_not_just_the_name(self) -> None:
+        """Classification needs the exception text; the state NAME ("Failed") carries none.
+
+        This is what lets an expired-credential failure be told apart from a coverage gate.
+        """
+        run = SimpleNamespace(
+            state=SimpleNamespace(
+                type=StateType.FAILED,
+                name="Failed",
+                message="PermissionError: The provided token has expired.",
+            )
+        )
+        detail = mod._leg_failure_detail(run, "s1 (ascending)")
+        assert detail is not None
+        assert "token has expired" in detail
+        assert mod._is_retryable_leg_failure(detail) is True
+
+    def test_a_missing_state_message_still_yields_a_detail(self) -> None:
+        run = SimpleNamespace(state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=None))
+        detail = mod._leg_failure_detail(run, "s2")
+        assert detail is not None
+        assert "did not complete successfully" in detail
+
+
+def test_max_leg_attempts_defaults_to_retrying() -> None:
+    """Off by default would leave the behaviour that cost three zones a day."""
+    from tessera_embeddings.config.ingest import IngestSettings
+
+    assert IngestSettings().max_leg_attempts >= 2

@@ -195,6 +195,53 @@ def _s1_max_workers(s2_max_workers: int, settings: IngestSettings) -> int:
 
 
 #: Tag prefix for the S1/S2 ROI ingest runs this flow dispatches.
+#: Markers in a failed leg's detail that mean a re-dispatch CANNOT help. Everything else
+#: is retried, and that polarity is deliberate: a wasted retry costs one leg's work on a
+#: resumable ingest, while a missed retry leaves a mosaic incomplete until a human notices
+#: — which is exactly what happened to 35N, 12N and 53N on 2026-08-04.
+#:
+#: Keep this list to failures that are deterministic in the INPUT, not merely severe. A
+#: crash, a throttle, an expired source credential and a warp error are all transient by
+#: nature: the same dispatch can succeed on the next attempt because it resumes from the
+#: dates already committed.
+_NON_RETRYABLE_LEG_MARKERS = (
+    "InsufficientCoverageError",  # the source has no such data; asking again gets the same answer
+    "ObjectNotFound",  # the child deployment is not registered — a registration bug, not a blip
+    "ValidationError",  # malformed parameters
+    "calendar-year",  # the year-window gate rejected the request itself
+    "no live tiles",  # nothing to ingest in this zone
+)
+
+
+def _leg_failure_detail(run: object, label: str) -> str | None:
+    """A one-line failure detail for a settled leg, or ``None`` if it completed.
+
+    Prefers the child's own state MESSAGE over the state name, because the name
+    ("FAILED") cannot be classified and the message carries the exception text that
+    :data:`_NON_RETRYABLE_LEG_MARKERS` is matched against.
+    """
+    if isinstance(run, BaseException):
+        return f"{label}: {run!r}"
+    try:
+        _check_completed(run, label)
+    except Exception as exc:  # a returned-but-not-COMPLETED terminal state
+        state = getattr(run, "state", None)
+        message = getattr(state, "message", None) or ""
+        return f"{exc}{f': {message}' if message else ''}"
+    return None
+
+
+def _is_retryable_leg_failure(detail: str) -> bool:
+    """Whether re-dispatching this leg could plausibly succeed.
+
+    Default TRUE. The ingest resumes — committed dates are skipped, not rewritten — so a
+    retry is cheap and the failure modes actually observed are transient. Only a failure
+    that is deterministic in the input is excluded.
+    """
+    lowered = detail.lower()
+    return not any(marker.lower() in lowered for marker in _NON_RETRYABLE_LEG_MARKERS)
+
+
 _CHILD_TAG_PREFIX = "ingest-zone-year"
 
 
@@ -452,10 +499,13 @@ async def ingest_zone_year(
     # alone (see _CHILD_TAG_PREFIX). None outside a Prefect run — a direct .fn() call in
     # tests dispatches nothing worth sweeping.
     child_tags = [t] if (t := child_run_tag(_CHILD_TAG_PREFIX, flow_run_ctx.id)) else None
-    s1_coros = [
-        arun_deployment(
+    # One (label, deployment, parameters) per leg, so a failed leg can be re-dispatched
+    # verbatim rather than reconstructed.
+    legs: list[tuple[str, str, dict]] = [
+        (
+            f"ingest_s1_roi_sar ({orbit})",
             deployments.ingest_s1_roi_sar,
-            parameters={
+            {
                 **common,
                 "orbit": orbit,
                 "batch_days": ingest_settings.batch_days,
@@ -466,37 +516,69 @@ async def ingest_zone_year(
                 "max_workers": s1_workers,
                 "perf_report_uri": f"{perf_base}/s1-{orbit}.html" if perf_base else None,
             },
-            tags=child_tags,
         )
         for orbit in orbits
+    ] + [
+        (
+            "ingest_s2_roi_reflectance",
+            deployments.ingest_s2_roi_reflectance,
+            {
+                **common,
+                "min_valid_coverage": ingest_settings.min_valid_coverage,
+                "perf_report_uri": f"{perf_base}/s2.html" if perf_base else None,
+            },
+        )
     ]
-    s2_coro = arun_deployment(
-        deployments.ingest_s2_roi_reflectance,
-        parameters={
-            **common,
-            "min_valid_coverage": ingest_settings.min_valid_coverage,
-            "perf_report_uri": f"{perf_base}/s2.html" if perf_base else None,
-        },
-        tags=child_tags,
-    )
-    # return_exceptions=True so we WAIT for every deployment to settle before raising:
-    # a plain gather() surfaces the first failure while the sibling S1/S2 jobs keep
-    # writing to mosaic_base, and a retry could then clear the prefix mid-write. Join
-    # them all, then report every failure at once.
-    *s1_runs, s2_run = await asyncio.gather(*s1_coros, s2_coro, return_exceptions=True)
-    labelled = [
-        *((f"ingest_s1_roi_sar ({o})", r) for o, r in zip(orbits, s1_runs, strict=True)),
-        ("ingest_s2_roi_reflectance", s2_run),
-    ]
+
     errors: list[str] = []
-    for label, run in labelled:
-        if isinstance(run, BaseException):
-            errors.append(f"{label}: {run!r}")
-            continue
-        try:
-            _check_completed(run, label)
-        except Exception as exc:  # a returned-but-not-COMPLETED terminal state
-            errors.append(str(exc))
+    for attempt in range(1, ingest_settings.max_leg_attempts + 1):
+        # return_exceptions=True so we WAIT for every leg to settle before retrying or
+        # raising: a plain gather() surfaces the first failure while the siblings keep
+        # writing to mosaic_base, and a re-dispatch could then clear the prefix mid-write.
+        # Join them all, then decide.
+        results = await asyncio.gather(
+            *(arun_deployment(dep, parameters=params, tags=child_tags) for _, dep, params in legs),
+            return_exceptions=True,
+        )
+
+        failed: list[tuple[str, str, dict]] = []
+        errors = []
+        for (label, dep, params), run in zip(legs, results, strict=True):
+            detail = _leg_failure_detail(run, label)
+            if detail is None:
+                continue
+            errors.append(detail)
+            if _is_retryable_leg_failure(detail):
+                failed.append((label, dep, params))
+            else:
+                log.error(
+                    "Zone %s year %s: %s failed in a way a re-dispatch cannot fix — not retrying: %s",
+                    zone,
+                    year,
+                    label,
+                    detail,
+                )
+
+        if not errors:
+            break
+        if not failed or attempt == ingest_settings.max_leg_attempts:
+            break
+        # A re-dispatch RESUMES: already-committed dates are skipped, not rewritten, so the
+        # retry costs only the work that was actually lost. That idempotency is what makes
+        # retrying the default rather than the exception — the two failures seen in practice
+        # (an expired source credential, a warp error hours in) are both transient, and
+        # leaving them meant a mosaic sat incomplete until a human noticed.
+        log.warning(
+            "Zone %s year %s: attempt %d/%d — re-dispatching %d leg(s) that can resume: %s",
+            zone,
+            year,
+            attempt,
+            ingest_settings.max_leg_attempts,
+            len(failed),
+            ", ".join(label for label, _, _ in failed),
+        )
+        legs = failed
+
     if errors:
         raise RuntimeError(f"ingest deployment(s) failed for zone {zone} year {year}: " + "; ".join(errors))
 
