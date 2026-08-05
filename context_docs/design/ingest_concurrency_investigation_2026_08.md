@@ -131,12 +131,37 @@ causes stay ruled out.
 
 **But the campaign's duration basis is still too low, for a benign reason.** The July fit
 (5.95 h/zone-year at 60w) is built from January-conditions measurements, and a zone-year is not
-twelve Januaries. On one zone at one width, summer dates cost **1.68x** January dates. Weighting
-across the year puts a dense zone-year materially above its January-rate projection — a rough
-midpoint of the January and May–September anchors lands near **1.5–1.7x** the basis, which is an
-estimate and not a measurement. **The fix is a seasonal weighting of the basis, not a hunt for a
-performance defect.** Getting it properly requires per-date covered chunks (Stage 4) or one
-completed full-year cell measured end to end.
+twelve Januaries.
+
+#### The seasonal profile of one zone, measured months marked
+
+All 35N at 60 workers. **Six of twelve months are measured**; the rest are interpolated between
+measured anchors or, for October–December, extrapolated by symmetry with no data at all.
+
+| month | windows/date | s/date | write/window | source |
+|---|---:|---:|---:|---|
+| Jan (2024) | 15.0 | **196.3** | 11.04 | measured, n=27, loaded |
+| Feb (2024) | 16.0 | **218.4** | 10.21 | measured, n=4 so far, quiet |
+| Mar–Apr | — | ~250–290 | — | *interpolated* |
+| May (2021) | 18.0 | **330.5** | — | measured, n=29 |
+| Jun (2021) | 18.0 | **381.6** | 18.71 | measured, n=30 |
+| Jul (2021) | 18.0 | **317.6** | 16.11 | measured, n=31 |
+| Aug (2021) | 18.0 | **309.6** | 14.15 | measured, n=31 |
+| Sep (2021) | 18.0 | **320.6** | — | measured, n=7 |
+| Oct–Dec | — | ~210–290 | — | **extrapolated, no data** |
+
+Two things the table makes clear that a single multiplier hides. **windows/date saturates at 18.0
+by May and stays there** — it is not a smooth sinusoid, it plateaus once the zone is fully imaged.
+And the summer premium is mostly **not** window count: 18.0/15.0 is 1.20x, while 330/196 is 1.68x.
+The rest is that summer windows are individually dearer (write per window 16.7 s against 11.0 s),
+because a window with less cloud and snow carries more valid pixels. Both effects push the same
+way and neither is a defect.
+
+Averaging that profile gives **~280 s/date against the fit's 167.9, i.e. ~1.67x** — consistent
+with the 1.5–1.7x band, but note that a quarter of the year in it is extrapolated, so treat the
+band and not the point. **The fix is a seasonal weighting of the basis, not a hunt for a
+performance defect.** Pin it with per-date covered chunks (Stage 4) or one completed full-year
+60-worker cell; the seven complete 2021 zone-years cannot serve, because they ran at 10 workers.
 
 **Stage 1 still matters, and its job has narrowed.** It now splits a **1.17x** residual into
 contention versus drift rather than a 2x one. The quiet arm is running
