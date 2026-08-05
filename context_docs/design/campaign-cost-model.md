@@ -297,6 +297,37 @@ sixth of campaign width (45-61 cells = 16,700-22,700 vCPU) and below the ~20 cel
 was ever hypothesised — so **contention at campaign width is unmeasured**, and Stage 3's 25/40/55
 ladder is what would price it. Nothing in the evidence suggests a knee approaching 17.
 
+### TOKENS AND COST DECOUPLE — the inference line is far less sensitive to the census than it looks
+
+The single most useful thing measured on the campaign path (2026-08-05). Observations per pixel
+and cost per chunk do **not** move together, because a token-poor chunk still pays the fixed
+per-chunk overhead:
+
+| | span across measured zones | ratio |
+|---|---|---:|
+| observations per pixel | 60 → 179 | **3.0x** |
+| **cost per chunk** | $0.116 → $0.238 | **2.1x** |
+
+Projected over every live tile, a token census 37% lower than assumed moves the inference line
+only **10%** — 1.24 x 10¹⁵ tokens against 1.98, but **$482 k against the planned $538 k**, still
+inside the costed range.
+
+**Two consequences for how this document should be used.**
+
+**Do not re-price inference off a revised token census.** The elasticity is roughly 0.3: a third
+off the tokens buys a tenth off the cost. Any saving argued from the census alone is overstated by
+about 3x, and the current interval for observations per pixel (75–139 central 106) has the
+assumed 145 just above its top, so there may be no saving to argue at all.
+
+**The lever that would actually move the line is per-chunk overhead, not tokens.** At the sparse
+end a chunk's cost is dominated by fixed work — model load, read setup, write — rather than by
+inference over its observations. Reducing that overhead pays on every chunk, and pays most on the
+majority of land, which is token-poor. Reducing tokens pays proportionally to tokens, which is
+where the cost is not.
+
+Stratified figures, the projection interval, and what remains unmeasured:
+`campaign_inference_profile_2026_08.md`.
+
 **What this means for the durations above: raise them, but for seasonality.** The fit is built on
 January-conditions dates and a zone-year is not twelve Januaries — on one zone at one width,
 summer dates cost **1.68x** January dates, carried by 18.0 windows/date against 15.0 plus dearer

@@ -124,6 +124,98 @@ So "17 distinct zones" is met on COUNT but not on COVERAGE. The ±20% argument a
 spread drives the sample size; it did not assume the zones would cluster in one hemisphere.
 **Finishing the northern dense zones matters more now than adding further southern ones.**
 
+### The CHUNK-level model — and it holds out-of-sample
+
+Zone-level modelling failed because a zone spans every latitude of its hemisphere. Each chunk
+sits at one latitude, which the mask's grid geometry gives exactly (tile row → northing →
+latitude), so the model belongs at chunk level: **2,759 chunks with known latitudes instead of
+four zone points.**
+
+**Latitude does real work, and this is the confound-free evidence.** Across zones, latitude and
+zone are nearly collinear here — each completed zone occupies its own narrow band — so a
+cross-zone fit cannot separate them. WITHIN a zone the zone is held constant by construction,
+and every zone shows a positive gradient:
+
+| zone | n | \|lat\| span | r | slope /deg |
+|---|---:|---|---:|---:|
+| 57S | 493 | 6.5–11.7 | +0.113 | +2.31 |
+| 59S | 562 | 12.2–47.2 | +0.243 | +0.80 |
+| 03N | 612 | 52.9–70.0 | +0.489 | +2.72 |
+| 06N | 857 | 59.1–70.4 | +0.429 | +3.58 |
+| 53N | 235 | 68.3–75.9 | +0.509 | +5.42 |
+
+Five of five positive. The slope steepens with latitude, so the relationship is convex rather
+than linear.
+
+**The shape is a STEP function, not a smooth curve** — median `t_kept` by band, training zones:
+
+| \|lat\| | 5–34 | 35–59 | 60–69 | 70+ |
+|---|---:|---:|---:|---:|
+| `t_kept` | ~60 | ~120 | ~149 | ~179 |
+
+Three plateaus with jumps between them, which is what increasing Sentinel-2 swath overlap toward
+the poles would produce — passes become available in discrete steps, not continuously.
+
+**Held out on 53N** (never trained on, and at the top edge of the training range so partly
+extrapolating): linear fit MAE 23.1 with −17 bias; **quadratic MAE 14.9 with −5.6 bias — 3%
+under-predicted.** So it does predict.
+
+### What that does to the estimate — as an INTERVAL, because a mean is misleading here
+
+A single weighted mean hides the two things that decide the answer: the spread inside each
+latitude band, and the global land histogram the mean is taken over. Stratified at 5°, with each
+band's own measured distribution:
+
+| \|lat\| | % of land | tiles/yr | n measured | p10 | median | p90 |
+|---|---:|---:|---:|---:|---:|---:|
+| 0–5 | 7.4 | 26,811 | — | — | — | — |
+| 5–10 | 7.7 | 27,940 | 425 | 54 | 59 | 119 |
+| 10–15 | 7.4 | 26,679 | 74 | 60 | 63 | 65 |
+| 15–20 | 8.3 | 29,785 | 62 | 61 | 65 | 128 |
+| 20–25 | 8.8 | 31,732 | **6** | 62 | 94 | 110 |
+| 25–30 | 8.7 | 31,429 | — | — | — | — |
+| 30–35 | 7.9 | 28,399 | 18 | 59 | 62 | 124 |
+| 35–40 | 6.4 | 23,189 | 39 | 62 | 123 | 127 |
+| 40–45 | 6.4 | 23,160 | 328 | 61 | 120 | 130 |
+| 45–50 | 6.3 | 22,833 | 103 | 61 | 118 | 124 |
+| 50–55 | 6.1 | 21,887 | 84 | 111 | 119 | 132 |
+| 55–60 | 4.9 | 17,653 | 94 | 102 | 122 | 171 |
+| 60–65 | 5.4 | 19,358 | 680 | 102 | 150 | 167 |
+| 65–70 | 4.8 | 17,168 | 712 | 138 | 149 | 192 |
+| 70–75 | 2.1 | 7,529 | 135 | 164 | 173 | 201 |
+| 75–80 | 1.1 | 4,032 | 19 | 187 | 194 | 199 |
+| 80–85 | 0.4 | 1,369 | — | — | — | — |
+
+**Projection, pricing unmeasured bands at the full measured range rather than interpolating:**
+
+| | `t_kept` | tokens |
+|---|---:|---:|
+| low | 75 | 1.02 × 10¹⁵ |
+| **central** | **106** | **1.45 × 10¹⁵** |
+| high | 139 | 1.89 × 10¹⁵ |
+| census assumption | 145 | 1.98 × 10¹⁵ |
+
+**This supersedes the coarse four-band figure of 91, which was too low and too confident.** The
+census's 145 sits just above the top of the interval, so it is defensible as a conservative
+planning figure. **Any claim that the token census should be cut is not supported.**
+
+**Three reasons a point estimate cannot be trusted here, all visible in the table:**
+
+1. **Within-band spread is as large as between-band.** At 5–10° the p10–p90 is 54–119, a 2.2×
+   range inside one 5° band. At 35–40° the p10 is half the median. Latitude explains part of
+   `t_kept` and nowhere near all of it, so a per-band median discards most of the variance the
+   projection should carry.
+2. **The land histogram is nearly FLAT from 0–50°**, at 6–9% per 5° band. No band dominates, so
+   no single zone can settle the answer — precision requires coverage across the whole range.
+   This is why the earlier "56% of land below 35°" framing was misleading: it was true, but it
+   lumped seven distinct bands into one and implied one measurement could fix them.
+3. **About 26% of land is effectively unmeasured** — 15.5% in bands with no data at all (0–5,
+   25–30, 80–85) plus 8.8% resting on six chunks (20–25).
+
+**So the test programme should be selected on latitude coverage, not on which zones are ready.**
+Filling 0–5°, 20–30° and the thin 30–40° bands would do more for precision than any further
+high-latitude zone, where 4,000+ chunks across three zones already agree.
+
 ### What survives all three corrections
 
 **Throughput per actor rises with `t_kept`** — 1.25 M at 60 against 1.57 M at 151 — because a
