@@ -269,10 +269,12 @@ the cheap half of the campaign. It does not change the inference line, which §6
 **Investigation and plan: `ingest_concurrency_investigation_2026_08.md`.** Six candidate causes
 are ruled out, including the orchestrator, the Dask schedulers, capacity, and store growth. Two
 findings bear directly on this section. Per-date cost rises through a run because **windows per
-date rise** — write cost per window is flat at 16.4–18.3 s over 137 dates — which means **every
-velocity figure measured early in a run understates the full year**, so the durations above are
-optimistic even before the July gap is explained. And 35N now writes 18 windows/date against
-13 in July, which by that same arithmetic accounts for ~1.4× of the ~2× gap on its own.
+date rise** — on 53N, write cost per window held flat at 16.4–18.3 s over 137 dates while
+windows/date rose 45% — which means **every velocity figure measured early in a run understates
+the full year**, so the durations above are optimistic on that count alone. (Write per window is
+the better normaliser but is **not** a constant: on 35N it falls 18.71 → 14.15 s June to August
+with windows/date pinned at 18.0.) The same arithmetic across seasons is what dissolves the
+apparent July gap — see the next-but-one paragraph.
 
 **The per-tile cost gap is intrinsic, not width waste.** 53N costs ~$0.14/tile-year against
 12N's ~$0.09, and the investigation attributes that to 53N doing **1.38x the per-tile work**
@@ -280,13 +282,26 @@ optimistic even before the July gap is explained. And 35N now writes 18 windows/
 to an oversized fleet. 53N at 60 workers is still ~80% write-bound, so it *can* use the fleet;
 narrowing sparse zones would recover single-digit percent of campaign ingest compute.
 
-**The unexplained factor is time, not width.** Every zone measured on 2026-08-04 ran **1.8-2.1x
-slower than the July record at the same zone and the same width** — 35N at 60w cost 300-359
-s/date against July's 167.9. That inflates the durations above at *both* widths and no width
-change addresses it. Candidates the data cannot yet separate: source-read contention above the
-~20 cells July measured to, US-daytime load on the public archive, the 2021 catalogue versus the
-2024 dates every July figure used, and post-July config drift. **This, not width, is the open
-question that decides the ingest line.**
+**The factor is SEASON, not width and not a regression** (corrected 2026-08-05; this paragraph
+previously asserted an unexplained 1.8-2.1x slowdown, and that claim is **withdrawn**). The
+comparison behind it put 35N's **May-September 2021** dates against the July record's **January
+2024** baseline: 330.7 s/date against 167.9. Same zone, same width, different season — and the
+July record's own reading instructions name dates as the third condition that must match. Matched
+on all three, 35N at 60w costs **196.3 s/date against 167.9, i.e. 1.17x**, and that 196.3 was
+measured under 17 concurrent fleets, so it bounds contention and drift together rather than
+isolating either.
+
+**What this means for the durations above: raise them, but for seasonality.** The fit is built on
+January-conditions dates and a zone-year is not twelve Januaries — on one zone at one width,
+summer dates cost **1.68x** January dates, carried by 18.0 windows/date against 15.0 plus dearer
+windows (write per window 16.7 s against 11.0 s). A seasonally weighted year therefore lands
+materially above the January-rate basis; a midpoint of the two measured anchors suggests
+**~1.5-1.7x**, which is an estimate rather than a measurement — pin it with per-date covered
+chunks or one completed full-year cell before committing a schedule to it. **The practical
+difference from the withdrawn claim is large: seasonality is predictable and schedulable, so peak
+months can be planned around instead of hunted as a defect.**
+
+Full derivation and withdrawal: `ingest_concurrency_investigation_2026_08.md` §"E IS WITHDRAWN".
 
 Two properties of the fit matter for anything that reasons about *individual* zones rather
 than the aggregate, and the aggregate basis hides both:

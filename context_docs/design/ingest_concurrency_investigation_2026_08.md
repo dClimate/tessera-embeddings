@@ -1,7 +1,11 @@
 # Ingest throughput at fleet scale — what we know, and what we still need
 
-**Status: open.** One question decides the campaign's ingest line and is not yet answered; six
-candidate explanations have been ruled out, and two effects are quantified and fixed or bounded.
+**Status: substantially resolved 2026-08-05.** The headline finding — a 1.8–2.1x slowdown against
+the July record — **was an artefact of comparing summer dates against a January baseline, and is
+withdrawn.** Matched on zone, width AND dates the gap is 1.12–1.17x. Six candidate explanations
+were ruled out along the way and two real effects quantified and fixed. What remains open is
+narrow: splitting that 1.17x into contention versus drift (Stage 1's quiet arm, running), and
+re-basing the campaign's duration on a **seasonally weighted** year rather than a January rate.
 Companion to `ingest_optimization_campaign_2026_07.md`, which remains the authoritative record
 for everything measured before 2026-08.
 
@@ -9,8 +13,16 @@ for everything measured before 2026-08.
 
 The cost model prices ingest at $115,000–$126,000 from a duration basis of **6.36 h per
 zone-year at 60 workers**. Measured on 2026-08-04, three virgin zones projected **26, 28 and 47
-hours**. If that gap is real and general, ingest trebles and stops being the cheap half of the
-campaign. Everything below exists to decide whether it is real, and what causes it.
+hours**. Everything below exists to decide whether that gap is real, and what causes it.
+
+**The answer, up front.** It is not a regression. Two separate reading errors inflated it: A
+compared different zones (a per-chunk workload that varies four-fold), and E compared different
+seasons on the same zone (18.0 windows/date in summer against 15.0 in January, and dearer windows
+besides). The residual after both corrections is 1.12–1.17x, measured under load. **But the basis
+itself is genuinely too low**, because it was fitted on January-conditions dates and a zone-year
+is not twelve Januaries — summer dates cost 1.68x January dates on one zone at one width. So the
+ingest line does need raising; it needs raising for seasonality, which is predictable and
+schedulable, not for a defect.
 
 ## The evidence, with sample sizes
 
@@ -20,7 +32,7 @@ campaign. Everything below exists to decide whether it is real, and what causes 
 | B | Same-zone width pairs: 6x workers buys **3.7–4.9x** | 3 zones x 2 widths, 8–37 dates/arm | scaling analysis |
 | C | Per-date serial floor (build + unhidden stall + gate residual) = **19–24% at 60w**, 7–8% at 10w | 5 runs, 23–115 dates | scaling analysis |
 | D | Fleets hold **85–90%** of nominal width; one 60-slot fleet registered **1,250 distinct workers in 5 h** | 6 fleets, 10,000 events | scaling analysis |
-| E | **35N at 60w costs 300–359 s/date today vs 167.9 s/date in July** — same zone, same width | 60 and 147 dates | vs July record §3.15 |
+| E | ~~35N at 60w costs 300–359 s/date today vs 167.9 s/date in July — same zone, same width~~ **WITHDRAWN: the two sides are different SEASONS. Matched, it is 1.12–1.17x** | 60 and 147 dates | vs July record §3.10/§3.16 |
 | F | Same zone/width degraded **15–48%** from the 27-cell overnight wave to the 35-cell afternoon wave (but ~0% on 3 of 6 zones) | 6 zones | scaling analysis |
 | G | The three 60w cells' per-date cost rose **204 → 269 s (+32%)** as fleet concurrency FELL from ~29 zones to 5–12 | 3 zones, 9 buckets | this investigation |
 | H | Over that same window orchestrator CPU fell 13%→5.6%, requests 12.4→4.1/s, latency 146→39 ms, zero dropped events | 7 h | `prefect_load.py` |
@@ -82,11 +94,53 @@ for this reason, independent of anything else.
 same-zone pairs. Sixty workers costs about what ten does per date and finishes 4–5x sooner, so
 re-scaling `max_workers` is not where money is saved.
 
-## What survives, unexplained
+## E IS WITHDRAWN — it compared different seasons (2026-08-05, Stage 2)
 
-**E: every zone measured on 2026-08-04 ran 1.8–2.1x slower than the July record at the same zone
-and the same width.** No width change addresses it, and it inflates every duration at both widths
-— which makes it, not width, the thing that decides the ingest line.
+**E claimed every zone ran 1.8–2.1x slower than the July record at the same zone and width. It
+does not. E compared summer dates against a January baseline**, and the matched comparison is
+**1.12–1.17x**.
+
+Stage 2 needed no run, only the two figures put on the same footing:
+
+| | zone | width | dates | windows/date | s/date |
+|---|---|---|---|---:|---:|
+| July record §3.10/§3.16 | 35N | 60w | **January 2024** | — | **167.9 / 175.6** |
+| E's "today" figure | 35N | 60w | **May–September 2021** (n=128) | **18.0** | **330.7** |
+| Stage 1 loaded arm | 35N | 60w | **January 2024** (n=27) | **15.0** | **196.3** |
+
+The July record's own reading instructions state it: *"Unless a figure says otherwise, every
+timing is zone 35N, January 2024."* E honoured zone and width and silently violated the third
+condition, which is the one that moves cost most. Matched on all three, the gap is
+**196.3 / 167.9 = 1.17x** — and the loaded arm carried 17 concurrent fleets while the July figure
+did not, so 1.17x is an upper bound on contention **plus** drift combined, not a floor.
+
+The mechanism is L, applied across seasons rather than within a run: summer dates image far more
+of a zone's land. 18.0 windows/date against 15.0 is 1.20x more work per date, and summer windows
+are also individually dearer (write per window 16.7 s against 11.0 s), which together carry the
+330.7-versus-196.3 ratio of 1.68x without any appeal to a regression.
+
+**This is the third time this investigation has had to withdraw a claim for the same reason** —
+see §"Corrections". Each time a real measurement was compared against another real measurement
+whose conditions differed in a dimension nobody had listed. The reading-instructions block in the
+July record exists precisely to prevent this, and I did not consult it before writing E.
+
+### What it changes, and what it does NOT
+
+**The code has not regressed.** No performance bug is being hidden by this, and the six ruled-out
+causes stay ruled out.
+
+**But the campaign's duration basis is still too low, for a benign reason.** The July fit
+(5.95 h/zone-year at 60w) is built from January-conditions measurements, and a zone-year is not
+twelve Januaries. On one zone at one width, summer dates cost **1.68x** January dates. Weighting
+across the year puts a dense zone-year materially above its January-rate projection — a rough
+midpoint of the January and May–September anchors lands near **1.5–1.7x** the basis, which is an
+estimate and not a measurement. **The fix is a seasonal weighting of the basis, not a hunt for a
+performance defect.** Getting it properly requires per-date covered chunks (Stage 4) or one
+completed full-year cell measured end to end.
+
+**Stage 1 still matters, and its job has narrowed.** It now splits a **1.17x** residual into
+contention versus drift rather than a 2x one. The quiet arm is running
+(`julyref-35N-feb2024-quiet-yield`).
 
 **F and G point in opposite directions and cannot both be simple.** F says more cells is slower,
 across waves. G says fewer cells is slower, within a run. L explains most of G (windows rose as
@@ -222,3 +276,15 @@ Recorded because each was written down and acted on before being checked:
    and the rise is workload.
 3. "Concurrency is the likeliest confound" — the evidence points the other way at every turn.
 4. "763 tasks pending" — an ECS statistics artefact, contradicted by the schedulers.
+5. **"Write per window is THE stable unit"** — true on 53N, false in general. On 35N it falls
+   18.71 → 14.15 s June to August with windows/date pinned at 18.0.
+6. **"E: 1.8–2.1x slower than July at the same zone and width"** — the two sides were different
+   SEASONS (May–September 2021 against January 2024). Matched, 1.12–1.17x.
+
+**Four of these six are one error repeated:** a real measurement compared against another real
+measurement whose conditions differed in a dimension that was never listed — zone in (1), keep
+threshold in the withdrawn observation census, season in (6), and generalising one zone in (5).
+The cure is mechanical and cheap: **before comparing two figures, write down the conditions of
+each side and diff them.** The July record already carries a reading-instructions block naming
+zone, width and dates as the three that must match; consulting it would have caught (6) in one
+minute, and (1) as well.
