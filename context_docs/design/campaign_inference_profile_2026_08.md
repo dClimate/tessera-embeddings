@@ -137,9 +137,16 @@ cost per delivered chunk at **$0.101–0.214** depending on `t_kept`.
 | $0.15 | $487 k |
 | $0.18 | $585 k |
 
-The model's **$503–579 k** sits inside that band at a mean of roughly $0.155–0.18 — which is
-where a land-weighted mean should land, given equatorial zones cost ~$0.20/chunk and far-south
-ones ~$0.11. **This is a genuinely independent route to the same number**: it multiplies a chunk
+The model's **$503–579 k** sits inside that band at a mean of roughly $0.155–0.18 — which is a
+plausible place for a land-weighted mean to land, given how far apart the two modes are.
+
+> **Watch this figure: the equatorial cost is running higher than first measured.** At 61–68
+> chunks each, 03N and 06N are at **$0.30–0.31 per chunk** — not the ~$0.20 an earlier, smaller
+> sample suggested — because their chunks take 475–480 s of inference against ~200 s in the far
+> south. Some of that is cluster warm-up amortised over few chunks and will fall as they
+> progress; how much is exactly what completing them answers. If the equatorial mode settles
+> near $0.30, a land-weighted mean lands above $0.18 and the inference line moves toward the top
+> of the model's range or past it. **Do not treat the band above as settled.** **This is a genuinely independent route to the same number**: it multiplies a chunk
 census from the coverage mask by a measured per-chunk cost, using neither the token census nor
 the reference rate that the model's own derivation depends on. Two unrelated methods agreeing to
 within their spreads is the strongest evidence yet that the inference line is sound.
