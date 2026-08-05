@@ -138,6 +138,40 @@ anything by itself — this is the cross-comparison error corrected in §"Correc
 in a new guise. And the ~300/~168 figures in the decision table are per-date at unmatched
 windows/date, so the comparison against 196 is indicative, not exact.
 
+### The quiet arm runs on the yield account, which is a confound — read this before comparing
+
+Dispatched 2026-08-05 02:38 UTC as `julyref-35N-feb2024-quiet-yield`: zone 35N, **February**
+2024, 60 workers, `min_workers=1`, store `s3://arbol-tessera-inputs-dev/mosaics/35N/2024`.
+global-tessera-dev was carrying 17 fleets at the time and could not host a quiet arm, while
+yield held **one** ECS task against a 6,000 vCPU quota.
+
+**What is matched, and verified in the run's own log rather than in the parameters passed:** the
+zone, the width and churn (`Adaptive scaling configured: min=1, max=60`, identical to the loaded
+arm's line), the container image (both accounts' `dev-global-tessera` tag was pushed by the same
+CI build, two seconds apart), and the worker shape (`worker_cpu 4096`, `worker_mem 16384`, on the
+pinned `yield-dask-worker-dev-global-tessera` definition).
+
+**What is NOT matched:** the account, VPC, ECS cluster, Prefect server, and S3 bucket — and the
+month, which is the intended variable. So a difference between the arms is "quiet-on-yield minus
+loaded-on-dev", not "quiet minus loaded". Treat a *small* difference as strong evidence against a
+contention term, since the confounds would have to cancel to hide one; treat a *large* difference
+as unattributed until it is reproduced within one account.
+
+**Getting there needed a fix, and the fix is the reason the arm is usable at all.** yield's
+branch runner was pinned at revision 38 against dev's 142, missing four environment variables —
+including both `DASK_{SCHEDULER,WORKER}_TASK_DEFINITION_ARN`. `register_branch_task_defs.py`'s own
+docstring names that consequence: a runner pinning no Dask definition "would produce runners that
+pin no Dask definition and therefore fall back to base-image fleets". The arm would have run at a
+different worker shape and the comparison would have been silently void. Also missing was
+`PREFECT_FLOWS_HEARTBEAT_FREQUENCY`, whose absence leaves the stock 180 s interval against the
+crash detector's 300 s timeout — under two beats of margin, so the detector could have declared
+this healthy run dead and swept its fleet mid-write. Re-registering brought yield to 15/15
+variable parity before dispatch.
+
+**The generalisation for any future cross-account measurement:** diff the runner task definition
+against the reference account's before trusting the run, because the accounts drift independently
+and the drift is invisible in the run's parameters.
+
 **It also contradicts L's generalisation.** Write per window was flat across 53N's four quartiles
 (16.4–18.3 s), which L used to argue it is *the* stable unit. On 35N it is not flat: within the
 single 2021 run, at windows/date pinned at exactly 18.0 all summer, write per window falls
