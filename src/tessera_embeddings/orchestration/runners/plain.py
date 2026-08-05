@@ -235,6 +235,7 @@ def _run_inference_and_assemble(
         model_checkpoint=model_version,
         num_obs_checkpoints=config.num_obs_checkpoints,
         upstream_manifests=upstream_manifests,
+        allow_s2_only=config.allow_s2_only,
     )
 
     writer.assemble(

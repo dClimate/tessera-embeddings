@@ -381,7 +381,13 @@ def _resolve_ray_config(
     config["head_start_ray_commands"].append(cw_cmd)
     config["worker_start_ray_commands"].append(cw_cmd)
 
-    # Substitute {CODE_BUCKET} and {CODE_SUFFIX} in setup_commands.
+    # Substitute {CODE_BUCKET} and {CODE_SUFFIX} in setup_commands. With no bucket the
+    # command is DROPPED, not left alone: an unsubstituted `aws s3 cp
+    # s3://{CODE_BUCKET}/...` is a valid command line over a bucket name that cannot
+    # exist, so `ray up` runs it on every node and every node fails setup. `None` is the
+    # documented default and means the AMI already carries the code, so there is nothing
+    # to fetch — dropping the line is what that default has to mean for the cluster to
+    # boot at all.
     if code_bucket is not None:
         config["setup_commands"] = [
             cmd.replace("{CODE_BUCKET}", code_bucket).replace("{CODE_SUFFIX}", code_suffix)
@@ -389,6 +395,8 @@ def _resolve_ray_config(
             else cmd
             for cmd in config["setup_commands"]
         ]
+    else:
+        config["setup_commands"] = [cmd for cmd in config["setup_commands"] if "{CODE_BUCKET}" not in str(cmd)]
 
     resolved_fd, resolved_path = tempfile.mkstemp(prefix="ray_cluster_", suffix=".yaml")
     with os.fdopen(resolved_fd, "w") as rf:

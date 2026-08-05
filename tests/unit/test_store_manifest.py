@@ -357,6 +357,34 @@ class TestEmbeddingManifestFromUpstreamStores:
         assert m.num_obs_checkpoints == (8, 16)
 
 
+class TestS2OnlyPolicyIsPartOfEmbeddingIdentity:
+    """``allow_s2_only`` decides which pixels become embeddings and which stay fill.
+
+    Nothing else in the manifest reflects that, so without it a store could hold two
+    time slices produced under opposite per-pixel S1 policies and the append gate
+    would see nothing wrong.
+    """
+
+    def test_turning_the_policy_on_changes_the_digest(self):
+        off = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=False)
+        on = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=True)
+        assert off.hash() != on.hash()
+
+    def test_the_policy_off_matches_a_store_written_before_the_field_existed(self):
+        """False and unrecorded are the SAME state — a store written by the old code
+        was written with the policy off — so an append must not be rejected for it.
+        """
+        legacy = EmbeddingManifest(model_checkpoint="ckpt", num_obs_checkpoints=(8,))
+        off = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=False)
+        assert off.allow_s2_only is None
+        assert off.hash() == legacy.hash()
+        assert "allow_s2_only" not in off.to_dict()
+
+    def test_the_policy_survives_a_round_trip(self):
+        on = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=True)
+        assert EmbeddingManifest.from_dict(on.to_dict()).allow_s2_only is True
+
+
 class TestAdmissionThresholdIsPartOfIngestIdentity:
     """A resumed mosaic must be built to ONE admission policy.
 

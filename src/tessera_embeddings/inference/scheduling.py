@@ -1162,7 +1162,18 @@ def _process_chunks_work_stealing(
             # and it routes into the SAME path a crashed actor already takes:
             # requeue the chunk (bounded by max_chunk_retries), hand back any
             # deferred write, return the reserved chunk, replace the slot.
+            # A chunk can be BOTH ready and past the stall threshold on the same tick:
+            # `ray.wait` returned its ref, but the tracker's last progress report is
+            # older than the threshold and the result has not been processed yet, so
+            # the item is still in `pending`. Recovering it would pop the ref here and
+            # the ready loop below would pop it again — a KeyError that aborts the
+            # whole fleet exactly when a long-stalled chunk finally succeeds. A ready
+            # ref has a result waiting, so the ready path is the right one: killing its
+            # actor would throw away work that is already done.
+            ready_uids = {it.uid for it, _ in (pool.pending[r] for r in ready_refs if r in pool.pending)}
             for uid in wedged:
+                if uid in ready_uids:
+                    continue
                 # POP the pending ref before handling. The killed actor's object ref
                 # will never resolve, and `_handle_failure` is written for the
                 # ready-refs path where the ref is already popped — leaving it in

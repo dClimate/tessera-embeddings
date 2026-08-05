@@ -435,6 +435,48 @@ def test_adapter_shutdown_cancels_in_flight_child_runs(monkeypatch):
     assert client.cancelled[0] == ("fr-9", StateType.CANCELLING)
 
 
+def test_discard_cancels_a_still_registered_child_before_re_dispatch(monkeypatch):
+    """A retry must not put a second ingest onto a mosaic prefix the first still holds.
+
+    Polling gives up after a persistent run of API errors WITHOUT deregistering the
+    child, precisely because the server-side ingest may still be healthy. The retry
+    path then calls discard() then start(); if discard only dropped the memo, the
+    replacement would write the same prefix as a live sibling — and the ingest path's
+    commits do not rebase, so the loser's ConflictError is terminal.
+    """
+    adapter, client = _running_child(monkeypatch, "fr-abandoned")
+    adapter.start("33N", 2025)
+    _await_inflight(adapter, {("33N", 2025): "fr-abandoned"})
+
+    try:
+        adapter.discard("33N", 2025)
+        assert ("fr-abandoned", StateType.CANCELLING) in client.cancelled
+        assert adapter._inflight == {}  # dropped, so shutdown doesn't cancel it twice
+        assert ("33N", 2025) not in adapter._futures  # a fresh start() will re-submit
+    finally:
+        adapter.shutdown()
+
+
+def test_discard_still_forgets_the_cell_when_cancellation_fails(monkeypatch):
+    """The Prefect API being unreachable is the likeliest reason we are here at all,
+    so a cancellation that cannot be delivered must not block the retry.
+    """
+    adapter, client = _running_child(monkeypatch, "fr-unreachable")
+    adapter.start("33N", 2025)
+    _await_inflight(adapter, {("33N", 2025): "fr-unreachable"})
+
+    def _boom(*_a, **_k):
+        raise ConnectionError("prefect api down")
+
+    client.set_flow_run_state = _boom
+    try:
+        adapter.discard("33N", 2025)  # swallowed
+        assert ("33N", 2025) not in adapter._futures
+    finally:
+        adapter._inflight.clear()  # else shutdown re-raises into the same dead client
+        adapter.shutdown()
+
+
 def test_adapter_wait_honors_the_runner_stop_event(monkeypatch):
     """A blocked wait() returns promptly (raising) once the runner's stop event
     is set — the feeder must never sit behind a full ingest during unwind.
@@ -533,7 +575,7 @@ def test_cancel_child_ingests_hook_sweeps_live_runs_by_tag(monkeypatch):
             super().__init__([_state(StateType.RUNNING, final=False)])
             self.filters: list = []
 
-        def read_flow_runs(self, flow_run_filter=None):
+        def read_flow_runs(self, flow_run_filter=None, limit=None, offset=0):
             self.filters.append(flow_run_filter)
             return [live, done]
 
@@ -542,6 +584,34 @@ def test_cancel_child_ingests_hook_sweeps_live_runs_by_tag(monkeypatch):
     mod._cancel_child_ingests_on_cancellation(None, SimpleNamespace(id="run-1"), None)
     assert client.cancelled == [("fr-live", StateType.CANCELLING)]  # final child untouched
     assert client.filters[0].tags.all_ == ["chained-ingest:run-1"]
+
+
+def test_child_sweep_pages_past_the_server_default(monkeypatch):
+    """A live child beyond the first page is still cancelled.
+
+    A campaign tags one child per (zone, year) and they keep the tag after they
+    finish, so the tagged set outgrows one page long before the run ends. An
+    unpaginated sweep would cancel nothing outside the first page and leave that
+    child's GPU fleet billing against the mosaic a retry is about to rewrite.
+    """
+    page_size = _child_runs._PAGE
+    done = [SimpleNamespace(id=f"fr-{i}", state=_state(StateType.COMPLETED, final=True)) for i in range(page_size)]
+    live = SimpleNamespace(id="fr-live-late", state=_state(StateType.RUNNING, final=False))
+
+    class _PagedClient(_FakeClient):
+        def __init__(self):
+            super().__init__([_state(StateType.RUNNING, final=False)])
+            self.offsets: list[int] = []
+
+        def read_flow_runs(self, flow_run_filter=None, limit=None, offset=0):
+            self.offsets.append(offset)
+            return done if offset == 0 else [live]
+
+    client = _PagedClient()
+    monkeypatch.setattr(_child_runs, "get_client", lambda sync_client=True: client)
+    mod._cancel_child_ingests_on_cancellation(None, SimpleNamespace(id="run-1"), None)
+    assert client.offsets == [0, page_size]  # a full page means ask again
+    assert client.cancelled == [("fr-live-late", StateType.CANCELLING)]
 
 
 def test_flow_registers_child_ingest_sweep_on_cancel_and_crash():

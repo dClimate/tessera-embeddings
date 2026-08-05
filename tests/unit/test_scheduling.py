@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import tessera_embeddings.inference.scheduling as _sched_mod
+from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.scheduling import (
     ActorPool,
     _batch_actors_to_request,
@@ -1392,6 +1393,61 @@ class TestDeferredWrites:
         # Both chunks completed (on the replacement) despite the death, and c0
         # was re-run because its deferred write died with the first actor.
         assert sorted(r["chunk"] for r in results) == ["c0", "c1"]
+
+    def test_a_chunk_that_is_ready_and_stalled_on_the_same_tick_is_not_double_popped(self) -> None:
+        """A long-stalled chunk that finally RETURNS must be recorded, not crash the run.
+
+        ``ray.wait`` can hand back a ref on the very tick the tracker reports its chunk
+        past the recovery threshold: the result exists but has not been processed, so
+        the item is still pending and the recovery scan finds it. Popping it there and
+        again in the ready loop raised KeyError out of the scheduler — killing the whole
+        fleet at the moment the wedge cleared. The ready path wins: there is a result
+        waiting, and killing the actor would throw away work already done.
+        """
+        actor = MagicMock(name="actor_0")
+        chunks = [_fake_chunk("c0")]
+        ref0 = MagicMock(name="ref0")
+        actor.process_chunk.remote.return_value = ref0
+        done: list = []
+
+        def fake_wait(pending_refs, **kw):
+            if kw.get("timeout", 60) == 0:
+                return (list(pending_refs), [])
+            if ref0 in pending_refs and ref0 not in done:
+                done.append(ref0)
+                return ([ref0], [x for x in pending_refs if x is not ref0])
+            return ([], list(pending_refs))
+
+        def fake_get(ref, *args, **kwargs):
+            if ref is ref0:
+                return {"chunk": "c0", "status": "success"}
+            return MagicMock()
+
+        config = MagicMock()
+        config.checkpoint_path = "s3://bucket/ckpt.pt"
+        # The tracker declares c0 wedged on every poll, including the tick it returns.
+        with (
+            patch.object(_sched_mod.ray, "wait", side_effect=fake_wait),
+            patch.object(_sched_mod.ray, "get", side_effect=fake_get),
+            patch.object(_sched_mod.ray, "kill") as kill,
+            patch.object(_sched_mod, "_poll_tracker", return_value=[chunk_uid("r", "c0")]),
+            patch.object(_sched_mod.time, "sleep"),
+        ):
+            results = _process_chunks_work_stealing(
+                actors=[actor],
+                actor_instance_ids=["i-0000"],
+                chunks=chunks,
+                mosaic_base="m",
+                staging_base="s",
+                run_id="r",
+                config=config,
+                t0=time.monotonic(),
+                log=logging.getLogger("test"),
+                tracker=MagicMock(name="tracker"),
+            )
+
+        assert [r["chunk"] for r in results] == ["c0"]  # recorded, not lost to a KeyError
+        kill.assert_not_called()  # and its actor was not killed for work it had finished
 
     def test_flush_failure_replaces_actor_and_retries_on_replacement(self) -> None:
         """A failed/timed-out tail flush kills + replaces the actor.

@@ -542,6 +542,7 @@ async def ingest_zone_year(
         )
 
         failed: list[tuple[str, str, dict]] = []
+        terminal: list[str] = []
         errors = []
         for (label, dep, params), run in zip(legs, results, strict=True):
             detail = _leg_failure_detail(run, label)
@@ -551,6 +552,7 @@ async def ingest_zone_year(
             if _is_retryable_leg_failure(detail):
                 failed.append((label, dep, params))
             else:
+                terminal.append(detail)
                 log.error(
                     "Zone %s year %s: %s failed in a way a re-dispatch cannot fix — not retrying: %s",
                     zone,
@@ -560,6 +562,16 @@ async def ingest_zone_year(
                 )
 
         if not errors:
+            break
+        # A leg that can never succeed ENDS the attempt loop, and `errors` still holds
+        # it. Retrying the siblings around it would clear `errors` at the top of the
+        # next attempt, and if those siblings then succeeded the terminal failure would
+        # be gone: `s1_orbit="both"` with one SAR deployment permanently broken would
+        # resolve to the single orbit that did ingest, pass the coverage gate on it, and
+        # stamp a "both" marker over half the radar — after which every later run reads
+        # the marker and skips the cell. The siblings' committed dates survive either
+        # way, so aborting here costs a resumable re-dispatch and nothing else.
+        if terminal:
             break
         if not failed or attempt == ingest_settings.max_leg_attempts:
             break

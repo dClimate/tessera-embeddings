@@ -77,6 +77,7 @@ def build_embedding_manifest(
             if mosaic_base
             else {}
         ),
+        allow_s2_only=config.allow_s2_only,
     )
 
 

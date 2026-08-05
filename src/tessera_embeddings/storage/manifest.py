@@ -230,6 +230,17 @@ class EmbeddingManifest(StoreManifest):
     num_obs_checkpoints: tuple[int, ...]
     reflectance_manifest_hash: str | None = None
     sar_manifest_hash: str | None = None
+    #: ``True`` when the run embedded S2-valid pixels that had ZERO S1 observations.
+    #: It belongs in the manifest because it decides which pixels become embeddings and
+    #: which stay fill, so two appends to one store under different values leave time
+    #: slices that are not comparable — and nothing else in the manifest would notice.
+    #:
+    #: The policy being OFF is recorded as ``None``, not ``False``, and the two mean the
+    #: same thing here: ``to_dict`` drops ``None`` before hashing, so a store written
+    #: before this field existed keeps its digest and still matches a later flag-off run —
+    #: which is right, because that store WAS written with the policy off. Only turning
+    #: the policy on changes the digest, which is the append this needs to catch.
+    allow_s2_only: bool | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> EmbeddingManifest:
@@ -246,6 +257,7 @@ class EmbeddingManifest(StoreManifest):
         model_checkpoint: str,
         num_obs_checkpoints: tuple[int, ...],
         upstream_manifests: dict[str, dict[str, Any] | None],
+        allow_s2_only: bool | None = None,
     ) -> EmbeddingManifest:
         """Build from upstream ingest store manifests.
 
@@ -255,6 +267,9 @@ class EmbeddingManifest(StoreManifest):
             upstream_manifests: Map of store name to manifest dict (or None).
                 Expected keys: ``"reflectance"``, optionally ``"sar_ascending"``
                 and/or ``"sar_descending"``.
+            allow_s2_only: The run's per-pixel S1 policy. Falsy is stored as ``None`` so
+                the digest matches stores written before the field existed — see the
+                field's own note for why those are the same state.
         """
         ref_dict = upstream_manifests.get("reflectance")
         ref_hash = IngestManifest.from_dict(ref_dict).hash() if ref_dict else None
@@ -274,4 +289,5 @@ class EmbeddingManifest(StoreManifest):
             num_obs_checkpoints=tuple(int(v) for v in num_obs_checkpoints),
             reflectance_manifest_hash=ref_hash,
             sar_manifest_hash=sar_hash,
+            allow_s2_only=allow_s2_only or None,
         )

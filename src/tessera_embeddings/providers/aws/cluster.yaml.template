@@ -122,10 +122,10 @@ upscaling_speed: 2.0  # Cluster can add 2x current nodes per autoscaling round
 # workers at a versioned tarball of the package source code in S3.
 #
 # {CODE_BUCKET}: S3 bucket name (without s3:// prefix). REPLACED at
-#                runtime when the provider is invoked with
-#                `sync_source_path` set; absent that, leave the line
-#                unchanged or remove it (workers will use whatever code
-#                is baked into the AMI).
+#                runtime when a `code_bucket` is given. With none, the
+#                provider DROPS the whole command — an unsubstituted
+#                bucket name is a copy that fails and takes node setup
+#                with it — and workers use the code baked into the AMI.
 # {CODE_SUFFIX}: optional filename suffix (e.g. `-mybranch`); REPLACED
 #                at runtime. Empty string for production tarballs.
 #

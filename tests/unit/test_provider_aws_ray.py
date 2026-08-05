@@ -119,6 +119,40 @@ def test_resolve_ray_config_writes_a_complete_yaml(tmp_path: Path) -> None:
         assert any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["head_start_ray_commands"])
         assert any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["worker_start_ray_commands"])
         assert not any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["setup_commands"])
+
+        # No code_bucket was given (the documented AMI-baked default), so the tarball
+        # fetch is DROPPED rather than left holding an unsubstituted placeholder. Left
+        # in, `aws s3 cp s3://{CODE_BUCKET}/...` is a copy from a bucket name that
+        # cannot exist, and `ray up` runs setup on every node before Ray starts — so
+        # the default path would fail to provision a cluster at all.
+        assert not any("{CODE_BUCKET}" in str(cmd) for cmd in config["setup_commands"])
+        assert not any("s3 cp" in str(cmd) for cmd in config["setup_commands"])
+        # The rest of setup survives; only the fetch went.
+        assert any("PYTHONPATH" in str(cmd) for cmd in config["setup_commands"])
+    finally:
+        cleanup_ray_tempfiles(resolved)
+
+
+@mock_aws
+def test_resolve_ray_config_substitutes_the_code_bucket_when_given(tmp_path: Path) -> None:
+    """The tarball fetch survives, fully substituted, when a bucket IS supplied."""
+    ami_param, _, _ = _seed_ssm_and_vpc()
+
+    resolved = _resolve_ray_config(
+        DEFAULT_CLUSTER_TEMPLATE,
+        region=REGION,
+        ami_ssm_name=ami_param,
+        ssm_prefix=SSM_PREFIX,
+        cluster_name="test-cluster",
+        code_bucket="my-code-bucket",
+        code_suffix="-mybranch",
+    )
+    try:
+        config = yaml.safe_load(Path(resolved).read_text())
+        fetch = [cmd for cmd in config["setup_commands"] if "s3 cp" in str(cmd)]
+        assert len(fetch) == 1
+        assert "s3://my-code-bucket/code/src-mybranch.tar.gz" in fetch[0]
+        assert "{CODE_BUCKET}" not in fetch[0] and "{CODE_SUFFIX}" not in fetch[0]
     finally:
         cleanup_ray_tempfiles(resolved)
 

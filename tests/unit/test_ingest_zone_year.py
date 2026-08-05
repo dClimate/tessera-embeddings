@@ -569,3 +569,47 @@ def test_max_leg_attempts_defaults_to_retrying() -> None:
     from tessera_embeddings.config.ingest import IngestSettings
 
     assert IngestSettings().max_leg_attempts >= 2
+
+
+def test_a_terminal_leg_failure_is_not_forgotten_when_a_sibling_retries(wired, monkeypatch):
+    """A leg that can never succeed must fail the flow even if its siblings recover.
+
+    ``errors`` is rebuilt each attempt and only retryable legs are re-dispatched, so
+    retrying around a terminal failure used to erase it. For ``s1_orbit="both"`` that
+    is silent data loss: the surviving orbit resolves, passes the coverage gate, and
+    gets stamped with a "both" marker, after which every later run reads the marker
+    and skips the cell — half its radar gone for good.
+    """
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+    dispatched: list[str] = []
+
+    async def fake_arun(dep, parameters=None, tags=None):
+        orbit = parameters.get("orbit")
+        dispatched.append(str(orbit))
+        if orbit == "ascending":
+            # Not retryable: the deployment itself is missing.
+            return SimpleNamespace(
+                id="r",
+                state=SimpleNamespace(
+                    type=StateType.FAILED, name="Failed", message="ObjectNotFound: no such deployment"
+                ),
+            )
+        if orbit == "descending":
+            return SimpleNamespace(
+                id="r",
+                state=SimpleNamespace(
+                    type=StateType.FAILED, name="Failed", message="PermissionError: The provided token has expired."
+                ),
+            )
+        return _completed_run()
+
+    monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+
+    with pytest.raises(RuntimeError, match="ObjectNotFound"):
+        _run(s1_orbit="both", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+
+    # Aborted on the first attempt rather than retrying the recoverable legs around a
+    # failure that a re-dispatch cannot fix.
+    assert sorted(dispatched) == ["None", "ascending", "descending"]  # one dispatch each, no retry
+    assert wired["markers_written"] == []  # and nothing was marked complete

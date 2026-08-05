@@ -26,6 +26,10 @@ from collections.abc import Callable
 from prefect.client.orchestration import get_client
 from prefect.states import Cancelling
 
+#: Runs fetched per page when sweeping children by tag. Prefect's server-side default
+#: is 200; asking explicitly is what makes "a short page means the last page" true.
+_PAGE = 200
+
 
 def child_run_tag(prefix: str, flow_run_id: object) -> str | None:
     """The tag a parent stamps on its children, or ``None`` outside a flow run.
@@ -62,8 +66,28 @@ def make_child_cancel_hook(prefix: str, what: str) -> Callable[..., None]:
             from prefect.client.schemas.filters import FlowRunFilter, FlowRunFilterTags
 
             with get_client(sync_client=True) as client:
-                runs = client.read_flow_runs(flow_run_filter=FlowRunFilter(tags=FlowRunFilterTags(all_=[tag])))
-                live = [r for r in runs if r.state is None or not r.state.is_final()]
+                # PAGE. `limit=None` takes the server default (200), and a campaign
+                # dispatches one child per (zone, year) — thousands over its life, all
+                # carrying this tag long after they finish. A live child outside the
+                # first page would never be cancelled, and its Ray fleet would keep
+                # billing and keep writing the mosaic a retry is about to rebuild.
+                # Filtering to live states server-side would be the cheaper query, but
+                # the state filter is what decides which runs a page contains, and
+                # getting the terminal-state set wrong here fails silently in exactly
+                # the same way — so page over everything and judge finality locally,
+                # where `is_final()` is the authority.
+                live = []
+                offset = 0
+                while True:
+                    page = client.read_flow_runs(
+                        flow_run_filter=FlowRunFilter(tags=FlowRunFilterTags(all_=[tag])),
+                        limit=_PAGE,
+                        offset=offset,
+                    )
+                    live.extend(r for r in page if r.state is None or not r.state.is_final())
+                    if len(page) < _PAGE:
+                        break
+                    offset += len(page)
                 if live:
                     log.warning("Cancelling %d live %s(s) tagged %r", len(live), what, tag)
                 for r in live:

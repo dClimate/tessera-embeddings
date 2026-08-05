@@ -355,14 +355,45 @@ class _DeploymentCellInputs:
         delete_prefix(f"{self._inputs_bucket.rstrip('/')}/mosaics/{zone}/{year}", log=self._log)
 
     def discard(self, zone: str, year: int) -> None:
-        """Forget the cell's ingest future so the next ``start`` submits a new one.
+        """Forget the cell's ingest future, cancelling any child still registered for it.
 
-        Only the memo is dropped; whatever the attempt committed to the mosaic stays,
-        and the fresh ingest resumes it rather than rebuilding. Nothing is cancelled —
-        a future still running is left to finish under its own run id, since this is
-        called on a cell whose attempt already failed.
+        Whatever the attempt committed to the mosaic stays, and the fresh ingest that
+        follows resumes it rather than rebuilding.
+
+        The cancellation is the load-bearing part. A cell reaches here because its ingest
+        FAILED, and for one failure mode the child is still alive: when polling gives up
+        after a persistent run of API errors it deliberately leaves the run registered,
+        because the server-side ingest may well be running fine and only the parent's
+        view of it broke. Re-dispatching on top of that gives one mosaic prefix two
+        concurrent writers — and the ingest path forbids exactly that, since its commits
+        do not rebase and the second writer's ConflictError is not retried. So the
+        registered child is asked to stop before its replacement starts.
+
+        Best effort, and it has to be: this runs on the failure path, the Prefect API is
+        the thing most likely to be down, and a cancellation this cannot deliver must not
+        stop the retry. The id is dropped either way — a child that outlives the request
+        is caught again by ``shutdown``'s sweep.
         """
         self._futures.pop((zone, year), None)
+        with self._lock:
+            fr_id = self._inflight.pop((zone, year), None)
+        if fr_id is None:
+            return
+        try:
+            with get_client(sync_client=True) as client:
+                client.set_flow_run_state(fr_id, state=Cancelling())
+            self._log.warning(
+                "Cancelled still-registered ingest %s-%d (%s) before re-dispatching it", zone, year, fr_id
+            )
+        except Exception:
+            self._log.warning(
+                "Could not cancel still-registered ingest %s-%d (%s) before re-dispatch — it may still be "
+                "writing the mosaic; check the Prefect UI",
+                zone,
+                year,
+                fr_id,
+                exc_info=True,
+            )
 
     def shutdown(self) -> None:
         """Stop dispatching AND cancel in-flight child ingest runs (best effort).
@@ -843,22 +874,17 @@ def fill_zones_sequential_flow(
             s3_region=s3_region,
         )
 
-    # The shared stream session: ONE set of actors for every same-orbit zone,
-    # fed via the runner's more_work source. Its config carries the session
-    # orbit; zones resolving a different orbit are deferred by the runner to
-    # _infer_single below. The placeholder path args are never used — the
-    # initial chunk list is empty and every streamed item carries its own
-    # ZoneContext.
+    # The shared stream session: ONE set of actors for EVERY zone in the cluster,
+    # whatever orbit each resolves, fed via the runner's more_work source. The
+    # placeholder path args are never used — the initial chunk list is empty and
+    # every streamed item carries its own ZoneContext.
     #
-    # The session orbit is simply the REQUEST (default "both"). A whole UTM zone
-    # is anticipated to always carry BOTH S1 orbits — single/no-orbit is a
-    # sub-zone and pixel-level reality (handled per-pixel in the mosaic and by
-    # `allow_s2_only`), NOT a whole-zone one — so `resolve_s1_orbit` returns
-    # "both" for every cell and none ever mismatches a "both" session. Resolving
-    # the session orbit from the cells' data would only matter for a
-    # single-orbit whole zone, which does not occur; the orbit-mismatch
-    # deferral + fallback below remains as a safety net for an explicit
-    # single-orbit request (or that non-scenario), bounded by the deferral cap.
+    # The session orbit is simply the REQUEST (default "both"), and it does not
+    # constrain which cells can join: the resolved orbit travels on each cell's
+    # ZoneContext, exactly as its time window does, so one actor reads each cell
+    # under that cell's own orbit. A radar-free cell resolving `none` is therefore
+    # ordinary work rather than something to route around — which matters, because
+    # radar-free zone-years are a predictable population, not an anomaly.
     # The densest live cell's year, NOT a leaked triage loop variable. This config sizes
     # the shared session and builds its actors; its window is only a DEFAULT now, because
     # every work item carries its own cell's window (ZoneContext.time_window) and the
@@ -896,8 +922,9 @@ def fill_zones_sequential_flow(
         )
 
     def _infer_single(cell: SequentialCell, prep: PreparedCell, final: bool) -> ZoneFillHandoff:
-        # Orbit-mismatch fallback: a per-cell session with the cell's own
-        # config, after the shared stream ends.
+        # A per-cell session with the cell's own config, on the still-provisioned
+        # cluster, for the cells the shared stream did not finish — a crashed
+        # session's survivors and the retry pass.
         return infer_zone_year(
             store_path=store_path,
             zone=cell.zone,
