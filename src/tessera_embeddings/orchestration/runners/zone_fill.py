@@ -69,6 +69,7 @@ from tessera_embeddings.inference.assembly import (
     ZarrWriter,
     read_spatial_coords,
     read_store_spatial_coords,
+    summarise_radar_coverage,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks
 from tessera_embeddings.inference.data_loading import _active_orbits
@@ -846,6 +847,21 @@ def assemble_zone_year(
     # this one skips it, its data would survive under this run's completion mark.
     skipped_labels = sorted({c.label for c in live} - staged_labels)
     n_workers = n_assembly_workers or AssemblyConfig().compute_n_workers(len(live))
+    # Reduced from what the actors already reported, so it costs no reads. Recorded on the
+    # YEAR's provenance entry: radar coverage is a property of what was acquired, so one
+    # year of a zone can be radar-free where another is not.
+    radar_coverage = summarise_radar_coverage(results)
+    if radar_coverage:
+        log.info(
+            "Radar coverage %s-%d: %.1f%% of embedded pixels have NO radar, %.1f%% have "
+            "fewer than %d observations (%d tile(s) wholly radar-free)",
+            zone,
+            year,
+            radar_coverage["s1_free_pct"],
+            radar_coverage["s1_light_pct"],
+            radar_coverage["s1_light_below_obs"],
+            radar_coverage["tiles_fully_s1_free"],
+        )
     snapshot = writer.assemble_global(
         store_path,
         zone,
@@ -856,6 +872,7 @@ def assemble_zone_year(
         staged_labels=staged_labels,
         skipped_labels=skipped_labels,
         s3_concurrency=s3_concurrency,
+        radar_coverage=radar_coverage,
         get_credentials=get_credentials,
         s3_region=s3_region,
         log=log,

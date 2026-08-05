@@ -30,6 +30,7 @@ import requests
 from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
     PREFETCH_DEPTH,
+    RADAR_LIGHT_MAX_OBS,
     S1_ORBIT_NONE,
     S2_BAND_ORDER,
     InferenceConfig,
@@ -1294,6 +1295,20 @@ class InferenceActor:
             # write's outcome is confirmed (see class comment above).
             self._writer_pool_handle()
 
+            # Radar coverage for this chunk, from buffers already in memory — no extra read.
+            # `scales` is NaN-filled and written only where a pixel was embedded, so it IS
+            # the embedded mask; counting over the whole chunk instead would score every
+            # out-of-ROI pixel as radar-free and swamp the answer.
+            #
+            # Summed only over embedded pixels, so the intermediate is as small as the ROI
+            # rather than the chunk. Radar-free needs no sum at all — both counts zero.
+            embedded = ~np.isnan(scales)
+            asc, desc = obs_buffers["s1_asc_obs_count"], obs_buffers["s1_desc_obs_count"]
+            s1_free_px = int((embedded & (asc == 0) & (desc == 0)).sum())
+            obs_at_embedded = asc[embedded].astype(np.uint32) + desc[embedded].astype(np.uint32)
+            s1_light_px = int(((obs_at_embedded > 0) & (obs_at_embedded < RADAR_LIGHT_MAX_OBS)).sum())
+            del embedded, obs_at_embedded
+
             def _timed_write() -> str:
                 # "write" is a separate context slot: the upload overlaps the
                 # NEXT chunk's prologue on the main thread, so both phases must
@@ -1369,6 +1384,11 @@ class InferenceActor:
                 "chunk": chunk.label,
                 "status": "success",
                 "valid_pixels": total_valid,
+                # Per-chunk radar coverage, aggregated per YEAR at assembly. Reported from
+                # here because this is the only place the observation maps and the embedded
+                # mask are both in memory; recomputing it later would mean reading the grid.
+                "s1_free_pixels": s1_free_px,
+                "s1_light_pixels": s1_light_px,
                 "elapsed_sec": elapsed,
                 "instance_id": self.instance_id,
                 "write_deferred": True,

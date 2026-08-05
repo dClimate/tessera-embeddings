@@ -255,6 +255,16 @@ S2_BAND_ORDER = ["red", "blue", "green", "nir", "nir08", "rededge1", "rededge2",
 # SCL classes considered valid for masking (complement of S2_SCL_INVALID_CLASSES)
 SCL_VALID_CLASSES = frozenset({4, 5, 6, 7, 10, 11})
 
+#: A pixel with fewer than this many radar observations in the year is "radar-light".
+#:
+#: Reported per year alongside the radar-free count so a downstream user can tell a pixel
+#: the radar barely saw from one it saw normally — a distinction the embedding itself does
+#: not expose, since both produce an embedding. The exact per-pixel counts are in the store;
+#: this only sets where the summary draws its line, and it is deliberately generous:
+#: twelve is roughly one observation a month, below which a year's radar signal is thin
+#: however it is sampled.
+RADAR_LIGHT_MAX_OBS = 12
+
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
 #:
 #: Distinct from an empty request: nobody ASKS for ``"none"``, it is what ``"both"`` resolves

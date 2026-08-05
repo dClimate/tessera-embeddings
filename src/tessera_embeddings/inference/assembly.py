@@ -47,7 +47,7 @@ import numpy as np
 import xarray as xr
 import zarr
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM, TimeWindow
+from tessera_embeddings.config.inference import EMBEDDING_DIM, RADAR_LIGHT_MAX_OBS, TimeWindow
 from tessera_embeddings.config.store_layout import INNER_PX, OBS_COUNT_VARS, SINGLE, StoreLayout
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
 from tessera_embeddings.inference.conventions import build_convention_attrs
@@ -1693,6 +1693,7 @@ class ZarrWriter:
         staged_labels: Iterable[str] | None = None,
         skipped_labels: Iterable[str] | None = None,
         s3_concurrency: int | None = None,
+        radar_coverage: dict | None = None,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
@@ -1737,6 +1738,11 @@ class ZarrWriter:
                 process drives (fleet-wide gating is the orchestrator's job).
             staged_labels: Pre-listed staged tile labels (e.g. the return of
                 :meth:`verify_staged_completeness`); ``None`` lists the prefix.
+            radar_coverage: This YEAR's radar-coverage summary, from
+                :func:`summarise_radar_coverage` over the run's chunk results. Recorded on
+                the year's ``runs`` entry. Per year rather than per zone because radar
+                coverage is a property of what was acquired: one year of a zone can be
+                radar-free where another is not.
             skipped_labels: Live tiles this run resolved to a SKIP. Written as fill,
                 so the published year is exactly this run's output — see
                 :meth:`StagedShardSource.live_shards` for the mixed-year hazard that
@@ -1885,6 +1891,7 @@ class ZarrWriter:
             shard_px=shard_px,
             commit_msg=f"Run {run_id}: fill {zone} year {year}",
             run_id=run_id,
+            radar_coverage=radar_coverage,
         )
         _log.info("Global assembly complete: %s/%s year %d (snapshot %s)", store_path, zone, year, snapshot)
         return snapshot
@@ -1909,3 +1916,47 @@ class ZarrWriter:
         # Shared prefix delete: s5cmd --all-versions (so a versioned bucket doesn't
         # keep the staged tiles as non-current versions), fsspec fallback.
         delete_prefix(target, log=_log)
+
+
+def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
+    """Aggregate per-chunk radar counts into one year's coverage summary.
+
+    Reduces what the actors already reported — the counts are computed where the
+    observation maps and the embedded mask are both in memory, so nothing here reads
+    pixels. ``None`` when no chunk reported the counts, which is how a run from an older
+    build records no summary rather than a wrong one of zeros.
+
+    Percentages are of EMBEDDED area, not of the zone: a zone is mostly ocean and mostly
+    unembedded, so a fraction of the grid would be dominated by area no radar was ever
+    expected over and would say nothing about the data.
+    """
+    embedded = free = light = 0
+    reported = 0
+    for r in results:
+        if r.get("status") != "success" or "s1_free_pixels" not in r:
+            continue
+        reported += 1
+        embedded += int(r.get("valid_pixels", 0))
+        free += int(r["s1_free_pixels"])
+        light += int(r.get("s1_light_pixels", 0))
+    if not reported or embedded == 0:
+        return None
+    return {
+        "embedded_px": embedded,
+        "s1_free_px": free,
+        "s1_free_pct": round(100.0 * free / embedded, 3),
+        "s1_light_px": light,
+        "s1_light_pct": round(100.0 * light / embedded, 3),
+        "s1_light_below_obs": RADAR_LIGHT_MAX_OBS,
+        "chunks_reporting": reported,
+        # Where, coarsely: a tile that is ENTIRELY radar-free localises the gap without
+        # storing a per-tile grid, and distinguishes a concentrated absence (whole tiles,
+        # e.g. an ice margin) from a diffuse one (a swath edge crossing many tiles). Exact
+        # locations are already in the store's per-pixel observation-count arrays.
+        "tiles_fully_s1_free": sum(
+            1
+            for r in results
+            if r.get("status") == "success" and r.get("s1_free_pixels") and r["s1_free_pixels"] == r.get("valid_pixels")
+        ),
+        "tiles_reporting": reported,
+    }

@@ -132,7 +132,14 @@ def read_years_complete(node: zarr.Group) -> list[int]:
     return sorted(int(y) for y in raw) if isinstance(raw, list) else []
 
 
-def run_provenance(existing: object, year: int, run_id: str, *, empty: bool = False) -> dict:
+def run_provenance(
+    existing: object,
+    year: int,
+    run_id: str,
+    *,
+    empty: bool = False,
+    radar_coverage: dict | None = None,
+) -> dict:
     """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
 
     Both fill paths use this — the shard write (:func:`write_year_shards`) and
@@ -141,10 +148,20 @@ def run_provenance(existing: object, year: int, run_id: str, *, empty: bool = Fa
     store GUARANTEES calendar-year slots (the zone-fill gate rejects any window
     that is not exactly Jan-Dec of the slot's year), and each slot's true interval
     is stated by the seeded ``time_bnds`` CF-bounds variable.
+
+    ``radar_coverage`` records how much of the year's embedded area had no radar, or
+    little of it. It belongs PER YEAR rather than per zone because radar coverage is a
+    property of what was acquired, not of the terrain: one year of a zone can be
+    radar-free where another is not, so a zone-level figure would be wrong for at least
+    one of them. Exact per-pixel counts already live in the store's
+    ``s1_asc_obs_count``/``s1_desc_obs_count`` arrays; this is the summary that makes the
+    question answerable without reading a zone-sized grid.
     """
     record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat()}
     if empty:
         record["empty"] = True
+    if radar_coverage:
+        record["radar_coverage"] = dict(radar_coverage)
     return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
 
 
@@ -155,6 +172,7 @@ def commit_year_attrs(
     *,
     run_id: str | None = None,
     empty: bool = False,
+    radar_coverage: dict | None = None,
     gate: CommitGate | None = None,
     tries: int = 8,
     skip_if_marked: bool = False,
@@ -198,7 +216,9 @@ def commit_year_attrs(
         if year_label not in done:
             node.attrs["years_complete"] = sorted([*done, year_label])
         if run_id is not None:
-            node.attrs["runs"] = run_provenance(node.attrs.get("runs"), year_label, run_id, empty=empty)
+            node.attrs["runs"] = run_provenance(
+                node.attrs.get("runs"), year_label, run_id, empty=empty, radar_coverage=radar_coverage
+            )
         try:
             return commit_with_rebase(session, f"mark {group} year {year_label} complete", gate=gate)
         except icechunk.RebaseFailedError:
@@ -260,6 +280,7 @@ def write_year_shards(
     shard_px: int = SHARD_PX,
     commit_msg: str | None = None,
     run_id: str | None = None,
+    radar_coverage: dict | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
@@ -309,4 +330,4 @@ def write_year_shards(
     # collision costs a sub-second retry instead of this whole assembly. Return that
     # snapshot rather than the shard one: a tag must point at a state where the year is
     # both written AND marked.
-    return commit_year_attrs(repo, group, year_label, run_id=run_id, gate=gate)
+    return commit_year_attrs(repo, group, year_label, run_id=run_id, radar_coverage=radar_coverage, gate=gate)
