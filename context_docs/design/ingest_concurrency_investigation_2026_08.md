@@ -297,19 +297,24 @@ them a cold fleet, is not a measurement of anything.
 >
 > Candidate 1 was **"source-read contention above ~20 cells"**, because July measured contention
 > only to 20 cells and explicitly left "aggregate source-read elasticity at large cell counts
-> unmeasured". **The loaded arm ran at 17 concurrent Dask fleets, 803 workers, ~3,200 vCPU — below
-> that 20-cell line, and about one sixth of campaign width** (45–61 concurrent cells at 372 vCPU
-> each is 16,700–22,700 vCPU).
+> unmeasured". **The loaded arm ran against 17 concurrent optical fleets, 803 workers, ~3,200 vCPU
+> of worker capacity — below that line, and about one sixth of campaign width in vCPU** (45–61 cells
+> at 372 vCPU each is 16,700–22,700).
+>
+> **Quote this in vCPU, not in cells.** A cell runs three fleets — one optical, two radar — and many
+> cells had only their optical leg active at the time, so "17 fleets" is roughly 8–9 cells' worth of
+> capacity, not 17. Reading the coverage in cells would overstate it about twofold.
 >
 > So this A/B does **not** test candidate 1. What it establishes is that nothing goes wrong up to
-> ~17 fleets, a range July had largely covered already. **Contention at campaign width remains
-> unmeasured.**
+> ~3,200 vCPU of concurrent ingest, a range July had largely covered already. **Contention at
+> campaign width remains unmeasured.**
 >
 > What has changed is the *motivation*: with E withdrawn there is no 1.8–2.1x anomaly demanding a
-> contention term to explain it, and no sign of a knee approaching 17. The remaining 1.17x is
-> season, account and code drift, of which contention at this width contributes nothing
-> measurable. A ladder at 25/40/55 concurrent cells (Stage 3) is now the only way to close the
-> campaign-width question, and it is worth running for the schedule rather than for the diagnosis.
+> contention term to explain it, and no sign of a knee approaching this width. The remaining 1.17x is
+> season, account and code drift, of which contention here contributes nothing measurable. Stage 3's
+> ladder is the only way to close the campaign-width question — and per the table there, **its 40-
+> and 55-cell rungs are impossible until prod's quota raise lands**, which makes the quota request
+> the critical path.
 
 ### A third arm is now OPTIONAL — the result made it cheap to skip
 
@@ -356,14 +361,32 @@ comparison was never like-for-like: E's "today" side was May–September 2021 an
 January 2024. Matched, 1.17x rather than 1.8–2.1x. This was the cheapest step in the plan and it
 was the one that mattered — it should have come first. See §"E IS WITHDRAWN".
 
-**Stage 3 — a concurrency ladder. NOW THE ONLY OPEN QUESTION, and its purpose has changed.** It
-was conditional on Stage 1 finding contention; Stage 1 found none, but only up to 17 fleets, which
-is below the ~20 cells where contention was ever hypothesised and a sixth of campaign width. So the
-ladder is no longer a diagnosis — **it is the schedule input**, and it should start where the
-existing evidence stops rather than below it: **25, 40 and 55 concurrent cells**, 90 minutes per
-rung, on the same 3 zones at 60 workers, measuring **write per window**. Normalising is not
-optional; per-date cost re-measures L and would show a rise that is purely seasonal. Rungs below 20
-would only re-confirm what Stage 1 and July already cover. Cost ~3 rungs x 90 min.
+**Stage 3 — a concurrency ladder. THE ONLY OPEN QUESTION, and it is BLOCKED ON THE QUOTA RAISE.**
+It was conditional on Stage 1 finding contention; Stage 1 found none, but only up to 17 fleets. So
+the ladder is no longer a diagnosis — **it is the schedule input** — and it should start where the
+evidence stops rather than below it, measuring **write per window** (per-date cost re-measures L and
+would show a purely seasonal rise).
+
+**The arithmetic says most of it cannot be run today.** A cell is 372 vCPU (60 S2 + 13 per S1 orbit,
+plus schedulers and runners), so:
+
+| rung | vCPU | at 10,000 (both accounts today) | at 25,000 (prod, filed) | ~cost, 90 min |
+|---:|---:|---|---|---:|
+| 25 cells | 9,300 | OK, but needs a near-idle account | OK | ~$800 |
+| 40 cells | 14,880 | **IMPOSSIBLE** | OK | ~$1,300 |
+| 55 cells | 20,460 | **IMPOSSIBLE** | OK | ~$1,780 |
+
+**10,000 vCPU caps concurrency at 26 cells.** Since Stage 1 already covers ~17 fleets, the only rung
+available at the current quota is ~25 cells — a single step, and one that still sits at the bottom of
+the hypothesised range. **The campaign-width question (45–61 cells) cannot be answered in either
+account until prod's raise to 25,000 is granted.** That makes the quota request the critical path for
+this question, not our willingness to spend.
+
+> **"17 fleets" is not "17 cells" — keep the unit straight.** A cell runs three fleets (one optical,
+> two radar), and at the time of the loaded arm many cells had only their optical leg active: 17
+> fleets at ≥40 workers, 803 workers, **~3,200 vCPU of worker capacity**. Against the campaign's
+> 16,700–22,700 vCPU that is ~14–19%, so "about a sixth of campaign width" is right **in vCPU**,
+> which is the unit to quote. Read in cells it would overstate the coverage roughly twofold.
 
 **Stage 4 — close the instrumentation gap that forced proxies throughout.** Per-date **covered
 chunks** is not logged, so every cross-zone comparison here uses the zone's live chunks as a
