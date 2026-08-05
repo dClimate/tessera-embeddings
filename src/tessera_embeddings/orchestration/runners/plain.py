@@ -175,7 +175,12 @@ def _run_inference_and_assemble(
 
     # Probe for available SAR stores before dispatching inference; if s1_orbit="both"
     # is requested but only one orbit was ingested, fall back gracefully.
-    effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
+    #
+    # Radar is DEMANDED here, matching the single-cell flows: this runner exists to fill
+    # one named ROI on one machine, so no radar at all is far more likely to be a broken
+    # ingest than genuinely radar-free terrain, and the operator should be told. A caller
+    # filling radar-free land passes ``s1_orbit`` explicitly.
+    effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit, allow_none=False)
     config = build_inference_config(
         s1_orbit=effective_orbit,
         time_window=time_window,

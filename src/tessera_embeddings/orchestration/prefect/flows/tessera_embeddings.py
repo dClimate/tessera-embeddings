@@ -134,7 +134,7 @@ def tessera_embeddings(
     code_suffix: str = "",
     num_actors: int = 20,
     s1_orbit: str = "both",
-    require_s1: bool = False,
+    require_s1: bool = True,
     s3_region: str | None = None,
     allow_s2_only: bool = False,
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
@@ -172,11 +172,13 @@ def tessera_embeddings(
             Empty for production tarballs.
         num_actors: Number of GPU actors to create.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
-        require_s1: Demand radar rather than request it. ``s1_orbit="both"`` normally
-            resolves to ``"none"`` when no SAR store exists, because parts of the globe are
-            radar-free in principle and a global run cannot refuse them. Set this on a single
-            run over terrain known to be imaged, where an absent store means something
-            upstream broke and embedding without radar would hide it.
+        require_s1: Demand radar rather than request it, and **True by default here**
+            because this flow fills ONE cell: an operator naming a single zone-year over
+            terrain that should be imaged wants to be told when its radar is missing, not
+            to receive optical-only embeddings quietly. Set False for a cell that is
+            genuinely radar-free — parts of the globe have no dual-pol coverage at all, and
+            the ingest's per-orbit item count is what distinguishes that from a lost orbit.
+            The global campaign passes False for the same reason.
         s3_region: Optional S3 region for the mosaic/store opens — threaded, like the
             IAM credential callback, through orbit resolution, chunk enumeration, the
             coverage gate, and the assembly task. ``None`` uses the default Icechunk

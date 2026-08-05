@@ -18,6 +18,9 @@ alternative is a run that writes nothing and still reports success.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 
 import tessera_embeddings.ingest.s1_roi as s1_roi_module
@@ -28,6 +31,8 @@ from tessera_embeddings.inference.data_loading import (
     _active_orbits,
     resolve_s1_orbit,
 )
+
+_SRC = Path(__file__).resolve().parents[2] / "src" / "tessera_embeddings"
 
 
 def test_none_activates_no_orbit() -> None:
@@ -196,3 +201,53 @@ class TestTheInferenceConfigAcceptsRadarFreeLand:
     def test_the_real_orbits_are_unaffected_by_the_flag(self, orbit: str) -> None:
         """The new rule must bind only to 'none'; a real orbit never needs the flag."""
         assert self._config(s1_orbit=orbit).s1_orbit == orbit
+
+
+class TestWhoDemandsRadarAndWhoDoesNot:
+    """The default differs by SCOPE, and getting it backwards fails silently either way.
+
+    A single cell dispatched by hand should report missing radar rather than quietly produce
+    optical-only embeddings — there, no radar is far more likely a broken ingest than
+    genuinely radar-free terrain. A global run is the opposite: parts of the globe have no
+    dual-pol coverage at all, and refusing them fails those cells on every retry forever.
+
+    So the single-cell flows demand radar and the campaign must OVERRIDE that. These tests
+    exist because the override is the fragile half: a parameter the parent must remember to
+    pass is exactly the shape that regresses unnoticed.
+    """
+
+    @staticmethod
+    def _default(module: str, param: str) -> object:
+        tree = ast.parse((_SRC / "orchestration" / "prefect" / "flows" / module).read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            args = node.args
+            for name, default in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+                if name.arg == param and default is not None:
+                    return ast.literal_eval(default)
+        raise AssertionError(f"{module}: no keyword-only {param} with a default found")
+
+    @pytest.mark.parametrize("module", ["fill_zone_year.py", "tessera_embeddings.py"])
+    def test_a_single_cell_flow_demands_radar(self, module: str) -> None:
+        assert self._default(module, "require_s1") is True
+
+    def test_a_sweep_does_not_demand_radar(self) -> None:
+        """Every cell of a sweep is chosen by breadth, so some will be radar-free."""
+        assert self._default("fill_zones_sequential.py", "require_s1") is False
+
+    def test_the_campaign_overrides_the_single_cell_default_on_every_dispatch_path(self) -> None:
+        """Both dispatch modes must pass it — chained clusters AND cluster-per-cell.
+
+        Counted rather than merely found, because covering one path and missing the other is
+        the realistic regression, and it only shows up on a radar-free zone.
+        """
+        src = (_SRC / "orchestration" / "prefect" / "flows" / "run_global_campaign.py").read_text()
+        assert src.count('"require_s1": False,') == 2, (
+            "the campaign dispatches fills two ways; both must allow radar-free cells"
+        )
+
+    def test_the_local_runner_demands_radar(self) -> None:
+        """Same reasoning as the single-cell flows: it fills one named ROI."""
+        src = (_SRC / "orchestration" / "runners" / "plain.py").read_text()
+        assert "allow_none=False" in src

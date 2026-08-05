@@ -881,6 +881,12 @@ async def run_global_campaign(
             "commit_limit_name": commit_limit_name,
             "allow_partial_window": allow_partial_window,
             "allow_s2_only": allow_s2_only,
+            # Explicit, and it must stay explicit: `fill-zone-year` DEMANDS radar by
+            # default, because a lone cell dispatched by hand should report missing radar
+            # rather than quietly produce optical-only embeddings. A global campaign is the
+            # opposite case — parts of the globe have no dual-pol coverage at all, and
+            # refusing them fails those cells on every retry forever.
+            "require_s1": False,
             # The child re-runs the model gate this flow already cleared in preflight, so
             # without forwarding the override it rejects the same store — after its ingest
             # has been paid for. The campaign-level flag has to reach the gate that fires.
@@ -1108,6 +1114,8 @@ async def run_global_campaign(
                         "commit_limit_name": commit_limit_name,
                         "allow_partial_window": allow_partial_window,
                         "allow_s2_only": allow_s2_only,
+                        # As in _fill_params: the chained child must not demand radar either.
+                        "require_s1": False,
                         # As in _fill_params: the chained child gates on the seeded model too.
                         "allow_model_mismatch": allow_model_mismatch,
                         "ssm_prefix": ssm_prefix,
