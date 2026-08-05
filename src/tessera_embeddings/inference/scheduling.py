@@ -48,12 +48,22 @@ class ZoneContext:
     session's only mismatch check is on ``s1_orbit``, so nothing would catch it.
     ``None`` means "use the actor's own config" — what the single-ROI path passes,
     and what keeps that path byte-for-byte unchanged.
+
+    ``s1_orbit`` is here for the same reason and closes the gap named above. A chained
+    session's cells may resolve DIFFERENT orbits: parts of the globe are radar-free in
+    principle, so a cell can resolve ``"none"`` while the session was asked for ``"both"``.
+    Reading the orbit from the actor's config made that a mismatch the session could only
+    handle by deferring the cell and holding its mosaic against a bounded budget — and past
+    that bound the cell failed and its mosaic was deleted, so a deterministic, predictable
+    population of zones could never complete. Carried per cell, a radar-free cell is ordinary
+    work for any actor.
     """
 
     mosaic_base: str
     staging_base: str
     run_id: str
     time_window: TimeWindow | None = None
+    s1_orbit: str | None = None
 
 
 @dataclass(frozen=True)
@@ -316,6 +326,7 @@ class ActorPool:
             tracker=tracker,
             prefetch_hint=hint.chunk if hint is not None else None,
             time_window=item.ctx.time_window,
+            s1_orbit=item.ctx.s1_orbit,
         )
         self.pending[ref] = (item, actor_idx)
         self.chunk_attempts[item.uid] = self.chunk_attempts.get(item.uid, 0) + 1

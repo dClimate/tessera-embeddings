@@ -10,6 +10,7 @@ dependency, stubbed at the module namespace.
 from __future__ import annotations
 
 import logging
+import pathlib
 import threading
 import time
 
@@ -280,7 +281,15 @@ def test_resumed_skip_markers_are_counted_as_skips_not_successes(monkeypatch):
     assert seen["02N"] and all(r["status"] == "success" for r in seen["02N"])
 
 
-def test_orbit_mismatch_defers_to_fallback():
+def test_a_cell_with_a_different_orbit_streams_under_its_own_orbit():
+    """It used to be deferred out of the stream; it no longer needs to be.
+
+    The orbit rides on each cell's ``ZoneContext``, exactly as its inference window already
+    does, so one actor serves cells of differing orbits. That has to work: parts of the globe
+    are radar-free in principle, so a cell resolving something other than the session's
+    request is a permanent population, and deferring it against a bounded budget meant that
+    population could never complete.
+    """
     events: list[str] = []
     calls: list[tuple[str, bool]] = []
 
@@ -298,10 +307,36 @@ def test_orbit_mismatch_defers_to_fallback():
         assemble=_assemble(events),
         infer_single=infer_single,
     )
-    assert summary["deferred_orbit_mismatch"] == 1
-    assert calls == [("02N", True)]  # ran after the stream, flagged final
-    assert not [e for e in events if e.startswith("infer:r-02N")]  # never streamed
+    assert summary["deferred_orbit_mismatch"] == 0, "nothing should be deferred for its orbit now"
+    assert calls == [], "the per-cell fallback must not be reached by an orbit mismatch"
+    assert [e for e in events if e.startswith("infer:r-02N")], "the mismatched cell must STREAM"
     assert summary["succeeded"] == 3
+
+
+def test_the_streamed_work_carries_each_cell_s_own_orbit():
+    """Streaming it is only correct if the actor is TOLD the cell's orbit.
+
+    Without this the mismatched cell would stream and be read under the session's orbit —
+    silently the wrong data, which is worse than the deferral it replaces.
+    """
+    seen: dict[str, str | None] = {}
+
+    def session(more_work, on_item_done):
+        """Drain the stream, recording the orbit each work item carried."""
+        results = []
+        while True:
+            batch = more_work()
+            if batch is None:
+                return results
+            for item in batch:
+                seen[item.ctx.run_id.removeprefix("r-")] = item.ctx.s1_orbit
+                result = {"chunk": item.chunk.label, "status": "success"}
+                results.append(result)
+                on_item_done(item, result)
+
+    _run(_cells(3), orbits={"02N": "ascending"}, session=session, assemble=_assemble([]))
+    assert seen.get("02N") == "ascending", seen
+    assert {v for k, v in seen.items() if k != "02N"} <= {"both"}, seen
 
 
 def test_assembly_failure_recorded_run_continues():
@@ -379,39 +414,30 @@ def test_failed_cell_releases_budget_slot_and_keeps_mosaic():
     assert len([e for e in events if e.startswith("cleanup:")]) == 7
 
 
-def test_deferred_mosaics_capped_with_loud_failure():
-    """Orbit-mismatch deferrals retain mosaics until the post-session fallback,
-    so they are capped at look_ahead + 1 budget slots; mismatch cells beyond
-    the cap fail loudly (and their mosaics are cleaned) instead of silently
-    stacking multi-TB mosaics for the whole run.
+def test_every_cell_mismatching_the_session_orbit_still_completes():
+    """Replaces a test of the deferral cap, which no longer exists.
+
+    When mismatched cells were deferred they retained their mosaics against a bounded budget,
+    and past that bound they FAILED with their mosaics deleted. A whole-run mismatch was
+    therefore unfillable — which is exactly what a campaign meets when its zone list holds
+    radar-free zones. Now every cell streams under its own orbit, so the run completes and the
+    storage bound still holds.
     """
     events: list[str] = []
     inputs = BudgetProbeInputs(events)
-    calls: list[str] = []
 
-    def infer_single(cell, prep, final):
-        calls.append(cell.zone)
-
-        return ZoneFillHandoff(
-            zone=cell.zone, year=cell.year, run_id=prep.run_id, t0=0.0, summary={}, live=[], results=[]
-        )
-
-    # ALL cells mismatch the session orbit; look_ahead=0 → cap = 1 retained.
-    with pytest.raises(RuntimeError) as exc_info:
-        _run(
-            _cells(4),
-            orbits=dict.fromkeys(("01N", "02N", "03N", "04N"), "ascending"),
-            inputs=inputs,
-            infer_single=infer_single,
-            look_ahead=0,
-        )
-    assert "deferred-mosaic-budget" in str(exc_info.value)
-    assert "'02N'" in str(exc_info.value) and "'01N'" not in str(exc_info.value)
-    assert calls == ["01N"]  # the retained deferral still ran via fallback
-    assert inputs.high_water <= 2  # look_ahead + 2
-    # Capped cells' mosaics cleaned immediately; the deferred one after fallback.
+    summary = _run(
+        _cells(4),
+        orbits=dict.fromkeys(("01N", "02N", "03N", "04N"), "ascending"),
+        inputs=inputs,
+        look_ahead=0,
+    )
+    assert summary["succeeded"] == 4, "a wholly-mismatched run must complete, not fail"
+    assert summary["failed"] == 0
+    assert summary["deferred_orbit_mismatch"] == 0
+    assert inputs.high_water <= 2, "the storage bound (look_ahead + 2) must still hold"
     for z in ("01N", "02N", "03N", "04N"):
-        assert f"cleanup:{z}" in events
+        assert f"cleanup:{z}" in events, f"{z}'s mosaic was never released"
 
 
 def test_stop_unblocks_a_running_ingest_wait():
@@ -436,32 +462,22 @@ def test_stop_unblocks_a_running_ingest_wait():
     assert time.monotonic() - t0 < 30  # no 600s join-timeout hang
 
 
-def test_lookahead_does_not_deadlock_on_early_deferrals():
-    """THE deadlock regression (PR #90 review, HIGH): two early orbit-mismatch
-    deferrals retain budget slots and a started look-ahead cell holds the third;
-    the feeder must then block only on the CURRENT cell's slot (whose processing
-    frees slots), never on a future look-ahead slot — blocking there wedged the
-    feeder forever before the fix.
+def test_a_mismatched_run_does_not_deadlock_the_feeder():
+    """The deadlock this replaces came from deferrals sitting on budget slots.
+
+    Streaming them removes the mechanism, but the feeder's slot discipline is what made the
+    old bug possible, so the shape is still worth a test: a run where EVERY cell mismatches
+    must drain rather than wedge, under a look-ahead that leaves the budget tight.
     """
     events: list[str] = []
     inputs = BudgetProbeInputs(events)
-    calls: list[str] = []
-
-    def infer_single(cell, prep, final):
-        calls.append(cell.zone)
-
-        return ZoneFillHandoff(
-            zone=cell.zone, year=cell.year, run_id=prep.run_id, t0=0.0, summary={}, live=[], results=[]
-        )
-
     result: dict = {}
 
     def target():
         result["summary"] = _run(
             _cells(4),
-            orbits={"01N": "ascending", "02N": "ascending"},  # cap (look_ahead+1=2) NOT exceeded
+            orbits=dict.fromkeys(("01N", "02N", "03N", "04N"), "ascending"),
             inputs=inputs,
-            infer_single=infer_single,
             look_ahead=1,
         )
 
@@ -469,11 +485,9 @@ def test_lookahead_does_not_deadlock_on_early_deferrals():
     t.start()
     t.join(timeout=30)
     if t.is_alive():
-        pytest.fail("feeder deadlocked: blocked on a future cell's budget slot with deferrals holding the rest")
-    assert result["summary"]["succeeded"] == 4  # 2 streamed + 2 fallback
-    assert result["summary"]["deferred_orbit_mismatch"] == 2
-    assert calls == ["01N", "02N"]
-    assert inputs.high_water <= 3  # the bound still held throughout
+        pytest.fail("feeder deadlocked on a wholly orbit-mismatched run")
+    assert result["summary"]["succeeded"] == 4
+    assert inputs.high_water <= 3
 
 
 def test_systematic_failure_stops_feeder_at_retained_cap():
@@ -750,50 +764,38 @@ def test_max_cell_attempts_one_disables_the_retry():
     assert attempts == [], "no retry may run at max_cell_attempts=1"
 
 
-def test_a_cell_whose_mosaic_was_deleted_is_not_retried():
+def test_the_in_child_retry_only_considers_cells_that_kept_a_mosaic():
     """The bug this caught in review, pinned so it cannot come back.
 
-    Two failure paths delete the mosaic on purpose — the orbit-mismatch deferral cap and
-    a terminal plan — so that a systematic failure cannot stack multi-terabyte inputs.
-    Retrying one of those runs against nothing. Eligibility is "kept its mosaic", which is
-    NOT the same as "failed": a first version of the retry pass used the failure list and
-    silently "recovered" cells whose input had been deleted.
+    Retry eligibility is "kept its mosaic", NOT "failed": a first version keyed off the
+    failure list and silently "recovered" cells whose input had been deleted, running them
+    against nothing.
+
+    The scenario used to be built with the orbit-mismatch deferral cap, which deleted the
+    mosaics of cells past the cap. That path is gone — cells now stream under their own orbit
+    — and every remaining failure path RETAINS its mosaic, so the two sets currently coincide.
+    What is pinned here is therefore the filter itself: the retry pass must consult the
+    retained set rather than the failure list, so that a future delete-on-failure path cannot
+    reintroduce the bug by simply existing.
     """
-    events: list[str] = []
-    attempts: list[str] = []
-    inputs = BudgetProbeInputs(events)
-    # Every cell mismatches the session orbit and look_ahead=0 caps deferrals at 1, so the
-    # cells past the cap fail with their mosaics CLEANED.
-    with pytest.raises(RuntimeError, match="deferral cap reached"):
-        _run(
-            _cells(4),
-            orbits=dict.fromkeys(("01N", "02N", "03N", "04N"), "ascending"),
-            inputs=inputs,
-            look_ahead=0,
-            infer_single=_recovering_single(attempts),
-        )
-    # The capped cells were cleaned, so they must NOT appear as retry attempts. Only the
-    # one legitimately-deferred cell may reach infer_single, via the fallback pass.
-    assert len(attempts) <= 1, attempts
-
-
-def test_retry_runs_before_the_fallback_so_actors_are_still_alive():
-    """Ordering is load-bearing: the fallback marks its last cell `final`, which retires
-    idle actors. A retry scheduled after that would need actors the fallback released.
-    """
-    order: list[str] = []
-
-    def infer_single(cell, prep, final):
-        order.append(f"{cell.zone}:final={final}")
-        return ZoneFillHandoff(
-            zone=cell.zone, year=cell.year, run_id=prep.run_id, t0=0.0, summary={}, live=[], results=[]
-        )
-
-    _run(
-        _cells(2),
-        orbits={"02N": "ascending"},  # 02N defers to the fallback
-        session=_sync_session(fail={"01N"}),  # 01N fails in the stream → retried
-        inputs=RecordingInputs([]),
-        infer_single=infer_single,
+    src = pathlib.Path(mod.__file__).read_text() if hasattr(mod, "__file__") and mod.__file__ else ""
+    assert "pending = failed_keys if budget is None else [k for k in failed_keys if k in eligible]" in src, (
+        "the retry pass must filter the failure list by the retained-mosaic set"
     )
-    assert order == ["01N:final=False", "02N:final=True"], order
+    assert "eligible = set(retained_failed)" in src
+
+
+def test_the_retry_pass_precedes_the_fallback_pass():
+    """Ordering is load-bearing: the fallback marks its last cell ``final``, which retires
+    idle actors, so a retry scheduled after it would need actors the fallback released.
+
+    This used to be driven end-to-end with an orbit-mismatched cell, which reached the
+    fallback. Nothing routes there any more — cells stream under their own orbit — so the hook
+    is retained for a caller that supplies one, and the ordering is pinned structurally
+    instead. Kept rather than deleted because the constraint is about ACTOR LIFETIME, not
+    about orbits: whatever feeds the fallback next inherits it.
+    """
+    src = pathlib.Path(mod.__file__).read_text()
+    retry_at = src.index("for attempt in range(2, max_cell_attempts + 1):")
+    fallback_at = src.index("fallback_cells = list(deferred)")
+    assert retry_at < fallback_at, "the in-child retry must run BEFORE the fallback retires idle actors"

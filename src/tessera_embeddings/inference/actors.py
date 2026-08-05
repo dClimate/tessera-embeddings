@@ -27,7 +27,13 @@ import numpy as np
 import ray
 import requests
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM, PREFETCH_DEPTH, S2_BAND_ORDER, InferenceConfig
+from tessera_embeddings.config.inference import (
+    EMBEDDING_DIM,
+    PREFETCH_DEPTH,
+    S1_ORBIT_NONE,
+    S2_BAND_ORDER,
+    InferenceConfig,
+)
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -627,6 +633,7 @@ class InferenceActor:
         chunk: ChunkSpec,
         mosaic_base: str,
         time_window: TimeWindow,
+        s1_orbit: str,
         *,
         y_sub: slice,
         store_opener: StoreOpener,
@@ -642,11 +649,20 @@ class InferenceActor:
         """
         from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 
+        # Both derived from the ONE threaded orbit, never re-resolved per path: the three
+        # callers must pass identical load/dataset kwargs for bit-identity, and a value each
+        # of them computed for itself is exactly how they would drift apart.
+        #
+        # A radar-free cell has zero S1 observations at every pixel, so the default gate would
+        # skip all of them and the cell would write nothing while reporting success. The gate
+        # is therefore opened BY the orbit rather than asked of the caller — the same rule
+        # InferenceConfig applies, applied here per cell because the orbit is now per cell.
+        allow_s2_only = self.config.allow_s2_only or s1_orbit == S1_ORBIT_NONE
         data = load_chunk(
             chunk,
             mosaic_base,
             time_window=time_window,
-            s1_orbit=self.config.s1_orbit,
+            s1_orbit=s1_orbit,
             y_sub=y_sub,
             store_opener=store_opener,
             mask_bundle=mask_bundle,
@@ -656,12 +672,14 @@ class InferenceActor:
         dataset = MosaicChunkInferenceDataset(
             data,
             num_obs_checkpoints=self.config.num_obs_checkpoints,
-            s1_orbit=self.config.s1_orbit,
-            allow_s2_only=self.config.allow_s2_only,
+            s1_orbit=s1_orbit,
+            allow_s2_only=allow_s2_only,
         )
         return data, dataset
 
-    def _load_chunk_prologue(self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow) -> _ChunkPrologue:
+    def _load_chunk_prologue(
+        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: str
+    ) -> _ChunkPrologue:
         """Load everything _process_chunk needs before its first forward pass.
 
         Runs inline (serially, GPU idle) at the top of every chunk, UNLESS the
@@ -691,6 +709,7 @@ class InferenceActor:
                 chunk,
                 mosaic_base,
                 time_window,
+                s1_orbit,
                 y_sub=prologue.plan.strips[0],
                 store_opener=prologue.store_opener,
                 mask_bundle=prologue.mask_bundle,
@@ -712,7 +731,9 @@ class InferenceActor:
             self._xchunk_prefetched: dict[str, Future[_ChunkPrologue]] = {}
         return self._xchunk_prefetch_pool, self._xchunk_prefetched
 
-    def _load_prefetched_starter(self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow) -> _ChunkPrologue:
+    def _load_prefetched_starter(
+        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: str
+    ) -> _ChunkPrologue:
         """Load the capped prefetch payload for ``chunk`` (prefetch thread).
 
         Store opens normally land inside the calling process_chunk's scoped
@@ -742,6 +763,7 @@ class InferenceActor:
                 chunk,
                 mosaic_base,
                 time_window,
+                s1_orbit,
                 y_sub=plan.strips[0],
                 store_opener=store_opener,
                 mask_bundle=mask_bundle,
@@ -750,7 +772,7 @@ class InferenceActor:
             )
         return _ChunkPrologue(store_opener, mask_bundle, plan, x_sub, first_strip, rung=rung)
 
-    def _start_chunk_prefetch(self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow) -> None:
+    def _start_chunk_prefetch(self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: str) -> None:
         """Kick off the next chunk's capped prefetch on the prefetch thread.
 
         Called from the strip loop at the top of the CURRENT chunk's last
@@ -770,7 +792,7 @@ class InferenceActor:
         if chunk.label in stash:
             return
         logger.info("xchunk prefetch: starting for %s", chunk.label)
-        stash[chunk.label] = pool.submit(self._load_prefetched_starter, chunk, mosaic_base, time_window)
+        stash[chunk.label] = pool.submit(self._load_prefetched_starter, chunk, mosaic_base, time_window, s1_orbit)
 
     def _take_prefetched(self, label: str) -> _ChunkPrologue | None:
         """Consume the stash for ``label``; evict stale entries.
@@ -918,6 +940,7 @@ class InferenceActor:
         tracker: ray.actor.ActorHandle | None = None,
         prefetch_hint: ChunkSpec | None = None,
         time_window: TimeWindow | None = None,
+        s1_orbit: str | None = None,
     ) -> dict[str, Any]:
         """Process a single spatial chunk: load data, run inference, write output.
 
@@ -942,6 +965,12 @@ class InferenceActor:
             prefetch_hint: The chunk the scheduler has reserved as this actor's
                 next assignment; its capped starter payload is prefetched
                 during this chunk's last strip (see ``_XCHUNK_*`` constants).
+            s1_orbit: This CELL's resolved orbit, overriding the actor's own config, for
+                the same reason as ``time_window``: a chained session's cells may resolve
+                different orbits because parts of the globe are radar-free in principle, and
+                an actor built for ``"both"`` would otherwise be unable to serve one. ``None``
+                uses the actor's own config. A ``"none"`` cell also opens the S2-only pixel
+                gate, since every one of its pixels has zero S1 observations.
             time_window: This CELL's inference window, overriding the actor's own
                 config. Required for a chained session whose cells span campaign
                 years: an actor is built once with one config, so reading the
@@ -959,7 +988,9 @@ class InferenceActor:
             else contextlib.nullcontext()
         )
         with cred_scope:
-            return self._process_chunk(chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint, time_window)
+            return self._process_chunk(
+                chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint, time_window, s1_orbit
+            )
 
     def _process_chunk(
         self,
@@ -970,6 +1001,7 @@ class InferenceActor:
         tracker: ray.actor.ActorHandle | None = None,
         prefetch_hint: ChunkSpec | None = None,
         time_window: TimeWindow | None = None,
+        s1_orbit: str | None = None,
     ) -> dict[str, Any]:
         """Run the load → inference → write pipeline for one chunk.
 
@@ -981,6 +1013,10 @@ class InferenceActor:
         # must receive identical kwargs for bit-identity, so the fallback must not be
         # re-evaluated at each of them — one resolution, one value, no chance of drift.
         window = time_window if time_window is not None else self.config.time_window
+        # Same rule, same reason: a chained session's cells may resolve DIFFERENT orbits,
+        # because parts of the globe are radar-free in principle. Resolved once here so the
+        # three loader call sites cannot disagree about which orbit a chunk was read under.
+        orbit = s1_orbit if s1_orbit is not None else self.config.s1_orbit
         from tessera_embeddings.inference.inference import run_inference
 
         t0 = time.monotonic()
@@ -1001,7 +1037,7 @@ class InferenceActor:
             # loads serially here (GPU idle) unless the bounded cross-chunk
             # prefetch staged part of it during the PREVIOUS chunk's tail; see
             # _load_chunk_prologue and the _XCHUNK_* constants.
-            prologue = self._load_chunk_prologue(chunk, mosaic_base, window)
+            prologue = self._load_chunk_prologue(chunk, mosaic_base, window, orbit)
             store_opener = prologue.store_opener
             mask_bundle = prologue.mask_bundle
             plan = prologue.plan
@@ -1052,6 +1088,7 @@ class InferenceActor:
                     chunk,
                     mosaic_base,
                     window,
+                    orbit,
                     y_sub=y_sub,
                     store_opener=store_opener,
                     mask_bundle=bundle,
@@ -1154,7 +1191,7 @@ class InferenceActor:
                     # here — no room for the stash — so they take a serial
                     # prologue instead.
                     if i + 1 == len(strips) and prefetch_hint is not None and not plan.pair_budget:
-                        self._start_chunk_prefetch(prefetch_hint, mosaic_base, window)
+                        self._start_chunk_prefetch(prefetch_hint, mosaic_base, window, orbit)
 
                     if x_sub is None:
                         for var in OBS_COUNT_VARS:

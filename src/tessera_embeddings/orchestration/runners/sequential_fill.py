@@ -63,9 +63,14 @@ it while the work source is unexhausted and resumes it for the true cluster
 tail (see ``scheduling._process_chunks_work_stealing``).
 
 A zone whose mosaic resolves a DIFFERENT s1 orbit than the shared session's
-config cannot join the stream (actor configs are fixed at creation); such
-cells are deferred and filled per-cell after the session ends, via the
-caller-supplied ``infer_single`` fallback.
+config STILL joins the stream: the orbit travels on each cell's ``ZoneContext``,
+so an actor reads every cell under that cell's orbit — the same mechanism that
+lets one session span campaign years. It has to work that way because parts of
+the globe are radar-free in principle, so a cell resolving ``"none"`` against a
+``"both"`` session is a permanent population rather than an anomaly.
+
+The ``infer_single`` fallback therefore no longer receives orbit-mismatch cells
+and is retained only as the handoff for a caller that supplies one.
 
 KNOWN LIMITATION — small-zone fleet fill. The ``look_ahead + 2`` admission
 bound doubles as the fleet-fill parallelism: only that many zones' tiles can
@@ -317,8 +322,10 @@ def fill_zones_sequential(
         infer_single: Per-cell fallback ``(cell, prepared, is_final) →``
             handoff for orbit-mismatch cells, run AFTER the session ends
             (their actor config cannot join the shared stream).
-        session_s1_orbit: The shared session's actor-config orbit; a cell
-            whose resolved orbit differs is deferred to ``infer_single``.
+        session_s1_orbit: The shared session's actor-config orbit. A cell whose
+            resolved orbit differs is logged and streamed anyway — its orbit rides
+            on its ``ZoneContext`` — so this is now an observability reference
+            rather than a routing decision.
         log: Logger.
         inputs: Mosaic lifecycle adapter; ``None`` means the mosaics already
             exist upstream (no starts, no waits, no cleanup).
@@ -364,10 +371,6 @@ def fill_zones_sequential(
     # capacity — look-ahead starts are admitted through it, so they can no longer
     # escape the storage bound (see _MosaicBudget). No inputs → no mosaics.
     budget = _MosaicBudget(look_ahead + 2) if inputs is not None else None
-    # Orbit-mismatch deferrals RETAIN their mosaics until the post-session
-    # fallback; cap how many budget slots they may sit on so at least one slot
-    # keeps cycling for the stream (all held → feeder deadlock).
-    max_deferred_retained = look_ahead + 1
     # A FAILED cell keeps its mosaic (for the retry's staged resume) but frees
     # its budget slot — otherwise a systematic failure deadlocks the feeder (no
     # cell ever succeeds to free a slot). But freeing every failed slot lets a
@@ -573,42 +576,25 @@ def fill_zones_sequential(
                     zone_slots.release()
                     continue
                 if prep.config.s1_orbit != session_s1_orbit:
-                    # Actor configs are fixed at session creation — this cell
-                    # runs per-cell after the stream (see infer_single). Its
-                    # mosaic is RETAINED (and keeps its budget slot) until the
-                    # fallback — bounded: past the cap, further mismatch cells
-                    # fail loudly rather than silently stacking multi-TB
-                    # mosaics for the whole run (retry next campaign pass, or
-                    # run those zones with the matching s1_orbit).
-                    with lock:
-                        n_deferred = len(deferred)
-                    if budget is not None and n_deferred >= max_deferred_retained:
-                        _record_failure(
-                            cell,
-                            "deferred-mosaic-budget",
-                            RuntimeError(
-                                f"orbit-mismatch deferral cap reached ({n_deferred} retained mosaics): "
-                                f"cell resolved s1_orbit={prep.config.s1_orbit} != session "
-                                f"{session_s1_orbit} — rerun with s1_orbit={prep.config.s1_orbit} "
-                                f"or a larger look_ahead"
-                            ),
-                        )
-                        if inputs is not None:
-                            inputs.cleanup(cell.zone, cell.year)
-                        _release_mosaic(cell)
-                        zone_slots.release()
-                        continue
+                    # NOT a deferral any more. The orbit travels on the cell's ZoneContext, so
+                    # an actor built for the session's orbit reads this cell under ITS orbit —
+                    # the same mechanism that already lets one session span campaign years.
+                    #
+                    # It used to be deferred and its mosaic retained against a bounded budget,
+                    # and past that bound the cell FAILED and its mosaic was deleted. That was
+                    # safe only while a whole zone always carried both orbits. It does not:
+                    # parts of the globe are radar-free in principle, so that population could
+                    # never complete — every pass re-ingested and re-failed it. Logged because
+                    # a cell read under a different orbit than the session was asked for is
+                    # worth seeing, not because anything special happens to it.
                     log.info(
-                        "Cell %s-%d resolved s1_orbit=%s != session %s — deferring to the per-cell fallback",
+                        "Cell %s-%d resolved s1_orbit=%s != session %s — streaming it under its "
+                        "own orbit (carried per cell on the work item)",
                         cell.zone,
                         cell.year,
                         prep.config.s1_orbit,
                         session_s1_orbit,
                     )
-                    with lock:
-                        deferred.append((cell, prep))
-                    zone_slots.release()
-                    continue
                 try:
                     zplan = plan(cell, prep)
                     if zplan.done is not None:
@@ -652,7 +638,13 @@ def fill_zones_sequential(
                 # once from the session config, so a cell of a different campaign year
                 # would otherwise be inferred over the session's months rather than its
                 # own — silently, since the session only checks s1_orbit.
-                ctx = ZoneContext(prep.mosaic_base, prep.staging_base, prep.run_id, prep.config.time_window)
+                ctx = ZoneContext(
+                    prep.mosaic_base,
+                    prep.staging_base,
+                    prep.run_id,
+                    prep.config.time_window,
+                    prep.config.s1_orbit,
+                )
                 with lock:
                     tallies[prep.run_id] = tally
                     if live:
@@ -761,12 +753,19 @@ def fill_zones_sequential(
     # because the partition is zone-disjoint.
     #
     # ONLY cells whose mosaic still EXISTS are eligible, and that is not the same as
-    # "cells that failed". Two failure paths deliberately DELETE the mosaic — the
-    # orbit-mismatch deferral cap and a terminal plan — precisely so a systematic
-    # failure cannot stack multi-terabyte inputs. Retrying one of those would run
-    # against a deleted mosaic. `retained_failed` is the set that kept its mosaic, so
-    # it is the eligibility list; when there is no budget at all the mosaics are
-    # upstream and permanent, so everything is eligible.
+    # "cells that failed": retrying a cell whose input was deleted runs against nothing,
+    # which a first version of this pass did by keying off the failure list.
+    #
+    # As it stands every FAILING path retains its mosaic, so the two sets coincide — the
+    # one path that deletes is a terminal plan, and that records a success. The filter is
+    # kept because the property it protects is not a coincidence worth relying on: any
+    # future delete-on-failure path reintroduces the bug the moment it lands, and this is
+    # what makes that land safely. (The orbit-mismatch deferral cap used to be such a
+    # path; cells now stream under their own orbit and nothing deletes on that account.)
+    #
+    # `retained_failed` is the set that kept its mosaic, so it is the eligibility list;
+    # when there is no budget at all the mosaics are upstream and permanent, so
+    # everything is eligible.
     for attempt in range(2, max_cell_attempts + 1):
         with lock:
             # Cells the feeder never admitted are recorded as failures so the run
