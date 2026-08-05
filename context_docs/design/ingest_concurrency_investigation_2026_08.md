@@ -7,12 +7,11 @@ paired A/B then measured the contention term at **zero** (the quiet arm came out
 window, not cheaper), so none of that 1.17x is load at the width tested. Six candidate explanations
 were ruled out along the way and two real effects quantified and fixed.
 
-**What is left, and it is a schedule question rather than a diagnosis:** the A/B ran at 17
-concurrent fleets, which is below the ~20 cells where contention was ever hypothesised and about a
-sixth of campaign width, so **contention at 45–61 concurrent cells is still unmeasured** — Stage 3's
-ladder is the way to price it. And the campaign's duration basis needs re-fitting on a **seasonally
-weighted** year rather than a January rate, which is the one correction that genuinely raises the
-ingest line.
+**What is left.** Contention at 45–61 concurrent cells is still unmeasured, because the A/B ran at
+about a sixth of campaign width — but **Stage 3's ladder is on hold by decision (2026-08-05)** and
+its rungs are blocked on the quota raise regardless. The live item is instead the campaign's duration
+basis, which needs re-fitting on a **seasonally weighted** year rather than a January rate; that is
+the one correction which genuinely raises the ingest line.
 Companion to `ingest_optimization_campaign_2026_07.md`, which remains the authoritative record
 for everything measured before 2026-08.
 
@@ -361,7 +360,16 @@ comparison was never like-for-like: E's "today" side was May–September 2021 an
 January 2024. Matched, 1.17x rather than 1.8–2.1x. This was the cheapest step in the plan and it
 was the one that mattered — it should have come first. See §"E IS WITHDRAWN".
 
-**Stage 3 — a concurrency ladder. THE ONLY OPEN QUESTION, and it is BLOCKED ON THE QUOTA RAISE.**
+**Stage 3 — a concurrency ladder. ON HOLD BY DECISION (Robert, 2026-08-05): "not convinced it's
+necessary."** Recorded as a decision rather than an open action, because everything below still
+reads as a recommendation and should not be mistaken for one. The reasoning that makes the hold
+defensible: E is withdrawn so no anomaly demands a contention term, the paired A/B measured it at
+zero up to ~3,200 vCPU, and the rungs that would extend that are blocked on a quota raise anyway.
+Revisit only if a wide run shows a slowdown the seasonal model does not explain.
+
+The specification below is kept for that contingency.
+
+**Original scope, if it is ever revived — and it is BLOCKED ON THE QUOTA RAISE.**
 It was conditional on Stage 1 finding contention; Stage 1 found none, but only up to 17 fleets. So
 the ladder is no longer a diagnosis — **it is the schedule input** — and it should start where the
 evidence stops rather than below it, measuring **write per window** (per-date cost re-measures L and
