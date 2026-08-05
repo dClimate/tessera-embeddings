@@ -1,107 +1,121 @@
 # Campaign inference, measured — the P3 chained run
 
-**What this is.** The first per-zone GPU profile taken on the **campaign path** (whole UTM zones,
-campaign thresholds, `fill-zones-sequential`) rather than on the Iowa reference ROI. It exists
-because two of the cost model's headline inputs — tokens per pixel and the per-worker inference
-rate — can both be read directly off this run, and one of them is the largest unvalidated number
-in the campaign budget.
+**What this is.** The first GPU profile taken on the **campaign path** (whole UTM zones, campaign
+thresholds, `fill-zones-sequential`) rather than on the Iowa reference ROI. It exists because two of
+the cost model's headline inputs — tokens per pixel and the per-worker inference rate — can be read
+directly off this run, and one of them is the largest unvalidated number in the campaign budget.
 
 Companion to `inference_gpu_saturation_profile_2026_07.md` (single-ROI saturation work) and
-`campaign-cost-model.md` (which this feeds). Source: `p3-chained-7zones-v2`, cells processed
-sequentially in one process on 20–21 `g6e.xlarge` actors.
+`campaign-cost-model.md` (which this feeds). Source: `p3-chained-7zones-v2` on 20 `g6e.xlarge`
+actors, cells processed sequentially in one process.
 
-## How the numbers were derived, and where they can be wrong
+## READ THIS FIRST: what this telemetry can and cannot tell you
 
-Everything comes from the `CHUNK_SUMMARY` JSON line each actor emits per chunk. Three properties
-of that instrument matter, and getting any of them wrong changes the answer:
+> **`CHUNK_SUMMARY` cannot be attributed to a zone, and attempting it produced two wrong findings
+> before the attribution itself was checked.** The line carries no zone. Its `label` is
+> `chunk_<row>_<col>` — **grid-local**, so every cell restarts at `chunk_0_0` and labels collide
+> across zones *and* across concurrently running fills, which share one log group.
+>
+> Attributing by time window and treating repeated labels as retries produced a confident "49S
+> re-inferred 101 chunks after write failures, a 9.1% GPU tax". **Both halves were false.** There is
+> not one `staging write unconfirmed` / `writer pool wedged` / `flush failed` line in the window —
+> the mechanism did not fire at all. And the giveaway was in the data already: `t_kept` *differed*
+> between the supposed retry pairs (60→56, 122→58), which cannot happen when re-running identical
+> data. They were two different zones sharing a label space.
+>
+> A second attempt, splitting cells where a label repeats, is also unsound: a genuine within-cell
+> retry splits a segment, and the boundaries it produced contradict the chain's own per-cell counts.
+>
+> **So this document reports aggregates over ONE log stream, plus per-cell facts the chain states
+> outright.** It does not report per-zone throughput, because the instrument cannot support it.
 
-1. **Every event is logged twice** — once `|`-delimited, once not. A naive count doubles
-   everything.
-2. **A failed deferred write requeues the item and the chunk is inferred AGAIN**, re-emitting the
-   same `label` at a later timestamp. So *delivered* chunks and tokens must count **distinct
-   labels**, while GPU-hours and cost must count **every pass**, because the rework really consumed
-   GPUs. Conflating the two made 49S look 8% cheaper per chunk than 48S when they agree to within
-   2% — the apparent difference was entirely its rework.
-3. **`CHUNK_SUMMARY` carries no zone.** Its `label` is `chunk_<row>_<col>`, grid-local, and the
-   chain runs cells sequentially in one process. Zones were therefore separated **by time**, using
-   the chain's own `Deleting prefix …/mosaics/<zone>/<year>` markers as each cell's closing
-   boundary. That is an inference from the log, not a field in it: a chunk adjacent to a boundary
-   could fall in the wrong bucket, so per-zone counts carry ±1–2 chunks. **Adding the zone to this
-   line would remove the whole class of doubt** and is the single cheapest instrumentation fix here.
+**The fix is one field.** The chain already mints a per-cell run id (`49S-2021-f1fa65fc`) and logs
+it. Adding that id — or just the zone — to `CHUNK_SUMMARY` makes every figure below decomposable
+per zone, retries distinguishable from collisions, and concurrent fills separable. It is the
+highest-value instrumentation change available and it is additive, so it cannot break the
+`campaign_progress.py` needles.
 
-`write_confirmed` is **always `false`** in this line and that is by design, not a fault — the write
-is confirmed one chunk later via chain-confirmation, which updates an in-memory record the log line
-never sees. Do not read it as an unconfirmed-write problem.
+`write_confirmed` is **always `false`** in this line, by design: the write is confirmed one chunk
+later via chain-confirmation, which updates an in-memory record the log never sees. It is not an
+unconfirmed-write signal.
 
-## Measured, three cells
+## Per-cell chunk counts, as the chain states them
 
-| | 49S-2021 | 48S-2021 | 17S-2021 (partial) |
-|---|---:|---:|---:|
-| chunks delivered | 1,005 | 627 | 86+ |
-| inference passes | 1,106 | 627 | 86 |
-| **rework** | **101 (9.1%)** | **0** | **0** |
-| wall span (h) | 3.29 | 2.02 | 0.25 |
-| actors | 20 | 20 | 21 |
-| GPU-hours | 65.9 | 40.5 | 5.3 |
-| cost at $1.861/GPU-h | $123 | $75 | $10 |
-| `infer_s`/chunk, median | 198.7 | 218.2 | 197.6 |
-| overhead/chunk, median | 12.5 s (8.0%) | 6.2 s (3.5%) | 4.8 s (3.3%) |
-| **`t_kept` median (range)** | **64 (49–145)** | **62 (34–138)** | **68 (50–136)** |
-| tokens delivered | 316.9 G | 182.0 G | 26.7 G |
-| **$/delivered chunk** | **0.122** | **0.121** | **0.114** |
-| tok/s per actor (wall) | 1.34 M | 1.25 M | 1.40 M |
-| skipped chunks | 1 | 4 | 0 |
+Authoritative, because the chain logs them with the zone and the run id
+(`Zone <z> year <y>: N/<total> tiles are live in the campaign coverage mask`):
 
-**$/delivered chunk is the tight, transferable unit: $0.114–0.122 across three zones.** Per-token
-cost is looser ($0.349–0.414 per G token) because `t_kept` varies more than chunk work does. Quote
-the per-chunk figure for budgeting and the token figure only where tokens are the actual driver.
+| cell | live chunks | of grid |
+|---|---:|---:|
+| 49S-2021 | 943 | 14,355 |
+| 48S-2021 | 774 | 14,355 |
+| 17S-2021 | 767 | 14,355 |
+| 32S-2021 | 386 | 14,355 |
+| 58S-2021 | 354 | 14,355 |
+| 02N-2021 | 245 | 15,048 |
+
+**A useful sanity figure in its own right: live chunks run 1.6–6.6% of the grid** on these
+southern/tropical zones. Fill cost scales with the live count, not the grid.
+
+## Aggregate, one runner, cells 49S → 32S
+
+| | |
+|---|---:|
+| chunk events (deduped) | 2,123 — 2,118 success, 5 skipped |
+| wall span | 6.55 h |
+| actors | 20 |
+| GPU-hours | 131 |
+| cost at $1.861/GPU-h | **$244** |
+| `infer_s`/chunk, median | 206.9 |
+| **`t_kept`** | **median 64, p10 55, p90 122, range 34–145** |
+| tokens delivered | 648.0 G |
+| **tok/s per actor (wall-clock)** | **1.37 M** |
+| **$/chunk** | **0.115** |
+
+Skips are rare and benign: **5 of 2,123 (0.24%)**.
 
 ## Two findings that bear on the cost model, and they pull opposite ways
 
 The model costs inference at **$503–579 k**, from 1.98 × 10¹⁵ tokens (1.363 × 10¹³ pixels at a
 land-weighted **145** observations per pixel) at a reference **≈1.9 M tok/sec** per worker, giving
-289,000 GPU-hours. Both inputs now have campaign-path measurements, and the reference rate was
-measured on **the same `g6e.xlarge`**, so the comparison is like-for-like.
+289,000 GPU-hours. The reference rate was measured on **the same `g6e.xlarge`** at the same
+wall-clock basis, so the rate comparison is like-for-like.
 
-**1. `t_kept` is far below 145 — median 62–68 on three zones.** That is 2.1–2.3× lower, and it is
-the dominant term. **But do not re-base the budget on it yet**, for reasons that killed the last
-version of this claim:
+**1. `t_kept` centres far below 145 — median 64 — but its DISTRIBUTION reaches 145.** p90 is 122 and
+the maximum is exactly 145. That reframes the question and is the most important nuance here: the
+census figure may be a faithful description of *dense* chunks while the median describes typical
+ones, in which case the census is not wrong but differently weighted. Three further reasons not to
+re-base the budget on this yet:
 
-- **n = 3 zones**, and all three are southern-hemisphere and comparatively sparse (49S, 48S, 17S).
-  The census figure is **land-area weighted across 112 zones**; dense northern zones are exactly
-  the ones missing here.
-- **The within-zone range reaches 138–145.** So 145 may faithfully describe dense chunks while the
-  median describes typical ones — in which case the census is not wrong, only differently weighted.
+- These are southern-hemisphere and tropical zones (49S, 48S, 17S, 32S). The census is **land-area
+  weighted across 112 zones**, and dense northern zones — the ones that would sit at the top of the
+  distribution — are absent.
 - A previous "the census is ~2× high" claim was withdrawn because its chunks ran a 50× stricter keep
-  threshold, biasing `t_kept` low in precisely the direction claimed. These cells ran the campaign
-  path, which removes *that* bias but not the weighting problem.
+  threshold, biasing `t_kept` low in exactly the direction claimed. The campaign path removes *that*
+  bias, not the weighting problem.
+- Per-chunk `t_kept` here spans 34–145, a 4.3× internal spread. A median from four zones is not a
+  land-weighted mean.
 
 **This is what the 17-zone fill programme exists to settle**, and it is close: 16 distinct zones are
 filled or in flight. Treat 145 as the planning figure until the weighted mean lands.
 
-**2. Per-actor throughput is BELOW the reference: 1.25–1.40 M tok/sec against ≈1.9 M.** Same
-instance type, same wall-clock basis (tokens ÷ actor-seconds), so this is a genuine 1.36–1.52×
-shortfall and it pushes GPU-hours **up**. Likely candidates, none yet tested: whole-zone chunks mix
-strategies (`single+xstarter` dominates here, with `dense/prefetch+starter` for 11–19%) where the
-reference ROI was more uniform; and the reference was 12 actors against 20–21 here.
+**2. Per-actor throughput is BELOW the reference: 1.37 M tok/sec against ≈1.9 M.** Same instance
+type, same basis — a genuine **1.39×** shortfall that pushes GPU-hours up. Untested candidates:
+whole-zone work mixes strategies (`single+xstarter` dominant, `dense/prefetch+starter` for a
+minority) where the reference ROI was more uniform, and the reference ran 12 actors against 20 here.
 
-**Net direction, and why it is not a new budget line.** Naively combining them — tokens × 0.45,
-GPU-hours ÷ rate — lands near **$350 k** against the planned $538 k. That arithmetic multiplies a
-well-measured rate by a badly-weighted token census, so it is a *direction*, not a figure. The
-weighting is worth more than the rate: fix `t_kept` first.
+**Net direction, not a new budget line.** Naively combining a 2.3× token reduction with a 1.39× rate
+shortfall lands near **$350 k** against the planned $538 k. That multiplies a well-measured rate by a
+badly-weighted token census, so it is a direction only. **The weighting is worth more than the rate:
+fix `t_kept` first.**
 
 ## Operational notes
 
-- **Rework is real and uneven: 9.1% of 49S's GPU time, 0% of 48S's and 17S's.** It comes from
-  deferred S3 write failures, which requeue the chunk for full re-inference rather than just
-  retrying the upload. At campaign scale that is worth watching — a 9% GPU tax is ~$48 k on a
-  $538 k line — and worth an eventual fix that retries the *write* rather than the inference.
-- **First cell pays a visible overhead premium**: 8.0% on 49S against 3.3–3.5% after. Cold model
-  load and cluster warm-up, amortised across a chained shard rather than paid per zone.
 - **The chain deletes each cell's staging prefix and source mosaics after the fill lands**, which is
   correct and deliberate — the embeddings carry `years_complete`, so the mosaic is reclaimable. Two
-  consequences: a "complete mosaic" is a transient state, and a cell that has been cleaned looks
-  identical to a never-ingested one from the mosaic side. Judge doneness from the embedding store's
-  year tag, never from the presence of mosaics.
-- Its own delete left residue on one prefix while reporting success, the same failure mode seen
-  operating `s5cmd` by hand. Verify a reclaim by listing the prefix.
+  consequences: a "complete mosaic" is a transient state, and a cleaned cell is indistinguishable
+  from a never-ingested one *from the mosaic side*. **Judge doneness from the embedding store's year
+  tag, never from the presence of mosaics.**
+- Its reclaim uses the same `s5cmd` path that, operated by hand the same night, reported success
+  while leaving residue. Verify a reclaim by listing the prefix.
+- **First cell pays a warm-up premium** in per-chunk overhead, amortised across a chained shard
+  rather than paid per zone. Quantifying it per cell needs the zone field above.
