@@ -12,7 +12,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 |---|---|
 | `stac.py` | STAC-based data loading via `odc.stac.load`. Handles multiple providers (Earth Search, Planetary Computer), S2 baseline correction, and date filtering. |
 | `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, item construction from the native CMR Granule Search API (bypasses CMR-STAC search; orbit-direction filtered server-side), UTM EPSG derivation, and asset preparation. |
-| `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary AWS credentials minted by ASF, ~1 hour) and legacy CloudFront signed URL resolution. Those credentials expire on their OWN clock, unrelated to any unit of work: renew against the advertised expiry, never on a cadence tied to a batch, or a long batch outlives them and every read fails. |
+| `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary AWS credentials minted by ASF, ~1 hour) and legacy CloudFront signed URL resolution. Those credentials expire on their OWN clock, unrelated to any unit of work, so renewal must be driven by a timer and by the advertised expiry — never by the work loop, which can only renew between units and so cannot renew inside one that outlives the margin. |
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
@@ -1013,9 +1013,7 @@ figure that contention has inflated.
 
 `ingest_s1_roi_sar` uses a different approach: it splits the full date range into
 `batch_days`-wide windows (default 30) and runs one `build → compute → write → discard`
-cycle per window. The reason is that the STS credentials obtained for S3 direct access to
-OPERA data expire after 1 hour, so batches also serve as natural credential-refresh
-checkpoints:
+cycle per window, which bounds how large any one task graph gets.
 
 ```text
 Batched approach (batch_days=30, ingest_s1_roi_sar only):
@@ -1024,9 +1022,14 @@ Batched approach (batch_days=30, ingest_s1_roi_sar only):
 │ build      │  │ build      │  │ build      │
 │ compute    │  │ compute    │  │ compute    │
 │ write      │  │ write      │  │ write      │
-│ discard ◄──┼──┼── graph freed; S3 creds refreshed
+│ discard ◄──┼──┼── graph freed
 └────────────┘  └────────────┘  └────────────┘
 ```
+
+A batch boundary is **not** a credential checkpoint, and treating it as one is unsafe: the STS
+credential's roughly one-hour life is unrelated to how long a batch takes, so a batch that outruns
+it cannot renew at its own boundary. Renewal is owned by a timer — see "Renewal runs on a timer"
+below.
 
 `batch_days` is a parameter on `ingest_s1_roi_sar`. It is not present on the S2 flow. The
 formula in the background section above applies to estimating how many tasks a given
@@ -1143,6 +1146,21 @@ You must also approve the **ASF Cumulus** application at
 future Dask workers via a `WorkerPlugin`. It sets `AWS_*` environment variables (consumed by
 boto3 when `odc.loader` builds an `AWSSession`) and resets the cached per-thread session so the
 next `/vsis3/` open picks up the new credentials.
+
+**Renewal runs on a timer, not on the work loop.** `s1_roi.credential_ticker` re-checks the
+credential's remaining life every `CRED_TICK_INTERVAL_SEC` for as long as batches are being
+consumed; the loop's own per-batch and per-date checks remain as a fallback. The timer is what makes
+this correct rather than merely usual: renewal driven only by the loop can fire only *between* units
+of work, so any unit that outlives the remaining margin cannot renew from inside itself. That
+coupling is self-reinforcing — slow work renews less often, an expired credential fails every read,
+failing reads stop progress, and no progress means no further renewal.
+
+**What a worker receives is a snapshot.** The plugin freezes the credential at construction, so a
+worker joining N minutes after the last broadcast starts life with only the remaining TTL, and past
+the TTL starts with none. Under adaptive scaling workers join throughout a leg, which makes the
+broadcast **cadence** a correctness condition rather than a tidiness one — the ticker is what bounds
+N. Every broadcast logs the credential's advertised expiry (`S3 credentials broadcast to workers`),
+so the cadence is auditable from a leg's own log.
 
 **Per-thread AWSSession cache**: `odc.loader` caches a boto3 `AWSSession` per thread in
 `threading.local` on first use and ignores subsequent env var updates for that thread's

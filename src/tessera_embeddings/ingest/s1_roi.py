@@ -14,10 +14,13 @@ Algorithm (unchanged from the reference):
    ``compute()`` call's task graph manageable.
 3. Each batch:
 
-   * Renew the OPERA read credentials whenever they are close to expiring —
-     checked at the start of a batch AND before every date's write, because
-     the credential's roughly one-hour life is unrelated to batch boundaries:
-     a longer batch outlives it and every read afterwards fails.
+   * Renew the OPERA read credentials whenever they are close to expiring.
+     A background ticker owns this, so renewal does not wait for a unit of
+     work to finish; the credential's roughly one-hour life is unrelated to
+     the shape of the loop, and any unit that outlives the remaining margin
+     cannot renew from inside itself. The loop also checks at a batch
+     boundary and before every date's write, which costs nothing while the
+     ticker is keeping the credential fresh.
    * Build an OPERA RTC item filter for the orbit / bounding box /
      batch window.
    * Call :func:`ingest_tile` to produce a per-batch ``xarray.Dataset``.
@@ -29,8 +32,10 @@ Algorithm (unchanged from the reference):
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from typing import Literal, cast, final
@@ -81,7 +86,58 @@ two cheap HTTP calls, so a generous margin costs almost nothing and the failure 
 prevents costs the remainder of the run.
 """
 
+CRED_TICK_INTERVAL_SEC = 5 * 60
+"""How often the background ticker re-checks the credential's remaining life.
+
+Bounds how far past the renewal point a credential can drift, so it must be well under
+``CRED_EXPIRY_MARGIN_SEC``. A tick only *checks*; the staleness test decides whether to
+spend an HTTP call, so a short interval is nearly free.
+"""
+
 S1Orbit = Literal["ascending", "descending"]
+
+
+@contextmanager
+def credential_ticker(
+    refresh: Callable[[], None],
+    log: logging.Logger,
+    orbit: str,
+    roi: str,
+    interval_sec: float = CRED_TICK_INTERVAL_SEC,
+) -> Iterator[None]:
+    """Call ``refresh`` on a timer for the duration of the block, in a daemon thread.
+
+    A read credential renewed only from the work loop can be renewed only *between* units
+    of work, so any single unit that outlives the remaining margin — a long write, a query,
+    a stall — has no opportunity to renew from inside itself. That coupling is
+    self-reinforcing: slower work renews less often, an expired credential fails every
+    read, failing reads stop progress, and no progress means no further renewal. A timer
+    removes the coupling, so renewal no longer depends on the shape or the speed of the
+    loop.
+
+    ``refresh`` must be idempotent and safe to call concurrently with the loop's own calls;
+    it decides for itself whether a renewal is due.
+
+    Exceptions from ``refresh`` are logged and swallowed. The ticker must outlive a single
+    failed renewal: the next tick retries well inside the margin, whereas a dead thread
+    would silently return the caller to loop-driven renewal.
+    """
+    stop = threading.Event()
+
+    def tick() -> None:
+        while not stop.wait(interval_sec):
+            try:
+                refresh()
+            except Exception:
+                log.warning("[%s] Credential ticker refresh failed roi=%s", orbit, roi, exc_info=True)
+
+    thread = threading.Thread(target=tick, name=f"cred-ticker-{orbit}-{roi}", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=interval_sec)
 
 
 def _parse_credential_expiry(creds: dict[str, str]) -> float | None:
@@ -283,37 +339,49 @@ def ingest_s1_roi_sar(
 
     last_cred_refresh: float = float("-inf")
     cred_expires_at: float | None = None
+    cred_lock = threading.Lock()
 
     def refresh_credentials_if_stale() -> None:
         """Re-fetch the OPERA read credentials when they are close to expiring.
 
-        Driven by the credential's OWN expiry rather than a fixed cadence, and called
-        before every date's write rather than only between batches. Both changes fix the
-        same defect: the credential ASF mints lives about an hour, so any unit of work
-        longer than that outlives it, and every subsequent read fails with an expired
-        token. Refreshing only between batches meant a single long batch could never
-        renew — the credential's clock does not care about batch boundaries.
+        Driven by the credential's OWN expiry rather than a fixed cadence. The margin must
+        exceed the longest single date write, since a credential valid at the start of a
+        write must still be valid at its end — the reads happen throughout it.
 
-        Calling it per date bounds staleness to one date's write, which is the smallest
-        unit this loop can renew between. The margin must exceed that duration, since a
-        credential valid at the start of a write must still be valid at its end.
+        Callable from the work loop and from the background ticker, so it takes a lock:
+        two concurrent renewals would each broadcast, and the later broadcast could carry
+        the earlier credential.
         """
         nonlocal last_cred_refresh, cred_expires_at
         if edl_credentials_fn is None:
             return
-        now_wall, now_mono = time.time(), time.monotonic()
-        if cred_expires_at is not None:
-            fresh_enough = now_wall < cred_expires_at - CRED_EXPIRY_MARGIN_SEC
-        else:
-            # No expiry advertised: fall back to the age-based cadence.
-            fresh_enough = now_mono - last_cred_refresh <= cred_refresh_interval_sec
-        if fresh_enough:
+        with cred_lock:
+            now_wall, now_mono = time.time(), time.monotonic()
+            if cred_expires_at is not None:
+                fresh_enough = now_wall < cred_expires_at - CRED_EXPIRY_MARGIN_SEC
+            else:
+                # No expiry advertised: fall back to the age-based cadence.
+                fresh_enough = now_mono - last_cred_refresh <= cred_refresh_interval_sec
+            if fresh_enough:
+                return
+            creds = edl_credentials_fn()
+            if apply_credentials_fn is not None:
+                apply_credentials_fn(creds)
+            last_cred_refresh = now_mono
+            cred_expires_at = _parse_credential_expiry(creds)
+
+    def ticked(batches: Iterator[tuple[_PreparedBatch, float]]) -> Iterator[tuple[_PreparedBatch, float]]:
+        """Run the credential ticker for exactly as long as the batches are being consumed.
+
+        Wrapping the iterator rather than the loop body ties the ticker's lifetime to the
+        work it protects — it starts before the first batch is consumed and stops however
+        the loop leaves, including by raising.
+        """
+        if edl_credentials_fn is None:
+            yield from batches
             return
-        creds = edl_credentials_fn()
-        if apply_credentials_fn is not None:
-            apply_credentials_fn(creds)
-        last_cred_refresh = now_mono
-        cred_expires_at = _parse_credential_expiry(creds)
+        with credential_ticker(refresh_credentials_if_stale, log, orbit, roi_label):
+            yield from batches
 
     orbit_store = f"{store_path}/sar_{orbit}.zarr"
 
@@ -576,7 +644,7 @@ def ingest_s1_roi_sar(
             prepared_serial = _prepare_batch(rng)
             yield prepared_serial, prepared_serial.query_s
 
-    prepared_batches = pipelined(batch_ranges, _prepare_batch, depth=1) if pipeline_batches else _serially()
+    prepared_batches = ticked(pipelined(batch_ranges, _prepare_batch, depth=1) if pipeline_batches else _serially())
 
     # NOT short-circuited on a run of empty batches, and the reason is worth keeping. Zone 23N
     # paginates ~182,000 granules across a year to write nothing, so abandoning such an orbit

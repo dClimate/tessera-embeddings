@@ -413,6 +413,12 @@ class _S3CredentialPlugin(WorkerPlugin):
 
     Unlike ``client.run``, a plugin's ``setup`` is called on workers
     that join *after* registration — critical for adaptive scaling.
+
+    What it distributes is a SNAPSHOT: the credential is frozen at construction and
+    stored on the scheduler, so a worker joining N minutes after the last broadcast
+    starts life with the remaining (TTL - N), and past the TTL starts with none. That
+    makes the broadcast CADENCE, not just the credential's own margin, a correctness
+    condition — the caller must re-broadcast on a timer for late joiners to be usable.
     """
 
     name = "s3-creds"

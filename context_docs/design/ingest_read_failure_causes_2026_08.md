@@ -1,0 +1,245 @@
+# Ingest source-read failures: the two causes behind `WarpOperationError`
+
+Investigation record, 2026-08-04/05, `global-tessera-dev`. Traces
+`WarpOperationError('Chunk and warp failed')` and `PermissionError: The provided token has
+expired` to their exact causes, so the guards can be aimed at the right terms.
+
+Companion to `ingest_optimization_campaign_2026_07.md` (the authoritative ingest record) and
+`ingest_concurrency_investigation_2026_08.md` (the fleet-width contention work).
+
+## Headline
+
+`WarpOperationError('Chunk and warp failed')` is **not a cause**. It is rasterio's wrapper around
+whatever GDAL failed at, and it **discards the reason**. Behind it are **two unrelated causes**
+that need opposite responses:
+
+| | source | preceded by | retryable? |
+|---|---|---|---|
+| **Expired read credential** | `asf-cumulus-prod-opera-products` (radar) | `ERROR 1: Request for <url> range X-Y failed with response_code=403` | **yes** — the next attempt with a fresh credential succeeds |
+| **Corrupt source object** | `sentinel-cogs` (optical) | nothing; no HTTP error at all | **never** — the object is broken at the provider |
+
+Both surface as the identical exception text, so **the leg-retry classifier cannot tell them
+apart from the message**, and one of them makes retrying pure waste. See "Coupling to the leg
+retry" below.
+
+**Correction, in place.** `docs/runbooks/incident-response.md` previously attributed this error to
+"a Dask worker task definition missing a `ulimit` the library needed", citing the
+`mirror-a-pinned-resource-field-for-field` episode. **That attribution was wrong for these
+failures.** A missing ulimit did cause a warp failure once, which is why the guess was available;
+it is not what caused any of the 226 aborted loads examined here. The worker task definitions were
+not implicated, and checking them first sends the reader to the wrong place.
+
+## How the wrapper hides the cause
+
+Every one of the 214 pickled `WarpOperationError` payloads in the window carries the same inner
+GDAL exception:
+
+```
+rasterio._err.CPLE_AppDefinedError: ZIPDecode:Decoding error at scanline <N>
+rasterio._err.CPLE_AppDefinedError: <asset>, band 1: IReadBlock failed at X offset i, Y offset j:
+                                    TIFFReadEncodedTile() failed.
+```
+
+`ZIPDecode` is libtiff failing to inflate a tile's DEFLATE stream. It is what GDAL reports
+whenever the bytes it hands the codec are not a valid deflate stream — **including when the range
+GET that should have produced them failed.** GDAL logs the HTTP failure to its error handler and
+then proceeds into the codec with an unusable buffer, so the decode error is the one that
+propagates and the access error is the one that is lost.
+
+The consequence for diagnosis: the words "token has expired" and `ExpiredToken` **never appear on
+this path**. Bucketing warp failures against those strings finds no overlap, because the two
+populations are disjoint by construction, not because the causes are unrelated. The string that
+does correlate is **`response_code=403`**.
+
+## Cause 1 — the read credential expires mid-run (radar)
+
+### What the logs show
+
+Split by source bucket, the 226 `Aborting load due to failure while reading` lines are:
+
+| hour (UTC) | radar | optical |
+|---|---:|---:|
+| 08-04 16:00 | 10 | 0 |
+| 08-04 17:00 | 0 | 15 |
+| 08-04 18:00 | 0 | 1 |
+| 08-04 19:00 | 4 | 0 |
+| 08-04 20:00 | 3 | 0 |
+| 08-04 21:00 | 1 | 0 |
+| 08-04 22:00 | 1 | 0 |
+| **08-04 23:00** | **169** | 0 |
+| 08-05 00:00 | 0 | 1 |
+| 08-05 01:00 | 0 | 2 |
+| 08-05 02:00 | 0 | 19 |
+
+Radar is **188** and concentrated in one mass event; optical is **38** and scattered. The 23:00
+hour carries 224 `response_code=403` lines against 400 warp-failure lines. No optical failure has
+a 403 anywhere near it — `sentinel-cogs` is public and the reads are unsigned.
+
+### The credential's own record
+
+`set_s3_credentials` logs each broadcast with the credential's advertised expiry, which makes the
+lifecycle directly measurable. Grouping those lines by flow-runner log stream over 21:00–01:00
+(each stream is one leg, each with its own Dask cluster and its own credential):
+
+| broadcasts | last broadcast | credential dies |
+|---:|---|---|
+| 1 (× 6 legs) | ~21:14 | **22:14–22:15** |
+| 2 (× 3 legs) | 22:08–22:12 | **23:08–23:12** |
+| 3 (× 5 legs) | 22:44–22:59 | 23:44–23:59 |
+
+The two expired-token spikes are these cohorts dying:
+
+- the six single-broadcast legs expire 22:14–22:15 → the **22:30 spike (95 errors)**
+- the three two-broadcast legs expire 23:08–23:12 → the **23:15 spike (83 errors)**, with the
+  403 burst leading it at 23:00
+
+The five legs that kept refreshing on cadence do not appear in either spike. **The legs that died
+are exactly the legs that stopped refreshing.**
+
+### Why they stopped refreshing
+
+ASF mints a 1-hour credential. `s1_roi.refresh_credentials_if_stale` renews at
+`CRED_EXPIRY_MARGIN_SEC` (15 min) before expiry, giving a ~45-minute cadence — which the
+three-broadcast legs show exactly. The renewal call itself never fails: counted in the same
+15-minute buckets, renewals continue right through both spikes.
+
+**The defect is that the check is only reached when the work loop advances.** It is called at a
+batch boundary (`s1_roi.py:596`) and before each date's write (`s1_roi.py:654`) — so the credential
+can only be renewed *between* units of work. Any single unit that outlives the remaining margin
+has no opportunity to renew inside itself:
+
+- a date's `write_day_windows` compute, which is where the source reads actually happen, and which
+  under fleet-width contention can far exceed 15 minutes
+- a batch prepare (STAC query plus graph build) ahead of the first write
+- anything that stalls
+
+This is a **positive feedback loop, and that is what makes it dangerous at campaign width**: the
+slower a leg runs, the longer it goes without renewing; the longer it goes, the more likely its
+credential dies; a dead credential fails every read, which stops progress, which guarantees no
+further renewal. A leg that is merely slow converts into a leg that is dead.
+
+### The second limb: the plugin distributes a snapshot
+
+`_S3CredentialPlugin.__init__` freezes `_build_aws_env(creds)` into `self.env` at construction, and
+`client.register_plugin` stores that pickled object on the scheduler. `setup()` runs on every
+worker that joins later — the docstring is right that this is what makes it work under adaptive
+scaling — but each late joiner receives **the credential as it was when the plugin was built**.
+
+A worker joining N minutes after the last broadcast starts life with (60 − N) minutes of
+credential, and past 60 minutes it starts with none. This is directly visible: one worker
+registered its `s3-creds` plugin at 16:58:18 and took a 403 at 16:59:27 — **69 seconds into its
+life**, on a credential it had just been handed.
+
+Adaptive scaling means new workers join throughout a leg, so this limb fires continuously once a
+leg's broadcast cadence lapses.
+
+### What is *not* the cause
+
+Each of these was excluded, and each would have implied a different and wrong fix:
+
+- **Not a missing refresh.** The loop renews before every date's write, driven by the credential's
+  own advertised expiry rather than a fixed cadence.
+- **Not too small a margin.** 15 minutes comfortably exceeds a single radar date's write under
+  normal conditions. The margin is not what breaks; being unable to *check* it is.
+- **Not a batch outrunning the token.** The original suspicion. The per-date call already closed
+  it — renewal does not wait for a batch boundary.
+- **Not the known per-thread session cache.** `_patch_odc_thread_session_for_env_drift` already
+  makes odc.loader's thread-local `AWSSession` self-invalidate on env drift, and it is installed at
+  module import so it reaches Dask worker processes.
+- **Not a failing renewal call.** Renewals continue throughout both spikes. This excludes the
+  whole family of fixes aimed at the renewer: more retries around it, a longer margin, a different
+  cadence. None would change anything.
+
+### The guard
+
+**Drive the refresh from a timer, not from the work loop.** A background ticker on the runner that
+re-fetches and re-broadcasts every ~30 minutes regardless of what the loop is doing removes the
+coupling that produced every failure above, and fixes both limbs at once:
+
+- a long date write can no longer outlive its credential, because renewal no longer waits for the
+  write to finish
+- a late-joining worker inherits a snapshot at most one tick old, so it always starts with ≥30
+  minutes of credential
+
+Keep the existing per-date check as the belt to the timer's braces — it costs nothing when the
+timer is already keeping the credential fresh.
+
+A reader-side guard (bounding how long an open dataset handle may live across a renewal, or
+re-opening on credential change) is the deeper fix, since `rasterio.env.Env` passes the
+`AWSSession`'s frozen credentials into GDAL on entry and an already-open handle keeps them. It is
+not needed if the timer holds the credential fresh for longer than any single read, and it is the
+harder change; the timer comes first.
+
+## Cause 2 — the source object is corrupt (optical)
+
+### What the logs show
+
+The 38 optical failures name a single object over and over:
+
+```
+sentinel-cogs/sentinel-s2-l2a-cogs/34/W/FA/2021/9/S2B_34WFA_20210908_1_L2A/B02.tif
+```
+
+It fails at **many distinct tile offsets** (X 1–10, Y 3–9; scanlines 1024 through 10240, i.e. Y
+offset × the 1024-pixel tile height), across **at least seven independent Dask workers**, and again
+five minutes later on retry with the same result. No 403, no HTTP error of any kind.
+
+### Reproduced independently
+
+Read directly from a laptop with **no AWS credentials at all**
+(`AWS_NO_SIGN_REQUEST=YES`), walking every block window of band 1:
+
+```
+opened: 10980 x 10980  blocks [(1024, 1024)]  compress deflate
+tiles ok=41 bad=80
+```
+
+**80 of 121 tiles are unreadable.** Two-thirds of the object is broken, permanently, at the
+provider. No retry, credential, worker configuration, or ulimit has any bearing on it.
+
+The STAC catalogue holds **two items for this tile-date** — `S2B_34WFA_20210908_0_L2A` and
+`S2B_34WFA_20210908_1_L2A` — a known Element 84 duplicate-item situation. The pipeline read the
+`_1_` version.
+
+### The guard
+
+A read that fails repeatedly on the same object is bad data, not a transient. The leg should
+**name the object, drop its contribution, and continue** rather than die — the pipeline already
+tolerates nodata within a date, so a missing granule footprint is a coverage loss, not a
+correctness problem. Failing the whole leg trades a partial date for no dates at all.
+
+Whether to instead prefer a sibling STAC item when one exists is a separate question and a
+data-semantics decision, not a reliability fix. Skipping is the conservative default.
+
+## Coupling to the leg retry
+
+`orchestration/prefect/flows/ingest_zone_year.py` retries a failed leg up to
+`ingest_settings.max_leg_attempts` (3) unless the failure matches
+`_NON_RETRYABLE_LEG_MARKERS`. That list does **not** mention the warp failure, and it cannot
+usefully be made to:
+
+- a **403-driven** warp failure is retryable and *should* consume attempts
+- a **corrupt-object** warp failure will burn all three attempts and every hour of fleet time they
+  cost, and can never succeed
+
+Because the wrapper discards the inner cause, the exception text is identical in both cases, so
+**no marker on the message can separate them.** The discriminators that do work are elsewhere:
+
+- **the object URL** — a corrupt object fails on the *same* URL every attempt, while a credential
+  expiry fails *many* URLs at once
+- **`response_code=403` in the preceding log line** — present for cause 1, absent for cause 2
+
+So the classification has to live where the read fails, not where the leg is retried. Capturing
+the inner GDAL cause and the object URL into the failure detail is the prerequisite for ever
+letting the retry classifier act on this at all.
+
+## Method notes
+
+- `WarpOperationError`, `ZIPDecode`, and `Chunk and warp failed` each appear **several times per
+  actual failure** (the pickled payload, the traceback line, the `Exception:` line, the Prefect
+  retry warning). Raw counts of those strings are inflated ~3–5× and are only safe to read as
+  zero-versus-nonzero. `Aborting load due to failure while reading` is emitted **once per failure**
+  and is the countable line.
+- The failing source URL appears only on the `Aborting load` line and the GDAL `ERROR 1` line —
+  never inside the exception. Any attribution to a granule has to come from those.
+- CloudWatch Logs Insights `like` is case-sensitive; see the `querying-logs-and-apis` playbook.
