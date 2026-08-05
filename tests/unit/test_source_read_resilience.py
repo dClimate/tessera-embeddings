@@ -12,7 +12,9 @@ enough to attribute the failure to a cell and a date.
 
 from __future__ import annotations
 
+import ast
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -120,8 +122,6 @@ class TestZeroDateOutcomeIsAttributable:
 
     def test_every_informational_line_carries_the_roi(self) -> None:
         """A line without ``roi=`` cannot be tied to a cell: the log stream is a task id."""
-        import re
-
         src = (_SRC / "ingest" / "s1_roi.py").read_text()
         # Format strings passed to log.info / log.warning, excluding debug-level detail.
         calls = re.findall(r"log\.(?:info|warning)\(\s*\n?\s*((?:\"[^\"]*\"\s*\n?\s*)+)", src)
@@ -130,8 +130,6 @@ class TestZeroDateOutcomeIsAttributable:
 
     def test_placeholders_match_arguments(self) -> None:
         """A miscounted %-placeholder loses the line on a worker rather than raising here."""
-        import ast
-
         tree = ast.parse((_SRC / "ingest" / "s1_roi.py").read_text())
         bad = []
         for node in ast.walk(tree):
@@ -148,3 +146,72 @@ class TestZeroDateOutcomeIsAttributable:
             if placeholders != len(node.args) - 1:
                 bad.append((node.lineno, text[:50]))
         assert not bad, f"placeholder/argument mismatch: {bad}"
+
+
+class TestEveryComputeThatReadsSourceIsAttributed:
+    """A read failure must name its granules wherever the read happens, not only at the gate.
+
+    The optical coverage gate computes only SCL, so a reflectance band that cannot be read
+    survives the gate and fails in the WRITE's compute instead. That path had no attribution
+    context, so the failure named no granule and identifying the object meant correlating
+    GDAL's own stderr by timestamp across the whole fleet.
+    """
+
+    def test_both_sensor_writes_are_wrapped(self) -> None:
+        """``write_day_windows`` must never be reached outside ``read_failure_context``.
+
+        Checked by CONTAINMENT, not by textual order. The optical gate's own context appears
+        earlier in the file, so "a context exists above the write" is satisfied by a write
+        that is not wrapped at all.
+        """
+        for module in ("s1_roi.py", "s2_roi.py"):
+            tree = ast.parse((_SRC / "ingest" / module).read_text())
+            writes = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "write_day_windows"
+            ]
+            assert writes, f"{module}: no write_day_windows call found — has it been renamed?"
+            for write in writes:
+                assert _enclosing_contexts(tree, write) & {"read_failure_context"}, (
+                    f"{module}: the write at line {write.lineno} computes source pixels, so it "
+                    "must be lexically inside `with read_failure_context(...)` — otherwise a "
+                    "failed read names no granule"
+                )
+
+    def test_the_optical_write_passes_its_items(self) -> None:
+        """A context with no items names a count of zero, which is worse than no line.
+
+        The radar path has no per-date item list to pass; the optical path does, and it is
+        the only thing that identifies WHICH source object failed.
+        """
+        src = (_SRC / "ingest" / "s2_roi.py").read_text()
+        assert "items=prepared.items" in src, "the optical write must pass the day's items"
+
+
+def _enclosing_contexts(tree: object, target: object) -> set[str]:
+    """Names of the context managers whose ``with`` blocks lexically contain ``target``."""
+    found: set[str] = set()
+
+    def walk(node: object, active: frozenset[str]) -> None:
+        if node is target:
+            found.update(active)
+            return
+        if isinstance(node, ast.With | ast.AsyncWith):
+            names = {
+                item.context_expr.func.id
+                for item in node.items
+                if isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Name)
+            }
+            for child in node.body:
+                walk(child, active | names)
+            for item in node.items:
+                walk(item.context_expr, active)
+            return
+        for child in ast.iter_child_nodes(node):  # type: ignore[arg-type]
+            walk(child, active)
+
+    walk(tree, frozenset())
+    return found

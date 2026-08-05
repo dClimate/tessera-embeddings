@@ -39,7 +39,7 @@ import logging
 import math
 import operator
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import partial, reduce
 from typing import final
@@ -202,6 +202,14 @@ class _PreparedDate:
     build_s: float
     gate_s: float
     skip_reason: str | None = None
+    items: Sequence[object] = ()
+    """The day's STAC items, carried so the WRITE can name them on failure.
+
+    The write's compute is where the reflectance bands are first read, so a source object
+    that cannot be read fails there — after the coverage gate has already passed on SCL.
+    Without the items the failure names no granule, and identifying the object then means
+    correlating GDAL's own stderr by timestamp across every worker in the fleet.
+    """
 
 
 def _baselines_for(baselines: dict[str, int], dates: Iterable[str]) -> dict[str, int]:
@@ -522,7 +530,7 @@ def ingest_s2_roi_reflectance(
             mask_for_var = roi_2d if str(var) == "scl" else keep
             day_ds[str(var)] = day_ds[str(var)].where(mask_for_var, other=0)
 
-        return _PreparedDate(date, day_ds, date_windows, build_s, gate_s)
+        return _PreparedDate(date, day_ds, date_windows, build_s, gate_s, items=day_items)
 
     def _write_date(prepared: _PreparedDate, stall_s: float, baselines: dict[str, int]) -> None:
         """Write one prepared date's pixels: the store's only writer.
@@ -539,21 +547,29 @@ def ingest_s2_roi_reflectance(
         # commits nothing, so the retry re-runs only the write, from the graph preparation
         # already built. A second writer is excluded from the retry — see
         # store_write_retrying.
-        for attempt in store_write_retrying(log):
-            with attempt:
-                write_day_windows(
-                    reflectance_store,
-                    day_ds,
-                    prepared.windows,
-                    roi=roi,
-                    manifest=ingest_manifest,
-                    baselines=_baselines_for(baselines, [prepared.date]),
-                    tile_id=roi_zarr_path,
-                    crs=roi.native_crs,
-                    chunks=INGEST_CHUNKS,
-                    parallel_windows=overlap_window_writes,
-                    s3_region=s3_region,
-                )
+        #
+        # Named on failure, exactly as the coverage gate and the radar write are. The
+        # reflectance bands are first READ here, so a source object that cannot be read
+        # fails at this point rather than at the gate, which only reads SCL — and a
+        # permanently unreadable object exhausts the retry and kills the leg. Which object
+        # it was is the difference between a one-command diagnosis and a fleet-wide log
+        # correlation.
+        with read_failure_context(log, roi=roi_label, date=prepared.date, items=prepared.items):
+            for attempt in store_write_retrying(log):
+                with attempt:
+                    write_day_windows(
+                        reflectance_store,
+                        day_ds,
+                        prepared.windows,
+                        roi=roi,
+                        manifest=ingest_manifest,
+                        baselines=_baselines_for(baselines, [prepared.date]),
+                        tile_id=roi_zarr_path,
+                        crs=roi.native_crs,
+                        chunks=INGEST_CHUNKS,
+                        parallel_windows=overlap_window_writes,
+                        s3_region=s3_region,
+                    )
         # One line per kept date, partitioning its wall clock into the client-side
         # graph build, the coverage-gate compute, and the write (windows + commit).
         # Stable format: CloudWatch queries and the pipeline analysis key off it.
