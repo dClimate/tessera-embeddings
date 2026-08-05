@@ -1,5 +1,12 @@
 # Ingest optimization campaign — July 2026
 
+> **Superseded in part.** Throughput at fleet scale was re-measured on 2026-08-04 and every
+> zone ran 1.8-2.1x slower than the figures here at the same zone and the same width. The
+> width conclusions below still hold (6x workers buys 3.7-4.9x, confirmed by same-zone
+> pairs); the DURATION basis does not. See
+> `ingest_concurrency_investigation_2026_08.md` before quoting any per-date or per-zone
+> duration from this document.
+
 Authoritative record of the campaign-ingest optimization work: what was changed, how much
 each change bought, what was tried and abandoned, and the constraints future work must
 respect. The empirical basis for why the ingest path looks the way it does.

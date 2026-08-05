@@ -266,6 +266,14 @@ the cheap half of the campaign. It does not change the inference line, which §6
    sooner, so re-scaling `max_workers` is not where the money is.
 3. **The fit's own basis** is five regions at R² 0.954, on code that has since changed.
 
+**Investigation and plan: `ingest_concurrency_investigation_2026_08.md`.** Six candidate causes
+are ruled out, including the orchestrator, the Dask schedulers, capacity, and store growth. Two
+findings bear directly on this section. Per-date cost rises through a run because **windows per
+date rise** — write cost per window is flat at 16.4–18.3 s over 137 dates — which means **every
+velocity figure measured early in a run understates the full year**, so the durations above are
+optimistic even before the July gap is explained. And 35N now writes 18 windows/date against
+13 in July, which by that same arithmetic accounts for ~1.4× of the ~2× gap on its own.
+
 **The per-tile cost gap is intrinsic, not width waste.** 53N costs ~$0.14/tile-year against
 12N's ~$0.09, and the investigation attributes that to 53N doing **1.38x the per-tile work**
 (9.7 vs 7.0 worker-seconds per chunk-date, fewer tiles amortising the same per-date floor) — not
