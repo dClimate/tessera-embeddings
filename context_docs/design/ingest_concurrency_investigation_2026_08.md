@@ -226,6 +226,29 @@ variable parity before dispatch.
 against the reference account's before trusting the run, because the accounts drift independently
 and the drift is invisible in the run's parameters.
 
+**Preliminary, n=4 of 29 — do not cite yet.** The quiet arm's first four dates: 16.0 windows/date,
+218.4 s/date median, **write per window 10.21 s** against the loaded arm's 11.04 s. The raw
+per-date figure is *higher* purely because February carries more windows per date, which is L
+again and exactly why the per-window column is the one to read. Normalised, quiet is ~8% cheaper
+than loaded — the right direction for a contention term, and a small one. Four dates is n≈4 with a
+cold-start date among them; wait for the arm to finish.
+
+### A third arm removes the account confound, and dev is draining into position
+
+The two-arm design cannot separate "quiet" from "yield". A third arm — **35N March 2024, 60w,
+`min_workers=1`, on global-tessera-dev once it is quiet** — closes that, because it gives two
+independent one-variable comparisons instead of one two-variable comparison:
+
+| pair | varies | isolates |
+|---|---|---|
+| dev January (loaded) vs dev March (quiet) | load only | **the contention term** |
+| yield February (quiet) vs dev March (quiet) | account only | **the account confound itself** |
+
+Dev fell from 17 fleets/803 workers to 12/484 within the hour, so the window is opening on its own.
+Cost is ~$25 and one month of one zone; the arms must keep `min_workers=1` and 60 workers to stay
+comparable, and March is adjacent to February so the seasonal step between arms stays small.
+Compare on **write per window**, not per date, since windows/date rises across all three months.
+
 **It also contradicts L's generalisation.** Write per window was flat across 53N's four quartiles
 (16.4–18.3 s), which L used to argue it is *the* stable unit. On 35N it is not flat: within the
 single 2021 run, at windows/date pinned at exactly 18.0 all summer, write per window falls
