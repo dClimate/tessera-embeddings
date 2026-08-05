@@ -53,7 +53,7 @@ from tessera_embeddings.ingest.live_windows import (
     windows_for_date,
 )
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
-from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
+from tessera_embeddings.ingest.roi import StorageOptions, read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import apply_roi_mask, read_failure_context
 from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
@@ -246,7 +246,7 @@ def ingest_s1_roi_sar(
     use_s3_direct: bool = True,
     cred_refresh_interval_sec: float = DEFAULT_CRED_REFRESH_INTERVAL_SEC,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
-    storage_options: dict | None = None,
+    storage_options: StorageOptions = None,
     overlap_window_writes: bool = True,
     pipeline_batches: bool = True,
     narrow_windows_per_date: bool = True,

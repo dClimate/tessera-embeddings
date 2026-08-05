@@ -84,8 +84,17 @@ def iam_s3_storage_options() -> dict[str, str]:
     ``set_s3_credentials`` has overridden ``AWS_*`` env vars with
     OPERA-scoped STS tokens.
 
-    Returns frozen credential strings that Dask can serialize into the
-    task graph without re-invoking the credential chain.
+    Returns frozen credential strings, which Dask can serialize into a task graph.
+
+    **Pass this function to the ingest, not its result.** What it returns is a snapshot,
+    and the role credential behind it expires (instance-metadata ~1h, ECS task role ~6h)
+    — a leg can run longer, so options resolved once at leg entry stop working partway
+    through, on a bucket the role can always read. Every consumer accepts a callable for
+    exactly this reason (see
+    :func:`tessera_embeddings.ingest.roi.resolve_storage_options`) and re-invokes it at
+    each read. That is cheap: :func:`_resolve_iam_credentials` caches a live refreshable
+    credential, so each call is a frozen-copy of an already-resolved one and botocore
+    refreshes underneath.
 
     Raises:
         RuntimeError: If no AWS credentials are found outside env vars.

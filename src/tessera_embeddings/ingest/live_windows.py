@@ -43,6 +43,7 @@ import numpy as np
 import zarr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE
+from tessera_embeddings.ingest.roi import StorageOptions, resolve_storage_options
 
 logger = logging.getLogger(__name__)
 
@@ -99,14 +100,15 @@ class LiveWindow:
     x1: int
 
 
-def _open_mask(mask_path: str, storage_options: dict | None = None) -> zarr.Array:
+def _open_mask(mask_path: str, storage_options: StorageOptions = None) -> zarr.Array:
     """Open + validate the ROI mask array (the shape both mask writers produce).
 
-    ``storage_options`` mirrors :func:`ingest.roi.read_roi_mask`: a deployment whose
-    mask needs non-default fsspec/S3 settings must pass them here too, or window
-    derivation fails where the ingest's own mask read succeeds.
+    ``storage_options`` mirrors :func:`ingest.roi.read_roi_mask` in both senses: a
+    deployment whose mask needs non-default fsspec/S3 settings must pass them here too,
+    or window derivation fails where the ingest's own mask read succeeds — and a callable
+    is resolved here, at the read, so a credential cannot be older than this call.
     """
-    z = zarr.open(mask_path, mode="r", storage_options=storage_options)
+    z = zarr.open(mask_path, mode="r", storage_options=resolve_storage_options(storage_options))
     if not isinstance(z, zarr.Array) or z.ndim != 2 or z.dtype != np.bool_:
         raise ValueError(f"ROI mask at {mask_path} is not a 2-D boolean zarr array")
     return z
@@ -117,7 +119,7 @@ def live_chunk_grid_from_keys(
     mask: zarr.Array,
     *,
     chunk_px: int = INGEST_CHUNK_SIZE,
-    storage_options: dict | None = None,
+    storage_options: StorageOptions = None,
 ) -> np.ndarray | None:
     """The live-chunk grid read from the mask's stored chunk KEYS, not its pixels.
 
@@ -162,7 +164,7 @@ def live_chunk_grid_from_keys(
     height, width = mask.shape
     rows, cols = math.ceil(height / chunk_px), math.ceil(width / chunk_px)
     try:
-        fs, root = fsspec.core.url_to_fs(mask_path, **(storage_options or {}))
+        fs, root = fsspec.core.url_to_fs(mask_path, **(resolve_storage_options(storage_options) or {}))
         keys = fs.find(root)
     except (OSError, ValueError) as exc:
         logger.debug("cannot list %s (%s); using the block scan", mask_path, exc)
@@ -193,7 +195,7 @@ def live_chunk_grid_from_keys(
 
 
 def live_chunk_grid(
-    mask_path: str, *, chunk_px: int = INGEST_CHUNK_SIZE, storage_options: dict | None = None
+    mask_path: str, *, chunk_px: int = INGEST_CHUNK_SIZE, storage_options: StorageOptions = None
 ) -> np.ndarray:
     """Coarsen the ROI mask onto the ingest chunk grid: True where any pixel is live.
 
@@ -505,7 +507,7 @@ def live_windows_for_mask(
     prefer_keys: bool = True,
     merge: bool = True,
     window_cost_in_chunks: int = WINDOW_COST_IN_CHUNKS,
-    storage_options: dict | None = None,
+    storage_options: StorageOptions = None,
 ) -> list[LiveWindow]:
     """The one-call form: mask store → live windows to write.
 

@@ -19,6 +19,7 @@ from dask.distributed import get_client
 from prefect import get_run_logger, task
 
 from tessera_embeddings.config.ingest import INGEST_MANIFEST_SPLIT
+from tessera_embeddings.ingest.roi import StorageOptions
 from tessera_embeddings.ingest.roi_processing import DEFAULT_MIN_VALID_COVERAGE
 from tessera_embeddings.ingest.s1_roi import S1Orbit, ingest_s1_roi_sar
 from tessera_embeddings.ingest.s2_roi import ingest_s2_roi_reflectance
@@ -35,7 +36,7 @@ def process_roi_reflectance(
     min_valid_coverage: float = DEFAULT_MIN_VALID_COVERAGE,
     provider: str = "earth-search",
     collection: str = "sentinel-2-l2a",
-    storage_options: dict | None = None,
+    storage_options: StorageOptions = None,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
@@ -92,7 +93,7 @@ def process_roi_sar(
     edl_credentials_fn: Callable[[], dict[str, str]] | None = None,
     apply_credentials_fn: Callable[[dict[str, str]], None] | None = None,
     use_s3_direct: bool = True,
-    storage_options: dict | None = None,
+    storage_options: StorageOptions = None,
     # Mirror the domain defaults: these shells forward knobs, so a default here that
     # disagrees with s1_roi.ingest_s1_roi_sar silently changes behaviour for any caller
     # that does not pass the flag explicitly.
@@ -141,7 +142,11 @@ def process_roi_sar(
         cred_provider_cm = credentials_provider(iam_icechunk_credentials)
 
         if storage_options is None and roi_zarr_path.startswith("s3://"):
-            storage_options = iam_s3_storage_options()
+            # The CALLABLE, not its result. Resolved once here it is a snapshot, and the
+            # role credential behind it expires — an ECS task role lasts hours, which a
+            # radar leg outlives, and every mask read after that point fails on a bucket
+            # our role can always read. Passing the provider moves resolution to each read.
+            storage_options = iam_s3_storage_options
 
     # manifest_split for the same reason as the S2 task: this mosaic is
     # region-written once per date batch, so an unsharded manifest makes each

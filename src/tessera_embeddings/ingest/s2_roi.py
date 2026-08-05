@@ -58,7 +58,7 @@ from tessera_embeddings.ingest.live_windows import (
     live_windows_for_mask,
     windows_for_date,
 )
-from tessera_embeddings.ingest.roi import read_roi_mask, read_roi_metadata
+from tessera_embeddings.ingest.roi import StorageOptions, read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import (
     DEFAULT_MIN_VALID_COVERAGE,
     read_failure_context,
@@ -236,7 +236,7 @@ def ingest_s2_roi_reflectance(
     provider: str = "earth-search",
     collection: str = "sentinel-2-l2a",
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
-    storage_options: dict | None = None,
+    storage_options: StorageOptions = None,
     stream_stac_monthly: bool = True,
     overlap_window_writes: bool = True,
     pipeline_dates: bool = False,
@@ -373,6 +373,9 @@ def ingest_s2_roi_reflectance(
     # per (chunk, band) and the write needs no rechunk at all.
     spatial_chunks = {"northing": INGEST_CHUNKS["northing"], "easting": INGEST_CHUNKS["easting"]}
 
+    # Leg-entry read, for the pixel total ONLY — computed immediately below, so the
+    # credential it resolves cannot go stale before use. Every per-date consumer builds its
+    # own graph instead (see ``date_mask``); do not reuse this one there.
     roi_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
     # The mask stays LAZY and the total comes from the live windows only.
     #
@@ -457,12 +460,18 @@ def ingest_s2_roi_reflectance(
         # on failure: an unretried read here used to propagate out of the loop and fail the
         # whole zone-year, and its message carried neither the zone nor the date.
         built_at = time.monotonic()
+        # The mask graph is rebuilt PER DATE, not reused from leg entry. The reads it
+        # performs recur per date either way (nothing is persisted), but a graph built
+        # once carries whatever credential was resolved then — and an IAM role credential
+        # expires in hours, which a leg outlives. Rebuilding moves the resolution to the
+        # date that consumes it; the graph itself is cheap next to the pixels it reads.
+        date_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
         with read_failure_context(log, roi=roi_label, date=date, items=day_items):
             for attempt in source_read_retrying(log):
                 with attempt:
                     passes, any_valid = _coverage_from_scl(
                         day_ds["scl"].isel(time=0),
-                        roi_mask,
+                        date_mask,
                         roi_pixel_count,
                         min_valid_coverage,
                         client,
@@ -524,7 +533,7 @@ def ingest_s2_roi_reflectance(
         # — and each `where` is a graph task per (chunk, band), which is the budget
         # that limits ingest. SCL keeps only the ROI mask: it is categorical, and
         # zeroing it by its own validity would rewrite the class codes it carries.
-        roi_2d = roi_mask if roi_mask is not None else read_roi_mask(roi_zarr_path, spatial_chunks)
+        roi_2d = date_mask
         keep = roi_2d if any_valid is None else (any_valid & roi_2d)
         for var in day_ds.data_vars:
             mask_for_var = roi_2d if str(var) == "scl" else keep
