@@ -939,15 +939,21 @@ def ecs_inventory_client(region: str | None = None) -> Any:  # noqa: ANN401 — 
     tasks) one walk is ~24 calls, and boto3's default of four legacy retries gives up
     partway with ``ThrottlingException: Rate exceeded``.
 
-    ``adaptive`` mode is the fix rather than a bigger ``max_attempts``: it adds
-    client-side rate limiting that learns the throttle and paces requests into it,
-    instead of retrying into a bucket that is still empty. Slower is the intended
-    outcome — an enumeration that takes a minute is worth far more than one that fails.
+    ``adaptive`` mode pairs with a generous attempt budget. Adaptive adds client-side
+    rate limiting that learns the throttle and paces requests into it rather than
+    retrying into an empty bucket; the attempt budget then decides how long it is willing
+    to wait. Both are needed: pacing alone still gives up while the bucket is starved,
+    and attempts alone hammer it.
+
+    **The bucket is shared, and this client is not its main consumer** — a fleet's own
+    task polling is. So contention is not something a caller can reduce by making fewer
+    calls; it can only wait for a gap. That is why the budget is set for a wait of
+    minutes rather than seconds.
 
     The orphan-fleet sweep is the caller that matters: it enumerates in order to stop
     fleets a dead run left behind, so it runs precisely when the cluster is widest and a
-    leak is most expensive. A safety mechanism that fails under load is worse than a slow
-    one. A quota raise is tracked separately in yield-embeddings
+    leak is most expensive. Nothing waits on a sweep, so finishing slowly always beats
+    failing. A quota raise is the real remedy and is tracked in yield-embeddings
     ``docs/aws-quota-requests.md``, but this client must not depend on being granted one.
     """
     import boto3
@@ -956,7 +962,7 @@ def ecs_inventory_client(region: str | None = None) -> Any:  # noqa: ANN401 — 
     return boto3.client(
         "ecs",
         region_name=region,
-        config=Config(retries={"max_attempts": 10, "mode": "adaptive"}),
+        config=Config(retries={"max_attempts": 30, "mode": "adaptive"}),
     )
 
 

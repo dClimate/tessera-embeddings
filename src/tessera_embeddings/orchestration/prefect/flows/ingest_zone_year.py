@@ -196,14 +196,14 @@ def _s1_max_workers(s2_max_workers: int, settings: IngestSettings) -> int:
 
 #: Tag prefix for the S1/S2 ROI ingest runs this flow dispatches.
 #: Markers in a failed leg's detail that mean a re-dispatch CANNOT help. Everything else
-#: is retried, and that polarity is deliberate: a wasted retry costs one leg's work on a
-#: resumable ingest, while a missed retry leaves a mosaic incomplete until a human notices
-#: — which is exactly what happened to 35N, 12N and 53N on 2026-08-04.
+#: is retried, and that polarity is deliberate: a wasted retry costs one leg's remaining
+#: work on a resumable ingest, while a missed retry leaves a mosaic incomplete until a
+#: human notices.
 #:
 #: Keep this list to failures that are deterministic in the INPUT, not merely severe. A
 #: crash, a throttle, an expired source credential and a warp error are all transient by
-#: nature: the same dispatch can succeed on the next attempt because it resumes from the
-#: dates already committed.
+#: nature: the same dispatch can succeed next time because it resumes from the dates
+#: already committed.
 _NON_RETRYABLE_LEG_MARKERS = (
     "InsufficientCoverageError",  # the source has no such data; asking again gets the same answer
     "ObjectNotFound",  # the child deployment is not registered — a registration bug, not a blip
@@ -565,9 +565,7 @@ async def ingest_zone_year(
             break
         # A re-dispatch RESUMES: already-committed dates are skipped, not rewritten, so the
         # retry costs only the work that was actually lost. That idempotency is what makes
-        # retrying the default rather than the exception — the two failures seen in practice
-        # (an expired source credential, a warp error hours in) are both transient, and
-        # leaving them meant a mosaic sat incomplete until a human noticed.
+        # retrying the default rather than the exception.
         log.warning(
             "Zone %s year %s: attempt %d/%d — re-dispatching %d leg(s) that can resume: %s",
             zone,

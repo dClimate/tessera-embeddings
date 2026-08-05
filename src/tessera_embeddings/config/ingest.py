@@ -116,23 +116,17 @@ class IngestSettings(BaseModel):
     # a quota. Keep this and the campaign's per-cell vCPU figure in step; changing one alone
     # silently invalidates the other.
     #
-    # ``min_workers`` defaults to None meaning **follow the derived width**, i.e. a fixed-size
-    # fleet. It used to default to 1, and `cluster.adapt(minimum=1, ...)` then retired workers
-    # in every inter-date gap and relaunched them cold into the next write. Measured
-    # 2026-08-04 across a 35-cell wave: one 60-slot fleet registered **1,250 distinct workers
-    # in five hours** — full turnover roughly every 35 minutes — and the fleets held only
-    # ~85-90% of nominal width, with the scheduler's own health line showing p10 dips to 15-37
-    # workers on max-60 fleets. That is ~10-12% of the width we pay for, spent on Fargate boot
-    # latency inside writes, cold GDAL/HTTP caches, and ECS control-plane churn across the wave.
+    # ``min_workers`` defaults to None meaning **follow the derived width**, i.e. a
+    # fixed-size fleet. A floor of 1 lets ``cluster.adapt`` retire workers in every
+    # inter-date gap and relaunch them cold into the next write, which costs a
+    # material share of the width being paid for: Fargate boot latency lands inside
+    # writes, and each new worker starts with cold GDAL/HTTP caches.
     #
-    # Adaptivity bought nothing to offset it: these fleets are busy essentially the whole run
-    # (per-date cadence is build+gate+write+stall with a ~5-8 s remainder), so there is no idle
-    # trough for a minimum of 1 to exploit. The in-account proof is the inference-side ingest
-    # fleets, which set a real minimum and register exactly that many workers once, never
-    # churning.
-    #
-    # Set it explicitly to restore adaptive behaviour — a reference run being compared against
-    # older measurements wants ``min_workers=1`` so the churn is present in both arms.
+    # Adaptivity buys nothing to offset that here, because these fleets are busy for
+    # essentially the whole run — there is no idle stretch for a lower floor to
+    # reclaim. Set a floor below the derived width only for a fleet that genuinely
+    # idles. Measurements are in
+    # context_docs/design/ingest_optimization_campaign_2026_07.md.
     min_workers: int | None = Field(default=None, ge=1)
     max_workers: int = Field(default=60, ge=1)
     # Each S1 orbit's fleet width as a FRACTION of the S2 fleet's, because S1's work is a
@@ -166,13 +160,11 @@ class IngestSettings(BaseModel):
     # orbit) before giving up on it. 1 disables retrying.
     #
     # Retrying is safe because a re-dispatch RESUMES — dates already committed are skipped,
-    # not rewritten — so the cost is only the work actually lost. It is on by default
-    # because the alternative was worse: on 2026-08-04 an expired source credential and a
-    # warp error each killed a leg hours in, and the mosaic then sat incomplete until
-    # someone noticed and re-dispatched by hand. Three zones lost a day that way.
+    # not rewritten — so the cost is only the work actually lost. On by default because the
+    # alternative leaves a mosaic incomplete until a human notices and re-dispatches.
     #
-    # Failures that a re-dispatch cannot fix are excluded by class rather than by count —
-    # see ``_NON_RETRYABLE_LEG_MARKERS`` in the flow.
+    # Failures a re-dispatch cannot fix are excluded by CLASS rather than by count — see
+    # ``_NON_RETRYABLE_LEG_MARKERS`` in the flow.
     max_leg_attempts: int = Field(default=3, ge=1)
     # Optional base URI (an fsspec target, e.g. s3://.../perf/) for capturing a
     # Dask ``distributed.performance_report`` per child ingest. Default None =
