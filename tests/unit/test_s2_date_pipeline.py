@@ -144,6 +144,7 @@ def run_ingest(monkeypatch):
         *,
         pipeline_dates: bool,
         fail_on: str | None = None,
+        fail_with: str | None = None,
         write_s: float = 0.0,
         log: logging.Logger | None = None,
         existing_dates: set[str] | None = None,
@@ -168,7 +169,7 @@ def run_ingest(monkeypatch):
             date = str(day_ds.time.dt.date.values[0])
             run.attempts.append(date)
             if date == fail_on:
-                raise RuntimeError(f"write of {date} failed")
+                raise RuntimeError(fail_with or f"write of {date} failed")
             time.sleep(write_s)
             run.written.append(date)
             run.write_ended[date] = time.monotonic()
@@ -435,3 +436,40 @@ def test_no_assessed_window_is_recorded_when_the_store_does_not_exist(run_ingest
     run_ingest(dict.fromkeys(["2024-01-01"], False), pipeline_dates=False)
 
     assert seen == []
+
+
+def test_a_batch_isolates_an_unreadable_source_instead_of_failing_the_leg(run_ingest, caplog):
+    """One object that will never read must cost its date, not the whole S2 leg.
+
+    The duplicate ladder and the give-up-and-record path both live in the per-date
+    consume, which the batched write does not go through. Compact ROIs auto-batch, so
+    for them that was the DEFAULT path: a single permanently unreadable COG anywhere in
+    a batch failed the leg, and failed it identically on every retry, stranding the
+    zone-year. The batch now re-runs one date at a time on an unreadable source, so the
+    bad date is recorded as lost and its batch-mates still land.
+    """
+    dates = {"2024-01-01": True, "2024-01-02": True, "2024-01-03": True, "2024-01-04": True}
+    with caplog.at_level(logging.WARNING):
+        run = run_ingest(
+            dates,
+            pipeline_dates=False,
+            fail_on="2024-01-02",
+            fail_with="rasterio.errors.WarpOperationError: Chunk and warp failed",
+            batch_dates=2,
+        )
+
+    assert run.result.dates_processed == 3  # the batch-mate and the second batch
+    assert run.result.dates_filtered_coverage == 1  # only the unreadable date is lost
+    assert "retrying the batch one date at a time" in caplog.text
+    assert "DATA LOSS" in caplog.text
+
+
+def test_a_batch_failure_that_is_not_a_read_error_still_fails_the_leg(run_ingest):
+    """Isolation is for unreadable SOURCES only.
+
+    Re-running k dates singly to watch each hit the same non-data failure costs k times
+    as long to reach the same answer, so anything unrecognised propagates as before.
+    """
+    dates = {"2024-01-01": True, "2024-01-02": True}
+    with pytest.raises(RuntimeError, match="write of 2024-01-02 failed"):
+        run_ingest(dates, pipeline_dates=False, fail_on="2024-01-02", batch_dates=2)

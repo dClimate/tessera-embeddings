@@ -798,6 +798,48 @@ def ingest_s2_roi_reflectance(
                         total_filtered += 1
                         return
 
+        def _write_batch_or_isolate(batch: list[_PreparedDate], stall_s: float) -> None:
+            """Write a batch, falling back to one date at a time if a source will not read.
+
+            The duplicate ladder and the give-up-and-record path both live in
+            :func:`_consume`, which the batched path never reaches — so without this a
+            single permanently unreadable object anywhere in a batch fails the whole S2
+            leg, and fails it identically on every retry, stranding the zone-year. Compact
+            ROIs auto-batch, so that is the DEFAULT path for them rather than an opt-in.
+
+            Isolating is safe because the batched write commits nothing on failure (see
+            :func:`_write_batch`): re-running its dates singly starts from the same clean
+            state, and each then gets the per-date recovery — alternate copies first, and
+            only the date that has run out of copies given up and recorded.
+
+            Only an unreadable SOURCE is isolated. Anything else propagates, because
+            re-running k dates one by one to watch each hit the same non-data failure
+            costs k times as long to reach the same answer.
+            """
+            nonlocal total_processed
+            try:
+                _write_batch(batch, baselines, stall_s)
+            except Exception as exc:
+                if not is_unreadable_source(exc):
+                    raise
+                log.warning(
+                    "Batched write failed roi=%s dates=%s..%s n=%d on an unreadable source (%s) — "
+                    "retrying the batch one date at a time so the duplicate-copy fallback applies "
+                    "and at most the unreadable date is lost.",
+                    roi_label,
+                    batch[0].date,
+                    batch[-1].date,
+                    len(batch),
+                    exc,
+                )
+                # Zero stall: the batch's preparation stall was already spent and cannot be
+                # re-attributed per date. The metric compares steady-state modes, and this
+                # path is not one.
+                for prepared in batch:
+                    _consume(prepared, 0.0)
+                return
+            total_processed += len(batch)
+
         # query_stac_items sorts by (date, cloud_cover ASC). Re-sort cloudiest-first so
         # the clearest tile paints last (wins) in solar_day's painter's algorithm.
         # group_items_by_date preserves this within-group order.
@@ -843,12 +885,10 @@ def ingest_s2_roi_reflectance(
                 batch.append(prepared)
                 batch_stall += stall_s
                 if len(batch) == batch_dates:
-                    _write_batch(batch, baselines, batch_stall)
-                    total_processed += len(batch)
+                    _write_batch_or_isolate(batch, batch_stall)
                     batch, batch_stall = [], 0.0
             if batch:
-                _write_batch(batch, baselines, batch_stall)
-                total_processed += len(batch)
+                _write_batch_or_isolate(batch, batch_stall)
         elif pipeline_dates:
             # The pipeline drains at each month boundary, since it lives inside one
             # _drive call: one unhidden preparation per month, not worth threading
