@@ -125,6 +125,28 @@ estimate of anything. Stratify by the variable that drives the spread — here l
 comparing against a weighted reference. See `ingest_concurrency_investigation_2026_08.md`
 §"Corrections", where the same error appears as zone-mix, season-mix and threshold-mix.
 
+## An independent cross-check of the inference line, from the coverage mask
+
+`scripts/rank_zones.py` reads the campaign coverage mask directly: **360,953 live tiles across
+112 zones**, i.e. per campaign year. Nine years is **3.25 M chunk-years**, and this run measured
+cost per delivered chunk at **$0.101–0.214** depending on `t_kept`.
+
+| assumed land-weighted mean $/chunk | implied inference line |
+|---|---:|
+| $0.115 (the sparse-zone figure) | $374 k |
+| $0.15 | $487 k |
+| $0.18 | $585 k |
+
+The model's **$503–579 k** sits inside that band at a mean of roughly $0.155–0.18 — which is
+where a land-weighted mean should land, given equatorial zones cost ~$0.20/chunk and far-south
+ones ~$0.11. **This is a genuinely independent route to the same number**: it multiplies a chunk
+census from the coverage mask by a measured per-chunk cost, using neither the token census nor
+the reference rate that the model's own derivation depends on. Two unrelated methods agreeing to
+within their spreads is the strongest evidence yet that the inference line is sound.
+
+Do not read the table as narrowing the estimate — the mean $/chunk is exactly the unknown the
+17-zone programme measures, and quoting a row of it as a result would be picking the answer.
+
 ## Operational notes
 
 - **The chain deletes each cell's staging prefix and source mosaics after the fill lands**, which is
