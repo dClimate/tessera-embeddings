@@ -197,19 +197,78 @@ tiles ok=41 bad=80
 **80 of 121 tiles are unreadable.** Two-thirds of the object is broken, permanently, at the
 provider. No retry, credential, worker configuration, or ulimit has any bearing on it.
 
-The STAC catalogue holds **two items for this tile-date** — `S2B_34WFA_20210908_0_L2A` and
-`S2B_34WFA_20210908_1_L2A` — a known Element 84 duplicate-item situation. The pipeline read the
-`_1_` version.
+### The duplicate item is the discriminator
+
+The STAC catalogue holds **two items per affected tile-date**, and only the higher-sequence one is
+broken. Two independent cases, different satellites, different bands, different UTM zones:
+
+| tile-date | item | `s2:sequence` | baseline | tiles ok / bad |
+|---|---|---:|---|---|
+| 34WFA 2021-09-08 | `S2B_..._0_L2A` | 0 | 03.01 | **121 / 0** |
+| 34WFA 2021-09-08 | `S2B_..._1_L2A` | 1 | 05.00 | 41 / **80** |
+| 11VPD 2021-08-04 | `S2A_..._0_L2A` | 0 | — | **121 / 0** |
+| 11VPD 2021-08-04 | `S2A_..._1_L2A` | 1 | — | 16 / **105** |
+
+The `_0_` sibling is **intact in both cases**, and covers the same tile fully — so the pixels are
+not lost, and dropping the broken duplicate costs nothing.
+
+**Caveat on the sample.** Both cases were found *by their corruption*, so this does not establish
+that higher-sequence items are broadly corrupt — only that where corruption occurred, the
+lower-sequence sibling was the healthy one. An unbiased survey (sampling duplicates not selected on
+failure) was attempted and did not converge: reading 121 tiles per asset over HTTPS is slow, and the
+`earth-search` STAC API returned 502s under repeated querying.
+
+### A second, independent defect the duplicates expose
+
+The two items carry **different processing baselines** — 03.01 and 05.00, i.e. **either side of
+`S2_BASELINE_THRESHOLD = 400`**, which decides whether `S2_BASELINE_OFFSET = -1000` is applied.
+
+`stac._extract_baselines` keys by date:
+
+```python
+baselines[date_str] = _extract_baseline(item)   # last item for a date WINS
+```
+
+Nothing dedupes items per tile-date, and `odc.stac.load` fuses both items into one solar-day slice
+(`fuse_nd_slices` is in the failing traceback). So a duplicated tile-date can hold pixels processed
+under both baselines while **one** correction is applied to the fused result — and which one is
+decided by item order, not by which item's pixels are present. Part of that date's reflectance is
+then wrong by 1000 DN.
+
+This is a correctness defect independent of the corruption, and it is **not fixed** by anything in
+this record. Fixing it requires choosing one item per (tile, solar day), which is the same choice
+the corruption forces.
 
 ### The guard
 
-A read that fails repeatedly on the same object is bad data, not a transient. The leg should
-**name the object, drop its contribution, and continue** rather than die — the pipeline already
-tolerates nodata within a date, so a missing granule footprint is a coverage loss, not a
-correctness problem. Failing the whole leg trades a partial date for no dates at all.
+Deduplicating to one item per (tile, solar day) addresses both the corruption and the baseline
+mixing at once, and loses no pixels. **Which item to keep is a data-quality decision, not a
+reliability one**, and the two candidate rules disagree:
 
-Whether to instead prefer a sibling STAC item when one exists is a separate question and a
-data-semantics decision, not a reliability fix. Skipping is the conservative default.
+- **keep the lower sequence** — matches the corruption evidence (2/2), but discards the newer
+  processing baseline, which is normally the better data
+- **keep the higher sequence** — the usual data-quality preference, and the one that fails here
+
+`odc.stac.load(fail_on_error=False)` is **not** a safe substitute. It would tolerate a corrupt
+object, but it would equally swallow the credential 403s of cause 1 — turning a credential outage
+into silent, large-scale missing data on dates that then commit and read as complete. If it is ever
+used it needs a bound on how much of a date may fail before the date is rejected. The credential
+fix must land first regardless.
+
+### It kills legs, and the leg retry feeds them back in
+
+Observed live on 2026-08-05, after the automatic leg retry shipped: **four optical leg attempts
+died on these two objects within one hour** — two attempts per zone, the retry re-running each leg
+into the same permanently-broken object.
+
+```
+17:01, 17:03  almond-parrot, lean-anteater   Failed  WarpOperationError   (11VPD)
+17:35, 17:36  knowing-narwhal, straight-aardwolf  Failed  WarpOperationError   (34WFA)
+```
+
+Only **four distinct objects** appeared in eight hours of fleet logs, two of them these — so this is
+rare per granule and expensive per occurrence, which is the profile that justifies a guard rather
+than tolerance.
 
 ## Coupling to the leg retry
 
@@ -232,6 +291,22 @@ Because the wrapper discards the inner cause, the exception text is identical in
 So the classification has to live where the read fails, not where the leg is retried. Capturing
 the inner GDAL cause and the object URL into the failure detail is the prerequisite for ever
 letting the retry classifier act on this at all.
+
+## Why the object was hard to identify — an attribution gap, now closed
+
+No `READ FAILED roi=` line existed for any of these failures, despite `read_failure_context`
+wrapping the optical coverage gate. The gate computes **only SCL**, so a broken *reflectance* band
+passes the gate and fails later, in the write's compute — and the optical write was the one compute
+in either sensor path with no attribution context around it. The radar write had one; the gate had
+one; this did not.
+
+So the object's identity existed only in odc's own `Aborting load` line on some worker's stream,
+and finding it meant correlating by timestamp across the whole fleet. The optical write is now
+wrapped and carries the day's items, so the failure names the granule directly.
+
+The general shape, which is the part worth keeping: **an attribution context has to wrap every
+compute that reads source pixels, not just the first one.** A lazy graph moves the read to wherever
+it is finally computed, and a gate that computes a subset of bands only protects that subset.
 
 ## Method notes
 
