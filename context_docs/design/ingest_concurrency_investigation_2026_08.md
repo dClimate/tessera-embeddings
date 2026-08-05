@@ -230,6 +230,14 @@ arm's line), the container image (both accounts' `dev-global-tessera` tag was pu
 CI build, two seconds apart), and the worker shape (`worker_cpu 4096`, `worker_mem 16384`, on the
 pinned `yield-dask-worker-dev-global-tessera` definition).
 
+**Achieved width is matched too, which is the check that would have voided this quietly.** Nominal
+width is a request, not a fact, and evidence D records fleets holding only 85–90% of nominal. Read
+off the scheduler health lines: the quiet arm ran at **median 57, max 60** workers with
+`no-worker=0` on every one of 48 samples. Across the loaded arm's own window 28 dev fleets
+reported, **14 of them at max 60**, and `no-worker=0` on all 28 — so neither arm was width-starved
+and neither was quietly running narrow. Without this the arms could have differed in width rather
+than in load, and nothing in either run's parameters would have shown it.
+
 **What is NOT matched:** the account, VPC, ECS cluster, Prefect server, and S3 bucket — and the
 month, which is the intended variable. So a difference between the arms is "quiet-on-yield minus
 loaded-on-dev", not "quiet minus loaded". Treat a *small* difference as strong evidence against a
