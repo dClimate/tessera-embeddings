@@ -110,10 +110,43 @@ gap is small.
 
 ## The plan
 
-**Stage 1 — separate contention from drift. RUNNING.** `julyref-35N-jan2024-loaded`: zone 35N,
-January **2024** dates, 60 workers, churn deliberately left on for comparability. A second arm on
-February 2024 runs when the account is quiet. Adjacent months of one zone at one width, which is
-the design B used.
+**Stage 1 — separate contention from drift. LOADED ARM MEASURED; quiet arm outstanding.**
+`julyref-35N-jan2024-loaded`: zone 35N, January **2024** dates, 60 workers, churn deliberately
+left on for comparability. A second arm on February 2024 runs when the account is quiet.
+Adjacent months of one zone at one width, which is the design B used.
+
+### The loaded arm's result, 27 dates (2026-08-05)
+
+Measured while the account carried **17 concurrent fleets and 803 Dask workers** with
+`no-worker=0` on every scheduler — a genuinely loaded account, not a nominal one.
+
+| | windows/date | s/date | write per window |
+|---|---:|---:|---:|
+| 35N Jan **2024**, loaded, 60w (this arm, n=27) | 15.0 | **196.3** | 11.04 |
+| 35N Jun–Aug **2021**, loaded, 60w (n=85) | 18.0 | 344.1 | 16.71 |
+
+**196 s/date sits far nearer the decision table's quiet branch (~168) than its loaded branch
+(~300), measured under heavy load.** On its own that bounds the contention term at ~17 cells as
+small: if source-read contention above 20 cells were the mechanism behind E, a 60-worker cell
+sharing the account with 16 others should not run at close to the isolated July rate. The quiet
+arm still completes the A/B and should still run, but it is now expected to confirm rather than
+decide.
+
+**Two cautions on the table above, both of which the earlier framing would have missed.** The two
+rows differ in year *and* season, so neither the per-date nor the per-window column isolates
+anything by itself — this is the cross-comparison error corrected in §"Corrections", reappearing
+in a new guise. And the ~300/~168 figures in the decision table are per-date at unmatched
+windows/date, so the comparison against 196 is indicative, not exact.
+
+**It also contradicts L's generalisation.** Write per window was flat across 53N's four quartiles
+(16.4–18.3 s), which L used to argue it is *the* stable unit. On 35N it is not flat: within the
+single 2021 run, at windows/date pinned at exactly 18.0 all summer, write per window falls
+**18.71 → 16.11 → 14.15** from June to August, a 1.32x decline with the workload per date held
+constant. Same zone, same store, same fleet, same width. So write-per-window is a better
+normaliser than per-date cost but is **not a constant**, and a residual measured through it is not
+automatically a real effect. What varies alongside it — elapsed wall-clock, account load, and the
+store's accumulating size — is exactly the set Stage 1's paired arms are designed to separate,
+which is another reason to run the quiet arm rather than stop at the loaded one.
 
 | outcome | conclusion |
 |---|---|
