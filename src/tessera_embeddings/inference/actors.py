@@ -1222,6 +1222,7 @@ class InferenceActor:
                     "%s",
                     _chunk_summary_line(
                         label=chunk.label,
+                        run=run_id,
                         status="skipped",
                         valid_px=0,
                         total_s=round(elapsed, 1),
@@ -1294,6 +1295,15 @@ class InferenceActor:
                 "%s",
                 _chunk_summary_line(
                     label=chunk.label,
+                    # The per-CELL run id (e.g. "49S-2021-f1fa65fc"). Without it this line
+                    # cannot be attributed to a zone at all: `label` is chunk_<row>_<col>,
+                    # grid-local, so every cell restarts at chunk_0_0 and labels collide both
+                    # across zones and across concurrent fills sharing a log group. Attributing
+                    # by time window instead produced two confidently wrong findings on
+                    # 2026-08-05, including a write-failure rework tax whose mechanism had not
+                    # fired at all. Additive, and observe_cluster reads keys via .get(), so no
+                    # consumer breaks.
+                    run=run_id,
                     # "success" = inference finished and outputs are staged for
                     # upload. write_confirmed=False flags that the deferred S3
                     # write is NOT yet durably confirmed (that happens a chunk
@@ -1335,7 +1345,13 @@ class InferenceActor:
             # fields can be unbound here); parsers key on status.
             logger.info(
                 "%s",
-                _chunk_summary_line(label=chunk.label, status="failed", total_s=round(elapsed, 1), error=str(e)[:200]),
+                _chunk_summary_line(
+                    label=chunk.label,
+                    run=run_id,
+                    status="failed",
+                    total_s=round(elapsed, 1),
+                    error=str(e)[:200],
+                ),
             )
             return {
                 "chunk": chunk.label,

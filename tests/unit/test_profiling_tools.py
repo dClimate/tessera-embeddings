@@ -78,6 +78,32 @@ class TestChunkSummaryLine:
         line = _chunk_summary_line(z=1, a=2)
         assert line.index('"a"') < line.index('"z"')
 
+    def test_carries_the_per_cell_run_id(self) -> None:
+        """``run`` is what makes this line attributable to a zone.
+
+        ``label`` is ``chunk_<row>_<col>`` — grid-local, so every cell restarts at
+        ``chunk_0_0`` and labels collide across zones AND across concurrent fills sharing a
+        log group. Attributing by time window instead produced two confidently wrong findings
+        on 2026-08-05. Every emitting path must carry it: success, skipped and failed.
+        """
+        payload = json.loads(
+            _chunk_summary_line(label="chunk_0_0", run="49S-2021-f1fa65fc", status="success")[len("CHUNK_SUMMARY: ") :]
+        )
+        assert payload["run"] == "49S-2021-f1fa65fc"
+
+    def test_an_added_key_does_not_disturb_the_existing_ones(self) -> None:
+        """Additive by construction — observe_cluster reads keys via ``.get()``, so a new
+        field cannot break a consumer, but the old fields must stay put.
+        """
+        payload = json.loads(
+            _chunk_summary_line(label="chunk_0_0", run="r", status="success", valid_px=123, total_s=4.5)[
+                len("CHUNK_SUMMARY: ") :
+            ]
+        )
+        assert payload["label"] == "chunk_0_0"
+        assert payload["valid_px"] == 123
+        assert payload["total_s"] == 4.5
+
 
 class TestPhaseParser:
     """observe_cluster's on-worker phase-table builder."""
