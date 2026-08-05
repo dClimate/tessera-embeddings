@@ -80,33 +80,50 @@ land-weighted **145** observations per pixel) at a reference **≈1.9 M tok/sec*
 289,000 GPU-hours. The reference rate was measured on **the same `g6e.xlarge`** at the same
 wall-clock basis, so the rate comparison is like-for-like.
 
-**1. `t_kept` centres far below 145 — median 64 — but its DISTRIBUTION reaches 145.** p90 is 122 and
-the maximum is exactly 145. That reframes the question and is the most important nuance here: the
-census figure may be a faithful description of *dense* chunks while the median describes typical
-ones, in which case the census is not wrong but differently weighted. Three further reasons not to
-re-base the budget on this yet:
+### CORRECTION (2026-08-05, later the same day): both apparent findings were zone composition
 
-- These are southern-hemisphere and tropical zones (49S, 48S, 17S, 32S). The census is **land-area
-  weighted across 112 zones**, and dense northern zones — the ones that would sit at the top of the
-  distribution — are absent.
-- A previous "the census is ~2× high" claim was withdrawn because its chunks ran a 50× stricter keep
-  threshold, biasing `t_kept` low in exactly the direction claimed. The campaign path removes *that*
-  bias, not the weighting problem.
-- Per-chunk `t_kept` here spans 34–145, a 4.3× internal spread. A median from four zones is not a
-  land-weighted mean.
+An earlier version of this section reported that `t_kept` runs ~2.3× below the census's 145 and that
+per-actor throughput runs 1.39× below the ≈1.9 M reference, and reasoned toward a ~$350 k inference
+line. **Both were artefacts of aggregating four southern sparse zones**, and per-zone attribution —
+possible for single-cell runs by log stream, see `scripts/inference_profile.py` — reverses them.
 
-**This is what the 17-zone fill programme exists to settle**, and it is close: 16 distinct zones are
-filled or in flight. Treat 145 as the planning figure until the weighted mean lands.
+| cell | latitude band | `t_kept` median (range) | tok/s per actor |
+|---|---|---:|---:|
+| 57S-2021 | far south | 57 (51–125) | 1.12 M |
+| 47S-2022 | far south | 56 (45–118) | 1.31 M |
+| chain aggregate (49S, 48S, 17S, 32S …) | south/tropical | 64 (34–145) | 1.38 M |
+| **03N-2021** | **equatorial** | **176 (128–186)** | **1.68 M** |
+| **06N-2021** | **equatorial** | **178 (136–186)** | **1.85 M** |
 
-**2. Per-actor throughput is BELOW the reference: 1.37 M tok/sec against ≈1.9 M.** Same instance
-type, same basis — a genuine **1.39×** shortfall that pushes GPU-hours up. Untested candidates:
-whole-zone work mixes strategies (`single+xstarter` dominant, `dense/prefetch+starter` for a
-minority) where the reference ROI was more uniform, and the reference ran 12 actors against 20 here.
+**`t_kept` is strongly bimodal by latitude, and the equatorial zones sit ABOVE 145, not below.**
+Equatorial zones are imaged on nearly every pass and screen out little, so they retain ~177
+observations per pixel against ~57 in the far south. A land-weighted mean over 112 zones is exactly
+the right way to combine those, and **145 is entirely plausible as that mean** — it is not a high
+figure, it is a middle one. The earlier reading sampled only the low mode and mistook it for the
+distribution.
 
-**Net direction, not a new budget line.** Naively combining a 2.3× token reduction with a 1.39× rate
-shortfall lands near **$350 k** against the planned $538 k. That multiplies a well-measured rate by a
-badly-weighted token census, so it is a direction only. **The weighting is worth more than the rate:
-fix `t_kept` first.**
+**The rate shortfall was the same artefact, and it has a mechanism.** Throughput per actor rises with
+`t_kept` — 1.12 M at `t_kept` 57 against 1.85 M at 178 — because a token-poor chunk is dominated by
+fixed per-chunk overhead while a token-rich one amortises it. So the reference ≈1.9 M is reproduced
+on token-rich zones and the low figures are what overhead-dominated sparse chunks cost. **Nothing is
+slower than the model assumes; the model's rate simply applies to token-rich work.**
+
+**Consequence for the budget: the cost model's two headline inputs both look sound, and no
+re-basing is warranted.** What this run does add is that **cost per chunk is NOT a stable unit
+across zones** ($0.101–0.214 here) because it scales with `t_kept` — the cost model is right to
+price in tokens.
+
+**Caveats, stated because the corrected reading is only hours old.** The equatorial figures rest on
+16 successful chunks each (both fills had just started), so their medians will move; and warm-up
+overhead is still in their per-chunk cost. The far-south figures rest on 58–64 chunks. **The 17-zone
+land-weighted measurement remains the thing that settles it**, and it is close: 16 distinct zones
+filled or in flight. Treat 145 as the planning figure until it lands — now with the expectation that
+it will be confirmed rather than cut.
+
+**The generalisable lesson, third instance in one day:** a median over a mixed population is not an
+estimate of anything. Stratify by the variable that drives the spread — here latitude — *before*
+comparing against a weighted reference. See `ingest_concurrency_investigation_2026_08.md`
+§"Corrections", where the same error appears as zone-mix, season-mix and threshold-mix.
 
 ## Operational notes
 
