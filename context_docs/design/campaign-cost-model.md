@@ -287,9 +287,15 @@ previously asserted an unexplained 1.8-2.1x slowdown, and that claim is **withdr
 comparison behind it put 35N's **May-September 2021** dates against the July record's **January
 2024** baseline: 330.7 s/date against 167.9. Same zone, same width, different season — and the
 July record's own reading instructions name dates as the third condition that must match. Matched
-on all three, 35N at 60w costs **196.3 s/date against 167.9, i.e. 1.17x**, and that 196.3 was
-measured under 17 concurrent fleets, so it bounds contention and drift together rather than
-isolating either.
+on all three, 35N at 60w costs **196.3 s/date against 167.9, i.e. 1.17x**.
+
+**And none of that 1.17x is contention at the width tested.** The paired A/B completed the same day:
+a quiet arm on an idle account came out **3.3% DEARER** per window than the loaded arm (11.40 against
+11.04), with both verified at full achieved width. So there is no load penalty to price into the
+ingest line at 17 concurrent fleets. **The caveat is the scale:** 17 fleets is ~3,200 vCPU, about a
+sixth of campaign width (45-61 cells = 16,700-22,700 vCPU) and below the ~20 cells where contention
+was ever hypothesised — so **contention at campaign width is unmeasured**, and Stage 3's 25/40/55
+ladder is what would price it. Nothing in the evidence suggests a knee approaching 17.
 
 **What this means for the durations above: raise them, but for seasonality.** The fit is built on
 January-conditions dates and a zone-year is not twelve Januaries — on one zone at one width,
