@@ -46,19 +46,22 @@ class MosaicChunkInferenceDataset:
         num_obs_checkpoints: Sorted bucket sizes. A pixel with ``k`` valid
             observations is mapped to the smallest checkpoint ``>= k``.
         s1_orbit: Which S1 orbit direction(s) are active. Only affects logging.
+            ``"none"`` means radar-free land, where every pixel takes the
+            ``allow_s2_only`` branch below.
         allow_s2_only: Keep S2-valid pixels with ZERO S1 observations (sub-zone
-            SAR coverage gaps). They land in the smallest S1 bucket and receive
-            the upstream v1.1 missing-S1 input: an all-zeros normalized-space S1
-            slice (``resample_s1_bucket`` zero-count rows == ucam-eo/tessera's
-            ``_sample_s1_merged`` zero return). Default False: such pixels are
-            skipped entirely (no embedding — this pipeline's historical gate).
+            SAR coverage gaps, or an ROI with no radar at all). They land in the
+            smallest S1 bucket and receive the upstream v1.1 missing-S1 input: an
+            all-zeros normalized-space S1 slice (``resample_s1_bucket``
+            zero-count rows == ucam-eo/tessera's ``_sample_s1_merged`` zero
+            return). Default False: such pixels are skipped entirely (no
+            embedding — this pipeline's historical gate).
     """
 
     def __init__(
         self,
         chunk_data: ChunkData,
         num_obs_checkpoints: tuple[int, ...] = DEFAULT_NUM_OBS_CHECKPOINTS,
-        s1_orbit: Literal["ascending", "descending", "both"] = "both",
+        s1_orbit: Literal["ascending", "descending", "both", "none"] = "both",
         allow_s2_only: bool = False,
     ) -> None:
         self.num_obs_checkpoints = _normalize_obs_checkpoints(num_obs_checkpoints)

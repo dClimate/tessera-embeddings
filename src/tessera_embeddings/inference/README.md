@@ -196,10 +196,17 @@ directly from `root["time"]`. `data_loading.py` imports neither `xarray` nor `da
 
 S1 SAR: VV is read first to identify non-empty timesteps, then VH is loaded for survivors.
 Both ascending and descending stores are loaded when `s1_orbit="both"`;
-`resolve_s1_orbit(mosaic_base, s1_orbit, *, get_credentials=None, s3_region=None)` probes
-for available stores and falls back gracefully when only one orbit was ingested. Callers
-thread the same credential callback / region they use for the rest of the fill, so the
-probe doesn't drop to the default Icechunk credential chain in a callback-only deployment.
+`resolve_s1_orbit(mosaic_base, s1_orbit, *, allow_none=True, get_credentials=None,
+s3_region=None)` probes for available stores and falls back gracefully when only one orbit was
+ingested, or to `"none"` when neither exists. Callers thread the same credential callback /
+region they use for the rest of the fill, so the probe doesn't drop to the default Icechunk
+credential chain in a callback-only deployment.
+
+`allow_none` defaults to True because parts of the globe are radar-free as a matter of
+geography. Pass the flows' `require_s1` to demand radar instead, on a single run over terrain
+known to be imaged. A resolved `"none"` makes `InferenceConfig` force `allow_s2_only`, since
+every pixel there has zero S1 observations and the default gate would otherwise skip all of
+them and complete having written nothing.
 
 Output: `ChunkData` — numpy arrays for S2 bands/masks/DOYs, S1 ascending/descending
 bands/DOYs, and per-pixel observation counts (`s2_obs_count`, `s1_asc_obs_count`,

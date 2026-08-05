@@ -482,13 +482,24 @@ per passing date (one writable session ── one commit)
   anything that is not dual-pol VV+VH — so an ROI whose land is ice has a catalogue full of
   granules and not one the ingest can use. Zone 23N (Greenland) returns ~45,000 ascending and
   ~138,000 descending granules for 2021 and **zero** usable items. Requiring a SAR store there
-  failed the cell permanently, so `resolve_s1_orbit` gained `allow_none`, and `"both"` can now
-  resolve to `S1_ORBIT_NONE`, which activates no orbit and leaves the coverage gate checking
-  reflectance alone. **Only the ingest opts in**: it has just queried both orbits and its
-  per-batch item counts say whether the source offered anything, so it can tell a radar-free
-  ROI from a lost orbit. A consumer reading a finished mosaic cannot, so for readers a missing
-  SAR store stays an error — embedding without radar it was asked for is the failure the gate
-  exists to prevent. An operator who names one orbit is never downgraded either.
+  failed the cell permanently, so `"both"` resolves to `S1_ORBIT_NONE`, which activates no orbit
+  and leaves the coverage gate checking reflectance alone.
+
+  **Permissive by default, refusable on demand.** A global product cannot reject terrain that is
+  radar-free as a matter of geography, so `resolve_s1_orbit`'s `allow_none` defaults to True for
+  every caller. A single run over terrain known to be imaged is the opposite case — there an
+  absent store means something upstream broke, and resolving to `none` would embed without radar
+  and hide it — so those callers pass the flows' `require_s1`, which reaches the resolver as
+  `allow_none=False`. An operator who names one orbit is never downgraded either.
+
+  **The ingest's per-orbit item count is the authority on which case it is.** It has just queried
+  both orbits, so `items_seen=0` means the source offers nothing here, which is terrain rather
+  than a gap. A consumer reading a finished mosaic cannot distinguish the two, which is why its
+  warning names the mosaic and points at that count.
+
+  Accepting a radar-free ROI necessarily means embedding S2-only pixels, since every pixel there
+  has zero S1 observations. `InferenceConfig` derives `allow_s2_only` for that case rather than
+  asking the caller, because the alternative is a fill that writes nothing and reports success.
 
 - **Reads retry too, and did not used to.** `roi_processing.source_read_retrying` wraps the
   point where a date's graph is first *computed*. The two sensors reach that point

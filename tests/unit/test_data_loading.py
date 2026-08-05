@@ -8,7 +8,7 @@ import pytest
 import zarr
 
 import tessera_embeddings.inference.data_loading as _dl_mod
-from tessera_embeddings.config.inference import S2_BAND_ORDER, SCL_VALID_CLASSES
+from tessera_embeddings.config.inference import S1_ORBIT_NONE, S2_BAND_ORDER, SCL_VALID_CLASSES
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -402,12 +402,18 @@ class TestResolveS1Orbit:
         with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._probe({"descending"})):
             assert resolve_s1_orbit("s3://b/m", "both") == "descending"
 
-    def test_both_with_neither_present_raises(self):
+    def test_both_with_neither_present_resolves_to_none(self):
+        """The default is permissive: parts of the globe are radar-free in principle."""
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._probe(set())):
+            assert resolve_s1_orbit("s3://b/m", "both") == S1_ORBIT_NONE
+
+    def test_both_with_neither_present_raises_when_radar_is_demanded(self):
+        """``require_s1`` reaches here as ``allow_none=False``: an absent store is then an error."""
         with (
             patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._probe(set())),
             pytest.raises(InsufficientCoverageError, match="no SAR stores found"),
         ):
-            resolve_s1_orbit("s3://b/m", "both")
+            resolve_s1_orbit("s3://b/m", "both", allow_none=False)
 
     def test_probe_threads_credentials_and_region(self):
         """The SAR probe must use the caller's credential callback / region, not
@@ -495,7 +501,7 @@ class TestResolveS1OrbitErrors:
             patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open),
             pytest.raises(InsufficientCoverageError, match="no SAR stores found"),
         ):
-            resolve_s1_orbit("s3://b/m", "both")
+            resolve_s1_orbit("s3://b/m", "both", allow_none=False)
 
     def test_transient_error_reraises_not_downgrades(self):
         def _open(path, **kwargs):

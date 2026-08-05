@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, final
 
 from tessera_embeddings.config.time_windows import TimeWindow
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Model checkpoints
@@ -252,6 +255,18 @@ S2_BAND_ORDER = ["red", "blue", "green", "nir", "nir08", "rededge1", "rededge2",
 # SCL classes considered valid for masking (complement of S2_SCL_INVALID_CLASSES)
 SCL_VALID_CLASSES = frozenset({4, 5, 6, 7, 10, 11})
 
+#: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
+#:
+#: Distinct from an empty request: nobody ASKS for ``"none"``, it is what ``"both"`` resolves
+#: to once probing shows neither orbit wrote a store. Some land has no dual-pol VV+VH radar in
+#: principle — over ice Sentinel-1 runs Extra Wide swath with HH/HV, which the OPERA query
+#: correctly discards — so a zone can be permanently radar-free while the catalogue holds a
+#: hundred thousand granules for it. Requiring a SAR store there fails the cell forever.
+#:
+#: Defined HERE, in the layer the config lives in, because ``InferenceConfig`` has to validate
+#: it and the loader that resolves it already depends on this module.
+S1_ORBIT_NONE = "none"
+
 # Embedding output dimension — v1.1 produces 192-D reps; we save the first 128.
 EMBEDDING_DIM = 128
 
@@ -303,7 +318,8 @@ class InferenceConfig:
             batch_size: Per-GPU sub-batch size within a bucket.
             norm_source: Which v1.1 checkpoint/stats — "aws" (default) or "mpc".
             num_workers: GPU workers.
-            s1_orbit: Which S1 orbit(s) — "ascending", "descending", or "both".
+            s1_orbit: Which S1 orbit(s) — "ascending", "descending", "both", or
+                "none" for radar-free land (which requires allow_s2_only).
             compute_std: No-op under v1.1 (deterministic sampling); always False.
 
         I/O:
@@ -342,7 +358,16 @@ class InferenceConfig:
     batch_size: int = 7168
     num_workers: int = 4
     norm_source: Literal["mpc", "aws"] = "aws"
-    s1_orbit: Literal["ascending", "descending", "both"] = "both"
+    s1_orbit: Literal["ascending", "descending", "both", "none"] = "both"
+    """Which S1 orbit direction(s) to read.
+
+    ``"none"`` is a RESOLVED value, not a request: it is what ``"both"`` becomes once probing
+    finds that neither orbit wrote a store. Parts of the globe are radar-free in principle —
+    over ice Sentinel-1 flies Extra Wide swath with HH/HV, which the dual-pol query correctly
+    discards — so this is a permanent property of the terrain rather than an ingest failure,
+    and a global product cannot refuse it. It requires ``allow_s2_only``: with no radar at all
+    every pixel has zero S1 observations, so the default gate would skip every one of them.
+    """
     # Deterministic sampling under v1.1 — no repeat variance; forced False in __post_init__.
     compute_std: bool = False
 
@@ -397,8 +422,31 @@ class InferenceConfig:
         if self.norm_source not in _NORM_STATS:
             valid = ", ".join(repr(k) for k in _NORM_STATS)
             raise ValueError(f"Invalid norm_source: {self.norm_source!r}. Must be one of {valid}.")
-        if self.s1_orbit not in {"ascending", "descending", "both"}:
-            raise ValueError(f"Invalid s1_orbit: {self.s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
+        if self.s1_orbit not in {"ascending", "descending", "both", S1_ORBIT_NONE}:
+            raise ValueError(
+                f"Invalid s1_orbit: {self.s1_orbit!r}. Must be 'ascending', 'descending', 'both', or {S1_ORBIT_NONE!r}."
+            )
+        if self.s1_orbit == S1_ORBIT_NONE and not self.allow_s2_only:
+            # FORCED, not refused, and not left alone. Refusing would defeat the decision that
+            # radar-free land is acceptable — a global product cannot reject terrain that has no
+            # dual-pol radar in principle. Leaving the flag alone would be worse than either:
+            # with no radar every pixel has zero S1 observations, the default gate skips every
+            # one, and the fill would COMPLETE having written nothing while tagging the year
+            # done. An empty result that reads as success is the one outcome no later run
+            # revisits.
+            #
+            # Safe to derive rather than demand from the caller because it is a function of
+            # s1_orbit alone, so a resume computes the same value from the same inputs and the
+            # staged-chunk consistency check in the embeddings flow still holds.
+            self.allow_s2_only = True
+            logger.warning(
+                "s1_orbit=%r: forcing allow_s2_only=True. This ROI has no radar at all, so "
+                "EVERY pixel gets the missing-S1 input (all-zeros normalised S1) and every "
+                "embedding here is S2-only — whose quality is unvalidated for this S1-trained "
+                "checkpoint (see the optional-S1 ADR). Without this the fill would write "
+                "nothing and still report success.",
+                self.s1_orbit,
+            )
         self.num_obs_checkpoints = _normalize_obs_checkpoints(self.num_obs_checkpoints)
 
         # v1.1 sampling is deterministic — no repeat variance to measure.

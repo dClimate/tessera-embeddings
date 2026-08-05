@@ -440,6 +440,7 @@ def fill_zones_sequential_flow(
     staging_code_identity: str | None = None,
     num_actors: int = 20,
     s1_orbit: str = "both",
+    require_s1: bool = False,
     s3_region: str | None = None,
     commit_limit_name: str | None = None,
     cleanup_staging: bool = True,
@@ -497,6 +498,10 @@ def fill_zones_sequential_flow(
             ``min(num_actors, its live tiles)``.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"`` (resolved
             per cell against its mosaic, post-ingest).
+        require_s1: Demand radar rather than request it. ``"both"`` normally resolves to
+            ``"none"`` for a cell with no SAR store, because parts of the globe are
+            radar-free in principle and a global run cannot refuse them. Set this only
+            where every cell in the sweep is known to be imaged.
         s3_region: Optional S3 region for the global store + mosaics.
         commit_limit_name: Prefect global concurrency limit bounding fleet-wide
             simultaneous committers (D6). ``None`` = ungated.
@@ -775,7 +780,11 @@ def fill_zones_sequential_flow(
         # any change → fresh prefix).
         mosaic_base = f"{paths.inputs.rstrip('/')}/mosaics/{cell.zone}/{cell.year}"
         resolved = resolve_s1_orbit(
-            mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+            mosaic_base,
+            s1_orbit,
+            allow_none=not require_s1,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
         )
         check_time_window_coverage(
             mosaic_base,

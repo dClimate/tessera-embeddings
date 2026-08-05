@@ -134,6 +134,7 @@ def tessera_embeddings(
     code_suffix: str = "",
     num_actors: int = 20,
     s1_orbit: str = "both",
+    require_s1: bool = False,
     s3_region: str | None = None,
     allow_s2_only: bool = False,
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
@@ -171,6 +172,11 @@ def tessera_embeddings(
             Empty for production tarballs.
         num_actors: Number of GPU actors to create.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
+        require_s1: Demand radar rather than request it. ``s1_orbit="both"`` normally
+            resolves to ``"none"`` when no SAR store exists, because parts of the globe are
+            radar-free in principle and a global run cannot refuse them. Set this on a single
+            run over terrain known to be imaged, where an absent store means something
+            upstream broke and embedding without radar would hide it.
         s3_region: Optional S3 region for the mosaic/store opens — threaded, like the
             IAM credential callback, through orbit resolution, chunk enumeration, the
             coverage gate, and the assembly task. ``None`` uses the default Icechunk
@@ -229,7 +235,11 @@ def tessera_embeddings(
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 
     resolved_s1_orbit = resolve_s1_orbit(
-        mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        mosaic_base,
+        s1_orbit,
+        allow_none=not require_s1,
+        get_credentials=iam_icechunk_credentials,
+        s3_region=s3_region,
     )
     if resolved_s1_orbit != s1_orbit:
         log.info("s1_orbit resolved: %s → %s", s1_orbit, resolved_s1_orbit)

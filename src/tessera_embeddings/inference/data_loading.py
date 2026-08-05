@@ -26,7 +26,7 @@ import icechunk
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.inference import S2_BAND_ORDER, SCL_VALID_CLASSES
+from tessera_embeddings.config.inference import S1_ORBIT_NONE, S2_BAND_ORDER, SCL_VALID_CLASSES
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -285,16 +285,6 @@ def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.nd
     return indices, compute_doy(times[indices])
 
 
-#: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
-#:
-#: Distinct from an empty request: nobody ASKS for ``"none"``, it is what ``"both"`` resolves
-#: to once probing shows neither orbit wrote a store. Some land has no dual-pol VV+VH radar in
-#: principle — over ice Sentinel-1 runs Extra Wide swath with HH/HV, which the OPERA query
-#: correctly discards — so a zone can be permanently radar-free while the catalogue holds a
-#: hundred thousand granules for it. Requiring a SAR store there fails the cell forever.
-S1_ORBIT_NONE = "none"
-
-
 def _active_orbits(s1_orbit: str) -> tuple[str, ...]:
     """Return the orbit directions active for a given ``s1_orbit`` setting."""
     if s1_orbit == "both":
@@ -310,7 +300,7 @@ def resolve_s1_orbit(
     mosaic_base: str,
     s1_orbit: str,
     *,
-    allow_none: bool = False,
+    allow_none: bool = True,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
 ) -> str:
@@ -323,6 +313,17 @@ def resolve_s1_orbit(
 
     ``"ascending"`` / ``"descending"`` are returned unchanged without probing;
     a missing store at that point is an error surfaced downstream.
+
+    ``allow_none`` defaults to **True**, because parts of the globe are radar-free in
+    principle and a global product cannot refuse them: over ice Sentinel-1 flies Extra Wide
+    swath with HH/HV, which the dual-pol query correctly discards, so a zone can be
+    permanently radar-free while its catalogue holds a hundred thousand granules. Requiring a
+    SAR store there fails the cell forever, on every retry.
+
+    Pass ``allow_none=False`` where radar is a *demand* rather than a request — a single run
+    over terrain that is known to be imaged, where an absent store means something upstream
+    broke and silently embedding without radar would hide it. Callers reach this through the
+    flows' ``require_s1`` parameter.
 
     The SAR stores are opened with the SAME credential callback / region that
     the runner uses for the rest of the fill (``get_credentials`` / ``s3_region``);
@@ -359,13 +360,17 @@ def resolve_s1_orbit(
 
     if not present:
         if not allow_none:
-            msg = f"s1_orbit='both' but no SAR stores found under {mosaic_base}"
+            msg = (
+                f"s1_orbit='both' but no SAR stores found under {mosaic_base}, and radar was "
+                "demanded (require_s1). Either the ingest lost an orbit, or this ROI is "
+                "genuinely radar-free — the ingest's per-orbit item counts say which."
+            )
             raise InsufficientCoverageError(msg)
-        # Opt-in, and only the INGEST opts in. It has just run both orbits and can say in the
-        # log whether the source offered usable items, so a legitimately radar-free ROI and a
-        # lost orbit are distinguishable there. A consumer reading a finished mosaic cannot
-        # tell them apart, so for readers this stays an error: silently embedding without
-        # radar it was asked for is the failure this gate exists to prevent.
+        # A consumer reading a finished mosaic cannot distinguish a radar-free ROI from a lost
+        # orbit, so this warning is the only record that it happened. It must name the mosaic
+        # and say where to confirm, because the confirmation lives in a different run's log:
+        # the INGEST queried both orbits and its per-orbit item count is the authority —
+        # `items_seen=0` means the source offers nothing here, which is terrain, not a gap.
         logger.warning(
             "s1_orbit='both' and NO SAR store exists under %s — resolving to %r. "
             "Legitimate where the ROI has no dual-pol VV+VH coverage; check the ingest's "

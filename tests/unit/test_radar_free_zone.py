@@ -1,23 +1,30 @@
-"""A zone with no usable radar must ingest, not fail forever.
+"""A zone with no usable radar must ingest AND fill, not fail forever.
 
 Some land has no dual-pol VV+VH radar in principle: over ice Sentinel-1 runs Extra Wide
 swath with HH/HV polarisation, which the OPERA query correctly discards. Zone 23N's live land
 is Greenland, and its 2021 catalogue holds ~45,000 ascending and ~138,000 descending granules
 of which the ingest can use NONE. Requiring a SAR store there failed the cell permanently.
 
-The asymmetry these tests pin is the point. The INGEST may resolve to no radar, because it has
-just queried both orbits and its log says whether the source offered anything usable. A
-CONSUMER reading a finished mosaic cannot tell a radar-free ROI from a lost orbit, so for
-readers the absence stays an error.
+**Permissive by default, refusable on demand.** A global product cannot reject terrain that is
+radar-free as a matter of geography, so ``s1_orbit="both"`` resolves to ``"none"`` rather than
+raising. A single run over terrain known to be imaged is the opposite case: there an absent
+store means something upstream broke, and embedding without radar would hide it — so those
+callers pass ``require_s1``, which reaches the resolver as ``allow_none=False``.
+
+Accepting a radar-free ROI necessarily means embedding S2-only pixels, since every pixel has
+zero S1 observations. The config derives that rather than asking the caller for it, because the
+alternative is a run that writes nothing and still reports success.
 """
 
 from __future__ import annotations
 
 import pytest
 
+import tessera_embeddings.ingest.s1_roi as s1_roi_module
+from tessera_embeddings.config.inference import S1_ORBIT_NONE, InferenceConfig
+from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.data_loading import (
-    S1_ORBIT_NONE,
     _active_orbits,
     resolve_s1_orbit,
 )
@@ -34,20 +41,36 @@ def test_none_is_not_an_accepted_request() -> None:
         _active_orbits("neither")
 
 
-def test_a_reader_still_fails_when_no_radar_store_exists(tmp_path) -> None:
-    """Default behaviour is unchanged: silently embedding without radar is the old bug."""
-    base = f"file://{tmp_path}/mosaics/23N/2021"
-    with pytest.raises(InsufficientCoverageError, match="no SAR stores found"):
-        resolve_s1_orbit(base, "both")
+def test_no_radar_store_resolves_to_none_by_default(tmp_path, caplog) -> None:
+    """The default must not fail: radar-free land exists and a global run has to cover it.
 
-
-def test_the_ingest_may_resolve_to_no_radar(tmp_path, caplog) -> None:
-    """Opt-in, and it must say so loudly enough to be found in a fleet-wide log."""
+    Still a WARNING, because a consumer reading a finished mosaic cannot tell a radar-free ROI
+    from a lost orbit — this line is the only record that it happened.
+    """
     base = f"file://{tmp_path}/mosaics/23N/2021"
     with caplog.at_level("WARNING"):
-        assert resolve_s1_orbit(base, "both", allow_none=True) == S1_ORBIT_NONE
+        assert resolve_s1_orbit(base, "both") == S1_ORBIT_NONE
     assert "NO SAR store exists" in caplog.text
     assert base in caplog.text, "the warning must name the mosaic it applies to"
+
+
+def test_radar_can_still_be_demanded(tmp_path) -> None:
+    """``require_s1`` reaches the resolver as ``allow_none=False``.
+
+    For a single run over terrain known to be imaged, an absent store means something upstream
+    broke, and resolving to 'none' there would embed without radar and hide it.
+    """
+    base = f"file://{tmp_path}/mosaics/23N/2021"
+    with pytest.raises(InsufficientCoverageError, match="no SAR stores found"):
+        resolve_s1_orbit(base, "both", allow_none=False)
+
+
+def test_the_demand_failure_says_where_to_confirm_which_case_it_is(tmp_path) -> None:
+    """The reader cannot distinguish the two causes, so it must point at what can."""
+    base = f"file://{tmp_path}/mosaics/23N/2021"
+    with pytest.raises(InsufficientCoverageError) as excinfo:
+        resolve_s1_orbit(base, "both", allow_none=False)
+    assert "item counts" in str(excinfo.value)
 
 
 @pytest.mark.parametrize("orbit", ["ascending", "descending"])
@@ -76,9 +99,7 @@ class TestAbandoningAnUnusableOrbit:
         Pinned as a test so a future attempt has to confront the seasonal case below rather
         than rediscover it in production, where the loss is silent.
         """
-        import tessera_embeddings.ingest.s1_roi as mod
-
-        assert not hasattr(mod, "LEADING_EMPTY_BATCHES_BEFORE_SKIP")
+        assert not hasattr(s1_roi_module, "LEADING_EMPTY_BATCHES_BEFORE_SKIP")
 
     @staticmethod
     def _consume(items_per_batch: list[int], threshold: int) -> int:
@@ -111,3 +132,67 @@ class TestAbandoningAnUnusableOrbit:
     def test_a_mid_window_gap_would_have_been_safe(self) -> None:
         """The one case the leading-only formulation did get right, kept for the eventual fix."""
         assert self._consume([500] + [0] * 11, 3) == 12
+
+
+class TestTheInferenceConfigAcceptsRadarFreeLand:
+    """``resolve_s1_orbit`` produces ``"none"``, so the config it feeds must accept it.
+
+    Parts of the globe are radar-free in principle, which a global product cannot refuse. The
+    value was rejected at the config boundary — so the resolver produced something no consumer
+    could hold, and the failure surfaced only once a fill was already dispatched.
+    """
+
+    @staticmethod
+    def _config(**kwargs: object) -> InferenceConfig:
+        return InferenceConfig(time_window=parse_time_window("December 2021"), **kwargs)  # type: ignore[arg-type]
+
+    def test_none_is_accepted_with_s2_only_embeddings_enabled(self) -> None:
+        assert self._config(s1_orbit=S1_ORBIT_NONE, allow_s2_only=True).s1_orbit == S1_ORBIT_NONE
+
+    def test_none_forces_s2_only_embeddings(self) -> None:
+        """Derived, not demanded from the caller, and NOT left alone.
+
+        With no radar store every pixel has zero S1 observations, so the default gate would skip
+        every one and the fill would COMPLETE having written nothing while tagging the year done.
+        An empty result that reads as success is the one outcome no later run revisits. Refusing
+        instead would defeat the decision that radar-free land is acceptable.
+        """
+        assert self._config(s1_orbit=S1_ORBIT_NONE).allow_s2_only is True
+
+    def test_the_forcing_is_logged_loudly(self, caplog) -> None:
+        """It changes WHICH pixels are embedded and what their quality means.
+
+        Nothing else records that a zone-year's embeddings are entirely S2-only, so a silent
+        force would make an unvalidated output indistinguishable from a normal one.
+        """
+        with caplog.at_level("WARNING"):
+            self._config(s1_orbit=S1_ORBIT_NONE)
+        assert "allow_s2_only=True" in caplog.text
+        assert "S2-only" in caplog.text
+
+    def test_the_forcing_is_reproducible_from_s1_orbit_alone(self) -> None:
+        """A resume must derive the same value, or the staged-chunk consistency check trips.
+
+        The embeddings flow refuses to resume a run whose ``allow_s2_only`` differs from the one
+        its staged chunks were produced under, so a forced value has to be a pure function of
+        inputs the resume also has.
+        """
+        first = self._config(s1_orbit=S1_ORBIT_NONE)
+        second = self._config(s1_orbit=S1_ORBIT_NONE)
+        assert first.allow_s2_only == second.allow_s2_only is True
+
+    def test_a_real_orbit_never_has_the_flag_forced(self) -> None:
+        """The force must bind only to 'none' — a partial-radar zone keeps the caller's choice."""
+        assert self._config(s1_orbit="both").allow_s2_only is False
+        assert self._config(s1_orbit="ascending").allow_s2_only is False
+
+    def test_a_bogus_orbit_is_still_refused_and_lists_none(self) -> None:
+        """The valid set in the message must match the one enforced, or it misdirects."""
+        with pytest.raises(ValueError, match="Invalid s1_orbit") as excinfo:
+            self._config(s1_orbit="sideways")
+        assert S1_ORBIT_NONE in str(excinfo.value)
+
+    @pytest.mark.parametrize("orbit", ["ascending", "descending", "both"])
+    def test_the_real_orbits_are_unaffected_by_the_flag(self, orbit: str) -> None:
+        """The new rule must bind only to 'none'; a real orbit never needs the flag."""
+        assert self._config(s1_orbit=orbit).s1_orbit == orbit

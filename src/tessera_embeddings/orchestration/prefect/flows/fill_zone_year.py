@@ -167,6 +167,7 @@ def fill_zone_year_flow(
     code_suffix: str = "",
     num_actors: int = 20,
     s1_orbit: str = "both",
+    require_s1: bool = False,
     s3_region: str | None = None,
     commit_limit_name: str | None = None,
     cleanup_staging: bool = True,
@@ -205,6 +206,11 @@ def fill_zone_year_flow(
         code_suffix: Source-tarball filename suffix (lets branches coexist).
         num_actors: GPU actor count for inference.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
+        require_s1: Demand radar rather than request it. ``s1_orbit="both"`` normally
+            resolves to ``"none"`` when no SAR store exists, because parts of the globe are
+            radar-free in principle and a global run cannot refuse them. Set this on a single
+            run over terrain known to be imaged, where an absent store means something
+            upstream broke and embedding without radar would hide it.
         s3_region: Optional S3 region for the global store + mosaics, threaded through
             the preflight reads and the zone-fill runner (default region if None).
         commit_limit_name: Prefect global concurrency limit that bounds the
@@ -290,7 +296,13 @@ def fill_zone_year_flow(
     # resolve_s1_orbit probes the mosaics (with the same credential callback / region
     # the rest of the fill uses), so only do it when we'll actually infer.
     resolved_s1 = (
-        resolve_s1_orbit(mosaic_base, s1_orbit, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
+        resolve_s1_orbit(
+            mosaic_base,
+            s1_orbit,
+            allow_none=not require_s1,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+        )
         if needs_cluster
         else s1_orbit
     )
