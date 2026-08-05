@@ -80,50 +80,63 @@ land-weighted **145** observations per pixel) at a reference **≈1.9 M tok/sec*
 289,000 GPU-hours. The reference rate was measured on **the same `g6e.xlarge`** at the same
 wall-clock basis, so the rate comparison is like-for-like.
 
-### CORRECTION (2026-08-05, later the same day): both apparent findings were zone composition
+### `t_kept` across COMPLETED zones — and three corrections this section has had to make
 
-An earlier version of this section reported that `t_kept` runs ~2.3× below the census's 145 and that
-per-actor throughput runs 1.39× below the ≈1.9 M reference, and reasoned toward a ~$350 k inference
-line. **Both were artefacts of aggregating four southern sparse zones**, and per-zone attribution —
-possible for single-cell runs by log stream, see `scripts/inference_profile.py` — reverses them.
+This section has now been wrong three times, in different directions, on the same number. The
+completed-run figures are below; the corrections are kept because each one is a distinct mistake
+worth not repeating.
 
-| cell | latitude band | `t_kept` median (range) | tok/s per actor |
-|---|---|---:|---:|
-| 57S-2021 | far south | 57 (51–125) | 1.12 M |
-| 47S-2022 | far south | 56 (45–118) | 1.31 M |
-| chain aggregate (49S, 48S, 17S, 32S …) | south/tropical | 64 (34–145) | 1.38 M |
-| **03N-2021** | **equatorial** | **176 (128–186)** | **1.68 M** |
-| **06N-2021** | **equatorial** | **178 (136–186)** | **1.85 M** |
+| cell | the land in that band | `t_kept` median (range) | $/chunk | n chunks |
+|---|---|---:|---:|---:|
+| 57S-2021 | NZ / SW Pacific | 60 (51–126) | 0.116 | 246 |
+| chain aggregate (49S, 48S, 17S, 32S …) | southern mixed | 67 (34–197) | 0.115 | 2,224 |
+| 47S-2022 + 02N-2022 (aggregate) | — | 102 (45–189) | 0.168 | 422 |
+| 59S-2021 | NZ / SW Pacific | 118 (4–135) | 0.179 | 562 |
+| 03N-2021 | **western Alaska** | 143 (92–198) | 0.200 | 612 |
+| 06N-2021 | **Alaska / Yukon** | 151 (97–202) | 0.211 | 767 |
 
-**`t_kept` is strongly bimodal by latitude, and the equatorial zones sit ABOVE 145, not below.**
-Equatorial zones are imaged on nearly every pass and screen out little, so they retain ~177
-observations per pixel against ~57 in the far south. A land-weighted mean over 112 zones is exactly
-the right way to combine those, and **145 is entirely plausible as that mean** — it is not a high
-figure, it is a middle one. The earlier reading sampled only the low mode and mistook it for the
-distribution.
+**A continuum from 60 to 151, not two modes** — and the mechanism is almost certainly that
+polar-orbiting revisit converges toward the poles, so observation depth rises with |latitude|. The
+census's land-weighted **145** sits near the TOP of this observed range.
 
-**The rate shortfall was the same artefact, and it has a mechanism.** Throughput per actor rises with
-`t_kept` — 1.12 M at `t_kept` 57 against 1.85 M at 178 — because a token-poor chunk is dominated by
-fixed per-chunk overhead while a token-rich one amortises it. So the reference ≈1.9 M is reproduced
-on token-rich zones and the low figures are what overhead-dominated sparse chunks cost. **Nothing is
-slower than the model assumes; the model's rate simply applies to token-rich work.**
+#### Correction 1 — "the census is ~2.3× too high". WRONG: sampled only sparse southern zones.
 
-**Consequence for the budget: the cost model's two headline inputs both look sound, and no
-re-basing is warranted.** What this run does add is that **cost per chunk is NOT a stable unit
-across zones** ($0.101–0.214 here) because it scales with `t_kept` — the cost model is right to
-price in tokens.
+#### Correction 2 — "it is bimodal, and the equatorial zones are 176–181, above 145". WRONG TWICE.
 
-**Caveats, stated because the corrected reading is only hours old.** The equatorial figures rest on
-16 successful chunks each (both fills had just started), so their medians will move; and warm-up
-overhead is still in their per-chunk cost. The far-south figures rest on 58–64 chunks. **The 17-zone
-land-weighted measurement remains the thing that settles it**, and it is close: 16 distinct zones
-filled or in flight. Treat 145 as the planning figure until it lands — now with the expectation that
-it will be confirmed rather than cut.
+**A UTM zone number is a LONGITUDE band (1–60, six degrees each); the letter is the HEMISPHERE.**
+A zone therefore spans *every latitude* of its hemisphere, and 02N/03N/06N are longitudes −174° to
+−144° north — **Alaska and the Bering Sea, not the equator.** Calling them equatorial inverted the
+mechanism: their high `t_kept` comes from dense high-latitude revisit, the opposite of the reason
+given. This is the same error as reading a zone's trailing letter wrongly in the radar audit — see
+`a-granule-count-is-not-coverage`: **derive a zone's geography from the convention, never from what
+the number looks like.**
 
-**The generalisable lesson, third instance in one day:** a median over a mixed population is not an
-estimate of anything. Stratify by the variable that drives the spread — here latitude — *before*
-comparing against a weighted reference. See `ingest_concurrency_investigation_2026_08.md`
-§"Corrections", where the same error appears as zone-mix, season-mix and threshold-mix.
+And the numbers themselves moved once the runs finished: **03N went 176 → 143 and 06N 181 → 151**
+between 16 chunks and 612/767. Early chunks are not a random sample of a cell.
+
+#### Correction 3 — the sample is not land-area representative, so the weighted mean is not yet in hand.
+
+Of 16 filled zones, **13 are southern hemisphere** and the 3 northern ones are all Alaskan. **Zero
+mid-latitude northern zones are filled**, and that is where most of the world's land is. The zones
+that would cover it — 35N, 37N, 38N, 53N, 12N — are still ingesting.
+
+So "17 distinct zones" is met on COUNT but not on COVERAGE. The ±20% argument assumed between-zone
+spread drives the sample size; it did not assume the zones would cluster in one hemisphere.
+**Finishing the northern dense zones matters more now than adding further southern ones.**
+
+### What survives all three corrections
+
+**Throughput per actor rises with `t_kept`** — 1.25 M at 60 against 1.57 M at 151 — because a
+token-poor chunk is dominated by fixed per-chunk overhead while a token-rich one amortises it. The
+reference ≈1.9 M is approached on the deepest zones. So the earlier "the rate is 1.39× short" was
+also a composition artefact, and **nothing measured is slower than the model assumes.**
+
+**Cost per chunk is NOT stable across zones** — $0.115 to $0.211, tracking `t_kept`. The cost model
+is right to price in tokens rather than chunks.
+
+**No re-basing of the $503–579 k line is warranted on this evidence.** 145 remains the planning
+figure. It now looks high rather than low relative to what has been measured, but every measured
+zone is in the half of the world with less land.
 
 ## An independent cross-check of the inference line, from the coverage mask
 
