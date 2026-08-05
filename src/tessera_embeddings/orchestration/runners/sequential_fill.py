@@ -69,8 +69,8 @@ lets one session span campaign years. It has to work that way because parts of
 the globe are radar-free in principle, so a cell resolving ``"none"`` against a
 ``"both"`` session is a permanent population rather than an anomaly.
 
-The ``infer_single`` fallback therefore no longer receives orbit-mismatch cells
-and is retained only as the handoff for a caller that supplies one.
+There is therefore no post-stream fallback pass any more. ``infer_single`` itself is
+still live: the in-child retry runs failed cells on it, on the still-provisioned cluster.
 
 KNOWN LIMITATION — small-zone fleet fill. The ``look_ahead + 2`` admission
 bound doubles as the fleet-fill parallelism: only that many zones' tiles can
@@ -199,7 +199,7 @@ class _MosaicBudget:
         ``blocking=False`` is for LOOK-AHEAD admissions: the feeder must only
         ever block on the CURRENT cell's slot (whose processing is what frees
         slots) — blocking on a future cell's slot while the current one sits
-        unprocessed is a deadlock when deferred/retained mosaics hold the rest
+        unprocessed is a deadlock when retained mosaics hold the rest
         of the budget. A denied look-ahead is retried on a later feed step.
         """
         with self._lock:
@@ -358,7 +358,6 @@ def fill_zones_sequential(
     lock = threading.Lock()
     outcomes: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
-    deferred: list[tuple[SequentialCell, PreparedCell]] = []
     tallies: dict[str, _ZoneTally] = {}  # run_id → tally
     ready: deque[list[WorkItem]] = deque()  # zones awaiting injection, in cell order
     feeder_done = threading.Event()
@@ -426,7 +425,7 @@ def fill_zones_sequential(
         can never materialize more mosaics than the bound. Only the CURRENT
         cell's admission may block (its processing is what frees slots —
         blocking on a future cell's slot while the current one sits unprocessed
-        deadlocks once deferred/retained mosaics hold the rest of the budget);
+        deadlocks once retained mosaics hold the rest of the budget);
         look-ahead cells are admitted non-blocking and simply retried on later
         feed steps when the budget is tight. That degradation IS the intended
         backpressure: ingest paced by fill throughput (ADR-011).
@@ -831,27 +830,15 @@ def fill_zones_sequential(
                 retained_failed.discard((zone_name, year))
             log.info("Cell %s-%d recovered on in-child retry attempt %d", zone_name, year, attempt)
 
-    # Orbit-mismatch cells: per-cell sessions on the same (still-provisioned)
-    # cluster, after the stream so they never contend with it for GPUs.
-    with lock:
-        fallback_cells = list(deferred)
-    for j, (cell, prep) in enumerate(fallback_cells):
-        try:
-            handoff = infer_single(cell, prep, j == len(fallback_cells) - 1)
-            _record_outcome(assemble(handoff, prep))
-            if inputs is not None:
-                inputs.cleanup(cell.zone, cell.year)
-        except Exception as exc:
-            _record_failure(cell, "fallback", exc)
-        finally:
-            _release_mosaic(cell)  # held since its ingest start (deferral retention)
-
+    # No post-stream fallback pass. There was one, for cells whose resolved orbit could not
+    # join the shared session; the orbit now travels on each cell's ZoneContext so every cell
+    # streams, and the pass had nothing left to receive. ``infer_single`` is still LIVE — the
+    # in-child retry above runs on it — so only the pass is gone, not the hook.
     elapsed = time.monotonic() - t0
     summary: dict[str, Any] = {
         "cells": len(cells),
         "succeeded": len(outcomes),
         "failed": len(failures),
-        "deferred_orbit_mismatch": len(fallback_cells),
         "failures": failures,
         "outcomes": outcomes,
         "elapsed_sec": elapsed,

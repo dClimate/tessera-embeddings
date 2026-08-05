@@ -307,7 +307,7 @@ def test_a_cell_with_a_different_orbit_streams_under_its_own_orbit():
         assemble=_assemble(events),
         infer_single=infer_single,
     )
-    assert summary["deferred_orbit_mismatch"] == 0, "nothing should be deferred for its orbit now"
+    assert "deferred_orbit_mismatch" not in summary, "the deferral key should be gone, not merely zero"
     assert calls == [], "the per-cell fallback must not be reached by an orbit mismatch"
     assert [e for e in events if e.startswith("infer:r-02N")], "the mismatched cell must STREAM"
     assert summary["succeeded"] == 3
@@ -434,7 +434,6 @@ def test_every_cell_mismatching_the_session_orbit_still_completes():
     )
     assert summary["succeeded"] == 4, "a wholly-mismatched run must complete, not fail"
     assert summary["failed"] == 0
-    assert summary["deferred_orbit_mismatch"] == 0
     assert inputs.high_water <= 2, "the storage bound (look_ahead + 2) must still hold"
     for z in ("01N", "02N", "03N", "04N"):
         assert f"cleanup:{z}" in events, f"{z}'s mosaic was never released"
@@ -783,19 +782,3 @@ def test_the_in_child_retry_only_considers_cells_that_kept_a_mosaic():
         "the retry pass must filter the failure list by the retained-mosaic set"
     )
     assert "eligible = set(retained_failed)" in src
-
-
-def test_the_retry_pass_precedes_the_fallback_pass():
-    """Ordering is load-bearing: the fallback marks its last cell ``final``, which retires
-    idle actors, so a retry scheduled after it would need actors the fallback released.
-
-    This used to be driven end-to-end with an orbit-mismatched cell, which reached the
-    fallback. Nothing routes there any more — cells stream under their own orbit — so the hook
-    is retained for a caller that supplies one, and the ordering is pinned structurally
-    instead. Kept rather than deleted because the constraint is about ACTOR LIFETIME, not
-    about orbits: whatever feeds the fallback next inherits it.
-    """
-    src = pathlib.Path(mod.__file__).read_text()
-    retry_at = src.index("for attempt in range(2, max_cell_attempts + 1):")
-    fallback_at = src.index("fallback_cells = list(deferred)")
-    assert retry_at < fallback_at, "the in-child retry must run BEFORE the fallback retires idle actors"
