@@ -16,9 +16,9 @@ from pathlib import Path
 
 import pytest
 
+from tessera_embeddings.config.code_identity import first_party_import_closure
 from tessera_embeddings.config.inference import (
     _STAGED_OUTPUT_SOURCES,
-    _first_party_import_closure,
     inference_code_identity,
 )
 
@@ -34,7 +34,7 @@ def _covered() -> set[str]:
             seed.extend(p for p in target.rglob("*.py") if "__pycache__" not in p.parts)
         else:
             seed.append(target)
-    return {str(p.relative_to(_ROOT)) for p in _first_party_import_closure(seed, _ROOT)}
+    return {str(p.relative_to(_ROOT)) for p in first_party_import_closure(seed, _ROOT)}
 
 
 @pytest.mark.parametrize(
@@ -97,7 +97,7 @@ def test_an_edit_to_a_transitive_dependency_moves_the_digest(tmp_path: Path) -> 
     helper.write_text("def doy(x):\n    return x\n")
 
     seed = [root / "inference" / "runner.py"]
-    reached = _first_party_import_closure(seed, root)
+    reached = first_party_import_closure(seed, root)
     assert helper in reached, "an imported module must be reached"
 
     def digest(paths: set[Path]) -> tuple[str, ...]:
@@ -105,4 +105,4 @@ def test_an_edit_to_a_transitive_dependency_moves_the_digest(tmp_path: Path) -> 
 
     before = digest(reached)
     helper.write_text("def doy(x):\n    return x + 1\n")  # a different model input
-    assert digest(_first_party_import_closure(seed, root)) != before
+    assert digest(first_party_import_closure(seed, root)) != before

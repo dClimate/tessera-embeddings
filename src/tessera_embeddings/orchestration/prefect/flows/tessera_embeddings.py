@@ -54,7 +54,6 @@ from tessera_embeddings.orchestration.prefect.tasks.inference import (
     assemble_embeddings_task,
     run_inference_task,
 )
-from tessera_embeddings.providers.aws.ray import cluster_name_for_flow_run
 
 # Fresh runs with allow_s2_only=True carry this run_id prefix. The run_id
 # namespaces the staging directory, so the prefix records the per-pixel S1
@@ -327,7 +326,11 @@ def tessera_embeddings(
     # can be inspected (for arch tests) on machines without ray
     # installed. The provider is only needed when the flow actually
     # runs.
-    from tessera_embeddings.providers.aws.ray import make_instance_terminator, ray_cluster
+    from tessera_embeddings.providers.aws.ray import (
+        cluster_name_for_flow_run,
+        make_instance_terminator,
+        ray_cluster,
+    )
 
     assemble_kwargs: dict[str, Any] = {
         "chunk_size": chunk_size or INFERENCE_CHUNK_SIZE,

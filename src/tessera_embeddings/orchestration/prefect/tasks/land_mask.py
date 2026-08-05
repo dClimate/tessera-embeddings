@@ -34,6 +34,7 @@ def build_land_mask_coverage(
     registry_uri: str | None = None,
     delivery_uri: str = DEFAULT_DELIVERY_URI,
     zones: list[str] | None = None,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Prefect task: build per-zone coverage bitmaps into ``dest`` (one commit)."""
     result = build_all(
@@ -41,6 +42,7 @@ def build_land_mask_coverage(
         registry_uri=registry_uri,
         delivery_uri=delivery_uri,
         zones=zones,
+        s3_region=s3_region,
         log=get_run_logger(),
     )
     return asdict(result)
@@ -71,6 +73,6 @@ def verify_land_mask_delivery(
 
 
 @task(name="validate-land-mask-coverage")
-def validate_land_mask_coverage(*, dest: str, zones: list[str] | None = None) -> None:
+def validate_land_mask_coverage(*, dest: str, zones: list[str] | None = None, s3_region: str | None = None) -> None:
     """Prefect task: structural + geographic self-checks on a built coverage repo."""
-    validate_coverage(dest, zones=zones, log=get_run_logger())
+    validate_coverage(dest, zones=zones, s3_region=s3_region, log=get_run_logger())

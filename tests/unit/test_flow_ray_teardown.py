@@ -20,7 +20,7 @@ import tessera_embeddings.orchestration.prefect.flows._ray_lifecycle as lifecycl
 import tessera_embeddings.orchestration.prefect.flows.fill_zone_year as fill_mod
 import tessera_embeddings.orchestration.prefect.flows.fill_zones_sequential as seq_mod
 import tessera_embeddings.orchestration.prefect.flows.tessera_embeddings as flows_mod
-from tessera_embeddings.providers.aws.ray import cluster_name_for_flow_run
+from tessera_embeddings.providers.aws.ray import RAY_DOWN_TIMEOUT_S, cluster_name_for_flow_run
 
 _RUN_ID = "1cb5e1da-7454-4bd6-89f8-e20cd020dbaa"
 
@@ -47,16 +47,16 @@ def test_lifecycle_hook_bounds_ray_down_and_terminates_by_tag(tmp_path: Path) ->
     with (
         patch.object(lifecycle_mod, "_active_resolved_yaml", str(yaml_file)),
         patch.object(lifecycle_mod, "_active_cluster_name", "tessera-inference-fill01"),
-        patch.object(lifecycle_mod, "terminate_ray_instances_by_tag") as terminate,
-        patch.object(lifecycle_mod, "cleanup_ray_tempfiles") as cleanup,
+        patch("tessera_embeddings.providers.aws.ray.terminate_ray_instances_by_tag") as terminate,
+        patch("tessera_embeddings.providers.aws.ray.cleanup_ray_tempfiles") as cleanup,
         patch.object(
             lifecycle_mod.subprocess,
             "run",
-            side_effect=subprocess.TimeoutExpired(cmd="ray down", timeout=lifecycle_mod.RAY_DOWN_TIMEOUT_S),
+            side_effect=subprocess.TimeoutExpired(cmd="ray down", timeout=RAY_DOWN_TIMEOUT_S),
         ) as ray_down,
     ):
         lifecycle_mod.ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
-    assert ray_down.call_args.kwargs["timeout"] == lifecycle_mod.RAY_DOWN_TIMEOUT_S
+    assert ray_down.call_args.kwargs["timeout"] == RAY_DOWN_TIMEOUT_S
     cleanup.assert_called_once_with(str(yaml_file))
     terminate.assert_called_once_with(cluster_name="tessera-inference-fill01", log=terminate.call_args.kwargs["log"])
 
@@ -70,8 +70,8 @@ def test_lifecycle_hook_swallows_ray_down_launch_error(tmp_path: Path) -> None:
     with (
         patch.object(lifecycle_mod, "_active_resolved_yaml", str(yaml_file)),
         patch.object(lifecycle_mod, "_active_cluster_name", "tessera-inference-fill01"),
-        patch.object(lifecycle_mod, "terminate_ray_instances_by_tag") as terminate,
-        patch.object(lifecycle_mod, "cleanup_ray_tempfiles") as cleanup,
+        patch("tessera_embeddings.providers.aws.ray.terminate_ray_instances_by_tag") as terminate,
+        patch("tessera_embeddings.providers.aws.ray.cleanup_ray_tempfiles") as cleanup,
         patch.object(lifecycle_mod.subprocess, "run", side_effect=OSError("ray: command not found")),
     ):
         lifecycle_mod.ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
@@ -86,7 +86,7 @@ def test_lifecycle_hook_prefers_the_recorded_cluster_name(tmp_path: Path) -> Non
     with (
         patch.object(lifecycle_mod, "_active_resolved_yaml", None),
         patch.object(lifecycle_mod, "_active_cluster_name", "tessera-inference-stored99"),
-        patch.object(lifecycle_mod, "terminate_ray_instances_by_tag") as terminate,
+        patch("tessera_embeddings.providers.aws.ray.terminate_ray_instances_by_tag") as terminate,
         patch.object(lifecycle_mod.subprocess, "run") as ray_down,
     ):
         lifecycle_mod.ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
@@ -102,7 +102,7 @@ def test_lifecycle_hook_derives_cluster_name_in_fresh_process(tmp_path: Path) ->
     with (
         patch.object(lifecycle_mod, "_active_resolved_yaml", None),
         patch.object(lifecycle_mod, "_active_cluster_name", None),
-        patch.object(lifecycle_mod, "terminate_ray_instances_by_tag") as terminate,
+        patch("tessera_embeddings.providers.aws.ray.terminate_ray_instances_by_tag") as terminate,
     ):
         lifecycle_mod.ray_cleanup_on_cancellation(None, SimpleNamespace(id=_RUN_ID), None)
     terminate.assert_called_once()
@@ -159,3 +159,25 @@ def test_both_gpu_flows_terminate_retired_actors_instances() -> None:
         source = inspect.getsource(module)
         assert "on_actor_retire" in source, module.__name__
         assert "make_instance_terminator" in source, module.__name__
+
+
+def test_ray_owning_flows_do_not_import_the_aws_provider_at_module_scope() -> None:
+    """A `tessera_embeddings[prefect]` install must be able to IMPORT these flows.
+
+    ``providers.aws.ray`` pulls in ``boto3`` from the ``aws`` extra and ``ray`` from
+    ``inference``. Imported at module scope, that makes registering or inspecting these
+    flows impossible without both — including to run them locally or against a non-AWS
+    provider, which need neither. The Dask twin (``_dask_lifecycle``) already defers for
+    this reason; a static check is what keeps the Ray side from drifting back, since a
+    module-scope import only fails on an install this test suite does not run under.
+    """
+    import ast
+
+    for mod in (lifecycle_mod, fill_mod, seq_mod, flows_mod):
+        tree = ast.parse(Path(inspect.getfile(mod)).read_bytes())
+        offenders = [
+            node.module
+            for node in tree.body  # module scope only — a deferred import is nested
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("tessera_embeddings.providers.aws")
+        ]
+        assert not offenders, f"{Path(inspect.getfile(mod)).name} imports {offenders} at module scope"

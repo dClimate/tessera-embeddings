@@ -816,11 +816,47 @@ def assemble_zone_year(
     if not staged_labels:
         # Every live tile resolved to a skip marker (zero valid pixels under
         # the validity filters) — a legitimate no-data cell, same as all-ocean.
+        #
+        # It still WRITES, over the whole live footprint, for the reason the mixed
+        # path below writes over its skipped tiles: a year lands in two commits, so an
+        # attempt that crashed between them leaves shards on a year nothing has marked,
+        # and the campaign re-dispatches it. If that attempt's mosaic made tiles
+        # productive where this one skips them all, marking the year empty without
+        # writing would leave its embeddings readable under a completion mark and a
+        # zone-year tag that both say the cell holds nothing.
+        #
         # Mark + tag FIRST, clean up after (matching the data path): a crash
         # after cleanup but before the tag would otherwise force full
         # re-inference just to regenerate zero-byte skip markers.
+        if live:
+            # The fill write and the completion mark land together, in the one call, so
+            # the year can never be marked empty over shards this run did not clear.
+            snapshot = writer.assemble_global(
+                store_path,
+                zone,
+                year=year,
+                run_id=run_id,
+                n_workers=n_assembly_workers or AssemblyConfig().compute_n_workers(len(live)),
+                gate=gate,
+                staged_labels=(),
+                skipped_labels=sorted(c.label for c in live),
+                s3_concurrency=s3_concurrency,
+                empty=True,
+                get_credentials=get_credentials,
+                s3_region=s3_region,
+                log=log,
+            )
+        else:
+            # No live tiles at all: nothing was ever written here, so there is nothing
+            # to clear and the attrs alone are the whole job.
+            snapshot = mark_zone_year_empty(
+                open_global_repo(store_path, get_credentials=get_credentials, region=s3_region),
+                zone,
+                year,
+                run_id=run_id,
+                gate=gate,
+            )
         repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
-        snapshot = mark_zone_year_empty(repo, zone, year, run_id=run_id, gate=gate)
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
         result = {
             **summary,

@@ -48,7 +48,6 @@ from tessera_embeddings.orchestration.runners.zone_fill import (
     zone_year_complete,
     zone_year_on_axis,
 )
-from tessera_embeddings.providers.aws.ray import cluster_name_for_flow_run
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
@@ -258,7 +257,11 @@ def fill_zone_year_flow(
     # Lazily import the AWS providers so the flow file imports on machines
     # without ray/boto installed (arch tests, local inspection).
     from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
-    from tessera_embeddings.providers.aws.ray import make_instance_terminator, ray_cluster
+    from tessera_embeddings.providers.aws.ray import (
+        cluster_name_for_flow_run,
+        make_instance_terminator,
+        ray_cluster,
+    )
 
     zone = canonicalize_zone(zone)
     store_path = paths.global_store(store_name)

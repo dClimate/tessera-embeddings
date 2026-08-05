@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import ast
-import hashlib
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Literal, final
 
+from tessera_embeddings.config.code_identity import source_identity
 from tessera_embeddings.config.time_windows import TimeWindow
 
 logger = logging.getLogger(__name__)
@@ -44,9 +42,9 @@ def checkpoint_filename(norm_source: str = "aws") -> str:
 
 #: SEED for the source whose behaviour determines what a staged tile CONTAINS.
 #:
-#: The fingerprint covers this plus everything it imports, transitively
-#: (:func:`_first_party_import_closure`) — a hand-maintained list cannot keep up with
-#: the imports, and it fails in the silent direction when it falls behind.
+#: The fingerprint covers this plus everything it imports, transitively (see
+#: :mod:`tessera_embeddings.config.code_identity`) — a hand-maintained list cannot keep
+#: up with the imports, and it fails in the silent direction when it falls behind.
 #:
 #: A change anywhere in that closure means already-staged tiles were produced by
 #: different logic and must not be mixed with new ones. Code outside it — orchestration,
@@ -66,55 +64,6 @@ def checkpoint_filename(norm_source: str = "aws") -> str:
 _STAGED_OUTPUT_SOURCES: tuple[str, ...] = ("inference", "config/inference.py")
 
 
-def _first_party_import_closure(seed: list[Path], root: Path) -> set[Path]:
-    """Every in-package module reachable from *seed*, following imports transitively.
-
-    The seed names the code that OBVIOUSLY produces a staged tile; this finds the code
-    it delegates to. Without it the identity misses exactly the dependencies that matter
-    most — ``data_loading`` calls ``compute_doy`` from ``storage.zarr_store`` to build a
-    model input, and reads ``TimeWindow`` from ``config.time_windows`` to choose which
-    observations are used. A change to either alters a staged tile's CONTENT while
-    leaving a hand-listed identity unmoved, so a retry mixes tiles from two code
-    versions into one write-once zone-year.
-
-    A closure rather than a longer list, because a list only covers the dependencies
-    someone remembered: it goes stale the first time an import is added, and it goes
-    stale silently, in the direction that loses data.
-
-    Parses rather than imports — this runs on a flow runner that has no torch, and
-    importing to inspect would execute module bodies for a hash. ``from x import y``
-    contributes both ``x`` and ``x.y`` as candidates, since either may name the module.
-    Non-package imports and names that resolve to no file are skipped.
-    """
-    package = __name__.split(".")[0]
-
-    def module_file(dotted: str) -> Path | None:
-        rel = dotted.removeprefix(package + ".").replace(".", "/")
-        for candidate in (root / f"{rel}.py", root / rel / "__init__.py"):
-            if candidate.exists():
-                return candidate
-        return None
-
-    def imported_modules(path: Path) -> set[str]:
-        found: set[str] = set()
-        for node in ast.walk(ast.parse(path.read_bytes())):
-            if isinstance(node, ast.Import):
-                found.update(a.name for a in node.names if a.name.startswith(package))
-            elif isinstance(node, ast.ImportFrom) and node.module and node.module.startswith(package):
-                found.add(node.module)
-                found.update(f"{node.module}.{a.name}" for a in node.names)
-        return found
-
-    reached, stack = set(seed), list(seed)
-    while stack:
-        for dotted in imported_modules(stack.pop()):
-            path = module_file(dotted)
-            if path is not None and path not in reached:
-                reached.add(path)
-                stack.append(path)
-    return reached
-
-
 def inference_code_identity() -> str:
     """Fingerprint of the code that determines staged tile CONTENT, not of the whole build.
 
@@ -125,38 +74,16 @@ def inference_code_identity() -> str:
     hotfix costing minutes and costing a re-run.
 
     Hashes :data:`_STAGED_OUTPUT_SOURCES` **and everything it imports**, transitively —
-    the seed alone misses the code it delegates the tile's contents to. Contents are
-    hashed with their package-relative paths, sorted, so the digest is stable across
-    machines and checkouts.
+    see :func:`~tessera_embeddings.config.code_identity.source_identity` for the closure
+    and for what a source hash cannot see.
 
-    **What this deliberately no longer covers: dependency drift.** The old AMI-based identity
-    changed when the image changed, so a re-bake onto a new torch was caught; a source hash is
-    blind to it. Two things bound that gap — the AMI is resolved once and PINNED into every
-    fill of a campaign (so one run cannot straddle two images), and a model change ships under
-    a new checkpoint filename, which is still in the fingerprint. A deliberate library upgrade
-    mid-campaign is the residual case, and it wants the force-new escape hatch rather than a
-    silent reuse.
+    The residual dependency-drift case is bounded twice here: the AMI is resolved once
+    and PINNED into every fill of a campaign, so one run cannot straddle two images, and
+    a model change ships under a new checkpoint filename, which is in the fingerprint
+    separately. A deliberate library upgrade mid-campaign wants the force-new escape
+    hatch rather than a silent reuse.
     """
-    root = Path(__file__).resolve().parent.parent
-    seed: list[Path] = []
-    for entry in _STAGED_OUTPUT_SOURCES:
-        target = root / entry
-        if target.is_dir():
-            seed.extend(p for p in target.rglob("*.py") if "__pycache__" not in p.parts)
-        elif target.is_file():
-            seed.append(target)
-        else:  # pragma: no cover - a rename must fail loudly, not fingerprint nothing
-            raise FileNotFoundError(
-                f"{target} is listed in _STAGED_OUTPUT_SOURCES but does not exist. A moved or "
-                f"renamed module must update that list — silently fingerprinting fewer files "
-                f"would let two code versions share one staging prefix."
-            )
-    files = _first_party_import_closure(seed, root)
-    digest = hashlib.sha256()
-    for path in sorted(files):
-        digest.update(str(path.relative_to(root)).encode())
-        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode())
-    return f"infcode-{digest.hexdigest()[:16]}"
+    return source_identity(_STAGED_OUTPUT_SOURCES, "infcode")
 
 
 def _normalize_obs_checkpoints(checkpoints: tuple[int, ...]) -> tuple[int, ...]:

@@ -339,14 +339,11 @@ def _load_from_stac(
               collections whose STAC items lack the proj extension (e.g., OPERA
               RTC-S1 on CMR-STAC). Default None uses the CRS from STAC items.
               Ignored when geobox is provided.
-        groupby: How to group STAC items into time slices. "solar_day" (default)
-              groups by solar day from longitude, merging same-pass tiles from
-              adjacent orbits into one mosaic — the convention this package uses
-              everywhere, for both sensors. "time" uses each item's exact
-              timestamp, and is only correct for a caller that has NOT had its
-              items solar-day normalised: `query_stac_items` stamps every item to
-              noon of its solar day, so exact-timestamp grouping over those items
-              would collapse a day's separate acquisitions into one plane.
+        groupby: How to group STAC items into time slices. Must be "solar_day",
+              which groups by solar day from longitude, merging same-pass tiles
+              from adjacent orbits into one mosaic — the convention this package
+              uses everywhere, for both sensors. Anything else is rejected; see
+              below for why the alternative cannot work here.
         resolution: Override pixel resolution in metres. When None (default),
               uses collection_config.resolution. Ignored when geobox is provided.
         geobox: Optional odc.geo.geobox.GeoBox specifying the exact output
@@ -358,6 +355,18 @@ def _load_from_stac(
     """
     if not items:
         raise ValueError("No items to load")
+    # The load is the LAST place that could still honour an exact timestamp, and by then
+    # there is none left to honour: `query_stac_items` stamps every item to noon of its
+    # solar day, once, as the package's single application of the offset. Grouping those
+    # items by "time" therefore does not preserve separate same-day acquisitions — it
+    # collapses them, exactly as "solar_day" would, while reporting a different
+    # convention. Refuse rather than quietly agree.
+    if groupby != "solar_day":
+        raise ValueError(
+            f"groupby={groupby!r} is not supported: items reaching the loader have already been "
+            "normalised to noon of their solar day, so no exact acquisition timestamp survives to "
+            "group on. Use groupby='solar_day'."
+        )
 
     load_chunks = chunks_to_odc(chunks if chunks is not None else INGEST_CHUNKS)
 
@@ -824,8 +833,8 @@ def load_stac_items(
         resolution: Override pixel resolution in metres
         post_load_fn: Optional function applied after loading and correction
         preserve_low_values: Tessera-style baseline correction mode
-        groupby: How to group items into time slices (default "solar_day"
-              — see :func:`_load_from_stac` for why "time" is not the default)
+        groupby: How to group items into time slices. Must be "solar_day" —
+              :func:`_load_from_stac` rejects anything else and says why.
         geobox: Optional output grid specification
 
     Returns:
@@ -957,10 +966,9 @@ def ingest_tile(
         preserve_low_values: When True, baseline correction only subtracts
               from pixels >= abs(offset), matching Tessera's harmonize_arr().
               When False (default), subtracts from all pixels.
-        groupby: How to group STAC items into time slices. "solar_day" (default)
-              merges same-day tiles into one mosaic. "time" uses exact
-              timestamps and does not suit items this package has normalised —
-              see :func:`_load_from_stac`.
+        groupby: How to group STAC items into time slices. Must be "solar_day",
+              which merges same-day tiles into one mosaic; :func:`_load_from_stac`
+              rejects anything else and says why.
         geobox: Optional odc.geo.geobox.GeoBox specifying the exact output
               grid. When provided, overrides bbox/crs/resolution for the load
               step (bbox is still used for the STAC query).

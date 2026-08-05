@@ -311,6 +311,8 @@ def build_all(
     registry_uri: str | None = None,
     delivery_uri: str = DEFAULT_DELIVERY_URI,
     zones: list[str] | None = None,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
 ) -> BuildResult:
     """Build per-zone coverage bitmaps for all requested zones in one commit.
@@ -323,6 +325,12 @@ def build_all(
             keys ``zone_grid.zone`` is registered under, not EPSG codes
             (default: all 120). A restricted build still commits; unlisted
             zones simply aren't touched.
+        get_credentials: Optional Icechunk credential callback.
+        s3_region: Region of the coverage repo, when it is not Icechunk's default.
+            Every reader in this module already takes one, and so does every
+            campaign/seed/fill/export flow — without it here, a deployment whose
+            bucket lives elsewhere can seed and fill the global store but cannot
+            build the mask those steps require.
         log: Optional logger.
 
     Returns:
@@ -338,7 +346,7 @@ def build_all(
     target_zones = zones if zones is not None else list(ZONES)
     created_at = utcnow_iso()
 
-    repo, _ = open_or_create_repo(dest)
+    repo, _ = open_or_create_repo(dest, get_credentials=get_credentials, region=s3_region)
     session = repo.writable_session("main")
     root = zarr.open_group(session.store, mode="a")
 
@@ -424,6 +432,8 @@ def validate_coverage(
     dest: str,
     *,
     zones: list[str] | None = None,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
 ) -> None:
     """Structural + geographic self-checks on a built coverage repo.
@@ -439,7 +449,8 @@ def validate_coverage(
     log = log or logger
     ratio = SHARD_PX // INNER_PX
     target_zones = zones if zones is not None else list(ZONES)
-    root = open_store_as_zarr_group(dest)  # one repo open; groups are indexed off the root
+    # One repo open; groups are indexed off the root.
+    root = open_store_as_zarr_group(dest, get_credentials=get_credentials, region=s3_region)
     for zone in target_zones:
         node = _group(root, zone)
         tile_live = _bitmap(node, "tile_live_2048")

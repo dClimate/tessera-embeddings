@@ -10,7 +10,9 @@ from __future__ import annotations
 from typing import ClassVar
 
 import pytest
+import zarr
 
+from tessera_embeddings.config.ingest import ingest_code_identity
 from tessera_embeddings.errors import ConfigMismatchError
 from tessera_embeddings.storage.manifest import (
     EmbeddingManifest,
@@ -355,6 +357,47 @@ class TestEmbeddingManifestFromUpstreamStores:
         assert m.reflectance_manifest_hash is None
         assert m.sar_manifest_hash is None
         assert m.num_obs_checkpoints == (8, 16)
+
+
+class TestIngestCodeIsPartOfMosaicIdentity:
+    """A resumed mosaic must have been built by the code that is resuming it.
+
+    A campaign runs for weeks and its ingest source changes in that time. Resume skips
+    dates already committed, so without this a deploy mid-cell appends dates built under
+    a new duplicate-copy preference, validity gate or query onto dates built under the
+    old one, and stamps a single completion fingerprint over the pair.
+    """
+
+    @staticmethod
+    def _roi(tmp_path) -> str:
+        """A bare ROI store — no manifest of its own, which is not what is under test."""
+        path = str(tmp_path / "roi.zarr")
+        zarr.open_group(path, mode="w")
+        return path
+
+    def test_a_fresh_manifest_records_the_ingest_code(self, tmp_path):
+        m = IngestManifest.from_roi_store(self._roi(tmp_path))
+        assert m.ingest_code_identity == ingest_code_identity()
+        assert m.ingest_code_identity.startswith("ingcode-")
+
+    def test_resuming_a_store_built_by_other_code_is_refused(self, tmp_path):
+        roi = self._roi(tmp_path)
+        stored = IngestManifest.from_roi_store(roi).to_dict()
+        stored["ingest_code_identity"] = "ingcode-0000000000000000"
+        with pytest.raises(ConfigMismatchError, match="ingest_code_identity"):
+            IngestManifest.from_roi_store(roi).validate_against(stored, "s3://in/mosaics/33N/2025/reflectance.zarr")
+
+    def test_a_store_written_before_the_field_existed_still_resumes(self, tmp_path):
+        """Absent is not a mismatch: nothing recorded it, so nothing can contradict it.
+
+        Rejecting these would strand every mosaic already on disk behind a manual
+        delete, for a hazard their own writes never had a chance to avoid.
+        """
+        legacy = {"manifest_type": "IngestManifest", "roi_manifest_hash": None}
+        IngestManifest.from_roi_store(self._roi(tmp_path)).validate_against(legacy, "legacy.zarr")
+
+    def test_the_identity_is_deterministic(self):
+        assert ingest_code_identity() == ingest_code_identity()
 
 
 class TestS2OnlyPolicyIsPartOfEmbeddingIdentity:

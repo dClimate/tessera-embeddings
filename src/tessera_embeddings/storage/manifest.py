@@ -25,6 +25,7 @@ from typing import Any, Self, cast
 
 import zarr
 
+from tessera_embeddings.config.ingest import ingest_code_identity
 from tessera_embeddings.errors import ConfigMismatchError
 
 logger = logging.getLogger(__name__)
@@ -184,11 +185,22 @@ class IngestManifest(StoreManifest):
     campaign's stated contract that a changed parameter raises rather than quietly
     mixing configurations. Optical-only: the SAR stores have no admission threshold,
     and their orbit is already in the store name.
+
+    ``ingest_code_identity`` closes the last version of the same hole. The mask says
+    WHERE, the threshold says WHICH dates were admitted, and this says by what CODE —
+    the query, the solar-day normalisation, the duplicate-copy preference, the OPERA
+    granule filter. A campaign runs for weeks and its ingest source does change in that
+    time, so a resume after a deploy would otherwise append dates built one way onto
+    dates built another and stamp one fingerprint over the pair. Validated on append
+    rather than folded into the completion marker, deliberately: the marker decides
+    whether a FINISHED mosaic is reusable, and a code hash there would declare every one
+    of them stale on any ingest change.
     """
 
     roi_manifest_hash: str | None = None
     coverage_sha256: str | None = None
     min_valid_coverage: float | None = None
+    ingest_code_identity: str | None = None
 
     @classmethod
     def from_roi_store(cls, roi_zarr_path: str, *, min_valid_coverage: float | None = None) -> IngestManifest:
@@ -214,7 +226,15 @@ class IngestManifest(StoreManifest):
             logger.warning("Could not read _manifest from ROI store %s: %s", roi_zarr_path, exc)
             roi_manifest_dict = None
         roi_mhash = RoiManifest.from_dict(roi_manifest_dict).hash() if roi_manifest_dict else None
-        return cls(roi_manifest_hash=roi_mhash, coverage_sha256=coverage_sha, min_valid_coverage=min_valid_coverage)
+        return cls(
+            roi_manifest_hash=roi_mhash,
+            coverage_sha256=coverage_sha,
+            min_valid_coverage=min_valid_coverage,
+            # Resolved here, at the one place both legs build their manifest, so the two
+            # cannot disagree about what code they are — a value each computed for itself
+            # is how they would drift.
+            ingest_code_identity=ingest_code_identity(),
+        )
 
 
 @dataclass(frozen=True)

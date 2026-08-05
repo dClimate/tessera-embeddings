@@ -19,6 +19,7 @@ from tessera_embeddings.ingest.stac import (
     _filter_existing_dates,
     _get_collection_config,
     _get_provider_config,
+    _load_from_stac,
     _loadable_assets,
     _prune_item_dict,
     _query_stac_items,
@@ -726,3 +727,17 @@ def test_requested_extra_bands_survive_item_pruning(monkeypatch):
         extra_bands=["aot"],
     )
     assert seen["extra_bands"] == ["aot"]
+
+
+def test_the_loader_refuses_a_grouping_it_cannot_honour():
+    """`groupby="time"` is a lie by the time items reach the loader.
+
+    `query_stac_items` stamps every item to noon of its solar day — the package's one
+    application of the offset — so no exact acquisition timestamp survives to group on.
+    Grouping by "time" would collapse a day's separate acquisitions exactly as
+    "solar_day" does while reporting a different convention, which is worse than
+    refusing: the caller would believe it had exact timestamps.
+    """
+    config = _get_collection_config("earth-search", "sentinel-2-l2a")
+    with pytest.raises(ValueError, match="groupby='time' is not supported"):
+        _load_from_stac([object()], config, groupby="time")

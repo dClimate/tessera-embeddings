@@ -210,6 +210,11 @@ _NON_RETRYABLE_LEG_MARKERS = (
     "ValidationError",  # malformed parameters
     "calendar-year",  # the year-window gate rejected the request itself
     "no live tiles",  # nothing to ingest in this zone
+    # The store disagrees with this run about the mask, the admission threshold, or the
+    # ingest code that produced its dates. Every retry re-reads the same store and gets
+    # the same answer, and the resolution is a human deleting the interrupted store —
+    # the same answer a mismatched completion marker gets, for the same reason.
+    "ConfigMismatchError",
 )
 
 

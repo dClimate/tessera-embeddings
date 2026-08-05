@@ -4,6 +4,41 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, model_validator
 
+from tessera_embeddings.config.code_identity import source_identity
+
+#: Source whose change alters which dates and pixels a MOSAIC holds.
+#:
+#: The two leg entry points seed it and the import closure pulls in what they delegate
+#: to — the catalogue query, the solar-day normalisation, the duplicate-copy choice, the
+#: OPERA granule filter, the validity gate. Seeding with the entry points rather than a
+#: hand-picked module list is what keeps it from going stale the next time one of them
+#: takes a new import.
+#:
+#: Deliberately NOT the whole ``ingest`` package: ``land_mask`` decides which tiles are
+#: live rather than what a mosaic contains, and it is already fingerprinted separately
+#: as ``coverage_sha256``. Including it would make a mask rebuild look like an ingest
+#: code change.
+_MOSAIC_CONTENT_SOURCES: tuple[str, ...] = ("ingest/s1_roi.py", "ingest/s2_roi.py")
+
+
+def ingest_code_identity() -> str:
+    """Fingerprint of the code that decides a mosaic's CONTENT.
+
+    Recorded in each mosaic store's :class:`~tessera_embeddings.storage.manifest.
+    IngestManifest` on its first commit, and re-validated on every later batch write.
+    That is what makes resuming an interrupted store safe: a store holds dates its own
+    code produced, and appending dates produced by different code — a different
+    duplicate-copy preference, a different validity gate, a different query — would
+    leave one mosaic built two ways with a single fingerprint stamped over it.
+
+    The check is on APPEND, not on the completion marker, and the difference is the
+    point. Putting this in the marker fingerprint would make every ingest change declare
+    every finished mosaic stale, and there are petabytes of them; putting it on the
+    append only ever rejects work that was already incomplete.
+    """
+    return source_identity(_MOSAIC_CONTENT_SOURCES, "ingcode")
+
+
 # Spatial chunk size for storage (written at ingest). 4096 aligns with the
 # embedding store's 2048-px shard grid: one ingest chunk is exactly 2x2 shards
 # (and 16x16 of the 256-px inner chunks). Still larger than the inference

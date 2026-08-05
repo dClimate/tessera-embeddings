@@ -37,13 +37,6 @@ from pathlib import Path
 
 import yaml
 
-from tessera_embeddings.providers.aws.ray import (
-    RAY_DOWN_TIMEOUT_S,
-    cleanup_ray_tempfiles,
-    cluster_name_for_flow_run,
-    terminate_ray_instances_by_tag,
-)
-
 _active_resolved_yaml: str | None = None
 _active_cluster_name: str | None = None
 
@@ -72,6 +65,27 @@ def ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -
     must stay idempotent.
     """
     log = logging.getLogger(__name__)
+    # Deferred, NOT imported at module scope. Three Prefect flows import this module
+    # unconditionally to register the hook, and ``providers.aws.ray`` pulls in ``boto3``
+    # from the ``aws`` extra and ``ray`` from ``inference``. At module scope that makes a
+    # supported ``tessera_embeddings[prefect]`` install unable to so much as IMPORT those
+    # flows — including to run them locally or against a non-AWS provider, which need
+    # neither package. Same pattern, and the same reasoning, as ``_dask_lifecycle``.
+    #
+    # An ImportError here is NOT a failure: no AWS provider means there was no AWS
+    # cluster, so there is nothing to tear down. Every other exception propagates, since
+    # a failed teardown leaks billed GPU instances and that is what this hook is for.
+    try:
+        from tessera_embeddings.providers.aws.ray import (
+            RAY_DOWN_TIMEOUT_S,
+            cleanup_ray_tempfiles,
+            cluster_name_for_flow_run,
+            terminate_ray_instances_by_tag,
+        )
+    except ImportError as exc:
+        log.info("AWS provider not installed (%s) — no Ray cluster to tear down for this run.", exc)
+        return
+
     log.warning("Flow cancelled/crashed — tearing down Ray cluster")
     # Fresh-import fallback: the flows pin cluster_name_for_flow_run(flow_run_ctx.id)
     # at provisioning, so the hook can re-derive the same name when the module

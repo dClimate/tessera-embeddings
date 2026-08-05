@@ -45,6 +45,7 @@ def build_land_mask(
     spot_check: int = 500,
     reconcile: bool = True,
     run_validation: bool = True,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Build per-zone coverage bitmaps and (optionally) verify + validate them.
 
@@ -65,6 +66,9 @@ def build_land_mask(
             bucket. Off for a fast verify that only samples tiles.
         run_validation: When True, run structural + geographic self-checks on
             the built store.
+        s3_region: Region of the coverage repo, when it is not Icechunk's default.
+            The rest of the campaign already accepts one; the mask build is a
+            required step, so without it a non-default-region deployment stops here.
 
     Returns:
         The build summary dict (snapshot id, counts, registry sha256), plus a
@@ -93,12 +97,13 @@ def build_land_mask(
         registry_uri=resolved_registry,
         delivery_uri=delivery_uri,
         zones=zones,
+        s3_region=s3_region,
     )
     summary.update(result)
 
     if run_validation:
         log.info("Validating coverage store %s", dest)
-        validate_land_mask_coverage(dest=dest, zones=zones)
+        validate_land_mask_coverage(dest=dest, zones=zones, s3_region=s3_region)
 
     log.info("Land-mask coverage ready at %s (%s)", dest, result["snapshot_id"])
     return summary

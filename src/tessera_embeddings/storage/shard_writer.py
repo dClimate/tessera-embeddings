@@ -281,6 +281,7 @@ def write_year_shards(
     commit_msg: str | None = None,
     run_id: str | None = None,
     radar_coverage: dict | None = None,
+    empty: bool = False,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
@@ -310,6 +311,12 @@ def write_year_shards(
     (a whole-shard overwrite) and re-marks. That is strictly better than the previous
     behaviour, where a collision discarded the shards as well.
 
+    ``empty`` records the year as holding no data, for the case where every live tile
+    resolved to a skip. Such a year still writes shards — fill over the whole live
+    footprint, so a previous attempt's data cannot survive under this run's completion
+    mark — so it comes through here rather than through ``mark_zone_year_empty``, which
+    writes the attrs alone.
+
     Returns the ATTR commit's snapshot id — a tag must point at a state where the
     year is both written and marked.
     """
@@ -330,4 +337,6 @@ def write_year_shards(
     # collision costs a sub-second retry instead of this whole assembly. Return that
     # snapshot rather than the shard one: a tag must point at a state where the year is
     # both written AND marked.
-    return commit_year_attrs(repo, group, year_label, run_id=run_id, radar_coverage=radar_coverage, gate=gate)
+    return commit_year_attrs(
+        repo, group, year_label, run_id=run_id, radar_coverage=radar_coverage, gate=gate, empty=empty
+    )
