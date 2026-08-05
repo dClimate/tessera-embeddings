@@ -39,11 +39,25 @@ def _fake_chunk(label: str) -> MagicMock:
     return c
 
 
-def _poll(progress: dict, *, stall_threshold: float = 300.0, max_stalls: int = 3) -> None:
+def _poll(
+    progress: dict,
+    *,
+    stall_threshold: float = 300.0,
+    max_stalls: int = 3,
+    recovery_threshold: float | None = None,
+) -> list[str]:
     tracker = MagicMock()
     tracker.get_all.remote.return_value = MagicMock()
     with patch.object(_sched_mod.ray, "get", return_value=progress):
-        _poll_tracker(tracker, 0, 10, stall_threshold, max_stalls, logging.getLogger("test"))
+        return _poll_tracker(
+            tracker,
+            0,
+            10,
+            stall_threshold,
+            max_stalls,
+            logging.getLogger("test"),
+            recovery_threshold_sec=recovery_threshold,
+        )
 
 
 def _do_replace(pool: ActorPool, actor_idx: int = 0) -> None:
@@ -111,6 +125,66 @@ class TestPollTracker:
         progress = {f"c_{i}": (1, 5, 400.0, "inference") for i in range(count)}
         with pytest.raises(RuntimeError, match="stalled simultaneously"):
             _poll(progress, stall_threshold=300.0, max_stalls=3)
+
+    def test_returns_nothing_to_recover_by_default(self) -> None:
+        """Recovery is opt-in: without a threshold the poll stays log-only."""
+        assert _poll({"c": (1, 5, 99_999.0, "inference")}, max_stalls=10) == []
+
+    def test_warns_but_does_not_recover_between_the_thresholds(self) -> None:
+        """The warning must fire well before anything is killed.
+
+        A chunk past the stall threshold but short of the recovery one is logged and
+        left alone — this is the window that keeps a merely-slow chunk alive.
+        """
+        recover = _poll(
+            {"c": (1, 5, 400.0, "inference")},
+            stall_threshold=300.0,
+            recovery_threshold=1200.0,
+            max_stalls=10,
+        )
+        assert recover == []
+
+    def test_recovers_only_past_the_recovery_threshold(self) -> None:
+        recover = _poll(
+            {"slow": (1, 5, 400.0, "inference"), "wedged": (50, 587, 14_396.0, "inference")},
+            stall_threshold=300.0,
+            recovery_threshold=1200.0,
+            max_stalls=10,
+        )
+        assert recover == ["wedged"], "only the chunk past the recovery threshold"
+
+    def test_recovers_a_stall_in_any_phase(self) -> None:
+        """The observed wedge was in 'inference', but a hung load is just as fatal."""
+        recover = _poll(
+            {"c": (0, 0, 5_000.0, "loading")},
+            stall_threshold=300.0,
+            recovery_threshold=1200.0,
+            max_stalls=10,
+        )
+        assert recover == ["c"]
+
+    def test_a_failed_poll_recovers_nothing(self) -> None:
+        """Losing visibility must not be read as 'everything is wedged'.
+
+        A tracker error is swallowed as non-fatal, and it must return an EMPTY
+        recovery list — returning anything else would kill actors because the
+        monitor broke, which is the opposite of what it exists for.
+        """
+        tracker = MagicMock()
+        tracker.get_all.remote.return_value = MagicMock()
+        with patch.object(_sched_mod.ray, "get", side_effect=ConnectionError("dead")):
+            out = _poll_tracker(tracker, 0, 10, 300.0, 3, logging.getLogger("test"), recovery_threshold_sec=1200.0)
+        assert out == []
+
+    def test_systemic_abort_still_wins_over_recovery(self) -> None:
+        """The two guards answer different questions and must not be merged.
+
+        Many chunks stalling at once is systemic and wants a human, so it still
+        raises rather than quietly killing the whole fleet one actor at a time.
+        """
+        progress = {f"c_{i}": (1, 5, 14_000.0, "inference") for i in range(4)}
+        with pytest.raises(RuntimeError, match="stalled simultaneously"):
+            _poll(progress, stall_threshold=300.0, max_stalls=3, recovery_threshold=1200.0)
 
     def test_tracker_error_swallowed(self) -> None:
         tracker = MagicMock()

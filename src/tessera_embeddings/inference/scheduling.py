@@ -544,18 +544,21 @@ def _poll_tracker(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     elapsed_min: float | None = None,
     gpu_hours: float | None = None,
-) -> None:
-    """Poll ProgressTracker; log stalls; raise RuntimeError on systemic stall.
+    recovery_threshold_sec: float | None = None,
+) -> list[str]:
+    """Poll ProgressTracker; log stalls; return the uids that need recovery.
 
     This function has no access to pool or loop state — all context is passed
-    explicitly so it can be tested in isolation.
+    explicitly so it can be tested in isolation. It therefore cannot kill an
+    actor itself: it NAMES the chunks whose actors the caller should replace,
+    and the caller (which holds the pool) acts.
 
     Args:
         tracker: ProgressTracker Ray actor handle.
         n_done: Number of chunks already completed (for the progress log line).
         n_total: Total chunks in the run.
         stall_threshold_sec: Seconds without a batch update before a chunk is
-            considered stalled.
+            considered stalled — the WARNING threshold.
         max_simultaneous_stalls: Number of simultaneous stalls that triggers a
             systemic abort (RuntimeError).
         log: Logger.
@@ -563,6 +566,15 @@ def _poll_tracker(
             line (this is the ONLY progress log line — keep it that way).
         gpu_hours: Fleet GPU-hours consumed so far (live-actor-count integrated
             over wall time; one GPU per actor), folded into the same line.
+        recovery_threshold_sec: Seconds without an update before a chunk is
+            declared unrecoverable in place and returned for kill-and-requeue.
+            Deliberately well above ``stall_threshold_sec`` so a warning always
+            fires long before anything is killed, and a merely-slow chunk is
+            never destroyed. ``None`` disables recovery (log-only).
+
+    Returns:
+        The uids stalled past ``recovery_threshold_sec``, for the caller to
+        recover. Empty in the normal case.
 
     Raises:
         RuntimeError: When ``>= max_simultaneous_stalls`` chunks are stalled.
@@ -570,6 +582,7 @@ def _poll_tracker(
     try:
         progress = cast(dict, ray.get(tracker.get_all.remote(), timeout=5))  # type: ignore[union-attr]
         stalled_chunks: list[str] = []
+        needs_recovery: list[str] = []
         for label, (batch, total, staleness, phase) in progress.items():
             if staleness > stall_threshold_sec:
                 stalled_chunks.append(label)
@@ -588,6 +601,8 @@ def _poll_tracker(
                         phase,
                         staleness,
                     )
+                if recovery_threshold_sec is not None and staleness > recovery_threshold_sec:
+                    needs_recovery.append(label)
 
         if len(stalled_chunks) >= max_simultaneous_stalls:
             msg = (
@@ -614,6 +629,7 @@ def _poll_tracker(
                 elapsed,
                 gpu,
             )
+        return needs_recovery
     except Exception as exc:
         # Tracker is a monitoring aid — never a single point of failure.
         # Swallow all Ray errors (actor death, timeout, serialization)
@@ -621,6 +637,9 @@ def _poll_tracker(
         if isinstance(exc, RuntimeError):
             raise  # re-raise our own stall-abort RuntimeError
         log.debug("Tracker poll failed (non-fatal): %s", exc)
+        # A failed poll says nothing about the chunks, so recover nothing. Losing
+        # visibility must not be read as "everything is wedged".
+        return []
 
 
 def _batch_actors_to_request(
@@ -812,6 +831,18 @@ def _process_chunks_work_stealing(
 
     results: list[dict] = []
     stall_threshold_sec = 300.0
+
+    #: Seconds of no batch progress before a chunk's actor is killed and the chunk
+    #: re-queued. FOUR TIMES the warning threshold, so an operator always sees
+    #: several STALL lines before anything is destroyed, and a merely-slow chunk is
+    #: never killed.
+    #:
+    #: The margin is enormous relative to legitimate work: this measures the gap
+    #: BETWEEN BATCH UPDATES, which is normally well under a second, while the
+    #: slowest whole chunk yet observed takes ~480 s in total. The wedge this exists
+    #: for sat 14,396 s. So the choice is not between 20 and 30 minutes — it is
+    #: between minutes and forever, and anywhere in that range works.
+    stall_recovery_sec = 4 * stall_threshold_sec
 
     # Stall threshold scales with the eventual fleet size, not just the first
     # batch. With batching, ``actors`` holds only the initial subset, so a
@@ -1095,7 +1126,7 @@ def _process_chunks_work_stealing(
         # Poll tracker on every iteration (including timeouts with no completions)
         # so stall detection stays responsive.
         if tracker:
-            _poll_tracker(
+            wedged = _poll_tracker(
                 tracker,
                 len(results),
                 n_total,
@@ -1104,7 +1135,42 @@ def _process_chunks_work_stealing(
                 log,
                 elapsed_min=(time.monotonic() - t0) / 60,
                 gpu_hours=gpu_seconds / 3600,
+                recovery_threshold_sec=stall_recovery_sec,
             )
+            # A SINGLE wedged chunk used to hold the whole fleet forever: the poll
+            # logged it once a minute and only ever acted on the SIMULTANEOUS-stall
+            # threshold, which one chunk never reaches. Measured cost of that on
+            # 2026-08-05: 20 actors pinned ~7 h after all other work finished, on a
+            # cell whose useful work cost a fraction of it.
+            #
+            # An in-process timeout cannot fix this. The hang is inside a CUDA call
+            # that never returns, so no Python-level timeout can interrupt the
+            # thread, and forcing past one would leave the GPU context in an
+            # unknown state — turning a loud, localised stall into quiet corruption
+            # on later chunks. Killing the actor is the only way to reclaim the GPU,
+            # and it routes into the SAME path a crashed actor already takes:
+            # requeue the chunk (bounded by max_chunk_retries), hand back any
+            # deferred write, return the reserved chunk, replace the slot.
+            for uid in wedged:
+                # POP the pending ref before handling. The killed actor's object ref
+                # will never resolve, and `_handle_failure` is written for the
+                # ready-refs path where the ref is already popped — leaving it in
+                # `pending` would have `ray.wait` hand back the same item later and
+                # process it twice.
+                ref = next((r for r, (it, _) in pool.pending.items() if it.uid == uid), None)
+                if ref is None:
+                    # It finished between the poll and here, or its actor already
+                    # died and was handled. Either way there is nothing to kill.
+                    continue
+                item, actor_idx = pool.pending.pop(ref)
+                log.error(
+                    "STALL RECOVERY: chunk %s made no progress for >%.0fs — killing actor %d "
+                    "and re-queuing. The GPU cannot be reclaimed any other way.",
+                    item.chunk.label,
+                    stall_recovery_sec,
+                    actor_idx,
+                )
+                _handle_failure(item, actor_idx, f"stalled >{stall_recovery_sec:.0f}s with no batch progress")
 
         # --- Handle completed (or failed) chunks ---
         for ref in ready_refs:
