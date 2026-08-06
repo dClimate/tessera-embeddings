@@ -273,11 +273,21 @@ high-latitude zone, where 4,000+ chunks across three zones already agree.
 
 Measured 2026-08-06. This is the largest single effect in this document and it is not latitude.
 
-**The mechanism is a code fact, not an inference from two runs.** `t_kept` is
-`S2MaskBundle.mask.shape[0]` — the count of *optical* timesteps that survive SCL pruning. The
-radar sequence the model encodes is not in it. So `tokens = t_kept × valid_px` measures optical
-work only, and a radar-bearing chunk does strictly more forward work than its token count claims.
-**Every tok/sec figure in this document is therefore comparable only within one radar status.**
+**The mechanism is a code fact, not an inference from two runs, and it has two halves.**
+
+1. **The metric cannot see radar.** `t_kept` is `S2MaskBundle.mask.shape[0]` — the count of
+   *optical* timesteps surviving SCL pruning. So `tokens = t_kept × valid_px` measures optical work
+   only, and every tok/sec figure here is comparable within one radar status and no further.
+2. **The work really is smaller, and by a defined amount.** A radar-free pixel takes the
+   `allow_s2_only` branch in `MosaicChunkInferenceDataset`, which lands it in the **smallest S1
+   bucket** and hands the model an all-zeros normalised S1 slice. The forward pass therefore
+   encodes a minimal radar sequence rather than a ~90-timestep one. That is the cost difference:
+   not the model skipping a modality, but the sequence length collapsing to the smallest bucket.
+
+Worth stating plainly because it also settles a correctness question: **that all-zeros slice is
+what the upstream reference implementation returns for missing radar** (`resample_s1_bucket`'s
+zero-count rows match `ucam-eo/tessera`'s `_sample_s1_merged` zero return). A radar-free embedding
+is the upstream-defined missing-radar case, not an improvised one.
 
 **Magnitude, from two pairs that differ in radar and are matched on the things that matter:**
 
