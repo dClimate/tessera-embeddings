@@ -170,6 +170,7 @@ def fill_zone_year_flow(
     s3_region: str | None = None,
     commit_limit_name: str | None = None,
     cleanup_staging: bool = True,
+    n_assembly_workers: int | None = None,
     allow_partial_window: bool = False,
     allow_model_mismatch: bool = False,
     allow_s2_only: bool = False,
@@ -217,7 +218,13 @@ def fill_zone_year_flow(
         commit_limit_name: Prefect global concurrency limit that bounds the
             fleet's simultaneous committers (D6). ``None`` = ungated (a single
             isolated run has no commit contention).
-        cleanup_staging: Delete staged tiles after a successful fill.
+        cleanup_staging: Delete staged tiles after a successful fill. Pass False to keep them,
+            which is what makes an assembly measurement repeatable against identical input.
+        n_assembly_workers: Override the assembly process-pool size for THIS run; ``None`` uses
+            ``AssemblyConfig``'s sizing. Exposed because the pool size is the assembly's binding
+            constraint and was previously reachable only by editing config and redeploying — and
+            because the deployment's stored schema already advertised this name, so a dispatch
+            passing it was accepted and then crashed on a signature mismatch 78 seconds in.
         allow_partial_window: Relax the pre-Ray temporal-coverage gate to
             "non-empty" (default requires the mosaic's months to span the window).
         allow_model_mismatch: Fill even when the seeded store advertises a
@@ -380,6 +387,7 @@ def fill_zone_year_flow(
         "run_id": run_id,
         "gate": gate,
         "cleanup_staging": cleanup_staging,
+        "n_assembly_workers": n_assembly_workers,
         "s3_concurrency": s3_concurrency,
         "get_credentials": iam_icechunk_credentials,
         "s3_region": s3_region,

@@ -22,9 +22,10 @@ class AssemblyConfig:
     full grid: only live chunks have staged data to read and write, so they
     account for essentially all the work.
 
-    ``max_workers`` defaults to 8: each worker holds at most one staged-tile
+    ``max_workers`` defaults to 16: each worker holds at most one staged-tile
     slice in memory (~1-1.5 GB at a 2048-px full-band tile), so the pool peaks
-    around ~12 GB — comfortable on the flow runner. It also keeps aggregate S3
+    around ~24 GB — inside the flow runner's 64 GiB, and measured at 20 GB peak
+    when the pool was 8. It also keeps aggregate S3
     PUT concurrency trivially under
     ``assembly.TARGET_AGGREGATE_S3_CONCURRENCY`` (the per-fork request cap is
     ``target // n_workers``, so aggregate <= target whenever
@@ -32,7 +33,17 @@ class AssemblyConfig:
     """
 
     chunks_per_worker: int = 10
-    max_workers: int = 8
+    #: Raised 8 -> 16 on 2026-08-06 from a measurement, not a guess. At 8 the flow runner's box was
+    #: HALF IDLE on the largest assembly attempted: 9,050 tiles wrote a dead-flat 248 objects/min for
+    #: 160 minutes while CPU peaked at 7,443 of 16,384 allocated units and memory at 20 of 64 GiB.
+    #: A flat rate at half the CPU is the signature of a fixed worker count rather than a resource
+    #: limit — and the count did not scale with the job, since a 9,050-tile zone got the same 8
+    #: processes as a 267-tile one.
+    #:
+    #: 16 is what the flow runner was sized for: `consumer_stack.py` says "16 vCPU / 64 GiB leaves
+    #: headroom for n_workers=16 (~19 GiB)". Beyond 16 the box saturates and the next step is the
+    #: already-registered 32-vCPU `assembly_large` family — with evidence, not before.
+    max_workers: int = 16
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
