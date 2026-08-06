@@ -13,6 +13,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `stac.py` | STAC-based data loading via `odc.stac.load`. Handles multiple providers (Earth Search, Planetary Computer), S2 baseline correction, and date filtering. |
 | `opera_query.py` | OPERA RTC-S1 query utilities: spatial bbox construction, item construction from the native CMR Granule Search API (bypasses CMR-STAC search; orbit-direction filtered server-side), UTM EPSG derivation, and asset preparation. |
 | `duplicates.py` | Chooses between DUPLICATE catalogue items for one tile-date — Element 84 publishes more than one whenever a granule is reprocessed, distinguished by `s2:sequence`. Newest is preferred; the rejected copies are retained as a fallback the write steps down when a source object will never read. Reducing to one copy before the loader is what makes a fallback possible at all, since `odc.stac.load` FUSES a solar-day group — and it is also what makes the recorded baseline match the pixels written. |
+| `loader_failures.py` | Names the source object a failed load could not read. `odc.stac.load` reports it in its OWN log record and raises an exception that does not carry it, so a logging handler on every reader process records each aborted href, and the caller collects them after a failure and maps them back to tile-dates. That name is what lets the duplicate ladder step down ONE copy instead of every duplicated tile in the date. Attribution is best effort by design: an empty answer means "attribute nothing", never "nothing was at fault", and the recovery it sharpens still works without it. |
 | `auth.py` | NASA Earthdata Login (EDL) authentication for ASF-hosted OPERA data. Provides S3 direct access (temporary AWS credentials minted by ASF, ~1 hour) and legacy CloudFront signed URL resolution. Those credentials expire on their OWN clock, unrelated to any unit of work, so renewal must be driven by a timer and by the advertised expiry — never by the work loop, which can only renew between units and so cannot renew inside one that outlives the margin. |
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
@@ -1087,6 +1088,50 @@ The filter is an optimisation, not the guarantee. On S1 the queries are built on
 ahead of the writes, so the set they filter against is a snapshot frozen before the run
 began; the write loop tracks what it has actually written and is the authority, on the
 cropped and full-extent branches alike.
+
+### When a source object will not read
+
+Some published objects are corrupt: a tile of the COG will not inflate, and no retry of any
+length recovers it. That is a different condition from a throttle or an expired credential,
+which look similar coming out of the loader — `rasterio` wraps both in a
+`WarpOperationError` that discards the cause — so `is_unreadable_source` inspects the whole
+exception chain and matches only the codec-level signatures, excluding the credential and
+throttle markers explicitly. It fails CLOSED: anything unrecognised propagates rather than
+being treated as bad data, because responding to a bad minute by reading worse imagery is
+the one outcome the recovery must never produce.
+
+Past that point the response is a ladder, in `s2_roi.py`'s consume path:
+
+1. **Attribute.** Ask the cluster which objects the loader gave up on
+   (`loader_failures.collect_aborted_hrefs`) and map them back to tile-dates.
+2. **Step down** those tile-dates to their next catalogue copy and re-prepare the date. The
+   copy is older reprocessing, so this trades processing baseline for a date that reads.
+3. **Give up, loudly,** when the implicated tile-dates have no copies left: the date is
+   skipped rather than the leg failed, and it is recorded on the store as
+   `assessed_unreadable_dates` so the absence reads as a finding rather than an unexamined
+   gap.
+
+Two properties are worth stating because they are what the attribution step buys, and they
+are held by tests rather than by comment:
+
+- **Blast radius.** With attribution, one bad object steps one tile-date. Without it, every
+  duplicated tile-date in the date steps together — which on a wide ROI is most of the date,
+  so a single bad object downgrades the baseline of hundreds of tiles that read perfectly
+  well.
+- **Termination.** A bad object whose tile-date has no alternate is given up immediately.
+  Without attribution the ladder first walks every *other* tile's alternates, at a full
+  re-read of the date per rung, before reaching the same answer.
+
+Attribution can fail — a worker that died with the read, a cluster already gone, a loader
+that words its message differently. When it does, the unattributed behaviour above is the
+fallback, and the record says which of the two happened: `scope=attributed` means the named
+objects are the ones that failed, `scope=whole-date` means the failing object was not
+identified and the tiles listed are every tile in the date.
+
+The batched write path cannot reach the ladder — a batch is one graph and one commit — so it
+isolates first: an unreadable source anywhere in a batch re-runs the batch's dates one at a
+time, each then getting the per-date recovery. That isolation is what stops one corrupt
+object from failing a zone-year identically on every retry.
 
 ### S3 direct access for OPERA
 

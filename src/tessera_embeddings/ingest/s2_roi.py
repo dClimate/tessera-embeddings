@@ -58,18 +58,24 @@ from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS, a
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
 from tessera_embeddings.ingest.duplicates import (
-    alternates_for,
     copies_label,
     is_unreadable_source,
     item_tile,
     log_duplicate_selection,
     select_preferred_duplicates,
+    step_down_copies,
 )
 from tessera_embeddings.ingest.live_windows import (
     WINDOW_COST_IN_CHUNKS,
     WINDOW_COST_IN_CHUNKS_OVERLAPPED,
     live_windows_for_mask,
     windows_for_date,
+)
+from tessera_embeddings.ingest.loader_failures import (
+    collect_aborted_hrefs,
+    implicated_tile_dates,
+    install_capture_everywhere,
+    label_objects,
 )
 from tessera_embeddings.ingest.roi import StorageOptions, read_roi_mask, read_roi_metadata
 from tessera_embeddings.ingest.roi_processing import (
@@ -80,7 +86,6 @@ from tessera_embeddings.ingest.roi_processing import (
 from tessera_embeddings.ingest.solar_days import (
     normalize_to_solar_day,
     owned_items,
-    solar_day_of,
     solar_grouping_longitude,
     whole_window_range,
 )
@@ -331,6 +336,13 @@ def ingest_s2_roi_reflectance(
     if batch_dates is not None and batch_dates < 1:
         raise ValueError(f"batch_dates must be >= 1 or None for auto, got {batch_dates}")
     reflectance_store = f"{store_path}/reflectance.zarr"
+
+    # Before the first read, because what it captures is only ever recorded as the read
+    # happens: the loader names the object it gave up on in its own log record on whichever
+    # worker hit it, and nothing in the exception carries it. Installed on every current and
+    # future worker; never fatal, since the recovery it sharpens works without it.
+    install_capture_everywhere(client)
+
     roi = read_roi_metadata(roi_zarr_path)
 
     # The coverage threshold goes in the manifest because it decides WHICH dates this
@@ -701,31 +713,13 @@ def ingest_s2_roi_reflectance(
         log_duplicate_selection(log, roi_label, alternates)
         date_alternates.update(alternates)
 
-        def _step_down_duplicates(items: list) -> list | None:
-            """Swap each duplicated tile-date's copy for its next alternate, or ``None``.
-
-            Steps down EVERY duplicated tile-date in the date rather than only the one that
-            failed, because the exception does not name the object — the failing URL appears
-            in the loader's own log line and not in what propagates. A date carries one or
-            two duplicated tiles in practice, so the cost of over-stepping is reading an
-            older copy of something that read fine, which is cheap and rare next to losing
-            the date.
-            """
-            remaining = alternates_for(date_alternates, items)
-            if not remaining:
-                return None
-            swap: dict[tuple[str, str], object] = {}
-            for key, copies in remaining.items():
-                swap[key] = copies[0]
-                date_alternates[key] = copies[1:]
-            out = []
-            for it in items:
-                tile = item_tile(it)
-                key = (tile, solar_day_of(it)) if tile is not None else None
-                out.append(swap.get(key, it) if key is not None else it)
-            return out
-
-        def _record_unreadable(prepared: _PreparedDate, exc: BaseException, tried: list[str]) -> None:
+        def _record_unreadable(
+            prepared: _PreparedDate,
+            exc: BaseException,
+            tried: list[str],
+            blamed: set[tuple[str, str]] | None,
+            hrefs: list[str],
+        ) -> None:
             """Accept the loss for one date, as loudly as a log can manage.
 
             Every copy of some object in this date failed to read, so its pixels cannot be
@@ -734,18 +728,38 @@ def ingest_s2_roi_reflectance(
             the loss is visible, and the reason it names each copy it tried. The same set is
             re-stated at the end of the run and recorded on the store, because a log line
             alone is lost the moment nobody greps for it.
+
+            ``scope`` on the durable record says how precisely the loss is located.
+            ``attributed`` means the named objects are the ones the loader actually gave up
+            on, so the tiles listed are the tiles that lost pixels. ``whole-date`` means the
+            failing object could not be identified, and the tiles listed are every tile in
+            the date — of which an unknown few lost pixels. Recording which of the two it is
+            matters because the second cannot be acted on the way the first can.
             """
-            tiles = sorted({t for it in prepared.items if (t := item_tile(it)) is not None})
-            unreadable_tile_dates.append({"date": prepared.date, "tiles": ",".join(tiles), "tried": ",".join(tried)})
+            all_tiles = sorted({t for it in prepared.items if (t := item_tile(it)) is not None})
+            attributed = bool(blamed)
+            tiles = sorted({tile for tile, _ in blamed}) if blamed else all_tiles
+            unreadable_tile_dates.append(
+                {
+                    "date": prepared.date,
+                    "tiles": ",".join(tiles),
+                    "tried": ",".join(tried) or copies_label(prepared.items, only=blamed),
+                    "objects": label_objects(hrefs),
+                    "scope": "attributed" if attributed else "whole-date",
+                }
+            )
             log.error(
                 "DATA LOSS roi=%s date=%s: every catalogue copy failed to read, so this date "
-                "is SKIPPED and its pixels are absent from the mosaic. tiles=%s copies_tried=%s "
-                "last_error=%s — the objects are unreadable at the provider, so no retry of "
-                "this run recovers it; re-check the catalogue for a newly reprocessed copy.",
+                "is SKIPPED and its pixels are absent from the mosaic. objects=%s scope=%s "
+                "tiles=%s copies_tried=%s last_error=%s — the objects are unreadable at the "
+                "provider, so no retry of this run recovers it; re-check the catalogue for a "
+                "newly reprocessed copy.",
                 roi_label,
                 prepared.date,
+                label_objects(hrefs),
+                "attributed" if attributed else "whole-date",
                 ",".join(tiles) or "unknown",
-                ",".join(tried) or "1",
+                ",".join(tried) or copies_label(prepared.items, only=blamed),
                 exc,
                 exc_info=True,
             )
@@ -761,12 +775,21 @@ def ingest_s2_roi_reflectance(
             exhausted by this point, so what is left is an object that does not read, and a
             duplicated tile-date has another copy to try. Only when every copy has failed is
             the date given up, and that is recorded rather than swallowed.
+
+            Which copies step down is decided by ASKING THE CLUSTER what it aborted on, since
+            the exception itself names nothing. That collection is destructive and
+            cluster-wide, so a date failing while a concurrent date's read is aborting can
+            drain the other's evidence; the other date then attributes nothing and steps its
+            whole ladder, which is the behaviour it had before attribution existed. That is
+            the right direction for the race to fail — a lost attribution costs precision,
+            while a borrowed one would step down a tile that read.
             """
             nonlocal total_processed, total_filtered
             if prepared.day_ds is None:
                 total_filtered += 1
                 return
-            attempt, tried = prepared, [copies_label(prepared.items)]
+            attempt: _PreparedDate = prepared
+            tried: list[str] = []
             while True:
                 try:
                     _write_date(attempt, stall_s, baselines)
@@ -775,22 +798,33 @@ def ingest_s2_roi_reflectance(
                 except Exception as exc:
                     if not is_unreadable_source(exc):
                         raise
-                    stepped = _step_down_duplicates(attempt.items)
+                    hrefs = collect_aborted_hrefs(client)
+                    blamed = implicated_tile_dates(attempt.items, hrefs) if hrefs else None
+                    stepped = step_down_copies(date_alternates, attempt.items, only=blamed)
                     if stepped is None:
-                        _record_unreadable(attempt, exc, tried)
+                        _record_unreadable(attempt, exc, tried, blamed, hrefs)
                         total_filtered += 1
                         return
-                    tried.append(copies_label(stepped))
+                    stepped_items, swapped = stepped
+                    before = copies_label(attempt.items, only=swapped)
+                    after = copies_label(stepped_items, only=swapped)
+                    if not tried:
+                        tried.append(before)
+                    tried.append(after)
                     log.warning(
-                        "Source read failed roi=%s date=%s with copies=%s — falling back to the "
-                        "next catalogue copy (%s). The preferred copy is the newer reprocessing, "
-                        "so this trades processing baseline for a date that reads.",
+                        "Source read failed roi=%s date=%s on objects=%s — falling back from "
+                        "copies=%s to %s (%d tile-date(s) stepped, attribution=%s). The "
+                        "preferred copy is the newer reprocessing, so this trades processing "
+                        "baseline for a date that reads.",
                         roi_label,
                         attempt.date,
-                        tried[-2],
-                        tried[-1],
+                        label_objects(hrefs),
+                        before,
+                        after,
+                        len(swapped),
+                        "objects" if blamed else "whole-date",
                     )
-                    attempt = _prepare_date(stepped, baselines=baselines)
+                    attempt = _prepare_date(stepped_items, baselines=baselines)
                     if attempt.day_ds is None:
                         # The fallback copy was prepared and skipped on its own merits (it
                         # failed coverage, or reaches no live window). That is a legitimate
@@ -989,7 +1023,7 @@ def ingest_s2_roi_reflectance(
             "reads as a finding rather than as an unexamined window.",
             roi_label,
             len(unreadable_tile_dates),
-            "; ".join(f"{u['date']}[{u['tiles']}]" for u in unreadable_tile_dates),
+            "; ".join(f"{u['date']} objects={u['objects']} scope={u['scope']}" for u in unreadable_tile_dates),
         )
 
     if total_processed == 0:

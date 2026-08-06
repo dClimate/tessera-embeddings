@@ -154,6 +154,7 @@ def log_duplicate_selection(
 def alternates_for(
     alternates: dict[tuple[str, str], list[Any]],
     items: Iterable[Any],
+    only: Iterable[tuple[str, str]] | None = None,
 ) -> dict[tuple[str, str], list[Any]]:
     """The subset of ``alternates`` belonging to the tile-dates present in ``items``.
 
@@ -161,10 +162,21 @@ def alternates_for(
     what identify a source object, and stepping down the wrong one would swap imagery for a
     day that read perfectly well.
 
+    ``only`` narrows further, to the tile-dates a failure was actually ATTRIBUTED to. Without
+    it the answer is every duplicated tile-date in the date, which is what a caller that
+    cannot name the failing object has to step down — on a wide ROI that is most of the date,
+    so one bad object downgrades hundreds of tiles that read fine, and a bad object with no
+    alternate still walks every rung of every other tile's ladder before the date is given
+    up. Pass the attributed keys and both costs disappear. Passing an EMPTY ``only`` is
+    meaningful and distinct from ``None``: it says the failure was attributed to nothing in
+    this date, so there is nothing here to step down.
+
     Exhausted entries are omitted rather than returned empty, so a caller can treat "no
     alternates" and "every alternate already tried" as the one condition they are.
     """
     wanted = {(tile, solar_day_of(it)) for it in items if (tile := item_tile(it)) is not None}
+    if only is not None:
+        wanted &= set(only)
     return {key: copies for key, copies in alternates.items() if key in wanted and copies}
 
 
@@ -206,11 +218,70 @@ def is_unreadable_source(exc: BaseException) -> bool:
     return any(m in text for m in _UNREADABLE_MARKERS)
 
 
-def copies_label(items: Iterable[Any]) -> str:
+def step_down_copies(
+    alternates: dict[tuple[str, str], list[Any]],
+    items: Sequence[Any],
+    only: Iterable[tuple[str, str]] | None = None,
+) -> tuple[list[Any], set[tuple[str, str]]] | None:
+    """Swap tile-dates' copies for their next alternates, or ``None`` if none is left.
+
+    ``alternates`` is CONSUMED: each key it steps loses the copy it hands out, so a caller
+    walking the ladder repeatedly cannot re-offer a copy that already failed. Pass the same
+    dict across a date's whole recovery, and never one shared with a date whose copies must
+    stay untouched.
+
+    ``only`` is the set of tile-dates a failure was ATTRIBUTED to. ``None`` means the failing
+    object could not be identified, and then every duplicated tile-date in ``items`` steps
+    together — the only option available without attribution, and expensive in two ways: on a
+    wide ROI most of the date's tiles carry alternates, so one bad object downgrades hundreds
+    of tiles that read perfectly well, and a bad object with no alternate of its own still
+    walks every rung of every other tile's ladder before the date can be given up. An EMPTY
+    ``only`` returns ``None`` rather than stepping everything: the failure was attributed,
+    and to nothing here.
+
+    Returns the new item list and the keys that were stepped, so a caller can name what
+    changed rather than the whole date.
+    """
+    remaining = alternates_for(alternates, items, only=only)
+    if not remaining:
+        return None
+    swap: dict[tuple[str, str], Any] = {}
+    for key, copies in remaining.items():
+        swap[key] = copies[0]
+        alternates[key] = copies[1:]
+    out: list[Any] = []
+    for item in items:
+        tile = item_tile(item)
+        key = (tile, solar_day_of(item)) if tile is not None else None
+        out.append(swap.get(key, item) if key is not None else item)
+    return out, set(remaining)
+
+
+#: How many tiles a label names before it summarises the rest. A label is read by a human
+#: deciding what happened to one date; a wide ROI's date carries over a thousand tiles, and
+#: naming them all costs tens of kilobytes of log per attempt while telling that reader
+#: nothing they can act on.
+_LABEL_CAP = 12
+
+
+def copies_label(items: Iterable[Any], only: Iterable[tuple[str, str]] | None = None) -> str:
     """A compact record of which copy was used per duplicated tile, for the log.
 
     Sequences rather than full ids: the tile is already named alongside, and what the reader
     needs is which reprocessing was tried, on which attempt.
+
+    ``only`` restricts the label to particular tile-dates — the ones a step-down actually
+    swapped, rather than every tile in the date, which is the difference between a label a
+    reader can use and one they have to diff against the previous attempt to interpret.
     """
-    parts = sorted(f"{tile}#{item_sequence(it)}" for it in items if (tile := item_tile(it)) is not None)
-    return ",".join(parts) or "none"
+    keys = None if only is None else set(only)
+    parts = sorted(
+        f"{tile}#{item_sequence(it)}"
+        for it in items
+        if (tile := item_tile(it)) is not None and (keys is None or (tile, solar_day_of(it)) in keys)
+    )
+    if not parts:
+        return "none"
+    if len(parts) > _LABEL_CAP:
+        return ",".join(parts[:_LABEL_CAP]) + f",+{len(parts) - _LABEL_CAP} more"
+    return ",".join(parts)
