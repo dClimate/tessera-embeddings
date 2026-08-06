@@ -1053,6 +1053,19 @@ class InferenceActor:
             # Captured for the CHUNK_SUMMARY line — mask_bundle and prologue are
             # both deleted before the completion site.
             t_kept = int(mask_bundle.mask.shape[0])
+            # Radar sequence lengths, also for the CHUNK_SUMMARY line, and NOT redundant with
+            # ``t_kept``: that counts OPTICAL timesteps only, since it comes from the S2 SCL
+            # mask. So the token identity built on it (``t_kept x valid_px``) cannot see the two
+            # further sequences a radar-bearing chunk's forward pass encodes — and those are no
+            # rounding error. Measured pairs at equal optical depth put a chunk carrying one
+            # orbit at about 1.3x, and both orbits at about 2.0x, the per-chunk inference time of
+            # a radar-free one. Without these fields that gap is visible only by comparing whole
+            # runs; with them it is a within-run regression over every chunk.
+            #
+            # Zero is a real answer here rather than a missing one: for a radar-free cell it is
+            # every chunk, which is exactly what makes the comparison possible.
+            t_s1_asc = 0
+            t_s1_desc = 0
             rung = prologue.rung or "serial"
             prologue_s = time.monotonic() - t0
             logger.info(
@@ -1193,6 +1206,14 @@ class InferenceActor:
                     # prologue instead.
                     if i + 1 == len(strips) and prefetch_hint is not None and not plan.pair_budget:
                         self._start_chunk_prefetch(prefetch_hint, mosaic_base, window, orbit)
+
+                    # The chunk's radar sequence lengths. Read here because every strip of a
+                    # chunk sees the same ones — SAR is read full-width regardless of the crop —
+                    # so any strip's value is the chunk's, and the last assignment wins. A
+                    # skipped orbit gets an EMPTY array rather than None (see
+                    # ``load_chunk``'s full-width placeholders), so a length is always defined.
+                    t_s1_asc = len(chunk_data.s1_asc_doys)
+                    t_s1_desc = len(chunk_data.s1_desc_doys)
 
                     if x_sub is None:
                         for var in OBS_COUNT_VARS:
@@ -1375,6 +1396,10 @@ class InferenceActor:
                     strip_h=plan.strip_h,
                     strategy=plan.strategy,
                     t_kept=t_kept,
+                    # Optical depth alone does not say how much the forward pass did — see the
+                    # capture site. Additive keys, and every consumer reads by name.
+                    t_s1_asc=t_s1_asc,
+                    t_s1_desc=t_s1_desc,
                     rung=rung,
                     x_crop_w=(x_sub.stop - x_sub.start) if x_sub is not None else None,
                 ),
