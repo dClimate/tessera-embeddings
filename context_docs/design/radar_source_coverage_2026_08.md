@@ -4,9 +4,20 @@ What OPERA RTC-S1 actually publishes over the 112 land zones, how much of the pr
 optical-only as a result, and why the largest part of that is a polarisation decision rather
 than an absence of radar.
 
-The durable artefacts live in S3, not here:
-`s3://global-tessera-inputs-dev/source-coverage/radar_coverage.json` and the same key under
-`s3://global-tessera-inputs/`, each beside a `RADAR_README.md` stating the method and caveats.
+The durable artefacts live in S3, not here, under `source-coverage/` in **both**
+`global-tessera-inputs-dev` and `global-tessera-inputs`, which now hold an identical set:
+
+| key | what it is |
+|---|---|
+| `README.md` | indexes both sensors' surveys and states the one way they differ |
+| `radar_coverage.json` + `RADAR_README.md` | this survey, all nine campaign years |
+| `optical_gaps.json` + `OPTICAL_README.md` | the Sentinel-2 equivalent |
+| `zone_live_mgrs_tiles.json` | which MGRS tiles carry each zone's live land — the input both surveys key off |
+| `mgrs_tile_years.json` | the raw optical tile-year census |
+
+**Files at that level are the current authority; dated directories are snapshots.** The optical
+artefacts previously lived only under a dated prefix, so a cross-reference to them from the radar
+README was broken and a consumer following it would have found nothing.
 This document records how the measurement was taken and what it changed, so the next person
 does not repeat the two ways I got it wrong first.
 
