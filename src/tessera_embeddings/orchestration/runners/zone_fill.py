@@ -137,7 +137,15 @@ def zone_live_tile_count(
 #: `context_docs/design/campaign-cost-model.md`. Radar is a CMR granule census of
 #: OPERA RTC-S1 normalised by cos(lat); optical is a Sentinel-2 STAC census of distinct
 #: acquisition dates weighted by mean clear fraction. The value is `S2 + S1`, which is
-#: the token count per pixel and therefore proportional to inference cost.
+#: the token count per pixel and therefore taken to be proportional to inference cost.
+#:
+#: **That proportionality treats a radar token and an optical token as equally expensive, and
+#: that is an assumption rather than a measurement.** The forward pass encodes optical and radar
+#: as separate sequences, so a chunk carrying radar does work that scales with more than its
+#: token total; whether the per-token cost is the same across the two is unmeasured. If it is
+#: not, this weight under-values a radar-heavy zone relative to a radar-free one, and clusters
+#: balanced on it finish unevenly in that direction. `CHUNK_SUMMARY` now reports the radar
+#: sequence lengths per chunk, which is what would settle it — see the inference profile record.
 #:
 #: The bands are wide and the absolutes carry sampling error (five points per band), but
 #: cluster balancing only needs the RATIOS between bands, which are the robust part —
