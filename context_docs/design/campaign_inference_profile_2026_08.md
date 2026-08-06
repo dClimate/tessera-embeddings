@@ -355,14 +355,28 @@ the picture reverses for the population that matters:
 | **both orbits** | **1.26 M – 1.62 M** | **~98%** |
 
 The planning reference of ≈1.9 M sits ABOVE every both-orbit cell measured and below every
-radar-free one. So on the 98% of land that carries both orbits, the reference looks optimistic by
-roughly 20–35% rather than conservative.
+radar-free one. All of these figures — the reference included — are **optical** tokens per second,
+since they all come from `t_kept × valid_px`.
 
-**So re-basing the $503–579 k line is now a live question, and this document cannot settle it.**
-What is needed is narrow and specific: **establish the radar status of P2's three rate sites** (see
-`inference-perf-run-ledger.md`, which records that they were chosen to bracket the token range and
-explicitly NOT to be dual-orbit) and re-derive the reference from the both-orbit subset. Until that
-is done, treat ≈1.9 M as measured on an unknown mixture rather than as a floor.
+**Re-basing the $503–579 k line is now a live question, and this document cannot settle it, in
+either direction.** The exposure turned out to be a UNIT mismatch rather than a rate shortfall, and
+the two point opposite ways:
+
+- The cost model's numerator, the token census, counts **S2 + S1** — 52 optical plus 91 radar
+  observations per pixel. Its denominator, this rate, counts **optical only**. Dividing the first by
+  the second buys more GPU-seconds than the work needs, which makes the line *conservative* on that
+  axis.
+- But the rate itself was measured at sites carrying at most one orbit, and both-orbit chunks are
+  slower per optical token, which cuts the other way.
+
+Neither term is pinned, so **no direction is claimed here.** An earlier version of this section said
+the reference "looks optimistic by roughly 20–35%"; that is withdrawn as unsupported — it netted one
+term against nothing. The full accounting, including a third term (the censused optical figure of 52
+against a measured 69.9), is in `campaign-cost-model.md` beside the census table.
+
+**What settles it is one run.** With `t_s1_asc` and `t_s1_desc` on `CHUNK_SUMMARY` from 2026-08-06,
+a single both-orbit cell yields the radar term per chunk, hence the true S2+S1 token count and a
+rate in the SAME unit as the census. Then the division is like-for-like.
 
 **One caution against over-correcting.** The 20–35% above compares whole-cell medians across
 different zones, which is exactly the kind of comparison that has been wrong three times in this

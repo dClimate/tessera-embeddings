@@ -575,29 +575,42 @@ Net, the campaign is **1.07× Iowa's tokens per pixel**, so at equal tok/sec it 
 its px/s. That ratio is now bookkeeping rather than an assumption — it exists only to reuse
 historical px/s measurements.
 
-> **2026-08-06 — the 1.07× correction is the SMALLER half of the Iowa problem, and the larger
-> half is not priced here.** Point 1 above assumed that being single-orbit changes Iowa's tokens
-> per pixel and nothing else, so a token ratio fixes it *at equal tok/sec*. Measurement says
-> tok/sec is not equal. `t_kept` counts optical timesteps only, so a radar-bearing chunk's forward
-> pass encodes sequences the token identity cannot see, and at equal optical depth that costs
-> about **1.3× (one orbit) to 2.0× (both orbits)** the per-chunk inference time. Stratified:
-> radar-free cells measure **2.26–2.93 M tok/s per actor**, one-orbit **1.60 M**, both-orbit
-> **1.26–1.62 M**. **This model's ≈1.9 M reference sits above every both-orbit cell measured**,
-> and both orbits is about **98% of campaign land** (see
-> `radar_source_coverage_2026_08.md`). So the inference line here is plausibly optimistic by
-> something like 20–35%, on top of the 1.07× already applied.
+> **2026-08-06 — THE RATE AND THE CENSUS USE DIFFERENT TOKEN DEFINITIONS, and that sits in this
+> model's central division.** The census above counts **S2 + S1**: 52 optical plus 91 radar
+> observations per pixel, land-weighted. The rate is measured as `t_kept × valid_px ÷ seconds`, and
+> **`t_kept` is the S2 SCL mask's first dimension — optical timesteps ONLY.** So
+> `GPU-hours = total tokens ÷ tok/sec` divides an S2+S1 numerator by an optical-only denominator.
 >
-> **The line is NOT re-based on this note**, deliberately. The figures above compare whole-cell
-> medians across different zones, which is the comparison that has been wrong three times in
-> `campaign_inference_profile_2026_08.md`. What would justify moving it is narrow: establish the
-> radar status of the three sites the ≈1.9 M reference was measured at — the perf ledger records
-> they were chosen to bracket the token range and explicitly *not* to be dual-orbit — and
-> re-derive from the both-orbit subset. `CHUNK_SUMMARY` gained `t_s1_asc` / `t_s1_desc` on
-> 2026-08-06 so that this becomes a within-run regression over thousands of chunks rather than a
-> four-run comparison.
+> **This model states the equality that hides it.** §6 says `t_kept × valid_px` "*is* the
+> observations-per-pixel term in `tokens = pixels × (T_s2 + T_s1)`", on the strength of it
+> reproducing the measured token *rate* to within 9%. That 9% is an instrument self-check — the
+> same optical quantity computed two ways — not evidence that an optical count equals an S2+S1
+> concept. Radar is 91 of the census's 143 tokens, so if `t_kept` did include radar the two would
+> not agree to 9%; they agree *because* both sides are optical.
 >
-> **Until then, read ≈1.9 M as measured on an unknown mixture, not as a floor**, and treat the
-> uncertainty budget in §9 as missing a radar-rate term.
+> **THE DIRECTION OF THE RESULTING ERROR IS NOT DETERMINED BY WHAT HAS BEEN MEASURED**, and an
+> earlier version of this note claimed it was (it said "plausibly optimistic by 20–35%"). Withdrawn.
+> Three terms push different ways and none is pinned:
+>
+> 1. **The unit mismatch pushes the estimate HIGH.** Dividing S2+S1 tokens by an optical-token rate
+>    buys more GPU-seconds than the work needs, so on this axis alone the line is conservative.
+> 2. **Iowa's single-orbit provenance pushes it LOW.** Radar-bearing chunks are slower per optical
+>    token — measured pairs put one orbit at about 1.3× and both at about 2.0× the per-chunk
+>    inference time at equal optical depth — and about 98% of campaign land carries both orbits
+>    (`radar_source_coverage_2026_08.md`). Every rate we hold comes from at most one orbit.
+> 3. **The censused OPTICAL term looks LOW.** Measured `t_kept` across P2's sites averages 69.9
+>    against the census's optical 52. §6 sets that 69.9 against the *total* 145 and concludes the
+>    census is not 2× high; the comparison it should have made is 69.9 against 52.
+>
+> **So §6's four sampling reasons for not trusting a 69.9-versus-145 gap are joined by a fifth,
+> which is arithmetic rather than statistical: the two numbers are in different units.**
+>
+> **The line is NOT re-based here, and should not be re-based on this note.** What settles it is
+> narrow and now cheap: `CHUNK_SUMMARY` gained `t_s1_asc` and `t_s1_desc` on 2026-08-06, so one
+> both-orbit cell run under that code yields the radar term per chunk, the true S2+S1 token count,
+> and a rate in the same unit as the census. Then the division is like-for-like and all three terms
+> above resolve at once. Until then, treat the inference line as carrying an unquantified
+> two-sided error and the §9 uncertainty budget as missing a radar term.
 
 | | px/s equivalent | GPU-hours | cost |
 |---|---|---|---|
