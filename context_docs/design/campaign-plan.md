@@ -396,6 +396,57 @@ never averaged away.
 
 ---
 
+## 9b. Findings since 2026-08-05 that change how the campaign is run
+
+Added 2026-08-06 from the pre-campaign test programme. Only what alters an operational decision or
+retires an open question; the figures live in the documents named.
+
+**Radar costs about twice as much per chunk as optical, and the token metric cannot see it.**
+`t_kept` is the Sentinel-2 mask's first dimension — optical timesteps only — so `tokens = t_kept ×
+valid_px` measures optical work and misses the radar sequences the forward pass also encodes.
+Measured on completed cells: radar-free 2.26–2.93 M tok/s per actor, one orbit 1.60–1.79 M, both
+orbits 1.23–1.62 M, the last anchored on a 9,051-chunk cell. **The ≈1.9 M planning reference sits
+above the entire both-orbit range.** Consequence for operations: a throughput or cost figure is
+comparable only within one radar status, and `inference_profile.py` now prints its radar basis.
+Details and the unresolved budget question: `campaign_inference_profile_2026_08.md` and
+`campaign-cost-model.md`.
+
+**The cost model's central division mixes two token units, and it is not yet resolved.** The census
+numerator counts S2 + S1; the measured rate denominator counts optical only. Three terms push in
+different directions and none is pinned, so **the inference line is not re-based** — but it carries
+an unquantified two-sided error until one both-orbit cell is measured under the per-chunk radar
+fields added to `CHUNK_SUMMARY` on 2026-08-06. **That measurement is a launch prerequisite**, not an
+optimisation: it is the only thing that makes the fleet-sizing arithmetic like-for-like.
+
+**Never read observation depth, tokens, throughput or cost per chunk off a run still in flight.** A
+run sweeps its zone north to south while depth falls with latitude, so a partial run has measured
+only its deepest part. Zone 38N read `t_kept` 121 at one third complete and **73** at completion.
+The bias is one-directional and predictable, not noise. Duty cycle is the exception and rises
+legitimately as actor start-up amortises.
+
+**Greenland and Arctic Canada ship optical-only, and that is now a settled decision** (2026-08-06).
+They are not short of radar: zones 23N and 24N publish tens of thousands of **HH/HV** granules and
+effectively no VV+VH, so the ingest declines them on polarisation. This is distinct from the
+Sentinel-1B gap in §8 and adds ~208 live tiles of deliberately optical-only land. Not EW mode — those
+granules report `BEAM_MODE=IW`. If ever revisited it is a model question, not an ingest one.
+
+**The duty-cycle question is answered: ≥97.3%** on 38N-2021 at 60 actors over 9,051 chunks, $1,600,
+nothing stalled in 14.7 hours. Fleet-feeding is not a risk to plan around.
+
+**`overlap_years` is cleared for campaign use** — all five multi-year checks passed, with the
+per-cell-window one evidenced from the store. One caveat: both zones it ran on were radar-free, so
+the radar half of the per-cell window is still unevidenced.
+
+**Prod is further from ready than its deployment list suggests** (checked 2026-08-06). It has the
+model and the code tarball, but **no coverage mask, no ROI stores and no seeded global store**, so it
+cannot run a fill or even an ingest. Four Ray flows — `tessera-embeddings`, `fill-zone-year`,
+`fill-zones-sequential`, `run-global-campaign` — fail to register for `--env prod` because the baked
+AMI sits at `/global-tessera-prod/ray/ami-id-global-tessera` while an unsuffixed prod registration
+looks for `ami-id-prod`; pass `--ami-ssm-name` or bake a prod AMI. The sweep deployment carries **no
+concurrency limit** on prod (dev has 2 with `CANCEL_NEW`), and prod's Prefect server is **0.5 vCPU**,
+the size that dropped orchestrator events on dev before it was raised to 4. **Treat the server
+resize as a prerequisite for arming the heartbeat-crash automation there.**
+
 ## 10. Evidence
 
 - [`campaign-cost-model.md`](campaign-cost-model.md) — costs, GPU fleet sizing, the idle-burn
