@@ -80,6 +80,45 @@ where zones crossed from screened to probed — not at anything the provider did
 a zone in every requested year if it is unsettled in any of them, and prints the per-year method mix
 so the asymmetry cannot recur silently.
 
+## The nine-year picture, with the method artefact accounted for exactly
+
+`both_orbits` holds **95.8% to 98.6%** of live tiles in every year from 2017 to 2025, so the
+headline is a property of the whole span. Radar does not appear partway through the campaign
+window: all four verdict classes already exist in 2017.
+
+**How much of the year-on-year comparison the method artefact actually spoils: 8 zones of 112,
+holding 770 of 24,202 live tiles — 3.2%.** Those eight had some years screened and others probed.
+The other 104 zones were answered by ONE method across all nine years, so their comparison is
+valid as it stands. The eight are 22S, 23S, 24S, 02N, 57S, 25S, 26S and 31S, and a
+method-consistent re-probe of them was in flight when this was written.
+
+### The real reversals, from the 104 method-consistent zones
+
+**One finding is robust and it is the one that matters: 05S and 06S both have exactly zero
+descending granules in 2022**, between years holding 250 to 1,300.
+
+| zone | descending VV granules, 2017 → 2025 |
+|---|---|
+| 05S (10 live tiles) | 252, 270, 279, 270, 261, **0**, 786, 1552, 1799 |
+| 06S (24 live tiles) | 1176, 1260, 1302, 1260, 1218, **0**, 723, 1546, 2403 |
+
+Two independent zones, the same year, both per-tile probed on both sides of the hole. **So radar
+coverage is not monotone in time**, and the safety property this record previously claimed — that a
+stale copy can never wrongly call a zone covered — does not hold for radar. It holds for optical.
+
+**The rest are orbit SWITCHES, not losses.** Zones 42S and 43S publish ascending early (56 and 50
+granules in 2019) and descending later (rising to 2,913 and 372 by 2025), with the two never
+overlapping. A reader watching only one orbit would read that as a loss.
+
+### A limitation of the twelve-granule floor, worth stating rather than fixing blind
+
+The floor is per ZONE, and a zone's tile count varies from 1 to 556. Zone 23N reads `single_orbit`
+for 2019 alone on **48** granules spread over **6 of its 116 live tiles** — above the floor, and
+still nothing like an orbit. The defensible unit is granules per live tile, and the sweep already
+records how many live tiles each orbit reaches, so the fix is available. It is not applied here
+because changing the floor changes every verdict, and that wants doing once, deliberately, rather
+than as a side effect of writing this section.
+
 ## The finding that actually changes something
 
 **Three quarters of the "radar-free" land is radar we decline.** Zones 23N and 24N — Greenland
