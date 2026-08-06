@@ -102,13 +102,28 @@ below), so every row is the cell's whole population rather than whatever fitted 
 | 47S-2022 + 02N-2022 (aggregate) | 102 (55–149, 45–189) | 0.168 | 422 |
 | 59S-2021 | 118 (61–128, 4–135) | 0.179 | 562 / 577 |
 | 59S-2022 | 119 (61–132, 38–137) | 0.156 | 486 / 577 |
-| 38N-2021 *(in flight)* | 121 (65–160, 50–206) | 0.171 | 3,242 / 9,100 |
-| 53N-2021 *(in flight)* | 128 (67–173, 54–220) | 0.158 | 2,887 / 3,269 |
+| 38N-2021 | **73** (69–145, 50–206) | 0.177 | 9,051 / 9,100 |
+| 53N-2021 | 127 (64–171, 54–220) | 0.158 | 3,189 / 3,269 |
 | 03N-2021 | 143 (102–175, 92–198) | 0.194 | 612 / 614 |
 | 06N-2021 | 151 (109–188, 97–202) | 0.202 | 857 / 856 |
 | **23N-2021** | **158 (121–181, 29–204)** | 0.183 | 1,395 / 1,402 |
 
 **The observed range is now 57 to 158**, on about 15,000 measured chunks across eighteen zones.
+
+**Every row above is a COMPLETED cell, and that is now a stated requirement rather than a
+preference.** Two rows previously carried in-flight figures and both were wrong: 38N-2021 read
+`t_kept` **121** at one third complete and **73** at completion — a 40% overstatement — and its
+$/chunk moved 0.171 → 0.177.
+
+The cause is not sampling noise. A run sweeps its zone **north to south**, and observation depth
+falls with latitude, so a partial run has measured only its deepest part. Splitting 38N's 9,051
+chunks into time-ordered fifths shows the median chunk row index climbing 146 → 229 → 295 → 354 →
+419 while median `t_kept` falls 124 → 116 → 73 → 73 → 72. **An in-flight median is therefore biased
+high by construction, predictably and in one direction.**
+
+That is also the mechanism behind corrections 1 and 2 below, which observed the effect (03N 176 →
+143, 06N 181 → 151) without identifying why. **Never quote depth, tokens, throughput or cost per
+chunk from a run still in flight.**
 
 **Two claims elsewhere in this document no longer hold as written.**
 
