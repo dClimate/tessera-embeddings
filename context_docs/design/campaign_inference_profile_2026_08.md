@@ -325,19 +325,50 @@ calculation, and it needs the radar sequence length per cell, which this telemet
 timestep count alongside `t_kept`. With it, the effect above becomes a within-run regression over
 thousands of chunks instead of a between-run comparison over four.
 
-### What survives all three corrections
+### What survives all three corrections — and what the radar finding takes back
 
-**Throughput per actor rises with `t_kept`** — 1.25 M at 60 against 1.57 M at 151 — because a
-token-poor chunk is dominated by fixed per-chunk overhead while a token-rich one amortises it. The
-reference ≈1.9 M is approached on the deepest zones. So the earlier "the rate is 1.39× short" was
-also a composition artefact, and **nothing measured is slower than the model assumes.**
+**This section contradicted the radar section above until 2026-08-06, and the contradiction was
+mine.** It restated "cost per chunk tracks `t_kept`, $0.115–$0.211" as a surviving conclusion two
+sections after the radar finding showed that range mixes two populations, and then used the
+restatement to rule out re-basing the budget. Retained below with the retraction attached, because
+the mistake is the interesting part: I wrote the warning and then left the sentence it invalidates
+standing in the same file.
 
-**Cost per chunk is NOT stable across zones** — $0.115 to $0.211, tracking `t_kept`. The cost model
-is right to price in tokens rather than chunks.
+**Still stands: the cost model is right to price in tokens rather than chunks.** A fixed
+per-chunk price cannot describe a 2× spread whatever causes it.
 
-**No re-basing of the $503–579 k line is warranted on this evidence.** 145 remains the planning
-figure. It now looks high rather than low relative to what has been measured, but every measured
-zone is in the half of the world with less land.
+**Still stands: `t_kept` 145 remains a defensible planning figure for observation depth.** It is
+inside the observed 57–158 range rather than above it, which is a change from what this document
+said earlier but not a reason to move it.
+
+**WITHDRAWN: "cost per chunk tracks `t_kept`."** The deepest cell measured (23N-2021, `t_kept` 158)
+is among the cheapest ($0.113) because it is radar-free. Depth and radar status are confounded
+across the measured set, and this document previously read the combination as depth alone.
+
+**WITHDRAWN: "nothing measured is slower than the model assumes."** Stratified by radar status,
+the picture reverses for the population that matters:
+
+| population | tok/s per actor, busy | share of campaign land (2025) |
+|---|---:|---:|
+| radar-free | 2.26 M – 2.93 M | ~1.2% |
+| one orbit | 1.60 M | ~0.7% |
+| **both orbits** | **1.26 M – 1.62 M** | **~98%** |
+
+The planning reference of ≈1.9 M sits ABOVE every both-orbit cell measured and below every
+radar-free one. So on the 98% of land that carries both orbits, the reference looks optimistic by
+roughly 20–35% rather than conservative.
+
+**So re-basing the $503–579 k line is now a live question, and this document cannot settle it.**
+What is needed is narrow and specific: **establish the radar status of P2's three rate sites** (see
+`inference-perf-run-ledger.md`, which records that they were chosen to bracket the token range and
+explicitly NOT to be dual-orbit) and re-derive the reference from the both-orbit subset. Until that
+is done, treat ≈1.9 M as measured on an unknown mixture rather than as a floor.
+
+**One caution against over-correcting.** The 20–35% above compares whole-cell medians across
+different zones, which is exactly the kind of comparison that has been wrong three times in this
+document already. The `t_s1_asc` / `t_s1_desc` fields added to `CHUNK_SUMMARY` on 2026-08-06 turn
+it into a within-run regression over thousands of chunks; the honest sequence is to deploy those,
+re-measure one both-orbit cell, and only then move a budget line.
 
 ## An independent cross-check of the inference line, from the coverage mask
 
