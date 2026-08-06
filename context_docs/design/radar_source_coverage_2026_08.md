@@ -92,23 +92,44 @@ The other 104 zones were answered by ONE method across all nine years, so their 
 valid as it stands. The eight are 22S, 23S, 24S, 02N, 57S, 25S, 26S and 31S, and a
 method-consistent re-probe of them was in flight when this was written.
 
-### The real reversals, from the 104 method-consistent zones
+### The real reversals — measured per live tile across all nine years
 
-**One finding is robust and it is the one that matters: 05S and 06S both have exactly zero
-descending granules in 2022**, between years holding 250 to 1,300.
+**Correction, and this is the second one on this question.** An earlier version of this section said
+the reversals were "mostly the method" and named 05S and 06S as the only robust case. **That was
+wrong.** Re-probing the ten disputed zones per live tile for all nine years — one method in every
+cell — shows the reversals are real, and the two largest are far bigger than the pair I highlighted.
 
-| zone | descending VV granules, 2017 → 2025 |
-|---|---|
-| 05S (10 live tiles) | 252, 270, 279, 270, 261, **0**, 786, 1552, 1799 |
-| 06S (24 live tiles) | 1176, 1260, 1302, 1260, 1218, **0**, 723, 1546, 2403 |
+| zone | orbit | granules per year, 2017 → 2025 |
+|---|---|---|
+| **57S** (35 tiles) | ascending | 11544, 10846, 11563, 10390, 10441, **0, 0, 0**, 6885 |
+| **02N** (44 tiles) | ascending | 9019, 6997, 8905, 9987, 10388, **0, 0, 0**, 11025 |
+| 02N | descending | 25692, 26937, 27676, 27511, 27358, 24433, 26893, 25620, 25512 |
+| 05S (10 tiles) | descending | 252, 270, 279, 270, 261, **0**, 786, 1552, 1799 |
+| 06S (24 tiles) | descending | 1176, 1260, 1302, 1260, 1218, **0**, 723, 1546, 2403 |
+| 31S (3 tiles) | descending | 546, 1131, 503, **0 from 2020 onward** |
 
-Two independent zones, the same year, both per-tile probed on both sides of the hole. **So radar
-coverage is not monotone in time**, and the safety property this record previously claimed — that a
-stale copy can never wrongly call a zone covered — does not hold for radar. It holds for optical.
+**Two unrelated zones lose an entire orbit for exactly 2022, 2023 and 2024 and regain it in 2025.**
+57S is the south-west Pacific and 02N the mid-Pacific; 02N's descending orbit continues unbroken at
+about 26,000 granules a year straight through the gap, so this is not an outage of the sensor or of
+the zone. The extent is identical in both.
 
-**The rest are orbit SWITCHES, not losses.** Zones 42S and 43S publish ascending early (56 and 50
-granules in 2019) and descending later (rising to 2,913 and 372 by 2025), with the two never
-overlapping. A reader watching only one orbit would read that as a loss.
+**What the method artefact actually corrupted was the LABELS, not the reversals.** The screen called
+57S `both_orbits` for 2017–2021; the probe calls it `single_orbit`. Both agree radar was present, and
+both agree 2022–2024 is zero. So the collapse was always there — my first pass over-stated its
+before-state, and my correction then over-corrected into denying it. Stating the distinction because
+it is the reusable part: **a method inconsistency can misdescribe a change without inventing it.**
+
+The remaining movement is orbit SWITCHING rather than loss. 42S and 43S publish ascending early (56
+and 50 granules in 2019) and descending later (2,913 and 372 by 2025), never overlapping.
+
+**Operationally, this is the part to carry:** a cell in 57S or 02N for **2022, 2023 or 2024** gets
+materially less radar than the same zone in 2021 or 2025. That is not a defect in our pipeline to
+chase — it is what the archive holds — and it explains why the 57S-2022 fill resolved to radar-free
+and recorded 100% of its pixels as having no radar. It behaved correctly on data that genuinely was
+not there.
+
+Three zones — 22S, 23S and 24S, 661 live tiles — still hold a mix of screened and probed years and
+were not re-probed. Their year-on-year behaviour is unmeasured; each of their cells says so.
 
 ### A limitation of the twelve-granule floor, worth stating rather than fixing blind
 
