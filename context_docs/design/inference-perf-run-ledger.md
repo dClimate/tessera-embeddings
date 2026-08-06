@@ -137,6 +137,23 @@ already validated radar-free output, which is what let the rung shrink from six 
 | Iowa — the continuity anchor | `iowa` (existing) | EPSG:5070 | 144,700 km² |
 | humid tropics (Amazon) | `p2_amazon` | EPSG:32721 | 96,500 km² |
 
+> **2026-08-06 — READ THE UNIT BEFORE REUSING THIS RATE.** The `tok/sec` below is computed from
+> `t_kept`, which is the Sentinel-2 cloud mask's first dimension — **optical timesteps only.** It is
+> therefore *optical* tokens per second. The campaign token census that this rate is divided into
+> counts **S2 + S1**, so the two are not in the same unit, and the cost model's central division is
+> not like-for-like. See the note beside the census table in `campaign-cost-model.md`.
+>
+> Compounding it: the sentence above says these sites were chosen to bracket the token range
+> **rather than to be dual-orbit**, so this rate's radar composition was never established. Later
+> per-cell measurement puts radar-free cells at 2.26–2.93 M optical tok/s and both-orbit cells at
+> 1.26–1.62 M, with about 98% of campaign land carrying both orbits
+> (`radar_source_coverage_2026_08.md`). **1.90–1.93 M sits above every both-orbit cell measured.**
+>
+> No correction is applied here and no direction is claimed — three terms push different ways and
+> none is pinned (see the cost model). What settles it is one both-orbit cell run with the
+> `t_s1_asc` / `t_s1_desc` fields added to `CHUNK_SUMMARY` on 2026-08-06, which yields the radar
+> term per chunk and hence a rate in the census's own unit.
+
 Aggregated over twelve `g6e.xlarge` actors, from the `tok/sec` line each sub-batch emits:
 
 | | mean | range |
