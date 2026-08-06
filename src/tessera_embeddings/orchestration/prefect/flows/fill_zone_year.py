@@ -221,10 +221,8 @@ def fill_zone_year_flow(
         cleanup_staging: Delete staged tiles after a successful fill. Pass False to keep them,
             which is what makes an assembly measurement repeatable against identical input.
         n_assembly_workers: Override the assembly process-pool size for THIS run; ``None`` uses
-            ``AssemblyConfig``'s sizing. Exposed because the pool size is the assembly's binding
-            constraint and was previously reachable only by editing config and redeploying — and
-            because the deployment's stored schema already advertised this name, so a dispatch
-            passing it was accepted and then crashed on a signature mismatch 78 seconds in.
+            ``AssemblyConfig``'s sizing. The pool size, not the runner's instance type, is what
+            bounds assembly throughput, so it belongs to the run rather than to the deployment.
         allow_partial_window: Relax the pre-Ray temporal-coverage gate to
             "non-empty" (default requires the mosaic's months to span the window).
         allow_model_mismatch: Fill even when the seeded store advertises a

@@ -24,9 +24,11 @@ worker body.
 
 from __future__ import annotations
 
+import logging
 import multiprocessing
+import time
 from collections.abc import Callable, Iterable
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
@@ -38,6 +40,15 @@ import zarr
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage.zarr_store import read_time_values
 from tessera_embeddings.storage.zone_grid import year_of
+
+_log = logging.getLogger(__name__)
+
+#: How often :func:`run_forked` states how many band writes are still outstanding.
+#: A forked write emits nothing between its start and its finish, so without a
+#: periodic line a healthy long write and a hung one are indistinguishable in the
+#: log — and the operator's only recourse is to guess. Set far enough apart to stay
+#: quiet for short writes and close enough to bound how long a stall hides.
+PROGRESS_INTERVAL_S = 300.0
 
 #: Any context manager works as a commit gate (``threading.Semaphore`` is the
 #: canonical in-process one — acquire on enter, release on exit).
@@ -95,10 +106,35 @@ def shard_pitch(arr: zarr.Array) -> int:
     return (arr.shards or arr.chunks)[1]
 
 
+def _await_forks(futures: list[Future], progress_interval_s: float) -> list[Any]:
+    """Collect ``futures`` in submission order, logging what is still outstanding.
+
+    Returns results positionally rather than by completion order, because a fork's
+    position is its band and :meth:`icechunk.Session.merge` is given them as the
+    caller's payloads were ordered. Re-raises the first failure in that same order,
+    matching what ``Executor.map`` would have done.
+    """
+    started = time.monotonic()
+    pending: set[Future] = set(futures)
+    while pending:
+        _, pending = wait(pending, timeout=progress_interval_s, return_when=FIRST_COMPLETED)
+        if pending:
+            _log.info(
+                "Assembly progress: %d/%d band writes done, %d outstanding after %.0f min",
+                len(futures) - len(pending),
+                len(futures),
+                len(pending),
+                (time.monotonic() - started) / 60.0,
+            )
+    return [future.result() for future in futures]
+
+
 def run_forked(
     session: icechunk.Session,
     worker_fn: Callable[[dict[str, Any]], Any],
     payloads: list[dict[str, Any]],
+    *,
+    progress_interval_s: float = PROGRESS_INTERVAL_S,
 ) -> None:
     """Fork ``session``, run ``worker_fn`` over ``payloads``, merge the forks back.
 
@@ -108,6 +144,13 @@ def run_forked(
     fork and returns it, and the coordinator merges. One payload
     runs in-process; more spawn a process pool (``spawn`` context — workers must
     be module-level functions and payloads picklable).
+
+    Every payload gets its own process, so the pool never queues and the whole
+    write is as long as its slowest band. That is why progress is reported on a
+    TIMER rather than per completion: waiting on completions alone would say
+    nothing until the first band landed, which on a dense zone is the bulk of the
+    write. ``progress_interval_s`` is the reporting period; a single payload runs
+    in-process and reports nothing, having no concurrency to describe.
     """
     fork = session.fork()
     # Copies, not mutation: callers keep their payload dicts fork-free.
@@ -117,7 +160,8 @@ def run_forked(
     else:
         ctx = multiprocessing.get_context("spawn")
         with ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx) as ex:
-            forks = list(ex.map(worker_fn, payloads))
+            futures = [ex.submit(worker_fn, payload) for payload in payloads]
+            forks = _await_forks(futures, progress_interval_s)
     session.merge(*forks)
 
 

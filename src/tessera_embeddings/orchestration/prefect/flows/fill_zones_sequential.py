@@ -475,6 +475,7 @@ def fill_zones_sequential_flow(
     s3_region: str | None = None,
     commit_limit_name: str | None = None,
     cleanup_staging: bool = True,
+    n_assembly_workers: int | None = None,
     allow_partial_window: bool = False,
     allow_s2_only: bool = False,
     allow_model_mismatch: bool = False,
@@ -537,6 +538,10 @@ def fill_zones_sequential_flow(
         commit_limit_name: Prefect global concurrency limit bounding fleet-wide
             simultaneous committers (D6). ``None`` = ungated.
         cleanup_staging: Delete each cell's staged tiles after it lands.
+        n_assembly_workers: Override the assembly process-pool size for every cell in this
+            run; ``None`` uses ``AssemblyConfig``'s sizing. Applies per cell, not per run —
+            assemblies here run one at a time on the trailing thread, so each gets the whole
+            pool rather than a share of it.
         allow_partial_window: Relax each cell's temporal-coverage gate to
             "non-empty".
         allow_s2_only: Embed S2-valid pixels with ZERO S1 observations (sub-zone
@@ -952,6 +957,7 @@ def fill_zones_sequential_flow(
             gate=gate,
             s3_concurrency=s3_concurrency,
             cleanup_staging=cleanup_staging,
+            n_assembly_workers=n_assembly_workers,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
         )

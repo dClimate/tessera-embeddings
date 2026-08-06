@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+from concurrent.futures import Future
 
 import numpy as np
+import pytest
 import zarr
 
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import global_store, zarr_store
 from tessera_embeddings.storage.shard_writer import (
+    _await_forks,
     commit_with_rebase,
     write_year_shards,
 )
@@ -106,3 +110,55 @@ def test_write_year_shards_behind_gate(tmp_path):
         repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, gate=gate, shard_px=_SHARD
     )
     assert isinstance(sid, str) and sid
+
+
+class TestForkProgressReporting:
+    """A forked write reports what is outstanding, on a timer, without reordering forks.
+
+    Exercises :func:`_await_forks` against plain futures rather than a real process
+    pool: the behaviour under test is the coordinator's waiting policy, and driving it
+    with resolvable futures makes the timing deterministic instead of dependent on how
+    fast a spawned interpreter starts.
+    """
+
+    @staticmethod
+    def _resolved(value):
+        future: Future = Future()
+        future.set_result(value)
+        return future
+
+    @staticmethod
+    def _progress_lines(caplog):
+        return [r.getMessage() for r in caplog.records if "Assembly progress" in r.getMessage()]
+
+    def test_results_follow_submission_order_not_completion_order(self):
+        # The slow fork is submitted FIRST but finishes LAST; merge order must still be
+        # the caller's band order, so a completion-ordered collect would fail here.
+        slow: Future = Future()
+        quick = self._resolved("second")
+        threading.Timer(0.05, lambda: slow.set_result("first")).start()
+        assert _await_forks([slow, quick], 10.0) == ["first", "second"]
+
+    def test_progress_is_reported_on_a_timer_not_only_on_completions(self, caplog):
+        # ONE outstanding fork, so there is no completion to report until the very end.
+        # Per-completion reporting would leave this silent — which is the failure mode
+        # the timer exists to remove.
+        outstanding: Future = Future()
+        threading.Timer(0.15, lambda: outstanding.set_result("done")).start()
+        with caplog.at_level(logging.INFO, logger="tessera_embeddings.storage.shard_writer"):
+            assert _await_forks([outstanding], 0.01) == ["done"]
+        lines = self._progress_lines(caplog)
+        assert len(lines) >= 2, f"a single long band reported {len(lines)} progress line(s)"
+        assert "1 outstanding" in lines[0]
+
+    def test_nothing_outstanding_reports_nothing(self, caplog):
+        with caplog.at_level(logging.INFO, logger="tessera_embeddings.storage.shard_writer"):
+            assert _await_forks([self._resolved(1), self._resolved(2)], 0.01) == [1, 2]
+        assert self._progress_lines(caplog) == []
+
+    def test_a_failed_fork_still_raises(self):
+        # Waiting must not swallow a band failure into a partial merge.
+        failed: Future = Future()
+        failed.set_exception(RuntimeError("band 0 failed"))
+        with pytest.raises(RuntimeError, match="band 0 failed"):
+            _await_forks([failed, self._resolved("ok")], 10.0)
