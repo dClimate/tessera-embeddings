@@ -370,6 +370,56 @@ calculation, and it needs the radar sequence length per cell, which this telemet
 timestep count alongside `t_kept`. With it, the effect above becomes a within-run regression over
 thousands of chunks instead of a between-run comparison over four.
 
+### Assembly: the box is half idle and the worker cap is the constraint
+
+Measured 2026-08-06 on 38N-2021's assembly — 9,050 staged tiles, the largest attempted.
+
+**Assembly is not a fleet.** It runs in-process on the flow runner, which forks `n_workers`
+processes that each hold one staged tile slice. The runner is the `inference` family:
+**16 vCPU / 64 GiB Fargate**.
+
+| measurement | value | against |
+|---|---|---|
+| write rate | **248 objects/min, flat for 160 min** (2,333–2,825 per 10-min bucket, no trend) | — |
+| CPU used | avg 2,403 units, **max 7,443** (≈7.3 vCPU) | **16,384 allocated** |
+| memory used | avg 3.0 GB, **max 20.2 GB** | **64 GiB allocated** |
+| aggregate S3 concurrency | ~4.1 PUT/s | **budget 100** |
+| `n_workers` chosen | **8** | `AssemblyConfig.max_workers = 8` |
+
+**The binding constraint is the worker cap, not the box.** `compute_n_workers` is
+`min(live_tiles / 10, max_workers)`, and `max_workers` is **8** — so a **9,050-tile zone gets the
+same 8 processes as a 267-tile zone.** Parallelism does not scale with the job, which is why a dense
+cell's assembly runs for hours.
+
+Every resource signal agrees: at most **45% of allocated vCPU** and **31% of memory**, with a
+perfectly flat rate — no degradation, no backpressure, no thrashing. A flat rate at half the CPU is
+the signature of a fixed worker count, not of a resource limit.
+
+**So: raise `max_workers` before touching the task size.** The 16 vCPU / 64 GiB box was *explicitly*
+sized for this — `consumer_stack.py` says "16 vCPU / 64 GiB leaves headroom for n_workers=16
+(~19 GiB)". At 16 workers, expect CPU near 90% of the box and memory near 38 GB, both inside it, and
+roughly half the wall clock.
+
+**Do NOT adopt `assembly_large` (32 vCPU / 244 GiB) yet.** It is registered and unused, and its own
+comment says to adopt it only once a measurement shows 16 vCPU is insufficient. **We are not using
+half of the 16 we have.** It becomes the next step only after `max_workers=16` saturates the current
+box.
+
+**One thing that could defeat the raise, and why it probably will not.** The per-fork S3 request cap
+is `TARGET_AGGREGATE_S3_CONCURRENCY // n_workers`, so aggregate PUT concurrency stays at 100 whatever
+the worker count — if the assembly were S3-concurrency-bound, more workers would buy nothing. It is
+measured at **~4.1 PUT/s against a budget of 100**, nowhere near the ceiling, so the budget is not
+what is holding it.
+
+**Why this matters at campaign scale.** Assembly is serial per cell and follows inference, so a
+dense cell's hours land directly on the critical path, 1,008 times. It is also cheap to fix: the GPU
+fleet is released before assembly starts ("Killing 60 actors to release resource reservations"), so
+these hours cost one flow-runner task rather than sixty GPUs — a wall-clock problem, not a cost one.
+
+**Caveat on the utilisation figures.** They are Container Insights metrics for the whole cluster, so
+the maxima include two concurrent 35N ingest tasks. The true assembly-only CPU share is therefore
+**below** the 45% quoted, which strengthens the conclusion rather than weakening it.
+
 ### What survives all three corrections — and what the radar finding takes back
 
 **This section contradicted the radar section above until 2026-08-06, and the contradiction was
