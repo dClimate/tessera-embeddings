@@ -278,7 +278,21 @@ There are **no Prefect-level retries** on any ingest flow, deliberately.
 ## 8. Open before launch
 
 Settled since the last revision, and not to be re-opened: **the model is v1.1**, **GPUs are
-on-demand**, and the permanent store goes to **AWS Open Data**.
+on-demand**, the permanent store goes to **AWS Open Data**, and (2026-08-06) **Greenland and Arctic
+Canada ship optical-only** — they publish cross-pol rather than the VV+VH pair the ingest requires,
+which is a model question if ever revisited, not an ingest one.
+
+> **NEW AND BLOCKING, 2026-08-06: the inference line's central division mixes two token units.** The
+> census numerator counts S2 + S1; the measured rate denominator counts optical only, because
+> `t_kept` is the Sentinel-2 mask's first dimension. Three terms push in different directions and
+> none is pinned, so no re-basing has been done — but the arithmetic is not like-for-like and the
+> fleet is sized on it.
+>
+> **What closes it is one run**, and the instrument is already deployed-pending: `CHUNK_SUMMARY`
+> gained `t_s1_asc` / `t_s1_desc` on 2026-08-06, so a single **both-orbit** cell measured under that
+> code yields the radar term per chunk, the true S2+S1 token count, and a rate in the census's own
+> unit. Treat it as a launch prerequisite. Full accounting: `campaign-cost-model.md` beside the
+> census table.
 
 1. **Report the optical-only cells in whatever ships with the data.** OPERA RTC-S1 coverage was
    withdrawn from about a fifth of the land after Sentinel-1B failed in December 2021 and largely
@@ -448,6 +462,23 @@ the size that dropped orchestrator events on dev before it was raised to 4. **Tr
 resize as a prerequisite for arming the heartbeat-crash automation there.**
 
 ## 10. Evidence
+
+**Read this list as authority boundaries, not a bibliography.** Where two documents disagree, the
+one named for that subject wins. A figure quoted outside its own document is a result with a
+pointer, never a derivation.
+
+| document | authoritative for | explicitly NOT for |
+|---|---|---|
+| this file | what runs, with what settings, in what order, and what to do when it breaks | any figure's derivation |
+| [`campaign-cost-model.md`](campaign-cost-model.md) | every cost, rate, fleet size and GPU-hour figure, and the per-pixel source-coverage census | operational order |
+| [`campaign-cluster-sizing.md`](campaign-cluster-sizing.md) | how work balances across N clusters, and that commits do not constrain the count | throughput, GPU-hours or cost — its px/s figures predate the switch to tokens |
+| [`campaign_inference_profile_2026_08.md`](campaign_inference_profile_2026_08.md) | measured per-cell inference behaviour: observation depth, throughput, cost per chunk, and the radar effect on all three | anything from a run still in flight, which it now refuses to carry |
+| [`radar_source_coverage_2026_08.md`](radar_source_coverage_2026_08.md) | which zones publish **no** usable radar at all, and the polarisation reason Greenland and Arctic Canada are optical-only | how much LAND has radar — that is a per-pixel question and belongs to the cost model |
+| [`inference-perf-run-ledger.md`](inference-perf-run-ledger.md) | the raw per-run measurements each figure came from | conclusions |
+
+**Three of those carry withdrawn claims next to the claim rather than deleted.** That is deliberate:
+each was wrong in a way worth not repeating, and a reviewer who only sees the corrected number
+learns nothing about how it went wrong. The withdrawals are marked in bold and dated.
 
 - [`campaign-cost-model.md`](campaign-cost-model.md) — costs, GPU fleet sizing, the idle-burn
   arithmetic, and the observation-count model behind the throughput basis.
