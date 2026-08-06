@@ -86,18 +86,71 @@ This section has now been wrong three times, in different directions, on the sam
 completed-run figures are below; the corrections are kept because each one is a distinct mistake
 worth not repeating.
 
-| cell | the land in that band | `t_kept` median (range) | $/chunk | n chunks |
-|---|---|---:|---:|---:|
-| 57S-2021 | NZ / SW Pacific | 60 (51–126) | 0.116 | 246 |
-| chain aggregate (49S, 48S, 17S, 32S …) | southern mixed | 67 (34–197) | 0.115 | 2,224 |
-| 47S-2022 + 02N-2022 (aggregate) | — | 102 (45–189) | 0.168 | 422 |
-| 59S-2021 | NZ / SW Pacific | 118 (4–135) | 0.179 | 562 |
-| 03N-2021 | **western Alaska** | 143 (92–198) | 0.200 | 612 |
-| 06N-2021 | **Alaska / Yukon** | 151 (97–202) | 0.211 | 767 |
+Re-measured 2026-08-06 with a truncation-free profiler (see "The instrument was undercounting"
+below), so every row is the cell's whole population rather than whatever fitted in one query.
 
-**A continuum from 60 to 151, not two modes** — and the mechanism is almost certainly that
+| cell | `t_kept` median (p10–p90, range) | $/chunk | n chunks / live |
+|---|---:|---:|---:|
+| 32S-2022 | 57 (48–97, 40–121) | 0.148 | 342 / 386 |
+| 57S-2021 | 60 (54–118, 51–126) | 0.116 | 247 / 267 |
+| 57S-2022 | 63 (58–122, 32–135) | 0.069 | 267 / 267 |
+| chain aggregate (49S, 48S, 17S, 32S, 58S, 02N, 47S) | 65 (55–132, 34–197) | 0.115 | 3,637 |
+| 16S-2021 + 16S-2022 (aggregate) | 71 (66–136, 61–139) | — | 34 / 34 |
+| 26S-2021 | 82 (69–134, 66–137) | — | 25 / 27 |
+| 47S-2022 + 02N-2022 (aggregate) | 102 (55–149, 45–189) | 0.168 | 422 |
+| 59S-2021 | 118 (61–128, 4–135) | 0.179 | 562 / 577 |
+| 59S-2022 | 119 (61–132, 38–137) | 0.156 | 486 / 577 |
+| 38N-2021 *(in flight)* | 121 (65–160, 50–206) | 0.171 | 3,242 / 9,100 |
+| 53N-2021 *(in flight)* | 128 (67–173, 54–220) | 0.158 | 2,887 / 3,269 |
+| 03N-2021 | 143 (102–175, 92–198) | 0.194 | 612 / 614 |
+| 06N-2021 | 151 (109–188, 97–202) | 0.202 | 857 / 856 |
+| **23N-2021** | **158 (121–181, 29–204)** | 0.183 | 1,395 / 1,402 |
+
+**The observed range is now 57 to 158**, on about 15,000 measured chunks across eighteen zones.
+
+**Two claims elsewhere in this document no longer hold as written.**
+
+1. **"The census's 145 sits just above the top of the interval."** It does not any more. **23N's
+   median is 158 and 06N's is 151**, both above 145. The census figure is inside the observed
+   range rather than above it, which strengthens rather than weakens it as a planning number —
+   but the sentence claiming it is conservative relative to everything measured is now false.
+2. **"About 26% of land is effectively unmeasured."** Three of the new cells are large and
+   high-latitude — 23N at 1,395 chunks, 53N at 2,887, 38N at 3,242 so far — so the thin bands at
+   the top of the stratified table almost certainly have far more support now. **I have not
+   recomputed the stratification**, because that needs per-chunk latitude and this profile does
+   not carry it. Recomputing it is the specific next step, and it is the only thing standing
+   between these figures and a revised interval.
+
+**A zone name is not a latitude, and this table deliberately no longer pretends otherwise.** The
+earlier version labelled each row with a region, which is how correction 2 below happened. A UTM
+zone number is a longitude band and its letter is a hemisphere, so a zone spans every latitude of
+that hemisphere and its median is a median over a mixed population. Per-band attribution belongs
+to the stratified table, which derives latitude per chunk.
+
+**A continuum from 57 to 158, not two modes** — and the mechanism is almost certainly that
 polar-orbiting revisit converges toward the poles, so observation depth rises with |latitude|. The
 census's land-weighted **145** sits near the TOP of this observed range.
+
+#### The instrument was undercounting, and it was invisible
+
+`inference_profile.py` asked Logs Insights for up to 10,000 rows sorted oldest-first. **Insights
+caps a non-aggregating query at exactly that many and reports the truncation nowhere**, so on a
+busy log group the rows it silently dropped were the NEWEST — and because a run's later chunks
+are systematically different from its early ones (see correction 2: 03N read 176 at 16 chunks and
+143 at 612), the loss is biased rather than random.
+
+**How it surfaced:** a healthy 8-actor fill was reported at 251 of 577 chunks while the fill's own
+progress line said 455, which read as a stall on a run that had never stalled. Nothing in the
+output hinted at it.
+
+**What it cost, checked rather than assumed.** Re-measuring every completed cell moved the CHUNK
+COUNTS — 06N went 767 → 857, the whole cell — and the per-chunk dollar figures by a few percent,
+because the busy-hours denominator changed. **It did not move a single `t_kept` median:** 06N
+stayed at 151 and 03N at 143 to the unit. So the load-bearing finding of this document survived
+its instrument being wrong, which is luck rather than design.
+
+The profiler now bisects its window until no sub-window reaches the ceiling, and prints a warning
+if a one-minute window still does.
 
 #### Correction 1 — "the census is ~2.3× too high". WRONG: sampled only sparse southern zones.
 
