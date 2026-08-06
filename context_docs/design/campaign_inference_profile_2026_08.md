@@ -315,6 +315,24 @@ is the upstream-defined missing-radar case, not an improvised one.
 | 57S-2021 | ascending only (26.3 obs) | 60 | **157.1** | 1.60 M | — |
 | 57S-2022 | **none** | 63 | **120.6** | 2.26 M | **1.30×** |
 
+**The anchor for the both-orbit population is now 38N-2021, and it is the largest sample in the
+programme.** Its own assembly recorded `0.0% of embedded pixels have NO radar, 0.5% with fewer than
+12 observations, 0 tiles wholly radar-free` — so it is fully dual-orbit, on the store's own evidence
+rather than a catalogue's. Over **9,051 chunks** it runs at **1.23 M tok/s per actor**, the lowest
+figure measured anywhere in the programme.
+
+That places the two populations, on completed cells only:
+
+| population | tok/s per actor (busy) | largest sample |
+|---|---:|---:|
+| radar-free | 2.26 M – 2.93 M | 1,395 chunks (23N) |
+| one orbit | 1.60 M – 1.79 M | 3,189 chunks (53N) |
+| **both orbits** | **1.23 M – 1.62 M** | **9,051 chunks (38N)** |
+
+The ordering is monotone in radar burden and the largest sample sits at the bottom of it. The
+planning reference of ≈1.9 M tok/sec lies **above the entire both-orbit range** — and both orbits is
+about 98% of campaign land.
+
 The first pair is matched on peak actors (20 and 20) and on tokens per chunk (0.636 G against
 0.640 G, within 0.7%), so the geographic variable that usually dominates is controlled. The second
 pair is the SAME ZONE and the same 267 live tiles, differing in year and in radar.
