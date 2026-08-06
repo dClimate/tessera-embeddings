@@ -1,7 +1,9 @@
 # Campaign cluster sizing — how the world's UTM zones divide across N Ray clusters
 
 Authoritative basis for choosing `max_parallel_clusters` and `max_parallel_ingest`
-on the chained (`fill_strategy="chained-clusters"`) campaign. Two halves: how the
+on the chained (`fill_strategy="chained-clusters"`) campaign. **Authoritative for how work
+BALANCES and whether commits constrain the cluster count; NOT for throughput, GPU-hours or cost** —
+those are `campaign-cost-model.md`'s, and the px/s figures below predate the switch to tokens. Two halves: how the
 work **balances** across clusters, and whether the **commit** path to the global
 Icechunk store constrains how many you can run. Measured against the **real**
 coverage bitmaps, not synthetic weights, because every conclusion here depends on
@@ -203,6 +205,20 @@ file — so it depends only on how many writers race, never on which zones they
 touch.
 
 ### Duty cycle: the reason it never bites
+
+> **The wall-clock and GPU-hour columns below are in a superseded unit and are kept only for the
+> commit-rate argument they support.** They come from a **pixels-per-second** figure measured on one
+> ROI (Iowa) in July 2026. Inference cost scales with TOKENS, not pixels, and px/s is a property of
+> the pipeline *and the geography it ran over* — it falls as observation depth rises, with a roughly
+> fourfold spread across the campaign. Two later findings compound it: the measured token rate is in
+> **optical** tokens while the campaign's token census counts optical *plus* radar, and a
+> radar-bearing chunk takes about twice as long per chunk as a radar-free one at equal optical depth.
+>
+> **For any GPU-hour or cost figure, use `campaign-cost-model.md`.** For the duty-cycle question this
+> section actually answers, the unit does not matter: the conclusion is that commits are four
+> thousandths of a percent of fleet time, and it survives a 4× error in the rate by two orders of
+> magnitude. **A measured duty cycle now exists and agrees** — the P6 rung ran 9,051 chunks at 60
+> actors and returned **≥97.3%**, nothing stalled in 14.7 hours.
 
 Combining the tile counts above with the measured fleet throughput from
 [`inference_gpu_saturation_profile_2026_07.md`](inference_gpu_saturation_profile_2026_07.md)
