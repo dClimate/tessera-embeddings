@@ -53,6 +53,23 @@ tiles; and the fill's own assembly recorded 100% radar-free. The probe agrees wi
 actually happened and the screen does not. Every zone the screen did not settle was re-probed
 per tile, which is about 6,000 queries and a few minutes.
 
+**Two consequences of that asymmetry, both found on 2026-08-06 and both worth carrying.**
+
+*The headline rests on screen verdicts.* The probe runs only where the screen fails, so every
+`both_orbits` zone is screen-only by construction — and 57S shows a screen `both_orbits` can be
+wrong. The exposure concentrates in zones whose land is scattered across a large box, since
+contiguous land gives an accurate screen; that argues the tile-weighted error is small, but it is an
+argument rather than a measurement. Bounding it needs a probe of a sample of screen-settled
+both-orbits zones.
+
+*A table whose cells used different methods is not a comparison.* Extending the survey to all nine
+campaign years as nine separate invocations let a zone be screened in one year and probed in
+another, and the difference between those years then measures the method. It produced fourteen
+zones apparently LOSING coverage, with the reversals clustered at exactly the two year boundaries
+where zones crossed from screened to probed — not at anything the provider did. The sweep now probes
+a zone in every requested year if it is unsettled in any of them, and prints the per-year method mix
+so the asymmetry cannot recur silently.
+
 ## The finding that actually changes something
 
 **Three quarters of the "radar-free" land is radar we decline.** Zones 23N and 24N — Greenland
