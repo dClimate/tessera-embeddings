@@ -76,7 +76,9 @@ Skips are rare and benign: **5 of 2,123 (0.24%)**.
 ## Two findings that bear on the cost model, and they pull opposite ways
 
 The model costs inference at **$503–579 k**, from 1.98 × 10¹⁵ tokens (1.363 × 10¹³ pixels at a
-land-weighted **145** observations per pixel) at a reference **≈1.9 M tok/sec** per worker, giving
+land-weighted **145** observations per pixel) at a reference **≈1.9 M tok/sec** per worker — the
+rate being *optical* tokens/sec and the census S2+S1, which is a unit mismatch settled nowhere yet
+(see "Radar roughly DOUBLES per-chunk inference cost" below) — giving
 289,000 GPU-hours. The reference rate was measured on **the same `g6e.xlarge`** at the same
 wall-clock basis, so the rate comparison is like-for-like.
 

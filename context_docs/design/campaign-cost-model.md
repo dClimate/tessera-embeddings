@@ -27,7 +27,10 @@ rather than buried.
 
 **Costed in tokens.** The campaign is **1.98 × 10¹⁵ tokens** — 1.363 × 10¹³ pixels at a
 land-weighted 145 observations per pixel, both halves censused from public catalogues — run
-at a reference **≈1.9M tok/sec** per worker. Pixels-per-second is a derived figure from here
+at a reference **≈1.9M tok/sec** per worker — which is **optical** tokens per second, in a
+different unit from the S2+S1 census above it (see the note beside the census table in §6; the
+inference line carries an unquantified two-sided error until one both-orbit cell is re-measured).
+Pixels-per-second is a derived figure from here
 on: it mixes machine speed with geography, which is why this document rewrote its throughput
 basis three times before switching units (§6). The range carried through is the reference
 ROI's own 13–15K px/s band.
@@ -110,7 +113,7 @@ transfer (everything is in us-west-2, so there is no egress); engineering time.
 | Worker | 4 vCPU, 16 GiB → **$0.2330/worker-hour** | derived |
 | g6e.xlarge | $1.861/h **on-demand** (spot excluded by decision) | `docs/providers/aws.md` |
 | **Campaign tokens** | **1.98 × 10¹⁵** (1.363e13 px × 145 tok/px) | token census, §6 |
-| **Inference rate** | **≈1.9M tok/sec** per worker (13.1K px/s equivalent) | measured, §6 |
+| **Inference rate** | **≈1.9M tok/sec** per worker (13.1K px/s equivalent) — *optical* tokens/sec, NOT the same unit as the census above; see §6 | measured, §6 |
 | Embedding output | int8, 128 dims | `config/store_layout.py` |
 
 ---
