@@ -25,13 +25,23 @@ For **2025**, the deliverable year, weighted by live MGRS tiles:
 | verdict | zones | live tiles | share of land |
 |---|---|---|---|
 | both orbits | 93 | 23,820 | 98.42% |
-| one orbit only | 7 | 181 | 0.75% |
-| radar exists, wrong polarisation | 2 | 150 | 0.62% |
+| one orbit only | 6 | 89 | 0.37% |
+| radar exists, wrong polarisation | 3 | 242 | 1.00% |
 | no radar at all | 10 | 51 | 0.21% |
 
-For **2022**, where most of the test programme's cells were filled: 96.91% both orbits, 1.59%
-single orbit, 1.00% wrong polarisation, 0.50% no radar. The difference between the two years is
-the provider expanding — 57S has no radar at all in 2022 and one orbit in 2025.
+Counted with the **twelve-granule floor applied to the verdict** rather than as a footnote: an
+orbit under roughly one granule a month over a zone's live tiles cannot support a year, and
+labelling it an orbit invites a reader to explain provider behaviour that never happened. 24N's
+entire 2025 ascending total is one granule, which is why it sits in the wrong-polarisation row
+rather than the single-orbit one.
+
+Across all nine campaign years, `both_orbits` holds between **95.8% and 98.6%** of live tiles, so
+this is a property of the whole span and not of the deliverable year.
+
+**A year-on-year comparison is NOT offered here, and the reason is the point.** The first attempt
+found fourteen zones losing coverage; almost all of it was the survey's own method changing between
+years (see below). A method-consistent re-measurement of the affected zones was in flight when this
+was written. Do not read a trend out of this table until that lands.
 
 ## Three things this measurement gets right that a naive version would not
 
@@ -74,8 +84,9 @@ so the asymmetry cannot recur silently.
 
 **Three quarters of the "radar-free" land is radar we decline.** Zones 23N and 24N — Greenland
 and Arctic Canada, 208 live tiles — publish effectively no VV+VH and tens of thousands of HH/HV
-granules. 24N's 2025 total is *one* ascending VV granule, which is why the stored table carries
-a caveat marking any orbit under twelve granules as too thin to build a year.
+granules. 24N's 2025 total is *one* ascending VV granule, which is why the twelve-granule floor
+now sits in the verdict itself and places 24N with Greenland rather than with the single-orbit
+zones.
 
 `opera_query._granule_to_item` already rejects those granules and its comment already names
 Greenland, so the behaviour was known. What was not known is the price: the radar half of the
@@ -100,8 +111,8 @@ Two claims not to make about it, both of which I would have made without checkin
 ## What it implies for the campaign
 
 **Fleet count.** A cell with both orbits is three concurrent fleets; single orbit is two; no
-radar is one. For 2025 that is 93×3 + 7×2 + 12×1 = 305 fleets against 336 if every cell needed
-both — about 9% fewer. Real, but not a planning lever.
+usable radar is one. For 2025 that is 93×3 + 6×2 + 13×1 = 304 fleets against 336 if every cell
+needed both — about 9% fewer. Real, but not a planning lever.
 
 **Product quality is where it lands instead.** Roughly 1.2% of the 2025 land will ship
 optical-only embeddings, and it is not scattered: it is Greenland, Arctic Canada, and a set of
