@@ -395,9 +395,16 @@ the picture reverses for the population that matters:
 
 | population | tok/s per actor, busy | share of campaign land (2025) |
 |---|---:|---:|
-| radar-free | 2.26 M – 2.93 M | ~1.2% |
-| one orbit | 1.60 M | ~0.7% |
-| **both orbits** | **1.26 M – 1.62 M** | **~98%** |
+| radar-free | 2.26 M – 2.93 M | see below |
+| one orbit | 1.60 M | see below |
+| **both orbits** | **1.26 M – 1.62 M** | see below |
+
+**The land shares that used to sit in this table are withdrawn.** They came from a per-ZONE presence
+survey and were presented as coverage. The area-weighted per-pixel census in `campaign-cost-model.md`
+is the authority: **81% of land covered in 2022–2024** against a 100% baseline for 2017–2021, and
+**6.8% of pixel-years optical-only** across the nine years, following Sentinel-1B's failure in
+December 2021. Radar-free work is therefore a much larger share of the campaign than the withdrawn
+1.2% implied, which makes the throughput split below matter more, not less.
 
 The planning reference of ≈1.9 M sits ABOVE every both-orbit cell measured and below every
 radar-free one. All of these figures — the reference included — are **optical** tokens per second,

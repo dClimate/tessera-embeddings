@@ -1,5 +1,41 @@
 # Radar source coverage across the campaign — measured 2026-08-06
 
+> ## ⚠ READ THIS FIRST — this survey answers a NARROWER question than its headline claimed
+>
+> **Withdrawn: "both orbits cover 95.8–98.6% of campaign land in every year."** That figure is
+> **per ZONE**, not per pixel: a zone counts as dual-orbit if each orbit has granules *anywhere*
+> over its live tiles. The 2022–2024 radar loss is **sub-zonal** — interior Australia and much of
+> Siberia, inside zones whose coastal tiles keep their radar — so this instrument cannot see it and
+> reported those zones as fully covered.
+>
+> **The authoritative measurement already existed** and is area-weighted per pixel, in
+> `campaign-cost-model.md` §"The 2022–2024 radar gap":
+>
+> | era | covered land (area-weighted) | dual-orbit fraction |
+> |---|---|---|
+> | 2017–2021, S1A + S1B | 100% (baseline) | 0.57 |
+> | **2022–2024, S1A alone** | **81%** | **0.51** |
+> | 2025, S1A + S1C | 96% | 0.57 |
+>
+> **The cause was already known too: Sentinel-1B failed in December 2021**, and Sentinel-1C
+> restored coverage during 2025. My "looks like a production backlog" is withdrawn — it is a
+> satellite failure. Across the nine years **6.8% of pixel-years are optical-only**, and
+> `allow_s2_only` is ON precisely so those pixels produce data.
+>
+> **What this survey IS still good for**, and why it is kept:
+> - **A zone-level ZERO is decisive.** A zone with no granules over any live tile genuinely has
+>   none, so the `radar_free_no_radar` and `radar_free_wrong_polarisation` verdicts stand.
+> - **The polarisation finding is new and is not in the census**: zones 23N and 24N publish tens of
+>   thousands of HH/HV granules and effectively no VV+VH, so they are radar-free because the ingest
+>   declines cross-pol, not because radar is absent.
+> - The per-orbit, per-year granule counts are sound as counts.
+>
+> **What it must never be used for again: any statement of the form "N% of campaign land has both
+> orbits."** Use the per-pixel census. This is the same error as
+> `a-granule-count-is-not-coverage`, committed at a coarser granularity — a count over a zone is
+> not coverage of that zone's land.
+
+
 What OPERA RTC-S1 actually publishes over the 112 land zones, how much of the product is
 optical-only as a result, and why the largest part of that is a polarisation decision rather
 than an absence of radar.
