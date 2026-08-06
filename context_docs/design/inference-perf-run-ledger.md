@@ -146,8 +146,8 @@ already validated radar-free output, which is what let the rung shrink from six 
 > Compounding it: the sentence above says these sites were chosen to bracket the token range
 > **rather than to be dual-orbit**, so this rate's radar composition was never established. Later
 > per-cell measurement puts radar-free cells at 2.26–2.93 M optical tok/s and both-orbit cells at
-> 1.26–1.62 M, with about 98% of campaign land carrying both orbits
-> (`radar_source_coverage_2026_08.md`). **1.90–1.93 M sits above every both-orbit cell measured.**
+> 1.26–1.62 M. Dual-orbit pixels are 0.51–0.57 of land by era (`campaign-cost-model.md`'s per-pixel
+> census; a per-zone survey put it near 98% and that is withdrawn — it measured presence). **1.90–1.93 M sits above every both-orbit cell measured.**
 >
 > No correction is applied here and no direction is claimed — three terms push different ways and
 > none is pinned (see the cost model). What settles it is one both-orbit cell run with the

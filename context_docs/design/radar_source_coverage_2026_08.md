@@ -129,8 +129,11 @@ so the asymmetry cannot recur silently.
 
 ## The nine-year picture, with the method artefact accounted for exactly
 
-`both_orbits` holds **95.8% to 98.6%** of live tiles in every year from 2017 to 2025, so the
-headline is a property of the whole span. Radar does not appear partway through the campaign
+`both_orbits` holds **95.8% to 98.6% of LIVE TILES** in every year from 2017 to 2025. **Read that
+as 'almost every zone has radar somewhere', which is what it measures — not as a coverage figure.**
+The per-pixel census puts actual dual-orbit coverage at 0.51–0.57 of land by era, and land coverage
+at 81% for 2022–2024 against a 100% baseline. A zone stays in the `both_orbits` column while losing
+its interior. Radar does not appear partway through the campaign
 window: all four verdict classes already exist in 2017.
 
 **How much of the year-on-year comparison the method artefact actually spoils: 8 zones of 112,

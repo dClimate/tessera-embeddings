@@ -331,7 +331,7 @@ That places the two populations, on completed cells only:
 
 The ordering is monotone in radar burden and the largest sample sits at the bottom of it. The
 planning reference of ≈1.9 M tok/sec lies **above the entire both-orbit range** — and both orbits is
-about 98% of campaign land.
+the majority of campaign land — 0.51–0.57 of it by the per-pixel census.
 
 The first pair is matched on peak actors (20 and 20) and on tokens per chunk (0.636 G against
 0.640 G, within 0.7%), so the geographic variable that usually dominates is controlled. The second

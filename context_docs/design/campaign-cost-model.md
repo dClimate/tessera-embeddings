@@ -599,7 +599,8 @@ historical px/s measurements.
 >    buys more GPU-seconds than the work needs, so on this axis alone the line is conservative.
 > 2. **Iowa's single-orbit provenance pushes it LOW.** Radar-bearing chunks are slower per optical
 >    token — measured pairs put one orbit at about 1.3× and both at about 2.0× the per-chunk
->    inference time at equal optical depth — and about 98% of campaign land carries both orbits
+>    inference time at equal optical depth — and dual-orbit pixels are 0.51–0.57 of land by era, per this
+>    document's own census above
 >    (`radar_source_coverage_2026_08.md`). Every rate we hold comes from at most one orbit.
 > 3. **The censused OPTICAL term looks LOW.** Measured `t_kept` across P2's sites averages 69.9
 >    against the census's optical 52. §6 sets that 69.9 against the *total* 145 and concludes the
