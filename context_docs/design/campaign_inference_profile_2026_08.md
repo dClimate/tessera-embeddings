@@ -269,6 +269,62 @@ planning figure. **Any claim that the token census should be cut is not supporte
 Filling 0–5°, 20–30° and the thin 30–40° bands would do more for precision than any further
 high-latitude zone, where 4,000+ chunks across three zones already agree.
 
+### Radar roughly DOUBLES per-chunk inference cost, and the token metric cannot see it
+
+Measured 2026-08-06. This is the largest single effect in this document and it is not latitude.
+
+**The mechanism is a code fact, not an inference from two runs.** `t_kept` is
+`S2MaskBundle.mask.shape[0]` — the count of *optical* timesteps that survive SCL pruning. The
+radar sequence the model encodes is not in it. So `tokens = t_kept × valid_px` measures optical
+work only, and a radar-bearing chunk does strictly more forward work than its token count claims.
+**Every tok/sec figure in this document is therefore comparable only within one radar status.**
+
+**Magnitude, from two pairs that differ in radar and are matched on the things that matter:**
+
+| pair | radar (from the STORE, not the catalogue) | `t_kept` med | median `infer_s`/chunk | tok/s per actor | ratio |
+|---|---|---:|---:|---:|---:|
+| 06N-2021 | both orbits (asc 38.9, desc 51.7 obs) | 151 | **334.4** | 1.62 M | — |
+| 23N-2021 | **none** | 158 | **169.0** | 2.93 M | **1.98×** |
+| 57S-2021 | ascending only (26.3 obs) | 60 | **157.1** | 1.60 M | — |
+| 57S-2022 | **none** | 63 | **120.6** | 2.26 M | **1.30×** |
+
+The first pair is matched on peak actors (20 and 20) and on tokens per chunk (0.636 G against
+0.640 G, within 0.7%), so the geographic variable that usually dominates is controlled. The second
+pair is the SAME ZONE and the same 267 live tiles, differing in year and in radar.
+
+**The obvious confound is controlled, and it is small.** In both pairs the radar-free member ran
+LATER in the day, so any unrelated improvement that landed during the day would masquerade as a
+radar effect. The control is **59S-2021 against 59S-2022**: the same zone, the same 577 live tiles,
+the same 562 chunks, `t_kept` 118 against 119, **both carrying both orbits**, run on the two
+different days. Median `infer_s` moved 303.6 → 287.1, a **5.4%** difference. So the day-to-day
+effect is roughly 5–10%, an order of magnitude below the 1.30× and 1.98× above.
+
+**One orbit costs about a third more, two orbits about double.** Do not extrapolate that into a
+per-orbit constant from two points; the radar sequence length and the optical depth differ between
+the pairs.
+
+#### What this invalidates, and what it means
+
+**"Cost per chunk tracks `t_kept`" no longer holds as stated.** 23N-2021 is the DEEPEST cell
+measured, at `t_kept` 158, and among the cheapest, at $0.113 per chunk. The recorded $0.115–$0.211
+range mixes radar-free and radar-bearing cells, and the correlation with depth is partly an
+artefact of that mixing.
+
+**"Nothing measured is slower than the model assumes" needs stratifying.** The two highest
+throughput figures in the whole programme — 2.93 M and 2.26 M tok/s per actor — are both
+radar-free cells, i.e. cells doing less work per token than the reference assumes. The
+radar-bearing cells sit at 1.26–1.62 M.
+
+**For the cost model, two things follow.** The radar-free ~1.2% of campaign land is roughly half
+price, which is small. The consequential half is the other 98%: **a token census built on optical
+timesteps understates the inference work**, so a line item derived from it is optimistic by
+something like the ratios above unless radar is priced separately. That is the specific next
+calculation, and it needs the radar sequence length per cell, which this telemetry does not carry.
+
+**A concrete instrument gap to close if this is pursued:** `CHUNK_SUMMARY` should carry the radar
+timestep count alongside `t_kept`. With it, the effect above becomes a within-run regression over
+thousands of chunks instead of a between-run comparison over four.
+
 ### What survives all three corrections
 
 **Throughput per actor rises with `t_kept`** — 1.25 M at 60 against 1.57 M at 151 — because a
