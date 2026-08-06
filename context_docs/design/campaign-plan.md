@@ -1,7 +1,7 @@
 # Global TESSERA campaign — the plan
 
-**Dated 2026-07-29.** The operational plan for building 9 years × 111 land zones of 10 m
-embeddings into one Icechunk store. Everything here is settled unless it appears in §8,
+**Dated 2026-07-29, revised 2026-08-06.** The operational plan for building 9 years × **112 land
+zones** of 10 m embeddings into one Icechunk store. Everything here is settled unless it appears in §8,
 which is the list of decisions still open before launch.
 
 This document is the entry point and the source of truth for **operations** — what runs,
@@ -11,6 +11,13 @@ every cost, rate, fleet size and the arithmetic behind them. Numbers appear here
 with a pointer, never as derivations; where the two disagree, the cost model is right.
 
 ---
+
+> **The zone count, settled 2026-08-06.** The coverage mask holds **120** UTM zone groups, of which
+> **8 are all-ocean** (`10S 11S 13S 14S 27S 44S 45S 46S`) and **112 carry live land** — 360,953 live
+> 2048-px tiles, or 24,202 live MGRS tiles. This document and the cost model both said **111** and
+> that was one short; every per-cell cost multiplies by it. The authority is
+> `scripts/rank_zones.py`, which reads the mask directly — rerun it rather than trusting this
+> sentence if the mask is rebuilt.
 
 ## 1. Shape
 

@@ -2,7 +2,7 @@
 
 **Dated 2026-07-29.** Extends the July-27 ingest cost estimate — which costed **ingest
 only** — to the whole campaign: ingest, inference, assembly, and the permanent output
-store. Nine years × 111 land zones. The ingest measurements it rests on are recorded in
+store. Nine years × **112 land zones**. The ingest measurements it rests on are recorded in
 [`ingest_optimization_campaign_2026_07.md`](ingest_optimization_campaign_2026_07.md);
 section references below of the form "ingest estimate §N" point at that working note.
 
