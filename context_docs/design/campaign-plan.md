@@ -40,30 +40,26 @@ and model load once for its whole set rather than once per zone-year.
 
 ```
    campaign
-   ├── year 2017 ─┬── cluster 1 ── zones: 35N → 12S → 04N → …   (densest first)
-   │              ├── cluster 2 ── zones: 38N → …
-   │              └── … 8 clusters, each opening on one of the 8 densest zones
-   ├── year 2018 ─── (same, after 2017 completes)
-   └── … 2017–2025, serial
+   └── 8 clusters, each opening on one of the 8 densest zones
+       ├── cluster 1 ── 35N 2017…2025 → 12S 2017…2025 → 04N …   (densest zone first)
+       ├── cluster 2 ── 38N 2017…2025 → …
+       └── … every requested year dispatched as ONE batch
 ```
 
-**Years run serially — for now.** A cluster is dispatched per year, so the campaign pays 72
-`ray up` cycles and each year waits out its predecessor.
+**Every year is dispatched together** (`overlap_years=true`). A cluster works a multi-year
+zone list, so one zone's later years overlap the inference of its earlier ones, and the
+campaign pays **8 `ray up` cycles rather than 72**.
 
-> **Why they were serial, and what changed (2026-07-30).** The reason was never that
-> concurrent zone-years are unsafe: different groups rebase cleanly, and even two years of
-> the SAME zone write strictly disjoint objects, because every chunk and shard is 1 in the
-> time dimension. The obstacle was two group *attributes* — `years_complete` and `runs` —
-> which both writers rewrote in the same commit as their shards, and which
-> `ConflictDetector` cannot merge. **Those now commit separately and retry**
-> (`shard_writer.commit_year_attrs`), so the obstacle is gone.
+> **Why this is safe.** Concurrent zone-years were never unsafe in the data: different groups
+> rebase cleanly, and even two years of the SAME zone write strictly disjoint objects, because
+> every chunk and shard is 1 in the time dimension. The only obstacle was two group
+> *attributes* — `years_complete` and `runs` — which both writers rewrote in the same commit as
+> their shards, and which `ConflictDetector` cannot merge. Those commit separately and retry
+> (`shard_writer.commit_year_attrs`).
 >
-> `overlap_years` drops the barrier: every requested year dispatched as one batch, so a
-> cluster works a multi-year list, year N+1's ingest overlaps year N's inference, and the
-> campaign pays 8 boots instead of 72. It is **shipped and default OFF** — see §8 item 7 for
-> what it still needs. Note it required no "zone-disjointness scheduler", which an earlier
-> version of this paragraph assumed: the partition is over ZONES, so a zone's every year
-> lands in one cluster, where assemblies serialize on that cluster's single trailing thread.
+> No zone-disjointness scheduler is needed: **the partition is over ZONES**, so a zone's every
+> year lands in one cluster, where assemblies serialize on that cluster's single trailing
+> thread. That is also what bounds concurrent assembly memory to one cluster's worth.
 
 ---
 
@@ -76,9 +72,9 @@ shipped defaults.**
 |---|---|---|
 | `fill_strategy` | `"chained-clusters"` | one cluster per zone-set, not per zone-year |
 | `max_parallel_clusters` | 8 | balance holds to ~16; 8 keeps each cluster opening on a top-8 zone |
-| **`max_parallel_ingest`** | **40 → 45** ★ | fleet-wide cap on simultaneous zone-ingests. 45 is the knee *while years are serial*: past it the year barrier makes extra cells worthless. Without the barrier it becomes 61 (§4, §8) |
-| `max_zone_attempts` | 2 | bounded re-dispatch **per year** — the year is the retry unit, see §6 |
-| **`ingest_settings.max_workers`** | **50 → 60** ★ | S2 fleet width. Past the knee this is the ONLY thing that shortens the campaign, because the longest single zone sets the floor (§4) |
+| **`max_parallel_ingest`** | **40 → 61** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§4) |
+| `max_zone_attempts` | 2 | bounded re-dispatch per zone-year, see §6 |
+| **`ingest_settings.max_workers`** | **50 → 60** ★ | S2 fleet width. Shortens each cell, and so the tail of the cluster holding the densest zone (§4) |
 | `ingest_settings.s1_worker_fraction` | 0.22 | → 13 workers per S1 orbit at the recommended 60w, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
 | **`num_actors`** | **20 → ~228** ★ | GPU actors per cluster: 85% of what ingest can feed, so the fleet never idles and keeps headroom for a restart (§4) |
@@ -86,7 +82,7 @@ shipped defaults.**
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
 | **`allow_s2_only`** | **`false` → `true`** ★ | ON for the global campaign. A fifth of the land has no radar for 2022–24 (§4); without this those pixels produce nothing. ADR 013 does not consider the combination validated — see §8 |
-| **`overlap_years`** | **`false`** | drops the year barrier — every requested year dispatched as ONE batch, so year N+1's ingest overlaps year N's inference. Shipped but **not fleet-validated**; leave off until Phase 4 clears it (§8) |
+| **`overlap_years`** | **`false` → `true`** ★ | every requested year dispatched as ONE batch, so a zone's later years overlap the inference of its earlier ones and the campaign boots 8 clusters rather than 72. **Cleared by Phase 4** (§9b) |
 | `max_cell_attempts` | 2 | attempts per cell WITHIN a cluster (one retry on the still-provisioned fleet). Distinct from `max_zone_attempts`, which counts whole dispatches |
 | `force_staging_reuse` | `false` | escape hatch: reuse staged tiles across an inference-code change you know is output-neutral |
 | `force_staging_restage` | `""` | escape hatch: any new token forces a fresh staging prefix, for a change the source hash cannot see (a library upgrade) |
@@ -124,54 +120,31 @@ Sentinel-2 STAC (optical) — at a reference **≈1.9M tok/sec** per worker. **Q
 px/s**: pixels-per-second mixes machine speed with geography, and the pipeline has been
 logging tok/sec all along for exactly this reason. The equivalent px/s here is 13.1K.
 
-**Years run serially, so a year cannot finish faster than its longest single zone** — about
-17.3 hours at 50 workers, 15.0 at 60. That floor is what shapes everything:
+**The GPU fleet sets the schedule, not ingest.** Every year is dispatched in one batch, so a
+zone's nine years are a single work list and no per-year floor exists: the longest single zone
+gates only its own cluster's tail. Past ~52 cells the 2,500-actor fleet is what the campaign
+waits on, so **extra cells buy buffer rather than speed**:
 
-```
-   makespan per year = max( longest zone ,  total work / cells )
-                            ^ only WIDTH     ^ only CELLS shorten
-                              shortens this    this, and only up to 45
-```
-
-| | 40 × 50w<br>shipped | 45 × 50w<br>the knee | **45 × 60w**<br>**recommended** | 45 × 80w<br>target |
+| cells | Fargate vCPU | ingest | GPU provisioning | **campaign** |
 |---|---|---|---|---|
-| Fargate vCPU | 12,640 | 14,220 | **16,740** | 22,140 |
-| Ingest wall clock (9 yr) | 7.2 d | 6.5 d | **5.6 d** | 4.5 d |
-| Mosaic supply | 5.76/h | 6.41/h | **7.42/h** | 9.22/h |
-| GPU fleet to provision | 1,416 | 1,576 | **1,824** | 2,267 |
-| — actors per cluster | 177 | 197 | **228** | 283 |
-| **Campaign wall clock** | ~8.7 d | ~7.8 d | **~6.8 d** | ~5.5 d |
-| **Campaign cost** | $670,000 | $671,000 | **$672,000** | $674,000 |
+| 52 | 19,344 | 4.80 d | 100% | ~4.8 d |
+| **61** ★ | **22,692** | **4.09 d** | **85%** | **~4.8 d** |
+| 66 | 24,552 | 3.78 d | 79% | ~4.8 d |
+| 80 | 29,760 | 3.12 d | 65% | ~4.8 d |
 
-**Every configuration costs the same to within 0.5%.** Inference is the same pixels at the
-same rate; ingest worker-hours are width-neutral. The decision is wall clock, bought with
-Fargate quota — nothing here is a cost trade.
+**61 cells at 60 workers is the recommended shape, and prod's applied Fargate quota of 25,000
+vCPU accommodates it** (22,692 needed). It is not the fastest row — every row lands near 4.8
+days — it is the row that reaches the 85% GPU provisioning the policy below calls for.
 
-**Above 45 cells, extra Fargate quota buys nothing — *while years run serially*.** Not
-schedule, not supply, not usable GPU fleet. An earlier version of this plan asked for 71 cells
-and 23,000 vCPU; 45 × 60w is nearly two days faster on 16,740.
+**Every configuration costs the same to within 0.5%: ~$672,000.** Inference is the same pixels
+at the same rate, and ingest worker-hours are width-neutral. The decision is wall clock bought
+with Fargate quota, not a cost trade.
 
-> **The knee is a consequence of the year barrier, not of ingest (established 2026-07-30).**
-> Years are serial only because two years of one zone rewrite that zone group's
-> `years_complete`/`runs` attrs and cannot auto-merge (§6). Nothing else requires it: every
-> chunk and shard is **1 in the time dimension**, so different years of one zone write
-> strictly disjoint objects. **Remove the barrier and the knee moves from ingest to the GPU
-> fleet** — see §8 item 7 for the payoff and what it depends on.
->
-> The second-order consequence is worth knowing before asking for quota. **Past ~52 cells the
-> 2,500-actor fleet, not ingest, sets the schedule**, so extra cells buy *buffer* rather than
-> speed:
->
-> | cells | vCPU | ingest | provisioning | campaign |
-> |---|---|---|---|---|
-> | 52 | 19,344 | 4.80 d | 100% | ~4.8 d |
-> | **61** | **22,692** | **4.09 d** | **85%** | **~4.8 d** |
-> | 66 | 24,552 | 3.78 d | 79% | ~4.8 d |
-> | 80 | 29,760 | 3.12 d | 65% | ~4.8 d |
->
-> A deeper buffer is worth having — it is what absorbs a failed ingest cell — but it is not a
-> speed-up. **To go faster, ask for ACTORS, not cells:** 2,750 actors (67 cells) is ~4.4 d,
-> 3,000 (73 cells) ~4.0 d. 66 cells at proper 85% provisioning wants 2,704 actors, an ~8% bump.
+**To go faster, ask for ACTORS, not cells.** 2,750 actors (67 cells) is ~4.4 d; 3,000 actors
+(73 cells) ~4.0 d; 66 cells at proper 85% provisioning wants 2,704 actors, an ~8% bump. A
+deeper ingest buffer is worth having — it absorbs a cell failing and restarting — but it is not
+a speed-up. An earlier version of this plan asked for 71 cells and 23,000 vCPU on the theory
+that cells were the lever. They are not.
 
 **Provision the GPU fleet UNDER what ingest can feed — about 85% of it.** That is the policy,
 not an accident of rounding. It keeps a standing queue of finished mosaics so the fleet is
@@ -198,12 +171,12 @@ that costs more. Settled; do not re-open.
 
 ## 5. Before launch
 
-1. **Fargate quota ≥ 17,000 vCPU** in us-west-2. The existing 2,500-actor GPU quota covers
-   every year-serial configuration in §4 — the recommended fleet is 1,824 and even 80 workers
-   wants only 2,267. **It stops being slack if the year barrier is removed** (§8 item 7): that
-   configuration provisions the full 2,500 at 61 cells and wants ~22,700 vCPU, so the two quota
-   asks are coupled and the barrier decision should come first. Fargate quota has lead time;
-   start there.
+1. **Quotas — both now applied in prod (verified 2026-08-06).** Fargate **25,000 vCPU**, which
+   covers the recommended 61 cells at 22,692. G-and-VT **10,000 vCPU**, which is 2,500
+   `g6e.xlarge` actors — the full fleet the recommended shape provisions. Neither is slack: 61
+   cells provisions all 2,500 actors, so the two are matched by design rather than by margin.
+   Read the APPLIED value in the account before relying on either; the request history lags
+   amendments to an open case.
 2. **Prefect concurrency limits provisioned** — `tessera-global-ingests` and
    `tessera-global-commits`. Both gates are strict and fail closed on a missing limit.
 3. **Coverage/land mask built** for all 120 zones, and its `registry_sha256` frozen. A
@@ -327,8 +300,8 @@ which is a model question if ever revisited, not an ingest one.
    campaign is 5.6 days or 4.5, and it is the only remaining question about the schedule. The
    width model is fitted over roughly 30–60 workers, so 80 is currently an extrapolation.
    This is the last preflight gate.
-4. **Fargate quota to ~17,000 vCPU**, then set `max_parallel_ingest` to 45 and
-   `max_workers` to 60. Quota has lead time; start it first.
+4. ~~**Raise the Fargate quota.**~~ **DONE 2026-08-06** — prod is at 25,000 vCPU and G-and-VT at
+   10,000. Set `max_parallel_ingest` to 61 and `max_workers` to 60.
 5. **Public release.** The store is 0.9–1.8 PB. AWS Open Data has lead time and the size
    figure is what the application asks for.
 6. ~~**Weight the zone-to-cluster split by work rather than area.**~~ **DONE 2026-07-30.**
@@ -337,39 +310,33 @@ which is a model question if ever revisited, not an ingest one.
    Measured on the real coverage census at 8 clusters, true-work spread falls from **9.43%
    to 0.04%**. The within-cluster order is unchanged and still sorts on tile counts, which
    is correct: ordering and actor clamping are properties of area, not of work.
-7. **Turn the year barrier OFF, once Phase 4 validates it.** The code shipped 2026-07-30
-   behind `overlap_years` (default off). What remains is a deployment re-registration and a
-   real-fleet run — Phase 4's **P4** rung.
+7. **All years dispatch in one batch (`overlap_years=true`).** Worth **~4.8 days against ~6.8**
+   at 61 cells and the full 2,500-actor fleet, plus 8 Ray cluster boots instead of 72 (~$8,000
+   of the ramp line), and it is what makes GPU quota buy schedule again.
 
-   Payoff: the knee moves from ingest (45 cells) to the GPU fleet, giving **~4.8 days against
-   ~6.8** at 61 cells and the full 2,500-actor quota, plus 8 Ray cluster boots instead of 72
-   (~$8,000 of the ramp line). It also makes GPU quota buy schedule again.
+   The enabling change was making the inference window a **per-cell** value carried on every
+   work item (`ZoneContext.time_window`) rather than read from the actor's config. That was the
+   real blocker: an actor is built once with one config, so a cell of another year streamed
+   through it would silently have been inferred over the wrong months, and the session's only
+   mismatch check is on `s1_orbit`.
 
-   **SHIPPED 2026-07-30 behind `overlap_years` (default OFF).** Option A was taken: the
-   inference window is now a PER-CELL value carried on every work item
-   (`ZoneContext.time_window`) rather than read from the actor's config. That was the
-   blocker — an actor is built once with one config, so a cell of another year streamed
-   through it would silently have been inferred over the wrong months, and the session's
-   only mismatch check is on `s1_orbit`.
+   Three pieces hold it up:
 
-   Three pieces, all unit-tested:
+   - **The window travels with the cell.** Bit-identity was the risk, since three loader call
+     sites must receive identical kwargs; the fallback is resolved ONCE into a local and that
+     value passed to all three, so they cannot drift. One test asserts that passing the
+     config's own window explicitly is byte-for-byte identical at `atol=0`; a second asserts
+     that a *different* window genuinely changes what is read — the failure the first cannot
+     see, since an ignored argument passes every identity test.
+   - **A cluster takes `(zone, year)` pairs**, with windows and configs derived per year. A
+     literal `time_window_end` override is refused for a multi-year list rather than applied
+     to every year in it.
+   - **The partition is over ZONES**, so a zone's every year lands in one cluster and its
+     assemblies serialize on that cluster's single trailing thread. That is what bounds
+     concurrent assembly memory and removes any need for a disjointness scheduler.
 
-   - **The window travels with the cell.** Bit-identity was the risk, since three loader
-     call sites must receive identical kwargs; the fallback is resolved ONCE into a local
-     and that value passed to all three, so they cannot drift. A test asserts passing the
-     config's own window explicitly is byte-for-byte identical at `atol=0`, and a second
-     asserts a *different* window genuinely changes what is read — the failure the first
-     cannot see.
-   - **A cluster takes `(zone, year)` pairs**, with windows and configs derived per year.
-     A literal `time_window_end` override is refused for a multi-year list rather than
-     applied to every year.
-   - **The driver iterates BATCHES**: one per year (default) or one for everything
-     (`overlap_years=True`). The partition is over ZONES, so a zone's every year lands in
-     one cluster and its assemblies serialize on that cluster's single trailing thread.
-
-   **Still to do:** re-register the deployments (the child's parameter schema changed), and
-   validate against a real fleet — Phase 4 carries the drills. Do not turn `overlap_years`
-   on for a campaign before that.
+   **Fleet-validated 2026-08-06.** Phase 4's P4 rung passed all five checks, and P7 then ran
+   two clusters across six both-orbit cells with a same-zone year rollover inside one of them.
 
 
 ---
@@ -393,8 +360,8 @@ in the table below is a *chosen setting*, not a computed one.
 
 **Four mechanisms. If a number moves and none of these explains it, something else changed.**
 
-1. **Years are serial, so the longest single zone floors each year.** This is why cells stop
-   helping at 45 and why width is the only lever past it.
+1. **The GPU fleet, not ingest, sets the schedule.** Past ~52 cells every configuration lands
+   near 4.8 days, so extra cells buy buffer and only extra ACTORS buy time.
 2. **Inference cost scales with tokens, not pixels.** Quote `tok/sec`. Pixels-per-second
    mixes machine speed with geography, which made the cost model's throughput basis wrong
    three times before the unit was changed. It is not purely token-bound either — a
@@ -454,19 +421,21 @@ granules report `BEAM_MODE=IW`. If ever revisited it is a model question, not an
 **The duty-cycle question is answered: ≥97.3%** on 38N-2021 at 60 actors over 9,051 chunks, $1,600,
 nothing stalled in 14.7 hours. Fleet-feeding is not a risk to plan around.
 
-**`overlap_years` is cleared for campaign use** — all five multi-year checks passed, with the
-per-cell-window one evidenced from the store. One caveat: both zones it ran on were radar-free, so
-the radar half of the per-cell window is still unevidenced.
+**`overlap_years` is cleared for campaign use and is the campaign setting** — all five multi-year
+checks passed, with the per-cell-window one evidenced from the store. Its one caveat, that both
+zones it ran on were radar-free, is closed by P7: six cells, every one carrying both radar orbits,
+with a same-zone year rollover inside one cluster.
 
-**Prod is further from ready than its deployment list suggests** (checked 2026-08-06). It has the
-model and the code tarball, but **no coverage mask, no ROI stores and no seeded global store**, so it
-cannot run a fill or even an ingest. Four Ray flows — `tessera-embeddings`, `fill-zone-year`,
-`fill-zones-sequential`, `run-global-campaign` — fail to register for `--env prod` because the baked
-AMI sits at `/global-tessera-prod/ray/ami-id-global-tessera` while an unsuffixed prod registration
-looks for `ami-id-prod`; pass `--ami-ssm-name` or bake a prod AMI. The sweep deployment carries **no
-concurrency limit** on prod (dev has 2 with `CANCEL_NEW`), and prod's Prefect server is **0.5 vCPU**,
-the size that dropped orchestrator events on dev before it was raised to 4. **Treat the server
-resize as a prerequisite for arming the heartbeat-crash automation there.**
+**Prod is ready (verified 2026-08-06).** Coverage mask built, all 112 land-zone ROIs exported, all
+120 store groups seeded, the campaign deployment set registered in its branch-scoped form, the
+crash-recovery automations armed, and the Prefect server resized. The seven stray unsuffixed
+deployments left by an earlier registration attempt have been removed, so a dispatch to a default
+name can no longer reach old code with a thinner parameter set.
+
+**Operate prod from the branch, not from `main`.** Every prod deployment is the `-global-tessera`
+form, and the branch-scoped registration is the supported path until the global code merges. A
+consequence worth knowing: management scripts that resolve a deployment by name need `--branch
+global-tessera` on prod, and fail with a bare object-not-found without it.
 
 ## 10. Evidence
 
