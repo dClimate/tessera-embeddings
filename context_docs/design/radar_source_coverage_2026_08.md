@@ -119,8 +119,20 @@ both agree 2022–2024 is zero. So the collapse was always there — my first pa
 before-state, and my correction then over-corrected into denying it. Stating the distinction because
 it is the reusable part: **a method inconsistency can misdescribe a change without inventing it.**
 
+**The gap is per ORBIT and not specific to VV, which is what makes it look like a production
+backlog rather than anything about the polarisation we require.** Zone 43S's *cross-pol* descending
+granules run 463, 3921, 2174, 2012, 1087, **0, 0, 0**, 1297 — the same three-year hole, in HH, while
+its ascending HH continues at about 3,700 a year throughout. So in every case one orbit of one
+polarisation over one region goes missing for a span while the other orbit carries on.
+
+A small methodological note worth keeping: a first check for this summed ascending and descending
+before comparing, and found nothing. **Aggregating over orbits hides a per-orbit gap** — the zone
+total never reaches zero because the surviving orbit holds it up. Compare per orbit.
+
 The remaining movement is orbit SWITCHING rather than loss. 42S and 43S publish ascending early (56
-and 50 granules in 2019) and descending later (2,913 and 372 by 2025), never overlapping.
+and 50 granules in 2019) and descending later (2,913 and 372 by 2025), never overlapping. And 31S is
+the one degradation that has NOT recovered: both orbits for 2017–2019, then descending at zero for
+six straight years to 2025.
 
 **Operationally, this is the part to carry:** a cell in 57S or 02N for **2022, 2023 or 2024** gets
 materially less radar than the same zone in 2021 or 2025. That is not a defect in our pipeline to
