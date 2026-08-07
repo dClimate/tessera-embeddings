@@ -185,7 +185,55 @@ that costs more. Settled; do not re-open.
    stamped. The seed is the only writer of the time axis.
 5. **Model checkpoint staged** at `{inputs}/models/` and matching the seed.
 6. **Deployments registered** for `ingest-zone-year`, the chained fill, and the campaign.
-7. **A single dense zone-year end to end** — see §8; this is the last gate.
+7. **Storage at petabyte scale prepared — see §5b.** Not a quota; a set of operational
+   capabilities that only stop working once the store is large, which is after it is too late
+   to add them.
+8. **A single dense zone-year end to end** — see §8; this is the last gate.
+
+### 5b. What petabyte scale actually constrains
+
+**Neither bucket size nor object count is limited**, and the only object cap is 5 TB against
+chunks of a few megabytes. Two things do bind, and neither is a filing:
+
+**Request rate is per PREFIX, not per bucket** — roughly 3,500 writes and 5,500 reads per second
+per partitioned prefix. S3 splits the keyspace as load rises, but reactively, and a `503
+SlowDown` on **our own** bucket is that split not yet having happened. The store's chunk keys are
+flat, single-level, high-entropy identifiers directly under one short prefix, which is the layout
+S3 partitions cleanly and repeatedly; the anti-pattern is monotonic keys, which pile every write
+on one end of the keyspace. **Splitting the store across buckets addresses none of this** — the
+constraint is prefix rate, the key layout already answers it, and a split costs two stores to
+keep consistent and a broken single-URI story for public release.
+
+Distinguishing a `SlowDown` that is ours from one that belongs to a source bucket is what makes
+this observable rather than alarming: the campaign absorbs upstream refusals continuously and by
+design.
+
+**LIST stops being usable long before anything breaks.** A flat bucket of tens of millions of
+objects makes `list_objects_v2` slow enough to time out, so every audit that scans the store —
+completeness, orphan detection, coverage census — must read **S3 Inventory** instead. Inventory
+is a scheduled manifest delivered as a file, so it costs one read of a known object rather than a
+walk, but it takes a day to produce its first report. **That lead time is the whole reason this
+is a before-launch item and not an operational note.**
+
+Required, in the order they must happen:
+
+1. **Enable S3 Inventory on the prod embeddings and inputs buckets**, daily, Parquet, with size
+   and storage-class fields. Then **wait for the first manifest and read it** — an Inventory
+   configuration that has never delivered is indistinguishable from one that works.
+2. **Point at least one real audit at the manifest** rather than at LIST, and confirm it agrees
+   with a LIST over a small prefix where both are cheap. An audit that has only ever run against
+   LIST will be rewritten under pressure, at the worst moment.
+3. **Confirm versioning is OFF** on both buckets and keep it off. With versioning on, deletes
+   leave markers and prior versions, so a store whose mosaics are deleted after consumption keeps
+   billing for them and the true footprint silently diverges from the intended one. The whole
+   ~$3,000 storage figure depends on deletion actually reclaiming space.
+4. **Decide prod's lifecycle policy deliberately, or record that there is none.** Neither bucket
+   carries any rule today. Nothing ages out and nothing transitions storage class, which may be
+   correct — but at this size it should be a decision rather than a default. **Any rule must
+   never touch `global/`**, which holds the published store rather than transient inputs.
+5. **Verify bulk deletion by LISTING the prefix, never by an exit code.** Deletion at this scale
+   is `s5cmd` with `--all-versions`, and one pass is not reliably complete: a run has reported a
+   single error while leaving residue in three prefixes, two of them with no error at all.
 
 ---
 
