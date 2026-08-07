@@ -223,17 +223,38 @@ Required, in the order they must happen:
 2. **Point at least one real audit at the manifest** rather than at LIST, and confirm it agrees
    with a LIST over a small prefix where both are cheap. An audit that has only ever run against
    LIST will be rewritten under pressure, at the worst moment.
-3. **Confirm versioning is OFF** on both buckets and keep it off. With versioning on, deletes
-   leave markers and prior versions, so a store whose mosaics are deleted after consumption keeps
-   billing for them and the true footprint silently diverges from the intended one. The whole
-   ~$3,000 storage figure depends on deletion actually reclaiming space.
-4. **Decide prod's lifecycle policy deliberately, or record that there is none.** Neither bucket
-   carries any rule today. Nothing ages out and nothing transitions storage class, which may be
-   correct — but at this size it should be a decision rather than a default. **Any rule must
-   never touch `global/`**, which holds the published store rather than transient inputs.
-5. **Verify bulk deletion by LISTING the prefix, never by an exit code.** Deletion at this scale
-   is `s5cmd` with `--all-versions`, and one pass is not reliably complete: a run has reported a
-   single error while leaving residue in three prefixes, two of them with no error at all.
+3. **Versioning stays OFF on both buckets — DECIDED (Robert, 2026-08-06).** With versioning on,
+   deletes leave markers and prior versions, so mosaics deleted after consumption keep billing and
+   the true footprint silently diverges from the intended one. The ~$3,000 storage figure depends
+   on deletion actually reclaiming space.
+4. **No lifecycle rules — DECIDED (Robert, 2026-08-06).** Neither bucket carries one, and that is
+   correct rather than an oversight: the embeddings store is the published product and nothing in
+   it should age out or change storage class, while the mosaics are removed explicitly by the
+   campaign at the moment they stop being needed, which is sooner and more precisely than any age
+   rule could manage.
+5. **Verify deletion by LISTING the prefix, never by an exit code.** One pass is not reliably
+   complete: a run has reported a single error while leaving residue in three prefixes, two of
+   them with no error at all.
+
+> **Two populations, opposite retention policies. Do not let a statement about one reach the
+> other.**
+>
+> **The embeddings store is PERMANENT.** It is the deliverable, it is destined for AWS Open Data,
+> and nothing deletes from it. This is also a second, independent reason not to split it across
+> buckets: a published dataset wants one stable URI.
+>
+> **The mosaics are TRANSIENT and their deletion is load-bearing.** `cleanup_mosaics=true` is
+> required, not preferred — deleting each zone-year's optical and radar inputs once inference has
+> consumed them is what makes storage a throughput cost of a few thousand dollars instead of a
+> six-figure balance. Deletion is per-cell and continuous rather than a periodic bulk sweep, but
+> it still removes millions of objects over a campaign, which is why item 5 stands.
+>
+> **Open Data has consequences worth settling early**, since the application has lead time and the
+> size figure is what it asks for: the store must be publicly readable with Requester Pays OFF, it
+> needs a registry entry, and sponsorship may cover its storage and egress — which would move the
+> storage line in §3 rather than merely confirming it. The store currently sits branch-prefixed
+> inside a private bucket, so the path from here to a public dataset is a migration question that
+> has not been designed.
 
 ---
 
