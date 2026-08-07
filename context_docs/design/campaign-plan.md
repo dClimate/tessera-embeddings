@@ -78,19 +78,31 @@ shipped defaults.**
 | `ingest_settings.s1_worker_fraction` | 0.22 | → 13 workers per S1 orbit at the recommended 60w, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
 | **`num_actors`** | **20 → ~228** ★ | GPU actors per cluster: 85% of what ingest can feed, so the fleet never idles and keeps headroom for a restart (§4) |
-| `s1_orbit` | `"both"` | downgrades per zone when an orbit has no imagery |
+| `s1_orbit` | `"both"` | downgrades per zone when an orbit has no imagery. `"none"` is a *resolved* value, not a request — passing it in is refused (2026-08-07), since it could defeat `require_s1` and publish optical-only embeddings that report success |
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
 | **`allow_s2_only`** | **`false` → `true`** ★ | ON for the global campaign. A fifth of the land has no radar for 2022–24 (§4); without this those pixels produce nothing. ADR 013 does not consider the combination validated — see §8 |
 | **`overlap_years`** | **`false` → `true`** ★ | every requested year dispatched as ONE batch, so a zone's later years overlap the inference of its earlier ones and the campaign boots 8 clusters rather than 72. **Cleared by Phase 4** (§9b) |
 | `max_cell_attempts` | 2 | attempts per cell WITHIN a cluster (one retry on the still-provisioned fleet). Distinct from `max_zone_attempts`, which counts whole dispatches |
-| `force_staging_reuse` | `false` | escape hatch: reuse staged tiles across an inference-code change you know is output-neutral |
+| `force_staging_reuse` | `false` | escape hatch — but it does NOT reach staging fingerprinted without it; the reliable resume lever is `fill-zone-year`'s explicit `run_id`. See the staging corrections in §6 (2026-08-07) |
 | `force_staging_restage` | `""` | escape hatch: any new token forces a fresh staging prefix, for a change the source hash cannot see (a library upgrade) |
 | commit limit | derived, `min(clusters, 8)` | never set by hand — and it bounds commits IN FLIGHT (~1 s each), not concurrent assemblies |
 
-The commit gate and the ingest gate are **Prefect global concurrency limits**, because
-clusters are separate flow runs on separate machines and only a server-side gate can bound
-them together. Both must exist before launch or the flow fails closed.
+The commit gate and the ingest gate are both **Prefect global concurrency limits**, because
+clusters are separate flow runs on separate machines and only a server-side gate can bound them
+together. **They are provisioned differently, and conflating them sends an operator hunting a
+problem that is not there** (corrected 2026-08-07; this paragraph previously said both must
+pre-exist):
+
+| gate | who creates it | if it is absent |
+|---|---|---|
+| `tessera-global-ingests` | **the campaign, at start.** `run_global_campaign` upserts it from `max_parallel_ingest`, so that parameter is the single place the number lives | nothing to fix. Absent is the EXPECTED state on an account no campaign has run on |
+| `tessera-global-commits` | **a human, before launch:** `register_work_pool.py --commit-limit N` | fills fail closed — `prefect.concurrency` does not auto-create it |
+
+So the ingest gate needs no pre-provisioning and **should not be created by hand**: a hand-set
+value is overwritten by `max_parallel_ingest` at the next start, which reintroduces exactly the
+drift the upsert exists to prevent. The registration script's asymmetry — a `--commit-limit` flag
+and no ingest equivalent — is deliberate rather than an omission.
 
 ---
 
@@ -105,6 +117,13 @@ as soon as *any* mosaic in its opening window lands, not its densest one. Blocki
 densest — which is also the slowest to ingest — idled a fleet about six hours per
 cluster-year with finished mosaics already on disk.
 
+> **Until 2026-08-07 that first-ready behaviour was partly defeated by a sizing bug.** The
+> flow primes `1 + look_ahead` cells but the adapter's executor had only `look_ahead`
+> threads, so a sibling sat queued behind the head cell and never started — and the fleet
+> then waited on whichever zone came *first in the order* rather than on the first one
+> ready, which is the entire point of priming a window. Fixed; the paragraph above now
+> describes what the code does.
+
 ---
 
 ## 4. Sizing, cost, and the two things that actually bind
@@ -113,12 +132,16 @@ cluster-year with finished mosaics already on disk.
 is the source of truth for every number here and the arithmetic behind it; this section states
 what to run and what it costs. Where the two disagree, the cost model is right.
 
-**Costed in tokens.** Inference consumes a sequence per pixel, so cost scales with
-`tokens = pixels × observations`, not with pixels. The campaign is **1.98 × 10¹⁵ tokens** —
-1.363 × 10¹³ pixels at a land-weighted 145 observations each, censused from CMR (radar) and
-Sentinel-2 STAC (optical) — at a reference **≈1.9M tok/sec** per worker. **Quote tok/sec, not
-px/s**: pixels-per-second mixes machine speed with geography, and the pipeline has been
-logging tok/sec all along for exactly this reason. The equivalent px/s here is 13.1K.
+**Costed in tokens, and since 2026-08-07 both sides of the division are measured in one
+unit.** Inference consumes a sequence per pixel, so cost scales with
+`tokens = pixels × observations`, not with pixels. The campaign is **2.32 × 10¹⁵ combined
+S2+S1 tokens** — 1.363 × 10¹³ pixels at a measured land-weighted **170 tokens per pixel** — at
+a measured **2.273 M combined tok/sec** per worker (cost model §6b). The pair this replaces —
+1.98 × 10¹⁵ tokens at ≈1.9 M tok/sec — divided a combined census by an *optical-only* rate;
+the two errors nearly cancel, so the line moved only 2%. **Quote COMBINED tok/sec, not px/s
+and not optical tok/sec**: pixels-per-second mixes machine speed with geography, and an
+optical rate is a different unit that sat in the model's central division for three revisions.
+The equivalent px/s here is 13.4K.
 
 **The GPU fleet sets the schedule, not ingest.** Every year is dispatched in one batch, so a
 zone's nine years are a single work list and no per-year floor exists: the longest single zone
@@ -136,9 +159,10 @@ waits on, so **extra cells buy buffer rather than speed**:
 vCPU accommodates it** (22,692 needed). It is not the fastest row — every row lands near 4.8
 days — it is the row that reaches the 85% GPU provisioning the policy below calls for.
 
-**Every configuration costs the same to within 0.5%: ~$672,000.** Inference is the same pixels
-at the same rate, and ingest worker-hours are width-neutral. The decision is wall clock bought
-with Fargate quota, not a cost trade.
+**Every configuration costs the same to within 0.5%: ~$661,000** (re-based 2026-08-07 from
+~$672,000 with the inference line's one-unit correction; cost model §1, §6b). Inference is the
+same pixels at the same rate, and ingest worker-hours are width-neutral. The decision is wall
+clock bought with Fargate quota, not a cost trade.
 
 **To go faster, ask for ACTORS, not cells.** 2,750 actors (67 cells) is ~4.4 d; 3,000 actors
 (73 cells) ~4.0 d; 66 cells at proper 85% provisioning wants 2,704 actors, an ~8% bump. A
@@ -177,8 +201,9 @@ that costs more. Settled; do not re-open.
    cells provisions all 2,500 actors, so the two are matched by design rather than by margin.
    Read the APPLIED value in the account before relying on either; the request history lags
    amendments to an open case.
-2. **Prefect concurrency limits provisioned** — `tessera-global-ingests` and
-   `tessera-global-commits`. Both gates are strict and fail closed on a missing limit.
+2. **The COMMIT gate provisioned** — `tessera-global-commits`, via
+   `register_work_pool.py --commit-limit N`. Fills fail closed without it. The ingest gate is
+   NOT a pre-launch item: the campaign upserts it from `max_parallel_ingest` at start (§2).
 3. **Coverage/land mask built** for all 120 zones, and its `registry_sha256` frozen. A
    mask rebuild mid-campaign invalidates every completed zone-year's fingerprint.
 4. **Store seeded** — all zone groups, all 9 year slots, `geoemb:model` and `checkpoint_id`
@@ -266,6 +291,18 @@ Three mechanisms, all shipped.
 slot atomically with its pixels, so a date present is complete and a date absent was never
 started. Resume assumes the same land mask, which the manifest enforces on every write.
 
+**Hardened 2026-08-07 — the S2 duplicate-copy machinery.** Two places a failure never reached
+the recovery built for it. An unreadable preferred copy failed at the **coverage gate** — a
+date's *first* compute, one stage before the duplicate ladder that would have stepped down to
+an older copy — so one bad object stranded its whole zone-year identically on every retry with
+a good older copy sitting unused; preparation now returns that failure into the same ladder a
+write failure uses, and only an unreadable source is converted (anything else still
+propagates). And the S2 processing-baseline map was built once per catalogue query, before
+duplicates were pruned, and never rebuilt on a step-down — so the reflectance offset applied
+could describe a copy the loader never opened, shifting every pixel of a date silently. It is
+now derived per preparation from that preparation's own items and travels back on the result,
+so the write records exactly what it applied.
+
 **Retry, at two levels (the second added 2026-07-30).**
 
 *Inside a cluster.* A failed cell is re-attempted on the still-provisioned fleet —
@@ -275,6 +312,15 @@ rather than a fresh zone-year. **Eligibility is "kept its mosaic", not "failed"*
 delete the mosaic on purpose (the orbit-mismatch deferral cap, a terminal plan) so a
 systematic failure cannot stack multi-terabyte inputs, and retrying one of those would run
 against nothing.
+
+**A cancellation is a request, not a fact (hardened 2026-08-07).** Prefect marks a run
+Cancelling and a worker acts on it later, so a child being replaced can keep writing across
+that gap — and the old discard dropped the run id, which also removed the run from the
+shutdown sweep in the same breath. The flow now follows a discarded run to a *terminal* state
+and keeps the id registered until it gets there; if the run will not confirm within five
+minutes, **the retry is refused rather than raced**. That costs a recoverable cell, and it is
+the cheaper mistake: two writers on one mosaic prefix produce a mosaic nothing downstream can
+detect, and those commits do not rebase, so the loser's failure is terminal anyway.
 
 *Across dispatches.* A failed zone does not sink the campaign. Each dispatch gets up to
 `max_zone_attempts` rounds, and every round re-reads the *store* for what is still missing,
@@ -308,6 +354,54 @@ has to be cleaned up by hand first — the re-run overwrites it.
 > thing stopping one run straddling two images. Two overrides exist for the judgement calls the
 > hash cannot make (§2).
 
+> **Corrected 2026-08-07 — three holes in these guards, each a path around a check that was
+> meant to be unavoidable.**
+>
+> - **The code-identity import closure missed relative imports.** The walker followed only
+>   imports whose module name starts with the package, and a relative import's name is the
+>   tail alone (`providers` for `from .providers import …`), so the walk stopped at every
+>   package `__init__`. Measured on this tree: `config/providers.py` — the STAC collections,
+>   band lists, resolutions and baseline settings — sat **outside the ingest fingerprint**, so
+>   changing which imagery a mosaic is built from left that mosaic's identity unmoved and a
+>   resume was free to append across the change. Fixed by resolving relative levels against
+>   the importing module; the ingest closure went **29 → 30 files**, and the file it gained is
+>   that one. Read any pre-2026-08-07 statement about what a fingerprint covers against this.
+> - **A zero-append resume stamped its completion marker unchecked.** The ingest code identity
+>   is validated on the *append* path — deliberately, so a code change does not declare
+>   finished mosaics stale — but a resume that adopts a store whose every date already landed
+>   appends nothing: no append, no check, and the marker lands over a mosaic built under a
+>   different mask, threshold or code, after which every later run skips the cell. The same
+>   validation now runs before marking, in its own pass, so a disagreement on the last store
+>   cannot leave the earlier ones marked.
+> - **"A changed parameter raises" had a one-way hole for `allow_s2_only`.** The flag records
+>   "off" by being absent — deliberately, to stay compatible with stores predating the field —
+>   but manifest validation skipped any key the store lacks, so a flag-ON run against a legacy
+>   store matched nothing and passed, mixing both pixel policies in one store: the exact
+>   append the field was added to refuse. `ABSENT_MEANS_OFF` now names the fields where a
+>   store having no opinion IS an opinion; a field *describing* a store and a field stating
+>   the *policy* it was built under want opposite answers, and one rule cannot express both.
+
+> **Three staging-resume corrections (2026-08-07), found operating the escape hatches.**
+>
+> - **`force_staging_reuse` does not reach staging fingerprinted without it.** It substitutes
+>   a constant into the run-id hash, so it yields a *different* prefix from the one an
+>   unflagged run staged under — it preserves reuse only between runs that both set it. The
+>   settings table (and an earlier version of this row) described it as "reuse staged tiles
+>   across an inference-code change"; that reading is withdrawn. **The explicit `run_id`
+>   parameter is the only reliable lever for reaching existing staging.**
+> - **`fill-zone-year` mints a fresh run_id when the parameter is omitted.** The deterministic
+>   staging fingerprint belongs to the campaign driver, not the per-cell flow, so a bare
+>   re-dispatch of the cell flow starts staging over. Pass the preserved `run_id` to resume.
+> - **Re-assembling an already-complete zone-year is possible only by calling
+>   `assemble_global` directly with the preserved run id.** Both flow paths refuse a complete
+>   cell; the direct call is repeatable because it never moves the tag.
+>
+> Related, same date: the staging run_id is now minted from the **effective** S2-only mode —
+> `InferenceConfig` forces `allow_s2_only` when the orbit resolves to none — rather than the
+> requested flag, and assembly-only mode reads the policy off the run_id prefix rather than
+> trusting a parameter nobody had to set. The prefix is the record of what the staged pixels
+> ARE.
+
 There are **no Prefect-level retries** on any ingest flow, deliberately.
 
 ---
@@ -318,7 +412,7 @@ There are **no Prefect-level retries** on any ingest flow, deliberately.
 |---|---|
 | **Mosaic backlog** (completed, not yet inferred) | the $3,000 storage figure assumes prompt deletion; a four-week backlog is ~400 TB and ~$9,200/month, and sooner a bucket-capacity problem |
 | **GPU duty cycle** | the whole of §4; a fleet below ~80% busy is being paid for idling |
-| **Cells actually running** vs the cap | the ingest gate is fleet-wide; if the limit is missing the flow fails closed, but if it is set too low nothing complains |
+| **Cells actually running** vs the cap | the ingest gate is fleet-wide and the campaign sets it from `max_parallel_ingest`, so it cannot be missing — but if that parameter is too low nothing complains, and the fleet simply runs narrow |
 | **Zones failing twice** | the retry loop stops on no-progress; these need a human |
 | **Coverage-gate rejection rate** | 365 dates per zone-year is measured on three zones; heavy rejection changes both time and cost |
 
@@ -331,17 +425,17 @@ on-demand**, the permanent store goes to **AWS Open Data**, and (2026-08-06) **G
 Canada ship optical-only** — they publish cross-pol rather than the VV+VH pair the ingest requires,
 which is a model question if ever revisited, not an ingest one.
 
-> **NEW AND BLOCKING, 2026-08-06: the inference line's central division mixes two token units.** The
-> census numerator counts S2 + S1; the measured rate denominator counts optical only, because
-> `t_kept` is the Sentinel-2 mask's first dimension. Three terms push in different directions and
-> none is pinned, so no re-basing has been done — but the arithmetic is not like-for-like and the
-> fleet is sized on it.
->
-> **What closes it is one run**, and the instrument is already deployed-pending: `CHUNK_SUMMARY`
-> gained `t_s1_asc` / `t_s1_desc` on 2026-08-06, so a single **both-orbit** cell measured under that
-> code yields the radar term per chunk, the true S2+S1 token count, and a rate in the census's own
-> unit. Treat it as a launch prerequisite. Full accounting: `campaign-cost-model.md` beside the
-> census table.
+> ~~**NEW AND BLOCKING, 2026-08-06: the inference line's central division mixes two token
+> units.**~~ **RESOLVED 2026-08-07 — the launch prerequisite is met.** The both-orbit
+> measurement was taken (four cells under the new `t_s1_asc` / `t_s1_desc` telemetry) and the
+> division re-based on one unit. Two errors of similar size pointed opposite ways — the rate
+> rises 1.90 → 2.27 M tok/s on the combined basis while the measured combined depth rises
+> 145 → 170 tokens per pixel — so the inference line lands at **$527,000, 0.98×** its prior
+> value, interval $452,000 – $573,000. **Fleet sizing, the 85% provisioning policy and the
+> work-hours bank are unaffected** (the capacity-planning rate moved +2.0%). Correcting only
+> the named unit mismatch would have moved the line 19% the wrong way. Full accounting:
+> `campaign-cost-model.md` §6b. Still open there: an unexplained 30% rate deficit on the one
+> 20–45° both-orbit sample, and no both-orbit rate measured at campaign fleet width.
 
 1. **Report the optical-only cells in whatever ships with the data.** OPERA RTC-S1 coverage was
    withdrawn from about a fifth of the land after Sentinel-1B failed in December 2021 and largely
@@ -359,8 +453,8 @@ which is a model question if ever revisited, not an ingest one.
    re-litigation away from being open again.
 2. **Run the Phase-4 test geographies.** **Three** sites spanning 120–200 tokens per pixel,
    settling the two remaining throughput questions: whether tok/sec is flat across sequence
-   length (the assumption the cost model now rests on) and how large the per-chunk read floor
-   is. It was four sites and six runs until 2026-08-03 — every site had to be dual-orbit and
+   length (confirmed by P2, 2026-08-04 — flat to ±1% across three geographies) and how large
+   the per-chunk read floor is. It was four sites and six runs until 2026-08-03 — every site had to be dual-orbit and
    two had to run twice, because validating optical-only output meant masking radar and
    comparing the same pixels. Cambridge validated radar-free embeddings, so that constraint is
    gone and what remains needs neither dual orbits nor paired runs. Site list and rationale in
@@ -379,6 +473,15 @@ which is a model question if ever revisited, not an ingest one.
    Measured on the real coverage census at 8 clusters, true-work spread falls from **9.43%
    to 0.04%**. The within-cluster order is unchanged and still sorts on tile counts, which
    is correct: ordering and actor clamping are properties of area, not of work.
+
+   **Extended 2026-08-07: weight is per-year work × the years a zone carries.** The 07-30 fix
+   still weighed each zone ONCE — irrelevant while every zone owed a single year, and wrong
+   the moment `overlap_years` lets a batch span years (which is now the campaign setting) or a
+   repair run leaves uneven gaps: one cluster drains the extra years while the rest sit idle,
+   and its finish time is the campaign's. A zone with no years left weighs zero, which
+   subsumes the old `known_complete` retag-only case and skips its mask read the same way.
+   One caveat inherited from the census: the per-band *split* behind `zone_work_weight` is
+   refuted at high latitude while the totals hold — an open check, cost model §9 item 3.
 7. **All years dispatch in one batch (`overlap_years=true`).** Worth **~4.8 days against ~6.8**
    at 61 cells and the full 2,500-actor fleet, plus 8 Ray cluster boots instead of 72 (~$8,000
    of the ramp line), and it is what makes GPU quota buy schedule again.
@@ -431,11 +534,12 @@ in the table below is a *chosen setting*, not a computed one.
 
 1. **The GPU fleet, not ingest, sets the schedule.** Past ~52 cells every configuration lands
    near 4.8 days, so extra cells buy buffer and only extra ACTORS buy time.
-2. **Inference cost scales with tokens, not pixels.** Quote `tok/sec`. Pixels-per-second
-   mixes machine speed with geography, which made the cost model's throughput basis wrong
-   three times before the unit was changed. It is not purely token-bound either — a
-   per-chunk read floor scales with pixels and bytes, and stops being hidden where sequences
-   are short.
+2. **Inference cost scales with tokens, not pixels — and the tokens are COMBINED S2+S1.**
+   Quote combined `tok/sec`. Pixels-per-second mixes machine speed with geography, which made
+   the cost model's throughput basis wrong three times before the unit was changed; an
+   *optical* tok/sec is a further different unit, and it sat in the model's central division
+   until 2026-08-07 (cost model §6b). It is not purely token-bound either — a per-chunk read
+   floor scales with pixels and bytes, and stops being hidden where sequences are short.
 3. **Ingest worker-hours are width-neutral.** Halve the fleet, double the duration, same
    bill — so fleet width is schedule bought for free, and cost is nearly flat across every
    configuration in §4.
@@ -458,22 +562,43 @@ never averaged away.
 Added 2026-08-06 from the pre-campaign test programme. Only what alters an operational decision or
 retires an open question; the figures live in the documents named.
 
-**Radar costs about twice as much per chunk as optical, and the token metric cannot see it.**
-`t_kept` is the Sentinel-2 mask's first dimension — optical timesteps only — so `tokens = t_kept ×
-valid_px` measures optical work and misses the radar sequences the forward pass also encodes.
-Measured on completed cells: radar-free 2.26–2.93 M tok/s per actor, one orbit 1.60–1.79 M, both
-orbits 1.23–1.62 M, the last anchored on a 9,051-chunk cell. **The ≈1.9 M planning reference sits
-above the entire both-orbit range.** Consequence for operations: a throughput or cost figure is
-comparable only within one radar status, and `inference_profile.py` now prints its radar basis.
-Details and the unresolved budget question: `campaign_inference_profile_2026_08.md` and
-`campaign-cost-model.md`.
+**Radar costs about twice as much per chunk as optical, and the OPTICAL token metric cannot see
+it.** `t_kept` is the Sentinel-2 mask's first dimension — optical timesteps only — so
+`tokens = t_kept × valid_px` measures optical work and misses the radar sequences the forward
+pass also encodes. Measured on completed cells: radar-free 2.26–2.93 M optical tok/s per actor,
+one orbit 1.60–1.79 M, both orbits 1.23–1.62 M. Consequence for operations: an **optical**
+throughput or cost figure is comparable only within one radar status, and `inference_profile.py`
+prints its radar basis. **Resolved 2026-08-07: on the COMBINED (S2+S1) basis the spread
+collapses** — within a run, both-orbit and one-orbit chunks run at the same combined rate to
+1.01–1.08× — so quote combined tok/sec and the comparability problem disappears. Details:
+`campaign_inference_profile_2026_08.md` and `campaign-cost-model.md` §6b.
 
-**The cost model's central division mixes two token units, and it is not yet resolved.** The census
-numerator counts S2 + S1; the measured rate denominator counts optical only. Three terms push in
-different directions and none is pinned, so **the inference line is not re-based** — but it carries
-an unquantified two-sided error until one both-orbit cell is measured under the per-chunk radar
-fields added to `CHUNK_SUMMARY` on 2026-08-06. **That measurement is a launch prerequisite**, not an
-optimisation: it is the only thing that makes the fleet-sizing arithmetic like-for-like.
+**The cost model's central division mixed two token units — RESOLVED 2026-08-07.** An earlier
+version of this paragraph said "not yet resolved" and named the measurement a launch
+prerequisite; it has been taken (four cells under the per-chunk radar fields) and the line
+re-based on one unit: **$527,000, 0.98× the prior value** — two errors of similar size pointed
+opposite ways and nearly cancelled, and fleet sizing is unaffected. See §8's resolved note and
+`campaign-cost-model.md` §6b, which also names what is still open (the 20–45° rate sample, and
+no both-orbit rate at campaign fleet width).
+
+**Radar observation depth is REGIONAL, not latitudinal — do not model it against latitude.**
+Across five measured latitude bands radar depth spans 66–147 tokens per pixel with a
+correlation against latitude of +0.009, while optical depth over the same bands gives +0.912.
+The deepest radar measured anywhere is the Middle East and the shallowest the Arctic, which
+points at the Sentinel-1 observation plan rather than geometry. Radar's *share* of a sequence
+does fall with latitude, but only because the optical denominator rises. Planning form: a
+constant 90 tokens/px with stated range 66–147 (`campaign-cost-model.md` §6b).
+
+**No contention penalty at 55 concurrent cells — measured on prod at 20,316 vCPU
+(2026-08-06).** The ingest line carries no load penalty at full campaign width; the
+orchestrator sat at 25% CPU with zero dropped events, placement was exact, and every 503 in
+the window was upstream. Figures and the reading rules: `campaign-cost-model.md` §4.
+
+**Cold start is a real term in any restart calculus.** At 160 requested actors the fleet stood
+at 60 after 25 minutes and 151 after 60, so widening a fleet by cancel-and-redispatch pays a
+fresh `ray up` plus per-worker bringup and model load — the saving is the naive ratio MINUS
+that ramp. It is also the standing argument for the chained-cluster strategy. Figures:
+`campaign-cost-model.md` §8, the ramp note.
 
 **Never read observation depth, tokens, throughput or cost per chunk off a run still in flight.** A
 run sweeps its zone north to south while depth falls with latitude, so a partial run has measured
