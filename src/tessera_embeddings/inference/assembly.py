@@ -1765,7 +1765,10 @@ class ZarrWriter:
         # stands. run_forked would spawn a zero-worker pool, so skip it.
         fill: dict[str, Any] = {"workers": [], "wall_s": 0.0, "merge_s": 0.0}
         if payloads:
-            fill = run_forked(session, _fill_band_worker, payloads)
+            # These payloads genuinely are northing-band writes — name them so.
+            # `_log` is the caller's logger (the flow's run logger under Prefect),
+            # so the coordinator's progress lines reach the orchestrator too.
+            fill = run_forked(session, _fill_band_worker, payloads, unit="band writes", log=_log)
 
         # --- Phase 3: root attrs + one data commit ----------------------------
         node = zarr.open_group(session.store, mode="a")
@@ -2081,6 +2084,10 @@ class ZarrWriter:
             radar_coverage=radar_coverage,
             empty=empty,
             telemetry=telemetry,
+            # The fill's coordinator progress goes through the caller's logger —
+            # under Prefect that is the flow's run logger, the only route to the
+            # Prefect API; the module logger reaches only the process log stream.
+            log=_log,
         )
         workers = telemetry.get("workers", [])
         _log.info(

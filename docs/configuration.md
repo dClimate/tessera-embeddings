@@ -23,6 +23,8 @@ config/
 ├── providers.py            STAC PROVIDERS registry: Earth Search, CMR-STAC, PC
 ├── satellites.py           Band lists, baseline thresholds, SCL classes
 └── environment.py          configure_gdal_environment() — call before rasterio import
+                            configure_logging() — package logger level + fallback handler;
+                            spawned worker processes call it at entry (they inherit none)
 ```
 
 ## The contract: caller-supplied URIs, never env-derived

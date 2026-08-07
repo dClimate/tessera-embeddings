@@ -20,6 +20,19 @@ so it can be shipped to spawned workers. :func:`run_forked` is the shared
 fork → parallel-write → merge scaffolding; the single-ROI assembly engine
 (:mod:`tessera_embeddings.inference.assembly`) drives it with a different
 worker body.
+
+Progress is reported at two levels, because no single scope can see both. The
+coordinator (:func:`_await_forks`) knows the total and states, on a timer, how
+many payloads are still outstanding — but a payload only completes near the end
+of the write, so the coordinator alone cannot draw a curve. Each worker
+(:func:`_write_shards_worker`) states its own within-payload progress on the
+same timer; workers are separate spawned processes with no shared counter, so
+the per-worker lines are what a log reader aggregates into the write-wide curve.
+Routing differs too: the coordinator logs through the caller-supplied ``log``
+(a Prefect flow passes its run logger down, which is the only route to the
+Prefect API — this module's own logger reaches only the process's log stream),
+while a worker can only ever use the module logger of its own spawned process,
+so worker lines appear in the container's log stream alone.
 """
 
 from __future__ import annotations
@@ -37,13 +50,15 @@ import icechunk
 import numpy as np
 import zarr
 
+from tessera_embeddings.config.environment import configure_logging
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage.zarr_store import read_time_values
 from tessera_embeddings.storage.zone_grid import year_of
 
 _log = logging.getLogger(__name__)
 
-#: How often :func:`run_forked` states how many band writes are still outstanding.
+#: How often :func:`run_forked`'s coordinator states how many payloads are still
+#: outstanding, and how often a worker states its own progress within one.
 #: A forked write emits nothing between its start and its finish, so without a
 #: periodic line a healthy long write and a hung one are indistinguishable in the
 #: log — and the operator's only recourse is to guess. Set far enough apart to stay
@@ -174,23 +189,38 @@ def shard_pitch(arr: zarr.Array) -> int:
     return (arr.shards or arr.chunks)[1]
 
 
-def _await_forks(futures: list[Future], progress_interval_s: float) -> list[Any]:
+def _await_forks(
+    futures: list[Future],
+    progress_interval_s: float,
+    *,
+    unit: str = "partitions",
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+) -> list[Any]:
     """Collect ``futures`` in submission order, logging what is still outstanding.
 
     Returns results positionally rather than by completion order, because a fork's
     position is its band and :meth:`icechunk.Session.merge` is given them as the
     caller's payloads were ordered. Re-raises the first failure in that same order,
     matching what ``Executor.map`` would have done.
+
+    ``unit`` is the caller's name for one payload. What a payload holds is the
+    caller's decision (northing bands for one, round-robin tile partitions for
+    another), so a fixed noun here would misdescribe the work for all callers but
+    one. ``log`` is where the lines go: the module logger reaches only the
+    process's own log stream, so a caller inside a flow passes its run logger to
+    make the wait visible to the orchestrator as well.
     """
+    logger = log or _log
     started = time.monotonic()
     pending: set[Future] = set(futures)
     while pending:
         _, pending = wait(pending, timeout=progress_interval_s, return_when=FIRST_COMPLETED)
         if pending:
-            _log.info(
-                "Assembly progress: %d/%d band writes done, %d outstanding after %.0f min",
+            logger.info(
+                "Assembly progress: %d/%d %s done, %d outstanding after %.0f min",
                 len(futures) - len(pending),
                 len(futures),
+                unit,
                 len(pending),
                 (time.monotonic() - started) / 60.0,
             )
@@ -203,24 +233,32 @@ def run_forked(
     payloads: list[dict[str, Any]],
     *,
     progress_interval_s: float = PROGRESS_INTERVAL_S,
+    unit: str = "partitions",
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
 ) -> dict[str, Any]:
     """Fork ``session``, run ``worker_fn`` over ``payloads``, merge the forks back.
 
     The shared coordinator scaffolding for cooperative writes: each payload is
-    shipped to ``worker_fn`` with a ``"fork"`` key added (a pickled copy per
-    spawned worker; caller dicts are not mutated), the worker writes into its
-    fork and returns ``(fork, stats)`` — the fork for the coordinator to merge,
-    and a JSON-serialisable dict of whatever the worker measured about its own
-    run (``{}`` when it measured nothing). One payload runs in-process; more
-    spawn a process pool (``spawn`` context — workers must be module-level
-    functions and payloads picklable).
+    shipped to ``worker_fn`` with three keys added (a pickled copy per spawned
+    worker; caller dicts are not mutated) — ``"fork"``, the forked session to
+    write into; ``"worker_index"``, the payload's position (also its stats and
+    merge position); and ``"progress_interval_s"``, so a worker body that
+    self-reports does so against the same clock as the coordinator. The worker
+    writes into its fork and returns ``(fork, stats)`` — the fork for the
+    coordinator to merge, and a JSON-serialisable dict of whatever the worker
+    measured about its own run (``{}`` when it measured nothing). One payload
+    runs in-process; more spawn a process pool (``spawn`` context — workers must
+    be module-level functions and payloads picklable).
 
     Every payload gets its own process, so the pool never queues and the whole
     write is as long as its slowest band. That is why progress is reported on a
     TIMER rather than per completion: waiting on completions alone would say
     nothing until the first band landed, which on a dense zone is the bulk of the
     write. ``progress_interval_s`` is the reporting period; a single payload runs
-    in-process and reports nothing, having no concurrency to describe.
+    in-process and the coordinator reports nothing, having no concurrency to
+    describe — a worker body's own progress lines are then the only signal.
+    ``unit`` and ``log`` are the coordinator lines' payload noun and destination
+    (see :func:`_await_forks`).
 
     Returns the write's telemetry rather than nothing, because this is the only
     scope that sees all three of the fork, the workers, and the merge:
@@ -233,14 +271,17 @@ def run_forked(
     t0 = time.monotonic()
     fork = session.fork()
     # Copies, not mutation: callers keep their payload dicts fork-free.
-    payloads = [{**payload, "fork": fork} for payload in payloads]
+    payloads = [
+        {**payload, "fork": fork, "worker_index": i, "progress_interval_s": progress_interval_s}
+        for i, payload in enumerate(payloads)
+    ]
     if len(payloads) == 1:
         results = [worker_fn(payloads[0])]
     else:
         ctx = multiprocessing.get_context("spawn")
         with ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx) as ex:
             futures = [ex.submit(worker_fn, payload) for payload in payloads]
-            results = _await_forks(futures, progress_interval_s)
+            results = _await_forks(futures, progress_interval_s, unit=unit, log=log)
     t_merge = time.monotonic()
     session.merge(*(fork_result for fork_result, _ in results))
     done = time.monotonic()
@@ -389,18 +430,39 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
     encode cost, and the remainder is time blocked on the store. ``bytes`` is
     the uncompressed block bytes handed to zarr — the logical write volume, not
     what landed on the wire.
+
+    Progress within the assignment is this worker's own to report: the
+    coordinator sees only whole payloads complete, so without these lines a
+    partition is silent for its entire life. Reported on a TIMER (the payload's
+    ``progress_interval_s``) rather than every N shards, because shard cost
+    varies — a count-based cadence would speed up and slow down with the very
+    thing an operator is trying to observe. Workers are separate spawned
+    processes with no shared counter, so each line carries the worker's own
+    index and done/total for a reader to aggregate. Logging is configured at
+    entry: a spawned process inherits none, and an unconfigured worker's reports
+    would not exist (:func:`~tessera_embeddings.config.environment.configure_logging`).
+    These lines reach the process's log stream only, never the Prefect API — a
+    spawned worker has no run logger to route through.
     """
+    configure_logging()
     fork = payload["fork"]
     group = payload["group"]
     year = int(payload["year_index"])
     shard_px = int(payload["shard_px"])
     source: ShardSource = payload["source"]
+    worker_index = payload.get("worker_index", 0)
+    progress_interval_s = float(payload.get("progress_interval_s", PROGRESS_INTERVAL_S))
+    total = len(payload["shards"])
 
     node = _group_node(fork.store, group)
     arrays: dict[str, zarr.Array] = {}
     timer = PhaseTimer()
     tiles = writes = nbytes = 0
+    last_report = time.monotonic()
     for sy, sx in payload["shards"]:
+        if time.monotonic() - last_report >= progress_interval_s:
+            _log.info("Assembly worker %d progress: %d/%d shards written (%s)", worker_index, tiles, total, group)
+            last_report = time.monotonic()
         with timer.phase("read"):
             blocks = source.load((sy, sx))
         tiles += 1
@@ -433,6 +495,7 @@ def write_year_shards(
     radar_coverage: dict | None = None,
     empty: bool = False,
     telemetry: dict[str, Any] | None = None,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
@@ -476,6 +539,13 @@ def write_year_shards(
     rather than a changed return, so the snapshot id the callers and tags key on
     stays a plain string; the caller that wants a summary record owns emitting it.
 
+    ``log`` is where the coordinator's progress lines go while the fill's forks
+    are outstanding — the longest phase of a fill. A caller inside a flow passes
+    its run logger so that phase is visible to the orchestrator; ``None`` keeps
+    the lines on this module's logger, which reaches only the process's own log
+    stream. Workers additionally self-report within their partitions
+    (:func:`_write_shards_worker`), to their own process streams.
+
     Returns the ATTR commit's snapshot id — a tag must point at a state where the
     year is both written and marked.
     """
@@ -488,7 +558,9 @@ def write_year_shards(
         {"group": group, "year_index": year_index, "shards": part, "source": source, "shard_px": shard_px}
         for part in partition_round_robin(shards, max(1, n_workers))
     ]
-    fill = run_forked(session, _write_shards_worker, payloads)
+    # The payloads are round-robin partitions of the source's tiles — name them
+    # that way; "band writes" would describe the OTHER caller of run_forked.
+    fill = run_forked(session, _write_shards_worker, payloads, unit="tile partitions", log=log)
 
     year_label = _year_label(_group_node(session.store, group), year_index)
     t_commit = time.monotonic()

@@ -57,6 +57,19 @@ def configure_gdal_environment() -> None:
     # os.environ.setdefault("CPL_VSIL_CURL_CHUNK_SIZE", "YES")
 
     # LOGGING
+    configure_logging()
+
+
+def configure_logging() -> None:
+    """Make the package's module loggers emit, wherever the process got its handlers.
+
+    Idempotent, and safe to call in any process. Two callers need it: process
+    entry points (via :func:`configure_gdal_environment`), and spawned worker
+    processes — a ``spawn`` child inherits NO logging configuration, so its
+    module loggers fall through to the root WARNING default with no handler and
+    every INFO record is silently dropped. A worker that reports progress must
+    call this first or its reports never exist.
+    """
     # Set the LEVEL on the `tessera_embeddings` package logger so all module-level
     # loggers (getLogger(__name__) in stac.py, zarr_store.py, etc.) are not dropped.
     # The package logger name must match the module loggers' parent — they are
@@ -75,7 +88,9 @@ def configure_gdal_environment() -> None:
     # straight 2x on log ingest at campaign scale, and it silently inflates any
     # analysis that counts log lines. Root-handler presence is the right test
     # rather than a Prefect import check: it equally covers a caller who ran
-    # logging.basicConfig() themselves.
+    # logging.basicConfig() themselves. In a spawned worker neither logger has
+    # handlers, so the worker gets this handler and its records reach the
+    # container's log stream through the inherited stderr.
     #
     # This does NOT affect the Prefect UI. UI logs come from the APILogHandler on
     # `prefect.flow_runs` (what get_run_logger() returns) — never from this logger.

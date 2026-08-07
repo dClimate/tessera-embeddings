@@ -12,10 +12,11 @@ import pytest
 import zarr
 
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
-from tessera_embeddings.storage import global_store, zarr_store
+from tessera_embeddings.storage import global_store, shard_writer, zarr_store
 from tessera_embeddings.storage.shard_writer import (
     PhaseTimer,
     _await_forks,
+    _write_shards_worker,
     commit_with_rebase,
     run_forked,
     write_year_shards,
@@ -281,3 +282,118 @@ class TestForkProgressReporting:
         failed.set_exception(RuntimeError("band 0 failed"))
         with pytest.raises(RuntimeError, match="band 0 failed"):
             _await_forks([failed, self._resolved("ok")], 10.0)
+
+    def test_progress_line_names_the_callers_unit(self, caplog):
+        # A payload is a band for one caller and a round-robin tile partition for
+        # another; a fixed noun misdescribes the work for one of them. The caller
+        # names it, and the default is the neutral "partitions".
+        def _one_line(**kwargs):
+            outstanding: Future = Future()
+            threading.Timer(0.05, lambda: outstanding.set_result("done")).start()
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="tessera_embeddings.storage.shard_writer"):
+                _await_forks([outstanding], 0.01, **kwargs)
+            return self._progress_lines(caplog)[0]
+
+        assert "band writes done" in _one_line(unit="band writes")
+        default_line = _one_line()
+        assert "partitions done" in default_line
+        assert "band writes" not in default_line
+
+    def test_progress_lines_go_to_the_callers_logger(self, caplog):
+        # The module logger reaches only the process's own log stream; the whole
+        # point of the log parameter is that a flow can pass its run logger and
+        # make the wait visible to the orchestrator. Lines emitted on the module
+        # logger instead would silently undo that routing.
+        outstanding: Future = Future()
+        threading.Timer(0.05, lambda: outstanding.set_result("done")).start()
+        with caplog.at_level(logging.INFO, logger="test.callers.logger"):
+            _await_forks([outstanding], 0.01, log=logging.getLogger("test.callers.logger"))
+        progress = [r for r in caplog.records if "Assembly progress" in r.getMessage()]
+        assert progress, "no progress line was captured at all"
+        assert {r.name for r in progress} == {"test.callers.logger"}
+
+
+class TestWorkerProgressReporting:
+    """A worker reports its own within-partition progress, on a timer.
+
+    The coordinator only sees whole payloads complete, so on a real fill its
+    outstanding-count line cannot move until the end — the worker's own lines are
+    the only in-flight progress signal. Driven by calling the worker body directly,
+    in-process, against a real (throwaway) fork: the behaviour under test is the
+    worker's reporting policy, not the process pool.
+    """
+
+    @staticmethod
+    def _payload(repo, *, interval, shards=((0, 0), (1, 0)), worker_index=3):
+        session = repo.writable_session("main")
+        return {
+            "fork": session.fork(),
+            "group": "01N",
+            "year_index": 2,
+            "shard_px": _SHARD,
+            "source": _SlowLoadSource(),  # each load outlasts a tiny interval
+            "shards": list(shards),
+            "worker_index": worker_index,
+            "progress_interval_s": interval,
+        }
+
+    @staticmethod
+    def _worker_lines(caplog):
+        return [r.getMessage() for r in caplog.records if "Assembly worker" in r.getMessage()]
+
+    def test_worker_reports_done_and_total_between_shards(self, tmp_path, caplog):
+        store, repo = _seed(tmp_path)
+        with caplog.at_level(logging.INFO, logger="tessera_embeddings.storage.shard_writer"):
+            _write_shards_worker(self._payload(repo, interval=0.01))
+        lines = self._worker_lines(caplog)
+        assert lines, "a multi-shard partition produced no worker progress line"
+        # After the first slow shard the timer has expired, so the first line
+        # must say one of two shards is written — the done/total pair a reader
+        # aggregates across workers.
+        assert "1/2 shards written" in lines[0]
+        # The worker names itself by its payload index: separate processes share
+        # no counter, so the index is what makes the lines aggregatable.
+        assert "worker 3" in lines[0]
+
+    def test_worker_stays_quiet_within_the_interval(self, tmp_path, caplog):
+        # The report is a TIMER, not an every-N-shards cadence: a short write
+        # must stay silent rather than narrate every shard.
+        store, repo = _seed(tmp_path)
+        with caplog.at_level(logging.INFO, logger="tessera_embeddings.storage.shard_writer"):
+            _write_shards_worker(self._payload(repo, interval=300.0))
+        assert self._worker_lines(caplog) == []
+
+    def test_run_forked_ships_index_and_interval_to_workers(self, tmp_path):
+        # The worker's clock comes from the coordinator via the payload; if the
+        # injection is dropped the worker silently falls back to the default
+        # interval and a caller-tuned period never takes effect.
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        result = run_forked(
+            session,
+            lambda p: (p["fork"], {"idx": p["worker_index"], "interval": p["progress_interval_s"]}),
+            [{}],
+            progress_interval_s=1.25,
+        )
+        assert result["workers"] == [{"idx": 0, "interval": 1.25}]
+
+    def test_write_year_shards_threads_log_and_unit_through(self, tmp_path, monkeypatch):
+        # write_year_shards' payloads are tile partitions, and its coordinator
+        # lines must go to the CALLER's logger (the flow's run logger under
+        # Prefect) — both die silently if the pass-through is dropped.
+        store, repo = _seed(tmp_path)
+        captured: dict = {}
+        real = shard_writer.run_forked
+
+        def spy(session, worker_fn, payloads, **kwargs):
+            captured.update(kwargs)
+            return real(session, worker_fn, payloads, **kwargs)
+
+        monkeypatch.setattr(shard_writer, "run_forked", spy)
+        marker = logging.getLogger("test.fill.logger")
+        write_year_shards(
+            repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD, log=marker
+        )
+        assert captured["log"] is marker
+        assert captured["unit"] == "tile partitions"
