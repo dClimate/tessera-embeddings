@@ -97,8 +97,13 @@ def _resolve_run_id(previous_run_id: str | None, *, allow_s2_only: bool, assembl
     and refuse a mode flip. Fresh default-mode runs keep the historical bare-uuid
     run_id, so the single-ROI path is unchanged when the flag is off.
 
-    Assembly-only resumes are exempt: they re-publish whatever is staged and never
-    run the per-pixel gate, so the requested flag can't change their output.
+    Assembly-only resumes never run the per-pixel gate, so the requested flag cannot
+    change WHICH pixels they publish — but it still reaches the ``EmbeddingManifest``
+    they write, so exempting them outright let a staged S2-only run be published as
+    flag-off, after which a later flag-off append mixes incompatible slices into one
+    store. :func:`staged_s2_only_mode` is what the caller uses instead: the prefix is the
+    record of what the staged pixels ARE, so the mode is read off it rather than trusted
+    from a parameter nobody had to set.
     """
     if previous_run_id:
         resumed_s2_only = previous_run_id.startswith(S2_ONLY_RUN_PREFIX)
@@ -111,6 +116,30 @@ def _resolve_run_id(previous_run_id: str | None, *, allow_s2_only: bool, assembl
             )
         return previous_run_id
     return (S2_ONLY_RUN_PREFIX if allow_s2_only else "") + uuid.uuid4().hex[:12]
+
+
+def _assert_resume_mode_matches(previous_run_id: str | None, *, allow_s2_only: bool, assembly_only: bool) -> None:
+    """The mode-mixing refusal alone, callable before any store is opened.
+
+    :func:`_resolve_run_id` has to run LATE, because the flag it must encode is the
+    config's effective one and that is not known until the orbit has been resolved
+    against the mosaic. But a resume whose staged mode already contradicts the REQUEST
+    can be refused straight away, and should be: the whole point of this check is that it
+    costs nothing, and a run that will refuse regardless should not open a store first.
+    """
+    _resolve_run_id(previous_run_id, allow_s2_only=allow_s2_only, assembly_only=assembly_only)
+
+
+def staged_s2_only_mode(previous_run_id: str | None) -> bool:
+    """Whether a staged run's chunks were produced under the S2-only pixel gate.
+
+    The run_id prefix is the durable record of that, and on an ASSEMBLY-ONLY resume it is
+    the only one: nothing recomputes the pixels, so the flow parameter says nothing about
+    what is in the staging directory. Publishing on the parameter alone wrote a manifest
+    claiming S1-gated pixels over S2-only ones, and a later flag-off append then mixed
+    two policies into one store with nothing objecting.
+    """
+    return bool(previous_run_id and previous_run_id.startswith(S2_ONLY_RUN_PREFIX))
 
 
 @flow(
@@ -210,7 +239,10 @@ def tessera_embeddings(
     if not dev_params.assembly_only and num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
 
-    run_id = _resolve_run_id(
+    # Refuse a contradicted resume before anything is opened. The run_id itself is minted
+    # much later, from the config's EFFECTIVE flag (see below), but this half of the check
+    # needs only the request and must not wait behind a store probe.
+    _assert_resume_mode_matches(
         dev_params.previous_run_id, allow_s2_only=allow_s2_only, assembly_only=dev_params.assembly_only
     )
     run_started_at = datetime.datetime.now(datetime.UTC)
@@ -229,7 +261,6 @@ def tessera_embeddings(
     checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename()}"
 
     mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
-    log.info("Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s", roi_name, mosaic_base, run_id)
 
     # Probe the SAR stores with the same credential callback + region the assemble
     # step uses, so orbit resolution doesn't fall back to the default Icechunk chain.
@@ -251,7 +282,30 @@ def tessera_embeddings(
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
-        allow_s2_only=allow_s2_only,
+        # An assembly-only resume republishes staged pixels without recomputing them, so
+        # what they ARE is recorded in the run_id prefix and nowhere in this call's
+        # parameters. Reading it back is what stops the manifest claiming S1-gated pixels
+        # over S2-only ones.
+        allow_s2_only=allow_s2_only or (dev_params.assembly_only and staged_s2_only_mode(dev_params.previous_run_id)),
+    )
+
+    # AFTER the config, and from the config's own flag. `InferenceConfig` FORCES
+    # allow_s2_only when the orbit resolves to none — every pixel there has zero S1
+    # observations, so the default gate would skip all of them — and minting the run_id
+    # from the requested flag missed that: S2-only chunks landed under an unprefixed
+    # staging prefix, where an explicit S2-only resume is then refused and the same bare
+    # id can be reused under the S1-gated mode the prefix exists to separate.
+    run_id = _resolve_run_id(
+        dev_params.previous_run_id,
+        allow_s2_only=config.allow_s2_only,
+        assembly_only=dev_params.assembly_only,
+    )
+    log.info(
+        "Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s, allow_s2_only=%s",
+        roi_name,
+        mosaic_base,
+        run_id,
+        config.allow_s2_only,
     )
 
     staging_base = f"{output_bucket.rstrip('/')}/staging"
