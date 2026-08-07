@@ -223,14 +223,20 @@ def _extract_baseline(item: Item) -> int:
         return 0
 
 
-def _extract_baselines(items: list[Any]) -> dict[str, int]:
-    """Extract processing baselines for multiple STAC items.
+def extract_baselines(items: list[Any]) -> dict[str, int]:
+    """The processing baseline to apply per date, over exactly ``items``.
+
+    Last item of a date wins. Where a date's tiles disagree, that makes the pick a
+    property of the caller's sort order, which is why this is derived from the items
+    being LOADED rather than computed once per query: a map built over a wider list can
+    name a baseline belonging to an item the loader never sees, and the reflectance
+    offset it selects is applied to the pixels of the items it does.
 
     Args:
-        items: List of pystac Items
+        items: STAC items, in the order they will be loaded.
 
     Returns:
-        Dict mapping date strings (YYYY-MM-DD) to baseline integers
+        Dict mapping date strings (YYYY-MM-DD) to baseline integers.
     """
     baselines = {}
     for item in items:
@@ -789,7 +795,7 @@ def query_stac_items(
             )
         )
 
-    baselines = _extract_baselines(items)
+    baselines = extract_baselines(items)
 
     if existing_dates:
         items = _filter_existing_dates(items, existing_dates)

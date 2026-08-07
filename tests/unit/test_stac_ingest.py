@@ -15,7 +15,6 @@ from tessera_embeddings.ingest.stac import (
     _apply_baseline_corrections_by_date,
     _build_stac_query,
     _extract_baseline,
-    _extract_baselines,
     _filter_existing_dates,
     _get_collection_config,
     _get_provider_config,
@@ -23,6 +22,7 @@ from tessera_embeddings.ingest.stac import (
     _loadable_assets,
     _prune_item_dict,
     _query_stac_items,
+    extract_baselines,
     ingest_tile,
     split_antimeridian_bbox,
 )
@@ -179,7 +179,7 @@ class TestBaselineExtraction:
             mock_stac_item("2024-01-06", baseline="05.10"),
         ]
 
-        result = _extract_baselines(items)
+        result = extract_baselines(items)
 
         assert result == {"2024-01-01": 400, "2024-01-06": 510}
 

@@ -210,6 +210,26 @@ class TestBlastRadius:
         kept, alternates = select_preferred_duplicates(items)
         assert step_down_copies(alternates, kept, only=set()) is None
 
+    def test_a_failure_this_date_cannot_claim_is_unattributed_not_attributed_to_nothing(self) -> None:
+        """The other half of the pair above, and the one the caller has to get right.
+
+        ``collect_aborted_hrefs`` drains a CLUSTER-WIDE record, so the hrefs it returns can
+        belong to another date entirely, or be a stale line from a failure already handled.
+        Matching none of them against this date means "could not attribute" — not
+        "attributed to nothing". Handing the empty set straight to ``step_down_copies``
+        conflates the two, steps down no copy, and records a date with a perfectly good
+        older copy as permanently lost. The consume path coerces it to ``None`` so the
+        whole-date ladder still runs, which is what it did before attribution existed.
+        """
+        items = _wide_date()
+        kept, alternates = select_preferred_duplicates(items)
+        foreign = ["s3://b/p/S2B_33TAA_20210101_0_L2A/B02.tif"]
+
+        assert implicated_tile_dates(kept, foreign) == set()  # nothing in this date matches
+        # What s2_roi._consume passes on, having read that as "unknown":
+        blamed = implicated_tile_dates(kept, foreign) or None
+        assert step_down_copies(alternates, kept, only=blamed) is not None
+
 
 class TestTermination:
     """When the date is given up, and how many rungs that takes."""

@@ -44,9 +44,9 @@ import logging
 import math
 import operator
 import time
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-from functools import partial, reduce
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from functools import reduce
 from typing import final
 
 import dask.array as da
@@ -90,6 +90,7 @@ from tessera_embeddings.ingest.solar_days import (
     whole_window_range,
 )
 from tessera_embeddings.ingest.stac import (
+    extract_baselines,
     group_items_by_date,
     load_stac_items,
     query_stac_items,
@@ -229,19 +230,26 @@ class _PreparedDate:
     Without the items the failure names no granule, and identifying the object then means
     correlating GDAL's own stderr by timestamp across every worker in the fleet.
     """
+    baselines: dict[str, int] = field(default_factory=dict)
+    """The processing baselines of THESE items — the correction applied, and recorded.
 
-
-def _baselines_for(baselines: dict[str, int], dates: Iterable[str]) -> dict[str, int]:
-    """The baseline entries belonging to ``dates`` only.
-
-    Each cropped write is its own atomic commit, and ``write_day_windows`` merges the
-    map it is handed into the store's ``baselines_applied``. Handing it the whole
-    query's map makes the very first commit claim provenance for every date in the
-    month — including dates a later coverage rejection or crash means the store never
-    receives. Provenance that describes data which is not there is worse than none.
+    Derived where the items are known rather than once per query, because the two lists
+    differ: the query's map is built before duplicate copies are pruned and before a read
+    failure steps down to an older one, so it can name the baseline of a copy the loader
+    never opened. Sentinel-2's reflectance offset is keyed on that number and duplicate
+    copies straddle the threshold it tests, so the wrong entry silently shifts every pixel
+    of the date.
     """
-    wanted = {d[:10] for d in dates}
-    return {k: v for k, v in baselines.items() if k[:10] in wanted}
+    read_error: BaseException | None = None
+    """Set when PREPARATION hit a source that would not read, instead of raising.
+
+    The coverage gate is the first compute of the date, so an unreadable object fails
+    there — before the write, which is where the duplicate-copy ladder lives. Raising
+    would carry that failure past the ladder and out of the leg, stranding the whole
+    zone-year on one bad object; returning it lets the consume side step down exactly as
+    it does for a write failure. ``day_ds`` is None alongside it, so a caller that only
+    checks for a skip must check this too before counting the date as filtered.
+    """
 
 
 def ingest_s2_roi_reflectance(
@@ -431,17 +439,27 @@ def ingest_s2_roi_reflectance(
     #: so this is the ONLY record of where the loss is; it is re-stated at the end of the run.
     unreadable_tile_dates: list[dict[str, str]] = []
 
-    def _prepare_date(day_items: list, baselines: dict[str, int]) -> _PreparedDate:
+    def _prepare_date(day_items: list) -> _PreparedDate:
         """Build one solar day's write-ready dataset, or the reason it has none.
 
         A closure so the streamed and single-query paths run byte-identical work; the
         per-date logic must not fork on how its items were supplied.
 
+        The processing baselines are derived HERE, from ``day_items``, and travel back on
+        the result. They used to be a whole-query map threaded in from the caller, built
+        before duplicate copies were pruned and never rebuilt when a read failure stepped
+        down to an older copy — so the offset applied to a date's pixels, and the
+        provenance recorded beside them, could belong to a copy the loader never opened.
+        Deriving them from the items being loaded makes that disagreement unrepresentable
+        rather than merely fixed.
+
         SIDE-EFFECT-FREE by contract: under ``pipeline_dates`` this runs on a
         background thread while the previous date is being written, so anything it
         mutated outside its return value would race the writer. Everything the write
-        needs travels back in the :class:`_PreparedDate`.
+        needs travels back in the :class:`_PreparedDate` — including a read failure,
+        which is RETURNED rather than raised for the same reason (see ``read_error``).
         """
+        baselines = extract_baselines(day_items)
         # THE GROUP'S SOLAR DAY, which is what this mosaic slice represents. Every item in
         # the group shares it by construction — it is the grouping key — so any item yields
         # it, and shifting one item is cheaper than threading the key through the pipeline.
@@ -498,17 +516,31 @@ def ingest_s2_roi_reflectance(
         # expires in hours, which a leg outlives. Rebuilding moves the resolution to the
         # date that consumes it; the graph itself is cheap next to the pixels it reads.
         date_mask = read_roi_mask(roi_zarr_path, spatial_chunks, storage_options=storage_options)
-        with read_failure_context(log, roi=roi_label, date=date, items=day_items):
-            for attempt in source_read_retrying(log):
-                with attempt:
-                    passes, any_valid = _coverage_from_scl(
-                        day_ds["scl"].isel(time=0),
-                        date_mask,
-                        roi_pixel_count,
-                        min_valid_coverage,
-                        client,
-                        windows=live_windows,
-                    )
+        try:
+            with read_failure_context(log, roi=roi_label, date=date, items=day_items):
+                for attempt in source_read_retrying(log):
+                    with attempt:
+                        passes, any_valid = _coverage_from_scl(
+                            day_ds["scl"].isel(time=0),
+                            date_mask,
+                            roi_pixel_count,
+                            min_valid_coverage,
+                            client,
+                            windows=live_windows,
+                        )
+        except Exception as exc:
+            # The gate is the FIRST compute of the date, so an SCL object that will never
+            # read fails here — one stage before the write, which is where the
+            # duplicate-copy ladder lives. Raising sent that failure straight out of the
+            # leg, so a single bad preferred copy stranded the whole zone-year and did so
+            # identically on every retry. Returned instead, it reaches the same ladder the
+            # write's failures do, and an older copy of the same tile-date gets its turn.
+            if not is_unreadable_source(exc):
+                raise
+            build_s, gate_s = built_at - stage_started, time.monotonic() - built_at
+            return _PreparedDate(
+                date, None, [], build_s, gate_s, "unreadable", items=day_items, baselines=baselines, read_error=exc
+            )
         build_s, gate_s = built_at - stage_started, time.monotonic() - built_at
         if not passes:
             return _PreparedDate(date, None, [], build_s, gate_s, "coverage")
@@ -571,9 +603,9 @@ def ingest_s2_roi_reflectance(
             mask_for_var = roi_2d if str(var) == "scl" else keep
             day_ds[str(var)] = day_ds[str(var)].where(mask_for_var, other=0)
 
-        return _PreparedDate(date, day_ds, date_windows, build_s, gate_s, items=day_items)
+        return _PreparedDate(date, day_ds, date_windows, build_s, gate_s, items=day_items, baselines=baselines)
 
-    def _write_date(prepared: _PreparedDate, stall_s: float, baselines: dict[str, int]) -> None:
+    def _write_date(prepared: _PreparedDate, stall_s: float) -> None:
         """Write one prepared date's pixels: the store's only writer.
 
         Runs on the driver thread, one date at a time, under both modes — icechunk
@@ -604,7 +636,7 @@ def ingest_s2_roi_reflectance(
                         prepared.windows,
                         roi=roi,
                         manifest=ingest_manifest,
-                        baselines=_baselines_for(baselines, [prepared.date]),
+                        baselines=prepared.baselines,
                         tile_id=roi_zarr_path,
                         crs=roi.native_crs,
                         chunks=INGEST_CHUNKS,
@@ -641,7 +673,7 @@ def ingest_s2_roi_reflectance(
             stall_s,
         )
 
-    def _write_batch(batch: list[_PreparedDate], baselines: dict[str, int], stall_s: float = 0.0) -> None:
+    def _write_batch(batch: list[_PreparedDate], stall_s: float = 0.0) -> None:
         """Write a batch of prepared dates: one dask compute, ONE commit.
 
         The same retry contract as ``_write_date``, at batch granularity: the
@@ -660,7 +692,7 @@ def ingest_s2_roi_reflectance(
                     days,
                     roi=roi,
                     manifest=ingest_manifest,
-                    baselines=_baselines_for(baselines, [p.date for p in batch]),
+                    baselines={d: b for p in batch for d, b in p.baselines.items()},
                     tile_id=roi_zarr_path,
                     crs=roi.native_crs,
                     chunks=INGEST_CHUNKS,
@@ -693,7 +725,7 @@ def ingest_s2_roi_reflectance(
             stall_s,
         )
 
-    def _drive(items: list, baselines: dict[str, int]) -> None:
+    def _drive(items: list) -> None:
         """Sort one supply of items cloudiest-first, group by date, and ingest each.
 
         Normalises defensively on the way in. Both suppliers — the streamed months and the
@@ -705,10 +737,11 @@ def ingest_s2_roi_reflectance(
         items = normalize_to_solar_day(items, mid_longitude=mid_longitude)
         # Duplicate items for one tile-date must be reduced to ONE copy before the loader
         # sees them, because the loader FUSES a solar-day group: with both copies in it, an
-        # unreadable copy fails the date and there is nothing to fall back to. Reducing here
-        # also makes the baseline recorded for a date match the pixels written, which a
-        # fused pair of differing baselines cannot guarantee. Rejected copies are retained
-        # as the fallback ladder the write steps down on a persistent read failure.
+        # unreadable copy fails the date and there is nothing to fall back to. Rejected
+        # copies are retained as the fallback ladder the write steps down on a persistent
+        # read failure. (The BASELINE a date is corrected by is derived later, from the
+        # items a preparation actually loads — pruning here does not by itself make the two
+        # agree, and an earlier version of this comment claimed it did.)
         items, alternates = select_preferred_duplicates(items)
         log_duplicate_selection(log, roi_label, alternates)
         date_alternates.update(alternates)
@@ -785,52 +818,70 @@ def ingest_s2_roi_reflectance(
             while a borrowed one would step down a tile that read.
             """
             nonlocal total_processed, total_filtered
-            if prepared.day_ds is None:
+            if prepared.day_ds is None and prepared.read_error is None:
                 total_filtered += 1
                 return
             attempt: _PreparedDate = prepared
             tried: list[str] = []
             while True:
+                # A date can arrive here ALREADY failed: the coverage gate is the first
+                # compute, so an unreadable SCL object fails during preparation, one stage
+                # before the write. Preparation returns that failure rather than raising
+                # it (see `_PreparedDate.read_error`) precisely so it lands in this ladder
+                # instead of leaving the leg — the two failures want the same remedy, and
+                # only one of them used to get it.
+                exc: BaseException | None = attempt.read_error
                 try:
-                    _write_date(attempt, stall_s, baselines)
-                    total_processed += 1
-                    return
-                except Exception as exc:
-                    if not is_unreadable_source(exc):
+                    if exc is None:
+                        _write_date(attempt, stall_s)
+                        total_processed += 1
+                        return
+                except Exception as write_exc:
+                    if not is_unreadable_source(write_exc):
                         raise
-                    hrefs = collect_aborted_hrefs(client)
-                    blamed = implicated_tile_dates(attempt.items, hrefs) if hrefs else None
-                    stepped = step_down_copies(date_alternates, attempt.items, only=blamed)
-                    if stepped is None:
-                        _record_unreadable(attempt, exc, tried, blamed, hrefs)
-                        total_filtered += 1
-                        return
-                    stepped_items, swapped = stepped
-                    before = copies_label(attempt.items, only=swapped)
-                    after = copies_label(stepped_items, only=swapped)
-                    if not tried:
-                        tried.append(before)
-                    tried.append(after)
-                    log.warning(
-                        "Source read failed roi=%s date=%s on objects=%s — falling back from "
-                        "copies=%s to %s (%d tile-date(s) stepped, attribution=%s). The "
-                        "preferred copy is the newer reprocessing, so this trades processing "
-                        "baseline for a date that reads.",
-                        roi_label,
-                        attempt.date,
-                        label_objects(hrefs),
-                        before,
-                        after,
-                        len(swapped),
-                        "objects" if blamed else "whole-date",
-                    )
-                    attempt = _prepare_date(stepped_items, baselines=baselines)
-                    if attempt.day_ds is None:
-                        # The fallback copy was prepared and skipped on its own merits (it
-                        # failed coverage, or reaches no live window). That is a legitimate
-                        # skip, not a read failure, and must not be recorded as data loss.
-                        total_filtered += 1
-                        return
+                    exc = write_exc
+
+                hrefs = collect_aborted_hrefs(client)
+                # An href that matches nothing in THIS date is another date's, or a stale
+                # line from a failure already handled — the collection is cluster-wide and
+                # destructive, so both happen. An empty match is therefore "could not
+                # attribute", not "no copies to try": passing the empty set on would step
+                # down nothing and record a recoverable date as permanently lost. `None`
+                # puts it back on the whole-date ladder, which is what this did before
+                # attribution existed.
+                blamed = (implicated_tile_dates(attempt.items, hrefs) or None) if hrefs else None
+                stepped = step_down_copies(date_alternates, attempt.items, only=blamed)
+                if stepped is None:
+                    _record_unreadable(attempt, exc, tried, blamed, hrefs)
+                    total_filtered += 1
+                    return
+                stepped_items, swapped = stepped
+                before = copies_label(attempt.items, only=swapped)
+                after = copies_label(stepped_items, only=swapped)
+                if not tried:
+                    tried.append(before)
+                tried.append(after)
+                log.warning(
+                    "Source read failed roi=%s date=%s on objects=%s — falling back from "
+                    "copies=%s to %s (%d tile-date(s) stepped, attribution=%s). The "
+                    "preferred copy is the newer reprocessing, so this trades processing "
+                    "baseline for a date that reads.",
+                    roi_label,
+                    attempt.date,
+                    label_objects(hrefs),
+                    before,
+                    after,
+                    len(swapped),
+                    "objects" if blamed else "whole-date",
+                )
+                attempt = _prepare_date(stepped_items)
+                if attempt.day_ds is None and attempt.read_error is None:
+                    # The fallback copy was prepared and skipped on its own merits (it
+                    # failed coverage, or reaches no live window). That is a legitimate
+                    # skip, not a read failure, and must not be recorded as data loss.
+                    # A fallback that ALSO failed to read keeps its place in the ladder.
+                    total_filtered += 1
+                    return
 
         def _write_batch_or_isolate(batch: list[_PreparedDate], stall_s: float) -> None:
             """Write a batch, falling back to one date at a time if a source will not read.
@@ -852,7 +903,7 @@ def ingest_s2_roi_reflectance(
             """
             nonlocal total_processed
             try:
-                _write_batch(batch, baselines, stall_s)
+                _write_batch(batch, stall_s)
             except Exception as exc:
                 if not is_unreadable_source(exc):
                     raise
@@ -891,7 +942,7 @@ def ingest_s2_roi_reflectance(
         )
         by_date = group_items_by_date(items)
         total_seen += len(by_date)
-        prepare = partial(_prepare_date, baselines=baselines)
+        prepare = _prepare_date
         if batch_dates > 1:
             # Only PASSING dates occupy batch slots — a skipped date adds no work to
             # the batch's compute, so letting it consume a slot would shrink batches
@@ -913,6 +964,13 @@ def ingest_s2_roi_reflectance(
             batch: list[_PreparedDate] = []
             batch_stall = 0.0
             for prepared, stall_s in supply:
+                if prepared.read_error is not None:
+                    # Preparation could not read a source. It has no dataset to batch, and
+                    # the duplicate ladder lives in the per-date consume — so hand it there
+                    # rather than counting it as a filtered date, which would record a
+                    # recoverable date as gone without ever trying its older copy.
+                    _consume(prepared, stall_s)
+                    continue
                 if prepared.day_ds is None:
                     total_filtered += 1
                     continue
@@ -941,7 +999,7 @@ def ingest_s2_roi_reflectance(
     if stream_stac_monthly:
         # Stream month by month: querying the whole window up front retains every item
         # for the run's duration, which a zone-year cannot fit on this worker.
-        for _mr, month_items, month_baselines in stream_stac_months(
+        for _mr, month_items, _month_baselines in stream_stac_months(
             provider=provider,
             collection=collection,
             tile_id=None,
@@ -958,7 +1016,7 @@ def ingest_s2_roi_reflectance(
             mid_longitude=mid_longitude,
             log=log,
         ):
-            _drive(month_items, month_baselines)
+            _drive(month_items)
     else:
         # One query for the whole window, and it needs the SAME own-versus-query
         # separation the streamed path uses. Asking for exactly [start, end] cannot
@@ -966,7 +1024,7 @@ def ingest_s2_roi_reflectance(
         # adjacent UTC date, so those two days were quietly written short. The range
         # pads the query and still owns only the window — see ingest.solar_days.
         window = whole_window_range(start_date, end_date)
-        items, baselines = query_stac_items(
+        items, _baselines = query_stac_items(
             provider=provider,
             collection=collection,
             tile_id=None,
@@ -983,7 +1041,7 @@ def ingest_s2_roi_reflectance(
         )
         owned = owned_items(normalize_to_solar_day(items, mid_longitude=mid_longitude), window)
         if owned:
-            _drive(owned, baselines)
+            _drive(owned)
 
     log.info("%d/%d dates passed coverage filter", total_processed, total_seen)
 

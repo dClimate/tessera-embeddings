@@ -473,3 +473,69 @@ def test_a_batch_failure_that_is_not_a_read_error_still_fails_the_leg(run_ingest
     dates = {"2024-01-01": True, "2024-01-02": True}
     with pytest.raises(RuntimeError, match="write of 2024-01-02 failed"):
         run_ingest(dates, pipeline_dates=False, fail_on="2024-01-02", batch_dates=2)
+
+
+# ---------------------------------------------------------------------------
+# The recovery ladder must cover every read, and carry its own baselines.
+# ---------------------------------------------------------------------------
+
+
+def test_the_baseline_map_is_derived_from_the_items_being_loaded(run_ingest, monkeypatch):
+    """Sentinel-2's reflectance offset is keyed on the processing baseline, so the map
+    handed to the loader decides the pixel values.
+
+    It used to be built once per query, over the UNPRUNED catalogue, and never rebuilt
+    when a read failure stepped down to an older copy — so it could name the baseline of
+    a copy the loader never opened. Duplicate copies straddle the offset threshold, which
+    is what makes that shift the whole date silently rather than harmlessly. Deriving it
+    per preparation, from that preparation's own items, is what makes the two agree by
+    construction rather than by coincidence.
+    """
+    calls: list[list[str]] = []
+    real = s2_roi.extract_baselines
+
+    def recording(items):
+        calls.append([it.datetime.strftime("%Y-%m-%d") for it in items])
+        return real(items)
+
+    monkeypatch.setattr(s2_roi, "extract_baselines", recording)
+    run_ingest({"2024-01-01": True, "2024-01-02": True}, pipeline_dates=False)
+
+    # Once per date, over that date's items alone — never over the whole query.
+    assert calls == [["2024-01-01"], ["2024-01-02"]]
+
+
+def test_a_coverage_gate_read_failure_reaches_the_duplicate_ladder(run_ingest, monkeypatch, caplog):
+    """The gate is the first compute of a date, so an unreadable object fails THERE —
+    one stage before the write, which is where the fallback ladder lives.
+
+    Raising out of preparation carried the failure past the ladder and out of the leg, so
+    one bad preferred copy stranded the whole zone-year and did so identically on every
+    retry. The date must instead be given up on its own, and recorded.
+    """
+
+    def gate_cannot_read(*_a, **_k):
+        raise RuntimeError("rasterio.errors.WarpOperationError: Chunk and warp failed")
+
+    monkeypatch.setattr(s2_roi, "_coverage_from_scl", gate_cannot_read)
+    with caplog.at_level(logging.ERROR):
+        run = run_ingest({"2024-01-01": True, "2024-01-02": True}, pipeline_dates=False)
+
+    # The leg completed rather than dying on the first date...
+    assert run.result.status == "skipped"
+    assert run.result.dates_filtered_coverage == 2
+    # ...and the loss is recorded, not swallowed.
+    assert "DATA LOSS" in caplog.text
+
+
+def test_a_non_read_failure_in_preparation_still_fails_the_leg(run_ingest, monkeypatch):
+    """Only an unreadable SOURCE is turned into a per-date outcome. Anything else is a
+    fault in the run, and swallowing it per date would hide it behind a coverage figure.
+    """
+
+    def gate_blows_up(*_a, **_k):
+        raise RuntimeError("the ROI mask is the wrong shape")
+
+    monkeypatch.setattr(s2_roi, "_coverage_from_scl", gate_blows_up)
+    with pytest.raises(RuntimeError, match="wrong shape"):
+        run_ingest({"2024-01-01": True}, pipeline_dates=False)
