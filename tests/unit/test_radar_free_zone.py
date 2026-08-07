@@ -251,3 +251,23 @@ class TestWhoDemandsRadarAndWhoDoesNot:
         """Same reasoning as the single-cell flows: it fills one named ROI."""
         src = (_SRC / "orchestration" / "runners" / "plain.py").read_text()
         assert "allow_none=False" in src
+
+
+def test_asking_for_no_radar_while_demanding_radar_is_refused(tmp_path):
+    """``none`` is meant as a RESOLVED value — what "both" becomes over radar-free
+    terrain — but it is a plain string on a public flow parameter, so it can be passed in.
+
+    Passed in, it returned before the ``allow_none`` check was ever reached, and
+    ``InferenceConfig`` then forces ``allow_s2_only`` for that orbit. So a run that
+    demanded radar published optical-only embeddings and reported success — the one
+    outcome ``require_s1`` exists to prevent.
+    """
+    with pytest.raises(InsufficientCoverageError, match="cannot both hold"):
+        resolve_s1_orbit(str(tmp_path / "mosaics"), S1_ORBIT_NONE, allow_none=False)
+
+
+def test_a_global_run_may_still_be_handed_the_resolved_none(tmp_path):
+    """The campaign passes the resolved orbit back in with radar allowed, which is the
+    whole point of the value existing — refusing that would break every radar-free cell.
+    """
+    assert resolve_s1_orbit(str(tmp_path / "mosaics"), S1_ORBIT_NONE, allow_none=True) == S1_ORBIT_NONE

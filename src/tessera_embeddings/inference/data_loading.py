@@ -332,6 +332,19 @@ def resolve_s1_orbit(
     """
     if s1_orbit != "both":
         _active_orbits(s1_orbit)  # validates
+        if s1_orbit == S1_ORBIT_NONE and not allow_none:
+            # `none` is meant as a RESOLVED value — what "both" becomes over radar-free
+            # terrain — but it is a plain string on a public flow parameter, so a caller
+            # can pass it in. Returning it here skipped the check below entirely, and
+            # `InferenceConfig` then forces `allow_s2_only` for it, so a run that demanded
+            # radar published optical-only embeddings instead of failing. Asking for no
+            # radar while demanding radar is a contradiction, and the only safe reading of
+            # a contradiction is to refuse it.
+            raise InsufficientCoverageError(
+                f"s1_orbit={S1_ORBIT_NONE!r} was requested for {mosaic_base} while radar was demanded "
+                "(require_s1). Those cannot both hold: drop require_s1 to embed this cell optical-only, "
+                "or name the orbit(s) the run must have."
+            )
         return s1_orbit
 
     present = []

@@ -117,6 +117,11 @@ _INGEST_POLL_S = 15.0
 # retry across it. A PERSISTENT failure eventually raises — leaving the id
 # registered so shutdown's sweep can still reach the live child.
 _INGEST_POLL_MAX_ERRORS = 10
+# How long a cancelled child is given to reach a terminal state before the retry is
+# refused. Generous: Prefect's cancellation is asynchronous — the server marks the run
+# Cancelling and a worker acts on it — and a mid-write ingest finishes its commit first.
+# Waiting is cheap next to the alternative, which is two writers on one mosaic prefix.
+_CANCEL_CONFIRM_S = 300.0
 # Lease length for a held fleet-wide ingest slot. Renewed in the background for the
 # life of the ingest; generous so a slow renewal round-trip never drops the slot.
 _INGEST_LEASE_S = 900.0
@@ -377,40 +382,62 @@ class _DeploymentCellInputs:
         Whatever the attempt committed to the mosaic stays, and the fresh ingest that
         follows resumes it rather than rebuilding.
 
-        The cancellation is the load-bearing part. A cell reaches here because its ingest
-        FAILED, and for one failure mode the child is still alive: when polling gives up
-        after a persistent run of API errors it deliberately leaves the run registered,
-        because the server-side ingest may well be running fine and only the parent's
-        view of it broke. Re-dispatching on top of that gives one mosaic prefix two
-        concurrent writers — and the ingest path forbids exactly that, since its commits
-        do not rebase and the second writer's ConflictError is not retried. So the
-        registered child is asked to stop before its replacement starts.
+        Ending the old child is the load-bearing part. A cell reaches here because its
+        ingest FAILED, and for one failure mode the child is still alive: when polling
+        gives up after a persistent run of API errors it deliberately leaves the run
+        registered, because the server-side ingest may well be running fine and only the
+        parent's view of it broke. Re-dispatching on top of that gives one mosaic prefix
+        two concurrent writers — and the ingest path forbids exactly that, since its
+        commits do not rebase and the second writer's ConflictError is not retried.
 
-        Best effort, and it has to be: this runs on the failure path, the Prefect API is
-        the thing most likely to be down, and a cancellation this cannot deliver must not
-        stop the retry. The id is dropped either way — a child that outlives the request
-        is caught again by ``shutdown``'s sweep.
+        **A cancellation is a REQUEST, not a fact**, and this used to treat it as one:
+        it asked, dropped the run id, and returned. Between the request and the run
+        actually stopping, the child is still writing — and having dropped the id,
+        ``shutdown``'s sweep could no longer see it either, so the one thing that would
+        have caught it later was given up in the same breath. So the request is now
+        followed until the run reports a TERMINAL state, and the id stays registered the
+        whole time.
+
+        Raises:
+            RuntimeError: if the old child cannot be confirmed finished. The caller must
+                not re-dispatch — better to lose a recoverable cell to a failure that
+                names itself than to publish a mosaic two runs wrote at once, which
+                nothing downstream can detect and no retry repairs.
         """
         self._futures.pop((zone, year), None)
         with self._lock:
-            fr_id = self._inflight.pop((zone, year), None)
+            fr_id = self._inflight.get((zone, year))
         if fr_id is None:
             return
         try:
             with get_client(sync_client=True) as client:
                 client.set_flow_run_state(fr_id, state=Cancelling())
-            self._log.warning(
-                "Cancelled still-registered ingest %s-%d (%s) before re-dispatching it", zone, year, fr_id
-            )
-        except Exception:
-            self._log.warning(
-                "Could not cancel still-registered ingest %s-%d (%s) before re-dispatch — it may still be "
-                "writing the mosaic; check the Prefect UI",
-                zone,
-                year,
-                fr_id,
-                exc_info=True,
-            )
+                self._log.warning(
+                    "Cancelling still-registered ingest %s-%d (%s) before re-dispatching it", zone, year, fr_id
+                )
+                deadline = time.monotonic() + _CANCEL_CONFIRM_S
+                while time.monotonic() < deadline and not self._stopping.is_set():
+                    run = client.read_flow_run(fr_id)
+                    if run.state is not None and run.state.is_final():
+                        with self._lock:
+                            self._inflight.pop((zone, year), None)
+                        self._log.info("Ingest %s-%d (%s) is terminal; the retry may start", zone, year, fr_id)
+                        return
+                    # `_stopping` doubles as the sleep, so a shutdown wakes this at once
+                    # rather than holding the unwind for the rest of the confirmation
+                    # window — and the loop condition then ends it, since a retry during
+                    # shutdown is not wanted anyway.
+                    self._stopping.wait(_INGEST_POLL_S)
+        except Exception as exc:
+            raise RuntimeError(
+                f"could not confirm the previous ingest of {zone}-{year} ({fr_id}) has stopped: {exc}. "
+                f"Refusing to start a second one over the same mosaic prefix."
+            ) from exc
+        raise RuntimeError(
+            f"the previous ingest of {zone}-{year} ({fr_id}) did not reach a terminal state within "
+            f"{_CANCEL_CONFIRM_S:.0f}s of being cancelled. Refusing to start a second one over the same "
+            f"mosaic prefix — those commits do not rebase, so the loser's failure is terminal."
+        )
 
     def shutdown(self) -> None:
         """Stop dispatching AND cancel in-flight child ingest runs (best effort).
@@ -821,7 +848,12 @@ def fill_zones_sequential_flow(
             # divide it evenly by construction rather than racing for slots on the
             # global gate. The gate (`ingest_limit_name`) is still the hard ceiling —
             # this only decides how many a single cluster ever asks for at once.
-            max_parallel=look_ahead,
+            # 1 + look_ahead, matching the cells the flow PRIMES. Sized at look_ahead
+            # alone, the opening window's sibling ingests sat queued behind the head
+            # cell rather than running — so "start on whichever mosaic lands first"
+            # could only ever land the head one, and the fleet waited on it even when
+            # it was the slowest zone in the window.
+            max_parallel=1 + look_ahead,
             log=log,
             # Parent-derived tag so the cancellation/crash hook can sweep live
             # child ingests from a fresh process (see _ingest_child_tag). None

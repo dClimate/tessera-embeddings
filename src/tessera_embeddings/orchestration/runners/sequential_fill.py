@@ -151,6 +151,12 @@ class CellInputs(Protocol):
         cell's attempt budget is spent re-reading one dead result. The retry path calls
         this first; a no-op is a valid implementation for an adapter that keeps no
         state, and discarding a cell that was never started must also be a no-op.
+
+        MAY RAISE, and the retry path lets it. An adapter whose previous attempt is still
+        running somewhere has to end it before a replacement starts, and it cannot always
+        confirm that it did. Raising then refuses the retry, which costs a recoverable
+        cell; the alternative costs a mosaic written by two runs at once, which nothing
+        downstream detects and no retry repairs.
         """
         ...
 

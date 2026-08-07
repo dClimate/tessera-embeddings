@@ -500,31 +500,62 @@ def test_adapter_shutdown_cancels_in_flight_child_runs(monkeypatch):
     assert client.cancelled[0] == ("fr-9", StateType.CANCELLING)
 
 
-def test_discard_cancels_a_still_registered_child_before_re_dispatch(monkeypatch):
+def test_discard_waits_for_the_cancelled_child_to_actually_stop(monkeypatch):
     """A retry must not put a second ingest onto a mosaic prefix the first still holds.
 
     Polling gives up after a persistent run of API errors WITHOUT deregistering the
-    child, precisely because the server-side ingest may still be healthy. The retry
-    path then calls discard() then start(); if discard only dropped the memo, the
-    replacement would write the same prefix as a live sibling — and the ingest path's
-    commits do not rebase, so the loser's ConflictError is terminal.
+    child, precisely because the server-side ingest may still be healthy. The retry path
+    then calls discard() then start().
+
+    Cancellation is a REQUEST: Prefect marks the run Cancelling and a worker acts on it
+    later, so asking and returning leaves a live writer behind — and dropping the run id
+    in the same breath removed it from shutdown's sweep too, which was the one thing that
+    would have caught it. discard therefore FOLLOWS the request to a terminal state.
     """
-    adapter, client = _running_child(monkeypatch, "fr-abandoned")
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-x", state=None)
+    )
+    # RUNNING while the poller holds it, then terminal once cancellation lands.
+    client = _FakeClient([_state(StateType.RUNNING, final=False)] * 3 + [_state(StateType.CANCELLED, final=True)])
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    adapter = _adapter()
     adapter.start("33N", 2025)
-    _await_inflight(adapter, {("33N", 2025): "fr-abandoned"})
+    _await_inflight(adapter, {("33N", 2025): "fr-x"})
 
     try:
         adapter.discard("33N", 2025)
-        assert ("fr-abandoned", StateType.CANCELLING) in client.cancelled
-        assert adapter._inflight == {}  # dropped, so shutdown doesn't cancel it twice
+        assert ("fr-x", StateType.CANCELLING) in client.cancelled
+        assert adapter._inflight == {}  # released only once it was CONFIRMED finished
         assert ("33N", 2025) not in adapter._futures  # a fresh start() will re-submit
     finally:
         adapter.shutdown()
 
 
-def test_discard_still_forgets_the_cell_when_cancellation_fails(monkeypatch):
-    """The Prefect API being unreachable is the likeliest reason we are here at all,
-    so a cancellation that cannot be delivered must not block the retry.
+def test_discard_refuses_the_retry_when_the_child_will_not_confirm(monkeypatch):
+    """Unconfirmed is not the same as stopped.
+
+    Losing a recoverable cell to a failure that names itself is the cheaper mistake: a
+    mosaic written by two runs at once is undetectable downstream, and the ingest path's
+    commits do not rebase, so the loser's failure is terminal anyway.
+    """
+    monkeypatch.setattr(mod, "_CANCEL_CONFIRM_S", 0.05)
+    adapter, client = _running_child(monkeypatch, "fr-stuck")  # never reports terminal
+    adapter.start("33N", 2025)
+    _await_inflight(adapter, {("33N", 2025): "fr-stuck"})
+
+    try:
+        with pytest.raises(RuntimeError, match="did not reach a terminal state"):
+            adapter.discard("33N", 2025)
+        # STILL registered, so shutdown's sweep can reach it.
+        assert adapter._inflight == {("33N", 2025): "fr-stuck"}
+    finally:
+        adapter.shutdown()
+
+
+def test_discard_refuses_the_retry_when_the_api_cannot_answer(monkeypatch):
+    """The Prefect API being unreachable is the likeliest reason this path is reached at
+    all, and it is exactly when 'the old run has stopped' cannot be established.
     """
     adapter, client = _running_child(monkeypatch, "fr-unreachable")
     adapter.start("33N", 2025)
@@ -535,8 +566,8 @@ def test_discard_still_forgets_the_cell_when_cancellation_fails(monkeypatch):
 
     client.set_flow_run_state = _boom
     try:
-        adapter.discard("33N", 2025)  # swallowed
-        assert ("33N", 2025) not in adapter._futures
+        with pytest.raises(RuntimeError, match="could not confirm"):
+            adapter.discard("33N", 2025)
     finally:
         adapter._inflight.clear()  # else shutdown re-raises into the same dead client
         adapter.shutdown()
@@ -907,3 +938,16 @@ def test_every_year_is_validated_before_any_ingest_is_dispatched(wired):
         _run(cells=[("33N", 2025), ("34N", 2024)], time_window_end="June 2025")
     assert wired["ray_kwargs"] is None
     assert not wired.get("ingest_dispatches"), wired.get("ingest_dispatches")
+
+
+def test_the_ingest_adapter_can_run_every_cell_the_flow_primes(wired):
+    """The opening window is ``1 + look_ahead`` cells and the flow waits for whichever
+    mosaic lands FIRST — which only means anything if they are all actually started.
+
+    Sized at ``look_ahead`` alone, the executor had one fewer thread than the flow
+    primed, so the siblings sat queued behind the head cell and the shared GPU fleet
+    still waited on whichever zone happened to be first in the order.
+    """
+    _run(zones=["01N", "02N", "03N"], look_ahead=2)
+    inputs = wired["seq_kwargs"]["inputs"]
+    assert inputs._executor._max_workers == 3
