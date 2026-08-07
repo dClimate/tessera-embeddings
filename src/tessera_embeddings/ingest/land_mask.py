@@ -629,18 +629,15 @@ def _to_wgs84(epsg: int) -> Transformer:
     return Transformer.from_crs(epsg, 4326, always_xy=True)
 
 
-def _live_tile_bbox_wgs84(spec: ZoneSpec, tile_live: np.ndarray) -> tuple[float, float, float, float]:
-    """WGS84 ``(minx, miny, maxx, maxy)`` bounding the zone's LIVE tiles.
+def _tile_range_bbox_wgs84(spec: ZoneSpec, r0: int, r1: int, c0: int, c1: int) -> tuple[float, float, float, float]:
+    """WGS84 ``(minx, miny, maxx, maxy)`` covering tile rows ``[r0, r1)`` x cols ``[c0, c1)``.
 
-    Tight to the live-tile envelope (not the full zone extent) so the STAC/CMR
-    query never scans ocean-only latitudes. The projected rectangle's perimeter
-    is densified before projecting to WGS84 so meridian curvature can't clip the
-    extremes (which may fall mid-edge, not at a corner).
+    The projected rectangle's perimeter is densified before projecting to WGS84
+    so meridian curvature can't clip the extremes (which may fall mid-edge, not
+    at a corner) — the WGS84 envelope of the perimeter therefore CONTAINS the
+    whole projected rectangle, which is what lets callers treat a catalogue miss
+    against the box as a miss against everything inside it.
     """
-    rows = np.where(tile_live.any(axis=1))[0]
-    cols = np.where(tile_live.any(axis=0))[0]
-    r0, r1 = int(rows.min()), int(rows.max()) + 1  # half-open tile indices
-    c0, c1 = int(cols.min()), int(cols.max()) + 1
     tile_m = SHARD_PX * PIXEL_M
     e_lo = spec.easting[0] + c0 * tile_m
     e_hi = spec.easting[0] + c1 * tile_m
@@ -667,6 +664,57 @@ def _live_tile_bbox_wgs84(spec: ZoneSpec, tile_live: np.ndarray) -> tuple[float,
         east = float(lon[lon < 0.0].max())
         return west, lat_min, east, lat_max
     return float(lon.min()), lat_min, float(lon.max()), lat_max
+
+
+def _live_tile_bbox_wgs84(spec: ZoneSpec, tile_live: np.ndarray) -> tuple[float, float, float, float]:
+    """WGS84 ``(minx, miny, maxx, maxy)`` bounding the zone's LIVE tiles.
+
+    Tight to the live-tile envelope (not the full zone extent) so the STAC/CMR
+    query never scans ocean-only latitudes. This is the box the ingest itself
+    queries the catalogue with (via the ROI's ``bbox_wgs84`` attr).
+    """
+    rows = np.where(tile_live.any(axis=1))[0]
+    cols = np.where(tile_live.any(axis=0))[0]
+    return _tile_range_bbox_wgs84(spec, int(rows.min()), int(rows.max()) + 1, int(cols.min()), int(cols.max()) + 1)
+
+
+def live_tile_block_bboxes_wgs84(
+    spec: ZoneSpec, tile_live: np.ndarray, *, block_tiles: int
+) -> list[tuple[tuple[float, float, float, float], int]]:
+    """Per-block WGS84 boxes covering the zone's live tiles, with each block's live count.
+
+    The tile grid is cut into ``block_tiles`` x ``block_tiles`` blocks and each
+    block containing at least one live tile yields ``(bbox, live_count)``, the
+    bbox tight to that block's live rows/cols. Together the boxes cover every
+    live tile, and each box contains the live tiles it reports — so a catalogue
+    miss against EVERY box is a miss against all of the zone's live land, while
+    the union envelope alone cannot say that (a sparse zone's envelope is mostly
+    water and land the zone does not own, so an envelope hit may be nothing the
+    zone can use).
+
+    The count is a proxy for land carried, letting callers probe the densest
+    block first: where the source publishes anything at all, the densest block
+    is where it shows up soonest.
+    """
+    if block_tiles < 1:
+        raise ValueError(f"block_tiles must be >= 1, got {block_tiles}")
+    blocks: list[tuple[tuple[float, float, float, float], int]] = []
+    for br in range(0, tile_live.shape[0], block_tiles):
+        for bc in range(0, tile_live.shape[1], block_tiles):
+            block = tile_live[br : br + block_tiles, bc : bc + block_tiles]
+            if not block.any():
+                continue
+            rows = np.where(block.any(axis=1))[0]
+            cols = np.where(block.any(axis=0))[0]
+            bbox = _tile_range_bbox_wgs84(
+                spec,
+                br + int(rows.min()),
+                br + int(rows.max()) + 1,
+                bc + int(cols.min()),
+                bc + int(cols.max()) + 1,
+            )
+            blocks.append((bbox, int(block.sum())))
+    return blocks
 
 
 def _zone_roi_transform(spec: ZoneSpec) -> list[float]:

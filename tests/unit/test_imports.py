@@ -31,11 +31,13 @@ def test_ingest_modules_import() -> None:
     """Every ingest submodule imports."""
     from tessera_embeddings.ingest import (  # noqa: F401
         auth,
+        land_mask,
         opera_query,
         roi,
         roi_processing,
         s1_roi,
         s2_roi,
+        source_coverage,
         stac,
         transforms,
     )

@@ -22,6 +22,22 @@ all-ocean cells are marked complete-empty *before* Ray is provisioned — and,
 unlike the per-cell path, an all-ocean cell is never ingested at all. Live
 cells are ordered largest-first (clamped ``min(num_actors, live tiles)``
 requests) so the autoscaled fleet only ever shrinks across the run.
+
+Triage also preflights each live cell's OPTICAL source
+(:func:`tessera_embeddings.ingest.source_coverage.preflight_optical_source`) when this
+flow will ingest: a cell whose source catalogue confirmably publishes nothing reaching
+its live land in its window is refused here, where refusal costs seconds, instead of
+failing its coverage gate after its ingest has run and the shared fleet is up. What the
+preflight guarantees: it refuses only on a POSITIVE finding of absence — probes of the
+ingest's own catalogue, over boxes jointly covering all live land, with the window
+padded per the solar-day convention, all cleanly empty — a condition under which even
+the ``allow_partial_window``-relaxed gate must fail. What it does NOT guarantee: that a
+passed cell is buildable (a catalogue hit is provisional; the fill's gates remain the
+authority), nor that every doomed cell is caught (an inconclusive probe passes the cell
+through — losing a buildable cell to a flaky check would cost campaign coverage, which
+is worse than the cluster time it saves). Refused cells are reported in the summary
+(``no_optical``) and left unfilled; ``ingest=False`` skips the preflight entirely,
+because pre-built mosaics, not the catalogue, are then the source of truth.
 """
 
 from __future__ import annotations
@@ -50,6 +66,7 @@ from tessera_embeddings.inference.data_loading import check_time_window_coverage
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.inference.scheduling import WorkItem
+from tessera_embeddings.ingest.source_coverage import SourceFinding, preflight_optical_source
 from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
 from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     activate,
@@ -671,6 +688,7 @@ def fill_zones_sequential_flow(
     # ------------------------------------------------------------------
     retagged: list[dict[str, Any]] = []
     empty: list[dict[str, Any]] = []
+    no_optical: list[dict[str, Any]] = []
     live: list[SequentialCell] = []
 
     def _fill_no_cluster(zone: str, year: int, run_id: str) -> dict[str, Any]:
@@ -710,6 +728,34 @@ def fill_zones_sequential_flow(
             # (there is no staging to fingerprint and no mosaic to read).
             empty.append(_fill_no_cluster(zone, year, f"{zone}-{year}-empty"))
             continue
+        # Optical preflight, only when THIS flow produces the mosaics: a cell whose
+        # source confirmably publishes nothing for its live land would otherwise pay
+        # for its ingest and a share of the fleet before failing its coverage gate.
+        # Only a CONFIRMED_ABSENT refuses — an inconclusive or provisional answer
+        # passes the cell through unchanged (see the module docstring's guarantees).
+        # With ingest=False the mosaics already exist upstream and are the source of
+        # truth; the catalogue can say nothing about them, so no preflight runs.
+        if ingest:
+            pre = preflight_optical_source(
+                zone,
+                _window_for(year),
+                land_mask_path=land_mask_path,
+                get_credentials=iam_icechunk_credentials,
+                s3_region=s3_region,
+                log=log,
+            )
+            if pre.finding is SourceFinding.CONFIRMED_ABSENT:
+                log.warning(
+                    "Optical preflight refused %s-%d after %d probe(s): %s — the cell is left "
+                    "unfilled (no ingest, no fleet share); it will keep appearing in the campaign's "
+                    "unfilled report until the source publishes it or it is dropped from the ask.",
+                    zone,
+                    year,
+                    pre.probes,
+                    pre.reason,
+                )
+                no_optical.append({"zone": zone, "year": year, "reason": pre.reason})
+                continue
         live.append(SequentialCell(zone=zone, year=year, num_actors=min(num_actors, n_tiles), n_tiles=n_tiles))
 
     # DENSEST FIRST, on the unclamped tile count. Two things depend on it: the
@@ -723,11 +769,12 @@ def fill_zones_sequential_flow(
     # of the list in arbitrary order — precisely the part this ordering is for.
     live.sort(key=lambda c: c.n_tiles, reverse=True)
     log.info(
-        "Triage for year(s) %s: %d retagged, %d empty, %d live cell(s) — order: %s",
+        "Triage for year(s) %s: %d retagged, %d empty, %d live cell(s), %d refused (no optical) — order: %s",
         cell_years,
         len(retagged),
         len(empty),
         len(live),
+        len(no_optical),
         [f"{c.zone}-{c.year}" for c in live],
     )
 
@@ -737,6 +784,7 @@ def fill_zones_sequential_flow(
         "retagged": len(retagged),
         "empty": len(empty),
         "live": len(live),
+        "no_optical": [[c["zone"], c["year"]] for c in no_optical],
     }
     if not live:
         log.info("No live cells — no Ray cluster needed")

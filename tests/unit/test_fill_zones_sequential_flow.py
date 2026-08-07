@@ -55,6 +55,17 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)
     monkeypatch.setattr(mod, "zone_live_tile_count", lambda *a, **k: 10)
 
+    # Default optical preflight: provisional PRESENT for every cell (the real one
+    # probes a catalogue over the network). Preflight tests override it; the record
+    # lets them assert whether, and for which cells, it ran.
+    rec["preflights"] = []
+
+    def fake_preflight(zone, window, **kwargs):
+        rec["preflights"].append(zone)
+        return SimpleNamespace(finding=mod.SourceFinding.PRESENT, reason="test default", probes=1)
+
+    monkeypatch.setattr(mod, "preflight_optical_source", fake_preflight)
+
     def fake_no_cluster_fill(**kwargs):
         rec["no_cluster_fills"].append(kwargs)
         return {"zone": kwargs["zone"], "run_id": kwargs["run_id"]}
@@ -132,6 +143,60 @@ def test_off_axis_year_fails_the_run(wired, monkeypatch):
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: False)
     with pytest.raises(ValueError, match="pre-allocated axis"):
         _run()
+
+
+def _finding(finding):
+    return SimpleNamespace(finding=finding, reason="scripted", probes=2)
+
+
+def test_confirmed_absent_optical_refuses_the_cell_before_any_dispatch(wired, monkeypatch):
+    """A refused cell is neither ingested nor given a fleet share — and is reported."""
+    monkeypatch.setattr(
+        mod,
+        "preflight_optical_source",
+        lambda zone, window, **k: _finding(
+            mod.SourceFinding.CONFIRMED_ABSENT if zone == "01N" else mod.SourceFinding.PRESENT
+        ),
+    )
+    result = _run(zones=["01N", "02N"])
+    assert result["no_optical"] == [["01N", 2025]]
+    assert result["live"] == 1
+    assert [c.zone for c in wired["seq_kwargs"]["cells"]] == ["02N"]
+    # Not settled through the no-cluster fill either: the cell is left unfilled.
+    assert wired["no_cluster_fills"] == []
+
+
+def test_inconclusive_preflight_passes_the_cell_through(wired, monkeypatch):
+    """Refuse only on a POSITIVE finding: 'could not determine' must not lose the cell."""
+    monkeypatch.setattr(
+        mod, "preflight_optical_source", lambda zone, window, **k: _finding(mod.SourceFinding.INCONCLUSIVE)
+    )
+    result = _run(zones=["01N"])
+    assert result["no_optical"] == []
+    assert [c.zone for c in wired["seq_kwargs"]["cells"]] == ["01N"]
+
+
+def test_every_cell_refused_means_no_cluster(wired, monkeypatch):
+    monkeypatch.setattr(
+        mod, "preflight_optical_source", lambda zone, window, **k: _finding(mod.SourceFinding.CONFIRMED_ABSENT)
+    )
+    result = _run(zones=["01N", "02N"])
+    assert result["live"] == 0 and result["sequential"] is None
+    assert wired["ray_kwargs"] is None
+
+
+def test_preflight_skipped_for_upstream_mosaics(wired):
+    """With ingest=False the pre-built mosaics are the source of truth, not the catalogue."""
+    _run(ingest=False)
+    assert wired["preflights"] == []
+
+
+def test_preflight_runs_only_for_live_cells(wired, monkeypatch):
+    """Retagged and all-ocean cells are settled before the catalogue is ever asked."""
+    monkeypatch.setattr(mod, "zone_year_complete", lambda store, zone, year, **k: zone == "01N")
+    monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: 0 if zone == "02N" else 10)
+    _run(zones=["01N", "02N", "03N"])
+    assert wired["preflights"] == ["03N"]
 
 
 def test_live_cells_ordered_by_clamped_fleet_desc(wired, monkeypatch):
