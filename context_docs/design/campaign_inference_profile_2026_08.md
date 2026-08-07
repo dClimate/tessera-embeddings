@@ -75,11 +75,12 @@ Skips are rare and benign: **5 of 2,123 (0.24%)**.
 
 ## Two findings that bear on the cost model, and they pull opposite ways
 
-The model costs inference at **$503–579 k**, from 1.98 × 10¹⁵ tokens (1.363 × 10¹³ pixels at a
+The model costed inference at **$503–579 k**, from 1.98 × 10¹⁵ tokens (1.363 × 10¹³ pixels at a
 land-weighted **145** observations per pixel) at a reference **≈1.9 M tok/sec** per worker — the
-rate being *optical* tokens/sec and the census S2+S1, which is a unit mismatch settled nowhere yet
-(see "Radar roughly DOUBLES per-chunk inference cost" below) — giving
-289,000 GPU-hours. The reference rate was measured on **the same `g6e.xlarge`** at the same
+rate being *optical* tokens/sec and the census S2+S1, a unit mismatch **settled 2026-08-07**:
+the line is re-based on one unit to **$527,000 (0.98×)** in `campaign-cost-model.md` §6b, and
+"The radar term, measured" below carries this document's share of the evidence. The reference
+rate was measured on **the same `g6e.xlarge`** at the same
 wall-clock basis, so the rate comparison is like-for-like.
 
 ### `t_kept` across COMPLETED zones — and three corrections this section has had to make
@@ -110,6 +111,18 @@ below), so every row is the cell's whole population rather than whatever fitted 
 
 **The observed range is now 57 to 158**, on about 15,000 measured chunks across eighteen zones.
 
+#### Correction 4 (2026-08-07) — every comparison of `t_kept` against the census's 145 in this section mixed units
+
+`t_kept` is optical; **145 is a COMBINED S2+S1 figure** — established three ways in
+`campaign-cost-model.md` §6b, including that 60N-2020's optical `t_kept` of exactly 145
+coincides with a band whose measured *combined* depth is 210 against a censused 208 (a
+coincidence that, read as agreement, would have inverted the correction). The like-for-like
+comparisons are: measured land-weighted **optical** depth **103.1** against the census's
+optical half of 52 — the census's optical half is LOW — and measured **combined** 170 against
+the censused 145. Sentences in this section that read 145 as a comparator for `t_kept` ("sits
+near the top of the observed range", "inside the observed range rather than above it") are
+**retired as unit-mixed**, not repaired.
+
 **Every row above is a COMPLETED cell, and that is now a stated requirement rather than a
 preference.** Two rows previously carried in-flight figures and both were wrong: 38N-2021 read
 `t_kept` **121** at one third complete and **73** at completion — a 40% overstatement — and its
@@ -131,6 +144,7 @@ chunk from a run still in flight.**
    median is 158 and 06N's is 151**, both above 145. The census figure is inside the observed
    range rather than above it, which strengthens rather than weakens it as a planning number —
    but the sentence claiming it is conservative relative to everything measured is now false.
+   *(2026-08-07: this whole comparison is unit-mixed — correction 4 above.)*
 2. **"About 26% of land is effectively unmeasured."** Three of the new cells are large and
    high-latitude — 23N at 1,395 chunks, 53N at 2,887, 38N at 3,242 so far — so the thin bands at
    the top of the stratified table almost certainly have far more support now. **I have not
@@ -146,7 +160,8 @@ to the stratified table, which derives latitude per chunk.
 
 **A continuum from 57 to 158, not two modes** — and the mechanism is almost certainly that
 polar-orbiting revisit converges toward the poles, so observation depth rises with |latitude|. The
-census's land-weighted **145** sits near the TOP of this observed range.
+census's land-weighted **145** sits near the TOP of this observed range *(retired — unit-mixed,
+correction 4)*.
 
 #### The instrument was undercounting, and it was invisible
 
@@ -232,6 +247,15 @@ under-predicted.** So it does predict.
 
 ### What that does to the estimate — as an INTERVAL, because a mean is misleading here
 
+> **Superseded 2026-08-07.** The stratification below now exists at full coverage: **22,343
+> chunks across 13 zones, every one of the 17 populated 5° bands measured**, land-weighted
+> optical depth **103.1** (per-band p25 85.4, p75 115.6) — replacing this section's central
+> 106 (interval 75–139, built on 2,779 chunks) and retiring reason 3 below, "about 26% of
+> land is effectively unmeasured". The monotonic rise (74.0 at 0–5° to 175.5 at 80–85°, no
+> reversal) confirms the step-function finding. The "census assumption" row in the table is a
+> COMBINED figure (correction 4); the combined planning depth is **170**. Arithmetic and the
+> full band table: `campaign-cost-model.md` §6b.
+
 A single weighted mean hides the two things that decide the answer: the spread inside each
 latitude band, and the global land histogram the mean is taken over. Stratified at 5°, with each
 band's own measured distribution:
@@ -295,6 +319,8 @@ Measured 2026-08-06. This is the largest single effect in this document and it i
 1. **The metric cannot see radar.** `t_kept` is `S2MaskBundle.mask.shape[0]` — the count of
    *optical* timesteps surviving SCL pruning. So `tokens = t_kept × valid_px` measures optical work
    only, and every tok/sec figure here is comparable within one radar status and no further.
+   (On the **combined** basis, available since 2026-08-06, comparability is restored — see
+   "The radar term, measured" below.)
 2. **The work really is smaller, and by a defined amount.** A radar-free pixel takes the
    `allow_s2_only` branch in `MosaicChunkInferenceDataset`, which lands it in the **smallest S1
    bucket** and hands the model an all-zeros normalised S1 slice. The forward pass therefore
@@ -365,12 +391,153 @@ price, which is small. The consequential half is the other 98%: **a token census
 timesteps understates the inference work**, so a line item derived from it is optimistic by
 something like the ratios above unless radar is priced separately. That is the specific next
 calculation, and it needs the radar sequence length per cell, which this telemetry does not carry.
+*(Made 2026-08-07 — and the premise half-fails: the census's 145 was itself COMBINED, so the
+line was not optimistic by these ratios; the net correction is −2%. Cost model §6b.)*
 
 **A concrete instrument gap to close if this is pursued:** `CHUNK_SUMMARY` should carry the radar
 timestep count alongside `t_kept`. With it, the effect above becomes a within-run regression over
-thousands of chunks instead of a between-run comparison over four.
+thousands of chunks instead of a between-run comparison over four. **CLOSED: `t_s1_asc` /
+`t_s1_desc` landed 2026-08-06, and the within-run measurement exists — next section.**
 
-### Assembly: the box is half idle and the worker cap is the constraint
+### The radar term, measured — four cells under `t_s1_asc` / `t_s1_desc` (2026-08-07)
+
+The first cells run with per-chunk radar telemetry, from a 96-hour CloudWatch corpus (29,886
+successful chunks, 1,633 carrying the radar fields). This section is the per-cell record; the
+re-based cost line and the full derivation live in `campaign-cost-model.md` §6b.
+
+| run | cell | chunks / live | `t_kept` med | asc / desc med | optical tok/s | combined tok/s (both-orbit chunks) | $/chunk | radar basis |
+|---|---|---:|---:|---:|---:|---:|---:|---|
+| `p4d2-47S-2020-w16` | 47S/2020 | 235 / 239 | 61 | 30 / 31 | 1.301 M | **2.499 M** | 0.118 | both on 228 of 235 |
+| `p4d2b-60N-2020-w16-run2` | 60N/2020 | 527 / 620 | 145 | 22 / 30 | 1.693 M — **mixed, do not quote whole-cell** | **2.431 M** | 0.177 | 326 both, 199 one, 2 free |
+| `assembly-dense-37N-2021-w160` | 37N/2021, chunks at 65–69° | 141 | — | — | 1.601 M (both-orbit chunks) | **2.579 M** | — | 45 of 141 both |
+| ~~`assembly-dense-37N-2021-resume`~~ *in flight* | 37N/2021, chunks at 30–32° | 203 | — | — | 0.756 M (both-orbit chunks) | ~~1.870 M~~ | — | 163 of 203 both |
+| **`assembly-dense-37N-2021-resume` COMPLETE** | **37N/2021, chunks at 0.1–32.1°** | **4,859** | 71 | 29 / 30 | 1.005 M (both-orbit chunks) | **2.038 M** | 0.161 | 1,997 both, 2,862 one, 0 free |
+
+Reading rules, each one earned:
+
+- **60N gets no single rate.** Its 1.69 M averages three populations (326 both-orbit, 199
+  one-orbit, 2 radar-free), and the profiler refuses to quote one figure for a mixed basis.
+  Decomposed, its both-orbit chunks run 1.562 M optical / 2.431 M combined and its one-orbit
+  chunks 1.946 M / 2.489 M.
+- **The two 37N samples are admissible per latitude band only, never as whole-cell medians** —
+  one was in flight when read, and 37N spans 0–70°+, which is why its runs report `t_kept`
+  medians of 72, 121 and 149 without disagreeing. (The in-flight bias this document warns
+  about is a bias in *whole-cell* medians; attributing each chunk to its own latitude removes
+  the mechanism.) A related run without radar telemetry,
+  `assembly-baseline-37N-2021-stagekept`, was cancelled at 44% (3,855 of 8,731; optical
+  1.085 M, $0.232/chunk) and its `t_kept` 121 is an in-flight figure.
+- **`-resume` COMPLETED 2026-08-07, and the in-flight row it replaces was wrong about two
+  things** beyond being small. Its span read 30–32° because those were the run's *opening*
+  chunks and the sweep went north to south; complete, it is 0.1–32.1°. And its both-orbit radar
+  depth read 146.8 tok/px, "the deepest radar measured anywhere"; complete, it is **89.9** —
+  ordinary against 60N's 76.4 and 47S's 66.3. Deep radar is real but belongs to the **32.5°
+  band** (151.8 over 243 chunks), not to the cell. Both errors are the same mechanism this
+  reading rule names, and both survived into the cost model for several hours.
+- **The two legs together price the whole zone-year.** Baseline 3,855 chunks at 480.4 GPU-hours
+  plus resume 4,859 at 421.7 gives **8,714 chunks, 902.1 GPU-hours, $1,679** — the first
+  complete dense both-orbit zone-year cost we hold. The legs differ 1.50× in seconds per chunk
+  and agree to **5.8%** on tokens per second, which is the best validation the token basis has:
+  a per-chunk or per-pixel basis would have read one zone-year as two incompatible machines.
+- **A duplicate 60N fill against one mosaic put the run-to-run noise floor at 0.3%** — treat
+  any effect under ~1% on this instrument as noise.
+
+**The finding that matters: the combined rate is invariant to radar status; the optical rate is
+not.** Within each of the four cells, both-orbit and one-orbit chunks agree on the combined
+basis to 1.01–1.08× while spreading 1.24–1.35× on the optical basis. Geography, day, code and
+fleet are held constant by the within-run comparison, so this is the empirical justification
+for the combined-token unit — the same shape of evidence that settled tokens-versus-pixels.
+The radar-free cells corroborate from the other end: their optical rate IS their combined rate,
+and 23N (2.934 M) and 57S (2.258 M) bracket the both-orbit combined figures instead of sitting
+far above them, which is what the optical basis made them look like.
+
+**Pooled both-orbit combined rate: 2.127 M tok/s per actor** (2,596 chunks, revised 2026-08-07
+from 2.273 M over 762 when `-resume` completed). Three of the four cells agree within 6%; **37N
+south of 32° is 19% below and unexplained** — strip plan, bucket fragmentation and per-chunk
+overhead each ruled out by measurement, and completing the cell narrowed the deficit from 30%
+without closing it. That cell now carries **77% of the pooled weight**, so the pooled rate is
+largely its rate and the deficit is inherited by the campaign line rather than diluted. **Do not
+price optical and radar tokens separately from this data**: the two-coefficient regression is
+not identifiable (the ratio changes sign across cells) despite an R² that looks respectable.
+
+**Radar depth is regional, not latitudinal — restated on ten bands.** Radar depth runs **66–152
+tokens/px with r = +0.21** against |latitude|, where optical gives **+0.91** over the same
+bands; deepest is the Middle East, shallowest the equator and the Arctic, pointing at the
+Sentinel-1 observation plan rather than geometry. **The decisive evidence is non-monotonicity,
+not the correlation**: the minimum (66.1 at 22.5°) sits *between* 76.3 below it and 117.3 above,
+so no monotone curve fits regardless of what r reads. Radar's *share* of a sequence falls with
+latitude (48% → 34–37%) only because the optical denominator rises. Planning form: a constant
+**94** tokens/px land-weighted, range 66–152 — a level with a spread, never a curve. (The
+sample-weighted pooling of the same bands gives 86; see the weighting note below for why land is
+the right weight.) One-orbit chunks carry **0.49** of a both-orbit
+chunk's radar (0.39–0.58); a radar-free chunk carries **8** (the smallest S1 bucket — a code
+fact). An earlier two-cell reading ("radar depth is approximately flat while optical rises") is
+**withdrawn**; and the five-band reading's r = +0.009 is superseded — at ten bands it is +0.21,
+so the claim must be stated as *weak and non-monotonic*, never as *zero*.
+
+**Unmeasured and interpolated: 35–50°.** The completion filled every 5° band from the equator to
+35° and the bands above 50°, leaving **35–50 empty** — 19.2% of campaign land, and the largest
+unmeasured span. It is now **interpolated** between its measured neighbours (137, 123, 108 across
+its three sub-bands), which is defensible and must not be mistaken for the latitude curve the
+band table forbids: interpolating one gap between two neighbours is not fitting a trend.
+
+**Doing that interpolation is what exposed a weighting defect, and that mattered more than the
+gap.** Radar depth had been pooled by CHUNK over the measured cells, while optical depth was
+weighted by live tiles over campaign land — two different questions, and the pair put the halves
+of one depth on two different weightings. Land-weighting radar gives **94.3 tok/px against the
+sample's 86.3, +9.2%**, and the difference is geographic: the deepest radar sits at 30–35° and the
+unmeasured band beside it carries a fifth of campaign land, so a sample-weighted figure
+under-represents exactly where radar is deepest. The land-weighted figure is now the model's.
+
+A measured band there remains the best available refinement — preferably outside Europe and the
+Middle East, the densely-tasked Sentinel-1 regions that supply every deep observation we hold —
+but it is a refinement, not a hole, and not worth delaying a cell for.
+
+**Two open items this telemetry surfaced.** 93 of 60N's 620 live tiles produced zero valid
+pixels (valid-pixel yield 0.811 against 0.983–0.984 elsewhere); whether high-latitude cells
+systematically yield less is unmeasured. And **no both-orbit rate exists at campaign fleet
+width** — these cells ran at 20–95 actors against a planned 228 per cluster, with no
+actor-count trend among them but no measurement either.
+
+**Zero-valid-pixel tiles are deterministic and spatially clustered (2026-08-07).** Both open
+items moved. On the width question the widest measurement is now **160 actors**, still short of
+228 — but it is the *slowest* cell and it is also the one carrying the unexplained geographic
+deficit, so **fleet width and geography are now perfectly confounded** in this table. That
+combination looks like an actor-count penalty and must not be read as one; separating them needs
+a second wide run in a different zone.
+
+On the zero-yield tiles, comparing the skip markers left by two independent fills of the same
+cell settles what they are:
+
+| cell | skipped | identical across two fills? | connected components (8-neighbour) |
+|---|---:|---|---|
+| 37N/2021 | 17 of 8,731 | **yes** | 16 + 1 |
+| 60N/2020 | 93 of 620 | **yes** | 62 + 15 + 9 + 6 + 1 |
+
+Byte-for-byte the same tile sets, a day apart, in contiguous blocks. Random worker failures
+scatter; reproducible regions are a property of the input data, which matches what the code
+documents a skip to mean — every pixel failed the validity filter. **So the campaign is handling
+these correctly rather than losing data quietly**, and "do high latitudes yield less" is the
+wrong question: 60N loses 15% of its tiles in five blocks, which is a coverage fact about
+specific places, not a latitude gradient.
+
+**What is NOT handled: the store keeps no record of them.** Skipped tiles are written as *fill*
+and the year is then marked complete, and the per-year provenance record carries `run_id`,
+`assembled_at`, an `empty` flag for a wholly-empty year and `radar_coverage` — but **no field
+for partial optical skips**. A consumer reading 37N/2021 finds zeros across ~7,100 km² and
+cannot distinguish "no valid optical data" from "not land", because ocean is also zeros. For
+60N/2020 that is ~39,000 km². The argument that already justifies recording `radar_coverage`
+per year — coverage is a property of what was acquired, not of the terrain — applies identically
+here, and the plumbing exists: `assemble_global` already holds the skipped labels and
+`write_year_shards` already forwards a summary dict into the provenance record. Folded into
+Phase 5.
+
+### Assembly: the worker cap WAS the constraint at 8, and at 16 nothing is
+
+> **SUPERSEDED IN ITS CONCLUSION, 2026-08-07 — see "Assembly re-measured at 16 workers" below.**
+> This section's finding ("the box is half idle, the cap binds, raise it") was correct at
+> `max_workers = 8` and drove the raise to 16. Measured at 16 on a real dense cell, the box is
+> **not** half idle and no resource binds. The section is kept because the reasoning that
+> justified the raise is the reasoning that predicts where the next one would help.
 
 Measured 2026-08-06 on 38N-2021's assembly — 9,050 staged tiles, the largest attempted.
 
@@ -387,18 +554,22 @@ processes that each hold one staged tile slice. The runner is the `inference` fa
 | `n_workers` chosen | **8** | `AssemblyConfig.max_workers = 8` |
 
 **The binding constraint is the worker cap, not the box.** `compute_n_workers` is
-`min(live_tiles / 10, max_workers)`, and `max_workers` is **8** — so a **9,050-tile zone gets the
-same 8 processes as a 267-tile zone.** Parallelism does not scale with the job, which is why a dense
-cell's assembly runs for hours.
+`min(live_tiles / 10, max_workers)`, and `max_workers` was **8** when this was measured — so a
+**9,050-tile zone got the same 8 processes as a 267-tile zone.** Parallelism did not scale with
+the job, which is why a dense cell's assembly ran for hours. **Decided from this measurement:
+`AssemblyConfig.max_workers` is 16 (raised 2026-08-06), and 8 is dead** — 16 is what the flow
+runner was explicitly sized for.
 
 Every resource signal agrees: at most **45% of allocated vCPU** and **31% of memory**, with a
 perfectly flat rate — no degradation, no backpressure, no thrashing. A flat rate at half the CPU is
 the signature of a fixed worker count, not of a resource limit.
 
-**So: raise `max_workers` before touching the task size.** The 16 vCPU / 64 GiB box was *explicitly*
+**So: raise `max_workers` before touching the task size.** — DONE, 16 shipped 2026-08-06. The
+16 vCPU / 64 GiB box was *explicitly*
 sized for this — `consumer_stack.py` says "16 vCPU / 64 GiB leaves headroom for n_workers=16
-(~19 GiB)". At 16 workers, expect CPU near 90% of the box and memory near 38 GB, both inside it, and
-roughly half the wall clock.
+(~19 GiB)". Measured at 16 workers, memory sits near **19 of 64 GiB** (the 38 GB this
+paragraph once predicted was high) — **memory is not a constraint** at any pool size under
+consideration.
 
 **Do NOT adopt `assembly_large` (32 vCPU / 244 GiB) yet.** It is registered and unused, and its own
 comment says to adopt it only once a measurement shows 16 vCPU is insufficient. **We are not using
@@ -411,14 +582,86 @@ the worker count — if the assembly were S3-concurrency-bound, more workers wou
 measured at **~4.1 PUT/s against a budget of 100**, nowhere near the ceiling, so the budget is not
 what is holding it.
 
-**Why this matters at campaign scale.** Assembly is serial per cell and follows inference, so a
-dense cell's hours land directly on the critical path, 1,008 times. It is also cheap to fix: the GPU
+**The constraint set around the pool, settled 2026-08-07.** Three things bound what raising
+the pool further could buy, and only the first is live:
+
+- **The S3 budget is DIVIDED by the pool**: 16 workers get **6** concurrent PUTs each where 8
+  got 12, so raising workers without raising the budget may not raise throughput — and the
+  budget should not be raised casually. Its own docstring records `SlowDown` observed at
+  **800** concurrent PUTs, the budget is per-RUN, and the campaign runs 8 clusters — so the
+  campaign-wide figure is ALREADY ~800.
+- **The northing-band count is NOT a constraint** — raised as one and withdrawn: a real zone
+  has ~456 bands, far above any worker count under consideration.
+- **Memory is not a constraint** (~19 of 64 GiB at 16 workers, above).
+
+**Phase-split instrumentation now exists**: the `ASSEMBLY_SUMMARY` record reports read and
+write wall-clock and CPU per worker. Compression and upload are **fused** in one call, and the
+record says so rather than inventing a split.
+
+**Why this matters at campaign scale — corrected 2026-08-07.** An earlier version of this
+paragraph said a dense cell's assembly hours "land directly on the critical path, 1,008
+times". On the chained path they do not: assembly runs on the cluster's dedicated **trailing
+thread** while later zones keep the GPUs busy, so it is **off the critical path by design** —
+it lands on the critical path only for a cluster's final zone, or if an assembly outlasts the
+next zones' inference. The runner design note puts assembly at ~10–15% of a zone's inference
+wall time, **which is unverified and should be treated as such** (Phase 5's F8 is the check at
+width). The cost half of the old sentence stands: the GPU
 fleet is released before assembly starts ("Killing 60 actors to release resource reservations"), so
-these hours cost one flow-runner task rather than sixty GPUs — a wall-clock problem, not a cost one.
+these hours cost one flow-runner task rather than sixty GPUs — a wall-clock question, not a cost one.
 
 **Caveat on the utilisation figures.** They are Container Insights metrics for the whole cluster, so
 the maxima include two concurrent 35N ingest tasks. The true assembly-only CPU share is therefore
 **below** the 45% quoted, which strengthens the conclusion rather than weakening it.
+
+### Assembly re-measured at 16 workers — no resource binds, and the runner is free during inference
+
+Measured 2026-08-07 on **37N/2021's assembly: 8,714 staged tiles**, the largest ever assembled,
+on the same 16 vCPU / 64 GiB Fargate runner. Metrics filtered to the runner's own task family,
+so unlike the figures above they carry no other workload.
+
+| measurement | value | against | verdict |
+|---|---|---|---|
+| CPU used | avg **10.6–12.7 vCPU**, peak 13.2 | 16 vCPU allocated | 57–79% — not idle, not saturated |
+| memory used | **30–34 GiB, flat from minute one** | 64 GiB allocated | ~52%, a steady working set |
+| network | **~1.0 GB/s combined** (≈550 read + ≈430 write) | Fargate 16 vCPU | ~7.5 Gbps mean, 8.9 peak |
+| `n_workers` | **16** | `AssemblyConfig.max_workers = 16` | one process per vCPU |
+
+**Nothing binds, and the network question is settled by variance rather than by level.** Over 26
+consecutive minutes combined throughput ran 760–1,116 MB/s: mean 935, coefficient of variation
+**9.6%**, maximum 19% above the mean. A hard cap pins the maximum at the mean and drives the
+variation to zero, so this is not a cap. CPU and memory are likewise mid-range. The box is
+correctly sized and **`assembly_large` remains unjustified.**
+
+**Memory now bounds the pool, and it does so before the northing bands ever would.** 16 processes
+hold ~2 GiB each. That is a ceiling near **32 workers** on a 64 GiB task — the first real bound
+found on the pool, and it supersedes "memory is not a constraint at any pool size under
+consideration" above, which was measured when the working set read 19 GiB. The 456-band figure
+remains irrelevant.
+
+**Two corrections to how the pool was described.** The dominant write path partitions tiles
+**round-robin**, not into northing bands: `write_year_shards` builds exactly `n_workers` payloads
+of ~545 tiles each, balanced by count. So the load balancing is structural, the "band" language
+applied only to the ROI path, and the progress reporter's `0/16 done` for hours was the designed
+behaviour of a partition scheme where nothing completes until everything nearly does. Both were
+fixed 2026-08-07 (per-worker progress on a timer, and the caller naming its own unit).
+
+**The staged intermediate is uncompressed, which is what sets the duration.** Every staged tile is
+byte-identical at **570.4 MB** — exactly the embeddings array plus the scales array with no
+compression — so a dense zone-year is **4.97 TB across 2.34 M objects** to read. That, not CPU,
+is why assembly takes hours: about 2.5 for this cell. Compressing the staged intermediate is the
+one change that would move assembly wall-clock materially.
+
+**Cost, measured for the first time.** The runner task is $0.93/hour, so a dense cell's assembly
+is **$2.33 of compute plus ~$1 of S3 requests**. Scaled by tile count over 1,008 campaign cells
+that is **~$1,300** — superseding the ~$200 previously carried in the cost model with no
+measurement behind it. Assembly is a scheduling term and never a cost term.
+
+**The trailing-thread design is now confirmed rather than assumed.** The claim above that
+assembly is "off the critical path by design" rested on the runner having capacity to spare. It
+does, decisively: **the runner sits at 0.02 vCPU for the entire 2.5 hours of GPU inference**,
+with one ten-minute burst of 6–8 vCPU at run start. So a trailing assembly needing 11–12 vCPU
+overlaps the next zone's inference with the box effectively to itself. The corollary is that
+**two concurrent assemblies on one runner would contend** — 2 × 12 exceeds 16.
 
 ### What survives all three corrections — and what the radar finding takes back
 
@@ -432,9 +675,11 @@ standing in the same file.
 **Still stands: the cost model is right to price in tokens rather than chunks.** A fixed
 per-chunk price cannot describe a 2× spread whatever causes it.
 
-**Still stands: `t_kept` 145 remains a defensible planning figure for observation depth.** It is
-inside the observed 57–158 range rather than above it, which is a change from what this document
-said earlier but not a reason to move it.
+~~**Still stands: `t_kept` 145 remains a defensible planning figure for observation depth.**~~
+**WITHDRAWN 2026-08-07 — unit-mixed (correction 4).** 145 is a COMBINED census figure and
+`t_kept` is optical, so "inside the observed 57–158 range" compared quantities in different
+units. The measured planning depths are **103.1 optical** (land-weighted, all populated bands)
+and **170 combined**; `campaign-cost-model.md` §6b.
 
 **WITHDRAWN: "cost per chunk tracks `t_kept`."** The deepest cell measured (23N-2021, `t_kept` 158)
 is among the cheapest ($0.113) because it is radar-free. Depth and radar status are confounded
@@ -461,7 +706,9 @@ radar-free one. All of these figures — the reference included — are **optica
 since they all come from `t_kept × valid_px`.
 
 **Re-basing the $503–579 k line is now a live question, and this document cannot settle it, in
-either direction.** The exposure turned out to be a UNIT mismatch rather than a rate shortfall, and
+either direction.** *(Settled 2026-08-07 — see "TAKEN" below and cost model §6b; the reasoning
+is kept because the refusal to pick a direction was load-bearing.)* The exposure turned out to
+be a UNIT mismatch rather than a rate shortfall, and
 the two point opposite ways:
 
 - The cost model's numerator, the token census, counts **S2 + S1** — 52 optical plus 91 radar
@@ -480,11 +727,19 @@ against a measured 69.9), is in `campaign-cost-model.md` beside the census table
 a single both-orbit cell yields the radar term per chunk, hence the true S2+S1 token count and a
 rate in the SAME unit as the census. Then the division is like-for-like.
 
+**TAKEN, 2026-08-07 — four cells, and the line is re-based at 0.98× ($527,000).** The two
+errors nearly cancelled: the combined rate is higher than the optical one (pushing the line
+down) and the measured combined depth is higher than the censused 145 (pushing it up).
+"Neither direction is claimed" above was the right refusal — the direction that a one-error
+correction would have produced was wrong by 19%. Per-cell record: "The radar term, measured"
+above; arithmetic: `campaign-cost-model.md` §6b.
+
 **One caution against over-correcting.** The 20–35% above compares whole-cell medians across
 different zones, which is exactly the kind of comparison that has been wrong three times in this
 document already. The `t_s1_asc` / `t_s1_desc` fields added to `CHUNK_SUMMARY` on 2026-08-06 turn
 it into a within-run regression over thousands of chunks; the honest sequence is to deploy those,
-re-measure one both-orbit cell, and only then move a budget line.
+re-measure one both-orbit cell, and only then move a budget line. **That sequence was followed,
+and the budget line moved 2%.**
 
 ## An independent cross-check of the inference line, from the coverage mask
 
