@@ -106,3 +106,35 @@ def test_an_edit_to_a_transitive_dependency_moves_the_digest(tmp_path: Path) -> 
     before = digest(reached)
     helper.write_text("def doy(x):\n    return x + 1\n")  # a different model input
     assert digest(first_party_import_closure(seed, root)) != before
+
+
+def test_a_relative_re_export_does_not_stop_the_closure(tmp_path: Path) -> None:
+    """Package ``__init__`` files re-export with RELATIVE imports, and a relative
+    import's module name is the tail alone — ``"providers"``, not the dotted package
+    path — so a first-party filter on the package prefix rejects it.
+
+    That stopped the walk at every re-export. Measured on the real tree, it left
+    ``config/providers.py`` — the STAC collections, band lists, resolutions and
+    baseline settings — outside the fingerprint of the code that ingests with them, so
+    changing a collection could leave a mosaic's identity unmoved and let a resume
+    append data produced under different settings.
+    """
+    root = tmp_path / "pkg"
+    (root / "ingest").mkdir(parents=True)
+    (root / "config").mkdir()
+    (root / "ingest" / "leg.py").write_text("from tessera_embeddings.config import PROVIDERS\n")
+    (root / "config" / "__init__.py").write_text("from .providers import PROVIDERS\n")
+    providers = root / "config" / "providers.py"
+    providers.write_text("PROVIDERS = {'earth-search': 1}\n")
+
+    reached = first_party_import_closure([root / "ingest" / "leg.py"], root)
+    assert providers in reached, "the re-exported module must be reached through the package"
+
+
+def test_the_real_ingest_fingerprint_covers_the_collection_settings() -> None:
+    """The case the miniature package stands in for, asserted on the tree that ships."""
+    from tessera_embeddings.config.ingest import _MOSAIC_CONTENT_SOURCES
+
+    seed = [_ROOT / entry for entry in _MOSAIC_CONTENT_SOURCES]
+    reached = {p.relative_to(_ROOT).as_posix() for p in first_party_import_closure(seed, _ROOT)}
+    assert "config/providers.py" in reached

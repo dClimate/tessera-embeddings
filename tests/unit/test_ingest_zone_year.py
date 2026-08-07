@@ -34,7 +34,7 @@ _LIVE_CHUNKS = 4
 @pytest.fixture()
 def wired(monkeypatch):
     """Mock every external touchpoint; return a record of what the flow did."""
-    rec: dict = {"arun": [], "markers_written": [], "roi_exported": [], "coverage_checked": []}
+    rec: dict = {"arun": [], "markers_written": [], "manifests_checked": [], "roi_exported": [], "coverage_checked": []}
 
     monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-ingest-zone-year"))
     # Credentials: the flow lazily imports this symbol; patch it on the source module.
@@ -51,6 +51,11 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "export_zone_roi", lambda z, **kw: rec["roi_exported"].append((z, kw)))
     monkeypatch.setattr(mod, "check_time_window_coverage", lambda *a, **k: rec["coverage_checked"].append((a, k)))
     monkeypatch.setattr(mod, "_write_ingest_marker", lambda store, fp, **kw: rec["markers_written"].append(store))
+    # Reads each store's existing manifest — an external touchpoint like the marker write,
+    # and the one gate a zero-append resume has. A test about it overrides this itself.
+    monkeypatch.setattr(
+        mod, "_assert_store_manifest_matches", lambda store, roi, **kw: rec["manifests_checked"].append(store)
+    )
     # Fingerprint inputs: coverage sha + orbit resolution ("ascending" resolves to
     # itself without probing, so _resolved_stores is deterministic in tests).
     monkeypatch.setattr(mod, "_coverage_sha", lambda *a, **k: "cov-sha-1")
@@ -613,3 +618,57 @@ def test_a_terminal_leg_failure_is_not_forgotten_when_a_sibling_retries(wired, m
     # failure that a re-dispatch cannot fix.
     assert sorted(dispatched) == ["None", "ascending", "descending"]  # one dispatch each, no retry
     assert wired["markers_written"] == []  # and nothing was marked complete
+
+
+def test_the_manifest_is_checked_before_any_marker_is_stamped(wired, monkeypatch):
+    """A resume that appends NOTHING has had no manifest check at all.
+
+    The ingest's append path validates on every batch, which is what makes resuming an
+    interrupted store safe. But an attempt that wrote every date and crashed before its
+    marker leaves a store the next run adopts as unmarked; the child legs then skip every
+    date as already present and write nothing, so the append check never fires — and the
+    marker gets stamped over a mosaic built under a different mask, threshold or ingest
+    code. Every later run then reads that marker and skips the cell.
+    """
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (True, None))  # unmarked = resume
+    order: list[tuple[str, str]] = []
+    monkeypatch.setattr(mod, "_assert_store_manifest_matches", lambda s, roi, **kw: order.append(("check", s)))
+    monkeypatch.setattr(mod, "_write_ingest_marker", lambda s, fp, **kw: order.append(("mark", s)))
+
+    _run(s1_orbit="ascending")
+
+    # Every store checked, and every check before every mark: a disagreement on the last
+    # store must not leave the earlier ones already marked.
+    assert [s for kind, s in order if kind == "check"] == [s for kind, s in order if kind == "mark"]
+    assert [kind for kind, _ in order] == ["check", "check", "mark", "mark"]
+
+
+def test_a_manifest_disagreement_stops_the_marker(wired, monkeypatch):
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (True, None))
+
+    def refuse(store, roi, **kw):
+        raise ConfigMismatchError(f"{store}: coverage_sha256 changed")
+
+    monkeypatch.setattr(mod, "_assert_store_manifest_matches", refuse)
+    with pytest.raises(ConfigMismatchError, match="coverage_sha256"):
+        _run(s1_orbit="ascending")
+    assert wired["markers_written"] == []
+
+
+def test_only_the_optical_store_is_held_to_the_admission_threshold(wired, monkeypatch):
+    """The SAR legs apply no coverage threshold, so their manifests carry none —
+    expecting one would fail every radar store on a path that only exists to protect them.
+    """
+    monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+    seen: dict[str, float | None] = {}
+    monkeypatch.setattr(
+        mod,
+        "_assert_store_manifest_matches",
+        lambda s, roi, *, min_valid_coverage, **kw: seen.update({s.rsplit("/", 1)[-1]: min_valid_coverage}),
+    )
+
+    _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(min_valid_coverage=0.25))
+    assert seen == {"reflectance.zarr": 0.25, "sar_ascending.zarr": None}

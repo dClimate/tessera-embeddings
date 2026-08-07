@@ -77,6 +77,7 @@ from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_coun
 from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles
+from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
 from tessera_embeddings.storage.zarr_store import is_missing_repo, open_repo, open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 from tessera_embeddings.utils import utcnow_iso
@@ -135,6 +136,34 @@ def _probe_marker(store_path: str, *, get_credentials: _Creds, s3_region: str | 
         raise
     raw = root.attrs.get("ingest_marker")
     return (True, dict(raw) if isinstance(raw, dict) else None)
+
+
+def _assert_store_manifest_matches(
+    store_path: str,
+    roi_zarr_path: str,
+    *,
+    min_valid_coverage: float | None,
+    get_credentials: _Creds,
+    s3_region: str | None,
+) -> None:
+    """Refuse to mark a store whose existing manifest disagrees with this run.
+
+    The ingest's own append path validates the manifest on every batch, which is what
+    makes RESUMING an interrupted store safe: a changed mask, admission threshold or
+    ingest code raises at the first write, before a date commits. A resume that appends
+    NOTHING never reaches that check — and one exists, routinely. An attempt that wrote
+    every date and crashed before its marker leaves a store the next run adopts as
+    unmarked; the child legs then skip every date as already present, write nothing, and
+    the marker is stamped over a mosaic built under whatever the previous run believed.
+    After that the fingerprint matches and every later run skips the cell entirely.
+
+    So the same check runs HERE too, on the zero-write path the append cannot cover. A
+    store with no manifest at all is a legacy store and passes with a warning, exactly as
+    it does on the append path — the two must not disagree about what is acceptable.
+    """
+    expected = IngestManifest.from_roi_store(roi_zarr_path, min_valid_coverage=min_valid_coverage)
+    root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
+    expected.validate_against(extract_manifest(dict(root.attrs)), store_path)
 
 
 def _write_ingest_marker(store_path: str, fingerprint: dict, *, get_credentials: _Creds, s3_region: str | None) -> None:
@@ -630,6 +659,21 @@ async def ingest_zone_year(
     )
 
     # (6) Marker last: a crash before this point re-runs incrementally.
+    #
+    # Validated first, and in a separate pass: a store the legs never appended to has had
+    # no manifest check at all this run, and marking a mosaic built under different inputs
+    # makes every later run skip it. Two passes rather than one so a disagreement on the
+    # LAST store cannot leave the earlier ones already marked.
+    for store in stores:
+        _assert_store_manifest_matches(
+            store,
+            roi_path,
+            # Optical only. The SAR legs apply no admission threshold, so their manifests
+            # carry none and expecting one would fail every radar store.
+            min_valid_coverage=ingest_settings.min_valid_coverage if store.endswith("reflectance.zarr") else None,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+        )
     for store in stores:
         _write_ingest_marker(store, fingerprint, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
 

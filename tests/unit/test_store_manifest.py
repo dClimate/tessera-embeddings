@@ -476,3 +476,35 @@ class TestAdmissionThresholdIsPartOfIngestIdentity:
     def test_sar_stores_carry_no_threshold(self):
         """Only the optical store has an admission gate; the SAR ones have no such knob."""
         assert IngestManifest.from_dict({**self.BASE}).min_valid_coverage is None
+
+
+class TestAbsenceIsAValueForAPolicyField:
+    """A store that records nothing about a policy was built with that policy off.
+
+    ``validate_against`` skips a key the store lacks, so a manifest written by newer code
+    can carry fields older stores never had. That is right for a field DESCRIBING a store
+    and wrong for one stating a POLICY it was built under: turning the policy on is
+    exactly the append to refuse, and it is the one shape the general rule cannot see —
+    the store says nothing, the current manifest says True, and nothing disagrees.
+    """
+
+    def _legacy(self) -> dict:
+        """An embedding store written before ``allow_s2_only`` existed."""
+        return EmbeddingManifest(model_checkpoint="ckpt", num_obs_checkpoints=(8,)).to_dict()
+
+    def test_turning_the_policy_on_against_a_legacy_store_is_refused(self):
+        current = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=True)
+        with pytest.raises(ConfigMismatchError, match="allow_s2_only"):
+            current.validate_against(self._legacy(), "s3://out/embeddings/roi.zarr")
+
+    def test_leaving_the_policy_off_against_a_legacy_store_is_accepted(self):
+        """Off and unrecorded are the same state, so this append changes nothing."""
+        current = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, allow_s2_only=False)
+        current.validate_against(self._legacy(), "s3://out/embeddings/roi.zarr")
+
+    def test_a_field_outside_the_policy_set_keeps_the_forward_compatible_rule(self):
+        """The general rule survives: a descriptive field the store never recorded is
+        unknown, not a disagreement, or every manifest gaining a field would break appends.
+        """
+        legacy = {"manifest_type": "IngestManifest"}
+        IngestManifest(roi_manifest_hash="abc123").validate_against(legacy, "legacy.zarr")

@@ -21,7 +21,7 @@ import json
 import logging
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
-from typing import Any, Self, cast
+from typing import Any, ClassVar, Self, cast
 
 import zarr
 
@@ -69,6 +69,15 @@ class StoreManifest:
     stage.  Upstream structural params are captured transitively by recording
     the upstream manifest's hash — if any upstream field changes, the hash
     changes, which triggers a mismatch here without duplicating fields.
+    """
+
+    ABSENT_MEANS_OFF: ClassVar[frozenset[str]] = frozenset()
+    """Fields whose absence from a store is a VALUE, not a gap — see ``validate_against``.
+
+    A subclass lists a field here when the store having no opinion is itself an opinion:
+    a policy that decides what the data IS, where "written before anyone recorded it" and
+    "written with it off" are the same state. Everything else keeps the default, under
+    which an unrecorded field is simply unknown and cannot disagree with anything.
     """
 
     def to_dict(self) -> dict[str, Any]:
@@ -133,6 +142,15 @@ class StoreManifest:
             current_val = current[key]
             if existing_val is not None and existing_val != current_val:
                 mismatches[key] = (existing_val, current_val)
+            elif existing_val is None and key in self.ABSENT_MEANS_OFF:
+                # ABSENT is a VALUE for these fields, not a gap. The general rule above
+                # skips a key the store lacks, so that a manifest written by newer code
+                # can carry fields older stores never had — right for a field that
+                # DESCRIBES the store, wrong for one that states a POLICY the store was
+                # built under. Turning such a policy on is exactly the append that must be
+                # refused, and it is the only shape the general rule cannot see: the store
+                # says nothing, the current manifest says True, and nothing disagrees.
+                mismatches[key] = ("<not recorded, i.e. off>", current_val)
         for key in existing:
             if key in known_fields and key not in current and existing[key] is not None:
                 mismatches[key] = (existing[key], None)
@@ -245,6 +263,8 @@ class EmbeddingManifest(StoreManifest):
     valid observation is used with bucketed sequence lengths. ``num_obs_checkpoints``
     replaces v1.0's ``repeat_times``/``sample_size_s2`` as the structural param.
     """
+
+    ABSENT_MEANS_OFF: ClassVar[frozenset[str]] = frozenset({"allow_s2_only"})
 
     model_checkpoint: str
     num_obs_checkpoints: tuple[int, ...]

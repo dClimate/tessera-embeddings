@@ -56,14 +56,40 @@ def first_party_import_closure(seed: list[Path], root: Path) -> set[Path]:
                 return candidate
         return None
 
+    def absolute_module(node: ast.ImportFrom, path: Path) -> str | None:
+        """The dotted name ``node`` imports from, resolved against ``path`` if relative.
+
+        A relative import's ``node.module`` is the tail alone — ``"providers"`` for
+        ``from .providers import PROVIDERS`` — so a first-party filter on the package
+        prefix rejects it. That mattered: package ``__init__`` files re-export with
+        relative imports, so the closure stopped at every one of them. ``config`` was
+        reached and ``config/providers.py`` was not, leaving the STAC collections, band
+        lists, resolutions and baseline settings outside the fingerprint of the code
+        that ingests with them.
+        """
+        if not node.level:
+            return node.module if node.module and node.module.startswith(_PACKAGE) else None
+        # `level` counts dots. One means the importing module's own package — which is the
+        # containing directory for a plain module AND for an ``__init__.py``, since a
+        # package's ``__init__`` IS that package. Each further dot climbs one more.
+        base = path.parent
+        for _ in range(node.level - 1):
+            base = base.parent
+        try:
+            rel = base.relative_to(root)
+        except ValueError:  # pragma: no cover - a level that climbs out of the package
+            return None
+        parts = [_PACKAGE, *rel.parts, *([node.module] if node.module else [])]
+        return ".".join(parts)
+
     def imported_modules(path: Path) -> set[str]:
         found: set[str] = set()
         for node in ast.walk(ast.parse(path.read_bytes())):
             if isinstance(node, ast.Import):
                 found.update(a.name for a in node.names if a.name.startswith(_PACKAGE))
-            elif isinstance(node, ast.ImportFrom) and node.module and node.module.startswith(_PACKAGE):
-                found.add(node.module)
-                found.update(f"{node.module}.{a.name}" for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and (dotted := absolute_module(node, path)):
+                found.add(dotted)
+                found.update(f"{dotted}.{a.name}" for a in node.names)
         return found
 
     reached, stack = set(seed), list(seed)
