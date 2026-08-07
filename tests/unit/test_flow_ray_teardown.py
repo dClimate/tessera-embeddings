@@ -181,3 +181,31 @@ def test_ray_owning_flows_do_not_import_the_aws_provider_at_module_scope() -> No
             if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("tessera_embeddings.providers.aws")
         ]
         assert not offenders, f"{Path(inspect.getfile(mod)).name} imports {offenders} at module scope"
+
+
+def test_every_ray_owning_flow_clears_the_hook_state_on_the_failure_path() -> None:
+    """The shared hook reads process-wide module state, and Prefect reuses worker
+    processes — so state left set by a failed run outlives it.
+
+    A later run's cancellation hook then PREFERS that stale cluster name over its own
+    flow-run fallback, tears down a cluster that is already gone, and leaks the live
+    fleet it was called to reclaim. Clearing only on success is therefore not clearing:
+    the exception path is exactly the one the hook exists for. Asserted structurally
+    across all three flows, because the leak only shows up on a reused worker after a
+    failure — no unit run reproduces it.
+    """
+    import ast
+
+    for mod in (fill_mod, seq_mod, flows_mod):
+        src = Path(inspect.getfile(mod)).read_text()
+        tree = ast.parse(src)
+        deactivates = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Try)
+            for handler in node.finalbody
+            if isinstance(handler, ast.Expr)
+            and isinstance(handler.value, ast.Call)
+            and getattr(handler.value.func, "id", None) == "deactivate"
+        ]
+        assert deactivates, f"{Path(inspect.getfile(mod)).name}: deactivate() must run from a finally block"

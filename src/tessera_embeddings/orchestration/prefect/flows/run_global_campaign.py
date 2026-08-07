@@ -49,7 +49,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Mapping
 from functools import partial
 from logging import LoggerAdapter
 from typing import Any
@@ -362,7 +362,7 @@ def _partition_by_live_tiles(
     n_clusters: int,
     *,
     land_mask_path: str,
-    known_complete: Collection[str] = (),
+    pending_years: Mapping[str, int] | None = None,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
 ) -> list[list[str]]:
@@ -400,18 +400,29 @@ def _partition_by_live_tiles(
     infer that the rest of the cluster's ingest window lands behind it, and
     inference is slower than ingest in almost every case. Change the assignment
     order and that guarantee goes with it.
-    ``known_complete`` zones (retag-only crash-recovery cells) weigh zero — the
-    child settles them without GPU work, so their tile counts would only skew
-    the balance (and their mask reads are skipped). Tile counts are one ~1 KB
-    GET per zone; ``n_clusters == 1`` skips the reads entirely. Empty clusters
-    (more clusters than zones) are dropped.
+    **Weighted by the YEARS assigned with the zone.** A cluster receives every pending
+    ``(zone, year)`` of the zones it owns, so a zone's cost to that cluster is its
+    per-year work times how many years it carries. Weighing it once made a zone missing
+    five years the same as one missing one — irrelevant while every zone owed the same
+    single year, and wrong the moment ``overlap_years`` let a batch span several, or a
+    repair run left zones with uneven gaps. The heavy cluster then drains its extra years
+    while the rest sit idle, and its finish time is the campaign's.
+
+    ``pending_years`` is that count per zone, and a zone with none weighs zero — which
+    covers the retag-only crash-recovery cells the child settles without GPU work, whose
+    tile counts would otherwise skew the balance, and skips their mask reads. Omit it and
+    every zone counts as one year, the single-year behaviour. Tile counts are one ~1 KB
+    GET per zone; ``n_clusters == 1`` skips the reads entirely. Empty clusters (more
+    clusters than zones) are dropped.
     """
     if n_clusters <= 1:
         return [zones]
+    years = pending_years or {}
+    n_years = {z: years.get(z, 1) if pending_years is not None else 1 for z in zones}
     weight = {
         z: 0.0
-        if z in known_complete
-        else zone_work_weight(land_mask_path, z, get_credentials=get_credentials, s3_region=s3_region)
+        if n_years[z] <= 0
+        else n_years[z] * zone_work_weight(land_mask_path, z, get_credentials=get_credentials, s3_region=s3_region)
         for z in zones
     }
     clusters: list[list[str]] = [[] for _ in range(n_clusters)]
@@ -1038,10 +1049,13 @@ async def run_global_campaign(
                     batch_zones,
                     min(max_parallel_clusters, len(batch_zones)),
                     land_mask_path=paths.land_mask_store(mask_name),
-                    # Weightless only if EVERY year of this zone in the batch is already
-                    # done — otherwise the zone still carries real GPU work and must count.
-                    known_complete={
-                        z for z in batch_zones if all(status.has(z, y) for zz, y in batch_cells if zz == z)
+                    # A cluster gets every pending (zone, year) of the zones it owns —
+                    # see `cells_for` below — so a zone's cost to it is per-year work
+                    # times the years it carries. Already-landed years count zero: the
+                    # child retags them without GPU work, and a zone with none left is
+                    # weightless outright (its mask read is skipped too).
+                    pending_years={
+                        z: sum(1 for zz, y in batch_cells if zz == z and not status.has(z, y)) for z in batch_zones
                     },
                     get_credentials=iam_icechunk_credentials,
                     s3_region=s3_region,

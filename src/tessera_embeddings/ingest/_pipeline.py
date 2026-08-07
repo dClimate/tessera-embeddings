@@ -45,10 +45,20 @@ def pipelined[T, P](items: Iterable[T], prepare: Callable[[T], P], *, depth: int
     # A sentinel rather than None: an item may legitimately BE None, and exhausting on
     # it would silently truncate the run.
     done = object()
-    # The `with` block is the leak bound: if the consumer raises or breaks mid-loop,
-    # generator finalisation exits the executor, which joins the in-flight preparation —
-    # bounded by the buffered work, never a stray thread.
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    # Exited WITHOUT joining on the abnormal path. A `with` block calls
+    # `shutdown(wait=True)`, so if the consumer raises or breaks mid-loop, generator
+    # finalisation blocks until the in-flight preparation returns — and preparation is a
+    # read against the very Dask cluster the failing flow is trying to tear down. A read
+    # that has stalled there holds the unwind for as long as it stalls, with the whole
+    # billed fleet still up, which is the opposite of what the failure path needs.
+    #
+    # `cancel_futures=True` drops the ones not yet started; the one already running cannot
+    # be interrupted (nothing in Python can interrupt it), so what changes is that cleanup
+    # no longer WAITS for it. The thread is still non-daemon and still joined at
+    # interpreter exit, so this abandons no work silently — it only stops the teardown
+    # queueing behind a read that may never finish.
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
         # Exactly `depth` in flight, so depth=1 keeps the original one-ahead behaviour:
         # the FIRST item's preparation is never hidden (nothing precedes it to hide
         # behind), and every later one overlaps the consumption of its predecessor.
@@ -68,3 +78,5 @@ def pipelined[T, P](items: Iterable[T], prepare: Callable[[T], P], *, depth: int
             if nxt is not done:
                 pending.append(pool.submit(prepare, nxt))  # type: ignore[arg-type]
             yield prepared, stall
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)

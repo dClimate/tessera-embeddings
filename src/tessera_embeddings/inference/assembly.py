@@ -107,6 +107,37 @@ def _staged_storage_options(path: str) -> dict | None:
     return None
 
 
+def roi_mask_storage_options(
+    roi_zarr_path: str,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None,
+) -> dict | None:
+    """Fsspec options for reading an ROI mask, from this run's Icechunk credentials.
+
+    The ROI mask is a PLAIN zarr, so it is read through fsspec rather than Icechunk and
+    does not travel on the credential callback its callers thread everywhere else. That
+    left one read — the one deciding which chunks exist at all — opening on whatever
+    ambient credentials the process happened to have, which in a callback-only deployment
+    is none.
+
+    Resolved at CALL time, not stored: an IAM credential expires in hours, and the point
+    of a callback is that each consumer asks when it needs one.
+    """
+    if fsspec.utils.get_protocol(roi_zarr_path) != "s3":
+        return None
+    options: dict[str, Any] = {}
+    if s3_region:
+        options["client_kwargs"] = {"region_name": s3_region}
+    if get_credentials is not None:
+        creds = get_credentials()
+        options |= {
+            "key": creds.access_key_id,
+            "secret": creds.secret_access_key,
+            "token": creds.session_token,
+        }
+    return options or None
+
+
 def _fs_for(uri: str, storage_options: dict | None = None) -> fsspec.AbstractFileSystem:
     """Return an fsspec filesystem inferred from the URI scheme.
 
@@ -1481,7 +1512,11 @@ class ZarrWriter:
         # crash-partial tile and a published timestep of fill values would be the
         # per-tile check inside the workers — a correct backstop, but one that fires
         # after the schema commit rather than before any work starts.
-        roi_live_chunks = filter_chunks_by_roi_mask(chunks, roi_zarr_path)
+        roi_live_chunks = filter_chunks_by_roi_mask(
+            chunks,
+            roi_zarr_path,
+            storage_options=roi_mask_storage_options(roi_zarr_path, get_credentials, s3_region),
+        )
         staged_labels = self.verify_staged_completeness(run_id, roi_live_chunks, log=_log)
         live_chunks = [c for c in roi_live_chunks if c.label in staged_labels]
         if not live_chunks:
@@ -2097,6 +2132,12 @@ class ZarrWriter:
 def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
     """Aggregate per-chunk radar counts into one year's coverage summary.
 
+    ``None`` when ANY embedded tile reported no counts, not just when none did. A resumed
+    tile is a synthetic success with no counters, and dropping it from both sides of the
+    ratio leaves a figure describing only the tiles this run redid — which is whatever the
+    previous attempt failed to finish, and so says nothing about the year it would be
+    stored as. See the branch itself.
+
     Reduces what the actors already reported — the counts are computed where the
     observation maps and the embedded mask are both in memory, so nothing here reads
     pixels. ``None`` when no chunk reported the counts, which is how a run from an older
@@ -2107,14 +2148,33 @@ def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
     expected over and would say nothing about the data.
     """
     embedded = free = light = 0
-    reported = 0
+    reported = silent = 0
     for r in results:
-        if r.get("status") != "success" or "s1_free_pixels" not in r:
+        if r.get("status") != "success":
+            continue
+        if "s1_free_pixels" not in r:
+            silent += 1
             continue
         reported += 1
         embedded += int(r.get("valid_pixels", 0))
         free += int(r["s1_free_pixels"])
         light += int(r.get("s1_light_pixels", 0))
+    if silent:
+        # A RESUMED tile is a synthetic success carrying no counters, and dropping it from
+        # both sides of the ratio still leaves a figure — computed over the tiles this run
+        # happened to redo, then written on the year's provenance and logged as the year's.
+        # A resume's redone set is whatever the previous attempt failed to finish, which
+        # has no relationship to the year's radar coverage, so the number would be wrong by
+        # an unknowable margin and carry nothing saying so. No summary is the honest
+        # answer; the per-pixel observation counts in the store remain the authority.
+        logger.info(
+            "No radar-coverage summary for this year: %d of %d embedded tile(s) reported no counts "
+            "(a resume reuses tiles staged by an earlier attempt, which did not report them). "
+            "The per-pixel s1_*_obs_count arrays in the store are unaffected.",
+            silent,
+            silent + reported,
+        )
+        return None
     if not reported or embedded == 0:
         return None
     return {

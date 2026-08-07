@@ -14,6 +14,7 @@ import json
 import logging
 from importlib.metadata import version as _dist_version
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -37,6 +38,7 @@ from tessera_embeddings.inference.assembly import (
     _s3_budget_split,
     _staged_storage_options,
     _write_granularity,
+    roi_mask_storage_options,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks, filter_chunks_by_roi_mask
 from tessera_embeddings.inference.conventions import ENCODER_VERSION
@@ -2410,3 +2412,40 @@ class TestAssembleGlobalGuards:
 
         with pytest.raises(IncompleteStageError, match="dtype float32, expected int8"):
             writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runF", n_workers=1)
+
+
+class TestRoiMaskIsReadWithTheRunsCredentials:
+    """The ROI mask is a PLAIN zarr, so it is read through fsspec and does not travel on
+    the Icechunk callback threaded everywhere else — leaving the one read that decides
+    which chunks exist opening on whatever ambient credentials the process had.
+    """
+
+    def _creds(self):
+        return SimpleNamespace(access_key_id="AK", secret_access_key="SK", session_token="TK")
+
+    def test_a_local_roi_needs_no_options(self, tmp_path):
+        assert roi_mask_storage_options(str(tmp_path / "roi.zarr"), lambda: self._creds(), "us-east-2") is None
+
+    def test_the_callbacks_credentials_and_the_region_both_reach_the_open(self):
+        options = roi_mask_storage_options("s3://in/rois/roi.zarr", lambda: self._creds(), "us-east-2")
+        assert options == {
+            "client_kwargs": {"region_name": "us-east-2"},
+            "key": "AK",
+            "secret": "SK",
+            "token": "TK",
+        }
+
+    def test_no_callback_and_no_region_leaves_the_default_chain_alone(self):
+        assert roi_mask_storage_options("s3://in/rois/roi.zarr", None, None) is None
+
+    def test_the_credential_is_resolved_per_call(self):
+        """An IAM credential expires in hours; a value captured once outlives its own TTL."""
+        calls = []
+
+        def get_credentials():
+            calls.append(1)
+            return self._creds()
+
+        roi_mask_storage_options("s3://in/rois/roi.zarr", get_credentials, None)
+        roi_mask_storage_options("s3://in/rois/roi.zarr", get_credentials, None)
+        assert len(calls) == 2

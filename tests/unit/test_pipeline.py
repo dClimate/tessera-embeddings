@@ -118,29 +118,43 @@ def test_single_item_stalls_for_its_whole_preparation():
     assert stall > 0.09
 
 
-def test_consumer_break_joins_background_thread():
-    """Abandoning the generator must not leak the preparation thread.
+def test_abandoning_the_generator_does_not_wait_on_the_in_flight_preparation():
+    """A consumer that raises or breaks must not hold the unwind behind a stalled read.
 
-    A consumer that raises or breaks leaves one preparation in flight; the
-    executor's context exit joins it, so the cost of abandonment is bounded by
-    a single preparation rather than by a thread that outlives the run.
+    Preparation reads against the very Dask cluster a failing flow is trying to tear
+    down, so joining it at generator close means the whole billed fleet stays up for as
+    long as that read stalls — which is unbounded, and is the opposite of what the
+    failure path needs. Closing therefore CANCELS what has not started and stops waiting
+    on what has.
     """
-    baseline = threading.active_count()
+    started = threading.Event()
+    release = threading.Event()
     workers: list[threading.Thread] = []
+    prepared_items: list[int] = []
 
     def prepare(item):
         workers.append(threading.current_thread())
-        time.sleep(0.2)
+        prepared_items.append(item)
+        started.set()
+        release.wait(5)
         return item
 
-    gen = pipelined(range(4), prepare)
-    for prepared, _stall in gen:
-        assert prepared == 0
-        break
-    gen.close()
+    gen = pipelined(range(4), prepare, depth=2)
+    next(gen)  # consumes item 0; item 1 is in flight and item 2 is queued
+    started.clear()
+    started.wait(5)
 
-    assert workers and not workers[0].is_alive(), "the preparation thread outlived the generator"
-    assert threading.active_count() == baseline
+    closed_at = time.monotonic()
+    gen.close()
+    assert time.monotonic() - closed_at < 1.0, "close() waited for the in-flight preparation"
+
+    release.set()
+    workers[0].join(timeout=5)
+    # It is not a LEAKED thread — it finishes its current item and exits on its own; the
+    # generator simply no longer blocks on that happening.
+    assert not workers[0].is_alive()
+    # And the queued item was never started: cancelling costs nothing to abandon.
+    assert 3 not in prepared_items
 
 
 # ── depth > 1: the look-ahead a BATCHING consumer needs ──

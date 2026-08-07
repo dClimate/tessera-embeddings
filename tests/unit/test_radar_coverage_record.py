@@ -134,3 +134,31 @@ class TestWhereItIsRecorded:
         record = run_provenance(None, 2021, "abc123", radar_coverage={"s1_free_pct": 1.0})["2021"]
         assert record["run_id"] == "abc123"
         assert "assembled_at" in record
+
+
+def test_a_resume_records_no_summary_rather_than_one_for_the_part_it_redid():
+    """A resumed tile is a synthetic success carrying no counters.
+
+    Dropping it from both sides of the ratio still leaves a figure — over the tiles this
+    run happened to redo, which is whatever the previous attempt failed to finish. That
+    set has no relationship to the year's radar coverage, so the number would be wrong by
+    an unknowable margin and stored as the year's with nothing saying so.
+    """
+    mixed = [
+        {"status": "success", "valid_pixels": 100, "s1_free_pixels": 10, "s1_light_pixels": 20},
+        {"status": "success", "valid_pixels": 100},  # resumed: staged by an earlier attempt
+    ]
+    assert summarise_radar_coverage(mixed) is None
+
+
+def test_a_skipped_tile_does_not_suppress_the_summary():
+    """A tile with no valid pixels reports no counts because it embedded nothing — that
+    is a complete answer, not a missing one, and must not cost the year its summary.
+    """
+    results = [
+        {"status": "success", "valid_pixels": 100, "s1_free_pixels": 10, "s1_light_pixels": 20},
+        {"status": "skipped", "valid_pixels": 0},
+    ]
+    summary = summarise_radar_coverage(results)
+    assert summary is not None
+    assert summary["s1_free_pct"] == 10.0

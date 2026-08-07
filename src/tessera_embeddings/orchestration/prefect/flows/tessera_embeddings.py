@@ -365,40 +365,49 @@ def tessera_embeddings(
     # Deterministic, flow-run-derived cluster name so the cancellation/crash hook can
     # re-derive it in a fresh process (see _ray_lifecycle). Outside a Prefect run
     # (unit tests) the id is None and ray_cluster falls back to its own random suffix.
-    with ray_cluster(
-        log,
-        ami_ssm_name=ami_ssm_name,
-        cluster_name=cluster_name_for_flow_run(flow_run_ctx.id) if flow_run_ctx.id else None,
-        ssm_prefix=ssm_prefix,
-        cloudwatch_log_group=cloudwatch_log_group,
-        code_bucket=code_bucket,
-        code_suffix=code_suffix,
-        sync_source_path=Path(dev_params.sync_source_path) if dev_params.sync_source_path else None,
-    ) as resolved_yaml:
-        activate(resolved_yaml)
+    try:
+        with ray_cluster(
+            log,
+            ami_ssm_name=ami_ssm_name,
+            cluster_name=cluster_name_for_flow_run(flow_run_ctx.id) if flow_run_ctx.id else None,
+            ssm_prefix=ssm_prefix,
+            cloudwatch_log_group=cloudwatch_log_group,
+            code_bucket=code_bucket,
+            code_suffix=code_suffix,
+            sync_source_path=Path(dev_params.sync_source_path) if dev_params.sync_source_path else None,
+        ) as resolved_yaml:
+            activate(resolved_yaml)
 
-        from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+            from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 
-        results = run_inference_task(
-            num_actors=num_actors,
-            config=config,
-            chunks=live_chunks,
-            mosaic_base=mosaic_base,
-            staging_base=staging_base,
-            run_id=run_id,
-            t0=t0,
-            get_credentials=iam_icechunk_credentials,
-            s3_region=s3_region,
-            # Terminate the EC2 instance behind each retired idle actor at once,
-            # rather than holding idle GPU nodes to the end of the run on the Ray
-            # autoscaler's idle timeout, which is unreliable after ray.kill()
-            # (providers/aws/gotchas.md). Actors go idle at the tail, while the
-            # last chunks finish, so this is where a run stops paying for GPUs it
-            # is done with. The callback runs driver-side; its boto3 client never
-            # ships to a worker. Matches fill_zone_year.
-            on_actor_retire=make_instance_terminator(log=log),
-        )
-    deactivate()
+            results = run_inference_task(
+                num_actors=num_actors,
+                config=config,
+                chunks=live_chunks,
+                mosaic_base=mosaic_base,
+                staging_base=staging_base,
+                run_id=run_id,
+                t0=t0,
+                get_credentials=iam_icechunk_credentials,
+                s3_region=s3_region,
+                # Terminate the EC2 instance behind each retired idle actor at once,
+                # rather than holding idle GPU nodes to the end of the run on the Ray
+                # autoscaler's idle timeout, which is unreliable after ray.kill()
+                # (providers/aws/gotchas.md). Actors go idle at the tail, while the
+                # last chunks finish, so this is where a run stops paying for GPUs it
+                # is done with. The callback runs driver-side; its boto3 client never
+                # ships to a worker. Matches fill_zone_year.
+                on_actor_retire=make_instance_terminator(log=log),
+            )
+    finally:
+        # Clear the hook state on the EXCEPTION path too. Cleared only on success, a run
+        # whose inference raised inside the Ray context left `_ray_lifecycle`'s
+        # process-wide cluster name pointing at it — and Prefect reuses worker processes,
+        # so a LATER run's cancellation hook would prefer that stale name over its own
+        # flow-run fallback, tear down a cluster already gone, and leak the live fleet it
+        # was called to reclaim. Matches fill_zone_year and fill_zones_sequential, which
+        # both already do this.
+        deactivate()
 
     succeeded = [r for r in results if r["status"] == "success"]
     skipped = [r for r in results if r["status"] == "skipped"]

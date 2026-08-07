@@ -136,6 +136,8 @@ def enumerate_chunks_from_dataset(
 def filter_chunks_by_roi_mask(
     chunks: list[ChunkSpec],
     roi_zarr_path: str,
+    *,
+    storage_options: dict | None = None,
 ) -> list[ChunkSpec]:
     """Return only the chunks whose spatial extent intersects the ROI mask.
 
@@ -148,11 +150,17 @@ def filter_chunks_by_roi_mask(
     Args:
         chunks: Full chunk grid from :func:`enumerate_chunks_from_dataset`.
         roi_zarr_path: S3 URI or local path to the ROI boolean zarr.
+        storage_options: fsspec options for the open — the credential and region a
+            deployment needs to read its own ROI. The mask is a PLAIN zarr, not an
+            Icechunk store, so it does not travel on the Icechunk callback its callers
+            thread everywhere else, and without this it opened on the ambient chain: in
+            a callback-only or non-default-region deployment, the wrong credentials or
+            none at all, on the one read that decides which chunks exist.
 
     Returns:
         Subset of *chunks* that contain at least one ROI pixel.
     """
-    mask = zarr.open(roi_zarr_path, mode="r")
+    mask = zarr.open(roi_zarr_path, mode="r", storage_options=storage_options)
 
     def intersects(chunk: ChunkSpec) -> bool:
         return bool(mask[chunk.y_start : chunk.y_stop, chunk.x_start : chunk.x_stop].any())  # type: ignore[index]

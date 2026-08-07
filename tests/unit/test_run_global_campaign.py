@@ -779,7 +779,7 @@ def test_sequential_single_shard_reads_no_tile_counts(wired, monkeypatch):
     assert len(wired["arun"]) == 1
 
 
-def test_partition_zero_weights_known_complete_cells(monkeypatch):
+def test_partition_zero_weights_zones_with_nothing_left_to_do(monkeypatch):
     """Retag-only cells cost the child no GPU time, so they must not skew the
     LPT balance — and their mask reads must be skipped entirely.
     """
@@ -787,15 +787,39 @@ def test_partition_zero_weights_known_complete_cells(monkeypatch):
 
     def count(mask, zone, **k):
         if zone not in counts:
-            raise AssertionError(f"zone weight read for known-complete zone {zone}")
+            raise AssertionError(f"zone weight read for a zone with no pending years: {zone}")
         return float(counts[zone])
 
     monkeypatch.setattr(mod, "zone_work_weight", count)
     clusters = mod._partition_by_live_tiles(
-        ["01N", "02N", "03N", "04N"], 2, land_mask_path="mask", known_complete={"04N"}
+        ["01N", "02N", "03N", "04N"],
+        2,
+        land_mask_path="mask",
+        pending_years={"01N": 1, "02N": 1, "03N": 1, "04N": 0},
     )
     # LPT over {100, 90, 80}: [01N] vs [02N, 03N]; 04N rides along at zero cost.
     assert sorted(map(sorted, clusters)) == [["01N", "04N"], ["02N", "03N"]]
+
+
+def test_partition_weights_a_zone_by_the_years_it_carries(monkeypatch):
+    """A cluster receives every pending year of the zones it owns, so a zone missing
+    five years is five times the work of one missing one.
+
+    Weighed once, the two looked identical — irrelevant while every zone owed the same
+    single year, and wrong as soon as overlap_years let a batch span several or a repair
+    run left uneven gaps. One cluster then drains the extra years while the rest idle,
+    and its finish time is the campaign's.
+    """
+    monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: 10.0)
+    clusters = mod._partition_by_live_tiles(
+        ["01N", "02N", "03N"],
+        2,
+        land_mask_path="mask",
+        pending_years={"01N": 4, "02N": 2, "03N": 2},
+    )
+    # 01N alone (40) balances the other two together (20 + 20). Unweighted by years,
+    # all three score 10 and the split would be 2-vs-1 the other way round.
+    assert sorted(map(sorted, clusters)) == [["01N"], ["02N", "03N"]]
 
 
 # ── branch-scoped deployment routing ──
