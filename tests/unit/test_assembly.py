@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import datetime
 import itertools
+import json
+import logging
 from importlib.metadata import version as _dist_version
 from pathlib import Path
 from unittest.mock import patch
@@ -122,6 +124,16 @@ def _stage_chunks(writer, chunks, run_id, rng, shape) -> np.ndarray:
 def _assembled(output: str) -> np.ndarray:
     """The single-timestep embeddings array from an assembled output store."""
     return open_store(output)["embeddings"].values[0, ...]
+
+
+def _assembly_summary_records(caplog) -> list[dict]:
+    """Every ASSEMBLY_SUMMARY record captured by caplog, parsed from its JSON payload."""
+    prefix = "ASSEMBLY_SUMMARY: "
+    return [
+        json.loads(record.getMessage().removeprefix(prefix))
+        for record in caplog.records
+        if record.getMessage().startswith(prefix)
+    ]
 
 
 class TestStagedStorageOptions:
@@ -642,6 +654,36 @@ class TestAssembly:
         np.testing.assert_array_equal(ds_parallel["embeddings"].values[0, ...], expected)
         np.testing.assert_array_equal(ds_parallel["embeddings"].values, ds_serial["embeddings"].values)
         np.testing.assert_array_equal(ds_parallel["scales"].values, ds_serial["scales"].values)
+
+    def test_emits_one_assembly_summary_record(self, tmp_path, caplog):
+        """One ASSEMBLY_SUMMARY per assemble — never per tile — whose counts match the staging."""
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        rng = np.random.default_rng(23)
+        _stage_chunks(writer, _GRID_1X2, "run1", rng, (5, 10))
+        roi = _make_full_roi_mask(tmp_path, 5, 10)
+        with caplog.at_level(logging.INFO, logger="tessera_embeddings.inference.assembly"):
+            writer.assemble(
+                _GRID_1X2,
+                total_y=5,
+                total_x=10,
+                run_id="run1",
+                output_path=str(tmp_path / "out.zarr"),
+                roi_zarr_path=roi,
+                n_workers=1,
+            )
+        (rec,) = _assembly_summary_records(caplog)
+        assert rec["run"] == "run1"
+        assert rec["tiles_staged"] == 2 and rec["tiles_cleared"] == 0
+        assert rec["workers_requested"] == 1 and rec["workers_used"] == 1
+        assert rec["per_worker_s3_cap"] == TARGET_AGGREGATE_S3_CONCURRENCY
+        assert rec["tiles"] == 2
+        assert rec["writes"] == 4  # 2 tiles x (embeddings + scales)
+        # Uncompressed bytes handed to zarr: 5x5 px per tile, int8 emb + f32 scales.
+        assert rec["bytes"] == 2 * (5 * 5 * EMBEDDING_DIM + 5 * 5 * 4)
+        assert rec["fused_compress_put"] is True
+        (worker,) = rec["workers"]
+        assert worker["read_s"] >= 0 and worker["write_s"] >= 0
+        assert rec["commit_s"] >= 0 and rec["total_s"] > 0
 
     def test_assemble_append_with_std(self, tmp_path):
         """Append preserves both embedding and embedding_std across runs."""
@@ -2110,6 +2152,51 @@ class TestAssembleGlobal:
         never_written = (slice(self.TILE, None), slice(0, self.TILE))  # (1, 0): outside both sets
         np.testing.assert_array_equal(emb[cleared], emb[never_written])
         assert np.isnan(scales[cleared]).all() and np.isnan(scales[never_written]).all()
+
+    def test_emits_one_assembly_summary_record(self, tmp_path, caplog):
+        """The record states what actually ran, not what was asked for.
+
+        Requested workers, effective forks, and the per-fork S3 cap can all
+        differ (the budget split and the work partition each cap the count), and
+        the totals are sums over workers — the figures that decide whether a
+        slow assembly is blocked on staged reads, on compression, or on the
+        object store.
+        """
+        dim = 8
+        ny = nx = 2 * self.TILE
+        store_path = self._seed_zone_repo(tmp_path, ny, nx, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        rng = np.random.default_rng(21)
+        for col in (0, 1):
+            self._stage_tile(writer, 0, col, dim, "runT", rng)
+        with caplog.at_level(logging.INFO, logger="tessera_embeddings.inference.assembly"):
+            writer.assemble_global(
+                store_path,
+                self.ZONE,
+                year=2025,
+                run_id="runT",
+                n_workers=4,
+                s3_concurrency=12,
+                staged_labels=["chunk_0_0", "chunk_0_1"],
+                skipped_labels=["chunk_1_0"],
+            )
+        (rec,) = _assembly_summary_records(caplog)
+        assert (rec["zone"], rec["year"], rec["run"]) == (self.ZONE, 2025, "runT")
+        assert rec["tiles_staged"] == 2 and rec["tiles_cleared"] == 1
+        # 4 workers requested, but only 3 live shards exist (2 staged + 1
+        # cleared), so only 3 forks actually ran.
+        assert rec["workers_requested"] == 4
+        assert rec["workers_used"] == 3 == len(rec["workers"])
+        assert rec["per_worker_s3_cap"] == 3  # budget 12 split across the 4 requested workers
+        # Totals are SUMS across workers: 3 tile loads (cleared included — its
+        # fill block is written like any other), 2 vars each.
+        assert rec["tiles"] == 3
+        assert rec["writes"] == 6
+        tile_bytes = self.TILE * self.TILE * dim + self.TILE * self.TILE * 4
+        assert rec["bytes"] == 3 * tile_bytes
+        assert rec["fused_compress_put"] is True
+        for key in ("read_s", "write_s", "fill_wall_s", "merge_s", "commit_s", "attrs_commit_s", "total_s"):
+            assert rec[key] >= 0
 
     def test_year_off_axis_raises(self, tmp_path):
         """A year outside the pre-allocated axis is a loud error (D1: never resize)."""

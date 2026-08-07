@@ -54,6 +54,74 @@ PROGRESS_INTERVAL_S = 300.0
 #: canonical in-process one — acquire on enter, release on exit).
 CommitGate = AbstractContextManager
 
+
+class PhaseTimer:
+    """Wall- and CPU-second accumulator for the phases of a fork worker.
+
+    Two clocks per span because they answer different questions: wall time is how
+    long a phase held the worker, CPU time is how much of that was computation.
+    Their difference is time the phase spent *blocked* — on the object store,
+    almost always — which a wall clock alone cannot distinguish from work, and
+    that distinction is what the caller's summary record exists to expose. CPU
+    time is process-wide (:func:`time.process_time`), so work the storage layer
+    or a codec does on its own threads is still counted; the CPU figure is an
+    upper bound on the phase's in-process compute, never an undercount.
+
+    Spans with the same name accumulate. Spans must not overlap or nest: each
+    moment of the worker's life belongs to at most one phase, so the per-phase
+    walls plus the un-phased residue sum to the worker's total wall time — the
+    invariant that lets a reader attribute every second of a slow worker.
+
+    The cost per span is four clock reads, so per-tile spans in a hot loop are
+    safe; nothing here writes a log line.
+    """
+
+    class _Span:
+        """One timed entry into a phase; ``with timer.phase(name):`` scoped."""
+
+        __slots__ = ("_cpu0", "_name", "_timer", "_wall0")
+
+        def __init__(self, timer: PhaseTimer, name: str) -> None:
+            self._timer = timer
+            self._name = name
+
+        def __enter__(self) -> PhaseTimer._Span:
+            self._wall0 = time.monotonic()
+            self._cpu0 = time.process_time()
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._timer._add(self._name, time.monotonic() - self._wall0, time.process_time() - self._cpu0)
+
+    def __init__(self) -> None:
+        self._wall0 = time.monotonic()
+        self._cpu0 = time.process_time()
+        self._wall: dict[str, float] = {}
+        self._cpu: dict[str, float] = {}
+
+    def _add(self, name: str, wall: float, cpu: float) -> None:
+        self._wall[name] = self._wall.get(name, 0.0) + wall
+        self._cpu[name] = self._cpu.get(name, 0.0) + cpu
+
+    def phase(self, name: str) -> PhaseTimer._Span:
+        """A context manager timing one entry into phase ``name``."""
+        return PhaseTimer._Span(self, name)
+
+    def stats(self) -> dict[str, float]:
+        """Accumulated ``{<phase>_s, <phase>_cpu_s}`` per phase, plus ``wall_s``/``cpu_s`` since construction.
+
+        Values are rounded — these feed a single JSON log record, and
+        sub-millisecond precision is noise at the durations that matter here.
+        """
+        out: dict[str, float] = {}
+        for name, wall in self._wall.items():
+            out[f"{name}_s"] = round(wall, 3)
+            out[f"{name}_cpu_s"] = round(self._cpu[name], 3)
+        out["wall_s"] = round(time.monotonic() - self._wall0, 3)
+        out["cpu_s"] = round(time.process_time() - self._cpu0, 3)
+        return out
+
+
 #: Default in-process commit cap: the middle of the run-1-mandated 4-8
 #: simultaneous committers (ADR-008 D6). Share one
 #: ``threading.Semaphore(DEFAULT_COMMIT_CAP)`` across the zone-year fills a
@@ -135,15 +203,17 @@ def run_forked(
     payloads: list[dict[str, Any]],
     *,
     progress_interval_s: float = PROGRESS_INTERVAL_S,
-) -> None:
+) -> dict[str, Any]:
     """Fork ``session``, run ``worker_fn`` over ``payloads``, merge the forks back.
 
     The shared coordinator scaffolding for cooperative writes: each payload is
     shipped to ``worker_fn`` with a ``"fork"`` key added (a pickled copy per
     spawned worker; caller dicts are not mutated), the worker writes into its
-    fork and returns it, and the coordinator merges. One payload
-    runs in-process; more spawn a process pool (``spawn`` context — workers must
-    be module-level functions and payloads picklable).
+    fork and returns ``(fork, stats)`` — the fork for the coordinator to merge,
+    and a JSON-serialisable dict of whatever the worker measured about its own
+    run (``{}`` when it measured nothing). One payload runs in-process; more
+    spawn a process pool (``spawn`` context — workers must be module-level
+    functions and payloads picklable).
 
     Every payload gets its own process, so the pool never queues and the whole
     write is as long as its slowest band. That is why progress is reported on a
@@ -151,18 +221,34 @@ def run_forked(
     nothing until the first band landed, which on a dense zone is the bulk of the
     write. ``progress_interval_s`` is the reporting period; a single payload runs
     in-process and reports nothing, having no concurrency to describe.
+
+    Returns the write's telemetry rather than nothing, because this is the only
+    scope that sees all three of the fork, the workers, and the merge:
+
+    * ``workers`` — the per-worker stats dicts, in payload order (a stats entry's
+      index IS its payload's index, matching how forks are merged).
+    * ``wall_s`` — fork creation through merge completion.
+    * ``merge_s`` — the merge alone.
     """
+    t0 = time.monotonic()
     fork = session.fork()
     # Copies, not mutation: callers keep their payload dicts fork-free.
     payloads = [{**payload, "fork": fork} for payload in payloads]
     if len(payloads) == 1:
-        forks = [worker_fn(payloads[0])]
+        results = [worker_fn(payloads[0])]
     else:
         ctx = multiprocessing.get_context("spawn")
         with ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx) as ex:
             futures = [ex.submit(worker_fn, payload) for payload in payloads]
-            forks = _await_forks(futures, progress_interval_s)
-    session.merge(*forks)
+            results = _await_forks(futures, progress_interval_s)
+    t_merge = time.monotonic()
+    session.merge(*(fork_result for fork_result, _ in results))
+    done = time.monotonic()
+    return {
+        "workers": [stats for _, stats in results],
+        "wall_s": round(done - t0, 3),
+        "merge_s": round(done - t_merge, 3),
+    }
 
 
 def _group_node(store: Any, group: str) -> zarr.Group:  # noqa: ANN401 — icechunk store handle
@@ -289,8 +375,21 @@ def partition_round_robin(items: list, n: int) -> list[list]:
     return [p for p in parts if p]
 
 
-def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - returns a ForkSession
-    """Write assigned shards into a forked session and return it for merge."""
+def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - returns (ForkSession, stats)
+    """Write assigned shards into a forked session; return ``(fork, stats)`` for merge.
+
+    Each shard is timed into two phases. ``read`` is ``source.load`` — in
+    production an object-store fetch of a staged tile, though a source may
+    instead build its blocks (a cleared position's fill block, a synthetic test
+    source), in which case the "read" is that construction. ``write`` is the
+    raw-zarr region assignment, inside which the codec pipeline encodes
+    (compresses) the shard AND the store uploads it — the two are fused in one
+    call this worker cannot see into, so the phase's CPU/wall split
+    (:class:`PhaseTimer`) is the only honest decomposition: CPU seconds bound the
+    encode cost, and the remainder is time blocked on the store. ``bytes`` is
+    the uncompressed block bytes handed to zarr — the logical write volume, not
+    what landed on the wire.
+    """
     fork = payload["fork"]
     group = payload["group"]
     year = int(payload["year_index"])
@@ -299,8 +398,12 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
 
     node = _group_node(fork.store, group)
     arrays: dict[str, zarr.Array] = {}
+    timer = PhaseTimer()
+    tiles = writes = nbytes = 0
     for sy, sx in payload["shards"]:
-        blocks = source.load((sy, sx))
+        with timer.phase("read"):
+            blocks = source.load((sy, sx))
+        tiles += 1
         for var, block in blocks.items():
             arr = arrays.get(var)
             if arr is None:
@@ -309,8 +412,11 @@ def _write_shards_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 - retu
             h, w = block.shape[1], block.shape[2]
             # Trailing dims (band) not indexed are written in full, so one
             # assignment covers both the 3-D and 4-D arrays.
-            arr[year : year + 1, y0 : y0 + h, x0 : x0 + w] = block
-    return fork
+            with timer.phase("write"):
+                arr[year : year + 1, y0 : y0 + h, x0 : x0 + w] = block
+            writes += 1
+            nbytes += block.nbytes
+    return fork, {"tiles": tiles, "writes": writes, "bytes": nbytes, **timer.stats()}
 
 
 def write_year_shards(
@@ -326,6 +432,7 @@ def write_year_shards(
     run_id: str | None = None,
     radar_coverage: dict | None = None,
     empty: bool = False,
+    telemetry: dict[str, Any] | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
@@ -361,6 +468,14 @@ def write_year_shards(
     mark — so it comes through here rather than through ``mark_zone_year_empty``, which
     writes the attrs alone.
 
+    ``telemetry`` is an out-parameter: pass a dict to receive the fill's timing
+    facts — the per-worker stats and ``wall_s``/``merge_s`` from
+    :func:`run_forked`, plus ``commit_s`` and ``attrs_commit_s`` (each measured
+    around its commit, so gate wait is included — to a caller asking where the
+    time went, waiting for the commit gate IS commit time). An out-parameter
+    rather than a changed return, so the snapshot id the callers and tags key on
+    stays a plain string; the caller that wants a summary record owns emitting it.
+
     Returns the ATTR commit's snapshot id — a tag must point at a state where the
     year is both written and marked.
     """
@@ -373,14 +488,25 @@ def write_year_shards(
         {"group": group, "year_index": year_index, "shards": part, "source": source, "shard_px": shard_px}
         for part in partition_round_robin(shards, max(1, n_workers))
     ]
-    run_forked(session, _write_shards_worker, payloads)
+    fill = run_forked(session, _write_shards_worker, payloads)
 
     year_label = _year_label(_group_node(session.store, group), year_index)
+    t_commit = time.monotonic()
     commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}", gate=gate)
+    t_attrs = time.monotonic()
     # The per-year attrs go in their OWN commit (see `commit_year_attrs`), so a same-zone
     # collision costs a sub-second retry instead of this whole assembly. Return that
     # snapshot rather than the shard one: a tag must point at a state where the year is
     # both written AND marked.
-    return commit_year_attrs(
+    snapshot = commit_year_attrs(
         repo, group, year_label, run_id=run_id, radar_coverage=radar_coverage, gate=gate, empty=empty
     )
+    if telemetry is not None:
+        telemetry.update(
+            workers=fill["workers"],
+            fill_wall_s=fill["wall_s"],
+            merge_s=fill["merge_s"],
+            commit_s=round(t_attrs - t_commit, 3),
+            attrs_commit_s=round(time.monotonic() - t_attrs, 3),
+        )
+    return snapshot

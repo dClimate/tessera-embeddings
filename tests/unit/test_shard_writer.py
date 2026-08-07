@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from concurrent.futures import Future
 
 import numpy as np
@@ -13,8 +14,10 @@ import zarr
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import global_store, zarr_store
 from tessera_embeddings.storage.shard_writer import (
+    PhaseTimer,
     _await_forks,
     commit_with_rebase,
+    run_forked,
     write_year_shards,
 )
 from tessera_embeddings.storage.zone_grid import ZoneSpec
@@ -49,6 +52,14 @@ class _OneInnerChunkSource:
         emb[0, 0:_CHUNK, 0:_CHUNK, :] = rng.integers(-127, 128, size=(_CHUNK, _CHUNK, _BAND), dtype="int8")
         scl[0, 0:_CHUNK, 0:_CHUNK] = rng.random((_CHUNK, _CHUNK), dtype="float32")
         return {"embeddings": emb, "scales": scl}
+
+
+class _SlowLoadSource(_OneInnerChunkSource):
+    """A source whose load stalls, standing in for a slow staged-tile GET."""
+
+    def load(self, shard):
+        time.sleep(0.05)
+        return super().load(shard)
 
 
 def _seed(tmp_path, zones=(_ZONE,)):
@@ -110,6 +121,114 @@ def test_write_year_shards_behind_gate(tmp_path):
         repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, gate=gate, shard_px=_SHARD
     )
     assert isinstance(sid, str) and sid
+
+
+class TestPhaseTimer:
+    """The wall/CPU phase accumulator behind the ASSEMBLY_SUMMARY record."""
+
+    def test_spans_with_the_same_name_accumulate(self):
+        # Per-tile spans re-enter the same phase thousands of times; a timer
+        # that RESET on re-entry would report only the last tile and the whole
+        # aggregation would silently understate every phase.
+        timer = PhaseTimer()
+        with timer.phase("read"):
+            time.sleep(0.02)
+        with timer.phase("read"):
+            time.sleep(0.02)
+        assert timer.stats()["read_s"] >= 0.035
+
+    def test_a_blocked_span_reports_wall_time_without_cpu_time(self):
+        # The whole point of the two clocks: a span blocked on I/O (here, a
+        # sleep) must show wall time with near-zero CPU, or blocked-on-S3 time
+        # would be indistinguishable from compression time.
+        timer = PhaseTimer()
+        with timer.phase("write"):
+            time.sleep(0.05)
+        stats = timer.stats()
+        assert stats["write_s"] >= 0.045
+        assert stats["write_cpu_s"] < stats["write_s"] / 2
+
+    def test_phases_do_not_bleed_into_each_other(self):
+        timer = PhaseTimer()
+        with timer.phase("read"):
+            time.sleep(0.03)
+        with timer.phase("write"):
+            pass
+        stats = timer.stats()
+        assert stats["read_s"] >= 0.025
+        assert stats["write_s"] < 0.01
+
+    def test_overall_wall_covers_time_outside_any_phase(self):
+        # wall_s runs from construction, so per-phase walls plus the un-phased
+        # residue account for the worker's whole life — the invariant that lets
+        # a summary reader attribute every second of a slow worker.
+        timer = PhaseTimer()
+        with timer.phase("read"):
+            time.sleep(0.01)
+        time.sleep(0.02)  # un-phased residue
+        stats = timer.stats()
+        assert stats["wall_s"] >= stats["read_s"] + 0.015
+
+
+class TestForkTelemetry:
+    """run_forked and write_year_shards report what the fill did, not just that it did."""
+
+    def test_run_forked_returns_worker_stats_in_payload_order(self, tmp_path):
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+        result = run_forked(session, lambda p: (p["fork"], {"tag": p["tag"]}), [{"tag": "only"}])
+        assert result["workers"] == [{"tag": "only"}]
+        assert result["wall_s"] >= result["merge_s"] >= 0
+
+    def test_write_year_shards_fills_the_telemetry_out_param(self, tmp_path):
+        store, repo = _seed(tmp_path)
+        telemetry: dict = {}
+        write_year_shards(
+            repo,
+            "01N",
+            year_index=2,
+            source=_OneInnerChunkSource(),
+            n_workers=1,
+            shard_px=_SHARD,
+            telemetry=telemetry,
+        )
+        (worker,) = telemetry["workers"]
+        assert worker["tiles"] == 1
+        assert worker["writes"] == 2  # embeddings + scales
+        # Uncompressed bytes handed to zarr: one whole shard per variable.
+        assert worker["bytes"] == (_SHARD * _SHARD * _BAND) + (_SHARD * _SHARD * 4)
+        assert worker["read_s"] >= 0 and worker["write_s"] >= 0
+        assert telemetry["commit_s"] >= 0 and telemetry["attrs_commit_s"] >= 0
+        assert telemetry["fill_wall_s"] >= telemetry["merge_s"]
+
+    def test_no_telemetry_param_changes_nothing(self, tmp_path):
+        # The out-param is optional by design: every existing caller that does
+        # not ask for telemetry must keep getting a plain snapshot id back.
+        store, repo = _seed(tmp_path)
+        sid = write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
+        assert isinstance(sid, str) and sid
+
+    def test_a_stalled_load_is_attributed_to_the_read_phase(self, tmp_path):
+        # A slow source must surface in read_s, not write_s: attributing it to
+        # the write would send an operator chasing S3 PUT concurrency when the
+        # staged GETs are the bottleneck — the exact confusion the phase split
+        # exists to prevent.
+        store, repo = _seed(tmp_path)
+        telemetry: dict = {}
+        write_year_shards(
+            repo,
+            "01N",
+            year_index=2,
+            source=_SlowLoadSource(),
+            n_workers=1,
+            shard_px=_SHARD,
+            telemetry=telemetry,
+        )
+        (worker,) = telemetry["workers"]
+        assert worker["read_s"] >= 0.045
+        assert worker["write_s"] < worker["read_s"]
+        # The stall is blocked time, so it must NOT appear as read CPU either.
+        assert worker["read_cpu_s"] < worker["read_s"]
 
 
 class TestForkProgressReporting:

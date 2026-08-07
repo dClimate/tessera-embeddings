@@ -658,6 +658,25 @@ tiles embed their ocean pixels — the mask selects tiles, not pixels), with
 zone-fill runner (`orchestration/runners/zone_fill.py`) drives it: coverage mask →
 inference → `assemble_global` → `campaign.tag_zone_year`.
 
+#### Assembly telemetry: the `ASSEMBLY_SUMMARY` record
+
+Both `assemble` and `assemble_global` emit **one machine-readable log line per assembly**
+— `ASSEMBLY_SUMMARY: {json}`, the assembly-phase counterpart of the actors'
+`CHUNK_SUMMARY` — so a slow assembly can be attributed to staged reads, to compression,
+or to the object store without re-running it. Each fork worker times its loop into two
+phases (`read` = staged-tile fetches, `write` = the raw-zarr region assignments) on two
+clocks: wall time says how long a phase held the worker, process CPU time says how much
+of that was computation, and the difference is time blocked on the store. That CPU/wall
+split is the honest boundary between compression and upload: the two are **fused inside
+the zarr→icechunk write call** (the codec encodes and the store uploads within one
+assignment the worker cannot see into), so there is no separate compress or upload timer
+— `write_cpu_s` bounds the encode cost, `write_s − write_cpu_s` is store wait, and the
+record says so in-band via `fused_compress_put`. The record also carries the per-worker
+stats (band order / partition order), requested-vs-effective worker counts, the per-fork
+S3 request cap in force, and object/byte counts, so throughput rates derive from the
+record alone. Field-by-field meaning lives on `assembly._assembly_summary_line`; keep the
+keys stable or update the parsers in the same change.
+
 The **campaign land mask** is not a pixel ROI but a per-zone *coverage bitmap*
 (`tile_live_2048`) built from the partner's delivery registry by
 `ingest/land_mask.py` and the `build-land-mask-coverage` flow (ADR-010). v1.1 tiles are

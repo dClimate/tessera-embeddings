@@ -28,6 +28,12 @@ nothing rechunks. Two write strategies:
   across workers via
   :func:`~tessera_embeddings.storage.shard_writer.write_year_shards`, and every
   shard object is emitted once, lean, with ocean inner chunks elided.
+
+Both paths emit one machine-readable ``ASSEMBLY_SUMMARY`` log record per
+assembly — per-worker read/write phase timings with a CPU/wall split, worker
+counts, and byte/object counts — so a slow assembly can be attributed to staged
+reads, to compression, or to the object store without re-running it. See
+:func:`_assembly_summary_line` for the fields and their exact claims.
 """
 
 from __future__ import annotations
@@ -37,7 +43,9 @@ import contextlib
 import dataclasses
 import datetime
 import itertools
+import json
 import logging
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, cast
 
@@ -57,6 +65,7 @@ from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manif
 from tessera_embeddings.storage.object_store import delete_prefix
 from tessera_embeddings.storage.shard_writer import (
     CommitGate,
+    PhaseTimer,
     commit_with_rebase,
     run_forked,
     shard_pitch,
@@ -214,6 +223,79 @@ def _s3_budget_split(s3_concurrency: int | None, n_workers: int) -> tuple[int, i
     return workers, max(1, budget // workers)
 
 
+def _assembly_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogeneous JSON payload
+    """One machine-readable per-assembly record for the profiling tools.
+
+    The assembly-phase counterpart of ``actors._chunk_summary_line``: a single
+    ``ASSEMBLY_SUMMARY: {json}`` line per assembly (never per tile — at zone
+    scale a per-tile line would be thousands of lines and would perturb the very
+    I/O being measured), parsed by the same prefix-plus-JSON convention. Keep the
+    keys stable — or update the parsers in the same change.
+
+    What the fields mean, and what they deliberately do not claim:
+
+    * ``read_s``/``read_cpu_s`` — staged-tile fetches, summed across workers.
+      ``write_s``/``write_cpu_s`` — the raw-zarr region assignments, summed.
+      Compression and upload are FUSED inside the write call (zarr encodes and
+      icechunk uploads within one assignment this code cannot see into), so
+      there is no separate compress or upload timer; the honest decomposition is
+      the CPU/wall split per phase — ``*_cpu_s`` bounds the in-process compute
+      (for writes, that is the compression), ``*_s - *_cpu_s`` is time blocked
+      on the object store. ``fused_compress_put`` states this in-band so a
+      reader of the record alone cannot mistake ``write_s`` for upload time.
+    * ``workers`` — the per-worker stats dicts in payload order (band order for
+      the single-ROI engine, round-robin partition order for the global one).
+      Per worker, ``wall_s - read_s - write_s`` is time outside both phases
+      (validation, partitioning, interpreter start), and ``wall_s`` of the
+      slowest worker bounds the fill: every payload gets its own process, so
+      the fill is as long as its slowest worker, not the sum.
+    * ``workers_requested`` vs ``workers_used`` — what the caller asked for vs
+      how many forks actually ran; the S3 budget and the work partition can both
+      cap the count, and a fill quietly running below its requested width is
+      exactly what this pair exposes.
+    * ``per_worker_s3_cap`` — each fork's concurrent-request cap
+      (``budget // workers``, see :data:`TARGET_AGGREGATE_S3_CONCURRENCY`).
+    * ``tiles``/``writes``/``bytes`` — tile loads, region assignments, and
+      uncompressed bytes handed to zarr, summed across workers; rates derive
+      from these without a store listing. ``tiles_staged``/``tiles_cleared``
+      are the caller's intent (real data vs fill-over-skip footprints).
+    * ``fill_wall_s``/``merge_s`` — the fork-to-merge span and the merge alone;
+      ``commit_s``/``attrs_commit_s`` — the data and attrs commits (gate wait
+      included); ``total_s`` — the whole assembly call.
+    """
+    return "ASSEMBLY_SUMMARY: " + json.dumps(fields, sort_keys=True)
+
+
+#: Worker-stats keys summed into the ASSEMBLY_SUMMARY totals. ``wall_s``/``cpu_s``
+#: are summed as ``worker_wall_s``/``worker_cpu_s`` — a SUM of per-worker walls,
+#: which measures aggregate occupancy, not the fill's duration (that is
+#: ``fill_wall_s``; the two differ by exactly the parallelism achieved).
+_WORKER_SUM_KEYS: tuple[str, ...] = (
+    "tiles",
+    "cleared",
+    "writes",
+    "bytes",
+    "read_s",
+    "read_cpu_s",
+    "write_s",
+    "write_cpu_s",
+    "wall_s",
+    "cpu_s",
+)
+
+
+def _sum_worker_stats(workers: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Sum the per-worker stats into record-level totals (missing keys count as absent, not zero)."""
+    totals: dict[str, Any] = {}
+    for key in _WORKER_SUM_KEYS:
+        values = [w[key] for w in workers if key in w]
+        if values:
+            total = sum(values)
+            name = f"worker_{key}" if key in ("wall_s", "cpu_s") else key
+            totals[name] = round(total, 3) if isinstance(total, float) else total
+    return totals
+
+
 def read_store_spatial_coords(
     store_path: str,
     *,
@@ -368,7 +450,7 @@ def _layout_matching_store(root: zarr.Group, layout: StoreLayout, variables: Ite
     return dataclasses.replace(layout, arrays=adjusted)
 
 
-def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns a ForkSession
+def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — returns (ForkSession, stats)
     """Write one northing band's staged-tile slices into a forked session.
 
     For each staged tile overlapping the band, reads the tile's overlapping
@@ -380,13 +462,19 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
     tiles (every chunk this run does not write, on a same-date overwrite — see
     :meth:`ZarrWriter.assemble`) get the fill value written over their footprint
     so a prior run's data — under a rerun's skip marker OR outside a changed ROI —
-    can't survive. Returns the fork for the coordinator to merge.
+    can't survive. Returns ``(fork, stats)``: the fork for the coordinator to
+    merge, and this band's phase timings and counts — ``read`` covers the staged
+    opens and slice fetches, ``write`` the zarr assignments (encode and upload
+    fused, see ``_assembly_summary_line``; clear-to-fill assignments count in
+    ``write`` too, since they emit output objects like any other write).
     """
     fork = payload["fork"]
     t = int(payload["time_index"])
     y0b, y1b = payload["band"]
     root = zarr.open_group(fork.store, mode="a")
     arrays = {var: cast(zarr.Array, root[var]) for var in payload["variables"]}
+    timer = PhaseTimer()
+    tiles = writes = nbytes = 0
     # Trailing dims (band) not indexed are written in full, so each assignment
     # below covers both the 3-D and 4-D arrays.
     for tile in payload["clear"]:
@@ -394,10 +482,14 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
         for arr in arrays.values():
             # Scalar assignment: zarr broadcasts per-chunk without materializing
             # the selection (a full-band float32 block here would be ~2 GB).
-            arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = arr.fill_value
+            with timer.phase("write"):
+                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = arr.fill_value
+            writes += 1
     for tile, path in payload["tiles"]:
         y0, y1 = max(tile.y_start, y0b), min(tile.y_stop, y1b)
-        staged = _open_staged_tile(path)
+        with timer.phase("read"):
+            staged = _open_staged_tile(path)
+        tiles += 1
         for var, arr in arrays.items():
             staged_arr = cast(zarr.Array, staged[var])
             # Validate dtype before assigning: zarr would silently CAST a float
@@ -420,12 +512,22 @@ def _fill_band_worker(payload: dict[str, Any]) -> Any:  # noqa: ANN401 — retur
                     f"Staged tile {path} variable {var!r} has shape {staged_arr.shape}, expected "
                     f"{expected_shape} — a singleton/off-grid dim would broadcast and corrupt the output."
                 )
-            block = np.asarray(staged_arr[y0 - tile.y_start : y1 - tile.y_start])[np.newaxis]
-            arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = block
+            with timer.phase("read"):
+                block = np.asarray(staged_arr[y0 - tile.y_start : y1 - tile.y_start])[np.newaxis]
+            with timer.phase("write"):
+                arr[t : t + 1, y0:y1, tile.x_start : tile.x_stop] = block
+            writes += 1
+            nbytes += block.nbytes
         # Drop the group reference so its file handles / S3 connections are
         # immediately collectable before the next tile's read.
         del staged
-    return fork
+    return fork, {
+        "tiles": tiles,
+        "cleared": len(payload["clear"]),
+        "writes": writes,
+        "bytes": nbytes,
+        **timer.stats(),
+    }
 
 
 def _extend_time_axis(node: zarr.Group, time_date: np.datetime64) -> int:
@@ -1298,6 +1400,8 @@ class ZarrWriter:
         the output arrays; the coordinator merges the forks, sets root attrs,
         and commits once via
         :func:`~tessera_embeddings.storage.shard_writer.commit_with_rebase`.
+        Emits one ``ASSEMBLY_SUMMARY`` record (:func:`_assembly_summary_line`)
+        with the fill's per-worker phase timings and counts.
 
         Create-or-extend semantics on the time axis:
 
@@ -1365,6 +1469,7 @@ class ZarrWriter:
             Path to the assembled output store.
         """
         _log = log or logger
+        t0 = time.monotonic()
 
         # Determine which chunks have COMPLETED staged zarrs. A chunk that intersects
         # the ROI but was skipped during inference (all pixels failed validity) has a
@@ -1623,8 +1728,9 @@ class ZarrWriter:
         # No payloads = an all-skipped run with nothing to write or clear (a fresh
         # or appended all-fill timestep); the schema/timestep from Phase 1 already
         # stands. run_forked would spawn a zero-worker pool, so skip it.
+        fill: dict[str, Any] = {"workers": [], "wall_s": 0.0, "merge_s": 0.0}
         if payloads:
-            run_forked(session, _fill_band_worker, payloads)
+            fill = run_forked(session, _fill_band_worker, payloads)
 
         # --- Phase 3: root attrs + one data commit ----------------------------
         node = zarr.open_group(session.store, mode="a")
@@ -1671,13 +1777,33 @@ class ZarrWriter:
             del node.attrs[stale]
         node.attrs.update(attrs)
 
+        t_commit = time.monotonic()
         commit_with_rebase(session, f"Run {run_id}: {len(chunks)} chunks assembled")
+        commit_s = round(time.monotonic() - t_commit, 3)
         # Atomic publish: fast-forward `main` to the fully-written tip. The guard
         # fails loudly if another writer advanced `main` since we branched (two
         # processes assembling the same ROI store — unsupported). Then drop the
         # work ref; `main` now retains the snapshot.
         repo.reset_branch("main", repo.lookup_branch(work_branch), from_snapshot_id=base_snapshot)
         repo.delete_branch(work_branch)
+        _log.info(
+            "%s",
+            _assembly_summary_line(
+                run=run_id,
+                tiles_staged=len(live_chunks),
+                tiles_cleared=len(clear_chunks),
+                workers_requested=n_workers,
+                workers_used=len(payloads),
+                per_worker_s3_cap=per_worker_cap,
+                fill_wall_s=fill["wall_s"],
+                merge_s=fill["merge_s"],
+                commit_s=commit_s,
+                total_s=round(time.monotonic() - t0, 3),
+                fused_compress_put=True,
+                workers=fill["workers"],
+                **_sum_worker_stats(fill["workers"]),
+            ),
+        )
         _log.info("Assembly complete: %s", output_path)
         return output_path
 
@@ -1708,7 +1834,9 @@ class ZarrWriter:
         behind ``gate``, ``years_complete`` and per-year run provenance updated
         in the same commit. The zone group must already be seeded
         (:func:`~tessera_embeddings.storage.global_store.seed_zone_groups`);
-        nothing is ever created or resized here (D1).
+        nothing is ever created or resized here (D1). Emits one
+        ``ASSEMBLY_SUMMARY`` record (:func:`_assembly_summary_line`) with the
+        fill's per-worker phase timings and counts.
 
         The caller (the zone-fill runner) is responsible for staged-completeness
         verification against the campaign land mask
@@ -1765,6 +1893,8 @@ class ZarrWriter:
             The commit snapshot id.
         """
         _log = log or logger
+        t0 = time.monotonic()
+        workers_requested = n_workers
 
         labels = sorted(staged_labels) if staged_labels is not None else self._list_staged_labels(run_id)
         # Zero staged tiles is legitimate in exactly one case: every live tile of the
@@ -1902,6 +2032,7 @@ class ZarrWriter:
             cleared=cleared,
             fill_values=fill_values,
         )
+        telemetry: dict[str, Any] = {}
         snapshot = write_year_shards(
             repo,
             zone,
@@ -1914,6 +2045,29 @@ class ZarrWriter:
             run_id=run_id,
             radar_coverage=radar_coverage,
             empty=empty,
+            telemetry=telemetry,
+        )
+        workers = telemetry.get("workers", [])
+        _log.info(
+            "%s",
+            _assembly_summary_line(
+                run=run_id,
+                zone=zone,
+                year=year,
+                tiles_staged=len(shards),
+                tiles_cleared=len(cleared),
+                workers_requested=workers_requested,
+                workers_used=len(workers),
+                per_worker_s3_cap=per_worker_cap,
+                fill_wall_s=telemetry.get("fill_wall_s"),
+                merge_s=telemetry.get("merge_s"),
+                commit_s=telemetry.get("commit_s"),
+                attrs_commit_s=telemetry.get("attrs_commit_s"),
+                total_s=round(time.monotonic() - t0, 3),
+                fused_compress_put=True,
+                workers=workers,
+                **_sum_worker_stats(workers),
+            ),
         )
         _log.info("Global assembly complete: %s/%s year %d (snapshot %s)", store_path, zone, year, snapshot)
         return snapshot
