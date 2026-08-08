@@ -672,7 +672,7 @@ def test_report(capsys: pytest.CaptureFixture[str]) -> None:
         print(f"\n  densest cluster: {len(cluster.zones)} zones, {cluster.total:,} tiles, opener {cluster.opener:,}")
         for width_name, workers in WIDTHS.items():
             print(f"\n  ingest {width_name}: opener ingests in {ingest_hours(cluster.opener, workers):.1f} h")
-            for la, cap in ((LOOK_AHEAD_AT_40, 40), (LOOK_AHEAD_AT_45, 71)):
+            for la, cap in ((LOOK_AHEAD_AT_40, 40), (LOOK_AHEAD_AT_45, 45)):
                 print(f"    ingest cap {cap} -> look_ahead {la}")
                 for bank in (0.0, 3.0, 6.0, 12.0):
                     r = run(
@@ -1063,8 +1063,15 @@ def test_cost_report(capsys: pytest.CaptureFixture[str]) -> None:
         print("\n  the interval, one driver at a time")
         print(
             f"    radar depth (band extremes, central rate):  {radar_lo:.1f} -> ${cost_radar_lo:,.0f}   "
-            f"{RADAR_BOTH_ORBIT_TOK_PER_PX:.2f} pooled -> ${cost_radar_mid:,.0f}   "
+            f"{RADAR_BOTH_ORBIT_TOK_PER_PX:.2f} land-weighted -> ${cost_radar_mid:,.0f}   "
             f"{radar_hi:.1f} -> ${cost_radar_hi:,.0f}"
+        )
+        # The two weightings side by side: same bands, different question, and the gap is the
+        # geography of where radar is deepest against where the measured cells happen to be.
+        print(
+            f"      weighting: land {RADAR_BOTH_ORBIT_TOK_PER_PX:.2f} vs sample"
+            f" {RADAR_CHUNK_WEIGHTED_TOK_PER_PX:.2f} tok/px"
+            f" ({RADAR_BOTH_ORBIT_TOK_PER_PX / RADAR_CHUNK_WEIGHTED_TOK_PER_PX - 1:+.1%})"
         )
         print(
             f"    rate (cell extremes, central depth):        slowest {rate_slow / 1e6:.3f}M -> ${cost_slow:,.0f}   "
