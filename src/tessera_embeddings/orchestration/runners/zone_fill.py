@@ -889,6 +889,11 @@ def assemble_zone_year(
     # may already hold shards from an attempt that crashed between the shard commit and
     # the completion attrs, and if THAT attempt's mosaic made a tile productive where
     # this one skips it, its data would survive under this run's completion mark.
+    # Derived from the STAGING PREFIX (live minus what verify_staged_completeness
+    # resolved as staged), never from `results`: a resumed run's skip markers were
+    # written by earlier legs, which the finishing leg reports as resumed successes —
+    # a results-based set would clear nothing and record zero skips over real gaps.
+    # Assembly also records this set as the year's `optical_skips` provenance.
     skipped_labels = sorted({c.label for c in live} - staged_labels)
     n_workers = n_assembly_workers or AssemblyConfig().compute_n_workers(len(live))
     # Reduced from what the actors already reported, so it costs no reads. Recorded on the

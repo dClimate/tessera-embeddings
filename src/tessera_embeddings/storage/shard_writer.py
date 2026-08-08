@@ -310,6 +310,7 @@ def run_provenance(
     *,
     empty: bool = False,
     radar_coverage: dict | None = None,
+    optical_skips: dict | None = None,
 ) -> dict:
     """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
 
@@ -327,12 +328,28 @@ def run_provenance(
     one of them. Exact per-pixel counts already live in the store's
     ``s1_asc_obs_count``/``s1_desc_obs_count`` arrays; this is the summary that makes the
     question answerable without reading a zone-sized grid.
+
+    ``optical_skips`` records the live tiles the fill resolved to a SKIP — no pixel
+    survived the validity filter, so nothing was staged and the tile published as fill.
+    Fill is also what ocean reads as, so without this field a consumer of a completed
+    year cannot tell "no valid optical data" from "not land". It belongs per year for
+    the same reason ``radar_coverage`` does: a skip is a property of what the year's
+    acquisitions yielded, not of the terrain
+    (:func:`~tessera_embeddings.inference.assembly.summarise_optical_skips` owns the
+    dict's shape). A summary of ZERO skips is recorded rather than omitted, because it
+    is an affirmative statement that every live tile staged data — a distinct fact from
+    a caller that never resolved the live set, which passes ``None`` and is recorded as
+    nothing. A year marked ``empty`` carries no ``optical_skips`` (normalised here, the
+    schema owner): the flag already states that the whole live footprint is fill, and
+    the label list would restate the land mask at zone size.
     """
     record: dict = {"run_id": run_id, "assembled_at": datetime.now(UTC).isoformat()}
     if empty:
         record["empty"] = True
     if radar_coverage:
         record["radar_coverage"] = dict(radar_coverage)
+    if optical_skips and not empty:
+        record["optical_skips"] = dict(optical_skips)
     return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
 
 
@@ -344,6 +361,7 @@ def commit_year_attrs(
     run_id: str | None = None,
     empty: bool = False,
     radar_coverage: dict | None = None,
+    optical_skips: dict | None = None,
     gate: CommitGate | None = None,
     tries: int = 8,
     skip_if_marked: bool = False,
@@ -388,7 +406,12 @@ def commit_year_attrs(
             node.attrs["years_complete"] = sorted([*done, year_label])
         if run_id is not None:
             node.attrs["runs"] = run_provenance(
-                node.attrs.get("runs"), year_label, run_id, empty=empty, radar_coverage=radar_coverage
+                node.attrs.get("runs"),
+                year_label,
+                run_id,
+                empty=empty,
+                radar_coverage=radar_coverage,
+                optical_skips=optical_skips,
             )
         try:
             return commit_with_rebase(session, f"mark {group} year {year_label} complete", gate=gate)
@@ -493,6 +516,7 @@ def write_year_shards(
     commit_msg: str | None = None,
     run_id: str | None = None,
     radar_coverage: dict | None = None,
+    optical_skips: dict | None = None,
     empty: bool = False,
     telemetry: dict[str, Any] | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
@@ -530,6 +554,10 @@ def write_year_shards(
     footprint, so a previous attempt's data cannot survive under this run's completion
     mark — so it comes through here rather than through ``mark_zone_year_empty``, which
     writes the attrs alone.
+
+    ``radar_coverage`` and ``optical_skips`` are the year's per-run coverage summaries,
+    recorded on the provenance entry (see :func:`run_provenance` for what each means
+    and the ``empty``-year normalisation).
 
     ``telemetry`` is an out-parameter: pass a dict to receive the fill's timing
     facts — the per-worker stats and ``wall_s``/``merge_s`` from
@@ -571,7 +599,14 @@ def write_year_shards(
     # snapshot rather than the shard one: a tag must point at a state where the year is
     # both written AND marked.
     snapshot = commit_year_attrs(
-        repo, group, year_label, run_id=run_id, radar_coverage=radar_coverage, gate=gate, empty=empty
+        repo,
+        group,
+        year_label,
+        run_id=run_id,
+        radar_coverage=radar_coverage,
+        optical_skips=optical_skips,
+        gate=gate,
+        empty=empty,
     )
     if telemetry is not None:
         telemetry.update(

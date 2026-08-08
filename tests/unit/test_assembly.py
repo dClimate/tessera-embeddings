@@ -2200,6 +2200,114 @@ class TestAssembleGlobal:
         for key in ("read_s", "write_s", "fill_wall_s", "merge_s", "commit_s", "attrs_commit_s", "total_s"):
             assert rec[key] >= 0
 
+    def _year_record(self, store_path):
+        """The landed year's provenance entry (2025 is index 1 on the seeded axis)."""
+        node = zarr.open_group(open_global_repo(store_path).readonly_session(branch="main").store, mode="r")[self.ZONE]
+        return dict(node.attrs["runs"])["2025"]
+
+    def test_the_skipped_tiles_are_recorded_on_the_year_s_provenance(self, tmp_path):
+        """Skipped tiles publish as fill, and ocean is fill too, so a consumer of the
+        completed year cannot tell "no valid optical data" from "not land" unless the
+        year says which tiles they were. The labels are what make the area maskable;
+        the live total is what makes the count interpretable without the land mask.
+        """
+        dim = 8
+        ny = nx = 2 * self.TILE
+        store_path = self._seed_zone_repo(tmp_path, ny, nx, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        self._stage_tile(writer, 0, 0, dim, "runOS", np.random.default_rng(31))
+
+        writer.assemble_global(
+            store_path,
+            self.ZONE,
+            year=2025,
+            run_id="runOS",
+            n_workers=1,
+            staged_labels=["chunk_0_0"],
+            skipped_labels=["chunk_1_0", "chunk_0_1"],
+        )
+
+        skips = self._year_record(store_path)["optical_skips"]
+        assert skips["tiles_skipped"] == 2
+        assert skips["labels"] == ["chunk_0_1", "chunk_1_0"]
+        assert skips["tiles_live"] == 3
+
+    def test_a_resolved_live_set_with_no_skips_records_a_zero(self, tmp_path):
+        """An empty skipped set is a resolved fact — every live tile staged data — while
+        a caller that resolved no live set at all (``None``) records nothing. Keeping the
+        two distinct is what stops an unresolved fill from reading as a measured zero.
+        """
+        dim = 8
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        self._stage_tile(writer, 0, 0, dim, "runZ", np.random.default_rng(32))
+
+        writer.assemble_global(
+            store_path, self.ZONE, year=2025, run_id="runZ", n_workers=1, staged_labels=["chunk_0_0"], skipped_labels=[]
+        )
+        skips = self._year_record(store_path)["optical_skips"]
+        assert skips == {"tiles_skipped": 0, "tiles_live": 1, "labels": []}
+
+    def test_an_unresolved_live_set_records_no_summary(self, tmp_path):
+        dim = 8
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        self._stage_tile(writer, 0, 0, dim, "runN", np.random.default_rng(33))
+
+        writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runN", n_workers=1)
+        assert "optical_skips" not in self._year_record(store_path)
+
+    def test_re_assembling_the_same_year_leaves_one_record(self, tmp_path):
+        """The campaign re-dispatches cells, so a year is assembled more than once. The
+        record must be replaced, not appended to or accumulated into.
+        """
+        dim = 8
+        ny = nx = 2 * self.TILE
+        store_path = self._seed_zone_repo(tmp_path, ny, nx, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        self._stage_tile(writer, 0, 0, dim, "runI", np.random.default_rng(34))
+
+        expected = {"tiles_skipped": 1, "tiles_live": 2, "labels": ["chunk_0_1"]}
+        for _ in range(2):
+            writer.assemble_global(
+                store_path,
+                self.ZONE,
+                year=2025,
+                run_id="runI",
+                n_workers=1,
+                staged_labels=["chunk_0_0"],
+                skipped_labels=["chunk_0_1"],
+            )
+            assert self._year_record(store_path)["optical_skips"] == expected
+
+        node = zarr.open_group(open_global_repo(store_path).readonly_session(branch="main").store, mode="r")[self.ZONE]
+        assert list(dict(node.attrs["runs"])) == ["2025"]
+        assert node.attrs["years_complete"] == [2025]
+
+    def test_an_all_skipped_year_records_the_empty_flag_instead(self, tmp_path):
+        """The wholly-empty case is already stated by ``empty``, which is also why the
+        label list needs no cap — the one situation where it could span a whole zone is
+        the situation the flag covers.
+        """
+        dim = 8
+        ny = nx = 2 * self.TILE
+        store_path = self._seed_zone_repo(tmp_path, ny, nx, dim)
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+
+        writer.assemble_global(
+            store_path,
+            self.ZONE,
+            year=2025,
+            run_id="runAS",
+            n_workers=1,
+            staged_labels=(),
+            skipped_labels=["chunk_0_0", "chunk_0_1"],
+            empty=True,
+        )
+        record = self._year_record(store_path)
+        assert record["empty"] is True
+        assert "optical_skips" not in record
+
     def test_year_off_axis_raises(self, tmp_path):
         """A year outside the pre-allocated axis is a loud error (D1: never resize)."""
         dim = 8

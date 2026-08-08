@@ -167,6 +167,72 @@ def _staging_inference_stub(staged: dict[str, np.ndarray]):
     return stub
 
 
+def _resuming_inference_stub(staged: dict[str, np.ndarray]):
+    """A run_inference stand-in that resumes from staging exactly as the real one does.
+
+    Mirrors the production resume prologue: scan the staging prefix, drop everything it
+    already resolved, infer only the remainder, and report the resolved tiles as
+    ``resumed`` successes. That last part is the hazard a resume-safety test needs — the
+    scan folds skip markers into "already done", so a leg that finishes a run reports a
+    SUCCESS for a tile it staged nothing for and whose skip marker an earlier leg wrote.
+    """
+
+    def stub(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
+        writer = ZarrWriter(staging_base, embedding_dim=_BAND)
+        already = writer.scan_existing_staged_chunks(run_id, chunks, log=log)
+        results = [
+            {"chunk": label, "status": "success", "valid_pixels": 0, "elapsed_sec": 0.0, "resumed": True}
+            for label in sorted(already)
+        ]
+        rng = np.random.default_rng(7)
+        for chunk in (c for c in chunks if c.label not in already):
+            emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
+            writer.write_chunk(chunk, emb, run_id, scales=rng.random((chunk.height, chunk.width)).astype(np.float32))
+            staged[chunk.label] = emb
+            results.append({"chunk": chunk.label, "status": "success", "valid_pixels": 1, "elapsed_sec": 0.0})
+        return results
+
+    return stub
+
+
+def test_a_resumed_fill_records_skips_an_earlier_leg_wrote(tmp_path, monkeypatch):
+    """The published skip record must come from the staging prefix, not the last leg.
+
+    Skip markers persist across legs of one run id, and the resume scan folds them into
+    "already staged" — so the leg that finishes a fill reports a resumed SUCCESS for a
+    tile it staged nothing for. A record built from that leg's own results would say the
+    year lost nothing while publishing fill over the skipped tiles, which is precisely
+    the silent loss the field exists to close.
+    """
+    store = _seed_global(tmp_path)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0), (1, 1)])
+
+    # Leg 1 of run "runRS": tile (1,1) had no valid pixels and left a skip marker;
+    # nothing else landed before the leg ended.
+    leg1 = ZarrWriter(str(tmp_path / "staging"), embedding_dim=_BAND)
+    chunk_11 = next(c for c in zone_fill.enumerate_chunks(_NY, _NX, _TILE) if (c.row, c.col) == (1, 1))
+    leg1.write_skip_marker(chunk_11, "runRS")
+
+    # Leg 2 stages only (0,0) and reports (1,1) as a resumed success.
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", _resuming_inference_stub(staged))
+    summary = _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, run_id="runRS")
+
+    assert summary["empty"] is False
+    assert list(staged) == ["chunk_0_0"], "leg 2 must have staged nothing for the skipped tile"
+    assert summary["resumed"] == 1
+
+    repo = global_store.open_global_repo(store)
+    node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
+    skips = dict(node.attrs["runs"])["2025"]["optical_skips"]
+    assert skips["labels"] == [chunk_11.label]
+    assert skips["tiles_skipped"] == 1
+    assert skips["tiles_live"] == 2
+    # And the record describes what the year actually holds: that tile reads as fill.
+    assert np.all(np.asarray(node["embeddings"][1])[_TILE:, _TILE:] == 0)
+
+
 def test_fill_zone_year_end_to_end(tmp_path, monkeypatch):
     """Live tiles land as shards at the year index; the cell is tagged and cleaned up."""
     store = _seed_global(tmp_path)
@@ -343,6 +409,9 @@ def test_all_tiles_skipped_marks_complete_empty(tmp_path, monkeypatch):
     node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[_ZONE]
     assert node.attrs["years_complete"] == [2025]
     assert node.attrs["runs"]["2025"]["empty"] is True
+    # The wholly-empty case is stated by the flag alone: a per-tile skip list would
+    # restate the zone's land mask on a group attribute and say nothing more.
+    assert "optical_skips" not in dict(node.attrs["runs"])["2025"]
     assert repo.lookup_tag("zone-01N-2025") == summary["snapshot_id"]
 
 

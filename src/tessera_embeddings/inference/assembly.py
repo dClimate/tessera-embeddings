@@ -1914,6 +1914,14 @@ class ZarrWriter:
                 so the published year is exactly this run's output — see
                 :meth:`StagedShardSource.live_shards` for the mixed-year hazard that
                 leaving them untouched creates. ``None`` writes only staged tiles.
+                Also recorded, with ``staged_labels``, as the year's ``optical_skips``
+                provenance summary (:func:`summarise_optical_skips`) — so it must be
+                the staging prefix's resolution of the live set (what the
+                staged-completeness scan established), never the finishing leg's own
+                tally: a resumed run's markers were written by earlier legs. An empty
+                sequence therefore MEANS "resolved, none skipped" and records a zero
+                summary, while ``None`` means the caller resolved no live set and
+                records no summary — a zero it did not establish would read as measured.
                 When EVERY live tile skipped, this is the whole footprint and
                 ``staged_labels`` is empty; pass ``empty=True`` with it.
             empty: Record the year as holding no data. For the all-skipped case, where
@@ -2048,9 +2056,12 @@ class ZarrWriter:
             list(variables),
             n_workers,
         )
+        # Materialised once: the same labels drive the clearing writes AND the year's
+        # provenance summary, so the two can never describe different tile sets.
+        skipped = sorted(skipped_labels or ())
         # Fill values come off the SEEDED arrays, so a cleared tile reads back exactly
         # as an unwritten one does (0 for int8 embeddings, NaN for float scales).
-        cleared = tuple(sorted(parse_chunk_label(label) for label in (skipped_labels or ())))
+        cleared = tuple(sorted(parse_chunk_label(label) for label in skipped))
         fill_values = tuple((v, float(cast(zarr.Array, node[v]).fill_value or 0)) for v in variables)
         if cleared:
             _log.info(
@@ -2082,6 +2093,13 @@ class ZarrWriter:
             commit_msg=f"Run {run_id}: fill {zone} year {year}",
             run_id=run_id,
             radar_coverage=radar_coverage,
+            # Derived from what THIS call publishes as fill, so the record and the
+            # write agree by construction; run_provenance drops it on an empty year.
+            # `skipped_labels=None` is a caller that resolved no live set at all, so
+            # there is nothing to summarise and no ZERO to assert (see below).
+            optical_skips=(
+                summarise_optical_skips(staged=labels, skipped=skipped) if skipped_labels is not None else None
+            ),
             empty=empty,
             telemetry=telemetry,
             # The fill's coordinator progress goes through the caller's logger —
@@ -2134,6 +2152,36 @@ class ZarrWriter:
         # Shared prefix delete: s5cmd --all-versions (so a versioned bucket doesn't
         # keep the staged tiles as non-current versions), fsspec fallback.
         delete_prefix(target, log=_log)
+
+
+def summarise_optical_skips(*, staged: Iterable[str], skipped: Iterable[str]) -> dict:
+    """One year's optical-skip summary: which live tiles published as fill, and how many.
+
+    A skipped tile — every pixel failed the validity filter, nothing staged — is
+    written as fill, which is also what ocean reads as, so a consumer of a completed
+    year cannot tell "no valid optical data" from "not land" without this record. The
+    count answers how much was lost; the labels answer WHERE, which is what lets a
+    consumer mask the area; the live total is the denominator that makes the count
+    interpretable without fetching the land mask.
+
+    Both inputs must be the STAGING PREFIX's resolution of the run's live tiles —
+    the two halves the staged-completeness scan establishes (staged zarrs and skip
+    markers) — never one leg's own tally: skip markers persist across resumes, and
+    the leg that finishes a run may have staged nothing for tiles an earlier leg
+    skipped, reporting them as resumed successes. A summary built from that leg's
+    results would record zero skips while publishing fill over them.
+
+    The label list needs no size cap: the one case where it would span a whole zone —
+    every live tile skipped — is recorded by the ``empty`` flag instead, and
+    :func:`~tessera_embeddings.storage.shard_writer.run_provenance` drops this summary
+    from an ``empty`` year's record.
+    """
+    skipped_list = sorted(skipped)
+    return {
+        "tiles_skipped": len(skipped_list),
+        "tiles_live": sum(1 for _ in staged) + len(skipped_list),
+        "labels": skipped_list,
+    }
 
 
 def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
