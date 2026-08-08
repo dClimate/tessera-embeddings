@@ -896,15 +896,42 @@ rate, so **fleet width and geography are perfectly confounded** in the cell tabl
 like an actor-count penalty and must not be read as one. Separating them needs a second wide
 run in a different zone.
 
-**Assembly, measured for the first time.** The same run's assembly gives the line that had
-been a guess. A 16 vCPU / 64 GiB Fargate task reads **4.97 TB across 2.34 M objects** for a
-dense zone-year — staged tiles are stored **uncompressed**, at 570.4 MB each — in about 2.5
-hours, at $0.93/hour plus about $1 of S3 requests. Scaling by tile count over 9 years of 112
-zones gives **~$1,300**, superseding the ~$200 in §1. Utilisation was 57–79% of CPU, ~1.0 GB/s
-of combined network and 52% of memory, so no resource was saturated and none of the three was
-the binding constraint; the box is correctly sized and assembly is a scheduling term, never a
-cost one. Crucially, **the flow runner sits at 0.02 vCPU throughout inference**, so a trailing
-assembly overlaps the next cell's inference with the box effectively to itself.
+**Assembly, measured for the first time — to completion.** A 16 vCPU / 64 GiB Fargate task
+reads **4.97 TB across 2.34 M objects** for a dense zone-year — staged tiles are stored
+**uncompressed**, at 570.4 MB each — at $0.93/hour plus about $1 of S3 requests. Scaling by tile
+count over 9 years of 112 zones gives **~$1,150**, superseding the ~$200 in §1. Utilisation was
+57–79% of CPU, ~1.0 GB/s of combined network and 52% of memory, so nothing was saturated.
+
+| | measured |
+|---|---|
+| shard-write phase | **195.9 min** (3.27 h) |
+| merge + commit | **37 s — 0.32% of assembly** |
+| total | **196.6 min** (3.28 h) |
+| effective read rate | **423 MB/s** |
+
+**Two corrections and one free result.** An in-flight estimate of 2.2–3.1 hours, extrapolated
+from a ~550 MB/s instantaneous network sample, was optimistic: sustained over the run the
+effective rate is **423 MB/s**, so a spot network reading is not a throughput basis. And **the
+commit is negligible** — 37 seconds of 196 minutes, because the forked workers have already
+written every chunk and the merge is metadata only. That is the phase split `ASSEMBLY_SUMMARY`
+was added to obtain, available from two log timestamps: for planning, **assembly IS the shard
+write**, with no second phase to model.
+
+**The trailing-thread margin is thinner than a 2.5-hour assembly implied.** The runner sits at
+0.02 vCPU throughout inference, so the box is free — but capacity was never the question. The
+question is whether assembly finishes before the next cell's inference does:
+
+| | assembly | inference at 228 actors | margin |
+|---|---|---|---|
+| dense cell (8,714 tiles) | 3.28 h | 3.96 h | **1.21×** |
+| average cell (3,222 tiles) | 1.21 h | 1.46 h | **1.21×** |
+
+**1.21×, not the 1.6× a 2.5-hour assembly gave**, and scale-invariant because both terms are
+linear in tiles. Assembly stays off the critical path, but by 21% rather than comfortably, and a
+cluster runs ~126 cells in sequence so a persistent deficit compounds rather than averaging out.
+That is what makes the **39% of CPU left idle** worth keeping: not spare performance to harvest,
+but the margin's only buffer. **F8 now tests a thin ratio rather than confirming a comfortable
+one.**
 
 ### Throughput is not purely token-bound, and the floor bites where tokens are fewest
 

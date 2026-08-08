@@ -648,20 +648,49 @@ fixed 2026-08-07 (per-worker progress on a timer, and the caller naming its own 
 **The staged intermediate is uncompressed, which is what sets the duration.** Every staged tile is
 byte-identical at **570.4 MB** — exactly the embeddings array plus the scales array with no
 compression — so a dense zone-year is **4.97 TB across 2.34 M objects** to read. That, not CPU,
-is why assembly takes hours: about 2.5 for this cell. Compressing the staged intermediate is the
-one change that would move assembly wall-clock materially.
+is why assembly takes hours. Compressing the staged intermediate is the one change that would
+move assembly wall-clock materially.
+
+**Measured to completion, and the write IS the assembly.** The run's own timestamps give the
+phase split without the `ASSEMBLY_SUMMARY` record:
+
+| | measured |
+|---|---|
+| shard-write phase | **195.9 min** (3.27 h) |
+| merge + commit | **37 s — 0.32%** |
+| total | **196.6 min** (3.28 h) |
+| effective read rate | **423 MB/s** |
+
+The commit is negligible because the forked workers have already written every chunk and the
+merge is metadata only — so there is no second phase to model, and the 16 partitions all
+completed inside a **6-minute window** at the end, which is the round-robin balance working and
+also why the old reporter read `0/16` for over three hours.
+
+**An in-flight estimate of 2.2–3.1 h, extrapolated from a ~550 MB/s instantaneous network
+sample, was optimistic.** Sustained, the effective rate is 423 MB/s. A spot network reading is
+not a throughput basis — the same class of error as a partial run's median.
 
 **Cost, measured for the first time.** The runner task is $0.93/hour, so a dense cell's assembly
-is **$2.33 of compute plus ~$1 of S3 requests**. Scaled by tile count over 1,008 campaign cells
-that is **~$1,300** — superseding the ~$200 previously carried in the cost model with no
+is **~$3.05 of compute plus ~$1 of S3 requests**. Scaled by tile count over 1,008 campaign cells
+that is **~$1,150** — superseding the ~$200 previously carried in the cost model with no
 measurement behind it. Assembly is a scheduling term and never a cost term.
 
-**The trailing-thread design is now confirmed rather than assumed.** The claim above that
-assembly is "off the critical path by design" rested on the runner having capacity to spare. It
-does, decisively: **the runner sits at 0.02 vCPU for the entire 2.5 hours of GPU inference**,
-with one ten-minute burst of 6–8 vCPU at run start. So a trailing assembly needing 11–12 vCPU
-overlaps the next zone's inference with the box effectively to itself. The corollary is that
-**two concurrent assemblies on one runner would contend** — 2 × 12 exceeds 16.
+**The trailing-thread design holds, but by 21% rather than comfortably.** The runner sits at
+0.02 vCPU for the whole of GPU inference, with one ten-minute burst of 6–8 vCPU at run start, so
+the box is free for a trailing assembly needing 11–12 vCPU. **Capacity was never the question**:
+what matters is whether assembly finishes before the next cell's inference does.
+
+| | assembly | inference at 228 actors | margin |
+|---|---|---|---|
+| dense cell (8,714 tiles) | 3.28 h | 3.96 h | **1.21×** |
+| average cell (3,222 tiles) | 1.21 h | 1.46 h | **1.21×** |
+
+Scale-invariant, because both terms are linear in tiles. A cluster runs ~126 cells in sequence,
+so a persistent deficit compounds rather than averaging out — which is what makes the 39% of CPU
+left idle worth keeping as the margin's buffer rather than harvesting it. The corollary about
+**two concurrent assemblies contending** is moot in practice: the trailing executor is
+`max_workers=1`, so a second assembly queues instead, and the queue is exactly what a margin
+this thin puts at risk.
 
 ### What survives all three corrections — and what the radar finding takes back
 
