@@ -852,6 +852,114 @@ def test_the_campaign_costs_more_per_pixel_than_the_site_every_rate_came_from() 
     assert RATE_CAPACITY_PLANNING < COMBINED_TOK_PER_SEC / IOWA_TOK_PER_PX
 
 
+# --- the trailing-assembly queue ----------------------------------------------------------
+# Assembly is not a fleet: it runs in-process on the flow runner and its cells SERIALISE on a
+# single trailing thread, which is what makes concurrent years safe. So a cluster working many
+# years of many zones queues every assembly behind one thread, and the question is whether that
+# queue ever outlasts the inference feeding it. Both rates below are per TILE, measured on one
+# completed dense zone-year (`campaign-cost-model.md` §6c), and both are linear in tiles —
+# which is an assumption this model rests on, not a measured property of the whole range.
+
+#: Wall seconds of assembly per live tile, from a completed dense zone-year.
+ASSEMBLY_S_PER_TILE = 196.6 * 60 / 8714
+#: GPU-hours of inference per live tile, from the same cell.
+INFERENCE_GPU_H_PER_TILE = 902.1 / 8714
+#: Campaign years, every one dispatched together (the `overlap_years` decision).
+CAMPAIGN_YEARS = 9
+
+
+def assembly_queue(tiles_in_dealt_order: Sequence[int], *, actors: int) -> dict[str, float]:
+    """Simulate one cluster's assembly queue; return the tail and the peak backlog, in hours.
+
+    Each cell's assembly can start only when BOTH its own inference has finished and the
+    trailing thread is free — the second term is the whole point, since it is what a single
+    thread imposes. ``tail_h`` is how long the last assembly runs past the end of inference,
+    which is the only part that lands on the campaign's critical path. ``peak_backlog_h`` is the
+    largest lead assembly ever falls behind, which is what a bigger runner or a wider pool would
+    buy if it mattered.
+
+    A HIGHER actor count is the adverse case, not the safe one: more actors shorten inference
+    while assembly is unchanged, so the margin narrows. Evaluate at the planned width.
+    """
+    now_inference = 0.0
+    thread_free = 0.0
+    peak = 0.0
+    for tiles in tiles_in_dealt_order:
+        now_inference += tiles * INFERENCE_GPU_H_PER_TILE * 3600 / actors
+        thread_free = max(now_inference, thread_free) + tiles * ASSEMBLY_S_PER_TILE
+        peak = max(peak, thread_free - now_inference)
+    return {"tail_h": (thread_free - now_inference) / 3600, "peak_backlog_h": peak / 3600}
+
+
+def test_the_trailing_assembly_thread_is_not_the_critical_path() -> None:
+    """F8's question, answered over the real dealt order rather than a synthetic pair.
+
+    The concern is structural: assemblies serialise on one thread, so a cluster holding every
+    year of every zone it owns queues them all behind each other. If that queue outlived its
+    inference, the fix would be the runner's size or the pool width — both settable per run.
+
+    It does not. The queue builds to roughly ONE dense cell's assembly and drains, and the tail
+    past the end of inference is minutes against a campaign of days. What this pins is the
+    conclusion AND its direction of safety: per tile, assembly must stay cheaper than inference,
+    because that inequality is what makes the queue drain at all. Reverse it and the backlog
+    compounds over a cluster's cells instead of clearing.
+    """
+    inference_s = INFERENCE_GPU_H_PER_TILE * 3600 / ACTORS_PER_CLUSTER
+    assert inference_s > ASSEMBLY_S_PER_TILE, (
+        "assembly is now dearer per tile than inference — the queue compounds instead of draining"
+    )
+
+    for cluster in plan(CLUSTERS):
+        cells = [t for t in cluster.tiles for _ in range(CAMPAIGN_YEARS)]
+        q = assembly_queue(cells, actors=ACTORS_PER_CLUSTER)
+        # Minutes, not hours: anything approaching a cell's own assembly means the queue stopped
+        # draining, and the tail is then bounded by the cluster's length rather than by one cell.
+        assert q["tail_h"] < 0.5, f"assembly tail {q['tail_h']:.2f} h is on the critical path"
+        # The backlog is expected and benign — one dense assembly in flight. Much more than that
+        # means cells are arriving faster than the single thread retires them.
+        assert q["peak_backlog_h"] < 2 * ASSEMBLY_S_PER_TILE * max(cluster.tiles) / 3600 + 1.0
+
+
+def test_the_assembly_ceiling_is_an_actor_count_and_the_policy_is_what_stays_under_it() -> None:
+    """Where the trailing thread becomes binding, and what keeps the campaign below it.
+
+    The margin is not a property of assembly; it is a property of the RATIO, and the actor
+    count sets it. Inference time per tile falls as actors rise while assembly does not move,
+    so there is a width at which the two cross and the queue stops draining. Above it, extra
+    actors buy less than proportionally: they shorten inference and lengthen the tail.
+
+    The consequence worth knowing is a COUPLING nobody chose. The 85%-provisioning policy
+    exists to stop a fleet idling on a shallow queue, and it is also the thing holding the
+    campaign under this ceiling. Anyone raising the fleet toward matched, for throughput, is
+    also spending this margin — so the two decisions cannot be taken independently.
+
+    The remedy, if a wider fleet is ever wanted, is the assembly side rather than the fleet:
+    the runner's pool is settable per run and its box has CPU left idle at the shipped width.
+    """
+    break_even = INFERENCE_GPU_H_PER_TILE * 3600 / ASSEMBLY_S_PER_TILE
+
+    def worst_tail(actors: int) -> float:
+        return max(
+            assembly_queue([t for t in c.tiles for _ in range(CAMPAIGN_YEARS)], actors=actors)["tail_h"]
+            for c in plan(CLUSTERS)
+        )
+
+    # The planned width sits UNDER the ceiling, which is the whole reason the tail is minutes.
+    assert break_even > ACTORS_PER_CLUSTER
+    assert worst_tail(ACTORS_PER_CLUSTER) < 0.5
+
+    # And it is not a comfortable distance: the OTHER configuration this module already models
+    # crosses it. That is the finding, so it is asserted rather than left as a footnote.
+    assert break_even * 1.05 > ACTORS_MATCHED, "matched width no longer sits near the ceiling — re-derive"
+    assert worst_tail(ACTORS_MATCHED) > worst_tail(ACTORS_PER_CLUSTER), (
+        "raising the fleet to matched must be seen to lengthen the assembly tail"
+    )
+
+    # Above the ceiling the queue compounds over a cluster's cells rather than clearing, so the
+    # tail is bounded by the cluster's length and not by one cell. Pin the shape, not a number.
+    assert worst_tail(int(break_even * 1.5)) > 5 * worst_tail(ACTORS_PER_CLUSTER)
+
+
 def test_the_bank_holds_across_the_whole_envelope() -> None:
     """Every cluster, both fleet policies, three widths, both ingest caps — 96 combinations.
 
