@@ -87,6 +87,8 @@ shipped defaults.**
 | `force_staging_reuse` | `false` | escape hatch — but it does NOT reach staging fingerprinted without it; the reliable resume lever is `fill-zone-year`'s explicit `run_id`. See the staging corrections in §6 (2026-08-07) |
 | `force_staging_restage` | `""` | escape hatch: any new token forces a fresh staging prefix, for a change the source hash cannot see (a library upgrade) |
 | commit limit | derived, `min(clusters, 8)` | never set by hand — and it bounds commits IN FLIGHT (~1 s each), not concurrent assemblies |
+| leg retry wall-clock budget | 36 h | **NEW 2026-08-10.** F7 settled that we retry expansively; this is what stops patience becoming unbounded. Only ATTEMPT counts were bounded before, and a page fetch is already 9 HTTP attempts over 364 s that every outer layer treats as one try. Checked only when STARTING an attempt, so a slow-but-succeeding leg is never why the loop stops (§9b) |
+| Earth Search page size | 100 | **NEW 2026-08-10**, down from 250 and set per provider. That catalogue refuses some (area, window) pairs at 250 and answers the same query at 100 (§9b). NOT a rule about page sizes — raising it for CMR-STAC made its 500s worse |
 
 The commit gate and the ingest gate are both **Prefect global concurrency limits**, because
 clusters are separate flow runs on separate machines and only a server-side gate can bound them
@@ -587,6 +589,50 @@ never averaged away.
 
 Added 2026-08-06 from the pre-campaign test programme. Only what alters an operational decision or
 retires an open question; the figures live in the documents named.
+
+### Added 2026-08-10 — two operational RULES, not just findings
+
+**A change inside the mosaic-content fingerprint closure has a LANDING WINDOW, and the campaign
+closes it.** Such a change moves the fingerprint, so a mosaic caught **mid-append** refuses its next
+append and needs its interrupted store deleted by hand. Finished mosaics are unaffected. Two such
+changes were landed deliberately while nothing was mid-ingest — verified by confirming only the
+Prefect worker service was running, not an ingest runner or fleet. `config/providers.py` and the
+ingest query modules are inside that closure, so **anything touching the query, the collections or
+the provider settings is a between-campaigns change**, not a mid-flight one. This is the operational
+face of a property the identity closure already documents; it is recorded here because the closure's
+docstring cannot tell you *when* it is safe to act.
+
+**Our own S3 ceiling has already been hit, and it is the DELETE path — and it is not a quota.** The
+per-prefix request rate is a service characteristic: no Service Quotas entry, no case to file, so
+there is nothing to raise. Every own-bucket refusal observed so far is **bulk mosaic deletion**
+hitting the prefix write rate — not ingest, not inference, not assembly. The campaign's own
+`cleanup_staging` runs per cell under its own `staging/<zone>/<year>/<run-id>/` prefix, so its
+traffic is distributed across prefixes and spread over the campaign's duration, which is a
+materially easier problem than the concentrated manual cleanups that produced those refusals.
+
+> **The open question, worth three orders of magnitude:** `DeleteObjects` accepts up to 1,000 keys
+> per request, and the production path is `s5cmd rm --all-versions`. Whether it batches is currently
+> a belief. **Confirm before launch** — if it does, the steady-state margin is enormous; if it does
+> not, moving the cleanup to batched deletion dwarfs anything a quota could have granted. Either
+> way a throttled delete costs time, not correctness; the one real harm is delete traffic contending
+> with a live measurement.
+
+**The retry policy now has a bound, because only attempt counts had one.** F7 settled that we back
+off and retry expansively and fail a cell only under duress. Measuring the ladder showed the gap:
+**wall clock was unbounded at all three layers** — a single page fetch is already nine HTTP attempts
+across 364 seconds, and the leg, cell and campaign budgets each treat that as one try, so one
+deterministically failing query could cost up to twelve leg dispatches. The bound is a **36-hour
+wall-clock budget** on the leg-retry loop, checked only when deciding to START another attempt, so a
+slow-but-succeeding leg can never be the reason the loop stops. A legitimately slow source loses its
+remaining attempts in one flow run and nothing else: the cell returns to the work list, the outer
+budgets re-dispatch it, and a re-dispatch resumes from committed dates.
+
+**One upstream failure turned out to be ours to fix.** A catalogue search that refused deterministically
+— defeating that whole ladder, three times hours apart — was a **page-size sensitivity**, not missing
+data and not our load: the same query answers at 100 items per page and refuses at 250, while the
+adjacent year answers at 250. Earth Search's page size is now 100. Note the opposite result already
+recorded for CMR-STAC, where *raising* it made 500s worse — page size is a per-service property, so
+this is set per provider and must not become a rule.
 
 ### Added 2026-08-08 — the failure drills, and what they retired
 
