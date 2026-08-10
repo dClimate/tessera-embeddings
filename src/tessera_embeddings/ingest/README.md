@@ -148,6 +148,21 @@ answer (collection, window, area, page) and nothing that varies between attempts
 or a timestamp inside it would make every refusal unique and the repeat check dead code that
 always reports "not repeated".
 
+**Attempts are the only thing those budgets count; elapsed time has exactly one bound.**
+Each page fetch already gets 9 HTTP attempts across 364 s of exponential backoff before
+anything above the ladder sees a failure, and every attempt budget above it — leg, cell,
+zone round — treats the whole layer below as one try. None of them reads a clock, and
+expansive backoff makes the clock the axis that can grow without limit.
+`IngestSettings.max_leg_wall_clock_s` bounds it in the leg loop, at the one place that
+cannot defeat the patience it serves: once the deadline has passed, the loop refuses to
+START another attempt. A leg that is running is never measured against it — a
+slow-but-succeeding leg cannot be why the loop stopped — so the loop's worst case is the
+deadline plus one final attempt. And failing the cell this way is not surrender: the cell
+returns to the campaign's work list, and a later dispatch RESUMES from the dates already
+committed (Icechunk commits a date's time slot atomically with its pixels), so the bound
+costs latency, never work. The default's derivation against measured leg durations is in
+`context_docs/design/catalogue_refusal_classification_2026_08.md`.
+
 `source_coverage.py`'s preflight probe deliberately does **not** use any of this. Every
 failure of that probe is already INCONCLUSIVE by design, which is the right answer for both
 refusals at once, and the module sits outside the mosaic-content fingerprint closure.

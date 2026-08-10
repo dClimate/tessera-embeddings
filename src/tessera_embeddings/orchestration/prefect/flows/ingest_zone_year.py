@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from time import monotonic
 from typing import Any, cast
 
 import icechunk
@@ -581,6 +582,10 @@ async def ingest_zone_year(
     # of the same answer. Scoped to this flow run: the evidence is the repeat, and a run
     # that has not seen one has nothing to act on.
     last_refusal: dict[str, str] = {}
+    # The wall-clock bound's anchor. Attempts are counted at every layer of the retry
+    # stack; elapsed time is bounded only here, and only at the decision to START another
+    # attempt — see the deadline check at the bottom of the loop.
+    leg_loop_start = monotonic()
     for attempt in range(1, ingest_settings.max_leg_attempts + 1):
         # return_exceptions=True so we WAIT for every leg to settle before retrying or
         # raising: a plain gather() surfaces the first failure while the siblings keep
@@ -655,6 +660,33 @@ async def ingest_zone_year(
         if terminal:
             break
         if not failed or attempt == ingest_settings.max_leg_attempts:
+            break
+        # The wall-clock bound, checked ONLY here — at the decision to start another
+        # attempt, after every leg has settled. A leg that is running is never measured
+        # against it, so a slow-but-succeeding leg cannot be why the loop stopped; what the
+        # bound refuses is re-dispatching a failed leg after patience has already had a
+        # deadline's worth of wall clock. Like a terminal failure, breaking leaves `errors`
+        # populated and the raise below fails the cell — which is not surrender: the cell
+        # returns to the campaign work list, and a later dispatch RESUMES from the dates
+        # already committed, so the cost is latency, not work.
+        elapsed = monotonic() - leg_loop_start
+        if elapsed >= ingest_settings.max_leg_wall_clock_s:
+            log.error(
+                "Zone %s year %s: %.0f s elapsed since the first leg attempt — past the "
+                "wall-clock budget for starting another (max_leg_wall_clock_s=%d) — so "
+                "attempt %d/%d is refused even though the attempt budget has room. The "
+                "bound only ever gates the START of an attempt; no running leg was "
+                "interrupted. The cell fails back to the campaign work list, and a later "
+                "dispatch RESUMES from the dates already committed — this costs latency, "
+                "not work. Failed leg(s): %s",
+                zone,
+                year,
+                elapsed,
+                ingest_settings.max_leg_wall_clock_s,
+                attempt + 1,
+                ingest_settings.max_leg_attempts,
+                ", ".join(label for label, _, _ in failed),
+            )
             break
         # A re-dispatch RESUMES: already-committed dates are skipped, not rewritten, so the
         # retry costs only the work that was actually lost. That idempotency is what makes

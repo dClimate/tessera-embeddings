@@ -199,8 +199,33 @@ class IngestSettings(BaseModel):
     # alternative leaves a mosaic incomplete until a human notices and re-dispatches.
     #
     # Failures a re-dispatch cannot fix are excluded by CLASS rather than by count — see
-    # ``_NON_RETRYABLE_LEG_MARKERS`` in the flow.
+    # ``_NON_RETRYABLE_LEG_MARKERS`` in the flow. This counts ATTEMPTS only; the bound on
+    # elapsed time in the same loop is ``max_leg_wall_clock_s`` below.
     max_leg_attempts: int = Field(default=3, ge=1)
+    # Wall-clock budget, in seconds, for ingest-zone-year's whole leg-retry loop — the only
+    # bound on ELAPSED time anywhere in the retry stack. Every other layer counts attempts:
+    # the HTTP ladder under a page fetch, this loop's attempt count above, and the cell and
+    # zone budgets above that, each treating the layer below as one try. None of them reads
+    # a clock, and expansive backoff — the campaign's deliberate policy toward a source
+    # refusing reads under load — makes the clock the one axis that can grow without limit.
+    #
+    # It bounds the decision to START ANOTHER ATTEMPT, never a leg that is running: the
+    # deadline is checked only where the loop decides whether to re-dispatch a failed leg,
+    # so a slow-but-succeeding leg is never why the loop stopped, and the loop's true worst
+    # case is this deadline plus one final attempt. Failing the cell here is not surrender:
+    # the cell returns to the campaign work list, and a later re-dispatch RESUMES from the
+    # dates already committed (Icechunk commits a date's time slot atomically with its
+    # pixels), so the cost of the bound is latency, not lost work.
+    #
+    # The default is a POLICY choice pinned between two facts. It must comfortably exceed
+    # the longest legitimate single leg at the default fleet width, so that a leg which ran
+    # long for honest reasons never costs a failed sibling its retry; and it must be small
+    # enough that a stuck cell releases its campaign slot within about a working day of
+    # outliving that legitimate range — no bound can release it sooner without cutting legs
+    # that are merely slow. Calibrate it against measured leg durations, which live in
+    # context_docs/design/ (the ingest optimisation campaign record and the catalogue
+    # refusal record); re-derive it if per-date cost or the default width changes.
+    max_leg_wall_clock_s: int = Field(default=36 * 3600, ge=1)
     # Optional base URI (an fsspec target, e.g. s3://.../perf/) for capturing a
     # Dask ``distributed.performance_report`` per child ingest. Default None =
     # off (normal runs pay nothing); set it only on a probe rung — ingest-zone-year

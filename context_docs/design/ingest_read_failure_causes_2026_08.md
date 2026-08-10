@@ -292,6 +292,15 @@ So the classification has to live where the read fails, not where the leg is ret
 the inner GDAL cause and the object URL into the failure detail is the prerequisite for ever
 letting the retry classifier act on this at all.
 
+**A second instance of this shape, since resolved for the catalogue query rather than the read:**
+`catalogue_refusal_classification_2026_08.md`. The optical leg's STAC search was refused
+deterministically (repeated 502s from `earth-search`) and burned the same budget for the same
+reason — the wrapper discarded the request, so no marker could separate a busy catalogue from one
+that cannot serve a particular query. The fix follows the prescription above: classify where the
+failure happens, carry the request identity into the failure detail, and let the layer holding the
+budget act on a REPEAT of it. Note that the "Caveat on the sample" 502s above are the first
+recorded observation of that same upstream defect.
+
 ## Why the object was hard to identify — an attribution gap, now closed
 
 No `READ FAILED roi=` line existed for any of these failures, despite `read_failure_context`

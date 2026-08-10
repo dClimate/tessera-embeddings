@@ -583,6 +583,19 @@ def test_max_leg_attempts_defaults_to_retrying() -> None:
     assert IngestSettings().max_leg_attempts >= 2
 
 
+def test_the_wall_clock_bound_is_on_by_default_and_is_a_real_duration() -> None:
+    """A default nobody sets has never run: the bound must ship enabled.
+
+    And it must be a real duration, not a placeholder — a bound shorter than any
+    plausible leg would refuse every first retry, which is the opposite failure. The
+    field's own docstring carries the two facts the number sits between; this only pins
+    that it exists, is on, and is denominated in hours rather than in accidents.
+    """
+    from tessera_embeddings.config.ingest import IngestSettings
+
+    assert IngestSettings().max_leg_wall_clock_s >= 3600
+
+
 def test_a_terminal_leg_failure_is_not_forgotten_when_a_sibling_retries(wired, monkeypatch):
     """A leg that can never succeed must fail the flow even if its siblings recover.
 
@@ -749,6 +762,161 @@ class TestCatalogueRefusalSpendsTheBudgetDifferently:
             _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
 
         assert dispatched.count("s2") == 3
+
+
+class _ManualClock:
+    """A ``monotonic()`` stand-in the test advances by hand — no sleeping in tests."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+#: A leg failure the classifier calls transient, so only the clock can stop its retries.
+_TRANSIENT_DETAIL = "PermissionError: The provided token has expired."
+
+
+class TestWallClockBoundsTheDecisionToStartAnotherAttempt:
+    """Elapsed time gets a bound, and it binds exactly one thing: starting another attempt.
+
+    Every layer of the retry stack counts attempts and none reads a clock, so expansive
+    backoff — the right policy for a source refusing reads under load — had no limit on
+    how long one cell could quietly consume. The bound must not defeat the policy it
+    serves: a leg that is RUNNING is never measured against it, a leg that fails inside
+    the deadline keeps its remaining attempts, and a load refusal keeps the patience the
+    campaign promised it. Only the decision to re-dispatch after the deadline is refused —
+    and the cell then fails back to the campaign work list, where a later dispatch resumes
+    from the dates already committed, so the price is latency rather than work.
+    """
+
+    @staticmethod
+    def _dispatch_with_clock(monkeypatch, *, details: list[str] | None, leg_duration: float):
+        """Drive the leg loop against a hand-advanced clock.
+
+        The optical leg 'runs' for ``leg_duration`` fake seconds per attempt — the clock
+        advances while the leg is in flight, which is where real time is spent — then
+        fails with the next entry of ``details``, or completes when ``details`` is None.
+        The radar leg completes immediately. Returns ``(dispatched, clock)``.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        clock = _ManualClock()
+        monkeypatch.setattr(mod, "monotonic", clock)
+        dispatched: list[str] = []
+        remaining = list(details or [])
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            leg = parameters.get("orbit") or "s2"
+            dispatched.append(leg)
+            if leg != "s2":
+                return _completed_run()
+            clock.now += leg_duration
+            if details is None:
+                return _completed_run()
+            message = remaining.pop(0) if remaining else details[-1]
+            return SimpleNamespace(id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=message))
+
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+        return dispatched, clock
+
+    def test_a_passed_deadline_refuses_the_next_attempt(self, wired, monkeypatch):
+        """Once the deadline has passed, remaining attempts are refused, not spent.
+
+        One dispatch, not three: the first attempt consumed the whole budget's worth of
+        wall clock, so re-dispatching would be patience without a limit — the exact shape
+        the bound exists to remove. The failure still raises, so the cell goes back to
+        the campaign work list rather than quietly succeeding at nothing.
+        """
+        dispatched, _ = self._dispatch_with_clock(monkeypatch, details=[_TRANSIENT_DETAIL] * 3, leg_duration=1000.0)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(max_leg_attempts=3, max_leg_wall_clock_s=500),
+            )
+
+        assert dispatched.count("s2") == 1, "the deadline had passed, so no further attempt may start"
+        assert wired["markers_written"] == []
+
+    def test_a_failure_inside_the_deadline_keeps_its_remaining_attempts(self, wired, monkeypatch):
+        """The bound must not make the system give up early.
+
+        Identical failures, identical clock — only the deadline is generous — and every
+        configured attempt is spent. The bound is a ceiling on patience, not a discount
+        of it.
+        """
+        dispatched, _ = self._dispatch_with_clock(monkeypatch, details=[_TRANSIENT_DETAIL] * 3, leg_duration=1000.0)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(max_leg_attempts=3, max_leg_wall_clock_s=1_000_000),
+            )
+
+        assert dispatched.count("s2") == 3, "inside the deadline the attempt budget is untouched"
+
+    def test_a_slow_but_succeeding_leg_is_never_interrupted(self, wired, monkeypatch):
+        """The deadline gates re-dispatch decisions, not running legs.
+
+        The leg blows straight through the deadline while in flight and then succeeds —
+        and the run completes and marks, because success is read before any clock is.
+        A bound that failed this cell would have turned a slow catalogue into lost
+        coverage, which is the policy defeat the placement exists to prevent.
+        """
+        dispatched, clock = self._dispatch_with_clock(monkeypatch, details=None, leg_duration=1000.0)
+
+        result = _run(
+            s1_orbit="ascending",
+            ingest_settings=mod.IngestSettings(max_leg_attempts=3, max_leg_wall_clock_s=500),
+        )
+
+        assert clock.now > 500, "the scenario requires the deadline to pass while the leg runs"
+        assert result["status"] == "ingested"
+        assert dispatched.count("s2") == 1
+        assert wired["markers_written"], "the slow leg's work must be marked complete, not discarded"
+
+    def test_a_load_refusal_keeps_its_attempts_inside_the_deadline(self, wired, monkeypatch):
+        """The bound serves the expansive-retry policy; it must not replace it.
+
+        A source naming itself as the constraint keeps every attempt while the clock has
+        budget — the wall clock is the only thing allowed to end that patience, and here
+        it never runs out.
+        """
+        dispatched, _ = self._dispatch_with_clock(
+            monkeypatch, details=[_refusal_detail(503, page=2)] * 3, leg_duration=100.0
+        )
+
+        with pytest.raises(RuntimeError, match="CATALOGUE_REFUSAL"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(max_leg_attempts=3, max_leg_wall_clock_s=1_000_000),
+            )
+
+        assert dispatched.count("s2") == 3, "a busy source inside the deadline keeps its whole budget"
+
+    def test_the_refusal_log_names_elapsed_deadline_and_the_resume(self, wired, monkeypatch, caplog):
+        """Refusing to retry has to say what ran out and what it costs.
+
+        The operator reading this line needs three things: how much wall clock was spent,
+        what the budget was, and that the cell comes back — a bound that looks like data
+        loss gets worked around, and a worked-around bound is no bound.
+        """
+        self._dispatch_with_clock(monkeypatch, details=[_TRANSIENT_DETAIL] * 3, leg_duration=1000.0)
+
+        with (
+            caplog.at_level(logging.ERROR, logger="test-ingest-zone-year"),
+            pytest.raises(RuntimeError),
+        ):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(max_leg_attempts=3, max_leg_wall_clock_s=500),
+            )
+
+        assert "1000" in caplog.text  # the elapsed time
+        assert "max_leg_wall_clock_s=500" in caplog.text  # the deadline it passed
+        assert "work list" in caplog.text and "RESUMES" in caplog.text  # latency, not work
 
 
 def test_the_manifest_is_checked_before_any_marker_is_stamped(wired, monkeypatch):
