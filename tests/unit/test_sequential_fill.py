@@ -17,6 +17,12 @@ import time
 import pytest
 
 import tessera_embeddings.orchestration.runners.sequential_fill as mod
+from tessera_embeddings.config.fault_injection import (
+    FAULT_LOG_PREFIX,
+    WITHHOLD_WORK,
+    ArmedFault,
+    FaultInjection,
+)
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.assembly import StagedResume
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -782,3 +788,80 @@ def test_the_in_child_retry_only_considers_cells_that_kept_a_mosaic():
         "the retry pass must filter the failure list by the retained-mosaic set"
     )
     assert "eligible = set(retained_failed)" in src
+
+
+# ---------------------------------------------------------------------------
+# Withholding supply from a fleet that is already up (the starvation drill)
+# ---------------------------------------------------------------------------
+
+
+def _armed_withhold(hold_minutes: float):
+    return FaultInjection(fault=WITHHOLD_WORK, hold_minutes=hold_minutes).arm(
+        ssm_prefix="/global-tessera-dev/ray/", supports=(WITHHOLD_WORK,), log=LOG
+    )
+
+
+def _polling_session(polls: list, poll_interval_s: float = 0.02):
+    """A session that records every poll and keeps polling through empty ones.
+
+    The real scheduler behaves this way while its source is unexhausted: an empty
+    poll is "nothing ready YET", so it waits and asks again rather than finishing.
+    That loop is what a withheld supply exploits, and what this fake has to
+    reproduce for the test to mean anything.
+    """
+
+    def session(more_work, on_item_done):
+        results = []
+        while True:
+            batch = more_work()
+            polls.append(batch)
+            if batch is None:
+                return results
+            if not batch:
+                time.sleep(poll_interval_s)
+                continue
+            for item in batch:
+                result = {"chunk": item.chunk.label, "status": "success"}
+                results.append(result)
+                on_item_done(item, result)
+
+    return session
+
+
+def test_withholding_starves_the_stream_and_then_lets_it_finish(caplog):
+    # The drill's whole claim: the fleet is left holding nothing, ALIVE, and the run
+    # still completes. A fault that failed the run would exercise the failure path
+    # instead of the starvation the tripwire exists to see.
+    polls: list = []
+    with caplog.at_level(logging.ERROR):
+        summary = _run(_cells(2), session=_polling_session(polls), fault=_armed_withhold(0.004))
+
+    assert summary["succeeded"] == 2 and summary["failed"] == 0, "withholding must not fail a cell"
+    handed_over = [batch for batch in polls if batch]
+    assert len(handed_over) == 2, "both zones must reach the stream once the hold ends"
+    said = [r.getMessage() for r in caplog.records if FAULT_LOG_PREFIX in r.getMessage()]
+    assert any("FIRING withhold_work" in line for line in said), "the hold must announce itself"
+    assert any("RELEASED" in line for line in said), "and must end by itself"
+
+
+def test_the_first_zone_is_handed_over_before_anything_is_withheld(caplog):
+    # A fleet that never received work has not starved; it has never started, which is
+    # the shape every detector exempts. So the hold must begin AFTER a hand-over.
+    polls: list = []
+    with caplog.at_level(logging.ERROR):
+        _run(_cells(2), session=_polling_session(polls), fault=_armed_withhold(0.004))
+    first_non_empty = next(i for i, batch in enumerate(polls) if batch)
+    said = [r.getMessage() for r in caplog.records if "FIRING withhold_work" in r.getMessage()]
+    assert said, "the hold must have fired at all"
+    assert first_non_empty < len(polls) - 1, "a zone must be streamed before the hold starts"
+
+
+def test_an_unarmed_run_never_consults_a_fault(monkeypatch):
+    # The property that matters more than the fault working: with no request passed,
+    # the withholding code is unreachable. Booby-trap it and run an ordinary fill.
+    def _must_not_run(self, supply, *, log):
+        raise AssertionError("an unarmed run consulted the fault injection")
+
+    monkeypatch.setattr(ArmedFault, "withhold", _must_not_run, raising=True)
+    summary = _run(_cells(2))
+    assert summary["succeeded"] == 2

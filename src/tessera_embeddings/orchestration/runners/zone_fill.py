@@ -62,6 +62,7 @@ import numpy as np
 import zarr
 
 from tessera_embeddings.config.assembly import AssemblyConfig
+from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import InferenceConfig
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
@@ -315,6 +316,7 @@ def fill_zone_year(
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
     on_actor_retire: Callable[[str], None] | None = None,
+    fault: ArmedFault | None = None,
 ) -> dict[str, Any]:
     """Fill one (zone, year): mask → inference → shard assembly → tag.
 
@@ -347,6 +349,9 @@ def fill_zone_year(
         s3_region: Optional S3 region override for the global store.
         on_actor_retire: Optional callback when a misbehaving actor is retired
             (the AWS provider injects an EC2 terminator).
+        fault: Supervised-drill hook, forwarded to the assembly phase. Inert unless
+            the run was armed for a fault this path hosts and for this cell
+            (:mod:`tessera_embeddings.config.fault_injection`).
 
     Returns:
         Summary dict: zone, year, run_id, snapshot_id, tag, tile counts,
@@ -379,6 +384,7 @@ def fill_zone_year(
         cleanup_staging=cleanup_staging,
         get_credentials=get_credentials,
         s3_region=s3_region,
+        fault=fault,
     )
 
 
@@ -796,6 +802,7 @@ def assemble_zone_year(
     cleanup_staging: bool = True,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
+    fault: ArmedFault | None = None,
 ) -> dict[str, Any]:
     """Assembly phase of a (zone, year) fill: verify staged → assemble → tag.
 
@@ -806,6 +813,11 @@ def assemble_zone_year(
     the sequential multi-zone runner can run it on a trailing thread while
     the caller's thread starts the next cell's inference. A terminal handoff
     (``done`` set) passes straight through.
+
+    ``fault`` is the supervised-drill hook, forwarded to the assembly call on both
+    the data and the all-skipped path so the drill does not depend on which one a
+    cell takes. Inert unless the run was armed for a fault this path hosts and for
+    this cell (:mod:`tessera_embeddings.config.fault_injection`).
     """
     if handoff.done is not None:
         return handoff.done
@@ -853,6 +865,7 @@ def assemble_zone_year(
                 get_credentials=get_credentials,
                 s3_region=s3_region,
                 log=log,
+                fault=fault,
             )
         else:
             # No live tiles at all: nothing was ever written here, so there is nothing
@@ -925,6 +938,7 @@ def assemble_zone_year(
         get_credentials=get_credentials,
         s3_region=s3_region,
         log=log,
+        fault=fault,
     )
     repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)

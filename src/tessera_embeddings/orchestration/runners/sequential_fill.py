@@ -107,6 +107,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.inference.assembly import ZarrWriter
 from tessera_embeddings.inference.scheduling import WorkItem, ZoneContext
 from tessera_embeddings.orchestration.runners.zone_fill import ZoneFillHandoff, ZonePlan, complete_zone_inference
@@ -295,6 +296,7 @@ def fill_zones_sequential(
     inputs: CellInputs | None = None,
     look_ahead: int = 2,
     max_cell_attempts: int = 2,
+    fault: ArmedFault | None = None,
 ) -> dict[str, Any]:
     """Stream ``cells`` through one shared inference session, assembly trailing.
 
@@ -346,6 +348,14 @@ def fill_zones_sequential(
         look_ahead: Cells beyond the feed head to keep in ingest flight; also
             sizes the un-finalized-zone bound AND the mosaic storage budget
             (both ``look_ahead + 2`` — see :class:`_MosaicBudget`).
+        fault: Supervised-drill hook, consulted where prepared work crosses from the
+            feeder to the scheduler. Inert unless the run was armed for the
+            supply-withholding fault (:mod:`tessera_embeddings.config.fault_injection`).
+            This is the only point at which a fleet can be left genuinely idle without
+            breaking anything: the session's liveness, its actors and its retirement
+            policy all key on the source still being unexhausted, so withholding here
+            starves the fleet while every other mechanism behaves exactly as it does
+            when a cell's ingest is simply slow.
 
     Returns:
         Summary dict: per-cell outcomes, failure records, deferral count, and
@@ -676,8 +686,8 @@ def fill_zones_sequential(
         finally:
             feeder_done.set()
 
-    def _more_work() -> list[WorkItem] | None:
-        """Scheduler-thread source: one prepared zone per poll, None = done."""
+    def _prepared_zone() -> list[WorkItem] | None:
+        """One prepared zone, ``[]`` if none is ready YET, ``None`` once none can be."""
         with lock:
             if ready:
                 return ready.popleft()
@@ -685,6 +695,13 @@ def fill_zones_sequential(
             with lock:
                 return ready.popleft() if ready else None
         return []  # nothing ready YET (ingest/plan still running) — keep polling
+
+    def _more_work() -> list[WorkItem] | None:
+        """Scheduler-thread source: one prepared zone per poll, None = done."""
+        # The fault takes the source as a CALLABLE, so a withheld poll never asks for a
+        # zone — a hand-over REMOVES the zone from `ready`, so consulting and discarding
+        # would delete prepared work instead of delaying it.
+        return _prepared_zone() if fault is None else fault.withhold(_prepared_zone, log=log)
 
     def _on_item_done(item: WorkItem, result: dict[str, Any]) -> None:
         """Scheduler-thread callback: tally the zone; finalize off-thread when full."""

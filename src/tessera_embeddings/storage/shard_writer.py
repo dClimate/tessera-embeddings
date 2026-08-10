@@ -51,6 +51,7 @@ import numpy as np
 import zarr
 
 from tessera_embeddings.config.environment import configure_logging
+from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage.zarr_store import read_time_values
 from tessera_embeddings.storage.zone_grid import year_of
@@ -520,6 +521,7 @@ def write_year_shards(
     empty: bool = False,
     telemetry: dict[str, Any] | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+    fault: ArmedFault | None = None,
 ) -> str:
     """Fill one (zone, year) with whole shards from ``source`` in one commit.
 
@@ -574,6 +576,13 @@ def write_year_shards(
     stream. Workers additionally self-report within their partitions
     (:func:`_write_shards_worker`), to their own process streams.
 
+    ``fault`` is the supervised-drill hook for the gap between the two commits, and
+    is a no-op unless the run was armed for exactly that fault and exactly this cell
+    (:mod:`tessera_embeddings.config.fault_injection`). It exists because the gap is
+    the one state above that no operator can produce deliberately: it is bounded by
+    two commits of one function, so there is nothing outside the process to aim a kill
+    at, and a state documented as benign but never observed is an assumption.
+
     Returns the ATTR commit's snapshot id — a tag must point at a state where the
     year is both written and marked.
     """
@@ -593,6 +602,10 @@ def write_year_shards(
     year_label = _year_label(_group_node(session.store, group), year_index)
     t_commit = time.monotonic()
     commit_with_rebase(session, commit_msg or f"fill {group} year {year_label}", gate=gate)
+    if fault is not None:
+        # The drill's death lands HERE, between the two commits, and nowhere else can
+        # produce this state on purpose. Inert for any other fault or any other cell.
+        fault.die_between_commits(group, year_label, log=log or _log)
     t_attrs = time.monotonic()
     # The per-year attrs go in their OWN commit (see `commit_year_attrs`), so a same-zone
     # collision costs a sub-second retry instead of this whole assembly. Return that

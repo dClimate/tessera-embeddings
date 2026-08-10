@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from concurrent.futures import Future
@@ -11,6 +12,7 @@ import numpy as np
 import pytest
 import zarr
 
+from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, DRILL_EXIT_STATUS, FaultInjection
 from tessera_embeddings.config.store_layout import DIMS_3D, DIMS_4D, ArrayLayout, StoreLayout
 from tessera_embeddings.storage import global_store, shard_writer, zarr_store
 from tessera_embeddings.storage.shard_writer import (
@@ -397,3 +399,99 @@ class TestWorkerProgressReporting:
         )
         assert captured["log"] is marker
         assert captured["unit"] == "tile partitions"
+
+
+class TestTheDrillDeathBetweenTheTwoCommits:
+    """The one state no operator can manufacture: shards landed, year unmarked.
+
+    A zone-year lands in two commits, and the interesting failure is a death
+    between them. The gap is bounded by two lines of one function, so there is
+    nothing outside the process to aim a kill at — which is why the drill is
+    injected rather than performed, and why what follows checks the state left
+    behind rather than only that something exited.
+    """
+
+    @staticmethod
+    def _armed(zone: str = "01N", year: int = 2025):
+        return FaultInjection(fault=DIE_BETWEEN_COMMITS, zone=zone, year=year).arm(
+            ssm_prefix="/global-tessera-dev/ray/", supports=(DIE_BETWEEN_COMMITS,), log=logging.getLogger("drill")
+        )
+
+    @staticmethod
+    def _intercept_the_exit(monkeypatch) -> list:
+        """Replace the hard exit with a raise, recording the order of what ran.
+
+        The production path flushes handlers and then leaves the process, and
+        neither half can happen inside a test runner — the flush would close
+        pytest's own handlers and the exit would take the session with it. Both
+        are intercepted, and the ORDER is recorded, because an exit before the
+        flush loses the announcement that says the damage was deliberate.
+        """
+        events: list = []
+
+        def _flushed() -> None:
+            events.append("flushed")
+
+        def _exited(status: int) -> None:
+            events.append(("exited", status))
+            raise SystemExit(status)
+
+        monkeypatch.setattr(logging, "shutdown", _flushed)
+        monkeypatch.setattr(os, "_exit", _exited)
+        return events
+
+    def test_the_shards_land_and_the_year_stays_unmarked(self, tmp_path, monkeypatch):
+        store, repo = _seed(tmp_path)
+        events = self._intercept_the_exit(monkeypatch)
+
+        with pytest.raises(SystemExit) as exc:
+            write_year_shards(
+                repo,
+                "01N",
+                year_index=2,
+                source=_OneInnerChunkSource(seed=1),
+                n_workers=1,
+                shard_px=_SHARD,
+                fault=self._armed(),
+            )
+
+        assert exc.value.code == DRILL_EXIT_STATUS, "the status must name the drill, not look like an OOM kill"
+        assert events == ["flushed", ("exited", DRILL_EXIT_STATUS)], "announce, flush, THEN leave"
+        g = zarr_store.open_store_as_zarr_group(store, group="01N")
+        expected = np.random.default_rng(1).integers(-127, 128, size=(_CHUNK, _CHUNK, _BAND), dtype="int8")
+        assert np.array_equal(g["embeddings"][2, 0:_CHUNK, 0:_CHUNK, :], expected), "the shard commit must have landed"
+        assert g.attrs["years_complete"] == [], "and nothing may mark the year complete"
+        assert "runs" not in dict(g.attrs), "nor record a run against it"
+
+    def test_a_fault_aimed_at_another_cell_leaves_this_one_alone(self, tmp_path, monkeypatch):
+        # The fault is a hard death on a code path every cell shares, so the cell it
+        # names is the only thing standing between one drilled cell and a run losing
+        # a cell it was never aimed at.
+        store, repo = _seed(tmp_path)
+        self._intercept_the_exit(monkeypatch)
+
+        write_year_shards(
+            repo,
+            "01N",
+            year_index=2,
+            source=_OneInnerChunkSource(),
+            n_workers=1,
+            shard_px=_SHARD,
+            fault=self._armed(zone="01N", year=2024),
+        )
+
+        g = zarr_store.open_store_as_zarr_group(store, group="01N")
+        assert g.attrs["years_complete"] == [2025], "a fill the fault does not name must complete normally"
+
+    def test_an_unarmed_fill_cannot_reach_the_exit_at_all(self, tmp_path, monkeypatch):
+        # The property that matters more than the fault working: with no request
+        # passed, the injected code is unreachable. The exit is booby-trapped, so a
+        # path that consulted a default or a module-level fault would be caught here.
+        store, repo = _seed(tmp_path)
+        events = self._intercept_the_exit(monkeypatch)
+
+        write_year_shards(repo, "01N", year_index=2, source=_OneInnerChunkSource(), n_workers=1, shard_px=_SHARD)
+
+        assert events == [], "nothing may flush or exit when no fault was requested"
+        g = zarr_store.open_store_as_zarr_group(store, group="01N")
+        assert g.attrs["years_complete"] == [2025]

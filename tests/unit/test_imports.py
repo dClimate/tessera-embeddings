@@ -20,6 +20,7 @@ def test_config_modules_import() -> None:
     from tessera_embeddings.config import (  # noqa: F401
         dask,
         environment,
+        fault_injection,
         inference,
         providers,
         satellites,

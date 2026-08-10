@@ -57,6 +57,7 @@ from prefect.deployments import run_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import Cancelling
 
+from tessera_embeddings.config.fault_injection import WITHHOLD_WORK, FaultInjection
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.ingest import IngestSettings
 from tessera_embeddings.config.paths import BucketPaths
@@ -533,6 +534,7 @@ def fill_zones_sequential_flow(
     ingest_limit_name: str | None = None,
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
+    fault_injection: FaultInjection | None = None,
 ) -> dict[str, Any]:
     """Fill many (zone, year) cells sequentially on a single shared Ray cluster.
 
@@ -629,6 +631,12 @@ def fill_zones_sequential_flow(
             coverage threshold, S1 batch window), forwarded verbatim to each
             cell's ingest — see
             :class:`tessera_embeddings.config.ingest.IngestSettings`.
+        fault_injection: A supervised failure drill's request to inject one deliberate
+            fault into THIS run. Absent by default, and this flow hosts only the
+            withholding of supply from a fleet that is already up — anything else, and
+            any deployment outside the drill allowlist, is refused before the flow does
+            any work (:mod:`tessera_embeddings.config.fault_injection`). A run that
+            carries it announces itself as a drill in its own logs.
 
     Returns:
         Summary dict: triage counts (retag / empty / live), the sequential
@@ -650,6 +658,17 @@ def fill_zones_sequential_flow(
     # look-ahead ingests are away and the shared Ray cluster is up.
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
+
+    # BEFORE triage, before any ingest is primed and before `ray up`: a refused fault
+    # must cost nothing, and an accepted one must be on the record before the run can
+    # produce the failure it was armed for. `ssm_prefix` is the run's injected
+    # deployment identity — arm() resolves it, so this flow cannot claim an account of
+    # its own choosing.
+    fault = (
+        fault_injection.arm(ssm_prefix=ssm_prefix, supports=(WITHHOLD_WORK,), log=log)
+        if fault_injection is not None
+        else None
+    )
 
     # Lazily import the AWS providers so the flow file imports on machines
     # without ray/boto installed (arch tests, local inspection).
@@ -1120,6 +1139,7 @@ def fill_zones_sequential_flow(
                 inputs=inputs,
                 look_ahead=look_ahead,
                 max_cell_attempts=max_cell_attempts,
+                fault=fault,
             )
     finally:
         if inputs is not None:

@@ -55,6 +55,7 @@ import numpy as np
 import xarray as xr
 import zarr
 
+from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import EMBEDDING_DIM, RADAR_LIGHT_MAX_OBS, TimeWindow
 from tessera_embeddings.config.store_layout import INNER_PX, OBS_COUNT_VARS, SINGLE, StoreLayout
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
@@ -1862,6 +1863,7 @@ class ZarrWriter:
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
         s3_region: str | None = None,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
+        fault: ArmedFault | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -1934,6 +1936,11 @@ class ZarrWriter:
             get_credentials: Optional icechunk credential callback.
             s3_region: Optional S3 region override.
             log: Optional logger.
+            fault: Supervised-drill hook, forwarded to
+                :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` for
+                the gap between its two commits. Inert unless the run was armed for
+                that fault and this cell
+                (:mod:`tessera_embeddings.config.fault_injection`).
 
         Returns:
             The commit snapshot id.
@@ -2106,6 +2113,7 @@ class ZarrWriter:
             # under Prefect that is the flow's run logger, the only route to the
             # Prefect API; the module logger reaches only the process log stream.
             log=_log,
+            fault=fault,
         )
         workers = telemetry.get("workers", [])
         _log.info(

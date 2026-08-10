@@ -29,6 +29,7 @@ from prefect import flow, get_run_logger
 from prefect.concurrency.sync import concurrency
 from prefect.runtime import flow_run as flow_run_ctx
 
+from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, FaultInjection
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import SHARD_PX
@@ -177,6 +178,7 @@ def fill_zone_year_flow(
     mosaic_base: str | None = None,
     s3_concurrency: int | None = None,
     run_id: str | None = None,
+    fault_injection: FaultInjection | None = None,
 ) -> dict[str, Any]:
     """Fill one ``(zone, year)`` cell of the global store on a Ray cluster.
 
@@ -244,6 +246,12 @@ def fill_zone_year_flow(
             write (``None`` = the full target, for a lone fill). The campaign passes
             ``target // max_parallel_zones`` so K concurrent fills stay near target.
         run_id: Reuse a prior run's id to resume it (staged tiles are skipped).
+        fault_injection: A supervised failure drill's request to inject one deliberate
+            fault into THIS run. Absent by default, and this flow hosts only the
+            death between a zone-year's two commits — anything else, and any
+            deployment outside the drill allowlist, is refused before the flow does
+            any work (:mod:`tessera_embeddings.config.fault_injection`). A run that
+            carries it announces itself as a drill in its own logs.
 
     Returns:
         The zone-fill summary dict (zone, year, run_id, snapshot_id, tag,
@@ -258,6 +266,16 @@ def fill_zone_year_flow(
     # wrapper rejects it too; the child is the authority for a direct invocation.
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
+
+    # BEFORE any store read, any mosaic probe and any cluster: a refused fault must cost
+    # nothing, and an accepted one must be on the record before the run can produce the
+    # failure it was armed for. `ssm_prefix` is the run's injected deployment identity —
+    # arm() resolves it, so this flow cannot claim an account of its own choosing.
+    fault = (
+        fault_injection.arm(ssm_prefix=ssm_prefix, supports=(DIE_BETWEEN_COMMITS,), log=log)
+        if fault_injection is not None
+        else None
+    )
 
     # Lazily import the AWS providers so the flow file imports on machines
     # without ray/boto installed (arch tests, local inspection).
@@ -389,6 +407,7 @@ def fill_zone_year_flow(
         "s3_concurrency": s3_concurrency,
         "get_credentials": iam_icechunk_credentials,
         "s3_region": s3_region,
+        "fault": fault,
     }
 
     if not needs_cluster:

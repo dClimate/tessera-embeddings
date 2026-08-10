@@ -252,6 +252,37 @@ hooks then clean up after.
 > [`inference/README.md`](../../inference/README.md#three-layer-chunk-anatomy)
 > for the assembly-side equivalent.
 
+## Deliberate fault injection (supervised drills only)
+
+Two of the campaign's failure modes cannot be produced from outside a run. One
+occupies the gap between a zone-year's two commits — bounded by two lines of one
+function, so there is nothing external to aim a kill at. The other needs a GPU fleet
+that is alive and holding nothing, a condition every healthy mechanism removes as soon
+as it appears. A drill that cannot reach the failure it names produces a false pass, so
+both are injected from inside the run.
+
+`config/fault_injection.py` owns the mechanism, and its module docstring is the
+authority on the guarantee. What matters at this layer:
+
+| flow | parameter | fault it hosts | where it fires |
+|---|---|---|---|
+| `fill_zone_year.py` | `fault_injection` | `die_between_commits` | between the shard commit and the commit that marks the year complete (`storage.shard_writer.write_year_shards`) |
+| `fill_zones_sequential.py` | `fault_injection` | `withhold_work` | where prepared work crosses from the feeder to the scheduler (`orchestration.runners.sequential_fill`) |
+
+Both parameters default to nothing, and both flows *arm* before doing any work.
+Arming refuses every deployment outside the drill allowlist — including a run whose
+deployment identity does not resolve — and refuses a fault the flow does not host, so
+an armed drill can never quietly inject nothing and be recorded as a pass. Identity is
+read off the run's own injected Ray control-plane prefix rather than asked for. A run
+carrying an armed fault says so at error level in its own logs under a fixed prefix, so
+nobody reading those logs later mistakes a drill's artifacts for an incident.
+
+Between the flow and the firing site the request travels as an explicit argument on
+every hop (`fill_zone_year` → `assemble_zone_year` → `assemble_global` →
+`write_year_shards`). Explicit rather than ambient, deliberately: one of these sits on
+the commit path of the store that is the campaign's only output, and a reviewer of any
+one of those functions should be able to see that it can be asked to fail.
+
 ## The two-flow pattern
 
 You'll notice each flow file has an outer `@flow` and an inner
