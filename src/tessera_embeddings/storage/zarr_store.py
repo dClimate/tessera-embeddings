@@ -282,6 +282,41 @@ _DEFAULT_S3_REGION = "us-west-2"
 _default_credentials_provider: "Callable[[], icechunk.S3StaticCredentials] | None" = None
 
 
+def plain_zarr_storage_options(
+    path: str,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None,
+) -> dict | None:
+    """Fsspec options for a PLAIN zarr at ``path``, from this run's Icechunk credentials.
+
+    An ROI mask is a plain zarr, not an Icechunk store, so it is opened through fsspec and
+    does not travel on the credential callback its callers thread everywhere else. Left to
+    the ambient chain, those opens fail outright in a callback-only deployment — and they
+    are the reads that decide which chunks exist and where the grid is, so they happen
+    before anything that was wired correctly.
+
+    Lives here rather than beside either caller because BOTH the ingest's ROI export and
+    the inference assembly need it, and neither package should import the other for five
+    lines.
+
+    Resolved at CALL time, not stored: an IAM credential expires in hours, and the point
+    of a callback is that each consumer asks when it needs one.
+    """
+    if fsspec.utils.get_protocol(path) != "s3":
+        return None
+    options: dict[str, Any] = {}
+    if s3_region:
+        options["client_kwargs"] = {"region_name": s3_region}
+    if get_credentials is not None:
+        creds = get_credentials()
+        options |= {
+            "key": creds.access_key_id,
+            "secret": creds.secret_access_key,
+            "token": creds.session_token,
+        }
+    return options or None
+
+
 @contextmanager
 def credentials_provider(
     provider: "Callable[[], icechunk.S3StaticCredentials] | None",
@@ -1135,8 +1170,12 @@ def record_assessed_window(
         root = zarr.open_group(session.store, mode="a")
         root.attrs[ASSESSED_WINDOW_ATTR] = [start_date, end_date]
         root.attrs["assessed_empty_dates"] = int(empty_dates)
-        if unreadable:
-            root.attrs["assessed_unreadable_dates"] = list(unreadable)
+        # Written UNCONDITIONALLY, so a clean re-assessment clears an earlier one's list.
+        # Guarded on truthiness, a repair run that recovered every date left the old dates
+        # advertised on the store, and an audit reading this attr would report pixels
+        # missing that are now present — the assessment describes THIS assessment, so an
+        # empty answer has to overwrite a previous non-empty one.
+        root.attrs["assessed_unreadable_dates"] = list(unreadable or ())
         # ``allow_empty`` because re-recording the SAME window writes no bytes, and icechunk
         # refuses a commit with no changes ("cannot commit, no changes made to the session").
         # That refusal surfaced as a WARNING on healthy stores — every resumed leg that had

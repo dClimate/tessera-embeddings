@@ -31,9 +31,17 @@ has to be structural rather than careful:
   fixed prefix. Whoever reads these logs next must not mistake a drill's
   artifacts for an incident.
 
-Deployment identity is READ, never asked for: :func:`deployment_stem` takes it off
-a control-plane parameter that a registration injects and a caller has no reason
-to set. A run cannot assert which account it is on.
+Deployment identity is READ, never asked for: :func:`deployment_stem` takes it off the
+Ray control-plane SSM prefix, which a registration injects and a caller has no reason to
+set.
+
+KNOWN LIMITATION, and it is a real one. That prefix is still a flow PARAMETER, so a
+dispatch CAN state it: naming a drill control plane while pointing every storage path at
+production passes this check. Closing it needs a second identity a dispatch cannot
+choose — the registered deployment name from the Prefect runtime, or an allowlist of
+drill storage — and both need a deployment fact this module does not have. Until then,
+the gate stops an accident, not a determined operator; note that arming also requires an
+explicit ``fault`` parameter, so reaching this point is already deliberate.
 """
 
 from __future__ import annotations
@@ -61,6 +69,7 @@ WITHHOLD_WORK = "withhold_work"
 #: registration that failed to inject its control-plane parameters is indistinguishable
 #: from a run on an account this module has never heard of.
 DRILL_DEPLOYMENTS: frozenset[str] = frozenset({"global-tessera-dev"})
+
 
 #: Prefix on every line this module emits, so a drill's artifacts are greppable and
 #: are never read as an incident. It is consumed by operators and monitors, so treat

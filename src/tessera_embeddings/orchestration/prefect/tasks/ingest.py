@@ -58,9 +58,30 @@ def process_roi_reflectance(
     transient cases, and outer retries would re-run the whole
     multi-day loop.
     """
+    # The store writes below open the reflectance repo WITHOUT an explicit
+    # get_credentials, so in a callback-only deployment they fall back to Icechunk's
+    # ambient chain and fail to create or append the S3 mosaic. The radar task next door
+    # registers the provider for exactly this reason; optical needs it just as much, and
+    # only its being wired first hid that. Gated on the store being on S3 — the import
+    # pulls in botocore, which lives only in the optional `aws` extra, so a local run must
+    # not need it. The ROI's fsspec options default the same way for the same reason: a
+    # plain zarr read does not travel on the Icechunk callback.
+    cred_provider_cm: Any = nullcontext()
+    if store_path.startswith("s3://"):
+        from tessera_embeddings.providers.aws.credentials import (
+            iam_icechunk_credentials,
+            iam_s3_storage_options,
+        )
+
+        cred_provider_cm = credentials_provider(iam_icechunk_credentials)
+        if storage_options is None and roi_zarr_path.startswith("s3://"):
+            # The CALLABLE, not its result: a role credential resolved once here is a
+            # snapshot, and an S2 leg outlives it (see the radar task's note).
+            storage_options = iam_s3_storage_options
+
     # Shard the mosaic's manifests: the store is created and appended to entirely
     # within this call, so create and every later append see the same config.
-    with manifest_split(INGEST_MANIFEST_SPLIT):
+    with cred_provider_cm, manifest_split(INGEST_MANIFEST_SPLIT):
         result = ingest_s2_roi_reflectance(
             roi_zarr_path=roi_zarr_path,
             start_date=start_date,

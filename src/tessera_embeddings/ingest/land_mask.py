@@ -59,7 +59,11 @@ from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX
 from tessera_embeddings.ingest.live_windows import coarsen_live_grid, live_chunk_grid_from_keys
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.manifest import RoiManifest
-from tessera_embeddings.storage.zarr_store import open_or_create_repo, open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import (
+    open_or_create_repo,
+    open_store_as_zarr_group,
+    plain_zarr_storage_options,
+)
 from tessera_embeddings.storage.zone_grid import PIXEL_M, ZONE_SCHEME, ZONES, ZoneSpec
 from tessera_embeddings.utils import utcnow_iso
 
@@ -728,7 +732,14 @@ def _zone_roi_transform(spec: ZoneSpec) -> list[float]:
 
 
 def _roi_is_current(
-    dest_path: str, height: int, width: int, crs: str, transform: list[float], coverage_sha: str | None
+    dest_path: str,
+    height: int,
+    width: int,
+    crs: str,
+    transform: list[float],
+    coverage_sha: str | None,
+    *,
+    storage_options: dict | None = None,
 ) -> bool:
     """Whether an ROI zarr already exists at ``dest_path`` for the current coverage.
 
@@ -739,7 +750,7 @@ def _roi_is_current(
     (missing store) means "rebuild".
     """
     try:
-        existing = zarr.open(dest_path, mode="r")
+        existing = zarr.open(dest_path, mode="r", storage_options=storage_options)
     except FileNotFoundError:
         return False
     if not isinstance(existing, zarr.Array):
@@ -776,9 +787,10 @@ def export_zone_roi(
         zone: UTM common name (e.g. ``"33N"``).
         land_mask_path: Coverage Icechunk repo (``BucketPaths.land_mask_store``).
         dest_path: Output ROI zarr URI (e.g. ``{inputs}/rois/zarrs/zone_33N.zarr``).
-        get_credentials: Icechunk credential callback for reading the coverage
-            repo (the ROI zarr itself is written with the ambient chain, matching
-            :func:`~tessera_embeddings.ingest.roi.rasterize_roi_zarr`).
+        get_credentials: Icechunk credential callback. Used for the coverage-repo read
+            AND, converted to fsspec options, for the ROI zarr's own currency probe and
+            write — the ROI is a plain zarr, so it does not travel on this callback by
+            itself, and a callback-only deployment could not export a mask at all.
         s3_region: Region for the coverage-repo read, if not the default.
 
     Returns:
@@ -796,12 +808,18 @@ def export_zone_roi(
     height, width = spec.height, spec.width
     transform = _zone_roi_transform(spec)
 
-    if _roi_is_current(dest_path, height, width, spec.crs, transform, coverage_sha):
+    roi_options = plain_zarr_storage_options(dest_path, get_credentials, s3_region)
+    if _roi_is_current(dest_path, height, width, spec.crs, transform, coverage_sha, storage_options=roi_options):
         logger.info("Zone %s ROI already current at %s — skipping", zone, dest_path)
         return dest_path
 
     z = zarr.open(
-        dest_path, mode="w", shape=(height, width), chunks=(INGEST_CHUNK_SIZE, INGEST_CHUNK_SIZE), dtype="bool"
+        dest_path,
+        mode="w",
+        shape=(height, width),
+        chunks=(INGEST_CHUNK_SIZE, INGEST_CHUNK_SIZE),
+        dtype="bool",
+        storage_options=roi_options,
     )
     assert isinstance(z, zarr.Array)
     z.attrs["crs"] = spec.crs
@@ -916,7 +934,9 @@ def validate_zone_roi(
     problems: list[str] = []
     spec = zone_grid.zone(zone)
     try:
-        z = zarr.open(roi_path, mode="r")
+        z = zarr.open(
+            roi_path, mode="r", storage_options=plain_zarr_storage_options(roi_path, get_credentials, s3_region)
+        )
     except (FileNotFoundError, KeyError) as exc:
         return [f"cannot open ROI mask at {roi_path}: {exc!r}"]
     if not isinstance(z, zarr.Array):

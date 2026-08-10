@@ -145,6 +145,7 @@ def run_ingest(monkeypatch):
         pipeline_dates: bool,
         fail_on: str | None = None,
         fail_with: str | None = None,
+        load_raises: BaseException | None = None,
         write_s: float = 0.0,
         log: logging.Logger | None = None,
         existing_dates: set[str] | None = None,
@@ -154,6 +155,8 @@ def run_ingest(monkeypatch):
         runs.append(run)  # so a test can inspect a run whose write raised
 
         def load_stac_items(day_items, **_kwargs):
+            if load_raises is not None:
+                raise load_raises
             date = day_items[0].datetime.strftime("%Y-%m-%d")
             run.load_started[date] = time.monotonic()
             run.loaded.append(date)
@@ -539,3 +542,27 @@ def test_a_non_read_failure_in_preparation_still_fails_the_leg(run_ingest, monke
     monkeypatch.setattr(s2_roi, "_coverage_from_scl", gate_blows_up)
     with pytest.raises(RuntimeError, match="wrong shape"):
         run_ingest({"2024-01-01": True}, pipeline_dates=False)
+
+
+def test_an_asset_incomplete_item_reaches_the_duplicate_ladder(run_ingest, caplog):
+    """A missing band is a property of the COPY, not of the day.
+
+    Earth Search publishes asset-incomplete items, and a different reprocessing of the
+    same tile-date routinely carries the full set. Returned as a plain skip, the whole
+    solar day was lost with a usable copy sitting one rung down — so it is carried back
+    as a read failure instead, onto the ladder an unreadable object already uses.
+    """
+    with caplog.at_level(logging.WARNING):
+        run = run_ingest(
+            {"2024-01-01": True},
+            pipeline_dates=False,
+            load_raises=ValueError("No such band/alias: scl"),
+        )
+
+    # The leg completed and the date is accounted for...
+    assert run.result.dates_filtered_coverage == 1
+    # ...but the distinguishing part is that it went through the LADDER and was recorded
+    # as a loss, rather than being dropped as an ordinary skip. A plain skip logs neither
+    # of these, and leaves the date indistinguishable from one the coverage gate rejected.
+    assert "DATA LOSS" in caplog.text
+    assert "2024-01-01" in caplog.text

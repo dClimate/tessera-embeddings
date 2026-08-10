@@ -54,6 +54,7 @@ from tessera_embeddings.orchestration.prefect.tasks.inference import (
     assemble_embeddings_task,
     run_inference_task,
 )
+from tessera_embeddings.storage.zarr_store import plain_zarr_storage_options
 
 # Fresh runs with allow_s2_only=True carry this run_id prefix. The run_id
 # namespaces the staging directory, so the prefix records the per-pixel S1
@@ -337,7 +338,15 @@ def tessera_embeddings(
         s3_region=s3_region,
     )
 
-    live_chunks = filter_chunks_by_roi_mask(chunks, roi_zarr_path)
+    live_chunks = filter_chunks_by_roi_mask(
+        chunks,
+        roi_zarr_path,
+        # The SAME options assembly uses. This filter and assembly's must derive the
+        # identical live set from the identical mask; opening one on the ambient chain
+        # and the other on the run's credentials can fail here before Ray, or — worse —
+        # succeed against a different mask than the one the output is assembled from.
+        storage_options=plain_zarr_storage_options(roi_zarr_path, iam_icechunk_credentials, s3_region),
+    )
     log.info(
         "ROI filter: %d/%d chunks intersect the ROI, sending %d to GPU actors",
         len(live_chunks),

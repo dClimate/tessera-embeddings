@@ -87,16 +87,21 @@ class GridSpec:
 # ---------------------------------------------------------------------------
 
 
-def read_roi_metadata(roi_path: str) -> ROIMetadata:
+def read_roi_metadata(roi_path: str, *, storage_options: StorageOptions = None) -> ROIMetadata:
     """Read spatial metadata from a Zarr ROI store.
 
     Args:
         roi_path: Path to the Zarr ROI store (local or s3://).
+        storage_options: fsspec options for the open, or a callable resolving them.
+            The per-date mask reads take these already; this open happens BEFORE any
+            of them, so without it a callback-only or non-default-region deployment
+            fails at the very first ROI read — on the leg whose mask reads were wired
+            to succeed.
 
     Returns:
         ROIMetadata with WGS84 bbox, native CRS string, and grid dimensions.
     """
-    z = zarr.open(roi_path, mode="r")
+    z = zarr.open(roi_path, mode="r", storage_options=resolve_storage_options(storage_options))
     assert isinstance(z, zarr.Array), f"Expected Zarr Array, got {type(z).__name__}"
     native_crs = str(z.attrs["crs"])
     transform = Affine(*cast(list, z.attrs["transform"]))

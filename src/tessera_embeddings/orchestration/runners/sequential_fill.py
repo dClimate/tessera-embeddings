@@ -848,7 +848,21 @@ def fill_zones_sequential(
                 continue
             _clear_failure(cell)
             if inputs is not None:
-                inputs.cleanup(zone_name, year)
+                try:
+                    inputs.cleanup(zone_name, year)
+                except Exception:
+                    # The cell LANDED — committed, tagged, recorded. Only its mosaic
+                    # prefix is still there. Letting this propagate would leave the whole
+                    # child reporting nothing for every other cell it filled, to punish a
+                    # failed delete; the orphan sweep (`sweep_orphan_mosaics`) is the
+                    # designed remedy for a leaked prefix, and it needs the prefix named.
+                    log.error(
+                        "Cell %s-%d recovered but its mosaic was not deleted — it stays until an "
+                        "orphan sweep reclaims it",
+                        zone_name,
+                        year,
+                        exc_info=True,
+                    )
             with lock:
                 retained_failed.discard((zone_name, year))
             log.info("Cell %s-%d recovered on in-child retry attempt %d", zone_name, year, attempt)

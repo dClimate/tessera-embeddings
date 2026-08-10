@@ -53,7 +53,12 @@ from tessera_embeddings.ingest.live_windows import (
     windows_for_date,
 )
 from tessera_embeddings.ingest.opera_query import make_s1_item_provider
-from tessera_embeddings.ingest.roi import StorageOptions, read_roi_mask, read_roi_metadata
+from tessera_embeddings.ingest.roi import (
+    StorageOptions,
+    read_roi_mask,
+    read_roi_metadata,
+    resolve_storage_options,
+)
 from tessera_embeddings.ingest.roi_processing import apply_roi_mask, read_failure_context
 from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
@@ -329,9 +334,11 @@ def ingest_s1_roi_sar(
     #: (``.../zone_47S.zarr`` -> ``zone_47S``) rather than taken as a parameter, so every
     #: caller gets it without threading one more argument through the flows.
     roi_label = roi_zarr_path.rstrip("/").rsplit("/", 1)[-1].removesuffix(".zarr")
-    roi = read_roi_metadata(roi_zarr_path)
+    roi = read_roi_metadata(roi_zarr_path, storage_options=storage_options)
 
-    ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path)
+    ingest_manifest = IngestManifest.from_roi_store(
+        roi_zarr_path, storage_options=resolve_storage_options(storage_options)
+    )
 
     # Load blocks match the store's chunks: one read task per (chunk, band), and the
     # write needs no rechunk. See config.ingest for why a coarser load block was removed.

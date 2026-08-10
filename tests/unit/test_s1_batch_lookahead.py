@@ -149,14 +149,14 @@ def _run_ingest(monkeypatch, catalogue: list[str], existing: set[str], **kwargs)
     monkeypatch.setattr(
         s1_roi,
         "read_roi_metadata",
-        lambda _p: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
+        lambda _p, **_k: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
     )
     monkeypatch.setattr(
         s1_roi, "live_windows_for_mask", lambda *a, **k: [type("W", (), {"y0": 0, "y1": 1, "x0": 0, "x1": 1})()]
     )
     monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
     # Reads the ROI store for provenance; irrelevant here and the only other S3 caller.
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p: object()))
+    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p, **_k: object()))
 
     s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/roi.zarr",
@@ -288,9 +288,9 @@ def _run_with_footprints(
     monkeypatch.setattr(
         s1_roi,
         "read_roi_metadata",
-        lambda _p: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
+        lambda _p, **_k: type("M", (), {"geobox": object(), "native_crs": "EPSG:32635", "bbox_wgs84": (0, 0, 1, 1)})(),
     )
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _c, _p: object()))
+    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _c, _p, **_k: object()))
 
     s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/roi.zarr",
@@ -479,7 +479,7 @@ def test_an_all_ocean_roi_banks_no_empty_dates(monkeypatch) -> None:
     monkeypatch.setattr(s1_roi, "live_windows_for_mask", lambda *a, **k: [])  # all ocean
     monkeypatch.setattr(s1_roi, "solar_grouping_longitude", lambda *a, **k: 0.0)
     monkeypatch.setattr(s1_roi, "make_s1_item_provider", lambda *a, **k: lambda: [])
-    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p: object()))
+    monkeypatch.setattr(s1_roi.IngestManifest, "from_roi_store", classmethod(lambda _cls, _p, **_k: object()))
 
     result = s1_roi.ingest_s1_roi_sar(
         roi_zarr_path="s3://bucket/ocean.zarr",

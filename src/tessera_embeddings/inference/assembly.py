@@ -76,6 +76,7 @@ from tessera_embeddings.storage.zarr_store import (
     manifest_split,
     open_or_create_repo,
     open_store_as_zarr_group,
+    plain_zarr_storage_options,
     read_time_values,
     time_index_of,
 )
@@ -106,37 +107,6 @@ def _staged_storage_options(path: str) -> dict | None:
     if fsspec.utils.get_protocol(path) == "s3":
         return {"config_kwargs": STAGED_READ_CONFIG_KWARGS}
     return None
-
-
-def roi_mask_storage_options(
-    roi_zarr_path: str,
-    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
-    s3_region: str | None,
-) -> dict | None:
-    """Fsspec options for reading an ROI mask, from this run's Icechunk credentials.
-
-    The ROI mask is a PLAIN zarr, so it is read through fsspec rather than Icechunk and
-    does not travel on the credential callback its callers thread everywhere else. That
-    left one read — the one deciding which chunks exist at all — opening on whatever
-    ambient credentials the process happened to have, which in a callback-only deployment
-    is none.
-
-    Resolved at CALL time, not stored: an IAM credential expires in hours, and the point
-    of a callback is that each consumer asks when it needs one.
-    """
-    if fsspec.utils.get_protocol(roi_zarr_path) != "s3":
-        return None
-    options: dict[str, Any] = {}
-    if s3_region:
-        options["client_kwargs"] = {"region_name": s3_region}
-    if get_credentials is not None:
-        creds = get_credentials()
-        options |= {
-            "key": creds.access_key_id,
-            "secret": creds.secret_access_key,
-            "token": creds.session_token,
-        }
-    return options or None
 
 
 def _fs_for(uri: str, storage_options: dict | None = None) -> fsspec.AbstractFileSystem:
@@ -1516,7 +1486,7 @@ class ZarrWriter:
         roi_live_chunks = filter_chunks_by_roi_mask(
             chunks,
             roi_zarr_path,
-            storage_options=roi_mask_storage_options(roi_zarr_path, get_credentials, s3_region),
+            storage_options=plain_zarr_storage_options(roi_zarr_path, get_credentials, s3_region),
         )
         staged_labels = self.verify_staged_completeness(run_id, roi_live_chunks, log=_log)
         live_chunks = [c for c in roi_live_chunks if c.label in staged_labels]

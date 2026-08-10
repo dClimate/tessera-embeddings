@@ -215,7 +215,15 @@ def _await_forks(
     started = time.monotonic()
     pending: set[Future] = set(futures)
     while pending:
-        _, pending = wait(pending, timeout=progress_interval_s, return_when=FIRST_COMPLETED)
+        done, pending = wait(pending, timeout=progress_interval_s, return_when=FIRST_COMPLETED)
+        # SURFACE A FAILURE AS SOON AS IT LANDS. A fork dies on a deterministic fault — a
+        # corrupt staged tile, a dtype the destination cannot hold — and every other fork
+        # is going to hit the same wall or write shards that will be discarded anyway.
+        # Collecting results only after `pending` emptied meant the coordinator sat through
+        # the rest of a multi-hour assembly to learn something the first fork already knew.
+        for future in done:
+            if future.exception() is not None:
+                future.result()  # re-raises, with the worker's traceback attached
         if pending:
             logger.info(
                 "Assembly progress: %d/%d %s done, %d outstanding after %.0f min",
@@ -280,9 +288,18 @@ def run_forked(
         results = [worker_fn(payloads[0])]
     else:
         ctx = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx) as ex:
+        ex = ProcessPoolExecutor(max_workers=len(payloads), mp_context=ctx)
+        try:
             futures = [ex.submit(worker_fn, payload) for payload in payloads]
             results = _await_forks(futures, progress_interval_s, unit=unit, log=log)
+        except BaseException:
+            # Drop the forks that have not started; the running ones cannot be
+            # interrupted, but the coordinator no longer waits on them to report a
+            # failure it already has. A `with` block would join every worker here — the
+            # whole delay `_await_forks` now avoids, re-introduced at the exit.
+            ex.shutdown(wait=False, cancel_futures=True)
+            raise
+        ex.shutdown()
     t_merge = time.monotonic()
     session.merge(*(fork_result for fork_result, _ in results))
     done = time.monotonic()

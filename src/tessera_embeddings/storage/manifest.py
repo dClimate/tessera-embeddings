@@ -221,11 +221,21 @@ class IngestManifest(StoreManifest):
     ingest_code_identity: str | None = None
 
     @classmethod
-    def from_roi_store(cls, roi_zarr_path: str, *, min_valid_coverage: float | None = None) -> IngestManifest:
+    def from_roi_store(
+        cls,
+        roi_zarr_path: str,
+        *,
+        min_valid_coverage: float | None = None,
+        storage_options: dict | None = None,
+    ) -> IngestManifest:
         """Build from an ROI store, chaining the upstream ROI manifest hash.
 
         Args:
             roi_zarr_path: Path to the ROI Zarr store.
+            storage_options: fsspec options for the open. The ROI is a plain zarr, so it
+                is read through fsspec rather than Icechunk and does not travel on the
+                credential callback the rest of an ingest leg threads — leaving this open,
+                which happens before any date is processed, on the ambient chain.
             min_valid_coverage: The admission threshold this ingest applies, for a
                 store whose dates it decides. ``None`` (the SAR stores, which have no
                 such gate) is dropped from the manifest by ``to_dict``, so it neither
@@ -234,7 +244,7 @@ class IngestManifest(StoreManifest):
         """
         coverage_sha: str | None = None
         try:
-            z = zarr.open(roi_zarr_path, mode="r")
+            z = zarr.open(roi_zarr_path, mode="r", storage_options=storage_options)
             roi_manifest_dict = extract_manifest(z.attrs)
             # A zone ROI carries the coverage delivery it was exported from
             # (``land_mask.export_zone_roi``). Absent for a plain single-ROI store,

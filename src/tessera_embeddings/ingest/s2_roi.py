@@ -77,7 +77,12 @@ from tessera_embeddings.ingest.loader_failures import (
     install_capture_everywhere,
     label_objects,
 )
-from tessera_embeddings.ingest.roi import StorageOptions, read_roi_mask, read_roi_metadata
+from tessera_embeddings.ingest.roi import (
+    StorageOptions,
+    read_roi_mask,
+    read_roi_metadata,
+    resolve_storage_options,
+)
 from tessera_embeddings.ingest.roi_processing import (
     DEFAULT_MIN_VALID_COVERAGE,
     read_failure_context,
@@ -351,14 +356,16 @@ def ingest_s2_roi_reflectance(
     # future worker; never fatal, since the recovery it sharpens works without it.
     install_capture_everywhere(client)
 
-    roi = read_roi_metadata(roi_zarr_path)
+    roi = read_roi_metadata(roi_zarr_path, storage_options=storage_options)
 
     # The coverage threshold goes in the manifest because it decides WHICH dates this
     # store holds, and an interrupted store records it nowhere else — so a resume at a
     # different threshold would skip the dates the old one admitted and append new ones
     # under the new rule. Validated on every write, so that refusal lands before the
     # resumed run commits a date.
-    ingest_manifest = IngestManifest.from_roi_store(roi_zarr_path, min_valid_coverage=min_valid_coverage)
+    ingest_manifest = IngestManifest.from_roi_store(
+        roi_zarr_path, min_valid_coverage=min_valid_coverage, storage_options=resolve_storage_options(storage_options)
+    )
 
     mid_longitude = solar_grouping_longitude(roi)
 
@@ -497,13 +504,29 @@ def ingest_s2_roi_reflectance(
                 geobox=roi.geobox,
             )
         except ValueError as exc:
-            # Earth-search occasionally publishes asset-incomplete items (missing
-            # SCL and/or reflectance bands). odc.stac.load resolves bands eagerly,
-            # so one such item raises before any graph is built. Drop the date.
+            # Earth-search occasionally publishes asset-incomplete items (missing SCL
+            # and/or reflectance bands). odc.stac.load resolves bands eagerly, so one such
+            # item raises before any graph is built.
+            #
+            # Carried back as a read failure, NOT as a plain skip. A missing asset is a
+            # property of the COPY, not of the day: a different reprocessing of the same
+            # tile-date routinely publishes the full set, and the ladder that would try it
+            # is the same one an unreadable object uses. Returning a bare skip here lost
+            # the whole solar day while a usable copy sat one rung down.
             if "No such band/alias" not in str(exc):
                 raise
-            log.warning("Dropping date: load failed on asset-incomplete STAC item(s): %s", exc)
-            return _PreparedDate(date, None, [], time.monotonic() - stage_started, 0.0, "asset-incomplete")
+            log.warning("Load failed on asset-incomplete STAC item(s): %s", exc)
+            return _PreparedDate(
+                date,
+                None,
+                [],
+                time.monotonic() - stage_started,
+                0.0,
+                "asset-incomplete",
+                items=day_items,
+                baselines=baselines,
+                read_error=exc,
+            )
 
         # The gate is where the graph is first COMPUTED, so it is where a source read
         # actually fails — `load_stac_items` above only builds. Retried per date and named
