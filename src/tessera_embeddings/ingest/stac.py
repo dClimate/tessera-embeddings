@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
+from itertools import count
 from typing import Any
 
 import numpy as np
@@ -31,6 +32,11 @@ from tessera_embeddings.config import (
 from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
 from tessera_embeddings.ingest._http import make_logging_retry
+from tessera_embeddings.ingest.catalogue_refusal import (
+    CatalogueRequest,
+    bbox_area_label,
+    raise_catalogue_query_error,
+)
 from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
     month_ranges,
@@ -553,6 +559,21 @@ def _prune_item_dict(item: dict[str, Any], keep_assets: frozenset[str]) -> dict[
     return pruned
 
 
+def _area_label(query_params: dict[str, Any], tile_id: str | None) -> str:
+    """The spatial term of a built query, as a stable identity fragment.
+
+    Reads the query that will actually be sent, so the name in a failure log cannot
+    disagree with what was asked. A query carrying neither spatial term is named as
+    such rather than raising: this feeds a diagnostic, and the collection, window and
+    page still identify the request without it.
+    """
+    if "query" in query_params:
+        return f"tile={tile_id}"
+    if (built := query_params.get("bbox")) is not None:
+        return bbox_area_label(built)
+    return "area=unspecified"
+
+
 def _query_stac_items(
     provider: STACProvider,
     collection_config: CollectionConfig,
@@ -585,14 +606,32 @@ def _query_stac_items(
 
     Returns:
         List of pystac Items
+
+    Raises:
+        CatalogueQueryError: The catalogue refused a request, classified and naming the
+            request that was refused. The client library reports transport failures with
+            the search discarded, so this is where a refusal becomes identifiable at all —
+            see :mod:`~tessera_embeddings.ingest.catalogue_refusal`.
+        ValueError: A returned item carries no ``id``, so it cannot be deduplicated.
+            Deliberately NOT wrapped as a refusal: it is a defect in what the catalogue
+            returned rather than a refusal to answer, and the retry policy keyed on
+            refusals must not act on it.
     """
     if item_provider_fn is not None:
         return item_provider_fn()
 
+    window = f"{start_date}/{end_date}"
     t0 = time.monotonic()
     logger.info(f"Opening STAC catalog: {provider.catalog_url}")
     stac_io = StacApiIO(max_retries=_STAC_RETRY, timeout=_STAC_TIMEOUT)
-    client = Client.open(provider.catalog_url, stac_io=stac_io)
+    try:
+        client = Client.open(provider.catalog_url, stac_io=stac_io)
+    except Exception as exc:
+        # Page 0: the catalogue root, fetched before any search exists. Named separately
+        # so a refusal here is not read as a refusal of the search it precedes.
+        raise_catalogue_query_error(
+            CatalogueRequest(collection_config.collection_id, window, "catalogue-root", 0), exc, log=logger
+        )
     logger.info(f"STAC catalog opened in {time.monotonic() - t0:.1f}s, executing search")
 
     items: list[Any] = []
@@ -600,22 +639,52 @@ def _query_stac_items(
     keep_assets = _loadable_assets(collection_config, extra_bands)
     for sub_bbox in split_antimeridian_bbox(bbox):
         query_params = _build_stac_query(collection_config, tile_id, start_date, end_date, bbox=sub_bbox)
+        # Read off the query that was BUILT rather than re-deciding property-versus-bbox
+        # here: a second copy of that branch could disagree with the one that ran, and
+        # then the log would name a request the catalogue was never asked. Tolerant of a
+        # query carrying neither term, because a diagnostic must never be the thing that
+        # raises — an unnamed area still leaves the collection, window and page named.
+        area = _area_label(query_params, tile_id)
         search = client.search(**query_params, limit=provider.max_page_size, max_items=None)
-        # Paged as DICTS rather than Items so a full item is never hydrated: pruning first
-        # and hydrating second is both smaller to retain and ~3x cheaper to build, because
-        # most of an item's construction cost is the assets that get dropped.
-        for raw in search.items_as_dicts():
-            # Dedupe across the two halves: a granule straddling +/-180 is returned by
-            # both searches, and loading it twice would double-count the solar day.
-            # `id` is required by the STAC spec; an item without one cannot be deduped,
-            # and defaulting it would collapse EVERY such item into a single entry —
-            # so say so rather than silently drop data.
-            if raw.get("id") is None:
-                raise ValueError(f"STAC item without an 'id' from {provider.catalog_url} — cannot dedupe it")
-            item_id = str(raw["id"])
-            if item_id not in seen:
-                seen.add(item_id)
-                items.append(Item.from_dict(_prune_item_dict(raw, keep_assets)))
+        # Paged EXPLICITLY (`pages_as_dicts`, which is what `items_as_dicts` iterates
+        # internally) so a failure can name the page ordinal it died on. Each page is a
+        # separate HTTP request behind its own retry ladder, so "the whole year fails" and
+        # "one deep cursor fails" are different defects with different reproductions, and
+        # an item count cannot tell them apart.
+        #
+        # Dicts rather than Items so a full item is never hydrated: pruning first and
+        # hydrating second is both smaller to retain and ~3x cheaper to build, because most
+        # of an item's construction cost is the assets that get dropped.
+        #
+        # `iter()` rather than trusting the return: advancing by hand needs an ITERATOR, and
+        # this seam is injectable, so a search that returns an iterable which is not one
+        # (a list of pages, a stub) would otherwise be a TypeError — or, for a stub that
+        # answers every call, an unbounded loop. Asking for an iterator costs nothing on the
+        # real generator, which is its own iterator.
+        pages = iter(search.pages_as_dicts())
+        for page_no in count(1):
+            request = CatalogueRequest(collection_config.collection_id, window, area, page_no)
+            try:
+                page = next(pages)
+            except StopIteration:
+                break
+            except Exception as exc:
+                # Scoped to the FETCH alone. Wrapping the body below as well would
+                # classify our own validation failure as a catalogue refusal, which the
+                # retry policy would then act on.
+                raise_catalogue_query_error(request, exc, log=logger, items_so_far=len(items))
+            for raw in page.get("features", []):
+                # Dedupe across the two halves: a granule straddling +/-180 is returned by
+                # both searches, and loading it twice would double-count the solar day.
+                # `id` is required by the STAC spec; an item without one cannot be deduped,
+                # and defaulting it would collapse EVERY such item into a single entry —
+                # so say so rather than silently drop data.
+                if raw.get("id") is None:
+                    raise ValueError(f"STAC item without an 'id' from {provider.catalog_url} — cannot dedupe it")
+                item_id = str(raw["id"])
+                if item_id not in seen:
+                    seen.add(item_id)
+                    items.append(Item.from_dict(_prune_item_dict(raw, keep_assets)))
     logger.info(f"STAC query returned {len(items)} items in {time.monotonic() - t0:.1f}s total")
 
     return items

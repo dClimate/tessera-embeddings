@@ -566,9 +566,9 @@ class TestAntimeridianBboxSplit:
         def _raw(id_: str) -> dict:
             """A minimal valid STAC item dict.
 
-            Dicts rather than stubs because the query pages ``items_as_dicts()`` and
-            hydrates AFTER pruning, so this also covers that a pruned item is still
-            something ``Item.from_dict`` accepts.
+            Dicts rather than stubs because the query pages as dicts and hydrates AFTER
+            pruning, so this also covers that a pruned item is still something
+            ``Item.from_dict`` accepts.
             """
             return {
                 "type": "Feature",
@@ -585,8 +585,11 @@ class TestAntimeridianBboxSplit:
             def __init__(self, ids):
                 self._ids = ids
 
-            def items_as_dicts(self):
-                return [_raw(i) for i in self._ids]
+            def pages_as_dicts(self):
+                # The query walks PAGES, so a failure can name the page ordinal it died
+                # on. `items_as_dicts` is defined upstream as exactly this, flattened over
+                # each page's "features", so the two differ only in attribution.
+                yield {"features": [_raw(i) for i in self._ids]}
 
         class _Client:
             def search(self, **kw):

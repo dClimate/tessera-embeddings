@@ -13,11 +13,18 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from prefect.states import StateType
+from pystac_client.exceptions import APIError
+from urllib3.exceptions import ResponseError
 
 import tessera_embeddings.orchestration.prefect.flows.ingest_zone_year as mod
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.errors import ConfigMismatchError, InsufficientCoverageError
 from tessera_embeddings.ingest import land_mask
+from tessera_embeddings.ingest.catalogue_refusal import (
+    CatalogueQueryError,
+    CatalogueRequest,
+    classify_refusal,
+)
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
@@ -618,6 +625,130 @@ def test_a_terminal_leg_failure_is_not_forgotten_when_a_sibling_retries(wired, m
     # failure that a re-dispatch cannot fix.
     assert sorted(dispatched) == ["None", "ascending", "descending"]  # one dispatch each, no retry
     assert wired["markers_written"] == []  # and nothing was marked complete
+
+
+def _refusal_detail(status: int, page: int) -> str:
+    """A leg failure detail carrying a real catalogue-refusal token.
+
+    Classified by the production classifier from urllib3's OWN cause template, so the
+    token under test is the one the ingest would emit rather than one written here. Only
+    the status and the page vary: the status is what the upstream said about itself, the
+    page is what was asked — which is exactly the contrast these tests turn on.
+    """
+    cause = APIError(
+        "HTTPSConnectionPool(host='earth-search.example', port=443): Max retries exceeded with url: "
+        f"/v1/search (Caused by ResponseError({ResponseError.SPECIFIC_ERROR.format(status_code=status)!r}))"
+    )
+    request = CatalogueRequest("sentinel-2-l2a", "2025-01-01/2025-12-31", "bbox=1.0000,2.0000,3.0000,4.0000", page)
+    error = CatalogueQueryError(request, classify_refusal(cause), cause)
+    return f"Flow run encountered an exception: {error}"
+
+
+class TestCatalogueRefusalSpendsTheBudgetDifferently:
+    """A source that cannot answer must not be given the patience meant for a busy one.
+
+    Both refusals reach the leg as ordinary failure text, and the default polarity retries
+    everything not deterministic in the input. A refusal that repeats identically IS
+    deterministic in the input — the same request, refused the same way, through an already
+    exhausted HTTP retry ladder — so the remaining attempts can only buy another copy of
+    the same answer, each at the price of a fleet. A refusal that repeats because the
+    source is busy is the opposite case and must keep every attempt.
+    """
+
+    @staticmethod
+    def _dispatch_counting(monkeypatch, details: list[str]) -> list[str]:
+        """Fail the optical leg with ``details`` in order; complete the radar leg."""
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        dispatched: list[str] = []
+        remaining = list(details)
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            leg = parameters.get("orbit") or "s2"
+            dispatched.append(leg)
+            if leg != "s2":
+                return _completed_run()
+            message = remaining.pop(0) if remaining else details[-1]
+            return SimpleNamespace(id="r", state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=message))
+
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+        return dispatched
+
+    def test_a_repeated_upstream_refusal_stops_spending_attempts(self, wired, monkeypatch):
+        """The identical request refused the identical way twice ends the loop.
+
+        Two attempts, not three: the second is what earns the evidence, and every attempt
+        after it is a fleet spent re-asking a question already answered.
+        """
+        dispatched = self._dispatch_counting(monkeypatch, [_refusal_detail(502, page=2)] * 3)
+
+        with pytest.raises(RuntimeError, match="CATALOGUE_REFUSAL"):
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+
+        assert dispatched.count("s2") == 2, "the third attempt was spent on a request already refused twice"
+        assert wired["markers_written"] == []
+
+    def test_the_stopping_log_line_names_the_request_and_what_to_do(self, wired, monkeypatch, caplog):
+        """Abandoning a cell has to say WHY, and that a human has somewhere to take it.
+
+        A reliably failing query is as actionable for the archive's operator as a coverage
+        gap, and this line is the only place the run says so. Asserted on the reasoning and
+        the referral, because the request identity reaches this record twice — once as the
+        token and once inside the interpolated leg detail — so an assertion on the identity
+        alone passes even if this line stops carrying it. That property is pinned where it
+        is uniquely observable, at the query itself.
+        """
+        self._dispatch_counting(monkeypatch, [_refusal_detail(502, page=2)] * 3)
+
+        with (
+            caplog.at_level(logging.ERROR, logger="test-ingest-zone-year"),
+            pytest.raises(RuntimeError),
+        ):
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+
+        assert "deterministic in the request" in caplog.text
+        assert "not congestion" in caplog.text
+        assert "operator" in caplog.text
+        # Present by either route; see the docstring for why this is not the assertion
+        # that guards it.
+        assert "upstream-error:502" in caplog.text and "@p2" in caplog.text
+
+    def test_a_repeated_load_refusal_keeps_every_attempt(self, wired, monkeypatch):
+        """A source naming itself as the constraint is what expansive retry is FOR.
+
+        The repeat here is evidence for patience, not against it: refusing the cell would
+        lose coverage the source would have served once it recovered.
+        """
+        dispatched = self._dispatch_counting(monkeypatch, [_refusal_detail(503, page=2)] * 3)
+
+        with pytest.raises(RuntimeError, match="CATALOGUE_REFUSAL"):
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+
+        assert dispatched.count("s2") == 3, "a busy source must keep its whole attempt budget"
+
+    def test_a_refusal_of_a_different_request_is_not_a_repeat(self, wired, monkeypatch):
+        """Progress through the catalogue must not read as a stuck query.
+
+        A leg that fails further into the window each attempt is making progress, and the
+        request that failed is a different request — so nothing has been shown to be
+        deterministic and the budget stands.
+        """
+        details = [_refusal_detail(502, page=2), _refusal_detail(502, page=5), _refusal_detail(502, page=9)]
+        dispatched = self._dispatch_counting(monkeypatch, details)
+
+        with pytest.raises(RuntimeError, match="CATALOGUE_REFUSAL"):
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+
+        assert dispatched.count("s2") == 3
+
+    def test_a_failure_carrying_no_refusal_token_is_unaffected(self, wired, monkeypatch):
+        """The pre-existing default must be untouched for everything that is not a refusal."""
+        dispatched = self._dispatch_counting(monkeypatch, ["PermissionError: The provided token has expired."] * 3)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+
+        assert dispatched.count("s2") == 3
 
 
 def test_the_manifest_is_checked_before_any_marker_is_stamped(wired, monkeypatch):

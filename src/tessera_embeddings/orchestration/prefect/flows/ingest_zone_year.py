@@ -73,6 +73,7 @@ from tessera_embeddings.inference.data_loading import (
     check_time_window_coverage,
     resolve_s1_orbit,
 )
+from tessera_embeddings.ingest.catalogue_refusal import RefusalKind, refusal_in, repeat_is_deterministic
 from tessera_embeddings.ingest.land_mask import export_zone_roi, live_chunk_count
 from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
@@ -233,6 +234,11 @@ def _s1_max_workers(s2_max_workers: int, settings: IngestSettings) -> int:
 #: crash, a throttle, an expired source credential and a warp error are all transient by
 #: nature: the same dispatch can succeed next time because it resumes from the dates
 #: already committed.
+#:
+#: One failure class is deterministic without being nameable here, because whether it is
+#: deterministic is not a property of a single message: a source catalogue that refuses
+#: the identical request the identical way on a later attempt. That is settled by
+#: observing the repeat inside the attempt loop below, not by a marker.
 _NON_RETRYABLE_LEG_MARKERS = (
     "InsufficientCoverageError",  # the source has no such data; asking again gets the same answer
     "ObjectNotFound",  # the child deployment is not registered — a registration bug, not a blip
@@ -565,6 +571,16 @@ async def ingest_zone_year(
     ]
 
     errors: list[str] = []
+    # Per leg, the catalogue-refusal signature its previous attempt carried. The default
+    # retry polarity above is right for a source that is momentarily unwilling and wrong
+    # for one that cannot answer a particular request at all — and only a REPEAT separates
+    # them, because a single refusal already reached us through an exhausted HTTP retry
+    # ladder and still cannot distinguish a minutes-long outage from a permanent one. The
+    # signature covers what was asked, so an identical entry means the identical request
+    # was refused the identical way and the remaining attempts would each buy another copy
+    # of the same answer. Scoped to this flow run: the evidence is the repeat, and a run
+    # that has not seen one has nothing to act on.
+    last_refusal: dict[str, str] = {}
     for attempt in range(1, ingest_settings.max_leg_attempts + 1):
         # return_exceptions=True so we WAIT for every leg to settle before retrying or
         # raising: a plain gather() surfaces the first failure while the siblings keep
@@ -583,7 +599,38 @@ async def ingest_zone_year(
             if detail is None:
                 continue
             errors.append(detail)
-            if _is_retryable_leg_failure(detail):
+            refusal = refusal_in(detail)
+            previous = last_refusal.get(label)
+            if refusal is not None:
+                last_refusal[label] = refusal.token
+            if refusal is not None and refusal.token == previous and repeat_is_deterministic(refusal.kind):
+                terminal.append(detail)
+                log.error(
+                    "Zone %s year %s: %s — the source catalogue refused the SAME request the SAME "
+                    "way again (%s). That is deterministic in the request, not congestion: the "
+                    "remaining attempts cannot succeed and would only spend this cell's budget "
+                    "more slowly. Report the request to the archive's operator — a reliably "
+                    "failing query is as actionable for them as a coverage gap. Detail: %s",
+                    zone,
+                    year,
+                    label,
+                    refusal.token,
+                    detail,
+                )
+            elif _is_retryable_leg_failure(detail):
+                if refusal is not None and refusal.kind is RefusalKind.LOAD:
+                    # Said out loud because it is the branch that deliberately keeps
+                    # waiting: a source naming itself as the constraint is exactly what the
+                    # expansive retry exists for, and a repeat of it is evidence FOR
+                    # patience rather than against it.
+                    log.warning(
+                        "Zone %s year %s: %s — the source catalogue refused under load (%s). "
+                        "Retrying: waiting is the remedy for this class, however often it recurs.",
+                        zone,
+                        year,
+                        label,
+                        refusal.token,
+                    )
                 failed.append((label, dep, params))
             else:
                 terminal.append(detail)

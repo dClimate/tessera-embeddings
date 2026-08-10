@@ -18,6 +18,7 @@ into Icechunk/Zarr stores. Used by the Tessera ingestion flows (`ingest_s1_roi_s
 | `transforms.py` | Post-load lazy Dask transforms. Currently: `amplitude_to_db` for converting OPERA RTC-S1 linear amplitude to scaled uint16 dB. |
 | `roi.py` | ROI (Region of Interest) utilities: reading existing Zarr ROI stores (WGS84 bbox, CRS, grid dims), rasterizing GeoJSON polygons to chunked boolean Zarr masks on UTM grids, and loading S2 MGRS tile footprints from S3. |
 | `source_coverage.py` | Optical-source preflight: whether the catalogue publishes ANYTHING reaching a zone's live land in a window, answered by limit-1 existence probes over live-tile block envelopes (window padded per the solar-day convention) before any cluster is provisioned. The verdict is three-valued — only a positive finding of absence refuses; inconclusive and provisional-present both pass the cell through, because a wrong refusal loses campaign coverage while a pass-through only costs the late failure it would have hit anyway. Deliberately OUTSIDE the mosaic-content fingerprint closure (its probe is built here, not in `stac.py`), so shipping preflight changes never invalidates in-flight mosaics. Called by the chained fill driver's pre-cluster triage. |
+| `catalogue_refusal.py` | Tells a catalogue that is BUSY apart from one that cannot serve a given REQUEST, and names the request either way. The client stack discards the search body when it wraps a transport failure, so a refusal arrives identifying the host and the endpoint path and nothing about what was asked. Both refusals are one exception type from one endpoint and need opposite responses: waiting is the entire remedy for a stated overload and pure waste against a request that is refused every time. The status separates them but does not settle it — what settles it is an identical REPEAT, which only the layer holding the attempt budget can observe, so this module classifies and that layer supplies the repeat. |
 | `roi_processing.py` | Higher-level ROI processing helpers used by the `generate_roi` flow. |
 | `_pipeline.py` | A prepare/consume pipeline with a configurable look-ahead `depth`: overlaps the preparation of the next item with the consumption of the current one on one background thread, and reports the preparation time the consumer had to wait for. Used by the S2 date loop (`pipeline_dates`), with `depth` sized to `batch_dates` so a batch's whole preparation can hide behind the previous batch's write. Depth buys BUFFERING, never concurrency — preparation stays on one thread in order, so the side-effect-free contract holds at any depth. |
 | `live_windows.py` | (Merge exchange rate is caller-owned: pass `WINDOW_COST_IN_CHUNKS_OVERLAPPED` when a date's windows share one graph, the higher `WINDOW_COST_IN_CHUNKS` when each is a blocking write. Both S2 and S1 select it from how the run writes, so the rate cannot drift from the write strategy it prices.) Derives the chunk-aligned live windows every ingest loads and writes: row bands over the ROI mask's live chunk-rows, then grouped into fewer, taller windows, and narrowed per date to the land that date's imagery reaches. Grouping was originally justified by each window being a serial blocking write — `overlap_window_writes` has since removed most of that serial cost, so the grouping bounds graph size and merge work rather than serial time. Serves single-ROI and campaign runs identically. |
@@ -84,6 +85,72 @@ to 250. This applies only to providers queried through `client.search()` (Earth 
 Planetary Computer) — the OPERA `cmr-asf` path bypasses CMR-STAC search entirely and queries
 the native CMR Granule API. See
 [ADR 009](../../../context_docs/decisions/009-native-cmr-granule-query.md) for the full rationale.
+
+#### When the catalogue refuses: naming the request, and telling the two refusals apart
+
+`catalogue_refusal.py` is where a refused query stops being anonymous. Two things about the
+client stack make that necessary:
+
+- **The request is discarded on the way up.** `StacApiIO.request` catches every transport
+  failure and re-raises `APIError(str(err))`. What survives names the host and the endpoint
+  path; a STAC search is a request **body**, so the collection, the window, the bbox and the
+  page are all gone. Without them a refusal cannot be narrowed to a month or a page,
+  reproduced, or reported to whoever runs the archive.
+- **Our layer sits ABOVE a retry ladder, not next to one.** The `urllib3.Retry` above
+  retries each page fetch with exponential backoff, so what escapes is the ladder reporting
+  its own exhaustion — a much stronger statement than one error response, and one that must
+  not be mistaken for a first attempt.
+
+So `_query_stac_items` pages explicitly (`pages_as_dicts`, which is what `items_as_dicts`
+iterates internally) and wraps **only the page fetch** in a `CatalogueQueryError` carrying a
+`CatalogueRequest`. Wrapping the page body as well would classify our own validation
+failures as someone else's outage. Opening the catalogue is page 0, named separately so a
+root outage is not attributed to a window that was never asked for.
+
+```text
+CATALOGUE REFUSED collection=sentinel-2-l2a window=2021-09-01/2021-10-02
+                  bbox=-3.0000,50.0000,-2.0000,51.0000 page 3
+                  with HTTP 502 after exhausting the retry ladder after 500 item(s)
+                  — classified upstream-error:502
+```
+
+The **classification** separates two refusals that arrive as one exception type from one
+endpoint and need opposite responses:
+
+| refusal | statuses | what it claims | response |
+|---|---|---|---|
+| `LOAD` | 429, 503 | the upstream names ITSELF as the constraint | wait — this is what the expansive retry exists for, however often it recurs |
+| `UPSTREAM_ERROR` | 500, 502, 504 | the upstream failed to PRODUCE an answer | retry once; a repeat settles it as deterministic |
+| `UNKNOWN` | anything else | no readable status | behave as the default does: retry |
+
+The two named sets must jointly cover the ladder's `status_forcelist` — a status the ladder
+retries but the taxonomy does not name falls to `UNKNOWN` and keeps its expansive retry
+forever. A unit test asserts that containment rather than leaving it to care.
+
+The status is read from the exception **chain**, not the message: `pystac_client` re-raises
+without `from`, so the evidence sits under `__context__` on urllib3's own exception, and the
+top-level text is only a stringification of it. The message is a documented fallback for a
+refusal that crossed a boundary carrying no chain.
+
+**A status is necessary and not sufficient.** A gateway can fail for minutes and recover, so
+one exhaustion is not proof of a defect. What settles it is a REPEAT — the identical request
+refused the identical way on a later attempt — and that observation belongs to whoever holds
+the attempt budget, which is `ingest_zone_year`'s leg loop (see
+[its retry policy](../orchestration/prefect/flows/ingest_zone_year.py)). The two halves are
+deliberately split: this module classifies, the budget holder supplies the repeat, and
+neither is a verdict alone.
+
+That split forces the signature's design. The leg that queries and the layer that counts
+attempts are separate deployment runs, so the only thing crossing between them is failure
+text — hence one whitespace-free token under a stable name (`CATALOGUE_REFUSAL=`), matched
+by name and never by position. And the signature covers exactly the fields that decide the
+answer (collection, window, area, page) and nothing that varies between attempts: a counter
+or a timestamp inside it would make every refusal unique and the repeat check dead code that
+always reports "not repeated".
+
+`source_coverage.py`'s preflight probe deliberately does **not** use any of this. Every
+failure of that probe is already INCONCLUSIVE by design, which is the right answer for both
+refusals at once, and the module sits outside the mosaic-content fingerprint closure.
 
 Cloud cover is intentionally **not** used as a filter at the STAC query stage — pixel-level
 cloud classification is handled later (SCL for S2, ML model for inference). For S2, items

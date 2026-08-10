@@ -194,7 +194,9 @@ def test_query_stac_items_passes_stac_io_to_client(mock_build, mock_stac_io_cls,
 
     mock_stac_io = MagicMock()
     mock_stac_io_cls.return_value = mock_stac_io
-    mock_client_cls.open.return_value.search.return_value.items.return_value = iter([])
+    # An EMPTY page cursor, named as the method the query actually walks. A bare MagicMock
+    # here answers `next()` forever, which is an unbounded loop rather than a failed test.
+    mock_client_cls.open.return_value.search.return_value.pages_as_dicts.return_value = iter([])
 
     provider = MagicMock()
     _query_stac_items(provider, MagicMock(), "T15TYH", "2024-01-01", "2024-01-31")
