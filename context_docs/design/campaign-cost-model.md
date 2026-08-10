@@ -885,10 +885,16 @@ model's.
 **Effect: depth 167 → 173, line $553,000 → $573,000, +3.5%.** Interpolation narrows no
 uncertainty — the 66–152 spread is untouched — it only stops the weighting from being wrong.
 
-**A further measured band would still be the best buy**, but it is now a refinement rather than a
-gap: filling 35–50° outside Europe and the Middle East (the densely-tasked Sentinel-1 regions
-that supply every deep observation we hold) would test whether 94.3 is right. That is worth a
-cell of opportunity, not a campaign delay.
+**Measuring that band is DECIDED AGAINST, 2026-08-08** — too expensive for what it buys, and the
+decision is recorded here so it is not revived as an open question. A measured 35–50° cell would
+test whether the land-weighted 94.3 is right, and it remains the widest single driver of the
+interval. What makes it declinable is that interpolation is already the defensible treatment: the
+band sits between two measured neighbours, and its absence is what would bias the weighting, not
+its interpolation. **The campaign proceeds on the interpolated figure.**
+
+The residual is therefore carried, not closed: if the true depth in that band sits at the top of
+the measured 66–152 spread, the line is understated, and 19.2% of campaign land is the exposure.
+That is inside the interval already published in §1.
 
 **What completing it did NOT settle.** The rate deficit narrowed from ~30% to **~19%** and did
 not close. Worse, the cell is now both the widest fleet measured (160 actors) and the slowest
@@ -1099,8 +1105,10 @@ the nine year-barriers at which one stalled zone holds up everything behind it.
    **ten band-observations spanning 66–152, land-weighted to 94**, worth $504,000 to $713,000 on
    its own. It is now the single widest driver, having overtaken the 37N rate deficit when that
    cell was completed (§6c). Two of those ten bands carry thin support (19 and 47 chunks) and the
-   35–50° band is interpolated rather than measured, which is where a refinement would go. The
-   census's optical/radar *split* is refuted at high latitude and must not be consumed on its own.
+   35–50° band is interpolated rather than measured. **Measuring it is decided against (§6c), so
+   this uncertainty is CARRIED rather than closable** — it is the one input the campaign runs on
+   without a plan to improve. The census's optical/radar *split* is refuted at high latitude and
+   must not be consumed on its own.
 
    What does *not* cancel is `eo:cloud_cover` omitting cloud shadow and dark pixels, which
    the pipeline also rejects. That inflates both sides' observation counts by perhaps 20–30%

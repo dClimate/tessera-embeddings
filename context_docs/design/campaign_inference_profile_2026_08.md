@@ -488,8 +488,14 @@ sample's 86.3, +9.2%**, and the difference is geographic: the deepest radar sits
 unmeasured band beside it carries a fifth of campaign land, so a sample-weighted figure
 under-represents exactly where radar is deepest. The land-weighted figure is now the model's.
 
-A measured band there remains the best available refinement — preferably outside Europe and the
-Middle East, the densely-tasked Sentinel-1 regions that supply every deep observation we hold —
+**Measuring that band is decided against (2026-08-08): too expensive for what it buys.** The
+campaign runs on the interpolated figure, and the residual is carried rather than closed — if the
+true depth there sits at the top of the measured 66–152 spread the line is understated across
+19.2% of land, which is inside the published interval. Recorded as a decision so it is not
+revived as an open question. The paragraph below is the superseded recommendation.
+
+~~A measured band there remains the best available refinement — preferably outside Europe and the
+Middle East, the densely-tasked Sentinel-1 regions that supply every deep observation we hold —~~
 but it is a refinement, not a hole, and not worth delaying a cell for.
 
 **Two open items this telemetry surfaced.** 93 of 60N's 620 live tiles produced zero valid

@@ -436,6 +436,32 @@ which is a model question if ever revisited, not an ingest one.
 > the named unit mismatch would have moved the line 19% the wrong way. Full accounting:
 > `campaign-cost-model.md` §6b. Still open there: an unexplained 30% rate deficit on the one
 > 20–45° both-orbit sample, and no both-orbit rate measured at campaign fleet width.
+>
+> **REVISED TWICE MORE, 2026-08-08, and the two moves point opposite ways.** The 20–45° sample
+> above was a partial in-flight read, and completing that zone-year raised its rate while cutting
+> its radar depth from 146.8 to 89.9 — a partial run's whole-cell summary is *biased*, not merely
+> imprecise. A separate **weighting** defect then surfaced: optical depth was weighted by campaign
+> land while radar depth was weighted by whichever cells we happened to measure, so their sum
+> answered no single question. Land-weighting radar gives depth **173 tok/px** and rate
+> **2.127 M tok/s**, putting the line at **$573,000** and the campaign total at **$707,000**.
+> **Fleet sizing, the 85% policy and the work-hours bank remain unaffected** — the
+> capacity-planning rate has moved only −6.2% from the superseded basis, so the near-cancellation
+> survived a twelvefold increase in evidence. `campaign-cost-model.md` §6c.
+>
+> Two residuals, one now permanent: the rate deficit narrowed to **~19% and did not close**, and
+> the **35–50° band stays interpolated** because measuring it is decided against — so that
+> uncertainty is *carried* rather than closable, and it is the widest single driver of the interval.
+
+> **NEW CONSTRAINT, 2026-08-08: the 85% provisioning policy is now load-bearing for a second
+> reason.** It was adopted to stop a fleet idling on a shallow queue. It is also the only thing
+> holding the campaign under an **assembly ceiling of ~275 actors per cluster**: assemblies
+> serialise on one trailing thread, and inference time per tile falls as actors rise while assembly
+> does not, so the two cross. At the planned 228 the assembly tail is ~11 minutes on an ~8-day
+> campaign; at matched (268) it crosses, and the widest configuration the cost model lists adds 7.5
+> hours. **So fleet width and assembly capacity cannot be decided independently** — anyone raising
+> the fleet for throughput is also spending this margin. If a wider fleet is ever wanted the remedy
+> is the assembly side, not the fleet: the runner leaves ~39% of its CPU idle at the shipped pool
+> width, and that idle capacity is precisely what a fleet above the ceiling would need.
 
 1. **Report the optical-only cells in whatever ships with the data.** OPERA RTC-S1 coverage was
    withdrawn from about a fifth of the land after Sentinel-1B failed in December 2021 and largely
@@ -561,6 +587,39 @@ never averaged away.
 
 Added 2026-08-06 from the pre-campaign test programme. Only what alters an operational decision or
 retires an open question; the figures live in the documents named.
+
+### Added 2026-08-08 — the failure drills, and what they retired
+
+**Crash recovery of a GPU fleet works, and takes about three seconds.** A hard kill of the flow
+body — every `finally` and context manager skipped — was recovered by the terminal hook, which
+terminated all five instances at the same second. This **refutes** the belief that Prefect runs
+those hooks in the flow's own process. The operational consequence: the orphan-fleet sweep's lack
+of any EC2 code path is real but **not on the recovery path**, so no work is needed there. Do not
+plan around a leaked Ray fleet as a likely event.
+
+**A dead committer's slot returns by itself in about five minutes.** There is no manual release
+procedure to write, and no runbook step to add. A whole-cluster death is a five-minute stall on
+commits rather than a deadlock.
+
+**Skipped tiles are real coverage gaps, deterministic and spatially clustered** — byte-identical
+sets across independent fills of the same cell. They publish as fill, which is what ocean also
+reads as, so the store now records `optical_skips` per year. **What ships with the data should say
+so**, alongside the optical-only cells already listed in §8.
+
+**The campaign-day view now carries twelve checks**, and two of them exist because a resume that
+silently restarts is otherwise invisible: the work-list ratio (which needs the dispatch intent) and
+orphaned staging (which needs none, and therefore catches the operator who meant to resume and
+omitted `run_id`). **Both are worth running early in a fill rather than late** — the finding is only
+actionable while killing the run still saves the money.
+
+**Assembly is the shard write.** The merge and commit are 37 seconds of a 196-minute assembly, so
+there is no second phase to plan around. The staged intermediate is stored **uncompressed**, which
+is what sets the duration; if assembly wall-clock ever matters, compressing it is the only lever
+with real leverage.
+
+**One monitoring defect worth knowing about, now fixed:** a concurrency limit set to zero while
+active read as *healthy* — a total stall reported as health. The view now records such a state
+without grading it, because zeroing a gate is also a legitimate way to park the campaign.
 
 **Radar costs about twice as much per chunk as optical, and the OPTICAL token metric cannot see
 it.** `t_kept` is the Sentinel-2 mask's first dimension — optical timesteps only — so
