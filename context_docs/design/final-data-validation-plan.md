@@ -8,8 +8,10 @@ asked whether the published pixels are right.** This is what does.
 
 The instrument exists and has been exercised on 15 zone-years of the dev store. It is what found the
 observation-count seams at tile edges, a dimension check that would have failed every healthy cell,
-and a cell published from six months of optical input. Two things do not exist yet: the in-campaign
-gate of §3, and the roll-up of §7.
+and a cell published from six months of optical input.
+
+**One thing remains unbuilt: the in-campaign gate of §3a.** The roll-up of §7 and the output plumbing
+of §3c were built 2026-08-11 and are described here as they are, not as they were wanted.
 
 ---
 
@@ -53,6 +55,9 @@ The pixel budget is then aimed only at shards already known to exist.
 Two passes, and the first is the one that changes the campaign's code.
 
 ### 3a. Per-cell, inside the campaign, BEFORE the tag — the FULL check, pixels included
+
+**NOT YET BUILT.** Everything it needs now exists — the check itself, its machine-readable verdict,
+and remote output — so what remains is wiring it into the fill path at the point below.
 
 **Run the whole instrument as the last step of every cell, and raise on a blocking finding.** A
 defect found on cell 3 of 1,000 is a fix; the same defect found at the end is 1,000 refills.
@@ -123,10 +128,15 @@ Filenames already carry the zone and the year (`detail_37N_2021.png`, `coverage_
 whole history is browsable in one place. The machine-readable verdict (§7) is written beside the
 figures, which is what lets the closing sweep roll up stored results instead of re-reading the product.
 
-**One tooling change this needs.** `embedding_reality_check.py`'s `--out` currently takes a local
-path. It must accept an **fsspec target** so a campaign run can write straight to S3 without a
-separate upload step — the same pattern `IngestSettings.perf_report_uri` already uses for its
-performance reports, so there is precedent rather than a new convention.
+**BUILT 2026-08-11.** `--out` accepts an fsspec target, so a run writes straight to S3 with no
+upload step — the same pattern `IngestSettings.perf_report_uri` already uses. A remote target is
+staged locally and uploaded once at the end, because the renderers hand PIL a filesystem path and a
+per-file remote write would leave a half-published set behind if the run failed midway.
+
+**`--label` is what makes a second pass ADD rather than replace.** It suffixes every filename, and
+paired with a different `--seed` the second pass samples different windows and different boundaries —
+so the two sets together cover more of the cell than either alone, which is the only reason to look
+again at a cell already checked. Verified against S3.
 
 ## 4. Per-cell pass criteria
 
@@ -187,27 +197,45 @@ A sub-Antarctic or atoll cell can be legitimately noise-like. `OPTICAL_LIGHT_MAX
 the cell — see §8 for exactly what it measures — so the answer is on the record rather than in
 someone's reading of a picture. **Publish thin cells; label them.**
 
-## 7. THE MISSING PIECE: a roll-up for the closing sweep
+## 7. The roll-up — BUILT 2026-08-11
 
-**A thousand per-cell verdicts is not a validation, it is a pile.** The tool prints a human-readable
-verdict and exits non-zero on any disagreement; it has **no machine-readable mode**. Without one the
-closing sweep gets skimmed or skipped.
+**A thousand per-cell verdicts is not a validation, it is a pile.** Two layers now exist so the sweep
+is actionable rather than skimmed.
 
-What is needed, in the cheapest form that works:
+**`embedding_reality_check.py --json`** emits the same result as a machine-readable projection — never
+a second implementation. Per finding a **stable slug**, its status and its detail, plus the quantities
+that only mean something in aggregate (coverage counts, per-field-and-axis seam medians, band health,
+cost). It also carries the cell's **snapshot id**, so a later pass that disagrees with a stored verdict
+points at either a changed store or changed checks, and the snapshot separates those.
 
-* **A `--json` mode on `embedding_reality_check.py`** — per check a stable slug, its status, and its
-  named subjects. `campaign_health.py` already implements exactly this projection, so it is a pattern
-  to copy rather than a design to invent.
-* **A driver** over every completed cell, emitting:
-  * a **one-line-per-cell table** — written, absent, reconciliation, optical range, seam medians;
-  * an **exception list**, only cells with a finding, worst first;
-  * **aggregate distributions** for what is only interpretable in bulk — seam median across all cells,
-    optical-light share, absent-tile fraction.
+Progress output goes to **stderr** in this mode. A machine-readable mode whose stdout carries prose is
+not machine-readable, and a driver forced to strip preamble will one day strip a line that mattered.
 
-The aggregate half matters as much as the exceptions, with one caution: **a consistent offset is not
-evidence of an effect until the noise floor is known.** The current set leans about 3% above 1.0 on
-seam medians in 7 of 9 cells, far inside tolerance, with no noise floor measured. The roll-up should
-surface that kind of pattern for judgement, not grade it.
+**`scripts/validate_all_cells.py`** is the driver. One subprocess per cell, run concurrently — for
+isolation as much as speed, since a cell that raises must not take the sweep down. It emits:
+
+* an **exception list**, only cells with a finding, blockers first;
+* a **per-cell table**, so a pattern across neighbouring zones is visible rather than buried;
+* **aggregate distributions** for what is only interpretable in bulk.
+
+It sorts findings **by slug, not by prose**. `BLOCKING_SLUGS` are the findings meaning the data is
+wrong. `EXPECTED_SLUGS` — the observation-count seams, upstream and present on nearly every cell — are
+**counted once rather than listed per cell**, because a line that fires a thousand times teaches the
+reader to skip the section including the times it matters. A cell whose check *itself* crashed is kept
+as a finding about the sweep with its raw output preserved, never silently dropped.
+
+`--report-only` re-rolls from results already on disk, fetching nothing. `--label` with a different
+`--seed` runs an additional differently-sampled pass over cells already checked.
+
+**The slug is derived from the check's name, not declared per check** — a stated trade. An explicit
+slug would mean nineteen construction sites and a defaulted field would let a new check ship keyless,
+so the guarantee lives in a test pinning the whole set: rewording a name fails that test rather than
+silently moving a caller's key.
+
+The aggregate half matters as much as the exceptions, with one caution the driver prints in its own
+output: **a consistent offset is not evidence of an effect until the noise floor is known.** The
+current set leans about 3% above 1.0 on seam medians in 7 of 9 cells, far inside tolerance, with no
+noise floor measured. Distributions are reported for judgement and never graded.
 
 ## 8. What `OPTICAL_LIGHT_MAX_OBS` actually measures
 
@@ -275,7 +303,8 @@ State these in whatever report the sweep produces, so nobody reads more into a p
 
 | what | where |
 |---|---|
-| the reader and renderer | `yield-embeddings/scripts/embedding_reality_check.py` |
+| the reader and renderer, per cell (`--json`, `--out <fsspec>`, `--label`) | `yield-embeddings/scripts/embedding_reality_check.py` |
+| **the closing sweep and its roll-up** | `yield-embeddings/scripts/validate_all_cells.py` |
 | the decisions and thresholds (unit-tested against synthetic arrays) | `yield-embeddings/src/yield_embeddings/domain/embedding_audit.py` |
 | per-cell structural + placement validation | `yield-embeddings/scripts/validate_zone_group.py` |
 | campaign-day monitoring, incl. published-input-coverage and shard-placement checks | `yield-embeddings/scripts/campaign_health.py` |
