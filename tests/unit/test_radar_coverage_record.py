@@ -20,13 +20,13 @@ from tessera_embeddings.inference.assembly import summarise_radar_coverage
 from tessera_embeddings.storage.shard_writer import run_provenance
 
 
-def _chunk(valid: int, free: int, light: int = 0, status: str = "success") -> dict:
+def _chunk(valid: int, free: int, thin: int = 0, status: str = "success") -> dict:
     return {
         "chunk": "chunk_0_0",
         "status": status,
         "valid_pixels": valid,
         "s1_free_pixels": free,
-        "s1_thin_pixels": light,
+        "s1_thin_pixels": thin,
     }
 
 
@@ -51,18 +51,18 @@ class TestSummarisingAYear:
         assert summary["embedded_px"] == 2000
         assert summary["s1_free_pct"] == 50.0
 
-    def test_radar_light_is_reported_separately_from_radar_free(self) -> None:
+    def test_radar_thin_is_reported_separately_from_radar_free(self) -> None:
         """A pixel the radar barely saw is not the same as one it never saw, and the
         embedding exposes neither — both simply exist.
         """
-        summary = summarise_radar_coverage([_chunk(1000, 100, light=250)])
+        summary = summarise_radar_coverage([_chunk(1000, 100, thin=250)])
         assert summary is not None
         assert summary["s1_free_pct"] == 10.0
         assert summary["s1_thin_pct"] == 25.0
 
-    def test_the_light_threshold_is_recorded_with_the_figure(self) -> None:
+    def test_the_thin_threshold_is_recorded_with_the_figure(self) -> None:
         """A percentage whose threshold is not stated cannot be compared across builds."""
-        summary = summarise_radar_coverage([_chunk(10, 0, light=1)])
+        summary = summarise_radar_coverage([_chunk(10, 0, thin=1)])
         assert summary is not None
         assert summary["s1_thin_below_obs"] == RADAR_THIN_MAX_OBS
 
