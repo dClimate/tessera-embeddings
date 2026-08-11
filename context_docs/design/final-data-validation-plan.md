@@ -116,8 +116,11 @@ persisted its verdict, so the closing sweep is:
 This is strictly better than re-reading everything: the same coverage, a fraction of the cost, and any
 disagreement between a stored verdict and a fresh read is itself a finding worth having.
 
-**3b writes to the same place as 3a** (§3c), so the folder always holds the most recent render of every
-cell. After 3a a complete set already exists; 3b refreshes whichever cells it re-reads.
+**3b renders NEW windows, it does not refresh the old ones** (decided in review). It writes to the same
+place as 3a (§3c) under a different `--label` and a different `--seed`, so each cell ends up with **two
+disjoint sets of sampled windows** and the total human-inspectable sample doubles. Refreshing the same
+windows would have bought nothing; sampling elsewhere is the only reason to look again at a cell already
+checked.
 
 ### 3c. Where the output goes
 
@@ -158,8 +161,19 @@ the sampled read, and are worth its 3 minutes.
    invariant confirming the data was quantized the way every reader assumes.
 6. **No seam on the embeddings**, on either axis — see §5 for why this one and not the other.
 7. **The detail windows look like the Earth.** Not reducible to a statistic, and the check that caught
-   the thin cells. Rendered and persisted per cell so a human can look at any of them later; judge
-   against that cell's own optical depth — §6.
+   the thin cells. Rendered and persisted per cell — §3c.
+
+   **An AI rates them first, and a human reads what it flags.** This is the check that otherwise does
+   not scale: nobody eyeballs a thousand cells, so in practice it would be sampled and the unsampled
+   majority would go unlooked-at. The monitoring AI already polls the campaign; adding "open this
+   cell's windows and rate how realistic they look" to its round turns the one unautomatable check
+   into a first pass over EVERY cell, with the human then looking at what it ranked lowest rather than
+   at everything.
+
+   Two constraints on that rating, both learned the hard way on this data. It must be judged **against
+   that cell's own optical depth** — a noise-like window at 14 observations is the correct output, not
+   a defect (§6) — and a low rating is a **flag for a human, never a blocker**, because "looks wrong to
+   a model" is not evidence a placement or quantization check would confirm.
 
 ## 5. The two seam rows are not the same finding
 
@@ -193,7 +207,7 @@ depth and nothing else** — measured across 15 cells: crisp, field-boundary-sha
 observations per pixel; indistinguishable from noise below about 20. Radar absence alone does not
 visibly degrade the embeddings.
 
-A sub-Antarctic or atoll cell can be legitimately noise-like. `OPTICAL_LIGHT_MAX_OBS` records that on
+A sub-Antarctic or atoll cell can be legitimately noise-like. `OPTICAL_THIN_MAX_OBS` records that on
 the cell — see §8 for exactly what it measures — so the answer is on the record rather than in
 someone's reading of a picture. **Publish thin cells; label them.**
 
@@ -237,16 +251,16 @@ output: **a consistent offset is not evidence of an effect until the noise floor
 current set leans about 3% above 1.0 on seam medians in 7 of 9 cells, far inside tolerance, with no
 noise floor measured. Distributions are reported for judgement and never graded.
 
-## 8. What `OPTICAL_LIGHT_MAX_OBS` actually measures
+## 8. What `OPTICAL_THIN_MAX_OBS` actually measures
 
 Asked in review; recorded because the granularity is easy to assume wrongly.
 
 * **Applied per PIXEL.** In the inference actor, over embedded pixels only:
-  `s2_obs_count < OPTICAL_LIGHT_MAX_OBS`. Currently **40**.
+  `s2_obs_count < OPTICAL_THIN_MAX_OBS`. Currently **40**.
 * **Counted per CHUNK** — one inference chunk is one 2048-px shard — and returned as
-  `s2_light_pixels` on that chunk's result.
-* **Published per CELL.** Aggregated into the year's `radar_coverage` record as `s2_light_px`,
-  `s2_light_pct` (share of the cell's embedded area), and `s2_light_below_obs` recording the
+  `s2_pixels` on that chunk's result.
+* **Published per CELL.** Aggregated into the year's `radar_coverage` record as `s2_thin_px`,
+  `s2_thin_pct` (share of the cell's embedded area), and `s2_thin_below_obs` recording the
   threshold in force, so a later change of the number does not silently reinterpret old records.
 * **Nothing is marked at shard or chunk level in the store.** The per-pixel `s2_obs_count` array is
   already published, so any granularity can be recomputed by a consumer at any time.
@@ -255,7 +269,7 @@ Asked in review; recorded because the granularity is easy to assume wrongly.
 a sub-zonal split, so the figure does not hide the case where a zone spans the tropics into temperate
 latitudes. But it does **not localise**: the percentage says how much, never where. Radar has a
 coarse locator for this (`tiles_fully_s1_free`); optical has no equivalent. If localisation is wanted,
-the cheapest addition is a per-cell count of tiles whose embedded area is *entirely* optical-light,
+the cheapest addition is a per-cell count of tiles whose embedded area is *entirely* optical-thin,
 mirroring the radar field. Not proposed here — flagged as the available option.
 
 **It is a reporting line only.** Nothing refuses a cell for being under it, and raising or lowering it
@@ -273,9 +287,16 @@ migration.
 | seam median outside 0.80–1.25 on **embeddings** | **BLOCKS at 3b.** Our grid, our defect — §5 |
 | scale-setting shares far from 1.0 | **BLOCKS at 3b.** Not quantized as readers assume |
 | constant embedding dimension | **BLOCKS at 3b.** Dead output |
-| high optical-light share | **RECORD and PUBLISH.** A property of the input, not a fault |
+| high optical-thin share | **RECORD and PUBLISH.** A property of the input, not a fault |
 | absent land tiles explained by skips | **RECORD.** Expected; the skip record is the evidence |
 | **observation-count seams** | **IGNORE.** Upstream, on every cell — §5 |
+
+**On a blocking finding the campaign KEEPS MOVING** (decided in review). The specific fill raises and
+that cell fails; the campaign flow does not crash, and the other cells in the cluster continue. The
+error must be **distinguishable to the monitoring tools rather than merely present** — a recognisable
+signal, not a generic exception — because the requirement is that monitoring surfaces it **with
+urgency**. A validation failure is a published-data defect, which outranks every throughput signal the
+campaign-day view reports.
 
 A corrected cell needs a **fresh tag name**: icechunk tags are write-once forever, so a refill cannot
 re-pin the canonical name. `scripts/reopen_zone_year.py` clears the completion mark and pins a fresh
@@ -336,15 +357,17 @@ Two operational notes:
   cross — the sample is systematic rather than random, so a defect large enough to matter is already
   visible in it.
 
-## 13. Open questions for review
+## 13. Decisions from review — 2026-08-11
 
-1. **Is the 1.6% pixel sample the accepted definition**, or should the closing sweep raise
-   `--max-shards`/`--seam-boundaries` and pay the extra?
-2. **Should 3b re-render every cell's windows, or only the cells it re-reads?** After 3a a complete set
-   already exists, so refreshing only the re-read cells is nearly free. A full final re-render is
-   another whole pixel pass — order $20 and a few hours — for figures that would mostly be identical.
-3. **Who reads the roll-up, and against what deadline?** The sweep is worth little if its output
-   arrives after the product is committed to.
-4. **On a 3a failure, does the campaign continue with other cells?** A blocking finding on one cell is
-   probably local; the same finding on the first three is systemic and should stop the run. That
-   threshold is a policy choice, not a technical one.
+1. **Sample depth: raise it.** The closing sweep raises `--max-shards` and `--seam-boundaries` rather
+   than accepting the default stride, and records the values used.
+2. **3b renders NEW windows**, increasing the total sample — not a refresh of 3a's. See §3b.
+3. **The roll-up is for final peace of mind**, not a gate the campaign waits on. Which usefully lowers
+   its urgency relative to the per-cell check of §3a: that one is what prevents a defect propagating.
+4. **A 3a failure does not stop the campaign.** The cell fails, the campaign continues, and monitoring
+   raises that specific error with urgency. See §9.
+5. **An AI rates the windows before a human sees them**, as part of the monitoring round. See §4.7.
+
+**What remains open** is only the sizing of the last one: how many windows per cell are worth rating,
+and what the AI's rating scale should be, so that "low" means the same thing across a thousand cells and
+across two passes sampled from different places.
