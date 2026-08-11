@@ -441,13 +441,31 @@ class _DeploymentCellInputs:
         )
 
     def shutdown(self) -> None:
-        """Stop dispatching AND cancel in-flight child ingest runs (best effort).
+        """Stop dispatching, cancel in-flight child ingest runs, and WAIT for them to stop.
 
         Queued futures are cancelled outright; running ones are unblocked by
         ``_stopping`` at their next poll tick. The child flow runs themselves
         would otherwise keep executing server-side after this parent dies —
         request their cancellation so a prompt retry never races an orphaned
         ingest writing the same mosaic prefix.
+
+        **Waiting is the point, for the same reason ``discard`` waits.** Cancellation is a
+        REQUEST: Prefect marks the run Cancelling and a worker acts on it later, so
+        returning as soon as the request is sent leaves a live writer behind. ``discard``
+        can at least refuse its own retry; teardown cannot, because the retry that races
+        this child is a WHOLE NEW PARENT RUN — it derives its own child tag from its own
+        flow-run id, so it can neither find this child nor be told about it. This wait is
+        the only place the two can be kept apart.
+
+        Best effort at the end of it: a child that will not confirm is logged by name and
+        left to the orphan sweep, because a teardown that blocks forever is its own
+        outage. But it is waited for FIRST, and the log says which ones were not confirmed
+        rather than implying all of them stopped.
+
+        The wait also gives up early on a run of read errors, on the same budget the
+        poller uses. An unreachable API is the case where confirmation is impossible
+        rather than merely slow, and spending the full window re-asking a server that is
+        not answering delays a teardown whose whole job is to stop costing money.
         """
         # Snapshot BEFORE waking the pollers: a woken worker deregisters its
         # run id on the way out, and an id that leaves the map un-swept is an
@@ -460,6 +478,7 @@ class _DeploymentCellInputs:
             return
         try:
             with get_client(sync_client=True) as client:
+                unconfirmed = dict(inflight)
                 for (zone, year), fr_id in inflight.items():
                     try:
                         client.set_flow_run_state(fr_id, state=Cancelling())
@@ -472,6 +491,36 @@ class _DeploymentCellInputs:
                             fr_id,
                             exc_info=True,
                         )
+                # Then wait for them, all together — the requests are already in, so this
+                # costs one child's teardown, not the sum of them.
+                deadline = time.monotonic() + _CANCEL_CONFIRM_S
+                # A run of read errors ends the wait early, on the same budget the poller
+                # uses. An API that is not answering is the case where confirmation is
+                # IMPOSSIBLE rather than slow, and spending the full window re-asking it
+                # delays a teardown whose whole job is to stop the run costing money.
+                errors = 0
+                while unconfirmed and time.monotonic() < deadline and errors < _INGEST_POLL_MAX_ERRORS:
+                    for cell, fr_id in list(unconfirmed.items()):
+                        try:
+                            run = client.read_flow_run(fr_id)
+                        except Exception:
+                            errors += 1
+                            continue
+                        errors = 0
+                        if run.state is not None and run.state.is_final():
+                            del unconfirmed[cell]
+                    if unconfirmed:
+                        time.sleep(_INGEST_POLL_S)
+                for (zone, year), fr_id in unconfirmed.items():
+                    self._log.error(
+                        "Ingest %s-%d (%s) did not reach a terminal state within %.0fs of being cancelled. "
+                        "It may still be writing its mosaic prefix — a retry of this cell is a NEW parent run "
+                        "and cannot see this child, so confirm it stopped before re-running the cell.",
+                        zone,
+                        year,
+                        fr_id,
+                        _CANCEL_CONFIRM_S,
+                    )
         except Exception:
             self._log.warning("Ingest cancellation sweep failed — check the Prefect UI for orphans", exc_info=True)
 

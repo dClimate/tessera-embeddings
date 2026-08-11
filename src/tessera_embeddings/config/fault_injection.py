@@ -35,13 +35,20 @@ Deployment identity is READ, never asked for: :func:`deployment_stem` takes it o
 Ray control-plane SSM prefix, which a registration injects and a caller has no reason to
 set.
 
-KNOWN LIMITATION, and it is a real one. That prefix is still a flow PARAMETER, so a
-dispatch CAN state it: naming a drill control plane while pointing every storage path at
-production passes this check. Closing it needs a second identity a dispatch cannot
-choose — the registered deployment name from the Prefect runtime, or an allowlist of
-drill storage — and both need a deployment fact this module does not have. Until then,
-the gate stops an accident, not a determined operator; note that arming also requires an
-explicit ``fault`` parameter, so reaching this point is already deliberate.
+RESIDUAL, ACCEPTED (repo owner, 2026-08-11 — do not "harden" this). That prefix is a flow
+PARAMETER, so a dispatch can state it: naming a drill control plane while pointing storage
+at production would pass this check. Reviewers raise it as a privilege-escalation finding
+and it is not one here. Arming ALSO requires an explicit ``fault`` argument, so the path
+is two deliberate acts by someone already authorised to dispatch the flow — the gate
+exists to stop an accident, not an operator who is trying. The owner's ruling: drills are
+not production, and this is not a threat model worth a second identity.
+
+Closing it anyway would need a deployment fact this module does not have (the registered
+Prefect deployment name, or an allowlist of drill storage) and would drag either the
+Prefect runtime or an AWS identity call into ``config`` — the latter forbidden outright by
+``no-botocore-outside-aws-provider``. An environment variable was tried and rejected for a
+separate reason: one can be left behind in a task definition and inherited by an ordinary
+run, which ``test_nothing_about_a_fault_is_read_from_the_environment`` pins.
 """
 
 from __future__ import annotations
@@ -153,6 +160,23 @@ class FaultInjection(BaseModel):
         if self.fault == DIE_BETWEEN_COMMITS:
             if self.zone is None or self.year is None:
                 raise ValueError(f"{DIE_BETWEEN_COMMITS} needs the zone and year it may fire on")
+            # CANONICAL FORM ONLY. The firing site compares the request's zone to the
+            # writer's, and the fill canonicalizes before it gets there — so ``"33n"``
+            # arms, announces itself, and then silently never matches ``"33N"``. A drill
+            # that does nothing and is written up as a pass is the one outcome this module
+            # exists to prevent, and it is worse here than anywhere else: the drill's whole
+            # purpose is to prove the recovery path runs.
+            #
+            # REFUSED rather than normalised, and refused HERE rather than at the firing
+            # site. Normalising would hide a request that does not say what its author
+            # meant, and refusing at dispatch is the only point where a human is still
+            # reading the error.
+            if self.zone != self.zone.upper():
+                raise ValueError(
+                    f"zone must be the canonical UTM common name (e.g. '33N', '07S'); got {self.zone!r}. "
+                    f"The writer compares against the canonicalized zone, so a lowercase request would "
+                    f"arm, log, and never fire — a drill that silently passes."
+                )
             if self.hold_minutes is not None:
                 raise ValueError(f"{DIE_BETWEEN_COMMITS} holds nothing — drop hold_minutes")
         if self.fault == WITHHOLD_WORK:

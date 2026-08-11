@@ -80,7 +80,12 @@ from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import zone_has_live_tiles
 from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
-from tessera_embeddings.storage.zarr_store import is_missing_repo, open_repo, open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import (
+    is_missing_repo,
+    open_repo,
+    open_store_as_zarr_group,
+    plain_zarr_storage_options,
+)
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 from tessera_embeddings.utils import utcnow_iso
 
@@ -163,7 +168,15 @@ def _assert_store_manifest_matches(
     store with no manifest at all is a legacy store and passes with a warning, exactly as
     it does on the append path — the two must not disagree about what is acceptable.
     """
-    expected = IngestManifest.from_roi_store(roi_zarr_path, min_valid_coverage=min_valid_coverage)
+    expected = IngestManifest.from_roi_store(
+        roi_zarr_path,
+        min_valid_coverage=min_valid_coverage,
+        # The ROI is a plain zarr, so it does not travel on the Icechunk callback. Without
+        # this the check itself fails on a callback-only deployment — leaving the stores
+        # UNMARKED after a successful ingest, so every retry re-reads a finished mosaic as
+        # an interrupted one.
+        storage_options=plain_zarr_storage_options(roi_zarr_path, get_credentials, s3_region),
+    )
     root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
     expected.validate_against(extract_manifest(dict(root.attrs)), store_path)
 

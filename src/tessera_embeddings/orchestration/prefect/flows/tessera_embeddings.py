@@ -285,9 +285,13 @@ def tessera_embeddings(
         output_bucket=output_bucket,
         # An assembly-only resume republishes staged pixels without recomputing them, so
         # what they ARE is recorded in the run_id prefix and nowhere in this call's
-        # parameters. Reading it back is what stops the manifest claiming S1-gated pixels
-        # over S2-only ones.
-        allow_s2_only=allow_s2_only or (dev_params.assembly_only and staged_s2_only_mode(dev_params.previous_run_id)),
+        # parameters. The prefix is therefore the ONLY source, not one of two: OR-ing the
+        # requested flag in let `allow_s2_only=True` over a bare staged run publish an
+        # S2-only manifest for S1-gated tiles, which is the same mislabelling in the other
+        # direction — and the direction that makes a later honest flag-off append fail.
+        allow_s2_only=(
+            staged_s2_only_mode(dev_params.previous_run_id) if dev_params.assembly_only else allow_s2_only
+        ),
     )
 
     # AFTER the config, and from the config's own flag. `InferenceConfig` FORCES

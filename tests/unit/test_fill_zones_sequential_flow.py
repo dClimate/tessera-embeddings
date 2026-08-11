@@ -424,6 +424,7 @@ class _FakeClient:
     def __init__(self, states):
         self._states = list(states)
         self.cancelled: list = []
+        self.reads_after_cancel = 0
 
     def __enter__(self):
         return self
@@ -432,6 +433,8 @@ class _FakeClient:
         return False
 
     def read_flow_run(self, fr_id):
+        if self.cancelled:
+            self.reads_after_cancel += 1
         state = self._states.pop(0) if len(self._states) > 1 else self._states[0]
         return SimpleNamespace(id=fr_id, state=state)
 
@@ -453,6 +456,10 @@ def _running_child(monkeypatch, run_id: str):
     Returns ``(adapter, client)``; the client records what was cancelled.
     """
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
+    # This child NEVER reports terminal, and both discard() and shutdown() now wait for
+    # confirmation — so the confirmation window has to be short or every test using this
+    # helper sits out the production five minutes.
+    monkeypatch.setattr(mod, "_CANCEL_CONFIRM_S", 0.05)
     monkeypatch.setattr(
         mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id=run_id, state=None)
     )
@@ -539,7 +546,6 @@ def test_discard_refuses_the_retry_when_the_child_will_not_confirm(monkeypatch):
     mosaic written by two runs at once is undetectable downstream, and the ingest path's
     commits do not rebase, so the loser's failure is terminal anyway.
     """
-    monkeypatch.setattr(mod, "_CANCEL_CONFIRM_S", 0.05)
     adapter, client = _running_child(monkeypatch, "fr-stuck")  # never reports terminal
     adapter.start("33N", 2025)
     _await_inflight(adapter, {("33N", 2025): "fr-stuck"})
@@ -757,6 +763,7 @@ def test_poll_error_keeps_id_registered_for_shutdown(monkeypatch):
     """
     monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.001)
     monkeypatch.setattr(mod, "_INGEST_POLL_MAX_ERRORS", 3)
+    monkeypatch.setattr(mod, "_CANCEL_CONFIRM_S", 0.05)
     monkeypatch.setattr(
         mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-5", state=None)
     )
@@ -951,3 +958,60 @@ def test_the_ingest_adapter_can_run_every_cell_the_flow_primes(wired):
     _run(zones=["01N", "02N", "03N"], look_ahead=2)
     inputs = wired["seq_kwargs"]["inputs"]
     assert inputs._executor._max_workers == 3
+
+
+def test_shutdown_waits_for_the_children_it_cancelled(monkeypatch):
+    """Teardown must not return while a child is still writing.
+
+    ``discard`` can refuse its own retry when a child will not confirm. Teardown cannot:
+    the run that races this child is a WHOLE NEW PARENT, deriving its own child tag from
+    its own flow-run id, so it can neither find this child nor be told about it. This
+    wait is the only place the two are kept apart — and those commits do not rebase, so
+    a collision is terminal for one of them.
+    """
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.01)
+    monkeypatch.setattr(mod, "_CANCEL_CONFIRM_S", 5.0)
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-slow", state=None)
+    )
+    # RUNNING while the poller holds it, then terminal once cancellation lands.
+    client = _FakeClient([_state(StateType.RUNNING, final=False)] * 4 + [_state(StateType.CANCELLED, final=True)])
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    adapter = _adapter()
+    adapter.start("33N", 2025)
+    _await_inflight(adapter, {("33N", 2025): "fr-slow"})
+
+    adapter.shutdown()
+    assert ("fr-slow", StateType.CANCELLING) in client.cancelled
+    # It read the run back after cancelling — the wait happened, rather than the request
+    # being sent and the method returning.
+    assert client.reads_after_cancel > 0
+
+
+def test_shutdown_gives_up_on_an_unreachable_api_rather_than_holding_teardown(monkeypatch):
+    """An API that is not answering is the case where confirmation is impossible rather
+    than slow, and a teardown whose job is to stop costing money must not sit out the
+    whole window re-asking it.
+    """
+    monkeypatch.setattr(mod, "_INGEST_POLL_S", 0.001)
+    monkeypatch.setattr(mod, "_INGEST_POLL_MAX_ERRORS", 3)
+    monkeypatch.setattr(mod, "_CANCEL_CONFIRM_S", 60.0)  # long: the error budget must end it
+    monkeypatch.setattr(
+        mod, "run_deployment", lambda dep, parameters, timeout, tags=None: SimpleNamespace(id="fr-dead", state=None)
+    )
+
+    class _DeadAfterCancel(_FakeClient):
+        def read_flow_run(self, fr_id):
+            if self.cancelled:
+                raise ConnectionError("prefect api down")
+            return SimpleNamespace(id=fr_id, state=_state(StateType.RUNNING, final=False))
+
+    client = _DeadAfterCancel([_state(StateType.RUNNING, final=False)])
+    monkeypatch.setattr(mod, "get_client", lambda sync_client=True: client)
+    adapter = _adapter()
+    adapter.start("33N", 2025)
+    _await_inflight(adapter, {("33N", 2025): "fr-dead"})
+
+    started = time.monotonic()
+    adapter.shutdown()
+    assert time.monotonic() - started < 10.0, "the error budget, not the deadline, must end the wait"

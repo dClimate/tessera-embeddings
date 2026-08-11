@@ -99,10 +99,18 @@ loop, not the higher attempt count, is the actual fix.
 
 
 def _staged_storage_options(path: str) -> dict | None:
-    """Return s3fs storage options for a staged read, or ``None`` for non-S3 paths.
+    """Return s3fs storage options for a staged read or write, or ``None`` off S3.
 
     The retry config is a botocore client setting and only applies to the S3
     backend; local staging paths (``/tmp/...``) get ``None`` and open normally.
+
+    Deliberately carries no credentials and no region. Unlike the ROI mask — a plain zarr
+    the Icechunk callback never reaches — staging is written by an inference actor on an
+    instance profile, and fsspec resolves AND REFRESHES that itself. The callback exists
+    because Icechunk's Rust client does not refresh, which is a problem staging does not
+    have. A non-default-region STAGING bucket would need a region here; the deployment
+    keeps staging under ``paths.outputs`` in the store's own region, so nothing threads one
+    today and inventing the parameter would leave four call sites passing None.
     """
     if fsspec.utils.get_protocol(path) == "s3":
         return {"config_kwargs": STAGED_READ_CONFIG_KWARGS}
@@ -916,7 +924,10 @@ class ZarrWriter:
             with contextlib.suppress(FileNotFoundError):
                 done_fs.rm(stale)
 
-        ds.to_zarr(path, mode="w", encoding=encoding)
+        # The same S3 client config the staged READS use. The write is the larger and
+        # more failure-prone of the two — it is the one uploading the tile — and it was
+        # the only staging op going out without the retry configuration.
+        ds.to_zarr(path, mode="w", encoding=encoding, storage_options=_staged_storage_options(path))
         # --- Completion markers, written LAST, in SEPARATE ops after to_zarr returns.
         # to_zarr can create every array's metadata before all its chunk objects, so a
         # crash mid-write leaves a tile with correct vars/shape/dtype but MISSING
