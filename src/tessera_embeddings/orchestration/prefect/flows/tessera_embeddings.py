@@ -289,9 +289,7 @@ def tessera_embeddings(
         # requested flag in let `allow_s2_only=True` over a bare staged run publish an
         # S2-only manifest for S1-gated tiles, which is the same mislabelling in the other
         # direction — and the direction that makes a later honest flag-off append fail.
-        allow_s2_only=(
-            staged_s2_only_mode(dev_params.previous_run_id) if dev_params.assembly_only else allow_s2_only
-        ),
+        allow_s2_only=(staged_s2_only_mode(dev_params.previous_run_id) if dev_params.assembly_only else allow_s2_only),
     )
 
     # AFTER the config, and from the config's own flag. `InferenceConfig` FORCES
