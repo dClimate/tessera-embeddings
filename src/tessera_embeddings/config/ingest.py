@@ -220,12 +220,22 @@ class IngestSettings(BaseModel):
     # The default is a POLICY choice pinned between two facts. It must comfortably exceed
     # the longest legitimate single leg at the default fleet width, so that a leg which ran
     # long for honest reasons never costs a failed sibling its retry; and it must be small
-    # enough that a stuck cell releases its campaign slot within about a working day of
-    # outliving that legitimate range — no bound can release it sooner without cutting legs
-    # that are merely slow. Calibrate it against measured leg durations, which live in
-    # context_docs/design/ (the ingest optimisation campaign record and the catalogue
-    # refusal record); re-derive it if per-date cost or the default width changes.
-    max_leg_wall_clock_s: int = Field(default=36 * 3600, ge=1)
+    # enough that a stuck cell releases its campaign slot promptly once it has outlived that
+    # legitimate range — no bound can release it sooner without cutting legs that are merely
+    # slow. Calibrate it against measured leg durations, which live in context_docs/design/
+    # (the ingest optimisation campaign record and the catalogue refusal record); re-derive
+    # it if per-date cost or the default width changes.
+    #
+    # LOWERED 2026-08-11, from 36 h. The old value was sized to DESCRIBE the worst case the
+    # attempt budgets could already reach, which is the wrong question: it made the ceiling
+    # knowable but expressed no judgement about what is worth waiting for. Two facts push it
+    # down. A leg holds a Dask fleet while it retries, so the wait is billed, not free — the
+    # attempt count (3) is what bounds the ordinary case, and this deadline only ever binds
+    # on a cell already behaving pathologically. And failing costs LATENCY, NOT WORK: the
+    # cell returns to the work list and resumes from its committed dates, so giving up early
+    # is cheap while giving up late holds a campaign slot against an eight-day run. 6 h still
+    # clears three legs of a slow dense cell plus expansive backoff.
+    max_leg_wall_clock_s: int = Field(default=6 * 3600, ge=1)
     # Optional base URI (an fsspec target, e.g. s3://.../perf/) for capturing a
     # Dask ``distributed.performance_report`` per child ingest. Default None =
     # off (normal runs pay nothing); set it only on a probe rung — ingest-zone-year
