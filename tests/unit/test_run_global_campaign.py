@@ -497,20 +497,22 @@ def test_all_ocean_cell_uses_empty_run_id_and_skips_cleanup(wired, monkeypatch):
 
 
 class TestValidationDeploymentForwarding:
-    """Both fill strategies must receive the validator the campaign was dispatched with.
+    """An explicit validator reaches both fill strategies; an absent one is left ALONE.
 
-    Forwarded rather than left to each child's own registration, and asserted on BOTH
-    strategies: a child registered before the validator existed carries ``None``, and a
-    campaign that failed to forward its own value would then run a thousand cells with no
-    validation at all while every deployment looked correctly configured.
+    The absent case is the load-bearing one and it is not symmetric with the rest of this
+    flow's parameters. Every other setting is forwarded unconditionally, which is right when
+    the campaign is the authority. Here it is not: the validator is a consumer's flow, named
+    on the fill deployments themselves, so passing None would override a correctly-registered
+    ref with nothing and run a whole campaign unvalidated while every deployment still looked
+    configured.
     """
 
-    def test_the_per_cell_fill_receives_it(self, wired):
+    def test_the_per_cell_fill_receives_an_explicit_ref(self, wired):
         _per_cell(validation_deployment="validate-zone-year/validate-zone-year-x")
         fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
         assert fill["validation_deployment"] == "validate-zone-year/validate-zone-year-x"
 
-    def test_the_chained_fill_receives_it(self, wired):
+    def test_the_chained_fill_receives_an_explicit_ref(self, wired):
         asyncio.run(
             mod.run_global_campaign.fn(
                 paths=_PATHS, ami_ssm_name="ami", validation_deployment="validate-zone-year/validate-zone-year-x"
@@ -519,14 +521,22 @@ class TestValidationDeploymentForwarding:
         params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
         assert params["validation_deployment"] == "validate-zone-year/validate-zone-year-x"
 
-    def test_it_is_not_derived_from_the_branch(self, wired):
-        """Unlike every other child ref. The validator is a consumer's flow rather than one
-        of this library's, so there is no base name here to suffix — a branch run that
-        names no validator validates nothing, and says so by carrying None.
+    @pytest.mark.parametrize("branch", [None, "some-branch"])
+    def test_an_unset_validator_is_omitted_rather_than_forwarded_as_none(self, wired, branch):
+        """So the CHILD deployment's own registered value stands — including its branch form.
+
+        Both branch cases, because the validator is the one child ref this flow does NOT
+        derive from the slug: there is no base name here to suffix, and the branch-scoped
+        registration on the child already carries it.
         """
-        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", branch="some-branch"))
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", branch=branch))
         params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
-        assert params["validation_deployment"] is None
+        assert "validation_deployment" not in params
+
+    def test_an_unset_validator_is_omitted_on_the_per_cell_path_too(self, wired):
+        _per_cell()
+        fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
+        assert "validation_deployment" not in fill
 
 
 def test_ingest_params_carry_s3_region(wired):

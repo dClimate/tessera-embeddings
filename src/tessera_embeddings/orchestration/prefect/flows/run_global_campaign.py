@@ -663,17 +663,19 @@ async def run_global_campaign(
             `work`, so it is never retried otherwise). Off by default; the zero-cost
             backstop for transient mosaics is an S3 lifecycle rule on the mosaics
             prefix, which this complements for immediate reclamation.
-        validation_deployment: ``flow-name/deployment-name`` of a deployment that checks
-            a landed cell, forwarded verbatim to every fill this campaign dispatches
-            (both strategies). Each fill dispatches it per cell as that cell is tagged
-            and never waits on it, so a cell is validated while the next one is being
-            filled — see
+        validation_deployment: ``flow-name/deployment-name`` of a deployment that checks a
+            landed cell. Each fill dispatches it per cell as that cell is tagged and never
+            waits on it, so a cell is validated while the next one is being filled — see
             :mod:`tessera_embeddings.orchestration.prefect.flows._cell_validation`.
-            ``None`` (the default) validates nothing, and is NOT derived from ``branch``
-            like the refs above: the validator is a consumer's flow rather than one of
-            this library's, so there is no base name here to suffix. A consumer names it
-            at registration, where a value that is absent or wrong is visible before a
-            campaign runs rather than a thousand cells later.
+
+            Unlike the refs above it is NOT derived from ``branch``: the validator is a
+            consumer's flow rather than one of this library's, so there is no base name
+            here to suffix. And unlike every other setting here, ``None`` (the default) is
+            NOT forwarded — the parameter is omitted from the dispatch entirely, so each
+            fill deployment's own registered value stands. That is where a consumer names
+            its validator, and a branch-scoped registration already carries the branch
+            suffix. Forwarding None would override that with nothing and switch validation
+            off for every cell of the run.
 
     Returns:
         Summary: pending count at start, dispatched run ids per year, totals.
@@ -922,11 +924,14 @@ async def run_global_campaign(
             "cloudwatch_log_group": cloudwatch_log_group,
             "code_bucket": code_bucket,
             "code_suffix": code_suffix,
-            # Forwarded rather than left to the child's own registered default, for the
-            # same reason every other setting here is: what the campaign was dispatched
-            # with is what its cells must be validated by, and a child registered before
-            # the validator existed would otherwise silently validate nothing.
-            "validation_deployment": validation_deployment,
+            # OMITTED when this campaign names no validator, and that is the difference
+            # between "the campaign decides" and "the campaign overrides". An omitted
+            # parameter takes the CHILD DEPLOYMENT's own registered value, which is where a
+            # consumer names its validator (and where a branch-scoped registration already
+            # carries the branch suffix). Passing None instead would override that with
+            # nothing and silently switch validation off for every cell — the failure mode
+            # of a default nobody sets.
+            **({"validation_deployment": validation_deployment} if validation_deployment else {}),
         }
 
     _ingest_params = partial(
@@ -1175,9 +1180,10 @@ async def run_global_campaign(
                         # The shared cap. Every cluster names the same limit, which is
                         # what makes it fleet-wide rather than per-cluster.
                         "ingest_limit_name": ingest_limit_name,
-                        # As in _fill_params: each cell's validation is dispatched by the
-                        # child, off its trailing assembly thread, as the cell is tagged.
-                        "validation_deployment": validation_deployment,
+                        # As in _fill_params: omitted when unset, so the child's own
+                        # registered validator stands. Each cell's validation is dispatched
+                        # by the child off its trailing assembly thread as the cell is tagged.
+                        **({"validation_deployment": validation_deployment} if validation_deployment else {}),
                     }
 
                 chained_results = await asyncio.gather(
