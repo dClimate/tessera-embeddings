@@ -128,6 +128,68 @@ cluster-year with finished mosaics already on disk.
 
 ---
 
+## 3b. Every cell validates itself before it is tagged
+
+**A cell is not finished when it is assembled. It is finished when it has been checked.** The
+validation runs as the last step of every cell, on the trailing assembly thread, in the gap between
+the year-attribute commit and `tag_zone_year` — and a cell that fails it **is never tagged**.
+
+That placement is doing three jobs at once, which is why it is that spot and not a separate step:
+
+* **It is already off the critical path.** The runner assembles cell N while cell N+1 is inferring,
+  so this delays only cell N's own tag. No GPU fleet waits on it — the fleet is released before
+  assembly and is busy on the next cell.
+* **An untagged cell reads as unfinished** to the dispatch queue, so it is retried rather than
+  entering the published set with a defect nobody blocked. Pendingness is decided by the completion
+  mark and the tag, not by run history.
+* **That state is known-recoverable**, because F2 drilled exactly it. Committed-but-untagged is the
+  mid-commit crash state, and the recovery path re-lands it. This reuses a state whose recovery is
+  measured rather than inventing one.
+
+**Cost: about 3 minutes on the densest cell** (8,714 shards), under a minute on small ones — roughly
+1.5% on top of that cell's ~196-minute trailing assembly, which the 1.21x trailing margin absorbs.
+The full check runs, pixels included: coverage, placement, provenance, seams, dimension health, the
+quantization invariant, and 10 native-resolution windows.
+
+**What blocks a tag**, in one line each: a shard written outside the land mask; a coverage
+reconciliation that does not close; an input window that was partial or had the coverage rule
+relaxed; a completion mark with no run record; an embedding seam median outside 0.80–1.25; a constant
+embedding dimension or scale-setting shares far from 1.0.
+
+**Four rules the campaign depends on:**
+
+1. **A finding fails the CELL, not the RUN.** The campaign keeps moving and the cluster's other cells
+   continue. It sits under the existing per-cell attempt budget, because a deterministic defect fails
+   every retry and must not loop.
+2. **The error is DISTINGUISHABLE to monitoring, not merely present.** Monitoring must surface it
+   *with urgency*: a published-data defect outranks every throughput signal in §7.
+3. **"Found a defect" and "could not run" are different, and only the first blocks.** A validator that
+   cannot read the store logs loudly and lets the cell tag — a guard that fails good data because the
+   guard broke is worse than no guard.
+4. **Figures go to `s3://global-tessera-embeddings/windows/<zone>/`**, and an **AI reviews them as
+   part of the monitoring round** — 10 windows per cell, reporting named features and named artifacts
+   plus plausible / cannot-tell / suspicious. Judged against that cell's own optical depth, because a
+   noise-like window on a thin cell is the correct output. Suspicious **flags for a human, never
+   blocks**.
+
+Two readings that will appear constantly and are **not** defects: the observation-count arrays step at
+tile edges on every cell (upstream of assembly, from cloud masking), and a **thin cell is not a broken
+cell** — picture quality tracks optical depth and nothing else, which `OPTICAL_THIN_MAX_OBS` records
+per pixel as a share of embedded area. Publish thin cells; label them.
+
+**A corrected cell needs a fresh tag name** — icechunk tags are write-once forever, so a refill can
+never re-pin the canonical name (`scripts/reopen_zone_year.py`).
+
+The whole design, its costs and its limits: `final-data-validation-plan.md`. A closing sweep over
+every published cell runs once at the end, for final peace of mind rather than as a gate — it renders
+a *second, differently sampled* set of windows so the inspectable total doubles.
+
+> **Wiring is the next task.** Every piece it composes exists and is tested — the check, its
+> machine-readable verdict, remote output, and the roll-up. What remains is calling it from the fill
+> path at the point named above.
+
+---
+
 ## 4. Sizing, cost, and the two things that actually bind
 
 **Figures below are results, not derivations.** [`campaign-cost-model.md`](campaign-cost-model.md)
@@ -417,6 +479,8 @@ There are **no Prefect-level retries** on any ingest flow, deliberately.
 | **Cells actually running** vs the cap | the ingest gate is fleet-wide and the campaign sets it from `max_parallel_ingest`, so it cannot be missing — but if that parameter is too low nothing complains, and the fleet simply runs narrow |
 | **Zones failing twice** | the retry loop stops on no-progress; these need a human |
 | **Coverage-gate rejection rate** | 365 dates per zone-year is measured on three zones; heavy rejection changes both time and cost |
+| **A cell that failed VALIDATION** (§3b) | the highest-priority signal here, and the only one about the PRODUCT rather than the machinery. A cell that failed is untagged and will be retried, so it is not lost — but a repeat, or two cells failing the same check, is systemic and wants a human before the campaign spends another day writing the same defect |
+| **The AI window review's `suspicious` verdicts** (§3b) | a ranking, not a gate. Read the worst few per round; ignore a thin cell rated poorly for being thin |
 
 ---
 
