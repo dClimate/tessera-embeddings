@@ -40,10 +40,14 @@ showed. One uint16 chunk at 4096² is 34 MB, so a single band-date materializes
 
 ## Measurement
 
-`scripts/measure_live_chunk_cropping.py` coarsens each zone's frozen
-`tile_live_2048` bitmap (ADR-010) onto the 4096-px ingest grid and costs three
-cropping strategies against today's full-extent baseline. It reads a few KB per
-zone from the coverage repo — no cluster, no mosaic, no writes.
+A one-off script coarsened each zone's frozen `tile_live_2048` bitmap (ADR-010)
+onto the 4096-px ingest grid and costed three cropping strategies against the
+full-extent baseline, reading a few KB per zone from the coverage repo — no
+cluster, no mosaic, no writes. It was **deleted once the strategy was chosen**
+(`scripts/measure_live_chunk_cropping.py`, removed 2026-08-11): it exists to pick
+between the three rows below, and the mask it reads is frozen for the campaign's
+duration. Recover it from history if a future delivery changes the coverage
+enough to reopen the choice.
 
 All 112 land zones, chunks computed per band-date:
 

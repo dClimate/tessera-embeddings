@@ -697,8 +697,9 @@ historical px/s measurements.
 Derived from CloudWatch `CHUNK_SUMMARY` records over a 96-hour window (`/ecs/global-tessera-dev`,
 29,886 successful chunks across 31 streams and 13 zones, 1,633 chunks carrying the radar
 telemetry), through the truncation-bisecting profiler. Full working:
-`yield-embeddings/temp/cost-model-revision-derivation.md` (commit `b8218da` on
-`dev/global-tessera`); this section carries what the model needs.
+[`inference_cost_basis_revision_2026_08.md`](inference_cost_basis_revision_2026_08.md) — its
+METHOD is current and its NUMBERS are the pre-completion ones this table's last row supersedes.
+This section carries what the model needs.
 
 **The headline.**
 

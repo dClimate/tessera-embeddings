@@ -24,20 +24,36 @@ context_docs/
 │   ├── 011-campaign-zone-ingestion.md
 │   ├── 012-validated-equivalence-for-inference-outputs.md
 │   └── 013-optional-s1-s2-only-pixels.md
-└── design/           Long-form framing docs (ported from planning)
-    ├── campaign-plan.md          <- START HERE for the global campaign
-    ├── campaign-cost-model.md
-    ├── campaign-cluster-sizing.md
-    ├── d3-sharding-plan.md
-    ├── global-store-test-impl-spec.md
-    ├── global-store-test-plan.md
-    ├── inference-perf-run-ledger.md
-    ├── inference_gpu_saturation_profile_2026_07.md
-    ├── ingest-graph-and-stac-budget.md
+└── design/           Long-form framing docs, grouped by what they answer
+    │
+    │  THE CAMPAIGN — start here
+    ├── campaign-plan.md                          <- START HERE; §10 is the authority map
+    ├── campaign-cost-model.md                    every cost, rate, fleet size, GPU-hour
+    ├── campaign-cluster-sizing.md                how work balances across N clusters
+    ├── campaign_inference_profile_2026_08.md     measured per-cell inference behaviour
+    ├── inference_cost_basis_revision_2026_08.md  the working behind cost-model §6b
+    ├── radar_source_coverage_2026_08.md          which zones publish no usable radar
+    ├── inference-perf-run-ledger.md              raw per-run measurements
+    │
+    │  INGEST
+    ├── ingest_optimization_campaign_2026_07.md   every ingest measurement
+    ├── ingest_concurrency_investigation_2026_08.md
+    ├── ingest_read_failure_causes_2026_08.md     the two WarpOperationError causes
+    ├── catalogue_refusal_classification_2026_08.md
     ├── ingest-live-tile-cropping.md
     ├── ingest-live-tile-cropping-icechunk-experiment.md
-    ├── ingest_optimization_campaign_2026_07.md
-    └── region-writes.md
+    ├── ingest-graph-and-stac-budget.md
+    ├── region-writes.md
+    │
+    │  INFERENCE + STORE
+    ├── inference_gpu_saturation_profile_2026_07.md
+    ├── single-global-alignment.md                why single-ROI was aligned to the campaign
+    ├── d3-sharding-plan.md                       settled ADR-008 D3; spec for scale_tests/t8
+    ├── global-store-test-plan.md                 the T0-T8 scale tests
+    ├── global-store-test-impl-spec.md
+    │
+    │  MODEL
+    └── v2_data_source_alignment_2026_07.md       AWS-vs-MPC input for Tessera v2
 ```
 
 ## How to read these

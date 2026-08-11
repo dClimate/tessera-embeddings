@@ -192,7 +192,7 @@ Sizing is adequate for every test except the label probe, where the effective sa
 size is the number of spatially blocked folds (70–77 at 20 km) rather than the pixel
 count, and which resolves differences of roughly 0.6 to 1.3 balanced-accuracy points
 — comfortably below v2's claimed 3.5-point margin over v1.1. Power analysis and
-usage in [`temp/rois/README.md`](../../temp/rois/README.md).
+usage in `temp/rois/README.md` — **untracked scratch, not in the repo**, so this is a pointer for whoever still has that working directory rather than a link.
 
 Also note the existing Iowa validation stores are **ascending-orbit only**, while
 the global campaign defaults to `s1_orbit="both"` — so they under-represent the SAR
