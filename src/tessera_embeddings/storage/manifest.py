@@ -80,6 +80,26 @@ class StoreManifest:
     which an unrecorded field is simply unknown and cannot disagree with anything.
     """
 
+    REQUIRED_TO_APPEND: ClassVar[frozenset[str]] = frozenset()
+    """Fields whose absence from a store means it cannot be SHOWN safe to append to.
+
+    The third answer to "the store does not record this", and the one the other two get
+    wrong for a guard. :data:`ABSENT_MEANS_OFF` reads absence as a known value, which suits
+    a boolean policy and nothing else. The default reads it as unknown and lets the append
+    through, which is right for a field that merely DESCRIBES a store and exactly wrong for
+    one that exists to make a resume safe: the guard then protects every store except the
+    ones written before it existed, which are the only stores it was ever needed for.
+
+    A field belongs here when this run knows its value, the store records none, and
+    appending anyway would mix two policies in one store with nothing recording that it
+    happened. The refusal is deliberately blunt — such a store must be rebuilt — and it is
+    cheap where it fires, because a store being appended to is by definition incomplete.
+
+    Only fires when the CURRENT manifest carries the field. A value legitimately absent
+    this run (no land mask behind a plain ROI, no admission threshold on a radar store)
+    never reaches the check.
+    """
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a dict suitable for writing to zarr attrs.
 
@@ -121,9 +141,18 @@ class StoreManifest:
             ConfigMismatchError: If any structural parameter differs.
         """
         if existing is None:
+            # A store with NO manifest is softer than one with a PARTIAL manifest, which
+            # REQUIRED_TO_APPEND now refuses — and that asymmetry is deliberate rather than
+            # missed. This path predates manifests entirely, so it cannot distinguish "old
+            # store" from "store built under a policy that has since changed"; refusing it
+            # would strand every pre-manifest artifact on a suspicion. A partial manifest is
+            # different: the store demonstrably kept a manifest and demonstrably lacks the
+            # field, which is evidence rather than silence.
             logger.warning(
-                "No _manifest in %s — legacy store, skipping structural validation. "
-                "Re-create the store to enable manifest-based safety checks.",
+                "No _manifest in %s — legacy store, skipping structural validation. Nothing "
+                "here can tell whether it was built under this run's mask, threshold or "
+                "ingest code, so an append MAY mix policies. Re-create the store to enable "
+                "manifest-based safety checks.",
                 store_path,
             )
             return
@@ -142,6 +171,11 @@ class StoreManifest:
             current_val = current[key]
             if existing_val is not None and existing_val != current_val:
                 mismatches[key] = (existing_val, current_val)
+            elif existing_val is None and key in self.REQUIRED_TO_APPEND:
+                # The store cannot demonstrate it was built under this run's policy, and a
+                # resume's whole premise is that it was. Refused rather than assumed — see
+                # REQUIRED_TO_APPEND for why "unknown" must not read as "compatible" here.
+                mismatches[key] = ("<not recorded — cannot be shown compatible>", current_val)
             elif existing_val is None and key in self.ABSENT_MEANS_OFF:
                 # ABSENT is a VALUE for these fields, not a gap. The general rule above
                 # skips a key the store lacks, so that a manifest written by newer code
@@ -214,6 +248,23 @@ class IngestManifest(StoreManifest):
     whether a FINISHED mosaic is reusable, and a code hash there would declare every one
     of them stale on any ingest change.
     """
+
+    #: ONE field, not three, and the difference is what each of them can actually change.
+    #:
+    #: ``ingest_code_identity`` is here because the ingest source DOES change mid-campaign —
+    #: that is the whole reason it exists, added 2026-08-05 after the duplicate-copy
+    #: selection changed which granule supplies a date. A mosaic written before that carries
+    #: no record of the code that built it, and resuming it under today's code mixes exactly
+    #: what the field was added to prevent. Absence there is not "nothing to contradict"; it
+    #: is "cannot be shown compatible", and the store is incomplete anyway.
+    #:
+    #: ``coverage_sha256`` and ``min_valid_coverage`` are deliberately NOT here, and their
+    #: legacy allowance stays (``test_a_store_predating_the_field_is_not_retro_blocked``).
+    #: A campaign holds its mask and its admission threshold fixed by contract, and the
+    #: repo owner has ruled that no mid-campaign mask change will occur — so refusing a
+    #: store for not recording a value that cannot have changed would guard a pattern
+    #: nobody anticipates, at the cost of stranding multi-terabyte mosaics.
+    REQUIRED_TO_APPEND: ClassVar[frozenset[str]] = frozenset({"ingest_code_identity"})
 
     roi_manifest_hash: str | None = None
     coverage_sha256: str | None = None

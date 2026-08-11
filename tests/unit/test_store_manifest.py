@@ -387,14 +387,18 @@ class TestIngestCodeIsPartOfMosaicIdentity:
         with pytest.raises(ConfigMismatchError, match="ingest_code_identity"):
             IngestManifest.from_roi_store(roi).validate_against(stored, "s3://in/mosaics/33N/2025/reflectance.zarr")
 
-    def test_a_store_written_before_the_field_existed_still_resumes(self, tmp_path):
-        """Absent is not a mismatch: nothing recorded it, so nothing can contradict it.
+    def test_a_store_that_records_no_ingest_code_cannot_be_resumed(self, tmp_path):
+        """Absent here is "cannot be shown compatible", not "nothing to contradict".
 
-        Rejecting these would strand every mosaic already on disk behind a manual
-        delete, for a hazard their own writes never had a chance to avoid.
+        A mosaic written before this field existed carries no record of the code that
+        built it — and the ingest source demonstrably changes mid-campaign, which is why
+        the field was added at all. Letting it through protected every mosaic EXCEPT the
+        ones whose provenance is unknown, which are the only ones that needed it. The
+        refusal is cheap where it fires: a store being appended to is incomplete anyway.
         """
         legacy = {"manifest_type": "IngestManifest", "roi_manifest_hash": None}
-        IngestManifest.from_roi_store(self._roi(tmp_path)).validate_against(legacy, "legacy.zarr")
+        with pytest.raises(ConfigMismatchError, match="ingest_code_identity"):
+            IngestManifest.from_roi_store(self._roi(tmp_path)).validate_against(legacy, "legacy.zarr")
 
     def test_the_identity_is_deterministic(self):
         assert ingest_code_identity() == ingest_code_identity()
