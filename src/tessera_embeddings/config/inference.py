@@ -192,6 +192,27 @@ SCL_VALID_CLASSES = frozenset({4, 5, 6, 7, 10, 11})
 #: however it is sampled.
 RADAR_LIGHT_MAX_OBS = 12
 
+#: A pixel with fewer than this many valid OPTICAL observations in the year is
+#: "optical-light".
+#:
+#: The counterpart to :data:`RADAR_LIGHT_MAX_OBS`, and the same argument: a thin year and a
+#: rich one both produce an embedding, and nothing about the embedding says which it came
+#: from. Only the extreme was previously visible — a tile where NO pixel survived the
+#: validity filter is recorded as an optical skip — so every depth above zero read as
+#: ordinary data.
+#:
+#: Higher than the radar line, because the sensors are not comparable. Radar sees through
+#: cloud, so its observation count is set by orbit geometry alone and roughly one a month is
+#: a thin-but-usable year. Optical loses most of its passes to cloud, so the count that
+#: survives masking is a small fraction of the overpasses, and the model resamples across
+#: whatever remains. Forty is roughly a valid observation a week and a half.
+#:
+#: Only a REPORTING line: nothing refuses a cell for being under it, and the exact per-pixel
+#: counts live in the store's ``s2_obs_count`` array either way. Raising or lowering it
+#: changes what future summaries say and never what is published, so it is a config change
+#: rather than a migration.
+OPTICAL_LIGHT_MAX_OBS = 40
+
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
 #:
 #: Distinct from an empty request: nobody ASKS for ``"none"``, it is what ``"both"`` resolves

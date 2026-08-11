@@ -518,8 +518,19 @@ def check_time_window_coverage(
         # on the UNEXPLAINED count, never on the month total, or it fires on healthy cells.
         _assessed = root.attrs.get(ASSESSED_WINDOW_ATTR)
         _explained = _months_within_assessed(missing, _assessed) if missing else set()
+        # The ingest's own account of what it looked at and did not keep, carried onto the
+        # year because it is recorded on the MOSAIC and the mosaic is deleted once a cell
+        # lands. Empty dates are the cloud-and-footprint answer — dates the window examined
+        # that yielded nothing — and unreadable dates are the ones it deliberately gave up on.
+        # Together they turn "why is this year thin?" from an unanswerable question into a
+        # read, WITHOUT needing a density threshold: a month holding two dates because two is
+        # all the sky offered is not the same as one holding two because the rest were lost,
+        # and only these counts tell them apart.
+        _unreadable = root.attrs.get("assessed_unreadable_dates")
         summary["stores"][label].update(
             assessed_window=list(_assessed) if isinstance(_assessed, (list, tuple)) else None,
+            assessed_empty_dates=int(root.attrs.get("assessed_empty_dates") or 0),
+            assessed_unreadable_dates=len(_unreadable) if isinstance(_unreadable, (list, tuple)) else 0,
             months_absent=len(missing),
             months_absent_examined=len(_explained),
             months_absent_unexplained=len(missing) - len(_explained),

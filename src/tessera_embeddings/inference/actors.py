@@ -29,6 +29,7 @@ import requests
 
 from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
+    OPTICAL_LIGHT_MAX_OBS,
     PREFETCH_DEPTH,
     RADAR_LIGHT_MAX_OBS,
     S1_ORBIT_NONE,
@@ -1328,7 +1329,15 @@ class InferenceActor:
             s1_free_px = int((embedded & (asc == 0) & (desc == 0)).sum())
             obs_at_embedded = asc[embedded].astype(np.uint32) + desc[embedded].astype(np.uint32)
             s1_light_px = int(((obs_at_embedded > 0) & (obs_at_embedded < RADAR_LIGHT_MAX_OBS)).sum())
-            del embedded, obs_at_embedded
+            # Optical depth, from the same mask and the same principle. Previously only the
+            # EXTREME was visible: a tile where nothing survived the validity filter is recorded
+            # as a skip, so every depth above zero published as ordinary data even though a year
+            # seen a handful of times and one seen weekly are not the same embedding. No
+            # optical-free count is needed — that case IS the skip, and a skipped chunk never
+            # reaches here.
+            s2_at_embedded = obs_buffers["s2_obs_count"][embedded]
+            s2_light_px = int((s2_at_embedded < OPTICAL_LIGHT_MAX_OBS).sum())
+            del embedded, obs_at_embedded, s2_at_embedded
 
             def _timed_write() -> str:
                 # "write" is a separate context slot: the upload overlaps the
@@ -1414,6 +1423,7 @@ class InferenceActor:
                 # mask are both in memory; recomputing it later would mean reading the grid.
                 "s1_free_pixels": s1_free_px,
                 "s1_light_pixels": s1_light_px,
+                "s2_light_pixels": s2_light_px,
                 "elapsed_sec": elapsed,
                 "instance_id": self.instance_id,
                 "write_deferred": True,

@@ -156,3 +156,41 @@ def test_the_same_gap_without_an_assessed_window_is_unexplained(monkeypatch) -> 
 
     with pytest.raises(InsufficientCoverageError, match="missing 1"):
         check_time_window_coverage("mem://m", parse_time_window("December 2024"), s1_orbit="none")
+
+
+def test_the_ingests_own_account_of_dropped_dates_is_carried_onto_the_year(monkeypatch) -> None:
+    """Dates examined and not kept are recorded on the MOSAIC, which is deleted after a fill.
+
+    Carrying them onto the year is what makes "why is this year thin?" answerable later, and it
+    needs no density threshold: two dates because two is all the sky offered is not the same as
+    two because the rest were lost, and only these counts separate them.
+    """
+    root = zarr.open_group(store=zarr.storage.MemoryStore(), mode="w")
+    values = np.array(_year_dates(2024, range(1, 13)), dtype="datetime64[ns]").astype("int64")
+    arr = root.create_array("time", shape=(len(values),), dtype="int64")
+    arr[:] = values
+    arr.attrs["units"] = "nanoseconds since 1970-01-01"
+    root.attrs["assessed_window"] = ["2024-01-01", "2024-12-31"]
+    root.attrs["assessed_empty_dates"] = 137
+    root.attrs["assessed_unreadable_dates"] = ["2024-03-04", "2024-07-19"]
+    monkeypatch.setattr(data_loading, "open_store_as_zarr_group", lambda *a, **k: root)
+
+    summary = check_time_window_coverage("mem://m", parse_time_window("December 2024"), s1_orbit="none")
+    store = summary["stores"]["reflectance"]
+    assert store["assessed_empty_dates"] == 137
+    assert store["assessed_unreadable_dates"] == 2
+    # A count, not the list: the record is a summary and the dates themselves stay on the
+    # mosaic for as long as it exists.
+    assert isinstance(store["assessed_unreadable_dates"], int)
+
+
+def test_a_store_with_no_assessment_records_zero_rather_than_nothing(monkeypatch) -> None:
+    """Absent attrs read as zero drops, which is the only safe default: it never invents a
+    loss, and a reader can tell "no assessment" from the window field being None.
+    """
+    _serve(monkeypatch, _year_dates(2024, range(1, 13)))
+    summary = check_time_window_coverage("mem://m", parse_time_window("December 2024"), s1_orbit="none")
+    store = summary["stores"]["reflectance"]
+    assert store["assessed_window"] is None
+    assert store["assessed_empty_dates"] == 0
+    assert store["assessed_unreadable_dates"] == 0
