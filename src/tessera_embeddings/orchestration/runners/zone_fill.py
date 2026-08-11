@@ -927,8 +927,8 @@ def assemble_zone_year(
             zone,
             year,
             radar_coverage["s1_free_pct"],
-            radar_coverage["s1_light_pct"],
-            radar_coverage["s1_light_below_obs"],
+            radar_coverage["s1_thin_pct"],
+            radar_coverage["s1_thin_below_obs"],
             radar_coverage["tiles_fully_s1_free"],
         )
     snapshot = writer.assemble_global(

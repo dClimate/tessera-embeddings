@@ -58,8 +58,8 @@ import zarr
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
-    OPTICAL_LIGHT_MAX_OBS,
-    RADAR_LIGHT_MAX_OBS,
+    OPTICAL_THIN_MAX_OBS,
+    RADAR_THIN_MAX_OBS,
     TimeWindow,
 )
 from tessera_embeddings.config.store_layout import INNER_PX, OBS_COUNT_VARS, SINGLE, StoreLayout
@@ -2202,7 +2202,7 @@ def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
     unembedded, so a fraction of the grid would be dominated by area no radar was ever
     expected over and would say nothing about the data.
     """
-    embedded = free = light = s2_light = 0
+    embedded = free = light = s2_thin = 0
     reported = silent = 0
     for r in results:
         if r.get("status") != "success":
@@ -2213,8 +2213,8 @@ def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
         reported += 1
         embedded += int(r.get("valid_pixels", 0))
         free += int(r["s1_free_pixels"])
-        light += int(r.get("s1_light_pixels", 0))
-        s2_light += int(r.get("s2_light_pixels", 0))
+        light += int(r.get("s1_thin_pixels", 0))
+        s2_thin += int(r.get("s2_thin_pixels", 0))
     if silent:
         # A RESUMED tile is a synthetic success carrying no counters, and dropping it from
         # both sides of the ratio still leaves a figure — computed over the tiles this run
@@ -2237,15 +2237,15 @@ def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
         "embedded_px": embedded,
         "s1_free_px": free,
         "s1_free_pct": round(100.0 * free / embedded, 3),
-        "s1_light_px": light,
-        "s1_light_pct": round(100.0 * light / embedded, 3),
-        "s1_light_below_obs": RADAR_LIGHT_MAX_OBS,
+        "s1_thin_px": light,
+        "s1_thin_pct": round(100.0 * light / embedded, 3),
+        "s1_thin_below_obs": RADAR_THIN_MAX_OBS,
         # The optical counterpart, on the same denominator so the two are directly
         # comparable. There is no optical-FREE figure: a tile with no valid optical pixel is
         # a skip and never produces a result, so `optical_skips` is where that case lives.
-        "s2_light_px": s2_light,
-        "s2_light_pct": round(100.0 * s2_light / embedded, 3),
-        "s2_light_below_obs": OPTICAL_LIGHT_MAX_OBS,
+        "s2_thin_px": s2_thin,
+        "s2_thin_pct": round(100.0 * s2_thin / embedded, 3),
+        "s2_thin_below_obs": OPTICAL_THIN_MAX_OBS,
         "chunks_reporting": reported,
         # Where, coarsely: a tile that is ENTIRELY radar-free localises the gap without
         # storing a per-tile grid, and distinguishes a concentrated absence (whole tiles,

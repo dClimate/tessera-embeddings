@@ -182,7 +182,7 @@ S2_BAND_ORDER = ["red", "blue", "green", "nir", "nir08", "rededge1", "rededge2",
 # SCL classes considered valid for masking (complement of S2_SCL_INVALID_CLASSES)
 SCL_VALID_CLASSES = frozenset({4, 5, 6, 7, 10, 11})
 
-#: A pixel with fewer than this many radar observations in the year is "radar-light".
+#: A pixel with fewer than this many radar observations in the year is "radar-thin".
 #:
 #: Reported per year alongside the radar-free count so a downstream user can tell a pixel
 #: the radar barely saw from one it saw normally — a distinction the embedding itself does
@@ -190,12 +190,12 @@ SCL_VALID_CLASSES = frozenset({4, 5, 6, 7, 10, 11})
 #: this only sets where the summary draws its line, and it is deliberately generous:
 #: twelve is roughly one observation a month, below which a year's radar signal is thin
 #: however it is sampled.
-RADAR_LIGHT_MAX_OBS = 12
+RADAR_THIN_MAX_OBS = 12
 
 #: A pixel with fewer than this many valid OPTICAL observations in the year is
-#: "optical-light".
+#: "optical-thin".
 #:
-#: The counterpart to :data:`RADAR_LIGHT_MAX_OBS`, and the same argument: a thin year and a
+#: The counterpart to :data:`RADAR_THIN_MAX_OBS`, and the same argument: a thin year and a
 #: rich one both produce an embedding, and nothing about the embedding says which it came
 #: from. Only the extreme was previously visible — a tile where NO pixel survived the
 #: validity filter is recorded as an optical skip — so every depth above zero read as
@@ -211,7 +211,7 @@ RADAR_LIGHT_MAX_OBS = 12
 #: counts live in the store's ``s2_obs_count`` array either way. Raising or lowering it
 #: changes what future summaries say and never what is published, so it is a config change
 #: rather than a migration.
-OPTICAL_LIGHT_MAX_OBS = 40
+OPTICAL_THIN_MAX_OBS = 40
 
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
 #:

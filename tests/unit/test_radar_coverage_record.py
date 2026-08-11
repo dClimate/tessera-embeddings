@@ -15,7 +15,7 @@ no radar was ever expected over.
 
 from __future__ import annotations
 
-from tessera_embeddings.config.inference import RADAR_LIGHT_MAX_OBS
+from tessera_embeddings.config.inference import RADAR_THIN_MAX_OBS
 from tessera_embeddings.inference.assembly import summarise_radar_coverage
 from tessera_embeddings.storage.shard_writer import run_provenance
 
@@ -26,7 +26,7 @@ def _chunk(valid: int, free: int, light: int = 0, status: str = "success") -> di
         "status": status,
         "valid_pixels": valid,
         "s1_free_pixels": free,
-        "s1_light_pixels": light,
+        "s1_thin_pixels": light,
     }
 
 
@@ -58,13 +58,13 @@ class TestSummarisingAYear:
         summary = summarise_radar_coverage([_chunk(1000, 100, light=250)])
         assert summary is not None
         assert summary["s1_free_pct"] == 10.0
-        assert summary["s1_light_pct"] == 25.0
+        assert summary["s1_thin_pct"] == 25.0
 
     def test_the_light_threshold_is_recorded_with_the_figure(self) -> None:
         """A percentage whose threshold is not stated cannot be compared across builds."""
         summary = summarise_radar_coverage([_chunk(10, 0, light=1)])
         assert summary is not None
-        assert summary["s1_light_below_obs"] == RADAR_LIGHT_MAX_OBS
+        assert summary["s1_thin_below_obs"] == RADAR_THIN_MAX_OBS
 
     def test_failed_chunks_are_excluded_from_the_denominator(self) -> None:
         """A failed chunk embedded nothing, so counting it would dilute the fraction."""
@@ -145,7 +145,7 @@ def test_a_resume_records_no_summary_rather_than_one_for_the_part_it_redid():
     an unknowable margin and stored as the year's with nothing saying so.
     """
     mixed = [
-        {"status": "success", "valid_pixels": 100, "s1_free_pixels": 10, "s1_light_pixels": 20},
+        {"status": "success", "valid_pixels": 100, "s1_free_pixels": 10, "s1_thin_pixels": 20},
         {"status": "success", "valid_pixels": 100},  # resumed: staged by an earlier attempt
     ]
     assert summarise_radar_coverage(mixed) is None
@@ -156,7 +156,7 @@ def test_a_skipped_tile_does_not_suppress_the_summary():
     is a complete answer, not a missing one, and must not cost the year its summary.
     """
     results = [
-        {"status": "success", "valid_pixels": 100, "s1_free_pixels": 10, "s1_light_pixels": 20},
+        {"status": "success", "valid_pixels": 100, "s1_free_pixels": 10, "s1_thin_pixels": 20},
         {"status": "skipped", "valid_pixels": 0},
     ]
     summary = summarise_radar_coverage(results)
