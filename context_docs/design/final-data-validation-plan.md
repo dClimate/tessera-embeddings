@@ -31,7 +31,7 @@ is not:
 | **provenance reconciliation** | **exact, every cell** | attribute reads |
 | **pixels** | **sampled — one 256-px chunk per 2048-px shard, 1/64 = 1.6% of each shard** | the only axis where the budget binds |
 | **seam boundaries** | sampled per axis | each is a pixel read on both sides |
-| **native-resolution windows** | a handful per cell | for a human to look at |
+| **native-resolution windows** | **a handful per cell, for EVERY cell, persisted** | for a human to look at, on demand, without re-reading — §3c |
 
 **Do not describe the result as "every pixel checked".** The honest claim is: *every cell, every
 shard's existence and placement exactly, and 1.6% of every shard's pixels systematically sampled.*
@@ -52,56 +52,104 @@ The pixel budget is then aimed only at shards already known to exist.
 
 Two passes, and the first is the one that changes the campaign's code.
 
-### 3a. Per-cell, inside the campaign, BEFORE the tag
+### 3a. Per-cell, inside the campaign, BEFORE the tag — the FULL check, pixels included
 
-**Run the exact half as the last step of every cell, and raise on a blocking finding.** A defect
-found on cell 3 of 1,000 is a fix; the same defect found at the end is 1,000 refills.
+**Run the whole instrument as the last step of every cell, and raise on a blocking finding.** A
+defect found on cell 3 of 1,000 is a fix; the same defect found at the end is 1,000 refills.
 
-**Where exactly: in the gap between the year-attribute commit and `tag_zone_year`.** That placement
-is deliberate and is worth more than the convenience of a separate script:
+**Where exactly: on the trailing assembly thread, in the gap between the year-attribute commit and
+`tag_zone_year`.** That placement does the work of three separate requirements at once:
 
-* The data and provenance are committed, so validation can read the real thing.
-* **A cell that fails is never tagged.** Pendingness is decided by the completion mark and the tag,
-  so an untagged cell reads as unfinished to the dispatch queue and is retried — rather than entering
-  the published set with a defect nobody blocked.
-* **We know that state is recoverable, because F2 drilled it.** A cell left committed-but-untagged is
-  exactly the mid-commit crash state, and the recovery path re-lands it. This gate reuses a state
-  whose recovery is measured rather than inventing one.
+* **It is already off the critical path.** The chained runner assembles cell N on a trailing thread
+  while cell N+1 is inferring. Validation there delays **only cell N's tag** and blocks nothing else —
+  no GPU fleet waits on it, because the fleet is released before assembly and is busy on the next
+  cell.
+* **A cell that fails is never tagged.** Pendingness is decided by the completion mark and the tag, so
+  an untagged cell reads as unfinished to the dispatch queue and is retried, rather than entering the
+  published set with a defect nobody blocked.
+* **That state is known-recoverable, because F2 drilled it.** A committed-but-untagged cell is exactly
+  the mid-commit crash state, and the recovery path re-lands it. This reuses a state whose recovery is
+  measured rather than inventing one.
 
-Requirements on the mechanism:
+**Timing, measured rather than estimated.** The full pass — coverage, reconciliation, placement,
+seams, dimension health, quantization invariant — costs **3 minutes on the largest cell we have**
+(37N/2021, 8,714 shards) and under a minute on small ones. Against that cell's own ~196-minute
+assembly that is **about 1.5% added to the trailing budget**. The trailing-assembly margin at the
+planned width is 1.21x, so it absorbs this with room; it is the one place the cost is not literally
+free, and it is worth knowing rather than discovering.
 
-* **It raises.** Not a log line, not a warning — a deterministic error, so the failure is visible in
-  the run's state and in the campaign's own failed-run monitoring.
-* **The error names the cell and the finding**, so triage needs no log archaeology.
-* **It must not loop.** A deterministic defect will fail every retry, so the gate must sit under the
-  existing per-cell attempt budget; a cell that exhausts it is failed and left for a human, not
-  re-dispatched forever.
-* **Only the exact half runs here.** Coverage cross-tab, reconciliation, placement. No pixel reads,
-  so it adds about a second to a multi-hour cell.
+**Three implementation constraints, each guarding a way this could go wrong:**
+
+1. **It raises, and the error names the cell and the finding.** Not a log line — a deterministic error,
+   visible in the run's state and in the campaign's failed-run monitoring, so triage needs no log
+   archaeology.
+2. **A finding fails the CELL, not the RUN.** On the chained path an exception on the trailing thread
+   must be recorded as that cell's failure through the existing per-cell failure path, so the other
+   cells in the cluster continue. It must also sit under the existing per-cell attempt budget, because
+   a deterministic defect fails every retry and must not loop.
+3. **"Found a defect" and "could not run" are different, and only the first blocks.** A validator that
+   cannot read the store — an S3 hiccup, a bug of its own — must log loudly and let the cell tag. A
+   guard that fails good data because the guard broke is worse than no guard, and this is the same
+   three-state discipline the rest of the tooling uses.
+
+**Everything, including the native-resolution windows.** The windows are the one check that is not
+reducible to a statistic, and they cost a few pixel reads on top of a pass already reading pixels.
+Render them for every cell, not for a chosen few.
 
 ### 3b. Whole-globe, once, at the end
 
-The full instrument — pixels, seams, detail windows, dimension health — over every published cell,
-producing the roll-up of §7. One consistent snapshot of the finished product, and the pass that
-catches anything the cheap gate cannot see.
+Not a repeat of the expensive half. By then every cell has already been checked at full depth and has
+persisted its verdict, so the closing sweep is:
+
+* **the free exact half, re-run globally** — coverage, placement and reconciliation from the chunk
+  manifest across every cell, giving one consistent snapshot of the finished product at essentially no
+  cost;
+* **a roll-up of the stored per-cell verdicts** (§7), which is where aggregate patterns become visible;
+* **pixel re-reads only where warranted** — cells with a finding, plus a random audit sample to confirm
+  the stored verdicts still describe the store.
+
+This is strictly better than re-reading everything: the same coverage, a fraction of the cost, and any
+disagreement between a stored verdict and a fresh read is itself a finding worth having.
+
+**3b writes to the same place as 3a** (§3c), so the folder always holds the most recent render of every
+cell. After 3a a complete set already exists; 3b refreshes whichever cells it re-reads.
+
+### 3c. Where the output goes
+
+**`s3://global-tessera-embeddings/windows/<zone>/`** — per zone, from both passes.
+
+Filenames already carry the zone and the year (`detail_37N_2021.png`, `coverage_37N_2021.png`,
+`seams_…`, `bands_…`), so several years of one zone share a folder without colliding, and a zone's
+whole history is browsable in one place. The machine-readable verdict (§7) is written beside the
+figures, which is what lets the closing sweep roll up stored results instead of re-reading the product.
+
+**One tooling change this needs.** `embedding_reality_check.py`'s `--out` currently takes a local
+path. It must accept an **fsspec target** so a campaign run can write straight to S3 without a
+separate upload step — the same pattern `IngestSettings.perf_report_uri` already uses for its
+performance reports, so there is precedent rather than a new convention.
 
 ## 4. Per-cell pass criteria
 
-**The four that gate a cell in 3a** — all exact, all metadata:
+**All seven gate a cell in 3a.** The first four are exact and cost no pixels; the last three need
+the sampled read, and are worth its 3 minutes.
 
 1. **The coverage reconciliation closes**: `written + skipped == live`.
 2. **Zero shards written outside the land mask.**
 3. **`input_coverage` shows a full window and `relaxed: false`.** A cell published from a partial
    input through the coverage relaxation is the failure class P7 produced by accident.
 4. **The completion mark and the run record agree** — the year is marked and carries a record.
-
-**The additional ones in the closing sweep of 3b**, which need pixels:
-
-5. **No constant embedding dimension**, and the **scale-setting shares sum to 1.0** — the invariant
-   confirming the data was quantized the way every reader assumes.
+5. **No constant embedding dimension**, and the **scale-setting shares sum to 1.0**.
+   A **constant** dimension is one of the 128 numbers taking the same value at every sampled pixel —
+   standard deviation exactly zero. It is a dead output channel carrying no information, invisible in
+   any picture because three components make the image and the other 125 are projected away, which is
+   why it has to be found numerically. The likely causes are a channel the encoder head never
+   populated or a write that dropped one; what makes it blocking is less the wasted dimension than
+   what it implies about whether the rest are intact. The **shares summing to 1.0** is the separate
+   invariant confirming the data was quantized the way every reader assumes.
 6. **No seam on the embeddings**, on either axis — see §5 for why this one and not the other.
-7. **The detail windows look like the Earth.** Not reducible to a statistic, and the check that
-   caught the thin cells. Judge against that cell's own optical depth — §6.
+7. **The detail windows look like the Earth.** Not reducible to a statistic, and the check that caught
+   the thin cells. Rendered and persisted per cell so a human can look at any of them later; judge
+   against that cell's own optical depth — §6.
 
 ## 5. The two seam rows are not the same finding
 
@@ -261,10 +309,13 @@ Two operational notes:
 
 ## 13. Open questions for review
 
-1. **Is the 1.6% pixel sample the accepted definition of the closing sweep**, or should it raise
+1. **Is the 1.6% pixel sample the accepted definition**, or should the closing sweep raise
    `--max-shards`/`--seam-boundaries` and pay the extra?
-2. **Who reads the roll-up, and against what deadline?** The sweep is worth little if its output
+2. **Should 3b re-render every cell's windows, or only the cells it re-reads?** After 3a a complete set
+   already exists, so refreshing only the re-read cells is nearly free. A full final re-render is
+   another whole pixel pass — order $20 and a few hours — for figures that would mostly be identical.
+3. **Who reads the roll-up, and against what deadline?** The sweep is worth little if its output
    arrives after the product is committed to.
-3. **On a 3a failure, does the campaign continue with other cells?** A blocking finding on one cell is
+4. **On a 3a failure, does the campaign continue with other cells?** A blocking finding on one cell is
    probably local; the same finding on the first three is systemic and should stop the run. That
    threshold is a policy choice, not a technical one.
