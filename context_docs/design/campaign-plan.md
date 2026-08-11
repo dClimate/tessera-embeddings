@@ -755,6 +755,14 @@ pointer, never a derivation.
 each was wrong in a way worth not repeating, and a reviewer who only sees the corrected number
 learns nothing about how it went wrong. The withdrawals are marked in bold and dated.
 
+**[`../corrections-register.md`](../corrections-register.md) indexes every one of them**, across
+all 14 documents that carry them, grouped by the mechanism that produced them rather than by
+file. The withdrawals stay where they are — that is the point of the paragraph above — but the
+register is where the *pattern* is visible, and the pattern is the part that keeps repeating:
+eight mechanisms cover all 83 (audited 2026-08-11), and most recur in documents that do not
+cite each other. Read it
+before publishing a figure or reusing one.
+
 - [`campaign-cost-model.md`](campaign-cost-model.md) — costs, GPU fleet sizing, the idle-burn
   arithmetic, and the observation-count model behind the throughput basis.
 - [`campaign-cluster-sizing.md`](campaign-cluster-sizing.md) — the coverage census, how zones

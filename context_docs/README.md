@@ -10,6 +10,7 @@ proposing a change that conflicts with one of these decisions.
 
 ```
 context_docs/
+├── corrections-register.md   EVERY withdrawn figure, grouped by how it went wrong
 ├── decisions/        Architecture Decision Records (1 page each)
 │   ├── 001-thin-prefect-wrapping.md
 │   ├── 002-shape-c-task-shells.md
@@ -57,6 +58,16 @@ context_docs/
 ```
 
 ## How to read these
+
+**The corrections register** is the index over everything this programme has published and
+then withdrawn — **83 marked retractions across the 14 documents that carried them, audited
+2026-08-11** — grouped by the eight mechanisms that produced them rather than by which file
+they sit in. It does not replace the withdrawals
+themselves, which stay beside the claims they correct; it exists because the same mistake
+has recurred across documents that never cite each other, and no single document can see
+that. Read it before publishing a figure or quoting one.
+
+
 
 **Decision records** answer "why is X the way it is?" They have a
 fixed shape — Context, Decision, Rejected alternatives, Consequences
