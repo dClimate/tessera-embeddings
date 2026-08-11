@@ -503,15 +503,30 @@ def check_time_window_coverage(
             )
             raise InsufficientCoverageError(msg)
 
-        if skip_coverage_check:
-            continue
-
         # Require EVERY month of the window to be present, not just that the
         # min/max span it: a mosaic with only January + December (or out-of-window
         # dates bracketing the year) would otherwise pass despite missing every
         # intervening month, and the write-once tag would make that partial year
         # permanent. Month granularity matches the campaign's calendar-year window.
         missing = sorted(required_months - present_months)
+
+        # Split the absence into EXPLAINED and UNEXPLAINED for the record, before any
+        # decision to raise or to skip, and for BOTH paths. A month the ingest examined and
+        # found empty is a legitimately absent month — common for radar, where a zone's orbit
+        # may reach its land on no date of a month — and a count of present months alone
+        # cannot tell it from a hole. Anything reading this field to raise an alarm must key
+        # on the UNEXPLAINED count, never on the month total, or it fires on healthy cells.
+        _assessed = root.attrs.get(ASSESSED_WINDOW_ATTR)
+        _explained = _months_within_assessed(missing, _assessed) if missing else set()
+        summary["stores"][label].update(
+            assessed_window=list(_assessed) if isinstance(_assessed, (list, tuple)) else None,
+            months_absent=len(missing),
+            months_absent_examined=len(_explained),
+            months_absent_unexplained=len(missing) - len(_explained),
+        )
+
+        if skip_coverage_check:
+            continue
 
         # A month can be absent because the ingest EXAMINED it and found nothing reachable,
         # which is a finding, or because the ingest never covered it, which is a gap. Only
@@ -524,8 +539,10 @@ def check_time_window_coverage(
         # unexamined days, so it stays an error — strict here costs nothing on the campaign's
         # calendar-year windows, where months are always wholly inside.
         if missing:
-            assessed = root.attrs.get(ASSESSED_WINDOW_ATTR)
-            examined = _months_within_assessed(missing, assessed)
+            # Reuses the split computed above rather than re-deriving it: two copies of this
+            # decision could disagree, and the record and the gate must never differ about
+            # which months were examined.
+            assessed, examined = _assessed, _explained
             if examined:
                 logger.info(
                     "%s store at %s: %d month(s) absent but inside the assessed window %s "

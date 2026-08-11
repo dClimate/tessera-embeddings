@@ -108,3 +108,51 @@ def test_out_of_window_dates_do_not_count_toward_coverage(monkeypatch) -> None:
     assert store["months_present"] == 6
     assert store["dates_in_window"] == 6
     assert store["first"].startswith("2024-") and store["last"].startswith("2024-")
+
+
+def test_a_legitimately_empty_month_is_recorded_as_examined_not_a_hole(monkeypatch) -> None:
+    """The case an alarm must not fire on, and the reason the field needs two counters.
+
+    A zone's radar orbit can reach its land on no date of a month. That month is absent from
+    the store and entirely legitimate — the ingest looked and found nothing — and it passes
+    the STRICT gate on the strength of the assessed window. A reader keying an alarm on the
+    month total alone would flag it, which is why the record separates examined absence from
+    unexplained absence.
+    """
+    root = zarr.open_group(store=zarr.storage.MemoryStore(), mode="w")
+    values = np.array(_year_dates(2024, range(1, 12)), dtype="datetime64[ns]").astype("int64")
+    arr = root.create_array("time", shape=(len(values),), dtype="int64")
+    arr[:] = values
+    arr.attrs["units"] = "nanoseconds since 1970-01-01"
+    # The ingest processed the whole year and found December empty.
+    root.attrs["assessed_window"] = ["2024-01-01", "2024-12-31"]
+    monkeypatch.setattr(data_loading, "open_store_as_zarr_group", lambda *a, **k: root)
+
+    # Not relaxed: the strict rule passes, because the absence is explained.
+    summary = check_time_window_coverage("mem://m", parse_time_window("December 2024"), s1_orbit="none")
+    store = summary["stores"]["reflectance"]
+    assert summary["relaxed"] is False
+    assert store["months_present"] == 11
+    assert store["months_absent"] == 1
+    assert store["months_absent_examined"] == 1
+    assert store["months_absent_unexplained"] == 0
+    assert store["assessed_window"] == ["2024-01-01", "2024-12-31"]
+
+
+def test_the_same_gap_without_an_assessed_window_is_unexplained(monkeypatch) -> None:
+    """The control: identical data, no assessed window, and now the absence is a hole.
+
+    Same 11 months, so a month count cannot separate the two cases — only the explanation can.
+    Under the strict rule this one is refused outright.
+    """
+    _serve(monkeypatch, _year_dates(2024, range(1, 12)))
+    summary = check_time_window_coverage(
+        "mem://m", parse_time_window("December 2024"), s1_orbit="none", skip_coverage_check=True
+    )
+    store = summary["stores"]["reflectance"]
+    assert store["months_present"] == 11
+    assert store["months_absent_examined"] == 0
+    assert store["months_absent_unexplained"] == 1
+
+    with pytest.raises(InsufficientCoverageError, match="missing 1"):
+        check_time_window_coverage("mem://m", parse_time_window("December 2024"), s1_orbit="none")
