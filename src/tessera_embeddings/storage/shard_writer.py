@@ -329,12 +329,24 @@ def run_provenance(
     empty: bool = False,
     radar_coverage: dict | None = None,
     optical_skips: dict | None = None,
+    input_coverage: dict | None = None,
 ) -> dict:
     """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
 
+    ``input_coverage`` answers the question the calendar-year guarantee below does NOT: not
+    what window was *requested*, but **how much of it the input actually held** — per source
+    store, the months present of those required and the first/last in-window date, plus
+    whether the every-month rule was relaxed
+    (:func:`~tessera_embeddings.inference.data_loading.check_time_window_coverage` owns the
+    shape). A cell can be filled from a partial input through that relaxation and still be
+    marked complete, and the source mosaics are deleted once it lands — so without this
+    field "was this year built on a full year of imagery?" is answerable only until cleanup
+    runs, and after that never again. Recorded for every fill rather than only relaxed ones,
+    because a field that appears only on suspect cells cannot be used to find them.
+
     Both fill paths use this — the shard write (:func:`write_year_shards`) and
     the no-data marking (``campaign.mark_zone_year_empty``) — so the provenance
-    record shape can only change in one place. The record carries no window: the
+    record shape can only change in one place. The record carries no REQUESTED window: the
     store GUARANTEES calendar-year slots (the zone-fill gate rejects any window
     that is not exactly Jan-Dec of the slot's year), and each slot's true interval
     is stated by the seeded ``time_bnds`` CF-bounds variable.
@@ -368,6 +380,8 @@ def run_provenance(
         record["radar_coverage"] = dict(radar_coverage)
     if optical_skips and not empty:
         record["optical_skips"] = dict(optical_skips)
+    if input_coverage:
+        record["input_coverage"] = dict(input_coverage)
     return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
 
 
@@ -380,6 +394,7 @@ def commit_year_attrs(
     empty: bool = False,
     radar_coverage: dict | None = None,
     optical_skips: dict | None = None,
+    input_coverage: dict | None = None,
     gate: CommitGate | None = None,
     tries: int = 8,
     skip_if_marked: bool = False,
@@ -430,6 +445,7 @@ def commit_year_attrs(
                 empty=empty,
                 radar_coverage=radar_coverage,
                 optical_skips=optical_skips,
+                input_coverage=input_coverage,
             )
         try:
             return commit_with_rebase(session, f"mark {group} year {year_label} complete", gate=gate)
@@ -535,6 +551,7 @@ def write_year_shards(
     run_id: str | None = None,
     radar_coverage: dict | None = None,
     optical_skips: dict | None = None,
+    input_coverage: dict | None = None,
     empty: bool = False,
     telemetry: dict[str, Any] | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
@@ -635,6 +652,7 @@ def write_year_shards(
         run_id=run_id,
         radar_coverage=radar_coverage,
         optical_skips=optical_skips,
+        input_coverage=input_coverage,
         gate=gate,
         empty=empty,
     )

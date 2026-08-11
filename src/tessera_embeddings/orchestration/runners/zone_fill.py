@@ -317,6 +317,7 @@ def fill_zone_year(
     s3_region: str | None = None,
     on_actor_retire: Callable[[str], None] | None = None,
     fault: ArmedFault | None = None,
+    input_coverage: dict | None = None,
 ) -> dict[str, Any]:
     """Fill one (zone, year): mask → inference → shard assembly → tag.
 
@@ -349,6 +350,9 @@ def fill_zone_year(
         s3_region: Optional S3 region override for the global store.
         on_actor_retire: Optional callback when a misbehaving actor is retired
             (the AWS provider injects an EC2 terminator).
+        input_coverage: How much of the requested window the input mosaics actually held,
+            measured by the fill's preflight and recorded on the year. The mosaics are
+            deleted once a cell lands, so this is the only lasting record of it.
         fault: Supervised-drill hook, forwarded to the assembly phase. Inert unless
             the run was armed for a fault this path hosts and for this cell
             (:mod:`tessera_embeddings.config.fault_injection`).
@@ -385,6 +389,7 @@ def fill_zone_year(
         get_credentials=get_credentials,
         s3_region=s3_region,
         fault=fault,
+        input_coverage=input_coverage,
     )
 
 
@@ -803,6 +808,7 @@ def assemble_zone_year(
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
     fault: ArmedFault | None = None,
+    input_coverage: dict | None = None,
 ) -> dict[str, Any]:
     """Assembly phase of a (zone, year) fill: verify staged → assemble → tag.
 
@@ -866,6 +872,7 @@ def assemble_zone_year(
                 s3_region=s3_region,
                 log=log,
                 fault=fault,
+                input_coverage=input_coverage,
             )
         else:
             # No live tiles at all: nothing was ever written here, so there is nothing
@@ -939,6 +946,7 @@ def assemble_zone_year(
         s3_region=s3_region,
         log=log,
         fault=fault,
+        input_coverage=input_coverage,
     )
     repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)

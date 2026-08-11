@@ -1834,6 +1834,7 @@ class ZarrWriter:
         s3_region: str | None = None,
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
         fault: ArmedFault | None = None,
+        input_coverage: dict | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -1906,6 +1907,10 @@ class ZarrWriter:
             get_credentials: Optional icechunk credential callback.
             s3_region: Optional S3 region override.
             log: Optional logger.
+            input_coverage: How much of the requested window the INPUT mosaics actually
+                held, from the fill's preflight, recorded on the year by
+                :func:`~tessera_embeddings.storage.shard_writer.run_provenance`. The
+                mosaics are deleted once a cell lands, so this is the only lasting record.
             fault: Supervised-drill hook, forwarded to
                 :func:`~tessera_embeddings.storage.shard_writer.write_year_shards` for
                 the gap between its two commits. Inert unless the run was armed for
@@ -2084,6 +2089,7 @@ class ZarrWriter:
             # Prefect API; the module logger reaches only the process log stream.
             log=_log,
             fault=fault,
+            input_coverage=input_coverage,
         )
         workers = telemetry.get("workers", [])
         _log.info(

@@ -358,6 +358,10 @@ def fill_zone_year_flow(
         allow_s2_only=allow_s2_only,
     )
 
+    # None when this cell short-circuits before the preflight (an already-complete retag),
+    # which reads correctly on the record: nothing was measured, so nothing is claimed.
+    input_coverage: dict | None = None
+
     if needs_cluster:
         # Fail loudly BEFORE provisioning Ray if the store was seeded for a
         # different encoder than this build embeds with — a mid-campaign model
@@ -376,7 +380,10 @@ def fill_zone_year_flow(
         # zone-fill chain has no other temporal-coverage gate). `allow_partial_window`
         # relaxes the month-span check to "non-empty" for a legitimately partial
         # edge zone; an empty store still fails.
-        check_time_window_coverage(
+        # Kept rather than discarded: what the preflight measured about the INPUT goes onto
+        # the year, because the mosaics it just read are deleted once the cell lands and
+        # nothing afterwards can reconstruct how much of the window they held.
+        input_coverage = check_time_window_coverage(
             mosaic_base,
             config.time_window,
             s1_orbit=resolved_s1,
@@ -408,6 +415,7 @@ def fill_zone_year_flow(
         "get_credentials": iam_icechunk_credentials,
         "s3_region": s3_region,
         "fault": fault,
+        "input_coverage": input_coverage,
     }
 
     if not needs_cluster:

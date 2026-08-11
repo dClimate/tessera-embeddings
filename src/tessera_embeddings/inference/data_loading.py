@@ -431,17 +431,31 @@ def check_time_window_coverage(
     *,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
-) -> None:
-    """Verify that source stores span the requested time window.
+) -> dict:
+    """Verify that source stores span the requested time window; report what they hold.
 
     Opens each store with the caller's credential callback / region (same as the
     rest of the fill); ``skip_coverage_check=True`` still hard-fails an EMPTY
     store (no in-window data at all) but skips the month-span check, the escape
     hatch for a legitimately partial window (e.g. an arctic-only edge zone).
 
+    **Returns what it measured, so a fill can record it, and the RELAXED path is the whole
+    reason that is worth doing.** A cell filled under ``skip_coverage_check`` is published
+    from an input the strict rule would have refused, and afterwards nothing can tell:
+    mosaics are deleted once a cell lands, so the evidence outlives neither the run nor the
+    question. The returned summary is per store label — months present of those required,
+    and the first/last in-window date — plus ``relaxed``, which records which rule was in
+    force. :func:`~tessera_embeddings.storage.shard_writer.run_provenance` is where it
+    lands on the year.
+
     Raises:
         InsufficientCoverageError: If any required store does not span the window.
     """
+    summary: dict = {
+        "window_months": len(window.months),
+        "relaxed": bool(skip_coverage_check),
+        "stores": {},
+    }
     earliest = window.months[0]
     latest = window.months[-1]
 
@@ -460,6 +474,17 @@ def check_time_window_coverage(
         years = times.astype("datetime64[Y]").astype(int) + 1970
         months = times.astype("datetime64[M]").astype(int) % 12 + 1
         present_months = set(zip(years.tolist(), months.tolist(), strict=True))
+
+        # Recorded before any raise, and measured against the REQUIRED months rather than
+        # the store's own extent: a store may hold dates outside the window, and what a
+        # published year needs to state is how much of ITS OWN window the input covered.
+        in_window = times[[(y, m) in required_months for y, m in zip(years.tolist(), months.tolist(), strict=True)]]
+        summary["stores"][label] = {
+            "months_present": len(present_months & required_months),
+            "dates_in_window": len(in_window),
+            "first": str(in_window.min())[:10] if len(in_window) else None,
+            "last": str(in_window.max())[:10] if len(in_window) else None,
+        }
 
         # At least one timestamp INSIDE the window, whichever mode this is. A store with
         # only out-of-window dates is non-empty but useless: the loaders filter to the
@@ -528,13 +553,19 @@ def check_time_window_coverage(
             )
             raise InsufficientCoverageError(msg)
 
+    # Honest about WHICH rule passed. The relaxed path reaches here too, having verified
+    # only that each store holds something in the window — claiming "every month present"
+    # there would assert exactly the thing that was not checked.
     logger.info(
-        "Time window coverage verified (every month present): %d-%02d through %d-%02d",
+        "Time window coverage verified (%s): %d-%02d through %d-%02d — %s",
+        "non-empty only, month rule RELAXED" if skip_coverage_check else "every month present",
         earliest[0],
         earliest[1],
         latest[0],
         latest[1],
+        ", ".join(f"{k} {v['months_present']}/{len(required_months)} mo" for k, v in summary["stores"].items()),
     )
+    return summary
 
 
 # ---------------------------------------------------------------------------
