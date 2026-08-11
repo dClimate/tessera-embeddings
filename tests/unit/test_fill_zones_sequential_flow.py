@@ -88,6 +88,27 @@ def wired(monkeypatch):
 
     monkeypatch.setattr(mod, "fill_zones_sequential", fake_sequential)
 
+    # The per-cell validation dispatch. Stubbed at THIS module's name rather than at
+    # `run_deployment`: the helper holds its own reference to that, so patching the ingest
+    # adapter's copy below would leave a validation dispatch reaching a real Prefect API.
+    # Recorded so a test can assert the dispatch is genuinely made per cell.
+    rec["validations"] = []
+
+    def fake_validation_dispatch(deployment, *, zone, year, summary, parameters, log, tag=None):
+        rec["validations"].append(
+            {
+                "deployment": deployment,
+                "zone": zone,
+                "year": year,
+                "summary": summary,
+                "parameters": parameters,
+                "tag": tag,
+            }
+        )
+        return "validation-run"
+
+    monkeypatch.setattr(mod, "dispatch_cell_validation", fake_validation_dispatch)
+
     # The ingest adapter is the REAL one (several tests assert on it), so its one
     # external call is stubbed instead of the class. Needed because the flow now
     # BLOCKS on the first cell's ingest before `ray up`: previously `start` merely
@@ -137,6 +158,58 @@ def test_retag_and_ocean_cells_never_touch_the_cluster(wired, monkeypatch):
     # ...and no cluster was ever provisioned.
     assert wired["ray_kwargs"] is None and result["sequential"] is None
     assert result["retagged"] == 1 and result["empty"] == 1 and result["live"] == 0
+
+
+class TestPerCellValidation:
+    """Each cell is handed to the validation deployment as it lands, not at the end.
+
+    Asserted on the ``assemble`` callable the runner is given, because that is where the
+    timing lives: the runner calls it once per cell on the trailing thread while the next
+    cell infers. A dispatch anywhere else in this flow would still pass a "was it
+    dispatched" test while delivering every verdict hours late.
+    """
+
+    @staticmethod
+    def _landed(monkeypatch, summary):
+        monkeypatch.setattr(mod, "assemble_zone_year", lambda handoff, **k: summary)
+        return SimpleNamespace(zone="33N", year=2025)
+
+    def test_the_assemble_callable_validates_the_cell_it_just_landed(self, wired, monkeypatch):
+        handoff = self._landed(monkeypatch, {"zone": "33N", "year": 2025, "tag": "zone-33N-2025"})
+        _run(zones=["33N"], validation_deployment="validate-zone-year/validate-zone-year-x")
+        assert wired["seq_kwargs"]["assemble"](handoff, SimpleNamespace(staging_base="s3://out/staging")) == {
+            "zone": "33N",
+            "year": 2025,
+            "tag": "zone-33N-2025",
+        }, "the assembly summary must pass through untouched"
+        (call,) = wired["validations"]
+        assert call["deployment"] == "validate-zone-year/validate-zone-year-x"
+        assert (call["zone"], call["year"]) == ("33N", 2025)
+        assert call["parameters"]["paths"] == _PATHS.model_dump()
+
+    def test_the_cell_is_identified_by_the_handoff_not_the_summary(self, wired, monkeypatch):
+        """A summary missing its coordinates must not raise inside the assembly thread."""
+        handoff = self._landed(monkeypatch, {"tag": "zone-33N-2025"})
+        _run(zones=["33N"], validation_deployment="v/v")
+        wired["seq_kwargs"]["assemble"](handoff, SimpleNamespace(staging_base="s3://out/staging"))
+        (call,) = wired["validations"]
+        assert (call["zone"], call["year"]) == ("33N", 2025)
+
+    def test_a_retagged_cell_is_validated_too(self, wired, monkeypatch):
+        """Its data landed under an earlier run, which may never have been checked."""
+        monkeypatch.setattr(mod, "zone_year_complete", lambda store, zone, year, **k: zone == "01N")
+        monkeypatch.setattr(mod, "zone_live_tile_count", lambda mask, zone, **k: 0)
+        _run(zones=["01N", "02N"], validation_deployment="v/v")
+        # Both no-cluster cells reach the dispatch; declining the all-ocean one is the
+        # helper's own decision (it is marked empty), which its unit tests cover.
+        assert [(c["zone"], c["year"]) for c in wired["validations"]] == [("01N", 2025), ("02N", 2025)]
+
+    def test_nothing_is_dispatched_when_no_validator_is_configured(self, wired, monkeypatch):
+        """The default: the library names no consumer's flow, so the ref is None."""
+        handoff = self._landed(monkeypatch, {"zone": "33N", "year": 2025, "tag": "t"})
+        _run(zones=["33N"])
+        wired["seq_kwargs"]["assemble"](handoff, SimpleNamespace(staging_base="s3://out/staging"))
+        assert [c["deployment"] for c in wired["validations"]] == [None]
 
 
 def test_off_axis_year_fails_the_run(wired, monkeypatch):

@@ -16,6 +16,7 @@ orchestration/prefect/
 │   ├── build_land_mask.py           # global campaign: registry → per-zone coverage bitmaps (no cluster)
 │   ├── seed_global_store.py         # global campaign: seed the 120 UTM-zone groups (no cluster)
 │   ├── fill_zone_year.py            # global campaign: one (zone, year) via Ray → assembly → tag
+│   ├── _cell_validation.py          # internal helper: hand a tagged cell to its validator, don't wait
 │   └── run_global_campaign.py       # global campaign driver: dispatch every pending (zone, year)
 ├── tasks/                  Layer 2: thin @task wrappers (~20 LOC each)
 │   ├── ingest.py                    # process_roi_reflectance, process_roi_sar
@@ -218,6 +219,26 @@ override.
 | `fill_zones_sequential.py` | Global campaign: fill one cluster's zones sequentially on a SINGLE shared Ray cluster (densest-first, ingest look-ahead, trailing assembly, idle-retirement gated until the final zone). Waits for its densest zone's mosaic before requesting GPUs. Pre-cluster triage settles retag/all-ocean cells. |
 | `ingest_zone_year.py` | Global campaign: build one cell's S1/S2 mosaics on the fixed zone grid by dispatching the ROI ingest deployments onto a synthesised zone-shaped ROI. Marker-gated and crash-safe: a stale or half-written mosaic is cleared and rebuilt, never appended onto. |
 | `run_global_campaign.py` | Global campaign driver: dispatch fills per pending `(zone, year)`, year-serial — per-cell `fill-zone-year` runs with bounded zone parallelism (`fill_strategy="cluster-per-zone"`), or size-balanced `fill-zones-sequential` runs on long-lived clusters (`"chained-clusters"`). |
+
+### A landed cell is handed to a validator, and nothing waits for it
+
+Both fill flows take a `validation_deployment`. As each cell is tagged they create one run
+of it and return immediately (`flows/_cell_validation.py`), so cell N is checked while cell
+N+1 is still being filled — on the chained path the dispatch happens on the trailing
+assembly thread, which already has that pipelining.
+
+Three properties are deliberate. The default is `None`, because the validator is a
+**consumer's** flow and this library names none — so unlike every other child ref here it
+is not derived from `branch`. A cell that fails validation **is already tagged**: the tag
+records that the cell landed and the verdict records that it is sound, which are different
+questions and get different records. And every failure in the dispatch is **swallowed** — a
+cell that has landed must not be undone by an unreachable API. What keeps that honest is
+not the log line but the verdict: a dispatch that never happened leaves none, and the
+consumer's monitoring reads published cells against the verdicts on file.
+
+The trace tag (`validates-cell-of:<id>`) is deliberately *not* the tag the cancellation
+hooks below sweep. A validation describes a cell that has already landed, holds no fleet,
+and is worth finishing even when its parent fill is cancelled.
 
 ### Cancelling reaches every level
 

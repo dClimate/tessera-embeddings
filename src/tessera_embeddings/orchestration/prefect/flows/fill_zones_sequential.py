@@ -68,6 +68,11 @@ from tessera_embeddings.inference.orchestration_helpers import build_inference_c
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.inference.scheduling import WorkItem
 from tessera_embeddings.ingest.source_coverage import SourceFinding, preflight_optical_source
+from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
+    cell_validation_parameters,
+    dispatch_cell_validation,
+    validation_run_tag,
+)
 from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
 from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     activate,
@@ -584,6 +589,7 @@ def fill_zones_sequential_flow(
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     fault_injection: FaultInjection | None = None,
+    validation_deployment: str | None = None,
 ) -> dict[str, Any]:
     """Fill many (zone, year) cells sequentially on a single shared Ray cluster.
 
@@ -686,6 +692,12 @@ def fill_zones_sequential_flow(
             any deployment outside the drill allowlist, is refused before the flow does
             any work (:mod:`tessera_embeddings.config.fault_injection`). A run that
             carries it announces itself as a drill in its own logs.
+        validation_deployment: ``flow-name/deployment-name`` of a deployment that
+            validates a landed cell. Dispatched from the TRAILING ASSEMBLY THREAD as each
+            cell is tagged and never waited on (:mod:`._cell_validation`), so cell N is
+            validated while cell N+1 is still inferring. ``None`` (the default)
+            validates nothing: the validator is a consumer's flow, so the library names
+            none.
 
     Returns:
         Summary dict: triage counts (retag / empty / live), the sequential
@@ -786,24 +798,71 @@ def fill_zones_sequential_flow(
     no_optical: list[dict[str, Any]] = []
     live: list[SequentialCell] = []
 
+    # Resolved ONCE here, in the flow's own thread. The trailing assembly thread carries no
+    # Prefect context, so reading the runtime id from inside `_validate` would yield None
+    # for every cell this cluster fills — and the validations would be untraceable back to
+    # the fill that produced them.
+    validation_tag = validation_run_tag(flow_run_ctx.id)
+
+    def _validate(zone: str, year: int, summary: dict[str, Any]) -> dict[str, Any]:
+        """Hand one landed cell to its validation deployment, without waiting for it.
+
+        Called for every cell as it finishes, on whichever thread finished it — the
+        trailing assembly thread for a filled cell, this flow's own thread for a retag or
+        an empty mark. Returns the summary unchanged: a landed, tagged cell must not be
+        affected by anything that happens to its validation (see :mod:`._cell_validation`).
+
+        The cell's coordinates come from the CALLER rather than out of ``summary``. Every
+        caller has them in hand, and reading them back out of the summary would make the
+        dispatch depend on the shape of a dict that several fill paths each build
+        separately — a cell whose summary spelled them differently would raise here,
+        inside the thread that has just landed it.
+        """
+        dispatch_cell_validation(
+            validation_deployment,
+            zone=zone,
+            year=year,
+            summary=summary,
+            parameters=cell_validation_parameters(
+                zone=zone,
+                year=year,
+                paths=paths,
+                store_name=store_name,
+                mask_name=mask_name,
+                s3_region=s3_region,
+            ),
+            log=log,
+            tag=validation_tag,
+        )
+        return summary
+
     def _fill_no_cluster(zone: str, year: int, run_id: str) -> dict[str, Any]:
         # fill_zone_year's no-Ray paths: repo metadata + coverage bitmap only.
         # s1_orbit is never resolved against a mosaic on these paths, so the
         # unresolved value is fine.
-        return fill_zone_year(
-            store_path=store_path,
-            zone=zone,
-            year=year,
-            land_mask_path=land_mask_path,
-            mosaic_base=f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}",
-            staging_base=f"{paths.outputs.rstrip('/')}/staging/{zone}/{year}",
-            config=_config_for(s1_orbit, year),
-            num_actors=1,
-            log=log,
-            run_id=run_id,
-            gate=gate,
-            get_credentials=iam_icechunk_credentials,
-            s3_region=s3_region,
+        #
+        # Validated like any other cell (`_validate` returns the summary unchanged). Both
+        # callers reach a TAGGED cell: a retag-only recovery, whose data landed under some
+        # earlier run that may never have been checked, and an all-ocean mark, which
+        # `_validate` declines for having nothing embedded.
+        return _validate(
+            zone,
+            year,
+            fill_zone_year(
+                store_path=store_path,
+                zone=zone,
+                year=year,
+                land_mask_path=land_mask_path,
+                mosaic_base=f"{paths.inputs.rstrip('/')}/mosaics/{zone}/{year}",
+                staging_base=f"{paths.outputs.rstrip('/')}/staging/{zone}/{year}",
+                config=_config_for(s1_orbit, year),
+                num_actors=1,
+                log=log,
+                run_id=run_id,
+                gate=gate,
+                get_credentials=iam_icechunk_credentials,
+                s3_region=s3_region,
+            ),
         )
 
     for zone, year in cells:
@@ -1097,17 +1156,27 @@ def fill_zones_sequential_flow(
         )
 
     def _assemble(handoff: ZoneFillHandoff, prep: PreparedCell) -> dict[str, Any]:
-        return assemble_zone_year(
-            handoff,
-            store_path=store_path,
-            staging_base=prep.staging_base,
-            log=log,
-            gate=gate,
-            s3_concurrency=s3_concurrency,
-            cleanup_staging=cleanup_staging,
-            n_assembly_workers=n_assembly_workers,
-            get_credentials=iam_icechunk_credentials,
-            s3_region=s3_region,
+        # The validation dispatch rides HERE, on the trailing assembly thread, immediately
+        # after the cell's tag is created — not at the end of the flow. The runner calls
+        # this once per cell while the next cell is already inferring, so a per-cell
+        # dispatch inherits that pipelining for free: cell N is being validated while cell
+        # N+1 works. Batching them at the end of the cluster's zone list would instead put
+        # every cell's verdict hours after the defect it would have caught.
+        return _validate(
+            handoff.zone,
+            handoff.year,
+            assemble_zone_year(
+                handoff,
+                store_path=store_path,
+                staging_base=prep.staging_base,
+                log=log,
+                gate=gate,
+                s3_concurrency=s3_concurrency,
+                cleanup_staging=cleanup_staging,
+                n_assembly_workers=n_assembly_workers,
+                get_credentials=iam_icechunk_credentials,
+                s3_region=s3_region,
+            ),
         )
 
     # START THE INGEST WINDOW, THEN WAIT FOR THE FIRST MOSAIC TO LAND — ANY OF THEM.

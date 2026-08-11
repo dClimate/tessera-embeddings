@@ -37,6 +37,11 @@ from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.conventions import expected_model_url
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
+from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
+    cell_validation_parameters,
+    dispatch_cell_validation,
+    validation_run_tag,
+)
 from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
     activate,
     deactivate,
@@ -179,6 +184,7 @@ def fill_zone_year_flow(
     s3_concurrency: int | None = None,
     run_id: str | None = None,
     fault_injection: FaultInjection | None = None,
+    validation_deployment: str | None = None,
 ) -> dict[str, Any]:
     """Fill one ``(zone, year)`` cell of the global store on a Ray cluster.
 
@@ -252,6 +258,10 @@ def fill_zone_year_flow(
             deployment outside the drill allowlist, is refused before the flow does
             any work (:mod:`tessera_embeddings.config.fault_injection`). A run that
             carries it announces itself as a drill in its own logs.
+        validation_deployment: ``flow-name/deployment-name`` of a deployment that
+            validates a landed cell — dispatched once this fill's cell is tagged, and
+            NOT waited on (:mod:`._cell_validation`). ``None`` (the default) validates
+            nothing: the validator is a consumer's flow, so the library names none.
 
     Returns:
         The zone-fill summary dict (zone, year, run_id, snapshot_id, tag,
@@ -418,6 +428,33 @@ def fill_zone_year_flow(
         "input_coverage": input_coverage,
     }
 
+    def _validate(summary: dict[str, Any]) -> dict[str, Any]:
+        """Hand the landed cell to its validation deployment, without waiting for it.
+
+        AFTER the cell is tagged and on both paths, including a retag-only recovery: a
+        cell that landed under an older image may never have been validated at all, and
+        the tag repair is the moment its coordinates are in hand. Returns the summary
+        unchanged — the dispatch is not allowed to affect a landed cell (see
+        :mod:`._cell_validation`).
+        """
+        dispatch_cell_validation(
+            validation_deployment,
+            zone=zone,
+            year=year,
+            summary=summary,
+            parameters=cell_validation_parameters(
+                zone=zone,
+                year=year,
+                paths=paths,
+                store_name=store_name,
+                mask_name=mask_name,
+                s3_region=s3_region,
+            ),
+            log=log,
+            tag=validation_run_tag(flow_run_ctx.id),
+        )
+        return summary
+
     if not needs_cluster:
         if already_complete:
             reason = "already complete (retag only)"
@@ -426,7 +463,7 @@ def fill_zone_year_flow(
         else:
             reason = "no live tiles (all-ocean)"
         log.info("Zone %s year %d %s — no Ray cluster", zone, year, reason)
-        return fill_zone_year(**fill_kwargs)
+        return _validate(fill_zone_year(**fill_kwargs))
 
     # Ray path only: terminate the EC2 instance behind each retired idle actor
     # immediately (the runner's on_actor_retire hook), instead of holding idle
@@ -461,4 +498,4 @@ def fill_zone_year_flow(
         deactivate()
 
     log.info("Zone %s year %d filled: %s", zone, year, summary.get("tag"))
-    return summary
+    return _validate(summary)

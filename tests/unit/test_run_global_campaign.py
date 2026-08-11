@@ -496,6 +496,39 @@ def test_all_ocean_cell_uses_empty_run_id_and_skips_cleanup(wired, monkeypatch):
     assert wired["deletes"] == []  # no mosaic produced → nothing to clean up
 
 
+class TestValidationDeploymentForwarding:
+    """Both fill strategies must receive the validator the campaign was dispatched with.
+
+    Forwarded rather than left to each child's own registration, and asserted on BOTH
+    strategies: a child registered before the validator existed carries ``None``, and a
+    campaign that failed to forward its own value would then run a thousand cells with no
+    validation at all while every deployment looked correctly configured.
+    """
+
+    def test_the_per_cell_fill_receives_it(self, wired):
+        _per_cell(validation_deployment="validate-zone-year/validate-zone-year-x")
+        fill = next(p for d, p in wired["arun"] if "fill-zone-year" in d)
+        assert fill["validation_deployment"] == "validate-zone-year/validate-zone-year-x"
+
+    def test_the_chained_fill_receives_it(self, wired):
+        asyncio.run(
+            mod.run_global_campaign.fn(
+                paths=_PATHS, ami_ssm_name="ami", validation_deployment="validate-zone-year/validate-zone-year-x"
+            )
+        )
+        params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
+        assert params["validation_deployment"] == "validate-zone-year/validate-zone-year-x"
+
+    def test_it_is_not_derived_from_the_branch(self, wired):
+        """Unlike every other child ref. The validator is a consumer's flow rather than one
+        of this library's, so there is no base name here to suffix — a branch run that
+        names no validator validates nothing, and says so by carrying None.
+        """
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", branch="some-branch"))
+        params = next(p for d, p in wired["arun"] if "fill-zones-sequential" in d)
+        assert params["validation_deployment"] is None
+
+
 def test_ingest_params_carry_s3_region(wired):
     """The campaign's s3_region reaches the ingest deployment (not just the fill), so a
     non-default-region deployment's ingest metadata opens hit the right bucket.

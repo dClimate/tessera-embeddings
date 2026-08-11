@@ -215,6 +215,51 @@ def test_staging_base_scoped_to_zone_year(wired):
     assert captured["staging_base"] == "s3://out/staging/33N/2025"
 
 
+class TestPerCellValidation:
+    """The landed cell is handed to its validation deployment on BOTH return paths.
+
+    Two paths, one dispatch each, and they are easy to leave half-wired: the flow returns
+    from the no-cluster branch early, so a dispatch added only after the Ray branch would
+    silently skip every retag-only recovery — the cells most likely never to have been
+    validated at all.
+    """
+
+    @pytest.fixture()
+    def dispatched(self, wired):
+        calls: list[dict] = []
+        wired.setattr(
+            mod,
+            "dispatch_cell_validation",
+            lambda deployment, **kw: calls.append({"deployment": deployment, **kw}) or "validation-run",
+        )
+        wired.setattr(mod, "fill_zone_year", lambda **kw: {"tag": "zone-33N-2025"})
+        return calls
+
+    def test_the_ray_path_validates_the_cell(self, wired, dispatched):
+        wired.setattr(
+            "tessera_embeddings.providers.aws.ray.make_instance_terminator", lambda **k: object(), raising=False
+        )
+        wired.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", _fake_ray_cluster(), raising=False)
+        mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami", validation_deployment="v/v")
+        (call,) = dispatched
+        assert call["deployment"] == "v/v"
+        assert (call["zone"], call["year"]) == ("33N", 2025)
+        assert call["parameters"]["store_name"] == "tessera"
+
+    def test_the_no_cluster_path_validates_a_retagged_cell(self, wired, dispatched):
+        wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)
+        mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami", validation_deployment="v/v")
+        assert [(c["zone"], c["year"]) for c in dispatched] == [("33N", 2025)]
+
+    def test_the_summary_reaches_the_caller_unchanged(self, wired, dispatched):
+        """The dispatch is a side effect; the fill's own summary is the return value."""
+        wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)
+        summary = mod.fill_zone_year_flow.fn(
+            zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami", validation_deployment="v/v"
+        )
+        assert summary == {"tag": "zone-33N-2025"}
+
+
 def test_commit_gate_is_thread_safe(monkeypatch):
     """The chained fill shares ONE _PrefectCommitGate between its feeder thread
     (terminal plans commit inside plan()) and its trailing-assembly thread. The
