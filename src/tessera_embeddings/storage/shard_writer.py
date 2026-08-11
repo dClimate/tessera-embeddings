@@ -50,7 +50,7 @@ import icechunk
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.environment import configure_logging
+from tessera_embeddings.config.environment import code_identity, configure_logging
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.store_layout import SHARD_PX
 from tessera_embeddings.storage.zarr_store import read_time_values
@@ -330,6 +330,7 @@ def run_provenance(
     radar_coverage: dict | None = None,
     optical_skips: dict | None = None,
     input_coverage: dict | None = None,
+    code: dict | None = None,
 ) -> dict:
     """Merge a per-year run record into a group's ``runs`` attr (the schema's one owner).
 
@@ -343,6 +344,11 @@ def run_provenance(
     field "was this year built on a full year of imagery?" is answerable only until cleanup
     runs, and after that never again. Recorded for every fill rather than only relaxed ones,
     because a field that appears only on suspect cells cannot be used to find them.
+
+    ``code`` is which build produced the cell
+    (:func:`~tessera_embeddings.config.environment.code_identity`), resolved here when the
+    caller does not pass one. **Recorded, never compared** — a mid-campaign change is a normal
+    event, and a value that differs between cells is a diagnostic aid rather than a condition.
 
     Both fill paths use this — the shard write (:func:`write_year_shards`) and
     the no-data marking (``campaign.mark_zone_year_empty``) — so the provenance
@@ -382,6 +388,12 @@ def run_provenance(
         record["optical_skips"] = dict(optical_skips)
     if input_coverage:
         record["input_coverage"] = dict(input_coverage)
+    # Resolved HERE rather than threaded from the flow, because it is an ambient fact about
+    # the process, not a decision any caller makes — threading it would put an argument for it
+    # on five signatures that have no opinion about it. Callers may pass one to pin it.
+    resolved_code = code if code is not None else code_identity()
+    if resolved_code:
+        record["code"] = dict(resolved_code)
     return {**(dict(existing) if isinstance(existing, dict) else {}), str(year): record}
 
 
