@@ -70,11 +70,48 @@ positive, and a refill costs hours and real money.
 
 ## 2. Slack — `#alerts-global-tessera`
 
-*Details to be filled in: the webhook URL goes in the GitHub secret
-`ARBOL_SLACK_WEBHOOK_ALERTS_GLOBAL_TESSERA` and the channel joins `infra/slack/channels.py`,
-following `#alerts-data`. Everything below is independent of those values.*
+**Two paths post to this channel, and the split is deliberate.** One is fast and lossy, the
+other slow and reliable, and neither substitutes for the other.
 
-**What gets posted, and once per fingerprint:**
+### 2.1 The fast path: server-side automations — **BUILT**
+
+Three things go wrong in a way the orchestrator observes the instant it happens, so for those a
+Prefect automation posts with no polling and no code of ours running.
+`scripts/register_alert_automations.py` registers them, and they are live on
+`global-tessera-dev`:
+
+| automation | fires on | urgency in the message |
+|---|---|---|
+| `notify-cell-validation-failed` | a `validate-zone-year` run FAILED | the highest — the only alert about the published product |
+| `notify-campaign-driver-stopped` | `run-global-campaign` FAILED or CRASHED | the show has stopped; every hour is deadline, not money |
+| `notify-fill-run-lost` | a fill run FAILED or CRASHED | context; the driver retries and the sweep reclaims the fleet |
+
+Four choices in there worth keeping:
+
+* **`CANCELLED` is not an alerting state.** An operator cancelling a run already knows, and the
+  campaign's own recovery cancels children by design — including in a normal teardown — so
+  alerting on it would post routinely, which is how a channel becomes unread.
+* **No ingest deployment is watched.** An ingest failure is retried; the driver reports genuinely
+  unfilled cells once, at the end.
+* **The validation alert does not guess *why* it failed.** "Found a defect" and "could not run"
+  both end as a FAILED run and the difference is the exception type in the log, so the body names
+  both readings and says they need opposite responses — refill nothing, re-dispatch the validator.
+* **Message bodies use exactly one template expression, `{{ event.resource.id }}`.** An invalid
+  Jinja expression makes the action fail with *nothing sent and nothing wrong on the run*, which
+  is invisible outside the orchestrator's own event log. That is the one expression this repo has
+  confirmed works in an action; a friendlier `{{ flow_run.name }}` is not worth an alert that
+  silently never arrives.
+
+**This path is lossy, by measurement.** Prefect's event broker is in-memory and drops events
+under load — we have watched it declare healthy runs dead — and it cannot fire at all when the
+server itself is the unwell thing, which is one of the conditions most worth alerting on. Hence
+the second path.
+
+### 2.2 The reliable path: the periodic poll — **NOT BUILT** (§1)
+
+The round of §1 posts what the automations cannot: everything that is a *reading* rather than an
+event (stalls, duty cycle, cost, quota, a published cell with no verdict), plus a second chance
+at everything above. Its rules:
 
 | grade | posted | re-posted |
 |---|---|---|
@@ -86,19 +123,35 @@ following `#alerts-data`. Everything below is independent of those values.*
 
 Three rules that matter more than the table:
 
-**A message carries the decision class, not just the finding.** `PROBLEM: cell validation — 2 cells
-failed` is a finding; `CLASS 1 CANDIDATE — 2 cells failed the same check` is a decision. The class
-comes from §3, which is a lookup, not a judgement.
+**A message carries the decision class, not just the finding.** `PROBLEM: cell validation — 2
+cells failed` is a finding; `CLASS 1 CANDIDATE — 2 cells failed the same check` is a decision.
+The class comes from §3, which is a lookup, not a judgement.
 
 **Every message carries its `follow_up` command.** `campaign_health` already computes the real
 invocation for each finding, filled with this round's window and roster. A message that names a
 problem without the next command makes the reader open a runbook at 3 a.m.
 
-**A resolved finding gets one closing message.** A fingerprint that stops appearing is posted once
-as resolved and dropped from the state. Without that, the channel is a list of things that may or
-may not still be true.
+**A resolved finding gets one closing message.** A fingerprint that stops appearing is posted
+once as resolved and dropped from the state. Without that, the channel is a list of things that
+may or may not still be true.
 
----
+### 2.3 Where the webhook lives
+
+**Secrets Manager, `global-tessera/slack-webhooks`, in each tessera account** — one JSON key per
+channel (`alerts-global-tessera`), so dev alerts cannot land where prod alerts go. The
+registration script reads it from the deployment's own account and writes it into a Prefect
+`SlackWebhook` block, which the server stores encrypted; the automations reference the block by
+document id. Rotating the webhook means updating the secret and re-running the script with
+`--apply`. **The URL appears in no file in either repository.**
+
+**One trap, paid for once.** `Block.save()` defaults to the *ambient* Prefect client, and Prefect
+resolves its settings at import — so on a laptop carrying a `prefect cloud login` profile, the
+first version of the script wrote the live webhook into an unrelated **Prefect Cloud** workspace.
+It looked like it worked: the block saved, `load()` read it straight back, and the only symptom
+was the automation's action failing with a *404 for a block id the deployment's own server had
+never heard of*. A secret in the wrong system, and an alert path that appeared registered. The
+save now goes through `explicit_client()` — the same client the automations use, bound to the URL
+the session exported — and the script refuses to write anything if that URL is not the target's.
 
 ## 3. Signals → decision class
 
