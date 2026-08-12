@@ -791,6 +791,17 @@ commits rather than a deadlock, and there is no manual release procedure.
 
 ## 9. Campaign monitoring
 
+**Two things watch the campaign, and neither substitutes for the other.** Server-side Prefect
+automations post the instant the orchestrator sees a run die — fast, and lossy by measurement, since
+the event broker drops events under load and cannot fire when the server itself is the unwell thing.
+So the reliable half is a poll: **`campaign-watch`, a flow on a five-minute cron** that runs
+`campaign_health.py`, remembers what it has already said, and posts what is new to
+`#alerts-global-tessera`. It grades nothing while the campaign is not running, publishes a record of
+every round to `monitoring/` in the outputs bucket, and mutates nothing. Full design and posting
+rules: [`campaign-monitoring-plan.md`](campaign-monitoring-plan.md).
+
+The signals below are what those two paths are watching for.
+
 | signal | why it matters |
 |---|---|
 | **Mosaic backlog** (completed, not yet inferred) | the $3,000 storage figure assumes prompt deletion; a four-week backlog is ~400 TB and ~$9,200/month, and sooner a bucket-capacity problem |
