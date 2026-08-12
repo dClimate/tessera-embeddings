@@ -657,7 +657,10 @@ async def run_global_campaign(
             the number is written and cannot drift from the server's.
         inference_pause_gate: Name of the global concurrency limit that PAUSES inference.
             Upserted to 1 at start (any positive value means run) and read — never acquired
-            — by every cluster's dispatch loop. Set it to **0** and each cluster lands the
+            — by every cluster's dispatch loop. **``"chained-clusters"`` only**, which is the
+            campaign's strategy: ``cluster-per-zone`` dispatches one ``fill-zone-year`` per
+            cell, and a per-cell run has no stream to hold, so the gate is neither created nor
+            forwarded there. Cancelling is the only lever on that path. Set it to **0** and each cluster lands the
             chunks it has queued and then takes on no further cell, keeping its actors and
             its run alive; set it back to 1 and they carry on where they stopped. Nothing
             fails either way and no cell is half-written, because a cell enters inference
