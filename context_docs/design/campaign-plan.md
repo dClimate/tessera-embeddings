@@ -628,7 +628,7 @@ it" safe.
 | guard | what it refuses | what it would otherwise let through |
 |---|---|---|
 | **write-once zone-year tag** | re-publishing a cell that already landed; both fill paths refuse a complete cell | two versions of one cell, with the tag pointing at whichever won |
-| **atomic date commits** | nothing — it is a property | Icechunk commits a date's pixels and its time slot together, so a date present is complete and a date absent was never started. This is what makes resume, rather than restart, correct |
+| **atomic date commits** | a half-written date existing at all | Icechunk commits a date's pixels and its time slot together, so a date present is complete and a date absent was never started. Without that, resume would have to distrust everything already there, and restarting from scratch would be the only safe option |
 | **mosaic manifest identity** (`ConfigMismatchError`) | appending to a mosaic built under a different land mask, coverage threshold, orbit, pixel policy or ingest code — this is also what makes a changed parameter raise instead of continuing | one store holding dates built two different ways, indistinguishable afterwards |
 | **completion marker validated in its own pass** | marking a mosaic finished when its recorded identity disagrees with the running code | a resume that appends nothing — every date already present — silently blessing a store built under different rules, after which every later run skips the cell |
 | **absent-means-off fields** | a run with `allow_s2_only` on passing against a store that predates the field | both pixel policies mixed in one store, which is the exact append the field exists to prevent |
@@ -649,9 +649,9 @@ independent levels, each cheaper than the one below it:
 4. **staged-tile resume inside inference** — finished tiles are not re-inferred.
 
 Nothing has to be cleaned up by hand first: an interrupted staged tile is re-inferred and
-overwritten. Two exceptions, both deliberate: a **changed parameter** raises rather than silently
-mixing configurations, and a change to the **inference code** invalidates staged tiles, because the
-tiles are what that code produced.
+overwritten. Two exceptions: a **changed parameter** raises rather than silently mixing
+configurations, and a change to the **inference code** invalidates staged tiles, because the tiles
+are what that code produced.
 
 Two consequences of how recovery actually behaves, both of which remove work rather than add it. A
 fill's terminal hook tears down its GPU fleet even when the flow body is killed outright, skipping
