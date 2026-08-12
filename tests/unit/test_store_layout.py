@@ -31,15 +31,28 @@ def test_global_scales_is_sharded_pcodec():
 
 
 def test_single_matches_global_geometry():
-    """One geometry, two names: the presets must agree, array for array.
+    """One geometry, two presets: every SHARED array must agree, array for array.
 
-    A divergence puts the single-ROI path back to rechunking at every hop.
+    A divergence puts the single-ROI path back to rechunking at every hop. The variable
+    SETS differ by design (see below); the geometry of what they share may not.
     """
-    assert SINGLE.arrays.keys() == GLOBAL.arrays.keys()
     for var in GLOBAL.arrays:
         single, global_ = SINGLE.for_var(var), GLOBAL.for_var(var)
         assert (single.dims, single.chunks, single.shards) == (global_.dims, global_.chunks, global_.shards), var
         assert (single.dtype, single.codec) == (global_.dtype, global_.codec), var
+
+
+def test_the_global_store_never_declares_embedding_std():
+    """It would be created in all 120 zone groups and never written.
+
+    v1.1's sampling is deterministic, so there is no spread to record — and an always-empty
+    array in a published petabyte is a schema surprise for every downstream reader. The
+    single-ROI path keeps it, which is the ONLY difference between the two presets.
+    """
+    assert "embedding_std" not in GLOBAL.arrays
+    assert "embedding_std" in SINGLE.arrays
+    assert SINGLE.arrays.keys() - GLOBAL.arrays.keys() == {"embedding_std"}
+    assert not GLOBAL.arrays.keys() - SINGLE.arrays.keys()
 
 
 def test_single_embeddings_are_sharded_full_band():

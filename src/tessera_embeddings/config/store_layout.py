@@ -5,13 +5,21 @@ shard shape, dtype, fill value, and codec. It is the single source of truth that
 both the empty-store seeder and the shard writer consult, so seeding and writing
 can never disagree about geometry.
 
-``SINGLE`` and ``GLOBAL`` are two names for ONE geometry (ADR-008 D2/D3), built
-from one definition so they cannot drift: ``(1, 256, 256, 128)`` full-band int8
-inner chunks in ``(1, 2048, 2048, 128)`` shards for ``embeddings``, with the 3-D
-companion arrays (``scales``, ``embedding_std``, obs counts) on the same 2048²
-spatial shards. **Both `embeddings` and `scales` are sharded** — leaving `scales`
-unsharded caps the object-count win (d3v2 E4). PCodec composes with the sharding
-codec (verified: round-trip + fill on partial shards).
+``SINGLE`` and ``GLOBAL`` share ONE geometry (ADR-008 D2/D3), built from one
+definition so it cannot drift: ``(1, 256, 256, 128)`` full-band int8 inner chunks
+in ``(1, 2048, 2048, 128)`` shards for ``embeddings``, with the 3-D companion
+arrays (``scales``, obs counts) on the same 2048² spatial shards.
+
+They differ in ONE thing, and only in which variables exist: **``embedding_std``
+is single-ROI only and is never part of the global store.** v1.1's sampling is
+deterministic, so there is no spread to record, and an array that is created in
+every zone group and never written is a schema surprise for every downstream
+reader of the published product. The geometry is still shared, so the two cannot
+diverge in chunking — which is what the shared definition exists to prevent.
+
+**Both ``embeddings`` and ``scales`` are sharded** — leaving ``scales`` unsharded
+caps the object-count win (d3v2 E4). PCodec composes with the sharding codec
+(verified: round-trip + fill on partial shards).
 
 One shard is one inference tile is a quarter of one ingest chunk, so the chain
 divides evenly end to end and nothing rechunks.
@@ -163,29 +171,39 @@ _INNER_3D = (1, INNER_PX, INNER_PX)
 _SHARD_3D = (1, SHARD_PX, SHARD_PX)
 
 
-def _sharded_arrays() -> dict[str, ArrayLayout]:
+def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
     """The embedding-store geometry: 256-px full-band inner chunks in 2048² shards.
 
     8x8 = 64 inner chunks per shard; the band axis is never split (D2), so a
     reader gets a pixel's whole 128-dimensional embedding from one object.
-    ``embedding_std`` is 4-D and mirrors ``scales``' float32 + PCodec treatment;
-    v1.1's deterministic sampling forces ``compute_std=False``, so it is declared
-    but never written.
+
+    ``include_std`` adds ``embedding_std``, which is 4-D and mirrors ``scales``'
+    float32 + PCodec treatment. It is for the SINGLE-ROI path only: v1.1's
+    deterministic sampling forces ``compute_std=False``, so in the global store it
+    would be created in all 120 zone groups and never written — a schema surprise
+    for every downstream reader of a published petabyte. The write path already
+    treats it as optional in the destination (``assembly`` filters on presence), so
+    its absence needs no other change.
 
     A fresh dict per call: ``StoreLayout.arrays`` is mutable, and two presets
     sharing one instance would let a mutation of either reach both.
     """
-    return {
+    arrays = {
         "embeddings": ArrayLayout(DIMS_4D, _INNER_4D, "int8", 0, _ZSTD, shards=_SHARD_4D),
         "scales": ArrayLayout(DIMS_3D, _INNER_3D, "float32", float("nan"), _PCODEC, shards=_SHARD_3D),
-        "embedding_std": ArrayLayout(DIMS_4D, _INNER_4D, "float32", float("nan"), _PCODEC, shards=_SHARD_4D),
         **_obs(_INNER_3D, _SHARD_3D, _ZSTD),
     }
+    if include_std:
+        arrays["embedding_std"] = ArrayLayout(
+            DIMS_4D, _INNER_4D, "float32", float("nan"), _PCODEC, shards=_SHARD_4D
+        )
+    return arrays
 
 
 #: Single-ROI output. Its own name because callers pass a preset explicitly and
 #: the name lands in the store's creating commit message.
-SINGLE = StoreLayout(name="single", arrays=_sharded_arrays())
+SINGLE = StoreLayout(name="single", arrays=_sharded_arrays(include_std=True))
 
-#: The global campaign (ADR-008 D3).
-GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays())
+#: The global campaign (ADR-008 D3). No ``embedding_std``, ever — see
+#: :func:`_sharded_arrays`.
+GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays(include_std=False))

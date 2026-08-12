@@ -29,13 +29,26 @@ Fargate; inference consumes it on GPU and the mosaic is deleted. The two use dif
 resource pools, so overlapping them costs neither side.
 
 ```
-   sequential :  ingest  +  inference          ~12 days, and 5.6 PB held at once
-   staged     :  max(ingest, inference) + lag  ~6.8 days, and ~330 TB held at once
+                        makespan                      wall clock   mosaics held at once
+   sequential           ingest + inference            ~12 days     5.6 PB  (all of them)
+   staged, year-serial   max(ingest, inference)+lag   ~6.8 days    ~250 TB (45 cells)
+   staged + all years    total work ÷ cells           ~4.8 days    ~340 TB (61 cells)  ← the campaign
 ```
 
-Staging is **not an optimisation on top of the plan — it is the plan.** Without it the
-full 5.6 PB of intermediate mosaics is held simultaneously and storage alone becomes about
-$128,000 a month.
+**Two independent axes, and the campaign takes both.**
+
+*Staging* is what drops the storage. Mosaics are transient — deleted as inference consumes
+them — so what is held at once is `cells in flight × ~5.6 TB per cell` (5.6 PB over 1,008
+zone-years), not the whole 5.6 PB. Without staging that full volume is held simultaneously and
+storage alone becomes about **$128,000 a month**; with it the line is ~$3,000 and is flat across
+configurations, because more cells hold more data for proportionally less time.
+
+*Dropping the year barrier* (`overlap_years=true`, §3) is what drops the wall clock the rest of
+the way: a year-serial makespan is `max(longest zone, work ÷ cells)` **per year**, so cells stop
+helping past about 45, while a barrier-free one is simply `work ÷ cells` and the constraint moves
+onto the GPU fleet. **Plan against ~4.8 days at 61 cells on the full 2,500-actor fleet.** The
+~6.8-day row is the best *year-serial* configuration (45 cells × 60 workers) and is what the cost
+model's scenario table reports, because that table is year-serial throughout (§6; cost model §8).
 
 Within that, work is organised as **8 long-lived Ray clusters**, each owning a set of UTM
 zones and streaming them through one persistent set of GPU actors. A cluster pays `ray up`
@@ -51,8 +64,8 @@ and model load once for its whole set rather than once per zone-year.
 
 **Every year is dispatched together** (`overlap_years=true`). A cluster works a multi-year zone
 list, so one zone's later years overlap the inference of its earlier ones, and the campaign pays
-**8 `ray up` cycles rather than 72** — worth ~$8,000 of the ramp line, and the difference between
-~4.8 days and ~6.8 at 61 cells on the full fleet. It is what makes GPU quota buy schedule again.
+**8 `ray up` cycles rather than 72**, worth ~$8,000 of the ramp line. The schedule is the real
+reason, not that: it is what makes GPU quota buy wall clock again (§6).
 
 > **Why this is safe.** Concurrent zone-years were never unsafe in the data: different groups
 > rebase cleanly, and even two years of the SAME zone write strictly disjoint objects, because
@@ -80,8 +93,8 @@ list, so one zone's later years overlap the inference of its earlier ones, and t
 ## 2. What comes out — the store a downstream user opens
 
 **One Icechunk repository, 120 UTM-zone groups, 9 annual timesteps, a 128-dimensional
-embedding per 10 m pixel.** 120 groups are seeded and about 112 hold land. The whole store is
-0.9–1.8 PB and is destined for AWS Open Data. Read-only consumers need `icechunk` plus `zarr`
+embedding per 10 m pixel.** The seed creates 120 zone groups, of which about 112 hold land, and
+the whole store is 0.9–1.8 PB — destined for AWS Open Data. Read-only consumers need `icechunk` plus `zarr`
 (v3); beyond that it is ordinary Zarr with named dimensions and coordinate arrays, so `xarray`
 opens it with no custom reader.
 
@@ -193,8 +206,8 @@ the fastest way for a consumer to see what a cell looks like before reading a te
 
 ## 3. Settings
 
-These are the values to run. Where one differs from `run_global_campaign`'s shipped default it
-is marked ★, because that is the set an operator has to pass explicitly.
+These are the values to run. **★ marks the four that differ from the shipped defaults**, which is
+exactly the set an operator has to pass explicitly; everything else is already the default.
 
 | parameter | value | why |
 |---|---|---|
@@ -202,7 +215,7 @@ is marked ★, because that is the set an operator has to pass explicitly.
 | `max_parallel_clusters` | 8 | balance holds to ~16; 8 keeps each cluster opening on a top-8 zone |
 | **`max_parallel_ingest`** | **61** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§6) |
 | `max_zone_attempts` | 2 | bounded re-dispatch per zone-year, see §8 |
-| **`ingest_settings.max_workers`** | **60** ★ | S2 fleet width. Shortens each cell, and so the tail of the cluster holding the densest zone (§6) |
+| `ingest_settings.max_workers` | 60 | S2 fleet width. Shortens each cell, and so the tail of the cluster holding the densest zone (§6) |
 | `ingest_settings.s1_worker_fraction` | 0.22 | → 13 workers per S1 orbit at the recommended 60w, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
 | **`num_actors`** | **~228** ★ | GPU actors per cluster: 85% of what ingest can feed, so the fleet never idles and keeps headroom for a restart (§6) |
@@ -437,10 +450,12 @@ that costs more. Settled; do not re-open.
    to add them.
 8. **A single dense zone-year end to end** — see §10; this is the last gate.
 
-**Prod's state, verified in the account 2026-08-06:** the coverage mask is built, all 112
-land-zone ROIs are exported, all 120 store groups are seeded, the campaign deployment set is
-registered in its branch-scoped form, the crash-recovery automations are armed, and the Prefect
-server is resized. Seven stray unsuffixed deployments left by an earlier registration attempt
+**Prod's state:** the coverage mask is built, all 112 land-zone ROIs are exported, the campaign
+deployment set is registered in its branch-scoped form, the crash-recovery automations are armed,
+and the Prefect server is resized (verified in the account 2026-08-06). **The store is NOT seeded —
+deliberately.** The seed that existed was created before `embedding_std` was removed from the global
+layout, held no data (120 groups, no completed years, no tags), and was deleted so the published
+product starts on the current schema. Re-seeding is item 4 above and takes minutes. Seven stray unsuffixed deployments left by an earlier registration attempt
 were removed, so a dispatch to a default name can no longer reach old code with a thinner
 parameter set.
 
@@ -714,7 +729,7 @@ mode (those granules report `BEAM_MODE=IW`). A model question if ever revisited,
 > **The 85% provisioning policy is load-bearing for a second reason.** It was adopted to stop a fleet idling on a shallow queue. It is also the only thing
 > holding the campaign under an **assembly ceiling of ~275 actors per cluster**: assemblies
 > serialise on one trailing thread, and inference time per tile falls as actors rise while assembly
-> does not, so the two cross. At the planned 228 the assembly tail is ~11 minutes on an ~8-day
+> does not, so the two cross. At the planned 228 the assembly tail is ~11 minutes across the whole
 > campaign; at matched (268) it crosses, and the widest configuration the cost model lists adds 7.5
 > hours. **So fleet width and assembly capacity cannot be decided independently** — anyone raising
 > the fleet for throughput is also spending this margin. If a wider fleet is ever wanted the remedy
