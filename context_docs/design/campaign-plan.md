@@ -80,12 +80,12 @@ once is `cells in flight × ~5.6 TB` rather than the whole 5.6 PB (5.6 PB over 1
 zone-years). Run sequentially, that full volume is held at once and storage alone becomes about
 **$128,000 a month** instead of ~$3,000.
 
-**Every year is dispatched in one batch, so there is no year barrier.** A cluster works a
-multi-year zone list, which makes the makespan `total work ÷ cells` rather than
+**Every year is dispatched in one batch** (`overlap_years=true`), **so there is no year barrier.**
+A cluster works a multi-year zone list, which makes the makespan `total work ÷ cells` rather than
 `max(longest zone, work ÷ cells)` *per year*. That is what lets cell count and GPU quota buy wall
-clock at all: with the barrier, cells stop helping at about 45 and no quota purchase moves the
-date. It also costs 10 `ray up` cycles instead of 90, worth ~$8,000 of the ramp line. That saving is not the
-reason to do it; the schedule is.
+clock at all: with the barrier, cells stop helping at about 45 and no quota purchase moves the date.
+It also costs 10 `ray up` cycles instead of 90, worth ~$8,000 of the ramp line — a saving, not the
+reason; the schedule is the reason.
 
 Within that, work is organised as **10 long-lived Ray clusters**, each owning a set of UTM zones
 and streaming them through one persistent set of 250 GPU actors. A cluster pays `ray up` and model
@@ -99,14 +99,9 @@ load once for its whole set, rather than once per zone-year.
        └── … every requested year dispatched as one batch
 ```
 
-**Every year is dispatched together** (`overlap_years=true`). A cluster works a multi-year zone
-list, so one zone's later years overlap the inference of its earlier ones, and the campaign pays
-**10 `ray up` cycles rather than 90**, worth ~$8,000 of the ramp line. The schedule is the real
-reason, not that: it is what makes GPU quota buy wall clock again (§6).
-
-> **Why this is safe.** Concurrent zone-years are not unsafe in the data: different groups
-> rebase cleanly, and even two years of the same zone write strictly disjoint objects, because
-> every chunk and shard is 1 in the time dimension.
+> **Why running years together is safe.** Concurrent zone-years cannot collide in the data:
+> different groups rebase cleanly, and even two years of the same zone write strictly disjoint
+> objects, because every chunk and shard is 1 in the time dimension.
 >
 > No zone-disjointness scheduler is needed: **the partition is over zones**, so a zone's every
 > year lands in one cluster, where assemblies serialize on that cluster's single trailing
