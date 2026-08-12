@@ -1362,16 +1362,39 @@ async def run_global_campaign(
     dispatched = sum(len(v) for v in runs_by_year.values())
     log.info("Campaign dispatch complete: %d fill run(s) across %d year(s)", dispatched, len(runs_by_year))
     if unfilled:
-        # Loudly, and LAST. Every year got its attempts and every landed zone-year is
-        # committed and tagged, so a re-run resumes from here rather than repeating
-        # any of it — but a campaign that did not finish its work must not report
-        # success, and the operator needs the whole list rather than the first cell
-        # that happened to fail.
+        # LOUDLY, and last — but the run SUCCEEDS. A handful of cells failing every attempt is
+        # an expected outcome at this scale, not a failed campaign: every other cell is
+        # committed and tagged, and the product of those failures is a list of zones for a
+        # second wave. Raising here would have said the opposite — it would mark 1,000 landed
+        # cells a failure because 3 did not land, fire the driver-stopped alert (which means
+        # "nothing is being filled any more", and nothing here is being filled any more
+        # because the campaign FINISHED), and leave an operator reading a stack trace to find
+        # a list.
+        #
+        # The list is not quiet, either. It goes in the log at WARNING under a banner, and in
+        # the returned summary under `unfilled`, so the report a caller keeps carries it as
+        # data rather than as prose to re-parse. Nothing about a cell on this list is
+        # ambiguous: it was dispatched, it was attempted every round, and it is missing from
+        # the store.
         detail = "; ".join(f"{y}: {', '.join(z)}" for y, z in sorted(unfilled.items(), reverse=True))
         total = sum(len(z) for z in unfilled.values())
-        raise RuntimeError(
-            f"campaign finished with {total} unfilled cell(s) after up to {max_dispatch_rounds} attempt(s) "
-            f"per year — every other cell landed and is tagged, so a re-run resumes from here. "
-            f"Unfilled: {detail}"
+        log.warning(
+            "=== CAMPAIGN FINISHED WITH %d UNFILLED CELL(S) — SECOND-WAVE LIST FOLLOWS ===", total
         )
-    return {"work_at_start": len(work), "dispatched": dispatched, "runs_by_year": runs_by_year}
+        log.warning(
+            "%d cell(s) did not land after up to %d dispatch round(s) each. Every OTHER cell is "
+            "committed and tagged, so a re-run resumes from here and re-attempts only these. "
+            "Unfilled: %s",
+            total,
+            max_dispatch_rounds,
+            detail,
+        )
+        log.warning("=== END OF UNFILLED LIST (%d cell(s)) ===", total)
+    return {
+        "work_at_start": len(work),
+        "dispatched": dispatched,
+        "runs_by_year": runs_by_year,
+        # Always present, empty when everything landed: a caller testing for the KEY rather
+        # than for its truthiness must not have to know which shape it gets.
+        "unfilled": {year: sorted(zones) for year, zones in sorted(unfilled.items())},
+    }

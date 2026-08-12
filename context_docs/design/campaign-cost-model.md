@@ -1145,10 +1145,16 @@ the nine year-barriers at which one stalled zone holds up everything behind it.
    it directly. It also meant `_partition_by_live_tiles` balanced clusters on **area, not
    work**, which is only sound if observation count is uncorrelated with zone — and latitude
    says it is not. **Fixed 2026-07-30:** the partition now weights each live tile row by its
-   latitude band's observation count (`zone_work_weight`), which takes true-work spread across
-   8 clusters from **9.43% to 0.04%**. The band table is this section's census, so the fix
-   inherits its sampling error — but balancing needs only the RATIOS between bands, which is
-   the robust part.
+   latitude band's observation count (`zone_work_weight`). **Re-measured 2026-08-12 against the
+   current mask, through the real partitioner (`scripts/cluster_work_spread.py`), at the campaign's
+   10 clusters: true-work spread is 0.009%, against 21.8% if the split balanced tile counts
+   alone.** At 8 clusters the same
+   measurement gives 0.040%, which agrees with the 0.04% recorded when the fix landed; the
+   tile-only baseline recorded then (9.43%) does **not** reproduce — it measures 11.5% at 8
+   clusters today. Same direction and a larger gap, so the case for the fix is stronger, but the
+   old baseline figure should not be quoted. The band table is this section's census, so the fix
+   inherits its sampling error — but balancing needs only the RATIOS between bands, which is the
+   robust part.
 
    **Open item, 2026-08-07: check that weight against §6b.** The census's per-band
    optical/radar split is refuted at high latitude (close to inverted at 60N) while its totals
@@ -1241,8 +1247,10 @@ the nine year-barriers at which one stalled zone holds up everything behind it.
    disentangle fleet width from geography, which are perfectly confounded in the current cell
    table — but neither question is worth delaying the campaign for.
 
-5. ~~**Weight the zone-to-cluster split by work, not area.**~~ **DONE 2026-07-30.** True-work
-   spread across 8 clusters falls from 9.43% to 0.04%. Worth recording why it mattered more
+5. ~~**Weight the zone-to-cluster split by work, not area.**~~ **DONE 2026-07-30.** At the
+   campaign's 10 clusters, true-work spread is **0.009%** where balancing on tile counts alone
+   would give **21.8%** (re-measured 2026-08-12; see §9 item 3 for what did and did not
+   reproduce). Worth recording why it mattered more
    than "uneven finish times" suggested: clusters are long-lived so the last to finish sets the
    campaign date and a heavy cluster is never averaged away, and the imbalance was **not
    random** — latitude drives it, so a cluster drawing high-latitude zones was heavy in *every*

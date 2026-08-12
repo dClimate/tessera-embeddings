@@ -76,9 +76,11 @@ and counts the expected-and-upstream ones once rather than listing them per cell
 
 ### 1.3 Output
 
-**`s3://global-tessera-embeddings/windows/<zone>/`**, from both passes. Filenames carry zone and year,
-so a zone's whole history shares one browsable folder, and the machine-readable verdict sits beside the
-figures — which is what lets the sweep roll up stored results instead of re-reading the product.
+Two prefixes in the outputs bucket, one per zone, written by both passes:
+**`windows/<zone>/`** for the figures and **`verdicts/<zone>/`** for the machine-readable verdict.
+Filenames carry zone and year, so a zone's whole history shares one browsable folder in each. The
+split is what keeps the sweep cheap: it rolls up stored verdicts rather than re-reading the product,
+and it can list a directory of verdicts without paging past every PNG.
 
 ## 2. What blocks, and what does not
 

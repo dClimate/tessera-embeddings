@@ -1142,33 +1142,53 @@ class TestFailedZonesAreRetried:
         retries stop rather than burning a fleet per attempt.
         """
         rounds = self._wire(monkeypatch, wired, ["01N", "02N"], complete_after={1: {"01N"}})  # 02N never lands
-        with pytest.raises(RuntimeError, match="unfilled cell"):
-            asyncio.run(
-                mod.run_global_campaign.fn(
-                    paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=5
-                )
+        summary = asyncio.run(
+            mod.run_global_campaign.fn(
+                paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=5
             )
+        )
+        assert summary["unfilled"] == {2025: ["02N"]}
         # One attempt, one retry that achieves nothing, then stop — the minimum
         # possible without guessing at the child's failure type.
         assert rounds["n"] == 2, f"kept retrying a deterministic failure: {rounds['n']} rounds"
 
-    def test_the_campaign_reports_every_unfilled_cell_and_fails(self, wired, monkeypatch):
-        """Loudly, and last: a campaign that did not finish must not report success,
-        and the operator needs the whole list rather than the first failure.
+    def test_the_campaign_reports_every_unfilled_cell_and_still_succeeds(self, wired, monkeypatch, caplog):
+        """A few cells failing every attempt is an expected outcome at this scale, not a failed
+        campaign — so the run SUCCEEDS and the list is the product.
+
+        Raising would say the opposite: it would mark a thousand landed cells a failure because
+        three did not land, fire the driver-stopped alert (whose meaning is "nothing is being
+        filled any more"), and leave an operator reading a stack trace to find a list.
         """
         self._wire(monkeypatch, wired, ["01N", "02N"], complete_after={})
-        with pytest.raises(RuntimeError, match=r"unfilled cell\(s\).*01N.*02N"):
-            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
+        with caplog.at_level(logging.WARNING):
+            summary = asyncio.run(
+                mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1)
+            )
+        # The list is DATA in the summary, not prose to be re-parsed out of a message.
+        assert summary["unfilled"] == {2025: ["01N", "02N"]}
+        # And it is loud: a banner, the whole list, and what a re-run would do.
+        logged = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+        assert "UNFILLED CELL(S)" in logged
+        assert "01N" in logged and "02N" in logged
+        assert "resumes from here" in logged
+
+    def test_a_campaign_that_lands_everything_still_carries_the_key(self, wired, monkeypatch):
+        """Empty rather than absent: a caller that tests for the key must not have to know
+        which of two shapes it gets."""
+        self._wire(monkeypatch, wired, ["01N"], complete_after={1: {"01N"}})
+        summary = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
+        assert summary["unfilled"] == {}
 
     def test_retries_are_disabled_at_one_attempt(self, wired, monkeypatch):
         rounds = self._wire(monkeypatch, wired, ["01N"], complete_after={})
-        with pytest.raises(RuntimeError, match="unfilled cell"):
-            asyncio.run(
-                mod.run_global_campaign.fn(
-                    paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=1
-                )
+        summary = asyncio.run(
+            mod.run_global_campaign.fn(
+                paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=1
             )
+        )
         assert rounds["n"] == 1
+        assert summary["unfilled"] == {2025: ["01N"]}
 
     def test_zero_attempts_is_rejected(self, wired):
         with pytest.raises(ValueError, match="max_dispatch_rounds"):
@@ -1269,15 +1289,15 @@ def test_overlap_years_still_reports_unfilled_cells_per_year(wired, monkeypatch)
         return _completed_run()
 
     monkeypatch.setattr(mod, "arun_deployment", arun)
-    with pytest.raises(RuntimeError, match="unfilled cell") as exc:
-        asyncio.run(
-            mod.run_global_campaign.fn(
-                paths=_PATHS,
-                ami_ssm_name="ami",
-                fill_strategy="chained-clusters",
-                max_parallel_clusters=1,
-                overlap_years=True,
-            )
+    summary = asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS,
+            ami_ssm_name="ami",
+            fill_strategy="chained-clusters",
+            max_parallel_clusters=1,
+            overlap_years=True,
         )
-    # Both years named separately, newest first, each with its zone.
-    assert "2025: 01N" in str(exc.value) and "2024: 01N" in str(exc.value), str(exc.value)
+    )
+    # Both years accounted for SEPARATELY, each with its zone: one run spanning years must not
+    # collapse into one entry, because the second wave is dispatched per cell.
+    assert summary["unfilled"] == {2024: ["01N"], 2025: ["01N"]}, summary["unfilled"]
