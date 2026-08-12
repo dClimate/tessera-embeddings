@@ -205,7 +205,13 @@ RADAR_THIN_MAX_OBS = 12
 #: cloud, so its observation count is set by orbit geometry alone and roughly one a month is
 #: a thin-but-usable year. Optical loses most of its passes to cloud, so the count that
 #: survives masking is a small fraction of the overpasses, and the model resamples across
-#: whatever remains. Forty is roughly a valid observation a week and a half.
+#: whatever remains.
+#:
+#: Fifteen is roughly a valid observation every three and a half weeks, and it sits BELOW the
+#: depth at which pictures visibly degrade (measured across 15 cells: crisp at 30+, noisy in
+#: the low twenties). So this flags cells that are thin enough to be worth naming rather than
+#: every cell that is merely not crisp — which is the difference between a label a reader acts
+#: on and one that covers a third of the globe. It was 40 until 2026-08-12.
 #:
 #: Only a REPORTING line: nothing refuses a cell for being under it, and the exact per-pixel
 #: counts live in the store's ``s2_obs_count`` array either way. Raising or lowering it

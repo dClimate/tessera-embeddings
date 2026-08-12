@@ -126,6 +126,14 @@ nothing else** — measured across 15 cells: crisp at 30+ valid observations per
 20. Radar absence alone does not visibly degrade the embeddings. `OPTICAL_THIN_MAX_OBS` records this per
 pixel as a share of embedded area. **Publish thin cells; label them.**
 
+**The line is 15 observations, set 2026-08-12 (it was 40).** That is deliberately *below* the depth at
+which pictures start to degrade, so the label names cells thin enough to be worth calling out rather
+than every cell that is merely not crisp — at 40 a large share of the globe would carry it, and a label
+that covers a third of the product is not a label. It is only a reporting line: nothing refuses a cell
+for being under it, and the per-pixel counts are in the store either way. The verdict publishes the
+cell's own mean depth (`s2_obs_mean`) beside the share, which is what a reviewer judges a window
+against — so lowering the threshold changed what is *flagged*, not what is *known*.
+
 **An AI reviews the windows before a human sees them**, as part of the monitoring round — **10 windows
 per cell**. This is the one check that otherwise does not scale: nobody eyeballs a thousand cells, so in
 practice it would be sampled and the majority would go unlooked-at.
