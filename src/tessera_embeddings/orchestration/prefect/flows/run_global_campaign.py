@@ -599,18 +599,31 @@ async def run_global_campaign(
             clusters are separate flow runs, so the cap has to live server-side);
             under ``"cluster-per-zone"`` an in-process semaphore is equivalent,
             because that strategy has one driver.
-        force_staging_reuse: Reuse staged tiles even across an INFERENCE code change.
-            The staging fingerprint normally includes a hash of the inference source, so a
-            change there starts a fresh prefix. Set this when you know a change does not
-            alter staged output (a log line, a comment) and want the hours back. Unsafe if
-            that judgement is wrong: it mixes two code versions into one write-once
-            zone-year, and `assemble_global` probes the variable set from a single tile on
-            the assumption that a staging prefix is homogeneous.
+        force_staging_reuse: Reuse staged tiles across an inference code change. Both
+            ``force_staging_*`` knobs move the STAGING fingerprint — which S3 prefix the
+            intermediate tiles are written to and read back from — and nothing else. Neither
+            one touches the published store or relaxes any gate on it: a cell's completion
+            mark, its write-once tag and its manifest checks are unaffected either way.
+
+            **This flag cannot reach staging that was created without it.** It substitutes a
+            constant into the run-id hash, so it produces a *different* prefix from the one an
+            unflagged run staged under; it preserves reuse only between runs that both set it.
+            To resume a specific existing prefix, pass ``fill-zone-year``'s explicit ``run_id``
+            — that is the only reliable lever.
+
+            Set it when a change to the inference source provably cannot alter staged output (a
+            log line, a comment, a type annotation) and the staging hours are worth having.
+            Unsafe if that judgement is wrong: it mixes two code versions into one write-once
+            zone-year, and ``assemble_global`` probes the variable set from a single tile on the
+            assumption that a staging prefix is homogeneous.
         force_staging_restage: An arbitrary token mixed into the staging fingerprint, so a
-            change the source hash CANNOT see forces a fresh prefix. The case this exists
-            for is a deliberate dependency upgrade mid-campaign — a new torch changes the
-            numbers without changing our source. Any new value starts fresh; reusing the
-            same value resumes.
+            change the source hash CANNOT see starts a fresh prefix. Its case is the opposite
+            of ``force_staging_reuse``'s: a deliberate dependency upgrade mid-campaign, where a
+            new torch changes the numbers without changing our source. Any new value starts
+            fresh; reusing the same value resumes what that value staged.
+
+            Unlike ``force_staging_reuse`` this is a production tool — abandoning stale staged
+            work is always safe, where reusing it across a real change is not.
         overlap_years: Drop the YEAR BARRIER — dispatch every requested year as one
             batch instead of one batch per year, so a cluster works a multi-year list and
             year N+1's ingest overlaps year N's inference. Default off; the year-serial

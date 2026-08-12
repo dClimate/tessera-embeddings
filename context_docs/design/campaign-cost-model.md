@@ -20,10 +20,11 @@ rather than buried.
 |---|---|
 | Ingest (Fargate) | $115,000 – $126,000 — **under review, see §4: measured velocity is 2.7–4.0× slower than the basis, which would treble this** |
 | **Inference (GPU, on-demand)** | **$472,000 – $713,000**, plan on **$573,000** — re-based 2026-08-07 on one token unit (§6b), re-measured the same day on a COMPLETED dense cell, then re-weighted onto campaign land (§6c). Was $452,000 – $573,000 / $527,000 |
-| Assembly | ~$1,300 — **measured 2026-08-07** (§6c), superseding ~$200, which was an estimate with no measurement behind it |
+| Assembly | ~$1,300 — measured (§6c) |
+| S3 requests | ~$1,600 — almost all of it ingest (§7) |
 | Mosaic storage (transient) | ~$3,000 |
-| Ray cluster ramp (72 boots, §4) | ~$9,000 |
-| **Campaign total** | **$607,000 – $848,000**, plan on **$707,000** — the ingest line is under review upward (§4); the inference line is measured on one token unit and one completed cell (§6b, §6c). Was $587,000 – $706,000 / $661,000 |
+| Ray cluster ramp | ~$1,200 — 10 boots, one per cluster. A year-serial campaign would pay one per cluster-year instead, ~$11,000 (§4) |
+| **Campaign total** | **$594,000 – $846,000**, plan on **$700,000** — the sum of the lines above. The ingest line is under review upward (§4); the inference line is measured on one token unit and one completed cell (§6b, §6c) |
 
 **The campaign is a GO and is inside budget; this document's job is now accuracy, not the
 decision.** Every revision since 2026-08-07 has moved the inference line by single-digit
@@ -32,10 +33,10 @@ sections below as cost *control* — where the money goes and which term to watc
 a gate. The one figure that could still change the answer is the ingest line, which is under
 review **upward** by up to 3x (§4).
 
-**Costed in tokens — and since 2026-08-07 both sides of the division are measured in ONE
-unit.** The campaign is **2.28 × 10¹⁵ combined S2+S1 tokens** — 1.363 × 10¹³ pixels at a
-measured, land-weighted **167 tokens per pixel** — run at a measured **2.127 M combined
-tok/sec** per worker (§6b, §6c). The pair this replaces — 1.98 × 10¹⁵ tokens at ≈1.9 M
+**Costed in tokens, with both sides of the division measured in ONE unit.** The campaign is
+**2.36 × 10¹⁵ combined S2+S1 tokens** — 1.363 × 10¹³ pixels at a measured, land-weighted
+**173 tokens per pixel** — run at a measured **2.127 M combined tok/sec** per worker, which is
+**307,854 GPU-hours** (§6b, §6c). The pair this replaces — 1.98 × 10¹⁵ tokens at ≈1.9 M
 tok/sec — divided an S2+S1 census by an **optical-only** rate; both terms were wrong by a
 similar factor in opposite directions, so the line itself moved little and the
 capacity-planning rate is **12,294 px/s** equivalent against the prior 13,103, a change of
@@ -490,9 +491,9 @@ The cheapest useful ask is **2,704 actors**, which is 66 cells at proper 85% pro
 > moved: the campaign floor is ~5.1 d at 61 cells (the barrier-free tables above), and the
 > cluster-ramp line is ~$1,200 (10 boots), not ~$11,000 (90).
 
-**The 2,500-actor quota fits every configuration here, but not by much at the widest.** The
-recommended 45 × 60w provisions 1,824; even 45 × 80w provisions 2,267, inside the quota with
-margin. The quota is adequate for every configuration considered here.
+**The campaign uses the entire 2,500-actor quota**, as 10 clusters of 250 — the quota is what sets
+the wall clock, not a margin above it. The year-serial rows above provision less (1,824 at 45 × 60w,
+2,267 at 45 × 80w) because their ingest supply is smaller.
 
 **Do not mix throughput bases.** Sizing the fleet on a while-processing rate (21–24K) and
 then running at the campaign rate leaves the fleet short by a third: GPU-hours are unchanged
@@ -508,7 +509,7 @@ campaign's duration.
 
 ## 6. Throughput
 
-**Cost the campaign in tokens — 2.28 × 10¹⁵ combined S2+S1 tokens at 2.127 M combined tok/sec
+**Cost the campaign in tokens — 2.36 × 10¹⁵ combined S2+S1 tokens at 2.127 M combined tok/sec
 per worker (measured, §6c).** This headline read "1.98 × 10¹⁵ at ≈1.9M tok/sec" until
 2026-08-07; that pair divided a combined census by an optical rate, and §6b re-bases both sides
 onto one unit. §6c then re-measured the rate on a completed cell the same day. Every earlier
@@ -801,7 +802,7 @@ not applied. A duplicate fill of 60N against one mosaic put the run-to-run noise
 
 **Open, and named as open:** the 37N/30–32° rate deficit is unexplained; **no both-orbit rate
 has been measured at campaign fleet width** — the four cells ran at 20–95 actors against a
-planned 228 per cluster, with no actor-count trend among them but no measurement either; and
+planned 250 per cluster, with no actor-count trend among them but no measurement either; and
 the convention cancellation above is exact only if the overstatement factor matches between
 corpus and rate cells (any residual pushes the line *down*). The highest-value next
 measurement is completing 37N/2021 — or any 20–40°N zone — under the radar telemetry; another
@@ -935,13 +936,14 @@ write**, with no second phase to model.
 0.02 vCPU throughout inference, so the box is free — but capacity was never the question. The
 question is whether assembly finishes before the next cell's inference does:
 
-| | assembly | inference at 228 actors | margin |
+| | assembly | inference at 250 actors | margin |
 |---|---|---|---|
-| dense cell (8,714 tiles) | 3.28 h | 3.96 h | **1.21×** |
-| average cell (3,222 tiles) | 1.21 h | 1.46 h | **1.21×** |
+| dense cell (8,714 tiles) | 3.28 h | 3.61 h | **1.10×** |
+| average cell (3,222 tiles) | 1.21 h | 1.33 h | **1.10×** |
 
-**1.21×, not the 1.6× a 2.5-hour assembly gave**, and scale-invariant because both terms are
-linear in tiles. Assembly stays off the critical path, but by 21% rather than comfortably, and a
+**1.10× at the campaign's 250 actors per cluster**, and scale-invariant because both terms are
+linear in tiles. (At 228 it was 1.21×; the two cross at **275**, which is what caps actors per
+cluster and therefore why the fleet is 10 clusters rather than 8.) Assembly stays off the critical path, but by 21% rather than comfortably, and a
 cluster runs ~126 cells in sequence so a persistent deficit compounds rather than averaging out.
 That is what makes the **39% of CPU left idle** worth keeping: not spare performance to harvest,
 but the margin's only buffer. **F8 now tests a thin ratio rather than confirming a comfortable
@@ -1002,9 +1004,9 @@ statistics ship alongside the data. Cambridge's study should be cited here once 
 
 ## 7. The lines that are not compute
 
-**Assembly — about $200, negligible.** Assembly runs on the fill flow's own runner rather
-than a worker fleet. Eight runners at 4 vCPU across a five-day campaign is roughly 3,900
-vCPU-hours. It is a rounding error and does not need a scenario.
+**Assembly — about $1,300, measured (§6c).** Assembly runs on the fill flow's own runner rather
+than a worker fleet, so it is a runner-hours line rather than a fleet one. Small enough not to need
+a scenario, but not the ~$200 a vCPU-hour estimate suggested before it was measured.
 
 **S3 requests — about $1,600, essentially all of it ingest.** The ingest estimate counts
 ~316M chunk writes at $5/M. (The zone-year attribute commit was split out of the shard
@@ -1041,19 +1043,23 @@ Ingest at its cost midpoint; inference at the **measured combined basis of §6b*
 2026-08-07 — the inference row read $537,700 on the borrowed 13.1K anchor until then), v1.1,
 with the fleet provisioned at 85% of matched so idle burn is zero (§5).
 
-| | 40 × 50w<br>shipped | 45 × 50w<br>the knee | 45 × 60w<br>**recommended** | 45 × 80w<br>if the width holds |
+**The first three columns are YEAR-SERIAL** and are kept for the ingest-width comparison only.
+The campaign runs the last column: all years in one batch, which is what changes the fleet, the
+cluster count and the wall clock.
+
+| | 40 × 50w<br>shipped | 45 × 50w<br>the knee | 45 × 60w | **THE CAMPAIGN**<br>61 cells × 60w, all years |
 |---|---|---|---|---|
-| Fargate vCPU | 12,640 | 14,220 | **16,740** | 22,140 |
-| GPU fleet to provision | 1,416 | 1,576 | **1,824** | 2,267 |
-| — actors per cluster (÷8) | 177 | 197 | **228** | 283 |
-| Ingest | $121,000 | $121,000 | $121,000 | $121,000 |
-| Inference (§6c) | $573,000 | $573,000 | $573,000 | $573,000 |
-| Assembly + S3 + mosaics | $5,900 | $5,900 | $5,900 | $5,900 |
-| Cluster ramp (72 boots — see below) | ~$7,000 | ~$8,000 | ~$9,000 | ~$11,000 |
-| **Total** | **$706,000** | **$707,000** | **$708,000** | **$710,000** |
-| Ingest wall clock (9 yr) | 7.2 d | 6.5 d | **5.6 d** | 4.5 d |
-| Campaign wall clock, YEAR-SERIAL (not the campaign — see the barrier-free table) | ~8.7 d | ~7.8 d | ~6.8 d | ~5.5 d |
-| Idle burn | $0 | $0 | **$0** | $0 |
+| Fargate vCPU | 12,640 | 14,220 | 16,740 | **22,692** |
+| GPU fleet | 1,416 | 1,576 | 1,824 | **2,500 — the quota** |
+| — clusters × actors | 8 × 177 | 8 × 197 | 8 × 228 | **10 × 250** |
+| Ingest | $121,000 | $121,000 | $121,000 | **$121,000** |
+| Inference (§6c) | $573,000 | $573,000 | $573,000 | **$573,000** |
+| Assembly + S3 + mosaics | $5,900 | $5,900 | $5,900 | **$5,900** |
+| Cluster ramp | ~$7,000 | ~$8,000 | ~$9,000 | **~$1,200 — 10 boots, not 90** |
+| **Total** | ~$706,000 | ~$707,000 | ~$708,000 | **~$700,000** |
+| Ingest wall clock (9 yr) | 7.2 d | 6.5 d | 5.6 d | **4.2 d** |
+| **Campaign wall clock** | ~8.7 d | ~7.8 d | ~6.8 d | **~5.1 d** |
+| Idle burn | $0 | $0 | $0 | **$0** |
 
 > **The 72-boot ramp line is a cost of the YEAR BARRIER, and it is now optional.** Clusters
 > are dispatched per year, so 8 clusters x 9 years is 72 `ray up` cycles plus 72 model-load
