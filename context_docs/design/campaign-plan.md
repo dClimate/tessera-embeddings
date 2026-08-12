@@ -24,39 +24,40 @@ with a pointer, never as derivations; where the two disagree, the cost model is 
 
 ## 1. Shape
 
-Ingest and inference are **staged, not sequential**. Ingest builds a zone-year's mosaic on
-Fargate; inference consumes it on GPU and the mosaic is deleted. The two use different
-resource pools, so overlapping them costs neither side.
-
 ```
-                        makespan                      wall clock   mosaics held at once
-   sequential           ingest + inference            ~12 days     5.6 PB  (all of them)
-   staged, year-serial   max(ingest, inference)+lag   ~6.8 days    ~250 TB (45 cells)
-   staged + all years    total work ÷ cells           ~4.8 days    ~340 TB (61 cells)  ← the campaign
+   what a naive run costs   ingest THEN inference     ~12 days     5.6 PB of mosaics at once
+   THE CAMPAIGN             ingest ALONGSIDE it       ~5.1 days    ~340 TB at once
 ```
 
-**Two independent axes, and the campaign takes both.**
+**~5.1 days is the campaign's wall clock.** It is 61 cells of ingest feeding 2,500 GPU actors
+across 10 clusters, with every year dispatched in one batch — the settings of §3, and the only
+configuration this plan describes. The campaign is **GPU-bound**: ingest finishes its 1,008
+zone-years in 4.2 days and the fleet needs 5.1 to consume them, so the schedule is
+`307,854 GPU-hours ÷ 2,500 actors` and nothing about ingest moves it. §6 says why those numbers.
 
-*Staging* is what drops the storage. Mosaics are transient — deleted as inference consumes
-them — so what is held at once is `cells in flight × ~5.6 TB per cell` (5.6 PB over 1,008
-zone-years), not the whole 5.6 PB. Without staging that full volume is held simultaneously and
-storage alone becomes about **$128,000 a month**; with it the line is ~$3,000 and is flat across
-configurations, because more cells hold more data for proportionally less time.
+Two design properties get it there, and both are load-bearing rather than optimisations.
 
-*Dropping the year barrier* (`overlap_years=true`, §3) is what drops the wall clock the rest of
-the way: a year-serial makespan is `max(longest zone, work ÷ cells)` **per year**, so cells stop
-helping past about 45, while a barrier-free one is simply `work ÷ cells` and the constraint moves
-onto the GPU fleet. **Plan against ~4.8 days at 61 cells on the full 2,500-actor fleet.** The
-~6.8-day row is the best *year-serial* configuration (45 cells × 60 workers) and is what the cost
-model's scenario table reports, because that table is year-serial throughout (§6; cost model §8).
+**Ingest and inference are STAGED, not sequential.** Ingest builds a zone-year's mosaic on
+Fargate; inference consumes it on GPU and the mosaic is deleted. They use different resource
+pools, so overlapping them costs neither side — and because mosaics are transient, what is held
+at once is `cells in flight × ~5.6 TB` rather than the whole 5.6 PB (5.6 PB over 1,008
+zone-years). Run sequentially, that full volume is held simultaneously and storage alone becomes
+about **$128,000 a month** instead of ~$3,000.
 
-Within that, work is organised as **8 long-lived Ray clusters**, each owning a set of UTM
-zones and streaming them through one persistent set of GPU actors. A cluster pays `ray up`
-and model load once for its whole set rather than once per zone-year.
+**Every year is dispatched in one batch, so there is no year barrier.** A cluster works a
+multi-year zone list, which makes the makespan `total work ÷ cells` rather than
+`max(longest zone, work ÷ cells)` *per year*. That is what lets cell count and GPU quota buy wall
+clock at all: with the barrier, cells stop helping at about 45 and no quota purchase moves the
+date. It also costs 10 `ray up` cycles instead of 90, worth ~$8,000 of the ramp line, which is the
+smaller reason.
+
+Within that, work is organised as **10 long-lived Ray clusters**, each owning a set of UTM zones
+and streaming them through one persistent set of 250 GPU actors. A cluster pays `ray up` and model
+load once for its whole set rather than once per zone-year.
 
 ```
    campaign
-   └── 8 clusters, each opening on one of the 8 densest zones
+   └── 10 clusters x 250 actors, each opening on one of the 10 densest zones
        ├── cluster 1 ── 35N 2017…2025 → 12S 2017…2025 → 04N …   (densest zone first)
        ├── cluster 2 ── 38N 2017…2025 → …
        └── … every requested year dispatched as ONE batch
@@ -64,7 +65,7 @@ and model load once for its whole set rather than once per zone-year.
 
 **Every year is dispatched together** (`overlap_years=true`). A cluster works a multi-year zone
 list, so one zone's later years overlap the inference of its earlier ones, and the campaign pays
-**8 `ray up` cycles rather than 72**, worth ~$8,000 of the ramp line. The schedule is the real
+**10 `ray up` cycles rather than 90**, worth ~$8,000 of the ramp line. The schedule is the real
 reason, not that: it is what makes GPU quota buy wall clock again (§6).
 
 > **Why this is safe.** Concurrent zone-years were never unsafe in the data: different groups
@@ -206,29 +207,29 @@ the fastest way for a consumer to see what a cell looks like before reading a te
 
 ## 3. Settings
 
-These are the values to run. **★ marks the four that differ from the shipped defaults**, which is
+These are the values to run. **★ marks the five that differ from the shipped defaults**, which is
 exactly the set an operator has to pass explicitly; everything else is already the default.
 
 | parameter | value | why |
 |---|---|---|
 | `fill_strategy` | `"chained-clusters"` | one cluster per zone-set, not per zone-year |
-| `max_parallel_clusters` | 8 | balance holds to ~16; 8 keeps each cluster opening on a top-8 zone |
+| **`max_parallel_clusters`** | **10** ★ | 10 x 250 actors reaches the full 2,500-actor quota while keeping each cluster's assembly thread under its ~275-actor ceiling (§6). Balance holds to ~16, and each cluster still opens on one of the 10 densest zones |
 | **`max_parallel_ingest`** | **61** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§6) |
-| `max_zone_attempts` | 2 | bounded re-dispatch per zone-year, see §8 |
+| `max_dispatch_rounds` | 2 | **The outer recovery.** How many times the campaign re-dispatches whatever is still missing — rounds, not a per-zone budget. It is the only thing that recovers a child run that DIED, since a killed or cancelled run takes its own retry counter with it (§8) |
 | `ingest_settings.max_workers` | 60 | S2 fleet width. Shortens each cell, and so the tail of the cluster holding the densest zone (§6) |
 | `ingest_settings.s1_worker_fraction` | 0.22 | → 13 workers per S1 orbit at the recommended 60w, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
-| **`num_actors`** | **~228** ★ | GPU actors per cluster: 85% of what ingest can feed, so the fleet never idles and keeps headroom for a restart (§6) |
+| **`num_actors`** | **250** ★ | GPU actors per cluster. 10 clusters x 250 = the 2,500-actor quota, which is 81% of what 61 cells of ingest can feed — under it by policy, so the fleet never idles (§6) |
 | `s1_orbit` | `"both"` | downgrades per zone when an orbit has no imagery. `"none"` is a *resolved* value, not a request: passing it in is refused, since it would defeat `require_s1` and publish optical-only embeddings that report success |
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
 | **`allow_s2_only`** | **`true`** ★ | ON for the global campaign. A fifth of the land has no radar for 2022–24 (§6); without this those pixels produce nothing. ADR 013 does not consider the combination validated — see §10 |
 | **`overlap_years`** | **`true`** ★ | every requested year dispatched as ONE batch, so a zone's later years overlap the inference of its earlier ones and the campaign boots 8 clusters rather than 72. Certified on six cells that each carry both radar orbits, including a same-zone year rollover inside one cluster |
-| `max_cell_attempts` | 2 | attempts per cell WITHIN a cluster (one retry on the still-provisioned fleet). Distinct from `max_zone_attempts`, which counts whole dispatches |
+| `attempts_per_cell_in_cluster` | 2 | **The cheap retry.** One more go at a failed cell on the cluster that is still standing, reusing its kept mosaic and staged tiles — minutes, not a fresh zone-year. Covers "the work failed but the machine is fine"; a dead run is `max_dispatch_rounds`' job (§8) |
 | `force_staging_reuse` | `false` | escape hatch — but it does NOT reach staging fingerprinted without it; the reliable resume lever is `fill-zone-year`'s explicit `run_id` (§8) |
 | `force_staging_restage` | `""` | escape hatch: any new token forces a fresh staging prefix, for a change the source hash cannot see (a library upgrade) |
 | commit limit | derived, `min(clusters, 8)` | never set by hand — and it bounds commits IN FLIGHT (~1 s each), not concurrent assemblies |
-| leg retry wall-clock budget | **6 h** (`max_leg_wall_clock_s`) | Bounds patience in WALL CLOCK, which attempt counts cannot: a single page fetch is already 9 HTTP attempts over 364 s that every outer layer counts as one try, so one deterministically failing query could otherwise cost twelve leg dispatches. Checked only when STARTING an attempt, so a slow-but-succeeding leg is never why the loop stops. A legitimately slow source loses its remaining attempts in that flow run and nothing else: the cell returns to the work list, and a re-dispatch resumes from committed dates |
+| leg retry wall-clock budget | **6 h** (`max_leg_wall_clock_s`) | **Ingest.** A zone-year's ingest is three legs — optical, and one per radar orbit — and each retries on its own when a source misbehaves. This caps how long ONE leg may keep retrying, so a single stuck source cannot hold a whole zone (and the Dask fleet it is paying for) indefinitely. Measured in TIME rather than tries because one try can itself take minutes. Nothing is lost when it fires: ingest commits date by date, so everything already fetched is kept, the cell goes back on the work list, and the next dispatch carries on from where it stopped — giving up early costs latency, not work. Six hours still clears three legs of the slowest dense zone |
 | Earth Search page size | 100 | Set PER PROVIDER. This catalogue refuses some (area, window) pairs at 250 and answers the same query at 100 — see the note below |
 
 The commit gate and the ingest gate are both **Prefect global concurrency limits**, because
@@ -257,8 +258,8 @@ and no ingest equivalent — is deliberate rather than an omission.
 
 ## 4. Order
 
-Zones are dealt to clusters **longest-processing-time first**, so each of the 8 clusters
-opens on one of the 8 densest zones and totals land within 0.0% of each other. Within a
+Zones are dealt to clusters **longest-processing-time first**, so each of the 10 clusters
+opens on one of the 10 densest zones and totals land within 0.0% of each other. Within a
 cluster, zones run densest to sparsest.
 
 That ordering does two jobs and is deliberately **not** a barrier: a cluster requests GPUs
@@ -353,47 +354,55 @@ pixels. The campaign is **2.36 × 10¹⁵ combined S2+S1 tokens** — 1.363 × 1
 measured, land-weighted **173 tokens per pixel** — at a measured **2.127 M combined tok/sec**
 per worker (cost model §6c). The equivalent px/s is 12.3K.
 
-**Quote COMBINED tok/sec, never px/s and never optical tok/sec.** Pixels-per-second mixes
-machine speed with geography, and an optical rate is a *different unit* that sat in the model's
-central division for three revisions: `t_kept` counts optical timesteps only, so it cannot see
-the radar sequences the same forward pass encodes. On an optical basis the same fleet reads
-2.26–2.93 M tok/s radar-free, 1.60–1.79 M on one orbit and 1.23–1.62 M on both — a spread that
-is entirely an artefact of the unit. On the combined basis it collapses to 1.01–1.08× within a
-run, which is why that is the only basis quoted here.
+**Quote COMBINED tok/sec, never px/s and never optical tok/sec.** Pixels-per-second mixes machine
+speed with geography. An optical rate is a *different unit*: `t_kept` counts optical timesteps only,
+so it cannot see the radar sequences the same forward pass encodes — on an optical basis the same
+fleet reads 2.26–2.93 M tok/s radar-free, 1.60–1.79 M on one orbit and 1.23–1.62 M on both, a spread
+that is an artefact of the unit rather than a real difference. On the combined basis it collapses to
+1.01–1.08× within a run, which is why that is the only basis quoted here.
 
-**The GPU fleet sets the schedule, not ingest.** Every year is dispatched in one batch, so a
-zone's nine years are a single work list and no per-year floor exists: the longest single zone
-gates only its own cluster's tail. Past ~52 cells the 2,500-actor fleet is what the campaign
-waits on, so **extra cells buy buffer rather than speed**:
+**The configuration is 61 ingest cells at 60 S2 workers each, and 2,500 GPU actors as 10 clusters
+of 250.** That is **~5.1 days** and **~$707,000** (interval $607,000 – $848,000, of which inference
+is $573,000; cost model §1, §6c, where the ingest line is under review upward). Both quotas are
+applied in prod and both are the binding limit rather than slack: 22,692 of 25,000 Fargate vCPU,
+and 10,000 of 10,000 G-and-VT.
 
-| cells | Fargate vCPU | ingest | GPU provisioning | **campaign** |
+**The schedule is `307,854 GPU-hours ÷ 2,500 actors` = 5.1 days**, and every other number here is
+subordinate to it. Ingest delivers its 1,008 zone-years in 4.2 days at 61 cells, so the fleet is
+the constraint and always finishes last.
+
+**Three limits set that shape, and it is the only point where all three are satisfied.**
+
+| limit | value | what it forces |
+|---|---|---|
+| G-and-VT quota | 10,000 vCPU = 2,500 `g6e.xlarge` actors | the total fleet, and therefore the 5.1 days |
+| assembly ceiling | ~275 actors per cluster | at least 10 clusters, since 2,500 ÷ 8 = 312 crosses it |
+| Fargate quota | 25,000 vCPU | at most ~67 cells; 61 is what the fleet can absorb |
+
+**Why 61 cells and not fewer or more.** With every year in one batch there is no per-year floor,
+so past about 52 cells the fleet is what the campaign waits on and the date stops moving. Fewer
+cells would reach the same 5.1 days but with no ingest buffer; more would buy neither speed nor
+anything else. 61 is the count that keeps the fleet fed at **81% of what ingest can supply** —
+under it by policy, so a mosaic is always waiting and no GPU idles.
+
+| cells | Fargate vCPU | ingest | fleet vs supply | campaign |
 |---|---|---|---|---|
-| 52 | 19,344 | 4.80 d | 100% | ~4.8 d |
-| **61** ★ | **22,692** | **4.09 d** | **85%** | **~4.8 d** |
-| 66 | 24,552 | 3.78 d | 79% | ~4.8 d |
-| 80 | 29,760 | 3.12 d | 65% | ~4.8 d |
+| 52 | 19,344 | 4.80 d | ~96% — no buffer | ~5.1 d |
+| **61 — the campaign** | **22,692** | **4.18 d** | **81%** | **~5.1 d** |
+| 66 | 24,552 | 3.86 d | 75% | ~5.1 d |
 
-**61 cells at 60 workers is the recommended shape, and prod's applied Fargate quota of 25,000
-vCPU accommodates it** (22,692 needed). It is not the fastest row — every row lands near 4.8
-days — it is the row that reaches the 85% GPU provisioning the policy below calls for.
+**Cost is flat across that table to within 0.5%**, because inference is the same pixels at the same
+rate and ingest worker-hours are width-neutral. So the column that matters is the buffer, not cost.
 
-**Every configuration costs the same to within 0.5%: ~$707,000**, interval
-$607,000 – $848,000, of which inference is $573,000 (cost model §1, §6c; the ingest line is
-under review upward there). Inference is the same pixels at the same rate, and ingest
-worker-hours are width-neutral. The decision is wall clock bought with Fargate quota, not a
-cost trade.
+**If the date ever has to move, buy ACTORS — nothing else touches it.** The fleet is already at
+quota, so this means a quota increase: at 3,000 actors the campaign is ~4.3 days, and each 250
+actors beyond that wants one more cluster to stay under the assembly ceiling.
 
-**To go faster, ask for ACTORS, not cells.** 2,750 actors (67 cells) is ~4.4 d; 3,000 actors
-(73 cells) ~4.0 d; 66 cells at proper 85% provisioning wants 2,704 actors, an ~8% bump. A
-deeper ingest buffer is worth having — it absorbs a cell failing and restarting — but it is not
-a speed-up: cells are not the lever, actors are.
-
-**Provision the GPU fleet UNDER what ingest can feed — about 85% of it.** That is the policy,
-not an accident of rounding. It keeps a standing queue of finished mosaics so the fleet is
-never idle, and the 15% margin absorbs an ingest cell failing and restarting without the GPUs
-noticing. Inference then trails ingest by roughly 18% of the run, which is the "slightly
-slower start" that buys the guarantee. The recommended configuration wants **1,824 actors**,
-comfortably inside the 2,500 quota; even 80 workers wants only 2,267.
+**Provision the GPU fleet UNDER what ingest can feed.** That is the policy, not an accident of
+rounding: it keeps a standing queue of finished mosaics so the fleet is never idle, and the margin
+absorbs an ingest cell failing and restarting without the GPUs noticing. The campaign sits at 81%,
+which the quota chose rather than the policy — 85% would want 2,611 actors and there are 2,500. The
+cost is that inference trails ingest slightly at the start, which is what buys the guarantee.
 
 **Fleet-feeding is not a risk to plan around: duty cycle is ≥97.3%**, measured on 38N-2021 at
 60 actors over 9,051 chunks and 14.7 hours for $1,600, with nothing stalled.
@@ -563,7 +572,7 @@ opened and shift every pixel of a date silently.
 **Retry, at two levels.**
 
 *Inside a cluster.* A failed cell is re-attempted on the still-provisioned fleet —
-`max_cell_attempts`, default 2, so one retry. The cluster is already up, the failed cell's
+`attempts_per_cell_in_cluster`, default 2, so one retry. The cluster is already up, the failed cell's
 mosaic was deliberately retained, and its staged tiles resume, so this is normally minutes
 rather than a fresh zone-year. **Eligibility is "kept its mosaic", not "failed"**: two paths
 delete the mosaic on purpose (the orbit-mismatch deferral cap, a terminal plan) so a
@@ -579,13 +588,13 @@ the cheaper mistake: two writers on one mosaic prefix produce a mosaic nothing d
 detect, and those commits do not rebase, so the loser's failure is terminal anyway.
 
 *Across dispatches.* A failed zone does not sink the campaign. Each dispatch gets up to
-`max_zone_attempts` rounds, and every round re-reads the *store* for what is still missing,
+`max_dispatch_rounds` rounds, and every round re-reads the *store* for what is still missing,
 so a retry never repeats a zone that landed. Rounds stop early when one makes no progress —
 that is what a deterministic failure looks like from the driver, and it wants a human rather
 than another fleet. The campaign raises at the very end listing every unfilled cell.
 
-**The two bounds are deliberately separate.** `max_cell_attempts` counts attempts per cell;
-`max_zone_attempts` counts whole dispatches. Overloading one knob for both would silently
+**The two bounds are deliberately separate.** `attempts_per_cell_in_cluster` counts attempts per cell;
+`max_dispatch_rounds` counts whole dispatches. Overloading one knob for both would silently
 change what either means. The in-cluster level exists because the driver's unit is a whole
 dispatch: without it, a cell failing early under `overlap_years` would wait for every cluster
 to finish its entire multi-year list before being re-attempted.
@@ -712,26 +721,22 @@ no VV+VH, so the ingest declines them on polarisation, not for lack of radar. Th
 tiles of deliberately optical-only land, distinct from the Sentinel-1B gap below, and **not** EW
 mode (those granules report `BEAM_MODE=IW`). A model question if ever revisited, not an ingest one.
 
-> **The inference line is measured on ONE token unit, and settled.** It was the last launch
-> prerequisite. Depth is **173 tok/px** and rate **2.127 M combined tok/s**, both land-weighted,
-> putting inference at **$573,000** and the campaign at **$707,000** (§6). **Fleet sizing, the 85%
-> provisioning policy and the work-hours bank are unaffected** — the capacity-planning rate has
-> moved only a few percent across every revision of this basis, so the sizing survived a twelvefold
-> increase in evidence. Full accounting and the three corrections behind it — a mixed unit, a
-> partial in-flight read, and radar depth weighted by the cells we happened to measure rather than
-> by campaign land — are `campaign-cost-model.md` §6b and §6c.
+> **The inference line is settled and measured on one token unit.** Depth **173 tok/px**, rate
+> **2.127 M combined tok/s**, both land-weighted: inference **$573,000**, campaign **$707,000** (§6).
+> Full accounting in `campaign-cost-model.md` §6b–§6c.
 >
-> **Two residuals are carried rather than closable.** An unexplained **~19% rate deficit** on the
-> 20–45° both-orbit sample narrowed but did not close, and the **35–50° band stays interpolated**
-> because measuring it is decided against. That is the widest single driver of the cost interval,
-> and no further measurement is planned.
+> **Two uncertainties are carried rather than closable**, and together they are the widest driver of
+> the cost interval: an unexplained **~19% rate deficit** on the 20–45° both-orbit sample, and the
+> **35–50° band is interpolated** because measuring it is decided against. No further measurement is
+> planned.
 
-> **The 85% provisioning policy is load-bearing for a second reason.** It was adopted to stop a fleet idling on a shallow queue. It is also the only thing
+> **Provisioning under supply is load-bearing for a second reason** beyond stopping a fleet idling
+> on a shallow queue. It is also the only thing
 > holding the campaign under an **assembly ceiling of ~275 actors per cluster**: assemblies
 > serialise on one trailing thread, and inference time per tile falls as actors rise while assembly
-> does not, so the two cross. At the planned 228 the assembly tail is ~11 minutes across the whole
-> campaign; at matched (268) it crosses, and the widest configuration the cost model lists adds 7.5
-> hours. **So fleet width and assembly capacity cannot be decided independently** — anyone raising
+> does not, so the two cross. **At the planned 250 per cluster the assembly tail is minutes across
+> the whole campaign; past ~275 it crosses and starts adding hours.** This is why the fleet is 10
+> clusters of 250 rather than 8 of 312: the same 2,500 actors, on the safe side of the ceiling. **So fleet width and assembly capacity cannot be decided independently** — anyone raising
 > the fleet for throughput is also spending this margin. If a wider fleet is ever wanted the remedy
 > is the assembly side, not the fleet: the runner leaves ~39% of its CPU idle at the shipped pool
 > width, and that idle capacity is precisely what a fleet above the ceiling would need.
@@ -784,8 +789,9 @@ in the table below is a *chosen setting*, not a computed one.
 
 **Four mechanisms. If a number moves and none of these explains it, something else changed.**
 
-1. **The GPU fleet, not ingest, sets the schedule.** Past ~52 cells every configuration lands
-   near 4.8 days, so extra cells buy buffer and only extra ACTORS buy time.
+1. **The GPU fleet, not ingest, sets the schedule.** The campaign is `GPU-hours ÷ actors`, so past
+   ~52 cells every configuration lands near 5.1 days: extra cells buy buffer, and only extra
+   ACTORS buy time.
 2. **Inference cost scales with tokens, not pixels — and the tokens are COMBINED S2+S1.**
    Quote combined `tok/sec`. Pixels-per-second mixes machine speed with geography, and an
    *optical* tok/sec is a third unit again — `t_kept` counts optical timesteps only, so it cannot
@@ -809,7 +815,7 @@ tokens/px, range 66–147** (cost model §6b).
 
 **Clusters are balanced on WORK, not on area, and the distinction is not a refinement.**
 `zone_work_weight` weights live tiles by their latitude band's observation count, and by the number
-of years a zone carries — measured over the real coverage census at 8 clusters, true-work spread is
+of years a zone carries — measured over the real coverage census, true-work spread is
 **0.04%** where balancing on tile counts alone gives 9.43%. Both halves are load-bearing: cost
 scales with area × observations, and a batch spanning years (which is the campaign setting) would
 otherwise leave one cluster draining the extra years while the rest sit idle. A zone with no years
@@ -836,22 +842,18 @@ pointer, never a derivation.
 | [`radar_source_coverage_2026_08.md`](radar_source_coverage_2026_08.md) | which zones publish **no** usable radar at all, and the polarisation reason Greenland and Arctic Canada are optical-only | how much LAND has radar — that is a per-pixel question and belongs to the cost model |
 | [`inference-perf-run-ledger.md`](inference-perf-run-ledger.md) | the raw per-run measurements each figure came from | conclusions |
 
-**Three of those carry withdrawn claims next to the claim rather than deleted.** That is deliberate:
-each was wrong in a way worth not repeating, and a reviewer who only sees the corrected number learns
-nothing about how it went wrong. The withdrawals are marked in bold and dated.
+**Those documents carry their own withdrawn claims beside the corrected ones, on purpose** — a
+reviewer who sees only the final number learns nothing about how it went wrong, and
+[`../corrections-register.md`](../corrections-register.md) indexes them by mechanism.
 
-**This file carries none of them, equally deliberately.** It states the current position; how that
-position was reached lives in the document that owns the measurement. A finding that changed a
-decision here is folded into the section it changed, and history appears only where it explains a
-decision that would otherwise look arbitrary.
+**This file carries none of them.** It states the current position; how that position was reached
+lives in the document that owns the measurement. A finding that changed a decision here is folded
+into the section it changed, and history appears only where it explains a decision that would
+otherwise look arbitrary.
 
-**[`../corrections-register.md`](../corrections-register.md) indexes every one of them**, across
-all 14 documents that carry them, grouped by the mechanism that produced them rather than by
-file. The withdrawals stay where they are — that is the point of the paragraph above — but the
-register is where the *pattern* is visible, and the pattern is the part that keeps repeating:
-eight mechanisms cover all 83 (audited 2026-08-11), and most recur in documents that do not
-cite each other. Read it
-before publishing a figure or reusing one.
+The register groups them by the MECHANISM that produced them rather than by file, which is the
+part that keeps repeating: eight mechanisms cover every one, and most recur across documents that
+do not cite each other. **Read it before publishing a figure or reusing one.**
 
 - [`campaign-cost-model.md`](campaign-cost-model.md) — costs, GPU fleet sizing, the idle-burn
   arithmetic, and the observation-count model behind the throughput basis.

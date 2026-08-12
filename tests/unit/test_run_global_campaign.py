@@ -1122,7 +1122,7 @@ class TestFailedZonesAreRetried:
         with pytest.raises(RuntimeError, match="unfilled cell"):
             asyncio.run(
                 mod.run_global_campaign.fn(
-                    paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_zone_attempts=5
+                    paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=5
                 )
             )
         # One attempt, one retry that achieves nothing, then stop — the minimum
@@ -1142,14 +1142,14 @@ class TestFailedZonesAreRetried:
         with pytest.raises(RuntimeError, match="unfilled cell"):
             asyncio.run(
                 mod.run_global_campaign.fn(
-                    paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_zone_attempts=1
+                    paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=1
                 )
             )
         assert rounds["n"] == 1
 
     def test_zero_attempts_is_rejected(self, wired):
-        with pytest.raises(ValueError, match="max_zone_attempts"):
-            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_zone_attempts=0))
+        with pytest.raises(ValueError, match="max_dispatch_rounds"):
+            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_dispatch_rounds=0))
 
 
 # --- overlap_years: dropping the year barrier -------------------------------------------

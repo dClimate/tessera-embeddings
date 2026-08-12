@@ -70,9 +70,11 @@ loop), under one of two strategies:
 
 Interruptions are expected — the orphan sweeper cancels child runs by design, and
 an interrupted mosaic is **resumed rather than rebuilt**, so no ingest work is lost.
-What the campaign adds on top is a **bounded re-dispatch**: `max_zone_attempts`
-(default 2) rounds per year, each re-reading the store for what is genuinely still
-missing, so a retry never repeats a landed zone.
+What the campaign adds on top is a **bounded re-dispatch**: `max_dispatch_rounds`
+(default 2) rounds, each re-reading the store for what is genuinely still missing, so a
+retry never repeats a landed zone. It is the only recovery that survives a child run
+DYING, since a killed or cancelled run takes its own `attempts_per_cell_in_cluster`
+counter with it.
 
 Failures are recorded, never raised mid-flight. A cluster that dies having landed
 most of its zones keeps that work — every zone-year is committed and tagged

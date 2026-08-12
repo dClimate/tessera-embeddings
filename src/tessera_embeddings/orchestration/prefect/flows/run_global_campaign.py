@@ -494,7 +494,7 @@ async def run_global_campaign(
     ingest_deployment: str | None = None,
     mask_name: str = "global",
     max_parallel_ingest: int = 40,
-    max_zone_attempts: int = 2,
+    max_dispatch_rounds: int = 2,
     # Staging-reuse escape hatches. Both default off; see `_staging_code_identity`.
     force_staging_reuse: bool = False,
     force_staging_restage: str = "",
@@ -620,15 +620,22 @@ async def run_global_campaign(
             zone no longer collide. The partition is over ZONES, so a zone's every year
             lands in one cluster and its assemblies serialize on that cluster's single
             trailing thread. **Untested against a real fleet — see the Phase 4 plan.**
-        max_zone_attempts: How many times a year's remaining cells are dispatched
-            before the campaign gives up on them. A failed zone must not cost the
-            campaign: interruptions are EXPECTED (the orphan sweeper cancels child
-            runs by design), and an interrupted mosaic is resumed rather than
-            rebuilt, so a re-dispatch is cheap. Each round re-reads the store and
-            targets only what is still missing, so a retry never re-does landed
-            work. Rounds stop early when one makes no progress at all — that is
-            what a DETERMINISTIC failure looks like from here (a coverage gate, a
-            fingerprint mismatch, an unseeded group), and those want a human, not
+        max_dispatch_rounds: How many ROUNDS of re-dispatch the campaign runs — not a
+            per-zone budget. Each round dispatches everything still missing, whatever
+            zones that is, and re-reads the STORE to decide, so it never re-does landed
+            work and an interrupted mosaic is resumed rather than rebuilt.
+
+            **This is the outer recovery, and the only one that survives a child run
+            dying.** A killed container or a cancelled run takes its in-cluster attempt
+            counter with it, so nothing inside the run can retry anything; interruptions
+            are EXPECTED here, because the orphan sweeper cancels child runs by design.
+            The child's own ``attempts_per_cell_in_cluster`` covers the cheaper case where
+            the run survives and one cell failed.
+
+            Rounds stop early when one makes no progress at all — that is what a
+            DETERMINISTIC failure looks like from here (a coverage gate, a fingerprint
+            mismatch, an unseeded group), and it is what bounds the two budgets
+            compounding on a cell that will never succeed. Those want a human, not
             another cluster. Set to 1 to disable retries.
         ingest_limit_name: Prefect global concurrency limit backing
             ``max_parallel_ingest`` under ``"chained-clusters"``. The campaign
@@ -696,8 +703,10 @@ async def run_global_campaign(
         raise ValueError(msg)
     if max_parallel_ingest < 1:
         raise ValueError(f"max_parallel_ingest must be >= 1, got {max_parallel_ingest} (Semaphore(0) blocks forever)")
-    if max_zone_attempts < 1:
-        raise ValueError(f"max_zone_attempts must be >= 1, got {max_zone_attempts} (no cell would ever be dispatched)")
+    if max_dispatch_rounds < 1:
+        raise ValueError(
+            f"max_dispatch_rounds must be >= 1, got {max_dispatch_rounds} (no cell would ever be dispatched)"
+        )
     # Publish both fleet-wide caps so the numbers the operator set here are the
     # numbers actually enforced in the children (see _upsert_limit). Cheap,
     # idempotent, and safe to repeat.
@@ -1045,7 +1054,7 @@ async def run_global_campaign(
         # ever target genuinely unfilled cells and an interrupted mosaic is resumed
         # rather than rebuilt.
         remaining = [(z, y) for z, y in work if y in set(batch_years)]
-        for attempt in range(1, max_zone_attempts + 1):
+        for attempt in range(1, max_dispatch_rounds + 1):
             if not remaining:
                 break
             batch_cells = list(remaining)
@@ -1257,15 +1266,15 @@ async def run_global_campaign(
                     "missing from the store — they were never attempted. Re-dispatching: %s",
                     batch_years,
                     attempt,
-                    max_zone_attempts,
+                    max_dispatch_rounds,
                     len(remaining),
                     ", ".join(f"{z}-{y}" for z, y in remaining[:10]),
                 )
             for f in round_failures:
-                log.warning("Year(s) %s attempt %d/%d: %s", batch_years, attempt, max_zone_attempts, f)
+                log.warning("Year(s) %s attempt %d/%d: %s", batch_years, attempt, max_dispatch_rounds, f)
             if not remaining:
                 break
-            if attempt >= max_zone_attempts:
+            if attempt >= max_dispatch_rounds:
                 break
             if set(remaining) == before and attempt > 1:
                 # A whole round achieved nothing. That is what a DETERMINISTIC
@@ -1286,7 +1295,7 @@ async def run_global_campaign(
                 batch_years,
                 len(remaining),
                 attempt,
-                max_zone_attempts - attempt,
+                max_dispatch_rounds - attempt,
             )
         for z, y in remaining:
             if z not in unfilled.setdefault(y, []):
@@ -1320,7 +1329,7 @@ async def run_global_campaign(
         detail = "; ".join(f"{y}: {', '.join(z)}" for y, z in sorted(unfilled.items(), reverse=True))
         total = sum(len(z) for z in unfilled.values())
         raise RuntimeError(
-            f"campaign finished with {total} unfilled cell(s) after up to {max_zone_attempts} attempt(s) "
+            f"campaign finished with {total} unfilled cell(s) after up to {max_dispatch_rounds} attempt(s) "
             f"per year — every other cell landed and is tagged, so a re-run resumes from here. "
             f"Unfilled: {detail}"
         )

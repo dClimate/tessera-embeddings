@@ -227,7 +227,7 @@ Two further consequences of the barrier, both currently unmodelled:
   of schedule** not counted anywhere below. The plan's description of clusters that "pay
   `ray up` once for the whole set" is true only *within* a year.
 - **Nine barriers are nine chances to stall.** A single pathological zone delays its whole
-  year, and the retry loop runs up to `max_zone_attempts` rounds before the year can close.
+  year, and the retry loop runs up to `max_dispatch_rounds` rounds before the year can close.
 
 > **One measured hint that narrowing may be slightly cheaper than width-neutral.** The
 > ingest ramp's 10 → 20 cell rung narrowed S2 from 60w to 45w and cost 1.24× in time
@@ -450,27 +450,34 @@ Every row above is **year-serial**, so its makespan is `max(longest zone, work /
 year and the cell count stops helping at ~45. Without the barrier the makespan is simply
 `total work / cells`, which moves the constraint onto the GPU fleet:
 
-| cells | Fargate vCPU | ingest | provisioning at 2,500 actors | **campaign** |
+| cells | Fargate vCPU | ingest | fleet vs supply | **campaign** |
 |---|---|---|---|---|
-| 52 | 19,344 | 4.80 d | 100% — no buffer | ~4.8 d |
-| **61** | **22,692** | **4.09 d** | **85% — the policy** | **~4.8 d** |
-| 66 | 24,552 | 3.78 d | 79% | ~4.8 d |
-| 80 | 29,760 | 3.12 d | 65% | ~4.8 d |
+| 52 | 19,344 | 4.80 d | ~96% — no buffer | ~5.1 d |
+| **61** | **22,692** | **4.18 d** | **81%** | **~5.1 d** |
+| 66 | 24,552 | 3.86 d | 75% | ~5.1 d |
+| 80 | 29,760 | 3.18 d | 62% | ~5.1 d |
 
-**Past ~52 cells the campaign is flat at ~4.8 days**, because the 2,500-actor fleet consumes at
-a fixed rate no matter how fast mosaics arrive. Extra cells buy the **buffer** the 85% policy is
+**Past ~52 cells the campaign is flat at ~5.1 days**, because the 2,500-actor fleet consumes at
+a fixed rate no matter how fast mosaics arrive: `307,854 GPU-hours ÷ 2,500 = 123 h`.
+
+> **Re-based on §6c (was ~4.8 d).** The rows above divided the OLD 283,200 GPU-hours by 2,500
+> actors. The land-weighted census raised the work to 307,854 GPU-hours — +8.7% — and the campaign
+> with it, from ~4.8 to ~5.1 days. Fleet SIZING is untouched, because that is set by ingest supply
+> rather than by total work; it is the DURATION that moves, and the duration is what the deadline
+> is measured against. The ingest column is likewise re-derived by scaling the measured 45-cell
+> row, which is why 4.09 became 4.18. Extra cells buy the **buffer** the 85% policy is
 made of — which is worth having, since it is what absorbs a failed ingest cell — but they buy no
 schedule at all. This is the easiest wrong quota request to make from this document: asking for
 Fargate when the binding resource is GPU.
 
 **To buy schedule, buy actors.** Cells shown are what keeps 85% provisioning:
 
-| actors | cells | Fargate vCPU | **campaign** | vs 2,500 |
-|---|---|---|---|---|
-| 2,500 | 61 | 22,700 | ~4.8 d | 1.00× |
-| 2,750 | 67 | 24,969 | **~4.4 d** | 0.91× |
-| 3,000 | 73 | 27,239 | **~4.0 d** | 0.83× |
-| 3,500 | 85 | 31,779 | ~3.4 d | 0.71× |
+| actors | clusters at ≤275 each | **campaign** | vs 2,500 |
+|---|---|---|---|
+| 2,500 | 10 × 250 | ~5.1 d | 1.00× |
+| 2,750 | 11 × 250 | **~4.7 d** | 0.91× |
+| 3,000 | 12 × 250 | **~4.3 d** | 0.83× |
+| 3,500 | 14 × 250 | ~3.7 d | 0.71× |
 
 The cheapest useful ask is **2,704 actors**, which is 66 cells at proper 85% provisioning — an
 ~8% quota bump for about half a day.
@@ -480,8 +487,8 @@ The cheapest useful ask is **2,704 actors**, which is 66 cells at proper 85% pro
 > and schedule planning should still use the year-serial rows above" while nothing had run on
 > a real fleet; P4 passed all five multi-year checks and P7 ran two clusters across six
 > both-orbit cells with a year rollover inside one of them. The two figures it moves are
-> moved: the campaign floor is ~4.8 d at 61 cells (the barrier-free tables above), and the
-> cluster-ramp line is ~$1,000 (8 boots), not ~$9,000 (72).
+> moved: the campaign floor is ~5.1 d at 61 cells (the barrier-free tables above), and the
+> cluster-ramp line is ~$1,200 (10 boots), not ~$11,000 (90).
 
 **The 2,500-actor quota fits every configuration here, but not by much at the widest.** The
 recommended 45 × 60w provisions 1,824; even 45 × 80w provisions 2,267, inside the quota with
@@ -1045,7 +1052,7 @@ with the fleet provisioned at 85% of matched so idle burn is zero (§5).
 | Cluster ramp (72 boots — see below) | ~$7,000 | ~$8,000 | ~$9,000 | ~$11,000 |
 | **Total** | **$706,000** | **$707,000** | **$708,000** | **$710,000** |
 | Ingest wall clock (9 yr) | 7.2 d | 6.5 d | **5.6 d** | 4.5 d |
-| **Campaign wall clock** | **~8.7 d** | ~7.8 d | **~6.8 d** | ~5.5 d |
+| Campaign wall clock, YEAR-SERIAL (not the campaign — see the barrier-free table) | ~8.7 d | ~7.8 d | ~6.8 d | ~5.5 d |
 | Idle burn | $0 | $0 | **$0** | $0 |
 
 > **The 72-boot ramp line is a cost of the YEAR BARRIER, and it is now optional.** Clusters

@@ -194,9 +194,7 @@ def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
         **_obs(_INNER_3D, _SHARD_3D, _ZSTD),
     }
     if include_std:
-        arrays["embedding_std"] = ArrayLayout(
-            DIMS_4D, _INNER_4D, "float32", float("nan"), _PCODEC, shards=_SHARD_4D
-        )
+        arrays["embedding_std"] = ArrayLayout(DIMS_4D, _INNER_4D, "float32", float("nan"), _PCODEC, shards=_SHARD_4D)
     return arrays
 
 

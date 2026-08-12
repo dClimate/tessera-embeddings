@@ -46,7 +46,7 @@ the flow and README point here):
   hold at most ``look_ahead + 1`` slots before further mismatch cells fail
   loudly instead of silently stacking multi-TB mosaics.
 - **In-child retry**: a failed cell is re-attempted on the still-provisioned
-  cluster before the run ends (``max_cell_attempts``), reusing the per-cell
+  cluster before the run ends (``attempts_per_cell_in_cluster``), reusing the per-cell
   ``infer_single`` path and the mosaic that was retained for exactly this. Without
   it the driver's retry unit is a whole dispatch, so an early failure would wait
   for every cluster to finish its list. See the block above the fallback pass.
@@ -295,7 +295,7 @@ def fill_zones_sequential(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     inputs: CellInputs | None = None,
     look_ahead: int = 2,
-    max_cell_attempts: int = 2,
+    attempts_per_cell_in_cluster: int = 2,
     fault: ArmedFault | None = None,
 ) -> dict[str, Any]:
     """Stream ``cells`` through one shared inference session, assembly trailing.
@@ -307,7 +307,7 @@ def fill_zones_sequential(
     per-item completion callbacks tally each zone, and a completed zone's
     ``assemble`` (plus mosaic cleanup) runs on the trailing thread. A cell
     that fails in any phase is recorded and the stream continues, then gets
-    ``max_cell_attempts - 1`` retries on this still-provisioned cluster before
+    ``attempts_per_cell_in_cluster - 1`` retries on this still-provisioned cluster before
     the run ends; anything still failing stays pending in the campaign ledger
     for the driver's next pass. (There is no consecutive-failure breaker here:
     zone outcomes interleave, and the scheduler already aborts on systemic
@@ -337,14 +337,17 @@ def fill_zones_sequential(
         log: Logger.
         inputs: Mosaic lifecycle adapter; ``None`` means the mosaics already
             exist upstream (no starts, no waits, no cleanup).
-        max_cell_attempts: Attempts per cell WITHIN this child, including the
-            first. 2 (the default) means one retry. This is deliberately a
-            different bound from the driver's ``max_zone_attempts``, which counts
-            whole-dispatch rounds: the two failure modes are different, and one
-            knob covering both would silently change what either means. The retry
-            reuses ``infer_single`` on the still-provisioned cluster and resumes
-            the failed cell's retained mosaic and staged tiles, so it is normally
-            minutes rather than a fresh zone-year.
+        attempts_per_cell_in_cluster: Attempts at one cell inside THIS run, counting the
+            first — 2 (the default) means one retry. **The cheap retry:** the cluster is
+            still standing, the cell's mosaic was kept and its staged tiles resume, so it
+            costs minutes rather than a fresh zone-year.
+
+            It covers "the work failed but the machine is fine", and nothing else. It
+            cannot help when this run itself dies — a killed container, a lost Ray head, a
+            cancelled run takes this counter with it — which is what the driver's
+            ``max_dispatch_rounds`` is for. The two are nested, not alternatives: a
+            deterministic failure will burn both, and what actually stops that is the
+            driver's no-progress check rather than either count.
         look_ahead: Cells beyond the feed head to keep in ingest flight; also
             sizes the un-finalized-zone bound AND the mosaic storage budget
             (both ``look_ahead + 2`` — see :class:`_MosaicBudget`).
@@ -774,21 +777,10 @@ def fill_zones_sequential(
     # thread has been joined by now. Across children it cannot collide either,
     # because the partition is zone-disjoint.
     #
-    # ONLY cells whose mosaic still EXISTS are eligible, and that is not the same as
-    # "cells that failed": retrying a cell whose input was deleted runs against nothing,
-    # which a first version of this pass did by keying off the failure list.
-    #
-    # As it stands every FAILING path retains its mosaic, so the two sets coincide — the
-    # one path that deletes is a terminal plan, and that records a success. The filter is
-    # kept because the property it protects is not a coincidence worth relying on: any
-    # future delete-on-failure path reintroduces the bug the moment it lands, and this is
-    # what makes that land safely. (The orbit-mismatch deferral cap used to be such a
-    # path; cells now stream under their own orbit and nothing deletes on that account.)
-    #
-    # `retained_failed` is the set that kept its mosaic, so it is the eligibility list;
-    # when there is no budget at all the mosaics are upstream and permanent, so
-    # everything is eligible.
-    for attempt in range(2, max_cell_attempts + 1):
+    # EVERY failing path retains its cell's mosaic, so every failed cell is retryable here.
+    # `retained_failed` is that set; with no mosaic budget at all the inputs are upstream and
+    # permanent, so everything is eligible.
+    for attempt in range(2, attempts_per_cell_in_cluster + 1):
         with lock:
             # Cells the feeder never admitted are recorded as failures so the run
             # REPORTS them, but they are not retry candidates: the feeder stopped
@@ -804,8 +796,8 @@ def fill_zones_sequential(
         pending = failed_keys if budget is None else [k for k in failed_keys if k in eligible]
         if skipped := [k for k in failed_keys if k not in pending]:
             log.warning(
-                "Not retrying %d cell(s) in-child — their mosaics were released or deleted, so a retry "
-                "would run against nothing (they stay pending for the driver's next pass): %s",
+                "Not retrying %d cell(s) in-child — their mosaic slots were released, so a retry would "
+                "run against nothing (they stay pending for the driver's next pass): %s",
                 len(skipped),
                 ", ".join(f"{z}-{y}" for z, y in skipped),
             )
@@ -815,7 +807,7 @@ def fill_zones_sequential(
         log.warning(
             "In-child retry attempt %d/%d over %d failed cell(s): %s",
             attempt,
-            max_cell_attempts,
+            attempts_per_cell_in_cluster,
             len(pending),
             ", ".join(f"{z}-{y}" for z, y in pending),
         )

@@ -63,8 +63,8 @@ Three nested budgets, none of which knew anything about the failure's class:
 | layer | knob | default | how a catalogue 502 is treated |
 |---|---|---|---|
 | leg | `IngestSettings.max_leg_attempts` | 3 | retryable — `_NON_RETRYABLE_LEG_MARKERS` names no HTTP failure, and the default is TRUE |
-| cell | `max_cell_attempts` (`sequential_fill` / `fill_zones_sequential`) | 2 | eligible — retry eligibility is by **phase**, and this is `inputs/prepare`, which additionally gets `discard()` + `start()`, re-dispatching the whole ingest |
-| zone round | `max_zone_attempts` (`run_global_campaign`) | 2 | re-dispatched; the zero-progress guard only breaks *after* a whole round has made none |
+| cell | `attempts_per_cell_in_cluster` (`sequential_fill` / `fill_zones_sequential`) | 2 | eligible — retry eligibility is by **phase**, and this is `inputs/prepare`, which additionally gets `discard()` + `start()`, re-dispatching the whole ingest |
+| zone round | `max_dispatch_rounds` (`run_global_campaign`) | 2 | re-dispatched; the zero-progress guard only breaks *after* a whole round has made none |
 
 So one deterministically-502ing query could cost up to **3 × 2 × 2 = 12 dispatches of the
 optical leg**, each preceded by ~6 minutes of ladder per failing page fetch, and each
@@ -159,8 +159,8 @@ Everything above counts ATTEMPTS. Elapsed time was bounded nowhere:
 - every single page fetch gets **9 HTTP attempts across 364 s** of exponential backoff
   (`stac._STAC_RETRY`: `total=8, backoff_factor=2`, urllib3 caps each sleep at 120 s) before
   anything of ours sees a failure;
-- the three budgets above it — `max_leg_attempts` (3), `max_cell_attempts` (2),
-  `max_zone_attempts` (2) — each treat that whole ladder as one try, and none of the three
+- the three budgets above it — `max_leg_attempts` (3), `attempts_per_cell_in_cluster` (2),
+  `max_dispatch_rounds` (2) — each treat that whole ladder as one try, and none of the three
   reads a clock.
 
 The campaign's decided policy is to back off and retry expansively when an upstream refuses

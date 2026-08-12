@@ -629,7 +629,7 @@ def test_only_the_started_window_is_eligible():
     assert order[0] == "01N", f"reached outside its window: {order}"
 
 
-# --- in-child retry (max_cell_attempts) -----------------------------------------------
+# --- in-child retry (attempts_per_cell_in_cluster) -----------------------------------------------
 
 
 def _recovering_single(attempts: list[str], fail_zones: set[str] | None = None):
@@ -710,7 +710,7 @@ def test_an_ingest_failure_is_re_ingested_on_retry():
 
     `start` is idempotent, so a cell that failed while producing its inputs keeps that
     failure cached — and a retry that only re-plans would probe the same missing mosaic
-    every time, making `max_cell_attempts` worthless for exactly the transient ingest
+    every time, making `attempts_per_cell_in_cluster` worthless for exactly the transient ingest
     failures it exists to absorb.
     """
     events: list[str] = []
@@ -749,13 +749,13 @@ def test_a_deterministic_failure_survives_its_retries_and_still_raises():
             session=_sync_session(fail={"02N"}),
             inputs=RecordingInputs([]),
             infer_single=_recovering_single(attempts, fail_zones={"02N"}),
-            max_cell_attempts=3,
+            attempts_per_cell_in_cluster=3,
         )
     # Attempted once per retry round (2 of 3 attempts are retries), not once forever.
     assert attempts == ["02N", "02N"], attempts
 
 
-def test_max_cell_attempts_one_disables_the_retry():
+def test_attempts_per_cell_in_cluster_of_one_disables_the_retry():
     """The bound is real, and 1 means the previous behaviour exactly."""
     attempts: list[str] = []
     with pytest.raises(RuntimeError, match="1/2 cell"):
@@ -764,9 +764,9 @@ def test_max_cell_attempts_one_disables_the_retry():
             session=_sync_session(fail={"01N"}),
             inputs=RecordingInputs([]),
             infer_single=_recovering_single(attempts),
-            max_cell_attempts=1,
+            attempts_per_cell_in_cluster=1,
         )
-    assert attempts == [], "no retry may run at max_cell_attempts=1"
+    assert attempts == [], "no retry may run at attempts_per_cell_in_cluster=1"
 
 
 def test_the_in_child_retry_only_considers_cells_that_kept_a_mosaic():
