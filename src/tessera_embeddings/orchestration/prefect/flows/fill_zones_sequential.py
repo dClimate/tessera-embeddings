@@ -52,7 +52,6 @@ from typing import TYPE_CHECKING, Any
 
 from prefect import flow, get_run_logger
 from prefect.client.orchestration import get_client
-from prefect.concurrency.sync import concurrency
 from prefect.deployments import run_deployment
 from prefect.runtime import flow_run as flow_run_ctx
 from prefect.states import Cancelling
@@ -68,6 +67,7 @@ from tessera_embeddings.inference.orchestration_helpers import build_inference_c
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.inference.scheduling import WorkItem
 from tessera_embeddings.ingest.source_coverage import SourceFinding, preflight_optical_source
+from tessera_embeddings.orchestration.prefect._fleet_gate import FleetGate
 from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
     cell_validation_parameters,
     dispatch_cell_validation,
@@ -200,16 +200,23 @@ class _DeploymentCellInputs:
         A Prefect GLOBAL concurrency limit rather than a local semaphore: the
         clusters are separate flow runs on separate machines, so nothing
         in-process can see across them. Same mechanism as the commit gate.
+
+        **This is also the campaign's pause lever.** Lowering the limit to zero
+        makes every stream HOLD here — the cell in flight finishes, no new cell is
+        taken up, and nothing fails (:class:`FleetGate`). Raising it resumes. The
+        hold is abandoned if the runner is already shutting down, so a pause
+        cannot outlive the run it is pausing.
         """
         if self._ingest_limit_name is None:
             self._dispatch_and_wait(zone, year)
             return
-        with concurrency(
+        with FleetGate(
             self._ingest_limit_name,
             occupy=1,
-            # Fail closed on a missing limit: an unprovisioned name would silently
-            # run every zone at once, which is the thing the cap exists to prevent.
-            strict=True,
+            log=self._log,
+            # A stream winding down must not park here waiting for a limit that a
+            # human may never raise; its cells are the driver's next round's work.
+            should_stop=self._stopping.is_set,
             # Generous, because an ingest runs tens of minutes to hours and the
             # lease is renewed in the background throughout.
             lease_duration=_INGEST_LEASE_S,
@@ -757,7 +764,7 @@ def fill_zones_sequential_flow(
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
     checkpoint_path = f"{paths.inputs.rstrip('/')}/models/{checkpoint_filename()}"
-    gate = _PrefectCommitGate(commit_limit_name) if commit_limit_name else None
+    gate = _PrefectCommitGate(commit_limit_name, log=log) if commit_limit_name else None
 
     @cache
     def _window_for(cell_year: int) -> TimeWindow:

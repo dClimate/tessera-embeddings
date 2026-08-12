@@ -19,14 +19,10 @@ conflict) is the campaign driver's job, not this flow's.
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Callable
-from contextlib import AbstractContextManager
-from types import TracebackType
 from typing import TYPE_CHECKING, Any, cast
 
 from prefect import flow, get_run_logger
-from prefect.concurrency.sync import concurrency
 from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.config.fault_injection import DIE_BETWEEN_COMMITS, FaultInjection
@@ -37,6 +33,7 @@ from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.conventions import expected_model_url
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import build_inference_config
+from tessera_embeddings.orchestration.prefect._fleet_gate import FleetGate
 from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
     cell_validation_parameters,
     dispatch_cell_validation,
@@ -58,10 +55,12 @@ from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group
 from tessera_embeddings.storage.zone_grid import canonicalize_zone
 
 if TYPE_CHECKING:
+    import logging
+
     import icechunk
 
 
-class _PrefectCommitGate(AbstractContextManager):
+class _PrefectCommitGate(FleetGate):
     """A ``CommitGate`` backed by a Prefect global concurrency limit.
 
     Each ``with gate:`` acquires one slot of the named limit for the duration of
@@ -70,37 +69,13 @@ class _PrefectCommitGate(AbstractContextManager):
     A fresh :func:`concurrency` context is opened per entry so the gate is
     reusable across the (few) commits a single fill performs.
 
-    ``strict=True``: this gate is LOAD-BEARING for fleet-wide commit contention, so
-    an absent or misspelled limit must fail closed. Prefect's ``concurrency``
-    defaults ``strict=False``, which would only log a warning and let the commit
-    proceed UNGATED — silently reintroducing the rebase/commit storm the gate
-    exists to prevent. Strict mode raises instead, so the limit must be
-    provisioned explicitly (see the campaign runbook).
-
-    THREAD-SAFE: the active context lives in a per-thread stack, not an instance
-    slot — the chained fill shares ONE gate between its feeder thread (terminal
-    plans commit inside ``plan``) and its trailing-assembly thread, and an
-    instance slot would let a concurrent enter overwrite the other thread's
-    context and release the wrong slot on exit.
+    Everything about how the gate behaves — failing closed on an absent limit,
+    queueing behind a full one, HOLDING on a limit lowered to zero, and the
+    per-thread context stack a chained fill needs — is :class:`FleetGate`.
     """
 
-    def __init__(self, name: str, occupy: int = 1) -> None:
-        self._name = name
-        self._occupy = occupy
-        self._local = threading.local()
-
-    def __enter__(self) -> None:
-        cm = concurrency(self._name, occupy=self._occupy, strict=True)
-        cm.__enter__()
-        stack: list[AbstractContextManager[Any]] = getattr(self._local, "stack", [])
-        stack.append(cm)
-        self._local.stack = stack
-
-    def __exit__(
-        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
-    ) -> None:
-        cm = self._local.stack.pop()
-        cm.__exit__(exc_type, exc, tb)
+    def __init__(self, name: str, occupy: int = 1, log: logging.Logger | logging.LoggerAdapter | None = None) -> None:
+        super().__init__(name, occupy=occupy, log=log)
 
 
 def _assert_seeded_model_matches(
@@ -402,7 +377,7 @@ def fill_zone_year_flow(
             s3_region=s3_region,
         )
 
-    gate = _PrefectCommitGate(commit_limit_name) if commit_limit_name else None
+    gate = _PrefectCommitGate(commit_limit_name, log=log) if commit_limit_name else None
 
     fill_kwargs: dict[str, Any] = {
         "store_path": store_path,

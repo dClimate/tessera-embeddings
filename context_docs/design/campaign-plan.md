@@ -248,6 +248,13 @@ value is overwritten by `max_parallel_ingest` at the next start, which reintrodu
 drift the upsert exists to prevent. The registration script's asymmetry — a `--commit-limit` flag
 and no ingest equivalent — is intentional, not an omission.
 
+**Changing the ingest gate while the campaign runs is a different matter, and it is the only way to
+throttle or pause one in flight.** The campaign writes both gates at start and never again, so a
+value set by hand mid-campaign holds until the next campaign start. Lower it to slow the intake;
+set it to **zero to pause** — every stream then holds before taking up its next cell, and raising the
+limit resumes (§8). Change the parameter as well as the gate if the new width is meant to survive a
+re-dispatch.
+
 > **Page size is a per-provider setting and must never become a rule.** A deterministic catalogue
 > refusal — one that defeats the whole retry ladder, because retrying an unacceptable request
 > cannot help — can be a page-size sensitivity rather than missing data or our own load: Earth
@@ -598,6 +605,33 @@ that a run full of failures cannot deadlock its own feeder.
 **No ingest flow carries a Prefect-level retry.** All retrying is the campaign's own, above. A
 Prefect retry would re-enter a flow whose cluster and gate slot are gone.
 
+### What you can do to a campaign that is already running
+
+Three levers, and it is worth knowing which one does what before needing them at 3 a.m.
+
+| lever | how | what it does |
+|---|---|---|
+| **throttle** | lower `tessera-global-ingests` | fewer cells ingest at once. Work queues; nothing fails |
+| **pause** | set `tessera-global-ingests` to **0** | every stream holds before taking up its next cell. The cell in flight finishes and lands; raising the limit resumes. Nothing fails and nothing is lost |
+| **stop** | cancel the runs — **tasks first** | the only thing that stops the spend. Cancel the campaign driver and its fills, and cancel the underlying tasks before stopping infrastructure, or runs sit in `CANCELLING` forever and look live to every guard |
+
+```bash
+prefect global-concurrency-limit update tessera-global-ingests --limit 0    # pause
+prefect global-concurrency-limit update tessera-global-ingests --limit 61   # resume
+```
+
+**A pause does not stop the meter.** A cluster holds its GPU fleet for its whole multi-cell walk,
+so a paused stream finishes its current cell and then idles at full width — the fleet is still
+billed. Pausing buys time to decide without losing work; it is not a way to sit still cheaply.
+
+**Never *deactivate* a gate to hold work back.** An inactive limit grants slots to everyone, so the
+work it was throttling runs unthrottled — the opposite of the intent, and silent.
+
+**The gates hold, they do not fail.** A limit at zero used to fail the next cell that reached it,
+because the server refuses a request for more slots than the limit holds and that refusal is not
+retried. Both gates now wait on that state and log it, which is what makes zero a pause rather
+than a way to lose cells. A gate that does not *exist* still fails immediately, and must.
+
 ### The three retry scopes, and why they are three
 
 | scope | setting | unit | what only it can fix |
@@ -706,13 +740,16 @@ intent) and orphaned staging (which needs none, and so catches the operator who 
 omitted `run_id`) both detect a resume that silently restarted — and that finding is only
 actionable while killing the run still saves the money.
 
-**Zeroing a concurrency gate is not a pause button — it fails cells.** The server rejects a
-request for more slots than the limit outright rather than queueing it, and both campaign gates
-fail closed, so the next cell to reach a zeroed gate *fails* instead of waiting. Deactivating a
-gate is worse in the other direction: slots are then granted to everyone, so the work it was
-throttling runs unthrottled. Neither state is a way to hold the campaign, and the monitoring view
-grades both as faults while any fill is live. **To hold the campaign, lower a gate rather than
-zero it** — a gate that is merely full does queue, which is the mechanism working as intended.
+**Zeroing the ingest gate is the pause lever; deactivating a gate is not.** Setting
+`tessera-global-ingests` to zero makes every stream hold before taking up its next cell — the cell
+in flight finishes, nothing fails, and raising the limit resumes. Deactivating a gate does the
+opposite of what it sounds like: the server grants slots against an inactive limit, so the work it
+was throttling runs unthrottled. The monitoring view records a zeroed gate without grading it, since
+that is a pause, and grades a deactivated one as a fault while any fill is live.
+
+**A pause is not free, and nothing stops a fleet that is already up.** A cluster holds its GPU fleet
+across its whole multi-cell walk, so a paused stream finishes its current cell and then idles at full
+width and full cost. Pausing buys time to decide; only cancelling stops the meter (§8).
 
 ---
 

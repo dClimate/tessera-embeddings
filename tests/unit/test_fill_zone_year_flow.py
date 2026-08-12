@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tessera_embeddings.orchestration.prefect import _fleet_gate as fleet_gate
+
 import tessera_embeddings.orchestration.prefect.flows.fill_zone_year as mod
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.errors import InsufficientCoverageError
@@ -284,12 +286,12 @@ def test_commit_gate_is_thread_safe(monkeypatch):
 
     cms: list[_RecordingCM] = []
 
-    def fake_concurrency(name, occupy=1, strict=True):
+    def fake_concurrency(name, occupy=1, strict=True, **kw):
         cm = _RecordingCM()
         cms.append(cm)
         return cm
 
-    monkeypatch.setattr(mod, "concurrency", fake_concurrency)
+    monkeypatch.setattr(fleet_gate, "concurrency", fake_concurrency)
     gate = mod._PrefectCommitGate("limit")
     barrier = threading.Barrier(2)
     errors: list[BaseException] = []
@@ -330,7 +332,7 @@ def test_commit_gate_is_reentrant_within_a_thread(monkeypatch):
             return False
 
     tags = iter(["outer", "inner"])
-    monkeypatch.setattr(mod, "concurrency", lambda name, occupy=1, strict=True: _CM(next(tags)))
+    monkeypatch.setattr(fleet_gate, "concurrency", lambda name, occupy=1, strict=True, **kw: _CM(next(tags)))
     gate = mod._PrefectCommitGate("limit")
     with gate, gate:
         pass
