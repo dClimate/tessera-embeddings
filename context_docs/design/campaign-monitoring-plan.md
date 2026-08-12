@@ -47,12 +47,21 @@ query scans ~2.2 GB at 36-cell width, ~$0.011, and `campaign_health` issues five
 **$0.055 per full round**. At 5 minutes that is ~$16/day, and 12 consecutive rounds would re-measure
 the same 60-minute window. So:
 
-* **every round (5 min) — the free checks.** Placement, fleet widths, sweep success, concurrency
-  limits, **crashed/failed runs**, cost accrual, **cell validation**. No Insights query, so the
-  round is essentially free; and this set carries the two most decision-relevant signals we have.
-* **every third round (15 min) — the paid checks.** Commit rates, per-cell roster silence, fill
-  scope, GPUs kept busy, GPU starvation. This keeps the measured **~$5/day** cost model, which is
-  a rounding error against one idle 20-worker fleet-hour (~$37).
+* **every round (5 min) — the nine free checks.** Placement, fleet widths, sweep success,
+  concurrency limits, **crashed/failed runs**, cost accrual, published input coverage, shard
+  placement, **cell validation**. No Insights query, so the round is essentially free — and this
+  set carries the two most decision-relevant signals we have.
+* **every third round (15 min) — the eight paid checks.** Commit rates, per-cell roster silence,
+  orchestrator load, throttle pressure, fill scope, orphaned staging, GPUs kept busy, GPU
+  starvation. Between them these are the five Insights queries; the rest read the same rows. This
+  keeps the measured **~$5/day** cost model, a rounding error against one idle 20-worker
+  fleet-hour (~$37).
+
+The split lives in `campaign_health.py` as `PAID_CHECKS`, and `--cheap` is what a round passes. A
+skipped check reports **`SKIPPED`**, which is deliberately neither `OK` nor `DID NOT RUN`: graded
+unrunnable it would report a healthy campaign as degraded eight checks at a time, and graded healthy
+it would tell the poll that a standing warning had cleared — which posts a false all-clear now and
+the same finding as new fifteen minutes later.
 
 **What each round publishes**, all under `s3://global-tessera-embeddings/monitoring/`:
 
@@ -123,7 +132,7 @@ under load — we have watched it declare healthy runs dead — and it cannot fi
 server itself is the unwell thing, which is one of the conditions most worth alerting on. Hence
 the second path.
 
-### 2.2 The reliable path: the periodic poll — **NOT BUILT** (§1)
+### 2.2 The reliable path: the periodic poll — **BUILT**
 
 The round of §1 posts what the automations cannot: everything that is a *reading* rather than an
 event (stalls, how busy the GPUs are, cost, quota, a published cell with no verdict), plus a second chance
@@ -309,24 +318,33 @@ it is the only Intervene Now signal available before real money has been spent.
 
 ---
 
-## 7. What exists, and what this needs
+## 7. What exists, and what is left
 
-**Built:** the detector (`campaign_health.py`, seventeen checks, `--json`, stable slugs, subjects,
-fingerprints, per-finding follow-up commands); every tool it composes; the per-cell validation and
-its published verdicts; `cost_accrual.py`, `campaign_progress.py`, `fleet_placement.py`,
-`inference_profile.py`, `sweep_health.py`, `prefect_load.py`; and the Slack helper plus its channel
-registry.
+**Built and verified against dev.** The detector (`campaign_health.py`: seventeen checks, `--json`,
+stable slugs, subjects, fingerprints, per-finding follow-up commands, and now `--cheap`); every tool
+it composes; the per-cell validation and its published verdicts; the four Slack automations; and the
+round itself — `campaign-watch`, registered with the campaign set on a `*/5` cron with concurrency 1
+and `CANCEL_NEW`, publishing all four artifacts and posting under the rules of §2.2.
+
+The round's own pieces live in `src/yield_embeddings/monitoring/`:
+
+| module | what it owns |
+|---|---|
+| `detector.py` | runs the detector as a subprocess behind `--json`, with a timeout |
+| `state.py` | the fingerprint memory: new vs standing vs resolved |
+| `shelf.py` | the Resolve Later list, projected from `subjects` |
+| `decisions.py` | slug + status + subjects → Intervene Now / Resolve Later / Take Note |
+| `sink.py` | the messages, and a channel outage that cannot fail a round |
+
+**A subprocess rather than an import**, deliberately: the detector is a 2,700-line CLI with six
+sibling modules and a tested JSON contract, so a wedged AWS call costs one round instead of the
+monitor, and a traceback inside the tool is a failed round rather than a dead flow. The flow-runner
+image ships `scripts/` for that reason.
 
 **To build:**
 
-1. **the `campaign-watch` flow** — cron `*/5`, `concurrency_limit=1` with `CANCEL_NEW` so a slow
-   round cannot pile up, tiered cadence, publishing the four artifacts of §1.
-2. **the Slack sink** — one channel, the posting rules of §2, and the state file that makes "once
-   per fingerprint" true.
-3. **the shelf** — §4, which is mostly a projection of `subjects` across rounds.
-4. **the agent loop** — §5, reading `rounds/` and the verdicts, with the window review.
+1. **the agent loop** — §5, reading `rounds/` and the verdicts, with the window review. The round
+   publishes everything it needs; nothing about the agent is blocking the poll.
 
-**One measurement to take before launch:** a full round against a live dev campaign, timed and
-priced, to confirm the $0.055 figure holds at the width we will actually run and that a round
-finishes inside its 5-minute tick. A round that overruns its cadence is the one way this design
-fails quietly — `CANCEL_NEW` then silently drops rounds, and the schedule stops being a heartbeat.
+---
+
