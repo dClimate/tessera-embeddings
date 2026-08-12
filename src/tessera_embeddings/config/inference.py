@@ -211,7 +211,7 @@ RADAR_THIN_MAX_OBS = 12
 #: counts live in the store's ``s2_obs_count`` array either way. Raising or lowering it
 #: changes what future summaries say and never what is published, so it is a config change
 #: rather than a migration.
-OPTICAL_THIN_MAX_OBS = 40
+OPTICAL_THIN_MAX_OBS = 15
 
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
 #:
