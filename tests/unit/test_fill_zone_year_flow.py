@@ -13,12 +13,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from tessera_embeddings.orchestration.prefect import _fleet_gate as fleet_gate
-
 import tessera_embeddings.orchestration.prefect.flows.fill_zone_year as mod
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.conventions import expected_model_url
+from tessera_embeddings.orchestration.prefect import _fleet_gate as fleet_gate
 
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
