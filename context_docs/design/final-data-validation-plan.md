@@ -57,13 +57,19 @@ missing verdict.
 ### 1.2 Closing sweep — **BUILT**
 
 `scripts/validate_all_cells.py` over every published cell, for final peace of mind rather than as a
-gate the campaign waits on. It re-runs the free exact half globally, rolls up the stored per-cell
-verdicts, and re-reads pixels where warranted, with `--max-shards` and `--seam-boundaries` raised above
-the defaults and the values recorded.
+gate the campaign waits on. It **re-runs the whole check per cell**, one subprocess each and
+concurrently, with `--max-shards` and `--seam-boundaries` raised above the defaults and the values
+recorded — then rolls the results into an exception list, a per-cell table, and aggregate
+distributions.
 
-**It renders NEW windows, not a refresh** — a different `--label` and `--seed`, so each cell ends with
-two disjoint sampled sets and the inspectable total doubles. Refreshing the same windows would buy
-nothing.
+**It re-runs rather than reading the stored verdicts, and that is the point.** A different `--label`
+and `--seed` sample different windows and different boundaries, so each cell ends with **two disjoint
+sampled sets and two verdicts** — the second an independent read of the cell rather than a copy of the
+first. The inspectable total doubles. Rolling up the per-cell verdicts alone would cost nothing and
+add nothing.
+
+Each pass writes its verdict beside its figures, labelled like them, so the two never overwrite each
+other and a disagreement between them is legible: same cell, same snapshot, two independent samples.
 
 Its behaviour is documented in the script. What matters here: it sorts findings **by slug, not prose**,
 and counts the expected-and-upstream ones once rather than listing them per cell.
@@ -80,7 +86,8 @@ figures — which is what lets the sweep roll up stored results instead of re-re
 |---|---|
 | shard written outside the land mask | **BLOCKS** — unambiguous misplacement |
 | coverage reconciliation does not close (`written + skipped == live`) | **BLOCKS** |
-| `input_coverage` shows a partial window or `relaxed: true` | **BLOCKS** — the input was not what the cell claims |
+| `input_coverage` shows a month gap **nothing accounts for** | **BLOCKS** — the input was not what the cell claims |
+| `input_coverage` shows `relaxed: true` but a whole window | **RECORD** — the guard was off for that *dispatch*, which is graded at the campaign level, where the other cells of it are. Failing this cell for its neighbours' risk would be a finding about a different cell |
 | completion mark with no run record | **BLOCKS** |
 | seam median outside 0.80–1.25 on **embeddings** | **BLOCKS** — §3 |
 | a constant embedding dimension, or scale-setting shares far from 1.0 | **BLOCKS** — a dead channel; or not quantized as readers assume |
