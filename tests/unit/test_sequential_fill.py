@@ -865,3 +865,109 @@ def test_an_unarmed_run_never_consults_a_fault(monkeypatch):
     monkeypatch.setattr(ArmedFault, "withhold", _must_not_run, raising=True)
     summary = _run(_cells(2))
     assert summary["succeeded"] == 2
+
+
+# --- the operator pause ---------------------------------------------------------------
+#
+# Pausing inference holds at the work source, which is the same site the starvation drill
+# withholds from. Two properties decide whether it is a pause or an outage, and both are
+# about what the source returns: `[]` keeps the session alive with its actors, while `None`
+# means exhausted and would retire the fleet and finalize the run. And a paused poll must
+# not CONSULT the source, because a hand-over removes the prepared zone from the queue.
+
+
+def _pausing_session(pause_for_polls: int, seen: list[str]):
+    """A session that polls the source, recording what it got, pausing for the first N polls."""
+
+    def session(more_work, on_item_done):
+        results: list[dict] = []
+        polls = 0
+        while True:
+            batch = more_work()
+            polls += 1
+            seen.append("none" if batch is None else ("empty" if not batch else f"work:{len(batch)}"))
+            if batch is None:
+                return results
+            for item in batch:
+                result = {"chunk": item.chunk.label, "status": "success"}
+                results.append(result)
+                on_item_done(item, result)
+            if polls > 200:  # pragma: no cover - a stuck pause would hang the suite
+                raise AssertionError("source never exhausted")
+
+    return session
+
+
+def test_a_pause_holds_the_stream_without_ending_it(monkeypatch):
+    """The whole mechanism: while paused the source yields nothing, and the moment the pause
+    lifts the waiting cell streams. Nothing fails and no cell is skipped.
+    """
+    seen: list[str] = []
+    polls = {"n": 0}
+
+    def paused() -> bool:
+        polls["n"] += 1
+        return polls["n"] <= 3  # paused for the first three polls, then released
+
+    out = _run(_cells(2), session=_pausing_session(0, seen), paused=paused)
+    assert seen[:3] == ["empty", "empty", "empty"], seen
+    # Nothing was lost to the pause: both cells still streamed and assembled.
+    assert out["succeeded"] == 2 and out["failed"] == 0, out
+    assert "none" in seen  # and the source still reached exhaustion afterwards
+
+
+def test_a_paused_poll_never_reports_exhaustion(monkeypatch):
+    """`None` is a teardown, not a pause: it retires the actors and finalizes the run, so a
+    cell held behind a pause would be finalized as complete having inferred nothing. The
+    pause must answer "nothing ready YET" no matter what the source would have said.
+    """
+    seen: list[str] = []
+    calls = {"n": 0}
+
+    def paused() -> bool:
+        calls["n"] += 1
+        return calls["n"] <= 5
+
+    _run(_cells(1), session=_pausing_session(0, seen), paused=paused)
+    # The first five answers are the pause, and not one of them is `none`.
+    assert seen[:5] == ["empty"] * 5, seen
+
+
+def test_a_paused_poll_does_not_consume_the_prepared_cell():
+    """A hand-over REMOVES the zone from the ready queue, so a pause that asked the source
+    and discarded the answer would delete prepared work rather than delay it. The cell must
+    still be there when the pause lifts — which is what makes a pause free.
+    """
+    seen: list[str] = []
+    state = {"paused": True}
+
+    def paused() -> bool:
+        return state["paused"]
+
+    def session(more_work, on_item_done):
+        results: list[dict] = []
+        # Poll a few times while paused; every answer must be empty and nothing consumed.
+        for _ in range(4):
+            assert more_work() == [], "a paused poll handed work over"
+        state["paused"] = False
+        while True:
+            batch = more_work()
+            if batch is None:
+                return results
+            for item in batch:
+                result = {"chunk": item.chunk.label, "status": "success"}
+                results.append(result)
+                on_item_done(item, result)
+
+    out = _run(_cells(1), session=session, paused=paused)
+    assert out["succeeded"] == 1 and out["failed"] == 0, out
+
+
+def test_no_pause_callable_means_no_check_at_all():
+    """Every path with no gate configured — a direct single-cluster run, a test — must not
+    pay a check or change behaviour.
+    """
+    seen: list[str] = []
+    out = _run(_cells(1), session=_pausing_session(0, seen))
+    assert out["succeeded"] == 1
+    assert "empty" not in seen[:1]

@@ -171,3 +171,111 @@ class FleetGate(AbstractContextManager):
     ) -> None:
         cm = self._local.stack.pop()
         cm.__exit__(exc_type, exc, tb)
+
+
+#: How long a pause reading is trusted before the server is asked again. The thing being
+#: watched is a human typing one command, so tens of seconds is responsive enough — and the
+#: read happens on the inference driver of every cluster, which is a Prefect API client like
+#: any other, so a tight poll would spend orchestrator capacity on asking whether to work.
+PAUSE_TTL_S = 30.0
+
+
+def pause_signal(
+    name: str,
+    *,
+    log: logging.Logger | logging.LoggerAdapter | None = None,
+    ttl_s: float = PAUSE_TTL_S,
+    read_limit: Callable[[str], tuple[int, bool] | None] | None = None,
+) -> Callable[[], bool]:
+    """Is work paused? — a cheap callable for a loop that is not allowed to import Prefect.
+
+    A gate used as a PAUSE FLAG rather than as a capacity cap: the limit is READ, never
+    acquired, and a limit of zero on an active gate means paused. Reading rather than
+    acquiring is what makes this usable inside a dispatch loop — there is no slot to hold, no
+    lease to renew, and nothing to release if the process dies mid-pause.
+
+    **Fail-open, always.** A read that errors, a gate that does not exist, a server that is
+    unwell — all answer "not paused". The alternative is a campaign that stops working because
+    a monitoring-adjacent read failed, which is a far worse failure than a pause that takes
+    another ``ttl_s`` to take effect. A pause is an operator's convenience; running is the job.
+
+    The returned callable is cheap enough to call in a tight loop (one read per ``ttl_s`` at
+    most) and is safe to share across threads: a stale answer by up to ``ttl_s`` is the
+    contract, so a race that returns the previous reading is not a defect.
+
+    Args:
+        name: The global concurrency limit read as a flag.
+        log: Where the transitions announce themselves — entering a pause, and leaving it.
+        ttl_s: How long a reading is trusted.
+        read_limit: Injection point for tests; returns ``(limit, active)`` or ``None`` when the
+            gate is absent. Defaults to a Prefect client read.
+    """
+    reader = read_limit if read_limit is not None else _read_limit_via_prefect
+    state: dict[str, Any] = {"checked_at": None, "paused": False, "since": None, "announced_at": None}
+    lock = threading.Lock()
+
+    def paused() -> bool:
+        now = time.monotonic()
+        with lock:
+            fresh = state["checked_at"] is not None and now - state["checked_at"] < ttl_s
+            if fresh:
+                return bool(state["paused"])
+        try:
+            reading = reader(name)
+        except Exception as exc:
+            if log is not None:
+                log.warning("Could not read pause gate %r (%s) — treating as NOT paused", name, exc)
+            with lock:
+                state["checked_at"] = now
+                state["paused"] = False
+            return False
+        is_paused = reading is not None and reading[0] == 0 and reading[1]
+        with lock:
+            was = bool(state["paused"])
+            state["checked_at"] = now
+            state["paused"] = is_paused
+            if is_paused and not was:
+                state["since"] = now
+                state["announced_at"] = None
+            if is_paused:
+                since = state["since"]
+                held = now - (since if since is not None else now)
+                announce = state["announced_at"] is None or held - state["announced_at"] >= HOLD_LOG_EVERY_S
+                if announce:
+                    state["announced_at"] = held
+            else:
+                announce = False
+                # `is not None`, not truthiness: a pause that began at monotonic 0.0 is still
+                # a pause, and treating it as absent loses the resume line for it.
+                resumed_after = now - state["since"] if was and state["since"] is not None else None
+                state["since"] = None
+        if log is not None:
+            if is_paused and announce:
+                log.warning(
+                    "Inference is PAUSED by gate %r (limit 0) — the fleet holds and takes on no new "
+                    "cell (%.0f min so far). In-flight chunks finish and land. Raise the limit with "
+                    "`prefect global-concurrency-limit update %s --limit 1` to resume.",
+                    name,
+                    held / 60.0,
+                    name,
+                )
+            elif not is_paused and resumed_after:
+                log.info("Pause gate %r cleared after %.0f min — resuming", name, resumed_after / 60.0)
+        return is_paused
+
+    return paused
+
+
+def _read_limit_via_prefect(name: str) -> tuple[int, bool] | None:
+    """``(limit, active)`` for one global concurrency limit, or ``None`` if it does not exist."""
+    from prefect.client.orchestration import get_client
+    from prefect.utilities.asyncutils import run_coro_as_sync
+
+    async def _read() -> tuple[int, bool] | None:
+        async with get_client() as client:
+            for gl in await client.read_global_concurrency_limits(limit=200):
+                if gl.name == name:
+                    return int(gl.limit), bool(gl.active)
+        return None
+
+    return run_coro_as_sync(_read())

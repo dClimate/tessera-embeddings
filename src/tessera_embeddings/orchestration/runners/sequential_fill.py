@@ -297,6 +297,7 @@ def fill_zones_sequential(
     look_ahead: int = 2,
     attempts_per_cell_in_cluster: int = 2,
     fault: ArmedFault | None = None,
+    paused: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Stream ``cells`` through one shared inference session, assembly trailing.
 
@@ -337,6 +338,13 @@ def fill_zones_sequential(
         log: Logger.
         inputs: Mosaic lifecycle adapter; ``None`` means the mosaics already
             exist upstream (no starts, no waits, no cleanup).
+        paused: Asked before each hand-over whether inference is paused. While it answers
+            true no further cell enters the stream: the chunks already queued run to
+            completion and land, the actors stay alive holding nothing, and the session does
+            not finish. Cheap and fail-open by contract (see ``pause_signal``) — a loop that
+            has to ask permission to work must never stop working because the asking failed.
+            ``None`` disables the check entirely, which is what every path that has no gate
+            configured gets.
         attempts_per_cell_in_cluster: Attempts at one cell inside THIS run, counting the
             first — 2 (the default) means one retry. **The cheap retry:** the cluster is
             still standing, the cell's mosaic was kept and its staged tiles resume, so it
@@ -701,6 +709,16 @@ def fill_zones_sequential(
 
     def _more_work() -> list[WorkItem] | None:
         """Scheduler-thread source: one prepared zone per poll, None = done."""
+        # An operator pause is checked BEFORE the source is consulted, and returns the
+        # "nothing ready yet" answer rather than the "exhausted" one. Both halves matter:
+        # not consulting keeps the prepared zone on the queue (a hand-over REMOVES it, so
+        # asking and discarding would delete prepared work), and `[]` rather than `None`
+        # keeps the session alive with its actors — `None` would retire the fleet and
+        # finalize the run, which is a teardown, not a pause. This is the same site and the
+        # same contract the starvation drill withholds from, which is what makes the
+        # "actors stay, nothing fails" property tested rather than hoped for.
+        if paused is not None and paused():
+            return []
         # The fault takes the source as a CALLABLE, so a withheld poll never asks for a
         # zone — a hand-over REMOVES the zone from `ready`, so consulting and discarding
         # would delete prepared work instead of delaying it.

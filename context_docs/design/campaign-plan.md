@@ -242,18 +242,25 @@ is not there:**
 |---|---|---|
 | `tessera-global-ingests` | **the campaign, at start.** `run_global_campaign` upserts it from `max_parallel_ingest`, so that parameter is the single place the number lives | nothing to fix. Absent is the expected state on an account no campaign has run on |
 | `tessera-global-commits` | **a human, before launch:** `register_work_pool.py --commit-limit N` | fills fail closed — `prefect.concurrency` does not auto-create it |
+| `tessera-global-inference` | **the campaign, at start**, always at 1 | inference simply runs. It is a pause flag, not a cap, so its absence removes a lever rather than a limit |
 
 So the ingest gate needs no pre-provisioning and **should not be created by hand**: a hand-set
 value is overwritten by `max_parallel_ingest` at the next start, which reintroduces exactly the
 drift the upsert exists to prevent. The registration script's asymmetry — a `--commit-limit` flag
 and no ingest equivalent — is intentional, not an omission.
 
-**Changing the ingest gate while the campaign runs is a different matter, and it is the only way to
-throttle or pause one in flight.** The campaign writes both gates at start and never again, so a
-value set by hand mid-campaign holds until the next campaign start. Lower it to slow the intake;
-set it to **zero to pause** — every stream then holds before taking up its next cell, and raising the
-limit resumes (§8). Change the parameter as well as the gate if the new width is meant to survive a
+**Changing a gate while the campaign runs is a different matter, and it is the only way to throttle
+or pause one in flight.** The campaign writes all three gates at start and never again, so a value
+set by hand mid-campaign holds until the next campaign start. Lower `tessera-global-ingests` to slow
+the intake, or set it to **zero to pause ingest**; set `tessera-global-inference` to **zero to pause
+inference** (§8). Change the parameter as well as the gate if a new width is meant to survive a
 re-dispatch.
+
+**The inference gate is read, not acquired**, which is why it can sit inside a dispatch loop: there
+is no slot to hold, no lease to renew, and nothing to release if a process dies mid-pause. **Zero
+means paused and any positive value means run** — the campaign writes 1 — so its number carries no
+capacity meaning, and a read that fails is treated as "not paused" rather than stopping the
+campaign.
 
 > **Page size is a per-provider setting and must never become a rule.** A deterministic catalogue
 > refusal — one that defeats the whole retry ladder, because retrying an unacceptable request
@@ -612,25 +619,38 @@ Three levers, and it is worth knowing which one does what before needing them at
 | lever | how | what it does |
 |---|---|---|
 | **throttle** | lower `tessera-global-ingests` | fewer cells ingest at once. Work queues; nothing fails |
-| **pause** | set `tessera-global-ingests` to **0** | every stream holds before taking up its next cell. The cell in flight finishes and lands; raising the limit resumes. Nothing fails and nothing is lost |
+| **pause ingest** | set `tessera-global-ingests` to **0** | no new cell starts ingesting. Ingests in flight finish |
+| **pause inference** | set `tessera-global-inference` to **0** | no new cell starts inferring. Each cluster finishes and lands the chunks it has already queued, keeps its actors, and waits |
 | **stop** | cancel the runs — **tasks first** | the only thing that stops the spend. Cancel the campaign driver and its fills, and cancel the underlying tasks before stopping infrastructure, or runs sit in `CANCELLING` forever and look live to every guard |
 
 ```bash
-prefect global-concurrency-limit update tessera-global-ingests --limit 0    # pause
-prefect global-concurrency-limit update tessera-global-ingests --limit 61   # resume
+prefect global-concurrency-limit update tessera-global-inference --limit 0  # pause inference
+prefect global-concurrency-limit update tessera-global-ingests   --limit 0  # pause ingest
+prefect global-concurrency-limit update tessera-global-inference --limit 1  # resume
+prefect global-concurrency-limit update tessera-global-ingests   --limit 61 # resume
 ```
+
+**Which one to reach for.** Pausing **inference** is the one that stops embeddings being
+written, so it is the lever for "something about the output looks wrong". Pausing **ingest**
+stops mosaics being built, which is the lever for "stop spending on inputs". Zero both to wind
+the campaign down to the cells already in flight. The two are independent, and a campaign start
+resets both to their running values, so a pause cannot be inherited by the next run.
 
 **A pause does not stop the meter.** A cluster holds its GPU fleet for its whole multi-cell walk,
 so a paused stream finishes its current cell and then idles at full width — the fleet is still
 billed. Pausing buys time to decide without losing work; it is not a way to sit still cheaply.
 
 **Never *deactivate* a gate to hold work back.** An inactive limit grants slots to everyone, so the
-work it was throttling runs unthrottled — the opposite of the intent, and silent.
+work it was throttling runs unthrottled — the opposite of the intent, and silent. That is true of
+the inference gate too: it reads an inactive gate as running, so deactivating it un-pauses.
 
 **The gates hold, they do not fail.** A limit at zero used to fail the next cell that reached it,
 because the server refuses a request for more slots than the limit holds and that refusal is not
-retried. Both gates now wait on that state and log it, which is what makes zero a pause rather
-than a way to lose cells. A gate that does not *exist* still fails immediately, and must.
+retried. The two capacity gates now wait on that state and log it, which is what makes zero a
+pause rather than a way to lose cells. A gate that does not *exist* still fails immediately, and
+must. The inference gate works differently by design — it is **read** rather than acquired, so it
+holds no slot and needs no lease, and a read that fails answers "not paused" so that a wobbly API
+can never stop the campaign working.
 
 ### The three retry scopes, and why they are three
 

@@ -1088,3 +1088,33 @@ def test_shutdown_gives_up_on_an_unreachable_api_rather_than_holding_teardown(mo
     started = time.monotonic()
     adapter.shutdown()
     assert time.monotonic() - started < 10.0, "the error budget, not the deadline, must end the wait"
+
+
+# --- the inference pause reaches the runner --------------------------------------------
+
+
+def test_the_pause_gate_reaches_the_runner_as_a_live_callable(wired, monkeypatch):
+    """A parameter that is declared, documented and then not threaded through passes every
+    other test in this file: the flow accepts it, the run succeeds, and inference can never be
+    paused. So this asserts the runner actually receives a callable AND that the callable
+    reads the named gate.
+    """
+    asked: list[str] = []
+    monkeypatch.setattr(
+        mod,
+        "pause_signal",
+        lambda name, **kw: lambda: bool(asked.append(name)),
+    )
+    _run(zones=["33N"], inference_pause_gate="tessera-global-inference")
+    paused = wired["seq_kwargs"]["paused"]
+    assert callable(paused), wired["seq_kwargs"].keys()
+    paused()
+    assert asked == ["tessera-global-inference"]
+
+
+def test_no_pause_gate_passes_no_callable(wired):
+    """Every non-campaign path — a fill dispatched by hand, a dev run — configures no gate,
+    and must not acquire a per-poll check it never asked for.
+    """
+    _run(zones=["33N"])
+    assert wired["seq_kwargs"]["paused"] is None

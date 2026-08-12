@@ -500,6 +500,7 @@ async def run_global_campaign(
     force_staging_restage: str = "",
     overlap_years: bool = False,
     ingest_limit_name: str = "tessera-global-ingests",
+    inference_pause_gate: str = "tessera-global-inference",
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
     allow_partial_window: bool = False,
@@ -654,6 +655,20 @@ async def run_global_campaign(
             ``max_parallel_ingest`` under ``"chained-clusters"``. The campaign
             upserts it to that value at start, so the parameter is the single place
             the number is written and cannot drift from the server's.
+        inference_pause_gate: Name of the global concurrency limit that PAUSES inference.
+            Upserted to 1 at start (any positive value means run) and read — never acquired
+            — by every cluster's dispatch loop. Set it to **0** and each cluster lands the
+            chunks it has queued and then takes on no further cell, keeping its actors and
+            its run alive; set it back to 1 and they carry on where they stopped. Nothing
+            fails either way and no cell is half-written, because a cell enters inference
+            whole.
+
+            **This is one of the two pause levers, and they cover different halves.** Zeroing
+            ``ingest_limit_name`` stops mosaics being built; zeroing this stops embeddings
+            being computed from the mosaics that exist. Zero both to wind the campaign down
+            to the cells already in flight. **Neither stops the bill** — a cluster holds its
+            GPU fleet for its whole multi-cell walk, so a paused fleet idles at full width.
+            Only cancelling ends the spend.
         cleanup_mosaics: Delete ``mosaics/{zone}/{year}`` (all versions) after the
             fill lands (default; the mosaic is a transient input). Keep for dev.
             Nothing throttles ingest against fill throughput, so at these defaults
@@ -725,6 +740,13 @@ async def run_global_campaign(
     # idempotent, and safe to repeat.
     if ingest and fill_strategy == "chained-clusters":
         _upsert_limit(ingest_limit_name, max_parallel_ingest, what="ingest", log=log)
+    if inference_pause_gate and fill_strategy == "chained-clusters":
+        # Upserted to ONE, and one is not a cap: this gate is read as a flag rather than
+        # acquired, so any positive value means "run" and nothing consumes a slot. It is
+        # created here so that pausing is always available — a gate an operator has to create
+        # first is not a lever they can reach at 3 a.m. — and reset to running at every start,
+        # so a campaign can never inherit a pause somebody left behind.
+        _upsert_limit(inference_pause_gate, 1, what="inference pause (1 = running)", log=log)
     if commit_limit_name:
         # DERIVED, not a parameter. A cluster's trailing assembly is a single
         # thread, so N clusters can produce at most N assembly commits at once —
@@ -1202,6 +1224,9 @@ async def run_global_campaign(
                         # The shared cap. Every cluster names the same limit, which is
                         # what makes it fleet-wide rather than per-cluster.
                         "ingest_limit_name": ingest_limit_name,
+                        # And the shared pause. Same reason it is one name for every
+                        # cluster: an operator pauses the CAMPAIGN, not a cluster.
+                        "inference_pause_gate": inference_pause_gate,
                         # As in _fill_params: omitted when unset, so the child's own
                         # registered validator stands. Each cell's validation is dispatched
                         # by the child off its trailing assembly thread as the cell is tagged.

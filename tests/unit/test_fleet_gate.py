@@ -78,7 +78,8 @@ def no_sleeping(monkeypatch):
 
 def test_a_422_from_the_server_is_a_hold() -> None:
     """The server's answer to "more slots than the limit holds", which with occupy=1 means the
-    limit is zero. This is the whole pause mechanism."""
+    limit is zero. This is the whole pause mechanism.
+    """
     exc = _wrapped(_server_said(422, "Slots requested is greater than the limit"))
     assert gate_is_holding(exc)
 
@@ -86,26 +87,30 @@ def test_a_422_from_the_server_is_a_hold() -> None:
 def test_a_missing_limit_is_not_a_hold() -> None:
     """Strict mode's own error carries no HTTP status at all. It must fail: an absent gate is a
     misconfiguration, and holding on it would park the campaign on a typo with no way to tell
-    that from a deliberate pause."""
+    that from a deliberate pause.
+    """
     assert not gate_is_holding(RuntimeError("Concurrency limits ['typo'] must be created before acquiring slots"))
 
 
 def test_a_full_gate_is_not_a_hold_here() -> None:
     """423 is ordinary queueing and Prefect already waits on it, so it never reaches this code.
-    If it ever did, treating it as a hold would double the waiting."""
+    If it ever did, treating it as a hold would double the waiting.
+    """
     assert not gate_is_holding(_wrapped(_server_said(423, "Locked")))
 
 
 @pytest.mark.parametrize("status", [401, 403, 404, 500, 503])
 def test_no_other_status_is_a_hold(status: int) -> None:
     """An unauthorised client and an unwell server are failures, not pauses. Holding on either
-    turns a broken campaign into a silently stalled one."""
+    turns a broken campaign into a silently stalled one.
+    """
     assert not gate_is_holding(_wrapped(_server_said(status, "nope")))
 
 
 def test_a_cause_cycle_does_not_hang_the_matcher() -> None:
     """Exception chains can be cyclic once something sets __cause__ by hand, and this walk runs
-    inside the acquisition path of every commit."""
+    inside the acquisition path of every commit.
+    """
     a = RuntimeError("a")
     b = RuntimeError("b")
     a.__cause__ = b
@@ -118,7 +123,8 @@ def test_a_cause_cycle_does_not_hang_the_matcher() -> None:
 
 def test_a_zeroed_gate_holds_and_then_proceeds(monkeypatch, no_sleeping) -> None:
     """The pause lever, end to end: three refusals, then the limit is raised and the work runs.
-    Nothing fails and nothing is lost."""
+    Nothing fails and nothing is lost.
+    """
     cm = _Opens(_wrapped(_server_said(422, "Slots requested is greater than the limit")), fail_times=3)
     monkeypatch.setattr(mod, "concurrency", cm)
     gate = FleetGate("tessera-global-ingests", log=logging.getLogger("test"), poll_s=30.0)
@@ -132,39 +138,41 @@ def test_a_missing_gate_fails_immediately_without_holding(monkeypatch, no_sleepi
     """The regression that matters most in the other direction."""
     cm = _Opens(RuntimeError("Concurrency limits ['typo'] must be created before acquiring slots"), fail_times=99)
     monkeypatch.setattr(mod, "concurrency", cm)
-    with pytest.raises(RuntimeError, match="must be created"):
-        with FleetGate("typo", log=logging.getLogger("test")):
-            pass  # pragma: no cover
+    with pytest.raises(RuntimeError, match="must be created"), FleetGate("typo", log=logging.getLogger("test")):
+        pass  # pragma: no cover
     assert no_sleeping == []
 
 
 def test_a_hold_is_abandoned_when_the_runner_is_shutting_down(monkeypatch, no_sleeping) -> None:
     """A pause must not outlive the run it is pausing. The cells behind the gate are the
     driver's next round's work, so raising here loses nothing — while parking past a shutdown
-    would leave a thread waiting on a limit no one is going to raise."""
+    would leave a thread waiting on a limit no one is going to raise.
+    """
     stopping = threading.Event()
     stopping.set()
     cm = _Opens(_wrapped(_server_said(422, "Slots requested is greater than the limit")), fail_times=99)
     monkeypatch.setattr(mod, "concurrency", cm)
-    with pytest.raises(RuntimeError, match="Unable to acquire"):
-        with FleetGate("gate", log=logging.getLogger("test"), should_stop=stopping.is_set):
-            pass  # pragma: no cover
+    with (
+        pytest.raises(RuntimeError, match="Unable to acquire"),
+        FleetGate("gate", log=logging.getLogger("test"), should_stop=stopping.is_set),
+    ):
+        pass  # pragma: no cover
     assert no_sleeping == []
 
 
 def test_a_hold_announces_itself_once_and_then_periodically(monkeypatch, no_sleeping, caplog) -> None:
     """A hold is indefinite, so silence would be indistinguishable from a hung run — but a line
     every poll would bury the log of a paused campaign. First attempt, then every
-    HOLD_LOG_EVERY_S of holding."""
+    HOLD_LOG_EVERY_S of holding.
+    """
     polls = int(mod.HOLD_LOG_EVERY_S / 30.0)
     cm = _Opens(
         _wrapped(_server_said(422, "Slots requested is greater than the limit")),
         fail_times=polls * 2 + 1,
     )
     monkeypatch.setattr(mod, "concurrency", cm)
-    with caplog.at_level(logging.WARNING):
-        with FleetGate("gate", log=logging.getLogger("hold-test"), poll_s=30.0):
-            pass
+    with caplog.at_level(logging.WARNING), FleetGate("gate", log=logging.getLogger("hold-test"), poll_s=30.0):
+        pass
     held = [r for r in caplog.records if "HELD" in r.getMessage()]
     assert len(held) == 3, [r.getMessage() for r in held]
     # The message has to carry the way out; a paused campaign is read by whoever is on call.
@@ -173,7 +181,8 @@ def test_a_hold_announces_itself_once_and_then_periodically(monkeypatch, no_slee
 
 def test_the_gate_survives_having_no_logger(monkeypatch, no_sleeping) -> None:
     """The commit gate is constructed before a run logger exists on some paths, and a hold must
-    not turn into an AttributeError inside a commit."""
+    not turn into an AttributeError inside a commit.
+    """
     cm = _Opens(_wrapped(_server_said(422, "Slots requested is greater than the limit")), fail_times=1)
     monkeypatch.setattr(mod, "concurrency", cm)
     with FleetGate("gate"):
@@ -184,7 +193,8 @@ def test_the_gate_survives_having_no_logger(monkeypatch, no_sleeping) -> None:
 def test_the_lease_kwargs_reach_prefect(monkeypatch, no_sleeping) -> None:
     """The ingest gate's generous lease and its "do not die on a renewal blip" policy are what
     let an hours-long ingest hold a slot. Passing them through the new indirection is not
-    optional, and a dropped kwarg is invisible until an ingest dies at five minutes."""
+    optional, and a dropped kwarg is invisible until an ingest dies at five minutes.
+    """
     seen: dict = {}
 
     class _CM:
@@ -208,3 +218,103 @@ def test_the_lease_kwargs_reach_prefect(monkeypatch, no_sleeping) -> None:
         "lease_duration": 900.0,
         "raise_on_lease_renewal_failure": False,
     }
+
+
+# --- the pause signal ------------------------------------------------------------------
+#
+# A gate read as a FLAG rather than acquired, for a loop that has to ask permission to work.
+# The asymmetry is deliberate and is the whole safety argument: a wrong "paused" stops a
+# campaign, a wrong "running" costs nothing, so every uncertain answer is "running".
+
+
+def _reading(limit: int, active: bool = True):
+    return lambda name: (limit, active)
+
+
+def test_zero_on_an_active_gate_is_paused() -> None:
+    assert mod.pause_signal("g", read_limit=_reading(0))() is True
+
+
+@pytest.mark.parametrize("limit", [1, 8, 61])
+def test_any_positive_limit_means_run(limit: int) -> None:
+    """The gate is a flag, not a cap — nothing acquires a slot, so the magnitude is only
+    "not zero". A campaign start writes 1.
+    """
+    assert mod.pause_signal("g", read_limit=_reading(limit))() is False
+
+
+def test_an_inactive_gate_is_not_a_pause() -> None:
+    """Deactivating a gate makes the server grant slots to everyone, so reading it as a
+    pause would give one state two opposite meanings across the two gate mechanisms.
+    """
+    assert mod.pause_signal("g", read_limit=_reading(0, active=False))() is False
+
+
+def test_an_absent_gate_is_not_a_pause() -> None:
+    """A campaign whose gate was never created must run, not sit still."""
+    assert mod.pause_signal("g", read_limit=lambda name: None)() is False
+
+
+def test_a_failed_read_is_not_a_pause() -> None:
+    """Fail-open, and this is the case that matters: the read happens on every cluster's
+    inference driver, so a wobbly API would otherwise stop the entire campaign working.
+    """
+
+    def boom(name: str):
+        raise RuntimeError("api down")
+
+    assert mod.pause_signal("g", read_limit=boom)() is False
+
+
+def test_a_reading_is_cached_for_its_ttl(monkeypatch) -> None:
+    """One read per TTL at most. The check sits in a dispatch loop that runs per chunk
+    hand-over, and 2,500 actors' worth of hand-overs asking the orchestrator whether to work
+    would spend real API capacity on the question.
+    """
+    reads = {"n": 0}
+
+    def counted(name: str):
+        reads["n"] += 1
+        return (1, True)
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+    paused = mod.pause_signal("g", read_limit=counted, ttl_s=30.0)
+    for _ in range(50):
+        paused()
+    assert reads["n"] == 1
+    clock["t"] += 31.0
+    paused()
+    assert reads["n"] == 2
+
+
+def test_the_pause_is_noticed_within_a_ttl(monkeypatch) -> None:
+    """The other side of caching: a stale answer must expire, or the pause never takes."""
+    state = {"limit": 1}
+    clock = {"t": 0.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+    paused = mod.pause_signal("g", read_limit=lambda name: (state["limit"], True), ttl_s=30.0)
+    assert paused() is False
+    state["limit"] = 0
+    assert paused() is False, "within the TTL the previous reading stands"
+    clock["t"] += 31.0
+    assert paused() is True
+
+
+def test_entering_and_leaving_a_pause_are_both_logged(monkeypatch, caplog) -> None:
+    """A paused fleet is an expensive, silent state — the log is the only place an operator
+    sees that it is deliberate, and the resume line is what confirms the lever worked.
+    """
+    state = {"limit": 0}
+    clock = {"t": 0.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["t"])
+    log = logging.getLogger("pause-test")
+    paused = mod.pause_signal("g", log=log, read_limit=lambda name: (state["limit"], True), ttl_s=30.0)
+    with caplog.at_level(logging.INFO):
+        assert paused() is True
+        clock["t"] += 31.0
+        state["limit"] = 1
+        assert paused() is False
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("PAUSED" in m and "global-concurrency-limit update" in m for m in messages), messages
+    assert any("cleared after" in m for m in messages), messages

@@ -179,7 +179,7 @@ Each of these means the work the campaign has *not* done yet is also affected.
 | **Fargate vCPU quota exhausted** | `placement` | ingest cannot start; the fill queue drains and the fleet idles |
 | **mass false cancellations / event loss** | `crashed/failed runs`, `orchestrator load` | measured before: the in-memory broker drops events, and the crash automation is event-driven. Healthy runs get declared dead and cancelled |
 | **cost accrual far above model with progress flat** | `cost accrual` + `commit rates` | the two together, never either alone: high burn with progress is just a wide fleet |
-| **a concurrency gate DEACTIVATED while fills are live** | `concurrency limits` | it does the opposite of what it sounds like: the server grants slots against an inactive limit, so the work it throttled runs unthrottled. A cost control silently gone, and one command to fix. (A gate at *zero* is the pause lever and is reported without being graded — cells hold there, nothing fails) |
+| **a concurrency gate DEACTIVATED while fills are live** | `concurrency limits` | it does the opposite of what it sounds like: the server grants slots against an inactive limit, so the work it throttled runs unthrottled. A cost control silently gone, and one command to fix. (A gate at *zero* is a pause lever and is reported without being graded: `tessera-global-ingests` at zero holds ingest, `tessera-global-inference` at zero holds inference, and in both cases work waits rather than failing) |
 
 **The stop itself is not free, so the message says what stopping costs.** Cancel the *tasks* before
 stopping infrastructure or runs sit in `CANCELLING` forever, looking live to every guard; a resumed

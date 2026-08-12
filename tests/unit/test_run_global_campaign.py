@@ -165,22 +165,45 @@ class TestCampaignDefaults:
         assert (clusters, ingests) == (8, 40)
         assert ingests % clusters == 0, "an uneven split rounds up and overshoots the cap"
 
-    def test_both_caps_are_published_to_the_server(self, wired):
-        """Both gates live in CHILD flow runs, so a cap only binds if it reaches the
-        Prefect limit they name. Writing both from this flow is what stops the
-        server's numbers drifting from the ones chosen here.
+    def test_every_gate_is_published_to_the_server(self, wired):
+        """All three gates live in CHILD flow runs, so a gate only binds if it reaches the
+        Prefect limit they name. Writing them from this flow is what stops the server's
+        numbers drifting from the ones chosen here — and, for the pause gate, what makes
+        pausing reachable without an operator creating anything first.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
-        assert dict(wired["limits"]) == {"tessera-global-ingests": 40, "tessera-global-commits": 8}
+        assert dict(wired["limits"]) == {
+            "tessera-global-ingests": 40,
+            "tessera-global-commits": 8,
+            "tessera-global-inference": 1,
+        }
         assert wired["arun"][0][1]["ingest_limit_name"] == "tessera-global-ingests"
         assert wired["arun"][0][1]["commit_limit_name"] == "tessera-global-commits"
+        assert wired["arun"][0][1]["inference_pause_gate"] == "tessera-global-inference"
+
+    def test_the_pause_gate_is_published_as_running_not_as_a_cap(self, wired):
+        """One, not the cluster count. The gate is READ as a flag rather than acquired, so a
+        larger number would imply a capacity it does not enforce — and zero, the value that
+        pauses, must never be what a campaign start writes.
+        """
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=8))
+        assert dict(wired["limits"])["tessera-global-inference"] == 1
+
+    def test_a_start_clears_a_pause_somebody_left_behind(self, wired):
+        """The gate is upserted at every start, so a campaign cannot inherit a zero from a
+        previous run's pause and sit there looking healthy while doing nothing.
+        """
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+        writes = [v for k, v in wired["limits"] if k == "tessera-global-inference"]
+        assert writes == [1]
 
     def test_no_ingest_cap_is_published_when_ingest_is_off(self, wired):
-        """Prebuilt mosaics mean no ingest to gate. Commits still happen, so that
-        cap is still published.
+        """Prebuilt mosaics mean no ingest to gate. Commits still happen, so that cap is
+        still published — and so is the inference pause, because inference is exactly what
+        this run still does and pausing it must stay available.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", ingest=False))
-        assert dict(wired["limits"]) == {"tessera-global-commits": 8}
+        assert dict(wired["limits"]) == {"tessera-global-commits": 8, "tessera-global-inference": 1}
 
     @pytest.mark.parametrize(("clusters", "expected"), [(1, 1), (4, 4), (8, 8), (16, 8), (40, 8)])
     def test_the_commit_cap_is_derived_from_the_cluster_count(self, wired, clusters, expected):
@@ -204,7 +227,7 @@ class TestCampaignDefaults:
         a limit named ``""``.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", commit_limit_name=""))
-        assert dict(wired["limits"]) == {"tessera-global-ingests": 40}
+        assert dict(wired["limits"]) == {"tessera-global-ingests": 40, "tessera-global-inference": 1}
 
     def test_nothing_bounds_mosaics_in_flight(self, wired, monkeypatch):
         """A whole year's mosaics may coexist: no backpressure from fill onto ingest.

@@ -67,7 +67,7 @@ from tessera_embeddings.inference.orchestration_helpers import build_inference_c
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.inference.scheduling import WorkItem
 from tessera_embeddings.ingest.source_coverage import SourceFinding, preflight_optical_source
-from tessera_embeddings.orchestration.prefect._fleet_gate import FleetGate
+from tessera_embeddings.orchestration.prefect._fleet_gate import FleetGate, pause_signal
 from tessera_embeddings.orchestration.prefect.flows._cell_validation import (
     cell_validation_parameters,
     dispatch_cell_validation,
@@ -592,6 +592,7 @@ def fill_zones_sequential_flow(
     branch: str | None = None,
     look_ahead: int = 2,
     attempts_per_cell_in_cluster: int = 2,
+    inference_pause_gate: str | None = None,
     ingest_limit_name: str | None = None,
     cleanup_mosaics: bool = True,
     ingest_settings: IngestSettings = IngestSettings(),  # noqa: B008
@@ -674,6 +675,14 @@ def fill_zones_sequential_flow(
             ``ingest_zone_year`` to their branch-scoped deployments (see
             :func:`run_global_campaign._dpl`). ``None`` (default) = unsuffixed prod
             refs. The direct ``ingest_deployment`` above is resolved by the caller.
+        inference_pause_gate: Prefect global concurrency limit READ as a pause flag for
+            inference — zero means paused, any positive value means run. It is read, never
+            acquired, so it holds no slot and needs no lease. While it reads zero this
+            cluster finishes and lands the chunks already queued, then takes on no further
+            cell: the actors stay alive and the run does not end, so raising the limit
+            resumes where it stopped. It pauses what enters INFERENCE; ``ingest_limit_name``
+            at zero pauses what enters ingest, and the two are independent. Neither stops the
+            fleet being billed — only cancelling does that. ``None`` disables the check.
         ingest_limit_name: Prefect global concurrency limit bounding how many UTM
             zones ingest simultaneously across ALL clusters. Every zone of this
             cluster is submitted at once and each holds one slot for the duration
@@ -1268,6 +1277,9 @@ def fill_zones_sequential_flow(
                 look_ahead=look_ahead,
                 attempts_per_cell_in_cluster=attempts_per_cell_in_cluster,
                 fault=fault,
+                # Built here rather than in the runner: the runner is Prefect-free, so the
+                # question "is inference paused" reaches it as a plain callable.
+                paused=(pause_signal(inference_pause_gate, log=log) if inference_pause_gate else None),
             )
     finally:
         if inputs is not None:
