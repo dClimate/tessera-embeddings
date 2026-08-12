@@ -144,6 +144,12 @@ registration script reads it from the deployment's own account and writes it int
 document id. Rotating the webhook means updating the secret and re-running the script with
 `--apply`. **The URL appears in no file in either repository.**
 
+**One thing that is NOT a bug, so nobody re-fixes it.** Subject and body reach Slack as a legacy
+attachment's `title` and `text` — two fields, rendered as a bold line above the body. Copying such
+a message out of Slack joins them with no newline (`...FAILED VALIDATIONA cell validation run
+FAILED`), which reads like a formatting fault and is not one. A leading newline was briefly added
+to "fix" it and only produced a blank first line; capturing apprise's payload settled it.
+
 **One trap, paid for once.** `Block.save()` defaults to the *ambient* Prefect client, and Prefect
 resolves its settings at import — so on a laptop carrying a `prefect cloud login` profile, the
 first version of the script wrote the live webhook into an unrelated **Prefect Cloud** workspace.
