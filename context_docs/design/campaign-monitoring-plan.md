@@ -50,7 +50,7 @@ the same 60-minute window. So:
   limits, **crashed/failed runs**, cost accrual, **cell validation**. No Insights query, so the
   round is essentially free; and this set carries the two most decision-relevant signals we have.
 * **every third round (15 min) — the paid checks.** Commit rates, per-cell roster silence, fill
-  scope, fleet duty cycle, GPU starvation. This keeps the measured **~$5/day** cost model, which is
+  scope, GPUs kept busy, GPU starvation. This keeps the measured **~$5/day** cost model, which is
   a rounding error against one idle 20-worker fleet-hour (~$37).
 
 **What each round publishes**, all under `s3://global-tessera-embeddings/monitoring/`:
@@ -110,7 +110,7 @@ the second path.
 ### 2.2 The reliable path: the periodic poll — **NOT BUILT** (§1)
 
 The round of §1 posts what the automations cannot: everything that is a *reading* rather than an
-event (stalls, duty cycle, cost, quota, a published cell with no verdict), plus a second chance
+event (stalls, how busy the GPUs are, cost, quota, a published cell with no verdict), plus a second chance
 at everything above. Its rules:
 
 | grade | posted | re-posted |
@@ -123,9 +123,10 @@ at everything above. Its rules:
 
 Three rules that matter more than the table:
 
-**A message carries the decision class, not just the finding.** `PROBLEM: cell validation — 2
-cells failed` is a finding; `CLASS 1 CANDIDATE — 2 cells failed the same check` is a decision.
-The class comes from §3, which is a lookup, not a judgement.
+**A message carries the decision class, not just the finding.** `PROBLEM: cell validation — 4
+cells failed` is a finding; `CLASS 1 CANDIDATE — 4 cells failed the same check` is a decision.
+The class comes from §3, which is a lookup, not a judgement. The check's `systemic_checks` subject
+is what the lookup keys on, so the class never depends on re-counting prose.
 
 **Every message carries its `follow_up` command.** `campaign_health` already computes the real
 invocation for each finding, filled with this round's window and roster. A message that names a
@@ -169,7 +170,7 @@ Each of these means the work the campaign has *not* done yet is also affected.
 
 | signal | source | why it stops the run |
 |---|---|---|
-| **the same validation check fails on ≥2 cells** | `cell validation` | one cell is bad luck; two of the same is systemic assembly or model, and every cell after it inherits it |
+| **the same validation check fails on ≥4 cells** | `cell validation` | one or two is bad luck — the checks describe the input as much as the code, and a 1,008-cell roster is heterogeneous enough to produce a pair on its own. Four of a kind is systemic assembly or model, and every cell after it inherits it. The check reports the running total per check from the first failure, so the count is visible on the way up |
 | **an embedding seam or constant-dimension failure at all** | `cell validation` | both are assembly- or encoder-wide by nature; neither is zone-specific |
 | **quantization invariant fails** (scale shares far from 1.0) | `cell validation` | the stored data is not what its readers assume, everywhere |
 | **the campaign flow itself CRASHED or FAILED** | `crashed/failed runs` | its own deterministic gate refused something; nothing is being filled while it is down |
@@ -178,6 +179,7 @@ Each of these means the work the campaign has *not* done yet is also affected.
 | **Fargate vCPU quota exhausted** | `placement` | ingest cannot start; the fill queue drains and the fleet idles |
 | **mass false cancellations / event loss** | `crashed/failed runs`, `orchestrator load` | measured before: the in-memory broker drops events, and the crash automation is event-driven. Healthy runs get declared dead and cancelled |
 | **cost accrual far above model with progress flat** | `cost accrual` + `commit rates` | the two together, never either alone: high burn with progress is just a wide fleet |
+| **a concurrency gate at zero, or deactivated, while fills are live** | `concurrency limits` | neither state does what its name suggests. A zeroed gate makes the next cell to reach it FAIL rather than queue (the server refuses a request for more slots than the limit, and both gates fail closed); a deactivated one grants slots to everyone, so the work it throttled runs unthrottled. One burns cells, the other removes a cost control — and both are one command to fix |
 
 **The stop itself is not free, so the message says what stopping costs.** Cancel the *tasks* before
 stopping infrastructure or runs sit in `CANCELLING` forever, looking live to every guard; a resumed
@@ -268,7 +270,7 @@ is a thing that can only be checked once.
 |---|---|---|
 | **T+15 min** | the first fleet placed at the width asked; the first ingest committed | no task placed, or the quota refused |
 | **T+1 h** | the **first cell's validation verdict** — the first real answer about the product | any blocking finding at all: at one cell, a defect is systemic until proven otherwise |
-| **T+2 h** | the first cell's cost against the model; duty cycle above ~80% | burn far above model, or a fleet idling |
+| **T+2 h** | the first cell's cost against the model; GPUs busy above ~80% of the time | burn far above model, or a fleet idling |
 | **T+4 h** | the first *window figures* reviewed by a human, not only the AI | the pictures do not look like Earth |
 | **T+8 h** | the shelf's growth rate | rules refusing cells far faster than the survey predicted |
 | **T+24 h** | cells/day against the deadline; spend against model | the arithmetic no longer reaches 2026-09-11 |

@@ -1,14 +1,14 @@
 # Global TESSERA campaign — the plan
 
 **The standing plan for building 9 years × 112 land zones of 10 m embeddings into one
-Icechunk store.** Everything here is settled unless it appears in §10, the list of decisions still open before
-launch.
+Icechunk store.** Everything here is settled. One measurement is still outstanding before launch,
+and it is item 8 of §7.
 
 This document is the entry point and the source of truth for **operations** — what runs, with
 what settings, in what order, what comes out, and what to do when it breaks. It states the
 current position rather than how that position was reached: a finding that changed a decision is
 folded into the section it changed, and the measurement behind it lives in the document named
-beside it (§12).
+beside it (§11).
 
 [`campaign-cost-model.md`](campaign-cost-model.md) is the source of truth for **figures**:
 every cost, rate, fleet size and the arithmetic behind them. Numbers appear here as results
@@ -191,7 +191,8 @@ Three records, in increasing detail:
 **`optical_skips` is a real coverage record, not a diagnostic.** Skipped tiles are deterministic
 and spatially clustered: independent fills of the same cell produce byte-identical skip sets. They
 publish as fill, and so does ocean. So the store records them per year, and
-**what ships with the data should say so**, alongside the optical-only regions of §10.
+**what ships with the data should say so** — alongside the 6.8% of pixel-years embedded without
+radar, which is the other thing a reader cannot infer from the pixels (§6).
 
 Alongside the data, each published cell has **figures and a machine-readable verdict** under
 `windows/<zone>/` in the same bucket — a coverage map, sampled native-resolution windows, the
@@ -223,7 +224,7 @@ exactly the set an operator has to pass explicitly; everything else is already t
 | `s1_orbit` | `"both"` | downgrades per zone when an orbit has no imagery. `"none"` is a *resolved* value, not a request: passing it in is refused, since it would defeat `require_s1` and publish optical-only embeddings that report success |
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
-| **`allow_s2_only`** | **`true`** ★ | On for the global campaign. A fifth of the land has no radar for 2022–24 (§6); without this those pixels produce nothing. ADR 013 does not consider the combination validated — see §10 |
+| **`allow_s2_only`** | **`true`** ★ | On for the global campaign. A fifth of the land has no radar for 2022–24 (§6); without this those pixels produce nothing. Cambridge validated radar-free embeddings, which cleared ADR 013's blocking follow-up |
 | **`overlap_years`** | **`true`** ★ | every requested year dispatched as one batch, so a zone's later years overlap the inference of its earlier ones and the campaign boots 8 clusters rather than 72. Certified on six cells that each carry both radar orbits, including a same-zone year rollover inside one cluster |
 | `attempts_per_cell_in_cluster` | 2 | **The cheap retry.** One more go at a failed cell on the cluster that is still standing, reusing its kept mosaic and staged tiles — minutes, not a fresh zone-year. Covers "the work failed but the machine is fine"; a dead run is `max_dispatch_rounds`' job (§8) |
 | `force_staging_reuse` | `false` | Escape hatch, and it cannot reach staging created without it: setting it changes the prefix, so it only preserves reuse between runs that both set it. To resume a specific prefix, pass `fill-zone-year`'s explicit `run_id` (§8) |
@@ -404,8 +405,21 @@ absorbs an ingest cell failing and restarting without the GPUs noticing. The cam
 which the quota chose rather than the policy — 85% would want 2,611 actors and there are 2,500. The cost
 is that inference trails ingest slightly at the start.
 
-**Fleet-feeding is not a risk to plan around: duty cycle is ≥97.3%**, measured on 38N-2021 at
-60 actors over 9,051 chunks and 14.7 hours for $1,600, with nothing stalled.
+**Fleet-feeding is not a risk to plan around: the GPUs were busy at least 97.3% of the time**,
+measured on 38N-2021 at 60 actors over 9,051 chunks and 14.7 hours for $1,600, with nothing stalled.
+
+> **Provisioning under supply also keeps the campaign under the assembly ceiling.** A cluster
+> assembles on one trailing thread, and adding actors makes inference faster while assembly stays
+> the same speed, so the two eventually cross: above roughly **275 actors per cluster** assembly
+> becomes the critical path. At the campaign's **250**, assembly finishes in **1.10×** the time
+> inference takes — off the critical path, but by 10% rather than comfortably. That is why the
+> fleet is **10 clusters of 250** rather than 8 of 312: the same 2,500 actors, on the safe side of
+> the ceiling.
+>
+> **So fleet width and assembly capacity are one decision, not two.** Anyone raising the fleet for
+> throughput is spending this margin. If a wider fleet is ever wanted, the remedy is the assembly
+> side rather than the fleet: the runner leaves about 39% of its CPU idle at the shipped pool
+> width, and that idle capacity is exactly what a fleet above the ceiling would need.
 
 **Assembly is the shard write.** The merge and commit are 37 seconds of a 196-minute assembly,
 so there is no second phase to schedule around. What sets that duration is that the staged
@@ -432,8 +446,16 @@ that costs more. Settled; do not re-open.
 > *zero* granules for those years — and was restored when Sentinel-1C came online in 2025.
 > **`allow_s2_only` is on**, so those pixels are embedded from their optical sequence with a
 > neutral radar input instead of being dropped: 6.8% of pixel-years across the campaign.
-> They are cheaper too, which is where part of the rate above comes from. What remains is a
-> quality caveat rather than a coverage hole — see §10.
+> They are cheaper too, which is where part of the rate above comes from. Cambridge validated
+> radar-free embeddings, so this is a share to report with the data rather than a caveat to
+> defend, and every affected pixel is identifiable afterwards
+> (`s1_asc_obs_count + s1_desc_obs_count == 0`).
+>
+> **Greenland and Arctic Canada ship optical-only in every year, for an unrelated reason.**
+> Zones 23N and 24N publish tens of thousands of **HH/HV** granules and effectively no VV+VH, so
+> the ingest declines them on polarisation rather than for lack of radar — about 208 live tiles.
+> Those granules report `BEAM_MODE=IW`, so this is **not** EW mode, and it is a model question if
+> ever revisited rather than an ingest one. Settled.
 
 ---
 
@@ -457,7 +479,11 @@ that costs more. Settled; do not re-open.
 7. **Nothing to prepare for petabyte scale — done.** S3 Inventory delivers daily on both prod
    buckets and the audit path is exercised against a real manifest. What remains is the standing
    constraints of §7b, which are rules rather than tasks.
-8. **A single dense zone-year end to end** — see §10; this is the last gate.
+8. **A single dense zone-year end to end, at both 60 and 80 ingest workers.** The last gate, and
+   the only remaining question about the schedule. The plan runs at 60 (§3), and the gate is that
+   the densest zone behaves as the model says at that width. The 80-worker arm is upside only:
+   the width model is fitted over roughly 30–60 workers, so 80 is an extrapolation and nothing in
+   the plan depends on it.
 
 **Prod's state:** the coverage mask is built, all 112 land-zone ROIs are exported, the campaign
 deployment set is registered in its branch-scoped form, the crash-recovery automations are armed,
@@ -542,142 +568,128 @@ would be rewritten under pressure, at the worst possible moment.
 
 ## 8. Failure handling
 
-Three mechanisms, all shipped.
+**One rule underlies all of it: what has landed is read from the store, never from what a run
+reported.** Every dispatch round re-derives the work list from the store's own completion state and
+tags, so a run that reported success while quietly leaving cells unattempted does not end the
+campaign, and a cell that landed is never redone. Everything below is either a retry scope, a guard
+that refuses a write, or the list of what is left at the end.
 
-**Resume.** An interrupted mosaic is picked up, not cleared. Icechunk commits a date's time
-slot atomically with its pixels, so a date present is complete and a date absent was never
-started. Resume assumes the same land mask, which the manifest enforces on every write.
+### What happens when something fails
 
-**If one copy of a date's imagery is unusable, ingest falls back to another.** Sentinel-2 dates are
-often published as several copies, and an unreadable one steps down to the next — from every stage
-that can hit it, including the very first read of a date, so a single bad object cannot strand a
-whole zone-year while a good copy sits unused. Only an *unreadable* source falls back; every other
-error still fails loudly.
+Read this as the escalation path: each row is handled at the cheapest level that can handle it, and
+falls to the row below only if that fails too.
 
-**The reflectance offset is read from the copy actually opened.** Copies can carry different
-processing baselines, and the baseline sets that offset — so taking it from the catalogue query
-instead would correct the pixels with the wrong constant and shift a whole date's values silently.
+| what fails | what happens | where it retries | if it keeps failing |
+|---|---|---|---|
+| one copy of a date's imagery is unreadable | ingest steps down to another copy of the same date, from every stage that can hit it | in place | the date's ingest fails loudly — only *unreadable* sources fall back |
+| one ingest leg misbehaves (optical, or either radar orbit) | the leg retries on its own, capped at 6 h of wall clock (§3) | in the leg | the cell's ingest fails with everything fetched so far committed |
+| a cell's ingest | the cell is recorded as failed; its partial mosaic is kept | in the cluster: the dead input production is dropped and re-run | the next dispatch round resumes the mosaic date by date |
+| a cell's planning, inference or assembly | the cell is recorded as failed; **its mosaic and staged tiles are kept for exactly this** | in the cluster, on the fleet that is already up — usually minutes | the next dispatch round |
+| many cells at once (`look_ahead + 2` failures holding mosaics) | the cluster stops admitting new cells and winds down; the unstarted ones are recorded as never attempted | **not in the cluster** — admitting more work is what that cap exists to prevent | the next dispatch round |
+| the fill run itself — crash, cancellation, lost host | nothing in-process survives it | nowhere | the next dispatch round, which is the **only** recovery from a dead run |
+| a whole round achieves nothing | read as a deterministic failure — a gate, a fingerprint mismatch, an unseeded group | rounds stop early for that batch rather than buying another fleet | straight to the unfilled list |
+| everything, to the end | | | the cell goes on the **unfilled list** and the campaign raises at the very end naming every one |
+| a published cell fails validation | the cell stays published, flagged, with its verdict on file | **never automatically** — a refill is a human decision (§5) | it is on the list a human works through (§9) |
 
-**Retry, at two levels.**
+**Nothing is deleted on failure.** A failed cell keeps its mosaic and its staged tiles, which is
+what makes the retry cheap; the only thing a failure releases is its slot in the storage budget, so
+that a run full of failures cannot deadlock its own feeder.
 
-*Inside a cluster.* A failed cell is re-attempted on the still-provisioned fleet —
-`attempts_per_cell_in_cluster`, default 2, so one retry. The cluster is already up, the failed cell's
-mosaic was retained, and its staged tiles resume, so this is normally minutes
-rather than a fresh zone-year. **Eligibility is "kept its mosaic", not "failed"**: two paths
-delete the mosaic on purpose (the orbit-mismatch deferral cap, a terminal plan) so a
-systematic failure cannot stack multi-terabyte inputs, and retrying one of those would run
-against nothing.
+**No ingest flow carries a Prefect-level retry.** All retrying is the campaign's own, above. A
+Prefect retry would re-enter a flow whose cluster and gate slot are gone.
 
-**Cancelling a run is a request, not an instant.** Prefect marks it cancelling and a worker acts
-on that some seconds later, so a run being replaced can still be writing. The flow therefore waits
-for the old run to actually stop before starting its replacement, and gives up on the retry if it
-has not stopped within five minutes. Losing a recoverable cell is the cheaper mistake: two runs
-writing one mosaic produce a mosaic nothing downstream can detect as broken.
+### The three retry scopes, and why they are three
 
-*Across dispatches.* A failed zone does not sink the campaign. Each dispatch gets up to
-`max_dispatch_rounds` rounds, and every round re-reads the *store* for what is still missing,
-so a retry never repeats a zone that landed. Rounds stop early when one makes no progress —
-that is what a deterministic failure looks like from the driver, and it wants a human rather
-than another fleet. The campaign raises at the very end listing every unfilled cell.
+| scope | setting | unit | what only it can fix |
+|---|---|---|---|
+| inside a leg | `max_leg_wall_clock_s` (6 h) | one source stream of one cell | a stuck or flaky source, without failing the zone |
+| inside a cluster | `attempts_per_cell_in_cluster` (2, so one retry) | one cell, on the live fleet | a cell that failed while its cluster is still up and its inputs are still on disk |
+| across dispatches | `max_dispatch_rounds` (2) | a whole re-dispatch | a run that is **gone** — nothing in-process can retry what is no longer running |
 
-**The two bounds are separate on purpose.** `attempts_per_cell_in_cluster` counts attempts per cell;
-`max_dispatch_rounds` counts whole dispatches. Overloading one knob for both would silently
-change what either means. The in-cluster level exists because the driver's unit is a whole
-dispatch: without it, a cell failing early under `overlap_years` would wait for every cluster
-to finish its entire multi-year list before being re-attempted.
+At the shipped two rounds, the second round is the last whatever it achieves, so the
+no-progress stop above only bites if that setting is ever raised.
 
-**Re-run.** A fresh campaign run recomputes nothing already done: completed work is
-filtered at the work list, at the per-zone ingest marker, at date-level resume inside
-ingest, and at staged-tile resume inside inference. Two exceptions — a changed
-parameter raises rather than silently mixing configurations, and a change to the **inference
-code** invalidates staged tiles by design.
+They are separate settings because they are separate units, and one knob for two of them would
+change both meanings at once. The in-cluster scope earns its keep because the driver's unit is a
+whole dispatch: without it, a cell failing early in a multi-year list would wait for every cluster
+to finish that list before being tried again.
 
-Staged-tile resume distinguishes a *finished* tile from one a crash caught mid-upload: a
-staged tile is many objects with no atomic commit, and its missing pieces would read back as
-fill values rather than as an error. A tile counts as done only if its completion marker
-landed, so an interrupted one is re-inferred instead of assembled with silent holes. Nothing
-has to be cleaned up by hand first — the re-run overwrites it.
+**Cancelling a run takes effect after a delay, so a replacement must wait for it.** Prefect marks a
+run as cancelling and a worker acts on it seconds later, during which the old run can still be
+writing. A retry therefore waits for the old run to actually stop, and abandons the retry if it has
+not stopped within five minutes. Losing a recoverable cell is the cheaper mistake: two runs writing
+one mosaic produce a mosaic nothing downstream can detect as broken.
 
-> **The staging fingerprint is a hash of the inference source only** (`inference_code_identity`),
-> so an orchestration or ingest fix reuses staged tiles. The AMI is resolved once per campaign and
-> pinned into every fill, and that pin is the only thing stopping one run straddling two images. Two
-> overrides exist for the judgement calls a hash cannot make (§3).
+### The guards — what stops a resume or a restart from mixing data
 
-> **Three properties of these guards that are easy to reintroduce a hole in.** Each is a path
-> around a check that is meant to be unavoidable, and each was one.
+Every one of these refuses a write rather than warning about it. They are what make "just re-run
+it" safe.
+
+| guard | what it refuses | what it would otherwise let through |
+|---|---|---|
+| **write-once zone-year tag** | re-publishing a cell that already landed; both fill paths refuse a complete cell | two versions of one cell, with the tag pointing at whichever won |
+| **atomic date commits** | nothing — it is a property | Icechunk commits a date's pixels and its time slot together, so a date present is complete and a date absent was never started. This is what makes resume, rather than restart, correct |
+| **mosaic manifest identity** (`ConfigMismatchError`) | appending to a mosaic built under a different land mask, coverage threshold, orbit, pixel policy or ingest code — this is also what makes a changed parameter raise instead of continuing | one store holding dates built two different ways, indistinguishable afterwards |
+| **completion marker validated in its own pass** | marking a mosaic finished when its recorded identity disagrees with the running code | a resume that appends nothing — every date already present — silently blessing a store built under different rules, after which every later run skips the cell |
+| **absent-means-off fields** | a run with `allow_s2_only` on passing against a store that predates the field | both pixel policies mixed in one store, which is the exact append the field exists to prevent |
+| **seeded model check** | filling a store seeded for a different encoder or checkpoint | embeddings from a new encoder under a root advertising the old one |
+| **reflectance offset read from the copy actually opened** | taking the offset from the catalogue query instead | copies of one date can carry different processing baselines, and the baseline sets that offset, so the wrong constant would shift a whole date's values with nothing to show for it |
+| **staged-tile completion marker** | assembling a tile whose upload was interrupted | a tile is many objects with no atomic commit, so its missing pieces read back as *fill values*, not as an error — holes that look like data |
+| **staging fingerprint** | reusing staged tiles a different configuration or a different inference build produced | one cell assembled from two versions of the model's output |
+| **frozen land-mask `registry_sha256`** | a mask rebuilt mid-campaign | every completed cell's identity invalidated at once, and no way to tell which side of the rebuild a cell came from |
+
+### When a re-run is free
+
+A fresh campaign run recomputes nothing already done. Completed work is filtered at four
+independent levels, each cheaper than the one below it:
+
+1. **the work list** — the store's completion state and tags decide what is dispatched at all;
+2. **the per-zone ingest marker** — a finished mosaic is not re-ingested;
+3. **date-level resume inside ingest** — a partial mosaic continues from the first missing date;
+4. **staged-tile resume inside inference** — finished tiles are not re-inferred.
+
+Nothing has to be cleaned up by hand first: an interrupted staged tile is re-inferred and
+overwritten. Two exceptions, both deliberate: a **changed parameter** raises rather than silently
+mixing configurations, and a change to the **inference code** invalidates staged tiles, because the
+tiles are what that code produced.
+
+Two consequences of how recovery actually behaves, both of which remove work rather than add it. A
+fill's terminal hook tears down its GPU fleet even when the flow body is killed outright, skipping
+every `finally` — so a leaked Ray fleet is not an event to plan around. And a dead committer's gate
+slot returns on its own within about five minutes, so a whole cluster dying is a short stall on
+commits rather than a deadlock, and there is no manual release procedure.
+
+> **Staged work is reused only when the run would produce the same tiles.** A run's staging prefix
+> is derived from the inputs, the parameters and the inference source, so a re-run reuses tiles only
+> when all three match. The code component is the inference source alone, so an orchestration or
+> ingest fix reuses staging rather than abandoning it.
 >
-> - **The code-identity closure resolves relative imports.** A relative import's module name is the
->   tail alone (`providers` for `from .providers import …`), so a walker that follows only names
->   starting with the package stops at every `__init__` — which left `config/providers.py`, holding
->   the STAC collections, band lists, resolutions and baseline settings, *outside* the ingest
->   fingerprint. Changing which imagery a mosaic is built from then left its identity unmoved and a
->   resume was free to append across the change. The ingest closure is 30 files; enumerate it, never
->   trust a docstring's account of it.
-> - **The completion marker validates identity in its own pass.** The ingest code identity is
->   checked on the *append* path, so that a code change does not declare finished mosaics
->   stale — but a resume adopting a store whose every date already landed appends nothing, and with
->   no append there is no check. The marker would land over a mosaic built under a different mask,
->   threshold or code, after which every later run skips the cell. Validating before marking is what
->   stops a disagreement on the last store leaving the earlier ones marked.
-> - **`ABSENT_MEANS_OFF` names the fields where having no opinion is itself an opinion.** `allow_s2_only`
->   records "off" by being absent, for compatibility with stores predating the field — so manifest
->   validation skipping absent keys let a run with the flag on pass against a legacy store and mix both pixel
->   policies in one store, the exact append the field exists to refuse. A field *describing* a store
->   and a field stating the *policy* it was built under want opposite answers, and one rule cannot
->   express both.
-
-> **Reaching existing staging: what works and what only looks like it does.** All three levers move
-> which STAGING prefix a run uses. None of them touches the published store or relaxes a gate on it.
+> **To resume a specific staging prefix, pass `fill-zone-year`'s explicit `run_id`.** That is the
+> only reliable lever; the two `force_staging_*` knobs change the prefix as a side effect of
+> changing the fingerprint (§3). None of them relaxes a gate on the published store.
 >
-> - **`force_staging_reuse` does not reach staging fingerprinted without it.** It substitutes a
->   constant into the run-id hash, so it yields a *different* prefix from the one an unflagged run
->   staged under; it preserves reuse only between runs that both set it. **The explicit `run_id`
->   parameter is the only reliable lever.**
-> - **`fill-zone-year` mints a fresh run_id when the parameter is omitted.** The deterministic
->   staging fingerprint belongs to the campaign driver, not the per-cell flow, so a bare re-dispatch
->   of the cell flow starts staging over. Pass the preserved `run_id` to resume.
-> - **Re-assembling an already-complete zone-year needs `assemble_global` called directly** with the
->   preserved run id. Both flow paths refuse a complete cell; the direct call is repeatable because
->   it never moves the tag.
+> **A change inside that fingerprint's import closure has a landing window.** It moves the
+> fingerprint, so a mosaic caught mid-append refuses its next append and needs its interrupted store
+> deleted by hand. `config/providers.py` and the ingest query modules are inside the closure, so
+> anything touching the query, the collections or the provider settings is a between-campaigns
+> change — land it only when nothing is mid-ingest: no ingest runner and no fleet up, only the
+> Prefect worker service.
 >
-> The run_id is minted from the **effective** S2-only mode — `InferenceConfig` forces
-> `allow_s2_only` when the orbit resolves to none — rather than from the requested flag, and
-> assembly-only mode reads the policy off the run_id prefix rather than trusting a parameter nobody
-> had to set. **The prefix is the record of what the staged pixels are.**
-
-**No ingest flow carries a Prefect-level retry.** All of the retrying is the campaign's own, above.
-
-**Two recovery facts the drills settled, both of which remove work rather than add it.** A hard
-kill of a fill's flow body, skipping every `finally` and context manager, was recovered by the
-terminal hook: it terminated all five GPU instances **in the same second**. That refutes the
-belief that Prefect runs those hooks in the flow's own process, and it means the orphan-fleet
-sweep's lack of an EC2 code path is real but **not on the recovery path**: do not plan around a
-leaked Ray fleet as a likely event. And a dead committer's gate slot **returns by itself in about
-five minutes**, so there is no manual release procedure to write and a whole-cluster death is a
-five-minute stall on commits rather than a deadlock.
-
-> **A change inside the mosaic-content fingerprint closure has a landing window, and a running
-> campaign closes it.** Such a change moves the fingerprint, so a mosaic caught **mid-append**
-> refuses its next append and needs its interrupted store deleted by hand; finished mosaics are
-> unaffected. `config/providers.py` and the ingest query modules are inside that closure, so
-> **anything touching the query, the collections or the provider settings is a between-campaigns
-> change, not a mid-flight one.** The closure's own docstring can say what it covers but not
-> *when* it is safe to act, so the rule lives here. Land such a change only after
-> confirming nothing is mid-ingest — that no ingest runner or fleet is up, only the Prefect
-> worker service.
+> The mechanism, the three guard properties that have each had a hole in them, and the full set of
+> resume levers: [`staging-identity-and-resume.md`](staging-identity-and-resume.md).
 
 ---
 
-## 9. What to watch
+## 9. Campaign monitoring
 
 | signal | why it matters |
 |---|---|
 | **Mosaic backlog** (completed, not yet inferred) | the $3,000 storage figure assumes prompt deletion; a four-week backlog is ~400 TB and ~$9,200/month, and sooner a bucket-capacity problem |
-| **GPU duty cycle** | the whole of §6; a fleet below ~80% busy is being paid for idling |
+| **How busy the GPUs are** | the whole of §6 rests on a fleet that stays busy; below about 80% busy it is being paid for idling. `campaign_health.py` reports it as "GPUs kept busy" |
 | **Cells actually running** vs the cap | the ingest gate is fleet-wide and the campaign sets it from `max_parallel_ingest`, so it cannot be missing — but if that parameter is too low nothing complains, and the fleet simply runs narrow |
 | **Zones failing twice** | the retry loop stops on no-progress; these need a human |
 | **Coverage-gate rejection rate** | 365 dates per zone-year is measured on three zones; heavy rejection changes both time and cost |
-| **A cell that failed validation** (§5) | the highest-priority signal here, and the only one about the product rather than the machinery. The cell stays published and flagged — nothing retries it, because a refill is a decision — so a single failure is a note on a list. A repeat, or two cells failing the same check, is systemic and wants a human before the campaign spends another day writing the same defect |
+| **A cell that failed validation** (§5) | the highest-priority signal here, and the only one about the product rather than the machinery. The cell stays published and flagged — nothing retries it, because a refill is a decision — so a single failure is a note on a list. **Four cells failing the same check** is a property of the campaign rather than of those cells, and wants a human before another day is spent writing the same defect. The monitoring script keeps the running total per check, campaign to date, and reports it from the first failure onward — the tally is the only thing that tells the two cases apart |
 | **A published cell with no verdict** (§5) | nothing checked it. The dispatch is best-effort, so a missing verdict is how a lost dispatch shows up; those cells need a validation run by hand |
 | **The AI window review's `suspicious` verdicts** (§5) | a ranking, not a gate. Read the worst few per round; ignore a thin cell rated poorly for being thin |
 
@@ -686,80 +698,25 @@ five-minute stall on commits rather than a deadlock.
 **Never read observation depth, tokens, throughput or cost off a run still in flight.** A run
 sweeps its zone north to south while depth falls with latitude, so a partial run has measured only
 its deepest part: zone 38N read `t_kept` 121 at one third complete and **73** at completion. The
-bias is one-directional and predictable, not noise. Duty cycle is the exception — it rises
-legitimately as actor start-up amortises.
+bias is one-directional and predictable, not noise. How busy the GPUs are is the exception — that
+rises legitimately as actor start-up amortises.
 
 **Run the resume checks early in a fill, not late.** The work-list ratio (which needs the dispatch
 intent) and orphaned staging (which needs none, and so catches the operator who meant to resume and
 omitted `run_id`) both detect a resume that silently restarted — and that finding is only
 actionable while killing the run still saves the money.
 
-**A gate at zero is not a fault.** A concurrency limit set to zero while active once read as
-*healthy*, reporting a total stall as health; the view now records that state without grading it,
-because zeroing a gate is also a legitimate way to park the campaign.
+**Zeroing a concurrency gate is not a pause button — it fails cells.** The server rejects a
+request for more slots than the limit outright rather than queueing it, and both campaign gates
+fail closed, so the next cell to reach a zeroed gate *fails* instead of waiting. Deactivating a
+gate is worse in the other direction: slots are then granted to everyone, so the work it was
+throttling runs unthrottled. Neither state is a way to hold the campaign, and the monitoring view
+grades both as faults while any fill is live. **To hold the campaign, lower a gate rather than
+zero it** — a gate that is merely full does queue, which is the mechanism working as intended.
 
 ---
 
-## 10. Open before launch
-
-Settled, and not to be re-opened: **the model is v1.1**, **GPUs are
-on-demand**, the permanent store goes to **AWS Open Data**, and **Greenland and Arctic Canada ship
-optical-only** — zones 23N and 24N publish tens of thousands of **HH/HV** granules and effectively
-no VV+VH, so the ingest declines them on polarisation, not for lack of radar. That is ~208 live
-tiles of optical-only land, distinct from the Sentinel-1B gap below, and **not** EW
-mode (those granules report `BEAM_MODE=IW`). A model question if ever revisited, not an ingest one.
-
-> **The inference line is settled and measured on one token unit.** Depth **173 tok/px**, rate
-> **2.127 M combined tok/s**, both land-weighted: inference **$573,000**, campaign **$700,000** (§6).
-> Full accounting in `campaign-cost-model.md` §6b–§6c.
->
-> **Two uncertainties are carried rather than closable**, and together they are the widest driver of
-> the cost interval: an unexplained **~19% rate deficit** on the 20–45° both-orbit sample, and the
-> **35–50° band is interpolated** because measuring it is decided against. No further measurement is
-> planned.
-
-> **Provisioning under supply does a second job** beyond stopping a fleet idling
-> on a shallow queue. It is also the only thing
-> holding the campaign under an **assembly ceiling of ~275 actors per cluster**: assemblies
-> serialise on one trailing thread, and inference time per tile falls as actors rise while assembly
-> does not, so the two cross. **At the campaign's 250 actors per cluster, assembly finishes in 1.10×
-> the time inference takes — off the critical path, but by 10% rather than comfortably.** The two
-> cross at ~275. That is why the fleet is 10 clusters of 250 rather than 8 of 312: the same 2,500
-> actors, on the safe side of the ceiling. **So fleet width and assembly capacity cannot be decided independently** — anyone raising
-> the fleet for throughput is also spending this margin. If a wider fleet is ever wanted the remedy
-> is the assembly side, not the fleet: the runner leaves ~39% of its CPU idle at the shipped pool
-> width, and that idle capacity is precisely what a fleet above the ceiling would need.
-
-1. **Report the optical-only cells in whatever ships with the data.** OPERA RTC-S1 coverage was
-   withdrawn from about a fifth of the land after Sentinel-1B failed in December 2021 and largely
-   restored with Sentinel-1C in 2025 — interior Australia and much of Siberia return *zero*
-   granules for 2022–2024. `allow_s2_only` is on, so **6.8% of pixel-years are embedded without
-   radar** rather than missing.
-
-   Whether to produce them is settled: Cambridge validated radar-free embeddings, satisfying ADR
-   013's blocking follow-up. What remains is descriptive. Every affected pixel is identifiable
-   after the fact (`s1_asc_obs_count + s1_desc_obs_count == 0`) and `scripts/census_s1_coverage.py`
-   maps the area in advance, so the campaign can report the share and how those embeddings compare
-   — a statistic that ships with the data, not a gate on shipping it. **Attach Cambridge's study
-   when available:** a cleared gate whose only evidence is a sentence in a chat log is one
-   re-litigation away from being open again.
-
-2. **Measure the densest zone at two fleet widths (60 and 80).** It decides whether the campaign is
-   5.6 days or 4.5, and it is the only remaining question about the schedule. The width model is
-   fitted over roughly 30–60 workers, so 80 is an extrapolation. **This is the last preflight
-   gate.**
-
-3. **Public release.** The store is 0.9–1.8 PB. AWS Open Data has lead time and the size figure is
-   what the application asks for. The store currently sits branch-prefixed inside a private
-   bucket, so the path to a public dataset is a migration question that has not been designed.
-
-4. **The per-band split behind `zone_work_weight` is refuted at high latitude while its totals
-   hold.** An open check rather than a live problem — the balance it produces is measured good to
-   0.04% — but it is the one caveat inherited from the observation census (cost model §9 item 3).
-
----
-
-## 11. What moves the numbers
+## 10. What moves the numbers
 
 **The figures in §6 are not derived here.** `campaign-cost-model.md` is the source of truth
 for every number and the arithmetic behind it; this section is the index — what to look at
@@ -775,6 +732,12 @@ in the table below is a *chosen setting*, not a computed one.
 | a measured `tok/sec` arrives from a real run | the inference rate directly — replaces the borrowed anchor | §6 |
 | GPU or Fargate pricing | the totals, nothing structural | §3 |
 | `allow_s2_only` is switched off | 6.8% of pixel-years stop producing output | §6 |
+
+**Two uncertainties are carried rather than closed**, and together they are the widest driver of
+the cost interval: an unexplained **~19% rate deficit** on the 20–45° both-orbit sample, and the
+**35–50° latitude band is interpolated** rather than measured. No further measurement is planned;
+if a cell of opportunity lands in that band, reading its observation counts refines the level
+(cost model §9, §10 item 4b).
 
 **Four mechanisms. If a number moves and none of these explains it, something else changed.**
 
@@ -816,7 +779,7 @@ long-lived, so the last to finish sets the campaign date and a heavy one is neve
 Within-cluster order still sorts on tile counts, which is correct: ordering and actor clamping are
 properties of area, not of work.
 
-## 12. Evidence
+## 11. Evidence
 
 **Read this list as authority boundaries, not a bibliography.** Where two documents disagree, the
 one named for that subject wins. A figure quoted outside its own document is a result with a

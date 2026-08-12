@@ -1082,13 +1082,13 @@ cluster count and the wall clock.
 rate in all four; ingest worker-hours are width-neutral; and the fleet policy removes idle
 burn everywhere. The entire decision is wall clock, bought with Fargate quota.
 
-**The recommendation is 45 cells at 60 workers** *under the year barrier* — with
-`overlap_years` cleared, the operating shape is 61 cells (§5, §10 item 1) — provisioning about
-2,100 GPU actors — 264
-per cluster. It is the fastest configuration whose fleet width sits inside the range the
-width model was fitted over, and the widest whose matched fleet still fits under the
-2,500-actor GPU quota. It also needs *less* Fargate quota than the 71-cell plan an earlier
-version recommended (16,740 against 22,436) while finishing nearly two days sooner.
+**The campaign runs 61 cells at 60 workers, provisioning 2,500 actors as 10 clusters of 250**
+(§10 item 3). That is the widest shape whose ingest width stays inside the range the width model
+was fitted over and whose matched fleet still fits under the 2,500-actor GPU quota. Under the year
+barrier — the constraint `overlap_years` removed — the same reasoning gave **45 cells at 60
+workers** and about 2,100 actors; that shape is the year-serial fallback, and it needs *less*
+Fargate quota than the 71-cell plan an earlier version recommended (16,740 against 22,436) while
+finishing nearly two days sooner.
 
 **80 workers is viable at the measured rate** — 2,267 provisioned against a 2,500 quota —
 and buys another 1.3 days for 5,400 more vCPU. It stays a target rather than a recommendation
@@ -1157,7 +1157,7 @@ the nine year-barriers at which one stalled zone holds up everything behind it.
    matches the censused one (104 → 208), so the fix is probably not urgent — but it has not
    been checked and should be. (The partition itself was extended on 2026-08-07: weight is now
    per-year work × the years a zone carries, since `overlap_years` batches span years — see
-   `campaign-plan.md` §11.)
+   `campaign-plan.md` §10.)
 4. **Fleet-matching assumes ingest and inference stay in lockstep, and they do not.** The
    duty-cycle arithmetic treats supply as smooth. It is not: dense zones take far longer than
    sparse ones, and the campaign deals the densest first, so early supply is slower than
@@ -1216,11 +1216,14 @@ the nine year-barriers at which one stalled zone holds up everything behind it.
    (`s1_asc_obs_count + s1_desc_obs_count == 0`), so the work is describing them, not finding
    them (§6).
 
-3. **Provision about 2,100 GPU actors — 264 per cluster.** Sizing at 85% of what ingest can
-   feed makes idle burn structurally zero and leaves 15% headroom for an ingest cell to fail
-   and restart without starving the fleet (§5). That fits inside the 2,500-actor quota; do
-   not go wider on ingest, because at 80 workers the matched fleet passes the quota and
-   inference becomes the critical path.
+3. **Provision 2,500 GPU actors as 10 clusters of 250.** Sizing under what ingest can feed
+   makes idle burn structurally zero and leaves headroom for an ingest cell to fail and restart
+   without starving the fleet (§5). The campaign sits at 81% of supply, which the 2,500-actor
+   quota chose rather than the policy — 85% would want 2,611. The split into ten clusters rather
+   than eight is the assembly ceiling: a cluster assembles on one trailing thread, and above about
+   275 actors per cluster assembly becomes the critical path (`campaign-plan.md` §6). Do not go
+   wider on ingest, because at 80 workers the matched fleet passes the quota and inference becomes
+   the critical path.
 
 4. **Read `s2_obs_count` and `s1_*_obs_count` off the first completed zone-years.** Both
    halves of the throughput model are now counted from public catalogues, but from a sparse
