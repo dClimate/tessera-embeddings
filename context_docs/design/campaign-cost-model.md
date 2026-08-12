@@ -1051,7 +1051,7 @@ with the fleet provisioned at 85% of matched so idle burn is zero (§5).
 > **The 72-boot ramp line is a cost of the YEAR BARRIER, and it is now optional.** Clusters
 > are dispatched per year, so 8 clusters x 9 years is 72 `ray up` cycles plus 72 model-load
 > cold starts. With `overlap_years` (shipped 2026-07-30, default off — see
-> `campaign-plan.md` §8 item 7) a cluster works a multi-year list, so the campaign pays **8
+> `campaign-plan.md` §1) a cluster works a multi-year list, so the campaign pays **8
 > boots**, taking this line from about $9,000 to roughly $1,000. That is a small number
 > against the total and is NOT the reason to drop the barrier — the schedule is (§"Which
 > quota actually binds") — but it is the one line item that moves, so it belongs here rather
@@ -1144,7 +1144,7 @@ the nine year-barriers at which one stalled zone holds up everything behind it.
    matches the censused one (104 → 208), so the fix is probably not urgent — but it has not
    been checked and should be. (The partition itself was extended on 2026-08-07: weight is now
    per-year work × the years a zone carries, since `overlap_years` batches span years — see
-   `campaign-plan.md` §8 item 6.)
+   `campaign-plan.md` §11.)
 4. **Fleet-matching assumes ingest and inference stay in lockstep, and they do not.** The
    duty-cycle arithmetic treats supply as smooth. It is not: dense zones take far longer than
    sparse ones, and the campaign deals the densest first, so early supply is slower than
@@ -1193,7 +1193,7 @@ the nine year-barriers at which one stalled zone holds up everything behind it.
    **Amended once the barrier cleared:** with `overlap_years` validated (P4/P7) and prod's
    applied quotas at Fargate 25,000 vCPU and G-and-VT 10,000 vCPU (2,500 actors, both verified
    in the account 2026-08-06), the operating shape is **61 cells at 60 workers** — the 85%-
-   provisioning row of §5's barrier-free table, and what `campaign-plan.md` §2 stars. The
+   provisioning row of §5's barrier-free table, and what `campaign-plan.md` §3 stars. The
    45-cell figure above is the year-serial fallback.
 
 2. **Report the 2022–2024 optical-only cells in whatever ships with the data.**
