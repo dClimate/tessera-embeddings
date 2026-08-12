@@ -8,19 +8,20 @@ or a second wave at the end.
 So monitoring is not a dashboard. It exists to produce **one of three decisions** as early as
 possible:
 
-| | decision | when |
+| decision | what it means | when it applies |
 |---|---|---|
-| **1** | **Stop everything, fix, restart** | the defect taints work the campaign has not done yet, so every hour it keeps running is wasted money |
-| **2** | **Let it run; fix in a second wave** | the problem is confined to named zones and does not touch the rest |
-| **3** | **Ignore; maybe patch attrs later** | a property of the input or of an older image, not a defect |
+| **INTERVENE NOW** | stop everything, fix, restart | the defect taints work the campaign has not done yet, so every hour it keeps running is wasted money |
+| **RESOLVE LATER** | let it run; fix in a second wave | the problem is confined to named zones and does not touch the rest |
+| **TAKE NOTE** | record it; maybe patch attrs at the end | a property of the input or of an older image, not a defect |
 
-Class 1 is only affordable in the **first hours**. Class 2 is the common outcome and its whole
-product is a **list of zones** to re-run at the end. Class 3 is most of what monitoring will see,
-and the design problem is stopping it from burying the other two.
+**Intervene Now** is only affordable in the **first hours**. **Resolve Later** is the common outcome
+and its whole product is a **list of zones** to re-run at the end. **Take Note** is most of what
+monitoring will see, and the design problem is stopping it from burying the other two.
 
-Two things follow, and they shape everything below. **The cost of a missed class-1 signal is the
-whole remaining campaign**, so those checks run on the fastest cadence and page. And **the cost of a
-noisy class-3 signal is that nobody reads the channel**, so a standing finding must be said once.
+Two things follow, and they shape everything below. **The cost of a missed Intervene Now signal is
+the whole remaining campaign**, so those checks run on the fastest cadence and page. And **the cost
+of a noisy Take Note signal is that nobody reads the channel**, so a standing finding must be said
+once.
 
 ---
 
@@ -59,7 +60,7 @@ the same 60-minute window. So:
 |---|---|
 | `rounds/<timestamp>.json` | the full `campaign_health --json` report, verbatim. The audit trail, and what the agent reads |
 | `state.json` | fingerprint → `first_seen`, `last_posted`, `times_seen`. The dedup and ageing memory |
-| `shelf.json` | the class-2 list: per zone, what is wrong, the evidence, and whether it is resolved (§4) |
+| `shelf.json` | the Resolve Later list: per zone, what is wrong, the evidence, and whether it is resolved (§4) |
 | `latest.json` | the newest round, for a cheap read |
 
 **A round never mutates the campaign.** No cancelling, no reopening, no dispatching a refill. The
@@ -75,32 +76,47 @@ other slow and reliable, and neither substitutes for the other.
 
 ### 2.1 The fast path: server-side automations — **BUILT**
 
-Three things go wrong in a way the orchestrator observes the instant it happens, so for those a
+Four things go wrong in a way the orchestrator observes the instant it happens, so for those a
 Prefect automation posts with no polling and no code of ours running.
-`scripts/register_alert_automations.py` registers them, and they are live on
-`global-tessera-dev`:
+`scripts/register_alert_automations.py` registers them, and they are live on both accounts:
 
 | automation | fires on | urgency in the message |
 |---|---|---|
 | `notify-cell-validation-failed` | a `validate-zone-year` run FAILED | the highest — the only alert about the published product |
 | `notify-campaign-driver-stopped` | `run-global-campaign` FAILED or CRASHED | the show has stopped; every hour is deadline, not money |
 | `notify-fill-run-lost` | a fill run FAILED or CRASHED | context; the driver retries and the sweep reclaims the fleet |
+| `notify-ingest-failed` | an `ingest-zone-year` run FAILED or CRASHED | a **warning**, said as one: the cell keeps what it committed and is retried |
 
-Four choices in there worth keeping:
+Choices in there worth keeping:
 
 * **`CANCELLED` is not an alerting state.** An operator cancelling a run already knows, and the
   campaign's own recovery cancels children by design — including in a normal teardown — so
   alerting on it would post routinely, which is how a channel becomes unread.
-* **No ingest deployment is watched.** An ingest failure is retried; the driver reports genuinely
-  unfilled cells once, at the end.
+* **The ingest alert exists for the REPEAT, not the failure.** A single failed ingest resolves
+  itself: everything already fetched is committed, the cell is retried on the standing cluster and
+  then across dispatch rounds, and a resume continues from the first missing date. What is not
+  self-resolving is a pattern — the same cell failing every time (a deterministic gate), or
+  different cells failing the same way at once (a catalogue refusing requests, a quota, a provider
+  timing out over one region). No single event can see either, so the message names both readings
+  and points at the check that counts. Without it the first report of a bad cell is the driver's
+  end-of-run list, days later.
 * **The validation alert does not guess *why* it failed.** "Found a defect" and "could not run"
   both end as a FAILED run and the difference is the exception type in the log, so the body names
   both readings and says they need opposite responses — refill nothing, re-dispatch the validator.
-* **Message bodies use exactly one template expression, `{{ event.resource.id }}`.** An invalid
-  Jinja expression makes the action fail with *nothing sent and nothing wrong on the run*, which
-  is invisible outside the orchestrator's own event log. That is the one expression this repo has
-  confirmed works in an action; a friendlier `{{ flow_run.name }}` is not worth an alert that
-  silently never arrives.
+* **Every message names the run four ways and carries the commands that open it.** The run name a
+  person recognises, the run id every tool takes as an argument, the deployment, and the fully
+  qualified event resource an events query keys on — then `watch_run.py` and `campaign_health.py`
+  with the account and the id already filled in. An alert that names a problem without the next
+  command sends the reader to find a runbook at 3 a.m., and an agent given an id and a command can
+  look for itself.
+* **Those expressions were checked against the server rather than assumed.** An invalid Jinja
+  expression makes an action fail with *nothing sent and nothing wrong on the run*, invisible
+  outside the orchestrator's own event log. The server builds an action's template context by
+  scanning the template for the native objects it knows (`flow_run`, `deployment`, `flow`, …) and
+  fetching them from its own API, and its Jinja environment uses `ChainableUndefined` — so a lookup
+  that fails renders EMPTY rather than raising. An earlier version of this plan allowed only
+  `{{ event.resource.id }}` for fear of the silent-failure case; that was wrong twice over, and
+  reading the server's source plus firing a real event is what settled it.
 
 **This path is lossy, by measurement.** Prefect's event broker is in-memory and drops events
 under load — we have watched it declare healthy runs dead — and it cannot fire at all when the
@@ -124,7 +140,7 @@ at everything above. Its rules:
 Three rules that matter more than the table:
 
 **A message carries the decision class, not just the finding.** `PROBLEM: cell validation — 4
-cells failed` is a finding; `CLASS 1 CANDIDATE — 4 cells failed the same check` is a decision.
+cells failed` is a finding; `INTERVENE NOW? — 4 cells failed the same check` is a decision.
 The class comes from §3, which is a lookup, not a judgement. The check's `systemic_checks` subject
 is what the lookup keys on, so the class never depends on re-counting prose.
 
@@ -164,7 +180,7 @@ the session exported — and the script refuses to write anything if that URL is
 
 This is the heart of the plan. Everything monitoring reports maps here.
 
-### Class 1 — stop everything
+### Intervene Now — stop everything
 
 Each of these means the work the campaign has *not* done yet is also affected.
 
@@ -185,7 +201,7 @@ Each of these means the work the campaign has *not* done yet is also affected.
 stopping infrastructure or runs sit in `CANCELLING` forever, looking live to every guard; a resumed
 run measures the remainder rather than the whole; and restart dead **legs**, not cells that landed.
 
-### Class 2 — shelve it, fix in a second wave
+### Resolve Later — shelve it, fix in a second wave
 
 | signal | source | what goes on the shelf |
 |---|---|---|
@@ -197,18 +213,21 @@ run measures the remainder rather than the whole; and restart dead **legs**, not
 | **coverage reconciliation does not close** | `cell validation` | written + skipped vs live |
 | **orphaned staging under a foreign identifier** | `orphaned staging` | a resume that lost its `run_id`, or a deliberate invalidation |
 
-### Class 3 — expected; note, do not alert
+### Take Note — expected; record, do not alert
 
-These are the ones that would drown the channel. They are counted per round and never posted.
+**This is a list of things that will appear and must not be escalated.** That is its only purpose:
+each row is something a reader could reasonably mistake for a defect, so the table's job is to say
+why it is not one and stop it consuming an hour at 3 a.m. They are counted per round and never
+posted.
 
 | signal | why it is not a defect |
 |---|---|
 | **cells skipped by a deterministic rule** — the optical preflight refusing a cell whose catalogue publishes nothing over its live land; the coverage gate refusing a short window; a cell whose every live tile was skipped | the rule fired correctly. Each still goes on the shelf as a *named zone*, because "correctly skipped" and "we meant to publish it" are different |
-| **observation-count seams** | neighbouring MGRS tiles keep different date sets after cloud screening, so the count genuinely steps at a tile edge. Present on every cell |
+| **observation-count seams** | the counts genuinely step at an MGRS tile edge, because neighbouring tiles keep different date sets after cloud screening. It is listed only because the check's NAME reads like a defect and it is present on nearly every cell — the validator classes it as an expected upstream finding and does not even count it, so it never reaches a message. What would be worth reading is a seam in the **embeddings**, which is a different check and is not on this list |
 | **a thin cell** (high `s2_thin_pct`) | optical depth varies by an order of magnitude globally; publish and label |
 | **radar-free zones** | parts of the globe have no dual-pol coverage at all, and Sentinel-1B's failure is already documented |
 | **a provenance field absent on an older cell** | the fill predates the field. An attrs patch at the end, if it matters at all |
-| **a check reporting UNAVAILABLE** | unknown is not wrong. It is graded neither pass nor fail by design |
+| **a check reporting UNAVAILABLE** | the check could not be evaluated — which is not the same as the check failing. It fires when something the comparison needs is *absent* rather than wrong: most often a recorded figure the cell's fill never wrote, because that fill predates the field the check reads. The absence is in the RECORD, not in the pixels, and grading it either way asserts something untrue — "pass" hides a comparison that never happened, "fail" reports a store's age as a data fault. This is not hypothetical: an earlier version turned a missing recorded value into `NaN`, compared it, and reported the *record* as wrong on a healthy cell |
 
 ---
 
@@ -234,7 +253,8 @@ reconstructed from nine days of logs. Two properties it needs and neither is fre
 
 **An agent reads what the flow publishes, triages, and keeps a running narrative.** Three jobs:
 
-**1. Triage new findings against §3** and escalate class 1 immediately, with the reasoning stated.
+**1. Triage new findings against §3** and escalate an Intervene Now immediately, with the reasoning
+stated.
 The class table is a lookup, so the agent's value is not the classification — it is noticing the
 *combinations* that the per-check grades cannot see: two zones failing differently but at the same
 moment, a warning whose subjects are growing round over round, a cost curve bending while progress
@@ -254,6 +274,14 @@ worst twenty.
 **3. Post a running summary** — cells landed, rate against plan, spend against model, the shelf's
 length — on a slow cadence (hourly), so the channel has a pulse that is not only bad news.
 
+**Where it posts: `#alerts-global-tessera`, the same channel as everything else.** One place to
+look, because splitting the narrative from the alerts splits attention exactly when attention
+matters. Two rules make that safe. Its posts are **prefixed and attributed** so a reader can tell an
+interpretation from a deterministic finding at a glance — the automations and the poll state facts,
+the agent states readings. And its cadence is **bounded**: urgent escalations immediately, the
+narrative hourly, nothing else. If the hourly pulse ever turns out to bury real alerts, the fix is
+to move the pulse elsewhere and keep the escalations here, never the other way round.
+
 **Two constraints.** The agent is **not the alerting mechanism of record**: the flow posts the
 deterministic warnings itself, and the agent adds interpretation on top. An alert path whose only
 link is a model is a nondeterministic single point of failure. And the agent **acts on nothing** —
@@ -263,7 +291,7 @@ it recommends a decision and a human takes it, for the same reason the flow muta
 
 ## 6. The first day
 
-Class-1 decisions are only affordable early, so the first day has a protocol of its own. Each line
+Intervene Now decisions are only affordable early, so the first day has a protocol of its own. Each line
 is a thing that can only be checked once.
 
 | when | check | stop if |
@@ -277,7 +305,7 @@ is a thing that can only be checked once.
 
 **The T+1 h validation verdict is the single most valuable reading in the campaign.** It is the
 first time anything says whether the pixels are right, it costs three minutes and three cents, and
-it is the only class-1 signal available before real money has been spent.
+it is the only Intervene Now signal available before real money has been spent.
 
 ---
 
