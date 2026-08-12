@@ -106,6 +106,14 @@ class TestPollTracker:
     """Tests for _poll_tracker."""
 
     def test_no_op_on_empty_progress(self) -> None:
+        """An idle fleet is not a stalled one, and an operator PAUSE depends on this.
+
+        A paused cluster drains its queue and then completes nothing for as long as the pause
+        lasts. That is only safe because a finished chunk is removed from the tracker, so a
+        drained fleet reports no progress entries at all rather than entries whose staleness
+        grows without bound — which would trip the systemic-abort arm and turn a pause into a
+        crashed run. Anything that starts RETAINING completed entries breaks the pause.
+        """
         _poll({})
 
     def test_no_stall_below_threshold(self) -> None:

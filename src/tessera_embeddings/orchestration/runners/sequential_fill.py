@@ -341,8 +341,14 @@ def fill_zones_sequential(
         paused: Asked before each hand-over whether inference is paused. While it answers
             true no further cell enters the stream: the chunks already queued run to
             completion and land, the actors stay alive holding nothing, and the session does
-            not finish. Cheap and fail-open by contract (see ``pause_signal``) — a loop that
-            has to ask permission to work must never stop working because the asking failed.
+            not finish. Two properties elsewhere are what make an indefinite hold safe, and
+            both are load-bearing: idle actors are retired only once the source reports
+            EXHAUSTED (so a paused fleet keeps the actors a resume needs, and is billed for
+            them), and a finished chunk is removed from the progress tracker (so a drained
+            fleet has no entry whose staleness could grow into the systemic-stall abort).
+
+            Cheap and fail-open by contract (see ``pause_signal``) — a loop that has to ask
+            permission to work must never stop working because the asking failed.
             ``None`` disables the check entirely, which is what every path that has no gate
             configured gets.
         attempts_per_cell_in_cluster: Attempts at one cell inside THIS run, counting the
