@@ -214,13 +214,29 @@ valid looks each side received — **the embedding steps too**. Measured on thre
 mean 128-dimensional vector of equal strips either side against a control pair of adjacent strips
 wholly on one side:
 
-| window | observation step | embedding shift across the seam | against control |
-|---|---:|---:|---:|
-| 30S/2022 | +1.6 | 0.00036 | **4.6×** |
-| 30S/2023 | −0.2 | 0.00022 | 2.5× |
-| 26S/2021 | −2.6 | 0.00691 | **30.7×** |
+Swept across all 40 harvested cells (`scripts/seam_drift.py`), **148 seams**, with the seam located
+in the COUNT array rather than in the picture so the selection cannot be made on the outcome:
 
-Small in absolute terms, and unambiguous in direction: **observation count shifts the embedding
+| observation step | n | across the seam | beside it | ratio |
+|---|---:|---:|---:|---:|
+| 0–1 | 65 | 0.00470 | 0.00298 | 1.6× |
+| 1–2 | 35 | 0.00808 | 0.00337 | 2.4× |
+| 2–4 | 34 | 0.01088 | 0.00246 | **4.4×** |
+| 4–8 | 12 | 0.02481 | 0.00406 | **6.1×** |
+| 8+ | 2 | 0.08461 | 0.00609 | **13.9×** |
+
+**Monotonic over five bins, and 123 of the 148 seams move further across than beside.** An eight-
+observation step displaces the embedding about fourteen times more than neighbouring ground does on
+its own.
+
+The two methods measure against different baselines and that is why their per-observation slopes
+differ — 0.00264 here against 0.00053 for the overlaps. The seam's control is *adjacent ground within
+one scene*, which genuinely varies; the overlap's floor is *the same ground twice*, which does not. The
+overlap figure is therefore the cleaner estimate of the pure depth effect, and the seam figure is the
+one that says how the effect compares with ordinary spatial variation. Both agree on sign and on
+monotonicity, from 229 measurements sharing no code and no data.
+
+Unambiguous in direction: **observation count shifts the embedding
 systematically, as a bias rather than as noise.** That is a far better-founded worry than "thin data
 looks noisy", and it points somewhere uncomfortable for the rule: **a refusal does not remove a
 depth-induced discontinuity, it creates a sharper one** — between refused pixels, which are absent,
