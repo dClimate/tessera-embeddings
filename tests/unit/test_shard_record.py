@@ -273,3 +273,30 @@ class TestTheTwoImplementationsAgree:
                 eligible_per_chunk=grid,
                 optical_min_obs=25,
             )
+
+
+class TestWhatEligibleCanMean:
+    """The denominator is chunk-granular because the land mask is, and that is not a detail.
+
+    "ROI-live pixels" does not exist as a quantity: the mask holds liveness per 2048-px tile and per
+    256-px chunk and nothing finer. Every share derived from this row divides by it, so what it
+    counts has to be stated where it is computed rather than assumed by each reader.
+    """
+
+    def test_a_live_chunk_makes_all_its_pixels_eligible(self):
+        live = np.zeros((shard_record.CHUNKS_PER_EDGE, shard_record.CHUNKS_PER_EDGE), dtype=bool)
+        live[2, 3] = True
+        mask = shard_record.eligible_from_chunk_liveness(live, side=64)
+        assert mask.sum() == 8 * 8
+        assert mask[16:24, 24:32].all()
+
+    def test_an_all_ocean_shard_has_no_eligible_pixels(self):
+        live = np.zeros((shard_record.CHUNKS_PER_EDGE, shard_record.CHUNKS_PER_EDGE), dtype=bool)
+        assert shard_record.eligible_from_chunk_liveness(live, side=64).sum() == 0
+
+    def test_a_grid_of_the_wrong_shape_is_refused(self):
+        """A caller passing the whole zone's liveness instead of this shard's slice would otherwise
+        produce a denominator off by the size of the zone.
+        """
+        with pytest.raises(ValueError, match="one boolean per inner chunk"):
+            shard_record.eligible_from_chunk_liveness(np.ones((4, 4), dtype=bool), side=64)

@@ -102,6 +102,29 @@ def depth_histogram(depths: np.ndarray, edges: tuple[int, ...] = DEPTH_BIN_EDGES
     return tuple(counts)
 
 
+def eligible_from_chunk_liveness(chunk_live: np.ndarray, side: int = SHARD_PX) -> np.ndarray:
+    """Expand a shard's 8x8 chunk-liveness grid into the per-pixel eligibility mask.
+
+    **This is what "eligible" can mean, and it is coarser than the name suggests.** The land mask
+    holds liveness per 2048-px tile and per 256-px inner chunk, and nothing finer exists anywhere in
+    the system — so a pixel is eligible when the mask calls its CHUNK live, not when the mask calls
+    that pixel land. A live chunk on a coastline is part water, so the denominator over-counts there
+    and a coastal shard's refusal share is a lower bound. Stated here because the alternative is a
+    reader dividing by it and believing the answer is exact.
+
+    Defined as a function rather than left to each caller because the record, the validator and the
+    registry all need the same denominator, and three expansions of one grid is three chances to
+    disagree about what a shard contained.
+    """
+    if chunk_live.shape != (CHUNKS_PER_EDGE, CHUNKS_PER_EDGE):
+        raise ValueError(
+            f"chunk liveness is {chunk_live.shape}, expected {(CHUNKS_PER_EDGE, CHUNKS_PER_EDGE)} — "
+            "one boolean per inner chunk of the shard"
+        )
+    per_chunk = side // CHUNKS_PER_EDGE
+    return np.repeat(np.repeat(chunk_live.astype(bool), per_chunk, axis=0), per_chunk, axis=1)
+
+
 def chunk_skip_mask(refused: np.ndarray, eligible: np.ndarray) -> tuple[int, int, int]:
     """Which inner chunks were refused ENTIRELY, as a bitmask, with the two counts beside it.
 
