@@ -93,6 +93,11 @@ TIME_ENCODING = {"units": "nanoseconds since 1970-01-01", "calendar": "proleptic
 #: starts from clean committed state.
 CONCURRENT_WRITER_ERRORS: tuple[type[BaseException], ...] = (icechunk.ConflictError, DuplicateDateError)
 
+#: Failures that must NEVER trigger `cleanup_on_failure`'s delete, because each one means
+#: the store holds data somebody else committed. Named rather than unpacked inline in the
+#: `except` clause: mypy cannot verify a starred tuple there and rejects it outright.
+NEVER_CLEAN_UP: tuple[type[BaseException], ...] = (StoreHoldsCommittedDataError, *CONCURRENT_WRITER_ERRORS)
+
 #: Attempts per store write. Three has been enough for the transient failures this path
 #: actually sees (throttling, a credential rolling over mid-write, a flaky COG read).
 STORE_WRITE_ATTEMPTS = 3
@@ -232,7 +237,7 @@ def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
             raise ValueError("cleanup_on_failure requires store_path as first argument")
         try:
             return func(*args, **kwargs)
-        except (StoreHoldsCommittedDataError, *CONCURRENT_WRITER_ERRORS):
+        except NEVER_CLEAN_UP:
             # NOT ours to delete. Every other failure here leaves a half-written store
             # worth removing; these fired because the store holds data somebody else
             # committed, and cleaning up would destroy exactly what they wrote.
