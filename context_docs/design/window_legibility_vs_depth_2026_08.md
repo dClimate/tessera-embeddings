@@ -179,10 +179,61 @@ been measured.
 
 ---
 
-## 7. A separate finding: straight-edge artefacts, raised independently by four reviewers
+## 7. What explains the inversion — and why legibility was the wrong measurement
 
-Not part of the depth question, and recorded because it arrived unprompted from sessions that had no
-knowledge of each other. Across the 713 notes, **33 mention a straight edge, a seam or an
+The inverted gradient in §3 is real in the data but it is **not a fact about information content**.
+Three measurements, each computed over the 671 fully-land windows.
+
+**Legibility is a function of rendered contrast, not of depth.** Grouping by `variation_share` — each
+window's range as a share of the widest window in its cell — legibility runs 18%, 77%, 94%, 92%, 91%
+across five bands. There is a cliff below about 0.15 and a plateau above 0.3. Depth barely enters:
+hold contrast fixed in the middle band and legibility is 94%, 96%, 94% across three depth bands.
+
+**Spatial organisation does NOT fall with depth.** Measuring the share of each window's variance that
+survives 8×8 block averaging — per-pixel noise averages away, ground structure does not — the medians
+by depth band are **0.69, 0.70, 0.74, 0.72, 0.69, 0.72, 0.79** from under 15 observations to over 45.
+Flat. What falls with depth is amplitude: median 23.9 at 15–20 observations against 17.4 at 35–45.
+
+**So the same structure is present and rendered fainter.** The split that shows it: windows with high
+organisation but low amplitude are called legible **44%** of the time, against **91%** for equally
+organised but brighter windows. The faint group's median depth is 29.9 — deep.
+
+> **The conclusion this forces.** The legibility measurement, in both its July form and this one, is
+> measuring **contrast in a rendering choice**. The July per-window stretch amplified thin windows and
+> made them look noisy; the corrected shared stretch compresses deep-but-uniform windows and makes
+> them look empty. Neither reading is about whether the embedding carries information, and on the one
+> amplitude-invariant measure available — spatial organisation — **depth makes no difference across
+> 12 to 45 observations.** No cutoff in that range can be justified from pictures, in either
+> direction, because the pictures do not measure the thing.
+
+## 8. What DOES depend on observation count: a measurable bias
+
+Found while attributing the straight edges of §9, and it is the best-founded depth effect in this
+whole investigation. At an observation-count boundary — same ground, same day, a step in how many
+valid looks each side received — **the embedding steps too**. Measured on three windows, comparing the
+mean 128-dimensional vector of equal strips either side against a control pair of adjacent strips
+wholly on one side:
+
+| window | observation step | embedding shift across the seam | against control |
+|---|---:|---:|---:|
+| 30S/2022 | +1.6 | 0.00036 | **4.6×** |
+| 30S/2023 | −0.2 | 0.00022 | 2.5× |
+| 26S/2021 | −2.6 | 0.00691 | **30.7×** |
+
+Small in absolute terms, and unambiguous in direction: **observation count shifts the embedding
+systematically, as a bias rather than as noise.** That is a far better-founded worry than "thin data
+looks noisy", and it points somewhere uncomfortable for the rule: **a refusal does not remove a
+depth-induced discontinuity, it creates a sharper one** — between refused pixels, which are absent,
+and kept pixels at the cutoff. The measurement worth having is how the embedding drifts with depth
+over the whole range; it is cheap, since every ingredient is already in the store, and nobody has
+taken it.
+
+## 9. The straight-edge artefacts: upstream, not ours
+
+
+
+Raised unprompted by four of six reviewer sessions that had no knowledge of each other, then
+attributed by measurement. Across the 713 notes, **33 mention a straight edge, a seam or an
 axis-aligned artefact**; most are legitimate ground (roads, field boundaries, forestry blocks), but
 roughly a dozen are cases where the reviewer judged the frame's only structure to be an artefact.
 Three carry measurements:
@@ -196,9 +247,22 @@ Three carry measurements:
 One reviewer described a case as "a cluster of axis-aligned rectangular blocks — structure or chunk
 artefact", which is the reading that matters: **axis-aligned means aligned to OUR raster.**
 
-**The test that would settle it is cheap and has not been run.** A window is 512 pixels starting at a
-chunk boundary, so an internal chunk boundary sits at exactly column or row 256. Locate the strongest
-straight edge in each flagged window and look at where it falls: positions clustering at 256 implicate
-our chunking, scattered positions implicate acquisition geometry upstream — and the one measured
-position so far, column 77, is not a chunk boundary. Worth doing before the campaign, since the seam
-test in the validator only examines *shard* boundaries and would not see any of these.
+**The attribution, run 2026-08-13 over all 713 windows.** Taking the strongest full-width step in each
+axis profile, **45 windows (6.3%) carry one at eight sigma or more above their own frame's noise**.
+Where they fall settles it:
+
+* **none at our chunk boundary.** A window is 512 pixels starting at a chunk boundary, so ours sits at
+  exactly 256. **Zero of fifty** strong steps land within two pixels of it, and the positions show no
+  periodicity in our chunk grid.
+* **two zones repeat a position across DIFFERENT YEARS** — column 30 four times in 30S over 2022 and
+  2023, row 432 three times in 26S over 2021 and 2022 — so the line is fixed in geography, not in our
+  processing.
+* **the embedding step coincides exactly with a step in the input observation count.** Checked on
+  three windows: embedding column 30 against observation column 30; embedding row 432 against
+  observation row 432, at comparable strength each time.
+
+So these are **Sentinel-2 swath and orbit-overlap boundaries**, which the campaign already knows about
+and ignores at the count level. What is new is that they **propagate into the published embeddings**,
+visibly, in about one window in sixteen. Two consequences: the validator's seam test examines *shard*
+boundaries only and cannot see them, so they will not appear in any verdict; and they are the
+mechanism behind §8.
