@@ -131,6 +131,14 @@ Zarr v3 hierarchy. That also leaves `.zarr` free for the Zarr v3 translation Cam
 publish from this data. And only the published store lives there: mosaics, ROI masks, staged tiles,
 figures and verdicts stay in our own buckets, because they are working state.
 
+**A second published prefix sits beside the store, `v1.1/dclimate.registry/`**, holding the index a
+client reads to learn what the store contains without opening it. It is a sibling rather than a folder
+inside the store because Icechunk owns every key under its own prefix — its garbage collection
+enumerates that prefix and reconciles it against its own manifests, so a foreign file in there is at
+best unrecognised and at worst collected. **What the registry contains is not yet decided.** The
+prefix is named in the access request because it has to be in the bucket policy, and renaming it later
+means asking Cambridge twice.
+
 ```
 s3://tessera-embeddings/v1.1/dclimate.icechunk     ← one repository, branch `main`
 ├── (root attrs)  geoemb:dimensions=128, geoemb:data_type=int8, geoemb:gsd=10.0,
@@ -531,17 +539,20 @@ that costs more. Settled; do not re-open.
    (`s3://tessera-embeddings/v1.1/dclimate.icechunk`), so it cannot run until item 4b lands.
 4b. **Write access to the AWS Open Data bucket** — the one prerequisite that is not ours to
    complete. The bucket is Cambridge's, and it grants our production runner role write, read, list,
-   delete and multipart-abort on `v1.1/dclimate.icechunk/*` (delete included, or Icechunk garbage
-   collection cannot run and superseded manifests become permanent). We extend our own identity
-   policy to match; until both halves exist, seeding fails with `403`. The request is written and
-   ready to send: `yield-embeddings/context_docs/monitoring/open-data-access-request.md`. **Treat
-   the lead time as the schedule risk it is** — the code was a day and the access is somebody
-   else's queue.
+   delete and multipart-abort on **two prefixes**, `v1.1/dclimate.icechunk/*` and
+   `v1.1/dclimate.registry/*` (delete included, or Icechunk garbage collection cannot run and
+   superseded manifests become permanent). We extend our own identity policy to match; until both
+   halves exist, seeding fails with `403`. The request is written and ready to send:
+   `yield-embeddings/context_docs/monitoring/open-data-access-request.md`. Settle the registry's
+   name before it goes, since the prefix is in the policy (§2). **Treat the lead time as the
+   schedule risk it is** — the code was a day and the access is somebody else's queue.
 5. **Model checkpoint staged** at `{inputs}/models/` and matching the seed.
 6. **Deployments registered** for `ingest-zone-year`, the chained fill, and the campaign.
-7. **Nothing to prepare for petabyte scale — done.** S3 Inventory delivers daily on both prod
-   buckets and the audit path is exercised against a real manifest. What remains is the standing
-   constraints of §7b, which are rules rather than tasks.
+7. **Nothing to prepare for petabyte scale on our own buckets — done.** S3 Inventory delivers daily on both prod
+   buckets and the audit path is exercised against a real manifest. The published store's own
+   inventory is Cambridge's to configure and is asked for as an optional part of item 4b; nothing
+   blocks on it (§7b). What remains is the standing constraints of §7b, which are rules rather than
+   tasks.
 8. **A single dense zone-year end to end, at both 60 and 80 ingest workers.** The last gate, and
    the only remaining question about the schedule. The plan runs at 60 (§3), and the gate is that
    the densest zone behaves as the model says at that width. The 80-worker arm is upside only:
@@ -550,7 +561,8 @@ that costs more. Settled; do not re-open.
 
 **Prod's state:** the coverage mask is built, all 112 land-zone ROIs are exported, the campaign
 deployment set is registered in its branch-scoped form, the crash-recovery automations are armed, the
-Slack alerts are registered, and the Prefect server is sized correctly. **The published store is not
+Slack alerts are registered, the monitoring round's read permissions are deployed (§9), and the
+Prefect server is sized correctly. **The published store is not
 seeded, and cannot be until write access to the Open Data bucket exists** (item 4b). A store was
 seeded in prod's own bucket before the publish target changed; it is superseded, holds nothing, and
 should be deleted rather than left to look like the campaign's output.
@@ -595,6 +607,13 @@ coverage census all read the scheduled Parquet manifest — one read of a known 
 walk. Both prod buckets are configured daily with size and storage class, and
 `audit_inventory_vs_list.py` is the exercised path. **Do not write a new audit against LIST**: it
 would be rewritten under pressure, at the worst possible moment.
+
+**The published store is the exception, and it is not ours to configure.** Inventory is a property of
+a bucket, so the store's own audit depends on Cambridge or AWS Open Data adding a configuration on
+`tessera-embeddings` filtered to `v1.1/dclimate`, delivered to a bucket of ours. That ask is in the
+access request (§4 of it) as optional, because nothing blocks on it: without it the store's
+completeness audit falls back to LIST against hundreds of millions of objects, which is slow and paid
+rather than impossible. Our own buckets — mosaics, staging, figures, verdicts — are unaffected.
 
 **Three standing constraints on both buckets:**
 
@@ -824,6 +843,14 @@ So the reliable half is a poll: **`campaign-watch`, a flow on a five-minute cron
 `#alerts-global-tessera`. It grades nothing while the campaign is not running, publishes a record of
 every round to `monitoring/` in the outputs bucket, and mutates nothing. Full design and posting
 rules: [`campaign-monitoring-plan.md`](campaign-monitoring-plan.md).
+
+**The round runs inside the account it is grading**, which is what makes it trustworthy and is also
+why it needed permissions nothing in-account had ever asked for: CloudWatch Logs Insights, CloudWatch
+metrics, Service Quotas and Cost Explorer. Those are granted to the runner task role by the
+`ObservabilityReads` and `ObservabilityStartQuery` statements in `processing_infra.py`, deployed and
+verified in both accounts. The failure mode if a grant is ever missing is visible rather than silent:
+that check alone reports `DID NOT RUN` with the exception type, the rest of the checklist continues,
+and the round posts — so a permissions gap reads as a permissions gap and not as a healthy campaign.
 
 The signals below are what those two paths are watching for.
 

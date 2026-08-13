@@ -341,6 +341,19 @@ sibling modules and a tested JSON contract, so a wedged AWS call costs one round
 monitor, and a traceback inside the tool is a failed round rather than a dead flow. The flow-runner
 image ships `scripts/` for that reason.
 
+**The permissions the round needs are deployed in both accounts.** The detector was written to be run
+from a laptop against an account, and running it *inside* the account exposed four ways that assumption
+was load-bearing — a CodeArtifact-only import, an unconditional `AWS_PROFILE` export, a missing `aws`
+CLI, and read permissions the runner task role had never needed because nothing in-account had ever
+made those calls. The last one is the only part that is infrastructure rather than code:
+`infra/aws/cdk_constructs/processing_infra.py` now grants the runner role `ObservabilityReads`
+(CloudWatch metrics, Logs Insights result retrieval, Service Quotas, Cost Explorer — all on `*`,
+because none of those APIs support resource-level permissions) and `ObservabilityStartQuery`
+(`logs:StartQuery`, scoped to our own log groups, because that one does). Both are deployed to
+`global-tessera-dev` and `global-tessera-prod`, and verified with `aws iam simulate-principal-policy`
+in both directions: allowed on our log groups, denied on an unrelated one. Ten of the seventeen checks
+depend on them, so before this the round would have posted a mostly-blank verdict on a live campaign.
+
 **To build:**
 
 1. **the agent loop** — §5, reading `rounds/` and the verdicts, with the window review. The round
