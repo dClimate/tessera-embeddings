@@ -8,7 +8,7 @@ campaign year, and how cloudy each of those dates was, giving
     usable optical observations in a year
         = sum over distinct dates of (1 - eo:cloud_cover)
 
-which is the quantity ``s2_obs_count`` holds per pixel and ``OPTICAL_THIN_LABEL_OBS``
+which is the quantity ``s2_obs_count`` holds per pixel and ``OPTICAL_MIN_OBS``
 is compared against.
 
 **Distinct dates, not scenes.** Adjacent MGRS tiles overlap by ~10 km, so a point

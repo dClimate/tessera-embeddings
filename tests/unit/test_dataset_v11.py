@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from tessera_embeddings.inference.data_loading import ChunkData
 from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
@@ -182,3 +183,78 @@ def test_allow_s2_only_mixed_chunk_adds_exactly_the_s1_gap_pixels() -> None:
     assert default_idxs < flag_idxs
     gap_rows, gap_cols = np.where(s2_ok & ~s1_ok)
     assert set((gap_rows * 4 + gap_cols).tolist()) == flag_idxs - default_idxs
+
+
+class TestTheMinimumOpticalDepthGate:
+    """A pixel below the line is not embedded at all, and the three refusal reasons stay apart.
+
+    This is the one gate in the pipeline whose effect a consumer cannot undo: a filtered pixel can
+    be unfiltered, whereas a refused pixel has no embedding and recovering it means re-running its
+    whole shard. So these pin the boundary exactly, and pin that the off state is bit-identical to
+    the historical behaviour rather than merely similar to it.
+    """
+
+    @staticmethod
+    def _chunk(obs_counts: np.ndarray) -> ChunkData:
+        """Real reflectance everywhere, with per-pixel optical depth supplied directly.
+
+        ``s2_obs_count`` is the pre-pruning count the loader passes when it has one, and it is what
+        the gate reads — so a depth of 400 needs no 400 fabricated timesteps.
+        """
+        h, w = obs_counts.shape
+        return ChunkData(
+            s2_bands=np.ones((1, h, w, 10), dtype=np.uint16),
+            s2_masks=np.ones((1, h, w), dtype=bool),
+            s1_asc_bands=np.ones((1, h, w, 2), dtype=np.float32),
+            s1_desc_bands=np.ones((1, h, w, 2), dtype=np.float32),
+            s2_doys=np.array([100], dtype=np.int32),
+            s1_asc_doys=np.array([100], dtype=np.int32),
+            s1_desc_doys=np.array([100], dtype=np.int32),
+            height=h,
+            width=w,
+            s2_obs_count=obs_counts.astype(np.uint16),
+        )
+
+    def test_the_boundary_keeps_the_line_and_refuses_below_it(self):
+        """29 out at a line of 30, 30 in. An off-by-one here silently changes what a petabyte
+        contains, and the plan states the arithmetic once, as at-least."""
+        ds = MosaicChunkInferenceDataset(self._chunk(np.array([[29, 30]])), allow_s2_only=True, optical_min_obs=30)
+        assert len(ds) == 1
+        assert ds.refused_thin == 1
+
+    def test_none_embeds_everything_with_any_optical_input(self):
+        chunk = self._chunk(np.array([[1, 5, 29, 100]]))
+        ds = MosaicChunkInferenceDataset(chunk, allow_s2_only=True, optical_min_obs=None)
+        assert len(ds) == 4
+        assert ds.refused_thin == 0
+
+    def test_the_off_state_is_identical_to_no_gate_at_all(self):
+        """What protects every non-campaign caller: None must select exactly the pixels the
+        historical code selected, not almost those."""
+        chunk = self._chunk(np.array([[1, 14, 15, 400]]))
+        without = MosaicChunkInferenceDataset(chunk, allow_s2_only=True)
+        explicit = MosaicChunkInferenceDataset(chunk, allow_s2_only=True, optical_min_obs=None)
+        assert np.array_equal(without._global_idxs, explicit._global_idxs)
+
+    def test_zero_is_refused_rather_than_treated_as_off(self):
+        """Zero refuses nothing while presenting as a configured rule, so a campaign whose value
+        resolved to zero would publish under no rule while believing it had one."""
+        with pytest.raises(ValueError, match="refuses nothing"):
+            MosaicChunkInferenceDataset(self._chunk(np.array([[10]])), optical_min_obs=0)
+
+    def test_the_two_optical_reasons_partition_rather_than_overlap(self):
+        """No optical input at all is a fact about the imagery; too little of it is this
+        campaign's quality rule. Counting the first in both would overrun the shard's eligible
+        total, and the per-shard record's invariant is that the parts sum to it."""
+        chunk = self._chunk(np.array([[0, 0, 5, 40]]))
+        chunk.s2_bands[:, 0, 0:2, :] = 0  # no reflectance where the count is zero
+        ds = MosaicChunkInferenceDataset(chunk, allow_s2_only=True, optical_min_obs=30)
+        assert (ds.refused_no_optical, ds.refused_thin, len(ds)) == (2, 1, 1)
+
+    def test_a_radar_refusal_counts_only_pixels_that_passed_the_optical_test(self):
+        """Otherwise a thin pixel with no radar lands in two counters at once."""
+        chunk = self._chunk(np.array([[5, 40]]))
+        chunk.s1_asc_bands[:] = 0.0
+        chunk.s1_desc_bands[:] = 0.0
+        ds = MosaicChunkInferenceDataset(chunk, allow_s2_only=False, optical_min_obs=30)
+        assert (ds.refused_thin, ds.refused_no_radar, len(ds)) == (1, 1, 0)

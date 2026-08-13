@@ -30,8 +30,9 @@ def _capture_seed(monkeypatch) -> dict:
     monkeypatch.setattr(mod, "open_global_repo", _raise_open)  # → create path, seeded=set()
     captured: dict = {}
 
-    def _fake_seed(repo, todo, *, years, model_version, commit_msg):
+    def _fake_seed(repo, todo, *, years, model_version, optical_min_obs, commit_msg):
         captured["model_version"] = model_version
+        captured["optical_min_obs"] = optical_min_obs
         return "snapshot"
 
     monkeypatch.setattr(mod, "seed_zone_groups", _fake_seed)
@@ -99,3 +100,22 @@ def test_seed_treats_rootless_existing_repo_as_unseeded(monkeypatch):
     mod.seed_global_store.fn(paths=_PATHS)
     # Reached seeding (seeded=set()) instead of propagating the read error.
     assert captured["model_version"] == checkpoint_filename()
+
+
+def test_the_minimum_depth_rule_is_not_defaulted_from_the_config_constant(monkeypatch):
+    """The safety property of work item 1: a seed with no explicit rule stamps NO rule.
+
+    The rule decides what the product contains and can never be changed for the store
+    afterwards, so a value inherited from whatever the config module happened to hold is not a
+    decision anyone took. Pinned here because the failure is silent in the worst direction — a
+    store stamped with a rule nobody chose, permanently, and every fill afterwards enforcing it.
+    """
+    captured = _capture_seed(monkeypatch)
+    mod.seed_global_store.fn(paths=_PATHS)
+    assert captured["optical_min_obs"] is None
+
+
+def test_an_explicit_minimum_depth_rule_reaches_the_seeder(monkeypatch):
+    captured = _capture_seed(monkeypatch)
+    mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=25)
+    assert captured["optical_min_obs"] == 25

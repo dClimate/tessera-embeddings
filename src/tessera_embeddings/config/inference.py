@@ -192,38 +192,14 @@ SCL_VALID_CLASSES = frozenset({4, 5, 6, 7, 10, 11})
 #: however it is sampled.
 RADAR_THIN_MAX_OBS = 12
 
-#: A pixel with fewer than this many valid OPTICAL observations in the year is
-#: "optical-thin".
-#:
-#: The counterpart to :data:`RADAR_THIN_MAX_OBS`, and the same argument: a thin year and a
-#: rich one both produce an embedding, and nothing about the embedding says which it came
-#: from. Only the extreme was previously visible — a tile where NO pixel survived the
-#: validity filter is recorded as an optical skip — so every depth above zero read as
-#: ordinary data.
-#:
-#: Higher than the radar line, because the sensors are not comparable. Radar sees through
-#: cloud, so its observation count is set by orbit geometry alone and roughly one a month is
-#: a thin-but-usable year. Optical loses most of its passes to cloud, so the count that
-#: survives masking is a small fraction of the overpasses, and the model resamples across
-#: whatever remains.
-#:
-#: The THIN LABEL: embedded pixels with fewer than this many valid optical observations are counted
-#: and reported, and nothing is refused for being under it. 40 until 2026-08-12, then 15.
-#:
-#: **It exists only until the refusal below is enforced, and then it is deleted.** Once nothing under
-#: the line is embedded, "embedded pixels below the line" is the empty set by construction and every
-#: figure derived from it reads 0.000 forever — see the plan's §9.2. It is kept separate rather than
-#: folded into ``OPTICAL_MIN_OBS`` because during the transition **the two are different numbers**:
-#: the label is 15 and describes what has already been published, while the refusal is a proposed 30
-#: and describes what will be. Pointing both at one constant would silently restate every existing
-#: cell's thin share against a line that was never applied to it.
-#:
-#: Consumers: the per-chunk ``s2_thin_px`` counter, and ``s2_thin_below_obs`` in run provenance,
-#: which records WHICH line produced a percentage precisely so a change is detectable.
-OPTICAL_THIN_LABEL_OBS = 15
-
 #: Minimum valid Sentinel-2 observations for a pixel to be EMBEDDED AT ALL, in the calendar
 #: year being filled. A pixel below it is written as fill, exactly as an out-of-ROI pixel is.
+#:
+#: **Not the counterpart of :data:`RADAR_THIN_MAX_OBS`, and the asymmetry is deliberate.** The
+#: radar line labels; this one refuses. They are also not comparable as numbers: radar sees
+#: through cloud, so its count is set by orbit geometry and one observation a month is a
+#: thin-but-usable year, while optical loses most of its passes to cloud and what survives
+#: masking is a small fraction of the overpasses.
 #:
 #: **This is a refusal, not a label, and the difference is that it is not reversible.** Under
 #: its old name (``OPTICAL_THIN_MAX_OBS``, 40 until 2026-08-12, then 15) nothing was refused for
@@ -240,6 +216,13 @@ OPTICAL_THIN_LABEL_OBS = 15
 #:   store, not a migration;
 #: * the seeder takes it explicitly and does not default to this constant, so nothing can stamp
 #:   a store by inheriting whatever happens to be here.
+#:
+#: **What the thin counters mean now that this is the only line.** ``s2_thin_px`` per chunk and
+#: ``s2_thin_below_obs`` in run provenance count EMBEDDED pixels below this value. While nothing
+#: refuses, that is a preview of what a refusal would remove. Once the gate is enforced it is an
+#: invariant: **the count must be zero, and a non-zero one means the gate leaked.** Each cell's
+#: provenance records the line its own numbers were produced under, so cells filled before and
+#: after a change are comparable rather than silently restated.
 #:
 #: **The value is PROVISIONAL (2026-08-13).** It is 30 because that is what the plan proposed,
 #: and a blind re-measurement of the evidence behind 30 does not support it: legibility is not
@@ -411,8 +394,21 @@ class InferenceConfig:
     # see the optional-S1 ADR before enabling in production.
     allow_s2_only: bool = False
 
+    # Minimum valid optical observations for a pixel to be embedded at all, or None for "embed
+    # everything with any optical input" — the historical behaviour, and what every non-campaign
+    # caller wants. See OPTICAL_MIN_OBS for what a refusal costs. None rather than 0 because the
+    # two are different statements and only one of them is recoverable from a config dump: a
+    # campaign whose value silently resolved to 0 would publish under no rule while believing it
+    # had one, which is the shape of two failures already in this repo's register.
+    optical_min_obs: int | None = None
+
     def __post_init__(self) -> None:
         """Validate and normalise config fields."""
+        if self.optical_min_obs is not None and self.optical_min_obs <= 0:
+            raise ValueError(
+                f"optical_min_obs={self.optical_min_obs} refuses nothing — pass None for no "
+                "minimum optical depth, or a positive number of observations."
+            )
         if self.norm_source not in _NORM_STATS:
             valid = ", ".join(repr(k) for k in _NORM_STATS)
             raise ValueError(f"Invalid norm_source: {self.norm_source!r}. Must be one of {valid}.")

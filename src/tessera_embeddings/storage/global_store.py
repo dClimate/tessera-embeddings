@@ -162,18 +162,30 @@ def _zone_attrs(spec: ZoneSpec, north: np.ndarray, east: np.ndarray, layout: Sto
     return attrs
 
 
-def _root_attrs(layout: StoreLayout, model_version: str | None) -> dict:
+def _root_attrs(layout: StoreLayout, model_version: str | None, optical_min_obs: int | None) -> dict:
     """Root-group attrs for the multi-zone campaign store: geoemb: stated once.
 
     The geoembeddings ``utm_zones`` layout puts the encoder/quantization provenance
     on the root (identical across all zones), with ``spatial_layout="utm_zones"``.
+
+    ``optical_min_obs`` is the minimum valid optical observations a pixel needed to be
+    embedded at all, or ``None`` for a store that embedded every pixel it had input for. It
+    lives on the ROOT because it is a property of the whole product rather than of a zone:
+    a user asking "what rule produced this dataset" must be able to answer it from the store
+    without reading provenance per cell, and a fill must be able to check that the rule it
+    is about to apply is the rule the store advertises. Absent rather than zero when there
+    was no rule — zero is a threshold that refuses nothing, which is a different statement
+    from never having had one.
     """
-    return build_geoemb_root_attrs(
+    attrs = build_geoemb_root_attrs(
         embedding_dim=_layout_band(layout),
         spatial_layout="utm_zones",
         gsd=float(PIXEL_M),  # every zone is the same fixed-metre grid; the root has none to derive from
         model_version=model_version,
     )
+    if optical_min_obs is not None:
+        attrs["optical_min_obs"] = int(optical_min_obs)
+    return attrs
 
 
 def _fill_equal(have: object, want: object) -> bool:
@@ -263,6 +275,7 @@ def seed_zone_groups(
     years: tuple[int, ...] = CAMPAIGN_YEARS,
     layout: StoreLayout = GLOBAL,
     model_version: str | None = None,
+    optical_min_obs: int | None = None,
     commit_msg: str | None = None,
 ) -> str:
     """Seed one or more zone groups (metadata-only) in a single commit.
@@ -294,17 +307,29 @@ def seed_zone_groups(
     # A) be mixed with a new one (encoder B) under a root now advertising B. The
     # first seed stamps it; a matching reseed is a no-op; a changed identity is
     # rejected. (Software build_version may drift and is not part of the identity.)
-    new_root = _root_attrs(layout, model_version)
+    if optical_min_obs is not None and optical_min_obs <= 0:
+        # Zero cannot be a rule: it refuses nothing while presenting as a configured line, and it
+        # would then be stamped as one, permanently, on a store that has no rule at all.
+        raise ValueError(
+            f"optical_min_obs={optical_min_obs} refuses nothing — pass None for a store with no "
+            "minimum-depth rule, or a positive number of observations."
+        )
+    new_root = _root_attrs(layout, model_version, optical_min_obs)
     if "geoemb:model" not in root.attrs:
         root.attrs.update(new_root)
     else:
-        identity = ("geoemb:model", "geoemb:dimensions", "geoemb:data_type", "checkpoint_id")
+        # optical_min_obs is in the identity for the same reason the encoder is: a fill reads it to
+        # decide which pixels it may embed, so re-stamping it would let zones filled under one rule
+        # sit beside zones filled under another, under a root advertising only the second. The
+        # consequence to know is that it makes the rule UNCHANGEABLE for this store — moving the
+        # line means a new store, not a migration.
+        identity = ("geoemb:model", "geoemb:dimensions", "geoemb:data_type", "checkpoint_id", "optical_min_obs")
         mismatched = {k: (root.attrs.get(k), new_root.get(k)) for k in identity if root.attrs.get(k) != new_root.get(k)}
         if mismatched:
             raise ValueError(
-                f"Refusing to reseed: the store root's encoder provenance is write-once, but this seed "
-                f"would change {mismatched}. Seed a fresh store for a new encoder (mixing encoders under "
-                "one store would corrupt already-published zones)."
+                f"Refusing to reseed: the store root's published identity is write-once, but this seed "
+                f"would change {mismatched}. Seed a fresh store for a new encoder or a new minimum-depth "
+                "rule (mixing either under one store would corrupt already-published zones)."
             )
     # The time axis is fixed and UNIFORM across all zone groups (ADR-008 D1):
     # campaign status/fill code assumes every group shares one axis. A direct

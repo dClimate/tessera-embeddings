@@ -200,3 +200,59 @@ def test_global_store_config_has_time_split_and_preload():
     assert cfg.manifest is not None
     assert cfg.manifest.splitting is not None
     assert cfg.manifest.preload is not None
+
+
+def test_the_minimum_depth_rule_is_stamped_on_the_root(tmp_path):
+    """A user must be able to ask "what rule produced this dataset" without reading provenance
+    per cell, and a fill must be able to check the rule it is about to apply against the one the
+    store advertises. Both need it on the root."""
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), optical_min_obs=25)
+    root = zarr_store.open_store_as_zarr_group(store)
+    assert root.attrs["optical_min_obs"] == 25
+
+
+def test_a_store_with_no_rule_carries_no_attr_rather_than_zero(tmp_path):
+    """Absent and zero are different statements. Zero is a threshold that refuses nothing;
+    absent is a store that never had a rule, which is every store seeded before 2026-08-13.
+    Recording zero for the second would let a later reader believe a rule was applied."""
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+    root = zarr_store.open_store_as_zarr_group(store)
+    assert "optical_min_obs" not in root.attrs
+
+
+def test_a_rule_that_refuses_nothing_is_refused(tmp_path):
+    """Zero would be stamped as a configured rule on a store that has none, permanently, and
+    the write-once identity means it could never be corrected. Caught at the seeder instead."""
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    with pytest.raises(ValueError, match="refuses nothing"):
+        global_store.seed_zone_groups(repo, [_ZA], years=(2025,), optical_min_obs=0)
+
+
+def test_reseed_with_a_different_minimum_depth_rejected(tmp_path):
+    """The consequence of putting the rule in the write-once identity, and the reason it is
+    there: zones filled under one minimum depth must not end up beside zones filled under
+    another, under a root advertising only the second. It also means the rule can never be
+    changed for this store — moving the line is a new store, not a migration."""
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), optical_min_obs=30)
+    # The same rule on a later incremental seed: fine, provenance is a no-op.
+    global_store.seed_zone_groups(repo, [_ZB], years=(2025,), optical_min_obs=30)
+    with pytest.raises(ValueError, match="write-once"):
+        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), optical_min_obs=20)
+
+
+def test_adding_a_rule_to_a_store_seeded_without_one_is_rejected(tmp_path):
+    """The direction that matters most in practice: every store seeded so far has no rule, and
+    stamping one onto it retrospectively would claim its existing zones were filled under a
+    line that was never applied to them. A re-stamp is a deliberate act on a fresh store."""
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+    with pytest.raises(ValueError, match="write-once"):
+        global_store.seed_zone_groups(repo, [_ZB], years=(2025,), optical_min_obs=30)

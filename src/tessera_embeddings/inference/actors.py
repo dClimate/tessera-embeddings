@@ -29,7 +29,7 @@ import requests
 
 from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
-    OPTICAL_THIN_LABEL_OBS,
+    OPTICAL_MIN_OBS,
     PREFETCH_DEPTH,
     RADAR_THIN_MAX_OBS,
     S1_ORBIT_NONE,
@@ -676,6 +676,7 @@ class InferenceActor:
             num_obs_checkpoints=self.config.num_obs_checkpoints,
             s1_orbit=s1_orbit,
             allow_s2_only=allow_s2_only,
+            optical_min_obs=self.config.optical_min_obs,
         )
         return data, dataset
 
@@ -1336,7 +1337,7 @@ class InferenceActor:
             # optical-free count is needed — that case IS the skip, and a skipped chunk never
             # reaches here.
             s2_at_embedded = obs_buffers["s2_obs_count"][embedded]
-            s2_thin_px = int((s2_at_embedded < OPTICAL_THIN_LABEL_OBS).sum())
+            s2_thin_px = int((s2_at_embedded < OPTICAL_MIN_OBS).sum())
             del embedded, obs_at_embedded, s2_at_embedded
 
             def _timed_write() -> str:

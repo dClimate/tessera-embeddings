@@ -34,6 +34,7 @@ def seed_global_store(
     name: str = "tessera",
     years: tuple[int, ...] = CAMPAIGN_YEARS,
     model_version: str | None = None,
+    optical_min_obs: int | None = None,
     s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Create the global-store repo (if absent) and seed every unseeded zone group.
@@ -47,6 +48,12 @@ def seed_global_store(
             distinguish the concrete checkpoint (the ``aws``/``mpc`` v1.1 checkpoints
             share one ``geoemb:model`` URL); without it the checkpoint gate is a
             no-op. Override to record a custom identity.
+        optical_min_obs: Minimum valid optical observations for a pixel to be embedded, stamped
+            on the root and made part of its write-once identity. **Deliberately has no default
+            and is not read from the config constant**: it decides what the product contains,
+            it can never be changed for this store afterwards, and a value inherited from
+            whatever a module happened to hold is not a decision anyone took. ``None`` seeds a
+            store with no such rule, which is what every store seeded before 2026-08-13 has.
         s3_region: Optional S3 region for the global store, forwarded to
             open/create — like the campaign and fill paths, so a non-default-region
             deployment can seed at all.
@@ -119,9 +126,20 @@ def seed_global_store(
         return {"store_path": store_path, "seeded_now": 0, "already_seeded": len(seeded), "total": len(ZONES)}
 
     snapshot = seed_zone_groups(
-        repo, todo, years=years, model_version=model_version, commit_msg=f"seed {len(todo)} zone group(s)"
+        repo,
+        todo,
+        years=years,
+        model_version=model_version,
+        optical_min_obs=optical_min_obs,
+        commit_msg=f"seed {len(todo)} zone group(s)",
     )
-    log.info("Seeded %d zone group(s) into %s (%s)", len(todo), store_path, snapshot)
+    log.info(
+        "Seeded %d zone group(s) into %s (%s); minimum optical depth %s",
+        len(todo),
+        store_path,
+        snapshot,
+        optical_min_obs if optical_min_obs is not None else "no rule",
+    )
     return {
         "store_path": store_path,
         "seeded_now": len(todo),
