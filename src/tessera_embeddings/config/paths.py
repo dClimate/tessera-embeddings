@@ -24,6 +24,11 @@ _OUTPUT_KINDS: frozenset[str] = frozenset({"embeddings"})
 _ALL_KINDS: frozenset[str] = _INPUT_KINDS | _OUTPUT_KINDS
 
 
+#: The derived store's basename, and the only ``name`` an override tolerates. Named here so the
+#: guard in :meth:`BucketPaths.global_store` and that method's own default cannot drift apart.
+_DEFAULT_GLOBAL_STORE_NAME = "tessera"
+
+
 @final
 class BucketPaths(BaseModel):
     """Base storage URIs for each pipeline stage.
@@ -34,6 +39,14 @@ class BucketPaths(BaseModel):
 
     inputs: str = Field(..., description="Base URI for ROI masks and intermediate ingest stores.")
     outputs: str = Field(..., description="Base URI for final embedding outputs.")
+    global_store_uri: str | None = Field(
+        default=None,
+        description=(
+            "Full URI of the global-embeddings repo, overriding the path derived from `outputs`. "
+            "For publishing to a location whose shape the derivation cannot produce — a different "
+            "bucket, a different prefix, a different suffix. None means derive it."
+        ),
+    )
 
     def store_for(self, roi_name: str, kind: str) -> str:
         """Return the canonical store URI for ``(roi_name, kind)``.
@@ -73,13 +86,36 @@ class BucketPaths(BaseModel):
         """
         return self.store_for(f"zone_{zone}", "roi")
 
-    def global_store(self, name: str = "tessera") -> str:
+    def global_store(self, name: str = _DEFAULT_GLOBAL_STORE_NAME) -> str:
         """Return the URI of the single global-embeddings Icechunk repo.
 
         The global campaign writes all 120 UTM-zone groups into one repo
         (ADR-008 D5), addressed by zone group name — unlike :meth:`store_for`,
         which is one ``.zarr`` per (roi, kind).
+
+        **``global_store_uri`` overrides the derivation entirely**, because a published location
+        need not be shaped like one this method could build: a different bucket, no ``global/``
+        segment, a ``.zarr`` suffix on what is still an Icechunk repo. Every producer and consumer
+        of the campaign store asks this one method, which is what makes a single field enough — and
+        what makes it impossible for one tool to write the override while another reads the derived
+        path.
+
+        Args:
+            name: Repo basename, used only when deriving.
+
+        Raises:
+            ValueError: If an override is set AND a caller asks for a non-default ``name``. The
+                override IS the store, so the name has nowhere to go — and a silently ignored
+                argument is how a caller ends up certain it addressed a store that does not exist.
         """
+        if self.global_store_uri:
+            if name != _DEFAULT_GLOBAL_STORE_NAME:
+                raise ValueError(
+                    f"global_store(name={name!r}) with global_store_uri={self.global_store_uri!r}: "
+                    "the override is the whole URI, so a store name cannot be honoured. Drop the "
+                    "name, or drop the override."
+                )
+            return self.global_store_uri
         return posixpath.join(self.outputs, "global", f"{name}.icechunk")
 
     def land_mask_store(self, name: str = "global") -> str:

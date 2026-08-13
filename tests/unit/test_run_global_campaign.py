@@ -1152,9 +1152,7 @@ class TestFailedZonesAreRetried:
         """
         rounds = self._wire(monkeypatch, wired, ["01N", "02N"], complete_after={1: {"01N"}})  # 02N never lands
         summary = asyncio.run(
-            mod.run_global_campaign.fn(
-                paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=5
-            )
+            mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=5)
         )
         assert summary["unfilled"] == {2025: ["02N"]}
         # One attempt, one retry that achieves nothing, then stop — the minimum
@@ -1171,9 +1169,7 @@ class TestFailedZonesAreRetried:
         """
         self._wire(monkeypatch, wired, ["01N", "02N"], complete_after={})
         with caplog.at_level(logging.WARNING):
-            summary = asyncio.run(
-                mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1)
-            )
+            summary = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
         # The list is DATA in the summary, not prose to be re-parsed out of a message.
         assert summary["unfilled"] == {2025: ["01N", "02N"]}
         # And it is loud: a banner, the whole list, and what a re-run would do.
@@ -1184,7 +1180,8 @@ class TestFailedZonesAreRetried:
 
     def test_a_campaign_that_lands_everything_still_carries_the_key(self, wired, monkeypatch):
         """Empty rather than absent: a caller that tests for the key must not have to know
-        which of two shapes it gets."""
+        which of two shapes it gets.
+        """
         self._wire(monkeypatch, wired, ["01N"], complete_after={1: {"01N"}})
         summary = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1))
         assert summary["unfilled"] == {}
@@ -1192,9 +1189,7 @@ class TestFailedZonesAreRetried:
     def test_retries_are_disabled_at_one_attempt(self, wired, monkeypatch):
         rounds = self._wire(monkeypatch, wired, ["01N"], complete_after={})
         summary = asyncio.run(
-            mod.run_global_campaign.fn(
-                paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=1
-            )
+            mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", max_parallel_clusters=1, max_dispatch_rounds=1)
         )
         assert rounds["n"] == 1
         assert summary["unfilled"] == {2025: ["01N"]}

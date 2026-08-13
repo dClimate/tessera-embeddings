@@ -177,7 +177,8 @@ class TestPerCellValidation:
     def test_the_assemble_callable_validates_the_cell_it_just_landed(self, wired, monkeypatch):
         handoff = self._landed(monkeypatch, {"zone": "33N", "year": 2025, "tag": "zone-33N-2025"})
         _run(zones=["33N"], validation_deployment="validate-zone-year/validate-zone-year-x")
-        assert wired["seq_kwargs"]["assemble"](handoff, SimpleNamespace(staging_base="s3://out/staging", input_coverage=None)) == {
+        prepared = SimpleNamespace(staging_base="s3://out/staging", input_coverage=None)
+        assert wired["seq_kwargs"]["assemble"](handoff, prepared) == {
             "zone": "33N",
             "year": 2025,
             "tag": "zone-33N-2025",
