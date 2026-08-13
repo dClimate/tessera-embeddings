@@ -263,7 +263,8 @@ class TestDistinctAcquisitionsOnOneDay:
 
     def test_reprocessings_of_one_acquisition_still_reduce_to_one(self) -> None:
         """The behaviour the module exists for, unchanged: same instant, different
-        sequence, newest kept and the older offered as the fallback."""
+        sequence, newest kept and the older offered as the fallback.
+        """
         old = self._at("S2B_33XVG_20210908_0_L2A", "2021-09-08T10:20:31.024000Z", "0")
         new = self._at("S2B_33XVG_20210908_1_L2A", "2021-09-08T10:20:31.024000Z", "1")
         kept, alternates = select_preferred_duplicates([old, new])
@@ -272,7 +273,8 @@ class TestDistinctAcquisitionsOnOneDay:
 
     def test_each_acquisition_is_deduplicated_on_its_own(self) -> None:
         """Both at once — two acquisitions, each reprocessed. One survivor per
-        acquisition, and both rejected copies reachable through the ladder."""
+        acquisition, and both rejected copies reachable through the ladder.
+        """
         a_old = self._at("S2A_33XVG_20210908_0_L2A", "2021-09-08T10:20:31.024000Z", "0")
         a_new = self._at("S2A_33XVG_20210908_1_L2A", "2021-09-08T10:20:31.024000Z", "1")
         b_old = self._at("S2B_33XVG_20210908_0_L2A", "2021-09-08T11:10:14.512000Z", "0")
@@ -283,7 +285,8 @@ class TestDistinctAcquisitionsOnOneDay:
 
     def test_sub_second_jitter_is_one_acquisition(self) -> None:
         """Reprocessings differ in the microseconds of an otherwise identical instant.
-        Splitting on that would keep every reprocessing and defeat the module."""
+        Splitting on that would keep every reprocessing and defeat the module.
+        """
         old = self._at("S2B_33XVG_20210908_0_L2A", "2021-09-08T10:20:31.024000Z", "0")
         new = self._at("S2B_33XVG_20210908_1_L2A", "2021-09-08T10:20:31.026000Z", "1")
         kept, _ = select_preferred_duplicates([old, new])
@@ -292,7 +295,8 @@ class TestDistinctAcquisitionsOnOneDay:
     def test_copies_without_an_instant_keep_the_old_behaviour(self) -> None:
         """No instant is no evidence of distinctness, so they compete as before —
         which is what keeps a catalogue that stops publishing the field from
-        silently retaining every reprocessing."""
+        silently retaining every reprocessing.
+        """
         old, new = _pair()
         kept, alternates = select_preferred_duplicates([old, new])
         assert kept == [new]
