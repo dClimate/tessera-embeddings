@@ -140,15 +140,17 @@ nothing else** — measured across 15 cells: crisp at 30+ valid observations per
 20. Radar absence alone does not visibly degrade the embeddings. `OPTICAL_THIN_MAX_OBS` records this per
 pixel as a share of embedded area. **Publish thin cells; label them.**
 
-> **That measurement needs re-checking, and is not withdrawn (2026-08-13).** It was read off figures
-> drawn with a **per-window** contrast stretch, which expanded a low-variation window's noise floor to
-> full contrast — so "looks like noise" was partly a property of the rendering rather than of the
-> depth. The stretch is now shared across a cell's windows (see below), and a cell at 46.9
-> observations per pixel that previously showed three noise-like windows out of four now shows three
-> uniform surfaces. Which way this pushes the 30/20 boundary is unknown until the comparison is
-> re-run: the mechanism behind it is independently plausible, and finding a flaw in a measurement does
-> not tell you the direction of its error. What is safe to keep using is the *relationship* — deeper
-> input, crisper picture — not the two numbers.
+> **WITHDRAWN as stated (2026-08-13). The two numbers do not survive re-measurement; the direction
+> does.** The sentence above was read off figures drawn with a **per-window** contrast stretch, which
+> expanded a low-variation window's noise floor to full contrast whatever the depth, and against
+> **cell** means, when a cell holds windows differing severalfold. Re-taken blind over 73 windows from
+> 9 cells spanning 13 to 98 observations — full report in
+> [`window_legibility_vs_depth_2026_08.md`](window_legibility_vs_depth_2026_08.md) — the fully-land
+> figures are 50% legible below 20 observations, 33% between 30 and 45, and 97% above 45. So the
+> relationship is real and it is **not monotonic**, the crisp boundary is nearer 45 than 30, and the
+> thinnest legible window sits at 12.8. **Stop quoting "crisp at 30, noisy below 20."** What a
+> reviewer should be told instead is the window's own depth and that legibility tracks land cover at
+> least as strongly as depth.
 
 **The line is 15 observations, set 2026-08-12 (it was 40).** That is deliberately *below* the depth at
 which pictures start to degrade, so the label names cells thin enough to be worth calling out rather

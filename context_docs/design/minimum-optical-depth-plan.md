@@ -30,10 +30,10 @@ revisit:
 The repo's own quality measurement is *crisp at 30+ observations, noisy below about 20*,
 across 15 cells. 30 is the conservative end of that band.
 
-> **That measurement is being re-taken, and the threshold should not ship before it lands
-> (raised and accepted 2026-08-13).** Two defects were found in the instrument that produced it,
-> both on the same day, and this rule is the one decision in the campaign that cannot be revisited
-> later — a refused pixel does not exist, so recovery is a re-run rather than a filter change.
+> **That measurement has been re-taken and it does not hold (2026-08-13).** Two defects were found in
+> the instrument that produced it, and since this rule is the one decision in the campaign that
+> cannot be revisited later — a refused pixel does not exist, so recovery is a re-run rather than a
+> filter change — the evidence was re-gathered before the rule shipped. The defects were:
 >
 > 1. **The figures were drawn with a per-window contrast stretch.** Each window was stretched to its
 >    own 2nd–98th percentile, so a window whose ground varies little had its noise floor expanded to
