@@ -121,12 +121,34 @@ across many boundaries**, since one boundary on a coastline genuinely is a disco
 **edge-distance profile** separates a placement defect (a spike at the boundary only) from a model given
 less context near its tile edge (a rise over several pixels).
 
+**The seam test was not reproducible before 2026-08-13, and a borderline row could appear or vanish
+between runs of the same snapshot.** Its boundary offsets came from one generator that the worker
+threads also drew from, so how many draws the first axis's threads made decided which boundaries the
+second axis tested. Four runs of one cell at one seed gave four different northing results and flipped
+an embedding-seam row between "seam" and "no seam"; the easting axis, drawn before any thread started,
+was identical every time. Each axis now seeds from the seed and the axis, and each boundary's interior
+sample from that boundary's own identity, so three consecutive runs agree exactly. Two consequences
+worth holding: **a seam row in a verdict written before that date is not reproducible**, which matters
+because only dev verdicts exist so far and none is a record of the product; and a nondeterministic
+check is the one thing that could manufacture the campaign's systemic signal, since four cells failing
+the same check is what escalates.
+
 ## 4. A thin cell is not a broken cell — and how the AI review works
 
 Optical depth varies by an order of magnitude globally, and **picture quality tracks optical depth and
 nothing else** — measured across 15 cells: crisp at 30+ valid observations per pixel, noise below about
 20. Radar absence alone does not visibly degrade the embeddings. `OPTICAL_THIN_MAX_OBS` records this per
 pixel as a share of embedded area. **Publish thin cells; label them.**
+
+> **That measurement needs re-checking, and is not withdrawn (2026-08-13).** It was read off figures
+> drawn with a **per-window** contrast stretch, which expanded a low-variation window's noise floor to
+> full contrast — so "looks like noise" was partly a property of the rendering rather than of the
+> depth. The stretch is now shared across a cell's windows (see below), and a cell at 46.9
+> observations per pixel that previously showed three noise-like windows out of four now shows three
+> uniform surfaces. Which way this pushes the 30/20 boundary is unknown until the comparison is
+> re-run: the mechanism behind it is independently plausible, and finding a flaw in a measurement does
+> not tell you the direction of its error. What is safe to keep using is the *relationship* — deeper
+> input, crisper picture — not the two numbers.
 
 **The line is 15 observations, set 2026-08-12 (it was 40).** That is deliberately *below* the depth at
 which pictures start to degrade, so the label names cells thin enough to be worth calling out rather
@@ -157,6 +179,27 @@ Two constraints on the review: it is given **that cell's own optical depth** and
 it; and **suspicious flags for a human, never blocks**, because "looks wrong to a model" is not evidence
 any other check would confirm. Its value is ranking a thousand cells so the human reads the worst
 twenty.
+
+**What the review is actually handed, decided 2026-08-13 by looking at a real cell's figures.**
+
+* **One PNG per window, at the resolution it was read**, beside the composite panel. The panel is for a
+  person who can zoom into it; an image pipeline that bounds an image's long edge shrinks a composite
+  by however many windows are in it, so a reader that cannot zoom would judge a 512-pixel window at
+  150 pixels — and the artifacts in the list above are the first thing a downsample destroys. The
+  panel remains the human figure.
+* **One contrast stretch shared by all of a cell's windows**, rather than each window stretched to its
+  own percentiles. This was a real defect: a window whose ground varies little had its noise floor
+  expanded to full contrast and arrived looking broken, next to a window with real structure, while
+  the figure's caption claimed the colours were comparable. Uniform ground now looks uniform, which
+  is the only way the "uniform noise" artifact above can mean anything.
+* **Per-window facts as text**, in the verdict's `windows` list: how much of the window the **land
+  mask** calls land, and how flat it is relative to the widest window in the cell. Land share is not
+  the embedded share — inference fills every pixel of a live shard, so a window over open water is
+  100% embedded and entirely uninformative. Without these two numbers the correct reading of a flat
+  picture is indistinguishable from a defect, which would push the review toward `cannot-tell` on
+  exactly the cells it is supposed to rank.
+* **Not the other three figures.** Coverage, bands and seams are renderings of numbers that are
+  already in the verdict, and the verdict is the better input for those.
 
 ## 5. Scope and cost
 
