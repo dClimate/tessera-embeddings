@@ -266,3 +266,52 @@ and ignores at the count level. What is new is that they **propagate into the pu
 visibly, in about one window in sixteen. Two consequences: the validator's seam test examines *shard*
 boundaries only and cannot see them, so they will not appear in any verdict; and they are the
 mechanism behind §8.
+
+---
+
+## 10. The measurement that finally isolates depth — zone overlaps, 2026-08-13
+
+Adjacent UTM zones overlap by about 200 km and each embeds that ground independently: its own mosaic,
+its own ingest, its own per-pixel observation count. So the overlap gives the same ground twice, and —
+this is the part every earlier attempt lacked — **blocks where the two runs saw the same number of
+observations measure the pipeline's own reproducibility**, which is the yardstick everything else has
+to be judged against. 81 blocks across four adjacent pairs (`scripts/zone_overlap_drift.py`).
+
+**The noise floor: 0.00050.** Two completely independent embeddings of the same ground, at matched
+depth, differ by that much in cosine distance (n=59, 90th percentile 0.00232).
+
+**Depth of difference moves the embedding**, and two independent methods agree on the slope:
+
+| observation difference | n | median distance | against the floor |
+|---|---:|---:|---:|
+| 0–1 | 59 | 0.00050 | 1.0× |
+| 1–3 | 18 | 0.00140 | **2.8×** |
+| 3–6 | 4 | 0.00259 | **5.2×** |
+
+That is 0.00053 of excess distance per observation of difference. The seam measurement, which uses
+Sentinel-2 swath boundaries and shares no code or data with this one, gives **0.00060**.
+
+**And depth ITSELF predicts reproducibility** — measured on matched-depth blocks only, so this is not
+the difference effect:
+
+| shallower side | n | median distance | against the floor |
+|---|---:|---:|---:|
+| under 20 obs | 4 | 0.00164 | **3.3×** |
+| 20–25 | 4 | 0.00137 | 2.7× |
+| 25–30 | 4 | 0.00157 | 3.2× |
+| 30–40 | 14 | 0.00020 | 0.4× |
+| 40+ | 33 | 0.00032 | 0.6× |
+
+**Thin ground is about five times less reproducible than deep ground**, and the effect is not one
+zone's: it appears in all four pairs, thin against deep within each — 1.2×, 2.1×, 3.1× and 6.1×.
+
+> **This is the first evidence in the whole investigation that supports the rule's premise**, and it
+> arrives by a completely different route from legibility: not "thin pictures look worse" but "thin
+> embeddings are not reproducible". Two runs of the same thin ground disagree several times more than
+> two runs of the same deep ground.
+>
+> **What it cannot yet do is choose a number.** Twelve blocks below 30 observations, four per bin, is
+> enough to establish a direction and nowhere near enough to locate where the curve breaks — which is
+> exactly what separating 20 from 25 from 30 requires. The bin edges above are mine, not the data's.
+> More sampling is the fix and it is cheap: this run took about fifteen minutes and a dollar, and only
+> four of seven zone pairs yielded comparable blocks at all.
