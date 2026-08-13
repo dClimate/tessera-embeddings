@@ -288,6 +288,28 @@ Two changes, both small:
 Computed **in the actor**, where the obs array and the embedded mask are both already in
 memory (`actors.py` ~L1328). No extra reads.
 
+> **CORRECTION (2026-08-13): the actor cannot compute `n_eligible_px` as this section defines it,
+> and no layer can compute it at pixel granularity.** Two facts, both checked in the code rather
+> than assumed:
+>
+> * **There is no per-pixel land mask anywhere in the system.** The land mask holds
+>   `tile_live_2048` and `chunk_live_256` and nothing finer (`ingest/land_mask.py`), so "ROI-live
+>   pixels in the shard" is not a quantity that exists. The finest honest denominator is **pixels in
+>   live 256-px chunks**, which is what `n_eligible_px` must mean.
+> * **The actor never sees the land mask.** What it holds is an `S2MaskBundle` — SCL validity and
+>   observation counts — and a chunk reaches it only because a coarser ROI pre-filter let it
+>   through. It knows its chunk is live; it does not know which of its 64 inner chunks are.
+>
+> **The fix is small and must be deliberate:** thread the chunk's own 8×8 slice of `chunk_live_256`
+> — 64 booleans — into the actor beside the mask bundle, and define eligibility from it. The
+> alternative, computing the record in assembly where the mask is already read, moves it away from
+> the arrays it counts and would cost a re-read of the whole shard.
+>
+> Two consequences to carry into the registry: `n_eligible_px` **over-counts** on a coastal chunk,
+> since a live 256-px chunk can be part water, so a coastal shard's refusal share is a lower bound;
+> and `chunks_skipped_mask` is exactly at the mask's own granularity, which is why it is the field
+> the validator should grade against rather than any pixel count.
+
 | field | type | meaning |
 |---|---|---|
 | `zone` | str | `"33N"` |
