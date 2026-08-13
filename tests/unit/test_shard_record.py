@@ -193,3 +193,83 @@ class TestTheRuleTravelsWithTheRow:
         """Counts only: a stored share is a second copy of a truth that drifts from its numerator."""
         row = _build().as_row()
         assert not [k for k in row if "pct" in k or "percent" in k or "share" in k]
+
+
+class TestTheTwoImplementationsAgree:
+    """The fast path and the reference must describe the same shard identically.
+
+    ``build`` takes the whole shard's masks and is what the standalone rebuild reads out of the
+    store; ``build_from_counts`` takes aggregates because the actor processes a shard in strips and
+    never holds it whole. Two implementations of one answer is exactly the shape that drifts, and
+    the registry's claim to be a rebuildable cache rests on them not drifting.
+    """
+
+    def test_a_shard_described_both_ways_produces_the_same_row(self):
+        side = shard_record.CHUNKS_PER_EDGE * 8
+        rng = np.random.default_rng(11)
+        eligible = rng.random((side, side)) < 0.85
+        obs = rng.integers(0, 60, (side, side)).astype(np.uint16)
+        thin = eligible & (obs > 0) & (obs < 25)
+        no_optical = eligible & (obs == 0)
+        no_radar = np.zeros_like(eligible)
+        embedded = eligible & ~thin & ~no_optical
+
+        reference = shard_record.build(
+            zone="33N",
+            year=2024,
+            tile_row=7,
+            tile_col=2,
+            eligible=eligible,
+            embedded=embedded,
+            s2_obs=obs,
+            refused_thin=thin,
+            refused_no_optical=no_optical,
+            refused_no_radar=no_radar,
+            optical_min_obs=25,
+        )
+        grid = (shard_record.CHUNKS_PER_EDGE, 8, shard_record.CHUNKS_PER_EDGE, 8)
+        depths = obs[eligible].astype(np.float32)
+        fast = shard_record.build_from_counts(
+            zone="33N",
+            year=2024,
+            tile_row=7,
+            tile_col=2,
+            n_eligible_px=int(eligible.sum()),
+            n_embedded_px=int(embedded.sum()),
+            n_refused_thin_px=int(thin.sum()),
+            n_refused_no_optical_px=int(no_optical.sum()),
+            n_refused_no_radar_px=int(no_radar.sum()),
+            depth_sum=float(depths.sum()),
+            depth_median=float(np.median(depths)),
+            depth_p10=float(np.percentile(depths, 10)),
+            refused_depth_hist=shard_record.depth_histogram(obs[thin].astype(np.float32)),
+            refused_per_chunk=(thin | no_optical | no_radar).reshape(grid).sum(axis=(1, 3)),
+            eligible_per_chunk=eligible.reshape(grid).sum(axis=(1, 3)),
+            optical_min_obs=25,
+        )
+        assert fast.as_row() == pytest.approx(reference.as_row(), rel=1e-6)
+
+    def test_the_fast_path_refuses_a_histogram_that_does_not_account_for_its_population(self):
+        """The one invariant the mask path gets for free and this one has to check: the actor
+        accumulates the histogram separately from the thin count, so they can disagree.
+        """
+        grid = np.ones((shard_record.CHUNKS_PER_EDGE, shard_record.CHUNKS_PER_EDGE), dtype=int)
+        with pytest.raises(ValueError, match="histogram"):
+            shard_record.build_from_counts(
+                zone="33N",
+                year=2024,
+                tile_row=0,
+                tile_col=0,
+                n_eligible_px=10,
+                n_embedded_px=4,
+                n_refused_thin_px=6,
+                n_refused_no_optical_px=0,
+                n_refused_no_radar_px=0,
+                depth_sum=100.0,
+                depth_median=10.0,
+                depth_p10=3.0,
+                refused_depth_hist=(1, 1, 0, 0, 0, 0),  # sums to 2, not 6
+                refused_per_chunk=grid * 0,
+                eligible_per_chunk=grid,
+                optical_min_obs=25,
+            )

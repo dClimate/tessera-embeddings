@@ -198,3 +198,76 @@ def build(
         optical_min_obs=optical_min_obs,
         mosaic_identity=mosaic_identity,
     )
+
+
+def build_from_counts(
+    *,
+    zone: str,
+    year: int,
+    tile_row: int,
+    tile_col: int,
+    n_eligible_px: int,
+    n_embedded_px: int,
+    n_refused_thin_px: int,
+    n_refused_no_optical_px: int,
+    n_refused_no_radar_px: int,
+    depth_sum: float,
+    depth_median: float,
+    depth_p10: float,
+    refused_depth_hist: tuple[int, ...],
+    refused_per_chunk: np.ndarray,
+    eligible_per_chunk: np.ndarray,
+    optical_min_obs: int | None,
+    status: str = STATUS_WRITTEN,
+    mosaic_identity: str | None = None,
+) -> ShardRecord:
+    """The same record, from aggregates accumulated strip by strip.
+
+    :func:`build` is the reference: it takes the whole shard's masks and is what the standalone
+    rebuild reads out of the store. The actor cannot use it — it processes a shard in strips and
+    never holds the whole thing — so this takes the totals instead, plus the two 8x8 grids the
+    bitmask needs. **A test asserts the two agree on the same data**, which is the only thing that
+    keeps a fast path and a reference implementation from drifting into two different answers about
+    what a shard contained.
+
+    ``depth_sum`` is a sum over ELIGIBLE pixels and is divided here, so the caller accumulates one
+    number per strip rather than carrying an array.
+    """
+    parts = (n_embedded_px, n_refused_thin_px, n_refused_no_optical_px, n_refused_no_radar_px)
+    if sum(parts) != n_eligible_px:
+        raise ValueError(
+            f"{zone}/{year} shard ({tile_row},{tile_col}): embedded + refused = {sum(parts)} but "
+            f"{n_eligible_px} pixels are eligible."
+        )
+    if sum(refused_depth_hist) != n_refused_thin_px:
+        raise ValueError(
+            f"{zone}/{year} shard ({tile_row},{tile_col}): the depth histogram sums to "
+            f"{sum(refused_depth_hist)} but {n_refused_thin_px} pixels were refused as thin. A "
+            "histogram that does not account for its own population cannot rank a top-up."
+        )
+    fully = (eligible_per_chunk > 0) & (refused_per_chunk == eligible_per_chunk)
+    mask = 0
+    for index, flag in enumerate(fully.reshape(-1)):
+        if flag:
+            mask |= 1 << index
+    return ShardRecord(
+        zone=zone,
+        year=year,
+        tile_row=int(tile_row),
+        tile_col=int(tile_col),
+        n_eligible_px=n_eligible_px,
+        n_embedded_px=n_embedded_px,
+        n_refused_thin_px=n_refused_thin_px,
+        n_refused_no_optical_px=n_refused_no_optical_px,
+        n_refused_no_radar_px=n_refused_no_radar_px,
+        s2_obs_mean=depth_sum / n_eligible_px if n_eligible_px else float("nan"),
+        s2_obs_median=depth_median,
+        s2_obs_p10=depth_p10,
+        refused_depth_hist=tuple(refused_depth_hist),
+        chunks_skipped_mask=mask,
+        n_chunks_eligible=int((eligible_per_chunk > 0).sum()),
+        n_chunks_skipped=int(fully.sum()),
+        status=status,
+        optical_min_obs=optical_min_obs,
+        mosaic_identity=mosaic_identity,
+    )
