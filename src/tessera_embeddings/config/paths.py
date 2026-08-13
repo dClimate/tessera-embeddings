@@ -95,7 +95,7 @@ class BucketPaths(BaseModel):
 
         **``global_store_uri`` overrides the derivation entirely**, because a published location
         need not be shaped like one this method could build: a different bucket, no ``global/``
-        segment, a ``.zarr`` suffix on what is still an Icechunk repo. Every producer and consumer
+        segment, a name chosen by whoever owns the bucket. Every producer and consumer
         of the campaign store asks this one method, which is what makes a single field enough — and
         what makes it impossible for one tool to write the override while another reads the derived
         path.

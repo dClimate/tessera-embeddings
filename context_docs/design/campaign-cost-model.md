@@ -1031,7 +1031,7 @@ deleted as inference consumes them; if inference lags, it grows linearly with th
 ```
 
 This goes to **AWS Open Data, which sponsors the storage**, so it is not in the totals —
-written to `s3://tessera-embeddings/v1.1/dclimate.zarr`, an existing Open Data bucket we
+written to `s3://tessera-embeddings/v1.1/dclimate.icechunk`, an existing Open Data bucket we
 publish into rather than one we apply for. The figure is still worth holding: it is what a
 mirror or an egress-heavy consumer would cost, and it is the number the bucket's owners
 will want when they plan for it.

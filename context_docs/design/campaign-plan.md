@@ -122,16 +122,17 @@ the whole store is 0.9–1.8 PB. Read-only consumers need `icechunk` plus `zarr`
 (v3); beyond that it is ordinary Zarr with named dimensions and coordinate arrays, so `xarray`
 opens it with no custom reader.
 
-**It is published to AWS Open Data, at `s3://tessera-embeddings/v1.1/dclimate.zarr`.** Not to a
+**It is published to AWS Open Data, at `s3://tessera-embeddings/v1.1/dclimate.icechunk`.** Not to a
 bucket of ours: AWS Open Data carries the storage cost of the finished dataset and serves it
-publicly. Two things a reader should know about that address. The `.zarr` suffix is the **convention
-of that bucket**, whose other resident is `v1.1/cambridge.zarr`, and not a claim about the format —
-what is there is an Icechunk repository, opened with `icechunk.Repository.open` rather than
-`xr.open_zarr` directly. And only the published store lives there: mosaics, ROI masks, staged tiles,
+publicly. Two things a reader should know about that address. **The suffix says what the format is**:
+an Icechunk repository, opened with `icechunk.Repository.open` rather than `xr.open_zarr` — which is
+why it is not named `.zarr` like the bucket's other resident, `v1.1/cambridge.zarr`, a genuine plain
+Zarr v3 hierarchy. That also leaves `.zarr` free for the Zarr v3 translation Cambridge intends to
+publish from this data. And only the published store lives there: mosaics, ROI masks, staged tiles,
 figures and verdicts stay in our own buckets, because they are working state.
 
 ```
-s3://tessera-embeddings/v1.1/dclimate.zarr     ← one repository, branch `main`
+s3://tessera-embeddings/v1.1/dclimate.icechunk     ← one repository, branch `main`
 ├── (root attrs)  geoemb:dimensions=128, geoemb:data_type=int8, geoemb:gsd=10.0,
 │                 geoemb:model=<encoder URL>, spatial_layout=utm_zones
 ├── 01N/                                       ← one group per UTM zone, 120 of them
@@ -250,7 +251,7 @@ is in this table because it is the most consequential value in it.
 
 | parameter | value | why |
 |---|---|---|
-| **published store** | **`s3://tessera-embeddings/v1.1/dclimate.zarr`** | the AWS Open Data bucket, not ours — it carries the storage cost and serves the dataset publicly. Set as `BucketPaths.global_store_uri` on the PROD account's paths, so it is a property of the account rather than a parameter an operator can get wrong. Every producer and consumer of the store reads it from that one method, and no dev or branch deployment carries it, so nothing but production can reach the public bucket |
+| **published store** | **`s3://tessera-embeddings/v1.1/dclimate.icechunk`** | the AWS Open Data bucket, not ours — it carries the storage cost and serves the dataset publicly. Set as `BucketPaths.global_store_uri` on the PROD account's paths, so it is a property of the account rather than a parameter an operator can get wrong. Every producer and consumer of the store reads it from that one method, and no dev or branch deployment carries it, so nothing but production can reach the public bucket |
 | `fill_strategy` | `"chained-clusters"` | one cluster per zone-set, not per zone-year |
 | **`max_parallel_clusters`** | **10** ★ | 10 x 250 actors reaches the full 2,500-actor quota while keeping each cluster's assembly thread under its ~275-actor ceiling (§6). Balance holds to ~16, and each cluster still opens on one of the 10 densest zones |
 | **`max_parallel_ingest`** | **61** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§6) |
@@ -527,10 +528,10 @@ that costs more. Settled; do not re-open.
    mask rebuild mid-campaign invalidates every completed zone-year's fingerprint.
 4. **Store seeded** — all zone groups, all 9 year slots, `geoemb:model` and `checkpoint_id`
    stamped. The seed is the only writer of the time axis. **It seeds the published location**
-   (`s3://tessera-embeddings/v1.1/dclimate.zarr`), so it cannot run until item 4b lands.
+   (`s3://tessera-embeddings/v1.1/dclimate.icechunk`), so it cannot run until item 4b lands.
 4b. **Write access to the AWS Open Data bucket** — the one prerequisite that is not ours to
    complete. The bucket is Cambridge's, and it grants our production runner role write, read, list,
-   delete and multipart-abort on `v1.1/dclimate.zarr/*` (delete included, or Icechunk garbage
+   delete and multipart-abort on `v1.1/dclimate.icechunk/*` (delete included, or Icechunk garbage
    collection cannot run and superseded manifests become permanent). We extend our own identity
    policy to match; until both halves exist, seeding fails with `403`. The request is written and
    ready to send: `yield-embeddings/context_docs/monitoring/open-data-access-request.md`. **Treat

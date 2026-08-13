@@ -19,7 +19,7 @@ import pytest
 from tessera_embeddings.config.paths import BucketPaths
 
 #: The real target, so the test says what this exists for.
-OPEN_DATA = "s3://tessera-embeddings/v1.1/dclimate.zarr"
+OPEN_DATA = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
 
 
 def _paths(**kw) -> BucketPaths:
