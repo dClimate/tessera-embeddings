@@ -7,10 +7,14 @@ sentence into a **refusal**: a pixel with fewer than 30 observations would not b
 That decision is irreversible — a refused pixel does not exist, so recovery is a re-run — and on
 2026-08-13 two defects were found in the instrument that produced the original sentence.
 
-**Result, stated first: the claim is not supported, and a 30 line does not sit where the plan
-assumes.** The thinnest legible window in the corpus is at **12.8** observations per pixel, and a
-fully-land window at **41.6** observations is structureless confetti. Both were confirmed by eye
-after the blind pass, because they are the two cases the decision turns on.
+**Result, stated first: picture quality does not track optical depth, and in this corpus the
+gradient runs the other way.** Across 556 fully-land windows reviewed blind, legibility falls from 90%
+at 15–18 observations per pixel to 66% at 30–45. The cause is not depth: it is that depth is a proxy
+for climate and climate is a proxy for how much there is to see — deserts are clear overhead and
+uniform on the ground, while the cloudiest tropics are rivers, clearings and smallholder farmland.
+**At every candidate cutoff between 15 and 35 observations, about 85% of what the rule would refuse
+shows recognisable ground**, and raising the cutoff leaves a *higher* share of unreadable windows in
+the product, because the unreadable ones are mostly the deep ones.
 
 ---
 
@@ -28,9 +32,10 @@ now records its own mean and tenth percentile.
 
 ## 2. Method
 
-**73 windows from 9 completed dev cells**, spanning **13 to 98** observations per pixel, 18 of them
-below the 30 line. Thin windows are not evenly available: they come from equatorial cloud (32S/2022,
-Congo basin, latitude −0.3 to −4.9) and from the sub-Antarctic (26S/2021, latitude −56 to −59).
+**Two passes.** A pilot of 73 windows from 9 cells, sampled by latitude the way the audit samples, and
+then the pass this document reports: **713 windows from 40 cells**, sampled by depth so the bands that
+decide a cutoff are populated on purpose rather than by accident. The pilot is why the second pass
+exists — it had one window separating a cutoff of 20 from one of 30.
 
 **Blinded in code, not by instruction** (`scripts/depth_legibility_probe.py` in `yield-embeddings`).
 The reviewer received opaque filenames in shuffled order and one fact per window — how much of the
@@ -45,61 +50,90 @@ coastline, settlement, dune or glacial forms, a boundary between distinct covers
 desert and unbroken canopy are correctly illegible. Every verdict carries a one-line note naming what
 was seen, so a verdict can be audited rather than trusted.
 
-## 3. The result
+## 3. The result — 556 fully-land windows
 
-All 73 windows reviewed. **Restricted to the 54 fully-land windows**, which is the only comparison
-that isolates depth from how much of the frame is water:
+The first pass sampled 73 windows by latitude and had **one window** separating a cutoff of 20 from
+one of 30, so it could not choose between them. This pass sampled **by depth**: 713 windows from 40
+cells, harvested by probing one observation-count chunk per shard and then reading windows only where
+the estimate landed in a target band, preferring shards whose window is wholly land
+(`scripts/harvest_depth_windows.py`). Reviewed blind by six independent sessions over disjoint ranges,
+with depth and flatness both withheld.
+
+**The six agents agree on level**, which is what makes the pooling legitimate: on fully-land windows
+they returned 74%, 75%, 78%, 79% and 81% legible against matched median depths of 25 to 28
+observations. (Two of them reached that agreement by different routes — one upgraded verdicts after a
+per-image restretch revealed organised structure, another refused to upgrade on anything not visible
+at the delivered contrast. The seven-point spread is the size of that disagreement.)
 
 | depth band | n | legible | uncertain | illegible | % legible |
 |---|---:|---:|---:|---:|---:|
-| under 20 | 10 | 5 | 2 | 3 | **50%** |
-| 20–30 | 2 | 2 | 0 | 0 | 100% |
-| **30–45** | 9 | 3 | 0 | 6 | **33%** |
-| 45+ | 33 | 32 | 1 | 0 | **97%** |
+| under 12 | 13 | 8 | 3 | 2 | 62% |
+| 12–15 | 32 | 28 | 1 | 3 | **88%** |
+| 15–18 | 50 | 45 | 2 | 3 | **90%** |
+| 18–21 | 63 | 55 | 3 | 5 | 87% |
+| 21–24 | 59 | 51 | 4 | 4 | 86% |
+| 24–27 | 56 | 47 | 4 | 5 | 84% |
+| 27–30 | 58 | 45 | 3 | 10 | 78% |
+| 30–35 | 98 | 65 | 10 | 23 | **66%** |
+| 35–45 | 113 | 75 | 3 | 35 | **66%** |
+| 45+ | 14 | 11 | 0 | 3 | 79% |
 
-| split at the proposed line | n | % legible |
-|---|---:|---:|
-| below 30 — **would be refused** | 12 | **58%** |
-| 30 and above — would be kept | 42 | 83% |
+**Legibility FALLS as optical depth rises**, from 90% in the 15–18 band to 66% in the 30–45 bands. The
+July claim is not merely unsupported; the gradient in this corpus runs the other way.
 
-**Three readings, in descending order of how well the data supports them.**
+### Why it runs backwards, tested rather than asserted
 
-**The claim as written fails in both halves.** Half the fully-land windows below 20 observations are
-legible, and only a third of those between 30 and 45 are. The relationship is **not monotonic**: the
-band immediately above the proposed cutoff is the worst-performing band in the corpus, worse than the
-thinnest one.
+Not latitude: legibility by absolute latitude is flat within noise (76%, 78%, 67%, 84%, 72% across five
+bands). The controlled test is depth **within** a latitude band, and it splits:
 
-**Depth does still carry signal, but the only clean break is at about 45**, not 30 — 97% legible above
-it against 33% just below it. A line drawn at 45 would refuse a quarter of the product's pixels or
-more, which nobody has proposed and which the 2017 figures make untenable.
+| | under 20 obs | 20–30 | 30–45 |
+|---|---:|---:|---:|
+| tropics, 0–25° (n=401) | **87%** | 85% | **61%** |
+| mid-latitudes, 25–55° (n=112) | 77% | 82% | 82% |
+| high latitudes, 55–90° (n=43) | 75% | 67% | 67% |
 
-**Land cover explains more than depth does.** Land fraction alone accounts for 15 of the 24 illegible
-verdicts: of the 19 windows the mask calls less than fully land, 15 are illegible, and that is the
-correct output for a frame that is mostly water. Within fully-land windows, how structured a window is
-separates legible from illegible better than its depth does.
+So the effect is real inside the tropics and absent elsewhere, which points at **land cover
+correlated with cloudiness** rather than at depth doing anything. In the tropics the wettest places
+are the most persistently clouded — and they are river networks, forest-and-clearing mosaics and
+smallholder agriculture, which are legible. The drier tropics are clear overhead and uniform on the
+ground. Depth is a proxy for climate, and climate is a proxy for how much there is to see.
 
-## 4. The two cases the decision turns on
+The per-cell spread says the same thing more bluntly. Legibility by cell runs from **11%** (23N/2021,
+which is Saharan desert, deep and uniform) to **100%** (38N/2021, 47S/2021, 59S/2022). Which zone a
+window came from predicts its legibility far better than how many observations it had.
 
-Both re-examined directly rather than accepted from the blind pass.
+## 4. What each candidate cutoff costs
 
-**`32S/2022` window 7 — 12.8 observations per pixel, fully land, LEGIBLE.** Sharp lobed boundaries
-between strongly distinct covers, dark channel-like forms wrapping a bright lobe, and a corridor with
-parallel margins running about 5 km down the frame: a river or valley corridor with adjoining wetland.
-At less than half the proposed cutoff, this is recognisable ground, and the rule as specified would
-discard it.
+| cutoff | windows refused | legible among refused | illegible among kept | share of ALL legible windows lost |
+|---|---:|---:|---:|---:|
+| 15 | 45 | 36 (**80%**) | 88 (17%) | 8% |
+| 18 | 95 | 81 (85%) | 85 (18%) | 19% |
+| **20** | 133 | 113 (**85%**) | 81 (19%) | **26%** |
+| **25** | 239 | 204 (**85%**) | 73 (23%) | **47%** |
+| **30** | 331 | 279 (**84%**) | 61 (27%) | **65%** |
+| 35 | 429 | 344 (80%) | 38 (30%) | 80% |
 
-**`16S/2021` window 1 — 41.6 observations per pixel, fully land, ILLEGIBLE.** Structureless per-pixel
-confetti with no organisation at any scale. Above the cutoff, so the rule would keep it.
+**The transferable number is the second column, and it is flat: whatever line is drawn between 15 and
+35, about 85% of what it refuses shows recognisable ground.** The corpus is deliberately
+depth-stratified, so the last column describes the corpus rather than the product — the product-level
+volume comes from the census (10.9% of pixels below 30 in its sample, 18.4% globally).
+
+Note the fourth column too. Raising the cutoff barely improves what is kept — the illegible share of
+kept windows *rises*, from 17% at a cutoff of 15 to 27% at 30 — because the illegible windows are
+mostly the deep ones. A refusal line does not concentrate on poor data. It removes good data and
+leaves the poor data behind.
 
 ## 5. What this measurement cannot settle
 
-**Thin data and its geography are entangled, and the corpus is small.** Eight of the twelve fully-land
-windows below 30 come from one cell. You cannot obtain thin optical data except in places that are
-cloudy or dark for months, and those places have their own land cover — so "below 30 is 58% legible" is
-substantially a statement about the Congo basin in 2022. Nine cells cannot separate depth from biome.
+**Thin data and its geography remain entangled, and no sample fixes that.** Thin optical data occurs
+only where it is cloudy or dark for months, so a corpus of thin windows is a corpus of particular
+places. Forty cells and a within-latitude control make the confound visible and partly separable —
+that is what §3's second table does — but the campaign will publish zones this corpus has no example
+of, and the dev store holds no 2017, which is the year where two thirds of shard-years fall below 30.
 
-**Nothing here is measured below 12.8 observations**, which is the corpus floor. A refusal line low
-enough to sit under every legible window in this corpus is therefore unproven rather than supported.
+**Below 12 observations is thinly sampled** — 13 windows — so the shape of the curve at the very
+bottom is the one part of it that more data would still change. It is also the one part where the
+refusal case is strongest: legibility there is 62%, the lowest of any band.
 
 **Legibility is not utility, and this is the limit that matters most.** The picture is a
 three-component projection of a 128-dimensional embedding, so a window a reader cannot interpret may
@@ -111,8 +145,17 @@ about usefulness that no measurement here or before it has tested.**
 
 ## 6. What follows for the plan
 
-**Do not ship 30.** On this evidence it refuses demonstrably legible ground while keeping
-demonstrably structureless windows, which is the opposite of its stated purpose in both directions.
+**No cutoff between 15 and 35 is supportable on picture evidence, 30 least of all.** Each one refuses
+about 85% legible ground, and the higher the line the more unreadable windows it leaves behind. If a
+refusal ships, it ships as a product judgement with this document cited against it, not as a
+conclusion the pictures support.
+
+One further observation from the reviewers, which weakens any inference from "illegible" to
+"worthless": one session measured seven of its twenty-five illegible windows as carrying real,
+coherent ground structure — region boundaries, discrete patches, in one case a full drainage network —
+at roughly a tenth of the amplitude the shared contrast stretch renders visible, three to eight grey
+levels out of 255 against twenty or more for a typical legible window. **"Illegible" here means "low
+contrast relative to the rest of its cell", not "carries no information."**
 
 Three options, in the order I would consider them:
 
