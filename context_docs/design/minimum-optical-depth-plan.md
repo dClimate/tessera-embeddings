@@ -278,7 +278,7 @@ memory (`actors.py` ~L1328). No extra reads.
 | `chunks_skipped_mask` | uint64 | **bit _i_ set = inner 256-px chunk _i_ fully refused** |
 | `n_chunks_eligible`, `n_chunks_skipped` | uint8 | of 64 |
 | `status` | str | `"written"` \| `"skipped"` \| `"resumed_unknown"` |
-| `optical_thin_max_obs` | int16 | the rule this row was produced under |
+| `optical_min_obs` | int16 | the rule this row was produced under |
 | `refused_depth_hist` | 6 x uint32 | the THIN refusals binned by depth: 1-4, 5-9, 10-14, 15-19, 20-24, 25-29. Excludes zero-observation pixels, which `n_refused_no_optical_px` already counts, so the six bins **sum exactly to `n_refused_thin_px`** — a cheap invariant to assert |
 | `mosaic_identity` | str | the ingest marker this cell was filled from — see below |
 
@@ -385,7 +385,7 @@ whether it is finished gets read as if it were.
 
 Per zone-year: `n_live_shards` (from the land mask, so the denominator exists even for an
 empty cell), `n_shards_written`, `n_shards_fully_skipped`, the pixel counts summed,
-`pct_eligible_refused`, `optical_thin_max_obs`, the **cycle** the cell was last filled in and
+`pct_eligible_refused`, `optical_min_obs`, the **cycle** the cell was last filled in and
 its **generation** (§13), and the run id. Plus campaign totals, the current cycle, and a
 `schema_version`.
 
@@ -413,9 +413,10 @@ Scale: 360,953 live shards x 9 years = **3.2M rows**. Comfortable for a single p
 
 **Not optional tidying. Leaving any of these is how the repo ends up asserting two policies.**
 
-1. **`OPTICAL_THIN_MAX_OBS` 15 -> 30, and its meaning inverts** (§4). Every use follows:
-   `actors.py` L1339 becomes the refusal, and `assembly.py` L2248's `s2_thin_below_obs`
-   now reports a refusal line.
+1. **`OPTICAL_THIN_MAX_OBS` becomes `OPTICAL_MIN_OBS` at 30, and the meaning inverts** (§4).
+   The rename is what produces this list: every use is an import error until it is revisited.
+   `actors.py` L1339 becomes the refusal, and `assembly.py` L2248's `s2_thin_below_obs` now
+   reports a refusal line and should be renamed with it.
 2. `summarise_radar_coverage` reports `s2_thin_pct` over a denominator of **embedded**
    pixels. Once nothing below the line is embedded, that field is structurally `0.000`
    forever. Move the optical half to the **eligible** denominator and rename the fields for
@@ -480,8 +481,9 @@ It must be stated in three places a user actually encounters:
 
 ## 10. Tests
 
-- **The gate**: a pixel at 29 is refused and at 30 is kept; at `optical_thin_max_obs=0` the
-  mask is bit-identical to today (pin this — it is what protects the single-ROI path).
+- **The gate**: a pixel at 29 is refused and at 30 is kept; at `optical_min_obs=None` the mask is
+  bit-identical to today (pin this — it is what protects the single-ROI path); and
+  `optical_min_obs=0` is REFUSED at construction rather than quietly disabling the rule (§5).
 - **Separability**: a pixel refused for thin optical, one for no optical, and one for absent
   radar land in the three different counters.
 - **The bitmask**: a shard with exactly one fully-refused inner chunk sets exactly one bit,
@@ -490,12 +492,13 @@ It must be stated in three places a user actually encounters:
   not 2048².
 - **Resume**: a cell resumed from a prior leg produces a complete registry row from sidecars,
   not a row of zeros. This is the one most likely to be got wrong.
-- **Root identity**: reseeding a store with a different `optical_thin_max_obs` is rejected by
-  the existing write-once check, and a fill whose config disagrees with the root is refused.
+- **Root identity**: reseeding a store with a different `optical_min_obs` is rejected by the
+  existing write-once check; a fill whose config disagrees with the root is refused; and a fill
+  against a root carrying NO threshold refuses to run rather than running unrefused (§4).
 - **Cycles** (§13): `runs[year]` appends rather than replaces, so a second fill keeps the
   first's provenance; generation is the list length; and the work list treats a cell as done
   for the *current cycle* only, so a top-up cycle re-selects it while a resume does not.
-- **Fingerprint**: the staging `run_id` changes when `optical_thin_max_obs` changes.
+- **Fingerprint**: the staging `run_id` changes when `optical_min_obs` changes.
 - **Full suite green** with the flag off ⇒ today's behaviour bit-for-bit.
 
 ## 11. Verification
@@ -625,12 +628,12 @@ needs must be answerable from the store itself:
 
 | question | answered from the store alone |
 |---|---|
-| what rule produced this product? | root attr `optical_thin_max_obs` |
+| what rule produced this product? | root attr `optical_min_obs` |
 | which cycle is this store at? | root attr `current_cycle` |
 | has this cell been filled — how often, when, by which code? | `runs[year]` list |
 | which tiles in this cell were fully skipped? | `runs[year][-1].optical_skips.labels` |
 | how much of this cell was refused, and why? | the optical/radar summaries in the same record |
-| **is this specific pixel refused?** | `s2_obs_count < optical_thin_max_obs`, and `isnan(scales)` |
+| **is this specific pixel refused?** | `s2_obs_count < optical_min_obs`, and `isnan(scales)` |
 
 What the registry adds is speed and reach, not facts: per-shard rows, the chunk bitmask, the
 depth histogram, and cross-zone queries in one file instead of 120 group reads.
@@ -763,7 +766,7 @@ That repo's own scripts (`campaign_health.py`, `validate_all_cells.py`) and the
 `validate_zone_year` flow still read `rules.BLOCKING_SLUGS` directly for their own reporting —
 correct, because that is one campaign's tooling choosing the default.
 
-The tessera-side threshold `OPTICAL_THIN_MAX_OBS` is deliberately NOT among the tunables in
+The tessera-side threshold `OPTICAL_MIN_OBS` is deliberately NOT among the tunables in
 that sense: it is campaign-wide, stamped into the store's root attrs, and enforced (§4). A
 downstream campaign sets it for its own store; it is not a per-validation-run argument.
 
