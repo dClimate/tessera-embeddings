@@ -197,7 +197,7 @@ place in it: `campaign-monitoring-plan.md`.
 | the instrument: `audit_cell`, one implementation for both passes | `src/yield_embeddings/domain/embedding_validation.py` |
 | the operator CLI over it — `--json`, `--out <fsspec>`, `--label` | `scripts/validate_cell.py` |
 | the campaign's per-cell gate, dispatched by each fill | `src/yield_embeddings/orchestration/prefect/flows/validate_zone_year.py` |
-| its decisions and thresholds, unit-tested on synthetic arrays | `src/yield_embeddings/domain/embedding_audit.py` |
+| its decisions and thresholds, unit-tested on synthetic arrays | `src/yield_embeddings/domain/embedding_validation_rules.py` |
 | the closing sweep and its roll-up | `scripts/validate_all_cells.py` |
 | per-cell structural and placement validation | `scripts/validate_zone_group.py` |
 | campaign-day monitoring, incl. the per-cell **cell validation** check | `scripts/campaign_health.py` |
