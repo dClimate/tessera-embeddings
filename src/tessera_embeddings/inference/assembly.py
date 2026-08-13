@@ -58,7 +58,7 @@ import zarr
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
-    OPTICAL_THIN_MAX_OBS,
+    OPTICAL_THIN_LABEL_OBS,
     RADAR_THIN_MAX_OBS,
     TimeWindow,
 )
@@ -2245,7 +2245,7 @@ def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
         # a skip and never produces a result, so `optical_skips` is where that case lives.
         "s2_thin_px": s2_thin,
         "s2_thin_pct": round(100.0 * s2_thin / embedded, 3),
-        "s2_thin_below_obs": OPTICAL_THIN_MAX_OBS,
+        "s2_thin_below_obs": OPTICAL_THIN_LABEL_OBS,
         "chunks_reporting": reported,
         # Where, coarsely: a tile that is ENTIRELY radar-free localises the gap without
         # storing a per-tile grid, and distinguishes a concentrated absence (whole tiles,

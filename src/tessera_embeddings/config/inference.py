@@ -207,17 +207,47 @@ RADAR_THIN_MAX_OBS = 12
 #: survives masking is a small fraction of the overpasses, and the model resamples across
 #: whatever remains.
 #:
-#: Fifteen is roughly a valid observation every three and a half weeks, and it sits BELOW the
-#: depth at which pictures visibly degrade (measured across 15 cells: crisp at 30+, noisy in
-#: the low twenties). So this flags cells that are thin enough to be worth naming rather than
-#: every cell that is merely not crisp — which is the difference between a label a reader acts
-#: on and one that covers a third of the globe. It was 40 until 2026-08-12.
+#: The THIN LABEL: embedded pixels with fewer than this many valid optical observations are counted
+#: and reported, and nothing is refused for being under it. 40 until 2026-08-12, then 15.
 #:
-#: Only a REPORTING line: nothing refuses a cell for being under it, and the exact per-pixel
-#: counts live in the store's ``s2_obs_count`` array either way. Raising or lowering it
-#: changes what future summaries say and never what is published, so it is a config change
-#: rather than a migration.
-OPTICAL_THIN_MAX_OBS = 15
+#: **It exists only until the refusal below is enforced, and then it is deleted.** Once nothing under
+#: the line is embedded, "embedded pixels below the line" is the empty set by construction and every
+#: figure derived from it reads 0.000 forever — see the plan's §9.2. It is kept separate rather than
+#: folded into ``OPTICAL_MIN_OBS`` because during the transition **the two are different numbers**:
+#: the label is 15 and describes what has already been published, while the refusal is a proposed 30
+#: and describes what will be. Pointing both at one constant would silently restate every existing
+#: cell's thin share against a line that was never applied to it.
+#:
+#: Consumers: the per-chunk ``s2_thin_px`` counter, and ``s2_thin_below_obs`` in run provenance,
+#: which records WHICH line produced a percentage precisely so a change is detectable.
+OPTICAL_THIN_LABEL_OBS = 15
+
+#: Minimum valid Sentinel-2 observations for a pixel to be EMBEDDED AT ALL, in the calendar
+#: year being filled. A pixel below it is written as fill, exactly as an out-of-ROI pixel is.
+#:
+#: **This is a refusal, not a label, and the difference is that it is not reversible.** Under
+#: its old name (``OPTICAL_THIN_MAX_OBS``, 40 until 2026-08-12, then 15) nothing was refused for
+#: being under it and the per-pixel counts in ``s2_obs_count`` told the whole story either way —
+#: so raising or lowering it changed what summaries said and never what was published. That is no
+#: longer true: a refused pixel has no embedding, so recovering one is a re-run of its whole
+#: shard. **A reader of commits or documents from before 2026-08-13 will find the opposite claim
+#: under the old name.**
+#:
+#: Two things bound how freely this value moves:
+#:
+#: * it is stamped into the global store's root attrs and is part of their write-once identity,
+#:   so **a store cannot be re-stamped with a different value** — changing the line means a new
+#:   store, not a migration;
+#: * the seeder takes it explicitly and does not default to this constant, so nothing can stamp
+#:   a store by inheriting whatever happens to be here.
+#:
+#: **The value is PROVISIONAL (2026-08-13).** It is 30 because that is what the plan proposed,
+#: and a blind re-measurement of the evidence behind 30 does not support it: legibility is not
+#: monotonic in depth across 20 to 45, and a cutoff at 20 was measured to leave exactly the same
+#: unreadable windows in the product while discarding a third as many pixels. See
+#: ``context_docs/design/window_legibility_vs_depth_2026_08.md``. Settle it before any store is
+#: seeded; after that the seed decides.
+OPTICAL_MIN_OBS = 30
 
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
 #:
