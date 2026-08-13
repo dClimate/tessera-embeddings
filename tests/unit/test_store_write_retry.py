@@ -24,6 +24,7 @@ import pytest
 
 from tessera_embeddings.errors import DuplicateDateError
 from tessera_embeddings.ingest import s1_roi, s2_roi
+from tessera_embeddings.storage import zarr_store
 from tessera_embeddings.storage.zarr_store import (
     CONCURRENT_WRITER_ERRORS,
     STORE_WRITE_ATTEMPTS,
@@ -128,3 +129,37 @@ def test_no_ingest_module_builds_its_own_retry_policy(module):
         "concurrent-writer exclusion cannot be omitted"
     )
     assert "store_write_retrying" in source
+
+
+def test_a_losing_racer_never_deletes_the_winners_store(tmp_path, monkeypatch):
+    """The gap between the empty-store CHECK and the COMMIT.
+
+    Two first-date writers can both pass the empty-store probe. The loser then fails at
+    ``session.commit()`` with ``ConflictError`` — which is not ``StoreHoldsCommittedDataError``,
+    so it used to fall through to ``cleanup_on_failure``'s delete and destroy the winner's
+    committed data. A conflict is positive evidence the prefix is not ours.
+    """
+    deleted: list[str] = []
+    monkeypatch.setattr(zarr_store, "_delete_store", lambda p, **k: deleted.append(p))
+
+    @zarr_store.cleanup_on_failure
+    def _loser(store_path: str) -> None:
+        raise icechunk.ConflictError("expected-parent", "actual-parent")
+
+    with pytest.raises(icechunk.ConflictError):
+        _loser(str(tmp_path / "mosaic.icechunk"))
+    assert deleted == [], "a conflicted writer must not delete the store it lost the race for"
+
+
+def test_an_ordinary_failure_still_cleans_up(tmp_path, monkeypatch):
+    """The complementary half — otherwise the guard above would strand every partial store."""
+    deleted: list[str] = []
+    monkeypatch.setattr(zarr_store, "_delete_store", lambda p, **k: deleted.append(p))
+
+    @zarr_store.cleanup_on_failure
+    def _broken(store_path: str) -> None:
+        raise RuntimeError("half-written")
+
+    with pytest.raises(RuntimeError):
+        _broken(str(tmp_path / "mosaic.icechunk"))
+    assert deleted == [str(tmp_path / "mosaic.icechunk")]

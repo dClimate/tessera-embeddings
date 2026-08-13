@@ -232,11 +232,19 @@ def cleanup_on_failure[**P, T](func: Callable[P, T]) -> Callable[P, T]:
             raise ValueError("cleanup_on_failure requires store_path as first argument")
         try:
             return func(*args, **kwargs)
-        except StoreHoldsCommittedDataError:
+        except (StoreHoldsCommittedDataError, *CONCURRENT_WRITER_ERRORS):
             # NOT ours to delete. Every other failure here leaves a half-written store
-            # worth removing; this one fired BEFORE writing anything, because the store
-            # already held data. Cleaning up would destroy exactly what the guard
-            # refused to overwrite.
+            # worth removing; these fired because the store holds data somebody else
+            # committed, and cleaning up would destroy exactly what they wrote.
+            #
+            # StoreHoldsCommittedDataError is the check-time half: the store already held
+            # data when we looked. The concurrent-writer errors are the RACE half, and the
+            # gap between them is what made this dangerous — two first-date writers can
+            # both pass the empty-store probe, and the loser then fails at
+            # ``session.commit()`` with ConflictError, which is not the guard's error. It
+            # would have fallen through to the delete below and taken the WINNER's
+            # committed data with it. A conflict is positive evidence that the prefix is
+            # not ours, so it is the one class of failure that must never clean up.
             raise
         except Exception:
             logger.warning(f"Store creation failed, cleaning up {store_path}")
