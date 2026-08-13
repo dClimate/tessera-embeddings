@@ -1125,6 +1125,11 @@ class InferenceActor:
             }
 
             total_valid = 0
+            # Refusals accumulate across STRIPS: one dataset is built per strip, so its counters
+            # describe a slice rather than the shard. Summed here because the per-shard record's
+            # invariant is that the parts reach the shard's eligible total, and a per-strip count
+            # would fail it by construction.
+            refused = {"thin": 0, "no_optical": 0, "no_radar": 0}
             infer_s = 0.0  # summed wall-clock of the per-strip inference calls
             # Strip pipeline. When prefetch is on (dense/hideable), strip i+1
             # loads (and buckets) on the background thread while strip i runs
@@ -1241,6 +1246,12 @@ class InferenceActor:
                         # handling of fully-invalid chunks and the NaN convention
                         # for "no embedding here" (see #39). The strip still
                         # contributes its (zero) obs counts, already written above.
+                        # Its refusals still count: an empty strip is the case the record most
+                        # needs to explain, and skipping the tally here would make a fully refused
+                        # shard report zero refusals.
+                        refused["thin"] += dataset.refused_thin
+                        refused["no_optical"] += dataset.refused_no_optical
+                        refused["no_radar"] += dataset.refused_no_radar
                         logger.info("Chunk %s strip %s: no valid pixels, leaving zero-filled", chunk.label, strip)
                         continue
 
@@ -1254,6 +1265,9 @@ class InferenceActor:
                     embeddings[strip, cols] = result.embeddings
                     scales[strip, cols] = result.scales
                     total_valid += len(dataset)
+                    refused["thin"] += dataset.refused_thin
+                    refused["no_optical"] += dataset.refused_no_optical
+                    refused["no_radar"] += dataset.refused_no_radar
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
