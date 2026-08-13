@@ -224,13 +224,17 @@ RADAR_THIN_MAX_OBS = 12
 #: provenance records the line its own numbers were produced under, so cells filled before and
 #: after a change are comparable rather than silently restated.
 #:
-#: **The value is PROVISIONAL (2026-08-13).** It is 30 because that is what the plan proposed,
-#: and a blind re-measurement of the evidence behind 30 does not support it: legibility is not
-#: monotonic in depth across 20 to 45, and a cutoff at 20 was measured to leave exactly the same
-#: unreadable windows in the product while discarding a third as many pixels. See
-#: ``context_docs/design/window_legibility_vs_depth_2026_08.md``. Settle it before any store is
-#: seeded; after that the seed decides.
-OPTICAL_MIN_OBS = 30
+#: **The value is a PLACEHOLDER (Robert, 2026-08-13), not a decision.** 25 sits in the middle of the
+#: range under discussion so the rest of the machinery can be built and tested; the evidence that
+#: would choose a number does not exist yet. What is known: the blind re-measurement behind the
+#: proposed 30 does not support it, because the legibility it measured turned out to track RENDERED
+#: CONTRAST rather than information — spatial organisation is flat across 12 to 45 observations. See
+#: ``context_docs/design/window_legibility_vs_depth_2026_08.md``. The measurement that would settle
+#: it is the embedding's drift against observation count, in progress.
+#:
+#: **Settle it before any store is seeded.** After that the root attr decides and the store cannot be
+#: re-stamped, so a placeholder that reaches a seed becomes permanent.
+OPTICAL_MIN_OBS = 25
 
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
 #:
