@@ -553,19 +553,27 @@ that costs more. Settled; do not re-open.
    inventory is Cambridge's to configure and is asked for as an optional part of item 4b; nothing
    blocks on it (§7b). What remains is the standing constraints of §7b, which are rules rather than
    tasks.
-8. **A single dense zone-year end to end, at both 60 and 80 ingest workers.** The last gate, and
-   the only remaining question about the schedule. The plan runs at 60 (§3), and the gate is that
-   the densest zone behaves as the model says at that width. The 80-worker arm is upside only:
-   the width model is fitted over roughly 30–60 workers, so 80 is an extrapolation and nothing in
-   the plan depends on it.
+8. **A dense zone-year at 60 and 80 workers — NOT being run. Decided 2026-08-13: too expensive
+   for the margin it would buy.** It would have confirmed that the densest zone behaves at 60
+   workers the way the model says, and priced an 80-worker arm the plan does not depend on. What
+   we accept by skipping it: the ingest figure of 4.18 days (§6) is a model evaluated on the
+   densest zones rather than a measurement of them, and per-window cost is **not** constant across
+   zones, so the error on the deepest cells is unquantified rather than small.
+
+   **Why that is affordable.** The campaign is fleet-bound, not ingest-bound: 61 cells supply
+   ingest at 81% of what 2,500 actors consume, so ingest running slower than modelled spends the
+   buffer before it touches the date. The signal that the buffer is gone is the one monitoring
+   watches most closely — the GPUs stop being kept busy (§9) — and it appears in the first hours
+   of the campaign rather than at the end. The lever if it happens is `max_parallel_ingest`, which
+   is raisable in flight.
 
 **Prod's state:** the coverage mask is built, all 112 land-zone ROIs are exported, the campaign
 deployment set is registered in its branch-scoped form, the crash-recovery automations are armed, the
 Slack alerts are registered, the monitoring round's read permissions are deployed (§9), and the
 Prefect server is sized correctly. **The published store is not
-seeded, and cannot be until write access to the Open Data bucket exists** (item 4b). A store was
-seeded in prod's own bucket before the publish target changed; it is superseded, holds nothing, and
-should be deleted rather than left to look like the campaign's output.
+seeded, and cannot be until write access to the Open Data bucket exists** (item 4b). The store that
+had been seeded in prod's own bucket before the publish target changed was deleted on 2026-08-13
+(847 objects, all metadata), so the only global store prod will ever hold is the published one.
 
 **Operate prod from the branch, not from `main`.** Every prod deployment is the
 `-global-tessera` form, and branch-scoped registration is the supported path until the global
