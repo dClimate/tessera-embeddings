@@ -44,33 +44,36 @@ across 15 cells. 30 is the conservative end of that band.
 >    mean 46.9 holds windows at 34.5 and 61.0, and its *thinnest* window is the one with the most
 >    structure. Each window now records its own mean and tenth percentile.
 >
-> **The re-measurement has now been taken, and it does not support the line.** Full report:
-> [`window_legibility_vs_depth_2026_08.md`](window_legibility_vs_depth_2026_08.md). 73 windows from 9
-> cells spanning 13 to 98 observations per pixel, blind — depth withheld from the reviewer in code and
-> joined afterwards. Restricted to the 54 fully-land windows, which is the only comparison that
-> isolates depth from how much of a frame is water:
+> **The re-measurement has been taken and the gradient runs BACKWARDS.** Full report:
+> [`window_legibility_vs_depth_2026_08.md`](window_legibility_vs_depth_2026_08.md). 713 windows from
+> 40 cells sampled BY DEPTH, reviewed blind by six independent sessions over disjoint ranges with
+> depth and flatness withheld in code. On the 671 fully-land windows:
 >
 > | depth band | n | % legible |
 > |---|---:|---:|
-> | under 20 | 10 | **50%** |
-> | 20–30 | 2 | 100% |
-> | **30–45** | 9 | **33%** |
-> | 45+ | 33 | **97%** |
+> | under 12 | 15 | 60% |
+> | 12–18 | 98 | **91%** |
+> | 18–27 | 212 | 86% |
+> | 27–30 | 79 | 77% |
+> | 30–45 | 251 | **63%** |
 >
-> The claim fails in both halves, and the relationship is **not monotonic**: the band immediately
-> above the proposed cutoff is the worst in the corpus. The thinnest legible window sits at **12.8**
-> observations and shows a river corridor and lobed cover boundaries; a fully-land window at **41.6**
-> is structureless confetti. Both were re-examined by eye rather than taken from the blind pass. So
-> **a 30 line refuses demonstrably legible ground and keeps demonstrably structureless windows** —
-> the opposite of its purpose in both directions. The only clean break is near 45, which no one has
-> proposed and which 2017 makes untenable.
+> Legibility FALLS as depth rises. Tested rather than asserted: latitude alone explains nothing, but
+> depth *within* the tropics — where 401 windows sit — runs 87% below 20 observations and 61% at
+> 30–45, while mid-latitudes are flat. Depth is a proxy for climate and climate is a proxy for how
+> much there is to see: the cloudiest tropics are rivers, clearings and smallholder farmland, and the
+> clear tropics are uniform ground. Per-cell legibility runs from **11%** (Saharan desert, deep and
+> empty) to **100%**.
 >
-> Two limits that keep this from being a refutation of the *rule* rather than of the *number*: thin
-> data and geography are entangled, since 8 of the 12 fully-land sub-30 windows come from one cell, so
-> that figure is substantially about the Congo basin in 2022; and **legibility is not utility** — the
-> picture is a 3-component projection of 128 dimensions, so a window a reader cannot interpret may
-> still carry signal a model uses. The rule's reputational argument rests on usefulness, which no
-> measurement has ever tested.
+> **Two numbers for whoever picks the line.** At every cutoff from 15 to 30, about **85% of what it
+> refuses is legible**; only at 12 does that drop to 60%. And the illegible share of what a cutoff
+> KEEPS rises monotonically, 18% at 12 to **30% at 30** — refusing more makes the surviving product
+> proportionally worse, because the unreadable windows are mostly the deep ones.
+>
+> **The limit that outranks all of this: legibility is not utility.** The picture is a 3-component
+> projection of 128 dimensions, and one reviewer measured seven of its illegible windows as carrying
+> coherent structure at a tenth of the amplitude the stretch renders visible. The rule's argument
+> rests on usefulness, which no measurement has tested and — with no downstream model in existence
+> (2026-08-13) — none can.
 >
 > **Everything else in this plan stands.** The registry, the per-shard record, the skip-marker payload
 > and the cycle model are all wanted whether the line refuses pixels or merely labels them.
