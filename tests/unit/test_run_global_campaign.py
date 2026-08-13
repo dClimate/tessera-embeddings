@@ -710,7 +710,8 @@ def test_sequential_strategy_dispatches_one_run_per_year(wired):
     params = wired["arun"][0][1]
     assert _dispatched_zones(params) == ["33N"] and params["cells"] == [["33N", 2025]]
     # One cluster, so it carries the whole ingest bound as its window.
-    assert params["ingest"] is True and params["look_ahead"] == 40
+    # One cluster, cap 40: width 40 means 39 cells BEYOND the current one.
+    assert params["ingest"] is True and 1 + params["look_ahead"] == 40
     assert params["ingest_deployment"] == "ingest-zone-year/ingest-zone-year"
     # Mosaic lifecycle belongs to the child in this mode.
     assert wired["deletes"] == []
@@ -754,13 +755,20 @@ def test_sequential_strategy_shards_by_live_tiles(wired, monkeypatch):
     clusters = [_dispatched_zones(p) for _, p in wired["arun"]]
     # LPT: 500 alone; 300+250 together — balanced totals (500 vs 550).
     assert sorted(map(sorted, clusters)) == [["33N"], ["34N", "35N"]]
-    # The global ingest bound is divided across clusters: 6 over 2 clusters = 3 each.
-    assert all(p["look_ahead"] == 3 for _, p in wired["arun"])
+    # The global ingest bound is divided across clusters: 6 over 2 clusters = 3 each,
+    # and a cluster's width is 1 + look_ahead.
+    assert all(1 + p["look_ahead"] == 3 for _, p in wired["arun"])
 
 
 class TestIngestBoundAcrossClusters:
-    """The per-cluster look-ahead IS that cluster's ingest concurrency, so the
-    fleet-wide figure is the per-cluster value times the cluster count.
+    """A cluster's ingest concurrency is ``1 + look_ahead``, because ``look_ahead``
+    counts the cells kept in flight BEYOND the current one — that is the contract
+    ``fill_zones_sequential`` states and sizes its driver by (``max_parallel=1 +
+    look_ahead``). So the fleet-wide figure is ``(1 + look_ahead) * clusters``.
+
+    These assert the WIDTH rather than the raw parameter: pinning the parameter is
+    what let the two ends of this contract disagree, with the campaign handing over a
+    cluster's whole share and the fill then adding one to it.
     """
 
     @staticmethod
@@ -781,7 +789,8 @@ class TestIngestBoundAcrossClusters:
                 max_parallel_ingest=ingest_cap,
             )
         )
-        return wired["arun"][0][1]["look_ahead"]
+        # The cluster's ingest WIDTH, which is what the cap is expressed in.
+        return 1 + wired["arun"][0][1]["look_ahead"]
 
     def test_an_exact_division_delivers_the_requested_width(self, wired, monkeypatch):
         assert self._look_ahead(wired, monkeypatch, zones=4, clusters=4, ingest_cap=8) == 2

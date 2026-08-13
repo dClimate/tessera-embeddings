@@ -120,15 +120,27 @@ def _resolve_run_id(previous_run_id: str | None, *, allow_s2_only: bool, assembl
 
 
 def _assert_resume_mode_matches(previous_run_id: str | None, *, allow_s2_only: bool, assembly_only: bool) -> None:
-    """The mode-mixing refusal alone, callable before any store is opened.
+    """The half of the mode-mixing refusal that the REQUEST alone can settle.
 
     :func:`_resolve_run_id` has to run LATE, because the flag it must encode is the
     config's effective one and that is not known until the orbit has been resolved
-    against the mosaic. But a resume whose staged mode already contradicts the REQUEST
-    can be refused straight away, and should be: the whole point of this check is that it
-    costs nothing, and a run that will refuse regardless should not open a store first.
+    against the mosaic. This is the part that can be decided before any store is opened,
+    and it is deliberately only HALF the check.
+
+    **Only the request-is-True direction.** The effective flag is forced ON — never off —
+    when the orbit resolves to ``"none"`` (:class:`InferenceConfig`), so a request of
+    ``False`` may still become ``True`` and legitimately match an S2-only staged run.
+    Refusing that here rejected exactly the resume it should allow: a radar-free ROI
+    staged under the forced flag, resumed with ``require_s1=False`` and the flag left at
+    its default. The opposite direction has no such escape — nothing forces the flag off,
+    so a request of ``True`` against a bare staged run contradicts whatever the orbit
+    resolves to, and is refused now rather than after a store probe.
+
+    The full comparison still happens, against ``config.allow_s2_only``, once the orbit
+    is known. This check narrows what reaches it; it does not replace it.
     """
-    _resolve_run_id(previous_run_id, allow_s2_only=allow_s2_only, assembly_only=assembly_only)
+    if allow_s2_only and not assembly_only and previous_run_id and not staged_s2_only_mode(previous_run_id):
+        _resolve_run_id(previous_run_id, allow_s2_only=allow_s2_only, assembly_only=assembly_only)
 
 
 def staged_s2_only_mode(previous_run_id: str | None) -> bool:

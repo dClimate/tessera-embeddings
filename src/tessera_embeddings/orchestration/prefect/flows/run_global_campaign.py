@@ -1142,16 +1142,30 @@ async def run_global_campaign(
                 # Each cluster's EVEN SHARE of the fleet-wide ingest cap, so the clusters
                 # divide it by construction rather than racing for slots on the global
                 # gate — which sets the hard ceiling, not who reaches it first. Rounded
-                # up: a share of zero would leave a cluster unable to start any zone, and
-                # flooring would silently deliver less ingest width than was asked for.
-                look_ahead = -(-max_parallel_ingest // len(clusters)) if clusters else 1
+                # up: flooring would silently deliver less ingest width than was asked for.
+                #
+                # MINUS ONE, because `look_ahead` counts cells BEYOND the current one:
+                # the fill runs `1 + look_ahead` ingests per cluster (its ingest driver is
+                # sized `max_parallel=1 + look_ahead`). Passing the whole share therefore
+                # aimed each cluster at `1 + share`, so the fleet asked for
+                # `(1 + share) * clusters` — 48 against a cap of 40 at the shipped 8
+                # clusters. The global gate still held the line, so this oversubscribed
+                # rather than breached: clusters queued on the gate, and the log below
+                # reported a width the fleet never ran at. Floored at 0 so a
+                # one-cell-at-a-time cluster can still start its current cell.
+                #
+                # Rounding up still overshoots by up to `clusters - 1` when the cap does
+                # not divide evenly (45 over 8 aims at 48); the gate remains the ceiling,
+                # and widening the share is the deliberate side to err on.
+                share = -(-max_parallel_ingest // len(clusters)) if clusters else 1
+                look_ahead = max(0, share - 1)
                 if ingest:
                     log.info(
                         "chained-clusters: %d cluster(s) x %d zone(s) at a time = %d simultaneous ingest(s), "
                         "hard-capped fleet-wide at max_parallel_ingest=%d by %r",
                         len(clusters),
-                        look_ahead,
-                        look_ahead * len(clusters),
+                        1 + look_ahead,
+                        (1 + look_ahead) * len(clusters),
                         max_parallel_ingest,
                         ingest_limit_name,
                     )
@@ -1270,12 +1284,45 @@ async def run_global_campaign(
                 )
             elif batch_cells:
                 log.info("Year(s) %s: dispatching %d zone fill(s)", batch_years, len(batch_cells))
-                # All zones in a year are distinct groups → safe to fill concurrently.
-                # The outer loop is serial, so the SAME zone never fills two years at once.
+
+                # Different zones are different store groups, so they fill concurrently.
+                # A zone's OWN years do not: they write the same group, and this used to
+                # rely on the outer loop being one-year-per-round to keep them apart —
+                # which `overlap_years` removed, putting every year of every zone into one
+                # batch and dispatching them all here at once. So the serialisation is
+                # done explicitly now rather than inherited from the loop shape.
                 # return_exceptions=True so a single zone's failure doesn't abandon its
                 # siblings mid-flight (default gather() would leave them running orphaned);
                 # we let the whole year settle, then fail loudly with every failure.
-                cell_results = await asyncio.gather(*(_process(z, y) for z, y in batch_cells), return_exceptions=True)
+                years_of: dict[str, list[int]] = {}
+                for z, y in batch_cells:
+                    years_of.setdefault(z, []).append(y)
+
+                async def _zone_years(zone: str, years: list[int]) -> list[Any]:
+                    """One zone's years, in order, stopping at its first failure.
+
+                    Later years are reported as the exception that stopped them rather
+                    than being dispatched, so a zone never has two years in flight and
+                    the round still accounts for every cell it was given.
+                    """
+                    out: list[Any] = []
+                    for y in years:
+                        if out and isinstance(out[-1], BaseException):
+                            out.append(out[-1])
+                            continue
+                        try:
+                            out.append(await _process(zone, y))
+                        except Exception as exc:  # mirrors gather(return_exceptions=True)
+                            out.append(exc)
+                    return out
+
+                per_zone = await asyncio.gather(*(_zone_years(z, ys) for z, ys in years_of.items()))
+                by_cell = {
+                    (z, y): r
+                    for (z, ys), rs in zip(years_of.items(), per_zone, strict=True)
+                    for y, r in zip(ys, rs, strict=True)
+                }
+                cell_results = [by_cell[(z, y)] for z, y in batch_cells]
                 for (z, y), cr in zip(batch_cells, cell_results, strict=True):
                     if isinstance(cr, BaseException):
                         round_failures.append(f"{z}-{y}: {cr!r}")
@@ -1378,9 +1425,7 @@ async def run_global_campaign(
         # the store.
         detail = "; ".join(f"{y}: {', '.join(z)}" for y, z in sorted(unfilled.items(), reverse=True))
         total = sum(len(z) for z in unfilled.values())
-        log.warning(
-            "=== CAMPAIGN FINISHED WITH %d UNFILLED CELL(S) — SECOND-WAVE LIST FOLLOWS ===", total
-        )
+        log.warning("=== CAMPAIGN FINISHED WITH %d UNFILLED CELL(S) — SECOND-WAVE LIST FOLLOWS ===", total)
         log.warning(
             "%d cell(s) did not land after up to %d dispatch round(s) each. Every OTHER cell is "
             "committed and tagged, so a re-run resumes from here and re-attempts only these. "

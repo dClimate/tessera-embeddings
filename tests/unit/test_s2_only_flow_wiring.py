@@ -146,16 +146,16 @@ def test_the_run_id_is_minted_from_the_effective_mode_not_the_requested_one(monk
     """
     monkeypatch.setattr(emb_mod, "get_run_logger", lambda: logging.getLogger("test-emb"))
     monkeypatch.setattr(emb_mod, "resolve_s1_orbit", lambda *a, **k: S1_ORBIT_NONE)
-    # Called TWICE: once as the early pre-I/O guard, on the request, and once to mint the
-    # id, on the config's effective flag. The minting call is the one under test.
+    # The mint is the call under test. The early guard no longer reaches _resolve_run_id
+    # on a fresh run at all: it can only settle the request-is-True direction, because
+    # the effective flag is forced ON and never off, so a request of False may still
+    # become True. Asserting the flag the MINT saw pins the behaviour this test names;
+    # asserting how many times the helper was called pinned the old implementation.
     calls: list[bool] = []
-    real = emb_mod._resolve_run_id
 
     def record(previous, *, allow_s2_only, assembly_only):
         calls.append(allow_s2_only)
-        if len(calls) > 1:
-            raise _StopError
-        return real(previous, allow_s2_only=allow_s2_only, assembly_only=assembly_only)
+        raise _StopError
 
     monkeypatch.setattr(emb_mod, "_resolve_run_id", record)
     with pytest.raises(_StopError):
@@ -167,7 +167,37 @@ def test_the_run_id_is_minted_from_the_effective_mode_not_the_requested_one(monk
             require_s1=False,
             allow_s2_only=False,  # requested off; the resolved orbit forces it on
         )
-    assert calls == [False, True], "the guard sees the request; the mint must see the effective mode"
+    assert calls == [True], "the mint must see the EFFECTIVE mode, not the request"
+
+
+def test_a_forced_s2_only_resume_is_not_refused_by_the_early_guard(monkeypatch) -> None:
+    """The false refusal the narrowed guard exists to stop.
+
+    A radar-free ROI stages under the FORCED flag, so its run_id carries the S2-only
+    prefix. Resuming it with ``require_s1=False`` and the flag left at its default had
+    the early guard compare the prefix against the REQUEST and refuse — before any orbit
+    was resolved, and for a resume that the late check (on the effective flag) accepts.
+    """
+    monkeypatch.setattr(emb_mod, "get_run_logger", lambda: logging.getLogger("test-emb"))
+    monkeypatch.setattr(emb_mod, "resolve_s1_orbit", lambda *a, **k: S1_ORBIT_NONE)
+    seen: list[bool] = []
+
+    def record(previous, *, allow_s2_only, assembly_only):
+        seen.append(allow_s2_only)
+        raise _StopError
+
+    monkeypatch.setattr(emb_mod, "_resolve_run_id", record)
+    with pytest.raises(_StopError):
+        emb_mod.tessera_embeddings.fn(
+            roi_name="demo",
+            time_window_end="June 2025",
+            paths=_PATHS,
+            ami_ssm_name="ami",
+            require_s1=False,
+            allow_s2_only=False,
+            dev_params=emb_mod.EmbeddingsDevParams(previous_run_id=f"{emb_mod.S2_ONLY_RUN_PREFIX}abc123def456"),
+        )
+    assert seen == [True], "the guard must defer to the effective flag, which is forced on"
 
 
 def test_an_assembly_only_resume_publishes_under_the_staged_mode() -> None:

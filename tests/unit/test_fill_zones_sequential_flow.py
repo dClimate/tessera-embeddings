@@ -177,7 +177,7 @@ class TestPerCellValidation:
     def test_the_assemble_callable_validates_the_cell_it_just_landed(self, wired, monkeypatch):
         handoff = self._landed(monkeypatch, {"zone": "33N", "year": 2025, "tag": "zone-33N-2025"})
         _run(zones=["33N"], validation_deployment="validate-zone-year/validate-zone-year-x")
-        assert wired["seq_kwargs"]["assemble"](handoff, SimpleNamespace(staging_base="s3://out/staging")) == {
+        assert wired["seq_kwargs"]["assemble"](handoff, SimpleNamespace(staging_base="s3://out/staging", input_coverage=None)) == {
             "zone": "33N",
             "year": 2025,
             "tag": "zone-33N-2025",
@@ -191,7 +191,7 @@ class TestPerCellValidation:
         """A summary missing its coordinates must not raise inside the assembly thread."""
         handoff = self._landed(monkeypatch, {"tag": "zone-33N-2025"})
         _run(zones=["33N"], validation_deployment="v/v")
-        wired["seq_kwargs"]["assemble"](handoff, SimpleNamespace(staging_base="s3://out/staging"))
+        wired["seq_kwargs"]["assemble"](handoff, SimpleNamespace(staging_base="s3://out/staging", input_coverage=None))
         (call,) = wired["validations"]
         assert (call["zone"], call["year"]) == ("33N", 2025)
 
@@ -208,7 +208,7 @@ class TestPerCellValidation:
         """The default: the library names no consumer's flow, so the ref is None."""
         handoff = self._landed(monkeypatch, {"zone": "33N", "year": 2025, "tag": "t"})
         _run(zones=["33N"])
-        wired["seq_kwargs"]["assemble"](handoff, SimpleNamespace(staging_base="s3://out/staging"))
+        wired["seq_kwargs"]["assemble"](handoff, SimpleNamespace(staging_base="s3://out/staging", input_coverage=None))
         assert [c["deployment"] for c in wired["validations"]] == [None]
 
 

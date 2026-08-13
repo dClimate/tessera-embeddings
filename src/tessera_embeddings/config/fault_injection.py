@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from collections.abc import Callable, Iterable
 from typing import Any, Literal, final
@@ -93,6 +94,10 @@ DRILL_EXIT_STATUS = 93
 #: fleet nothing will reclaim is the failure the drill exists to study rather than a
 #: way to study it. A request above this ceiling is rejected at validation.
 MAX_HOLD_MINUTES = 45.0
+
+#: The canonical UTM common name, i.e. exactly what ``zone_grid.canonicalize_zone``
+#: emits: zero-padded zone number 01-60 followed by the hemisphere.
+_CANONICAL_ZONE = re.compile(r"(0[1-9]|[1-5][0-9]|60)[NS]")
 
 #: How often a running hold restates itself. Frequent enough that an operator reading
 #: the log knows the idleness is deliberate, sparse enough not to bury the run's own
@@ -171,11 +176,18 @@ class FaultInjection(BaseModel):
             # site. Normalising would hide a request that does not say what its author
             # meant, and refusing at dispatch is the only point where a human is still
             # reading the error.
-            if self.zone != self.zone.upper():
+            # The FULL canonical form, not merely uppercase: ``"7N"``, ``"99N"`` and
+            # ``"33N "`` are all uppercase and all fail to equal the writer's ``"07N"``,
+            # so an uppercase-only check leaves exactly the silent-pass it was added to
+            # close. Matched against a literal pattern rather than
+            # ``zone_grid.canonicalize_zone`` because ``storage`` imports ``config`` and
+            # the reverse would cycle; the pattern IS that function's output format
+            # (zero-padded 01-60 plus hemisphere), and a unit test pins the two together.
+            if _CANONICAL_ZONE.fullmatch(self.zone) is None:
                 raise ValueError(
                     f"zone must be the canonical UTM common name (e.g. '33N', '07S'); got {self.zone!r}. "
-                    f"The writer compares against the canonicalized zone, so a lowercase request would "
-                    f"arm, log, and never fire — a drill that silently passes."
+                    f"The writer compares against the canonicalized zone, so a request in any other form "
+                    f"would arm, log, and never fire — a drill that silently passes."
                 )
             if self.hold_minutes is not None:
                 raise ValueError(f"{DIE_BETWEEN_COMMITS} holds nothing — drop hold_minutes")

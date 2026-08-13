@@ -973,7 +973,13 @@ def validate_zone_roi(
     if tuple(z.chunks) != (INGEST_CHUNK_SIZE, INGEST_CHUNK_SIZE):
         problems.append(f"chunks {tuple(z.chunks)} != ({INGEST_CHUNK_SIZE}, {INGEST_CHUNK_SIZE})")
     else:
-        grid = live_chunk_grid_from_keys(roi_path, z)
+        # The SAME options the array was opened with above. Listing the mask's chunk
+        # keys is a second, independent trip to the store, so a callback-only or
+        # non-default-region ROI opens fine here and then fails validation on a
+        # listing that carried no credentials.
+        grid = live_chunk_grid_from_keys(
+            roi_path, z, storage_options=plain_zarr_storage_options(roi_path, get_credentials, s3_region)
+        )
         if grid is None:
             problems.append("live chunk grid not recoverable from the mask's keys (ingest would fall back to scanning)")
         else:

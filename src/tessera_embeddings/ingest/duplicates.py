@@ -26,6 +26,8 @@ alternates only on a demonstrated read failure.
 
 from __future__ import annotations
 
+import datetime
+import itertools
 import logging
 import re
 from collections.abc import Iterable, Sequence
@@ -86,6 +88,59 @@ def _preference_key(item: Any) -> tuple[int, int, str]:  # noqa: ANN401 — any 
     return (-known, -(sequence or 0), str(getattr(item, "id", "")))
 
 
+#: How far apart two acquisition instants must be to be different acquisitions rather
+#: than reprocessings of one. Reprocessings carry the same instant to sub-second
+#: precision; the closest genuinely distinct pair observed on the live catalogue is a
+#: successive orbit ~50 minutes later, so this sits more than an order of magnitude
+#: clear of both populations and no plausible catalogue jitter reaches it.
+_SAME_ACQUISITION_S = 120.0
+
+
+def acquisition_instant(item: Any) -> datetime.datetime | None:  # noqa: ANN401 — any STAC-like item
+    """The instant an item was ACQUIRED, or ``None`` if it cannot be read.
+
+    Read from ``properties["datetime"]`` and never from ``item.datetime``, because by
+    the time duplicates are selected the latter has been overwritten with the canonical
+    noon-UTC solar-day stamp (:func:`normalize_to_solar_day`) and every copy of a day
+    therefore carries an identical value. The property is the only surviving record of
+    which acquisition a copy came from.
+    """
+    raw = item.properties.get("datetime")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        logger.debug("Unparseable datetime %r on %s", raw, getattr(item, "id", "?"))
+        return None
+
+
+def _by_acquisition(copies: list[Any]) -> list[list[Any]]:
+    """Split one tile-date's copies into one list per distinct acquisition.
+
+    Copies whose instant cannot be read stay together in a single group, which is the
+    pre-existing behaviour and the conservative one: without an instant there is no
+    evidence they are distinct, and treating them as distinct would keep duplicate
+    reprocessings and hand the loader exactly the fused-baseline problem this module
+    exists to prevent.
+    """
+    dated = [(inst, it) for it in copies if (inst := acquisition_instant(it)) is not None]
+    undated = [it for it in copies if acquisition_instant(it) is None]
+    if not dated:
+        return [copies]
+
+    dated.sort(key=lambda pair: pair[0])
+    clusters: list[list[Any]] = [[dated[0][1]]]
+    for previous, current in itertools.pairwise(dated):
+        if (current[0] - previous[0]).total_seconds() > _SAME_ACQUISITION_S:
+            clusters.append([current[1]])
+        else:
+            clusters[-1].append(current[1])
+    if undated:
+        clusters.append(undated)
+    return clusters
+
+
 def select_preferred_duplicates(
     items: Sequence[Any],
 ) -> tuple[list[Any], dict[tuple[str, str], list[Any]]]:
@@ -99,11 +154,24 @@ def select_preferred_duplicates(
     the radar path has no such duplicates, and an item we cannot key is safer kept than
     silently dropped.
 
+    **One per ACQUISITION, not one per day.** A tile-date can hold two genuinely different
+    acquisitions as well as reprocessings of one — at high latitude, successive orbits
+    revisit the same tile the same day. Those are separate imagery, mosaicked together by
+    the loader, and collapsing them to one copy silently discards coverage. Measured
+    against the live catalogue over eight tiles and 2021: keying on (tile, solar day) alone
+    dropped **493 of 2,733 items** as duplicates when they were distinct acquisitions —
+    nothing at all in the mid-latitude tiles, 196 of 500 at 33XVG and 297 of 500 at 22XER.
+    So copies are split by acquisition instant first, and only true reprocessings of one
+    acquisition compete on ``s2:sequence``.
+
     Returns:
         ``(kept, alternates)``. ``kept`` preserves the input order of the survivors, so a
-        caller's own sort still decides fusion order. ``alternates`` maps each
-        ``(tile, solar_day)`` that had more than one copy to the *rejected* copies, most
-        preferred first — the ladder a caller steps down when the chosen copy cannot be read.
+        caller's own sort still decides fusion order — and now holds one item per
+        acquisition, so a tile-date with two acquisitions keeps both. ``alternates`` maps
+        each ``(tile, solar_day)`` that had a rejected copy to those copies, most preferred
+        first — the ladder a caller steps down when a chosen copy cannot be read. It stays
+        keyed by tile-date rather than by acquisition because that is the granularity a
+        read failure is attributed at.
     """
     groups: dict[tuple[str, str], list[Any]] = {}
     ungrouped: list[Any] = []
@@ -119,10 +187,13 @@ def select_preferred_duplicates(
     survivors: set[int] = {id(it) for it in ungrouped}
     alternates: dict[tuple[str, str], list[Any]] = {}
     for key, copies in groups.items():
-        ranked = sorted(copies, key=_preference_key)
-        survivors.add(id(ranked[0]))
-        if len(ranked) > 1:
-            alternates[key] = ranked[1:]
+        rejected: list[Any] = []
+        for acquisition in _by_acquisition(copies):
+            ranked = sorted(acquisition, key=_preference_key)
+            survivors.add(id(ranked[0]))
+            rejected.extend(ranked[1:])
+        if rejected:
+            alternates[key] = sorted(rejected, key=_preference_key)
 
     kept = [it for it in items if id(it) in survivors]
     return kept, alternates

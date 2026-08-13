@@ -178,8 +178,16 @@ def _run_inference_and_assemble(
     #
     # Radar is DEMANDED here, matching the single-cell flows: this runner exists to fill
     # one named ROI on one machine, so no radar at all is far more likely to be a broken
-    # ingest than genuinely radar-free terrain, and the operator should be told. A caller
-    # filling radar-free land passes ``s1_orbit`` explicitly.
+    # ingest than genuinely radar-free terrain, and the operator should be told.
+    #
+    # THERE IS NO ESCAPE HATCH, deliberately, and ``s1_orbit: none`` in the YAML is not
+    # one: it is refused here even though ``_run_ingest`` accepts it and writes
+    # reflectance alone. Honouring it would let a run that demanded radar publish
+    # optical-only embeddings and report success, which is the outcome ``require_s1``
+    # exists to prevent — pinned by ``test_asking_for_no_radar_while_demanding_radar_is
+    # _refused``. Radar-free land is filled through the campaign flows, which pass the
+    # resolved orbit back in with radar allowed. (An earlier version of this comment
+    # said a caller "passes s1_orbit explicitly"; that was never true of this runner.)
     effective_orbit = resolve_s1_orbit(mosaic_base, s1_orbit, allow_none=False)
     config = build_inference_config(
         s1_orbit=effective_orbit,

@@ -1048,7 +1048,11 @@ def fill_zones_sequential_flow(
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
         )
-        check_time_window_coverage(
+        # KEPT, not just gated on. The summary names the months and dates the mosaics
+        # actually held; the mosaics are deleted once the cell lands, so if it is dropped
+        # here nothing downstream can ever recover it — and a cell filled with
+        # ``allow_partial_window`` would publish with no record of what was missing.
+        coverage = check_time_window_coverage(
             mosaic_base,
             _window_for(cell.year),
             s1_orbit=resolved,
@@ -1072,6 +1076,7 @@ def fill_zones_sequential_flow(
                 s3_region=s3_region,
             ),
             config=_config_for(resolved, cell.year),
+            input_coverage=coverage,
         )
 
     # One assembly at a time trails the live cell's staging writes, so split
@@ -1188,6 +1193,7 @@ def fill_zones_sequential_flow(
                 handoff,
                 store_path=store_path,
                 staging_base=prep.staging_base,
+                input_coverage=prep.input_coverage,
                 log=log,
                 gate=gate,
                 s3_concurrency=s3_concurrency,

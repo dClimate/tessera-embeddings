@@ -267,6 +267,12 @@ class PreparedCell:
     staging_base: str
     run_id: str
     config: InferenceConfig
+    #: What the preflight coverage gate SAW in the mosaics — which months and dates were
+    #: actually present, not merely that enough of them were. It is measured once, here,
+    #: and is unrecoverable afterwards: the mosaics are deleted as soon as the cell lands.
+    #: Carried so ``assemble_zone_year`` can persist it in the zone-year's provenance,
+    #: which is the only durable record for a cell filled under ``allow_partial_window``.
+    input_coverage: dict | None = None
 
 
 @dataclass
@@ -489,11 +495,27 @@ def fill_zones_sequential(
                 return
             handoff = complete_zone_inference(tally.plan, results=tally.results)
             _record_outcome(assemble(handoff, prep))
-            if inputs is not None:
-                inputs.cleanup(cell.zone, cell.year)
-                cleaned = True
         except Exception as exc:
             _record_failure(cell, "assembly", exc)
+        else:
+            # OUTSIDE the assembly try, because by here the cell is committed, tagged
+            # and already recorded as a success. Deleting its mosaics is housekeeping
+            # on work that has landed, so a transient S3 error or a missing delete
+            # permission must not append a second, contradictory `assembly` failure for
+            # the same cell — which is what sharing the block above did, and it also
+            # retained the mosaic against the failure cap and could stall the feeder.
+            # The mosaic is still retained on this path; it is simply not a failure.
+            if inputs is not None:
+                try:
+                    inputs.cleanup(cell.zone, cell.year)
+                    cleaned = True
+                except Exception:
+                    log.exception(
+                        "Mosaic cleanup failed for %s-%s AFTER the cell landed; the cell stands, "
+                        "its mosaics are retained and will need sweeping.",
+                        cell.zone,
+                        cell.year,
+                    )
         finally:
             # Success → free the slot (clean); failure → retain the mosaic for
             # resume but free + COUNT the slot (bounded by the retained-failure

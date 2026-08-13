@@ -231,3 +231,69 @@ class TestWhenToStepDown:
 
     def test_an_unrelated_failure_does_not_step_down(self) -> None:
         assert not is_unreadable_source(ValueError("some unrelated bug"))
+
+
+class TestDistinctAcquisitionsOnOneDay:
+    """A tile-date can hold two ACQUISITIONS, not just two copies of one.
+
+    At high latitude successive orbits revisit a tile the same day. Those are separate
+    imagery that the loader mosaics together, so collapsing them to one copy discards
+    coverage silently. Measured on the live catalogue over eight tiles across 2021,
+    keying on (tile, solar day) alone discarded 493 of 2,733 items as duplicates when
+    they were distinct acquisitions — none in the mid-latitude tiles, 196 of 500 at
+    33XVG and 297 of 500 at 22XER.
+    """
+
+    @staticmethod
+    def _at(ident: str, acquired: str, sequence: str = "0") -> _Item:
+        """A copy carrying its ACQUISITION instant, as the catalogue supplies it.
+
+        ``properties["datetime"]`` and not ``item.datetime``: normalize_to_solar_day has
+        already overwritten the latter with the canonical noon stamp by this point, so the
+        property is the only surviving record of which acquisition a copy came from.
+        """
+        return _Item(ident, "MGRS-33XVG", sequence, **{"datetime": acquired})
+
+    def test_two_acquisitions_on_one_day_both_survive(self) -> None:
+        first = self._at("S2A_33XVG_20210908_0_L2A", "2021-09-08T10:20:31.024000Z")
+        second = self._at("S2B_33XVG_20210908_0_L2A", "2021-09-08T11:10:14.512000Z")
+        kept, alternates = select_preferred_duplicates([first, second])
+        assert kept == [first, second]
+        assert alternates == {}
+
+    def test_reprocessings_of_one_acquisition_still_reduce_to_one(self) -> None:
+        """The behaviour the module exists for, unchanged: same instant, different
+        sequence, newest kept and the older offered as the fallback."""
+        old = self._at("S2B_33XVG_20210908_0_L2A", "2021-09-08T10:20:31.024000Z", "0")
+        new = self._at("S2B_33XVG_20210908_1_L2A", "2021-09-08T10:20:31.024000Z", "1")
+        kept, alternates = select_preferred_duplicates([old, new])
+        assert kept == [new]
+        assert alternates == {("MGRS-33XVG", "2021-09-08"): [old]}
+
+    def test_each_acquisition_is_deduplicated_on_its_own(self) -> None:
+        """Both at once — two acquisitions, each reprocessed. One survivor per
+        acquisition, and both rejected copies reachable through the ladder."""
+        a_old = self._at("S2A_33XVG_20210908_0_L2A", "2021-09-08T10:20:31.024000Z", "0")
+        a_new = self._at("S2A_33XVG_20210908_1_L2A", "2021-09-08T10:20:31.024000Z", "1")
+        b_old = self._at("S2B_33XVG_20210908_0_L2A", "2021-09-08T11:10:14.512000Z", "0")
+        b_new = self._at("S2B_33XVG_20210908_1_L2A", "2021-09-08T11:10:14.512000Z", "1")
+        kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
+        assert kept == [a_new, b_new]
+        assert set(alternates[("MGRS-33XVG", "2021-09-08")]) == {a_old, b_old}
+
+    def test_sub_second_jitter_is_one_acquisition(self) -> None:
+        """Reprocessings differ in the microseconds of an otherwise identical instant.
+        Splitting on that would keep every reprocessing and defeat the module."""
+        old = self._at("S2B_33XVG_20210908_0_L2A", "2021-09-08T10:20:31.024000Z", "0")
+        new = self._at("S2B_33XVG_20210908_1_L2A", "2021-09-08T10:20:31.026000Z", "1")
+        kept, _ = select_preferred_duplicates([old, new])
+        assert kept == [new]
+
+    def test_copies_without_an_instant_keep_the_old_behaviour(self) -> None:
+        """No instant is no evidence of distinctness, so they compete as before —
+        which is what keeps a catalogue that stops publishing the field from
+        silently retaining every reprocessing."""
+        old, new = _pair()
+        kept, alternates = select_preferred_duplicates([old, new])
+        assert kept == [new]
+        assert alternates == {("MGRS-34WFA", "2021-09-08"): [old]}
