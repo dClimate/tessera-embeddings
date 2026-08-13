@@ -34,6 +34,9 @@ context_docs/
     ├── campaign_inference_profile_2026_08.md     measured per-cell inference behaviour
     ├── inference_cost_basis_revision_2026_08.md  the working behind cost-model §6b
     ├── radar_source_coverage_2026_08.md          which zones publish no usable radar
+    ├── optical_depth_census_2026_08.md           how much of the product is optically thin, and where
+    ├── minimum-optical-depth-plan.md             UNBUILT; its threshold is REOPENED, the rest approved
+    ├── window_legibility_vs_depth_2026_08.md     blind test of "crisp at 30 obs" — it does not hold
     ├── inference-perf-run-ledger.md              raw per-run measurements
     │
     │  INGEST

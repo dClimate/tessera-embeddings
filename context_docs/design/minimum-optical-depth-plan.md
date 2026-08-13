@@ -1,7 +1,12 @@
 # Minimum optical depth: refuse pixels below 30 observations — implementation plan
 
-**Status:** approved, not yet built. Handoff document for the implementing model.
-**Decision date:** 2026-08-13. **Evidence:** [`optical_depth_census_2026_08.md`](optical_depth_census_2026_08.md).
+**Status:** not yet built. Everything except the threshold itself is approved and ready to implement.
+**The value 30 is REOPENED (2026-08-13):** a blind re-measurement of the evidence behind it does not
+support it — see the box in §1 and
+[`window_legibility_vs_depth_2026_08.md`](window_legibility_vs_depth_2026_08.md). Build the registry,
+the per-shard record and the cycle model; do not enforce a refusal until the line is settled.
+**Decision date:** 2026-08-13. **Evidence:** [`optical_depth_census_2026_08.md`](optical_depth_census_2026_08.md)
+for the pixel-vs-shard arithmetic, and the legibility report for the threshold.
 
 ---
 
@@ -39,18 +44,36 @@ across 15 cells. 30 is the conservative end of that band.
 >    mean 46.9 holds windows at 34.5 and 61.0, and its *thinnest* window is the one with the most
 >    structure. Each window now records its own mean and tenth percentile.
 >
-> The re-measurement is a blind one — 73 windows from 9 cells spanning **13 to 98** observations per
-> pixel, with 18 of them below the 30 line, reviewed for whether ground features are nameable, with
-> depth withheld from the reviewer and joined afterwards. It also carries a confound it cannot
-> remove and must therefore report: **a uniform biome is illegible at any depth**, so desert,
-> unbroken canopy and open water read like thin data. One pair already visible in the corpus makes
-> the point — at 13 observations, one window is the most structured in its cell while three of its
-> neighbours at the same depth have almost no structure at all.
+> **The re-measurement has now been taken, and it does not support the line.** Full report:
+> [`window_legibility_vs_depth_2026_08.md`](window_legibility_vs_depth_2026_08.md). 73 windows from 9
+> cells spanning 13 to 98 observations per pixel, blind — depth withheld from the reviewer in code and
+> joined afterwards. Restricted to the 54 fully-land windows, which is the only comparison that
+> isolates depth from how much of a frame is water:
 >
-> **What the re-measurement can change:** the value, or the decision to refuse at all. What it
-> cannot change is the shape of everything else here, which is why the rest of this plan is worth
-> building either way — the registry, the per-shard record and the cycle model are all wanted even
-> if the line moves or becomes a label again.
+> | depth band | n | % legible |
+> |---|---:|---:|
+> | under 20 | 10 | **50%** |
+> | 20–30 | 2 | 100% |
+> | **30–45** | 9 | **33%** |
+> | 45+ | 33 | **97%** |
+>
+> The claim fails in both halves, and the relationship is **not monotonic**: the band immediately
+> above the proposed cutoff is the worst in the corpus. The thinnest legible window sits at **12.8**
+> observations and shows a river corridor and lobed cover boundaries; a fully-land window at **41.6**
+> is structureless confetti. Both were re-examined by eye rather than taken from the blind pass. So
+> **a 30 line refuses demonstrably legible ground and keeps demonstrably structureless windows** —
+> the opposite of its purpose in both directions. The only clean break is near 45, which no one has
+> proposed and which 2017 makes untenable.
+>
+> Two limits that keep this from being a refutation of the *rule* rather than of the *number*: thin
+> data and geography are entangled, since 8 of the 12 fully-land sub-30 windows come from one cell, so
+> that figure is substantially about the Congo basin in 2022; and **legibility is not utility** — the
+> picture is a 3-component projection of 128 dimensions, so a window a reader cannot interpret may
+> still carry signal a model uses. The rule's reputational argument rests on usefulness, which no
+> measurement has ever tested.
+>
+> **Everything else in this plan stands.** The registry, the per-shard record, the skip-marker payload
+> and the cycle model are all wanted whether the line refuses pixels or merely labels them.
 
 The census that produced the campaign figures measured **shard means**, and this rule
 refuses **individual pixels** — a different question, and the class of error the
