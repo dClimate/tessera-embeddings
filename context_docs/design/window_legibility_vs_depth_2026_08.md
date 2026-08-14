@@ -331,3 +331,59 @@ zone's: it appears in all four pairs, thin against deep within each — 1.2×, 2
 > exactly what separating 20 from 25 from 30 requires. The bin edges above are mine, not the data's.
 > More sampling is the fix and it is cheap: this run took about fifteen minutes and a dollar, and only
 > four of seven zone pairs yielded comparable blocks at all.
+
+---
+
+## 11. Where the curve breaks: 741 matched blocks, 2026-08-13
+
+The first overlap sweep established the direction with twelve blocks below thirty observations and
+could not locate anything. This one stratifies by depth — a block's depth is screened from the count
+array before either embedding is read, and sixteen blocks are taken from each qualifying shard — so
+the budget goes where the question is. **813 blocks across five adjacent zone pairs, 741 of them at
+matched depth.**
+
+**The floor is 0.00040**, the median distance between two independent embeddings of the same ground
+where both runs saw forty or more observations. That is as well as this pipeline ever agrees with
+itself, and every figure below is against it.
+
+| shallower side | n | median distance | against the floor |
+|---|---:|---:|---:|
+| under 15 | 36 | 0.00088 | 2.21× |
+| 15–20 | 76 | 0.00152 | **3.83×** |
+| 20–25 | 114 | 0.00135 | **3.40×** |
+| **25–30** | 114 | 0.00077 | **1.93×** |
+| 30–35 | 159 | 0.00057 | 1.43× |
+| 35–40 | 22 | 0.00048 | 1.22× |
+| 40+ | 220 | 0.00040 | 1.00× |
+
+**The elbow is at 25.** Reproducibility runs between three and four times the floor everywhere below
+25 observations, then **halves** crossing into the 25–30 band, and closes on the floor slowly after
+that. The single largest improvement available from any cutoff in this range is the one at 25.
+
+Read as a decision, cutting at each candidate:
+
+| cutoff | blocks refused | refused side, against floor | kept side, against floor |
+|---|---:|---:|---:|
+| 20 | 112 | 3.11× | 1.64× |
+| **25** | 226 | **3.15×** | **1.33×** |
+| 30 | 340 | 2.94× | 1.22× |
+| 35 | 499 | 2.36× | 1.06× |
+
+**Choosing 30 over 25 buys little and costs roughly double.** The kept side improves from 1.33× the
+floor to 1.22× while the refused population grows by half again — and by 35 the cutoff is eating data
+that is already near the floor, which is what the falling refused-side column shows.
+
+**Three things this does not say.**
+
+The bottom bin is not the worst: under 15 observations reproducibility is *better* than at 15–20
+(2.21× against 3.83×). One coherent explanation is that agreement needs either the same few inputs or
+enough inputs that the sample stops mattering, and the middle is where two runs most easily see
+different halves of a moderate set. It is an observation from 36 blocks, not a finding.
+
+**The effect is not universal.** Thin against deep within each pair: 3.0×, 2.8×, 2.1× — and then 1.1×
+and 1.1× for the two pairs that both involve zone 48S, which are poor at *every* depth (about 0.0016
+either side). Whatever is wrong there is not depth, and it is worth a look on its own.
+
+And this is reproducibility, not accuracy. Two runs agreeing tells you the pipeline is stable at that
+depth; it does not tell you the embedding is right. That question still has no measurement, and with
+no downstream model in existence it cannot get one.
