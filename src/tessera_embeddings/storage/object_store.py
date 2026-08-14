@@ -8,6 +8,11 @@ recursive ``rm`` if s5cmd is unavailable. The fallback is best-effort: fsspec
 cannot remove non-current versions, so a warning is logged when it is used on a
 versioned bucket.
 
+**The delete is verified, not reported.** A tool's count of what it removed says
+nothing about what is left, and a prefix that keeps some of its objects is worse
+than one that keeps all of them: chunks with no store read as a corrupted mosaic
+to whatever next tries to write there.
+
 Subprocess + fsspec only (no boto3), so this stays outside ``providers/aws``.
 """
 
@@ -47,6 +52,65 @@ def _s5cmd_rm(uri: str, log: _Log, *, all_versions: bool) -> None:
     log.info("s5cmd deleted %d object(s) from %s", n, uri)
 
 
+#: How many times a prefix is re-deleted before its survivors are reported. A delete that
+#: reports success can still leave objects behind, so one extra pass is worth taking; more
+#: than a couple means something other than a lost listing page is keeping them alive, and
+#: repeating will not find it.
+_DELETE_PASSES = 3
+
+
+class PrefixNotEmptyError(RuntimeError):
+    """A delete ran to completion and objects are still there.
+
+    Distinct from the s5cmd failures beside it because it needs the opposite response: those
+    mean the tool could not run and fsspec should try instead, this means the work was done
+    and did not take. Retrying it another way finds the same survivors.
+    """
+
+
+def _survivors(uri: str, log: _Log) -> list[str] | None:
+    """Objects still under *uri*, or None if the prefix could not be listed.
+
+    ``None`` is not "empty": a listing that failed proves nothing, and reporting it as a
+    clean prefix is how an unverified delete comes to look verified.
+    """
+    try:
+        fs = fsspec.filesystem(fsspec.utils.get_protocol(uri))
+        fs.invalidate_cache(uri)  # the delete just changed what a cached listing would say
+        return list(fs.find(uri))
+    except Exception:  # an unreadable prefix is unknown, never clean
+        log.warning("Could not list %s to confirm the delete", uri, exc_info=True)
+        return None
+
+
+def _s5cmd_rm_verified(uri: str, log: _Log, *, all_versions: bool) -> None:
+    """``s5cmd rm`` the prefix, then READ IT BACK, retrying while objects survive.
+
+    s5cmd reported deleting 145,195 objects from one cell's mosaics and exited zero, and 807 of
+    them were still there — hours older than the delete, so not a race with a writer. A count of
+    what a tool says it removed is not a statement about what is left, and the residue is not
+    inert: the next ingest of that cell finds a prefix holding chunks and no store, which is
+    indistinguishable from a corrupted mosaic.
+
+    Raises:
+        FileNotFoundError, RuntimeError: from :func:`_s5cmd_rm` — the tool could not run.
+        PrefixNotEmptyError: the tool ran and the prefix is still not empty.
+    """
+    for attempt in range(1, _DELETE_PASSES + 1):
+        _s5cmd_rm(uri, log, all_versions=all_versions)
+        left = _survivors(uri, log)
+        if left is None or not left:
+            return
+        log.warning(
+            "%d object(s) survived pass %d of the delete of %s (e.g. %s)",
+            len(left),
+            attempt,
+            uri,
+            left[0],
+        )
+    raise PrefixNotEmptyError(uri)
+
+
 def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = True, strict: bool = False) -> None:
     """Delete every object under *uri* (a directory-like prefix).
 
@@ -59,21 +123,37 @@ def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = Tru
         all_versions: Pass ``--all-versions`` to s5cmd so a versioned bucket does
             not accumulate non-current versions (the default; the reason this
             helper exists).
-        strict: When True, RAISE if the delete does not succeed. Best-effort
-            (default) is right for post-success cleanup (staging, tagged mosaics);
-            strict is for callers that must not proceed onto un-cleared data (e.g.
-            rebuilding a stale mosaic before re-ingest).
+        strict: When True, RAISE if the delete does not succeed — including when it ran
+            and left objects behind, which is the case a returned success used to hide.
+            Best-effort (default) is right for post-success cleanup (staging, tagged
+            mosaics); strict is for callers that must not proceed onto un-cleared data
+            (e.g. rebuilding a stale mosaic before re-ingest).
     """
     log = log or logger
     log.info("Deleting prefix: %s", uri)
 
     if fsspec.utils.get_protocol(uri) == "s3":
         try:
-            _s5cmd_rm(uri, log, all_versions=all_versions)
+            _s5cmd_rm_verified(uri, log, all_versions=all_versions)
+        # BEFORE the RuntimeError arm, which is its base class: except clauses match in order,
+        # so the general one would swallow every survivor into the fsspec fallback.
+        except PrefixNotEmptyError:
+            # The delete ran and did not finish the job. Falling back to fsspec would re-run the
+            # same failing work serially, so report and let the caller's own bar decide.
+            if strict:
+                raise
+            log.error(
+                "%s still holds objects after %d delete passes — a later ingest there will find "
+                "residue, not a clean prefix",
+                uri,
+                _DELETE_PASSES,
+            )
             return
         except (FileNotFoundError, RuntimeError) as exc:
             versions_note = " (non-current versions may remain)" if all_versions else ""
             log.warning("s5cmd rm of %s failed (%s) — falling back to fsspec%s", uri, exc, versions_note)
+        else:
+            return
 
     try:
         fs = fsspec.filesystem(fsspec.utils.get_protocol(uri))
