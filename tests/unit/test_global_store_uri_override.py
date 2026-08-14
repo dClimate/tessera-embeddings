@@ -85,3 +85,36 @@ def test_an_empty_override_derives_rather_than_returning_nothing(empty) -> None:
     like. Treating it as an override would ask Icechunk to open ``""``.
     """
     assert _paths(global_store_uri=empty).global_store() == "s3://out/global/tessera.icechunk"
+
+
+class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
+    """The registry is derived from the store's own location, never from ``outputs``.
+
+    Production publishes to a bucket that is not ours, so a registry built from ``outputs`` would
+    sit in our bucket while the store sat in the public one — and every tool would still work, which
+    is how a mask written where nothing reads it looks like success.
+    """
+
+    def test_a_derived_store_gets_a_derived_registry_beside_it(self):
+        paths = BucketPaths(inputs="s3://in", outputs="s3://out")
+        assert paths.global_store() == "s3://out/global/tessera.icechunk"
+        assert paths.optical_registry() == "s3://out/global/tessera.registry"
+
+    def test_an_overridden_store_takes_its_registry_with_it(self):
+        """The two prefixes named in the Open Data access request, and the reason they are two:
+        Icechunk owns every key under its own prefix, so the registry cannot live inside it."""
+        paths = BucketPaths(
+            inputs="s3://in",
+            outputs="s3://out",
+            global_store_uri="s3://tessera-embeddings/v1.1/dclimate.icechunk",
+        )
+        assert paths.optical_registry() == "s3://tessera-embeddings/v1.1/dclimate.registry"
+
+    def test_the_registry_is_never_inside_the_store(self):
+        """Icechunk's garbage collection enumerates its own prefix and reconciles it against its
+        manifests, so a parquet in there is at best unrecognised and at worst collected."""
+        for paths in (
+            BucketPaths(inputs="s3://in", outputs="s3://out"),
+            BucketPaths(inputs="s3://in", outputs="s3://out", global_store_uri="s3://pub/v1/x.icechunk"),
+        ):
+            assert not paths.optical_registry().startswith(paths.global_store() + "/")

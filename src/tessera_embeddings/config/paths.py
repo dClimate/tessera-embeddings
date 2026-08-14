@@ -118,6 +118,29 @@ class BucketPaths(BaseModel):
             return self.global_store_uri
         return posixpath.join(self.outputs, "global", f"{name}.icechunk")
 
+    def optical_registry(self) -> str:
+        """Return the URI of the per-shard registry that sits BESIDE the published store.
+
+        A Parquet dataset indexing what the store contains per shard and year — what was embedded,
+        what was refused and how close the refusals were to the line — so a consumer can answer
+        "is my area covered, and how well" with one read instead of opening a petabyte.
+
+        **Derived from the store's own location, never from ``outputs``.** Production publishes to a
+        bucket that is not ours through :attr:`global_store_uri`, so a registry built from
+        ``outputs`` would sit in our bucket while the store sat in the public one — and every tool
+        would still work, which is exactly how a mask written where nothing reads it looks like
+        success. Deriving it from :meth:`global_store` makes the two move together by construction.
+
+        A SIBLING of the store rather than a path inside it, because Icechunk owns every key under
+        its own prefix: its garbage collection enumerates that prefix and reconciles it against its
+        own manifests, so a Parquet file living there is at best unrecognised and at worst
+        collected.
+        """
+        store = self.global_store()
+        base, _, name = store.rpartition("/")
+        stem = name[: -len(".icechunk")] if name.endswith(".icechunk") else name
+        return f"{base}/{stem}.registry"
+
     def land_mask_store(self, name: str = "global") -> str:
         """Return the URI of the campaign land-mask coverage Icechunk repo.
 
