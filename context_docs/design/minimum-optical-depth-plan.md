@@ -1,10 +1,18 @@
 # Minimum optical depth: refuse pixels below 30 observations — implementation plan
 
-**Status:** not yet built. Everything except the threshold itself is approved and ready to implement.
-**The value 30 is REOPENED (2026-08-13):** a blind re-measurement of the evidence behind it does not
-support it — see the box in §1 and
-[`window_legibility_vs_depth_2026_08.md`](window_legibility_vs_depth_2026_08.md). Build the registry,
-the per-shard record and the cycle model; do not enforce a refusal until the line is settled.
+**Status:** partly built. **The line is 25**, on evidence gathered 2026-08-13 after the proposed 30
+was reopened: reproducibility measured on 741 blocks of doubly-embedded ground runs three to four
+times the pipeline's own floor everywhere below 25 observations and halves crossing into 25–30, so 25
+is where the largest available improvement sits and 30 buys 1.33× against 1.22× for roughly double the
+data discarded (§11 of the report). It remains a PLACEHOLDER in code until a store is seeded, because
+the root attr is write-once and a seed makes it permanent.
+
+**The evidence changed twice and the record of that matters more than the number.** The original 30
+rested on how the pictures looked; blind re-measurement showed legibility was tracking rendered
+contrast rather than information, and spatial organisation is flat across 12 to 45 observations. What
+supports a line at all is reproducibility — two independent embeddings of the same ground disagree
+several times more when it is thin — which is a different claim, arrived at by a different route, and
+still not a claim about accuracy.
 **Decision date:** 2026-08-13. **Evidence:** [`optical_depth_census_2026_08.md`](optical_depth_census_2026_08.md)
 for the pixel-vs-shard arithmetic, and the legibility report for the threshold.
 
