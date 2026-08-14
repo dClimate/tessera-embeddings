@@ -112,6 +112,9 @@ def wired(monkeypatch):
     # Seeded-model gate: real in production (a metadata read of the store root),
     # stubbed here so tests exercise dispatch rather than store contents.
     monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
+    # The staging fingerprint now includes the store's depth rule, which is read from the
+    # store root — stubbed here like the model gate beside it.
+    monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: None)
     # Store reads for the staging fingerprint: each mosaic store's branch-tip snapshot
     # (the authoritative term) plus its provenance attrs.
     monkeypatch.setattr(
@@ -1305,3 +1308,27 @@ def test_overlap_years_still_reports_unfilled_cells_per_year(wired, monkeypatch)
     # Both years accounted for SEPARATELY, each with its zone: one run spanning years must not
     # collapse into one entry, because the second wave is dispatched per cell.
     assert summary["unfilled"] == {2024: ["01N"], 2025: ["01N"]}, summary["unfilled"]
+
+
+def test_the_staging_fingerprint_changes_with_the_stores_depth_rule(wired, monkeypatch):
+    """Staging lives under `outputs/staging/{zone}/{year}` — not namespaced by store.
+
+    So re-running the same mosaics into a store with a different `optical_min_obs` would
+    otherwise resume tiles staged under the OLD rule and publish a mix of two depth
+    policies under one fingerprint. Same reasoning as `allow_s2_only`, which is already
+    in the key.
+    """
+    common = {
+        "inputs_bucket": "s3://in",
+        "min_valid_coverage": 0.001,
+        "s1_orbit": "both",
+        "allow_partial_window": False,
+        "allow_s2_only": False,
+        "code_identity": "code=x",
+    }
+    monkeypatch.setattr(mod, "ingest_marker_identity", lambda *a, **k: "mosaic=1", raising=False)
+    at_25 = mod._staging_run_id("33N", 2025, optical_min_obs=25, **common)
+    at_30 = mod._staging_run_id("33N", 2025, optical_min_obs=30, **common)
+    at_none = mod._staging_run_id("33N", 2025, optical_min_obs=None, **common)
+    assert len({at_25, at_30, at_none}) == 3, "each rule must own its staging prefix"
+    assert at_25 == mod._staging_run_id("33N", 2025, optical_min_obs=25, **common), "and be stable"

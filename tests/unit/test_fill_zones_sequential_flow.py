@@ -72,6 +72,8 @@ def wired(monkeypatch):
 
     monkeypatch.setattr(mod, "fill_zone_year", fake_no_cluster_fill)
     monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: rec["order"].append("model_guard"))
+    # The chained path reads the depth rule off the store root, like the per-cell flow.
+    monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: None)
     monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(**k))
     monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
     monkeypatch.setattr(mod, "check_time_window_coverage", lambda *a, **k: None)
@@ -1119,3 +1121,32 @@ def test_no_pause_gate_passes_no_callable(wired):
     """
     _run(zones=["33N"])
     assert wired["seq_kwargs"]["paused"] is None
+
+
+def test_the_chained_fill_applies_the_rule_its_store_advertises(wired, monkeypatch) -> None:
+    """The DEFAULT campaign strategy was reading no depth rule at all.
+
+    `fill_zone_year` resolves `optical_min_obs` from the store root, but this path built its
+    config without it — so a store seeded with a minimum would have published pixels below
+    its own advertised line, through the strategy the campaign actually runs.
+    """
+    built: list[dict] = []
+
+    def record(**kwargs):
+        built.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(mod, "build_inference_config", record)
+    monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: 25)
+    _run(zones=["33N"])
+    assert built, "no InferenceConfig was built"
+    assert {c.get("optical_min_obs") for c in built} == {25}, "the store's rule must reach every cell's config"
+
+
+def test_a_store_declaring_no_rule_leaves_the_config_unconstrained(wired, monkeypatch) -> None:
+    """Stores seeded before the rule existed carry no attr, and must keep filling as before."""
+    built: list[dict] = []
+    monkeypatch.setattr(mod, "build_inference_config", lambda **k: built.append(k) or SimpleNamespace(**k))
+    monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: None)
+    _run(zones=["33N"])
+    assert built and {c.get("optical_min_obs") for c in built} == {None}

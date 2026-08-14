@@ -439,9 +439,6 @@ def ingest_s2_roi_reflectance(
     total_processed = 0
     total_filtered = 0
     total_seen = 0
-    #: Rejected duplicate copies, keyed by (tile, solar day) — the fallback ladder.
-    #: Accumulated across every supply because a streamed month contributes its own.
-    date_alternates: dict[tuple[str, str], list] = {}
     #: Tile-dates whose every copy failed to read. Their pixels are absent from the mosaic,
     #: so this is the ONLY record of where the loss is; it is re-stated at the end of the run.
     unreadable_tile_dates: list[dict[str, str]] = []
@@ -756,7 +753,13 @@ def ingest_s2_roi_reflectance(
         last point before a date is derived. The operation is idempotent, so the honest
         cost of the guarantee is one dict build per supply.
         """
-        nonlocal total_seen, date_alternates
+        nonlocal total_seen
+        # SCOPED TO THIS SUPPLY, not to the run. The ladder is only ever consulted while
+        # recovering a date from THIS supply — `step_down_copies` looks up the keys of the
+        # date it is given — so entries from earlier months are dead weight that nothing can
+        # reach. Holding them made the rejected STAC items of a whole year resident and
+        # defeated the month-at-a-time memory bound the streaming supplier exists to provide.
+        date_alternates: dict[tuple[str, str], list] = {}
         items = normalize_to_solar_day(items, mid_longitude=mid_longitude)
         # Duplicate items for one tile-date must be reduced to ONE copy before the loader
         # sees them, because the loader FUSES a solar-day group: with both copies in it, an

@@ -81,6 +81,7 @@ from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
 )
 from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
     _assert_seeded_model_matches,
+    _optical_min_obs_from_store,
     _PrefectCommitGate,
 )
 from tessera_embeddings.orchestration.prefect.flows.run_global_campaign import (
@@ -793,6 +794,32 @@ def fill_zones_sequential_flow(
     for cell_year in cell_years:
         _window_for(cell_year)
 
+    # The STORE is the authority on the depth rule, exactly as in the per-cell flow: it is
+    # part of the root's write-once identity, so a fill that took it from a dispatch
+    # parameter could write one zone under 25 and its neighbour under 30 with nothing
+    # afterwards able to tell them apart. Read ONCE here rather than per cell — every cell
+    # in this run writes the same store, and the root cannot change under it.
+    #
+    # This is the DEFAULT campaign strategy, and it was reading no rule at all: a store
+    # seeded with a minimum published pixels below its own advertised line.
+    @cache
+    def _store_optical_min_obs() -> int | None:
+        """The rule, read once and only if a cell actually reaches inference.
+
+        LAZY for the same reason the per-cell flow resolves it inside its preflight: a run
+        whose cells all settle in triage — a retag, an empty mark, an all-ocean zone — must
+        not touch the store at all, and reading at flow start made every such path require a
+        live repository.
+        """
+        value = _optical_min_obs_from_store(
+            store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        )
+        log.info(
+            "Optical depth rule for this fill, from the store root: %s",
+            value if value is not None else "no rule",
+        )
+        return value
+
     @cache
     def _config_for(resolved_orbit: str, cell_year: int) -> InferenceConfig:
         return build_inference_config(
@@ -803,6 +830,7 @@ def fill_zones_sequential_flow(
             output_bucket=paths.outputs,
             chunk_size=SHARD_PX,  # 1 inference tile == 1 shard (D3)
             allow_s2_only=allow_s2_only,
+            optical_min_obs=_store_optical_min_obs(),
         )
 
     # ------------------------------------------------------------------
@@ -1071,6 +1099,7 @@ def fill_zones_sequential_flow(
                 s1_orbit=s1_orbit,
                 allow_partial_window=allow_partial_window,
                 allow_s2_only=allow_s2_only,
+                optical_min_obs=_store_optical_min_obs(),
                 code_identity=code_identity,
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,

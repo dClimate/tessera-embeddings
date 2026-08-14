@@ -1351,7 +1351,13 @@ class InferenceActor:
             # optical-free count is needed — that case IS the skip, and a skipped chunk never
             # reaches here.
             s2_at_embedded = obs_buffers["s2_obs_count"][embedded]
-            s2_thin_px = int((s2_at_embedded < OPTICAL_MIN_OBS).sum())
+            # The rule this RUN applied, not the module default. The dataset gates on
+            # `config.optical_min_obs`, which comes from the store root, so counting against
+            # the constant would report a thin share measured by a line the fill never used —
+            # and it would read as a non-zero count on a store whose rule already refuses
+            # every pixel it names.
+            thin_below = self.config.optical_min_obs or OPTICAL_MIN_OBS
+            s2_thin_px = int((s2_at_embedded < thin_below).sum())
             del embedded, obs_at_embedded, s2_at_embedded
 
             def _timed_write() -> str:
@@ -1439,6 +1445,9 @@ class InferenceActor:
                 "s1_free_pixels": s1_free_px,
                 "s1_thin_pixels": s1_thin_px,
                 "s2_thin_pixels": s2_thin_px,
+                # The line the count was measured against, carried so the year record
+                # states the rule this fill applied rather than the module default.
+                "s2_thin_below_obs": thin_below,
                 "elapsed_sec": elapsed,
                 "instance_id": self.instance_id,
                 "write_deferred": True,

@@ -67,7 +67,10 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.inference.assembly import TARGET_AGGREGATE_S3_CONCURRENCY
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.orchestration.prefect.flows._child_runs import child_run_tag, make_child_cancel_hook
-from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import _assert_seeded_model_matches
+from tessera_embeddings.orchestration.prefect.flows.fill_zone_year import (
+    _assert_seeded_model_matches,
+    _optical_min_obs_from_store,
+)
 from tessera_embeddings.orchestration.prefect.flows.ingest_zone_year import IngestDeployments
 from tessera_embeddings.orchestration.prefect.flows.tessera_full_pipeline import _check_completed
 from tessera_embeddings.orchestration.runners.zone_fill import (
@@ -262,6 +265,7 @@ def _staging_run_id(
     s1_orbit: str,
     allow_partial_window: bool,
     allow_s2_only: bool,
+    optical_min_obs: int | None,
     code_identity: str,
     get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
     s3_region: str | None = None,
@@ -292,6 +296,12 @@ def _staging_run_id(
         # flipped flag must start a fresh staging prefix — resuming would mix
         # S1-gated and S2-only tiles under one run.
         allow_s2_only,
+        # The store's minimum-depth rule, for exactly the same reason as allow_s2_only: it
+        # decides WHICH pixels get embeddings. Staging lives under `outputs/staging/{zone}/
+        # {year}`, which is not namespaced by store, so re-running the same mosaics into a
+        # store with a different rule would otherwise resume tiles staged under the old one
+        # and publish a mix of two depth policies under one fingerprint.
+        optical_min_obs,
         # Checkpoint identity is the FILENAME, not the weight bytes — deliberately.
         # A new model ships under a new filename (norm_source → a distinct name),
         # which both flips this fingerprint AND is rejected by the seeded model gate
@@ -869,6 +879,23 @@ async def run_global_campaign(
         commit_limit_name,
     )
 
+    optical_rule_cache: list[int | None] = []
+
+    def _campaign_optical_min_obs() -> int | None:
+        """The store's minimum-depth rule, for the staging fingerprint.
+
+        Read from the store because the store is the authority (its root attr is part of a
+        write-once identity), and cached because every cell this campaign dispatches writes
+        the same store and the root cannot change under it. In the fingerprint for the same
+        reason ``allow_s2_only`` is: it decides which pixels get embeddings, and staging is
+        not namespaced by store.
+        """
+        if not optical_rule_cache:
+            optical_rule_cache.append(
+                _optical_min_obs_from_store(store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
+            )
+        return optical_rule_cache[0]
+
     code_identity_cache: list[str] = []
 
     def _staging_code_identity() -> str:
@@ -1050,6 +1077,7 @@ async def run_global_campaign(
                 s1_orbit=s1_orbit,
                 allow_partial_window=allow_partial_window,
                 allow_s2_only=allow_s2_only,
+                optical_min_obs=_campaign_optical_min_obs(),
                 code_identity=_staging_code_identity(),
                 get_credentials=iam_icechunk_credentials,
                 s3_region=s3_region,

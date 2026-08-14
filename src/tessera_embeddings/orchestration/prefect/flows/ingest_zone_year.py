@@ -232,9 +232,13 @@ def _s1_max_workers(s2_max_workers: int, settings: IngestSettings) -> int:
     a 60-worker S2 fleet, and a sparse zone can scale S2 down far enough that the raw
     fraction would round below a single worker.
     """
-    return max(
-        settings.min_workers or 1,
-        min(s2_max_workers, round(s2_max_workers * settings.s1_worker_fraction)),
+    # S2 is the CEILING and is applied last. Clamping before the floor let
+    # `min_workers` win outright: with min_workers=40 and a 13-worker S2 leg for a sparse
+    # zone, this returned 40 — wider than S2, which is the one thing the docstring above
+    # promises it never is. The floor still applies wherever S2 leaves room for it.
+    return min(
+        s2_max_workers,
+        max(settings.min_workers or 1, round(s2_max_workers * settings.s1_worker_fraction)),
     )
 
 

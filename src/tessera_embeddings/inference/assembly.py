@@ -2204,6 +2204,7 @@ def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
     """
     embedded = free = light = s2_thin = 0
     reported = silent = 0
+    thin_below: int | None = None
     for r in results:
         if r.get("status") != "success":
             continue
@@ -2215,6 +2216,7 @@ def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
         free += int(r["s1_free_pixels"])
         light += int(r.get("s1_thin_pixels", 0))
         s2_thin += int(r.get("s2_thin_pixels", 0))
+        thin_below = thin_below or r.get("s2_thin_below_obs")
     if silent:
         # A RESUMED tile is a synthetic success carrying no counters, and dropping it from
         # both sides of the ratio still leaves a figure — computed over the tiles this run
@@ -2245,7 +2247,11 @@ def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
         # a skip and never produces a result, so `optical_skips` is where that case lives.
         "s2_thin_px": s2_thin,
         "s2_thin_pct": round(100.0 * s2_thin / embedded, 3),
-        "s2_thin_below_obs": OPTICAL_MIN_OBS,
+        # Reported by the actors, because the fill applies the STORE's rule and not the
+        # module default — stamping the constant here would label the year with a threshold
+        # no pixel was actually judged against. Captured in the loop above rather than by a
+        # second pass, because `results` is an Iterable and this function consumes it once.
+        "s2_thin_below_obs": thin_below or OPTICAL_MIN_OBS,
         "chunks_reporting": reported,
         # Where, coarsely: a tile that is ENTIRELY radar-free localises the gap without
         # storing a per-tile grid, and distinguishes a concentrated absence (whole tiles,

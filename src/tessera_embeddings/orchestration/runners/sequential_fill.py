@@ -417,12 +417,39 @@ def fill_zones_sequential(
     # once they reach this cap the feeder stops admitting new cells (the run
     # then winds down and fails on the recorded failures). Bounded either way.
     retained_failed: set[tuple[str, int]] = set()
+    #: Cells that LANDED but whose mosaic delete failed. Tracked apart from
+    #: ``retained_failed`` because these must not stop the feeder — see ``_leak_mosaic``.
+    cleanup_leaked: set[tuple[str, int]] = set()
     max_retained_failures = look_ahead + 2
     finalizer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="trailing-assembly")
 
     def _release_mosaic(cell: SequentialCell) -> None:
         if budget is not None:
             budget.release((cell.zone, cell.year))
+
+    def _leak_mosaic(cell: SequentialCell) -> None:
+        """A LANDED cell whose mosaic delete failed: free the slot, do NOT count it.
+
+        The mosaic stays on disk exactly as a retained failure's does, so the storage
+        concern is the same — but the cell succeeded, and `retained_failed` is what stops
+        the feeder admitting work. Counting a landed cell there let a run with broken
+        delete permissions halt the campaign after ``look_ahead + 2`` cells, every one of
+        which had published correctly. Loud and counted separately instead, so an operator
+        sees storage growing without the fill refusing to continue.
+        """
+        if budget is None:
+            return
+        with lock:
+            cleanup_leaked.add((cell.zone, cell.year))
+            n = len(cleanup_leaked)
+        budget.release((cell.zone, cell.year))
+        log.warning(
+            "Mosaic for %s-%d could not be deleted after the cell landed (%d leaked so far). "
+            "The cell is published and correct; its mosaics need sweeping.",
+            cell.zone,
+            cell.year,
+            n,
+        )
 
     def _retain_failed_mosaic(cell: SequentialCell) -> None:
         """A failed cell frees its budget slot (no deadlock) but keeps its mosaic
@@ -486,6 +513,7 @@ def fill_zones_sequential(
         """
         cell, prep = tally.cell, tally.prep
         cleaned = False
+        failed_assembly = False
         try:
             if tally.failed:
                 bad = [r for r in tally.results if r.get("status") == "failed"]
@@ -496,6 +524,7 @@ def fill_zones_sequential(
             handoff = complete_zone_inference(tally.plan, results=tally.results)
             _record_outcome(assemble(handoff, prep))
         except Exception as exc:
+            failed_assembly = True
             _record_failure(cell, "assembly", exc)
         else:
             # OUTSIDE the assembly try, because by here the cell is committed, tagged
@@ -517,13 +546,17 @@ def fill_zones_sequential(
                         cell.year,
                     )
         finally:
-            # Success → free the slot (clean); failure → retain the mosaic for
-            # resume but free + COUNT the slot (bounded by the retained-failure
-            # cap the feeder checks). Both free the slot exactly once.
+            # Three outcomes, not two. Clean → free the slot. FAILED cell → retain the
+            # mosaic for resume and COUNT it, so a systematic failure cannot accumulate
+            # every cluster's mosaic off-budget. LANDED cell whose delete failed → free
+            # the slot and leak, uncounted: the cell is correct and must not consume the
+            # cap that exists to stop the feeder. All three free the slot exactly once.
             if cleaned:
                 _release_mosaic(cell)
-            else:
+            elif tally.failed or failed_assembly:
                 _retain_failed_mosaic(cell)
+            else:
+                _leak_mosaic(cell)
             zone_slots.release()
 
     def _take_next(pending: list[SequentialCell]) -> SequentialCell:
@@ -651,26 +684,49 @@ def fill_zones_sequential(
                     )
                 try:
                     zplan = plan(cell, prep)
-                    if zplan.done is not None:
+                    terminal_done = zplan.done is not None
+                    if terminal_done:
                         # Terminal (already complete / all-ocean) — committed
-                        # and tagged inside plan(); nothing streams.
+                        # and tagged inside plan(); nothing streams, so the
+                        # staged-resume scan below has nothing to scan for.
+                        assert zplan.done is not None  # narrowed by terminal_done
                         _record_outcome(zplan.done)
-                        if inputs is not None:
-                            inputs.cleanup(cell.zone, cell.year)
-                        _release_mosaic(cell)
-                        zone_slots.release()
-                        continue
-                    # Per-zone staged-resume scan (the single-zone path does
-                    # this inside run_inference; the stream pre-filters here).
-                    restored = ZarrWriter(prep.staging_base).scan_existing_staged_artifacts(
-                        prep.run_id, zplan.live, compute_std=prep.config.compute_std, log=log
-                    )
-                    already = restored.done
+                        restored, already = None, set[str]()
+                    else:
+                        # Per-zone staged-resume scan (the single-zone path does
+                        # this inside run_inference; the stream pre-filters here).
+                        restored = ZarrWriter(prep.staging_base).scan_existing_staged_artifacts(
+                            prep.run_id, zplan.live, compute_std=prep.config.compute_std, log=log
+                        )
+                        already = restored.done
                 except Exception as exc:
                     _record_failure(cell, "plan", exc)
                     _retain_failed_mosaic(cell)  # mosaic retained for resume, counted
                     zone_slots.release()
                     continue
+                if terminal_done:
+                    # OUTSIDE the try, for the same reason the trailing assembly's cleanup
+                    # is: plan() has already committed, tagged and recorded this cell, so a
+                    # failed mosaic delete must not be caught above and recorded as a `plan`
+                    # failure for a cell that succeeded. This was the sibling path missed
+                    # when _finalize's copy of the bug was fixed.
+                    if inputs is not None:
+                        try:
+                            inputs.cleanup(cell.zone, cell.year)
+                            _release_mosaic(cell)
+                        except Exception:
+                            log.exception(
+                                "Mosaic cleanup failed for %s-%d after a TERMINAL plan; the cell "
+                                "stands, its mosaics are retained and will need sweeping.",
+                                cell.zone,
+                                cell.year,
+                            )
+                            _leak_mosaic(cell)
+                    else:
+                        _release_mosaic(cell)
+                    zone_slots.release()
+                    continue
+                assert restored is not None  # only None on the terminal path, which continued
                 live = [c for c in zplan.live if c.label not in already]
                 # Restore each artifact under the outcome it actually recorded. A skip
                 # marker means the tile had no pixels to write; calling that a success

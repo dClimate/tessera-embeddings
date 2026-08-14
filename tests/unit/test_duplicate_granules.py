@@ -24,6 +24,7 @@ from tessera_embeddings.ingest.duplicates import (
     item_sequence,
     item_tile,
     select_preferred_duplicates,
+    step_down_copies,
 )
 
 
@@ -301,3 +302,52 @@ class TestDistinctAcquisitionsOnOneDay:
         kept, alternates = select_preferred_duplicates([old, new])
         assert kept == [new]
         assert alternates == {("MGRS-34WFA", "2021-09-08"): [old]}
+
+
+class TestTheLadderStepsOneAcquisitionAtATime:
+    """The fallback ladder must not swap an acquisition's sibling out from under it.
+
+    `select_preferred_duplicates` keeps one copy per ACQUISITION, but `alternates` is keyed
+    by tile-date because that is the granularity a read failure is attributed at. Swapping
+    on that key replaced every surviving acquisition with the same alternate — turning
+    `[a_new, b_new]` into `[a_old, a_old]`, which duplicates one acquisition and drops the
+    other. That is worse than the coverage loss the acquisition split fixed, because the
+    loader is then handed the same granule twice.
+    """
+
+    @staticmethod
+    def _four() -> tuple[_Item, _Item, _Item, _Item]:
+        """Two acquisitions on one tile-date, each with a reprocessing."""
+        at = "2021-09-08T10:20:31.024000Z"
+        bt = "2021-09-08T11:10:14.512000Z"
+        return (
+            _Item("S2A_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", **{"datetime": at}),
+            _Item("S2A_33XVG_20210908_1_L2A", "MGRS-33XVG", "1", **{"datetime": at}),
+            _Item("S2B_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", **{"datetime": bt}),
+            _Item("S2B_33XVG_20210908_1_L2A", "MGRS-33XVG", "1", **{"datetime": bt}),
+        )
+
+    def test_stepping_down_keeps_the_other_acquisition(self) -> None:
+        a_old, a_new, b_old, b_new = self._four()
+        kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
+        assert kept == [a_new, b_new]
+
+        stepped, _ = step_down_copies(alternates, kept, only=None)
+        assert stepped == [a_old, b_new], "one acquisition steps; its sibling is untouched"
+        assert len({id(i) for i in stepped}) == 2, "no acquisition may be duplicated"
+
+    def test_the_ladder_then_steps_the_second_acquisition(self) -> None:
+        a_old, a_new, b_old, b_new = self._four()
+        kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
+        first, _ = step_down_copies(alternates, kept, only=None)
+        second, _ = step_down_copies(alternates, first, only=None)
+        assert second == [a_old, b_old]
+        assert step_down_copies(alternates, second, only=None) is None, "ladder exhausted"
+
+    def test_a_single_acquisition_steps_exactly_as_before(self) -> None:
+        """The behaviour the ladder was built for, unchanged."""
+        old, new = _pair()
+        kept, alternates = select_preferred_duplicates([old, new])
+        stepped, keys = step_down_copies(alternates, kept, only=None)
+        assert stepped == [old]
+        assert keys == {("MGRS-34WFA", "2021-09-08")}

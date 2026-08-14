@@ -316,16 +316,49 @@ def step_down_copies(
     remaining = alternates_for(alternates, items, only=only)
     if not remaining:
         return None
-    swap: dict[tuple[str, str], Any] = {}
-    for key, copies in remaining.items():
-        swap[key] = copies[0]
-        alternates[key] = copies[1:]
-    out: list[Any] = []
+
+    # Survivors grouped by the same key the alternates use, so an alternate can be matched
+    # to the ONE item it is an alternate for.
+    survivors: dict[tuple[str, str], list[Any]] = {}
     for item in items:
         tile = item_tile(item)
-        key = (tile, solar_day_of(item)) if tile is not None else None
-        out.append(swap.get(key, item) if key is not None else item)
-    return out, set(remaining)
+        if tile is not None:
+            survivors.setdefault((tile, solar_day_of(item)), []).append(item)
+
+    # BY IDENTITY, not by key. A tile-date can hold several distinct acquisitions
+    # (:func:`_by_acquisition`), and swapping on the key replaced every one of them with the
+    # same alternate — turning ``[a_new, b_new]`` into ``[a_old, a_old]``, which duplicates
+    # one acquisition and silently drops the other. That is worse than the coverage loss the
+    # acquisition split was added to fix, because it feeds the loader the same granule twice.
+    swap: dict[int, Any] = {}
+    for key, copies in remaining.items():
+        alternate = copies[0]
+        alternates[key] = copies[1:]
+        target = _alternate_for(alternate, survivors.get(key, ()), taken=swap)
+        if target is not None:
+            swap[id(target)] = alternate
+    if not swap:
+        return None
+    return [swap.get(id(item), item) for item in items], set(remaining)
+
+
+def _alternate_for(alternate: Any, survivors: Iterable[Any], *, taken: dict[int, Any]) -> Any | None:  # noqa: ANN401
+    """The surviving item ``alternate`` is a fallback FOR: the one sharing its acquisition.
+
+    Decided by :func:`_by_acquisition` rather than by a second notion of sameness, so the
+    ladder can only ever step a copy down onto the acquisition it came from. Falls back to
+    the first un-swapped survivor when the acquisition instants cannot be read at all, which
+    is the pre-acquisition-split behaviour and correct for the single-acquisition case that
+    produced it.
+    """
+    free = [it for it in survivors if id(it) not in taken]
+    if not free:
+        return None
+    for cluster in _by_acquisition([*free, alternate]):
+        if any(it is alternate for it in cluster):
+            sibling = [it for it in cluster if it is not alternate]
+            return sibling[0] if sibling else None
+    return free[0]
 
 
 #: How many tiles a label names before it summarises the rest. A label is read by a human
