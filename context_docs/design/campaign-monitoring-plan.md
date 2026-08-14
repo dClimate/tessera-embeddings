@@ -258,7 +258,7 @@ reconstructed from nine days of logs. Two properties it needs and neither is fre
 
 ---
 
-## 5. The AI reviewer
+## 5. The AI reviewer — **BUILT 2026-08-13**
 
 **An agent reads what the flow publishes, triages, and keeps a running narrative.** Three jobs:
 
@@ -295,6 +295,42 @@ to move the pulse elsewhere and keep the escalations here, never the other way r
 deterministic warnings itself, and the agent adds interpretation on top. An alert path whose only
 link is a model is a nondeterministic single point of failure. And the agent **acts on nothing** —
 it recommends a decision and a human takes it, for the same reason the flow mutates nothing.
+
+### What was built, and the four things measuring it changed
+
+**The reviewer is a committed skill**, `.claude/skills/campaign-review/SKILL.md`, so it is versioned,
+reviewable in a pull request, and its commit is stamped into every review it produces — which is how a
+later reader tells which instructions produced a verdict. It drives `scripts/review_cells.py` and
+nothing else: that script hands out cells worst-first, validates and stores reviews, and posts prefixed
+messages, and none of it can modify the store, a run or a deployment. **That is what makes "the agent
+acts on nothing" mechanical rather than advisory.**
+
+**It is measured before it is trusted.** `scripts/review_calibration.py` builds a labelled set from
+real published windows, half damaged in six ways a placement, quantization or write defect would
+produce, with opaque names, with the flat-but-healthy windows deliberately among the clean cases, and
+with each window's damaged twin in the opposite arm so damage cannot be found by comparing. The score
+card prints catch rate and false-alarm rate together and names a collapsed distribution as a stuck
+instrument. A blind session scored **7 of 7 caught, 0 false alarms** on one arm.
+
+Four things the measurement changed in the instructions, each of which had already produced a wrong
+reading:
+
+* **Judge against the window's OWN optical depth**, never the cell's. A cell holds windows differing
+  severalfold, and one cell's mean described nowhere in its own frames.
+* **Pale is a statement about a window relative to its cell**, not about its quality — the shared
+  stretch compresses a low-variation window rather than amplifying it.
+* **Faint is not empty.** Windows were measured carrying a full drainage network at a tenth of the
+  amplitude the stretch renders visible.
+* **Swath boundaries are upstream and appear in about one window in sixteen** — a dead-straight line
+  fixed in geography, recurring at the same place across years, coinciding exactly with a step in the
+  observation count. Without that, they are the artifact a reviewer flags most confidently and most
+  wrongly.
+
+**Coverage of the review is itself a monitored signal** — check 18, `window review`. It reports how
+many published cells have been looked at and never grades that as a fault, because the review is a
+deliberate worst-first sample. The one reading it does grade is **unanimity**: a reviewer that has
+collapsed onto a single answer is indistinguishable from a campaign going well, and in production
+there are no labels, so unanimity is the only symptom available.
 
 ---
 
@@ -354,10 +390,13 @@ because none of those APIs support resource-level permissions) and `Observabilit
 in both directions: allowed on our log groups, denied on an unrelated one. Ten of the seventeen checks
 depend on them, so before this the round would have posted a mostly-blank verdict on a live campaign.
 
-**To build:**
+**Nothing in this plan is unbuilt.** The last gap — the AI reviewer of §5 — closed on 2026-08-13
+with the skill, the three commands it drives, the calibration set that measures it, and check 18,
+which counts what it has actually looked at.
 
-1. **the agent loop** — §5, reading `rounds/` and the verdicts, with the window review. The round
-   publishes everything it needs; nothing about the agent is blocking the poll.
+**What remains is operational rather than structural**, and belongs to whoever runs the campaign:
+the review is a session a person starts, so its coverage depends on someone starting it. That is why
+its coverage is a monitored number rather than an assumption.
 
 ---
 
