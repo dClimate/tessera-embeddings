@@ -26,6 +26,19 @@ class DuplicateDateError(ValueError):
     """
 
 
+class InconclusiveStoreProbeError(Exception):
+    """The emptiness probe on the create path could not answer.
+
+    Exempt from ``cleanup_on_failure``'s delete for the same reason
+    :class:`StoreHoldsCommittedDataError` is, and by the stronger argument: that one says
+    the store is NOT ours, this one says we do not know. The probe reads the network, so a
+    transient failure — or a decode error while inspecting a repo another writer is
+    creating — is ordinary. Treating "could not tell" as "safe to delete" is what turns a
+    blip into the erasure of somebody else's committed store, so deletion happens only on
+    POSITIVE evidence that the prefix is ours.
+    """
+
+
 class StoreHoldsCommittedDataError(Exception):
     """Raised when the create path is handed a store that already holds committed data.
 

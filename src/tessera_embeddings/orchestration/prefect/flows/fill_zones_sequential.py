@@ -386,9 +386,18 @@ class _DeploymentCellInputs:
         ) from cause
 
     def cleanup(self, zone: str, year: int) -> None:
+        """Delete the cell's mosaics, and RAISE if that did not happen.
+
+        ``strict=True`` because the caller acts on the outcome: a mosaic that silently
+        failed to delete is multi-terabyte data left behind while the runner frees the
+        cell's budget slot and admits another ingest, so best-effort here lets repeated
+        storage or permission failures accumulate every cluster's mosaic off-budget. The
+        runner catches this and leaks the cell loudly rather than failing it — the cell has
+        already landed — but it can only do that if the failure reaches it.
+        """
         if (zone, year) not in self._futures or not self._cleanup_mosaics:
             return
-        delete_prefix(f"{self._inputs_bucket.rstrip('/')}/mosaics/{zone}/{year}", log=self._log)
+        delete_prefix(f"{self._inputs_bucket.rstrip('/')}/mosaics/{zone}/{year}", log=self._log, strict=True)
 
     def discard(self, zone: str, year: int) -> None:
         """Forget the cell's ingest future, cancelling any child still registered for it.
@@ -811,9 +820,7 @@ def fill_zones_sequential_flow(
         not touch the store at all, and reading at flow start made every such path require a
         live repository.
         """
-        value = _optical_min_obs_from_store(
-            store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region
-        )
+        value = _optical_min_obs_from_store(store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
         log.info(
             "Optical depth rule for this fill, from the store root: %s",
             value if value is not None else "no rule",

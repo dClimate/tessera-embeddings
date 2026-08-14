@@ -140,7 +140,15 @@ class CellInputs(Protocol):
         ...
 
     def cleanup(self, zone: str, year: int) -> None:
-        """Delete the cell's mosaics (only if this adapter produced them)."""
+        """Delete the cell's mosaics (only if this adapter produced them).
+
+        MUST RAISE if the delete did not happen. The runner treats a clean return as
+        "the mosaic is gone" and frees the cell's budget slot on that basis, so an
+        implementation that swallows storage or permission failures lets every cluster's
+        multi-terabyte mosaic accumulate off-budget while the fill reports success.
+        A raise is handled — the cell has already landed, so it is leaked loudly rather
+        than failed — but only if it reaches the runner.
+        """
         ...
 
     def discard(self, zone: str, year: int) -> None:

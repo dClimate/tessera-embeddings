@@ -22,7 +22,7 @@ import logging
 import icechunk
 import pytest
 
-from tessera_embeddings.errors import DuplicateDateError
+from tessera_embeddings.errors import DuplicateDateError, InconclusiveStoreProbeError
 from tessera_embeddings.ingest import s1_roi, s2_roi
 from tessera_embeddings.storage import zarr_store
 from tessera_embeddings.storage.zarr_store import (
@@ -163,3 +163,23 @@ def test_an_ordinary_failure_still_cleans_up(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         _broken(str(tmp_path / "mosaic.icechunk"))
     assert deleted == [str(tmp_path / "mosaic.icechunk")]
+
+
+def test_an_unanswered_emptiness_probe_never_deletes(tmp_path, monkeypatch):
+    """ "Could not tell" is not "safe to delete".
+
+    `_write_new`'s probe reads the network, so a transient failure — or a decode error
+    while inspecting a repo another writer is creating — is ordinary. Reaching
+    `cleanup_on_failure`'s generic handler on that basis would erase whatever is at the
+    prefix, possibly another writer's committed store. Deletion needs POSITIVE evidence.
+    """
+    deleted: list[str] = []
+    monkeypatch.setattr(zarr_store, "_delete_store", lambda p, **k: deleted.append(p))
+
+    @zarr_store.cleanup_on_failure
+    def _probe_failed(store_path: str) -> None:
+        raise InconclusiveStoreProbeError("network said no")
+
+    with pytest.raises(InconclusiveStoreProbeError):
+        _probe_failed(str(tmp_path / "mosaic.icechunk"))
+    assert deleted == [], "an unanswered probe must not authorise a delete"

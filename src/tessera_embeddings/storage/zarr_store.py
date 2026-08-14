@@ -63,7 +63,12 @@ import zarr
 from icechunk.xarray import to_icechunk
 from tenacity import Retrying, before_sleep_log, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 
-from tessera_embeddings.errors import CorruptedStoreError, DuplicateDateError, StoreHoldsCommittedDataError
+from tessera_embeddings.errors import (
+    CorruptedStoreError,
+    DuplicateDateError,
+    InconclusiveStoreProbeError,
+    StoreHoldsCommittedDataError,
+)
 from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
 from tessera_embeddings.storage.region_writes import (
     _drop_region_coords,
@@ -96,7 +101,11 @@ CONCURRENT_WRITER_ERRORS: tuple[type[BaseException], ...] = (icechunk.ConflictEr
 #: Failures that must NEVER trigger `cleanup_on_failure`'s delete, because each one means
 #: the store holds data somebody else committed. Named rather than unpacked inline in the
 #: `except` clause: mypy cannot verify a starred tuple there and rejects it outright.
-NEVER_CLEAN_UP: tuple[type[BaseException], ...] = (StoreHoldsCommittedDataError, *CONCURRENT_WRITER_ERRORS)
+NEVER_CLEAN_UP: tuple[type[BaseException], ...] = (
+    StoreHoldsCommittedDataError,
+    InconclusiveStoreProbeError,
+    *CONCURRENT_WRITER_ERRORS,
+)
 
 #: Attempts per store write. Three has been enough for the transient failures this path
 #: actually sees (throttling, a credential rolling over mid-write, a flaky COG read).
@@ -926,7 +935,19 @@ def _write_new(
     """
     repo, is_new = open_or_create_repo(store_path, get_credentials=get_credentials, region=s3_region)
     if not is_new:
-        _assert_no_committed_dates(repo, store_path)
+        # The probe reads the network, so it can fail without answering. An unanswered probe
+        # must not reach `cleanup_on_failure`'s generic handler, which would delete the whole
+        # prefix — possibly another writer's committed store — on the strength of not knowing.
+        # Deletion requires POSITIVE evidence the prefix is ours.
+        try:
+            _assert_no_committed_dates(repo, store_path)
+        except StoreHoldsCommittedDataError:
+            raise
+        except Exception as exc:
+            raise InconclusiveStoreProbeError(
+                f"Could not establish whether {store_path} holds committed data, so it will not be "
+                f"created over or cleaned up. Retry once the store is reachable."
+            ) from exc
         logger.info("Adopting existing repo at %s — an earlier attempt left it uncommitted", store_path)
     session = repo.writable_session("main")
     to_icechunk(data, session, mode="w", encoding=encoding, align_chunks=True)
