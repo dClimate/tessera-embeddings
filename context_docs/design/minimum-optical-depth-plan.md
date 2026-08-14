@@ -1,4 +1,4 @@
-# Minimum optical depth: refuse pixels below 30 observations — implementation plan
+# Minimum optical depth: refuse pixels below 25 observations — implementation plan
 
 **Status:** partly built. **The line is 25**, on evidence gathered 2026-08-13 after the proposed 30
 was reopened: reproducibility measured on 741 blocks of doubly-embedded ground runs three to four
@@ -14,13 +14,16 @@ supports a line at all is reproducibility — two independent embeddings of the 
 several times more when it is thin — which is a different claim, arrived at by a different route, and
 still not a claim about accuracy.
 **Decision date:** 2026-08-13. **Evidence:** [`optical_depth_census_2026_08.md`](optical_depth_census_2026_08.md)
-for the pixel-vs-shard arithmetic, and the legibility report for the threshold.
+for the pixel-vs-shard arithmetic, the legibility report for the threshold, and
+[`optical_retention_per_pixel_2026_08.md`](optical_retention_per_pixel_2026_08.md) for what
+the chosen line costs each cell — counted per pixel, which withdrew the window-mean proxy
+every earlier cost figure rested on.
 
 ---
 
 ## 1. The rule
 
-**A pixel is not embedded if it has fewer than 30 valid Sentinel-2 L2A observations in the
+**A pixel is not embedded if it has fewer than 25 valid Sentinel-2 L2A observations in the
 calendar year being filled.** The refused pixel is written as fill, exactly as an
 out-of-ROI pixel is, and the reason is recorded.
 
@@ -29,14 +32,16 @@ revisit:
 
 | decision | ruling |
 |---|---|
-| **2017**, where 65.7% of shard-years fall below 30 | **Same rule, populate it anyway, warn about it.** No per-year threshold — one rule keeps the product consistent. 2017 publishes roughly a third populated, and that must be stated where a user meets it (§7.1), not left for them to discover. |
-| **Temporal consistency** — a pixel can clear 30 in 2020 and fail in 2021 | **Per pixel, per year.** Holes move between years. No all-years gate, no stability mask in this iteration. |
+| **2017**, where the census brackets the line between 38.7% of shard-years below 20 and 65.7% below 30 | **Same rule, populate it anyway, warn about it.** No per-year threshold — one rule keeps the product consistent. 2017 publishes roughly a third populated, and that must be stated where a user meets it (§7.1), not left for them to discover. |
+| **Temporal consistency** — a pixel can clear 25 in 2020 and fail in 2021 | **Per pixel, per year.** Holes move between years. No all-years gate, no stability mask in this iteration. |
 | **Scope** | **Global campaign only.** The single-ROI path (`tessera_embeddings` flow, `plain` runner) keeps today's behaviour. |
 
-### Why 30, and why it is safe to apply per pixel
+### Why the line is where it is, and why it is safe to apply per pixel
 
-The repo's own quality measurement is *crisp at 30+ observations, noisy below about 20*,
-across 15 cells. 30 is the conservative end of that band.
+The line was originally proposed at 30, on this argument: the repo's own quality measurement
+was *crisp at 30+ observations, noisy below about 20*, across 15 cells, and 30 is the
+conservative end of that band. That argument no longer stands, and what replaced it is
+below.
 
 > **That measurement has been re-taken and it does not hold (2026-08-13).** Two defects were found in
 > the instrument that produced it, and since this rule is the one decision in the campaign that
@@ -108,6 +113,11 @@ pixels sit in chunks whose own mean is already below 30**, and chunks averaging 
 contribute 0.1%. This is what makes a per-shard registry an honest summary: refusals
 cluster, so a shard-level number is not hiding a diffuse scatter.
 
+> **What this section does NOT give is the per-cell cost**, and the two are easy to confuse:
+> a small global percentage is compatible with individual cells losing nearly everything.
+> Counted per pixel over 40 cells, the median cell keeps 92% at the line and two keep under
+> a tenth — [`optical_retention_per_pixel_2026_08.md`](optical_retention_per_pixel_2026_08.md).
+
 ---
 
 ## 2. Non-goals — do not build these
@@ -157,7 +167,7 @@ in the actor *is* per-shard accounting. Nothing needs to be re-read to build the
 ## 4. Work item 1 — the threshold, recorded once and enforced
 
 **One constant, carrying one value — and RENAME it. `OPTICAL_THIN_MAX_OBS` becomes
-`OPTICAL_MIN_OBS`, holding 30.** No second constant: two names holding the same number would be
+`OPTICAL_MIN_OBS`, holding 25.** No second constant: two names holding the same number would be
 two things to keep in step for no gain (settled 2026-08-13, against an earlier suggestion of a
 separate refusal constant). The comparison itself barely changes; what changes is that failing it
 **refuses** the pixel instead of labelling it.
@@ -179,7 +189,7 @@ Two further reasons it earns its keep:
 > **Rewrite the docstring in the same edit.** It currently says, in terms, *"Only a REPORTING line:
 > nothing refuses a cell for being under it, and the exact per-pixel counts live in the store's
 > `s2_obs_count` array either way."* That sentence becomes false the moment this ships. The new one
-> must state that the line is a refusal, that the value has been 40, then 15, then 30, and that a
+> must state that the line is a refusal, that the value has been 40, then 15, then 30, then 25, and that a
 > reader of older commits or documents will find the opposite claim under the old name.
 
 ### Where it lives
@@ -215,7 +225,7 @@ stores get re-stamped once, deliberately, rather than being silently grandfather
 **The line can never change for a store that already has one.** Putting the threshold in the
 write-once identity tuple is what buys the mixing guarantee, and it forecloses ever re-stamping a
 different value — so a top-up cycle inherits the original line, permanently. That is the intended
-behaviour and it is consistent with §12's "they clear the unchanged 30 on their own", but it must be
+behaviour and it is consistent with §12's "they clear the unchanged line on their own", but it must be
 stated rather than discovered: **a decision to move the line is a decision to build a new store.**
 The §1 re-measurement is therefore the last moment the value is free.
 
@@ -350,7 +360,7 @@ register's *correction applied in one place and not the others*.
 
 **Two fields exist for the planned top-up, not for reporting.** The intent is to revisit
 refused pixels once Element 84 publishes more imagery, at which point their observation
-counts rise and they clear 30 under the unchanged rule. That later pass needs to choose
+counts rise and they clear 25 under the unchanged rule. That later pass needs to choose
 *where* to spend without scanning a petabyte, and two cheap fields make the registry its work
 list. `refused_depth_hist` answers **how close they were** — a shard whose refusals sit at
 25-29 is rescued by a modest backfill, one whose refusals sit at 0-4 is not, and the
@@ -469,7 +479,7 @@ Scale: 360,953 live shards x 9 years = **3.2M rows**. Comfortable for a single p
 
 **Not optional tidying. Leaving any of these is how the repo ends up asserting two policies.**
 
-1. **`OPTICAL_THIN_MAX_OBS` becomes `OPTICAL_MIN_OBS` at 30, and the meaning inverts** (§4).
+1. **`OPTICAL_THIN_MAX_OBS` becomes `OPTICAL_MIN_OBS` at 25, and the meaning inverts** (§4).
    The rename is what produces this list: every use is an import error until it is revisited.
    `actors.py` L1339 becomes the refusal, and `assembly.py` L2248's `s2_thin_below_obs` now
    reports a refusal line and should be renamed with it.
@@ -537,7 +547,7 @@ It must be stated in three places a user actually encounters:
 
 ## 10. Tests
 
-- **The gate**: a pixel at 29 is refused and at 30 is kept; at `optical_min_obs=None` the mask is
+- **The gate**: a pixel at 24 is refused and at 25 is kept; at `optical_min_obs=None` the mask is
   bit-identical to today (pin this — it is what protects the single-ROI path); and
   `optical_min_obs=0` is REFUSED at construction rather than quietly disabling the rule (§5).
 - **Separability**: a pixel refused for thin optical, one for no optical, and one for absent
@@ -576,7 +586,7 @@ Refusing a pixel means no embedding exists for it, so recovering one is a re-run
 filter change. That is deliberate and it is **not** a bet that the line is right forever; it is
 a bet that the *input* will improve. The intent is to revisit refused pixels once Element 84
 publishes more imagery, at which point their observation counts rise and they clear the
-unchanged 30 on their own. §7's `refused_depth_hist` and `mosaic_identity` exist to make that
+unchanged line on their own. §7's `refused_depth_hist` and `mosaic_identity` exist to make that
 pass plannable from the registry rather than from a petabyte scan.
 
 Three things the later pass will face, recorded now so they are not discovered then:
@@ -602,7 +612,7 @@ Three things the later pass will face, recorded now so they are not discovered t
   affordable; it is recorded here so the ADR does not present the figure as a net gain.
 
 The counter-argument, stated once for the record: `s2_obs_count` is already per-pixel in the
-store, so a determined user could always have filtered at 30 themselves, and publishing
+store, so a determined user could always have filtered at 25 themselves, and publishing
 everything with a quality flag would have cost nothing to reverse. The decision to refuse
 instead is a deliberate choice to protect users who do not read documentation, taken on the
 reasoning that a published embedding is taken at face value and unsatisfactory results damage
