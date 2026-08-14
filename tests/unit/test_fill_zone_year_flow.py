@@ -7,6 +7,8 @@ mosaic fails BEFORE a cluster is provisioned.
 
 from __future__ import annotations
 
+import dataclasses
+
 import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -40,10 +42,23 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
     monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
-    monkeypatch.setattr(mod, "build_inference_config", lambda **k: SimpleNamespace(time_window="W"))
+    # A real dataclass rather than a namespace: the flow replaces the config to stamp the store's
+    # minimum-depth rule onto it, and dataclasses.replace is what that costs.
+    monkeypatch.setattr(mod, "build_inference_config", lambda **k: _FakeConfig())
     monkeypatch.setattr(mod, "_assert_seeded_model_matches", lambda *a, **k: None)
+    # Both store reads in the pre-Ray gate are stubbed for the same reason: these tests exercise
+    # the flow's wiring, not the store.
+    monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: None)
     monkeypatch.setattr(mod, "check_time_window_coverage", lambda *a, **k: None)
     return monkeypatch
+
+
+@dataclasses.dataclass
+class _FakeConfig:
+    """What the flow needs from an InferenceConfig here: a window, and a rule it can replace."""
+
+    time_window: str = "W"
+    optical_min_obs: int | None = None
 
 
 def _stop_before_ray(monkeypatch):
@@ -92,7 +107,7 @@ def test_allow_s2_only_reaches_inference_config(wired, flag):
     zone-level gates are NOT relaxed by it (the coverage gate still raises here).
     """
     captured: dict = {}
-    wired.setattr(mod, "build_inference_config", lambda **kw: captured.update(kw) or SimpleNamespace(time_window="W"))
+    wired.setattr(mod, "build_inference_config", lambda **kw: captured.update(kw) or _FakeConfig())
     _stop_before_ray(wired)
 
     with pytest.raises(InsufficientCoverageError):
@@ -337,3 +352,35 @@ def test_commit_gate_is_reentrant_within_a_thread(monkeypatch):
         pass
     # LIFO pairing: the inner exit releases the inner context, not the outer.
     assert entered == ["enter:outer", "enter:inner", "exit:inner", "exit:outer"]
+
+
+class TestTheMinimumDepthRuleComesFromTheStore:
+    """A fill applies the rule its STORE advertises, never one a dispatch supplied.
+
+    The value is part of the root's write-once identity, so the store is the authority on what rule
+    its zones were filled under. If a dispatch could set it, one zone could land under 25 and its
+    neighbour under 30, and nothing afterwards could tell which pixels came from which — the
+    refused pixels leave no trace to compare.
+    """
+
+    def test_the_flow_takes_no_minimum_depth_parameter(self):
+        """The structural half of the guarantee: there is no dispatch parameter to disagree with
+        the store, so the two cannot diverge."""
+        import inspect
+
+        flow = getattr(mod.fill_zone_year, "fn", mod.fill_zone_year)
+        params = inspect.signature(flow).parameters
+        assert "optical_min_obs" not in params
+
+    def test_the_reader_returns_none_for_a_store_that_declares_no_rule(self, monkeypatch):
+        """Every store seeded before 2026-08-13 declares none, and those stores already contain
+        everything with any optical input — applying a line retrospectively would claim their
+        existing zones were filled under one that never touched them."""
+        monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={}))
+        assert mod._optical_min_obs_from_store("s3://x", get_credentials=None) is None
+
+    def test_the_reader_returns_the_stamped_rule(self, monkeypatch):
+        monkeypatch.setattr(
+            mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"optical_min_obs": 25})
+        )
+        assert mod._optical_min_obs_from_store("s3://x", get_credentials=None) == 25

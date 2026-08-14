@@ -19,6 +19,7 @@ conflict) is the campaign driver's job, not this flow's.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
@@ -76,6 +77,29 @@ class _PrefectCommitGate(FleetGate):
 
     def __init__(self, name: str, occupy: int = 1, log: logging.Logger | logging.LoggerAdapter | None = None) -> None:
         super().__init__(name, occupy=occupy, log=log)
+
+
+def _optical_min_obs_from_store(
+    store_path: str,
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None,
+    s3_region: str | None = None,
+) -> int | None:
+    """The minimum-depth rule the STORE advertises, which is the only one this fill may apply.
+
+    Read from the root rather than taken as a parameter, and that is the whole point: the value is
+    part of the root's write-once identity, so the store is the authority on what rule its zones
+    were filled under. A fill that took it from a dispatch parameter could write one zone under 25
+    and its neighbour under 30, and nothing afterwards could tell which pixels came from which.
+
+    ``None`` means the store declares no rule — every store seeded before 2026-08-13 — and the fill
+    then embeds everything with any optical input, which is what those stores already contain.
+    """
+    root = open_store_as_zarr_group(store_path, get_credentials=get_credentials, region=s3_region)
+    value = root.attrs.get("optical_min_obs")
+    if value is None:
+        return None
+    return int(value)
 
 
 def _assert_seeded_model_matches(
@@ -358,6 +382,24 @@ def fill_zone_year_flow(
             allow_model_mismatch=allow_model_mismatch,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
+        )
+        # The minimum-depth rule comes from the STORE, never from this dispatch — the root attr is
+        # part of a write-once identity precisely so it cannot be argued about per run, and a cell
+        # filled under a different line than its neighbours would be undetectable afterwards.
+        # Resolved HERE rather than where the config is built, beside the model gate and for the
+        # same reason: both are store reads that only matter when this cell is about to infer, and
+        # a path that short-circuits before the preflight must not touch the store at all.
+        config = dataclasses.replace(
+            config,
+            optical_min_obs=_optical_min_obs_from_store(
+                store_path,
+                get_credentials=iam_icechunk_credentials,
+                s3_region=s3_region,
+            ),
+        )
+        log.info(
+            "Minimum optical depth for this fill: %s (from the store's root)",
+            config.optical_min_obs if config.optical_min_obs is not None else "no rule",
         )
         # Fail loudly on a partial/absent mosaic BEFORE provisioning Ray: a
         # zone-wide mosaic missing months is an ingest failure, and the write-once
