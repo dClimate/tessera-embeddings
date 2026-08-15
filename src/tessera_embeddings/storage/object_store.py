@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import time
 
 import fsspec
 
@@ -57,6 +58,11 @@ def _s5cmd_rm(uri: str, log: _Log, *, all_versions: bool) -> None:
 #: than a couple means something other than a lost listing page is keeping them alive, and
 #: repeating will not find it.
 _DELETE_PASSES = 3
+
+#: Seconds to wait before a retry, multiplied by the attempt number. Both failure modes here
+#: are rate pressure — S3 answered `SlowDown` outright on one prefix and silently dropped
+#: objects from another — and rate pressure wants time rather than another immediate attempt.
+_DELETE_BACKOFF_S = 5.0
 
 
 class PrefixNotEmptyError(RuntimeError):
@@ -97,7 +103,25 @@ def _s5cmd_rm_verified(uri: str, log: _Log, *, all_versions: bool) -> None:
         PrefixNotEmptyError: the tool ran and the prefix is still not empty.
     """
     for attempt in range(1, _DELETE_PASSES + 1):
-        _s5cmd_rm(uri, log, all_versions=all_versions)
+        if attempt > 1:
+            # A throttle needs TIME, not another immediate attempt.
+            time.sleep(_DELETE_BACKOFF_S * (attempt - 1))
+        try:
+            _s5cmd_rm(uri, log, all_versions=all_versions)
+        except RuntimeError as exc:
+            # The expected failure at this scale, and the one that produced the residue:
+            # `SlowDown: Please reduce your request rate` on a quarter-million-object prefix,
+            # observed live on 48S/2022. A throttle is transient by definition, so it earns the
+            # same retry budget as a pass that left survivors — the previous version fell
+            # straight through to the serial fsspec sweep, which faces the same rate limit with
+            # none of s5cmd's parallelism.
+            #
+            # NOT FileNotFoundError: a missing binary will still be missing next time, and the
+            # fallback is the whole answer for it.
+            log.warning("s5cmd rm of %s failed on pass %d (%s)", uri, attempt, exc)
+            if attempt == _DELETE_PASSES:
+                raise
+            continue
         left = _survivors(uri, log)
         if left is None or not left:
             return
@@ -108,6 +132,8 @@ def _s5cmd_rm_verified(uri: str, log: _Log, *, all_versions: bool) -> None:
             uri,
             left[0],
         )
+    # Only reachable when the LAST pass ran and left objects — a last pass that raised
+    # re-raised inside the loop, so the fsspec fallback still gets its turn.
     raise PrefixNotEmptyError(uri)
 
 

@@ -75,6 +75,7 @@ def test_delete_prefix_retries_while_objects_survive(monkeypatch):
     passes = []
     monkeypatch.setattr(object_store, "_s5cmd_rm", lambda uri, log, **k: passes.append(uri))
     monkeypatch.setattr(object_store, "_survivors", lambda uri, log: ["s3://b/p/chunks/ABC"])
+    monkeypatch.setattr(object_store.time, "sleep", lambda _s: None)
     monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _never_called())
 
     object_store.delete_prefix("s3://b/p")  # best-effort: reports, does not raise
@@ -107,8 +108,59 @@ def test_delete_prefix_strict_raises_when_delete_fails(monkeypatch):
             raise OSError("access denied")
 
     monkeypatch.setattr(object_store, "_s5cmd_rm", _s5_fail)
+    monkeypatch.setattr(object_store.time, "sleep", lambda _s: None)
     monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
 
     object_store.delete_prefix("s3://b/p")  # best-effort: swallows
     with pytest.raises(OSError, match="access denied"):
         object_store.delete_prefix("s3://b/p", strict=True)
+
+
+def test_a_throttled_delete_is_retried_before_the_fallback(monkeypatch):
+    """S3 answered `SlowDown: Please reduce your request rate` on a quarter-million-object
+    prefix (48S/2022, live). A throttle is transient, so it earns the same retry budget as a
+    pass that left survivors — falling straight through to the serial fsspec sweep meets the
+    same rate limit with none of s5cmd's parallelism.
+    """
+    calls = []
+
+    def throttled_then_ok(uri, log, **k):
+        calls.append(uri)
+        if len(calls) < 3:
+            raise RuntimeError("s5cmd failed (rc=1): SlowDown: Please reduce your request rate")
+
+    monkeypatch.setattr(object_store, "_s5cmd_rm", throttled_then_ok)
+    monkeypatch.setattr(object_store.time, "sleep", lambda _s: None)
+    _cleared(monkeypatch)
+    monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _never_called())
+
+    object_store.delete_prefix("s3://b/p")
+    assert len(calls) == 3
+
+
+def test_a_missing_binary_is_not_retried(monkeypatch):
+    """The adverse direction: s5cmd absent will still be absent next time, and the fsspec
+    fallback is the whole answer for it — so it must reach the fallback immediately.
+    """
+    calls = []
+
+    def absent(uri, log, **k):
+        calls.append(uri)
+        raise FileNotFoundError("s5cmd binary not found")
+
+    fell_back = []
+
+    class _FS:
+        def exists(self, p):
+            return True
+
+        def rm(self, p, recursive):
+            fell_back.append(p)
+
+    monkeypatch.setattr(object_store, "_s5cmd_rm", absent)
+    monkeypatch.setattr(object_store.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
+
+    object_store.delete_prefix("s3://b/p")
+    assert len(calls) == 1, "a missing binary must not be retried"
+    assert fell_back == ["s3://b/p"]
