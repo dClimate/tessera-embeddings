@@ -24,7 +24,10 @@ context_docs/
 │   ├── 010-landmask-registry-coverage.md
 │   ├── 011-campaign-zone-ingestion.md
 │   ├── 012-validated-equivalence-for-inference-outputs.md
-│   └── 013-optional-s1-s2-only-pixels.md
+│   ├── 013-optional-s1-s2-only-pixels.md
+│   ├── 014-architecture-rules-scan-the-package.md
+│   ├── 015-regrouping-the-unit-tests.md
+│   └── 016-scripts-layout-and-shared-modules.md
 └── design/           Long-form framing docs, grouped by what they answer
     │
     │  THE CAMPAIGN — start here
@@ -37,7 +40,10 @@ context_docs/
     ├── optical_depth_census_2026_08.md           how much of the product is optically thin, and where
     ├── minimum-optical-depth-plan.md             UNBUILT; its threshold is REOPENED, the rest approved
     ├── window_legibility_vs_depth_2026_08.md     blind test of "crisp at 30 obs" — it does not hold
+    ├── optical_retention_per_pixel_2026_08.md    what a per-pixel cutoff actually refuses
     ├── inference-perf-run-ledger.md              raw per-run measurements
+    ├── campaign-monitoring-plan.md               what is watched while it runs, and how
+    ├── final-data-validation-plan.md             the closing gate over every published cell
     │
     │  INGEST
     ├── ingest_optimization_campaign_2026_07.md   every ingest measurement
@@ -52,6 +58,7 @@ context_docs/
     │  INFERENCE + STORE
     ├── inference_gpu_saturation_profile_2026_07.md
     ├── single-global-alignment.md                why single-ROI was aligned to the campaign
+    ├── staging-identity-and-resume.md            what a run_id identifies, and what resumes
     ├── d3-sharding-plan.md                       settled ADR-008 D3; spec for scale_tests/t8
     ├── global-store-test-plan.md                 the T0-T8 scale tests
     ├── global-store-test-impl-spec.md
