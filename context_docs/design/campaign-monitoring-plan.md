@@ -265,6 +265,28 @@ posted.
 | **a provenance field absent on an older cell** | the fill predates the field. An attrs patch at the end, if it matters at all |
 | **a check reporting UNAVAILABLE** | the check could not be evaluated — which is not the same as the check failing. It fires when something the comparison needs is *absent* rather than wrong: most often a recorded figure the cell's fill never wrote, because that fill predates the field the check reads. The absence is in the RECORD, not in the pixels, and grading it either way asserts something untrue — "pass" hides a comparison that never happened, "fail" reports a store's age as a data fault. This is not hypothetical: an earlier version turned a missing recorded value into `NaN`, compared it, and reported the *record* as wrong on a healthy cell |
 
+#### OPEN — the 5xx arm of `orchestrator load` fires on n=1 (2026-08-17)
+
+Round 1398 of the `tessera-min15` rehearsal graded the campaign **DEGRADED** on this evidence:
+
+> dropped events (broker overflow): **0**; server CPU now: **2%**; latency now: **16ms** mean at
+> 1 req/s; HTTP 5xx from the API: **1**
+
+The arm is `if signals["err_5xx"]:` — **any** non-zero count warns. At 1 req/s over a 60-minute
+window that is one error in roughly 3,600 requests, a 0.03% rate, against an orchestrator that is
+otherwise idle by every other signal it just measured. The message reads "The orchestrator returned
+1 server errors" — which also has the n=1 grammar bug.
+
+**Not a false alert**: the 5xx was real, and it routes to `warnings`, so it never paged. But it is
+the shape the corrections register calls *an infra hiccup promoted to a finding*, and it puts
+"DEGRADED" on the verdict line of a healthy campaign, which is what makes the channel tiring to
+read. A rate- or count-based floor is wanted instead of truthiness — the other three signals in the
+same detail line are the evidence that one 5xx means nothing.
+
+**Deliberately not changed while the rehearsal was in flight**, because `campaign-watch` pulls its
+image at each round launch: fixing it mid-run would have split the observation across two versions of
+the detector and made the message-volume count meaningless.
+
 ---
 
 ## 4. The shelf — the second product of monitoring
