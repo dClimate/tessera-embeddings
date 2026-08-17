@@ -157,6 +157,35 @@ below.
 > crude spread statistic — twelve observations one per month scores the same as twelve in a fortnight
 > plus scattered singletons.
 
+> **If spread is to be retained, store twelve labelled month planes, not a packed bitmask
+> (2026-08-17).** Spread exists only in the mosaic SCL, which is deleted after a fill — so it is
+> captured during inference or not at all. The obvious space-efficient encoding is a 12-bit mask in
+> one ``uint16``, and it is the wrong choice for a published dataset: a reader opening the store in
+> xarray, R, Julia or QGIS sees an opaque integer, and every question needs bit arithmetic and a
+> helper library nobody outside this repo has.
+>
+> A trailing ``month`` axis of 12 — the same shape ``embeddings`` already uses for its 128 bands, and
+> like the band axis never split across chunks — needs no helpers at all: months covered is
+> ``cov.sum("month")``, July is ``cov.sel(month=7)``, a growing season is
+> ``cov.sel(month=slice(5, 9)).all("month")``.
+>
+> **The only argument for the mask was size, and measured it is 14%, not 6×.** Uncompressed the
+> planes are six times the mask. Compressed with the store's own zstd at its own 256-px inner-chunk
+> granularity, over three cells spanning the depth range:
+>
+> | cell | mask | planes | planes/mask |
+> |---|---:|---:|---:|
+> | 26S/2022 | 674,933 B | 786,838 B | 1.17× |
+> | 47S/2020 | 490,713 B | 546,019 B | 1.11× |
+> | 59S/2022 | 172,390 B | 187,154 B | 1.09× |
+> | **pooled** | **1,338,036 B** | **1,520,011 B** | **1.14×** |
+>
+> Both land under a quarter of a bit per pixel — 0.21 against 0.24 — because month coverage is
+> spatially smooth, so zstd compresses a plane 397× against the mask's 75×. The mask's packed bits
+> look closer to noise, which is exactly what defeats the compressor. **Nothing about spread being a
+> useful gate input is settled by this**; the array is for quality control and for retaining
+> information the pipeline currently destroys.
+
 The census that produced the campaign figures measured **shard means**, and this rule
 refuses **individual pixels** — a different question, and the class of error the
 corrections register calls *presence counted where coverage was meant*. It was therefore
