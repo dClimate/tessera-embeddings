@@ -39,7 +39,7 @@ that was entirely an artefact.
 
 - **The 1.8–2.1× "slowdown at fleet scale."** Compared May–September dates against a
   January baseline. Same zone, same width, different **season**. Matched on all three it is
-  **1.17×**. Withdrawn in `ingest_concurrency_investigation_2026_08.md` §"E IS WITHDRAWN";
+  **1.17×**. Withdrawn in `ingest_concurrency_investigation_2026_08.md` §"The withdrawn claim";
   the correction propagated to `campaign-cost-model.md` and to
   `ingest_optimization_campaign_2026_07.md`'s header, which had been superseded by it.
 - **"Width may not be usable."** The "six times the fleet for under twice the rate" reading

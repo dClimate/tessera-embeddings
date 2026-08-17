@@ -380,7 +380,8 @@ chunks or one completed full-year cell before committing a schedule to it. **The
 difference from the withdrawn claim is large: seasonality is predictable and schedulable, so peak
 months can be planned around instead of hunted as a defect.**
 
-Full derivation and withdrawal: `ingest_concurrency_investigation_2026_08.md` §"E IS WITHDRAWN".
+Full derivation and withdrawal: `ingest_concurrency_investigation_2026_08.md` §"The withdrawn
+claim, and the mechanism behind it".
 
 Two properties of the fit matter for anything that reasons about *individual* zones rather
 than the aggregate, and the aggregate basis hides both:
