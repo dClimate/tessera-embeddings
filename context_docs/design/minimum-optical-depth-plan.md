@@ -185,6 +185,36 @@ below.
 > look closer to noise, which is exactly what defeats the compressor. **Nothing about spread being a
 > useful gate input is settled by this**; the array is for quality control and for retaining
 > information the pipeline currently destroys.
+>
+> **What the planes would cost the finished store: 0.025%, about 353 GiB.** Measured the same way —
+> every stored array re-compressed from real store chunks with its own declared codec, 30 inner
+> chunks over five cells spanning the depth range:
+>
+> | array | compressed | note |
+> |---|---:|---|
+> | `embeddings` | 119.73 B/px | int8 × 128 bands; only a **1.07×** ratio, because quantised embeddings are near-noise |
+> | `scales` | 0.79 B/px | float32 + PCodec |
+> | `s2_obs_count` | 0.18 B/px | |
+> | `s1_desc_obs_count` | 0.13 B/px | |
+> | `s1_asc_obs_count` | 0.12 B/px | |
+> | **total today** | **120.93 B/px** | |
+> | *+ month planes* | *0.03 B/px* | |
+>
+> Over the campaign footprint — 1,405,080,698,880 land-live pixels a year across the 112 zones that
+> have land, times nine campaign years, so 12.65 trillion pixels — that is **1,390.9 TiB today and
+> 0.3 TiB added**.
+>
+> **Cross-check:** [`campaign-cost-model.md`](campaign-cost-model.md) puts the permanent store at
+> **0.9–1.8 PB** by an independent route; 1,390.9 TiB is 1.53 PB, inside that range. Two methods
+> agreeing is the reason to trust the absolute figure at all.
+>
+> The absolute number is an **upper bound** on two counts: a live 256-px chunk can be part water, so
+> land-live over-counts, and not every zone-year will fill (2017 is sparsely populated by design).
+> The *relative* 0.025% is robust to both, since numerator and denominator scale together.
+>
+> **The reason the share is so small is that embeddings barely compress.** 128 int8 bands of
+> quantised embedding shrink by 7%, so the store is essentially 120 bytes of embedding per pixel
+> whatever else is added beside it — and month coverage compresses ~400×.
 
 The census that produced the campaign figures measured **shard means**, and this rule
 refuses **individual pixels** — a different question, and the class of error the
