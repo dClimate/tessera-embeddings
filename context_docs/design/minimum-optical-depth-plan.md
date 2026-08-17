@@ -118,6 +118,55 @@ cluster, so a shard-level number is not hiding a diffuse scatter.
 > Counted per pixel over 40 cells, the median cell keeps 92% at the line and two keep under
 > a tenth — [`optical_retention_per_pixel_2026_08.md`](optical_retention_per_pixel_2026_08.md).
 
+#### Applying the rule to a coarser unit changes almost nothing (2026-08-17)
+
+The agreement above bounds one direction — thin pixels inside deep chunks, which a coarser rule
+would wave through. It does not bound the other: **deep pixels inside thin chunks, which a coarser
+rule would newly refuse.** On a thin cell that is most of what survives, so it was measured. Four
+rules at the 25 line over an identical footprint — six full 2048-px shards per cell, systematically
+spread over the written shards, six cells spanning the depth range:
+
+| rule | pooled retention |
+|---|---:|
+| per pixel: the pixel's own count ≥ 25 (ships today) | 54.5% |
+| chunk mean: keep a whole 256-px chunk iff its eligible mean ≥ 25 | 53.4% |
+| chunk share: keep a whole 256-px chunk iff half its eligible pixels clear 25 | 54.7% |
+| shard share: the same test at 2048 px | 55.6% |
+
+**Within about one point at every unit.** The reason is that retention is *bimodal* at chunk
+granularity — a live chunk is nearly all-in or all-out, so there is little mixed population for a
+coarser rule to reassign. Share of each cell's live 256-px chunks by how much of it clears the line:
+
+| cell | live chunks | median share | under 0.10 | under 0.50 | over 0.90 |
+|---|---:|---:|---:|---:|---:|
+| 26S/2021 | 384 | 0.00 | 83% | **94%** | 1% |
+| 32S/2022 | 384 | 0.00 | 60% | 65% | 32% |
+| 17S/2022 | 384 | 0.00 | 67% | 76% | 10% |
+| 47S/2021 | 384 | 1.00 | 9% | 17% | 76% |
+| 02N/2021 | 384 | 1.00 | 16% | 17% | 83% |
+| 58S/2021 | 384 | 1.00 | 1% | 3% | 89% |
+
+**Two consequences.**
+
+The coarser the unit, the *emptier* a thin cell gets, not the fuller. 26S/2021 keeps 7.5% of this
+footprint per pixel, 4.4% by chunk mean, and **0.0% under a shard-level half rule** — every one of
+its six shards fails, so the rule deletes the cell. A coarser unit is not a way to rescue thin
+cells.
+
+And a coarser unit quantises the answer, which cuts both ways: 17S/2022 reads 22.7% per pixel and
+33.3% at shard level, because two of its six shards pass and then wave through everything inside
+them. Disagreement at shard granularity reaches 14.2% of eligible pixels waved through on that cell
+against 7.5% blocked on 26S/2021; at chunk granularity both stay under 5%.
+
+**So the enforcement unit is not the open question — the record is.** Because refusals cluster this
+hard, the per-pixel rule already behaves like a chunk rule, and `chunks_skipped_mask` (§7) is
+therefore an almost lossless summary of what it did. That is the field nothing currently writes.
+
+> Levels here are **not comparable** to the retention report's per-cell column: that sample aims 40
+> inner chunks at land via `window_origin`, this one reads six whole shards including the non-land
+> parts of live tiles, so 17S/2022 reads 22.7% here against 55.5% there. The valid comparison is
+> *between rules within a row*, where all four rules see identical pixels.
+
 ---
 
 ## 2. Non-goals — do not build these
