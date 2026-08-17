@@ -501,295 +501,155 @@ hypothesis about scale, not a measured benefit — and it is recorded as one.
 
 ### 3.10 Where a date's time actually goes — the profile that reframed the campaign
 
-Measured with the toolkit's existing hook: `perf_report_uri` is already a flow parameter, so this
-needed **no code change** — a two-date probe run captures the Dask task stream to S3, and the
-report's own numbers are grouped per stage (`scratchpad/perf_budget.py`).
+Measured with an existing hook — `perf_report_uri` is already a flow parameter, so a two-date
+probe captured the Dask task stream with **no code change**.
 
-| stage | share of task work | s/date at perfect packing |
-|---|---|---|
-| **source read + resample** | **72.3%** | 41.4 s |
-| mask + region write | 16.3% | 9.4 s |
-| inter-worker transfer | 7.8% | 4.5 s |
-| coverage gate reduce | 2.9% | 1.7 s |
-| total task work | 100% | **57.2 s** |
+**Source read and resample is 72.3% of task work**; mask and region write 16.3%, inter-worker
+transfer 7.8%, coverage gate 2.9%. Stage shares are the durable output here; **every absolute
+packing figure this section originally carried was computed from a TRUNCATED task stream and is
+withdrawn — §3.14 has the corrected values**, and they are in §8.
 
-And the line that matters:
+**Three things it settles.**
 
-| | |
-|---|---|
-| measured wall clock per date | 131.0 s |
-| task work at PERFECT packing | 57.2 s (44%) |
-| **irreducible by adding workers** | **73.8 s (56%)** |
-| **ceiling from unlimited workers** | **1.78×** |
+*The graph was never the cost.* 72% of compute is fetching and resampling COGs against the public
+archive. That is why removing 23% of the graph (§3.9) moved the clock by nothing, and why §3.8's
+write-floor framing pointed at the wrong quantity.
 
-> **EVERY PACKING FIGURE IN THIS SECTION AND §3.12 IS WRONG — read §3.14.** All of them were
-> computed from a **TRUNCATED** Dask task stream (a bounded deque, default 100,000 records), so
-> each report covered only its run's TAIL while the analysis divided by the full date count.
-> Corrected: task work at perfect packing **64.3 s/date**, width-independent residual **~37 s
-> (~36%)**, one-cell ceiling **~2.8×** — not the 1.78× here, nor §3.12's 1.60×. The qualitative
-> verdict does not survive either: **most of a date DOES pack**; about a third does not.
+*More workers cannot help much.* Only the packable fraction packs; serial client work, dispatch,
+blocking region writes and commit do not — consistent with fitting `A + B/W` to a three-rung
+worker sweep, which is worth noting because the two methods share no inputs.
 
-**Three things this settles.**
+*It reconciles two results that looked contradictory.* Real I/O should scale with workers and
+does; a worker sweep showed scaling flattening above 60 workers, and it does, because the
+residual is more than half the date. Both observations were correct.
 
-*The graph was never the cost.* 72% of compute is fetching and resampling source COGs — real data
-movement against the public Sentinel-2 archive. That is why removing 23% of the graph (§3.9)
-moved the clock by nothing, and why §3.8's write-floor framing pointed at the wrong quantity.
-
-*More workers cannot help much, and the number is now known.* Only the 57 s packs; the 74 s of
-serial client work, dispatch, blocking region writes and commit does not. 1.78× is the ceiling on
-one cell however wide the fleet — independently consistent with the 1.2–1.7× obtained by fitting
-`A + B/W` to a three-rung worker sweep, which is worth noting because the two methods share no
-inputs.
-
-*It reconciles two results that looked contradictory.* Real I/O should scale with workers, and it
-does — that is the 41 s. A worker sweep showed scaling flattening above 60 workers, and it does —
-because the 74 s residual is more than half the date. Both observations were correct.
-
-**The lever this identifies.** The residual is the target, and shrinking it is not the only way to
-remove it: **overlapping one date's serial phase with the next date's compute** takes it off the
-critical path entirely, which is worth more than any further graph work. That is the open question
-in §7, and it is the first ingest change in this campaign to be proposed from a profile rather
+**The lever it identifies:** the residual is the target, and shrinking it is not the only way to
+remove it — **overlapping one date's serial phase with the next date's compute takes it off the
+critical path entirely.** The first ingest change in this campaign proposed from a profile rather
 than from a model.
 
 ### 3.11 Overlapping a date's windows — 1.59×, and the first change proposed from a profile
 
-§3.10 left one target: 74 s of every date that no fleet width could compress. Instrumenting the
-write path located it precisely, and the location was a surprise — it was none of the candidates
-reasoning had offered.
+**Phase I: instrument, then decide.** Three permanent log lines partitioned a date over 7
+sequential dates: build 10.8 s, gate 7.2 s, **write 148.0 s**, commit **0.6 s**. The per-window
+times summed to **146.9 s of that 148.0 s write phase**, with the longest single window only
+37.8 s. So `write_day_windows`' loop — one blocking `to_icechunk` per window — was the residual:
+the fleet worked one window at a time and idled through the rest. **The commit was never the
+cost.**
 
-**Phase I: instrument, then decide.** Three permanent log lines (per-date stage timings, per-window
-timings, commit timing) partitioned a date without inference. Measured over 7 dates, sequential:
-
-| | mean |
-|---|---|
-| build (client-side graph construction) | 10.8 s |
-| gate (coverage compute) | 7.2 s |
-| **write phase** | **148.0 s** |
-| total | 166.1 s |
-| **commit** | **0.6 s** |
-| sum of per-window times | **146.9 s** |
-| longest single window | 37.8 s |
-
-**The windows explained 99% of the write phase** (146.9 of 148.0), and no single window dominated
-(37.8 s against a 146.9 s sum). So `write_day_windows`' loop — one blocking `to_icechunk` per
-window — was the residual: the fleet worked on exactly one window at a time and idled through the
-rest of each date. The commit was never the cost.
-
-This was gated on a pre-registered kill condition: had one window been most of its date, the
+This was gated on a **pre-registered kill condition**: had one window been most of its date, the
 overlap would have bought nothing and the plan said stop. It was not.
 
 **Phase II: one compute for the date.** icechunk's dask path already forks a session, stores
 lazily and merges; `to_icechunk` merely runs that once per call. Lifting the sequence one level —
-build every window's region writer, fork ONCE, collect all windows' lazy stored arrays, run ONE
-merge reduction — puts every window's loads, masks and chunk writes in a single graph whose
-critical paths overlap across the fleet. One commit per date, `align_chunks`, the alignment guard
-and the failure contract are unchanged by construction.
+build every window's writer, fork ONCE, collect all lazy stored arrays, run ONE merge reduction —
+puts every window's loads, masks and writes in a single graph whose critical paths overlap. One
+commit per date, `align_chunks`, the alignment guard and the failure contract all unchanged by
+construction.
 
-**Phase III: the A/B, on identical dates and width.**
-
-| | sequential | parallel | |
-|---|---|---|---|
-| **chunk objects written** | **44,797** | **44,797** | **identical** |
-| write phase | 148.0 s | **86.5 s** | **1.71×** |
-| per-date total | 166.1 s | **104.2 s** | **1.59×** |
-| commit | 0.6 s | 0.9 s | negligible |
-| peak worker memory | — | 12.30 of 20 GiB | no pause |
-| worker spill | 0.00 GiB | 0.00 GiB | |
-
-Pre-registered prediction was 90–110 s per date at 1.5–1.8×; measured **104.2 s at 1.59×**, inside
-the range and independently consistent with §3.10's 1.78× packing ceiling derived from a different
-instrument. **This is the only projection in this campaign that landed** — the two that did not
+**Phase III: the A/B, identical dates and width.** Write phase **148.0 → 86.5 s (1.71×)**,
+per-date **166.1 → 104.2 s (1.59×)**, peak worker memory 12.30 of 20 GiB with zero spill — and
+**44,797 chunk objects on both arms, identical**. Pre-registered prediction was 90–110 s at
+1.5–1.8×. **This is the only projection in this campaign that landed**; the two that did not
 (§3.9, §5) were both projected from aggregates without measuring the mechanism first, which is
 exactly what Phase I existed to prevent.
 
-**Why not more.** The write phase falls to ~86 s, not to the 37.8 s longest window: the work still
-has to happen, and ~85 s is near the packing floor rather than the critical path. The remaining
-per-date budget is build 10.4 + gate 7.3 + write 86.5.
-
-**It also made a date MORE responsive to fleet width, which bears directly on scaling.** Both
-arms captured task streams, so each arm's packing can be derived from its own instrument:
-
-| | sequential | parallel |
-|---|---|---|
-| task work at perfect packing | 34.0 s/date | 39.1 s/date |
-| share of the date that packs | **20%** | **38%** |
-| headroom from adding workers | **1.26×** | **1.60×** |
-| total task work | 114,294 slot-s | 131,528 slot-s (**+15%**) |
-| task count | 182,311 | 178,123 (−2%) |
-| inter-worker transfer | 8,019 slot-s | 10,032 slot-s (+25%) |
-
-Two things follow. **The overlap nearly doubled the fraction of a date that parallelises** (20% →
-38%), so per-cell width is worth more after this change than before — a wider fleet now buys
-~1.60× where it bought ~1.26×. That partially softens §3.10's conclusion that fleet width is
-nearly spent: it is spent *for the serialised implementation*, less so for this one.
-
-And **it costs ~15% more total CPU-seconds for the same output**, with 2% FEWER tasks and 25%
-more inter-worker transfer — so individual tasks got slower rather than there being more work.
-That is contention, the ordinary price of parallelism: 1.15× the compute for 1.59× the latency.
-Worth stating because at multi-cell concurrency the aggregate CPU matters, whereas here latency
-is what the deadline cares about.
+**Why not more.** The write phase falls to ~86 s rather than to the 37.8 s longest window: the
+work still has to happen, and ~85 s is near the packing floor rather than the critical path.
 
 **Now the default** for S2 (`overlap_window_writes=True`). `write_day_windows`' own
-`parallel_windows` default stays **False** deliberately: S1 also calls it, its windows have never
-been A/B'd, and a storage-layer default must not change behaviour for an unmeasured caller. S1 can
-opt in when someone measures it.
+`parallel_windows` default stays **False** deliberately — S1 also calls it, its windows have
+never been A/B'd, and a storage-layer default must not change behaviour for an unmeasured caller.
 
-**The commit-growth concern it raised is RESOLVED — the cost is bounded, not cumulative.** The
-A/B's parallel arm showed commit times climbing monotonically across its 7 dates (0.5 → 1.2 s)
-where the sequential arm stayed flat (~0.6 s), which read as possible cumulative drift and was
-recorded as the sharpest question for the year soak. A longer run answers it: the series is a
-**sawtooth with a period of exactly 8 dates**, climbing to ~1.5 s and resetting to 0.5 s —
-
-```
-0.5 0.9 0.9 0.9 1.2 1.1 1.2 1.5 │ 0.5 0.9 0.9 1.0 1.1 1.3 1.0 1.2 │ 0.5 …
-└──────── dates 1-8 ────────────┘ └──────── dates 9-16 ───────────┘  └ 17
-```
-
+**The commit-growth concern it raised is RESOLVED — bounded, not cumulative.** Commit times
+climbed monotonically across the parallel arm's 7 dates (0.5 → 1.2 s), which read as drift. A
+longer run shows a **sawtooth of period exactly 8 dates**, climbing to ~1.5 s and resetting — and
 8 is `INGEST_MANIFEST_SPLIT["time"]`. Each commit rewrites the current shard's manifest, which
-grows as dates accumulate in it and resets when the next shard opens. So over a 330-date
-zone-year the commit oscillates between 0.5 and ~1.5 s rather than growing — **§3.6's manifest
-sharding turns out to bound commit cost as well as object count**, which was not among the
-reasons it was adopted.
+grows as dates accumulate in it and resets when the next shard opens. **§3.6's manifest sharding
+bounds commit cost as well as object count**, which was not among the reasons it was adopted.
 
-Two residual facts worth keeping. The overlapped path DOES grow commit time faster *within* a
-shard than the sequential one (1.2 s against 0.6 s by date 7), plausibly because one merged
-changeset per date produces a larger manifest delta than several smaller merges. And the reason
-the A/B could not see the reset at all is that both arms ran 7 dates — entirely inside one
-8-date shard. **A 7-date window cannot distinguish bounded periodic cost from unbounded growth**;
-only a run crossing a shard boundary can.
+The lesson is sharper than the finding: **a 7-date window cannot distinguish bounded periodic
+cost from unbounded growth.** Both A/B arms ran 7 dates, entirely inside one 8-date shard, so the
+instrument could not have seen the reset however carefully it was read.
 
 **Robustness.** The lift uses `_XarrayDatasetWriter`, which icechunk marks private. The version is
 lockfile-pinned, parity is pinned by test, and any import or signature drift falls back to the
-sequential loop with a warning — so drift degrades to the previously shipped behaviour, never to a
-failure. The A/B confirmed the fallback did not fire and no per-window lines appeared, i.e. the new
-path genuinely ran.
+sequential loop with a warning — so drift degrades to previously shipped behaviour, never to a
+failure.
 
 ### 3.12 What the overlap did to the packing budget — and why §3.10's programme verdict survives
 
-§3.11 established the overlap's win from wall clock and store contents. Re-running §3.10's
-packing analysis on **both arms' performance reports** — same instrument, same 480 slots, same
-7 dates — checks the mechanism from the other side, and corrects a plausible-sounding
-inference about what the change did.
+**Every absolute figure this section carried is withdrawn — the task stream was truncated, and
+§3.14 has the corrected values.** Two conclusions survive the correction, and they are the reason
+the section remains.
 
-| | sequential | parallel |
-|---|---|---|
-| wall clock per date | 166.1 s | 104.2 s |
-| task work at PERFECT packing | 34.0 s (20%) | 39.1 s (38%) |
-| **residual no worker count can remove** | **132.1 s (80%)** | **65.1 s (62%)** |
-| ceiling from unlimited workers, one cell | 1.26× | **1.60×** |
-| total slot-seconds | 114,294 s | 131,528 s (**+15%**) |
-| source read + resample, share of task work | 72.3% | 71.3% |
+**The overlap REMOVED serial time; it did not convert serial time into packable work.** The
+obvious reading gets this backwards. Packed task work barely moved; what collapsed was the
+residual. The windows' critical paths were never *work* the fleet could have absorbed — they were
+waiting, and the fix deleted the waiting rather than parallelising it.
 
-**The overlap REMOVED serial time; it did not convert serial time into packable work.** That
-distinction matters and the obvious reading gets it backwards. Packed task work barely moved
-(34.0 → 39.1 s); what collapsed was the residual, 132.1 → 65.1 s. The windows' critical paths
-were never *work* the fleet could have absorbed — they were waiting, and the fix deleted the
-waiting rather than parallelising it.
-
-**Two independent confirmations fall out.** The +15% slot-seconds reproduces the overlap's
-CPU cost from a second instrument (it was first measured from worker-time totals), and the
-stage shares are stable to within a percentage point, so the change did not silently alter
-what the graph computes — the same conclusion the identical 44,797 chunk-object counts reach
-from store contents.
-
-**§3.10's programme verdict stands, and this is the point of the section.** The ceiling moved
-from 1.26× to 1.60×, which is real but modest: **62% of a date still cannot be compressed by
-any worker count**, so widening a single cell remains unprofitable and the campaign's lever
-is still cell CONCURRENCY rather than cell width. It would have been easy to assume that
+**§3.10's programme verdict stands.** The ceiling moved, but a large fraction of a date still
+cannot be compressed by any worker count, so widening a single cell remains unprofitable and the
+campaign's lever is **cell concurrency, not cell width**. It would have been easy to assume that
 halving the residual freed the fleet to scale; measurement says it did not.
 
-**What the remaining 65.1 s is.** Roughly 18.6 s is accounted for by name — build 10.4 s
-(client-side graph construction), gate 7.3 s, commit 0.9 s. The other ~46 s sits *inside* the
-write phase, which is now a single dask compute: slots stand idle inside it, on dependency
-structure and straggler tails rather than on anything serial that remains to be lifted. That
-is the next thing worth profiling, and it is a different problem from the one §3.11 solved.
-
-**Caveat on the absolute figures — and it FIRED. See §3.14.** This section said: "A bounded
-stream would understate packed work in both arms and so understate both ceilings; the two arms
-captured 182,311 and 178,123 tasks, which are neither round numbers nor equal, so truncation is
-unlikely but not excluded." **The stream WAS truncated.** Those totals include inter-worker
-transfer rectangles, which pad them; the NON-transfer counts are **100,008 and 100,025** — the
-100,000 default cap, exactly. The instinct was right and the test was wrong, which is a more
-useful lesson than the number it got wrong: a truncation check must count the records the cap
-applies to. The paired DELTA does survive, as claimed.
+> **The truncation caveat in this section FIRED, and how it failed is worth more than the numbers
+> it got wrong.** It reasoned: "the two arms captured 182,311 and 178,123 tasks, which are neither
+> round numbers nor equal, so truncation is unlikely but not excluded." Those totals include
+> inter-worker transfer rectangles, which pad them. The NON-transfer counts are **100,008 and
+> 100,025** — the 100,000 default cap, exactly. The instinct was right and the test was wrong:
+> **a truncation check must count the records the cap applies to.**
 
 ### 3.13 The retained catalogue items — 2.45× smaller, and the first change forced by a LONG run
 
 Everything above was found by shortening a date. This one was found by lengthening a run: a
-two-month soak deadlocked at 53 of 60 dates when the worker running the ingest body crossed
-Dask's memory pause threshold and never resumed. Failure record: F-19 in the test plan; options
-weighed in `yield-embeddings/context_docs/decisions/driver-worker-memory-options.md`.
+two-month soak deadlocked at 53 of 60 dates when the worker running the ingest body crossed Dask's
+memory pause threshold and never resumed.
 
-**Why the driver is the worker that dies.** The ingest body runs as ONE task on ONE worker, so
-that worker holds the streamed month plus the prefetched next month **and** its ordinary share of
-compute. Measured: per-worker memory settles near **13.45 GiB** (flat across six consecutive
-measurement blocks — a real ceiling, not a leak), the driver sits **~4.9 GiB above** the fleet
-mean, and 0.80 × 18.63 = **14.90 GiB** is where Dask pauses. It peaked at **14.89**.
+**Why the driver is the worker that dies.** The ingest body runs as ONE task on ONE worker, so that
+worker holds the streamed month plus the prefetched next month **and** its ordinary share of
+compute. Per-worker memory settles near **13.45 GiB** — flat across six consecutive blocks, a real
+ceiling and not a leak — while the driver sits **~4.9 GiB above** the fleet mean. Dask pauses at
+14.90 GiB. It peaked at **14.89**.
 
-**Why spilling could not save it.** **91–100% of worker memory is UNMANAGED** all run — Dask has
-nothing it is permitted to evict. Raising the spill threshold, spilling harder, or (as was
-considered) raising the pause threshold from 0.80 to 0.90 all fail for the same reason: pausing
-frees nothing here, and Fargate has no swap, so a higher threshold removes the guard without
-buying runway. **This is why the fix had to delete memory rather than manage it.**
+**Why spilling could not save it.** **91–100% of worker memory is UNMANAGED**, so Dask has nothing
+it is permitted to evict. Raising the spill threshold, spilling harder, or raising the pause
+threshold all fail for the same reason: pausing frees nothing here, and Fargate has no swap, so a
+higher threshold removes the guard without buying runway. **The fix had to delete memory rather
+than manage it.**
 
-**What was deleted.** Sentinel-2 L2A items from earth-search carry **35 assets**; the ingest
-loads **11**. The rest — previews, per-band JP2 variants, metadata documents — were retained for
-a whole month and never read. Measured with the shipped code, streaming so no arm ever holds the
-unpruned form, each form in a fresh process:
+**What was deleted.** Sentinel-2 L2A items carry **35 assets**; the ingest loads **11**. The rest —
+previews, per-band JP2 variants, metadata documents — were retained for a whole month and never
+read. Dropping unused assets and links takes an item from **86.8 to 35.4 KiB (2.45×)**, which at a
+dense zone's 68,000 retained items is **~3.3 GiB off the driver**. Rehydration is a saving rather
+than a cost: building from a pruned dict costs **252 µs against 810 µs**, because most of an item's
+construction cost is the assets being dropped.
 
-| retained form | KiB/item | vs today |
-|---|---|---|
-| hydrated `pystac.Item` — the old behaviour | **86.8** | 1.00× |
-| drop unused assets + links, keep all else verbatim | **35.4** | **2.45×** |
-| also prune properties to an allow-list | 31.8 | 2.79× |
+**A DENY-list, and a bug is the reason.** The more aggressive allow-list variant failed on first
+attempt with "Failed to auto-guess CRS/resolution", because this collection carries its CRS in
+`proj:code` where the list expected `proj:epsg`. That failure was loud. A subtler one — dropping
+`raster:bands` scale/offset — would have **changed pixel values silently**. Dropping whole unread
+assets cannot lose metadata the loader needs, and it is where 85% of the saving is. An item whose
+asset names are all unrecognised is returned untouched.
 
-86.8 KiB/item independently reproduces §8's earlier "~80 KB per retained item", measured a
-different way — so the baseline is not in doubt. At a dense zone's 68,000 retained items this is
-**5.63 → 2.30 GiB, i.e. ~3.3 GiB off the driver.**
+**Shipped alongside: worker memory 20480 → 24576 MiB.** Both were needed; pruning alone leaves
+every worker ~1.5 GiB below a hard threshold, which is the margin that just failed.
 
-**A DENY-list, and the reason is a bug this caught.** The aggressive allow-list variant *failed
-on first attempt* with "Failed to auto-guess CRS/resolution", because this collection carries its
-CRS in `proj:code` where the list expected `proj:epsg`. That failure was loud. A subtler one —
-dropping `raster:bands` scale/offset — would have **changed pixel values silently**. Dropping
-whole unread assets cannot lose metadata the loader needs, and it is where 85% of the saving is.
-An item whose asset names are all unrecognised is returned untouched, so a differently-named
-collection degrades to the old behaviour rather than losing its bands.
+**The durable lesson, and the reason this section exists.** A 7-date A/B cannot see this — the
+failure appears past ~40 dates. Worse, the first drift analysis was fitted over samples from
+*after* the deadlock, when a frozen cluster reads as a plateau, and briefly concluded "bounded, not
+a leak" from evidence that could not support it. **Exclude the post-failure tail before fitting any
+resource trend, and size memory against a long run's asymptote rather than a short run's peak** —
+20480 was itself chosen against a ~12.4 GiB peak on a short run, and the true ceiling is ~15.
 
-**Rehydration is a saving, not a cost.** The query now pages `items_as_dicts()` and builds the
-item *after* pruning. Building from a pruned dict costs **252 µs/item against 810 µs** for a full
-one — **3.2× cheaper** — because most of an item's construction cost is the assets being dropped.
-Pruning itself is 8.7 µs/item.
-
-**Correctness is pinned structurally, not by inspection.** A pruned load is identical to a full
-one on band set, dims, dtypes, CRS, transform, geobox and timestamps; nine unit tests pin the
-deny-list contract. The OPERA path supplies items through `item_provider_fn` and returns before
-any of this, so radar is untouched.
-
-**Shipped alongside: worker memory 20480 → 24576 MiB**, moving the pause threshold to ~17.9 GiB.
-Both were needed. Pruning alone leaves every worker ~1.5 GiB below a hard threshold — the margin
-that just failed — and **where ordinary compute workers level off is still unmeasured** (mean
-9.9 GiB, still rising slowly at 53 dates). Headroom covers what pruning does not reach.
-
-**The durable methodological lesson, and it is the reason this section exists.** A 7-date A/B
-cannot see this: the failure appears past ~40 dates. Worse, the first drift analysis was fitted
-over samples from *after* the deadlock, when a frozen cluster reads as a plateau, and briefly
-concluded "bounded, not a leak" from evidence that could not support it. **Exclude the
-post-failure tail before fitting any resource trend, and size memory against a long run's
-asymptote rather than a short run's peak** — the 20480 figure was itself chosen against a ~12.4
-GiB peak observed on a short run, and the true ceiling is ~15.
-
-### 3.14 The packing ceiling was measured off a truncated stream — it is ~2.8×; and how wide a cell should be
-
-Two findings, in the order they were established, because the second depends on the first.
+### 3.14 The packing ceiling was measured off a truncated stream — it is ~2.8×
 
 **The instrument was lying, and the check that should have caught it measured the wrong thing.**
-Dask's task stream is a bounded deque — `distributed.scheduler.dashboard.tasks.task-stream-length`,
-default **100,000**. At ~25k tasks per date that is about **4 dates**. Both arms of §3.11's A/B hold
-**100,008 and 100,025 non-transfer rectangles**: the cap. So each captured the run's last ~3.5 of 7
-dates and `perf_budget.py` divided by 7. §3.12 explicitly considered truncation and dismissed it
-because the totals — 182,311 and 178,123 — were "neither round numbers nor equal". **Inter-worker
-transfer rectangles pad those totals**; the cap applies to the non-transfer records. The caveat was
-right and its test was wrong.
+Dask's task stream is a bounded deque, default **100,000** records — at ~25k tasks per date, about
+**4 dates**. Both arms of §3.11's A/B hold **100,008 and 100,025 non-transfer rectangles**: the cap.
+Each captured the run's last ~3.5 of 7 dates while the analysis divided by 7. §3.12 considered
+truncation and dismissed it because the totals were "neither round numbers nor equal" — but those
+totals include inter-worker transfer rectangles, which pad them.
 
 | quantity | as recorded (§3.10, §3.12) | **corrected** |
 |---|---|---|
@@ -797,54 +657,36 @@ right and its test was wrong.
 | width-independent residual | 73.8 s (56%), then (62%) | **~37 s (~36%)** |
 | ceiling, unlimited workers, ONE cell | 1.78×, then 1.60× | **~2.8× (2.0–3.0)** |
 
-**What settles it is two independent instruments agreeing.** The paired 60w/120w width measurement
-gives `T = F + K/W` with no reference to any task stream. Fed the corrected packed figure it
+**Two independent instruments agree, which is what settles it.** The paired 60w/120w width
+measurement gives `T = F + K/W` with no reference to any task stream. Fed the corrected figure it
 predicts T(60w) = **166.4 s** against **167.9 s measured (−0.9%)**; fed the recorded figure it
 predicted **141.2 s (−15.9%)**. And the "~30 s unexplained inside the write phase" that §3.13 named
-as the next profiling target **was this arithmetic error**, not a phenomenon. Fixed at source:
-`perf_budget.py` now warns when the non-transfer count approaches the cap, and `ecs_cluster` takes
-`diagnostic_task_stream`, wired to `perf_report_uri` so a report always covers its whole run.
+as the next profiling target **was this arithmetic error**, not a phenomenon.
 
-**The budget now closes.** Of a ~102 s date at 120 workers: **64.3 s scalable task work** (71%
-source COG read and resample; the profiler puts 61% of in-task time inside `rasterio._do_read`),
-and **~37 s that no width touches** — commit and build 12–14 s, gate round-trip ~7 s, writer
-assembly and graph submit 5–7 s, plus ~11 s of dispatch ramp and merge tail, consistent with the
-single-threaded scheduler's 600–800 tasks/s against ~25k tasks per date.
+Fixed at source: `perf_budget.py` warns when the non-transfer count approaches the cap, and
+`ecs_cluster` takes `diagnostic_task_stream`, wired to `perf_report_uri` so a report always covers
+its whole run.
 
-**Which makes cell WIDTH answerable, and 120 workers is not the answer.** 120 was never chosen; it
-is 512 vCPU ÷ 4 minus the scheduler and runner — an artifact of the quota. Fitting the paired
-points gives `T(W) = 36.3 + 7896/W`. At a fixed vCPU budget, counting the ~20 vCPU per-cell control
-overhead (dask scheduler + flow runner):
+**The budget now closes.** Of a ~102 s date at 120 workers: **64.3 s of scalable task work** (71%
+source COG read and resample; the profiler puts 61% of in-task time inside `rasterio._do_read`) and
+**~37 s that no width touches** — commit and build 12–14 s, gate round-trip ~7 s, writer assembly
+and graph submit 5–7 s, plus ~11 s of dispatch ramp and merge tail.
 
-| workers/cell | s/date | vCPU/cell | cells @10k | aggregate dates/h | vs 120w |
-|---|---|---|---|---|---|
-| 15 | 563 | 80 | 125 | 800 | 1.13× |
-| **30** | 300 | 140 | 71 | **853** | **1.21×** |
-| **45** | 212 | 200 | 50 | **850** | **1.21×** |
-| 60 | 168 | 260 | 38 | 815 | 1.16× |
-| 120 | 102 | 500 | 20 | 705 | 1.00× |
-| 250 | 68 | 1020 | 9 | 477 | 0.68× |
+**On cell width, the answer is that it barely matters.** An earlier version of this section fitted
+`T(W) = 36.3 + 7896/W` from **two** paired points and concluded 30–45 workers was ~20% better than
+120. Two points cannot constrain a two-parameter model: a third control at 45 workers put `F`
+anywhere from 11.4 to 39.3, and the three-point fit `T = 18.0 + 9391/W` makes aggregate throughput
+**flat within ~6% from 20 to 120 workers**. That claim is **withdrawn**, along with a per-cell
+interference figure of 1.04× that came from a single two-cell measurement — none is measurable to
+20 concurrent cells (§1).
 
-> **CORRECTION — the table above and the two conclusions drawn from it are SUPERSEDED.** Both of
-> its inputs turned out to be wrong. (1) The width curve was fitted from **two** paired points (60
-> and 120), which cannot constrain a two-parameter model: a third control at 45 workers put `F`
-> anywhere from 11.4 to 39.3, and the three-point fit `T = 18.0 + 9391/W` makes aggregate
-> throughput **flat within ~6% from 20 to 120 workers**. There is no meaningful optimum, so the
-> "30–45 workers, ~20% better than 120" claim is **withdrawn** — prefer whatever width is simplest
-> to operate. (2) The per-cell interference of 1.04× came from a single two-cell measurement and is
-> **withdrawn**: none is measurable to 20 concurrent cells (§1). The table is kept because its
-> *shape* — throughput per vCPU falling as cells widen — survives both corrections, and because the
-> reasoning is worth not repeating.
-
-What does survive: **wide cells are better than this record originally claimed and still lose per
+What survives: **wide cells are better than this record originally claimed and still lose per
 vCPU.** 250 workers buys 1.46× per cell, 500 buys 1.89×, unlimited ~2.8×, while throughput per vCPU
-falls monotonically. Combined with flat width sensitivity and no measurable interference, the
-practical rule is that **topology barely matters — pick the width that is easiest to run** and
-spend the quota on more cells.
+falls monotonically. With flat width sensitivity and no measurable interference, the practical rule
+is that **topology barely matters — pick the width easiest to run** and spend the quota on cells.
 
 The remaining open constraint is not contention but **launch**: Fargate sustains **20 tasks/s, 100
 burst**, and a 10,000 vCPU fleet is ~2,300 tasks, so about two minutes of ramp unless raised.
-Aggregate source-read elasticity at large cell counts is still unmeasured.
 
 ### 3.15 Load blocks re-unified with store chunks — width, not dispatch, was the limit
 
@@ -1261,182 +1103,97 @@ what this run exercised and a slow leak would compound.
 
 ### 4.9 S1 never received the changes S2 depends on — and overlapping paid double
 
-Sentinel-1 pays the serial penalties the S2 path had already shed. Two of the three are now closed:
+Sentinel-1 paid the serial penalties the S2 path had already shed. **Two of three axes are now
+closed:**
 
 | axis | S2 | S1 before | S1 now |
 |---|---|---|---|
 | windows within a date | one shared computation (§3.11) | **sequential** — a date costs the SUM of its windows | overlapped, by default (`12d2aed`) |
 | window merge pricing | cheap-boundary rate (§3.17) | expensive rate — *correct*, given it wrote serially | cheap rate, once overlapping (§3.17) |
-| dates per commit | sized per region (§3.16) | one commit per date | unchanged — still open, see below |
+| dates per commit | sized per region (§3.16) | one commit per date | **unchanged, still open** |
 
-**The symptom that pointed here.** On a sparse zone S1 cost ~39–59 s/date against S2's ~29–33,
-**despite carrying 2 bands against S2's 11**. A fraction of the data volume, and slower.
+The symptom that pointed here: on a sparse zone S1 cost ~39–59 s/date against S2's ~29–33,
+**despite carrying 2 bands against S2's 11**.
 
-**What we predicted, and what we measured.** The prediction was that turning overlapping on would
-transfer the S2 path's 1.59×, and that the gain would be **largest where a date has many windows**
-and shrink toward nothing as window count fell. Three ROIs, each run twice at S1 = 30 workers:
+**Overlapping buys 2.4–3.9×, and nothing predicts its size.** Measured over three ROIs at 23, 9
+and 7 windows per date: 2.79×, 2.86×, 2.40× — **flat in window count**, with nine windows gaining
+marginally more than twenty-three. A 2×2 then held it flat in fleet width too: 3.67× at 30 workers
+against 3.85× at 60, inside the 5% noise floor.
 
-| ROI | windows/date | sequential | overlapped | gain |
-|---|---|---|---|---|
-| 35N | 23 | 172.1 s | 61.8 s | **2.79×** |
-| 21N | 9 | 61.9 s | 21.6 s | **2.86×** |
-| 59S | 7 | 34.5 s | 14.3 s | **2.40×** |
+> **THREE MECHANISM ACCOUNTS HAVE BEEN PROPOSED AND ALL THREE ARE REFUTED.** Sum-over-max
+> (predicts the gain scales with window count — refuted, it is flat); fleet occupancy (predicts it
+> grows with fleet width — refuted, doubling the fleet did not move it); and `min(query, write)`
+> for the look-ahead below (predicts the gain is largest on sparse zones — refuted, it is exactly
+> backwards). No fourth is offered. **Use the measured range and do not model it.**
 
-Bigger than predicted, and — the part that matters — **flat in window count**. Nine windows gained
-marginally *more* than twenty-three. That refutes the reasoning behind the prediction.
+Insensitivity to both variables tested is a *stronger* operational position than any mechanism
+would have given: an effect that moves with neither can be applied across the campaign rather than
+only where it was measured. Two cautions — the ratio is what shipping the overlap *and* the merge
+re-pricing buys together, and the magnitude should not be extrapolated far outside 30–60 workers.
 
-> **TWO MECHANISM ACCOUNTS HAVE BEEN PROPOSED AND BOTH ARE WITHDRAWN.** The gain is real and
-> reproducible; why it is the size it is remains **unexplained**. Recorded in full because the
-> pattern of failure is itself the useful part.
->
-> 1. **Sum-over-max.** A date's sequential cost is the SUM of its windows and its overlapped cost
->    roughly the MAX, so the gain should scale with window count. **Refuted:** flat across a 3.3×
->    spread in window count (above).
-> 2. **Fleet occupancy.** One window's graph is only a few tasks wide, so sequential writing
->    occupies little of the fleet however many windows queue behind it; the gain would then be
->    fleet width ÷ per-window width, which drops window count out (consistent with the table) and
->    predicts the gain should **grow with fleet width**. **Refuted:** a 2×2 on 35N, all four arms
->    launched together, gave **3.67× at 30 workers and 3.85× at 60** — a 1.05× difference, at the
->    5% noise floor. Doubling the fleet did not move it.
+**Per-date window narrowing: shipped, 7–20%.** S2 narrows each date to the windows that date's
+imagery can reach; S1 wrote the run's **full** land-window set every date. Offline against real
+masks, a date's swath actually reaches **5–20% of live windows** (median 4–5 of 25 on 35N, 1 of 11
+on 21N). So S1 was building **5–20× more window-writes per date than had any data in them** —
+producing all-fill chunks that are never stored, so the mosaic is identical either way. Shipping it
+cut windows per date six-fold (11.0 → 1.8) for **20.1% and 7.3%** of wall clock on two zones. Note
+the share figures bound the *graph*, not the clock, and the conversion is nowhere near 6×.
 
-**What is established, and it is the operationally important part:** overlapping S1's window
-writes buys **2.4–3.9×** on per-date write time, and that gain is **insensitive to both variables
-tested** — window count over a 3.3× range and fleet width over a 2× range. An effect that does not
-move with either is one we can apply across the campaign rather than only to the zones and widths
-it was measured on. That is a stronger operational position than either mechanism would have given.
-
-Two cautions on the numbers. The measured ratio is **what shipping the pair buys, not the overlap
-alone**: the merge rate now follows the write mode, so the overlapped arms derive 25 windows to the
-sequential arms' 23 and write ~6% less dead area. And because the mechanism is unknown, treat the
-magnitude as an empirical range rather than something to extrapolate from — in particular, do not
-assume it holds at fleet widths far outside 30–60.
-
-One consequence survives both withdrawals: **narrowing S1's per-date windows is worth doing**
-(§4.9 continues below). That case rests on the measured fraction of windows a pass actually
-reaches, not on either mechanism.
-
-**The largest remaining S1 win is per-date window narrowing, and it is bigger than expected.**
-S2 narrows each date to the windows that date's own imagery can reach (`windows_for_date`); S1
-writes the run's **full** land-window set on every date. How much that costs was never measured,
-so we measured it offline — public CMR granule footprints against the real masks, grouped by solar
-day, no cluster and no credentials needed:
-
-| ROI | live windows | median windows a date actually reaches | share |
-|---|---|---|---|
-| 35N asc / desc | 25 | 4 / 5 | **16% / 20%** |
-| 21N asc / desc | 11 | 1 / 0.5 | **9% / 5%** |
-| 59S asc / desc | 12 | 2 / 2 | **17% / 17%** |
-
-A single Sentinel-1 pass covers a swath, not a UTM zone, so **S1 builds and runs 5–20× more
-window-writes per date than have any data in them.** Those windows produce all-fill chunks that
-are never stored, so the mosaic is identical either way — this is work whose result is already
-discarded, the same argument that justified narrowing on S2. Some dates reach **no** live window
-at all (the 0% minima), and S1 currently commits those dates rather than skipping them.
-
-**SHIPPED, and measured at 7–20%.** Both zones wrote **six times fewer windows per date**
-(11.0 → 1.8 and 12.0 → 2.0), worth **20.1%** and **7.3%** of per-date wall clock at 13 workers.
-That partly contradicts the caution written here first: the share figures do bound the *graph*
-rather than the wall clock, and the conversion is nowhere near 6× — but it is not negligible
-either, and the argument that S1's unsaturated scheduler would make it worthless was wrong.
-
-**The dangerous failure mode was designed out rather than accepted.** Keying each date's
-footprint by solar day would disagree with the loader wherever the offset crosses UTC midnight
-and would then narrow to the wrong footprint, dropping imagery silently. Instead the join is on
-an **exact timestamp**: odc sets each slice's time coordinate to `group[0].nominal_datetime`, the
-earliest item's real timestamp, so the minimum item datetime in a group reproduces it exactly. An
-unmatched slice writes every window; "reaches nothing" and "we do not know" are separate branches
+**The dangerous failure mode was designed out.** Keying each date's footprint by solar day would
+disagree with the loader wherever the offset crosses UTC midnight, narrowing to the wrong footprint
+and dropping imagery silently. The join is on an **exact timestamp** instead: odc sets each slice's
+time to `group[0].nominal_datetime`, so the minimum item datetime reproduces it exactly. An
+unmatched slice writes every window — "reaches nothing" and "we do not know" are separate branches
 and only the former skips.
 
-**Dates reaching no live window are skipped unconditionally, and that mattered more than the wall
-clock.** On one zone it removed **13 of 58 dates (22%)**. Verified on both sides by re-deriving
-footprints from the catalogue: the eight sampled skipped dates reach **zero** live windows despite
-carrying **483–1,113 granules each**, while sampled kept dates reach one to three. They are not
-no-data days — they are days whose swath covers only the zone's ocean.
-
-> **The skip fixes a latent correctness bug, which is not why it was built.** Some zones have an
-> orbit that never reaches land at all: **40S and 24S ascending have granules on ~30 days of 2024
-> and reach zero live windows on every one of them.** Writing those dates created a SAR store full
-> of fill, which `resolve_s1_orbit` then read as a *present* orbit — so inference consumed an
-> all-fill band as real signal, the same hazard the dual-pol granule guard exists to prevent. With
-> the skip, nothing is written, no store is created, and the orbit is correctly downgraded to
-> single-orbit; the coverage gate follows, since it derives its orbit from the stores present.
+> **Skipping dates that reach no live window fixes a latent correctness bug, which is not why it
+> was built.** It removed 13 of 58 dates (22%) on one zone — days whose swath covers only ocean,
+> carrying 483–1,113 granules each and reaching zero live windows. But some zones have an orbit
+> that never reaches land at all: **40S and 24S ascending have granules on ~30 days of 2024 and
+> reach zero live windows on every one.** Writing those dates created a SAR store full of fill,
+> which `resolve_s1_orbit` then read as a *present* orbit — so inference consumed an all-fill band
+> as real signal, the same hazard the dual-pol granule guard exists to prevent. With the skip
+> nothing is written, no store is created, and the orbit is correctly downgraded.
 >
 > Residual case, **not observed** across eight zone-orbits: a zone with some months emptied and
-> others not would leave a store missing those months, and the gate counts months present.
+> others not leaves a store missing those months, and the gate counts months present.
 > `allow_partial_window` is the designed relief. Worth a census before the campaign.
 
-**The catalogue look-ahead is now SHIPPED and measured — ~10%, and the query hides completely.**
-S1 used to pay its whole catalogue query before writing anything. It now prepares the next batch
-during the current batch's writes, reusing `ingest._pipeline.pipelined` unchanged — the same
-helper the S2 date loop uses — because the phase boundary the S1 timing logs already measured
-turned out to be exactly the prepare/consume split it wants: the query holds no credential and
-touches no store, so it is safe on a background thread. **One batch of look-ahead only**, because
-a batch's write is one long consume and deeper retention is what deadlocked the driver (§3.13).
+**Catalogue look-ahead: shipped, ~10%, and the query hides completely.** S1 now prepares the next
+batch during the current batch's writes, reusing `ingest._pipeline.pipelined` unchanged. Median
+stall after the first batch is **0.0 s** against queries of 3.5–23 s. Per-date wall clock fell
+**10.9%** on a 53-date arm. **One batch of look-ahead only** — deeper retention is what deadlocked
+the driver (§3.13).
 
-Measured, four arms launched together, 12 batches each: median stall on every batch after the
-first is **0.0 s** against queries of 3.5–23 s, so the query hides *entirely*. Per-date wall
-clock fell **10.9%** on a 53-date arm and 8.7% on a weaker 31-date one.
+That is below the 14% query share, and the reason is the useful part: **a query run concurrently
+gets slower**, 178 → 291 s on one zone, because the background thread contends with the write it
+hides behind. The log's `hidden` field therefore overstates badly — 279.7 s claimed against 120.8 s
+realised. **Treat the paired per-date difference as the result and `hidden` as an upper bound.**
 
-**That is below the 14% query share, and the reason is the useful part: a query run concurrently
-gets SLOWER** — 178 → 291 s on one zone (+63%). The background thread contends with the write it
-hides behind, so the log's `hidden` field overstates the saving badly (279.7 s claimed against
-120.8 s realised). **Treat the paired per-date difference as the result and `hidden` as an upper
-bound.** Against the honest ceiling — the *serial* arm's query — the look-ahead captured 74% of
-what was available.
+The look-ahead's gain also **rises with density** (−12.5% at 4 live windows, +15.3% at 25), which
+is the third refuted mechanism above. The sparsest zone loses because its look-ahead arm still
+stalls: most batches held no data, so there was no preceding write to hide behind and it paid
+contention for nothing. Absolute cost across the run: **1.4 seconds.** Recorded so nobody "fixes"
+it.
 
-It also demonstrates a sequencing rule worth generalising: **the query only became worth
-optimising because the overlap made the write several times faster.** At the sequential write
-speed the same query was 4–5% of a batch, below the threshold for being worth building. Speeding
-up one phase promotes the next, so re-rank remaining work after every win rather than once.
+**A sequencing rule worth generalising:** the query only became worth optimising *because* the
+overlap made the write several times faster — at the sequential write speed it was 4–5% of a
+batch, below the threshold for being worth building. **Speeding up one phase promotes the next, so
+re-rank remaining work after every win rather than once.**
 
-**The look-ahead's gain RISES with density, and the third mechanism is refuted too.** The
-prediction was that the saving per batch is `min(query, write)`, so the relative gain should peak
-where the two are comparable and be largest on sparse zones. Tested at a genuine 6.25× contrast
-(25 live windows against 4):
+**S1 is NOT fleet-bound, so narrowing its fleet cuts cost as well as quota.** A 2.31× narrowing
+(30w → 13w) cost only **1.34–1.52×** in time, not 2.31×, so worker-seconds per date fell **34–42%**
+where the width-neutral forecast assumed zero. That is a large proportional cut on a base the
+overlap had already shrunk to 9–16% of worker-hours, so the campaign total moves only ~4%, and
+longer-running narrow fleets raise per-fleet scheduler cost enough to offset part of it. **Do not
+reuse "worker-hours are width-independent"** — where a fleet is not the constraint, narrowing is
+strictly cheaper on both axes, and the only way to know is to measure two widths.
 
-| zone | live windows | serial | look-ahead | gain |
-|---|---|---|---|---|
-| 40S | 4 | 2.80 s | 3.15 s | **−12.5%** |
-| 21N | 11 | 20.93 s | 18.65 s | +10.9% |
-| 59S | 12 | 14.76 s | 13.48 s | +8.7% |
-| 35N | 25 | 74.45 s | 63.05 s | **+15.3%** |
-
-Exactly backwards: the gain rises with density and the sparsest zone loses. **Three mechanisms
-have now been proposed for this effect and all three refuted** — sum-over-max, fleet occupancy,
-and `min(query, write)`. No fourth is offered. Use the measured range and do not model it:
-**9–15% where coverage is continuous**, negligibly negative where batches are mostly empty.
-
-Why 40S loses is at least legible: its look-ahead arm *still stalls*, so the query never hid. It
-wrote only 4 dates across 4 of 12 batches — most batches held no data, so there was no preceding
-write to hide behind and it paid contention for nothing. Absolute cost across the run: **1.4
-seconds**. Recorded so nobody "fixes" it.
-
-**S1 is NOT fleet-bound, so narrowing its fleet cuts COST as well as quota.** The 13-worker width
-was chosen on the standard assumption that worker-hours are width-independent — halve the fleet,
-double the duration, same bill. Measured, that is false:
-
-| zone | 30w | 13w | time ratio | worker-seconds/date |
-|---|---|---|---|---|
-| 21N | 18.65 s | 24.90 s | **1.34×** (not 2.31×) | 560 → **324**, −42% |
-| 59S | 13.48 s | 20.50 s | **1.52×** (not 2.31×) | 404 → **267**, −34% |
-
-A 2.31× narrowing cost only 1.34–1.52× in time, so a 30-worker S1 fleet was paying for idle
-capacity. Two consequences. The re-sizing saves **34–42% of S1's compute** where the forecast
-assumed zero — though that is a large proportional cut on a base the overlap had already shrunk to
-9–16% of worker-hours, so the campaign total moves only ~4%, and longer-running narrow fleets raise
-per-fleet scheduler and runner cost enough to offset part of it. And it leaves S1 at roughly **half**
-the cell rather than the 83% the width-neutral model predicted, so 13 workers has about 2× margin.
-
-**Do not reuse "worker-hours are width-independent."** Where a fleet is not the constraint,
-narrowing is strictly cheaper on both axes, and the only way to know is to measure two widths.
-
-**Also still open on S1.** Date fusing remains the least certain lever: by §3.16's arithmetic it
-wins only where the fleet has idle capacity, and overlapping has just consumed much of exactly
-that, so the case for it is now *weaker* than before.
-
-S1 was also **uninstrumented** — it reported only "wrote N dates", so a slow batch was
-indistinguishable from a slow catalogue, and those have opposite remedies. It now emits per-date
-`write` and window `mode`, and per-batch `query` share.
+**Also still open.** Date fusing is the least certain lever: by §3.16's arithmetic it wins only
+where the fleet has idle capacity, and overlapping has just consumed much of exactly that, so the
+case is now *weaker* than before. S1 was previously uninstrumented — it reported only "wrote N
+dates", so a slow batch was indistinguishable from a slow catalogue, and those have opposite
+remedies. It now emits per-date `write` and window `mode`, and per-batch `query` share.
 
 ### 4.10 A latent S1 correctness bug: credentials renewed on the wrong clock
 
