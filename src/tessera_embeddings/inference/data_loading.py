@@ -27,6 +27,7 @@ import numpy as np
 import zarr
 
 from tessera_embeddings.config.inference import S1_ORBIT_NONE, S2_BAND_ORDER, SCL_VALID_CLASSES
+from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -132,12 +133,17 @@ class S2MaskBundle:
         abs_indices: Absolute store-level time indices of kept timesteps, (T_kept,).
         obs_count: Per-pixel valid-timestep count from the full (pre-prune) mask,
             shape (chunk_height, W), uint16.
+        month_covered: Which calendar months each pixel was seen in, shape
+            (12, chunk_height, W), bool, month 0 = January. From the same
+            pre-prune mask as ``obs_count``, so the twelve flags partition
+            exactly the observations that count totals.
     """
 
     mask: np.ndarray
     doys: np.ndarray
     abs_indices: np.ndarray
     obs_count: np.ndarray
+    month_covered: np.ndarray
 
 
 @dataclass
@@ -266,12 +272,17 @@ def _load_scl_mask(
 # ---------------------------------------------------------------------------
 
 
-def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.ndarray, np.ndarray]:
+def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Filter the time coordinate of a raw zarr group to a TimeWindow.
 
     Returns:
-        Tuple of (window_indices, doys): absolute store-level integer indices of
-        the matching timesteps, and int32 DOY values for those timesteps.
+        Tuple of (window_indices, doys, months): absolute store-level integer indices of
+        the matching timesteps, int32 DOY values for those timesteps, and their calendar
+        months as 1-12.
+
+    Months are taken from the timestamps themselves rather than derived from the DOYs, which
+        would need the year to place a boundary and would be a day out for every month after
+        February of a leap year.
     """
     times = root["time"][:].astype("datetime64[ns]")
     years = times.astype("datetime64[Y]").astype(int) + 1970
@@ -282,7 +293,7 @@ def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.nd
     if len(indices) == 0:
         msg = f"No observations found within time window {window.months[0]}-{window.months[-1]}"
         raise RuntimeError(msg)
-    return indices, compute_doy(times[indices])
+    return indices, compute_doy(times[indices]), months_arr[indices].astype(np.int16)
 
 
 def _active_orbits(s1_orbit: str) -> tuple[str, ...]:
@@ -652,7 +663,7 @@ def load_s2_mask_bundle(
     if store_opener is None:
         store_opener = open_store_as_zarr_group
     root = store_opener(f"{mosaic_base}/reflectance.zarr")
-    window_indices, doys_full = _filter_times_from_zarr(root, time_window)
+    window_indices, doys_full, months_full = _filter_times_from_zarr(root, time_window)
     y_slice = slice(chunk.y_start, chunk.y_stop)
     x_slice = slice(chunk.x_start, chunk.x_stop)
 
@@ -660,6 +671,14 @@ def load_s2_mask_bundle(
     t_full = mask_full.shape[0]
     # obs_count from the full (pre-prune) mask so pixels aren't under-counted.
     obs_count = mask_full.sum(axis=0).astype(np.uint16)
+    # Month coverage from that SAME mask, so "how many" and "which months" cannot disagree about
+    # what counted. Pruning only drops timesteps with no valid pixel anywhere in the chunk, which
+    # contribute to neither, but deriving both here removes the question.
+    month_covered = np.zeros((MONTHS_IN_YEAR, *obs_count.shape), dtype=bool)
+    for month in range(1, MONTHS_IN_YEAR + 1):
+        in_month = months_full == month
+        if in_month.any():
+            month_covered[month - 1] = mask_full[in_month].any(axis=0)
     logger.info("Loaded full-chunk SCL for %d S2 timesteps", t_full)
 
     # Prune timesteps with no valid pixel anywhere in the chunk — the v1.1
@@ -675,6 +694,7 @@ def load_s2_mask_bundle(
         doys=doys_full[kept],
         abs_indices=window_indices[kept],
         obs_count=obs_count,
+        month_covered=month_covered,
     )
 
 
@@ -748,7 +768,7 @@ def _load_s2(
         logger.info("Loaded S2 bands shape %s (sliced shared mask)", s2_bands.shape)
         return s2_bands, s2_masks, s2_doys, s2_obs_count
 
-    window_indices, s2_doys_full = _filter_times_from_zarr(root, time_window)
+    window_indices, s2_doys_full, _months = _filter_times_from_zarr(root, time_window)
     y_slice = _resolve_y_slice(chunk, y_sub)
 
     abs_indices = window_indices
@@ -802,7 +822,7 @@ def _load_sar_orbit(
     if store_opener is None:
         store_opener = open_store_as_zarr_group
     root = store_opener(f"{mosaic_base}/sar_{orbit}.zarr")
-    window_indices, doys_full = _filter_times_from_zarr(root, time_window)
+    window_indices, doys_full, _months = _filter_times_from_zarr(root, time_window)
     y_slice = _resolve_y_slice(chunk, y_sub)
     x_slice = slice(chunk.x_start, chunk.x_stop)
     bands, kept = _load_sar_bands_from_zarr(root, window_indices, y_slice, x_slice)

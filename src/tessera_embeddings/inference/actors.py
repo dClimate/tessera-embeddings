@@ -36,6 +36,7 @@ from tessera_embeddings.config.inference import (
     S2_BAND_ORDER,
     InferenceConfig,
 )
+from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -1123,6 +1124,11 @@ class InferenceActor:
             obs_buffers: dict[str, np.ndarray] = {
                 var: np.zeros((chunk.height, chunk.width), dtype=np.uint16) for var in OBS_COUNT_VARS
             }
+            # Which months each pixel was seen in, accumulated per strip like the obs counts. Gates
+            # nothing — it is published so a reader can apply their own view of sufficiency without
+            # the imagery, which is deleted after the fill. Month axis first so a strip assigns as
+            # `[:, strip, :]`, matching how the mask bundle is sliced.
+            month_buffer = np.zeros((MONTHS_IN_YEAR, chunk.height, chunk.width), dtype=bool)
 
             total_valid = 0
             # Refusals accumulate across STRIPS: one dataset is built per strip, so its counters
@@ -1227,12 +1233,15 @@ class InferenceActor:
                             arr = getattr(chunk_data, var)
                             if arr is not None:
                                 obs_buffers[var][strip] = arr
+                        if mask_bundle is not None:
+                            month_buffer[:, strip, :] = mask_bundle.month_covered[:, strip, :]
                     else:
                         # Cropped grid: the saved obs layers keep full-extent
                         # fidelity — S2 counts come from the (full-width) mask
                         # bundle, SAR counts from the full-width side channel
                         # (SAR is read full-width regardless; see load_chunk).
                         obs_buffers["s2_obs_count"][strip] = mask_bundle.obs_count[strip, :]
+                        month_buffer[:, strip, :] = mask_bundle.month_covered[:, strip, :]
                         for var, full in (
                             ("s1_asc_obs_count", chunk_data.s1_asc_obs_count_full),
                             ("s1_desc_obs_count", chunk_data.s1_desc_obs_count_full),
@@ -1374,6 +1383,7 @@ class InferenceActor:
                         embeddings_std=None,
                         scales=scales,
                         obs_counts=obs_buffers,
+                        month_covered=month_buffer,
                     )
                     # One line per chunk: how long the backgrounded upload took
                     # (the phase table's write_s is ~0 by design — this is the

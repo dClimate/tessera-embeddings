@@ -219,7 +219,7 @@ class _CapturingWriter:
     def __init__(self, staging_base, embedding_dim=128):
         self.embedding_dim = embedding_dim
 
-    def write_chunk(self, chunk, embeddings, run_id, scales, embeddings_std=None, obs_counts=None):
+    def write_chunk(self, chunk, embeddings, run_id, scales, embeddings_std=None, obs_counts=None, month_covered=None):
         _CapturingWriter.last_write = {
             "embeddings": embeddings.copy(),
             "scales": scales.copy(),
@@ -437,7 +437,9 @@ class TestDeferredStagingWrites:
 
     def test_failed_write_surfaces_on_next_call(self, inference_config, test_model):
         class _FailingWriter(_CapturingWriter):
-            def write_chunk(self, chunk, embeddings, run_id, scales, embeddings_std=None, obs_counts=None):
+            def write_chunk(
+                self, chunk, embeddings, run_id, scales, embeddings_std=None, obs_counts=None, month_covered=None
+            ):
                 raise OSError("S3 500")
 
         r1, r2, flushed = self._run_two_chunks(inference_config, test_model, _FailingWriter)

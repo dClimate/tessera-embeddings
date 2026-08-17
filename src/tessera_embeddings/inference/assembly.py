@@ -62,7 +62,14 @@ from tessera_embeddings.config.inference import (
     RADAR_THIN_MAX_OBS,
     TimeWindow,
 )
-from tessera_embeddings.config.store_layout import INNER_PX, OBS_COUNT_VARS, SINGLE, StoreLayout
+from tessera_embeddings.config.store_layout import (
+    INNER_PX,
+    MONTH_COVERED_VAR,
+    MONTHS_IN_YEAR,
+    OBS_COUNT_VARS,
+    SINGLE,
+    StoreLayout,
+)
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
 from tessera_embeddings.inference.conventions import build_convention_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
@@ -820,6 +827,7 @@ class ZarrWriter:
         scales: np.ndarray,
         embeddings_std: np.ndarray | None = None,
         obs_counts: Mapping[str, np.ndarray | None] | None = None,
+        month_covered: np.ndarray | None = None,
     ) -> str:
         """Write one chunk's embeddings to a staged intermediate (non-Icechunk) Zarr store.
 
@@ -839,6 +847,10 @@ class ZarrWriter:
             scales: Per-pixel scale factors of shape (H, W), float32.
                 Used to dequantize int8 embeddings.
             embeddings_std: Optional std array, same shape as embeddings, float32.
+            month_covered: Optional (12, H, W) bool array — which calendar months each pixel was
+                seen in, month 0 = January. Staged transposed to (H, W, month) so it lands in the
+                same axis order as the destination array, which the assembly graph writes without
+                reordering.
             obs_counts: Optional dict mapping obs count variable names to (H, W)
                 uint16 arrays. Keys should be from ``OBS_COUNT_VARS``.
 
@@ -898,6 +910,23 @@ class ZarrWriter:
                         raise ValueError(msg)
                     data_vars[var_name] = (["northing", "easting"], arr)
                     encoding[var_name] = {"chunks": staged_chunks_2d, "compressors": None}
+
+        if month_covered is not None:
+            expected_month = (MONTHS_IN_YEAR, chunk.height, chunk.width)
+            if month_covered.shape != expected_month:
+                msg = f"Expected {MONTH_COVERED_VAR} shape {expected_month}, got {month_covered.shape}"
+                raise ValueError(msg)
+            # Month axis LAST in the staged file, matching the destination's
+            # (northing, easting, month) so nothing has to transpose on the way in. The actor keeps
+            # it first because that is the axis order the mask bundle slices on.
+            data_vars[MONTH_COVERED_VAR] = (
+                ["northing", "easting", "month"],
+                np.ascontiguousarray(month_covered.transpose(1, 2, 0)),
+            )
+            encoding[MONTH_COVERED_VAR] = {
+                "chunks": (*staged_chunks_2d, MONTHS_IN_YEAR),
+                "compressors": None,
+            }
 
         ds = xr.Dataset(
             data_vars,

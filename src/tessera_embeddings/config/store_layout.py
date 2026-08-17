@@ -49,10 +49,34 @@ warnings.filterwarnings("ignore", message="Numcodecs codecs are not in the Zarr 
 
 DIMS_4D: tuple[str, str, str, str] = ("time", "northing", "easting", "band")
 DIMS_3D: tuple[str, str, str] = ("time", "northing", "easting")
+#: Trailing axis of :data:`MONTH_COVERED_VAR` — twelve calendar months, not bands.
+DIMS_4D_MONTH: tuple[str, str, str, str] = ("time", "northing", "easting", "month")
 
 #: obs-count variables carried through inference (canonical definition;
 #: inference.assembly re-exports it).
 OBS_COUNT_VARS: tuple[str, ...] = ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count")
+
+#: Months in the coverage axis, and the coordinate values written for it (1 = January), so a reader
+#: can say ``cov.sel(month=7)`` and mean July rather than having to know the axis is 0-based.
+MONTHS_IN_YEAR = 12
+MONTH_COORD = tuple(range(1, MONTHS_IN_YEAR + 1))
+
+#: Per-pixel record of WHICH months a pixel was seen in, as twelve booleans.
+#:
+#: ``s2_obs_count`` says how many usable optical observations a pixel had; this says how they were
+#: distributed. The two answer different questions and only the second one can distinguish a pixel
+#: seen twenty times in July from one seen twelve times, once a month — which for a year-long
+#: embedding is the difference between a partial season and a whole one.
+#:
+#: **It gates nothing.** ``config.inference.OPTICAL_MIN_OBS`` remains the only rule that decides
+#: whether a pixel is embedded. This exists so a reader can apply their own view of sufficiency
+#: without re-deriving it from imagery we do not publish — the mosaics this is computed from are
+#: deleted after a fill, so it is captured here or nowhere.
+#:
+#: Presence, not counts: a month is covered when at least one timestep that month passed the same
+#: SCL validity classes ``s2_obs_count`` totals, so the twelve flags partition the observations that
+#: count feeds on. ``False`` also reads for an unwritten pixel, exactly as ``s2_obs_count`` reads 0.
+MONTH_COVERED_VAR = "s2_month_covered"
 
 # codec keys
 _ZSTD = "zstd"  # default bytes codec + default (zstd) compressor
@@ -169,6 +193,11 @@ _INNER_4D = (1, INNER_PX, INNER_PX, EMBEDDING_DIM)
 _SHARD_4D = (1, SHARD_PX, SHARD_PX, EMBEDDING_DIM)
 _INNER_3D = (1, INNER_PX, INNER_PX)
 _SHARD_3D = (1, SHARD_PX, SHARD_PX)
+# The month axis is never split, for the same reason the band axis is not: a reader gets a pixel's
+# whole year from one object, so "was this pixel covered every month of the growing season" is one
+# read rather than twelve.
+_INNER_4D_MONTH = (1, INNER_PX, INNER_PX, MONTHS_IN_YEAR)
+_SHARD_4D_MONTH = (1, SHARD_PX, SHARD_PX, MONTHS_IN_YEAR)
 
 
 def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
@@ -192,6 +221,12 @@ def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
         "embeddings": ArrayLayout(DIMS_4D, _INNER_4D, "int8", 0, _ZSTD, shards=_SHARD_4D),
         "scales": ArrayLayout(DIMS_3D, _INNER_3D, "float32", float("nan"), _PCODEC, shards=_SHARD_3D),
         **_obs(_INNER_3D, _SHARD_3D, _ZSTD),
+        # Boolean rather than a packed integer, and zstd rather than PCodec. Measured on real
+        # coverage: twelve boolean planes cost 1.14x a packed 12-bit mask once compressed — 0.24
+        # bits a pixel against 0.21 — because month coverage is spatially smooth and a plane
+        # compresses ~400x while packed bits look like noise to the compressor. The 6x it costs
+        # uncompressed never reaches disk, and booleans need no helper library to read.
+        MONTH_COVERED_VAR: ArrayLayout(DIMS_4D_MONTH, _INNER_4D_MONTH, "bool", False, _ZSTD, shards=_SHARD_4D_MONTH),
     }
     if include_std:
         arrays["embedding_std"] = ArrayLayout(DIMS_4D, _INNER_4D, "float32", float("nan"), _PCODEC, shards=_SHARD_4D)

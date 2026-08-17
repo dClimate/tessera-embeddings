@@ -28,7 +28,7 @@ import icechunk
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.store_layout import GLOBAL, StoreLayout
+from tessera_embeddings.config.store_layout import GLOBAL, MONTH_COORD, MONTHS_IN_YEAR, StoreLayout
 from tessera_embeddings.inference.conventions import build_convention_attrs, build_geoemb_root_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.zarr_store import (
@@ -370,9 +370,26 @@ def seed_zone_groups(
         node = root.require_group(spec.group_name)
         north = northing_coords(spec)
         east = easting_coords(spec)
-        sizes = {"time": nt, "northing": spec.height, "easting": spec.width, "band": band}
+        sizes = {
+            "time": nt,
+            "northing": spec.height,
+            "easting": spec.width,
+            "band": band,
+            "month": MONTHS_IN_YEAR,
+        }
         create_layout_arrays(node, layout, layout.arrays, sizes)
-        _write_coord_arrays(node, {"time": times, "northing": north, "easting": east, "band": np.arange(band)})
+        _write_coord_arrays(
+            node,
+            {
+                "time": times,
+                "northing": north,
+                "easting": east,
+                "band": np.arange(band),
+                # 1..12, not 0..11, so ``cov.sel(month=7)`` means July. A 0-based axis would put
+                # every reader's selection one off from the calendar they are thinking in.
+                "month": np.asarray(MONTH_COORD, dtype="int16"),
+            },
+        )
         bnds = node.create_array("time_bnds", data=default_bnds, chunks=(nt, 2), dimension_names=("time", "bnds"))
         bnds.attrs.update(TIME_ENCODING)  # same int64-ns encoding as `time`
         node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
