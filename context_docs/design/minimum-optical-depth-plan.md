@@ -209,6 +209,39 @@ is no noise tail to guard against in this population.
 proposal therefore targets precisely the subset repair cannot reach, and leaves the bulk to the
 repair stream.
 
+##### Store-wide, over every complete cell
+
+The six cells above span the depth range on purpose and are **not** a store-wide figure — they
+include three of the thinnest cells there are, so they overstate the refusal. Re-run over every cell
+the store calls complete, ten whole shards each: **40 of 48 cells, 940,376,064 land-live pixels.**
+(The eight that contributed nothing had all ten sampled shards at the edge of the land-mask grid,
+where the shard's 8×8 slice is incomplete; they are small zones, so the aggregate under-weights
+those.)
+
+| | pixels | share of land-live |
+|---|---:|---:|
+| embedded under today's rule | 709,827,153 | **75.3%** |
+| thin, inside weak chunks (<50% full) | 209,302,978 | 22.26% |
+| thin, inside strong chunks (≥50% full) | 21,245,933 | **2.26%** |
+| refused in total | 230,548,911 | 24.52% |
+| no optical observation at all | — | **0.2%** |
+
+**Cross-check:** retention against the *any-optical* denominator reads 75.4% here against the
+retention study's 79.2% pixel-weighted — 3.8 points apart on entirely different sampling (ten whole
+shards versus forty land-aimed inner chunks). Close enough to trust both; the gap is spatial spread.
+
+**Three results carry over and one strengthens.** The bimodality holds at store scale — strong
+chunks are 75.4% of the land and **97.0% embedded** inside, weak chunks are 24.6% of the land and
+**8.7% embedded**. Missing imagery remains negligible at 0.2%, so essentially the whole refusal is a
+depth decision rather than an absence of data. And the near-miss concentration is *sharper* than in
+the six cells: of the 21.2M pixels the proposal would add, **81.7% sit at 20–24 observations** and
+1.7% below 10.
+
+The number that reframes the decision: **90.8% of refused pixels are in weak chunks.** The proposal
+rescues 9.2% of the refused population and defers the other nine tenths to a repair flow that does
+not exist. Per cell its reach runs from 0.00% (03N/2021, 23N/2021 — deep, nothing to rescue) through
+a median of 2.30% to **7.28%** (30S/2023) and 6.35% (26S/2022), both middling-depth cells.
+
 **Three things it does not settle**, all of which outrank the sizing:
 
 1. **It trades a visible hole for an invisible one.** Today every published pixel in a strong chunk
