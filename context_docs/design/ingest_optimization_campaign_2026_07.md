@@ -43,172 +43,31 @@ The work is distributed with Dask on Fargate: one scheduler and a fleet of worke
 scheduler breaks the work into tasks and hands them out; the workers read, reproject, mask and
 write. Almost everything below is about the relationship between those two.
 
-### Where the time goes, and why
+### Where the time goes, what still limits us, and three corrections
 
-Three facts explain nearly every decision in this document.
+**Three facts explain nearly every decision in this document.** A zone is mostly ocean — a tall
+thin strip of which typically a fifth is land, so computing the whole grid meant most work
+produced nothing. Source reads dominate what remains: 72% of task work is fetching and resampling
+COGs. And a large part of each date was never work at all but *waiting*, which is why removing a
+serial term beat shrinking one.
 
-**A zone is mostly ocean.** A UTM zone is a tall, thin strip of the globe and typically only a
-fifth of it is land. Computing the whole grid meant most of the work produced nothing, and the
-first and largest change was to compute only the rectangles that contain land.
+**What still limits us.** The fleet is already full on a dense region: one date's work
+oversubscribes the workers, so adding workers to a single run buys much less than it appears to —
+the measured ceiling from unlimited workers is under 3×. That also disqualifies several
+optimisations that look like they should help, because **there is no idle capacity for them to
+fill.** Date batching (§3.16) is the clearest case.
 
-**A separate write costs far more than the pixels in it.** Each region write carries a
-near-fixed overhead, so the *number* of rectangles mattered more than their total area. Merging
-many small rectangles into fewer larger ones was worth 6.2× even though it computes more area,
-including some ocean. Almost every subsequent tuning decision is a version of this trade:
-how much dead area is worth avoiding one more boundary.
+**Three corrections to carry into any planning.**
 
-```
-        the whole zone            only the land            land, merged
-     (what we used to do)       (many rectangles)      (fewer rectangles)
-
-    ┌──────────────────┐      ┌──────────────────┐    ┌──────────────────┐
-    │~~~~~~~~~~~~~~~~~~│      │~~~~~~~~~~~~~~~~~~│    │~~~~~~~~~~~~~~~~~~│
-    │~~~~~▓▓▓▓~~~~~~~~~│      │~~~~~[▓▓▓]~~~~~~~~│    │~~~~[▓▓▓▓▓▓▓▓]~~~~│
-    │~~~▓▓▓▓▓▓▓▓~~~~~~~│      │~~~[▓▓▓▓▓▓▓]~~~~~~│    │~~~~[▓▓▓▓▓▓▓▓]~~~~│
-    │~~~~▓▓▓▓~~~~▓▓~~~~│      │~~~~[▓▓▓]~~[▓▓]~~~│    │~~~~[▓▓▓▓▓▓▓▓]~~~~│
-    │~~~~~~~~~~~~~~~~~~│      │~~~~~~~~~~~~~~~~~~│    │~~~~~~~~~~~~~~~~~~│
-    └──────────────────┘      └──────────────────┘    └──────────────────┘
-      computes everything;      4 boundaries to pay     2 boundaries, some
-      ~78% of it is ocean       for, almost no           ocean recomputed —
-      → never finished          wasted area              and it is FASTER
-
-    ~ ocean, nothing to compute    ▓ land    [ ] one rectangle we write
-```
-
-The right-hand picture is the counter-intuitive one, and it is this campaign's central lesson:
-**deliberately computing some ocean is cheaper than paying for another boundary.** Every later
-tuning question — how coarsely to merge, when to stop — is that same trade re-priced as the other
-costs moved.
-
-**The scheduler is single-threaded, and it is the thing that runs out.** Its dispatch loop uses
-one core no matter how many it is given, so the number of *tasks* a date creates — not the number
-of pixels — sets how much fleet a single run can usefully absorb. This is why work went into
-shrinking the task graph before spending money on more workers: a run that chokes its scheduler
-at 120 workers cannot spend a larger allocation, and every concurrent run has its own scheduler
-hitting the same wall.
-
-### What changed, and the mechanism behind each gain
-
-| Change | Effect | Why it worked |
-|---|---|---|
-| Compute only rectangles containing land | ingest completes at all | ~78% of the work was ocean |
-| Merge those rectangles into fewer, larger ones | **6.2×** | a write's cost is mostly fixed, so count beat area |
-| One masking pass instead of two | 1.28× smaller graph | each pass cost a task per block per band |
-| Read the cloud mask as part of the band read | one fewer graph per date | it was being read twice |
-| Write all of a date's rectangles as ONE computation | **1.59×** | they had been serial, so a date cost their sum |
-| Prune unused metadata from retained catalogue entries | 2.45× less driver memory | most of each entry described bands we never read |
-| Store the date index in shards | cost, not speed | every commit had rewritten the whole index |
-| Match read blocks to stored chunks | **1.65×** on compact regions | coarse blocks capped how much could run at once |
-| Re-price rectangle merging for overlapped writes | **18.6%** less written | a boundary stopped being expensive, so merge less ocean |
-| Fuse several dates into one computation and commit | 1.61× to 0.71× **by region size** | amortises the commit only; see below |
-| Prepare S1's next catalogue query during the current batch's writes | **~10%** on S1 | the query was serial and is now hidden |
-
-Two things deliberately did not change: the store's chunk size, which the GPU inference path is
-tuned around, and the atomicity of a commit — though fusing dates makes the atomic unit a group
-of dates rather than one, which is forced by how Zarr resizes the time axis, not chosen.
-
-### The one result that is not a straight win
-
-Fusing several dates into a single computation **helps small regions and hurts middling ones.**
-The arithmetic is that a fused write costs proportionally more and the preparation running
-alongside it costs proportionally more, so the per-date cost is whichever of the two dominates,
-plus one commit divided among the dates. Fusing therefore buys only the commit saving; it cannot
-make the write faster, because the fleet is already the constraint. And it actively loses where
-the larger write crowds out the preparation overlapping it.
-
-Measured across four regions spanning a 127-fold size range: the smallest gained 1.61×, the next
-1.12×, the middling one **lost 29%**, and the largest was unchanged. Because the relationship is
-not monotonic, this ships as a size threshold rather than a fitted curve, and the threshold is
-set at the top of the range where fusing was measured to win rather than at an estimated
-crossover.
-
-### What still limits us
-
-**The fleet is already full on a dense region.** One date's work oversubscribes the workers, so
-adding workers to a single run buys much less than it appears to — the measured ceiling from
-unlimited workers is under 3×. More importantly, it means several optimisations that look like
-they should help cannot: there is no idle capacity for them to fill.
-
-**More than half of a date's elapsed time cannot be parallelised at all.** Client-side graph
-building, dispatch, the blocking write and the commit are serial. Within the part that *is*
-parallel, about 72% is reading and resampling the source imagery — real data movement, not
-overhead — so there is no large inefficiency left to remove, only less work to do.
-
-**One worker holds the retained catalogue and can deadlock the run.** The worker driving the
-ingest keeps the current month of catalogue entries plus the next month prefetched. If it crosses
-Dask's pause threshold it stops and never resumes, and the rest of the fleet waits forever on
-data it holds. Worker memory is therefore sized against that pause threshold, not against the
-container limit, and undersizing costs an entire run rather than a retry.
-
-**A realistic cell is three fleets, not one.** A campaign cell runs Sentinel-2 and both
-Sentinel-1 orbits concurrently, so its resource footprint is roughly three times a single ingest
-run. Any concurrency plan costed on Sentinel-2 alone understates what the campaign needs by that
-factor.
-
-**What does NOT limit us: running many cells at once.** This was the campaign's largest open risk
-and it is now measured up to **20 concurrent cells** (60 fleets, ~1,300 workers). Comparing
-per-window cost and pairing each zone against itself, 5→10 cells costs **1.01×** and 10→20 costs
-**1.24×** — against the **1.33×** that the narrower fleet quota forced at 20 cells predicts on its
-own. Fleet width more than accounts for the slowdown, so no contention term survives. An earlier
-forecast multiplied out a 1.04-per-cell penalty, implying 2.56× at 40 cells; that is **withdrawn**.
-**The binding constraint on schedule is the Fargate quota, not interference between cells.**
-
-### Three corrections worth reading before planning
-
-> **Do not size cells against the dispatch-rate model in §2.** Its shape still holds but its
-> constant is stale, and the advice it produced — keep cells narrow — is **withdrawn**. §2 has
-> the detail.
-
-> **How to get an ingest duration out of this document, because getting it wrong is easy.**
-> Three tables here report per-date seconds and they answer different questions. Taking the
-> wrong one cost real effort in July, so the mapping is written down:
->
-> | you want | use | not |
-> |---|---|---|
-> | duration for a zone of known density | the **five-region k=1 column** (§3.16) | the k=4 column — that is a batching A/B |
-> | how duration moves with fleet width | the **width model** `T(W) = 36.3 + 7896/W` (§3.10) | any single row, which is one width |
-> | what overlapping bought S1 | the **three-ROI table** (§4.9) | anything about whole-cell duration |
->
-> The five-region k=1 column fits `s/date = 10.16 + 0.06022 × live_4096_chunks`, R² 0.954, and
-> those measurements sit at **~60 workers** — its 35N row (175.6 s) is within 5% of the width
-> model at 60w (167.9 s), which is how the width is established rather than assumed. Two
-> checks that the fit is sound: summed over the 111 real per-zone tile counts it gives **5.95
-> h/zone-year at 60w against the campaign basis's 6.36, a 6.5% agreement**; and the apparent
-> "~10 h versus ~21 h" disagreement between planning documents is the same dense zone at 120
-> workers and at 50, via this model. **Nothing here was ever in conflict.**
->
-> Two limits to carry with the fit. The intercept is a real fixed cost of about **1.0 h per
-> zone-year**, so an all-but-empty zone costs an hour rather than minutes. And per-zone
-> residuals run to **±35%** — 35N and 47N differ by 3 chunks in 2,418 and by 27% in per-date
-> time, so area does not determine duration tightly.
->
-> **The S1 table is a precondition, not an addend.** A cell runs S2 and both S1 orbits
-> concurrently, so a cell's per-date cost is the MAX of the three arms, and the fit above is
-> the S2 arm alone. Using it as the cell duration is legitimate *only* because §4.9 took S1's
-> per-date write time down 2.4–3.9×, which is what brought S1's work to 15.5–18.1% of S2's and
-> lets `s1_worker_fraction = 0.22` hide it inside S2's runtime with 20–40% to spare. Before
-> that change S1 was the critical path on sparse zones and this substitution would have been
-> wrong. If S1's per-date cost ever regresses, the substitution fails before the ratio does.
-
-> **Dates per zone-year is 365, not the ~250 once assumed.** A full-height zone sees imagery
-> every day. The earlier figure came from a region spanning about 3° of latitude, which
-> intersects far fewer orbit passes and does not generalise to a zone.
-
-### Why the graph was shrunk before buying concurrency
-
-Running many cells at once is the obvious multiplier and needs no new code, so it is worth saying
-why it came last. **Graph size sets the ceiling on how many workers one cell can usefully absorb**,
-and the two multiply: a cell that chokes its scheduler at 120 workers cannot spend a larger
-allocation however much quota arrives, and every concurrent cell has its own scheduler hitting the
-same wall. Buying concurrency first would have bought the right to run twenty cells that each waste
-most of their fleet.
-
-That was known rather than guessed — ingest had previously degraded at ~250–300 workers, primarily
-because of the scheduler. Cutting the graph ~3.9× moves the ceiling up by about the same factor. So
-the order was **shrink the graph, raise the per-cell ceiling, then spend quota on concurrency**,
-with catalogue streaming in between because year-scale cells cannot run at all without it (§7b).
-
----
+1. **Do not size cells against the dispatch-rate model in §2.** Its shape holds, its constant is
+   stale, and the advice it produced — keep cells narrow — is **withdrawn**. Aggregate throughput
+   is flat within ~6% from 20 to 120 workers (§3.14).
+2. **Every velocity figure measured early in a run understates the full-year cost**, because later
+   dates image more of a zone's land. The same effect across seasons is what produced this
+   programme's most-repeated withdrawn claim.
+3. **Cost is not proportional to area.** A rectangle costs the greater of a fixed per-window term
+   and its task count over the dispatch rate — `per_date ≈ C + Σ max(F, tasks/R)` — so window
+   COUNT, not area, is what a windowing strategy must minimise once areas are small.
 
 ## 2. The shape of the cost — a picture and two formulas
 
