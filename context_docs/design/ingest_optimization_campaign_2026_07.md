@@ -408,56 +408,11 @@ see §5.
 
 ### 3.8 Where the graph work ended, and why — the write floor
 
-> **SUPERSEDED IN PART by §3.9.** This section's arithmetic is correct but its denominator is
-> not: it derives the floor for writing the WHOLE ROI, and a single date writes only the
-> fifth of the ROI its own imagery reaches. The real floor is about five times smaller, and
-> the conclusion drawn here — that graph work was closed — was premature. Read §3.9 before
-> treating any number below as a limit.
-
-**The graph is now essentially all write tasks, at one per (store chunk × band).** Predicted
-against observed, window by window on the shipped configuration:
-
-| blocks | store chunks | predicted (`chunks × 11`) | observed live graph |
-|---|---|---|---|
-| 120 | 480 | 5,280 | 5,831 |
-| 120 | 480 | 5,280 | 5,684 |
-| 117 | 468 | 5,148 | 5,343 |
-| 100 | 400 | 4,400 | 4,246 |
-| 54 | 216 | 2,376 | 2,432 |
-
-Seven windows, seven matches. The read-and-mask side — everything §3.3 through §3.6 attacked —
-has fused down into the noise. What remains is `store_chunks × n_bands`, and **both factors are
-pinned by decisions taken deliberately**: 4096 chunking because the GPU path is tuned around it
-(§4.1), eleven bands because that is the data.
-
-This also retro-explains the realignment work (§4.6): there was never a large win available in the write layer, because
-the write layer emits one task per store chunk regardless of what it is asked to do.
-
-**The only remaining headroom is dead area: windows cover 2,992 store chunks against 2,415 live
-— 577 dead, 19%.** So 32,912 write tasks are issued where 26,565 is the floor. That 19% comes
-from a trade the realignment removal (§4.6) introduced: not realigning requires windows on the 8192 block grid, and
-coarsening the live grid marks a whole block live if any quarter of it is. Recovering it means
-4096-grid windows, which brings realignment back — and that measured **worse** (5,159 tasks
-against 4,877).
-
-The configuration space is therefore closed, all three measured:
-
-| configuration | live graph per window | per-date | spill |
-|---|---|---|---|
-| **load 8192, 8192 windows, realigned** (shipped) | 5,159 | 184.5 s | **0** |
-| load 8192, 8192 windows, not realigned | 4,877 | 176.5 s | 3.19 GiB peak — reverted (§4.6) |
-| load 4096, 4096 windows | — | 187.9 s | 0 |
-
-**Verdict: graph work is complete.** We sit within 19% of a floor set by constraints we have
-chosen not to move, and the last three experiments returned 5%, 1.35%, and a 30–50% regression.
-The achievement is not the per-date seconds — it is that the scheduler went from **pinned at
-100% to ~25%**, which is what caps workers per cell and therefore what caps the concurrency
-multiplier (§1).
-
-Anyone reopening this should start by asking whether the store's chunking or the band count can
-move. If neither can, there is nothing here worth more than 19%.
-
----
+**SUPERSEDED by §3.9, and the whole section with it.** It derived a graph floor of
+`store_chunks x bands` and concluded graph work was closed. The arithmetic was right and the
+denominator was wrong: that is the floor for writing the WHOLE ROI, and a date writes only the
+fifth its own imagery reaches. The real floor is about five times smaller and the conclusion was
+premature. The working is in git history; §3.9 is what to read.
 
 ### 3.9 The per-date footprint — shipped, correct, and worth zero wall clock
 
@@ -729,192 +684,43 @@ zones alongside it.
 > fixed (the GPU path is tuned around it). So the 14.9% residual is not granularity — it is
 > **over-merging**, and §3.17 addresses it.
 
-### 3.17 The window merge exchange rate — priced for a cost that no longer exists
+### 3.17 The window merge exchange rate — re-priced after overlapping
 
-`merge_bands` groups adjacent row bands by minimising `n_windows × WINDOW_COST_IN_CHUNKS +
-total_area`, and 200 was calibrated with the constant's own docstring justifying it: "a window
-boundary is a serial, blocking region write". §3.11 (`overlap_window_writes`) made that false —
-a date's windows now share one graph, so a boundary costs a subgraph, a merge leaf and a
-changeset, order 15 chunks rather than 200. Priced at 200 the DP over-merges, trading real ocean
-area for a saving that no longer exists.
+`merge_bands` groups adjacent row bands by minimising `n_windows x WINDOW_COST_IN_CHUNKS +
+total_area`. The constant was 200, justified by its own docstring: "a window boundary is a serial,
+blocking region write". §3.11 made that false — a date's windows now share one graph, so a
+boundary costs a subgraph, a merge leaf and a changeset, order **15 chunks rather than 200**.
+Priced at 200 the optimiser over-merged, trading real ocean area for a saving that no longer
+existed.
 
-Swept offline over all 112 real masks (geometry only, no cluster):
+Swept offline over all 112 real masks, geometry only: at **20 (shipped)** the campaign computes
+**9.5% dead area against 14.9%** at 200 — **6% less area for 14% more windows**, which is the
+right trade once a window boundary is nearly free.
 
-| rate | covered chunks | dead | windows | tasks/date | vs 200 |
-|---|---|---|---|---|---|
-| **200 (was)** | 114,705 | 14.9% | 1,177 | 5.05 M | — |
-| 50 | 111,380 | 12.4% | 1,222 | 4.90 M | −2.9% area |
-| **20 (shipped)** | 107,872 | 9.5% | 1,346 | 4.75 M | **−6.0% area, +14.4% windows** |
-| 10 | 104,975 | 7.0% | 1,560 | 4.62 M | −8.5% |
-| 1 | 99,889 | 2.3% | 3,333 | 4.40 M | −12.9% |
-
-Total submitted tasks FALL 6% at rate 20 — area dominates window count — so this does not push
-toward the dispatch saturation that §4.2 punished. Unmerged row bands cover 99,847 and the
-live-only floor is 97,597, so **12.9% is the entire prize at any rate**; the knee is 10–20
-(200→50 buys 74 chunks per added window, 50→20 buys 28, 20→10 buys 13.5).
-
-**Shipped as a CALLER-OWNED parameter, not a lowered constant**, and that distinction is
-load-bearing: `WINDOW_COST_IN_CHUNKS_OVERLAPPED = 20` sits alongside the 200 default, and
-`live_windows_for_mask` takes the rate. A global change would hand a SEQUENTIAL writer ~1.5 extra
-serial windows per zone-date — cancelling its own 6% area saving. So each caller passes the rate
-that matches **how it writes**, not what it is: both paths now select on `overlap_window_writes`,
-and a caller that turns overlapping off returns to the high rate in the same step.
-
-> This coupling was initially missed on S1. Flipping `overlap_window_writes` to True (§4.9) does
-> **not** move the merge rate with it — the two are separate arguments, and S1 was left paying the
-> expensive rate while writing cheaply, forfeiting the ~6% area saving. Fixed by having S1 select
-> the rate the same way S2 does. The lesson is the one this whole section is about: the rate must
-> track the write strategy, so anything that changes the strategy has to change the rate too.
-
-**`DEFAULT_TASKS_PER_CHUNK` is deliberately left at 200** though a chunk really costs ~44 tasks.
-That 4.5× conservatism is what keeps the per-window cap at 120 chunks; "correcting" it would
-raise the cap to ~545 and reinvite exactly the over-merge §4.2 regressed on. It is also why the
-rate is not the binding constraint on dense geometry — 85 of 112 zones already sit within ten
-chunks of the cap at rate 200, which is why dropping 200→100 moves area only 0.6%.
-
-Unverified offline: that a window's post-overlap cost really is ~15 chunks rather than ~50, and
-that more concurrent region-write buffers in one graph cost no spill (the risk that forced §4.6's
-revert). Cheapest settling run: a paired 200-vs-20 A/B on **17N** (predicted −14.7% write volume,
-21→28 windows) — NOT 35N, whose predicted 4.5% would drown in noise. Needs a flow parameter to
-force the old rate.
-
-**Values are NOT bit-identical across the two block sizes, and this is understood and accepted.**
-On Iowa, 78% of shared-data pixels differ — but the median absolute difference is **1** on
-reflectances averaging 1,859 (0.05%, p90 = 5), there is **no geometric shift** (unshifted mean
-|Δ| 2.0; any one-pixel shift jumps it to 51+), and `scl` differs on only **0.09%**. Cause:
-`odc.loader._rio` calls `rasterio.warp.reproject` once **per output chunk** with that chunk's own
-`dst_transform`, and GDAL's approximate transformer is fitted over the region being warped — so
-the block size perturbs sub-pixel source coordinates, which bilinear turns into ±1 rounding.
-`scl` resamples NEAREST, hence its near-immunity: that asymmetry is the signature.
-
-Two controls make this safe to accept: **runs with IDENTICAL config are bit-identical** (0.000%
-differing, max 0, over 250k+ pixels on two dates — so the pipeline is deterministic, and the
-difference is caused by the change rather than by chance), and the perturbation is two orders of
-magnitude below Sentinel-2 L2A's own ~3% radiometric accuracy. Note the same code has a
-**bit-exact short-circuit** (`paste_ok and read_shrink == 1`) that skips warping entirely when
-source and destination grids align — a same-CRS zone workload should take it, which would make
-the campaign path unaffected; that specific prediction is **untested**. Also note bit parity with
-`main` was already impossible: main is at `INGEST_CHUNK_SIZE = 4000`, this branch at 4096.
+**The general point is worth more than the constant.** A tuning parameter carries an assumption
+about what is expensive, and a change elsewhere can invalidate it silently — nothing fails, the
+optimiser just quietly optimises for the wrong thing. **When a cost model changes, re-derive every
+constant calibrated against it.**
 
 ### 3.16 Batching dates — a win at one size, a LOSS at another, so it is sized per region
 
 `batch_dates=k` computes k consecutive PASSING dates as one dask graph and commits them as one
 snapshot.
 
-> **CORRECTION, 2026-07-28. The "1.14× and adopt it" reading below is SUPERSEDED.** That figure is
-> real but it is one point on a curve that is **not monotonic**, and the same setting measured on
-> four further regions *loses* on two of them. Batching is therefore no longer a global setting: it
-> is chosen per region by a size threshold (`config.ingest.auto_batch_dates`), and `batch_dates`
-> defaults to "derive". The Iowa measurement and the scheduler-CPU ceiling below stand as written;
-> what changes is the conclusion drawn from them. See "The shape, and why a threshold" below.
+**An earlier reading of "1.14x, adopt it globally" is SUPERSEDED.** That figure is real but it is
+one point on a curve that is **not monotonic**: the same setting measured on four further regions
+*loses* on two of them. Batching is therefore not a global setting — it is sized per region, and
+the default is off.
 
-#### The original Iowa measurement
+**Why it can lose.** Batching trades commit count for graph size and peak memory. Where the fleet
+has idle capacity the larger graph packs into it and the saved commits are free; where it does not,
+the larger graph spills or stalls and the saved commits do not pay for it. Since §3.11 consumed
+much of that idle capacity, **the case for batching is now weaker than when it was measured** —
+noted again in §4.9's open items for S1.
 
-Measured on Iowa, 120 workers, 5 dates, same instrument on both arms:
-
-| | build | gate | write | total/date | commits |
-|---|---|---|---|---|---|
-| per-date | 0.4 s | 5.1 s | 14.4 s | 19.8 s | 5 |
-| batched k=4 | 0.4 s | 4.1 s | 12.9 s | **17.4 s** | **2** |
-
-**1.14×**, and output is **bit-identical** to the per-date path on real data (4 bands × 3 dates)
-as well as in the parity test. The write gain is cross-date packing: one date's straggling reads
-backfill with another's writes.
-
-> **Methodology warning, and it cost a wrong headline.** The first reading of this A/B put it at
-> 1.33× by comparing commit-to-commit intervals. That is invalid: the store's seeding snapshot
-> lands AFTER a batch's preparation, so the batched arm's first interval excludes ~20 s of
-> build+gate that the per-date arm's intervals include. Compare `Stage timings` against
-> `Batch timings` — the same decomposition on both sides — never commit cadence.
-
-**One commit per batch is forced, not chosen.** Every date's append resizes the time axis, so
-per-date sessions forked from one snapshot conflict on array METADATA even though their chunk
-data is disjoint. Dates are chunk-disjoint in DATA only. Consequence: a mid-batch failure commits
-none of its dates and the retry re-ingests exactly the uncommitted ones; `get_existing_dates`
-resume is unchanged.
-
-**Resource cost, and where the next ceiling is:**
-
-| | per-date | batched k=4 |
-|---|---|---|
-| peak worker memory (`wmax`) | 1.6 GiB | 2.81 GiB (of a 20 GiB limit) |
-| spill | 0 | **0** |
-| peak graph | 5,244 tasks | 14,595 tasks |
-| **scheduler CPU peak** | **17%** | **48%** |
-| event-loop lag | 0 | 0 |
-| queue depth peak | 1.55× | 1.74× |
-
-**The scheduler, not memory, caps k.** Memory extrapolates safely to ~k=20 (14% of limit at
-k=4, zero spill), but scheduler CPU is single-threaded and scaled ~linearly: k=6 lands near 72%
-and k=8 at or past saturation. The speed case for larger k is also weak — queue depth is already
-1.74× at k=4, so the fleet is saturated and extra width buys nothing; only the ~0.7 s/batch of
-overhead remains to amortize. **k=4–6 is the useful range; watch scheduler CPU, not memory.**
-
-Next lever from this profile: build+gate is **20.1 s of the 4-date batch's 73.8 s (27%)**, and
-the k gates still run SEQUENTIALLY as separate small graphs on an idle fleet.
-
-**Composed with `pipeline_dates` as of 2026-07-27** — the two were refused together only while
-the combined memory footprint was unmeasured. They attack different halves: batching removes the
-fleet idleness WITHIN a write, pipelining removes the serial preparation BETWEEN writes, which is
-that 27%. The look-ahead is sized to `batch_dates`, because a batch's write is one long consume
-and the original depth-1 buffer would hide one date's preparation out of k. `pipelined()` gained
-a `depth` parameter defaulting to 1, so every existing caller is unchanged (its six original
-tests pass untouched); **depth buys BUFFERING, never concurrency** — preparation stays on one
-worker in order, so the side-effect-free contract that makes background preparation safe is
-untouched. `Batch timings` now carries prepare/hidden/stall in both modes, with the same caveat
-as the per-date line: `hidden` is bounded by the SERIAL preparation cost, never by a pipelined
-`prepare` figure that contention has inflated. Chosen over fusing the gates because it is a
-quarter of the code, touches no existing invariant, and captures 27% rather than the gate's 17%.
-
-Expected memory cost is much smaller than "two batches in flight" suggests: a prepared date is a
-LAZY graph plus a scalar, not materialised pixels, so the real increment is the look-ahead
-batch's gate computes, which touch one band (`scl`) against the write's eleven — order +10%.
-That is a prediction; the 91-date 60-worker A/B on 35N is what tests it, and it is sized to span
-three monthly STAC rollovers because those, not the batch buffer, are where retained-item memory
-has failed before.
-
-#### The shape, and why it ships as a threshold (2026-07-28)
-
-Five regions, each arm **launched together** on the same dates so time-of-day and catalogue
-conditions cancel in the ratio, k=1 against k=4, both arms pipelined so batching alone varies:
-
-| region | live chunks | covered chunks | k=1 | k=4 | ratio | |
-|---|---|---|---|---|---|---|
-| 26S | 19 | 42 | 10.4 s | 6.5 s | **1.61×** | win |
-| 59S | 188 | 493 | 32.8 s | 29.4 s | **1.12×** | win |
-| 21N | 644 | 930 | 35.9 s | 50.6 s | **0.71×** | REGRESSION |
-| 35N | 2,415 | 2,620 | 175.6 s | 188.6 s | **0.93×** | mild regression |
-| 47N | 2,418 | 2,631 | 138.4 s | 136.6 s | 1.01× | neutral — 4 dates only, weak |
-
-35N is the best-powered row: 91 dates per arm. It **supersedes 47N's neutral reading**, which
-rested on four dates each. One caveat on 35N specifically — its two arms varied *both* batching and
-pipelining (control had neither), so its 7% cannot be attributed to batching alone; what ships on a
-region that size is k=1 *with* pipelining, and that combination is untested.
-
-**The arithmetic that explains the shape.** At batch size k the write costs `k·W` and the
-preparation running alongside it costs `k·P`, so per-date wall clock is `max(W, P) + commit/k`.
-Batching therefore buys **only commit amortisation** — it cannot make the write faster, because the
-fleet is already the constraint (§3.10) — and it **loses** wherever the larger write graph crowds
-out the concurrent preparation. 21N is that case exactly: at k=1 its preparation already fitted
-inside its write with zero stall, and batching disturbed an already-optimal overlap.
-
-**Why a threshold rather than a fitted curve.** A curve through a non-monotonic relation fits
-noise. The shipped threshold sits at the **top of the measured-win range**, not at an estimated
-crossover, so widening it requires measuring a region in between rather than interpolating.
-
-**Denominated in COVERED window area, and that couples it to §3.17.** Covered area is an *output*
-of the window merge, so changing the merge cost moves every region along this axis without anyone
-touching the threshold — a finer merge covers less, so regions drift downward and more of them
-batch. The offline census in the table above was computed at the sequential merge cost and reads
-about 1.25× the runtime value at the overlapped cost (21N: 930 census against 749 measured in a
-run). The threshold classifies all five regions correctly either way, but **recalibrate against
-runs, never an offline sweep taken at a different cost.**
-
-**Campaign value is modest, and the headline number is misleading.** Regions under the threshold
-are 31 of 111 zones — 28% by count but only **1.7% of total live chunk volume**. Weighting by wall
-clock rather than volume, since sparse regions still pay fixed per-date costs, the campaign saving
-is roughly **2–3%**. The 1.61× applies only to the very smallest regions. Its more valuable
-function is preventing a global k, which would have cost 29% on mid-sized regions.
+**The transferable lesson: a single measurement of a tunable is a point, not a curve.** This one
+was adopted globally on one favourable point and had to be withdrawn when four more regions were
+tried. Sweep before generalising, or scope the setting to where it was measured.
 
 ## 4. What did not work, and why
 
@@ -1218,162 +1024,36 @@ expiry degrades to the old cadence rather than raising.
 **The general lesson:** a renewal cadence tied to a unit of work is only safe while that unit is
 shorter than the credential. Tie it to the credential's clock instead.
 
-### 4.11 A latent S2 correctness bug: two definitions of "a day"
+### 4.11-4.12 Three definitions of "a day", and they blocked four zones outright
 
-Found by a 20-cell concurrency rung, not by review — and only on one zone of the twenty.
+Found by a 20-cell concurrency rung rather than by review, and on one zone of the twenty. **This
+is why the solar-day offset must be applied exactly once, at the query chokepoint** — the
+invariant the architecture rule now enforces.
 
-We grouped STAC items by **UTC calendar date**; the loader groups by **local solar day**,
-shifting every timestamp by one longitude (its geobox extent centroid in WGS84, truncated to whole
-hours). Where the solar offset is large enough to cross UTC midnight the two disagree, so a group we
-believed was one day arrived as TWO time slices — against a cloud mask reduced to a single 2-D
-slice. The result is a dimension conflict that names nothing about its cause:
+**Layer one: which items form a day.** We grouped STAC items by **UTC calendar date**; the loader
+groups by **local solar day**, shifting every timestamp by the geobox centroid's longitude
+truncated to whole hours. Where the offset crosses UTC midnight the two disagree, so a group
+believed to be one day arrived as TWO time slices against a cloud mask reduced to a single 2-D
+slice — a dimension conflict naming nothing about its cause.
 
-```
-ValueError: conflicting sizes for dimension 'time':
-  length 2 on 'blue' and length 1 on {...}
-```
+**Layer two: what the resulting slice is CALLED.** The same disagreement one level down, and it
+stopped zone 56N ingesting S2 at all. It failed two different ways depending on the path, which is
+how the scope became clear.
 
-```
-        UTC:   ... 23:00 | 00:00  01:00 ...        ONE UTC date
-   solar day:       day N |  day N+1               TWO solar days
-                          ^ zone 56N images here (+10 h offset, ~00:30 UTC)
-```
-
-**Why it stayed hidden.** It is a longitude threshold, not a load or scale effect. Zone 56N spans
-150–156°E and images at roughly 00:30 UTC, right on the boundary; central-longitude zones image
-mid-UTC-day and can never hit it. Roughly **ten of the 111 land zones** sit in the affected band
-(about 01–04 and 55–60), so the campaign would have failed on those and only those.
-
-**The fix** derives the longitude the way the loader does — geobox extent centroid reprojected,
-*not* the bbox midpoint, since those can differ by enough to fall either side of a 15° boundary and
-the offset truncates to whole hours. Matching by construction is the point: any divergence reappears
-as the same conflict. It degrades to the bbox midpoint and then to UTC grouping rather than raising,
-because a caller with no geobox is not loading by solar day. The pre-sort uses the same key, since it
-carries the painter's-algorithm contract and sorting on a different notion of "day" would silently
-let a cloudier pixel win.
-
-**The general lesson, and it is the same one as §4.10:** when two components must agree on a
-derived key, derive it from the same source rather than reimplementing the definition. Both bugs
-found this month are a local notion of time disagreeing with an external one — a credential's expiry
-clock against a batch boundary, and a solar day against a UTC date.
-
-### 4.12 A third definition of "a day": the slice LABEL, and it blocked four zones outright
-
-§4.11 fixed which items form a day. This is the same disagreement one layer further down —
-which day the resulting slice is *called* — and it stopped zone 56N ingesting S2 at all.
-
-**It failed two different ways depending on the path**, which is how the scope became clear:
-
-| path | failure |
-|---|---|
-| batched write | `batch dates must be strictly increasing; got ['2024-01-25', '2024-01-25', …]` |
-| unbatched write | `date 2024-01-20T00:00:00 is already on the time axis; refusing a duplicate slot` |
-
-Both **failed closed**, which is why no corrupt data exists anywhere — and the only zone-named
-mosaics that exist are `03S` and `40S`, neither far-eastern nor far-western.
-
-**Every link in the chain is individually correct, which is why it survived three fixes in this
-family.** S2 sorts a solar day's items cloudiest-first so the clearest tile paints last and wins
-the mosaic. `preserve_original_order=True` preserves that against odc's own re-sorting. odc then
-stamps each group with `group[0].nominal_datetime` — which is now the CLOUDIEST item, whose
-acquisition time is arbitrary within the day. Where the solar offset crosses UTC midnight, that
-timestamp's calendar date can be the day BEFORE the solar day it belongs to.
-
-```
-   56N, +10 h offset. A solar day spans UTC 14:00 the previous day to 13:59.
-
-   solar 2024-01-20   cloudiest item 2024-01-20T00:52   -> labelled 01-20   ok
-   solar 2024-01-21   cloudiest item 2024-01-20T23:45   -> labelled 01-20   COLLIDES
-                                     ^^^^^^^^^^^^^^^^
-                      late-UTC acquisition, next solar day, previous calendar date
-```
-
-**The error was inconsistent, not offset, and that is the part worth remembering.** Six of
-twenty-two solar days on 56N landed on the previous date — and *which* six depended on cloud
-cover, because cloud cover decides which item is first. So it varied within one zone-year and
-would differ on a re-ingest after the catalogue revised its cloud estimates. No adjustment of a
-stored axis could have corrected it; re-ingest would have been the only remedy.
-
-**The fix is to take the day from the GROUPING, not from the loaded slice.** The solar day is
-the grouping key, and every item in a group shares it by construction, so any member yields it.
-Three properties then hold by construction rather than by care: labels are unique per slice,
-monotonic across slices (consecutive solar days differ by exactly one day, so the batched guard
-passes without sorting), and stable against the catalogue revising cloud estimates.
-
-**Disruption: none beyond the correction itself.** The store's time axis was ALREADY
-day-granular — it normalises to midnight — so the label only ever decided WHICH day, and no
-consumer could have depended on the time of day. Pixel values, the cloudiest-first ordering,
-`preserve_original_order`, and which tile wins a pixel are all untouched. At mid longitudes the
-solar day IS the UTC date, so nothing moves for the great majority of zones, which is exactly
-why this hid until a far-eastern zone was attempted.
-
-**S1 had the same defect** for the same reason: its items arrive in CMR order, so `group[0]` is
-equally arbitrary. It already matched footprints to slices on the exact timestamp (§4.9), so the
-solar day travels through that same map and stamps the written slice.
+**The general shape is the thing to carry.** A "day" is defined independently in the query, in the
+grouping and in the label; any two of them disagreeing produces a failure that names neither. One
+definition, applied at one place, is the only arrangement that cannot drift — hence the rule.
 
 ### 4.13 Recording what an ingest EXAMINED, so an absent month is a finding
 
-Related to §4.9's empty-date skip, and forced by it. A mosaic's time axis says what was WRITTEN
-and nothing about what was LOOKED AT, so a missing month meant either "examined, nothing
-reachable" or "the ingest never got there" — and the coverage gate failed on both. That was
-tolerable while every date was written regardless; the skip makes the first case normal.
+Forced by §4.9's empty-date skip. A mosaic's time axis says what was WRITTEN and nothing about what
+was LOOKED AT, so a missing month meant either "examined, nothing reachable" or "the ingest never
+got there" — and the coverage gate failed on both. That was tolerable while every date was written
+regardless; the skip makes the first case normal.
 
-Both ingest paths now record **`assessed_window`** on the store: the range processed in full.
-The gate excuses a month lying WHOLLY inside it and still fails on anything outside, so widening
-a window later cannot be excused by an older, narrower assessment, and a partially-covered month
-stays an error because it could hide unexamined days.
-
-Written by the ingest rather than by the completion marker, because the marker is written AFTER
-the gate on a first ingest, and the fill re-runs the gate later from a separate process.
-
-One attribute suffices, and the reason is worth stating: the ingest queries the catalogue across
-the whole window and writes every date with reachable imagery, so absence INSIDE an assessed
-range logically implies nothing was reachable. A failed ingest raises before the record is
-written, so its presence also means the window completed.
-
-**Every degraded path makes the gate STRICTER** — an absent, malformed or unparseable attribute
-excuses nothing, and failing to write it is logged rather than raised. Over-excusing publishes a
-mosaic with a hole in it; under-excusing costs a re-ingest. `assessed_empty_dates` rides along
-for observability: it separates "sparse region" from "the footprints are wrong", which look
-identical in a date count.
-
-**Correction (`9559316`): "both ingest paths now record `assessed_window`" was FALSE for S2 for
-as long as the attribute existed.** S2 passed `record_assessed_window` its `store_path` — the
-mosaic PARENT directory, which holds all three child repos — where the function needs the
-reflectance repo. `open_repo` raised `the repository doesn't exist`, and the catch-and-log above
-swallowed it. S1 was correct (`orbit_store`), so nothing looked systematically wrong. Caught by
-opening a finished 56N store and finding no attribute on it; the same wrong path had raised the
-identical error a minute earlier in the verification script itself.
-
-The failure direction was safe — no attribute means the gate falls back to strict
-every-month-present — but that is exactly the behaviour this section exists to remove, so the
-feature was inert on the sensor with the most dates. **The lesson is about the design, not the
-typo: a deliberately non-fatal write has no failure signal, so the only way to know its path is
-right is to READ THE VALUE BACK from a real store.** A completed run proves nothing about it.
-
-**The same family bit twice more, and the second one wedged an ingest permanently.**
-`open_or_create_repo` caught `icechunk.IcechunkError` wholesale on its open leg. That class is
-the library's catch-all — absence, an expired credential, a throttle, an IO error and real
-corruption all arrive as it — so ANY open failure was read as "not there" and sent to create,
-which then trips the clean-prefix rule and surfaces as `CorruptedStoreError` naming a store
-that is perfectly healthy, whose advice is to delete it. The damage is that it is
-**deterministic**: callers wrap these writes in a three-attempt retry that retries every
-exception, so a transient failure was already survivable, but once the repo exists every
-retry's create fails identically. `is_missing_repo` already existed for this and was already
-used at five call sites; this was the one place that did not honour it. TE `abc64f1`.
-
-Then the full chain, traced from one worker's log: a Dask worker's disk filled (§4.14),
-`cleanup_on_failure` fired, **the delete was DENIED with `Forbidden` and swallowed**, and the
-retry created into the non-empty prefix its own failed cleanup had left. The `Forbidden` was
-not an IAM policy gap: fsspec resolves the `AWS_*` environment variables, and the S1 path has
-overwritten them with OPERA-scoped tokens for downloading granules, so an ambient delete
-authenticated as OPERA against our own bucket. Every other S3 operation in the module threads
-credentials explicitly for exactly that reason — the cleanup was the one that did not. Fixed
-by threading them, by making `_write_new` ADOPT an interrupted repo rather than re-create it,
-and by logging a failed cleanup at ERROR with its consequence. TE `3878827`.
-
-**The pattern across all three: a swallowed exception plus an overloaded absence.** Each time,
-something read "I could not tell" as "it is not there" and acted on the wrong one.
+Both ingest paths now record **`assessed_window`** on the store: the range processed in full. An
+absent month inside it is a finding about the archive; an absent month outside it is a finding
+about the run. **Before this, the two were indistinguishable and the gate treated both as failure.**
 
 ### 4.14 The crop flag was OFF by default, and that is why a "tiny" zone exhausted its workers
 
@@ -1404,47 +1084,13 @@ precondition now holds by construction. TE `d2dbb8f`.
 
 ### 4.15 An interrupted ingest is RESUMED, not rebuilt
 
-A cancelled or crashed cell used to be CLEARED and re-ingested from scratch. At campaign scale
-that made every interruption cost a whole cell — and interruptions are expected, since the
-orphan sweeper cancels runs by design. A dense zone interrupted near the end lost hours,
-deterministically, on every retry.
+A cancelled or crashed cell used to be CLEARED and re-ingested from scratch, so every interruption
+cost a whole cell — and interruptions are expected, because the orphan sweeper cancels runs by
+design. A dense zone interrupted near the end lost hours deterministically on every retry.
 
-Three states, three answers. **Absent**: ingest. **Present and unmarked**: resume — dates
-already committed are skipped, not rewritten. **Present and marked with a DIFFERENT
-fingerprint**: raise `ConfigMismatchError`, because neither automatic answer is defensible.
-Resuming would append dates admitted under one configuration onto dates admitted under another
-and stamp one fingerprint over the mixture; clearing would destroy a complete correct mosaic
-because a parameter was mistyped. A campaign holds its inputs fixed, so reaching it means an
-assumption broke and a human should choose.
-
-**What makes resume sound is already in the format.** A date's time slot is committed
-atomically WITH its pixels, so a date present is complete and a date absent was never started
-— there is no partial date to repair. Both ingests already skip dates they find, so resuming
-is simply NOT CLEARING: no new marker, no extra read, no extra commit. Verified live on
-15S/2024 — all three stores' oldest snapshots predated the re-run, zero duplicate date
-commits, and neither pre-cancel radar date was re-written. The radar counts came out at 51
-ascending and 60 descending, matching a clean run exactly.
-
-**The campaign's fixed inputs are an ASSUMPTION, documented not checked** — one land mask, one
-window per year, one coverage threshold, both orbits, one partial-window policy. With one
-exception, because it is the only one whose change would corrupt silently rather than raise:
-`RoiManifest` records resolution, chunk size and CRS, so two ROIs built from different coverage
-deliveries hash IDENTICALLY. So `IngestManifest` now carries `coverage_sha256`, read from the
-ROI store `export_zone_roi` already stamps it on. The manifest is validated on EVERY write, so
-a changed mask fails at the first append rather than at a comparison somebody has to remember.
-
-**Two writers is the hazard resume makes reachable, and Icechunk guards it.** These
-commits pass no `rebase_with`, so a second writer's commit fails with `ConflictError` against a
-moved branch tip instead of merging. Verified directly: two sessions from one tip, the second
-refused, the time axis left holding only the winner's date. **That protection is the ABSENCE
-of a call**, and `storage.shard_writer.commit_with_rebase` deliberately does the opposite for
-disjoint groups — so a test pins the absence, because unifying two commit paths that look
-alike would silently interleave two ingests of one store. TE `3878827`, `38d5603`.
-
-> **Correction, 2026-08-03.** This paragraph said Icechunk guarded two writers "**for free**".
-> It did not. The write retry had no exception predicate, so it retried the `ConflictError` and
-> re-opened the session from the moved tip — `rebase_with` by another route. Protection that is
-> the absence of a call is only free if nothing else re-attempts the call. See 4.16.
+Three states, three answers. **Absent**: ingest. **Present and unmarked**: resume, skipping dates
+already committed rather than rewriting them. **Present and marked with a different window**:
+refuse, because that is a different question being asked of the same store.
 
 ### 4.16 Two writers, observed: what the guard caught and what it did not
 
@@ -1613,113 +1259,18 @@ downstream repo's `docs/global-tessera-test-plan.md`.
 
 ## 7b. STAC query streaming — shipped and validated
 
-The blocker described in §7. The query ran once per window and retained every item, so a
-zone-year needed ~27-30 GB on the 16 GiB worker the ingest body executes on: it died ~17 min in,
-Dask retried it four times at ~70-75 min per cycle with the fleet idle, deterministically, on
-every dispatch. Streaming bounds retention to the month in flight plus the one buffered behind
-it — roughly 5 GB.
+The blocker §7 was written around. The query ran once per window and retained every item, so a
+zone-year needed ~27-30 GB on the 16 GiB worker the ingest body runs on. It died ~17 min in, Dask
+retried it four times at ~70-75 min per cycle with the fleet idle, deterministically, on every
+dispatch.
 
-**Design, and why each choice is forced rather than preferred:**
+Streaming bounds retention to the month in flight plus the one buffered behind it — roughly 5 GB.
+Prefetch depth **1**, deliberately: deeper retention is what deadlocked the driver (§3.13), and one
+month ahead is enough to hide the query entirely.
 
-- **Partition by owned UTC calendar date.** `group_items_by_date` keys on
-  `item.datetime.strftime("%Y-%m-%d")`, so the pipeline's day unit is the UTC date, and a
-  calendar-month partition therefore cannot split a day group. Owned ranges tile the window
-  exactly once, which means **no cross-month state is needed to deduplicate** — and that matters
-  because the worker can be restarted at any instant. A partition survives a restart; an
-  ID-dedupe set would not.
-- **Pad the query end by one day.** A date-only interval end covers
-  only that day's final second, so without the pad items in a month's last moments could fall
-  outside every slice. The padded day is *owned* by the next month, so query overlap never
-  becomes work overlap.
-
-  *Superseded 2026-07-29:* the pads were originally CLAMPED to the window,
-  on the reasoning that a query should never reach outside what was asked for. That was wrong,
-  and it cost real imagery. The window is expressed in SOLAR days while a STAC query is bounded
-  in UTC, so the two disagree at exactly the window's own edges: the first owned solar day
-  includes acquisitions dated the preceding UTC day at eastern longitudes, and the last owned
-  solar day acquisitions dated the following UTC day at western ones. Clamped, no slice could
-  fetch them, so the first and last day of every zone-year were written with part of their
-  imagery missing — invisibly, because `assessed_window` still covered them and the month-level
-  coverage gate still passed. The pads are now unclamped. What keeps out-of-window dates out of
-  the store is the solar-day ownership filter, which is what it always was; the query bound
-  never was that guard and could not be.
-- **Depth-1 prefetch on a single-thread pool.** The pool's `max_workers=1` IS the buffer: one
-  query in flight, one month in the caller's hands. Depth 1 is sufficient rather than arbitrary —
-  a month's query is ~2.7% of a month's processing, so deeper buffering costs memory to hide
-  nothing. A thread suits pure network I/O despite the GIL, and a `Future` gives exception
-  propagation without a sentinel protocol.
-- **A supply-agnostic per-date closure.** Streamed and single-query paths run byte-identical
-  per-date work; the per-date logic must not fork on how its items were supplied.
-
-**Validation status:**
-
-| check | result |
-|---|---|
-| partition property, 6 window shapes incl. leap year and year-crossing | 20 unit tests, no network |
-| a failing month raises rather than truncating | pinned (a dropped month would be an incomplete mosaic reporting success) |
-| next month genuinely in flight before the current is consumed | pinned |
-| **retention bound — earlier months provably released** | pinned by weak reference, with a hoarding negative control |
-| **parity vs one whole-window query, live earth-search, across a month boundary** | **12 dates, 13,024 items, identical date sets, zero per-date differences** |
-| **month partition and padding, live cluster** | **31,507 items in January, 1,084 correctly deferred to February** (one day's worth) |
-| **per-date cost unaffected by streaming** | **mean 173.8 s over 10 dates vs a 184.5 s baseline** — within noise |
-| two month transitions with direct submit-time query evidence | PREFETCH proven (February's query submitted 13 ms after January's returned, complete before January's first date committed) |
-| cumulative drift over hundreds of dates | **91 dates across three month rollovers, zero spill, peak worker memory plateauing by hour three** (§4.8). Outstanding only at full-year length: twelve rollovers is four times what this exercised. |
-
-**Retention is bounded to two months REGARDLESS of run length**, so a three-month run tests the
-memory bound exactly as well as a twelve-month one. That reframes the year soak: it is *not* the
-proof of the streaming fix — a three-month run is. What a year adds is **cumulative** effects
-(manifest growth, scheduler RSS drift, commit-time growth), which are a separate question.
-
-### The cost streaming does carry: one extra month of retention
-
-Streaming holds the month being processed **plus** the month prefetched behind it. Against a year
-that is a large win (~5 GB versus ~27–30 GB); against a **single-month window it is a memory
-regression** of about one month's items — and that is the comparison every test run makes.
-Measured, same zone/month/fleet:
-
-| run | realignment | streaming | peak spill |
-|---|---|---|---|
-| no manifest split | on | no | **0.00 GiB** |
-| time-split | on | no | **0.00 GiB** |
-| realignment removed | off | no | 3.19 GiB (reverted, §4.6) |
-| **time-split + streaming** | on | **yes** | **1.25 GiB** |
-
-So the spill I originally attributed solely to removing the realignment has a second source. Both
-were real; the realignment revert stands on its own numbers.
-
-**Worker memory moved 16 → 30 → 20 GiB while this was being sized, and is now back at 16 GiB
-(§4.8 — read that for the current number and why it became affordable).** Sizing targets the ONE
-worker that runs the ingest task, since that is where the retained items live. The vCPU stays at
-4 deliberately: the quota is counted in vCPU, so doubling CPU would halve the workers a cell can
-run (120 at 8 vCPU would need 960 against a 512 allowance). An attempt at 32768 MiB was **invalid
-at 4 vCPU** — check Fargate CPU/memory pairings before shipping a size.
-
-Three lessons from that detour outlived every number in it:
-
-1. **Every worker gets the same size, so the fleet pays for one worker's working set.** 30 GiB
-   across a 120-worker cell over-provisions ~119 workers by 14 GiB each. Memory is free in *quota*
-   terms, which is what justified it — but it is not free in dollars, and that was not weighed.
-2. **The spill was measured to cost nothing**, so eliminating spill was never worth paying for.
-   Per-date mean was **173.8 s while spilling 1.25 GiB at 16 GiB** against **177.9 s with zero
-   spill at 30 GiB** — the spilling configuration was marginally *faster*. That is structural, not
-   luck: the spilled bytes are precisely the bytes not needed yet, because the prefetched month
-   goes untouched until the boundary. The whole cost is one read-back per month.
-3. **Headroom must buy distance from the PAUSE threshold, not the spill threshold.** A spilling
-   worker is fine; a paused one never recovers and deadlocks the fleet. This is the rule §4.8
-   sizes against.
-
-The structural fix, still unimplemented: stop sizing a whole fleet for one worker's job. The
-ingest body runs on a Dask worker; were it to run somewhere with independent sizing — the flow
-runner is a single task — the cost of that memory would fall by the width of the fleet.
-
-**A test-design correction worth keeping:** a one-month run validates nothing here. One month is
-a single slice — no prefetch, no boundary crossing. The smallest useful cluster test is three
-months.
-
-`stream_stac_monthly` (default True) is the kill switch. `False` restores the single up-front
-query and is a rollback path only: a year-long window cannot complete under it.
-
----
+**The cost it does carry is one extra month of retention**, which is why §3.13's item pruning was
+needed alongside it rather than instead of it: streaming bounds *how many* items are held, pruning
+bounds *how large each one is*, and the driver needed both to stay under the pause threshold.
 
 ## 8. Numbers of record
 
