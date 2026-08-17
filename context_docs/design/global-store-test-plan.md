@@ -308,3 +308,116 @@ timings.
 2. Delete the bucket; stop/terminate the instance; confirm no EBS orphans.
 3. Archive collated `report.py` output into this repo alongside ADR 008
    status updates (FIRM/superseded per decision).
+
+---
+
+## 8. Icechunk / zarr API ledger
+
+**Absorbed 2026-08-17 from `global-store-test-impl-spec.md`, which this document replaces.**
+That spec was a handoff for building `scripts/scale_tests/`; the suite shipped, so its build
+order, milestones and definition-of-done describe work that is now code and are recoverable
+from git history if ever wanted. What survives it is this ledger — signatures and gotchas
+that cost real time to establish and that no reader can derive from the call sites.
+
+Every signature below was verified against **icechunk 2.0.4 / zarr 3.2.1 on 2026-07-13**. The
+bench environment runs **icechunk ≥ 2.1.1** (ADR-008 D9). Re-verify with `inspect.signature`
+before relying on one; several of these are Rust-bound and do not introspect usefully.
+
+**Groups.** `create_empty_store_from_coords` CANNOT seed sibling groups (it
+opens root `mode="w"` — clobbers). For multi-group seeding use raw zarr on a
+session store:
+
+```python
+session = repo.writable_session("main")
+root = zarr.open_group(session.store)              # NOT mode="w" after first group
+g = root.require_group("32601")
+g.create_array(name, shape=…, chunks=…, shards=…,  # shards: outer shape in ELEMENTS, or None
+               dtype=…, fill_value=…, dimension_names=…,
+               serializer=…, compressors=None)
+```
+
+Data-var arrays: schema only (no chunk writes → zero objects). Coord arrays:
+write 1-D numpy in full (`data=`). Per-group attrs: `g.attrs.update({...})`.
+
+**Manifest splitting/preload.**
+
+```python
+split = icechunk.ManifestSplittingConfig.from_dict(
+    {icechunk.ManifestSplitCondition.AnyArray():
+        {icechunk.ManifestSplitDimCondition.DimensionName("time"): 1}})
+config.manifest = icechunk.ManifestConfig(splitting=split, preload=…)
+# preload: ManifestPreloadConfig(max_total_refs=…, max_arrays_to_scan=…)
+# kwargs are Rust-bound (*args/**kwargs in inspect) — confirm names via help()
+repo.save_config()   # REQUIRED to persist; workers re-opening read persisted config
+```
+
+Split config must be identical across create and every later open (library
+precedent: `manifest_split()` contextmanager docstring).
+
+**Fork/merge (cooperative writes).**
+
+```python
+fork = session.fork()          # Session.fork(self) -> ForkSession; picklable
+# worker: writes via zarr.open_group(fork.store) / to_icechunk; RETURNS its fork
+session.merge(*fork_sessions)  # variadic; then session.commit(...)
+```
+
+Multiprocessing MUST use `multiprocessing.get_context("spawn")` (or
+forkserver) — `fork` start method deadlocks icechunk's tokio runtime.
+To deliberately orphan chunks for T6: let a worker write via a fork, then
+drop the ForkSession without merging.
+
+**Commit / rebase-retry.**
+
+```python
+Session.commit(message, metadata=None, *, rebase_with=None, rebase_tries=1000,
+               allow_empty=False) -> str
+```
+
+Contention loop (T0/T5): `commit(msg, rebase_with=icechunk.ConflictDetector(),
+rebase_tries=N)`; catch `icechunk.ConflictError` / `icechunk.RebaseFailedError`,
+count retries, jittered sleep. Same-chunk resolution:
+`icechunk.BasicConflictSolver(on_chunk_conflict=icechunk.VersionSelection.UseOurs)`.
+
+**Shift (T3 prepend path).**
+
+```python
+Session.shift_array(array_path: str, chunk_offset: Iterable[int]) -> None
+# offsets in CHUNK units, one per dim, positive = toward higher indices
+```
+
+Prepend pattern: zarr `arr.resize(new_shape)` (grow at end) → `shift_array`
+(+1 on time axis, 0 elsewhere) → write index 0 → single commit. Also resize
+the 1-D time coord and rewrite it (coords are ordinary arrays — shift applies
+per array path; simplest is rewrite the small coord in full). Verify ALL
+prior years plus empty (ocean) chunk positions after each iteration —
+`reindex_array` (not used, but same machinery) documents a stale-data hazard
+at empty positions; prove `shift_array` is clean.
+
+**GC / expiry / rollback (T6).**
+
+```python
+Repository.expire_snapshots(older_than: datetime, *, delete_expired_branches=False,
+                            delete_expired_tags=False) -> set[str]
+Repository.garbage_collect(delete_object_older_than: datetime, *, dry_run=False,
+                           max_snapshots_in_memory=50,
+                           max_compressed_manifest_mem_bytes=512*2**20,
+                           max_concurrent_manifest_fetches=500) -> GCSummary
+Repository.reset_branch(branch, snapshot_id, *, from_snapshot_id=None)
+Repository.rewrite_manifests(message, *, branch, …)   # repo-wide only
+Repository.total_chunks_storage(...) -> int
+```
+
+Tags: `repo.create_tag(name, snapshot_id=…)` (verify exact name via `help()`)
+protect snapshots from expiry.
+
+**Reads.** Readonly sessions: `repo.readonly_session(branch=…)` or
+`(snapshot_id=…)`. Concurrency sweep: `zarr.config.set({"async.concurrency": N})`
++ `RepositoryConfig(max_concurrent_requests=…)`. Cold reads via fresh
+subprocess (§2.3). `xr.open_zarr(session.store, consolidated=False)`;
+`chunks=None` to skip dask graphs (library precedent in `_open_readonly`).
+
+**Library reuse map.** Use as-is: `_default_repo_config`, `manifest_split()`,
+`TIME_ENCODING`, `pcodec_serializer()`, `rollback_commits`,
+`create_empty_store_from_coords` (single-group cases ONLY). Raw APIs needed
+for: groups, fork/merge, shift_array, GC, tags, sharded arrays.

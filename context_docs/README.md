@@ -60,8 +60,7 @@ context_docs/
     ├── single-global-alignment.md                why single-ROI was aligned to the campaign
     ├── staging-identity-and-resume.md            what a run_id identifies, and what resumes
     ├── d3-sharding-plan.md                       settled ADR-008 D3; spec for scale_tests/t8
-    ├── global-store-test-plan.md                 the T0-T8 scale tests
-    ├── global-store-test-impl-spec.md
+    ├── global-store-test-plan.md                 the T0-T8 scale tests; §8 is the icechunk API ledger
     │
     │  MODEL
     └── v2_data_source_alignment_2026_07.md       AWS-vs-MPC input for Tessera v2

@@ -3,9 +3,8 @@
 Standalone benchmarks (NOT pytest) that settle the PENDING decisions in
 [`context_docs/decisions/008-global-store-architecture.md`](../../context_docs/decisions/008-global-store-architecture.md).
 They implement the program in
-[`context_docs/design/global-store-test-plan.md`](../../context_docs/design/global-store-test-plan.md)
-per the handoff spec
-[`global-store-test-impl-spec.md`](../../context_docs/design/global-store-test-impl-spec.md).
+[`context_docs/design/global-store-test-plan.md`](../../context_docs/design/global-store-test-plan.md),
+whose §8 carries the verified icechunk/zarr API ledger these scripts were built against.
 
 These scripts write real data to real object stores and cost real money at
 `--scale bench --backend s3`. Develop and smoke everything at
