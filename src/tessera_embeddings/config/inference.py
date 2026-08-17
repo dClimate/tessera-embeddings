@@ -224,17 +224,17 @@ RADAR_THIN_MAX_OBS = 12
 #: provenance records the line its own numbers were produced under, so cells filled before and
 #: after a change are comparable rather than silently restated.
 #:
-#: **The value is a PLACEHOLDER (Robert, 2026-08-13), not a decision.** 25 sits in the middle of the
-#: range under discussion so the rest of the machinery can be built and tested; the evidence that
-#: would choose a number does not exist yet. What is known: the blind re-measurement behind the
-#: proposed 30 does not support it, because the legibility it measured turned out to track RENDERED
-#: CONTRAST rather than information — spatial organisation is flat across 12 to 45 observations. See
-#: ``context_docs/design/window_legibility_vs_depth_2026_08.md``. The measurement that would settle
-#: it is the embedding's drift against observation count, in progress.
+#: **15 is a DECISION (Robert and colleague, 2026-08-17), not a placeholder** — it replaces the 25
+#: that stood here from 2026-08-13 purely so the machinery could be built. Coverage was chosen over
+#: reproducibility: the line keeps **94% of pixels rather than 79%**, and the cost, accepted
+#: knowingly, is that two independent embeddings of the same ground agree less well. The trade is
+#: recorded in full, including what 15 admits that 20 would not, in
+#: ``context_docs/design/minimum-optical-depth-plan.md``.
 #:
-#: **Settle it before any store is seeded.** After that the root attr decides and the store cannot be
-#: re-stamped, so a placeholder that reaches a seed becomes permanent.
-OPTICAL_MIN_OBS = 25
+#: **A store already seeded at another value keeps it.** The root attr decides, and it is write-once,
+#: so this constant changes what a NEW store is seeded with and what the thin counters report —
+#: never what an existing store enforces.
+OPTICAL_MIN_OBS = 15
 
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
 #:
