@@ -180,137 +180,26 @@ because region-merge's bytes are re-readable from a store by child processes
 region, which was built and removed for being the bottleneck (see the warning
 below). Per-window graphs stay per-window; only the session and commit are shared.
 
-## What we take from the region-writes / region-merge work, and why
+## What this shares with the region-merge tier
 
-`storage/region_merge.py` and its design note (PR #77), and the ROI fan-out
-foundations (PR #79), solve the tier directly above this one: merging many
-grid-aligned feature stores into one master. We take code from both, generalised —
-neither PR is merging soon, so the generalised version here becomes the shared one
-and those branches rebase onto it rather than landing a second copy.
+`storage/region_merge.py` and the ROI fan-out foundations solve the tier directly above this one:
+merging many grid-aligned feature stores into one master. Code was taken from both and
+generalised, so the generalised version here is the shared one and those branches rebase onto it
+rather than landing a second copy.
 
-Adopted as code:
+The one design consequence worth carrying: **snapping windows to the chunk grid makes them
+chunk-disjoint**, which removes the shared-boundary reconciliation the merge tier has to handle.
+That is why this path can write N windows into one session safely and the merge tier cannot.
 
-**Grid-aligned window derivation** (#79). `feature_window` snaps a geometry to a
-window of the master geobox with `GeoBox.enclosing` plus an `overlap_roi` clamp, so
-the window is an exact pixel-subset *by construction* rather than by post-hoc
-validation — region writes place data positionally and are silently wrong otherwise.
+## Bookkeeping relocation — resolved
 
-*Generalised:* geometry and bitmap are two ways of expressing the same live-cell
-selection, so one helper takes either and returns grid-aligned windows. The
-single-ROI path keeps its geometry entry point; the campaign gets a bitmap one.
-
-**The chunk-scaled cluster sizing pattern** (upstream `roi_fanout`): workers per
-cell derived from its live-chunk count, clamped to a floor and cap
-(`_workers_for_chunks`, 0.5 workers/chunk in [10, 200]). This is the direct fix for
-"the 50-worker ceiling was hit for a 4-tile zone" — after cropping, a cell's
-live-window count is exactly the work measure the cluster should be sized from.
-
-**NOT adopted after the experiment: `region_merge`'s fork-and-merge machinery.**
-Its process pool exists because raw zarr chunk writes serialise on a session's
-store mutex in-process — a constraint of the store-to-store copy, whose bytes are
-re-readable by child processes (only paths and slices pickle across). Our bytes
-come out of a Dask graph, and the experiment showed plain `to_icechunk` region
-writes on a shared session already give one commit per date with worker-side
-writes. Using the fork machinery would have meant materialising windows on the
-flow runner just to ship them to a pool — the exact thing `to_icechunk` avoids.
-
-**Forward compatibility with real merge workflows** therefore costs nothing: the
-batching surface we add (one session, N region writes, one commit — with the attrs
-preservation `_commit_preserving_attrs` provides) is useful to a merge tier but
-does not replace it. `region_merge` stays the right tool for store-to-store merges
-when they are wanted, unchanged, and nothing here forecloses porting it.
-
-**What we deliberately do not take: the merge *workflow*.** Ingesting each window to
-a temp store and merging it in would write every live byte twice. Empty chunks are
-already elided, so today's write volume is live-only — doubling it doubles S3 PUTs
-against a backend whose push-back is already managed by an aggregate concurrency
-budget. Take the mechanism, not the pipeline.
-
-Four further findings transfer, and one is a warning we would otherwise have walked
-into.
-
-**The warning: do not rebuild a Dask-graph region write.** `write_regions`, a
-`store_dask`-based batch path, was built and then removed. Its
-`O(runs × bands × spatial_chunks)` task graph, constructed single-threaded on the
-flow runner before any compute began, was itself the bottleneck that made
-continental merges take days. That is the same signature as the 03S incident — a
-119,002-task graph whose construction and scheduling, not its data, was the
-problem. It confirms the fix must shrink the **graph**, not merely make dead blocks
-cheap to compute.
-
-**The sparse-master pattern is the same problem one level up.** Region-merge's
-motivating use case is "a big rectangular master where only scattered regions are
-populated, the rest staying all-fill" — a zone mosaic with scattered live tiles is
-exactly that. Its workflow (seed all-fill over the full grid, then write only the
-populated parts) is the one adopted above, and `empty_store.create_empty_store` is
-the seeding primitive it established: correct grid, chunking, dtype and attrs with
-zero chunks written, so seeding a continental extent is cheap.
-
-**Positional writes demand grid-aligned windows.** PR #79's `feature_window` snaps a
-geometry to a window of the master geobox via `GeoBox.enclosing` plus an
-`overlap_roi` clamp, so the window is an exact pixel-subset *by construction* rather
-than by post-hoc validation — because region writes place data positionally and are
-silently wrong otherwise. Our windows come from a bitmap rather than a geometry, so
-the function is not directly reusable, but the invariant and the idiom are the same
-and the two should not drift. If #79 lands first, unify on one helper.
-
-**The temporal invariant is already satisfied.** Region-merge requires distinct
-dates in distinct time chunks, or concurrent writers race within a chunk with no
-conflict resolution. `INGEST_CHUNKS` already sets `time: 1`.
-
-**Fill-masked overlay is the hazard we design around rather than solve.** A
-rectangular window over an irregular footprint carries fill where the footprint
-does not cover, so region-merge must overlay only real pixels lest one feature
-overwrite a neighbour's data with its own fill. Chunk-aligned, per-row windows over
-a single ROI make our windows disjoint and single-owner, so the hazard does not
-arise — but it is the reason to keep windows chunk-snapped rather than tight to the
-live pixels.
-
-**Pacing, if we fan out.** PR #79's `DispatchThrottle` bounds concurrency *and*
-paces launch instants, which matters against APIs that throttle on burst rate. Only
-relevant if windows are ever dispatched as separate runs rather than looped
-in-process; noted so it is not reinvented.
-
-## Bookkeeping relocation inventory (traced 2026-07-24)
-
-`write_dataset` and its two callers own bookkeeping that the seed-then-region-write
-path must explicitly re-home. Full trace with file:line cites lives in the PR #97
-thread record; the load-bearing items:
-
-**Dissolved by keeping dates discovery-as-you-go** (the per-date append design):
-- `check_time_window_coverage` proves coverage by counting timestamps
-  (`data_loading.py:435`), so a pre-seeded daily axis would pass it vacuously and
-  the write-once ingest marker would make a hollow mosaic permanent. A
-  written-dates-only axis keeps the gate meaningful.
-- `get_existing_dates` means "already ingested" to both sensors' STAC dedupe; a
-  pre-seeded axis would filter every date and silently produce empty mosaics.
-- The empty-timestep prunes (S2 SCL-validity, S1 `vv != 0`) — sound as long as
-  the seed fill for every mosaic var is integer 0, which `_fill_for_dtype` gives.
-  Pin with a test; a float-seeded var (NaN fill) would break both.
-
-**Must be re-homed deliberately:**
-- `manifest.validate_against` runs on every append today (`zarr_store.py:984`) and
-  is the only gate against writing into a structurally different store. The
-  batched path must validate at least once per ingest invocation; `write_region`
-  does no manifest validation at all.
-- `last_appended` must keep moving per write session (`update_attrs`) — it is the
-  `_mosaic_identity` fallback for prebuilt mosaics, and frozen-at-seed it would
-  alias two different builds.
-- `baselines_applied` merges (dict union, new wins) and `doy` concatenates in
-  append order (`zarr_store.py:985-996`); a naive attrs `update` clobbers instead
-  of merging. `doy` has no src/ reader (inference recomputes from the time coord),
-  so write-at-append-time correctness is what matters, not consumers.
-- Chunk encoding + `TIME_ENCODING` are create-only today; they move wholesale to
-  the seeding call, and `create_empty_store` already computes the identical clamp.
-  Verify its default codecs match what `to_icechunk` picks today — `VarSpec`
-  defaults to `"auto"`, and a codec mismatch between seeded and appended stores
-  would be silent.
-- S1 writes a whole `batch_days` batch per call (many dates), unlike S2's one;
-  its dates are non-contiguous, so the S1 port loops per-date sessions rather
-  than assuming the S2 shape transfers.
-- Tenacity retry currently wraps only `write_dataset`; it must widen to the whole
-  per-date unit (resolve + append + region writes + commit), which stays safe
-  under icechunk atomicity since an uncommitted session is invisible to readers.
+`write_dataset` and its two callers owned bookkeeping the seed-then-region-write path had to
+re-home. The full trace with file:line cites is in the PR #97 thread record; the outcome is that
+**most of it dissolved rather than moved**, because keeping dates discovery-as-you-go meant the
+time axis still only ever contains dates that passed the gate and were written — which is the
+property `get_existing_dates`, `check_time_window_coverage` and the empty-timestep prunes all
+depend on. A pre-seeded daily axis would have broken all three, and that is the reason the design
+is the way it is.
 
 ## Also from the 03S run
 

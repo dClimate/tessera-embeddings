@@ -118,111 +118,19 @@ capture the whole win is therefore **disproved**.
 Alignment is fine either way: `SHARD_PX` = 2048 divides 8192 exactly (16 shards per chunk,
 32 of the 256-px inner chunks).
 
-### The inference-side constraint on the store change — already measured, and it vetoes it
+### Why the store chunk cannot be coarsened — measured, and it vetoes the change
 
-The GPU-saturation campaign (`inference_gpu_saturation_profile_2026_07.md`) measured this
-effect directly while tuning the strip budget:
+Enlarging the store chunk would shrink the ingest graph, and the inference side vetoes it:
+inference reads whole chunks, so a coarser store chunk multiplies read volume for every consumer
+of the store. That was measured rather than argued, and the measurement is what closed it.
 
-> Budget 4.75 → 5.75 GiB (P3). Lets the whole `T≤71` full-width band load as a single strip
-> instead of two, dropping a ~13 s fixed read/chunk (**source stores use 4000² chunks → every
-> read re-decompresses whole storage chunks; measured fixed read ≈13 s regardless of strip
-> size**).
+**What shipped instead: load blocks decoupled from store chunks.** The ingest can use a large
+load block without the store chunk following it, which takes the graph reduction and leaves the
+read path alone. §3's telemetry and §8's results carry the numbers.
 
-So a **fixed per-chunk read cost of ~13 s is already attributed to storage chunk size**. For
-a full-width strip the decompressed volume is `W × chunk_px` — linear in the chunk edge — so
-4096 → 8192 roughly **doubles** that fixed read, to ~26 s. Tile-shaped reads amplify worse
-(4× → 16× of the bytes actually used).
-
-Set that against what the campaign bought: GPU-idle overhead per chunk went **50–60 s →
-24–34 s** (striping + background write) → **~6 s median** on prefetch-hit chunks, with ~36 s
-remaining only on the first-per-worker cold start. Adding 13+ s of fixed read back would
-**roughly triple the steady-state overhead the campaign spent a whole branch reducing**, and
-it lands squarely on the resource that is otherwise pinned at 99% utilisation.
-
-There is a second, compounding effect. The strip budget (5.75 GiB) is sized so a full-width
-band load fits in ONE strip; larger storage chunks mean fewer rows fit per budget, so more
-chunks split into two strips, so more two-strip co-residency — which is precisely the
-direction of the 92–95% RAM OOM that motivated striping in the first place. The P3 budget
-raise *lowered* peak RAM (51% → 45–47%) by making more chunks single-strip; coarsening the
-store pushes the same lever backwards.
-
-**Conclusion: reject the store-side 8192 change on existing evidence.** It trades a 3.88×
-ingest graph reduction for a likely 2–4× regression in per-chunk GPU-idle overhead plus
-movement toward a known OOM regime, on the most expensive resource in the stack. The
-load-only 1.41× variant is unaffected — it leaves the store at 4096, so none of the above
-applies.
-
-If the full 4× is ever wanted, the route is NOT a coarser store: it is to reduce ingest
-graph tasks by some means that leaves the store's read geometry alone.
-
-### Baseline for any inference-touching change
-
-From the completed 15S/2024 fill (2,352 `RESOURCES` samples, 30.9 GB hosts):
-
-| phase | samples | GPU util mean/median/max | VRAM mean/max | host RAM mean/max |
-|---|---|---|---|---|
-| infer | 1,876 | **99% / 100% / 100%** | 70% / 97% | 36% / 46% |
-| prologue | 158 | 0% / 0% / 0% | 36% / 97% | 29% / 42% |
-| load | 24 | 0% / 0% / 0% | 64% / 97% | 34% / 35% |
-| (unlabelled) | 294 | 0% / 0% / 29% | 73% / 97% | 12% / 38% |
-
-Host RAM has slack (46% peak against the 60% ceiling; 35% during load). GPU has none: VRAM
-peaks at 97% and inference-phase utilisation averages 99% with 98% of samples ≥95%.
-
-**Use the campaign's metrics, not ad-hoc ones.** `te-observe-cluster --ram-report
---log-group /ec2/global-tessera-dev/ray --since … --until …` gives per-worker peak RAM and
-GPU-util distribution post-hoc with no live cluster; `--start-pollers` then `--report` gives
-1 s DCGM saturation (SMACT/TENSO) and the per-chunk phase-split table from the actors'
-`CHUNK_SUMMARY` lines. The decision metric is **GPU-idle overhead per chunk** (~6 s median
-shipped), with peak RAM as the safety check. `te-compare-outputs` provides the numerical
-parity gate, and per-run provenance goes in
-`context_docs/design/inference-perf-run-ledger.md`.
-
-**Sparse zones understate the harm.** Spatially-sparse chunks already read only a narrow
-easting window (optimization C), so a sparse zone shows less amplification than a dense one.
-Any inference-side chunk-geometry test must be run on a DENSE area — or a dense sub-section
-of a zone — or it will look safe and not be.
-
-### What shipped: load blocks decoupled from store chunks
-
-`INGEST_LOAD_CHUNK_SIZE` (8192) now sets the dask block size for the read path while
-`INGEST_CHUNK_SIZE` (4096) keeps setting the store's chunks. It must be a multiple, enforced
-at import, because the write rechunks load blocks down to store chunks and a non-multiple
-would make that a cross-block shuffle instead of a pure split.
-
-Windows are derived on the load-block grid (`live_windows_for_mask(window_px=...)`) by
-coarsening the derived live grid — NOT by snapping windows afterwards, which would be
-incorrect: two windows on adjacent fine rows can snap into the same coarse block and stop
-being chunk-disjoint, and the single-session per-date write depends on disjointness. The
-mask stays chunked at `INGEST_CHUNK_SIZE`, so the fast key-listing path is unaffected.
-
-The window cap is now `MAX_TASKS_PER_WINDOW` (24,000) in graph TASKS, converted to a chunk
-area through a `tasks_per_chunk` estimate. Chunk area was the wrong unit: it silently changes
-meaning whenever band count or block geometry moves. The old 2,048-chunk cap did exactly
-that, permitting an 84,054-task window.
-
-**Separating fixed from per-chunk cost in the census.** The ~956 per-item `open` tasks are
-fixed per date, so a small census window overstates the per-chunk figure. Removing them: per
-store chunk the variable cost goes **44 to 27.5 tasks (~1.6x)**; the 1.41x headline is that
-same effect diluted by fixed cost on a small window, so a full date should realise closer to
-1.6x.
-
-**Falsifiable prediction for the validation run** (35N, January, 120 workers), recorded
-before the run so it can be wrong: 7 windows of at most 120 blocks; ~12k tasks per window
-against 43k; ~83k tasks per date against ~130k; dispatch ~119 s at R around 700/s plus C of
-15-20 s, so **~135-145 s per date against 194 s measured**. Scheduler CPU should come off
-the pin.
-
-### Evidence that over-merging degrades, not merely plateaus
-
-The 3-window configuration's later dates were **232.9 s and 268.9 s** against 193.9 s for its
-first — with scheduler CPU pinned at 100% and dispatch lag reaching 1.2-2.0 s, and the
-hottest worker drifting 6.6 to 7.24 GiB. So the plateau was the optimistic reading; past the
-dispatch ceiling the configuration gets worse as the store's manifest grows. The 15-window
-configuration (mean ~225 s over 8 dates, scheduler 66% mean) remains the best measured before
-this change.
-
----
+**Baseline discipline for any inference-touching change:** GPU utilisation, VRAM peak, host RAM
+against its ceiling, and GPU-idle per chunk, all captured before the change. A graph win that
+costs read amplification is not a win, and only a paired baseline shows it.
 
 ## 5. The ingest worker's serial phase
 
