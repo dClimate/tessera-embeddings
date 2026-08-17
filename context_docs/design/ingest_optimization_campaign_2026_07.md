@@ -459,107 +459,45 @@ move. If neither can, there is nothing here worth more than 19%.
 
 ---
 
-### 3.9 The per-date footprint — four fifths of every graph was computing nothing
+### 3.9 The per-date footprint — shipped, correct, and worth zero wall clock
 
-**Found by counting objects, not by profiling**, and it reframes §3.8's write-floor
-conclusion. A completed 7-date run on a dense zone was compared against the area its graph
-covered:
+**Found by counting objects, not by profiling.** A 7-date run on a dense zone wrote 44,797 chunk
+objects — 582 per band-date — while its graph covered 2,992 chunks. So **19.4% of the graph
+produced data**, against a Sentinel-2 revisit that predicts 20.0%. The live windows describe
+where the ROI has LAND and were reused unchanged on every date, but one optical pass images only
+a fraction of a 6-degree zone. Four fifths of the write tasks ran, found nothing, and wrote
+nothing. **The waste was invisible precisely because the output was already correct.**
 
-| quantity | value |
-|---|---|
-| chunk objects in the store, 7 dates | **44,797** |
-| ⇒ chunks per band-date | **582** |
-| chunks covered by the run's live windows | **2,992** |
-| ⇒ share of the graph that produces data | **19.4%** |
-| Sentinel-2 revisit ⇒ expected daily coverage of a zone | **20.0%** |
+**It cannot appear on the single-ROI path**, and that is worth knowing before dismissing someone
+who has not seen it: the ratio is ROI extent over what one pass covers, and a yield ROI is
+smaller than one swath, so a date covers essentially all of it.
 
-That agreement is the finding. **The live windows describe where the ROI has LAND, and were
-being reused unchanged on every date — but one optical pass images only a fraction of a wide
-ROI.** Four fifths of the ~33,000 write tasks per date ran, found no data, and wrote nothing,
-because an all-fill chunk is never stored. The waste was invisible precisely BECAUSE the
-output was already correct.
+**The fix** (`live_windows.windows_for_date`) intersects the run's windows with the footprint of
+that date's own items before building the graph. It provably cannot change a mosaic — the chunks
+it skips are already absent, which is what 582-against-2,992 proves — so the entire safety burden
+is that the footprint be CONSERVATIVE: every uncertain path returns "assume everything", rounding
+goes outward, and the footprint is padded a whole cell against a curvature error measured in
+metres. The coverage gate deliberately keeps the FULL window set, because its ratio asks how much
+of the ROI's land a date saw and cropping the denominator would rescale every percentage.
 
-**Why it never appeared on the single-ROI path.** The ratio is (ROI extent ÷ what one pass
-covers). A yield ROI is smaller than one satellite swath, so a date covers essentially all of
-it and there is nothing to skip. It only appears once the ROI is a 6-degree zone. Anyone
-reasoning from single-ROI experience will not expect this, and that is not an error on their
-part.
+**Result: object-for-object identical stores, 1.01× on the clock, −23% graph tasks, −35%
+scheduler CPU.** The correctness claim held exactly. **The performance projection did not, and
+was wrong in two independent ways worth carrying forward.**
 
-**What it explains.** §3.8 concluded the graph had reached a write floor of
-`store_chunks × bands` and closed graph work. That floor was real but measured against the
-wrong denominator: it is the floor for writing *the whole ROI*, and a date does not write the
-whole ROI. The genuine floor is `chunks_the_date_images × bands`, five times smaller. So the
-per-date fixed cost — graph construction, task dispatch, per-window region writes — was about
-five times larger than the work required.
+**1. The 19.4% was a granularity artefact.** It counts 4096 px chunks; windows are built on the
+8192 px grid, where one cell is 82 km and a swath edge clipping a cell dirties all of it.
+Measured at the grid the ingest actually uses, a date touches **47–57% of live cells**, not 20%.
+**Nothing can narrow below its own grid.**
 
-**The fix** (`live_windows.windows_for_date`): intersect the run's windows with the footprint
-of that date's own items before building the graph. Both cost terms fall together, which is
-the point — the graph shrinks with the area, AND windows the date misses entirely disappear,
-taking their serial region writes with them. Per-date window count on a dense zone should
-drop from 7 to roughly 1–2.
+**2. The dead area splits two ways, and an earlier version of this section stated the split
+backwards** (withdrawn, §5). Over three dates at the 4096 grid: **geometric dead 55–66%** of live
+chunks — no image that day, and a window strategy can skip it — against **radiometric dead
+10–21%**, imaged but masked to zero, which it cannot. Geometry is the larger share, so what
+limited the shipped change was the grid it operates on, not the nature of the waste.
 
-**Why it cannot change a mosaic.** The chunks it skips are already absent from the store —
-that is what the 582-against-2,992 count proves. It removes computation whose result was
-being discarded, so the output is identical by construction. The safety burden is therefore
-entirely on the footprint being CONSERVATIVE:
-
-* every uncertain path returns "assume everything" and restores the previous behaviour — an
-  unreadable bbox, an unreadable geobox, a failed projection;
-* all rounding goes outward, and the footprint is padded a whole cell on every side, which is
-  tens of kilometres against a curvature error measured in metres;
-* the coverage gate deliberately keeps the run's FULL window set, because its ratio asks how
-  much of the ROI's land a date saw and cropping the denominator would rescale every
-  percentage. The numerator is unaffected: there are no valid pixels outside the footprint.
-
-Too large costs discarded area; too small silently drops imagery and nothing downstream
-notices. The tests are weighted at that asymmetry rather than at the happy path.
-
-**Per-date metadata is unaffected**, checked rather than assumed: `doy` is a scalar list with
-one entry per timestep, `baselines_applied` a per-date dict, and the time slot is appended
-once per date — none of them per-window. Narrowed windows stay 8192-aligned with ends clamped
-to the extent, satisfying the write path's chunk-alignment guard, and remain chunk-disjoint by
-construction.
-
-**Status: SHIPPED, CORRECT, and worth ZERO wall clock.** Measured against an anchor run on
-identical dates and width:
-
-| | anchor | footprint |
-|---|---|---|
-| median per date | 172.5 s | **172.4 s** |
-| paired speedup over 7 identical dates | — | **1.01×**, 4/7 faster, mixed directions |
-| windows per date | 7 | 5.3 mean |
-| graph tasks per date | ~40,000 | ~31,000 (−23%) |
-| scheduler CPU | ~40% | ~26% |
-| **chunk objects written** | **44,797** | **44,797 — IDENTICAL** |
-
-The correctness claim held exactly: the two stores are object-for-object the same, so the change
-provably removed computation and not data. **The performance projection was wrong**, and the
-reasoning behind it was wrong in two independent ways:
-
-**1. The 19.4% was a granularity artifact.** It counts 4096 px chunks; windows are built on the
-8192 px load-block grid, where one cell is 82 km. A swath edge clipping a cell dirties the whole
-cell. Measured at the grid the ingest actually uses, one date touches **47–57% of live cells**,
-not 20%. Nothing can narrow below its own grid.
-
-**2. The dead area splits two ways, and the split was stated backwards.** Measured over three
-dates at the 4096 grid (live 2,415 chunks):
-
-| | share of live |
-|---|---|
-| **geometric dead** — no image that day | **55–66%** — a window strategy CAN skip it |
-| radiometric dead — imaged, but cloud/invalid so masking zeroed it | 10–21% — it CANNOT |
-| written | 24% |
-
-An earlier version of this section claimed the radiometric part dominated and that geometry
-therefore could not help. **That is withdrawn (§5)** — geometry is the larger share. What limited
-the shipped change was the grid it operates on, not the nature of the dead area. The catalog
-returns ~960 items per date for this zone, roughly twice what covers it, because the zone reaches
-84°N where orbits converge — so imagery is present for far more of the zone than a 5-day revisit
-suggests, and the cloud share is a genuine floor no footprint can see in advance.
-
-**Keep it anyway**, on the scheduler rather than the clock: −23% graph and −35% scheduler CPU are
-the currency that buys worker count, and §3.10 shows the clock was never graph-bound. That is a
-hypothesis about scale, not a measured benefit.
+**Kept anyway, on the scheduler rather than the clock.** The graph and CPU reductions are the
+currency that buys worker count, and §3.10 shows the clock was never graph-bound. That is a
+hypothesis about scale, not a measured benefit — and it is recorded as one.
 
 ### 3.10 Where a date's time actually goes — the profile that reframed the campaign
 
