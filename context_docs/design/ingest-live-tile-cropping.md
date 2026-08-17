@@ -40,11 +40,6 @@ showed. One uint16 chunk at 4096² is 34 MB, so a single band-date materializes
 
 ## Measurement
 
-Raw per-zone output is committed beside this document as
-[`ingest-live-tile-cropping-measurements.json`](ingest-live-tile-cropping-measurements.json)
-(20 KB). It was previously unreferenced from anywhere, which is the state in which a figure
-loses its provenance — every number below is reproducible from it.
-
 A one-off script coarsened each zone's frozen `tile_live_2048` bitmap (ADR-010)
 onto the 4096-px ingest grid and costed three cropping strategies against the
 full-extent baseline, reading a few KB per zone from the coverage repo — no

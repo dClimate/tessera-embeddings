@@ -50,7 +50,6 @@ context_docs/
     ├── ingest_read_failure_causes_2026_08.md     the two WarpOperationError causes
     ├── catalogue_refusal_classification_2026_08.md
     ├── ingest-live-tile-cropping.md              + appendix A, the multi-write-per-commit test
-    ├── ingest-live-tile-cropping-measurements.json   its raw per-zone output
     ├── ingest-graph-and-stac-budget.md
     ├── region-writes.md
     │
