@@ -161,6 +161,33 @@ problem without the next command makes the reader open a runbook at 3 a.m.
 once as resolved and dropped from the state. Without that, the channel is a list of things that
 may or may not still be true.
 
+#### How the round learns the roster and the store, and the asymmetry between them (2026-08-17)
+
+A cron fires with no arguments, so the round must *discover* what the campaign was dispatched with. It
+reads the live dispatch rather than a stored parameter, because storing it on the deployment put it
+somewhere `deploy_flow.py` overwrites and every re-registration silently dropped it. Two dispatch
+shapes exist and they name the roster differently: the driver carries `zones` (crossed with `years`), a
+directly-dispatched fill carries `cells` as `[["49S", 2022], …]`.
+
+**The defect this fixes, found by running the shape that triggers it.** `_live_dispatch` read only
+`run-global-campaign`, while `campaign_health.live_cells` already read `fill-*` runs to learn which
+cells were being worked. So a fill dispatched on its own — how a rehearsal or a single-cell recovery is
+run — was **seen as live by five checks while the roster and store stayed unknown**, and the round
+graded *the detector's default store* instead of the one being filled. The cell-validation check, the
+only one about the published product, examined a store nobody was filling and reported nothing wrong.
+The single outward sign was a log line, `roster NOT GIVEN … store the detector's default`, which reads
+like a benign notice.
+
+**The two are not symmetric, and the rule is worth stating because the obvious fix is wrong.**
+
+| | where it comes from | why |
+|---|---|---|
+| **roster** | the drivers when any driver run is live, **else** the fills — never both | a driver-led campaign dispatches one fill per cell, so its fills name only what is in flight. Unioning them would *narrow* the roster to the cells running at that instant and drop the queued and finished ones |
+| **store** | either shape, whichever names one | a store name cannot narrow anything, and a fill names the store it is filling exactly as authoritatively as a driver does |
+
+The test that asserted the old exclude-fills-outright behaviour was kept and re-aimed at the property
+it was really protecting — that a driver's roster survives its own fills — rather than deleted.
+
 ### 2.3 Where the webhook lives
 
 **Secrets Manager, `global-tessera/slack-webhooks`, in each tessera account** — one JSON key per
