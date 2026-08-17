@@ -1,6 +1,13 @@
 # What the depth line refuses, counted per pixel — 2026-08-14
 
-The line is 25 observations. This is what it costs, measured by counting the pixels rather
+> **The line is now 15, not 25 (decided 2026-08-17).** The candidate table in §2 is what chose it:
+> 15 retains **94.1%** of pixels pixel-weighted against **79.2%** at 25, and leaves **no** cell under
+> half or under a tenth. Every figure below stands as measured — pricing each candidate was always
+> the point — but read the paragraph and §3 below as describing the *former* line. The decision, and
+> the reproducibility cost accepted with it, are in
+> [`minimum-optical-depth-plan.md`](minimum-optical-depth-plan.md).
+
+At the 25 line, this is what it costs, measured by counting the pixels rather
 than by inferring from window means: **the median measured cell keeps 92% of the pixels a
 rule-free fill would have published**, five of forty keep under half, and two keep under a
 tenth.

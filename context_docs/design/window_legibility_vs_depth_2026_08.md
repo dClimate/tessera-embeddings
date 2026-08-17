@@ -360,6 +360,13 @@ itself, and every figure below is against it.
 25 observations, then **halves** crossing into the 25–30 band, and closes on the floor slowly after
 that. The single largest improvement available from any cutoff in this range is the one at 25.
 
+> **The line shipped is 15, not this elbow (decided 2026-08-17).** Coverage was chosen over
+> reproducibility deliberately: 15 retains 94% of pixels against 79% at 25. A line at 15 admits the
+> **worst-reproducing band measured here** — 15–19 at 3.83× the floor, worse than under-15 at 2.21× —
+> and the decision was taken with that in view. This section is not withdrawn: it remains the best
+> available account of how agreement varies with depth, and it is the reason the trade has a price at
+> all. See [`minimum-optical-depth-plan.md`](minimum-optical-depth-plan.md).
+
 > **This elbow is stratified by observation COUNT, and count is confounded with temporal SPREAD
 > (added 2026-08-17).** Measured over 919M pixels in 24 cells, mean months covered climbs 5.1 → 9.9
 > → 11.5 across the count bands below 40, so the bands here differ in *how much of the year they

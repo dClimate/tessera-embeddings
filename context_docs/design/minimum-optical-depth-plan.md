@@ -1,29 +1,47 @@
-# Minimum optical depth: refuse pixels below 25 observations — implementation plan
+# Minimum optical depth: refuse pixels below 15 observations — implementation plan
 
-**Status:** partly built. **The line is 25**, on evidence gathered 2026-08-13 after the proposed 30
-was reopened: reproducibility measured on 741 blocks of doubly-embedded ground runs three to four
-times the pipeline's own floor everywhere below 25 observations and halves crossing into 25–30, so 25
-is where the largest available improvement sits and 30 buys 1.33× against 1.22× for roughly double the
-data discarded (§11 of the report). It remains a PLACEHOLDER in code until a store is seeded, because
-the root attr is write-once and a seed makes it permanent.
+**Status:** partly built. **The line is 15**, decided by Robert and a colleague on **2026-08-17**.
+**Coverage was chosen over reproducibility, knowingly.** The line keeps **94% of pixels against 79%
+at 25** (pixel-weighted over 40 cells), and the accepted cost is that two independent embeddings of
+the same ground agree less well. `OPTICAL_MIN_OBS` is 15 and the campaign's seeder registers 15.
 
-**The evidence changed twice and the record of that matters more than the number.** The original 30
-rested on how the pictures looked; blind re-measurement showed legibility was tracking rendered
-contrast rather than information, and spatial organisation is flat across 12 to 45 observations. What
-supports a line at all is reproducibility — two independent embeddings of the same ground disagree
-several times more when it is thin — which is a different claim, arrived at by a different route, and
-still not a claim about accuracy.
-**Decision date:** 2026-08-13. **Evidence:** [`optical_depth_census_2026_08.md`](optical_depth_census_2026_08.md)
-for the pixel-vs-shard arithmetic, the legibility report for the threshold, and
-[`optical_retention_per_pixel_2026_08.md`](optical_retention_per_pixel_2026_08.md) for what
-the chosen line costs each cell — counted per pixel, which withdrew the window-mean proxy
-every earlier cost figure rested on.
+**15 is not the reproducibility elbow, and that is the point of the decision rather than an oversight.**
+The elbow is at 25: measured on 741 blocks of doubly-embedded ground, agreement runs three to four
+times the pipeline's own floor everywhere below 25 and halves crossing into 25–30 (§11 of the
+legibility report). A line at 15 therefore **admits the worst-reproducing band in the whole
+measurement** — 15–19 sits at 3.83× the floor, worse even than under-15 at 2.21×. Whoever revisits
+this should know the trade was made with that in front of them, not around it.
+
+**Two things weigh on the other side, and both post-date the elbow.** Refusal is irreversible while
+filtering is not: `s2_obs_count` is published per pixel, so any user can apply a stricter line at read
+time and nobody can recover a pixel we refused. And **count is not a reliable proxy for temporal
+spread** — 33.7% of pixels at 15–19 observations already cover ten or more months of the year, so
+some of what the elbow refuses does describe a year (§1, 2026-08-17 measurement). Neither makes 15
+*better* than 25 on the evidence; they are why a coverage-first reading is defensible.
+
+**The history, because the number moved three times and the record matters more than the number.**
+The original 30 rested on how the pictures looked; blind re-measurement showed legibility was tracking
+rendered contrast rather than information, and spatial organisation is flat across 12 to 45
+observations. That put 25 in as an explicit **placeholder** (2026-08-13) so the machinery could be
+built while the evidence was gathered. 15 replaces it as a decision.
+
+**Evidence:** [`optical_depth_census_2026_08.md`](optical_depth_census_2026_08.md) for the
+pixel-vs-shard arithmetic; [`window_legibility_vs_depth_2026_08.md`](window_legibility_vs_depth_2026_08.md)
+§11 for reproducibility against depth; and
+[`optical_retention_per_pixel_2026_08.md`](optical_retention_per_pixel_2026_08.md) for what each
+candidate line costs, counted per pixel — which withdrew the window-mean proxy every earlier cost
+figure rested on.
+
+> **Measurements below that name the 25 line stay as they are.** They are what was measured, at the
+> line in force when they were taken, and several are line-independent in the way that matters (the
+> chunk-versus-pixel comparison, the count-versus-spread relationship). Where a figure is specific to
+> 25 it says so.
 
 ---
 
 ## 1. The rule
 
-**A pixel is not embedded if it has fewer than 25 valid Sentinel-2 L2A observations in the
+**A pixel is not embedded if it has fewer than 15 valid Sentinel-2 L2A observations in the
 calendar year being filled.** The refused pixel is written as fill, exactly as an
 out-of-ROI pixel is, and the reason is recorded.
 
@@ -33,7 +51,7 @@ revisit:
 | decision | ruling |
 |---|---|
 | **2017**, where the census brackets the line between 38.7% of shard-years below 20 and 65.7% below 30 | **Same rule, populate it anyway, warn about it.** No per-year threshold — one rule keeps the product consistent. 2017 publishes roughly a third populated, and that must be stated where a user meets it (§7.1), not left for them to discover. |
-| **Temporal consistency** — a pixel can clear 25 in 2020 and fail in 2021 | **Per pixel, per year.** Holes move between years. No all-years gate, no stability mask in this iteration. |
+| **Temporal consistency** — a pixel can clear 15 in 2020 and fail in 2021 | **Per pixel, per year.** Holes move between years. No all-years gate, no stability mask in this iteration. |
 | **Scope** | **Global campaign only.** The single-ROI path (`tessera_embeddings` flow, `plain` runner) keeps today's behaviour. |
 
 ### Why the line is where it is, and why it is safe to apply per pixel
@@ -696,7 +714,7 @@ Scale: 360,953 live shards x 9 years = **3.2M rows**. Comfortable for a single p
 
 **Not optional tidying. Leaving any of these is how the repo ends up asserting two policies.**
 
-1. **`OPTICAL_THIN_MAX_OBS` becomes `OPTICAL_MIN_OBS` at 25, and the meaning inverts** (§4).
+1. **`OPTICAL_THIN_MAX_OBS` becomes `OPTICAL_MIN_OBS` at 15, and the meaning inverts** (§4).
    The rename is what produces this list: every use is an import error until it is revisited.
    `actors.py` L1339 becomes the refusal, and `assembly.py` L2248's `s2_thin_below_obs` now
    reports a refusal line and should be renamed with it.
@@ -764,7 +782,7 @@ It must be stated in three places a user actually encounters:
 
 ## 10. Tests
 
-- **The gate**: a pixel at 24 is refused and at 25 is kept; at `optical_min_obs=None` the mask is
+- **The gate**: a pixel at 14 is refused and at 15 is kept; at `optical_min_obs=None` the mask is
   bit-identical to today (pin this — it is what protects the single-ROI path); and
   `optical_min_obs=0` is REFUSED at construction rather than quietly disabling the rule (§5).
 - **Separability**: a pixel refused for thin optical, one for no optical, and one for absent
