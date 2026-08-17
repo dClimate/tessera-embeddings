@@ -218,29 +218,57 @@ the store calls complete, ten whole shards each: **40 of 48 cells, 940,376,064 l
 where the shard's 8×8 slice is incomplete; they are small zones, so the aggregate under-weights
 those.)
 
-| | pixels | share of land-live |
+Both candidate lines below come from **one pass of reads**, so the two columns describe identical
+pixels and the only difference between them is the line. Note the strong/weak partition moves with
+the line too: a chunk is strong when half its pixels clear *that* line, so lowering the line promotes
+chunks as well as pixels.
+
+| | line 20 | share | **line 25** | share |
+|---|---:|---:|---:|---:|
+| embedded under the rule | 795,839,925 | 84.63% | 708,200,433 | **75.31%** |
+| thin, inside weak chunks (<50% full) | 119,958,492 | 12.76% | 209,302,978 | 22.26% |
+| thin, inside strong chunks (≥50% full) | 22,950,927 | **2.44%** | 21,245,933 | **2.26%** |
+| refused in total | 142,909,419 | 15.20% | 230,548,911 | 24.52% |
+| land in strong chunks | 800,653,312 | 85.14% | 709,361,664 | 75.43% |
+| land in weak chunks | 139,722,752 | 14.86% | 231,014,400 | 24.57% |
+
+| | line 20 | line 25 |
 |---|---:|---:|
-| embedded under today's rule | 709,827,153 | **75.3%** |
-| thin, inside weak chunks (<50% full) | 209,302,978 | 22.26% |
-| thin, inside strong chunks (≥50% full) | 21,245,933 | **2.26%** |
-| refused in total | 230,548,911 | 24.52% |
-| no optical observation at all | — | **0.2%** |
+| fill inside strong chunks | 97.1% | 97.0% |
+| fill inside weak chunks | 13.0% | 8.7% |
+| strong chunks' share of refused pixels | 16.1% | 9.2% |
+
+Pixels with no optical observation at all: **0.17%** of land-live, at either line.
+
+> **Correction.** An earlier version of this table gave embedded-under-the-line as 709,827,153
+> pixels. That was `land − thin`, which credits the 1.6M pixels with no optical observation as
+> embedded; they are neither embedded nor refused by the depth rule. The count is **708,200,433**.
+> The percentage was unaffected at one decimal.
+
+**The permanently-unrecoverable population is nearly invariant to the line: 2.44% at 20 against
+2.26% at 25.** It rises slightly as the line *falls*, because lowering the line promotes chunks into
+the strong class (85.1% of land against 75.4%) and each newly-promoted chunk brings its own
+sub-line pixels with it. So **the wave-through decision is orthogonal to where the line sits** —
+moving the line does not shrink the problem the proposal exists to solve, it only changes what
+fraction of all refusals it represents (16.1% at line 20, 9.2% at line 25).
+
+Both lines leave the population overwhelmingly near-miss: at line 20, 88.6% of thin-in-strong pixels
+are within five observations of the line and 2.5% are under 10; at line 25, 81.7% and 1.7%.
 
 **Cross-check:** retention against the *any-optical* denominator reads 75.4% here against the
 retention study's 79.2% pixel-weighted — 3.8 points apart on entirely different sampling (ten whole
 shards versus forty land-aimed inner chunks). Close enough to trust both; the gap is spatial spread.
 
-**Three results carry over and one strengthens.** The bimodality holds at store scale — strong
-chunks are 75.4% of the land and **97.0% embedded** inside, weak chunks are 24.6% of the land and
-**8.7% embedded**. Missing imagery remains negligible at 0.2%, so essentially the whole refusal is a
-depth decision rather than an absence of data. And the near-miss concentration is *sharper* than in
-the six cells: of the 21.2M pixels the proposal would add, **81.7% sit at 20–24 observations** and
-1.7% below 10.
+**What the six-cell findings look like at store scale.** Bimodality holds and is if anything
+sharper — a strong chunk is ~97% full at either line while a weak one is under 13%. Missing imagery
+stays negligible, so the refusal really is a depth decision rather than an absence of data, and the
+hole inside a strong chunk is entirely reachable by a rule change.
 
-The number that reframes the decision: **90.8% of refused pixels are in weak chunks.** The proposal
-rescues 9.2% of the refused population and defers the other nine tenths to a repair flow that does
-not exist. Per cell its reach runs from 0.00% (03N/2021, 23N/2021 — deep, nothing to rescue) through
-a median of 2.30% to **7.28%** (30S/2023) and 6.35% (26S/2022), both middling-depth cells.
+**The number that reframes the decision, at the 25 line: 90.8% of refused pixels are in weak
+chunks.** The proposal rescues a tenth of the refused population and defers the other nine tenths to
+a repair flow that does not exist. Its reach per cell runs from 0.00% (03N/2021, 23N/2021 — deep,
+nothing to rescue) through a median of 2.30% to **7.28%** (30S/2023) and 6.35% (26S/2022), both
+middling-depth cells. At the 20 line the same proposal covers 16.1% of a smaller refused population.
 
 **Three things it does not settle**, all of which outrank the sizing:
 
