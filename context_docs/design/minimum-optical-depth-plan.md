@@ -167,6 +167,65 @@ therefore an almost lossless summary of what it did. That is the field nothing c
 > parts of live tiles, so 17S/2022 reads 22.7% here against 55.5% there. The valid comparison is
 > *between rules within a row*, where all four rules see identical pixels.
 
+#### What the hole in a nearly-full chunk is made of (2026-08-17)
+
+**The open question is whether to embed sub-line pixels that sit in otherwise-strong chunks.** The
+argument for it is *permanence*: a repair sweep that targets chunks below some fill will never
+revisit a chunk at 95%, so anything refused inside one is unrecoverable no matter what imagery
+arrives later. Sizing that argument needs the hole decomposed, because a depth rule governs only
+part of it — a pixel with **zero** observations cannot be embedded by any rule change.
+
+Measured over the same six cells and six shards, denominator every pixel in a land-live 256-px
+chunk, taking "a repair targets chunks under 50% fill" as the assumption under test:
+
+| | chunks ≥ 50% full | chunks < 50% full |
+|---|---:|---:|
+| land pixels sampled | 46,661,632 | 42,532,864 |
+| embedded at the line | 95.8% | 4.4% |
+| the hole | 4.2% | 95.6% |
+| …of which no optical observation at all | **0.0%** | 0.0% |
+| …of which thin (1–24 observations) | **100.0%** | 100.0% |
+
+**The hole in a strong chunk is entirely a depth refusal.** No part of it is missing imagery, so
+waving thin pixels through closes *all* of it rather than some of it. (Zones with genuine no-data —
+coastal, out-of-swath — will not read 0.0%; these six cells have optical coverage over essentially
+their whole area.)
+
+**And the population is concentrated just under the line.** Of the 1,956,580 pixels the proposal
+would add — **2.19%** of all land-live pixels sampled, about 4% more embedded pixels, so roughly 1%
+on the inference bill:
+
+| depth | pixels | share |
+|---|---:|---:|
+| 1–9 obs | 9,416 | 0.5% |
+| 10–14 obs | 101,912 | 5.2% |
+| 15–19 obs | 328,365 | 16.8% |
+| **20–24 obs** | **1,516,887** | **77.5%** |
+
+So a secondary floor buys almost nothing: one at 10 observations would exclude 0.5% of them. There
+is no noise tail to guard against in this population.
+
+**95% of all thin pixels sampled are in the weak chunks**, which a repair sweep would revisit. The
+proposal therefore targets precisely the subset repair cannot reach, and leaves the bulk to the
+repair stream.
+
+**Three things it does not settle**, all of which outrank the sizing:
+
+1. **It trades a visible hole for an invisible one.** Today every published pixel in a strong chunk
+   meets the line. Waving through makes such a chunk read 100% full with 4.2% of it below the line,
+   detectable only by reading `s2_obs_count`. This is exactly what the blocking check in
+   `embedding_validation_rules.py` was written to prevent, in its own words: *"not low quality, it
+   is mislabelled — and unlike a thin cell, no picture of the data reveals it."* If the proposal
+   ships, `optical_min_obs: 25` **must not** — the root attribute has to become `null` plus a
+   separate field naming the chunk-level rule, or the store advertises a guarantee it does not keep.
+2. **Permanence is a property of a repair flow that does not exist.** Until one does, every refusal
+   is permanent, not 5% of them, and the argument taken literally says refuse nothing. Embedding
+   every eligible pixel would cost under 8% more inference against ~1% for the targeted version, so
+   cost is not what rules it out — a quality judgement about publishing near-empty chunks is.
+3. **The benefit is a function of a threshold not yet chosen.** At a repair cutoff of 90% the
+   rescued population shrinks; at 20% it grows. Choosing store contents now on a repair threshold
+   chosen later is the weakest link in the argument.
+
 ---
 
 ## 2. Non-goals — do not build these
