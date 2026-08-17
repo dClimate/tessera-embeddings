@@ -91,6 +91,54 @@ below.
 > **Everything else in this plan stands.** The registry, the per-shard record, the skip-marker payload
 > and the cycle model are all wanted whether the line refuses pixels or merely labels them.
 
+> **Count is NOT a reliable proxy for temporal spread, and it is weakest exactly at the line
+> (2026-08-17).** A year-long embedding is supposed to describe a year, so what plausibly matters is
+> whether the year is *covered*, not how many observations there are. Count and spread are correlated
+> by construction — 60 observations must span the year, 6 cannot — so the question is whether the
+> correlation is tight enough that gating on count already gates on spread. Measured off the zone
+> mosaics' SCL, which is the same input the gate sees: **24 cells, three 4096-px tiles each,
+> 919,224,646 pixels.**
+>
+> | count | pixels | mean months covered | ≥10 months | all 12 | ≥2-month gap | ≥3-month gap |
+> |---|---:|---:|---:|---:|---:|---:|
+> | 1–9 | 16,151,138 | 5.1 | 0.0% | 0.0% | 98.9% | 72.0% |
+> | 10–14 | 21,392,541 | 7.7 | 6.8% | 0.0% | 76.2% | 35.8% |
+> | 15–19 | 49,196,955 | 9.0 | 33.7% | 1.3% | 54.9% | 15.2% |
+> | **20–24** | 55,488,166 | 9.9 | **64.3%** | 7.8% | 38.2% | **15.1%** |
+> | 25–29 | 59,745,522 | 10.7 | 85.8% | 29.3% | 19.9% | 10.2% |
+> | 30–39 | 207,201,979 | 11.5 | 98.5% | 62.1% | 4.2% | 0.7% |
+> | **40+** | 510,048,345 | **11.1** | **81.2%** | 65.8% | **19.0%** | 5.0% |
+>
+> **Two errors the rule cannot see, and both are large.** Of the pixels at 20–24 observations that
+> the line refuses, **64.3% already cover ten or more months** — the refusal is discarding data that
+> describes the year. And **the 40+ band is worse-distributed than the 30–39 band** (11.1 months
+> against 11.5, and 19.0% with a two-month blind gap against 4.2%), so the line admits, unexamined,
+> deep pixels that are blind for a season.
+>
+> **The 40+ inversion is real but concentrated in a third of cells**, not an artefact of one:
+> 03N/2021 44.4%, 06N/2021 56.0%, 23N/2021 60.5%, 37N/2021 25.7%, 38N/2021 22.2%, 53N/2021 33.7%,
+> 60N/2020 36.5% have a two-month gap on a large share of their deepest pixels (26S/2022 reads 100%
+> on only 394k pixels — small n). The other sixteen cells read **0.0–4.6%**. The pattern is a strong
+> clear season: many observations, all in one window.
+>
+> **And whether the refused near-miss population is well distributed is a per-cell property.** Among
+> cells with over a million pixels at 20–24, the share covering ten or more months runs from **38.2%
+> (58S/2022) to 91.1% (58S/2025)**. One global count line cannot express that; a spread rule could.
+>
+> **What this does NOT show, and it is the load-bearing gap:** that better-spread pixels produce
+> better embeddings. It establishes only that spread is an axis *independent of* count — necessary
+> for a spread rule to be worth anything, nowhere near sufficient. The experiment that would settle
+> it is the zone-overlap reproducibility measurement re-stratified by spread **at fixed count**, and
+> it is runnable: 57S/2022–58S/2022 and 58S/2022–59S/2022 are adjacent pairs whose mosaics are both
+> still readable.
+>
+> **Limits.** Three tiles per cell, so three locations — within-cell variation between tiles is not
+> captured. Only **24 of 40** complete cells have a readable mosaic at all; the rest kept orphaned
+> chunk objects after their Icechunk metadata was deleted, and their SCL is unrecoverable, so the
+> measurable subset is whatever survived cleanup rather than a random sample. "Months covered" is a
+> crude spread statistic — twelve observations one per month scores the same as twelve in a fortnight
+> plus scattered singletons.
+
 The census that produced the campaign figures measured **shard means**, and this rule
 refuses **individual pixels** — a different question, and the class of error the
 corrections register calls *presence counted where coverage was meant*. It was therefore

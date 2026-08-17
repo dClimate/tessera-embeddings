@@ -360,6 +360,19 @@ itself, and every figure below is against it.
 25 observations, then **halves** crossing into the 25–30 band, and closes on the floor slowly after
 that. The single largest improvement available from any cutoff in this range is the one at 25.
 
+> **This elbow is stratified by observation COUNT, and count is confounded with temporal SPREAD
+> (added 2026-08-17).** Measured over 919M pixels in 24 cells, mean months covered climbs 5.1 → 9.9
+> → 11.5 across the count bands below 40, so the bands here differ in *how much of the year they
+> see* as well as in how many looks they got. The elbow may therefore be a spread elbow reported in
+> count's units. Two details point that way: only **64.3%** of pixels at 20–24 observations cover ten
+> or more months, and the **40+ band is worse-distributed than 30–39** — which is also the shape that
+> would explain the anomaly noted below, that the bottom bin reproduces better than 15–20. Full
+> figures and limits in
+> [`minimum-optical-depth-plan.md`](minimum-optical-depth-plan.md) §1. **Nothing here is withdrawn:**
+> the count elbow is a real, measured feature of the data and remains the best available basis for a
+> count rule. What is not established is that count is the right *variable*. Settling that means
+> re-stratifying this measurement by spread at fixed count.
+
 Read as a decision, cutting at each candidate:
 
 | cutoff | blocks refused | refused side, against floor | kept side, against floor |
