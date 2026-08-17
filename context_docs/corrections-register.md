@@ -104,7 +104,8 @@ are different questions, and a percentage that does not say which is not yet a f
 - **The 37N/2021 rate deficit.** Read from a 203-chunk in-flight sample as a ~30% deficit;
   completed at 4,859 chunks it is ~19%. The same cell's latitude span read 30–32° partial
   and **0.1–32.1°** complete, and its radar depth 146.8 partial against **89.9** complete.
-  (`inference_cost_basis_revision_2026_08.md`, `campaign-cost-model.md` §6c)
+  (`campaign-cost-model.md` §6c; originally recorded in the since-removed
+  `inference_cost_basis_revision_2026_08.md`, in git history)
 
 **A partial run's whole-cell summary is biased, not merely imprecise** — the chunks that
 have finished are not a random sample of the cell, because scheduling order correlates with

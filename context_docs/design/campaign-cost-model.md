@@ -704,10 +704,15 @@ historical px/s measurements.
 
 Derived from CloudWatch `CHUNK_SUMMARY` records over a 96-hour window (`/ecs/global-tessera-dev`,
 29,886 successful chunks across 31 streams and 13 zones, 1,633 chunks carrying the radar
-telemetry), through the truncation-bisecting profiler. Full working:
-[`inference_cost_basis_revision_2026_08.md`](inference_cost_basis_revision_2026_08.md) — its
-METHOD is current and its NUMBERS are the pre-completion ones this table's last row supersedes.
-This section carries what the model needs.
+telemetry), through the truncation-bisecting profiler.
+
+The long-form working for this re-basing was a separate document,
+`inference_cost_basis_revision_2026_08.md`, removed 2026-08-17 and recoverable from git
+history. Its method is described above and its two durable findings are carried below and in
+§6c; what it also carried was a headline of **$527,000**, superseded twice since — by the
+sample-weighted $553,000 and then by §6c's land-weighted $573,000. A retired figure that keeps
+its own file and its own headline is one a reader can land on without ever seeing what replaced
+it, which is the whole reason this model has one table rather than three documents.
 
 **The headline.**
 

@@ -35,7 +35,6 @@ context_docs/
     ├── campaign-cost-model.md                    every cost, rate, fleet size, GPU-hour
     ├── campaign-cluster-sizing.md                how work balances across N clusters
     ├── campaign_inference_profile_2026_08.md     measured per-cell inference behaviour
-    ├── inference_cost_basis_revision_2026_08.md  the working behind cost-model §6b
     ├── radar_source_coverage_2026_08.md          which zones publish no usable radar
     ├── optical_depth_census_2026_08.md           how much of the product is optically thin, and where
     ├── minimum-optical-depth-plan.md             UNBUILT; its threshold is REOPENED, the rest approved
