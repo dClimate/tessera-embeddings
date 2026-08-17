@@ -16,7 +16,7 @@ hinges on:
 Run from ``scripts/`` (bench, in-region)::
 
     uv run python -m scale_tests.t8_sharding --run-id d3 --backend s3 --scale bench \
-      --bucket arbol-tessera-embeddings-dev --store-root s3://arbol-tessera-embeddings-dev/global-embeddings
+      --bucket <bucket> --store-root s3://<bucket>/global-embeddings
 """
 
 from __future__ import annotations

@@ -139,7 +139,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 def _parse_bucket_arg(raw: str) -> tuple[str, str | None]:
     """Split a ``--bucket`` value into ``(bare_bucket_name, prefix_or_None)``.
 
-    Accepts a bare name (``arbol-tessera-embeddings-dev``), a ``bucket/prefix``
+    Accepts a bare name (``my-embeddings-bucket``), a ``bucket/prefix``
     path, or a full ``s3://bucket/prefix`` URI (with or without trailing slash).
     Returns the *bare* bucket name — which is what ``boto3``/T7 and the results
     mirror require — plus any prefix, used to derive the default store root.

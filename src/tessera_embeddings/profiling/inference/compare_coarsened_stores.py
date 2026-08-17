@@ -22,9 +22,9 @@ defect.
 
 Usage::
 
-    AWS_PROFILE=yield te-compare-stores \
-        s3://arbol-tessera-embeddings-dev/embeddings/iowa_epsg5070-reference_500m.zarr \
-        s3://arbol-tessera-embeddings-dev/embeddings/iowa_epsg5070-inference-speedup-phase5_500m.zarr
+    te-compare-stores \
+        s3://<bucket>/embeddings/<roi>-reference_500m.zarr \
+        s3://<bucket>/embeddings/<roi>-candidate_500m.zarr
 
 Exit code 0 = fully bit-identical, 1 = any difference (structural, coordinate,
 or array). Data volume is small (~0.4 GB/store for Iowa), so the full arrays

@@ -55,21 +55,21 @@ uv run python -m scale_tests.t5_contention --run-id dev --backend local --scale 
 uv run python -m scale_tests.t6_gc_bench   --run-id dev --backend local --scale tiny
 
 # the real campaign, in-region on the throwaway bucket
-uv run python -m scale_tests.t0_smoke      --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
-uv run python -m scale_tests.t1_read_bench --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/ --variant c256_full
-uv run python -m scale_tests.t2_write_bench --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
-uv run python -m scale_tests.t3_prealloc   --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
-uv run python -m scale_tests.t4_group_scale --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
-uv run python -m scale_tests.t5_contention --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
-uv run python -m scale_tests.t6_gc_bench   --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
-uv run python -m scale_tests.t7_ramp       --run-id run1 --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
+uv run python -m scale_tests.t0_smoke      --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scale_tests.t1_read_bench --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/ --variant c256_full
+uv run python -m scale_tests.t2_write_bench --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scale_tests.t3_prealloc   --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scale_tests.t4_group_scale --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scale_tests.t5_contention --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scale_tests.t6_gc_bench   --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
+uv run python -m scale_tests.t7_ramp       --run-id run1 --backend s3 --scale bench --bucket <bucket>/global-embeddings/
 
 # D3 settlement (separate run; see design/d3-sharding-plan.md)
-uv run python -m scale_tests.t8_sharding   --run-id d3   --backend s3 --scale bench --bucket arbol-tessera-embeddings-dev/global-embeddings/
+uv run python -m scale_tests.t8_sharding   --run-id d3   --backend s3 --scale bench --bucket <bucket>/global-embeddings/
 
 # collate + tear down
 uv run python -m scale_tests.report   --run-id run1
-uv run python -m scale_tests.teardown --run-id run1 --backend s3 --bucket arbol-tessera-embeddings-dev/global-embeddings/
+uv run python -m scale_tests.teardown --run-id run1 --backend s3 --bucket <bucket>/global-embeddings/
 ```
 
 Install the extra deps once: `uv sync --group scale-tests`.
