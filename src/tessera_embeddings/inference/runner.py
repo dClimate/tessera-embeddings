@@ -38,7 +38,7 @@ def run_inference(
     mosaic_base: str,
     staging_base: str,
     run_id: str,
-    t0: float,
+    t0: float,  # noqa: ARG001 — accepted and ignored; see the docstring and public-api.md
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     *,
     on_actor_retire: Callable[[str], None] | None = None,
@@ -64,8 +64,14 @@ def run_inference(
         staging_base: Base path for staged output stores.
         run_id: Unique run identifier; used for resume detection and
             staging-path namespacing.
-        t0: Monotonic timestamp from the run's start, used for elapsed
-            logging in the scheduler.
+        t0: **Accepted and ignored.** It used to feed the scheduler's progress line, reported as
+            "N min elapsed" — but for a chained session the run's start is the top of the whole
+            stream, so that figure counted the ingest look-ahead, ``ray up``, EC2 bringup and model
+            load, and read as though inference had been running that long. It also disagreed with
+            the GPU-hours on its own line, which measures actor time. The progress line now starts
+            its clock when the dispatch loop does. Kept in the signature because ``run_inference``
+            is documented in ``docs/public-api.md`` and dropping a parameter there is a breaking
+            change — remove it on the next deliberate pass at that API.
         log: Logger.
         on_actor_retire: Optional callback ``(instance_id) -> None`` invoked
             when a misbehaving actor is removed from the pool. The AWS
@@ -197,7 +203,6 @@ def run_inference(
             staging_base=staging_base,
             run_id=run_id,
             config=config,
-            t0=t0,
             log=log,
             tracker=progress_tracker,
             still_initializing=still_initializing,

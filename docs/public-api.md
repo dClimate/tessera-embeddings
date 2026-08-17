@@ -61,6 +61,12 @@ CI verifies that the names listed here match `tessera_embeddings.__all__`.
   staging_base, run_id, t0, log, on_actor_retire=None) -> list[dict]`
   — pure-domain Ray-based inference run. Caller is responsible for
   having connected to Ray (`ray.init` or attached to a cluster).
+  `t0` is **accepted and ignored**. The progress line it fed now times
+  inference from the dispatch loop's own start, because a run's start
+  includes the ingest look-ahead, cluster bringup and model load — so
+  reporting it beside a chunk counter read as though inference had been
+  running that long. Kept so this surface does not break; drop it on the
+  next deliberate pass here.
 
 ## Subpackages with their own surfaces
 

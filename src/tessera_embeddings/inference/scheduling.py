@@ -573,8 +573,11 @@ def _poll_tracker(
         max_simultaneous_stalls: Number of simultaneous stalls that triggers a
             systemic abort (RuntimeError).
         log: Logger.
-        elapsed_min: Minutes since run start, folded into the single progress
-            line (this is the ONLY progress log line — keep it that way).
+        elapsed_min: Minutes since INFERENCE began — the dispatch loop's own start, not the run's.
+            Folded into the single progress line (this is the ONLY progress log line — keep it that
+            way). Measured from the run's start it read as though inference had been going for the
+            ingest, cluster-bringup and model-load time too, and disagreed with ``gpu_hours`` on the
+            same line.
         gpu_hours: Fleet GPU-hours consumed so far (live-actor-count integrated
             over wall time; one GPU per actor), folded into the same line.
         recovery_threshold_sec: Seconds without an update before a chunk is
@@ -628,7 +631,9 @@ def _poll_tracker(
             for _, (_, _, _, phase) in progress.items():
                 phases[phase] = phases.get(phase, 0) + 1
             phase_summary = ", ".join(f"{v} {k}" for k, v in sorted(phases.items()))
-            elapsed = f" — {elapsed_min:.1f} min elapsed" if elapsed_min is not None else ""
+            # "inferring", not "elapsed": the number now counts from the dispatch loop's start, and
+            # a bare "elapsed" beside a chunk counter is what invited reading it as run wall-clock.
+            elapsed = f" — {elapsed_min:.1f} min inferring" if elapsed_min is not None else ""
             gpu = f", {gpu_hours:.1f} GPU-hrs" if gpu_hours is not None else ""
             log.info(
                 "Progress: %d/%d done, %d active (%s), %d stalled%s%s",
@@ -729,7 +734,6 @@ def _process_chunks_work_stealing(
     staging_base: str,
     run_id: str,
     config: InferenceConfig,
-    t0: float,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     tracker: ray.actor.ActorHandle | None = None,
     *,
@@ -767,7 +771,6 @@ def _process_chunks_work_stealing(
         staging_base: Base path for staged output.
         run_id: Run identifier.
         config: Inference config (needed to create replacement actors).
-        t0: Flow start time for progress logging.
         log: Logger.
         tracker: Optional ProgressTracker actor handle for batch-level progress polling.
         max_chunk_retries: Max times a failed chunk is re-queued before permanent failure.
@@ -1080,6 +1083,19 @@ def _process_chunks_work_stealing(
     # actor) so the progress line can report fleet GPU-hours consumed so far.
     gpu_seconds = 0.0
     last_tick = time.monotonic()
+    # The progress line's elapsed clock, and it starts HERE rather than at ``t0``.
+    #
+    # ``t0`` is the whole run's start: for a chained session that is the top of the stream, before
+    # the ingest look-ahead, before ``ray up``, before per-worker EC2 bringup and before the model
+    # loads. Printed beside a chunk counter it read as though inference had been running that long —
+    # a cell logged "0/10 done, 5 active ... 46.3 min elapsed" seconds after its actors came ready.
+    #
+    # It was also inconsistent with the other figure on its own line: ``gpu_seconds`` starts at zero
+    # right here, so GPU-hours already measured actor time while elapsed measured stream wall-clock.
+    # Two different clocks in one sentence is what made the line unreadable; now both start together.
+    #
+    # ``t0`` keeps its other uses (run summaries, provenance); only this line changes.
+    inference_t0 = last_tick
     # A chained session's work source: while unexhausted, the loop must stay
     # alive through empty-queue gaps (the next zone may still be ingesting)
     # and must not retire "idle" actors (they are the next zone's fleet).
@@ -1144,7 +1160,7 @@ def _process_chunks_work_stealing(
                 stall_threshold_sec,
                 _stall_threshold(),
                 log,
-                elapsed_min=(time.monotonic() - t0) / 60,
+                elapsed_min=(time.monotonic() - inference_t0) / 60,
                 gpu_hours=gpu_seconds / 3600,
                 recovery_threshold_sec=stall_recovery_sec,
             )

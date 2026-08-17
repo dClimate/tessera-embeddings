@@ -940,7 +940,6 @@ class TestWorkStealingLoopCondition:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
                 max_chunk_retries=2,
             )
@@ -1020,7 +1019,6 @@ class TestWorkStealingReturnedFailure:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
                 max_chunk_retries=2,
             )
@@ -1075,7 +1073,6 @@ class TestWorkStealingReturnedFailure:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
                 max_chunk_retries=2,
             )
@@ -1153,7 +1150,6 @@ class TestWorkStealingBatching:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
                 actor_factory=factory,
                 total_actors_target=3,
@@ -1194,7 +1190,6 @@ class TestWorkStealingBatching:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
             )
         assert len(results) == 1
@@ -1231,7 +1226,6 @@ class TestDeferredWrites:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
                 **kwargs,
             )
@@ -1394,7 +1388,6 @@ class TestDeferredWrites:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
             )
 
@@ -1449,7 +1442,6 @@ class TestDeferredWrites:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
                 tracker=MagicMock(name="tracker"),
             )
@@ -1521,7 +1513,6 @@ class TestDeferredWrites:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
             )
 
@@ -1576,7 +1567,6 @@ class TestRetireIdleGate:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
                 retire_idle_actors=retire_idle_actors,
             )
@@ -1642,7 +1632,6 @@ class TestChainedWorkSource:
                 staging_base="s/zone-a",
                 run_id="run-zone-a",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
                 more_work=more_work,
                 **loop_kwargs,
@@ -1717,7 +1706,6 @@ class TestChainedWorkSource:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
                 more_work=lambda: remaining.pop(0) if remaining else None,
             )
@@ -1785,7 +1773,6 @@ class TestChainedWorkSource:
                 staging_base="s",
                 run_id="r",
                 config=config,
-                t0=time.monotonic(),
                 log=logging.getLogger("test"),
                 more_work=lambda: remaining.pop(0) if remaining else None,
             )
