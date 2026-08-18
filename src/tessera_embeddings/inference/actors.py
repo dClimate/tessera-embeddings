@@ -1351,7 +1351,20 @@ class InferenceActor:
                         "px_with_any": int(any_obs.sum()),
                         "max": int(s2_obs.max()),
                         "mean_where_any": round(float(s2_obs[any_obs].mean()), 2) if any_obs.any() else 0.0,
+                        # MEDIAN, beside the mean, because a cleanup planner's question is "would
+                        # another scene or two cross the line for most of this tile" and a mean is
+                        # pulled by a bright patch of deep pixels next to a dark majority. Over
+                        # pixels that saw ANYTHING, not over the land: including the never-imaged
+                        # ones drags it to zero and then it describes neither population.
+                        "median_where_any": (round(float(np.median(s2_obs[any_obs])), 1) if any_obs.any() else 0.0),
                     },
+                    # RADAR PRESENCE, because a tile that is thin AND radar-free is a different
+                    # cleanup candidate from one that is merely thin — more optical will not fix
+                    # the first. Either orbit counts: which one it was is per-pixel in the coverage
+                    # tile this chunk also stages, so the summary only has to answer presence.
+                    "px_with_any_radar": int(
+                        ((obs_buffers["s1_asc_obs_count"] > 0) | (obs_buffers["s1_desc_obs_count"] > 0)).sum()
+                    ),
                 }
                 logger.info(
                     "Chunk %s has no valid pixels, skipping (assembly will fill) — refused %s",

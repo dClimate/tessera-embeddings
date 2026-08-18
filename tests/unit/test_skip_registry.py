@@ -29,6 +29,7 @@ import numpy as np
 import pytest
 import zarr
 
+import tessera_embeddings.inference.assembly as _assembly_mod
 from tessera_embeddings.config.store_layout import MONTH_COVERED_VAR, MONTHS_IN_YEAR, OBS_COUNT_VARS
 from tessera_embeddings.inference.assembly import (
     REFUSAL_REASONS,
@@ -467,3 +468,92 @@ class TestWhetherTheRadarRuleWasEvenOn:
         """Unknown, not assumed: a run from before this field cannot be described either way."""
         summary = summarise_optical_skips(staged=[], skipped=["a"], records={"a": self._rec("a", enforced=None)})
         assert "radar_refusal_rule" not in summary
+
+
+class TestThePerTileSidecar:
+    """Per-tile detail goes beside the store, not inside its metadata.
+
+    The year's summary is pooled over the cell, so it can say some tile reached fourteen observations
+    against a cutoff of fifteen but not WHICH — and ranking candidates by how close they came is the
+    whole of a cleanup campaign's planning problem. It cannot simply be added to the zone group's
+    attributes: every reader of that group pays for them on every open, and an earlier per-tile
+    version was removed for exactly that. So it is a sidecar, pointed at from the summary.
+    """
+
+    def test_it_writes_the_per_tile_records_and_points_at_them(self, tmp_path: Path) -> None:
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        detail = str(tmp_path / "refusals" / "32S" / "2021.json")
+        for col in (0, 1):
+            chunk = _chunk(0, col)
+            writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64, obs_max=14))
+
+        summary = writer._skip_summary("run1", [], ["chunk_0_0", "chunk_0_1"], detail)
+
+        assert summary["detail_uri"] == detail, "the pointer is the promise that it landed"
+        body = json.loads(Path(detail).read_text())
+        assert body["run_id"] == "run1"
+        assert [t["label"] for t in body["tiles"]] == ["chunk_0_0", "chunk_0_1"], "sorted, so diffable"
+        assert body["tiles"][0]["s2_obs"]["max"] == 14, "the per-tile depth the summary pools away"
+
+    def test_the_summary_still_pools_what_it_always_did(self, tmp_path: Path) -> None:
+        """The sidecar is additional, not a replacement: the attributes keep the compact aggregate
+        so a reader who only wants the year's shape never touches the sidecar.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+        writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64, obs_max=14))
+
+        summary = writer._skip_summary("run1", [], [chunk.label], str(tmp_path / "d.json"))
+        assert summary["refused_px_by_reason"]["thin"] == 64
+        assert summary["shards_by_reason"] == {"thin": [chunk.label]}
+
+    def test_no_uri_writes_nothing_and_promises_nothing(self, tmp_path: Path) -> None:
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+        writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64))
+
+        summary = writer._skip_summary("run1", [], [chunk.label], None)
+        assert "detail_uri" not in summary
+
+    def test_a_failed_sidecar_write_never_costs_the_cell(self, tmp_path: Path, monkeypatch) -> None:
+        """The summary is what the store commits. Losing the sidecar costs a future planner some
+        precision; failing the write would cost a cell that is otherwise complete.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+        writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64))
+
+        detail = str(tmp_path / "d.json")
+        real_fs_for = _assembly_mod._fs_for
+
+        def _boom_on_detail(uri, *a, **k):
+            # Only the SIDECAR write fails. Breaking `_fs_for` outright would break the marker read
+            # too, and then the test would prove nothing about which of the two is load-bearing.
+            if uri == detail:
+                raise OSError("no such bucket")
+            return real_fs_for(uri, *a, **k)
+
+        monkeypatch.setattr(_assembly_mod, "_fs_for", _boom_on_detail)
+        summary = writer._skip_summary("run1", [], [chunk.label], detail)
+
+        assert summary["refused_px_by_reason"]["thin"] == 64, "the year's record is unaffected"
+        assert "detail_uri" not in summary, "and it does not promise a sidecar it failed to write"
+
+
+def test_an_unopenable_staging_filesystem_does_not_fail_the_cell(tmp_path: Path, monkeypatch) -> None:
+    """Resolving the filesystem can fail on its own — bad credentials, a malformed URI — and that
+    sat outside every guard, so it would have raised out of the year's provenance construction and
+    failed a cell at ASSEMBLY, after all its inference was paid for.
+
+    Reported as every marker unreadable, which the caller surfaces loudly, rather than as no reasons
+    recorded: those two are the same empty mapping and mean opposite things.
+    """
+
+    def _boom(*_a, **_k):
+        raise OSError("credentials not found")
+
+    monkeypatch.setattr(_assembly_mod, "_fs_for", _boom)
+    records, unreadable = read_skip_records(str(tmp_path), "run1", ["chunk_0_0", "chunk_0_1"])
+
+    assert records == {}
+    assert unreadable == 2, "every marker, so the caller can say so rather than imply nothing existed"

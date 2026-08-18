@@ -318,6 +318,9 @@ def fill_zone_year(
     land_mask_path: str,
     mosaic_base: str,
     staging_base: str,
+    # Where the per-tile refusal detail is persisted; from `BucketPaths.refusal_detail`.
+    # None writes no sidecar. Mirrors `staging_base`: a path the CALLER resolves.
+    refusal_detail_uri: str | None = None,
     config: InferenceConfig,
     num_actors: int,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
@@ -346,6 +349,10 @@ def fill_zone_year(
         land_mask_path: Partner-supplied boolean zarr on the zone pixel grid.
         mosaic_base: Base path of the zone's ingest mosaic stores.
         staging_base: Base path for staged inference output.
+        refusal_detail_uri: Where to persist the PER-TILE refusal records
+            (:meth:`BucketPaths.refusal_detail`). The year's summary in the store is pooled, so it
+            cannot say which refused tile came closest to the depth cutoff — the question a cleanup
+            campaign asks. ``None`` writes no sidecar and changes nothing the store commits.
         config: Inference configuration; ``config.chunk_size`` must equal the
             group's shard size (1 tile == 1 shard, D3).
         num_actors: Ray inference actor count.
@@ -395,6 +402,7 @@ def fill_zone_year(
         handoff,
         store_path=store_path,
         staging_base=staging_base,
+        refusal_detail_uri=refusal_detail_uri,
         log=log,
         gate=gate,
         n_assembly_workers=n_assembly_workers,
@@ -872,6 +880,9 @@ def assemble_zone_year(
     *,
     store_path: str,
     staging_base: str,
+    # Where the per-tile refusal detail is persisted; from `BucketPaths.refusal_detail`.
+    # None writes no sidecar. Mirrors `staging_base`: a path the CALLER resolves.
+    refusal_detail_uri: str | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     gate: CommitGate | None = None,
     n_assembly_workers: int | None = None,
@@ -1008,6 +1019,7 @@ def assemble_zone_year(
         store_path,
         zone,
         year=year,
+        refusal_detail_uri=refusal_detail_uri,
         run_id=run_id,
         n_workers=n_workers,
         gate=gate,

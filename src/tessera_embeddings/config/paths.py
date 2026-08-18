@@ -156,3 +156,21 @@ class BucketPaths(BaseModel):
         helper. Lives under ``inputs`` (it is a campaign input, like ROI masks).
         """
         return posixpath.join(self.inputs, "masks", f"{name}.icechunk")
+
+    def refusal_detail(self, zone: str, year: int) -> str:
+        """Return the URI of one cell's PER-TILE refusal detail — a sidecar, not store metadata.
+
+        The year's refusal summary lives in the zone group's zarr attributes, which every reader of
+        that group pays for on every open. That is why the summary is pooled: a few hundred bytes per
+        tile across up to 556 live tiles is tens of kilobytes of metadata charged to readers who will
+        never look at it, and an earlier per-tile version was removed for exactly that.
+
+        The detail a future cleanup campaign needs is per tile, so it goes here instead: one small
+        JSON object per cell, read deliberately by a planner, pointed at from the summary. Same
+        shape as the per-cell verdicts and window figures, which are sidecars for the same reason —
+        one reader wants them, everyone else opens the store.
+
+        Under ``outputs``, beside the embeddings it describes, because it is a product of the fill
+        rather than an input to it.
+        """
+        return posixpath.join(self.outputs, "refusals", zone, f"{year}.json")

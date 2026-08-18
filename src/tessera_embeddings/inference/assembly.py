@@ -860,15 +860,59 @@ class ZarrWriter:
         """
         return f"{self.staging_base}/{run_id}/{chunk.label}.done"
 
-    def _skip_summary(self, run_id: str, staged: list[str], skipped: list[str]) -> dict:
+    def _skip_summary(
+        self,
+        run_id: str,
+        staged: list[str],
+        skipped: list[str],
+        detail_uri: str | None = None,
+    ) -> dict:
         """The year's optical-skip summary, with the per-shard reasons read from their markers.
 
         Read HERE and not later because this is the last moment the reasons exist: the markers go
         with the staging prefix when it is cleaned up, and the mosaic they were derived from goes when
         the cell lands. A published cell is write-once.
+
+        ``detail_uri`` is where the PER-TILE records are persisted, and passing one is what makes a
+        future cleanup campaign possible: the summary in the store's attributes is pooled over the
+        year, so it can say a tile somewhere reached fourteen observations against a cutoff of
+        fifteen but not WHICH tile — and ranking candidates by how close they came is the whole of
+        that planning problem. The detail is a sidecar rather than more store metadata because every
+        reader of the zone group pays for its attributes on every open, and an earlier per-tile
+        version was removed for exactly that. The URI comes from the caller
+        (:meth:`BucketPaths.refusal_detail`); nothing here constructs one.
+
+        Best-effort by design: the summary is what the store commits, and losing the sidecar costs a
+        future planner some precision while failing the write would cost the cell.
         """
         records, unreadable = read_skip_records(self.staging_base, run_id, skipped)
         summary = summarise_optical_skips(staged=staged, skipped=skipped, records=records)
+        if detail_uri and records:
+            try:
+                fs = _fs_for(detail_uri)
+                fs.makedirs(detail_uri.rsplit("/", 1)[0], exist_ok=True)
+                body = (
+                    json.dumps(
+                        {"run_id": run_id, "tiles": [records[label] for label in sorted(records)]},
+                        sort_keys=True,
+                        indent=1,
+                    ).encode()
+                    + b"\n"
+                )
+                with fs.open(detail_uri, "wb") as f:
+                    f.write(body)
+            except Exception:
+                logger.exception(
+                    "Run %s: per-tile refusal detail could not be written to %s; the year's pooled "
+                    "summary is unaffected",
+                    run_id,
+                    detail_uri,
+                )
+            else:
+                # A POINTER, so a reader of the attributes knows the detail exists without carrying
+                # it. Recorded only on a successful write, so its presence is a promise.
+                summary["detail_uri"] = detail_uri
+                logger.info("Wrote per-tile refusal detail for %d tile(s) to %s", len(records), detail_uri)
         if unreadable:
             # SURFACED, because "no records" and "every read failed" are the same empty dict. Without
             # this a systematic failure — expired credentials, a wrong prefix — would publish a
@@ -2146,6 +2190,9 @@ class ZarrWriter:
         log: logging.Logger | logging.LoggerAdapter[logging.Logger] | None = None,
         fault: ArmedFault | None = None,
         input_coverage: dict | None = None,
+        # Where the PER-TILE refusal detail is persisted, from `BucketPaths.refusal_detail`. None
+        # writes no sidecar and changes nothing the store commits — see `_skip_summary`.
+        refusal_detail_uri: str | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2183,6 +2230,11 @@ class ZarrWriter:
             year: Campaign calendar year to fill — must be on the group's
                 pre-allocated time axis.
             run_id: Run identifier (locates staged files).
+            refusal_detail_uri: Where to persist the PER-TILE refusal records, from
+                :meth:`BucketPaths.refusal_detail`. The year's summary in the store is pooled and
+                so cannot say WHICH tile came closest to the depth cutoff, which is the question a
+                cleanup campaign asks; this sidecar can. ``None`` writes nothing and changes
+                nothing the store commits.
             n_workers: Worker process count; also divides
                 ``TARGET_AGGREGATE_S3_CONCURRENCY`` into the per-fork cap.
             gate: Optional commit gate shared across the zone-year fills this
@@ -2388,7 +2440,9 @@ class ZarrWriter:
             # write agree by construction; run_provenance drops it on an empty year.
             # `skipped_labels=None` is a caller that resolved no live set at all, so
             # there is nothing to summarise and no ZERO to assert (see below).
-            optical_skips=(self._skip_summary(run_id, labels, skipped) if skipped_labels is not None else None),
+            optical_skips=(
+                self._skip_summary(run_id, labels, skipped, refusal_detail_uri) if skipped_labels is not None else None
+            ),
             empty=empty,
             telemetry=telemetry,
             # The fill's coordinator progress goes through the caller's logger —
@@ -2473,7 +2527,22 @@ def read_skip_records(
     if not labels:
         return {}, 0
     base = f"{staging_base.rstrip('/')}/{run_id}"
-    fs = _fs_for(base)
+    try:
+        fs = _fs_for(base)
+    except Exception:
+        # RESOLVING the filesystem can fail on its own — bad credentials, a malformed URI — and this
+        # sat outside every guard, so one such failure raised out of the year's provenance
+        # construction and would have failed a cell at ASSEMBLY, after all its inference was paid
+        # for. Same asymmetry as the marker itself: these reasons are a diagnostic, and losing them
+        # must never cost the cell that earned them. Reported as every marker unreadable, which the
+        # caller surfaces loudly, rather than as no reasons recorded.
+        logger.exception(
+            "Run %s: could not open the staging filesystem to read %d skip marker(s); their refusal "
+            "reasons will be absent from the year's record",
+            run_id,
+            len(labels),
+        )
+        return {}, len(labels)
 
     def one(label: str) -> tuple[str, dict | None, bool]:
         """``(label, record, unreadable)``. Absent and empty are ordinary; a read error is not."""

@@ -457,7 +457,14 @@ class TestProcessChunkStriping:
         assert set(record["refused"]) == {"no_optical", "thin", "no_radar"}
         assert sum(record["refused"].values()) > 0, "something refused every pixel; say what"
         # The observation summary rides along, because the counts alone cannot say HOW thin.
-        assert "s2_obs" in record and set(record["s2_obs"]) == {"px_with_any", "max", "mean_where_any"}
+        # MEDIAN as well as mean, and both over pixels that saw ANYTHING: a mean is pulled by a
+        # bright patch of deep pixels beside a dark majority, and including never-imaged pixels
+        # drags either statistic to zero so it describes neither population.
+        assert "s2_obs" in record
+        assert set(record["s2_obs"]) == {"px_with_any", "max", "mean_where_any", "median_where_any"}
+        # Radar presence, because a tile that is thin AND radar-free is a different cleanup
+        # candidate from one that is merely thin — more optical will not fix the first.
+        assert "px_with_any_radar" in record
 
 
 # ---------------------------------------------------------------------------
