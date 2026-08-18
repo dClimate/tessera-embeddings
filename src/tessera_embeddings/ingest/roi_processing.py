@@ -25,7 +25,7 @@ DEFAULT_MIN_VALID_COVERAGE = 5.0
 SOURCE_READ_ATTEMPTS = 3
 
 
-def source_read_retrying(log: logging.Logger) -> Retrying:
+def source_read_retrying(log: logging.Logger | logging.LoggerAdapter[logging.Logger]) -> Retrying:
     """Retry the source read for one date.
 
     Writes have always retried; reads did not, and that asymmetry cost whole cells. A
@@ -50,7 +50,9 @@ def source_read_retrying(log: logging.Logger) -> Retrying:
 
 
 @contextmanager
-def read_failure_context(log: logging.Logger, *, roi: str, date: str, items: Sequence[object] = ()) -> Iterator[None]:
+def read_failure_context(
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger], *, roi: str, date: str, items: Sequence[object] = ()
+) -> Iterator[None]:
     """Name the ROI, the date and the granules on any failure raised inside.
 
     Per-date telemetry is emitted *after* a date commits, so the last date in a log is the

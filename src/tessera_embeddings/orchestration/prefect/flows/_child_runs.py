@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from typing import Any
 
 from prefect.client.orchestration import get_client
 from prefect.states import Cancelling
@@ -76,7 +77,7 @@ def make_child_cancel_hook(prefix: str, what: str) -> Callable[..., None]:
                 # getting the terminal-state set wrong here fails silently in exactly
                 # the same way — so page over everything and judge finality locally,
                 # where `is_final()` is the authority.
-                live = []
+                live: list[Any] = []
                 offset = 0
                 while True:
                     page = client.read_flow_runs(

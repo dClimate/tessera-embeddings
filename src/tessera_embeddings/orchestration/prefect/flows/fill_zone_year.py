@@ -99,7 +99,7 @@ def _optical_min_obs_from_store(
     value = root.attrs.get("optical_min_obs")
     if value is None:
         return None
-    return int(value)
+    return int(cast("int", value))
 
 
 def _assert_seeded_model_matches(

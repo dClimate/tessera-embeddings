@@ -200,7 +200,7 @@ def select_preferred_duplicates(
 
 
 def log_duplicate_selection(
-    log: logging.Logger,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     roi: str,
     alternates: dict[tuple[str, str], list[Any]],
 ) -> None:

@@ -234,6 +234,11 @@ RADAR_THIN_MAX_OBS = 12
 #: **A store already seeded at another value keeps it.** The root attr decides, and it is write-once,
 #: so this constant changes what a NEW store is seeded with and what the thin counters report —
 #: never what an existing store enforces.
+#: The four orbit selections, as one name rather than a Literal repeated at every boundary.
+#: ``"none"`` is a real member: the S2-only path (ADR-013) carries it end to end, and a signature
+#: that omits it forces a cast at each hop instead of saying what the value is.
+S1Orbit = Literal["ascending", "descending", "both", "none"]
+
 OPTICAL_MIN_OBS = 15
 
 #: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
@@ -339,7 +344,7 @@ class InferenceConfig:
     batch_size: int = 7168
     num_workers: int = 4
     norm_source: Literal["mpc", "aws"] = "aws"
-    s1_orbit: Literal["ascending", "descending", "both", "none"] = "both"
+    s1_orbit: S1Orbit = "both"
     """Which S1 orbit direction(s) to read.
 
     ``"none"`` is a RESOLVED value, not a request: it is what ``"both"`` becomes once probing

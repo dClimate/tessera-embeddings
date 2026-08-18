@@ -833,7 +833,10 @@ def load_chunk(
     chunk: ChunkSpec,
     mosaic_base: str,
     time_window: TimeWindow,
-    s1_orbit: Literal["ascending", "descending", "both"] = "both",
+    # Includes "none": `_active_orbits` returns an empty tuple for it, and the S2-only path
+    # (ADR-013) reaches here with exactly that. The narrower annotation was wrong rather than
+    # protective — it described three of the four values this already handles.
+    s1_orbit: Literal["ascending", "descending", "both", "none"] = "both",
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
     mask_bundle: S2MaskBundle | None = None,

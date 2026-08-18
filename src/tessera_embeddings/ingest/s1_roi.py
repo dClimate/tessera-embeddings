@@ -105,7 +105,7 @@ S1Orbit = Literal["ascending", "descending"]
 @contextmanager
 def credential_ticker(
     refresh: Callable[[], None],
-    log: logging.Logger,
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     orbit: str,
     roi: str,
     interval_sec: float = CRED_TICK_INTERVAL_SEC,

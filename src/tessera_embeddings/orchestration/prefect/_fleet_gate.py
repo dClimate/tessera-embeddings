@@ -123,7 +123,13 @@ class FleetGate(AbstractContextManager):
         self._occupy = occupy
         self._poll_s = poll_s
         self._should_stop = should_stop
-        self._kwargs = concurrency_kwargs
+        # Typed loosely at the splat, deliberately. The parameter above declares what a CALLER
+        # may pass, which is the useful contract; `concurrency` itself takes heterogeneous
+        # parameters (int | None, float, a lease holder, bool | None), and a homogeneous
+        # `**dict[str, X]` cannot be checked against those — mypy reports one error per
+        # parameter whatever X is. That is a limitation of `**kwargs` typing rather than a
+        # defect here, so the looseness is confined to this one attribute.
+        self._kwargs: dict[str, Any] = dict(concurrency_kwargs)
         self._local = threading.local()
 
     def _acquire(self) -> AbstractContextManager[Any]:

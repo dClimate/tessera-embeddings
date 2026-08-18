@@ -35,6 +35,7 @@ from tessera_embeddings.config.inference import (
     S1_ORBIT_NONE,
     S2_BAND_ORDER,
     InferenceConfig,
+    S1Orbit,
 )
 from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
@@ -636,7 +637,7 @@ class InferenceActor:
         chunk: ChunkSpec,
         mosaic_base: str,
         time_window: TimeWindow,
-        s1_orbit: str,
+        s1_orbit: S1Orbit,
         *,
         y_sub: slice,
         store_opener: StoreOpener,
@@ -682,7 +683,7 @@ class InferenceActor:
         return data, dataset
 
     def _load_chunk_prologue(
-        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: str
+        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
     ) -> _ChunkPrologue:
         """Load everything _process_chunk needs before its first forward pass.
 
@@ -736,7 +737,7 @@ class InferenceActor:
         return self._xchunk_prefetch_pool, self._xchunk_prefetched
 
     def _load_prefetched_starter(
-        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: str
+        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
     ) -> _ChunkPrologue:
         """Load the capped prefetch payload for ``chunk`` (prefetch thread).
 
@@ -776,7 +777,9 @@ class InferenceActor:
             )
         return _ChunkPrologue(store_opener, mask_bundle, plan, x_sub, first_strip, rung=rung)
 
-    def _start_chunk_prefetch(self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: str) -> None:
+    def _start_chunk_prefetch(
+        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
+    ) -> None:
         """Kick off the next chunk's capped prefetch on the prefetch thread.
 
         Called from the strip loop at the top of the CURRENT chunk's last
@@ -944,7 +947,7 @@ class InferenceActor:
         tracker: ray.actor.ActorHandle | None = None,
         prefetch_hint: ChunkSpec | None = None,
         time_window: TimeWindow | None = None,
-        s1_orbit: str | None = None,
+        s1_orbit: S1Orbit | None = None,
     ) -> dict[str, Any]:
         """Process a single spatial chunk: load data, run inference, write output.
 
@@ -1005,7 +1008,7 @@ class InferenceActor:
         tracker: ray.actor.ActorHandle | None = None,
         prefetch_hint: ChunkSpec | None = None,
         time_window: TimeWindow | None = None,
-        s1_orbit: str | None = None,
+        s1_orbit: S1Orbit | None = None,
     ) -> dict[str, Any]:
         """Run the load → inference → write pipeline for one chunk.
 
