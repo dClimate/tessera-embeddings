@@ -310,6 +310,17 @@ def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> N
                 _fill_equal(arr.fill_value, want["fill_value"]),
             ),
             ("codec", _codec_id(arr), spec.codec, _codec_id(arr) == spec.codec),
+            # Attrs too, because for one array they are part of the TYPE rather than
+            # decoration: `s2_month_covered` carries `dtype="bool"`, which is how xarray
+            # knows an int8 array represents booleans. Without it a reader gets 0/1
+            # integers back, so an incremental seed could leave existing and new groups
+            # with different logical schemas while every geometry check passed.
+            (
+                "attrs",
+                {k: dict(arr.attrs).get(k) for k in dict(spec.attrs or ())},
+                dict(spec.attrs or ()),
+                all(dict(arr.attrs).get(k) == v for k, v in dict(spec.attrs or ()).items()),
+            ),
         )
         mismatch = {k: (have, wanted) for k, have, wanted, ok in checks if not ok}
         if mismatch:

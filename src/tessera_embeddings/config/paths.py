@@ -137,9 +137,14 @@ class BucketPaths(BaseModel):
         collected.
         """
         store = self.global_store()
-        base, _, name = store.rpartition("/")
+        base, sep, name = store.rpartition("/")
         stem = name[: -len(".icechunk")] if name.endswith(".icechunk") else name
-        return f"{base}/{stem}.registry"
+        # A store URI with no separator at all — a bare relative path like
+        # ``tessera.icechunk``, which local runs and tests use — leaves ``base`` empty, and
+        # f"{base}/{stem}" then names ``/tessera.registry`` at the FILESYSTEM ROOT rather
+        # than a sibling. That fails on permissions if you are lucky and writes somewhere
+        # unrelated to the configured store if you are not.
+        return f"{base}{sep}{stem}.registry"
 
     def land_mask_store(self, name: str = "global") -> str:
         """Return the URI of the campaign land-mask coverage Icechunk repo.

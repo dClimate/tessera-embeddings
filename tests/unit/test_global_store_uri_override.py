@@ -111,6 +111,18 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         )
         assert paths.optical_registry() == "s3://tessera-embeddings/v1.1/dclimate.registry"
 
+    def test_a_relative_store_uri_keeps_its_registry_beside_it(self):
+        """A bare relative path is what local runs and tests use, and it has no separator.
+
+        `rpartition("/")` then leaves `base` empty, so joining with "/" named
+        `/tessera.registry` at the FILESYSTEM ROOT rather than a sibling — failing on
+        permissions if you are lucky and writing somewhere unrelated to the configured store
+        if you are not.
+        """
+        paths = BucketPaths(inputs="s3://in", outputs="s3://out", global_store_uri="tessera.icechunk")
+        assert paths.optical_registry() == "tessera.registry"
+        assert not paths.optical_registry().startswith("/")
+
     def test_the_registry_is_never_inside_the_store(self):
         """Icechunk's garbage collection enumerates its own prefix and reconciles it against its
         manifests, so a parquet in there is at best unrecognised and at worst collected.
