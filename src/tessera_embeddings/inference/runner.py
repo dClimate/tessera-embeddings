@@ -31,6 +31,23 @@ from tessera_embeddings.inference.progress import ProgressTracker
 from tessera_embeddings.inference.scheduling import WorkItem, _process_chunks_work_stealing
 
 
+def _resumed_result(label: str, *, skipped: bool) -> dict:
+    """One restored outcome for a tile a previous attempt already staged.
+
+    ``status`` mirrors what the actor reported at the time — ``skipped`` for a tile it
+    found nothing to write in, ``success`` otherwise — so a resume and a fresh run agree
+    on what happened. The counters are absent rather than zero: this run did not measure
+    them, and a zero would read as a measurement of none.
+    """
+    return {
+        "chunk": label,
+        "status": "skipped" if skipped else "success",
+        "valid_pixels": 0,
+        "elapsed_sec": 0.0,
+        "resumed": True,
+    }
+
+
 def run_inference(
     num_actors: int,
     config: InferenceConfig,
@@ -114,14 +131,22 @@ def run_inference(
     # arrives via more_work, each zone pre-scanned by its feeder), and its
     # placeholder staging_base must not be listed.
     already_done: set[str] = set()
+    resumed_skips: set[str] = set()
     if chunks:
         writer = ZarrWriter(staging_base)
-        already_done = writer.scan_existing_staged_chunks(
+        # The ARTIFACT form, not the label-set form: both kinds mean "do not re-infer",
+        # but a staged zarr produced pixels and a skip marker recorded that the tile had
+        # none. Restoring both as successes makes a resumed zone's tally disagree with the
+        # same zone's tally on a fresh run, and the year's radar-coverage provenance is
+        # derived from those statuses — `summarise_radar_coverage` returns None when tiles
+        # report no counters, so miscounted skips can suppress the whole summary.
+        staged = writer.scan_existing_staged_artifacts(
             run_id,
             chunks,
             compute_std=config.compute_std,
             log=log,
         )
+        already_done, resumed_skips = staged.done, staged.skipped
     if already_done:
         remaining = len(chunks) - len(already_done)
         log.info(
@@ -133,10 +158,7 @@ def run_inference(
         chunks = [c for c in chunks if c.label not in already_done]
         if not chunks:
             log.info("All chunks already staged — skipping inference entirely")
-            return [
-                {"chunk": label, "status": "success", "valid_pixels": 0, "elapsed_sec": 0.0, "resumed": True}
-                for label in already_done
-            ]
+            return [_resumed_result(label, skipped=label in resumed_skips) for label in already_done]
 
     # --- Create actors ---
     log.info(
@@ -228,10 +250,7 @@ def run_inference(
 
     # Merge resumed chunks (already staged) with newly-processed results
     if already_done:
-        resumed = [
-            {"chunk": label, "status": "success", "valid_pixels": 0, "elapsed_sec": 0.0, "resumed": True}
-            for label in already_done
-        ]
+        resumed = [_resumed_result(label, skipped=label in resumed_skips) for label in already_done]
         results = resumed + results
 
     return results
