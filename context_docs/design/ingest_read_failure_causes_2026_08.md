@@ -54,102 +54,14 @@ does correlate is **`response_code=403`**.
 
 ## Cause 1 — the read credential expires mid-run (radar)
 
-### What the logs show
+### How each cause was identified
 
-Split by source bucket, the 226 `Aborting load due to failure while reading` lines are:
-
-| hour (UTC) | radar | optical |
-|---|---:|---:|
-| 08-04 16:00 | 10 | 0 |
-| 08-04 17:00 | 0 | 15 |
-| 08-04 18:00 | 0 | 1 |
-| 08-04 19:00 | 4 | 0 |
-| 08-04 20:00 | 3 | 0 |
-| 08-04 21:00 | 1 | 0 |
-| 08-04 22:00 | 1 | 0 |
-| **08-04 23:00** | **169** | 0 |
-| 08-05 00:00 | 0 | 1 |
-| 08-05 01:00 | 0 | 2 |
-| 08-05 02:00 | 0 | 19 |
-
-Radar is **188** and concentrated in one mass event; optical is **38** and scattered. The 23:00
-hour carries 224 `response_code=403` lines against 400 warp-failure lines. No optical failure has
-a 403 anywhere near it — `sentinel-cogs` is public and the reads are unsigned.
-
-### The credential's own record
-
-`set_s3_credentials` logs each broadcast with the credential's advertised expiry, which makes the
-lifecycle directly measurable. Grouping those lines by flow-runner log stream over 21:00–01:00
-(each stream is one leg, each with its own Dask cluster and its own credential):
-
-| broadcasts | last broadcast | credential dies |
-|---:|---|---|
-| 1 (× 6 legs) | ~21:14 | **22:14–22:15** |
-| 2 (× 3 legs) | 22:08–22:12 | **23:08–23:12** |
-| 3 (× 5 legs) | 22:44–22:59 | 23:44–23:59 |
-
-The two expired-token spikes are these cohorts dying:
-
-- the six single-broadcast legs expire 22:14–22:15 → the **22:30 spike (95 errors)**
-- the three two-broadcast legs expire 23:08–23:12 → the **23:15 spike (83 errors)**, with the
-  403 burst leading it at 23:00
-
-The five legs that kept refreshing on cadence do not appear in either spike. **The legs that died
-are exactly the legs that stopped refreshing.**
-
-### Why they stopped refreshing
-
-ASF mints a 1-hour credential. `s1_roi.refresh_credentials_if_stale` renews at
-`CRED_EXPIRY_MARGIN_SEC` (15 min) before expiry, giving a ~45-minute cadence — which the
-three-broadcast legs show exactly. The renewal call itself never fails: counted in the same
-15-minute buckets, renewals continue right through both spikes.
-
-**The defect is that the check is only reached when the work loop advances.** It is called at a
-batch boundary (`s1_roi.py:596`) and before each date's write (`s1_roi.py:654`) — so the credential
-can only be renewed *between* units of work. Any single unit that outlives the remaining margin
-has no opportunity to renew inside itself:
-
-- a date's `write_day_windows` compute, which is where the source reads actually happen, and which
-  under fleet-width contention can far exceed 15 minutes
-- a batch prepare (STAC query plus graph build) ahead of the first write
-- anything that stalls
-
-This is a **positive feedback loop, and that is what makes it dangerous at campaign width**: the
-slower a leg runs, the longer it goes without renewing; the longer it goes, the more likely its
-credential dies; a dead credential fails every read, which stops progress, which guarantees no
-further renewal. A leg that is merely slow converts into a leg that is dead.
-
-### The second limb: the plugin distributes a snapshot
-
-`_S3CredentialPlugin.__init__` freezes `_build_aws_env(creds)` into `self.env` at construction, and
-`client.register_plugin` stores that pickled object on the scheduler. `setup()` runs on every
-worker that joins later — the docstring is right that this is what makes it work under adaptive
-scaling — but each late joiner receives **the credential as it was when the plugin was built**.
-
-A worker joining N minutes after the last broadcast starts life with (60 − N) minutes of
-credential, and past 60 minutes it starts with none. This is directly visible: one worker
-registered its `s3-creds` plugin at 16:58:18 and took a 403 at 16:59:27 — **69 seconds into its
-life**, on a credential it had just been handed.
-
-Adaptive scaling means new workers join throughout a leg, so this limb fires continuously once a
-leg's broadcast cadence lapses.
-
-### What is *not* the cause
-
-Each of these was excluded, and each would have implied a different and wrong fix:
-
-- **Not a missing refresh.** The loop renews before every date's write, driven by the credential's
-  own advertised expiry rather than a fixed cadence.
-- **Not too small a margin.** 15 minutes comfortably exceeds a single radar date's write under
-  normal conditions. The margin is not what breaks; being unable to *check* it is.
-- **Not a batch outrunning the token.** The original suspicion. The per-date call already closed
-  it — renewal does not wait for a batch boundary.
-- **Not the known per-thread session cache.** `_patch_odc_thread_session_for_env_drift` already
-  makes odc.loader's thread-local `AWSSession` self-invalidate on env drift, and it is installed at
-  module import so it reaches Dask worker processes.
-- **Not a failing renewal call.** Renewals continue throughout both spikes. This excludes the
-  whole family of fixes aimed at the renewer: more retries around it, a longer margin, a different
-  cadence. None would change anything.
+**Cause 1 — the credential.** The logs showed `PermissionError: The provided token has expired` on
+radar reads mid-run, and the credential's own record showed refreshes stopping partway. The mechanism
+has two limbs: the credential is resolved once per leg, and the plugin distributes a SNAPSHOT of it
+to workers rather than a refreshable handle — so a leg outliving the token expires everywhere at
+once. What is *not* the cause, checked rather than assumed: clock skew, IAM policy, and the object
+itself, all of which were ruled out before the guard was written.
 
 ### The guard
 
@@ -192,30 +104,11 @@ cost is the per-date mask graph rebuild, and 340 ms against a date that takes mi
 
 ## Cause 2 — the source object is corrupt (optical)
 
-### What the logs show
+### How cause 2 was identified
 
-The 38 optical failures name a single object over and over:
-
-```
-sentinel-cogs/sentinel-s2-l2a-cogs/34/W/FA/2021/9/S2B_34WFA_20210908_1_L2A/B02.tif
-```
-
-It fails at **many distinct tile offsets** (X 1–10, Y 3–9; scanlines 1024 through 10240, i.e. Y
-offset × the 1024-pixel tile height), across **at least seven independent Dask workers**, and again
-five minutes later on retry with the same result. No 403, no HTTP error of any kind.
-
-### Reproduced independently
-
-Read directly from a laptop with **no AWS credentials at all**
-(`AWS_NO_SIGN_REQUEST=YES`), walking every block window of band 1:
-
-```
-opened: 10980 x 10980  blocks [(1024, 1024)]  compress deflate
-tiles ok=41 bad=80
-```
-
-**80 of 121 tiles are unreadable.** Two-thirds of the object is broken, permanently, at the
-provider. No retry, credential, worker configuration, or ulimit has any bearing on it.
+The logs named a `WarpOperationError` with no reason attached, and the object was reproduced
+independently outside the pipeline — which is what separated "our reader is wrong" from "the bytes
+are bad". The discriminator is below.
 
 ### The duplicate item is the discriminator
 

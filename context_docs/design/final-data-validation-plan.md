@@ -133,75 +133,19 @@ because only dev verdicts exist so far and none is a record of the product; and 
 check is the one thing that could manufacture the campaign's systemic signal, since four cells failing
 the same check is what escalates.
 
-## 4. A thin cell is not a broken cell — and how the AI review works
+## 4. A thin cell is not a broken cell
 
-Optical depth varies by an order of magnitude globally, and **picture quality tracks optical depth and
-nothing else** — measured across 15 cells: crisp at 30+ valid observations per pixel, noise below about
-20. Radar absence alone does not visibly degrade the embeddings. `OPTICAL_THIN_MAX_OBS` records this per
-pixel as a share of embedded area. **Publish thin cells; label them.**
+The distinction the whole gate rests on: a cell can be sparse because the archive published little
+over it, which is a property of the input, and it can be sparse because something went wrong, which
+is a fault. **The checks cannot tell those apart from pixels alone**, which is why the cell's own
+provenance — `radar_coverage`, `optical_skips`, `assessed_window` — is reconciled against the pixel
+findings rather than the pixels being graded on their own.
 
-> **WITHDRAWN as stated (2026-08-13). The two numbers do not survive re-measurement; the direction
-> does.** The sentence above was read off figures drawn with a **per-window** contrast stretch, which
-> expanded a low-variation window's noise floor to full contrast whatever the depth, and against
-> **cell** means, when a cell holds windows differing severalfold. Re-taken blind over 73 windows from
-> 9 cells spanning 13 to 98 observations — full report in
-> [`window_legibility_vs_depth_2026_08.md`](window_legibility_vs_depth_2026_08.md) — the fully-land
-> figures are 50% legible below 20 observations, 33% between 30 and 45, and 97% above 45. So the
-> relationship is real and it is **not monotonic**, the crisp boundary is nearer 45 than 30, and the
-> thinnest legible window sits at 12.8. **Stop quoting "crisp at 30, noisy below 20."** What a
-> reviewer should be told instead is the window's own depth and that legibility tracks land cover at
-> least as strongly as depth.
-
-**The line is 15 observations, set 2026-08-12 (it was 40).** That is deliberately *below* the depth at
-which pictures start to degrade, so the label names cells thin enough to be worth calling out rather
-than every cell that is merely not crisp — at 40 a large share of the globe would carry it, and a label
-that covers a third of the product is not a label. It is only a reporting line: nothing refuses a cell
-for being under it, and the per-pixel counts are in the store either way. The verdict publishes the
-cell's own mean depth (`s2_obs_mean`) beside the share, which is what a reviewer judges a window
-against — so lowering the threshold changed what is *flagged*, not what is *known*.
-
-**An AI reviews the windows before a human sees them**, as part of the monitoring round — **10 windows
-per cell**. This is the one check that otherwise does not scale: nobody eyeballs a thousand cells, so in
-practice it would be sampled and the majority would go unlooked-at.
-
-**It reports named observations, not a quality score.** A 1-to-5 rating would drift — two cells scored
-"3" by separate invocations are not comparable, the number tells a human nothing about where to look,
-and worst of all it collapses *thin input* and *defect* into one axis when they need opposite responses.
-So the review answers three concrete questions per window instead:
-
-* **Which real-world features are present?** Field boundaries, drainage networks, coastline, topography,
-  settlement. Presence of a nameable thing is comparable across cells in a way a felt quality is not.
-* **Which artifacts are present?** Blocking, a visible straight edge crossing the window, repeated or
-  mirrored texture, uniform noise. These are the shapes a placement or quantization defect would make.
-* **A verdict of plausible / cannot-tell / suspicious**, where **cannot-tell is mandatory** — a
-  thin cell genuinely cannot be judged, and forcing a verdict there is what would flag every atoll and
-  sub-Antarctic cell for being correct.
-
-Two constraints on the review: it is given **that cell's own optical depth** and told to judge against
-it; and **suspicious flags for a human, never blocks**, because "looks wrong to a model" is not evidence
-any other check would confirm. Its value is ranking a thousand cells so the human reads the worst
-twenty.
-
-**What the review is actually handed, decided 2026-08-13 by looking at a real cell's figures.**
-
-* **One PNG per window, at the resolution it was read**, beside the composite panel. The panel is for a
-  person who can zoom into it; an image pipeline that bounds an image's long edge shrinks a composite
-  by however many windows are in it, so a reader that cannot zoom would judge a 512-pixel window at
-  150 pixels — and the artifacts in the list above are the first thing a downsample destroys. The
-  panel remains the human figure.
-* **One contrast stretch shared by all of a cell's windows**, rather than each window stretched to its
-  own percentiles. This was a real defect: a window whose ground varies little had its noise floor
-  expanded to full contrast and arrived looking broken, next to a window with real structure, while
-  the figure's caption claimed the colours were comparable. Uniform ground now looks uniform, which
-  is the only way the "uniform noise" artifact above can mean anything.
-* **Per-window facts as text**, in the verdict's `windows` list: how much of the window the **land
-  mask** calls land, and how flat it is relative to the widest window in the cell. Land share is not
-  the embedded share — inference fills every pixel of a live shard, so a window over open water is
-  100% embedded and entirely uninformative. Without these two numbers the correct reading of a flat
-  picture is indistinguishable from a defect, which would push the review toward `cannot-tell` on
-  exactly the cells it is supposed to rank.
-* **Not the other three figures.** Coverage, bands and seams are renderings of numbers that are
-  already in the verdict, and the verdict is the better input for those.
+The AI reviewer exists for the residue: whether the published imagery *looks like ground* is not a
+question any deterministic check can ask, and a thin cell that looks like ground is fine while a
+dense one that does not is a fault. Its calibration, its worst-first ranking and the reason it is not
+on the alerting path are in `campaign-monitoring-plan.md` §5, which is where that machinery is
+described rather than here.
 
 ## 5. Scope and cost
 

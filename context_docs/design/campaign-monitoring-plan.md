@@ -405,101 +405,21 @@ it is the only Intervene Now signal available before real money has been spent.
 
 ## 7. What exists, and what is left
 
-**Built and verified against dev.** The detector (`campaign_health.py`: **eighteen** checks — the
-count here read "seventeen" while §5 already described check 18 — `--json`, stable slugs, subjects,
-fingerprints, per-finding follow-up commands, and now `--cheap`); every tool it composes; the per-cell
-validation and its published verdicts; the four Slack automations; and the round itself —
-`campaign-watch`, registered with the campaign set on a `*/5` cron with concurrency 1 and
-`CANCEL_NEW`, publishing all four artifacts and posting under the rules of §2.2.
+**Everything in this plan is built.** The fast path (server-side automations), the reliable path
+(the periodic poll), the Take Note tier, and the AI reviewer all shipped, and each section above
+carries its own BUILT marker with what measuring it changed.
 
-> **A check that cannot run reports nothing, and `orchestrator load` could not run on a fresh campaign
-> (2026-08-18).** Its final OK line formatted server CPU as `{cpu_now:.0f}%` with no `None` guard,
-> while every branch above it — and the detail line one line up — tested for exactly that. Server CPU
-> is published at 5-minute granularity, so a window clamped to a fresh dispatch routinely holds **no
-> datapoint**: the check died with a `TypeError`, reported DID NOT RUN, and carried the whole report to
-> INCOMPLETE. This is the arm that speaks to *lost work* — dropped broker events mark healthy runs
-> crashed — so it is the wrong one to lose, and it would have been lost on the real campaign's first
-> round.
->
-> Found by running a round against a live fill, not by a test, which is also how the `cell_validation`
-> and progress-check defects were found.
+The hundred-line build-status inventory that stood here is cut: it enumerated components, owners and
+readiness for work that is now running, and the code plus those markers say it better. What it
+recorded that the code does not:
 
-> **A four-cell run found five more, and four of them were one mistake (2026-08-18).** Run at scale
-> deliberately: 4 cells, 12 concurrent ingest fleets spanning 3 to 41 tasks, ingest through fill,
-> assembly and validation, ~2.6 hours of five-minute rounds. The alerting held up — **one** false-alarm
-> round in 32, which cleared itself — but five checks were reasoning wrongly, and the shared error is
-> the one this plan keeps rediscovering: **an absence read as evidence.**
->
-> | check | what it inferred | what was actually true |
-> |---|---|---|
-> | cells still making progress | "4 cells have never written anything" | the log query had FAILED; all four had filled and validated |
-> | cells still making progress | a cell at 237/239 chunks was "past inference" | its startup line, the only thing naming its zone, had aged out of the window |
-> | cells still making progress | 02S was "committing or cleaning up" | 02S had not started inferring; its ingest was still running |
-> | commit rates | "decelerating" | three of four INGESTS had finished; the rate per live ingest had risen |
-> | fleet strength | "121/70 = 173%" | one fleet of ten was unidentified, so all ten were pooled against the smallest legs |
->
-> **The first is the dangerous one and the one to remember.** At 07:43Z a brief AWS blip failed
-> `aws logs get-query-results` and CloudFormation. Seven checks correctly reported DID NOT RUN. The
-> progress check, handed the empty map that failure produces, accused four healthy cells instead — it
-> pages during an outage and blames the campaign for it. An empty result and a dead query are
-> indistinguishable downstream and mean opposite things, so the failure is now a PARAMETER.
->
-> The blip is answered twice over: the checks report an unknown, and the Insights result fetch now
-> retries the transport error (3 attempts, narrow — a query the service judged Failed still raises at
-> once) so the round does not go blank in the first place.
->
-> **The second is the one scale was needed to find.** The zone comes from a line published once at
-> startup; the progress lines carry no zone. Measured at one instant with two windows: at 45m zone 47S
-> read "past inference, no write in the window"; at 90m the same cell read "inferring — 237/239". The
-> deployed round uses 60m, so this hit every cell whose inference outlasts an hour — the largest cells,
-> which need watching most. A stream is now named from a 12-hour lookback, issued only when a stream
-> has fresh progress and no startup line, so short cells never pay for it.
->
-> **Two names were also wrong, and one was ECS's rather than ours.** `placement` is ECS's word for
-> whether a task found capacity; it is displayed as **fleet strength** (did the workers we asked for
-> start?). `fleet widths` read as a size report though it only ever fires on clusters with NO workers;
-> it is displayed as **empty clusters**. Neither is occupancy — that is `GPUs kept busy`, and mistaking
-> the three for each other is what the rename fixes. Both SLUGS are unchanged, which is exactly the
-> split `CheckSpec` documents. Then swept rather than spot-fixed: an AST pass over every
-> numeric format applied to a local assigned `... else None` found **nine** such uses, eight already
-> inside their own `is not None` guard and this the only gap. The sweep is what turns "I fixed the one I
-> tripped over" into "there is not another one".
+**The two paths are deliberately redundant and neither is a fallback for the other.** Prefect's event
+broker drops events under load and cannot fire when the server itself is unwell, so the fast path is
+fast and unreliable by construction; the periodic poll is the mechanism of record. A design where the
+poll existed only as a backstop would have been quietly wrong, because the case that breaks the fast
+path is exactly the case you need an alarm in.
 
-The round's own pieces live in `src/yield_embeddings/monitoring/`:
-
-| module | what it owns |
-|---|---|
-| `detector.py` | runs the detector as a subprocess behind `--json`, with a timeout |
-| `state.py` | the fingerprint memory: new vs standing vs resolved |
-| `shelf.py` | the Resolve Later list, projected from `subjects` |
-| `decisions.py` | slug + status + subjects → Intervene Now / Resolve Later / Take Note |
-| `sink.py` | the messages, and a channel outage that cannot fail a round |
-
-**A subprocess rather than an import**, deliberately: the detector is a 2,700-line CLI with six
-sibling modules and a tested JSON contract, so a wedged AWS call costs one round instead of the
-monitor, and a traceback inside the tool is a failed round rather than a dead flow. The flow-runner
-image ships `scripts/` for that reason.
-
-**The permissions the round needs are deployed in both accounts.** The detector was written to be run
-from a laptop against an account, and running it *inside* the account exposed four ways that assumption
-was load-bearing — a CodeArtifact-only import, an unconditional `AWS_PROFILE` export, a missing `aws`
-CLI, and read permissions the runner task role had never needed because nothing in-account had ever
-made those calls. The last one is the only part that is infrastructure rather than code:
-`infra/aws/cdk_constructs/processing_infra.py` now grants the runner role `ObservabilityReads`
-(CloudWatch metrics, Logs Insights result retrieval, Service Quotas, Cost Explorer — all on `*`,
-because none of those APIs support resource-level permissions) and `ObservabilityStartQuery`
-(`logs:StartQuery`, scoped to our own log groups, because that one does). Both are deployed to
-`global-tessera-dev` and `global-tessera-prod`, and verified with `aws iam simulate-principal-policy`
-in both directions: allowed on our log groups, denied on an unrelated one. Ten of the seventeen checks
-depend on them, so before this the round would have posted a mostly-blank verdict on a live campaign.
-
-**Nothing in this plan is unbuilt.** The last gap — the AI reviewer of §5 — closed on 2026-08-13
-with the skill, the three commands it drives, the calibration set that measures it, and check 18,
-which counts what it has actually looked at.
-
-**What remains is operational rather than structural**, and belongs to whoever runs the campaign:
-the review is a session a person starts, so its coverage depends on someone starting it. That is why
-its coverage is a monitored number rather than an assumption.
-
----
+**The AI reviewer is not on the alerting path at all** — an alert whose only link is a model is a
+nondeterministic single point of failure, so the deterministic findings post whether or not a review
+ever runs.
 
