@@ -218,6 +218,7 @@ class _CapturingWriter:
     last_write: dict | None = None
     last_skip: str | None = None
     last_skip_record: dict | None = None
+    discarded: str | None = None
 
     def __init__(self, staging_base, embedding_dim=128):
         self.embedding_dim = embedding_dim
@@ -231,6 +232,10 @@ class _CapturingWriter:
             # actor that never populates the buffer indistinguishable from one that does.
             "month_covered": month_covered.copy() if month_covered is not None else None,
         }
+
+    def discard_coverage(self, chunk, run_id):
+        """The real writer removes a partial coverage tile here; the fake records the intent."""
+        _CapturingWriter.discarded = chunk.label
 
     def write_skip_marker(self, chunk, run_id, record=None):
         _CapturingWriter.last_skip = chunk.label

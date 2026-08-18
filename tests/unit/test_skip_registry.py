@@ -471,88 +471,71 @@ class TestWhetherTheRadarRuleWasEvenOn:
         assert "radar_refusal_rule" not in summary
 
 
-class TestThePerTileSidecar:
-    """Per-tile detail goes beside the store, not inside its metadata.
+class TestThePartIsPublishedOnlyAfterTheCellCommits:
+    """The registry is a sibling of the store, and nothing reconciles the two.
 
-    The year's summary is pooled over the cell, so it can say some tile reached fourteen observations
-    against a cutoff of fifteen but not WHICH — and ranking candidates by how close they came is the
-    whole of a cleanup campaign's planning problem. It cannot simply be added to the zone group's
-    attributes: every reader of that group pays for them on every open, and an earlier per-tile
-    version was removed for exactly that. So it is a sidecar, pointed at from the summary.
+    So a part written while the assembly was still running advertises embedded and refused tiles for
+    a zone-year that may never land — a failed worker, a failed merge, an injected fault — and the
+    claim is permanent, to consumers who are explicitly told they need not open the store. The write
+    therefore happens after the commit, and these tests pin that rather than the writing.
     """
 
-    def test_it_writes_a_parquet_part_and_points_at_it(self, tmp_path: Path) -> None:
-        """A row per live tile, embedded and refused alike, readable with `pd.read_parquet` — which
-        is the promise the Open Data access request makes on our behalf.
-        """
-        pq = pytest.importorskip("pyarrow.parquet")
-        writer = ZarrWriter(str(tmp_path / "staging"))
-        root = str(tmp_path / "registry")
-        part = part_uri(root, "32S", 2021, "run1")
-        for col in (0, 1):
-            chunk = _chunk(0, col)
-            writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64, obs_max=14))
-
-        summary = writer._skip_summary("run1", ["chunk_9_9"], ["chunk_0_0", "chunk_0_1"], root, "32S", 2021)
-
-        assert summary["registry_part"] == part, "the pointer is the promise that it landed"
-        table = pq.read_table(part).to_pylist()
-        by_tile = {r["tile"]: r for r in table}
-        assert set(by_tile) == {"chunk_9_9", "chunk_0_0", "chunk_0_1"}, "every live tile, not just refused"
-        assert by_tile["chunk_9_9"]["embedded"] is True
-        assert by_tile["chunk_9_9"]["refused_px"] is None, "no measurement was taken, so none is claimed"
-        assert by_tile["chunk_0_0"]["embedded"] is False
-        assert by_tile["chunk_0_0"]["refused_thin_px"] == 64
-        # zone/year are the PARTITION keys, not columns — see the module docstring for the type
-        # collision that carrying both causes. The identity is in the file metadata instead.
-        assert "zone" not in by_tile["chunk_0_0"] and "year" not in by_tile["chunk_0_0"]
-        meta = pq.read_schema(part).metadata
-        assert meta[b"zone"] == b"32S" and meta[b"year"] == b"2021"
-
-    def test_the_summary_still_pools_what_it_always_did(self, tmp_path: Path) -> None:
-        """The sidecar is additional, not a replacement: the attributes keep the compact aggregate
-        so a reader who only wants the year's shape never touches the sidecar.
+    def test_the_summary_does_not_write_anything(self, tmp_path: Path) -> None:
+        """`_skip_summary` runs as an ARGUMENT to the shard write, so it must not publish. It reads
+        the markers — the last moment they exist — and hands them on.
         """
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = _chunk(0, 0)
         writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64, obs_max=14))
 
-        summary = writer._skip_summary("run1", [], [chunk.label], str(tmp_path / "reg"), "32S", 2021)
-        assert summary["refused_px_by_reason"]["thin"] == 64
-        assert summary["shards_by_reason"] == {"thin": [chunk.label]}
+        summary = writer._skip_summary("run1", [], [chunk.label])
 
-    def test_no_uri_writes_nothing_and_promises_nothing(self, tmp_path: Path) -> None:
+        assert summary["refused_px_by_reason"]["thin"] == 64, "the pooled summary is unchanged"
+        assert "registry_part" not in summary, "and it promises no part"
+        assert not list((tmp_path / "registry").glob("**/*.parquet")), "nothing was written"
+
+    def test_publishing_writes_a_row_per_live_tile(self, tmp_path: Path) -> None:
+        pq = pytest.importorskip("pyarrow.parquet")
         writer = ZarrWriter(str(tmp_path / "staging"))
-        chunk = _chunk(0, 0)
-        writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64))
+        root = str(tmp_path / "reg")
+        for col in (0, 1):
+            chunk = _chunk(0, col)
+            writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64, obs_max=14))
+        writer._skip_summary("run1", ["chunk_9_9"], ["chunk_0_0", "chunk_0_1"])
 
-        summary = writer._skip_summary("run1", [], [chunk.label], None, "32S", 2021)
-        assert "registry_part" not in summary
+        uri = writer.publish_registry_part(
+            root, "32S", 2021, "run1", embedded=["chunk_9_9"], refused=["chunk_0_0", "chunk_0_1"]
+        )
 
-    def test_a_failed_sidecar_write_never_costs_the_cell(self, tmp_path: Path, monkeypatch) -> None:
-        """The summary is what the store commits. Losing the sidecar costs a future planner some
-        precision; failing the write would cost a cell that is otherwise complete.
+        assert uri == part_uri(root, "32S", 2021, "run1")
+        by_tile = {r["tile"]: r for r in pq.read_table(uri).to_pylist()}
+        assert set(by_tile) == {"chunk_9_9", "chunk_0_0", "chunk_0_1"}, "every live tile"
+        assert by_tile["chunk_9_9"]["embedded"] is True
+        assert by_tile["chunk_9_9"]["refused_px"] is None, "nothing counted this, so nothing is claimed"
+        assert by_tile["chunk_0_0"]["refused_thin_px"] == 64
+        assert by_tile["chunk_0_0"]["obs_max"] == 14, "how close it came, per tile"
+        # zone/year are the partition keys, not columns — the identity is in the file metadata.
+        assert "year" not in by_tile["chunk_0_0"]
+        meta = pq.read_schema(uri).metadata
+        assert meta[b"zone"] == b"32S" and meta[b"year"] == b"2021"
+
+    def test_a_failed_publish_never_costs_a_committed_cell(self, tmp_path: Path, monkeypatch) -> None:
+        """The cell has already landed by the time this runs. Raising here would fail a complete cell
+        over its index, and every column is derivable from the store, so a lost part is rebuildable.
         """
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = _chunk(0, 0)
         writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64))
+        writer._skip_summary("run1", [], [chunk.label])
 
-        root = str(tmp_path / "reg")
-        detail = part_uri(root, "32S", 2021, "run1")
-        real_fs_for = _assembly_mod._fs_for
+        def _boom(*_a, **_k):
+            raise OSError("no such bucket")
 
-        def _boom_on_detail(uri, *a, **k):
-            # Only the SIDECAR write fails. Breaking `_fs_for` outright would break the marker read
-            # too, and then the test would prove nothing about which of the two is load-bearing.
-            if uri == detail:
-                raise OSError("no such bucket")
-            return real_fs_for(uri, *a, **k)
-
-        monkeypatch.setattr(_assembly_mod, "_fs_for", _boom_on_detail)
-        summary = writer._skip_summary("run1", [], [chunk.label], root, "32S", 2021)
-
-        assert summary["refused_px_by_reason"]["thin"] == 64, "the year's record is unaffected"
-        assert "registry_part" not in summary, "and it does not promise a sidecar it failed to write"
+        monkeypatch.setattr(_assembly_mod, "_fs_for", _boom)
+        assert (
+            writer.publish_registry_part(str(tmp_path / "reg"), "32S", 2021, "run1", embedded=[], refused=[chunk.label])
+            is None
+        ), "reported as not published rather than raised"
 
 
 def test_an_unopenable_staging_filesystem_does_not_fail_the_cell(tmp_path: Path, monkeypatch) -> None:
@@ -665,3 +648,58 @@ class TestTheDatasetIsActuallyReadable:
         assert rows[0]["embedded"] is False
         assert rows[0]["refused_px"] is None
         assert rows[0]["obs_max"] is None
+
+
+class TestAPartialCoverageTileCannotWedgeACell:
+    """The defect a reviewer found in the coverage tile, twice, from both ends.
+
+    `write_coverage_only` failing AFTER `to_zarr` created the array metadata but BEFORE
+    `staged_complete` was set leaves a tile that reads back as fill and that `_open_staged_tile`
+    refuses. The skip marker written straight afterwards makes every resume omit the chunk, so
+    nothing repairs it — and under the stable, input-fingerprinted run id that refusal repeats on
+    every retry and wedges the cell until someone deletes the prefix by hand.
+    """
+
+    def test_assembly_treats_an_incomplete_coverage_tile_as_absent(self, tmp_path: Path) -> None:
+        """Absent and half-written are the same answer for an OPTIONAL artifact: fill, and publish.
+
+        Refusing here would fail assembly over PROVENANCE for a cell whose data is fine.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+        obs = {"s2_obs_count": np.full((8, 8), 7, dtype=np.uint16)}
+        writer.write_coverage_only(chunk, "run1", obs, None)
+        # Strip the completion attribute, which is exactly what a crash mid-write leaves behind.
+        group = zarr.open_group(writer._coverage_path("run1", chunk), mode="a")
+        del group.attrs["staged_complete"]
+
+        source = StagedShardSource(
+            staging_base=str(tmp_path / "staging"),
+            run_id="run1",
+            shards=(),
+            variables=("s2_obs_count",),
+            shard_px=8,
+            dtypes=(("s2_obs_count", "uint16"),),
+            cleared=((0, 0),),
+            fill_values=(("s2_obs_count", 0),),
+        )
+        block = source.load((0, 0))
+        assert not block["s2_obs_count"].any(), "filled, not raised"
+
+    def test_a_partial_tile_is_removed_when_its_write_fails(self, tmp_path: Path) -> None:
+        """The other half: the producer deletes what it left, so nothing is there to tolerate."""
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+        obs = {"s2_obs_count": np.full((8, 8), 7, dtype=np.uint16)}
+        path = writer.write_coverage_only(chunk, "run1", obs, None)
+        assert Path(path).exists()
+
+        writer.discard_coverage(chunk, "run1")
+        assert not Path(path).exists()
+
+    def test_discarding_a_tile_that_is_not_there_is_silent(self, tmp_path: Path) -> None:
+        """It runs on a path that is already failing, so it must never raise: another exception there
+        would replace a degraded provenance entry with a lost chunk.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        writer.discard_coverage(_chunk(4, 4), "run1")  # must not raise

@@ -136,7 +136,12 @@ class BucketPaths(BaseModel):
         own manifests, so a Parquet file living there is at best unrecognised and at worst
         collected.
         """
-        store = self.global_store()
+        # TRAILING SEPARATORS FIRST. An override ending in "/" leaves `name` empty, and the sibling
+        # then comes out as `.../dclimate.icechunk/.registry` — INSIDE the Icechunk-owned prefix,
+        # which is the one place a Parquet file must never live: garbage collection enumerates that
+        # prefix, reconciles it against its own manifests, and can collect what it does not
+        # recognise. A configured URI is human-entered, so the trailing slash is a matter of time.
+        store = self.global_store().rstrip("/")
         base, sep, name = store.rpartition("/")
         stem = name[: -len(".icechunk")] if name.endswith(".icechunk") else name
         # A store URI with no separator at all — a bare relative path like

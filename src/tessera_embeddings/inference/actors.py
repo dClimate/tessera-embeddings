@@ -1385,6 +1385,22 @@ class InferenceActor:
                         "fill. The refusal reasons in the marker are unaffected.",
                         chunk.label,
                     )
+                    # AND REMOVE WHAT IT LEFT, which is the half of this that matters. A failure
+                    # AFTER `to_zarr` created the array metadata but BEFORE `staged_complete` was set
+                    # leaves a tile that reads back as fill and that `_open_staged_tile` refuses —
+                    # while the marker written just below makes every resume skip this chunk, so
+                    # nothing ever repairs it. Under the stable, input-fingerprinted run id that
+                    # refusal then repeats on every retry and wedges the cell until someone deletes
+                    # the prefix by hand. Swallowing the write and keeping its debris would have
+                    # turned a degraded provenance entry into a permanently failing cell.
+                    # Guarded at the CALL as well, even though `discard_coverage` is written not to
+                    # raise. Nothing on this path may stop the marker below being written: the marker
+                    # is what tells a legitimate skip from a crashed worker, and an exception here —
+                    # an older writer without the method, anything — would turn a benign skip into a
+                    # failed chunk and wedge the cell on every retry. Exactly the failure this whole
+                    # cleanup exists to prevent, so it must not reintroduce it one line up.
+                    with contextlib.suppress(Exception):
+                        writer.discard_coverage(chunk, run_id)
                 writer.write_skip_marker(chunk, run_id, skip_record)  # small marker: keep synchronous
                 # Collect the prior deferred write BEFORE snapshotting elapsed —
                 # the wait is actor-occupancy this chunk owns, same as the

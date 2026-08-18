@@ -760,7 +760,12 @@ class StagedShardSource:
         path = f"{self.staging_base}/{self.run_id}/{chunk_label(sy, sx)}{_COVERAGE_SUFFIX}"
         try:
             group = _open_staged_tile(path)
-        except FileNotFoundError:
+        except (FileNotFoundError, IncompleteStageError):
+            # ABSENT or HALF-WRITTEN are the same answer for an OPTIONAL artifact: fill, and publish
+            # the year. An incomplete coverage tile must not fail assembly — the skip marker means no
+            # resume will ever re-stage it, so refusing here wedges the cell on every retry under the
+            # stable run id, and it wedges it over provenance rather than over data. A crash between
+            # `to_zarr` and `staged_complete` leaves exactly this, with no handler having run.
             return blocks
         for var in self.variables:
             if var not in group:
@@ -866,9 +871,6 @@ class ZarrWriter:
         run_id: str,
         staged: list[str],
         skipped: list[str],
-        registry_root: str | None = None,
-        zone: str = "",
-        year: int = 0,
     ) -> dict:
         """The year's optical-skip summary, with the per-shard reasons read from their markers.
 
@@ -877,49 +879,21 @@ class ZarrWriter:
         the cell lands. A published cell is write-once.
 
         ``detail_uri`` is where the PER-TILE records are persisted, and passing one is what makes a
-        future cleanup campaign possible: the summary in the store's attributes is pooled over the
+        future infill campaign possible: the summary in the store's attributes is pooled over the
         year, so it can say a tile somewhere reached fourteen observations against a cutoff of
         fifteen but not WHICH tile — and ranking candidates by how close they came is the whole of
-        that planning problem. The detail is a sidecar rather than more store metadata because every
-        reader of the zone group pays for its attributes on every open, and an earlier per-tile
-        version was removed for exactly that. The URI comes from the caller
-        (:meth:`BucketPaths.refusal_detail`); nothing here constructs one.
+        that planning problem.
 
-        Best-effort by design: the summary is what the store commits, and losing the sidecar costs a
-        future planner some precision while failing the write would cost the cell.
+        This method does NOT publish them. It keeps them on the writer for
+        :meth:`publish_registry_part`, which the caller runs only after the cell has committed: the
+        registry is read by consumers who are explicitly told they need not open the store, so a part
+        written before the commit advertises a cell that may never land.
         """
         records, unreadable = read_skip_records(self.staging_base, run_id, skipped)
+        # KEPT for the caller to publish AFTER the commit — see `publish_registry_part`. Reading the
+        # markers here is not optional: this is the last moment they exist.
+        self._last_skip_records = dict(records)
         summary = summarise_optical_skips(staged=staged, skipped=skipped, records=records)
-        if registry_root:
-            detail_uri = part_uri(registry_root, zone, year, run_id)
-            try:
-                fs = _fs_for(detail_uri)
-                fs.makedirs(detail_uri.rsplit("/", 1)[0], exist_ok=True)
-                written = write_registry_part(
-                    detail_uri,
-                    registry_rows(
-                        run_id,
-                        datetime.datetime.now(datetime.UTC).isoformat(),
-                        embedded=staged,
-                        refused=skipped,
-                        records=records,
-                    ),
-                    open_output=lambda uri: fs.open(uri, "wb"),
-                    zone=zone,
-                    year=year,
-                )
-            except Exception:
-                logger.exception(
-                    "Run %s: per-tile refusal detail could not be written to %s; the year's pooled "
-                    "summary is unaffected",
-                    run_id,
-                    detail_uri,
-                )
-            else:
-                # A POINTER, so a reader of the attributes knows the registry part exists without
-                # carrying it. Recorded only on a successful write, so its presence is a promise.
-                summary["registry_part"] = detail_uri
-                logger.info("Wrote registry part with %d tile row(s) to %s", written, detail_uri)
         if unreadable:
             # SURFACED, because "no records" and "every read failed" are the same empty dict. Without
             # this a systematic failure — expired credentials, a wrong prefix — would publish a
@@ -998,6 +972,86 @@ class ZarrWriter:
         marker.attrs["staged_complete"] = True
         logger.info("Staged coverage-only tile for refused chunk %s to %s", chunk.label, path)
         return path
+
+    def publish_registry_part(
+        self,
+        registry_root: str,
+        zone: str,
+        year: int,
+        run_id: str,
+        *,
+        embedded: list[str],
+        refused: list[str],
+    ) -> str | None:
+        """Publish this cell's registry part. Call ONLY after the cell has committed.
+
+        The ordering is the point. The registry exists so a consumer need not open the store, and it
+        is a sibling of the store rather than part of it — so nothing reconciles the two. A part
+        written while the assembly was still running therefore advertises embedded and refused tiles
+        for a zone-year that may never land: a failed worker, a failed merge, an injected fault, and
+        the claim is permanent. Publishing after the commit makes the part's existence mean the cell
+        exists.
+
+        Returns the URI on success, ``None`` on failure. Best-effort, and only in this direction:
+        losing a part costs a future infill campaign some precision, while raising here would fail a
+        cell that has already landed — the worst trade available, since the data is fine and only its
+        index is missing. A lost part is also recoverable, because every column is derivable from the
+        store the cell just wrote.
+        """
+        records = getattr(self, "_last_skip_records", {})
+        uri = part_uri(registry_root, zone, year, run_id)
+        try:
+            fs = _fs_for(uri)
+            fs.makedirs(uri.rsplit("/", 1)[0], exist_ok=True)
+            written = write_registry_part(
+                uri,
+                registry_rows(
+                    run_id,
+                    datetime.datetime.now(datetime.UTC).isoformat(),
+                    embedded=embedded,
+                    refused=refused,
+                    records=records,
+                ),
+                open_output=lambda target: fs.open(target, "wb"),
+                zone=zone,
+                year=year,
+            )
+        except Exception:
+            logger.exception(
+                "Run %s: registry part for %s year %d could not be published to %s. The cell itself "
+                "is committed and unaffected, and every column is derivable from it, so this is a "
+                "rebuildable index rather than lost data.",
+                run_id,
+                zone,
+                year,
+                uri,
+            )
+            return None
+        logger.info("Published registry part with %d tile row(s) to %s", written, uri)
+        return uri
+
+    def discard_coverage(self, chunk: ChunkSpec, run_id: str) -> None:
+        """Remove a chunk's coverage-only tile, complete or partial. Never raises.
+
+        Called when :meth:`write_coverage_only` failed partway. A tile whose ``staged_complete`` was
+        never set reads back as fill and is REFUSED by :func:`_open_staged_tile`, and the skip marker
+        written immediately afterwards makes every resume omit the chunk — so nothing repairs it, and
+        under the stable run id the refusal repeats on every retry and wedges the cell. Best-effort
+        because it runs on a path that is already failing: another exception here would replace a
+        degraded provenance entry with a lost chunk.
+        """
+        path = self._coverage_path(run_id, chunk)
+        try:
+            fs = _fs_for(path)
+            with contextlib.suppress(FileNotFoundError):
+                fs.rm(path, recursive=True)
+        except Exception:
+            logger.exception(
+                "Chunk %s: could not remove the partial coverage tile at %s. Assembly tolerates an "
+                "incomplete tile as absent, so this is untidy rather than blocking.",
+                chunk.label,
+                path,
+            )
 
     def write_skip_marker(self, chunk: ChunkSpec, run_id: str, record: dict | None = None) -> str:
         """Write a skip marker for a chunk, carrying WHY it was refused.
@@ -2432,6 +2486,9 @@ class ZarrWriter:
             fill_values=fill_values,
         )
         telemetry: dict[str, Any] = {}
+        # The labels the registry part will describe, captured before the write so the part reports
+        # what THIS call published rather than whatever a later listing happens to see.
+        registry_embedded, registry_refused = list(labels), list(skipped)
         snapshot = write_year_shards(
             repo,
             zone,
@@ -2447,11 +2504,7 @@ class ZarrWriter:
             # write agree by construction; run_provenance drops it on an empty year.
             # `skipped_labels=None` is a caller that resolved no live set at all, so
             # there is nothing to summarise and no ZERO to assert (see below).
-            optical_skips=(
-                self._skip_summary(run_id, labels, skipped, registry_root, zone, year)
-                if skipped_labels is not None
-                else None
-            ),
+            optical_skips=(self._skip_summary(run_id, labels, skipped) if skipped_labels is not None else None),
             empty=empty,
             telemetry=telemetry,
             # The fill's coordinator progress goes through the caller's logger —
@@ -2461,6 +2514,18 @@ class ZarrWriter:
             fault=fault,
             input_coverage=input_coverage,
         )
+        # THE CELL IS COMMITTED. Only now is the registry allowed to say so — it is a sibling of the
+        # store that nothing reconciles against it, and consumers are told they need not open the
+        # store, so a part written any earlier could advertise a cell that never landed.
+        if registry_root:
+            self.publish_registry_part(
+                registry_root,
+                zone,
+                year,
+                run_id,
+                embedded=registry_embedded,
+                refused=registry_refused,
+            )
         workers = telemetry.get("workers", [])
         _log.info(
             "%s",

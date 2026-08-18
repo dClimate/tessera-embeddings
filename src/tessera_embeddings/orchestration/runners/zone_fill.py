@@ -64,7 +64,7 @@ import zarr
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import InferenceConfig
-from tessera_embeddings.config.store_layout import GLOBAL
+from tessera_embeddings.config.store_layout import GLOBAL, REQUIRED_VARS
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     SpatialCoords,
@@ -459,14 +459,27 @@ def preflight_destination(
     metadata read to fail before it spends anything at all.
 
     Raises:
-        ValueError: If the zone is not seeded, or its arrays disagree with the layout the
-            staging writer produces (dtype or logical attrs).
+        ValueError: If the zone is not seeded, if a REQUIRED array is missing from it, or if its
+            arrays disagree with the layout the staging writer produces (dtype or logical attrs).
     """
     repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
     if zone not in root:
         raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
-    check_destination_types(cast(zarr.Group, root[zone]), GLOBAL, where=f"{zone} year {year}")
+    node = cast(zarr.Group, root[zone])
+    # PRESENCE OF THE REQUIRED ARRAYS, which the type check deliberately does not test: it skips an
+    # absent array so an older store missing an OPTIONAL carried variable still fills. That
+    # tolerance is right for the optional set and wrong for `embeddings`/`scales` — a zone missing
+    # one of those passed this preflight, provisioned a GPU fleet, ran a full inference, and was
+    # rejected by assembly afterwards. Absent is a different fault from mistyped and needs its own
+    # test; the optional set stays tolerated.
+    missing = [var for var in REQUIRED_VARS if var not in node]
+    if missing:
+        raise ValueError(
+            f"{zone} year {year}: the seeded zone group is missing required array(s) {missing} — "
+            f"assembly cannot write a cell without them. Re-seed the zone group (D1) before filling."
+        )
+    check_destination_types(node, GLOBAL, where=f"{zone} year {year}")
 
 
 def plan_zone_inference(
@@ -950,6 +963,12 @@ def assemble_zone_year(
                 gate=gate,
                 staged_labels=(),
                 skipped_labels=sorted(c.label for c in live),
+                # THE CELL WITH THE MOST TO SAY, and it was the one saying nothing. Every live tile
+                # refused, so this branch holds the richest refusal record a cell can produce — and
+                # it omitted the registry root, so no part was written. `empty=True` also drops the
+                # pooled summary from the year's provenance, and staging cleanup then destroyed the
+                # only surviving account of which tiles were thin, unimaged, or radar-free.
+                registry_root=registry_root,
                 s3_concurrency=s3_concurrency,
                 empty=True,
                 get_credentials=get_credentials,
