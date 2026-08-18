@@ -216,6 +216,57 @@ below.
 > quantised embedding shrink by 7%, so the store is essentially 120 bytes of embedding per pixel
 > whatever else is added beside it — and month coverage compresses ~400×.
 
+> **OPTICAL DEPTH IS THE ONLY REFUSAL RULE — and radar was silently refusing land too
+> (2026-08-18).** A DECISION (Robert), and a correction to what the campaign was actually doing. The
+> per-pixel gate in `inference/dataset.py` is `has_optical & deep_enough`, then `if not
+> allow_s2_only: &= has_radar`. `allow_s2_only` defaults to **False** and no deployment set it, so
+> every pixel with zero S1 observations was refused — and a tile with no radar coverage had *every*
+> pixel refused, wrote a skip marker, and published as fill.
+>
+> Measured on the overnight four-cell run:
+>
+> | cell | live tiles | skipped | published |
+> |---|---:|---:|---:|
+> | 40S/2023 | 58 | **43** | 59.7M px, ~24% of its land |
+> | 40S/2022 | 58 | **43** (the same 43) | 58.6M px |
+> | 02S/2023 | 76 | 34 | 173.7M px |
+> | 47S/2023 | 239 | 4 | 858.9M px |
+> | 15S/2023 | 59 | 0 | 225.2M px |
+>
+> **The identical 43 tiles in two independent years is what identified the cause**: radar orbit
+> footprints are fixed geometry, so the same ground lacks radar every year. Cloud cover cannot
+> reproduce that. Two other explanations were tested and refuted first — reflectance bands missing
+> where the SCL is valid (0.0% of valid observations lack a red band, on surviving 16S/17S mosaics),
+> and a coordinate error in the comparison (the mosaic's northing at its own index equals the store's
+> at the resolved index).
+>
+> **Too much land to weed out, so the cost is accepted.** Radar-free pixels are embedded through the
+> upstream v1.1 missing-S1 convention (an all-zeros normalised S1 slice); their embedding quality is
+> unvalidated for an S1-trained checkpoint. The alternative was losing the majority of some zones.
+> `CAMPAIGN_ALLOW_S2_ONLY = True` is registered on the driver AND both fill deployments — a fill
+> dispatched by hand takes its own default, which is exactly how the overnight cells got the old
+> policy.
+>
+> **The line is STRICTLY FEWER than 15.** A pixel with exactly 15 valid optical observations is
+> embedded; 14 is refused. The gate reads `s2_valid_count >= optical_min_obs` and the thin count
+> reads `< thin_below`, so both agree, and a test now pins 13/14/15/16 at the campaign's own value
+> rather than at a stand-in line.
+>
+> **Three things about the RECORD are still wrong, and the per-shard registry is what fixes them.**
+> `dataset.py` deliberately computes `refused_no_optical`, `refused_thin` and `refused_no_radar` and
+> keeps them apart — then a fully refused chunk writes a zero-byte marker and all three are
+> discarded. What survives is called `optical_skips`, which for these tiles named the wrong cause.
+> And `radar_coverage.s1_free_pct` read **0.0** for 40S — "no radar-free pixels" — because it is
+> computed over EMBEDDED pixels only and so can never count the ones the gate removed. A
+> self-fulfilling measurement.
+>
+> **Still open, and deliberately not changed here:** the ZONE-level gate. `require_s1` defaults True
+> and refuses a fill that finds no SAR stores at all, which is what stopped 28S/2022 until it was
+> dispatched by hand. A zone with no radar in principle is real geography — the 2026-08-06 audit has
+> 28S at zero VV in all nine years — so that default now contradicts the decision above for a
+> handful of zones. It is a separate call because relaxing it also removes a genuine
+> ingest-bug detector; the audit's per-zone verdicts are what a targeted relaxation would key on.
+
 > **The first cell published twelve empty planes, and every other array beside them was right
 > (2026-08-18).** 09S/2022 landed in `tessera-months`, validated, and reported 51 observations per
 > pixel. Its `s2_month_covered` was `False` everywhere — 4 matching flags out of 786,432, and those 4

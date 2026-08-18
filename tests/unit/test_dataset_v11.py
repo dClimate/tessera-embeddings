@@ -223,6 +223,37 @@ class TestTheMinimumOpticalDepthGate:
         assert len(ds) == 1
         assert ds.refused_thin == 1
 
+    def test_the_campaigns_own_line_is_fifteen_and_fifteen_is_kept(self):
+        """Pinned at the value the campaign actually runs, not a stand-in.
+
+        The rule is STRICTLY FEWER than fifteen: 14 is refused, 15 is embedded. Stated here because
+        an off-by-one at the boundary changes what a petabyte contains and would be invisible in
+        aggregate — 15 is the modal depth in exactly the thin band this line was chosen to keep.
+        """
+        ds = MosaicChunkInferenceDataset(
+            self._chunk(np.array([[13, 14, 15, 16]])), allow_s2_only=True, optical_min_obs=15
+        )
+        assert len(ds) == 2, "15 and 16 are embedded"
+        assert ds.refused_thin == 2, "13 and 14 are refused"
+
+    def test_a_deep_pixel_with_no_radar_is_embedded_under_the_campaigns_policy(self):
+        """The case that cost 40S three-quarters of its land.
+
+        The per-pixel gate refuses a pixel with zero S1 observations unless allow_s2_only, and no
+        deployment set it — so 43 of 40S's 58 live tiles published as fill, identically in 2022 and
+        2023 because radar orbit footprints are fixed geometry. There is too much such land to weed
+        out, so the cost to embedding quality is accepted and optical depth is the ONLY refusal rule.
+        """
+        chunk = self._chunk(np.array([[40, 40]]))
+        chunk.s1_asc_bands[:] = 0.0
+        chunk.s1_desc_bands[:] = 0.0
+        embedded = MosaicChunkInferenceDataset(chunk, allow_s2_only=True, optical_min_obs=15)
+        assert len(embedded) == 2, "deep optical with no radar must still be embedded"
+        assert embedded.refused_no_radar == 0
+        # And the old behaviour, for contrast: the same pixels, refused for the wrong reason.
+        refused = MosaicChunkInferenceDataset(chunk, allow_s2_only=False, optical_min_obs=15)
+        assert (len(refused), refused.refused_no_radar, refused.refused_thin) == (0, 2, 0)
+
     def test_none_embeds_everything_with_any_optical_input(self):
         chunk = self._chunk(np.array([[1, 5, 29, 100]]))
         ds = MosaicChunkInferenceDataset(chunk, allow_s2_only=True, optical_min_obs=None)
