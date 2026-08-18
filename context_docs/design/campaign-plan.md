@@ -407,119 +407,33 @@ zone: `campaign-monitoring-plan.md`.
 
 ## 6. Sizing, cost, and the two things that actually bind
 
-**Figures below are results, not derivations.** [`campaign-cost-model.md`](campaign-cost-model.md)
-is the source of truth for every number here and the arithmetic behind it; this section states
-what to run and what it costs. Where the two disagree, the cost model is right.
+**Figures here are results, not derivations.** [`campaign-cost-model.md`](campaign-cost-model.md) is
+the source of truth for every number and the arithmetic behind it; where the two disagree, the cost
+model is right. This section says what to run and what it costs, and nothing more — the derivations
+that used to be restated here are one click away and were a second copy of numbers that move.
 
-**Costed in tokens, and both sides of the division are measured in one unit.** Inference
-consumes a sequence per pixel, so cost scales with `tokens = pixels × observations`, not with
-pixels. The campaign is **2.36 × 10¹⁵ combined S2+S1 tokens** — 1.363 × 10¹³ pixels at a
-measured, land-weighted **173 tokens per pixel** — at a measured **2.127 M combined tok/sec**
-per worker (cost model §6c). The equivalent px/s is 12.3K.
+| | |
+|---|---|
+| Shape | all years in one batch, 61 cells × 60 workers, 10 clusters × 250 actors |
+| Campaign total | **~$700,000** (ingest ~$121,000, inference ~$573,000, the rest ~$6,000) |
+| Wall clock | **~5.1 days** |
+| Basis | 2.36 × 10¹⁵ combined S2+S1 tokens — 1.363 × 10¹³ pixels at a measured, land-weighted **173 tokens/pixel** — at **2.127 M combined tok/sec** per worker |
+| Idle burn | $0, from provisioning at 85% of matched |
 
-**Quote combined tok/sec, never px/s and never optical tok/sec.** Pixels-per-second mixes machine
-speed with geography. An optical rate is a *different unit*: `t_kept` counts optical timesteps only,
-so it cannot see the radar sequences the same forward pass encodes — on an optical basis the same
-fleet reads 2.26–2.93 M tok/s radar-free, 1.60–1.79 M on one orbit and 1.23–1.62 M on both, a spread
-that is an artefact of the unit rather than a real difference. On the combined basis it collapses to
-1.01–1.08× within a run, so that is the only basis quoted here.
+**Quote combined tok/sec, never px/s and never optical tok/sec.** Pixels per second mixes machine
+speed with geography, and an optical rate is a *different unit* — the mismatch that put the line 19%
+wrong once already.
 
-**The configuration is 61 ingest cells at 60 S2 workers each, and 2,500 GPU actors as 10 clusters
-of 250.** That is **~5.1 days** and **~$700,000** (interval $594,000 – $846,000, of which inference
-is $573,000; cost model §1, §6c, where the ingest line is under review upward by up to 3×). Both quotas are
-applied in prod and both are the binding limit rather than slack: 22,692 of 25,000 Fargate vCPU,
-and 10,000 of 10,000 G-and-VT.
+**The two things that actually bind**, which is why this section exists at all rather than being a
+link:
 
-**The schedule is `307,854 GPU-hours ÷ 2,500 actors` = 5.1 days**, and every other number here is
-subordinate to it. Ingest delivers its 1,008 zone-years in 4.2 days at 61 cells, so the fleet is
-the constraint and always finishes last.
+**The GPU quota, not the money.** 2,500 GPUs is the ceiling and the fleet is sized to it; the budget
+has margin the quota does not.
 
-**Three limits set that shape, and it is the only point where all three are satisfied.**
-
-| limit | value | what it forces |
-|---|---|---|
-| G-and-VT quota | 10,000 vCPU = 2,500 `g6e.xlarge` actors | the total fleet, and therefore the 5.1 days |
-| assembly ceiling | ~275 actors per cluster | at least 10 clusters, since 2,500 ÷ 8 = 312 crosses it |
-| Fargate quota | 25,000 vCPU | at most ~67 cells; 61 is what the fleet can absorb |
-
-**Why 61 cells and not fewer or more.** With every year in one batch there is no per-year floor,
-so past about 52 cells the fleet is what the campaign waits on and the date stops moving. Fewer
-cells would reach the same 5.1 days but with no ingest buffer; more would buy neither speed nor
-anything else. 61 is the count that keeps the fleet fed at **81% of what ingest can supply** —
-under it by policy, so a mosaic is always waiting and no GPU idles.
-
-| cells | Fargate vCPU | ingest | fleet vs supply | campaign |
-|---|---|---|---|---|
-| 52 | 19,344 | 4.80 d | ~96% — no buffer | ~5.1 d |
-| **61 — the campaign** | **22,692** | **4.18 d** | **81%** | **~5.1 d** |
-| 66 | 24,552 | 3.86 d | 75% | ~5.1 d |
-
-**Cost is flat across that table to within 0.5%**, because inference is the same pixels at the same
-rate and ingest worker-hours are width-neutral. So the column that matters is the buffer, not cost.
-
-**If the date ever has to move, buy actors, because nothing else touches it.** The fleet is already at
-quota, so this means a quota increase: at 3,000 actors the campaign is ~4.3 days, and each 250
-actors beyond that wants one more cluster to stay under the assembly ceiling.
-
-**Provision the GPU fleet under what ingest can feed.** That is the policy, not an accident of
-rounding: it keeps a standing queue of finished mosaics so the fleet is never idle, and the margin
-absorbs an ingest cell failing and restarting without the GPUs noticing. The campaign sits at 81%,
-which the quota chose rather than the policy — 85% would want 2,611 actors and there are 2,500. The cost
-is that inference trails ingest slightly at the start.
-
-**Fleet-feeding is not a risk to plan around: the GPUs were busy at least 97.3% of the time**,
-measured on 38N-2021 at 60 actors over 9,051 chunks and 14.7 hours for $1,600, with nothing stalled.
-
-> **Provisioning under supply also keeps the campaign under the assembly ceiling.** A cluster
-> assembles on one trailing thread, and adding actors makes inference faster while assembly stays
-> the same speed, so the two eventually cross: above roughly **275 actors per cluster** assembly
-> becomes the critical path. At the campaign's **250**, assembly finishes in **1.10×** the time
-> inference takes — off the critical path, but by 10% rather than comfortably. That is why the
-> fleet is **10 clusters of 250** rather than 8 of 312: the same 2,500 actors, on the safe side of
-> the ceiling.
->
-> **So fleet width and assembly capacity are one decision, not two.** Anyone raising the fleet for
-> throughput is spending this margin. If a wider fleet is ever wanted, the remedy is the assembly
-> side rather than the fleet: the runner leaves about 39% of its CPU idle at the shipped pool
-> width, and that idle capacity is exactly what a fleet above the ceiling would need.
-
-**Assembly is the shard write.** The merge and commit are 37 seconds of a 196-minute assembly,
-so there is no second phase to schedule around. What sets that duration is that the staged
-intermediate is stored **uncompressed** — if assembly wall-clock ever matters, compressing it is
-the only lever with real leverage.
-
-**Width costs nothing in contention.** Measured on prod at 55 concurrent cells and 20,316 vCPU:
-the orchestrator sat at 25% CPU with zero dropped events, placement was exact, and every 503 in
-the window was upstream. The ingest line carries no load penalty at full campaign width.
-
-**Cold start is a real term in any restart calculus.** At 160 requested actors the fleet stood
-at 60 after 25 minutes and 151 after 60 — so widening a fleet by cancel-and-redispatch pays a
-fresh `ray up`, per-worker bringup and model load, and the saving is the naive ratio minus that
-ramp. It is also the standing argument for the chained-cluster strategy of §1.
-
-**GPUs are on-demand.** Spot is excluded by decision: sustaining this many g6e instances for
-days makes interruption a certainty, and a campaign that stalls on capacity is worse than one
-that costs more. Settled; do not re-open.
-
-**The model is v1.1.** v2 Large was evaluated and is not being used.
-
-> **A fifth of the land has no radar for 2022–2024.** OPERA RTC-S1 coverage was withdrawn
-> after Sentinel-1B failed in December 2021 — interior Australia and much of Siberia return
-> *zero* granules for those years — and was restored when Sentinel-1C came online in 2025.
-> **`allow_s2_only` is on**, so those pixels are embedded from their optical sequence with a
-> neutral radar input instead of being dropped: 6.8% of pixel-years across the campaign.
-> They are cheaper too, which is where part of the rate above comes from. Cambridge validated
-> radar-free embeddings, so this is a share to report with the data rather than a caveat to
-> defend, and every affected pixel is identifiable afterwards
-> (`s1_asc_obs_count + s1_desc_obs_count == 0`).
->
-> **Greenland and Arctic Canada ship optical-only in every year, for an unrelated reason.**
-> Zones 23N and 24N publish tens of thousands of **HH/HV** granules and effectively no VV+VH, so
-> the ingest declines them on polarisation rather than for lack of radar — about 208 live tiles.
-> Those granules report `BEAM_MODE=IW`, so this is **not** EW mode, and it is a model question if
-> ever revisited rather than an ingest one. Settled.
-
----
+**The ingest line is under review UPWARD by up to 3×.** Measured velocity on three virgin zones came
+in 2.7–4.0× slower than the fit that produced $121,000. If it holds, ingest stops being the cheap
+half. It does not touch the inference line. This is the one figure that could still change the
+answer — cost-model §4.
 
 ## 7. Before launch
 

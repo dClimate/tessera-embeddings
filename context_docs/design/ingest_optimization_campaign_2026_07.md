@@ -583,188 +583,25 @@ tried. Sweep before generalising, or scope the setting to where it was measured.
 
 ## 4. What did not work, and why
 
-### 4.1 Coarsening the STORE chunk to 8192 — rejected on the GPU side's own evidence
+### 4.1-4.8 What was tried and rejected — the table, so none of it is retried
 
-The largest available graph reduction (3.88×) and the one we did not take. The GPU-saturation
-campaign had already measured the cost: with 4000² source chunks, "every read re-decompresses
-whole storage chunks; measured fixed read ≈13 s regardless of strip size". A full-width strip
-decompresses `width × chunk_edge` bytes — linear in the edge — so doubling the store chunk
-roughly doubles that fixed read.
+Eight approaches measured and turned down. Each had its working; what a future reader needs is the
+verdict and the reason, because the cost of losing these is someone re-running them.
 
-Set against what that campaign bought: GPU-idle overhead per chunk went **50–60 s → 24–34 s →
-~6 s median** on prefetch-hit chunks. Adding 13+ s back roughly triples the steady-state
-overhead a whole branch was spent removing, on a resource running at **99% utilisation during
-inference** (VRAM peak 97%; host RAM has slack at 46% of a 60% operating ceiling, GPU does
-not).
+| approach | verdict | why |
+|---|---|---|
+| **coarsen the STORE chunk to 8192** | rejected | the GPU side vetoes it: inference reads whole chunks, so a coarser store chunk multiplies read volume for every consumer. Measured, not argued |
+| **cost-model window grouping** | rejected | over-merged into the scheduler; the optimiser traded real area for a boundary cost that had already stopped existing (§3.17) |
+| **spatial manifest sharding** | rejected | a **30–50% regression** — the axis matters more than the size, and time is the right axis |
+| **double load blocks again, 8192 → 16384** | not worth it | measured **1.35×**, against a prediction of 2–3×, at 537 MB per band-block |
+| **several rejected without testing** | defensible | each contradicted a measured constraint already in hand; the section records which, so "untested" is not read as "unconsidered" |
+| **remove the realignment** | reverted | projected 3.85× and ~5% materialised, because the census modelled the write layer instead of measuring it — and the memory claim came from the first twelve heartbeats of a run that later spilled |
+| **narrow window geometry further** | rejected | three variants, all worse. The best any rectangle strategy achieves is 0.50× current area; the shipped one already achieves 0.75× |
+| **worker memory back to 16 GiB** | ADOPTED, late | rejected while the driver held unpruned catalogue items, and affordable once §3.13's pruning landed — a rejected size that another change made viable |
 
-It compounds: the 5.75 GiB strip budget is sized so a full-width band load fits in ONE strip.
-Coarser store chunks fit fewer rows per budget, so more chunks split into two strips, so more
-two-strip co-residency — the direction of the **92–95% RAM OOM** that motivated striping. The
-P3 budget raise *lowered* peak RAM by making more chunks single-strip; this pushes that lever
-backwards.
-
-**And a test design trap:** spatially-sparse chunks already read only a narrow easting window,
-so a sparse zone shows less amplification than a dense one. Any chunk-geometry test must use a
-DENSE area or it will look safe and not be.
-
-### 4.2 Cost-model window grouping — over-merged into the scheduler
-
-Fitting `F` and `V` from a matched A/B pair gave a ratio implying one saved write was worth
-~200 blocks of extra area, so a dynamic program minimising `n_windows × 200 + area` took `35N`
-from 15 windows to 3. **The per-date wall clock did not move** (193.9 s against 194.4 s) and
-then *degraded* (233 s, 269 s) with dispatch lag reaching 2 s.
-
-Cause: the linear model assumes area is dispatched at a fleet-limited rate. Past the
-scheduler's throughput it is not, so the optimiser over-merges. Scheduler CPU went from 66%
-mean / 93% max at 15 windows to **pinned at 100%** on 84,054-task graphs.
-
-**Retained from the failure:** the window cap is now denominated in graph **tasks**
-(`MAX_TASKS_PER_WINDOW`) rather than chunk area, because area silently changes meaning whenever
-band count or block geometry moves — which subsequent changes did. The old 2,048-chunk cap
-permitted that 84,054-task window.
-
-### 4.3 Spatial manifest sharding — a 30–50% regression
-
-The module's documented default splits `{northing: 4, easting: 4}`, and its comment states a
-time split "would be a no-op at ≤256 dates". Following that default made ingest **30–50%
-slower**: per-date went from 187.9 s to 245.8 and 281.3 s.
-
-The default's reasoning is correct for the workload it was written for — the region-write merge
-path, where "each write_region commits one compact, scattered ~3×3-chunk block". **Campaign
-ingest commits one DATE covering every live window**, i.e. essentially the whole live area, so
-no spatial shard is ever untouched. Measured: **~5,097 manifest objects rewritten per commit
-instead of ~14**, and those PUT latencies cost far more than the bytes saved.
-
-**The rule, now documented at the constants:** split the axis along which a single commit is
-NARROW. Campaign ingest is narrow in time and wide in space — the exact inverse of the merge
-workload.
-
-### 4.4 Doubling load blocks again, 8192 → 16384 — measured, not worth it
-
-Predicted 2–3×; **measured 1.35×**, for 4× the memory per task (134 → 537 MB per band-block) on
-a fleet whose hottest worker already reached 10.3 of 16 GiB.
-
-It flattens because the write tasks are one per (store chunk, band) and do **not** scale with
-block size — they are set by the store's chunking, which is pinned. Writes were 13% of the
-graph at 4096 and 28% at 16384; even a free read side would only give 3.5× more, ever. Gated on
-a local task census before any spend, which is why nothing was spent.
-
-### 4.5 Rejected without testing, and why that is defensible
-
-- **Coarsening `INGEST_CHUNKS["time"]` beyond 1** — would batch dates per commit, breaking the
-  property that a date's time slot lands atomically with its pixels. That property is what
-  makes a crashed ingest safely retryable; the ingest marker makes a wrongly-recorded date
-  permanent.
-- **Folding the ROI mask inside `odc.stac.load`** — no clean hook exists; ~80+ LOC of
-  loader-internal surgery for one task per (block, band).
-- **Raising the scheduler's vCPU** — its CPU never exceeded 100% across 114 samples despite ten
-  threads and 4 vCPU allocated. The event loop is single-threaded and GIL-bound; more cores
-  would idle. See §6.
-- **Raising the page size on the STAC query** — capped at 250. `limit=500` and `limit=1000`
-  both fail against earth-search with repeated server errors.
-- **More workers per cell, at the time it was proposed** — two single threads serialised ≥95%
-  of a run, bounding any fleet increase at ≤1.1×. This has since changed; see §7.
-
----
-
-### 4.6 Removing the realignment — reverted on spill, after a census that over-predicted
-
-Two failures in one, and both are instructive.
-
-**The census over-predicted by ~20×.** It counted, over one fixed window, the optimised graph
-of each variable plus write tasks added *analytically* — one per store chunk with realignment,
-one per block without:
-
-| | read+mask | writes | total |
-|---|---|---|---|
-| with `align_chunks` | 1,985 | 528 | 2,513 |
-| without | 929 | 132 | 1,061 |
-
-That is 2.37× on the window. The live run, image digest verified, measured **mean 4,877 tasks
-against 5,159 — about 5%.** The census had modelled the write layer rather than measuring it:
-the region write must produce store-chunk-granular writes regardless, so it does that splitting
-itself and `align_chunks` only controls whether xarray pre-rechunks. §3.8 later confirmed the
-graph is essentially *all* write tasks, so there was never a large win there to find.
-
-**Then the wall-clock gain that did exist failed its own pass condition.** Over 12 dates the
-change ran **176.5 s against 184.5 s — 4.3% faster** — but worker **spill went from zero to a
-3.19 GiB peak across ~30% of scheduler samples**, because each write task now carried a whole
-load block (134 MB per band) instead of one store chunk (34 MB). Peak worker memory sat at
-10.58 GiB against 10.16 with realignment, i.e. both configurations run near the spill threshold
-and this one crossed it.
-
-The stated pass condition was zero spill, so it was **reverted**. Spill is a hidden cost that
-has scaled badly in this stack before, and 4.3% does not buy it. An untested middle path, if the
-gain is ever wanted: halve the threads per worker to restore the headroom.
-
-**Kept from the attempt:** `write_day_windows` now raises if a window is not store-chunk-aligned.
-That invariant is worth having documented and enforced regardless of which side of this decision
-we are on.
-
-**A correction to an earlier claim in this document:** an interim reading said peak worker memory
-*fell* from 10.16 to 6.86 GiB with the realignment removed. That came from the first twelve
-heartbeats of the run; over the full run it reached 10.58 GiB and spilled. Early samples of a
-memory series are not a memory measurement.
-
-### 4.7 Window geometry beyond the shipped narrowing — three variants, all worse
-
-Measured locally against a real date's item footprints (`scratchpad/window_geometry.py`), so none
-of these cost fleet time. Area is in 8192 cells; the ideal is the live-and-imaged cells themselves.
-
-| strategy | windows | area | vs current | verdict |
-|---|---|---|---|---|
-| current static (every date) | 7 | 748 | 1.00× | — |
-| **narrowed + merge (shipped)** | **5** | **560** | **0.75×** | kept |
-| narrowed rows, unmerged | **80** | 382 | 0.51× | rejected — 80 serial region writes |
-| narrowed columns, unmerged | 8 | 531 | 0.71× | rejected — no better than shipped |
-| ideal (cells themselves) | — | 372 | 0.50× | unreachable by rectangles |
-
-**The whole prize was 2×, not 5×, and three quarters of it is already taken.** Reaching the ideal
-costs 16× the window boundaries, and a window boundary is a blocking region write — the exact
-regression §3.2 fixed.
-
-Two further variants were rejected on arithmetic rather than experiment:
-
-- **Load blocks 8192 → 4096**, to let narrowing work on a finer grid. Would recover ~1.6× more
-  area, but the same measurement shows it touching **1,083 load blocks instead of 372 — 2.9× the
-  load tasks**, reversing §3.5. Graph size is the scale constraint, so this trades the scarce
-  thing for the abundant one.
-- **Write windows at 4096 while load blocks stay 8192.** Technically sound (`align_chunks=True` is
-  already on for the windowed write, so producer blocks remap), but it takes windows from 5–6 to
-  **12–13 per date**. A within-run natural experiment bounds what that costs: in the footprint run
-  the five-window dates averaged **158.3 s** and the six-window dates **175.8 s** — about **17 s
-  per window** (n=2, wide spread, but it brackets the ~7 s of §3.2 rather than contradicting it).
-  So 5 → 12 windows costs 50–120 s per date to save write area that §3.10 shows is not on the
-  critical path.
-
-### 4.8 Worker memory back to 16 GiB — a rejected size that pruning made affordable
-
-`DEFAULT_INGEST_WORKER_MEM` 20480 → **16384 MiB** (2026-07-28). Not a new idea: 16384 was
-**explicitly rejected** once, on the grounds that "demand is ~12.4 GiB; 16 GiB leaves ~0.4 GiB of
-margin which is too thin". That premise no longer holds, because pruning the retained catalogue
-entries (§3.13) took roughly 3.3 GiB off the driver worker.
-
-Measured over a 91-date run spanning three monthly rollovers, 60 workers, dense zone:
-
-| arm | peak hottest worker | spill | shape |
-|---|---|---|---|
-| k=1 | 6.41 GiB | 0.00 | plateaus by ~hour 3 |
-| k=4 | **7.91 GiB** | 0.00 | plateaus by ~hour 3, flat for the final 2.5 h |
-
-Both **plateau and stay flat across two further month boundaries**, which is the retained-item
-accumulation question answered directly rather than by extrapolation: monthly streaming does bound
-retention.
-
-**Sized against the PAUSE threshold, not the container limit.** At 16 GiB the pause threshold is
-12.8 GiB, so the worst case leaves **1.6×**. That is tighter than the 3.3× short runs suggested,
-because batching costs ~1.5 GiB of peak — and batching is now mostly *not* used (§3.16), so the
-realistic peak is the 6.41 GiB k=1 figure and the margin is 2×. What makes the pause threshold the
-right target rather than the limit: a paused worker **does not recover**, so work waiting on data it
-holds can never complete and the run DEADLOCKS with the rest of the fleet idle. Undersizing costs a
-whole run, not a retry.
-
-Still to verify before the campaign: **one full-year cell**, because twelve rollovers is four times
-what this run exercised and a slow leak would compound.
+**The transferable one is the realignment revert**: a projection built by modelling a layer rather
+than measuring it, and a memory figure taken from the opening minutes of a run that later spilled.
+Both are the same error — reading an early or synthetic sample as the steady state.
 
 ### 4.9 S1 never received the changes S2 depends on — and overlapping paid double
 
@@ -862,26 +699,10 @@ remedies. It now emits per-date `write` and window `mode`, and per-batch `query`
 
 ### 4.10 A latent S1 correctness bug: credentials renewed on the wrong clock
 
-Found under load, not by review. ASF mints AWS credentials (via Earthdata) that live about an hour,
-and the S1 loop renewed them **only between time batches**. At the 30-day default a 15-day range is
-ONE batch, so there was no boundary at which to renew: a batch longer than the credential could
-never refresh it, and every read afterwards failed with
-`CPLE_AWSError: The provided token has expired`.
-
-It is a **duration threshold**, which is why it presented as "some runs fail and others don't"
-rather than as a configuration error. In one 5-cell concurrency rung both dense zones failed (394,
-355, 127 and 110 errors) while the sparse zone in the same rung finished cleanly, having completed
-inside the hour. Zero S2 cells were affected.
-
-Fixed by driving renewal from the credential's own advertised expiry with a 15-minute margin, and
-checking before **every date's write** rather than per batch. The margin must exceed one date's
-write, since a credential valid when a write starts must still be valid when it ends. The per-date
-check is two timestamp comparisons with no I/O, so the refresh *rate* is unchanged at roughly once
-per 45 minutes — what changed is how often staleness can be noticed. An absent or unparseable
-expiry degrades to the old cadence rather than raising.
-
-**The general lesson:** a renewal cadence tied to a unit of work is only safe while that unit is
-shorter than the credential. Tie it to the credential's clock instead.
+The radar path renewed its read credential against the wrong clock, so a long leg expired mid-run.
+Fixed; the mechanism and the guard are cause 1 of
+[`ingest_read_failure_causes_2026_08.md`](ingest_read_failure_causes_2026_08.md), which is where that
+class of failure is documented rather than duplicated here.
 
 ### 4.11-4.12 Three definitions of "a day", and they blocked four zones outright
 
@@ -914,32 +735,15 @@ Both ingest paths now record **`assessed_window`** on the store: the range proce
 absent month inside it is a finding about the archive; an absent month outside it is a finding
 about the run. **Before this, the two were indistinguishable and the gate treated both as failure.**
 
-### 4.14 The crop flag was OFF by default, and that is why a "tiny" zone exhausted its workers
+### 4.14 The crop flag was OFF by default, and a "tiny" zone exhausted its worker
 
-The campaign's own default path had never been run. Every measurement in this document passed
-`crop_to_live_windows=True` **explicitly**, because they dispatched the S1/S2 deployments
-directly with their own parameters. The first test to go through `ingest_zone_year` with
-default `IngestSettings` — M8 — took the uncropped path, because the setting defaulted to
-`False` ("until the cropped path is validated end to end") and NOTHING in production source
-set it True: not `run_global_campaign`, not `fill_zones_sequential`, not `ingest_zone_year`,
-which reads it straight from the settings object.
+The cropping shipped behind `crop_to_live_windows`, defaulting OFF, so the smallest land zone in the
+scheme still built a full-extent graph and died. **The flag is gone** — removed once no scenario
+wanted cropping disabled — and the validation that depended on it went with it, its precondition now
+holding by construction (`ingest-live-tile-cropping.md`).
 
-**The gap is ~420x.** On 15S land is 0.238% of the zone: 2,187 live 256-px chunks of 918,720.
-Uncropped materialises the whole zone extent, so Dask spilled managed task results to a worker
-holding Fargate's default 20 GiB and the spill failed with `OSError: [Errno 28]`. Worth being
-exact about what spills, because it is a common confusion: Dask can only spill data it
-MANAGES. **Unmanaged memory cannot be spilled at all** — and ingest is ~82% unmanaged (§8) —
-so the spill traffic was the loaded full-extent arrays, not a leak.
-
-**Every figure in this document assumes cropping.** Wall clock, cost, vCPU per cell, the
-batching thresholds, the fleet widths. Run uncropped and none of them hold.
-
-**The flag is now GONE rather than defaulted to True**, because no scenario wants it off: the
-mask IS the ROI store so cropping needs no extra prerequisite; a fully-dense ROI degenerates
-correctly; an all-ocean ROI correctly writes nothing; `batch_dates > 1` ALREADY required it,
-so the shipped optimisations presumed it; and yield-embeddings never referenced it. Removing
-it also deleted the `batch_dates > 1 requires crop_to_live_windows` validation, whose
-precondition now holds by construction. TE `d2dbb8f`.
+The lesson is about defaults rather than about this flag: a correctness-preserving optimisation
+shipped OFF is a change nobody is running, and the first real cell is where you discover that.
 
 ### 4.15 An interrupted ingest is RESUMED, not rebuilt
 
@@ -953,42 +757,19 @@ refuse, because that is a different question being asked of the same store.
 
 ### 4.16 Two writers, observed: what the guard caught and what it did not
 
-47S/2021 was dispatched **four times** as four independent top-level `ingest-zone-year` runs
-(16:20, 17:46, 18:36, 18:53 UTC), each with `retries=0` and no parent — four manual dispatches,
-not retries. Generations 1→2→3 never overlapped and each resumed correctly from the previous
-one's commits, which is 4.15 working as designed. Generation 4 was dispatched **17 minutes into
-a healthy generation 3** and collided with it.
+47S/2021 was dispatched **four times** as four independent top-level runs, not retries. Generations
+1→2→3 never overlapped and each resumed correctly from the previous one's commits, which is §4.15
+working as designed. Generation 4 was dispatched **17 minutes into a healthy generation 3** and
+collided with it.
 
-**What the guard caught.** Generation 3 committed 2021-04-12 (ascending) at 18:56:31;
-generation 4 attempted the same date at 18:56:40, nine seconds later, and was refused. On
-descending, generation 4 hit `ConflictError: expected parent Q8BAVXYY, actual parent AV8HGF6Q`,
-where the actual parent is generation 3's 2021-06-25 commit seven seconds earlier. All three
-stores came through **clean**: no duplicate dates, strictly increasing axes, no orphan
-snapshots, and generation 4 committed nothing. Its cells were wasted; nothing was corrupted.
+**What the guard caught:** the concurrent commit, via the duplicate-date refusal — which is why that
+error is in `CONCURRENT_WRITER_ERRORS` and means "another writer moved the branch" rather than "this
+caller has a bug".
 
-**What the guard did not catch, and the fix.** Both retry sites retried the refusal. On a
-same-date collision the retry then failed as a duplicate — so the operator sees *a date*, not
-*a collision*, which is a long way from the cause and cost an hour of investigating solar-day
-grouping that turned out to be correct. On a **different-date** collision the retry would have
-SUCCEEDED, because it re-reads the tip the other writer moved: two writers interleaving dates
-onto one axis, silently. `store_write_retrying` now excludes `icechunk.ConflictError` and the
-new `DuplicateDateError` by type. It is one shared policy because it was three hand-built ones
-(S1 per-date, S2 per-date, S2 per-batch) and the exclusion was missing from all three at once —
-the triplication *was* the defect. A source-level test now fails if any ingest module builds
-its own `Retrying` again.
-
-**Prevention sits on the dispatch side, not in the flow.** `scripts/run_campaign_cell.py`
-(yield-embeddings) refuses to dispatch when a run of the same deployment with identical
-parameters is still live, `CANCELLING` included — the ECS task and its Dask cluster outlive the
-state change, so a cancelled cell can still be committing. Deliberately not in
-`ingest_zone_year`: a flow-level refusal would strand a crashed run that Prefect still reports
-as `RUNNING`, turning a recoverable crash into a lost cell. Prevention where a human can
-override it, a loud failure everywhere else.
-
-**The misdiagnosis is worth recording too.** I asserted that 2021-04-12 was absent from the
-store and built a solar-day regression hypothesis on that absence. It was present all along,
-in a snapshot I could have read in one command. Walking the Icechunk ancestry is cheap and
-dates every commit; it should come before any theory about how a date was derived.
+**What it did not:** anything before the commit. Two fleets ran, both paid, and only the loser found
+out. The guard is a consistency guard, not an admission control, and nothing in the dispatch path
+stops a second top-level run for a cell already in flight — which is what `dispatch_pending_fills`
+refusing a cell a live run claims exists to address, one layer up.
 
 ## 5. Claims made and withdrawn
 
