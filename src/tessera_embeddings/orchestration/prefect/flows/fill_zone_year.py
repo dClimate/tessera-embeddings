@@ -371,6 +371,25 @@ def fill_zone_year_flow(
     # which reads correctly on the record: nothing was measured, so nothing is claimed.
     input_coverage: dict | None = None
 
+    # The store's minimum-depth rule, for EVERY runner invocation and not only inference-bound
+    # ones. The runner asserts the config against the root before it checks completion or reads
+    # the land mask, so leaving it None on the cheap terminal paths — an all-ocean cell, or a
+    # complete cell needing only its tag repaired — made those paths raise instead of marking
+    # and tagging, which can stop the campaign finishing on work it has no reason to do.
+    #
+    # Resolved once here rather than inside the needs_cluster branch. It is a metadata-only
+    # read, and the branch it used to sit in is the one that does NOT need it cheap.
+    config = dataclasses.replace(
+        config,
+        optical_min_obs=_optical_min_obs_from_store(
+            store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        ),
+    )
+    log.info(
+        "Minimum optical depth for this fill: %s (from the store's root)",
+        config.optical_min_obs if config.optical_min_obs is not None else "no rule",
+    )
+
     if needs_cluster:
         # Fail loudly BEFORE provisioning Ray if the store was seeded for a
         # different encoder than this build embeds with — a mid-campaign model
@@ -382,24 +401,6 @@ def fill_zone_year_flow(
             allow_model_mismatch=allow_model_mismatch,
             get_credentials=iam_icechunk_credentials,
             s3_region=s3_region,
-        )
-        # The minimum-depth rule comes from the STORE, never from this dispatch — the root attr is
-        # part of a write-once identity precisely so it cannot be argued about per run, and a cell
-        # filled under a different line than its neighbours would be undetectable afterwards.
-        # Resolved HERE rather than where the config is built, beside the model gate and for the
-        # same reason: both are store reads that only matter when this cell is about to infer, and
-        # a path that short-circuits before the preflight must not touch the store at all.
-        config = dataclasses.replace(
-            config,
-            optical_min_obs=_optical_min_obs_from_store(
-                store_path,
-                get_credentials=iam_icechunk_credentials,
-                s3_region=s3_region,
-            ),
-        )
-        log.info(
-            "Minimum optical depth for this fill: %s (from the store's root)",
-            config.optical_min_obs if config.optical_min_obs is not None else "no rule",
         )
         # Fail loudly on a partial/absent mosaic BEFORE provisioning Ray: a
         # zone-wide mosaic missing months is an ingest failure, and the write-once

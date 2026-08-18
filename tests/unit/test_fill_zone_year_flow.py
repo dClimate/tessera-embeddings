@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import pathlib
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -385,3 +386,21 @@ class TestTheMinimumDepthRuleComesFromTheStore:
             mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={"optical_min_obs": 25})
         )
         assert mod._optical_min_obs_from_store("s3://x", get_credentials=None) == 25
+
+
+def test_the_depth_rule_is_resolved_even_when_no_cluster_is_needed(monkeypatch):
+    """An all-ocean or already-complete cell never provisions Ray, and still reaches the runner.
+
+    The runner asserts the config's rule against the store root BEFORE it checks completion or
+    reads the land mask, so leaving the rule unresolved on these cheap terminal paths made them
+    raise instead of marking and tagging — stopping the campaign finishing on the work it has
+    least reason to do.
+    """
+    seen: dict = {}
+    monkeypatch.setattr(mod, "_optical_min_obs_from_store", lambda *a, **k: seen.setdefault("read", 15) or 15)
+    src = pathlib.Path(mod.__file__).read_text()
+    before_branch = src.split("if needs_cluster:")[0]
+    assert "_optical_min_obs_from_store(" in before_branch, (
+        "the rule must be resolved before the needs_cluster branch, or terminal cells reach the "
+        "runner with optical_min_obs=None and its assertion fails them"
+    )

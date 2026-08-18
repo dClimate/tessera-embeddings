@@ -279,3 +279,9 @@ def test_seeding_a_zone_that_already_exists_is_a_no_op(tmp_path):
     global_store.seed_zone_groups(repo, [_ZA, _ZB], years=(2025,))
     root = zarr_store.open_store_as_zarr_group(store)
     assert set(root.group_keys()) >= {"01N", "01S"}, "the new zone must land beside the existing one"
+
+    # And a request with NOTHING new must not fail. Skipping complete groups means no writes,
+    # and icechunk refuses an empty commit unless asked — so committing regardless turned the
+    # idempotent reseed this skip exists to allow into a hard failure.
+    snapshot = global_store.seed_zone_groups(repo, [_ZA, _ZB], years=(2025,))
+    assert isinstance(snapshot, str) and snapshot, "an all-seeded reseed returns the current tip"

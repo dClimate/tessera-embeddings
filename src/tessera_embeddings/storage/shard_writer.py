@@ -312,8 +312,15 @@ def run_forked(
             # `_processes` is private: ProcessPoolExecutor exposes no terminate API. Guarded
             # so a future Python that renames it degrades to the old wait-free shutdown
             # rather than masking the original failure with an AttributeError.
+            # SNAPSHOT BEFORE SHUTDOWN. `ProcessPoolExecutor.shutdown` sets `_processes = None`
+            # unconditionally — it drops references to objects holding file descriptors — so
+            # reading it afterwards yields None and `.values()` raises AttributeError, masking
+            # the assembly failure this handler exists to propagate. Worse than the leak it was
+            # meant to fix, and a stub executor whose `shutdown` does not null the attribute
+            # cannot catch it.
+            procs = list((getattr(ex, "_processes", None) or {}).values())
             ex.shutdown(wait=False, cancel_futures=True)
-            for proc in list(getattr(ex, "_processes", {}).values()):
+            for proc in procs:
                 if proc.is_alive():
                     proc.terminate()
             raise

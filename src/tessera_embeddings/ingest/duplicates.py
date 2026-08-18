@@ -339,9 +339,20 @@ def step_down_copies(
     # same alternate — turning ``[a_new, b_new]`` into ``[a_old, a_old]``, which duplicates
     # one acquisition and silently drops the other. That is worse than the coverage loss the
     # acquisition split was added to fix, because it feeds the loader the same granule twice.
+    # Bucketed by the SAME key the alternates use. `implicated` carries the failed items from
+    # every tile in the date, and acquisition matching is by INSTANT — so neighbouring MGRS
+    # tiles imaged on one pass share an instant and cross-match. Unfiltered, a failure in tile B
+    # picks tile A's spare, downgrading A while leaving B's own failure selected: the exact
+    # defect this attribution was added to remove, moved one level sideways.
+    failed_by_key: dict[tuple[str, str], list[Any]] = {}
+    for item in implicated:
+        tile = item_tile(item)
+        if tile is not None:
+            failed_by_key.setdefault((tile, solar_day_of(item)), []).append(item)
+
     swap: dict[int, Any] = {}
     for key, copies in remaining.items():
-        alternate = _first_for_failed_acquisition(copies, implicated)
+        alternate = _first_for_failed_acquisition(copies, failed_by_key.get(key, ()))
         alternates[key] = [c for c in copies if c is not alternate]
         target = _alternate_for(alternate, survivors.get(key, ()), taken=swap)
         if target is not None:

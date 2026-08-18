@@ -323,6 +323,10 @@ class TestForkProgressReporting:
 
             def shutdown(self, **kwargs):
                 self.shutdown_args = kwargs
+                # CPython drops the reference here, to release file descriptors. The stub must
+                # do it too: without this the test passes against code that reads `_processes`
+                # AFTER shutdown, which is exactly the bug it is meant to catch.
+                self._processes = None
 
         monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", _FakeExecutor)
         store, repo = _seed(tmp_path)

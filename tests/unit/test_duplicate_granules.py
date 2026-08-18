@@ -406,3 +406,30 @@ def test_without_attribution_the_ladder_still_steps_the_best_ranked_spare():
     assert stepped is not None
     items, _keys = stepped
     assert a_old in items, "highest-ranked spare belongs to A, so A steps"
+
+
+def test_a_failure_in_one_tile_does_not_downgrade_a_neighbouring_tile():
+    """Acquisition matching is by INSTANT, and neighbouring MGRS tiles share one pass.
+
+    `implicated` carries the failed items from every tile in the date, so without filtering to
+    the tile-day being stepped, tile B's failure matches tile A's acquisition by time alone —
+    downgrading A while leaving B's own failed copy selected. That is the defect the attribution
+    was added to remove, moved one level sideways.
+    """
+    a_old = _Item("A_old", "MGRS-34WFA", "0")
+    a_new = _Item("A_new", "MGRS-34WFA", "1")
+    b_old = _Item("B_old", "MGRS-34WFB", "0")
+    b_new = _Item("B_new", "MGRS-34WFB", "1")
+    for it in (a_old, a_new, b_old, b_new):  # one pass — the same instant on both tiles
+        it.properties["datetime"] = "2021-09-08T10:00:00Z"
+
+    kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
+    assert set(kept) == {a_new, b_new}
+
+    # Only tile B failed.
+    stepped = step_down_copies(dict(alternates), kept, only=[("MGRS-34WFB", "2021-09-08")], implicated=[b_new])
+    assert stepped is not None
+    items, keys = stepped
+    assert b_old in items, "the tile that failed steps down"
+    assert a_new in items, "the neighbouring tile keeps its newest copy"
+    assert keys == {("MGRS-34WFB", "2021-09-08")}

@@ -453,6 +453,7 @@ def seed_zone_groups(
         ],
         axis=1,
     ).astype("int64")
+    created = 0
     for spec in specs:
         node = root.require_group(spec.group_name)
         # A zone already seeded is a NO-OP, not an error. `require_group` returns the existing
@@ -467,6 +468,7 @@ def seed_zone_groups(
         expected_arrays = set(layout.arrays) | {"time", "northing", "easting", "band"}
         if expected_arrays <= set(node.array_keys()):
             continue
+        created += 1
         north = northing_coords(spec)
         east = easting_coords(spec)
         sizes = {
@@ -493,4 +495,11 @@ def seed_zone_groups(
         bnds.attrs.update(TIME_ENCODING)  # same int64-ns encoding as `time`
         node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
         node.attrs.update(_zone_attrs(spec, north, east, layout))
-    return session.commit(commit_msg or f"seed {len(specs)} zone group(s)")
+    if not created:
+        # Every requested zone was already complete, so nothing was written — and icechunk
+        # refuses an empty commit unless asked. Committing anyway turned the advertised
+        # idempotent reseed into a failure, which is the opposite of what skipping complete
+        # groups was for. The identity and layout checks above still ran, so this returns
+        # having VERIFIED the store rather than having ignored the request.
+        return repo.lookup_branch("main")
+    return session.commit(commit_msg or f"seed {created} zone group(s)")
