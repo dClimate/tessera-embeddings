@@ -40,6 +40,7 @@ from tessera_embeddings.inference.assembly import (
     TARGET_AGGREGATE_S3_CONCURRENCY,
     AllChunksSkippedError,
     IncompleteStageError,
+    SpatialCoords,
     ZarrWriter,
     _layout_matching_store,
     _partition_bands,
@@ -2576,6 +2577,55 @@ class TestAssembleGuards:
                 roi_zarr_path=_make_full_roi_mask(tmp_path / "roi2", 4, 4),
                 run_started_at=datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
                 n_workers=1,
+            )
+
+    def test_append_refuses_a_reordered_interior_on_matching_endpoints(self, tmp_path, monkeypatch):
+        """Extent, CRS and endpoints do not pin an axis, and this phase writes POSITIONALLY.
+
+        A mosaic whose interior is reordered — or non-affine — while its first and last
+        coordinates match passes every check that existed here, and its pixels then land at
+        the wrong coordinates under the store's own unchanged axes. Nothing signals it: the
+        arrays are valid, the shapes agree, and the georeferencing looks intact.
+
+        The zone-fill runner already compares complete vectors for exactly this reason. This
+        is the single-ROI path, which is the one that accepts a hand-provided mosaic.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        output = str(tmp_path / "out.zarr")
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=8, x_start=0, x_stop=8)
+        north = np.arange(8, dtype="float64") * 10.0
+        east = np.arange(8, dtype="float64") * 10.0
+
+        coords = {"value": SpatialCoords(northing=north, easting=east)}
+        monkeypatch.setattr(_assembly_mod, "read_spatial_coords", lambda *a, **k: coords["value"])
+
+        def _run(run_id: str, when: datetime.datetime, roi: str):
+            self._stage_one(writer, chunk, run_id)
+            writer.assemble(
+                [chunk],
+                total_y=8,
+                total_x=8,
+                run_id=run_id,
+                output_path=output,
+                roi_zarr_path=roi,
+                run_started_at=when,
+                n_workers=1,
+                mosaic_base=str(tmp_path / "mosaic"),
+            )
+
+        _run("run1", datetime.datetime(2024, 6, 1, tzinfo=datetime.UTC), _make_full_roi_mask(tmp_path, 8, 8))
+
+        # Same endpoints, same length, same CRS — two interior values transposed.
+        scrambled = north.copy()
+        scrambled[3], scrambled[4] = scrambled[4], scrambled[3]
+        assert scrambled[0] == north[0] and scrambled[-1] == north[-1]
+        coords["value"] = SpatialCoords(northing=scrambled, easting=east)
+
+        with pytest.raises(ValueError, match="reordered or non-affine interior"):
+            _run(
+                "run2",
+                datetime.datetime(2025, 6, 1, tzinfo=datetime.UTC),
+                _make_full_roi_mask(tmp_path / "roi2", 8, 8),
             )
 
     def test_append_creates_missing_variables_from_layout(self, tmp_path):

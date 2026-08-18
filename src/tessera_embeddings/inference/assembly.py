@@ -1760,6 +1760,38 @@ class ZarrWriter:
                         f"Mosaic coordinates do not lie on existing store {output_path}'s grid "
                         "(shifted or reversed axes) — appending would silently misgeoreference the timestep."
                     )
+                # Extent, CRS and endpoints STILL do not pin an axis: a reordered or
+                # non-affine interior satisfies all three, and this phase writes staged
+                # pixels POSITIONALLY while the store keeps its existing coordinate arrays.
+                # Such an append publishes real pixels at the wrong coordinates with nothing
+                # to signal it.
+                #
+                # The same comparison the zone-fill runner makes, for the same reason and at
+                # the same cost: the complete vectors against the stored axes, two 1-D reads
+                # once per append. A per-step spacing test cannot substitute — whatever slack
+                # it admits per step, an axis that wanders and returns can accumulate while
+                # still matching the length and both endpoints.
+                #
+                # Reachable on the hand-provided mosaic path, which is supported.
+                for axis, values, stored in (
+                    ("northing", spatial.northing, z_north),
+                    ("easting", spatial.easting, z_east),
+                ):
+                    got = np.asarray(values, dtype="float64")
+                    want = np.asarray(stored[:], dtype="float64")
+                    # A float round-trip allowance, not a geometric one: coordinates
+                    # round-trip through float32 at ~1 m near a 9.3e6 m northing, while any
+                    # real displacement is a whole pixel.
+                    bad = ~np.isclose(got, want, rtol=0.0, atol=1.0)
+                    if bad.any():
+                        i = int(np.argmax(bad))
+                        raise ValueError(
+                            f"Mosaic {axis} does not match existing store {output_path}'s axis: "
+                            f"index {i} is {got[i]} where the store says {want[i]} "
+                            f"({int(bad.sum())} of {got.size} coordinates differ). Extent, CRS and "
+                            "endpoints all match, so this is a reordered or non-affine interior — "
+                            "appending would write real pixels at the wrong coordinates."
+                        )
             # Variables staged by this run but absent from the store (e.g. a
             # store created before obs counts, or compute_std newly on) are
             # created schema-only at the current time extent; prior timesteps
