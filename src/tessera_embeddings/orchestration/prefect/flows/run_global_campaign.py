@@ -1486,10 +1486,11 @@ async def run_global_campaign(
 
         # Backfill the year-complete milestone/retention tag even when NO fills
         # ran this pass — a prior run may have completed every zone for the year
-        # but crashed before tagging. The milestone is defined over ALL 120 zones
-        # (expected_zones defaults to the full set, NOT this run's `zones` subset,
-        # so a subset/repair run never stamps the global tag prematurely — and
-        # tags are write-once). ValueError = not yet all-120 complete → defer.
+        # but crashed before tagging. The milestone is defined over ALL 120 zones:
+        # `tag_year_complete` takes no scope argument, so this run's `zones` subset
+        # cannot narrow it and a subset/repair run cannot stamp the global tag
+        # prematurely — which matters because tags are write-once forever.
+        # ValueError = not yet all-120 complete → defer.
         # Attempted for EVERY year in the batch. `tag_year_complete` raises ValueError
         # when the year is not yet complete across all 120 zones, so attempting it for an
         # unfinished year is free — which is what lets the overlapping path use the same

@@ -188,20 +188,57 @@ def test_tag_zone_year_default_is_idempotent_after_head_moves(tmp_path):
     assert repo.lookup_tag("zone-01N-2023") == pinned, "existing pin must not move"
 
 
-def test_tag_year_complete_requires_all_zones(tmp_path):
+def test_tag_year_complete_requires_all_zones(tmp_path, monkeypatch):
+    monkeypatch.setattr(campaign, "ZONES", ("01N", "02N"))
     _, repo = _seed(tmp_path)
     _fill(repo, "01N", year_index=0)  # only one of two zones has 2023
     with pytest.raises(ValueError, match="have not landed it"):
-        campaign.tag_year_complete(repo, 2023, expected_zones=("01N", "02N"))
+        campaign.tag_year_complete(repo, 2023)
 
 
-def test_tag_year_complete_when_all_land(tmp_path):
+def test_tag_year_complete_when_all_land(tmp_path, monkeypatch):
+    monkeypatch.setattr(campaign, "ZONES", ("01N", "02N"))
     _, repo = _seed(tmp_path)
     _fill(repo, "01N", year_index=0)
     _fill(repo, "02N", year_index=0)
-    tag = campaign.tag_year_complete(repo, 2023, expected_zones=("01N", "02N"))
+    tag = campaign.tag_year_complete(repo, 2023)
     assert tag == "year-2023-complete"
     assert tag in repo.list_tags()
+
+
+def test_year_complete_tag_cannot_be_minted_from_a_zone_subset(tmp_path):
+    """The campaign-wide tag takes no scope argument, so a subset cannot mint it.
+
+    Icechunk tags are write-once forever and `_ensure_tag` treats an existing tag as an
+    idempotent success, so a `year-2023-complete` stamped after two zones landed could
+    never be corrected by the real 120-zone campaign. The guarantee is structural —
+    there is no parameter to pass — so this asserts the signature, not a branch: the
+    subset question is answerable only through the helper that does not tag.
+    """
+    _, repo = _seed(tmp_path)
+    _fill(repo, "01N", year_index=0)
+    _fill(repo, "02N", year_index=0)
+
+    with pytest.raises(TypeError):
+        campaign.tag_year_complete(repo, 2023, expected_zones=("01N", "02N"))  # type: ignore[call-arg]
+
+    # Both seeded zones HAVE landed 2023, so the subset check is satisfied...
+    assert campaign.missing_zones_for_year(repo, 2023, expected_zones=("01N", "02N")) == ()
+    # ...and no tag was created by asking.
+    assert "year-2023-complete" not in repo.list_tags()
+    # Against the real campaign scope the year is nowhere near done, and the refusal
+    # names how far off it is rather than tagging.
+    with pytest.raises(ValueError, match="have not landed it"):
+        campaign.tag_year_complete(repo, 2023)
+    assert "year-2023-complete" not in repo.list_tags()
+
+
+def test_missing_zones_for_year_reports_in_scope_order(tmp_path):
+    """The report is the scope minus what landed, so a caller can name what is left."""
+    _, repo = _seed(tmp_path)
+    _fill(repo, "02N", year_index=0)
+    assert campaign.missing_zones_for_year(repo, 2023, expected_zones=("01N", "02N")) == ("01N",)
+    assert campaign.missing_zones_for_year(repo, 2024, expected_zones=("02N", "01N")) == ("02N", "01N")
 
 
 # --- expire_and_gc ---------------------------------------------------------
@@ -302,7 +339,7 @@ def test_year_tag_refuses_an_empty_completion_scope(tmp_path):
     """
     _, repo = _seed(tmp_path)
     with pytest.raises(ValueError, match="expected_zones is empty"):
-        campaign.tag_year_complete(repo, _YEARS[0], expected_zones=[])
+        campaign.missing_zones_for_year(repo, _YEARS[0], expected_zones=[])
 
 
 # --- concurrent same-zone, different-year writes (the year barrier's whole content) ---

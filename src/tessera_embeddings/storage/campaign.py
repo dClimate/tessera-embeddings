@@ -89,43 +89,67 @@ def tag_zone_year(
     )
 
 
-def tag_year_complete(
+def missing_zones_for_year(
     repo: icechunk.Repository,
     year: int,
     *,
     expected_zones: Iterable[str] | None = None,
     snapshot_id: str | None = None,
     branch: str = "main",
-) -> str:
-    """Tag ``year`` complete once every expected zone has landed it; return the tag.
+) -> tuple[str, ...]:
+    """Zones in scope that have not landed ``year``, in scope order — no side effects.
 
-    Verifies against live ``years_complete`` attrs (via :func:`campaign_status`)
-    that all ``expected_zones`` (default: all 120) contain ``year`` before tagging;
-    raises with the missing zones otherwise. Idempotent like :func:`tag_zone_year`.
+    The verification half of :func:`tag_year_complete`, split out so a caller can ask
+    about an arbitrary scope (a road test, one hemisphere, a re-drive's remainder)
+    without being able to mint a campaign-wide completion tag from it. ``None`` means
+    the full campaign (:data:`ZONES`).
+
+    Reads ``years_complete`` at the same snapshot a tag would pin — ``snapshot_id``
+    when given, else ``branch``'s tip — so the answer describes that snapshot rather
+    than a branch that may have advanced since.
     """
     expected = tuple(expected_zones) if expected_zones is not None else tuple(ZONES)
     if not expected:
-        # An empty scope makes the missing-zone check vacuous, so the year would be
-        # tagged complete having verified nothing — and Icechunk tags are write-once,
-        # so that false marker could never be corrected under its own name. `None`
-        # means "all 120"; an empty list means the caller computed a scope and got
-        # nothing, which is a bug in the caller, not a completed year.
+        # An empty scope makes the check vacuous: every zone in scope has landed,
+        # having verified nothing. `None` means "the whole campaign"; an empty list
+        # means the caller computed a scope and got nothing, which is a bug in the
+        # caller, not a completed year.
         raise ValueError(
-            f"cannot tag year {year} complete: expected_zones is empty. Pass None for all "
+            f"cannot assess year {year}: expected_zones is empty. Pass None for all "
             "zones, or a non-empty scope; an empty scope verifies nothing."
         )
-    # Verify completeness at the SAME snapshot we will tag, not the moving branch
-    # tip — otherwise an explicit older snapshot_id could be tagged "complete"
-    # on the strength of zones that only landed later on the branch.
     status = (
         campaign_status(repo, snapshot_id=snapshot_id)
         if snapshot_id is not None
         else campaign_status(repo, branch=branch)
     )
-    missing = [z for z in expected if not status.has(z, year)]
+    return tuple(z for z in expected if not status.has(z, year))
+
+
+def tag_year_complete(
+    repo: icechunk.Repository,
+    year: int,
+    *,
+    snapshot_id: str | None = None,
+    branch: str = "main",
+) -> str:
+    """Tag ``year`` complete once **every** campaign zone has landed it; return the tag.
+
+    The scope is always the full campaign (:data:`ZONES`) and is deliberately *not* a
+    parameter. ``year-<year>-complete`` is a campaign-wide claim; icechunk tags are
+    write-once forever and :func:`_ensure_tag` treats an existing tag as an idempotent
+    success — so a tag minted after a subset landed could never be corrected under its
+    own name, and would permanently mark an incomplete snapshot as a finished year. To
+    ask whether a narrower scope has landed, call :func:`missing_zones_for_year`, which
+    answers without tagging.
+
+    Verifies against live ``years_complete`` attrs at the snapshot being tagged; raises
+    with the missing zones otherwise. Idempotent like :func:`tag_zone_year`.
+    """
+    missing = missing_zones_for_year(repo, year, snapshot_id=snapshot_id, branch=branch)
     if missing:
         raise ValueError(
-            f"cannot tag year {year} complete: {len(missing)}/{len(expected)} zone(s) "
+            f"cannot tag year {year} complete: {len(missing)}/{len(ZONES)} zone(s) "
             f"have not landed it (e.g. {missing[:5]})"
         )
     return _ensure_tag(
