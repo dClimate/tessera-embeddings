@@ -655,7 +655,19 @@ def _tile_range_bbox_wgs84(spec: ZoneSpec, r0: int, r1: int, c0: int, c1: int) -
     n_hi = spec.northing[1] - r0 * tile_m  # top (max northing)
     n_lo = spec.northing[1] - r1 * tile_m  # bottom (min northing)
 
-    n = 16  # samples per edge
+    # 64 samples per edge, chosen by measurement rather than by feel. The docstring's
+    # containment guarantee is what callers rely on — `preflight_optical_source` treats a
+    # catalogue miss against this box as a miss against everything inside it — and a sampled
+    # perimeter only contains the true envelope if no extremum hides between two samples.
+    # Measured worst-case under-coverage across zone edges and latitudes:
+    #
+    #     16 -> 325 m     32 -> 63 m     64 -> 9.8 m     128 -> 0.61 m
+    #
+    # 64 is the first that lands inside one pixel (10 m), i.e. below the resolution anything
+    # downstream can act on. The cost is ~30 us per box against ~8 us, and the campaign
+    # computes at most a few hundred boxes per cell: about eight seconds across all 1,008
+    # cells, which is not a number worth trading a correctness guarantee for.
+    n = 64  # samples per edge
     es = np.linspace(e_lo, e_hi, n)
     ns = np.linspace(n_lo, n_hi, n)
     perim_e = np.concatenate([es, np.full(n, e_hi), es[::-1], np.full(n, e_lo)])

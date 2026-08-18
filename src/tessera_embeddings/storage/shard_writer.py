@@ -293,11 +293,29 @@ def run_forked(
             futures = [ex.submit(worker_fn, payload) for payload in payloads]
             results = _await_forks(futures, progress_interval_s, unit=unit, log=log)
         except BaseException:
-            # Drop the forks that have not started; the running ones cannot be
-            # interrupted, but the coordinator no longer waits on them to report a
-            # failure it already has. A `with` block would join every worker here — the
-            # whole delay `_await_forks` now avoids, re-introduced at the exit.
+            # Cancel what has not started, then TERMINATE what has. `cancel_futures` only
+            # reaches queued work, so without the second step a multi-hour shard writer keeps
+            # running — and keeps writing fork objects — after the coordinator has already
+            # raised, and Python's own executor atexit hook then blocks interpreter shutdown
+            # on it. A `with` block would be worse still: it joins every worker here, which is
+            # the whole delay `_await_forks` exists to avoid.
+            #
+            # Killing them is safe because nothing they have written is IN the store. Workers
+            # write into a fork; a fork becomes part of the repository only when the
+            # coordinator merges it and commits, and neither happens on this path. Icechunk's
+            # own guidance says as much — dropping a ForkSession without merging is its
+            # documented way to orphan chunks deliberately. So the cost of a kill is
+            # unreferenced objects, which garbage collection reclaims, and the cost of NOT
+            # killing is CPU, S3 writes, and a retry racing the previous attempt in the same
+            # process.
+            #
+            # `_processes` is private: ProcessPoolExecutor exposes no terminate API. Guarded
+            # so a future Python that renames it degrades to the old wait-free shutdown
+            # rather than masking the original failure with an AttributeError.
             ex.shutdown(wait=False, cancel_futures=True)
+            for proc in list(getattr(ex, "_processes", {}).values()):
+                if proc.is_alive():
+                    proc.terminate()
             raise
         ex.shutdown()
     t_merge = time.monotonic()

@@ -285,6 +285,55 @@ class TestForkProgressReporting:
         with pytest.raises(RuntimeError, match="band 0 failed"):
             _await_forks([failed, self._resolved("ok")], 10.0)
 
+    def test_a_failed_fork_terminates_the_workers_still_running(self, tmp_path, monkeypatch):
+        """`cancel_futures` reaches only work that has not STARTED.
+
+        Without a second step a multi-hour shard writer keeps running — and keeps writing
+        fork objects — after the coordinator has raised, and Python's executor atexit hook
+        then blocks interpreter shutdown on it. A retry in the same process would overlap the
+        previous attempt.
+
+        Safe to kill because nothing a worker has written is in the store: a fork joins the
+        repository only when the coordinator merges and commits, and neither happens here.
+        Icechunk documents dropping a ForkSession without merging as the way to orphan chunks
+        deliberately, so the cost is unreferenced objects that GC reclaims.
+        """
+
+        class _Proc:
+            def __init__(self, alive):
+                self._alive, self.terminated = alive, False
+
+            def is_alive(self):
+                return self._alive
+
+            def terminate(self):
+                self.terminated = True
+
+        running, finished = _Proc(True), _Proc(False)
+
+        class _FakeExecutor:
+            def __init__(self, *a, **k):
+                self._processes = {1: running, 2: finished}
+                self.shutdown_args = None
+
+            def submit(self, fn, payload):
+                f: Future = Future()
+                f.set_exception(RuntimeError("worker died"))
+                return f
+
+            def shutdown(self, **kwargs):
+                self.shutdown_args = kwargs
+
+        monkeypatch.setattr(shard_writer, "ProcessPoolExecutor", _FakeExecutor)
+        store, repo = _seed(tmp_path)
+        session = repo.writable_session("main")
+
+        with pytest.raises(RuntimeError, match="worker died"):
+            run_forked(session, lambda p: p, [{"tag": "a"}, {"tag": "b"}])
+
+        assert running.terminated, "a worker still running must be terminated, not left to finish"
+        assert not finished.terminated, "an already-finished worker needs no signal"
+
     def test_progress_line_names_the_callers_unit(self, caplog):
         # A payload is a band for one caller and a round-robin tile partition for
         # another; a fixed noun misdescribes the work for one of them. The caller
