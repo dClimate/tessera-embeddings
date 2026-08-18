@@ -1,6 +1,19 @@
-# Minimum optical depth: refuse pixels below 15 observations — implementation plan
+# Minimum optical depth: refuse pixels below 15 observations — decision and evidence
 
-**Status:** partly built. **The line is 15**, decided by Robert and a colleague on **2026-08-17**.
+**Status: BUILT.** `OPTICAL_MIN_OBS = 15`, the gate applies it per pixel per year, the store stamps
+it as write-once root identity, and refused shards record why. The decision is
+[ADR-018](../decisions/018-refuse-pixels-below-minimum-optical-depth.md); this document is the
+evidence behind it and the record of how the number moved.
+
+> **Consolidated 2026-08-18, from 1,432 lines.** Eight work-item sections specified machinery that
+> has since shipped, and the code is a better record of it than a plan is — §4-11 now says where each
+> piece lives. The deferred-spend reasoning became ADR-018 and the cross-repo validation move became
+> ADR-019, both of which it was already written "for". The month-plane implementation defects are
+> compressed to the three things about that failure which generalise. What is kept in full is the
+> measurement evidence, because that is what a future revisit of the line will need and what no code
+> states.
+
+**The line is 15**, decided by Robert and a colleague on **2026-08-17**.
 **Coverage was chosen over reproducibility, knowingly.** The line keeps **94% of pixels against 79%
 at 25** (pixel-weighted over 40 cells), and the accepted cost is that two independent embeddings of
 the same ground agree less well. `OPTICAL_MIN_OBS` is 15 and the campaign's seeder registers 15.
@@ -156,132 +169,28 @@ below.
 > measurable subset is whatever survived cleanup rather than a random sample. "Months covered" is a
 > crude spread statistic — twelve observations one per month scores the same as twelve in a fortnight
 > plus scattered singletons.
+> **Spread is retained as twelve labelled month planes, and they are BUILT (`s2_month_covered`).**
+> A packed uint16 bitmask was rejected: the only argument for it was size, and measured that is 14%
+> rather than the 6x the proposal assumed, because embeddings barely compress and the planes are a
+> rounding error beside them. **Cost to the finished store: 0.025%, about 353 GiB** — cross-checked
+> against `campaign-cost-model.md`'s independent 0.9–1.8 PB estimate, inside which 1.53 PB sits.
+> Labelled planes also mean `cov.sel(month=7)` says July to a reader who has never seen this
+> document, which a bitmask cannot.
 
-> **If spread is to be retained, store twelve labelled month planes, not a packed bitmask
-> (2026-08-17).** Spread exists only in the mosaic SCL, which is deleted after a fill — so it is
-> captured during inference or not at all. The obvious space-efficient encoding is a 12-bit mask in
-> one ``uint16``, and it is the wrong choice for a published dataset: a reader opening the store in
-> xarray, R, Julia or QGIS sees an opaque integer, and every question needs bit arithmetic and a
-> helper library nobody outside this repo has.
+> **A refused shard records WHY, in its own marker, and the per-shard registry is BUILT.** Three
+> defects made this necessary rather than nice: a fully refused shard used to discard its counters,
+> so a thin-depth refusal was indistinguishable from no optical coverage at all; "no records" and
+> "every read failed" were the same empty dict; and nothing checked that the reasons partition the
+> refused set. The markers are read at ASSEMBLY, which is the last moment they exist — they live with
+> the staging prefix and go when it does.
 >
-> A trailing ``month`` axis of 12 — the same shape ``embeddings`` already uses for its 128 bands, and
-> like the band axis never split across chunks — needs no helpers at all: months covered is
-> ``cov.sum("month")``, July is ``cov.sel(month=7)``, a growing season is
-> ``cov.sel(month=slice(5, 9)).all("month")``.
+> **The marker's PRESENCE is load-bearing**, which is the part a reporting-shaped fix would have
+> missed: absent markers and absent refusals look identical downstream, so `unreadable_markers` is a
+> separate signal from "nothing was refused". Only FULLY refused shards need a record; for a shard
+> that was written, the per-pixel `s2_obs_count` arrays in the store are already the evidence.
 >
-> **The only argument for the mask was size, and measured it is 14%, not 6×.** Uncompressed the
-> planes are six times the mask. Compressed with the store's own zstd at its own 256-px inner-chunk
-> granularity, over three cells spanning the depth range:
->
-> | cell | mask | planes | planes/mask |
-> |---|---:|---:|---:|
-> | 26S/2022 | 674,933 B | 786,838 B | 1.17× |
-> | 47S/2020 | 490,713 B | 546,019 B | 1.11× |
-> | 59S/2022 | 172,390 B | 187,154 B | 1.09× |
-> | **pooled** | **1,338,036 B** | **1,520,011 B** | **1.14×** |
->
-> Both land under a quarter of a bit per pixel — 0.21 against 0.24 — because month coverage is
-> spatially smooth, so zstd compresses a plane 397× against the mask's 75×. The mask's packed bits
-> look closer to noise, which is exactly what defeats the compressor. **Nothing about spread being a
-> useful gate input is settled by this**; the array is for quality control and for retaining
-> information the pipeline currently destroys.
->
-> **What the planes would cost the finished store: 0.025%, about 353 GiB.** Measured the same way —
-> every stored array re-compressed from real store chunks with its own declared codec, 30 inner
-> chunks over five cells spanning the depth range:
->
-> | array | compressed | note |
-> |---|---:|---|
-> | `embeddings` | 119.73 B/px | int8 × 128 bands; only a **1.07×** ratio, because quantised embeddings are near-noise |
-> | `scales` | 0.79 B/px | float32 + PCodec |
-> | `s2_obs_count` | 0.18 B/px | |
-> | `s1_desc_obs_count` | 0.13 B/px | |
-> | `s1_asc_obs_count` | 0.12 B/px | |
-> | **total today** | **120.93 B/px** | |
-> | *+ month planes* | *0.03 B/px* | |
->
-> Over the campaign footprint — 1,405,080,698,880 land-live pixels a year across the 112 zones that
-> have land, times nine campaign years, so 12.65 trillion pixels — that is **1,390.9 TiB today and
-> 0.3 TiB added**.
->
-> **Cross-check:** [`campaign-cost-model.md`](campaign-cost-model.md) puts the permanent store at
-> **0.9–1.8 PB** by an independent route; 1,390.9 TiB is 1.53 PB, inside that range. Two methods
-> agreeing is the reason to trust the absolute figure at all.
->
-> The absolute number is an **upper bound** on two counts: a live 256-px chunk can be part water, so
-> land-live over-counts, and not every zone-year will fill (2017 is sparsely populated by design).
-> The *relative* 0.025% is robust to both, since numerator and denominator scale together.
->
-> **The reason the share is so small is that embeddings barely compress.** 128 int8 bands of
-> quantised embedding shrink by 7%, so the store is essentially 120 bytes of embedding per pixel
-> whatever else is added beside it — and month coverage compresses ~400×.
-
-> **The per-shard registry: a refused shard now records WHY (2026-08-18).** Built because the three
-> things wrong with the record all had one cause — a fully refused shard wrote a **zero-byte** marker.
-> The dataset computes `refused_no_optical`, `refused_thin` and `refused_no_radar` per strip and
-> deliberately keeps them apart; the actor sums them over the chunk; then all of it was discarded, and
-> what survived was a count of "optical skips" that named the wrong cause for 43 of 40S's 58 live
-> shards.
->
-> The marker now carries JSON: the three counts, the eligible pixel total, and an observation summary
-> (`px_with_any`, `max`, `mean_where_any`) — because the counts alone cannot say HOW thin, and obs
-> counts are accumulated per strip regardless of validity, so they are populated even where nothing
-> passed. `summarise_optical_skips` folds them into the year's provenance as `by_reason` totals plus a
-> per-shard `reason` (the reason that refused the most pixels, so a mixed shard is named by what
-> dominates it).
->
-> **Read at assembly, which is the last moment they exist:** the markers go with the staging prefix,
-> and the mosaic they were derived from goes when the cell lands. A published cell is write-once, so a
-> reason not written then is not recoverable.
->
-> **Three deliberate non-collapses**, each the same discipline this document keeps relearning:
-> a marker that is empty, unreadable or not JSON yields NO entry rather than an error, because markers
-> from before the registry are zero bytes and a resume across the change must still assemble; a shard
-> with no record is listed under `unrecorded` rather than folded into a zero, since "no reason
-> recorded" is a different claim from "nothing was refused"; and `summarise_optical_skips` called
-> without records returns exactly its previous shape, so a resume cannot write a half-populated
-> registry.
->
-> **The record's shape, after red-teaming it (2026-08-18).** Six things the first cut got wrong or
-> would have got wrong at scale:
->
-> | field | what it holds | why it is shaped this way |
-> |---|---|---|
-> | `tiles_skipped` / `tiles_live` | TILES | unchanged |
-> | `refused_px_by_reason` | PIXELS per reason | the units are in the NAME. The first cut called this `by_reason`, sitting beside a tile count, so a reader comparing the two compared different censuses |
-> | `shards_by_reason` | reason → labels | organised by REASON, not by shard: it is the question a reader asks, every key is self-describing, and it is an order of magnitude smaller than a nested record per shard — which went into a zarr ATTRIBUTE that every reader of the zone pays on every open, at up to 556 live tiles |
-> | `shards_mixed` | count | a shard sits under the reason that took the most of its pixels, so the lists partition; this says how many had more than one, which a bare dominant label hides |
-> | `s2_obs_at_refused` | pooled max + px_with_any | HOW thin, pooled. Per-shard depth answers a question nobody has once the mosaic is deleted, and it is what made the record large |
-> | `unrecorded` / `unreadable_markers` / `inconsistent` | labels / count / labels | the three ways this record can fail to know something, each said rather than folded into a zero |
->
-> **The dangerous one was not a reporting bug.** The marker's PRESENCE is load-bearing —
-> `verify_staged_completeness` tells a legitimate skip from a crashed worker by the file existing — so
-> a record that cannot be serialised must cost the RECORD, never the marker. One careless missing
-> `int()` around a numpy scalar in `json.dumps` would have turned a benign skip into a failed chunk
-> that wedged the cell on every retry. The write now falls back to a bare marker and logs.
->
-> **`unreadable_markers` exists because "no records" and "every read failed" are the same empty dict.**
-> Expired credentials or a wrong prefix would otherwise publish a provenance entry that quietly says
-> no reason was recorded for anything. The reader returns its failure count and the caller surfaces it.
->
-> **`inconsistent` checks the invariant nobody was checking.** The dataset's three reasons partition a
-> shard's pixels by construction, so on a FULLY refused shard they must account for every eligible
-> pixel. A mismatch means strips did not cover the chunk or a count was double-added — either way the
-> pixel totals are wrong, and saying so beats a plausible number. A record that refuses NOTHING while
-> its shard holds nothing lands here too: that is the producer and the summary disagreeing.
->
-> **Reading is concurrent** (one small GET per refused shard, resolved against one filesystem rather
-> than one per label): a zone can refuse hundreds, and serially that is a round trip each on the
-> critical path between the last chunk and the commit.
->
-> **Why only FULLY refused shards need a record at all.** For a shard that WAS written the evidence is
-> already published — its `s2_obs_count` is real, so a depth-refused pixel is identifiable as
-> `0 < obs < optical_min_obs` with a NaN scale. A fully refused shard writes nothing, its obs counts
-> read back as fill, and its mosaic is deleted when the cell lands. That is the only case where the
-> reason is unrecoverable, and so the only case this has to cover.
->
-> The monitoring round consumes it: the footprint check reports `40S/2023: 43/58 (74%) refused —
-> no_radar 180m px` instead of the bare word "refused".
+> Design and red-team detail is in `inference/assembly.py` and `tests/unit/test_skip_registry.py`,
+> which are now the record. What belongs here is why it exists.
 
 > **OPTICAL DEPTH IS THE ONLY REFUSAL RULE — and radar was silently refusing land too
 > (2026-08-18).** A DECISION (Robert), and a correction to what the campaign was actually doing. The
@@ -343,131 +252,37 @@ below.
 > False` is now registered on both global fill deployments so the two agree; the library default is
 > untouched, so a non-global caller still demands radar unless it says otherwise.
 
-> **The first cell published twelve empty planes, and every other array beside them was right
-> (2026-08-18).** 09S/2022 landed in `tessera-months`, validated, and reported 51 observations per
-> pixel. Its `s2_month_covered` was `False` everywhere — 4 matching flags out of 786,432, and those 4
-> by coincidence — while on the same 256-px window `s2_obs_count` agreed with the mosaic on **65,536
-> of 65,536 pixels** and the mosaic itself showed **45.3 observations and 11.99994 months per pixel**.
-> Fixed in `ac932c6`.
+> **The month array shipped wrong once, and how it failed is worth more than the fix.** The first
+> cell published twelve all-empty planes while every array beside them was correct. The cause was
+> ENUMERATION rather than the array: assembly chose which staged variables to copy by a whitelist
+> the new variable was not on, so it staged fine, was never copied, and the destination kept its
+> fill value — which for a bool plane reads as "no pixel had coverage" rather than as "nothing was
+> written". Fixed in `ac932c6`, verified in `fc16f57` on 40S/2022 and 28S/2025, and reproduced
+> against the published store with the reader expressions run verbatim rather than reasoned about
+> (`cov.sum("month")`, `cov.sel(month=7)`, `cov.all("month")` all work with no helper).
 >
-> **The cause was enumeration, not the array.** Assembly chose which staged variables to copy into the
-> destination from a hand-written tuple, `("embeddings", "scales", "embedding_std", *OBS_COUNT_VARS)`,
-> repeated at four decision points. Adding an array to the layout satisfied everything else — it was
-> created in every zone, seeded at the right dtype and geometry, computed per strip by the actors, and
-> staged with real values — so no step failed. The array simply had no name on the list, and a
-> variable that is never copied leaves the destination reading exactly like a pixel with no
-> observations. The copy set is now **derived from the layout** (`CARRIED_VARS`), so an array added to
-> the schema is carried by construction.
+> **Three things about the failure generalise.**
 >
-> Three further defects sat behind it, all latent because the copy never reached them, and all of
-> which would have failed the fill once the array was on the list. Each is the *same* mistake in a
-> different place — a rule written when `band` was the only trailing axis:
+> No test caught it because every assembly test hand-rolled its destination group, so none exercised
+> the enumeration that decides what gets copied. A test that builds its own destination cannot catch
+> a destination-selection bug.
 >
-> | check | assumed | consequence for a month tile |
-> |---|---|---|
-> | staged-tile shape | any 4-D trailing axis is bands | a correct 12-month tile looks like a 12-wide embedding, rejected |
-> | cleared-tile fill block | 4-D only for `embeddings`/`embedding_std` | a skipped tile writes a 3-D block into a 4-D array |
-> | single-ROI schema | `sizes` has no `"month"` key | `KeyError` creating the array, and no month coordinate written |
+> **A well-observed window cannot verify this array.** A dense window scores full marks whatever the
+> code does; only thin windows make "100% covered" mean something, which is why verification used
+> 28S's thinnest window and checked that months 10 and 11 are absent there exactly as the mosaic says.
 >
-> **Why no test caught it.** Every assembly test hand-rolled its destination group, so no test
-> destination held the new array; and the one fake that touched it — the strip-loop capturing writer —
-> accepted `month_covered` and discarded it. Both are now structural: the test destination is seeded
-> **from the layout**, and the round-trip assertion loops over `CARRIED_VARS` rather than a written-out
-> list, so the next array added is covered without anyone remembering. Both new tests were run against
-> the pre-fix code and fail there, the round-trip one with the production symptom exactly — all-`False`
-> against a mixed pattern.
+> **The array is `int8` on disk with the attribute `dtype="bool"`**, because the write path cannot
+> emit bool directly — and a test staging with raw zarr keeps bool, so it cannot see the production
+> representation at all.
 >
-> **The array is stored `int8` with the attribute `dtype="bool"`, because the write path cannot
-> express anything else (2026-08-18).** The re-fill then failed on a *fourth* defect, caught by a
-> guard written for something else entirely: the staged tile held `s2_month_covered` as **int8** while
-> the destination was seeded **bool**, and assembly's dtype check refused rather than silently
-> C-casting. `Dataset.to_zarr` stores a bool array as int8 with attrs `dtype="bool"` — xarray's own
-> boolean representation — and **ignores an encoding dtype asking for bool**; assembly reads staged
-> tiles with *raw* zarr, so it compares against what is on disk rather than what xarray hands back.
-> The guard was right and the destination's dtype was wrong.
+> Two operational notes for anyone verifying a future cell: the mosaic is the only external check and
+> is deleted once a cell lands, so the snapshot has to be taken between ingest finishing and the fill
+> completing — a fill cancelled *before* its cell lands keeps the mosaic. And a single-timestep probe
+> for "is this window populated" wrongly concluded 28S had no populated window at all, because a
+> partial-swath date reads empty over good land. Probe several.
 >
-> So the destination is seeded to match what the writer can produce, and the attribute is what
-> restores the reader's view: in xarray `s2_month_covered` is a **boolean** array, so
-> `cov.sel(month=7)` is still a mask and `cov.sum("month")` still counts months. Size is unchanged —
-> numpy bool is already one byte — so the 0.24 bits/pixel and 0.025%-of-store figures above stand.
-> `ArrayLayout` gained an `attrs` field for this, applied by the seeder, because a dtype is not always
-> the whole story about a type.
->
-> **The test that could not have caught it staged with raw zarr.** Raw zarr keeps bool; production
-> stages through xarray. A fixture that writes by a different route than production is not testing the
-> route, so there is now a test that stages through `write_chunk` itself with a bool buffer and asserts
-> both the values and the attribute at the destination. It fails against a bool-seeded destination.
->
-> **A well-observed window cannot verify this array.** The two windows first banked as external truth
-> came back at **11.99994 and 11.92 months per pixel**, where a correct array, an all-`True` array and
-> almost any wrong array agree to within a rounding error; they could only have caught a gross
-> misalignment. What discriminates is thin ground with genuine month gaps, so the snapshot now scans a
-> lattice and keeps the thinnest windows alongside a dense control:
->
-> | zone | window | obs/px | months/px | pixels with a month gap |
-> |---|---|---:|---:|---:|
-> | 40S | thin | 18.6 | 9.945 | **96.7%** |
-> | 40S | mid | 32.7 | 10.828 | 54.5% |
-> | 40S | dense (control) | 56.4 | 12.000 | 0.0% |
-> | 28S | thin | 14.3 | 8.376 | — |
-> | 28S | dense (control) | 56.0 | 12.000 | 0.0% |
->
-> The comparison also reports what an all-`True` and an all-`False` array would have scored on the
-> same ground, because an agreement figure means nothing without it.
-
-> **Verified, on ground where a wrong array would have shown (2026-08-18).** 40S/2022 and 28S/2022
-> re-filled into a fresh store from the same mosaics, and every published flag matches the SCL it was
-> derived from: **seven windows, 5,505,024 flags, zero disagreements**, with `s2_obs_count` also
-> matching on all 458,752 pixels and no pixel covering more months than it has observations.
->
-> | zone | window | obs/px | months/px | px with a gap | agreement | all-`True` would score |
-> |---|---|---:|---:|---:|---:|---:|
-> | 40S | thin | 18.6 | 9.945 | 96.7% | **100.0000%** | 82.9% |
-> | 40S | mid | 32.7 | 10.828 | 54.5% | **100.0000%** | 90.2% |
-> | 40S | dense | 56.4 | 12.000 | 0.0% | 100.0000% | 100.0% |
-> | 28S | thin | 14.3 | 8.376 | 100.0% | **100.0000%** | 69.8% |
-> | 28S | mid | 16.2 | 10.574 | 89.6% | **100.0000%** | 88.1% |
-> | 28S | mid | 18.3 | 10.795 | 100.0% | **100.0000%** | 90.0% |
-> | 28S | dense | 56.0 | 12.000 | 0.0% | 100.0000% | 100.0% |
->
-> The last column is the point of the table: on the dense windows the test has NO power — a broken
-> array scores full marks there — and the thin windows are where 100% means something. Seasonal
-> structure is reproduced too, not just totals: 28S's thinnest window has months 10 and 11 absent
-> across the whole window and its neighbour has month 10 absent, matching the mosaic exactly.
->
-> The reader expressions were run verbatim against the published store rather than reasoned about.
-> `s2_month_covered` opens in xarray with dims `(time, northing, easting, month)`, a `month`
-> coordinate of 1..12, and dtype **bool**; `cov.sum("month")`, `cov.sel(month=7)`,
-> `cov.sel(month=slice(5, 9)).all("month")` and `cov.all("month")` all work with no helper.
->
-> **CORRECTION to the 0.24 bits/pixel figure above: cost is driven by FRAGMENTATION, not by mean
-> coverage, and it spans a factor of 150.** Re-compressing published 256-px inner chunks with the
-> array's own zstd:
->
-> | 28S window | months/px | bits/px | zstd ratio |
-> |---|---:|---:|---:|
-> | thin | 8.38 | 0.514 | 187× |
-> | mid | 10.57 | **0.771** | 125× |
-> | mid | 10.79 | 0.209 | 459× |
-> | dense | 12.00 | 0.005 | 18,725× |
->
-> The 10.57-month window costs **more** than the 8.38-month one: a uniform plane — all covered or all
-> empty — is nearly free, and a mottled one is not, so the predictor is patchiness rather than depth.
-> The 0.24 bits/pixel design figure sits inside this range and remains the best population estimate;
-> it was measured over ordinary chunks, whereas a thin-weighted sample like the one above pools to
-> 0.325 and is an upper-tail sample by construction. **The store-share conclusion does not move**:
-> even at the worst window's 0.771 bits/pixel everywhere the array is ~0.08% of the store rather than
-> 0.025%, so it is negligible under either figure.
->
-> **Two operational notes.** The mosaic is the only external check and is deleted when a cell lands,
-> so the snapshot must be taken between ingest completing and the fill finishing — and a fill
-> cancelled *before* its cell lands preserves the mosaic (`cleanup` runs only after a cell lands),
-> which is what made a re-fill possible without re-ingesting. 09S/2022 keeps its empty planes: the
-> store is write-once, so a wrong array is not repaired, it is superseded by a fresh store.
->
-> A single-timestep probe for "is this window populated" wrongly concluded 28S had no populated window
-> at all — a partial-swath date reads empty over good land. Probe several.
-
+> 09S/2022 keeps its empty planes: the store is write-once, so a wrong array is superseded by a fresh
+> store rather than repaired.
 The census that produced the campaign figures measured **shard means**, and this rule
 refuses **individual pixels** — a different question, and the class of error the
 corrections register calls *presence counted where coverage was meant*. It was therefore
@@ -710,471 +525,46 @@ in the actor *is* per-shard accounting. Nothing needs to be re-read to build the
 
 ---
 
-## 4. Work item 1 — the threshold, recorded once and enforced
-
-**One constant, carrying one value — and RENAME it. `OPTICAL_THIN_MAX_OBS` becomes
-`OPTICAL_MIN_OBS`, holding 25.** No second constant: two names holding the same number would be
-two things to keep in step for no gain (settled 2026-08-13, against an earlier suggestion of a
-separate refusal constant). The comparison itself barely changes; what changes is that failing it
-**refuses** the pixel instead of labelling it.
-
-**The rename is the safety mechanism, and it is the whole reason not to keep the old name.** The
-constant has about twenty consumers across two repositories, and the plan's own §9 has to reconcile
-four documents plus two now-false statements in the validator. Keeping the name means every one of
-those consumers silently changes meaning, and the ones that are prose rather than logic change
-meaning without changing behaviour — the worst case, because nothing fails. Renaming makes every
-consumer an import error, so the compiler produces the reconciliation list instead of a grep.
-Two further reasons it earns its keep:
-
-- **`RADAR_THIN_MAX_OBS` stays a reporting line.** After this change, two identically-shaped
-  `*_THIN_MAX_OBS` constants would mean opposite things side by side in one config module.
-- **A stored verdict is a permanent record.** Verdicts already written carry `s2_thin_*` fields
-  computed under the labelling meaning. A new name upstream is what stops a later reader comparing
-  two verdicts that used one key for two quantities.
-
-> **Rewrite the docstring in the same edit.** It currently says, in terms, *"Only a REPORTING line:
-> nothing refuses a cell for being under it, and the exact per-pixel counts live in the store's
-> `s2_obs_count` array either way."* That sentence becomes false the moment this ships. The new one
-> must state that the line is a refusal, that the value has been 40, then 15, then 30, then 25, and that a
-> reader of older commits or documents will find the opposite claim under the old name.
-
-### Where it lives
-
-**Root group attrs of the global store, campaign-wide** — one value for the whole product,
-visible to anyone who opens the store. `storage/global_store.py::_root_attrs`.
-
-That location is not merely convenient: the root already has a **write-once identity check**
-(`global_store.py` ~L297) whose comment explains the exact hazard — *"an incremental seed must
-NOT silently re-stamp it … that would let already-seeded/filled zones (encoder A) be mixed
-with a new one (encoder B) under a root now advertising B"*. Adding the threshold to that
-`identity` tuple gets the guarantee for free:
-
-- first seed stamps it;
-- a matching reseed is a no-op;
-- **a reseed with a different value is rejected**, with the existing error.
-
-Fills already read the root attrs for the model gate, so `fill_zone_year` should read the
-threshold the same way and refuse a cell whose config disagrees with the store it is writing
-into. That closes the mixing hazard with machinery that already exists rather than a new one.
-
-**Two consequences to rule on explicitly, because both are silent otherwise.**
-
-**A store whose root carries no threshold at all.** That is the state of every store seeded so far,
-including the dev store the campaign is tested against — the attribute did not exist when they were
-seeded. The ruling: **a fill against a root with no threshold refuses to run, and names the
-remediation.** The alternative, running unrefused, would publish data under a rule the store never
-declared and could not later be told apart from data that legitimately predates the rule. The
-remediation is a one-line re-stamp of the root, which is safe precisely because the identity check
-makes a *conflicting* re-stamp impossible; add a `--stamp-threshold` path to the seeder for it. Dev
-stores get re-stamped once, deliberately, rather than being silently grandfathered.
-
-**The line can never change for a store that already has one.** Putting the threshold in the
-write-once identity tuple is what buys the mixing guarantee, and it forecloses ever re-stamping a
-different value — so a top-up cycle inherits the original line, permanently. That is the intended
-behaviour and it is consistent with §12's "they clear the unchanged line on their own", but it must be
-stated rather than discovered: **a decision to move the line is a decision to build a new store.**
-The §1 re-measurement is therefore the last moment the value is free.
-
-### The second place, and only the second
-
-Add it to `_staging_run_id`'s key tuple (`run_global_campaign.py` L256 and its twin in
-`fill_zones_sequential.py`). The root attr is the *published* guarantee; the run id is
-*staging hygiene* — it stops a resume reusing tiles staged under a different line, including
-in dev where the root may not be stamped yet. Two lines, and it sits beside
-`min_valid_coverage` and `allow_s2_only`, which exist for exactly this reason.
-
-**No `EmbeddingManifest` field is needed.** An earlier draft proposed one in
-`REQUIRED_TO_APPEND`; the root identity check supersedes it and is less machinery.
-
-## 5. Work item 2 — the gate
-
-`InferenceConfig` carries the run's line as **`optical_min_obs: int | None = None`**, mirroring the
-renamed constant. **`None` means "no refusal", and it is not the same value as zero** — that
-distinction is the point, and an earlier draft of this section had it wrong twice over: it claimed
-zero disabled refusal "naturally, because `obs < 0` is vacuously false" while showing code that
-guarded on `> 0` and compared with `>=`, and it left zero meaning both "refuse nothing" and "nobody
-configured this". Two failures already in the register have that exact shape — a throttle whose
-off-state was not a stop, and a default nobody set that had therefore never run. So:
-
-- `None` — no refusal. Every existing caller and the whole single-ROI path stay bit-identical.
-- a positive integer — the line.
-- **zero is refused at construction**, because it can only be a mistake: it would refuse nothing
-  while looking like a configured rule.
-
-**The campaign flows must not default it.** They resolve it from the store's root attr (§4) and
-**refuse to dispatch if that is absent** — a campaign that silently ran unrefused because a
-parameter defaulted is the failure this whole section exists to prevent. `tessera_embeddings` and
-`plain` pass nothing and keep `None`.
-
-Thread it through `build_inference_config` -> `fill_zone_year`, `run_global_campaign`,
-`fill_zones_sequential`.
-
-Then in `inference/dataset.py`, `MosaicChunkInferenceDataset.__init__`:
-
-```python
-valid_mask = s2_nonzero & (s2_valid_count > 0)
-if self.optical_min_obs is not None:
-    valid_mask &= s2_valid_count >= self.optical_min_obs
-if not self.allow_s2_only:
-    valid_mask &= s1_total_valid > 0
-```
-
-Pass `config.optical_min_obs` where the dataset is constructed (`actors.py`, `_load_strip`).
-
-**Keep the three refusal reasons separable** — a pixel can fail for no S2 at all, for thin S2,
-or for absent S1 — because §7's records depend on telling them apart. Compute the component
-masks once and reuse them; do not collapse to a single boolean.
-
-## 6. Work item 3 — keep fully-refused shards auditable
-
-Under this rule the dominant skip reason becomes "every pixel was too thin", and a
-fully-skipped shard currently writes a **zero-byte** marker and no `s2_obs_count` at all. Its
-evidence would vanish.
-
-Two changes, both small:
-
-1. **Give the skip marker a payload.** `write_skip_marker` writes the same per-shard record
-   defined in §7 as JSON instead of zero bytes. Assembly's resume scan reads only object
-   names (`_list_skip_marker_labels`, and the validation at ~L1305), so content is free and
-   this is backward compatible with markers already on disk — treat an empty marker as
-   "record unavailable", never as zeros.
-2. **Write a stats sidecar for every live shard**, embedded or skipped:
-   `<staging>/<run_id>/<label>.stats.json`. This is what makes the registry survive a
-   **resume**: a leg that resumes tiles staged by an earlier attempt reports
-   `{"status": "success", "valid_pixels": 0, "resumed": True}` with no counters, so a registry
-   built from one leg's results would record zeros for everything the previous leg did.
-   `summarise_optical_skips` documents this exact trap; the registry inherits it. Sidecars
-   persist alongside the staged artifacts and are read at assembly, so a resumed cell is
-   complete.
-
-## 7. Work item 4 — the per-shard record
-
-Computed **in the actor**, where the obs array and the embedded mask are both already in
-memory (`actors.py` ~L1328). No extra reads.
-
-> **CORRECTION (2026-08-13): the actor cannot compute `n_eligible_px` as this section defines it,
-> and no layer can compute it at pixel granularity.** Two facts, both checked in the code rather
-> than assumed:
->
-> * **There is no per-pixel land mask anywhere in the system.** The land mask holds
->   `tile_live_2048` and `chunk_live_256` and nothing finer (`ingest/land_mask.py`), so "ROI-live
->   pixels in the shard" is not a quantity that exists. The finest honest denominator is **pixels in
->   live 256-px chunks**, which is what `n_eligible_px` must mean.
-> * **The actor never sees the land mask.** What it holds is an `S2MaskBundle` — SCL validity and
->   observation counts — and a chunk reaches it only because a coarser ROI pre-filter let it
->   through. It knows its chunk is live; it does not know which of its 64 inner chunks are.
->
-> **The fix is small and must be deliberate:** thread the chunk's own 8×8 slice of `chunk_live_256`
-> — 64 booleans — into the actor beside the mask bundle, and define eligibility from it. The
-> alternative, computing the record in assembly where the mask is already read, moves it away from
-> the arrays it counts and would cost a re-read of the whole shard.
->
-> Two consequences to carry into the registry: `n_eligible_px` **over-counts** on a coastal chunk,
-> since a live 256-px chunk can be part water, so a coastal shard's refusal share is a lower bound;
-> and `chunks_skipped_mask` is exactly at the mask's own granularity, which is why it is the field
-> the validator should grade against rather than any pixel count.
-
-| field | type | meaning |
-|---|---|---|
-| `zone` | str | `"33N"` |
-| `year` | int16 | |
-| `tile_row`, `tile_col` | int32 | position in the zone's shard grid |
-| `lon_min/lat_min/lon_max/lat_max` | float32 | WGS84 bbox — so a map needs no reprojection |
-| `lon_c`, `lat_c` | float32 | centroid |
-| `n_eligible_px` | int32 | ROI-live pixels in the shard — **the denominator** |
-| `n_embedded_px` | int32 | |
-| `n_refused_thin_px` | int32 | eligible, ≥1 S2 observation, below the line |
-| `n_refused_no_optical_px` | int32 | eligible, zero S2 observations at all |
-| `n_refused_no_radar_px` | int32 | eligible, refused by the S1 gate (0 when `allow_s2_only`) |
-| `s2_obs_mean`, `s2_obs_median`, `s2_obs_p10` | float32 | over **eligible** pixels, not embedded ones |
-| `chunks_skipped_mask` | uint64 | **bit _i_ set = inner 256-px chunk _i_ fully refused** |
-| `n_chunks_eligible`, `n_chunks_skipped` | uint8 | of 64 |
-| `status` | str | `"written"` \| `"skipped"` \| `"resumed_unknown"` |
-| `optical_min_obs` | int16 | the rule this row was produced under |
-| `refused_depth_hist` | 6 x uint32 | the THIN refusals binned by depth: 1-4, 5-9, 10-14, 15-19, 20-24, 25-29. Excludes zero-observation pixels, which `n_refused_no_optical_px` already counts, so the six bins **sum exactly to `n_refused_thin_px`** — a cheap invariant to assert |
-| `mosaic_identity` | str | the ingest marker this cell was filled from — see below |
-
-Four deliberate choices, each of which should survive review:
-
-**Three categories, never two.** Live shards include the land mask's ~11 km sea buffer, so a
-coastal shard can be majority ocean. "% skipped" against the full 2048² is meaningless;
-`n_eligible_px` is the only honest denominator.
-
-**No stored percentages.** Store counts; document the formulas. A stored percentage is a
-second copy of a truth that can drift from its numerator — the exact shape of the corrections
-register's *correction applied in one place and not the others*.
-
-**Two fields exist for the planned top-up, not for reporting.** The intent is to revisit
-refused pixels once Element 84 publishes more imagery, at which point their observation
-counts rise and they clear 25 under the unchanged rule. That later pass needs to choose
-*where* to spend without scanning a petabyte, and two cheap fields make the registry its work
-list. `refused_depth_hist` answers **how close they were** — a shard whose refusals sit at
-25-29 is rescued by a modest backfill, one whose refusals sit at 0-4 is not, and the
-distinction is invisible in a single mean. `mosaic_identity` answers **what they were refused
-against**, so a later pass can tell whether the input for that shard actually changed rather
-than re-probing every mosaic. The staging run id already fingerprints the mosaic's ingest
-marker; reuse that value.
-
-**A `uint64` for chunk-level detail.** A shard holds exactly 64 inner chunks, so one integer
-records precisely which were fully refused. Per-chunk *rows* would be 193M for the campaign;
-this is chunk fidelity at 8 bytes, and the actor computes it by reshaping the refusal mask to
-`(8, 256, 8, 256)` and testing `.all()` on the inner axes.
-
-## 8. Work item 5 — the registry files
-
-**The registry lives ALONGSIDE the Icechunk store, never inside it.** Four reasons, and the
-first is decisive:
-
-1. Icechunk is transactional and its tags are **write-once forever**. A parquet inside the
-   store would make every registry update a commit on published data, and a registry
-   correction could never re-pin the tag it belonged to.
-2. Icechunk owns its internal layout — snapshots and chunk manifests. Arbitrary files are not
-   addressable there by ordinary tooling.
-3. The registry must be **rebuildable and replaceable without touching published data**. That
-   is the property that makes it a cache rather than a second source of truth (§8.3).
-4. Its consumers want `pd.read_parquet("s3://...")` and duckdb, not an icechunk dependency.
-
-### Layout and filenames
-
-**It goes in the AWS Open Data bucket, beside the published store** (ruled 2026-08-13). Production
-no longer publishes to a bucket of ours: the store is `s3://tessera-embeddings/v1.1/dclimate.icechunk`,
-and the registry is its sibling prefix.
-
-```
-s3://tessera-embeddings/v1.1/
-├── dclimate.icechunk/                      # the store, untouched
-└── dclimate.registry/
-    ├── optical_depth_registry.parquet      # the master — compacted from parts/, never hand-written
-    ├── index.json                          # per zone-year + campaign totals, human-readable
-    └── parts/
-        ├── zone=01N/year=2017/shards.parquet
-        ├── zone=01N/year=2018/shards.parquet
-        └── ...                             # one per landed cell, 1,008 in total
-```
-
-A sibling rather than a folder inside the store, for the reasons above **and** one that is specific
-to Icechunk: it owns every key under its own prefix and its garbage collection enumerates that
-prefix, so a parquet living in there is at best unrecognised and at worst collected.
-
-Three consequences of the bucket it now sits in, none of them optional:
-
-- **It needs Cambridge's write grant**, on `v1.1/dclimate.registry/*`, with the same actions as the
-  store's prefix — including delete and multipart-abort, since compaction replaces the master. That
-  prefix is already in the access request; what changes is that the request must say a parquet
-  dataset lives there, because "1,008 part files plus a master" is a different thing to review than
-  "an index file".
-- **The schema becomes a published interface.** A registry in our own bucket could be rebuilt into
-  a new shape whenever we liked; one in the public dataset cannot, so `schema_version` in
-  `index.json` stops being decoration. Adding columns is safe; renaming or retyping one is a
-  breaking change to somebody else's query.
-- **The rebuildability property (§8.3) is what keeps it honest.** It is still a cache — every row is
-  derivable from the store — and that is what makes it safe to replace in place after a correction.
-
-Add `BucketPaths.optical_registry()` alongside `global_store()` and `land_mask_store()`, and **derive
-it from the same override the store uses** rather than from `outputs`: production's store location is
-a whole-URI override (`global_store_uri`), so a registry path built from `outputs` would land in our
-bucket while the store sat in the public one, and every tool would still "work". The existing methods
-carry the reason — *"a mask written to a path the ingest does not read would look like success"*.
-
-### 8.1 Written incrementally, at assembly
-
-One parquet per zone-year, in `assemble_zone_year`, at the point `run_provenance` is written
-and the cell is tagged. **Never a global rewrite**: the campaign lands 1,008 cells over days
-from up to eight clusters at once, so rewriting one object per cell is both a throughput
-problem and a lost-update race.
-
-**The master is never written by the campaign** — only by `build_optical_registry.py`, from
-`parts/`, on demand. An earlier draft had it "written once at the end", which has two failure modes
-and no upside: a campaign that crashes leaves no master at all, and a campaign that ends with
-unfilled cells — which is now a **success with a warning**, not a failure — leaves a master that is
-silently partial. Rebuilding from parts also means a registry bug is fixed by re-running one script.
-
-**`index.json` carries its own completeness**, for the same reason: a `complete` boolean, the count
-of cells expected against cells present, and the unfilled list. A summary file that cannot say
-whether it is finished gets read as if it were.
-
-### 8.2 `index.json` — work item 4 of the request
-
-Per zone-year: `n_live_shards` (from the land mask, so the denominator exists even for an
-empty cell), `n_shards_written`, `n_shards_fully_skipped`, the pixel counts summed,
-`pct_eligible_refused`, `optical_min_obs`, the **cycle** the cell was last filled in and
-its **generation** (§13), and the run id. Plus campaign totals, the current cycle, and a
-`schema_version`.
-
-Keyed by cycle because that is how users think about the product — `v1.0`, then `v1.1` after
-a top-up — not by cell. **Everything here is derivable from the store's own attrs** (§13); the
-registry exists so the answer takes one GET instead of 120 group reads.
-
-Deliberately a small JSON a human can open, not a parquet needing tooling — it is the file
-someone reads to answer "how did the campaign go" without installing anything.
-
-### 8.3 Rebuildable from the store
-
-`scripts/build_optical_registry.py` compacts `parts/` into the master **and** can rebuild any
-row from the store: `s2_obs_count < threshold` combined with `isnan(scales)` reconstructs
-every field except those of fully-skipped shards, which write no arrays at all — which is
-exactly why §6 exists and why §13 states that exception plainly rather than glossing it.
-
-**Protect this property with a test**, not just a docstring: it is what makes the registry a
-cache rather than a second source of truth, and it is what lets a registry bug be fixed
-without re-running inference.
-
-Scale: 360,953 live shards x 9 years = **3.2M rows**. Comfortable for a single parquet.
-
-## 9. Work item 6 — reconcile the records this contradicts
-
-**Not optional tidying. Leaving any of these is how the repo ends up asserting two policies.**
-
-1. **`OPTICAL_THIN_MAX_OBS` becomes `OPTICAL_MIN_OBS` at 15, and the meaning inverts** (§4).
-   The rename is what produces this list: every use is an import error until it is revisited.
-   `actors.py` L1339 becomes the refusal, and `assembly.py` L2248's `s2_thin_below_obs` now
-   reports a refusal line and should be renamed with it.
-2. `summarise_radar_coverage` reports `s2_thin_pct` over a denominator of **embedded**
-   pixels. Once nothing below the line is embedded, that field is structurally `0.000`
-   forever. Move the optical half to the **eligible** denominator and rename the fields for
-   refusal (`s2_refused_px` / `s2_refused_pct`) — they are consumer-facing in the published
-   provenance, and `run_provenance` is the schema's one owner.
-3. **`final-data-validation-plan.md` §4 and `campaign-plan.md` state the standing policy as
-   "a thin cell is not a broken cell — publish thin cells; label them". This decision reverses
-   it.** Both change in the same commit. The AI figure review needs its instructions updated
-   too: a sparse cell is now the *expected* output of a thin region, and a reviewer not told
-   so will report every refusal as a defect.
-4. A new ADR in `context_docs/decisions/` records the rule, the three rulings in §1, the
-   evidence in §1-2, and the deferred-spend reasoning in §12.
-
-### 9.2b What refusal does to validation — the interaction that costs the most to miss
-
-Item 3 above says the window reviewer needs new instructions. That understates it: **this rule
-removes the review's single most reliable signal, and it opens a hole in coverage checking that
-nothing currently fills.** Both were found on 2026-08-13, the second while measuring the first.
-
-**A partially refused shard is the new common case, and nothing has an expectation for it.** The rule
-refuses individual pixels, so a shard is now one of three things rather than two: fully embedded, no
-pixel below the line; **fully refused**, every eligible pixel below it, which writes a skip marker and
-no arrays; or **partially refused** — written, but with NaN scales wherever a pixel failed. Because
-refusals cluster (§1: 90.4% of them inside chunks already below the line), a partially refused shard
-typically holds whole 256-px chunks of nothing next to healthy ground.
-
-The consequence is a granularity mismatch. `optical_skips` counts whole TILES, and the validator's
-identity `written + skipped == live` is a tile-level check, so it stays sound and a fully refused
-shard remains auditable — that is what §6 protects. But a *partially* refused shard is "written" by
-that identity while missing an arbitrary share of its pixels, and **no record says how much of it
-should be missing.** The validator would see a low embedded fraction and have nothing to compare it
-against. So:
-
-- **the validator reads the per-shard record** (§7) and grades the embedded fraction against
-  `n_eligible_px - n_refused_*` rather than against the whole footprint;
-- **`chunks_skipped_mask` becomes load-bearing for validation**, not just for top-up planning — it is
-  the only thing that says *which* holes are expected, at the granularity the holes have.
-
-**The artifact signature collision, which is the sharper problem.** A fully refused inner chunk
-renders as a flat grey 256-pixel square with chunk-aligned straight edges. That is pixel-for-pixel
-the shape of the defect class the window review is best at catching: a blind calibration on 2026-08-13
-caught 3 of 3 synthetic dead blocks, describing one as *"a 128x128 flat rectangle whose interior
-variance is a fraction of the scene's"*, and 7 of 7 defects overall with no false alarms. After this
-rule, that exact geometry becomes a **normal feature of the product**. Two things follow:
-
-- The review must be handed the cell's per-shard record and the chunk bitmask, so it can ask whether
-  a rectangular hole is one of the expected ones rather than whether it is rectangular. Without
-  that, its sharpest discriminator becomes its highest false-alarm source, and a reviewer that cries
-  wolf on every refused chunk is worse than no reviewer.
-- The calibration set has to be re-scored **after** the rule ships, with refused-chunk holes present
-  in the clean cases. Otherwise it certifies a reviewer against a product that no longer exists.
-
-### 9.1 Tell users about 2017 where they meet it
-
-2017 publishes roughly a third populated, and that is the expected output rather than a fault.
-It must be stated in three places a user actually encounters:
-
-- the root store attrs, beside the threshold — a one-line note that coverage varies by year
-  and that 2017 is substantially sparser because Sentinel-2B was not yet in routine operation;
-- `index.json`, where the per-year figures make it self-evident;
-- the root `README` section on reading the global store.
-
-## 10. Tests
-
-- **The gate**: a pixel at 14 is refused and at 15 is kept; at `optical_min_obs=None` the mask is
-  bit-identical to today (pin this — it is what protects the single-ROI path); and
-  `optical_min_obs=0` is REFUSED at construction rather than quietly disabling the rule (§5).
-- **Separability**: a pixel refused for thin optical, one for no optical, and one for absent
-  radar land in the three different counters.
-- **The bitmask**: a shard with exactly one fully-refused inner chunk sets exactly one bit,
-  in the right position.
-- **The denominator**: a half-ocean coastal shard reports `n_eligible_px` as its land half,
-  not 2048².
-- **Resume**: a cell resumed from a prior leg produces a complete registry row from sidecars,
-  not a row of zeros. This is the one most likely to be got wrong.
-- **Root identity**: reseeding a store with a different `optical_min_obs` is rejected by the
-  existing write-once check; a fill whose config disagrees with the root is refused; and a fill
-  against a root carrying NO threshold refuses to run rather than running unrefused (§4).
-- **Cycles** (§13): `runs[year]` appends rather than replaces, so a second fill keeps the
-  first's provenance; generation is the list length; and the work list treats a cell as done
-  for the *current cycle* only, so a top-up cycle re-selects it while a resume does not.
-- **Fingerprint**: the staging `run_id` changes when `optical_min_obs` changes.
-- **Full suite green** with the flag off ⇒ today's behaviour bit-for-bit.
-
-## 11. Verification
-
-1. `uv run pytest tests/unit tests/architecture` green; ruff, `ruff format --check`, and mypy
-   clean on touched files (11–15 pre-existing mypy errors are unrelated — compare, do not
-   assume).
-2. Fill **one dev cell in a mixed zone** with the rule on, and check: the registry row's
-   `n_embedded_px + n_refused_*` equals `n_eligible_px`; the parquet reads with a bare
-   `pd.read_parquet`; `index.json` totals match the parquet sums.
-3. Rebuild that cell's registry row from the store with the standalone script and confirm it
-   matches the row written at assembly. Any divergence means the actor and the store disagree
-   about what was embedded.
-4. Confirm a resumed fill produces the same registry as an uninterrupted one.
-
-## 12. Why the spend is deferred, not lost — for the ADR
-
-Refusing a pixel means no embedding exists for it, so recovering one is a re-run rather than a
-filter change. That is deliberate and it is **not** a bet that the line is right forever; it is
-a bet that the *input* will improve. The intent is to revisit refused pixels once Element 84
-publishes more imagery, at which point their observation counts rise and they clear the
-unchanged line on their own. §7's `refused_depth_hist` and `mosaic_identity` exist to make that
-pass plannable from the registry rather than from a petabyte scan.
-
-Three things the later pass will face, recorded now so they are not discovered then:
-
-- **A top-up is a new CYCLE, not a re-tag.** Per-cell tags are dropped (§13); the later pass
-  appends a run record carrying its cycle label and the release gets one tag. Decided now
-  because Icechunk tags are write-once forever and the campaign has not yet tagged anything.
-- **The unit of a top-up is a shard, not a pixel.** Rewriting any refused pixel rewrites its
-  whole shard, so the economics are set by how refusals cluster — which §1's measurement says
-  is heavily (90.4% of them inside chunks already below the line).
-- **The top-up's work list is shards whose OWN mean is below the line** (ruled 2026-08-13), not
-  every shard containing a refused pixel. That is a much smaller set and it is what makes the
-  re-run affordable: a shard that is mostly healthy with a thin corner is left alone, and its
-  corner stays refused until some later cycle takes the whole shard. The registry's per-shard
-  `s2_obs_mean` is therefore the selection column, and `refused_depth_hist` ranks within it.
-- **The saving now is smaller than the pixel share suggests.** Cost is token-denominated and
-  refused pixels are the thin ones: roughly 18% of pixels carry closer to 9% of tokens, order
-  $50K of a ~$573K inference spend. Real, but half what the headline implies.
-- **The recovery has not been priced, and the deferral was accepted anyway** (2026-08-13). Re-running
-  a shard later costs more than embedding it once now — a new fleet, re-ingested mosaics, and the
-  healthy pixels of every selected shard paid for twice — so the $50K is a deferral with a premium
-  rather than a saving. The ruling is that the campaign expects budget left over and the premium is
-  affordable; it is recorded here so the ADR does not present the figure as a net gain.
-
-The counter-argument, stated once for the record: `s2_obs_count` is already per-pixel in the
-store, so a determined user could always have filtered at 25 themselves, and publishing
-everything with a quality flag would have cost nothing to reverse. The decision to refuse
-instead is a deliberate choice to protect users who do not read documentation, taken on the
-reasoning that a published embedding is taken at face value and unsatisfactory results damage
-trust in the whole product.
-
-**Two objections were put to that reasoning on 2026-08-13 and answered.** First, that the branch
-being taken is the irreversible one while the reversible one is free — publishing with a flag can be
-tightened later, refusing cannot be loosened without a re-run. Second, that a hole is not obviously
-kinder to a careless user than a noisy value: a thin embedding degrades a downstream model slightly,
-whereas a chunk-shaped hole changes the geometry of a study area and the length of a time series, and
-for yield modelling in particular a NaN is not the gentler failure. **The ruling stands**: the
-dataset's reputation is the thing being protected, and erring toward high quality serves that even
-where it costs a user convenience. Recorded because the objections are the ones a reviewer of the ADR
-will raise, and the answer is a judgement about reputation rather than a measurement.
-
----
+## 4-11. The build — SHIPPED, and the code is the record
+
+Eight work-item sections stood here: the threshold recorded once and enforced, the gate, keeping
+fully-refused shards auditable, the per-shard record, the registry files, reconciling the records
+this contradicted, the tests, and the verification checklist. **All of it is built.** They specified
+field names, file layouts, invariants and a test list, and every one of those is now settled in code
+where it cannot drift from what runs:
+
+| What it specified | Where it lives now |
+|---|---|
+| the threshold, recorded once | `config/inference.py` (`OPTICAL_MIN_OBS = 15`), stamped into the store root as write-once identity by `storage/global_store.py` |
+| the gate | `inference/dataset.py`, applied per pixel per year |
+| the store's rule is the only rule a fill may apply | `orchestration/runners/zone_fill.py` asserts it; the Prefect adapter substitutes it |
+| refusal recorded per shard, with a reason | `inference/actors.py` writes the marker, `inference/assembly.py` reads it at assembly |
+| the registry beside the store | `config/paths.py` (`optical_registry()`), a sibling of the Icechunk prefix rather than inside it |
+| the tests | `tests/unit/test_skip_registry.py`, `test_dataset_v11.py`, `test_assembly.py` |
+
+Kept from those sections, because the code states the mechanism and not the reason:
+
+**The registry is a SIBLING of the store, never inside it.** Icechunk owns every key under its own
+prefix — garbage collection enumerates that prefix and reconciles it against its own manifests — so a
+Parquet file living there is at best unrecognised and at worst collected.
+
+**The rule is part of the store's write-once root identity.** Not a per-run parameter, because a cell
+filled under a different line than its neighbours is undetectable afterwards: a refused pixel is
+indistinguishable from one that had no optical input. Moving the line therefore means a new store,
+not a migration — which is the cost the decision in §1 was taken with in view.
+
+**Three categories, not two.** Not-eligible (ocean or outside the ROI), eligible-and-embedded, and
+eligible-and-refused. A percentage over the wrong denominator was the error this replaced: the land
+mask extends about 11 km into the sea, so "share of the grid" and "share of eligible land" differ by
+enough to change what a reader concludes.
+
+## 12. Why the spend is deferred — see ADR-018
+
+This section was written "for the ADR" and is now one:
+[ADR-018](../decisions/018-refuse-pixels-below-minimum-optical-depth.md) carries the decision, the
+deferral premium (a ~$50K deferral that costs MORE to recover later, not a saving), the top-up unit,
+and the two objections that were raised against refusing rather than flagging — with the answers,
+because those are what a reader of the ADR will raise.
 
 ## 13. Generations, update cycles, and what tags are actually for
 
@@ -1328,105 +718,10 @@ nothing.
 The four validation scripts stay where they are: they need `yield_embeddings.domain` as well
 as bucket config.
 
-### The validation modules move here, ideally FIRST (repo owner, 2026-08-13)
+### The validation modules move here — see ADR-019
 
-**Why, by the written boundary rather than by taste.** `yield-embeddings/README.md` defines
-that repo as *"a thin production layer over the OSS `tessera_embeddings` library"*, wrapping it
-with CDK infrastructure, the closed-source coarsening flow, Prefect deployments, the Packer AMI,
-customer ROI resolution, and operational tooling — with `domain/` for *"closed-source domain
-functions (coarsen, …)"*. This repo's own `architecture_tests/allowlist.py` says the same from
-the other side, calling closed-source repos *downstream consumers* that extend the OSS rules.
-
-Validation is none of those. It audits the output of the library's own assembly step, which the
-README puts in the library's column, and its imports agree: four tessera modules and nothing
-private but its own rules file. The CLI drivers and the `validate_zone_year` flow ARE
-operational tooling and stay.
-
-**How it ended up there:** born 2026-08-11 in `yield-embeddings` commit `077a7ca`, *"Validate
-every cell inside the campaign, as a flow of its own"* — written next to the flow that calls
-it, which legitimately lives there. Placement by adjacency, not by decision.
-
-Ruled 2026-08-13: **the move is in scope.** The methodology is not being treated as
-commercial know-how.
-
-**Say in the module docstring that the rules are meant to be tuned.** Once this is in the OSS
-library, someone running a different campaign — a different sensor mix, a different region, a
-different quality bar — should be able to adjust the thresholds without forking. That is
-almost entirely already true: every numeric threshold is a keyword parameter whose default is
-the module constant (`guard=DEFAULT_EDGE_GUARD`, `ratio_tol=DEFAULT_RATIO_TOL`,
-`max_flagged_fraction=DEFAULT_MAX_FLAGGED_FRACTION`,
-`dominant_share_floor=DOMINANT_SHARE_FLOOR`, `tolerance=SCALE_SHARE_TOLERANCE`). So this is a
-docstring edit.
-
-**DONE 2026-08-13, in `yield-embeddings` — carry it through the move, do not redo it.**
-`blocking()` took its policy from the module constant, so *which findings fail a cell* was the
-one thing an alternative campaign could not change without editing the file:
-
-```python
-def blocking(findings: list[Finding]) -> list[Finding]:
-    return [f for f in findings if f.status == CHECK_DISAGREES and f.slug in BLOCKING_SLUGS]
-```
-
-It now takes `blocking_slugs` like its five neighbours, and the policy is carried on
-`CellAudit` and accepted by `audit_cell()` — so the verdict, the report and the campaign's
-`CellValidationFailed` raise all read ONE policy rather than the leaf function offering a knob
-nobody could reach. It deliberately did **not** go on `CheckOptions`: that object is the
-sampling budget ("how much of the cell to read"), and what counts as failure is a different
-question. The module docstring now says the thresholds are defaults rather than laws.
-
-That repo's own scripts (`campaign_health.py`, `validate_all_cells.py`) and the
-`validate_zone_year` flow still read `rules.BLOCKING_SLUGS` directly for their own reporting —
-correct, because that is one campaign's tooling choosing the default.
-
-The tessera-side threshold `OPTICAL_MIN_OBS` is deliberately NOT among the tunables in
-that sense: it is campaign-wide, stamped into the store's root attrs, and enforced (§4). A
-downstream campaign sets it for its own store; it is not a per-validation-run argument.
-
-
-`yield_embeddings.domain.embedding_validation{,_rules}` relocate to this repo. Sizing, so the
-implementer is not surprised:
-
-| file | lines | coupling |
-|---|---:|---|
-| `embedding_validation_rules.py` | 1,201 | **none** — `dataclasses`, `math`, `numpy` only |
-| `embedding_validation.py` | 2,075 | four *tessera* modules; from `yield_embeddings`, only its own rules file |
-| `tests/unit/embedding_validation/` | 1,303 | paired |
-
-**~4,600 lines with essentially nothing to untangle**: the rules module is pure logic, and the
-audit module's sole private dependency is the rules file travelling with it. It violates none
-of the enforced architecture rules (the forbidden set is prefect, boto3, botocore,
-`tessera_embeddings.profiling`, plus three call names; this uses PIL, fsspec, zarr, numpy,
-asyncio).
-
-**Pillow becomes a new optional dependency** — 29 references in a bounded ~300-line rendering
-block. Add a `validation` extra rather than splitting the module; the repo already carries
-four extras and splitting to dodge one optional dep is the worse shape.
-
-**Stays behind:** the CLI drivers (`validate_cell.py`, `campaign_health.py`), which need
-`yield_embeddings.config.buckets`, and `test_campaign_health_detectors.py`.
-
-**The move happens AFTER the campaign (ruled 2026-08-13), and the ordering argument below is
-superseded.** An earlier version of this section wanted the move first, so that every consumer of the
-constant would sit under one CI and the collapse below would fail a test rather than surface later.
-That benefit is real but it is available far more cheaply, and the cost of the move is not: ~4,600
-lines across a repository boundary, a new optional Pillow dependency, and the modules the campaign's
-own monitoring depends on, four weeks before the deadline.
-
-**What to do instead, now:** the validator already takes the threshold as a parameter whose default
-is the constant (`optical_thin_max_obs: int = OPTICAL_THIN_MAX_OBS`), so the logic is safe already
-and only two *prose* statements are wrong. Fix those two in the same commit as the rename — which the
-rename forces anyway, since the old name stops resolving. No move required, and the collapse cannot
-happen silently.
-
-**The two places, which the rename now surfaces as import errors rather than as silent drift:**
-
-- **L458** defines a metric as *"embedded pixels with fewer than `OPTICAL_THIN_MAX_OBS` valid
-  optical observations"* — the **empty set by construction** once nothing below the line is
-  embedded;
-- **L1770** prints *"under {OPTICAL_THIN_MAX_OBS} obs — a PROPERTY OF THE INPUT, not a
-  fault"*, which becomes vacuous and contradicts the new policy outright. (It was L1749 when this
-  plan was written; the file has since gained the per-window depth fields, which is a standing
-  reminder that a line number in a handoff document is a hint, not an address.)
-
-That is §9.2's denominator collapse again, in a repo §9 does not reach — so add both files to §9's
-reconciliation list explicitly, since they live where §9's grep does not run.
+Ruled 2026-08-13: `yield_embeddings.domain.embedding_validation{,_rules}` belong in this library by
+the written boundary, and the move happens AFTER the campaign.
+[ADR-019](../decisions/019-validation-modules-belong-in-the-library.md) carries the reasoning, the
+sizing (~4,600 lines with essentially nothing to untangle), the new optional Pillow extra, what stays
+behind, and the two prose statements in that validator which the current rule makes wrong.

@@ -28,7 +28,9 @@ context_docs/
 │   ├── 014-architecture-rules-scan-the-package.md
 │   ├── 015-regrouping-the-unit-tests.md
 │   ├── 016-scripts-layout-and-shared-modules.md
-│   └── 017-no-antarctic-coverage.md
+│   ├── 017-no-antarctic-coverage.md
+│   ├── 018-refuse-pixels-below-minimum-optical-depth.md
+│   └── 019-validation-modules-belong-in-the-library.md
 └── design/           Long-form framing docs, grouped by what they answer
     │
     │  THE CAMPAIGN — start here
@@ -38,9 +40,9 @@ context_docs/
     ├── campaign_inference_profile_2026_08.md     measured per-cell inference behaviour
     ├── radar_source_coverage_2026_08.md          which zones publish no usable radar
     ├── optical_depth_census_2026_08.md           how much of the product is optically thin, and where
-    ├── minimum-optical-depth-plan.md             UNBUILT; its threshold is REOPENED, the rest approved
-    ├── window_legibility_vs_depth_2026_08.md     blind test of "crisp at 30 obs" — it does not hold
-    ├── optical_retention_per_pixel_2026_08.md    what a per-pixel cutoff actually refuses
+    ├── minimum-optical-depth-plan.md             BUILT at 15; the evidence behind ADR-018
+    ├── window_legibility_vs_depth_2026_08.md     the elbow at 25 — which the line at 15 knowingly crosses
+    ├── optical_retention_per_pixel_2026_08.md    what each candidate line costs, counted per pixel
     ├── inference-perf-run-ledger.md              raw per-run measurements
     ├── campaign-monitoring-plan.md               what is watched while it runs, and how
     ├── final-data-validation-plan.md             the closing gate over every published cell
