@@ -858,44 +858,31 @@ timings and took an object count to identify.
 
 ## 7. Open questions
 
-Four questions this section opened have since been answered, and are recorded as one line
-each rather than as the paragraphs that argued them — the arguments live in the sections
-cited, and a list where most entries are settled stops being readable as a list of what is
-open.
+**Four conclusions carried out of questions this section opened**, kept because they are load-bearing
+and cited elsewhere; the arguments are in the sections named.
 
-- **ANSWERED — is the ingest reproducible across the campaign and single-ROI paths? Yes**, on
-  current code: 65 of 65 shared dates, identical arrays and chunking, bit-identical pixels
-  across all 11 bands on five sampled dates, against the preserved July reference on identical
-  geometry. The one extra date is the coverage threshold, i.e. configuration. This was the
-  campaign's one open question about scientific soundness; the earlier answer was no (3.11% of
-  pixels disagreeing), and three date-handling fixes landed between the measurements — §4.9,
-  §4.11, §4.12.
-- **ANSWERED — is the fleet-bound floor reached? Yes** (§3.10, §3.12). A large fraction of a
-  date compresses under no worker count, so **cell concurrency is the lever and cell width is
-  not**. Two caveats travel with it: the sweep's absolute values are not reproducible (§5), and
-  its width curve ran pre-overlap, so post-overlap width sensitivity must be re-measured rather
-  than inherited.
-- **ANSWERED — can a date's serial residual come off the critical path? Yes**, 1.59× from
-  overlapping (§3.11), with date pipelining taking the rest (§3.16). The durable lesson is that
-  **removing a serial term beats shrinking it**.
-- **ANSWERED — the month-by-month streaming blocker this section was written around** shipped
-  and is validated (§7b).
+- **The ingest is reproducible across the campaign and single-ROI paths** (§4.9, §4.11-4.12): 65 of
+  65 shared dates, identical arrays and chunking, bit-identical pixels across all 11 bands. The
+  earlier answer was no — 3.11% of pixels disagreeing — and three date-handling fixes landed between
+  the two measurements.
+- **The fleet-bound floor is reached** (§3.10, §3.12), so **cell concurrency is the lever and cell
+  width is not**. Two caveats travel with it: the sweep's absolute values are not reproducible (§5),
+  and its width curve ran pre-overlap.
+- **A date's serial residual comes off the critical path**, 1.59× from overlapping (§3.11). The
+  durable lesson: **removing a serial term beats shrinking it.**
+- **Month-by-month streaming shipped** and is validated (§7b).
 
 Genuinely open:
 
-- **Is the 4096 write-window idea viable again?** §4.7 rejected it because it took windows from
-  5-6 to 12-13 per date at ~17 s of serial cost each; overlapping removed most of that per-window
-  serial cost, so the arithmetic that killed it no longer holds. Expected win is small — it cuts
-  computed area ~1.6×, and area was not on the critical path when measured (§3.9) — and the
-  memory cost is real. **Measure the prize before building it**, per §3.11's lesson.
-- **Is `F` fleet-invariant?** One block's fetch latency should be; scheduler round-trip would
-  grow with fleet size. Decides whether a window cap tuned at 120 workers transfers at all.
+- **Is the 4096 write-window idea viable again?** §4.7 rejected it on ~17 s of serial cost per
+  window; overlapping removed most of that, so the arithmetic that killed it no longer holds.
+  Expected win is small and the memory cost real. **Measure the prize before building it.**
+- **Is `F` fleet-invariant?** Decides whether a window cap tuned at 120 workers transfers at all.
 - **Commit time versus manifest size** — the last unmeasured per-date term.
-- **Does the scheduler's auxiliary-thread behaviour change at 250+ workers?** Re-check the
-  one-core finding before resizing at scale.
+- **Does the scheduler's auxiliary-thread behaviour change at 250+ workers?**
 
-Questions needing more workers than the current quota allows are tracked as S-1..S-6 in the
-downstream repo's `docs/global-tessera-test-plan.md`.
+Questions needing more workers than the quota allows are tracked as S-1..S-6 in the downstream
+repo's `docs/global-tessera-test-plan.md`.
 
 ## 7b. STAC query streaming — shipped and validated
 

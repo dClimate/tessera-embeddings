@@ -64,19 +64,11 @@ reasoning behind a threshold is ever needed.
 The decision matrix below is the durable half of this document, and §8 is the API ledger the
 implementation earned.
 
-## 5. Decision matrix
+## 5. Decision matrix — spent
 
-| Evidence | Threshold | Decision outcome |
-|---|---|---|
-| T0.1 cross-group rebase | clean | D6 confirmed; else redesign before T4/T5 |
-| T1 weighted score | best variant | D2 spatial size locked |
-| T1 sharded vs unsharded + T2.4 | sharded wins reads AND write amp acceptable | D3 adopt sharding; else defer with re-test trigger (zarr > 3.2.1) |
-| T2.2 year-fill trend | flat | D4 time@1 split locked; linear → escalate #1600, spatial splits, D5 input |
-| T2.1 RSS + commit wall | knee point | D6 refs/commit ceiling + fork count |
-| T4 snapshot/open walls | under thresholds | D5 one-repo arm 1 passes |
-| T5 N=16 wall + retries | ≤2× serial, no storms | D5 one-repo arm 2 passes; both arms pass → one repo GO |
-| T3.1 | green | D1 confirmed |
-| T6 GC objects/s | extrapolation | D7 cadence numbers |
+This mapped each test's evidence to the decision it would settle. **Every one of those decisions is
+now FIRM in ADR-008**, each annotated there with the run that confirmed it, so the matrix is a
+lookup from evidence nobody needs to gather to conclusions already recorded. Read ADR-008's D1–D9.
 
 ## 6. Risks and caveats
 

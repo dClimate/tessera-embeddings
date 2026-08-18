@@ -90,57 +90,22 @@ found fourteen zones losing coverage; almost all of it was the survey's own meth
 years (see below). A method-consistent re-measurement of the affected zones was in flight when this
 was written. Do not read a trend out of this table until that lands.
 
-## Three things this measurement gets right that a naive version would not
+## Why a naive version of this measurement is wrong
 
-**Weight by land, not by zone count.** Nineteen of 112 zones lack full radar in 2025 — 17% by
-zone count, and about 1.6% by land. The radar-free zones are almost all ocean: ten of the
-thirteen hold under ten live tiles, and 41S holds one. Reporting the zone share would overstate
-the product impact by an order of magnitude.
+Three things, each of which reverses a zone's answer:
 
-**Ask the way the ingest asks.** Same collection, same provider, and both of the ingest's
-server-side filters — orbit direction *and* the VV polarisation requirement. Without the
-polarisation filter the numbers describe a catalogue nobody reads; with it, a zero here is the
-same zero the ingest reports as `items_seen=0`.
+**Ask with the ingest's own filters, including VV+VH.** A zone that publishes only VV, or EW-mode
+HH/HV, has granules and no *usable* radar — so a query without the polarisation filter reports
+coverage the ingest will refuse. A zero here has to mean the ingest's `items_seen=0`, or it means
+nothing.
 
-**Probe per live tile, not per zone bounding box.** The zone-level query uses the union of the
-zone's live tiles' bounding boxes, which is a *superset* of the land: a zero over it is
-decisive, a hit is only a screen. **Zone 57S is the case that proves the distinction matters.**
-The union screen found 558 descending granules; the per-tile probe found none over its 35 live
-tiles; and the fill's own assembly recorded 100% radar-free. The probe agrees with what
-actually happened and the screen does not. Every zone the screen did not settle was re-probed
-per tile, which is about 6,000 queries and a few minutes.
+**A zone's union bounding box is not its land.** Zone 57S's box holds hundreds of granules its live
+tiles do not intersect. So a per-zone screen's ZERO is decisive and its HIT is only a screen; the
+per-live-tile probe is what settles anything the screen leaves open.
 
-**Two consequences of that asymmetry, both found on 2026-08-06 and both worth carrying.**
-
-*The headline rests on screen verdicts.* The probe runs only where the screen fails, so every
-`both_orbits` zone is screen-only by construction — and 57S shows a screen `both_orbits` can be
-wrong. The exposure concentrates in zones whose land is scattered across a large box, since
-contiguous land gives an accurate screen; that argues the tile-weighted error is small, but it is an
-argument rather than a measurement. Bounding it needs a probe of a sample of screen-settled
-both-orbits zones.
-
-*A table whose cells used different methods is not a comparison.* Extending the survey to all nine
-campaign years as nine separate invocations let a zone be screened in one year and probed in
-another, and the difference between those years then measures the method. It produced fourteen
-zones apparently LOSING coverage, with the reversals clustered at exactly the two year boundaries
-where zones crossed from screened to probed — not at anything the provider did. The sweep now probes
-a zone in every requested year if it is unsettled in any of them, and prints the per-year method mix
-so the asymmetry cannot recur silently.
-
-## The nine-year picture, with the method artefact accounted for exactly
-
-`both_orbits` holds **95.8% to 98.6% of LIVE TILES** in every year from 2017 to 2025. **Read that
-as 'almost every zone has radar somewhere', which is what it measures — not as a coverage figure.**
-The per-pixel census puts actual dual-orbit coverage at 0.51–0.57 of land by era, and land coverage
-at 81% for 2022–2024 against a 100% baseline. A zone stays in the `both_orbits` column while losing
-its interior. Radar does not appear partway through the campaign
-window: all four verdict classes already exist in 2017.
-
-**How much of the year-on-year comparison the method artefact actually spoils: 8 zones of 112,
-holding 770 of 24,202 live tiles — 3.2%.** Those eight had some years screened and others probed.
-The other 104 zones were answered by ONE method across all nine years, so their comparison is
-valid as it stands. The eight are 22S, 23S, 24S, 02N, 57S, 25S, 26S and 31S, and a
-method-consistent re-probe of them was in flight when this was written.
+**"No radar" and "radar in a polarisation we decline" are different findings** with different
+remedies — one is an archive gap, the other a choice we made — and a measurement that conflates them
+cannot inform either.
 
 ### The real reversals — measured per live tile across all nine years
 

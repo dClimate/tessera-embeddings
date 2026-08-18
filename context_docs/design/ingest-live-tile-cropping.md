@@ -121,64 +121,17 @@ mask.
 
 ## Writing N windows without a commit storm
 
-`zarr_store.write_region` writes **one region per commit**. At a median of 74
-windows and roughly 50 dates that is ~3,700 commits per zone-year, against a store
-whose commit pressure is already a governed constraint (ADR-008 D5/D6 caps
-concurrent committers). So the per-window loop cannot use it as-is.
+`zarr_store.write_region` writes **one region per commit**. At a median of 74 windows and ~50 dates
+that is ~3,700 commits per zone-year, against a store whose commit pressure is a governed constraint
+(ADR-008 D5/D6 caps concurrent committers). So the per-window loop cannot use it as-is.
 
-**Confirmed by local experiment (2026-07-24; the full test log is §A below):**
-several `to_icechunk`
-calls CAN share one `writable_session` and one commit, on this exact stack
-(icechunk 2.0.4 / zarr 3.2.1 / xarray 2026.4.0, dask-backed data). Twenty
-disjoint chunk-aligned region writes on one session produced exactly one
-snapshot with no cross-window interference, ~10 ms/write locally with no
-degradation. Two further results shape the design:
+**What shipped:** one session per date — extend the time axis by that date, region-write each live
+window into it, commit once. Appendix A is the verification that this is allowed, and its
+chunk-alignment caveat is the contract.
 
-- **A session sees its own uncommitted append.** `mode="a"` along time followed
-  by `mode="r+"` region writes into the just-appended date commits as ONE
-  snapshot — the region indices resolve against the uncommitted shape. So the
-  per-date flow can stay discovery-as-you-go: append the date's slot, write its
-  live windows, commit once. No pre-enumeration of dates is required.
-- **Uncommitted writes are invisible to readers** on separate repo handles, so
-  the per-date commit stays atomic for concurrent readers.
-
-Caveats carried into the implementation: every experimental window was exactly
-chunk-aligned. Two writes straddling the SAME chunk in one session were not
-tested and stay forbidden — disjoint chunk-aligned windows are the contract,
-which the 4096-snapped window derivation gives us by construction. And the
-experiment ran on icechunk 2.0.4 (the venv's pin) while the campaign standard is
-≥2.1.1 (ADR-008's pre-benchmark bump, the #2158 fix) — unlikely to change these
-results, but re-run the report's call sequences after the bump before relying on
-them at scale.
-
-**Framing principle (standing, 2026-07-24): avoid Dask where possible.** Direct
-zarr writes under an icechunk commit are cleaner than anything routed through a
-task graph — `write_regions`' removal is the precedent. Dask is genuinely needed
-to *compute* the mosaic (the STAC loads and resampling), so it stays for that;
-control flow, metadata, and commits are direct: the time-axis extension is a raw
-resize plus a coord append on the session, attrs are plain zarr writes, one
-commit per date is one `session.commit`.
-
-**For the window PIXELS, volume decides — the same split `region_merge` itself
-implements** (one shard → no pool, "fork once and write inline"; many → the
-pool). The domain function runs on a single Dask worker, so computing windows to
-numpy and assigning them directly funnels the date's live volume through that one
-node. The arithmetic: sparse zones — the ones that motivated this work — are
-trivial (03S: 4 chunks, well under 1 GB/date across all bands); a dense zone is
-not (35N: ~2,400 live chunks ≈ 80 GB per band-date; a single wide row window is
-~570 MB per band). At volume, the mechanism is the experiment's shared-session
-`to_icechunk(mode="r+", region=...)` per window: placement stays on the workers
-that computed the pixels, Dask's memory manager stays in charge, and the commit
-shape is unchanged. That is also the faithful adaptation of region-merge's
-fork/merge to graph-resident bytes — icechunk forks the session and merges
-changesets *inside* `to_icechunk`, with Dask workers playing the role
-region-merge gives its process pool. The pool itself does not transfer: it exists
-because region-merge's bytes are re-readable from a store by child processes
-(only paths and slices pickle across); ours would have to carry the pixels.
-
-**This must not become `write_regions` again** — a single Dask graph spanning every
-region, which was built and removed for being the bottleneck (see the warning
-below). Per-window graphs stay per-window; only the session and commit are shared.
+**Windows are snapped to the chunk grid deliberately**, which makes them chunk-disjoint and removes
+the shared-boundary reconciliation the region-merge tier has to handle. It is also what makes the
+single-session write safe: two writes into the same chunk in one session are a lost update.
 
 ## What this shares with the region-merge tier
 
@@ -223,43 +176,15 @@ throttling.
 
 ## What the first cropped run found: crop the coverage denominator too
 
-The first `03S` run with the flag on confirmed the mosaic side exactly as designed
-— **2 windows, 4 chunks per band-date** against 3,706, the window derivation
-agreeing with an independent full-resolution scan of the same mask. But the run
-still built an **8,794-task graph** and still spilled, and the dashboard showed
-why: `from-zarr 3706 / 3706`, `sum 3706 / 3706`, `sum-partial 1378`. Those totals
-are the whole graph, and none of it is the mosaic.
+Cropping the computation left the coverage GATE measuring against the full extent, so a cropped
+run's coverage ratio collapsed against a denominator that no longer described what it was computing.
+Fixed by cropping the denominator with it.
 
-It was these two lines, which sit upstream of every window and which the original
-change did not touch:
-
-```python
-roi_mask = client.persist(roi_mask)              # 3,706 chunks, ~60 GiB, pinned
-roi_pixel_count = int(roi_mask.sum().compute())  # a full-extent reduce
-```
-
-The ROI-pixel total is the **denominator** of the S2 coverage check. Cropping had
-already cropped the numerator (the SCL validity reduce) on the stated grounds that
-the mask is False outside every window — so the identical argument applies to the
-denominator, and the fix is to apply it: total the mask over the live windows, and
-drop the persist, since `persist` materialises the entire grid while every
-downstream consumer (that same reduce, and `apply_roi_mask`) slices to windows and
-lets dask cull the reads. S1 carries the same persist and gets the same treatment;
-it computes no coverage total of its own.
-
-For `03S` this is ~8,800 tasks and ~60 GiB down to a handful of tasks and ~64 MiB.
-Note the shape of the mistake, because it generalises: the residual cost was
-**constant per zone** (~3,700–4,000 chunks regardless of how much land a zone
-holds), so it would have been a fixed overhead on all 120 zones × 3 sensor
-children — the same extent-scaled pathology as the original finding, surviving in
-a place nobody was looking because the mosaic numbers looked right.
-
-The numerator/denominator coupling is now pinned by
-`tests/unit/test_s2_coverage_windows.py`, including a deliberately non-vacuous
-case: windows derived from one mask, applied to a mask with land outside them,
-asserting the totals DO diverge. Cropping only one side of that ratio would still
-have produced a plausible-looking percentage, and the write-once ingest marker
-would have made a wrongly-filtered year permanent.
+**The general shape is worth more than the instance**, and it recurs: an optimisation that narrows
+what is COMPUTED silently changes every ratio whose denominator was the old extent. The same error
+appears as §3.9's granularity artefact in the ingest record, and as the "presence counted where
+coverage was meant" family in the corrections register. **When you crop a numerator, go and find its
+denominators.**
 
 ## Also from the first cropped run: the profiler was blind to spill
 
@@ -404,80 +329,24 @@ a different fix from this one.
 
 ---
 
-## Appendix A — Icechunk multi-write-per-commit experiment (2026-07-24)
+## Appendix A — the multi-write-per-commit contract (verified 2026-07-24)
 
-**Absorbed 2026-08-17 from `ingest-live-tile-cropping-icechunk-experiment.md`.** It was
-always an appendix to this document — the only thing referencing it was the paragraph above
-— and the contract it establishes is one the ingest still depends on, so it belongs beside
-the design it justifies rather than one directory listing away.
+Six tests, and what they establish is one contract the ingest still depends on:
 
-Question: can multiple `icechunk.xarray.to_icechunk` calls share ONE `writable_session` + ONE `commit` (N disjoint spatial windows of one date -> one snapshot), with dask-backed xarray data?
+**N `to_icechunk` region writes CAN share one `writable_session` and one commit** — twenty disjoint
+chunk-aligned windows produced exactly one snapshot with no cross-window interference, ~10 ms per
+write locally with no degradation. `to_icechunk`'s internal fork/merge tolerates a session that
+already carries uncommitted changes.
 
-## Versions (repo venv `/Users/rbanick/dev/tessera-embeddings/.venv/bin/python`)
+**A session sees its own uncommitted append**, so `mode="a"` along time followed by `mode="r+"`
+region writes into the just-appended date commits as ONE snapshot. That is what lets dates stay
+discovery-as-you-go: append the slot, write its live windows, commit once, with no pre-enumeration.
 
-- icechunk 2.0.4
-- zarr 3.2.1
-- xarray 2026.4.0
-- dask 2026.3.0
-- numpy 2.4.4
-- scheduler: default threaded local dask scheduler (no distributed cluster)
+**Uncommitted writes are invisible to readers on separate repo handles**, so commit atomicity holds.
 
-## Setup (all tests)
+**The caveat that is still the contract:** every window tested was exactly chunk-aligned, so
+`align_chunks` never had to read-modify-write a boundary chunk. **Two writes straddling the SAME
+chunk in one session remain forbidden** — disjoint chunk-aligned windows is the contract, not
+"multiple writes work".
 
-Local filesystem icechunk repo per test. Store: dims (time=3, northing=64, easting=64), chunks (1, 16, 16), data vars `emb` float32 (fill -999.0) + `count` uint16 (fill 0), datetime64[ns] time coord. Seeded all-fill via `to_icechunk(ds, session, mode="w")` + commit (ancestry = 2 snapshots: repo-init + seed). All window datasets are dask-backed (`ds.chunk({"time":1,"northing":16,"easting":16})`, verified `dask.array.core.Array`) with coords dropped, mirroring the repo's `_drop_region_coords`. Scripts: `common.py`, `test_a.py` ... `test_f_attrs.py` in this directory.
-
-## TEST A — two r+ region writes, one session, one commit: **PASS**
-
-```python
-session = repo.writable_session("main")
-to_icechunk(win1, session, mode="r+",
-            region={"time": slice(1,2), "northing": slice(0,32), "easting": slice(0,64)},
-            align_chunks=True, split_every=8)
-to_icechunk(win2, session, mode="r+",
-            region={"time": slice(1,2), "northing": slice(32,64), "easting": slice(0,64)},
-            align_chunks=True, split_every=8)
-session.commit("...")
-```
-
-- Snapshots: 2 before -> 3 after (exactly 1 new).
-- Read-back: window 1 = 1.0/11, window 2 = 2.0/22, time slices 0 and 2 still all-fill. Both vars correct.
-
-## TEST B — same spatial chunk row, adjacent chunk-aligned windows: **PASS**
-
-Regions `northing 0:16` and `16:32` (same easting chunk columns 0:64), same call sequence as A. Snapshots 2 -> 3. No interference: window 1 = 3.0/33, window 2 = 4.0/44, `northing 32:64` of that date and the other two dates still fill.
-
-## TEST C — 20 disjoint chunk-aligned 16x16 windows, one session, one commit: **PASS**
-
-Loop of 20 `to_icechunk(..., mode="r+", region=..., align_chunks=True, split_every=8)` on one session, then one commit. Snapshots 2 -> 3. All 20 windows read back with their distinct values; untouched chunks still fill.
-
-- Timing: 20 writes + 1 commit = **0.20 s total (~0.010 s/write)** on local FS with tiny chunks. No per-call slowdown observed.
-
-## TEST D — append (mode="a") THEN region write into the new date, SAME session, one commit: **PASS (same-session works; fallback not needed)**
-
-```python
-session = repo.writable_session("main")
-to_icechunk(new_date_allfill_with_coords, session, mode="a", append_dim="time", align_chunks=True)
-# session sees its own uncommitted append:
-#   zarr.open_group(session.store)["emb"].shape == (4, 64, 64)  <- already 4
-to_icechunk(win, session, mode="r+",
-            region={"time": slice(3,4), "northing": slice(0,32), "easting": slice(0,64)},
-            align_chunks=True, split_every=8)
-session.commit("...")
-```
-
-- Snapshots: 2 before -> 3 after (append + region = ONE snapshot).
-- Known wrinkle answered: **the same session DOES see its own uncommitted append** — `zarr.open_group(session.store)` showed shape (4, 64, 64) and time indices [0 1 2 3] immediately after the append, before commit, so `region={"time": slice(3,4)}` validated and wrote fine.
-- Read-back: 4 dates, appended time == 2024-01-04, window 7.0/77 correct, rest of new date fill, original 3 dates untouched.
-- Two-session fallback (append+commit, then region+commit) was coded but never triggered. Pre-seeding dates first is NOT mandatory.
-
-## TEST E — uncommitted r+ writes invisible to a separate readonly reader: **PASS**
-
-After one r+ region write on an uncommitted session: a `readonly_session(branch="main")` from a **separate** `Repository.open` handle read the entire store as all-fill, and ancestry count was unchanged. After `session.commit(...)` the same read path saw the written window (guards against a false pass). Snapshots 2 -> 3.
-
-## TEST F (bonus) — root attrs across multiple r+ calls: preserved
-
-Root attrs stamped in a prior commit (`{"geoemb:probe": "keep-me", "spatial:thing": 42}`) survived two `mode="r+"` region writes + commit in one session, unchanged. So the attrs-clobbering that motivated the repo's `_commit_preserving_attrs` did **not** reproduce for pure `mode="r+"` region writes on icechunk 2.0.4 / xarray 2026.4.0 (it may still apply to `mode="a"`/`"w"` or older versions — this is a data point, not a recommendation to drop the guard).
-
-## Verdict
-
-**Multiple to_icechunk region writes per session+commit: YES.** On icechunk 2.0.4 / zarr 3.2.1 / xarray 2026.4.0 with dask-backed data on the threaded scheduler, N sequential `to_icechunk(..., mode="r+", region=..., align_chunks=True, split_every=8)` calls against one `writable_session("main")` followed by one `session.commit()` produce exactly one snapshot, with all windows correct and no cross-window interference even when windows share a chunk row (tested up to 20 windows; ~10 ms/write locally, no degradation). The session never refused a second write, i.e. to_icechunk's internal fork/merge for dask tolerates a session that already carries uncommitted changes. **Append+region same session: YES** — `mode="a", append_dim="time"` followed by `mode="r+"` region writes into the just-appended date commits as one snapshot, because the session exposes its own uncommitted append (shape already reflects the new date before commit), so region indices for the new date resolve without an intermediate commit; the two-session pre-seed-dates-first fallback is available but not required. Uncommitted session writes are invisible to readonly readers on separate repo handles (commit atomicity holds). Caveats: all windows here were exactly chunk-aligned, so `align_chunks=True` never had to read-modify-write a boundary chunk — two writes straddling the SAME chunk within one session were not tested and should still be treated as forbidden (disjoint chunk-aligned windows remain the contract); root attrs were not clobbered by multiple r+ calls in this stack; local-FS icechunk warns it is unsafe for concurrent commits (irrelevant here — one commit).
+Verified on icechunk 2.0.4 / zarr 3.2.1 / xarray 2026.4.0. Full transcripts in git history.

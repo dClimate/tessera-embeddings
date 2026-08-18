@@ -228,30 +228,11 @@ below.
 > reads `< thin_below`, so both agree, and a test now pins 13/14/15/16 at the campaign's own value
 > rather than at a stand-in line.
 >
-> **Three things about the RECORD are still wrong, and the per-shard registry is what fixes them.**
-> `dataset.py` deliberately computes `refused_no_optical`, `refused_thin` and `refused_no_radar` and
-> keeps them apart — then a fully refused chunk writes a zero-byte marker and all three are
-> discarded. What survives is called `optical_skips`, which for these tiles named the wrong cause.
-> And `radar_coverage.s1_free_pct` read **0.0** for 40S — "no radar-free pixels" — because it is
-> computed over EMBEDDED pixels only and so can never count the ones the gate removed. A
-> self-fulfilling measurement.
+> **Three defects in the RECORD, all fixed by the per-shard registry (2026-08-18).** A fully refused
+> shard discarded its counters; "no records" and "every read failed" were the same empty dict; and
+> nothing checked that the reasons partition the refused set. All three are closed and pinned — see
+> the registry paragraph above and `tests/unit/test_skip_registry.py`.
 >
-> **CORRECTION to the paragraph this replaces, which claimed the zone-level gate "still refuses a
-> fill that finds no radar at all" and called it an open decision. It does not, and it was not.** The
-> campaign driver passes `require_s1=False` to every child at both dispatch sites, and
-> `fill-zones-sequential` defaults to it — with comments giving the reason: "a global campaign is the
-> opposite case — parts of the globe have no dual-pol coverage at all, and refusing them fails those
-> cells on every retry forever." A GLOBAL run has never demanded radar. Refusing on absent radar is
-> an option, off by default for global runs, exactly as planned.
->
-> What actually refused 28S/2022 was a HAND dispatch of the single-cell flow, whose own default is
-> True by design — an operator naming one zone-year over terrain that should be imaged wants to be
-> told its radar is missing rather than handed optical-only embeddings quietly. That default is right
-> for the library and wrong for the deployment, because the deployment is a global one: the same cell
-> behaved differently by hand than by driver, which is what cost the time. `CAMPAIGN_REQUIRE_S1 =
-> False` is now registered on both global fill deployments so the two agree; the library default is
-> untouched, so a non-global caller still demands radar unless it says otherwise.
-
 > **The month array shipped wrong once, and how it failed is worth more than the fix.** The first
 > cell published twelve all-empty planes while every array beside them was correct. The cause was
 > ENUMERATION rather than the array: assembly chose which staged variables to copy by a whitelist
@@ -310,96 +291,22 @@ cluster, so a shard-level number is not hiding a diffuse scatter.
 > Counted per pixel over 40 cells, the median cell keeps 92% at the line and two keep under
 > a tenth — [`optical_retention_per_pixel_2026_08.md`](optical_retention_per_pixel_2026_08.md).
 
-#### Applying the rule to a coarser unit changes almost nothing (2026-08-17)
+#### The enforcement unit is settled, and the record was the open question
 
-The agreement above bounds one direction — thin pixels inside deep chunks, which a coarser rule
-would wave through. It does not bound the other: **deep pixels inside thin chunks, which a coarser
-rule would newly refuse.** On a thin cell that is most of what survives, so it was measured. Four
-rules at the 25 line over an identical footprint — six full 2048-px shards per cell, systematically
-spread over the written shards, six cells spanning the depth range:
+Applying the rule at a coarser unit than the pixel changes retention by **about one point at every
+unit tested**, because retention is *bimodal* at chunk scale: a chunk is nearly all-in or nearly
+all-out, so where the boundary is drawn barely matters. And the hole inside a nearly-full chunk is
+**entirely a depth refusal** — no part of it is missing imagery — with the refused population
+concentrated just under the line.
 
-| rule | pooled retention |
-|---|---:|
-| per pixel: the pixel's own count ≥ 25 (ships today) | 54.5% |
-| chunk mean: keep a whole 256-px chunk iff its eligible mean ≥ 25 | 53.4% |
-| chunk share: keep a whole 256-px chunk iff half its eligible pixels clear 25 | 54.7% |
-| shard share: the same test at 2048 px | 55.6% |
+Two consequences, which are why the measurement was worth taking:
 
-**Within about one point at every unit.** The reason is that retention is *bimodal* at chunk
-granularity — a live chunk is nearly all-in or all-out, so there is little mixed population for a
-coarser rule to reassign. Share of each cell's live 256-px chunks by how much of it clears the line:
+**Refusals cluster, they do not smear.** 90.4% of refused pixels sit in chunks already below the
+line, so a later top-up can select whole shards by their own mean rather than hunting scattered
+pixels. That is what makes a top-up affordable at all (ADR-018).
 
-| cell | live chunks | median share | under 0.10 | under 0.50 | over 0.90 |
-|---|---:|---:|---:|---:|---:|
-| 26S/2021 | 384 | 0.00 | 83% | **94%** | 1% |
-| 32S/2022 | 384 | 0.00 | 60% | 65% | 32% |
-| 17S/2022 | 384 | 0.00 | 67% | 76% | 10% |
-| 47S/2021 | 384 | 1.00 | 9% | 17% | 76% |
-| 02N/2021 | 384 | 1.00 | 16% | 17% | 83% |
-| 58S/2021 | 384 | 1.00 | 1% | 3% | 89% |
-
-**Two consequences.**
-
-The coarser the unit, the *emptier* a thin cell gets, not the fuller. 26S/2021 keeps 7.5% of this
-footprint per pixel, 4.4% by chunk mean, and **0.0% under a shard-level half rule** — every one of
-its six shards fails, so the rule deletes the cell. A coarser unit is not a way to rescue thin
-cells.
-
-And a coarser unit quantises the answer, which cuts both ways: 17S/2022 reads 22.7% per pixel and
-33.3% at shard level, because two of its six shards pass and then wave through everything inside
-them. Disagreement at shard granularity reaches 14.2% of eligible pixels waved through on that cell
-against 7.5% blocked on 26S/2021; at chunk granularity both stay under 5%.
-
-**So the enforcement unit is not the open question — the record is.** Because refusals cluster this
-hard, the per-pixel rule already behaves like a chunk rule, and `chunks_skipped_mask` (§7) is
-therefore an almost lossless summary of what it did. That is the field nothing currently writes.
-
-> Levels here are **not comparable** to the retention report's per-cell column: that sample aims 40
-> inner chunks at land via `window_origin`, this one reads six whole shards including the non-land
-> parts of live tiles, so 17S/2022 reads 22.7% here against 55.5% there. The valid comparison is
-> *between rules within a row*, where all four rules see identical pixels.
-
-#### What the hole in a nearly-full chunk is made of (2026-08-17)
-
-**The open question is whether to embed sub-line pixels that sit in otherwise-strong chunks.** The
-argument for it is *permanence*: a repair sweep that targets chunks below some fill will never
-revisit a chunk at 95%, so anything refused inside one is unrecoverable no matter what imagery
-arrives later. Sizing that argument needs the hole decomposed, because a depth rule governs only
-part of it — a pixel with **zero** observations cannot be embedded by any rule change.
-
-Measured over the same six cells and six shards, denominator every pixel in a land-live 256-px
-chunk, taking "a repair targets chunks under 50% fill" as the assumption under test:
-
-| | chunks ≥ 50% full | chunks < 50% full |
-|---|---:|---:|
-| land pixels sampled | 46,661,632 | 42,532,864 |
-| embedded at the line | 95.8% | 4.4% |
-| the hole | 4.2% | 95.6% |
-| …of which no optical observation at all | **0.0%** | 0.0% |
-| …of which thin (1–24 observations) | **100.0%** | 100.0% |
-
-**The hole in a strong chunk is entirely a depth refusal.** No part of it is missing imagery, so
-waving thin pixels through closes *all* of it rather than some of it. (Zones with genuine no-data —
-coastal, out-of-swath — will not read 0.0%; these six cells have optical coverage over essentially
-their whole area.)
-
-**And the population is concentrated just under the line.** Of the 1,956,580 pixels the proposal
-would add — **2.19%** of all land-live pixels sampled, about 4% more embedded pixels, so roughly 1%
-on the inference bill:
-
-| depth | pixels | share |
-|---|---:|---:|
-| 1–9 obs | 9,416 | 0.5% |
-| 10–14 obs | 101,912 | 5.2% |
-| 15–19 obs | 328,365 | 16.8% |
-| **20–24 obs** | **1,516,887** | **77.5%** |
-
-So a secondary floor buys almost nothing: one at 10 observations would exclude 0.5% of them. There
-is no noise tail to guard against in this population.
-
-**95% of all thin pixels sampled are in the weak chunks**, which a repair sweep would revisit. The
-proposal therefore targets precisely the subset repair cannot reach, and leaves the bulk to the
-repair stream.
+**So the enforcement unit was never the open question — the RECORD was**, and that is what the
+per-shard registry answers.
 
 ##### Store-wide, over every complete cell
 
