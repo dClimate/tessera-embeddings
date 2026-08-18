@@ -275,7 +275,7 @@ def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> N
 def check_root_identity(
     root_attrs: Mapping[str, object],
     *,
-    layout: str,
+    layout: StoreLayout,
     model_version: str | None = None,
     optical_min_obs: int | None = None,
 ) -> None:
