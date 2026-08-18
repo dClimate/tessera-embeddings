@@ -308,6 +308,39 @@ def test_unseeded_zone_raises(tmp_path):
         _fill(tmp_path, store, zone="60N")
 
 
+def test_the_runner_refuses_a_rule_the_store_does_not_advertise(tmp_path):
+    """The store's minimum-depth rule is write-once root identity, so the STORE is the
+    authority on what rule its zones were filled under — not the caller's config.
+
+    The Prefect adapter reads the root and substitutes the value before calling. This runner
+    is the orchestrator-agnostic entry point and was trusting that: called directly, it would
+    run inference under any threshold, publish, and mark the year complete. Zones filled under
+    different lines would then sit under one root advertising a single rule, and no later check
+    could tell which pixels came from which — a refused pixel is indistinguishable from one
+    that had no optical input.
+
+    Asserted rather than substituted: silently replacing a caller's value would let a direct
+    caller believe it had configured a line it had not.
+    """
+    store = _seed_global(tmp_path)  # seeded with no rule, so the store advertises None
+    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=25)
+    with pytest.raises(ValueError, match="write-once root identity"):
+        _fill(tmp_path, store, config=config)
+
+
+def test_the_runner_accepts_a_config_matching_the_store(tmp_path):
+    """The adapter's substitution must satisfy the check, not trip it — otherwise every
+    Prefect fill would fail on the guard meant to protect direct callers.
+    """
+    store = _seed_global(tmp_path)
+    config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE, num_gpus=0, optical_min_obs=None)
+    # This wiring points at an absent mask on purpose, so the fill still fails — just LATER,
+    # on the mask, which is what proves the rule check passed rather than short-circuited.
+    with pytest.raises(Exception) as exc:
+        _fill(tmp_path, store, config=config)
+    assert "write-once root identity" not in str(exc.value), "the matching config must clear the rule check"
+
+
 def test_chunk_size_shard_mismatch_raises(tmp_path):
     store = _seed_global(tmp_path)
     config = InferenceConfig(time_window=_WINDOW, chunk_size=_TILE * 2, num_gpus=0)

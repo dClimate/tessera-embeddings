@@ -995,6 +995,17 @@ def ingest_s2_roi_reflectance(
                     # the duplicate ladder lives in the per-date consume — so hand it there
                     # rather than counting it as a filtered date, which would record a
                     # recoverable date as gone without ever trying its older copy.
+                    #
+                    # FLUSH FIRST. Dates arrive in ascending order, so everything already
+                    # held is EARLIER than this one, and `_consume` commits immediately on
+                    # a successful recovery. Recovering before flushing therefore commits a
+                    # later date ahead of the held earlier ones, which the time axis refuses
+                    # (`NonMonotonicDateError`) — so the leg fails on a date it had already
+                    # read successfully. Ordering is nearly free to preserve here and
+                    # impossible to repair afterwards.
+                    if batch:
+                        _write_batch_or_isolate(batch, batch_stall)
+                        batch, batch_stall = [], 0.0
                     _consume(prepared, stall_s)
                     continue
                 if prepared.day_ds is None:
