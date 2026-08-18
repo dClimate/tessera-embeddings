@@ -15,6 +15,7 @@ where the reason is unrecoverable, and the only case this registry has to cover.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -84,6 +85,27 @@ class TestTheMarker:
         d = tmp_path / "staging" / "run1"
         d.mkdir(parents=True)
         (d / "chunk_2_2.skipped").write_bytes(b"not json at all")
+        got, unreadable = read_skip_records(str(tmp_path / "staging"), "run1", ["chunk_2_2"])
+        assert got == {}
+        assert unreadable == 1
+
+    def test_a_half_written_multibyte_marker_is_counted_not_raised(self, tmp_path: Path) -> None:
+        """A partial write that splits a multibyte character must not abort assembly.
+
+        `json.loads` decodes bytes itself, so a truncated UTF-8 sequence raises
+        UnicodeDecodeError — which is NOT a JSONDecodeError, so catching only the
+        latter let it escape `pool.map` and kill the whole run over one bad object.
+        The bytes below are a real record cut mid-character, not a synthetic blob.
+        """
+        d = tmp_path / "staging" / "run1"
+        d.mkdir(parents=True)
+        # ensure_ascii=False so the bytes really are multibyte — the default escapes
+        # non-ASCII to \uXXXX and a truncation would only ever be a JSONDecodeError.
+        whole = json.dumps({"label": "chunk_2_2", "note": "réfusé"}, ensure_ascii=False).encode()
+        (d / "chunk_2_2.skipped").write_bytes(whole[:-3])  # lands mid-sequence
+        with pytest.raises(UnicodeDecodeError):
+            json.loads(whole[:-3])  # the premise, pinned
+
         got, unreadable = read_skip_records(str(tmp_path / "staging"), "run1", ["chunk_2_2"])
         assert got == {}
         assert unreadable == 1

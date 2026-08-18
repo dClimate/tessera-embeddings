@@ -308,6 +308,21 @@ def test_unseeded_zone_raises(tmp_path):
         _fill(tmp_path, store, zone="60N")
 
 
+@pytest.mark.parametrize("bad", [0, -1, -16])
+def test_an_unusable_assembly_worker_override_is_refused_before_inference(tmp_path, bad):
+    """A bad worker count must not cost a whole GPU run.
+
+    The value is consumed only after inference, and `n or default` reads 0 as "unset"
+    while a negative rides through to `ProcessPoolExecutor(max_workers=<0)` — so both
+    used to surface as an assembly-time failure on a cell whose expensive half had
+    already run. This calls the runner with no mask and no mosaic on disk: reaching
+    the ValueError at all proves the check fires before anything is opened.
+    """
+    store = _seed_global(tmp_path)
+    with pytest.raises(ValueError, match="n_assembly_workers must be >= 1"):
+        _fill(tmp_path, store, n_assembly_workers=bad)
+
+
 def test_the_runner_refuses_a_rule_the_store_does_not_advertise(tmp_path):
     """The store's minimum-depth rule is write-once root identity, so the STORE is the
     authority on what rule its zones were filled under — not the caller's config.

@@ -298,6 +298,18 @@ class ZoneFillHandoff:
     done: dict[str, Any] | None = None
 
 
+def _check_assembly_workers(n: int | None) -> None:
+    """Reject an assembly worker override that cannot build a pool.
+
+    Checked at entry, not at use: the value is only consumed after the cell's whole
+    GPU inference has run, and `n or default` treats 0 as "unset" while passing a
+    negative through to `ProcessPoolExecutor(max_workers=<0)`. Either way the cell
+    dies at assembly having already burned the expensive half of the fill.
+    """
+    if n is not None and n < 1:
+        raise ValueError(f"n_assembly_workers must be >= 1 when set, got {n}")
+
+
 def fill_zone_year(
     *,
     store_path: str,
@@ -362,6 +374,7 @@ def fill_zone_year(
         Summary dict: zone, year, run_id, snapshot_id, tag, tile counts,
         inference outcome counts, ``empty`` flag, and elapsed seconds.
     """
+    _check_assembly_workers(n_assembly_workers)
     handoff = infer_zone_year(
         store_path=store_path,
         zone=zone,
@@ -853,6 +866,7 @@ def assemble_zone_year(
     cell takes. Inert unless the run was armed for a fault this path hosts and for
     this cell (:mod:`tessera_embeddings.config.fault_injection`).
     """
+    _check_assembly_workers(n_assembly_workers)
     if handoff.done is not None:
         return handoff.done
     zone, year, run_id, t0 = handoff.zone, handoff.year, handoff.run_id, handoff.t0

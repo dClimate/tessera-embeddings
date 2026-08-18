@@ -2343,7 +2343,11 @@ def read_skip_records(
             return label, None, False
         try:
             return label, json.loads(raw), False
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # UnicodeDecodeError is NOT a JSONDecodeError — a partially written or
+            # byte-corrupt marker raises it out of `json.loads`'s own decode step, and
+            # letting it escape `pool.map` aborts the whole assembly on one bad object.
+            # Provenance is fail-soft by design: count it unreadable and carry on.
             return label, None, True
 
     out: dict[str, dict] = {}
