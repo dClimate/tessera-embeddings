@@ -57,7 +57,8 @@ def test_the_bool_month_array_that_cost_two_fills_is_refused() -> None:
 
 def test_a_missing_bool_attr_is_refused_because_it_is_part_of_the_type() -> None:
     """int8 with no `dtype="bool"` attr reads back as 0/1 integers, not booleans — a different
-    published type, and one no reader of the docs would expect."""
+    published type, and one no reader of the docs would expect.
+    """
     g = _group(**{MONTH_COVERED_VAR: ("int8", {})})
     with pytest.raises(ValueError, match="attr dtype=None on disk, layout declares 'bool'"):
         check_destination_types(g, GLOBAL)
@@ -65,14 +66,16 @@ def test_a_missing_bool_attr_is_refused_because_it_is_part_of_the_type() -> None
 
 def test_a_store_that_predates_an_array_is_not_wrong() -> None:
     """Absence is not a mismatch: assembly writes only what BOTH sides have, so a store seeded
-    before an array existed must fill normally rather than be refused."""
+    before an array existed must fill normally rather than be refused.
+    """
     g = _group(**{v: _as_layout_declares(v) for v in REQUIRED_VARS})
     check_destination_types(g, GLOBAL)  # must not raise
 
 
 def test_geometry_is_deliberately_not_compared() -> None:
     """A variable joining an EXISTING store takes that store's chunking rather than the preset's,
-    by design. Comparing geometry would refuse every legitimately older store."""
+    by design. Comparing geometry would refuse every legitimately older store.
+    """
     g = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
     want = GLOBAL.for_var("s2_obs_count")
     a = g.create_array("s2_obs_count", shape=(1, 64, 64), chunks=(1, 16, 16), dtype=want.dtype, fill_value=0)
@@ -90,7 +93,8 @@ def test_every_mismatch_is_named_at_once() -> None:
 
 def test_an_array_the_layout_does_not_declare_is_not_this_gates_business() -> None:
     """`embedding_std` is single-ROI only. A global store carrying an extra variable is a schema
-    question, not a reason to refuse a fill."""
+    question, not a reason to refuse a fill.
+    """
     g = _group(**{v: _as_layout_declares(v) for v in REQUIRED_VARS})
     extra = g.create_array("embedding_std", shape=(1, 8, 8), chunks=(1, 8, 8), dtype="float32", fill_value=np.nan)
     assert extra is not None

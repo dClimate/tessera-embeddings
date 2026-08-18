@@ -11,7 +11,6 @@ reason exists.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from tessera_embeddings.inference.assembly import (
@@ -47,7 +46,8 @@ def test_the_marker_round_trips_its_record(tmp_path: Path) -> None:
 
 def test_a_zero_byte_marker_from_before_the_registry_is_not_an_error(tmp_path: Path) -> None:
     """A run resuming across the change must still assemble. Absent is not zero — the caller has to
-    be able to say "reason not recorded", which is a different claim from "nothing was refused"."""
+    be able to say "reason not recorded", which is a different claim from "nothing was refused".
+    """
     writer = ZarrWriter(str(tmp_path / "staging"))
     chunk = _chunk(1, 1)
     writer.write_skip_marker(chunk, "run1")  # the old form
@@ -92,7 +92,8 @@ def test_a_mixed_shard_is_named_by_what_dominates_it() -> None:
 
 def test_a_shard_with_no_record_is_listed_as_unrecorded_not_as_zero() -> None:
     """Folding it into a zero would say "nothing was refused here", which is the
-    absence-as-evidence error the whole record exists to avoid."""
+    absence-as-evidence error the whole record exists to avoid.
+    """
     records = {"chunk_1_1": _record("chunk_1_1", thin=64, obs_max=8)}
     out = summarise_optical_skips(staged=[], skipped=["chunk_1_1", "chunk_9_9"], records=records)
     assert out["unrecorded"] == ["chunk_9_9"]
@@ -102,7 +103,8 @@ def test_a_shard_with_no_record_is_listed_as_unrecorded_not_as_zero() -> None:
 
 def test_the_old_summary_shape_survives_without_records() -> None:
     """Callers that pass no records keep exactly the previous record, so a resume across the change
-    does not write a half-populated registry."""
+    does not write a half-populated registry.
+    """
     out = summarise_optical_skips(staged=["a"], skipped=["b"])
     assert out == {"tiles_skipped": 1, "tiles_live": 2, "labels": ["b"]}
 

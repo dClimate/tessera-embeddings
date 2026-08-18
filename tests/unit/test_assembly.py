@@ -2272,7 +2272,17 @@ class TestAssembleGlobal:
             store_path, self.ZONE, year=2025, run_id="runZ", n_workers=1, staged_labels=["chunk_0_0"], skipped_labels=[]
         )
         skips = self._year_record(store_path)["optical_skips"]
-        assert skips == {"tiles_skipped": 0, "tiles_live": 1, "labels": []}
+        # The registry's fields come along, empty: no shard was refused, so there is no reason to
+        # record. Asserted whole rather than by key, because a MISSING by_reason and an all-zero one
+        # say different things — the first is a record that cannot answer, the second is an answer.
+        assert skips == {
+            "tiles_skipped": 0,
+            "tiles_live": 1,
+            "labels": [],
+            "by_reason": {"no_optical": 0, "thin": 0, "no_radar": 0},
+            "shards": {},
+            "unrecorded": [],
+        }
 
     def test_an_unresolved_live_set_records_no_summary(self, tmp_path):
         dim = 8
@@ -2293,7 +2303,18 @@ class TestAssembleGlobal:
         writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
         self._stage_tile(writer, 0, 0, dim, "runI", np.random.default_rng(34))
 
-        expected = {"tiles_skipped": 1, "tiles_live": 2, "labels": ["chunk_0_1"]}
+        # `skipped_labels` names a shard the caller declares skipped, but this test writes no marker
+        # for it — so the registry has no record to read and says so under `unrecorded` rather than
+        # reporting an all-zero refusal. That distinction is the point: "no reason recorded" is not
+        # "nothing was refused", and folding the two would be the error the registry exists to avoid.
+        expected = {
+            "tiles_skipped": 1,
+            "tiles_live": 2,
+            "labels": ["chunk_0_1"],
+            "by_reason": {"no_optical": 0, "thin": 0, "no_radar": 0},
+            "shards": {},
+            "unrecorded": ["chunk_0_1"],
+        }
         for _ in range(2):
             writer.assemble_global(
                 store_path,
