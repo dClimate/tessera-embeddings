@@ -186,9 +186,7 @@ def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = Tru
             # unreadable prefix, so there is nothing further to try.
             if strict:
                 raise
-            log.error(
-                "Could not verify the delete of %s — treat the prefix as unknown, not clean", uri
-            )
+            log.error("Could not verify the delete of %s — treat the prefix as unknown, not clean", uri)
             return
         except PrefixNotEmptyError:
             # The delete ran and did not finish the job. Falling back to fsspec would re-run the

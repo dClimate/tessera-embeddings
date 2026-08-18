@@ -1355,6 +1355,5 @@ def test_overlap_years_does_not_overcount_per_cell_runs(wired, monkeypatch):
         )
     )
     assert result["dispatched"] == 4, (
-        f"four cells were dispatched; {result['dispatched']} means each year was credited "
-        "with the other years' runs"
+        f"four cells were dispatched; {result['dispatched']} means each year was credited with the other years' runs"
     )
