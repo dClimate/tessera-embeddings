@@ -29,7 +29,7 @@ once.
 
 **One flow, `campaign-watch`, on a 5-minute cron. Stateless per round; its memory lives in S3.**
 
-It is a thin wrapper around `campaign_health.py`, which already is the detector: seventeen checks in
+It is a thin wrapper around `campaign_health.py`, which already is the detector: eighteen checks in
 a fixed order, a verdict at the top, and `--json` giving every check a stable `slug`, structured
 `subjects`, a drill-down command, and a **`fingerprint` over `(slug, status, subjects)`** that tells
 a new finding from one already seen. Nothing about the detection is new here. What is new is that
@@ -47,11 +47,11 @@ query scans ~2.2 GB at 36-cell width, ~$0.011, and `campaign_health` issues five
 **$0.055 per full round**. At 5 minutes that is ~$16/day, and 12 consecutive rounds would re-measure
 the same 60-minute window. So:
 
-* **every round (5 min) — the nine free checks.** Placement, fleet widths, sweep success,
+* **every round (5 min) — the nine free checks.** Fleet strength, empty clusters, sweep success,
   concurrency limits, **crashed/failed runs**, cost accrual, published input coverage, shard
   placement, **cell validation**. No Insights query, so the round is essentially free — and this
   set carries the two most decision-relevant signals we have.
-* **every third round (15 min) — the eight paid checks.** Commit rates, per-cell roster silence,
+* **every third round (15 min) — the eight paid checks.** Commit rates, per-cell progress,
   orchestrator load, throttle pressure, fill scope, orphaned staging, GPUs kept busy, GPU
   starvation. Between them these are the five Insights queries; the rest read the same rows. This
   keeps the measured **~$5/day** cost model, a rounding error against one idle 20-worker
@@ -75,6 +75,20 @@ the same finding as new fifteen minutes later.
 **A round never mutates the campaign.** No cancelling, no reopening, no dispatching a refill. The
 one write it makes is its own record. A monitor that can act is a monitor that can act on a false
 positive, and a refill costs hours and real money.
+
+**Three things a round deliberately no longer raises, each because it paged for one on 2026-08-18.**
+The rule behind all three is the same: an alert has to describe the campaign as it is now, not the
+record the campaign left behind.
+
+| what it used to raise | why that was wrong | what it says now |
+|---|---|---|
+| a failure whose retry has since succeeded | ingest re-runs a failed stream by design, so the failed attempt keeps its record long after the work landed. One zone was still paging with `@here` two hours after its retry finished and its cell had published | reports it as absorbed, naming the zone and time, so an operator who saw the first alert learns the incident is closed |
+| a shrinking fleet at the end of a run | workers do not vanish when their work ends, they shut down over minutes. One surviving worker read as nought per cent of what the run had asked for | says nothing while no ingest is running — with nothing asking for workers, there is no width for them to fall short of |
+| a cell described by the wrong phase | a cell whose radar stream had already died still read as "waiting to infer" — true of its two surviving streams, false about the cell | names the dead stream and the time, so the per-cell view and the failure list agree |
+
+A fourth is a wording fix rather than a suppression. The commit-rate figures are **totals across
+every cell that is ingesting**, so a fall in them belongs to no single zone and is often just one
+cell finishing. The alert now says that, and points at the per-cell check for attribution.
 
 ---
 
@@ -226,9 +240,9 @@ Each of these means the work the campaign has *not* done yet is also affected.
 | **an embedding seam or constant-dimension failure at all** | `cell validation` | both are assembly- or encoder-wide by nature; neither is zone-specific |
 | **quantization invariant fails** (scale shares far from 1.0) | `cell validation` | the stored data is not what its readers assume, everywhere |
 | **the campaign flow itself CRASHED or FAILED** | `crashed/failed runs` | its own deterministic gate refused something; nothing is being filled while it is down |
-| **no GPU fleet places at the requested width, twice running** | `placement`, `fleet widths` | quota or capacity; the campaign is burning wall-clock and ingest storage producing nothing |
+| **no GPU fleet places at the requested width, twice running** | `fleet strength`, `empty clusters` | quota or capacity; the campaign is burning wall-clock and ingest storage producing nothing |
 | **GPU starvation: instances billing, zero chunks completed** | `gpu starvation` | the one failure with no other symptom — a fleet holding nothing publishes no progress line |
-| **Fargate vCPU quota exhausted** | `placement` | ingest cannot start; the fill queue drains and the fleet idles |
+| **Fargate vCPU quota exhausted** | `fleet strength` | ingest cannot start; the fill queue drains and the fleet idles |
 | **mass false cancellations / event loss** | `crashed/failed runs`, `orchestrator load` | measured before: the in-memory broker drops events, and the crash automation is event-driven. Healthy runs get declared dead and cancelled |
 | **cost accrual far above model with progress flat** | `cost accrual` + `commit rates` | the two together, never either alone: high burn with progress is just a wide fleet |
 | **a concurrency gate DEACTIVATED while fills are live** | `concurrency limits` | it does the opposite of what it sounds like: the server grants slots against an inactive limit, so the work it throttled runs unthrottled. A cost control silently gone, and one command to fix. (A gate at *zero* is a pause lever and is reported without being graded: `tessera-global-ingests` at zero holds ingest, `tessera-global-inference` at zero holds inference, and in both cases work waits rather than failing) |
@@ -241,7 +255,7 @@ run measures the remainder rather than the whole; and restart dead **legs**, not
 
 | signal | source | what goes on the shelf |
 |---|---|---|
-| **a zone failed every attempt** | the campaign's own `unfilled` list; `per-cell roster` | zone, year, last error |
+| **a zone failed every attempt** | the campaign's own `unfilled` list; `cells still making progress` | zone, year, last error |
 | **a cell failed validation, alone** | `cell validation` | zone, year, blocking slugs, verdict URI |
 | **an unexplained input-window gap** | `published input coverage`, `cell validation` | which source store was short, by how many months |
 | **a published cell with NO verdict** | `cell validation` | the dispatch was lost; needs a validator run, not a refill |

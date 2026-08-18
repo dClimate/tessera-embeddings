@@ -271,13 +271,16 @@ is in this table because it is the most consequential value in it.
 | `s1_orbit` | `"both"` | downgrades per zone when an orbit has no imagery. `"none"` is a *resolved* value, not a request: passing it in is refused, since it would defeat `require_s1` and publish optical-only embeddings that report success |
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
-| **`allow_s2_only`** | **`true`** ★ | On for the global campaign. A fifth of the land has no radar for 2022–24 (§6); without this those pixels produce nothing. Cambridge validated radar-free embeddings, which cleared ADR 013's blocking follow-up |
+| **`allow_s2_only`** | **`true`** ★ | On for the global campaign. A fifth of the land has no radar for 2022–24 (§6); without this those pixels produce nothing. Cambridge validated radar-free embeddings, which cleared ADR 013's blocking follow-up. Registered on the campaign's own deployments, so a global run gets it without anyone passing it — see the note below |
+| `require_s1` | `false` | Also registered on the campaign's deployments. A global run never refuses a cell for having no radar; that option exists for an operator filling one named zone-year who wants to be told (§8) |
+| **`optical_min_obs`** | **15** | **The one data-quality line, and the only reason a pixel is refused.** Fewer than fifteen clear optical observations in the year and the pixel is left empty; exactly fifteen is kept. Stamped on the store when it is seeded, so every cell is measured against the same line and a consumer can read what it was. Nothing about radar enters this decision |
 | **`overlap_years`** | **`true`** ★ | every requested year dispatched as one batch, so a zone's later years overlap the inference of its earlier ones and the campaign boots 8 clusters rather than 72. Certified on six cells that each carry both radar orbits, including a same-zone year rollover inside one cluster |
 | `attempts_per_cell_in_cluster` | 2 | **The cheap retry.** One more go at a failed cell on the cluster that is still standing, reusing its kept mosaic and staged tiles — minutes, not a fresh zone-year. Covers "the work failed but the machine is fine"; a dead run is `max_dispatch_rounds`' job (§8) |
 | `force_staging_reuse` | `false` | Escape hatch, and it cannot reach staging created without it: setting it changes the prefix, so it only preserves reuse between runs that both set it. To resume a specific prefix, pass `fill-zone-year`'s explicit `run_id` (§8) |
 | `force_staging_restage` | `""` | Any new token forces a fresh staging prefix, for a change the source hash cannot see (a dependency upgrade). Abandoning stale staged work is always safe, so unlike the row above this one is usable in production |
 | commit limit | derived, `min(clusters, 8)` = **8** | Never set by hand. It bounds commits in flight (~1 s each), not concurrent assemblies — so at 10 clusters two may briefly queue a commit, which is the intent: the gate is a bound, not an operating point, and seconds of queueing costs nothing against zones that run for hours |
-| leg retry wall-clock budget | **6 h** (`max_leg_wall_clock_s`) | **Ingest.** A zone-year's ingest is three legs (optical, plus one per radar orbit), and each retries on its own when a source misbehaves. This caps how long ONE leg may keep retrying, so a single stuck source cannot hold a whole zone (and the Dask fleet it is paying for) indefinitely. Measured in time rather than tries because one try can itself take minutes. Nothing is lost when it fires: ingest commits date by date, so everything already fetched is kept, the cell goes back on the work list, and the next dispatch carries on from where it stopped — giving up early costs latency, not work. Six hours still clears three legs of the slowest dense zone |
+| leg retry wall-clock budget | **6 h** (`max_leg_wall_clock_s`) | **Ingest.** A zone-year's ingest is three legs (optical, plus one per radar orbit), and each retries on its own when a source misbehaves. This caps how long ONE leg may keep retrying, so a single stuck source cannot hold a whole zone (and the Dask fleet it is paying for) indefinitely. **Counted per leg**, from that leg's first try, so one slow leg cannot spend another's budget. Measured in time rather than tries because one try can itself take minutes. Nothing is lost when it fires: ingest commits date by date, so everything already fetched is kept, the cell goes back on the work list, and the next dispatch carries on from where it stopped — giving up early costs latency, not work. Six hours still clears three legs of the slowest dense zone |
+| pause between leg tries | **30 s, doubling to a 2-minute ceiling** (`leg_retry_backoff_s`) | Deliberately short. A retry picks up from the dates already committed, so it costs only the work actually lost, and the campaign's pace depends on legs landing — a long pause leaves a GPU fleet waiting on a mosaic. The pause exists only to tell a momentary refusal from a permanent one, which does not take minutes; a failure no retry can fix waits not at all (§8) |
 | Earth Search page size | 100 | Set per provider. This catalogue refuses some (area, window) pairs at 250 and answers the same query at 100 — see the note below |
 
 The commit gate and the ingest gate are both **Prefect global concurrency limits**, because
@@ -462,6 +465,15 @@ answer — cost-model §4.
    schedule risk it is** — the code was a day and the access is somebody else's queue.
 5. **Model checkpoint staged** at `{inputs}/models/` and matching the seed.
 6. **Deployments registered** for `ingest-zone-year`, the chained fill, and the campaign.
+6b. **No leftover input locations** — `audit_mosaic_prefixes.py` (in yield-embeddings), which
+   exits non-zero if any is found and can therefore gate the dispatch. A location holding files but
+   no readable store cannot be written to, and every retry fails the same way, so the cell dies
+   after its fleet has been paid for. Found before launch it costs one listing and one delete;
+   found during the campaign it costs a cell. Twelve per cent of the dev account's locations were in
+   that state on 2026-08-18, all of them the residue of a cleanup nobody checked afterwards — which
+   is the real lesson, since a cleanup that silently did nothing looks exactly like one that worked.
+   The tool prints the deletes rather than running them, and deliberately passes a location whose
+   store merely will not open: that one may hold real data, and is a person's call.
 7. **Nothing to prepare for petabyte scale on our own buckets — done.** S3 Inventory delivers daily on both prod
    buckets and the audit path is exercised against a real manifest. The published store's own
    inventory is Cambridge's to configure and is asked for as an optional part of item 4b; nothing
@@ -670,6 +682,22 @@ independent legs — Sentinel-2 optical, Sentinel-1 radar ascending, Sentinel-1 
 and each retries on its own when a source misbehaves. The 6-hour budget caps how long one leg may
 keep retrying, so a single stuck source cannot hold the cell, or the Dask fleet it is paying for,
 indefinitely.
+
+**Independently means the legs do not wait for each other**, and that is worth stating because it
+used to be the other way round. A failed leg was once held until all three had settled before being
+re-run, which put the wait for the slowest leg onto the cell's own critical path: one radar leg
+failed a minute in and was not re-run for an hour, because it was waiting on an optical leg with an
+hour still to go. Since a cell cannot begin inference until all three have landed, that hour was
+added for nothing. Each leg now re-runs on its own clock, after the short pause in §3.
+
+**A failure no re-run can fix stops at once**, rather than spending the budget proving it. The clearest
+case is a leftover location that a fresh store cannot be created in: its contents decide the error,
+so every try returns the same one. One zone spent three tries re-reading the same twenty orphaned
+files this way and learned nothing after the first. Two consequences follow, and they are opposite
+on purpose: such a failure ends that leg immediately, and it also stops the *other* legs starting
+further tries, because the cell can no longer succeed and each try holds a fleet. What it never does
+is interrupt a leg already running — that leg's committed dates are useful to the next dispatch, and
+cutting a write short is how a location becomes leftover in the first place.
 
 **A "dispatch round" means the campaign starts the work again from scratch, as new flow runs.**
 This is the part worth being precise about, because it is not a resumption of anything. At the end
