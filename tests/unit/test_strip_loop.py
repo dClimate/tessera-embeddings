@@ -216,6 +216,7 @@ class _CapturingWriter:
 
     last_write: dict | None = None
     last_skip: str | None = None
+    last_skip_record: dict | None = None
 
     def __init__(self, staging_base, embedding_dim=128):
         self.embedding_dim = embedding_dim
@@ -230,8 +231,11 @@ class _CapturingWriter:
             "month_covered": month_covered.copy() if month_covered is not None else None,
         }
 
-    def write_skip_marker(self, chunk, run_id):
+    def write_skip_marker(self, chunk, run_id, record=None):
         _CapturingWriter.last_skip = chunk.label
+        # Recorded, not discarded — a fake that drops the record leaves an actor which never builds
+        # one indistinguishable from one that does, and the record is the whole registry.
+        _CapturingWriter.last_skip_record = record
 
 
 def _make_actor(inference_config, test_model):
@@ -443,6 +447,16 @@ class TestProcessChunkStriping:
         assert result["valid_pixels"] == 0
         assert _CapturingWriter.last_skip == _CHUNK.label
         assert _CapturingWriter.last_write is None
+        # THE REGISTRY'S PRODUCER SIDE. A fully refused chunk used to write a zero-byte marker, so a
+        # thin-depth refusal could not be told from land that was never imaged. The reason has to be
+        # written HERE: the cell is write-once and its mosaic is deleted when it lands.
+        record = _CapturingWriter.last_skip_record
+        assert record is not None, "a refused chunk must record WHY it was refused"
+        assert record["label"] == _CHUNK.label
+        assert set(record["refused"]) == {"no_optical", "thin", "no_radar"}
+        assert sum(record["refused"].values()) > 0, "something refused every pixel; say what"
+        # The observation summary rides along, because the counts alone cannot say HOW thin.
+        assert "s2_obs" in record and set(record["s2_obs"]) == {"px_with_any", "max", "mean_where_any"}
 
 
 # ---------------------------------------------------------------------------

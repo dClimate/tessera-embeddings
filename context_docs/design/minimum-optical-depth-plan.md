@@ -216,6 +216,35 @@ below.
 > quantised embedding shrink by 7%, so the store is essentially 120 bytes of embedding per pixel
 > whatever else is added beside it — and month coverage compresses ~400×.
 
+> **The per-shard registry: a refused shard now records WHY (2026-08-18).** Built because the three
+> things wrong with the record all had one cause — a fully refused shard wrote a **zero-byte** marker.
+> The dataset computes `refused_no_optical`, `refused_thin` and `refused_no_radar` per strip and
+> deliberately keeps them apart; the actor sums them over the chunk; then all of it was discarded, and
+> what survived was a count of "optical skips" that named the wrong cause for 43 of 40S's 58 live
+> shards.
+>
+> The marker now carries JSON: the three counts, the eligible pixel total, and an observation summary
+> (`px_with_any`, `max`, `mean_where_any`) — because the counts alone cannot say HOW thin, and obs
+> counts are accumulated per strip regardless of validity, so they are populated even where nothing
+> passed. `summarise_optical_skips` folds them into the year's provenance as `by_reason` totals plus a
+> per-shard `reason` (the reason that refused the most pixels, so a mixed shard is named by what
+> dominates it).
+>
+> **Read at assembly, which is the last moment they exist:** the markers go with the staging prefix,
+> and the mosaic they were derived from goes when the cell lands. A published cell is write-once, so a
+> reason not written then is not recoverable.
+>
+> **Three deliberate non-collapses**, each the same discipline this document keeps relearning:
+> a marker that is empty, unreadable or not JSON yields NO entry rather than an error, because markers
+> from before the registry are zero bytes and a resume across the change must still assemble; a shard
+> with no record is listed under `unrecorded` rather than folded into a zero, since "no reason
+> recorded" is a different claim from "nothing was refused"; and `summarise_optical_skips` called
+> without records returns exactly its previous shape, so a resume cannot write a half-populated
+> registry.
+>
+> The monitoring round consumes it: the footprint check now reports `40S/2023: 43/58 (74%) refused —
+> no_radar 180,388,626px` instead of the bare word "refused".
+
 > **OPTICAL DEPTH IS THE ONLY REFUSAL RULE — and radar was silently refusing land too
 > (2026-08-18).** A DECISION (Robert), and a correction to what the campaign was actually doing. The
 > per-pixel gate in `inference/dataset.py` is `has_optical & deep_enough`, then `if not

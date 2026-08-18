@@ -1295,8 +1295,34 @@ class InferenceActor:
                 # zero-byte skip marker so verify_staged_completeness can
                 # distinguish a legitimate skip from a silently-failed chunk
                 # (Ray worker crash, etc.).
-                logger.info("Chunk %s has no valid pixels, skipping (assembly will fill)", chunk.label)
-                writer.write_skip_marker(chunk, run_id)  # zero-byte marker: keep synchronous
+                # THE REASON, RECORDED. These three counts are summed over the chunk's strips just
+                # above and used to be discarded here, which made a thin-depth refusal
+                # indistinguishable from land that was never imaged — and left 43 of 40S's 58 live
+                # shards attributed to "optical skips" when every one was refused for having no
+                # radar. The cell is write-once and its mosaic is deleted when it lands, so a reason
+                # not written here is not recoverable.
+                #
+                # The observation summary rides along because the counts alone cannot say HOW thin:
+                # obs counts are accumulated per strip regardless of validity, so they are populated
+                # even on a chunk where nothing passed.
+                s2_obs = obs_buffers["s2_obs_count"]
+                any_obs = s2_obs > 0
+                skip_record = {
+                    "label": chunk.label,
+                    "refused": dict(refused),
+                    "eligible_px": int(chunk.height) * int(chunk.width),
+                    "s2_obs": {
+                        "px_with_any": int(any_obs.sum()),
+                        "max": int(s2_obs.max()),
+                        "mean_where_any": round(float(s2_obs[any_obs].mean()), 2) if any_obs.any() else 0.0,
+                    },
+                }
+                logger.info(
+                    "Chunk %s has no valid pixels, skipping (assembly will fill) — refused %s",
+                    chunk.label,
+                    ", ".join(f"{k}={v}" for k, v in sorted(refused.items()) if v),
+                )
+                writer.write_skip_marker(chunk, run_id, skip_record)  # small marker: keep synchronous
                 # Collect the prior deferred write BEFORE snapshotting elapsed —
                 # the wait is actor-occupancy this chunk owns, same as the
                 # success path below (else the phase table under-reports it).
