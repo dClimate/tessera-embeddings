@@ -268,6 +268,16 @@ _NON_RETRYABLE_LEG_MARKERS = (
     # the same answer, and the resolution is a human deleting the interrupted store —
     # the same answer a mismatched completion marker gets, for the same reason.
     "ConfigMismatchError",
+    # The mosaic prefix holds objects but no Icechunk repository, so `Repository.create`
+    # refuses it under the clean-prefix rule. Deterministic in the input in the strictest
+    # sense available: the prefix's contents decide it, and no attempt changes them. Added
+    # 2026-08-18, when zone 47S spent its whole attempt budget re-reading the same twenty
+    # orphaned chunk objects — three dispatches, three identical failures, an hour of a
+    # cell's critical path, and nothing learned after the first. `open_or_create_repo`
+    # creates ONLY on proven absence, so this error no longer has a transient form: a
+    # momentary open failure is re-raised as itself rather than routed into the create leg.
+    # `scripts/audit_mosaic_prefixes.py` in the consumer repo finds these before a dispatch.
+    "CorruptedStoreError",
 )
 
 
@@ -588,45 +598,79 @@ async def ingest_zone_year(
         )
     ]
 
-    errors: list[str] = []
-    # Per leg, the catalogue-refusal signature its previous attempt carried. The default
-    # retry polarity above is right for a source that is momentarily unwilling and wrong
-    # for one that cannot answer a particular request at all — and only a REPEAT separates
-    # them, because a single refusal already reached us through an exhausted HTTP retry
-    # ladder and still cannot distinguish a minutes-long outage from a permanent one. The
-    # signature covers what was asked, so an identical entry means the identical request
-    # was refused the identical way and the remaining attempts would each buy another copy
-    # of the same answer. Scoped to this flow run: the evidence is the repeat, and a run
-    # that has not seen one has nothing to act on.
-    last_refusal: dict[str, str] = {}
-    # The wall-clock bound's anchor. Attempts are counted at every layer of the retry
-    # stack; elapsed time is bounded only here, and only at the decision to START another
-    # attempt — see the deadline check at the bottom of the loop.
-    leg_loop_start = monotonic()
-    for attempt in range(1, ingest_settings.max_leg_attempts + 1):
-        # return_exceptions=True so we WAIT for every leg to settle before retrying or
-        # raising: a plain gather() surfaces the first failure while the siblings keep
-        # writing to mosaic_base, and a re-dispatch could then clear the prefix mid-write.
-        # Join them all, then decide.
-        results = await asyncio.gather(
-            *(arun_deployment(dep, parameters=params, tags=child_tags) for _, dep, params in legs),
-            return_exceptions=True,
-        )
+    # ONE RETRY LOOP PER LEG, joined only at the end — the legs no longer wait for each other.
+    #
+    # This was a barrier: every leg was joined, then the failed ones re-dispatched together. Its
+    # stated reason was that a re-dispatch could clear the mosaic prefix while a sibling was still
+    # writing into it. That reason is gone. The clear-and-rebuild recovery it guarded was replaced
+    # by resume (see "RESUME, do not rebuild" above), so a re-dispatch clears nothing, and each leg
+    # writes its OWN child store under the base regardless.
+    #
+    # What the barrier still cost was latency on the cell's critical path, which is the whole
+    # point of it: on 2026-08-18 zone 47S's descending leg failed one minute in and was not
+    # re-dispatched for an hour, because it waited on an optical leg that had another hour to run.
+    # A cell cannot infer until every leg has landed, so that hour was added for nothing.
+    #
+    # Two things the barrier did without saying so, now explicit rather than accidental: attempts
+    # are spaced by `leg_retry_backoff_s` rather than by however long the slowest sibling happened
+    # to take, and the wall-clock budget is per leg, anchored at that leg's own first dispatch.
+    #
+    # THE INVARIANT THAT SURVIVES UNCHANGED, and it is the important one: a leg that can never
+    # succeed must fail the cell, and a sibling's later success must not erase it. `s1_orbit="both"`
+    # with one SAR deployment permanently broken must not resolve to the single orbit that did
+    # ingest, pass the coverage gate on it, and stamp a "both" marker over half the radar — after
+    # which every later run reads the marker and skips the cell. The old loop protected that by
+    # breaking before `errors` could be rebuilt on the next pass; here each leg owns its own result
+    # and nothing can clear another's, so the property is structural rather than a matter of order.
+    #
+    # A terminally failed leg does NOT cancel its siblings. Their committed dates are useful to the
+    # next dispatch either way, and interrupting a running write is how a store becomes an
+    # interrupted one — the failure is reported as soon as they settle, and the cell returns to the
+    # campaign work list to resume.
+    #
+    # It DOES stop them spending further attempts, which the barrier used to do by aborting the
+    # whole loop. Once any leg has failed in a way no re-dispatch can fix, the cell cannot succeed,
+    # so a sibling's remaining retries would buy nothing and each one holds a Dask fleet while it
+    # runs. `doomed` gates only the decision to START another attempt — the same thing the
+    # wall-clock bound gates, and for the same reason: a leg already running is never interrupted.
+    doomed = asyncio.Event()
 
-        failed: list[tuple[str, str, dict]] = []
-        terminal: list[str] = []
-        errors = []
-        for (label, dep, params), run in zip(legs, results, strict=True):
+    def _leg_backoff_s(attempt: int) -> float:
+        """Delay before a leg's next attempt: doubling from the base, capped at four times it.
+
+        Deliberately short. The ingest resumes, so a retry costs only the work actually lost, and
+        the campaign's throughput is bounded by legs landing — a long backoff idles a GPU fleet
+        waiting on a mosaic. What the delay buys is the difference between a momentary source
+        refusal and a structural one, and that does not take minutes to establish.
+        """
+        base = ingest_settings.leg_retry_backoff_s
+        return min(base * (2 ** (attempt - 1)), base * 4)
+
+    async def _run_leg(label: str, dep: str, params: dict) -> str | None:
+        """Dispatch one leg, retrying on its own schedule; its failure detail, or None if it ran.
+
+        Every classification here is the one the joined loop applied — a deterministic repeat from
+        the source catalogue, a marker meaning a re-dispatch cannot help, a load refusal that is
+        evidence FOR patience — read per leg instead of per round.
+        """
+        started = monotonic()
+        last_token: str | None = None
+        detail: str | None = None
+        for attempt in range(1, ingest_settings.max_leg_attempts + 1):
+            try:
+                run: object = await arun_deployment(dep, parameters=params, tags=child_tags)
+            except Exception as exc:
+                # `CancelledError` is deliberately NOT caught: cancelling this flow must cancel
+                # its legs rather than be recorded as one leg's failure detail.
+                run = exc
             detail = _leg_failure_detail(run, label)
             if detail is None:
-                continue
-            errors.append(detail)
+                return None
             refusal = refusal_in(detail)
-            previous = last_refusal.get(label)
+            previous = last_token
             if refusal is not None:
-                last_refusal[label] = refusal.token
+                last_token = refusal.token
             if refusal is not None and refusal.token == previous and repeat_is_deterministic(refusal.kind):
-                terminal.append(detail)
                 log.error(
                     "Zone %s year %s: %s — the source catalogue refused the SAME request the SAME "
                     "way again (%s). That is deterministic in the request, not congestion: the "
@@ -639,23 +683,9 @@ async def ingest_zone_year(
                     refusal.token,
                     detail,
                 )
-            elif _is_retryable_leg_failure(detail):
-                if refusal is not None and refusal.kind is RefusalKind.LOAD:
-                    # Said out loud because it is the branch that deliberately keeps
-                    # waiting: a source naming itself as the constraint is exactly what the
-                    # expansive retry exists for, and a repeat of it is evidence FOR
-                    # patience rather than against it.
-                    log.warning(
-                        "Zone %s year %s: %s — the source catalogue refused under load (%s). "
-                        "Retrying: waiting is the remedy for this class, however often it recurs.",
-                        zone,
-                        year,
-                        label,
-                        refusal.token,
-                    )
-                failed.append((label, dep, params))
-            else:
-                terminal.append(detail)
+                doomed.set()
+                return detail
+            if not _is_retryable_leg_failure(detail):
                 log.error(
                     "Zone %s year %s: %s failed in a way a re-dispatch cannot fix — not retrying: %s",
                     zone,
@@ -663,61 +693,92 @@ async def ingest_zone_year(
                     label,
                     detail,
                 )
-
-        if not errors:
-            break
-        # A leg that can never succeed ENDS the attempt loop, and `errors` still holds
-        # it. Retrying the siblings around it would clear `errors` at the top of the
-        # next attempt, and if those siblings then succeeded the terminal failure would
-        # be gone: `s1_orbit="both"` with one SAR deployment permanently broken would
-        # resolve to the single orbit that did ingest, pass the coverage gate on it, and
-        # stamp a "both" marker over half the radar — after which every later run reads
-        # the marker and skips the cell. The siblings' committed dates survive either
-        # way, so aborting here costs a resumable re-dispatch and nothing else.
-        if terminal:
-            break
-        if not failed or attempt == ingest_settings.max_leg_attempts:
-            break
-        # The wall-clock bound, checked ONLY here — at the decision to start another
-        # attempt, after every leg has settled. A leg that is running is never measured
-        # against it, so a slow-but-succeeding leg cannot be why the loop stopped; what the
-        # bound refuses is re-dispatching a failed leg after patience has already had a
-        # deadline's worth of wall clock. Like a terminal failure, breaking leaves `errors`
-        # populated and the raise below fails the cell — which is not surrender: the cell
-        # returns to the campaign work list, and a later dispatch RESUMES from the dates
-        # already committed, so the cost is latency, not work.
-        elapsed = monotonic() - leg_loop_start
-        if elapsed >= ingest_settings.max_leg_wall_clock_s:
-            log.error(
-                "Zone %s year %s: %.0f s elapsed since the first leg attempt — past the "
-                "wall-clock budget for starting another (max_leg_wall_clock_s=%d) — so "
-                "attempt %d/%d is refused even though the attempt budget has room. The "
-                "bound only ever gates the START of an attempt; no running leg was "
-                "interrupted. The cell fails back to the campaign work list, and a later "
-                "dispatch RESUMES from the dates already committed — this costs latency, "
-                "not work. Failed leg(s): %s",
+                doomed.set()
+                return detail
+            if refusal is not None and refusal.kind is RefusalKind.LOAD:
+                # Said out loud because it is the branch that deliberately keeps waiting: a source
+                # naming itself as the constraint is exactly what the expansive retry exists for,
+                # and a repeat of it is evidence FOR patience rather than against it.
+                log.warning(
+                    "Zone %s year %s: %s — the source catalogue refused under load (%s). "
+                    "Retrying: waiting is the remedy for this class, however often it recurs.",
+                    zone,
+                    year,
+                    label,
+                    refusal.token,
+                )
+            if attempt == ingest_settings.max_leg_attempts:
+                return detail
+            if doomed.is_set():
+                # Another leg has failed in a way no re-dispatch can fix, so this cell cannot
+                # succeed however well this leg's next attempt goes. Its own failure is still
+                # what gets reported for this leg — the cell fails on the union of them.
+                log.warning(
+                    "Zone %s year %s: %s will not be re-dispatched — another leg of this cell "
+                    "failed terminally, so the cell cannot succeed and a further attempt would "
+                    "hold a fleet to learn nothing. Detail: %s",
+                    zone,
+                    year,
+                    label,
+                    detail,
+                )
+                return detail
+            # The wall-clock bound, checked ONLY here — at the decision to start another attempt.
+            # A leg that is RUNNING is never measured against it, so a slow-but-succeeding leg
+            # cannot be why this stopped; what the bound refuses is re-dispatching after patience
+            # has already had a deadline's worth of wall clock. Per leg now, because the legs no
+            # longer share a loop: one leg's slow retries must not spend another's budget.
+            elapsed = monotonic() - started
+            if elapsed >= ingest_settings.max_leg_wall_clock_s:
+                log.error(
+                    "Zone %s year %s: %s — %.0f s elapsed since this leg's first attempt, past the "
+                    "wall-clock budget for starting another (max_leg_wall_clock_s=%d), so attempt "
+                    "%d/%d is refused even though the attempt budget has room. No running leg was "
+                    "interrupted. The cell fails back to the campaign work list and a later "
+                    "dispatch RESUMES from the dates already committed — this costs latency, not "
+                    "work. Detail: %s",
+                    zone,
+                    year,
+                    label,
+                    elapsed,
+                    ingest_settings.max_leg_wall_clock_s,
+                    attempt + 1,
+                    ingest_settings.max_leg_attempts,
+                    detail,
+                )
+                return detail
+            wait = _leg_backoff_s(attempt)
+            # A re-dispatch RESUMES: already-committed dates are skipped, not rewritten, so the
+            # retry costs only the work that was actually lost. That idempotency is what makes
+            # retrying the default rather than the exception.
+            log.warning(
+                "Zone %s year %s: %s failed attempt %d/%d — re-dispatching in %.0f s (it resumes "
+                "from the dates already committed): %s",
                 zone,
                 year,
-                elapsed,
-                ingest_settings.max_leg_wall_clock_s,
-                attempt + 1,
+                label,
+                attempt,
                 ingest_settings.max_leg_attempts,
-                ", ".join(label for label, _, _ in failed),
+                wait,
+                detail,
             )
-            break
-        # A re-dispatch RESUMES: already-committed dates are skipped, not rewritten, so the
-        # retry costs only the work that was actually lost. That idempotency is what makes
-        # retrying the default rather than the exception.
-        log.warning(
-            "Zone %s year %s: attempt %d/%d — re-dispatching %d leg(s) that can resume: %s",
-            zone,
-            year,
-            attempt,
-            ingest_settings.max_leg_attempts,
-            len(failed),
-            ", ".join(label for label, _, _ in failed),
-        )
-        legs = failed
+            await asyncio.sleep(wait)
+            if doomed.is_set():
+                # Re-checked after the wait: a sibling can reach its terminal failure while this
+                # leg is backing off, and the point of the gate is to not start the attempt.
+                log.warning(
+                    "Zone %s year %s: %s will not be re-dispatched — another leg failed terminally "
+                    "while this one was waiting to retry. Detail: %s",
+                    zone,
+                    year,
+                    label,
+                    detail,
+                )
+                return detail
+        return detail
+
+    settled = await asyncio.gather(*(_run_leg(label, dep, params) for label, dep, params in legs))
+    errors: list[str] = [detail for detail in settled if detail is not None]
 
     if errors:
         raise RuntimeError(f"ingest deployment(s) failed for zone {zone} year {year}: " + "; ".join(errors))

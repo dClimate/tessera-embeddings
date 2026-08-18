@@ -29,6 +29,32 @@ from tessera_embeddings.ingest.catalogue_refusal import (
 _PATHS = BucketPaths(inputs="s3://in", outputs="s3://out")
 
 
+@pytest.fixture(autouse=True)
+def waited(monkeypatch):
+    """Record the leg-retry backoff instead of serving it.
+
+    The legs retry on their own schedule now, with a real ``asyncio.sleep`` between attempts, and
+    the retry paths here are exercised heavily — served literally, this file took ten minutes.
+    Autouse rather than opt-in because a test that forgets it does not fail, it just quietly costs
+    minutes, which is how a suite stops being run. The recorded delays are asserted on by the tests
+    about the backoff itself, so the schedule is still checked; only the waiting is skipped.
+
+    It still YIELDS to the event loop, which is not a detail: a real backoff lets the sibling legs
+    run while one is waiting, and a stub that returns without suspending serialises them instead —
+    each leg would run to completion before the next started, so nothing that depends on the legs
+    interleaving could be tested at all.
+    """
+    seen: list[float] = []
+    real_sleep = mod.asyncio.sleep
+
+    async def fake_sleep(seconds, *args, **kwargs):
+        seen.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+    return seen
+
+
 def _completed_run(rid: str = "r") -> SimpleNamespace:
     return SimpleNamespace(id=rid, state=SimpleNamespace(type=StateType.COMPLETED, name="Completed"))
 
@@ -971,3 +997,143 @@ def test_only_the_optical_store_is_held_to_the_admission_threshold(wired, monkey
 
     _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(min_valid_coverage=0.25))
     assert seen == {"reflectance.zarr": 0.25, "sar_ascending.zarr": None}
+
+
+class TestLegsRetryIndependently:
+    """Each leg retries on its own schedule; the legs no longer wait for each other.
+
+    This was a barrier — every leg joined, then the failed ones re-dispatched together — and its
+    stated reason (a re-dispatch could clear the prefix while a sibling was still writing) had
+    already been removed when clear-and-rebuild was replaced by resume. What it still cost was the
+    cell's critical path: on 2026-08-18 zone 47S's descending leg failed one minute in and was not
+    re-dispatched for an hour, because it waited on an optical leg that had another hour to run.
+
+    Two properties have to hold together, and they pull in opposite directions: a leg must retry
+    without waiting for its siblings, AND a leg that can never succeed must still stop the others
+    spending attempts on a cell that cannot finish.
+    """
+
+    def test_a_leg_retries_without_waiting_for_a_slow_sibling(self, wired, monkeypatch):
+        """The test the barrier could not pass: the slow leg only finishes AFTER the failing leg
+        has used all three of its attempts, so a design that joins the legs each round deadlocks
+        here and one that retries per leg completes.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        radar_done = asyncio.Event()
+        attempts = {"radar": 0}
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            if (parameters.get("orbit") or "s2") == "s2":
+                # Blocks until the radar leg has exhausted its attempts. Under the old barrier the
+                # radar leg could not start attempt 2 until this returned, so nothing would move.
+                await asyncio.wait_for(radar_done.wait(), timeout=5)
+                return _completed_run()
+            attempts["radar"] += 1
+            if attempts["radar"] >= 3:
+                radar_done.set()
+            return SimpleNamespace(
+                id="r",
+                state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL),
+            )
+
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+
+        assert attempts["radar"] == 3, "the radar leg spent its attempts without the sibling settling"
+
+    def test_the_backoff_doubles_and_is_capped(self, wired, monkeypatch, waited):
+        """Short and bounded. A retry resumes from the dates already committed, so waiting long
+        buys nothing and idles a GPU fleet behind the mosaic; the cap keeps a late attempt from
+        inheriting an exponential tail.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            if (parameters.get("orbit") or "s2") == "s2":
+                return _completed_run()
+            return SimpleNamespace(
+                id="r",
+                state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL),
+            )
+
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+
+        with pytest.raises(RuntimeError, match="token has expired"):
+            _run(
+                s1_orbit="ascending",
+                ingest_settings=mod.IngestSettings(max_leg_attempts=5, leg_retry_backoff_s=10),
+            )
+
+        assert waited == [10, 20, 40, 40], "doubling from the base, capped at four times it"
+
+    def test_a_terminal_failure_stops_a_siblings_remaining_attempts(self, wired, monkeypatch):
+        """The property the barrier gave for free: once a leg has failed in a way no re-dispatch
+        can fix, the cell cannot succeed, so a sibling's remaining retries would hold a Dask fleet
+        to learn nothing. Gated at the decision to START an attempt — never by interrupting a leg
+        that is already running.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        dispatched: list[str] = []
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            leg = parameters.get("orbit") or "s2"
+            dispatched.append(leg)
+            if leg == "s2":
+                # Terminal: no re-dispatch can register a missing deployment.
+                return SimpleNamespace(
+                    id="r",
+                    state=SimpleNamespace(
+                        type=StateType.FAILED, name="Failed", message="ObjectNotFound: no such deployment"
+                    ),
+                )
+            return SimpleNamespace(
+                id="r",
+                state=SimpleNamespace(type=StateType.FAILED, name="Failed", message=_TRANSIENT_DETAIL),
+            )
+
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+
+        with pytest.raises(RuntimeError, match="ObjectNotFound"):
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+
+        assert dispatched.count("ascending") == 1, "the retryable leg did not spend attempts on a doomed cell"
+
+    def test_a_dirty_mosaic_prefix_is_terminal_on_the_first_failure(self, wired, monkeypatch):
+        """A prefix holding objects but no repository fails ``Repository.create`` identically every
+        time — the prefix's contents decide it and no attempt changes them.
+
+        On 2026-08-18 zone 47S spent its whole attempt budget re-reading the same twenty orphaned
+        chunk objects: three dispatches, three identical failures, nothing learned after the first.
+        """
+        monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+        monkeypatch.setattr(mod, "_probe_marker", lambda store, **kw: (False, None))
+        dispatched: list[str] = []
+
+        async def fake_arun(dep, parameters=None, tags=None):
+            leg = parameters.get("orbit") or "s2"
+            dispatched.append(leg)
+            if leg == "s2":
+                return _completed_run()
+            return SimpleNamespace(
+                id="r",
+                state=SimpleNamespace(
+                    type=StateType.FAILED,
+                    name="Failed",
+                    message=(
+                        "CorruptedStoreError: Store s3://in/mosaics/47S/2021/sar_ascending.zarr holds "
+                        "objects but no readable repository"
+                    ),
+                ),
+            )
+
+        monkeypatch.setattr(mod, "arun_deployment", fake_arun)
+
+        with pytest.raises(RuntimeError, match="CorruptedStoreError"):
+            _run(s1_orbit="ascending", ingest_settings=mod.IngestSettings(max_leg_attempts=3))
+
+        assert dispatched.count("ascending") == 1, "a dirty prefix must not be retried at all"

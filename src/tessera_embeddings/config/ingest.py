@@ -202,8 +202,8 @@ class IngestSettings(BaseModel):
     # ``_NON_RETRYABLE_LEG_MARKERS`` in the flow. This counts ATTEMPTS only; the bound on
     # elapsed time in the same loop is ``max_leg_wall_clock_s`` below.
     max_leg_attempts: int = Field(default=3, ge=1)
-    # Wall-clock budget, in seconds, for ingest-zone-year's whole leg-retry loop — the only
-    # bound on ELAPSED time anywhere in the retry stack. Every other layer counts attempts:
+    # Wall-clock budget, in seconds, for ONE leg's retry loop — the only bound on ELAPSED
+    # time anywhere in the retry stack. Every other layer counts attempts:
     # the HTTP ladder under a page fetch, this loop's attempt count above, and the cell and
     # zone budgets above that, each treating the layer below as one try. None of them reads
     # a clock, and expansive backoff — the campaign's deliberate policy toward a source
@@ -235,7 +235,27 @@ class IngestSettings(BaseModel):
     # cell returns to the work list and resumes from its committed dates, so giving up early
     # is cheap while giving up late holds a campaign slot against an eight-day run. 6 h still
     # clears three legs of a slow dense cell plus expansive backoff.
+    #
+    # PER LEG since 2026-08-18, when the legs stopped sharing one retry loop. Each leg's
+    # deadline is anchored at its own first dispatch, so one leg's slow retries can no longer
+    # spend a sibling's budget. The value is unchanged: it was always sized against the
+    # longest legitimate SINGLE leg, so it already meant this.
     max_leg_wall_clock_s: int = Field(default=6 * 3600, ge=1)
+    # Base delay, in seconds, before re-dispatching a failed leg. Doubles per attempt and is
+    # capped at four times this value.
+    #
+    # It exists because the legs retry INDEPENDENTLY (2026-08-18). While they shared a loop,
+    # a retry was spaced by however long the slowest sibling took to settle — accidental
+    # backoff, invisible, and sometimes an hour. Removing the barrier removed that spacing,
+    # so the spacing became a decision.
+    #
+    # Deliberately SHORT. A retry resumes from the dates already committed, so it costs only
+    # the work actually lost, and the campaign's throughput is bounded by legs landing — a
+    # long backoff idles a GPU fleet waiting on a mosaic. What the delay buys is the
+    # difference between a momentary source refusal and a structural one, and that does not
+    # take minutes to establish; a failure that is deterministic in the input is excluded by
+    # CLASS (``_NON_RETRYABLE_LEG_MARKERS``) and never waits at all.
+    leg_retry_backoff_s: int = Field(default=30, ge=0)
     # Optional base URI (an fsspec target, e.g. s3://.../perf/) for capturing a
     # Dask ``distributed.performance_report`` per child ingest. Default None =
     # off (normal runs pay nothing); set it only on a probe rung — ingest-zone-year
