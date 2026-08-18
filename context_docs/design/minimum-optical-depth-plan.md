@@ -242,8 +242,46 @@ below.
 > without records returns exactly its previous shape, so a resume cannot write a half-populated
 > registry.
 >
-> The monitoring round consumes it: the footprint check now reports `40S/2023: 43/58 (74%) refused —
-> no_radar 180,388,626px` instead of the bare word "refused".
+> **The record's shape, after red-teaming it (2026-08-18).** Six things the first cut got wrong or
+> would have got wrong at scale:
+>
+> | field | what it holds | why it is shaped this way |
+> |---|---|---|
+> | `tiles_skipped` / `tiles_live` | TILES | unchanged |
+> | `refused_px_by_reason` | PIXELS per reason | the units are in the NAME. The first cut called this `by_reason`, sitting beside a tile count, so a reader comparing the two compared different censuses |
+> | `shards_by_reason` | reason → labels | organised by REASON, not by shard: it is the question a reader asks, every key is self-describing, and it is an order of magnitude smaller than a nested record per shard — which went into a zarr ATTRIBUTE that every reader of the zone pays on every open, at up to 556 live tiles |
+> | `shards_mixed` | count | a shard sits under the reason that took the most of its pixels, so the lists partition; this says how many had more than one, which a bare dominant label hides |
+> | `s2_obs_at_refused` | pooled max + px_with_any | HOW thin, pooled. Per-shard depth answers a question nobody has once the mosaic is deleted, and it is what made the record large |
+> | `unrecorded` / `unreadable_markers` / `inconsistent` | labels / count / labels | the three ways this record can fail to know something, each said rather than folded into a zero |
+>
+> **The dangerous one was not a reporting bug.** The marker's PRESENCE is load-bearing —
+> `verify_staged_completeness` tells a legitimate skip from a crashed worker by the file existing — so
+> a record that cannot be serialised must cost the RECORD, never the marker. One careless missing
+> `int()` around a numpy scalar in `json.dumps` would have turned a benign skip into a failed chunk
+> that wedged the cell on every retry. The write now falls back to a bare marker and logs.
+>
+> **`unreadable_markers` exists because "no records" and "every read failed" are the same empty dict.**
+> Expired credentials or a wrong prefix would otherwise publish a provenance entry that quietly says
+> no reason was recorded for anything. The reader returns its failure count and the caller surfaces it.
+>
+> **`inconsistent` checks the invariant nobody was checking.** The dataset's three reasons partition a
+> shard's pixels by construction, so on a FULLY refused shard they must account for every eligible
+> pixel. A mismatch means strips did not cover the chunk or a count was double-added — either way the
+> pixel totals are wrong, and saying so beats a plausible number. A record that refuses NOTHING while
+> its shard holds nothing lands here too: that is the producer and the summary disagreeing.
+>
+> **Reading is concurrent** (one small GET per refused shard, resolved against one filesystem rather
+> than one per label): a zone can refuse hundreds, and serially that is a round trip each on the
+> critical path between the last chunk and the commit.
+>
+> **Why only FULLY refused shards need a record at all.** For a shard that WAS written the evidence is
+> already published — its `s2_obs_count` is real, so a depth-refused pixel is identifiable as
+> `0 < obs < optical_min_obs` with a NaN scale. A fully refused shard writes nothing, its obs counts
+> read back as fill, and its mosaic is deleted when the cell lands. That is the only case where the
+> reason is unrecoverable, and so the only case this has to cover.
+>
+> The monitoring round consumes it: the footprint check reports `40S/2023: 43/58 (74%) refused —
+> no_radar 180m px` instead of the bare word "refused".
 
 > **OPTICAL DEPTH IS THE ONLY REFUSAL RULE — and radar was silently refusing land too
 > (2026-08-18).** A DECISION (Robert), and a correction to what the campaign was actually doing. The

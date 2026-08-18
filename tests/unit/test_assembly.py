@@ -2279,8 +2279,10 @@ class TestAssembleGlobal:
             "tiles_skipped": 0,
             "tiles_live": 1,
             "labels": [],
-            "by_reason": {"no_optical": 0, "thin": 0, "no_radar": 0},
-            "shards": {},
+            "refused_px_by_reason": {"no_optical": 0, "thin": 0, "no_radar": 0},
+            "shards_by_reason": {},
+            "shards_mixed": 0,
+            "s2_obs_at_refused": {"max": 0, "px_with_any": 0},
             "unrecorded": [],
         }
 
@@ -2311,8 +2313,10 @@ class TestAssembleGlobal:
             "tiles_skipped": 1,
             "tiles_live": 2,
             "labels": ["chunk_0_1"],
-            "by_reason": {"no_optical": 0, "thin": 0, "no_radar": 0},
-            "shards": {},
+            "refused_px_by_reason": {"no_optical": 0, "thin": 0, "no_radar": 0},
+            "shards_by_reason": {},
+            "shards_mixed": 0,
+            "s2_obs_at_refused": {"max": 0, "px_with_any": 0},
             "unrecorded": ["chunk_0_1"],
         }
         for _ in range(2):

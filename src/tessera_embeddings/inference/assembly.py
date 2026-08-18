@@ -47,6 +47,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
 
 import fsspec
@@ -798,6 +799,29 @@ class ZarrWriter:
         """
         return f"{self.staging_base}/{run_id}/{chunk.label}.done"
 
+    def _skip_summary(self, run_id: str, staged: list[str], skipped: list[str]) -> dict:
+        """The year's optical-skip summary, with the per-shard reasons read from their markers.
+
+        Read HERE and not later because this is the last moment the reasons exist: the markers go
+        with the staging prefix when it is cleaned up, and the mosaic they were derived from goes when
+        the cell lands. A published cell is write-once.
+        """
+        records, unreadable = read_skip_records(self.staging_base, run_id, skipped)
+        summary = summarise_optical_skips(staged=staged, skipped=skipped, records=records)
+        if unreadable:
+            # SURFACED, because "no records" and "every read failed" are the same empty dict. Without
+            # this a systematic failure — expired credentials, a wrong prefix — would publish a
+            # provenance entry that quietly says no reason was recorded for anything.
+            summary["unreadable_markers"] = unreadable
+            logger.warning(
+                "Run %s: %d of %d skip marker(s) could not be read, so their refusal reasons are "
+                "absent from the year's record",
+                run_id,
+                unreadable,
+                len(skipped),
+            )
+        return summary
+
     def write_skip_marker(self, chunk: ChunkSpec, run_id: str, record: dict | None = None) -> str:
         """Write a skip marker for a chunk, carrying WHY it was refused.
 
@@ -835,10 +859,22 @@ class ZarrWriter:
         for stale in (self._done_marker_path(run_id, chunk), self._staging_path(run_id, chunk)):
             with contextlib.suppress(FileNotFoundError):
                 fs.rm(stale, recursive=True)
+        # THE MARKER'S PRESENCE IS LOAD-BEARING; ITS CONTENT IS NOT. `verify_staged_completeness`
+        # distinguishes a legitimate skip from a crashed worker by this file existing, so a record
+        # that cannot be serialised must cost the RECORD, never the marker — losing the reason is a
+        # degraded provenance entry, while failing to write the marker turns a benign skip into a
+        # failed chunk and wedges the cell on every retry. A numpy scalar reaching `json.dumps` is
+        # exactly how that would happen, and it is one careless `int()` away at all times.
+        body = b""
+        if record is not None:
+            try:
+                # Sorted keys and a trailing newline: the marker is read by eye during an
+                # investigation at least as often as by the summariser.
+                body = json.dumps(record, sort_keys=True, indent=2).encode() + b"\n"
+            except (TypeError, ValueError):
+                logger.exception("Chunk %s: skip record could not be serialised; writing a bare marker", chunk.label)
         with fs.open(path, "wb") as f:
-            # Sorted keys and a trailing newline: the marker is read by eye during an
-            # investigation at least as often as by the summariser.
-            f.write(b"" if record is None else json.dumps(record, sort_keys=True, indent=2).encode() + b"\n")
+            f.write(body)
         logger.info("Wrote skip marker for %s to %s", chunk.label, path)
         return path
 
@@ -2175,18 +2211,7 @@ class ZarrWriter:
             # write agree by construction; run_provenance drops it on an empty year.
             # `skipped_labels=None` is a caller that resolved no live set at all, so
             # there is nothing to summarise and no ZERO to assert (see below).
-            optical_skips=(
-                summarise_optical_skips(
-                    staged=labels,
-                    skipped=skipped,
-                    # Read from the markers BEFORE the staging prefix is cleaned up. This is the last
-                    # moment the reasons exist: the markers go with the prefix, and the mosaic they
-                    # were derived from goes when the cell lands.
-                    records=read_skip_records(self.staging_base, run_id, skipped),
-                )
-                if skipped_labels is not None
-                else None
-            ),
+            optical_skips=(self._skip_summary(run_id, labels, skipped) if skipped_labels is not None else None),
             empty=empty,
             telemetry=telemetry,
             # The fill's coordinator progress goes through the caller's logger —
@@ -2250,32 +2275,54 @@ class ZarrWriter:
 REFUSAL_REASONS: tuple[str, ...] = ("no_optical", "thin", "no_radar")
 
 
-def read_skip_records(staging_base: str, run_id: str, labels: Iterable[str]) -> dict[str, dict]:
-    """``{label: record}`` for every skip marker that carries one.
+def read_skip_records(
+    staging_base: str, run_id: str, labels: Iterable[str], *, workers: int = 32
+) -> tuple[dict[str, dict], int]:
+    """``({label: record}, n_unreadable)`` for every skip marker that carries one.
 
-    A marker that is empty, unreadable or not JSON yields NO entry rather than an error: markers
-    from before the registry existed are zero bytes, and a run that resumes across that change must
-    still assemble. The caller therefore has to treat an absent record as "reason not recorded",
-    which is a different statement from "no pixels were refused" — the distinction the registry
-    exists to make, so it cannot be collapsed here.
+    **Concurrent, because this is one small GET per refused shard and they are independent.** A
+    zone can refuse hundreds — 40S refused 43 of 58, and the largest zones hold 556 live tiles — so
+    read serially this would add a round trip each to the critical path between the last chunk and
+    the commit. One filesystem is resolved once rather than per label, for the same reason.
+
+    **The failure count is RETURNED, not swallowed.** A marker that is empty, unreadable or not JSON
+    yields no entry, which is correct for the ordinary cases: markers written before the registry
+    existed are zero bytes, and a resume across that change must still assemble. But "no records" and
+    "every read failed" are the same empty dict and mean opposite things — a systematic failure
+    (expired credentials, a wrong prefix) would otherwise publish a provenance entry that quietly
+    says nothing was recorded. The caller reports the count.
     """
-    out: dict[str, dict] = {}
-    for label in labels:
-        path = f"{staging_base.rstrip('/')}/{run_id}/{label}.skipped"
+    labels = list(labels)
+    if not labels:
+        return {}, 0
+    base = f"{staging_base.rstrip('/')}/{run_id}"
+    fs = _fs_for(base)
+
+    def one(label: str) -> tuple[str, dict | None, bool]:
+        """``(label, record, unreadable)``. Absent and empty are ordinary; a read error is not."""
         try:
-            with _fs_for(path).open(path, "rb") as f:
+            with fs.open(f"{base}/{label}.skipped", "rb") as f:
                 raw = f.read()
-        except (FileNotFoundError, OSError):
-            continue
+        except FileNotFoundError:
+            return label, None, False
+        except OSError:
+            return label, None, True
         if not raw.strip():
-            continue
+            return label, None, False
         try:
-            record = json.loads(raw)
+            return label, json.loads(raw), False
         except json.JSONDecodeError:
-            continue
-        if isinstance(record, dict):
-            out[label] = record
-    return out
+            return label, None, True
+
+    out: dict[str, dict] = {}
+    unreadable = 0
+    with ThreadPoolExecutor(max_workers=min(workers, len(labels))) as pool:
+        for label, record, bad in pool.map(one, labels):
+            if bad:
+                unreadable += 1
+            elif isinstance(record, dict):
+                out[label] = record
+    return out, unreadable
 
 
 def summarise_optical_skips(
@@ -2310,32 +2357,64 @@ def summarise_optical_skips(
     }
     if records is None:
         return summary
-    # THE PER-SHARD REGISTRY, folded into the year's provenance. Two things a reader could not do
-    # before: name the reason a shard holds no data, and tell a thin-depth refusal from land that was
-    # never imaged. `by_reason` totals the pixels; `reason` per shard is the reason that refused the
-    # MOST of them, so a mixed shard is named by what dominates it rather than by the first key.
+    # THE PER-SHARD REGISTRY, folded into the year's provenance.
     #
-    # `unrecorded` is stated rather than folded into a zero: a marker written before the registry
-    # existed carries nothing, and counting it as "no pixels refused" would be the same
-    # absence-as-evidence error the rest of this record was built to avoid.
-    per_shard: dict[str, dict] = {}
-    totals = dict.fromkeys(REFUSAL_REASONS, 0)
+    # ORGANISED BY REASON rather than by shard, for three reasons. It is what a reader asks — "why is
+    # this land empty, and which parts" — answered without walking a dict. It is self-describing:
+    # every key is a reason name, so no legend is needed. And it is an order of magnitude smaller: a
+    # nested record per shard put ~200 bytes x hundreds of shards into a zarr ATTRIBUTE, which every
+    # reader of the zone group then pays on every open. The largest zones hold 556 live tiles.
+    #
+    # UNITS ARE IN THE NAMES. `tiles_skipped` counts TILES and the refusal totals count PIXELS; the
+    # earlier `by_reason` said neither, and a reader comparing the two numbers would be comparing a
+    # census to a census of something else.
+    per_reason: dict[str, list[str]] = {}
+    refused_px = dict.fromkeys(REFUSAL_REASONS, 0)
+    obs_max = 0
+    obs_px_with_any = 0
+    mixed = 0
+    inconsistent: list[str] = []
     for label in skipped_list:
         record = records.get(label)
         if record is None:
             continue
         refused = {r: int((record.get("refused") or {}).get(r) or 0) for r in REFUSAL_REASONS}
         for reason, n in refused.items():
-            totals[reason] += n
-        dominant = max(refused, key=lambda r: refused[r]) if any(refused.values()) else None
-        per_shard[label] = {
-            "reason": dominant,
-            "refused": refused,
-            **({"s2_obs": record["s2_obs"]} if "s2_obs" in record else {}),
-        }
-    summary["by_reason"] = totals
-    summary["shards"] = per_shard
-    summary["unrecorded"] = [label for label in skipped_list if label not in per_shard]
+            refused_px[reason] += n
+        total = sum(refused.values())
+        if not total:
+            # A record that refuses nothing cannot explain a shard that holds nothing. Named rather
+            # than dropped: it means the producer and this summary disagree, which is a defect in one
+            # of them and must not read as a shard with no reason recorded.
+            inconsistent.append(label)
+            continue
+        # THE INVARIANT: a fully refused shard refused every eligible pixel. The dataset's three
+        # reasons partition its pixels by construction, so a mismatch means strips did not cover the
+        # chunk or a count was double-added — either way the pixel totals below are wrong and saying
+        # so is worth more than a plausible number.
+        eligible = int(record.get("eligible_px") or 0)
+        if eligible and total != eligible:
+            inconsistent.append(label)
+        if sum(1 for n in refused.values() if n) > 1:
+            mixed += 1
+        dominant = max(refused, key=lambda r: refused[r])
+        per_reason.setdefault(dominant, []).append(label)
+        obs = record.get("s2_obs") or {}
+        obs_max = max(obs_max, int(obs.get("max") or 0))
+        obs_px_with_any += int(obs.get("px_with_any") or 0)
+
+    summary["refused_px_by_reason"] = refused_px
+    # A shard appears under the reason that refused the MOST of its pixels, so the lists partition
+    # the shards and their lengths sum to the recorded total. `shards_mixed` says how many had more
+    # than one reason, which is what a bare dominant label would hide.
+    summary["shards_by_reason"] = {r: sorted(v) for r, v in sorted(per_reason.items())}
+    summary["shards_mixed"] = mixed
+    # HOW THIN, pooled over the refused shards. Per-shard depth would answer a question nobody has
+    # once the mosaic is deleted, and it is what made the record large.
+    summary["s2_obs_at_refused"] = {"max": obs_max, "px_with_any": obs_px_with_any}
+    summary["unrecorded"] = [label for label in skipped_list if label not in records]
+    if inconsistent:
+        summary["inconsistent"] = sorted(inconsistent)
     return summary
 
 
