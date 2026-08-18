@@ -425,3 +425,45 @@ class TestTheGridAnAllSkippedRunWasStagedOn:
         writer = ZarrWriter(str(tmp_path / "staging"))
         with pytest.raises(FileNotFoundError):
             writer.detect_staged_chunk_size("no-such-run")
+
+
+class TestWhetherTheRadarRuleWasEvenOn:
+    """`no_radar: 0` means two different things and the count cannot say which.
+
+    `allow_s2_only` defaults to FALSE in the library — refusing radar-free land is the default — and
+    the global campaign registers True in order to embed it. So under campaign settings that count is
+    zero by construction, and a reader who took it for a measurement would conclude the campaign found
+    radar everywhere. The summary therefore reports the rule's state beside the count.
+    """
+
+    @staticmethod
+    def _rec(label: str, *, enforced: bool | None) -> dict:
+        record = _record(label, no_optical=64)
+        if enforced is not None:
+            record["radar_rule_enforced"] = enforced
+        return record
+
+    def test_a_campaign_run_says_the_rule_was_disabled(self) -> None:
+        summary = summarise_optical_skips(staged=[], skipped=["a"], records={"a": self._rec("a", enforced=False)})
+        assert summary["radar_refusal_rule"] == "disabled"
+        assert summary["refused_px_by_reason"]["no_radar"] == 0, "and the zero is now readable"
+
+    def test_a_run_that_did_enforce_it_says_so(self) -> None:
+        summary = summarise_optical_skips(staged=[], skipped=["a"], records={"a": self._rec("a", enforced=True)})
+        assert summary["radar_refusal_rule"] == "enforced"
+
+    def test_records_that_disagree_are_reported_as_mixed(self) -> None:
+        """A per-cell orbit downgrade forces the rule off for that cell, so one year can legitimately
+        hold both — and averaging them into a single answer would misdescribe every shard.
+        """
+        summary = summarise_optical_skips(
+            staged=[],
+            skipped=["a", "b"],
+            records={"a": self._rec("a", enforced=True), "b": self._rec("b", enforced=False)},
+        )
+        assert summary["radar_refusal_rule"] == "mixed"
+
+    def test_records_predating_the_field_say_nothing(self) -> None:
+        """Unknown, not assumed: a run from before this field cannot be described either way."""
+        summary = summarise_optical_skips(staged=[], skipped=["a"], records={"a": self._rec("a", enforced=None)})
+        assert "radar_refusal_rule" not in summary

@@ -2560,6 +2560,12 @@ def summarise_optical_skips(
     # NOT refusals, so folding them into a reason would misattribute them — but leaving them out
     # entirely makes the reason totals look short of the footprint they explain.
     not_evaluated_px = 0
+    # Whether the radar rule was in force, pooled over the records. `no_radar: 0` otherwise means
+    # two different things — no tile was refused for missing radar, or that rule was switched off —
+    # and the count alone cannot say which. `allow_s2_only` defaults to FALSE in the library, and the
+    # global campaign registers True, so under campaign settings the zero is structural. Reported so
+    # nobody reads it as a finding about radar coverage.
+    radar_rule: set[bool] = set()
     for label in skipped_list:
         record = records.get(label)
         if record is None:
@@ -2589,6 +2595,8 @@ def summarise_optical_skips(
         # A record predating this field carries no `chunk_px`; `eligible_px` is then the whole tile
         # by construction, so the difference is zero rather than unknown.
         not_evaluated_px += max(int(record.get("chunk_px") or eligible) - eligible, 0)
+        if isinstance(record.get("radar_rule_enforced"), bool):
+            radar_rule.add(bool(record["radar_rule_enforced"]))
         if sum(1 for n in refused.values() if n) > 1:
             mixed += 1
         dominant = max(refused, key=lambda r: refused[r])
@@ -2612,6 +2620,12 @@ def summarise_optical_skips(
     # per-reason totals this accounts for the whole filled footprint: refused + never evaluated.
     if not_evaluated_px:
         summary["not_evaluated_px"] = not_evaluated_px
+    # "enforced" / "disabled" / "mixed" — never a bare zero standing in for either. Absent when no
+    # record says (every run before the field), which is honestly unknown rather than assumed.
+    if radar_rule:
+        summary["radar_refusal_rule"] = (
+            "mixed" if len(radar_rule) > 1 else ("enforced" if next(iter(radar_rule)) else "disabled")
+        )
     if inconsistent:
         summary["inconsistent"] = sorted(inconsistent)
     return summary

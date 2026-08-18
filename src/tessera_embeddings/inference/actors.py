@@ -1139,6 +1139,15 @@ class InferenceActor:
             # invariant is that the parts reach the shard's eligible total, and a per-strip count
             # would fail it by construction.
             refused = {"thin": 0, "no_optical": 0, "no_radar": 0}
+            # WAS THE RADAR RULE IN FORCE? Recorded because otherwise `no_radar: 0` means two
+            # different things and the record cannot say which: no tile was refused for missing
+            # radar, or that rule was switched off. `allow_s2_only` defaults to FALSE in the
+            # library — refusing radar-free land is the default behaviour — and the global campaign
+            # registers True to embed it, so under campaign settings the count is zero by
+            # construction. A reader who took that for a measurement would conclude the campaign
+            # found radar everywhere. None until a strip has run, since the effective value includes
+            # the per-cell orbit downgrade and only the dataset knows it.
+            radar_rule_enforced: bool | None = None
             infer_s = 0.0  # summed wall-clock of the per-strip inference calls
             # Strip pipeline. When prefetch is on (dense/hideable), strip i+1
             # loads (and buckets) on the background thread while strip i runs
@@ -1264,6 +1273,7 @@ class InferenceActor:
                         refused["thin"] += dataset.refused_thin
                         refused["no_optical"] += dataset.refused_no_optical
                         refused["no_radar"] += dataset.refused_no_radar
+                        radar_rule_enforced = not dataset.allow_s2_only
                         logger.info("Chunk %s strip %s: no valid pixels, leaving zero-filled", chunk.label, strip)
                         continue
 
@@ -1280,6 +1290,7 @@ class InferenceActor:
                     refused["thin"] += dataset.refused_thin
                     refused["no_optical"] += dataset.refused_no_optical
                     refused["no_radar"] += dataset.refused_no_radar
+                    radar_rule_enforced = not dataset.allow_s2_only
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
@@ -1333,6 +1344,9 @@ class InferenceActor:
                     # CURRENT default re-enumerates the labels — after which the valid old markers
                     # read as unexpected and the new labels as missing.
                     "chunk_side_px": int(chunk.width),
+                    # None when no strip ran far enough to say — reported as unknown rather than
+                    # guessed from the config, whose value the per-cell orbit downgrade can override.
+                    "radar_rule_enforced": radar_rule_enforced,
                     "s2_obs": {
                         "px_with_any": int(any_obs.sum()),
                         "max": int(s2_obs.max()),
