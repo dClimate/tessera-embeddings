@@ -405,11 +405,27 @@ it is the only Intervene Now signal available before real money has been spent.
 
 ## 7. What exists, and what is left
 
-**Built and verified against dev.** The detector (`campaign_health.py`: seventeen checks, `--json`,
-stable slugs, subjects, fingerprints, per-finding follow-up commands, and now `--cheap`); every tool
-it composes; the per-cell validation and its published verdicts; the four Slack automations; and the
-round itself — `campaign-watch`, registered with the campaign set on a `*/5` cron with concurrency 1
-and `CANCEL_NEW`, publishing all four artifacts and posting under the rules of §2.2.
+**Built and verified against dev.** The detector (`campaign_health.py`: **eighteen** checks — the
+count here read "seventeen" while §5 already described check 18 — `--json`, stable slugs, subjects,
+fingerprints, per-finding follow-up commands, and now `--cheap`); every tool it composes; the per-cell
+validation and its published verdicts; the four Slack automations; and the round itself —
+`campaign-watch`, registered with the campaign set on a `*/5` cron with concurrency 1 and
+`CANCEL_NEW`, publishing all four artifacts and posting under the rules of §2.2.
+
+> **A check that cannot run reports nothing, and `orchestrator load` could not run on a fresh campaign
+> (2026-08-18).** Its final OK line formatted server CPU as `{cpu_now:.0f}%` with no `None` guard,
+> while every branch above it — and the detail line one line up — tested for exactly that. Server CPU
+> is published at 5-minute granularity, so a window clamped to a fresh dispatch routinely holds **no
+> datapoint**: the check died with a `TypeError`, reported DID NOT RUN, and carried the whole report to
+> INCOMPLETE. This is the arm that speaks to *lost work* — dropped broker events mark healthy runs
+> crashed — so it is the wrong one to lose, and it would have been lost on the real campaign's first
+> round.
+>
+> Found by running a round against a live fill, not by a test, which is also how the `cell_validation`
+> and progress-check defects were found. Then swept rather than spot-fixed: an AST pass over every
+> numeric format applied to a local assigned `... else None` found **nine** such uses, eight already
+> inside their own `is not None` guard and this the only gap. The sweep is what turns "I fixed the one I
+> tripped over" into "there is not another one".
 
 The round's own pieces live in `src/yield_embeddings/monitoring/`:
 
