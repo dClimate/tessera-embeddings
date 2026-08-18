@@ -261,3 +261,20 @@ def test_adding_a_rule_to_a_store_seeded_without_one_is_rejected(tmp_path):
     global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
     with pytest.raises(ValueError, match="write-once"):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,), optical_min_obs=30)
+
+def test_seeding_a_zone_that_already_exists_is_a_no_op(tmp_path):
+    """A matching reseed is allowed by the identity and layout checks, then used to fail.
+
+    `require_group` returns the existing group and `create_array` raises on its first array —
+    and it raises PART-WAY through `specs`, so a direct incremental call carrying both an old
+    and a new zone seeded neither the old one (correctly) nor the remaining new one (a loss).
+
+    So seeding the same zone twice must be a no-op, and a call carrying a new zone alongside
+    an existing one must still seed the new one.
+    """
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+    global_store.seed_zone_groups(repo, [_ZA, _ZB], years=(2025,))
+    root = zarr_store.open_store_as_zarr_group(store)
+    assert set(root.group_keys()) >= {"01N", "01S"}, "the new zone must land beside the existing one"

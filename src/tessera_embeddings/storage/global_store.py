@@ -394,6 +394,18 @@ def seed_zone_groups(
     ).astype("int64")
     for spec in specs:
         node = root.require_group(spec.group_name)
+        # A zone already seeded is a NO-OP, not an error. `require_group` returns the existing
+        # group and `create_array` then raises on its first array — which contradicted the
+        # matching-reseed behaviour the identity and layout checks above deliberately allow,
+        # and did it destructively: the raise lands part-way through `specs`, so any remaining
+        # NEW zones in the same call never get seeded either.
+        #
+        # Skipped only when the group is COMPLETE. A partially-seeded group is a real defect
+        # (a crash mid-seed) and still raises, because silently completing it here would write
+        # arrays under a group whose existing ones were sized by an unknown earlier call.
+        expected_arrays = set(layout.arrays) | {"time", "northing", "easting", "band"}
+        if expected_arrays <= set(node.array_keys()):
+            continue
         north = northing_coords(spec)
         east = easting_coords(spec)
         sizes = {
