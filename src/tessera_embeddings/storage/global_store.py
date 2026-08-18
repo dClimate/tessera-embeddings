@@ -28,7 +28,14 @@ import icechunk
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.store_layout import GLOBAL, MONTH_COORD, MONTHS_IN_YEAR, StoreLayout
+from tessera_embeddings.config.store_layout import (
+    CARRIED_VARS,
+    GLOBAL,
+    MONTH_COORD,
+    MONTHS_IN_YEAR,
+    REQUIRED_VARS,
+    StoreLayout,
+)
 from tessera_embeddings.inference.conventions import build_convention_attrs, build_geoemb_root_attrs
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.zarr_store import (
@@ -104,6 +111,49 @@ def create_layout_arrays(
             # Part of the array's TYPE rather than decoration: `dtype="bool"` on an int8 array is
             # how xarray represents a boolean, and without it a reader gets 0/1 integers back.
             array.attrs.update(dict(array_layout.attrs))
+
+
+def check_destination_types(node: zarr.Group, layout: StoreLayout, *, where: str = "") -> None:
+    """Raise unless every array the group holds has the dtype and attrs the layout declares.
+
+    A PREFLIGHT, run before a fill spends a GPU fleet. Assembly already refuses a staged tile whose
+    dtype the destination cannot hold — that guard is correct and it is what caught the defect below
+    — but it fires at the END, after inference. On 2026-08-18 two fills each ran their full inference
+    (13 and 14 minutes across 20 actors) and then died at assembly because ``s2_month_covered`` had
+    been seeded ``bool`` while the staging writer emits ``int8``. On a campaign that is one wasted
+    cell per attempt, and a schema change mid-campaign makes it every cell. The same comparison
+    costs one metadata read here.
+
+    Checks dtype and the layout's ``attrs`` (``dtype="bool"`` on an int8 array is part of its type:
+    without it a reader gets 0/1 integers). Deliberately NOT chunks or shards — a variable that
+    joined an existing store takes that store's geometry rather than the preset's, by design
+    (``inference.assembly._layout_matching_store``), so comparing geometry would refuse every
+    legitimately older store.
+
+    Arrays the group does not hold are skipped: a store seeded before an array existed is not
+    wrong, it simply predates it, and assembly writes only what both sides have. Arrays the LAYOUT
+    does not declare are skipped too, so a store carrying an extra variable is not this gate's
+    business.
+    """
+    mismatches: list[str] = []
+    for var in (*REQUIRED_VARS, *CARRIED_VARS):
+        if var not in node or var not in layout.arrays:
+            continue
+        want = layout.for_var(var)
+        array = cast("zarr.Array", node[var])
+        if str(array.dtype) != want.dtype:
+            mismatches.append(f"{var}: dtype {array.dtype} on disk, layout declares {want.dtype}")
+        attrs = dict(array.attrs)
+        for key, value in want.attrs:
+            if attrs.get(key) != value:
+                mismatches.append(f"{var}: attr {key}={attrs.get(key)!r} on disk, layout declares {value!r}")
+    if mismatches:
+        raise ValueError(
+            f"Refusing to fill{f' {where}' if where else ''}: the destination disagrees with the "
+            f"store layout about what it holds, so assembly would refuse this run AFTER inference. "
+            + "; ".join(mismatches)
+            + ". A store is write-once, so this is a fresh store rather than a migration."
+        )
 
 
 def _layout_band(layout: StoreLayout) -> int:

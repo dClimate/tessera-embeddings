@@ -64,6 +64,7 @@ import zarr
 from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import InferenceConfig
+from tessera_embeddings.config.store_layout import GLOBAL
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     SpatialCoords,
@@ -76,7 +77,7 @@ from tessera_embeddings.inference.chunk_spec import ChunkSpec, enumerate_chunks
 from tessera_embeddings.inference.data_loading import _active_orbits
 from tessera_embeddings.inference.runner import run_inference
 from tessera_embeddings.storage.campaign import mark_zone_year_empty, tag_zone_year, zone_year_tag
-from tessera_embeddings.storage.global_store import open_global_repo
+from tessera_embeddings.storage.global_store import check_destination_types, open_global_repo
 from tessera_embeddings.storage.shard_writer import CommitGate, read_years_complete, shard_pitch
 from tessera_embeddings.storage.zarr_store import open_store_as_zarr_group, time_index_of
 from tessera_embeddings.storage.zone_grid import (
@@ -507,6 +508,13 @@ def plan_zone_inference(
             f"config.chunk_size={config.chunk_size} but {zone} shards are {shard_px} px — "
             "the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
         )
+
+    # CAN THIS DESTINATION HOLD WHAT WE ARE ABOUT TO WRITE? One metadata read, here, rather than
+    # the same answer from assembly after the fleet has run: on 2026-08-18 two fills each spent
+    # their whole inference before dying on a seeded dtype the staging writer cannot produce.
+    # Beside the shard-pitch check above because it is the same kind of gate — the destination's
+    # shape, tested before anything is billed.
+    check_destination_types(node, GLOBAL, where=f"{zone} year {year}")
 
     zone_crs = node.attrs.get("crs")
 
