@@ -237,6 +237,37 @@ def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
 #: the name lands in the store's creating commit message.
 SINGLE = StoreLayout(name="single", arrays=_sharded_arrays(include_std=True))
 
+#: The arrays every staged tile must carry and every destination must hold.
+REQUIRED_VARS: tuple[str, str] = ("embeddings", "scales")
+
+#: The per-pixel arrays BESIDES :data:`REQUIRED_VARS` that inference stages and assembly copies
+#: into the destination.
+#:
+#: DERIVED from the layout, and deliberately so: this list used to be written out by hand at each
+#: of the write path's four decision points, which made adding an array to :func:`_sharded_arrays`
+#: silently insufficient — the array was created and seeded, tiles staged real values into it, and
+#: the destination copy dropped it, publishing fill over a whole zone-year. Deriving it means a new
+#: array is carried by construction. Assembly still filters on presence in BOTH the staged tile and
+#: the destination, so a store that predates an array, or a run that stages nothing for one, is
+#: unaffected. Built from :data:`SINGLE` because it is the superset (it alone has
+#: ``embedding_std``); the global path's filter drops what its zones do not hold.
+CARRIED_VARS: tuple[str, ...] = tuple(v for v in SINGLE.arrays if v not in REQUIRED_VARS)
+
+
+def trailing_extent(var: str, embedding_dim: int) -> int | None:
+    """The trailing-axis extent a 4-D *var* must have, or ``None`` if it is 2-D per timestep.
+
+    Read off the layout's own dims rather than a list of variable names, because the two 4-D
+    trailing axes are different widths: ``band`` is as wide as the embedding, ``month`` is twelve.
+    A single "4-D means band" rule rejects a correct month tile and shapes a cleared one wrongly.
+    ``None`` for an unknown var, or for a band axis when *embedding_dim* is 0 (check disabled).
+    """
+    dims = SINGLE.arrays[var].dims if var in SINGLE.arrays else ()
+    if len(dims) != 4:
+        return None
+    return MONTHS_IN_YEAR if dims[3] == "month" else (embedding_dim or None)
+
+
 #: The global campaign (ADR-008 D3). No ``embedding_std``, ever — see
 #: :func:`_sharded_arrays`.
 GLOBAL = StoreLayout(name="global", arrays=_sharded_arrays(include_std=False))

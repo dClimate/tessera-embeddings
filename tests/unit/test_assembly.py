@@ -24,7 +24,15 @@ import zarr
 
 import tessera_embeddings.inference.assembly as _assembly_mod
 from tessera_embeddings.config.inference import EMBEDDING_DIM, INFERENCE_CHUNK_SIZE
-from tessera_embeddings.config.store_layout import INNER_PX, SHARD_PX, SINGLE
+from tessera_embeddings.config.store_layout import (
+    CARRIED_VARS,
+    GLOBAL,
+    INNER_PX,
+    MONTH_COVERED_VAR,
+    MONTHS_IN_YEAR,
+    SHARD_PX,
+    SINGLE,
+)
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import (
     OBS_COUNT_VARS,
@@ -1986,11 +1994,15 @@ class TestAssembleGlobal:
     ZONE = "01N"
     YEARS = (2024, 2025)
 
-    def _seed_zone_repo(self, tmp_path, ny: int, nx: int, dim: int, *, obs_vars: tuple[str, ...] = ()):
+    def _seed_zone_repo(self, tmp_path, ny: int, nx: int, dim: int, *, carried: tuple[str, ...] = ()):
         """A miniature GLOBAL-shaped zone group: sharded arrays + calendar-year time axis.
 
-        ``obs_vars`` seeds the named observation-count arrays (uint16) so tests
-        can exercise the optional-variable dtype / heterogeneity guards.
+        ``carried`` seeds the named :data:`CARRIED_VARS` arrays so tests can exercise the
+        optional-variable dtype / heterogeneity guards and the staged-to-destination copy.
+        Their geometry and dtype are read off the GLOBAL layout rather than written out here,
+        so a variable added to the schema is seeded correctly by this helper without an edit
+        — the omission that let ``s2_month_covered`` publish as all-fill was invisible partly
+        because every test destination was hand-rolled and so never held the new array.
         """
         store_path = str(tmp_path / "global.icechunk")
         repo = create_global_repo(store_path)
@@ -2016,15 +2028,20 @@ class TestAssembleGlobal:
             fill_value=float("nan"),
             dimension_names=("time", "northing", "easting"),
         )
-        for var in obs_vars:
+        sizes = {"time": len(times), "northing": ny, "easting": nx, "band": dim, "month": MONTHS_IN_YEAR}
+        for var in carried:
+            layout = GLOBAL.for_var(var)
+            # Test-sized chunk/shard pitch, but the layout's own dims, dtype and fill —
+            # so the seeded array is exactly the shape the write path will meet.
+            trailing = tuple(sizes[d] for d in layout.dims[3:])
             node.create_array(
                 var,
-                shape=(len(times), ny, nx),
-                chunks=(1, self.INNER, self.INNER),
-                shards=(1, self.TILE, self.TILE),
-                dtype="uint16",
-                fill_value=0,
-                dimension_names=("time", "northing", "easting"),
+                shape=tuple(sizes[d] for d in layout.dims),
+                chunks=(1, self.INNER, self.INNER, *trailing),
+                shards=(1, self.TILE, self.TILE, *trailing),
+                dtype=layout.dtype,
+                fill_value=layout.fill_value,
+                dimension_names=layout.dims,
             )
         time_int = times.astype("int64")
         time_arr = node.create_array("time", data=time_int, chunks=(len(time_int),), dimension_names=("time",))
@@ -2359,6 +2376,51 @@ class TestAssembleGlobal:
         with pytest.raises(IncompleteStageError, match="missing required variable"):
             writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runC", n_workers=1)
 
+    def _carried_pattern(self, var: str, dim: int, rng) -> np.ndarray:
+        """A distinctive per-tile array for *var*, shaped and typed from the GLOBAL layout.
+
+        Deliberately never uniform and never the layout's fill: an assertion against a
+        constant array passes both when the value is copied and when the destination is left
+        as fill, which is exactly how an omitted variable hides.
+        """
+        layout = GLOBAL.for_var(var)
+        sizes = {"northing": self.TILE, "easting": self.TILE, "band": dim, "month": MONTHS_IN_YEAR}
+        shape = tuple(sizes[d] for d in layout.dims[1:])
+        if layout.dtype == "bool":
+            return rng.random(shape) > 0.4  # a mixed pattern, so all-True fails too
+        if np.issubdtype(np.dtype(layout.dtype), np.integer):
+            return rng.integers(1, 500, size=shape).astype(layout.dtype)
+        return rng.random(shape).astype(layout.dtype)
+
+    def test_every_carried_var_reaches_the_destination(self, tmp_path):
+        """Each variable the schema carries must arrive in the destination with its values.
+
+        Looped over :data:`CARRIED_VARS` rather than a written-out list, so an array added to
+        the store layout is covered by this test without anyone remembering to extend it.
+        That is the defect this test exists for: ``s2_month_covered`` was added to the schema,
+        seeded in every zone, and staged with real values by the actors, but assembly's copy
+        list was a hand-written tuple that did not name it — so a whole zone-year published
+        twelve all-``False`` planes, with the obs counts beside them correct and no error
+        anywhere. Nothing was wrong with the array; it was simply never copied.
+        """
+        dim = 8
+        carried = tuple(v for v in CARRIED_VARS if v in GLOBAL.arrays)
+        assert MONTH_COVERED_VAR in carried  # the array whose omission this guards
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim, carried=carried)
+        rng = np.random.default_rng(11)
+        expected = {var: self._carried_pattern(var, dim, rng) for var in carried}
+        self._stage_raw_tile(tmp_path, "runV", "chunk_0_0", dim, extra=expected)
+
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        assert writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runV", n_workers=1)
+
+        repo = open_global_repo(store_path)
+        node = zarr.open_group(repo.readonly_session("main").store, mode="r")[self.ZONE]
+        year_index = self.YEARS.index(2025)
+        for var, want in expected.items():
+            got = np.asarray(node[var][year_index])
+            np.testing.assert_array_equal(got, want, err_msg=f"{var} did not survive the staged-to-store copy")
+
     def test_staged_obs_dtype_mismatch_raises(self, tmp_path):
         """An obs count staged at the wrong dtype must abort, not silently narrow.
 
@@ -2367,7 +2429,7 @@ class TestAssembleGlobal:
         the probe (which agree here), so the guard is destination-dtype-based.
         """
         dim = 8
-        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim, obs_vars=("s2_obs_count",))
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim, carried=("s2_obs_count",))
         self._stage_raw_tile(
             tmp_path,
             "runD",
@@ -2388,7 +2450,7 @@ class TestAssembleGlobal:
         """
         dim = 8
         ny, nx = 2 * self.TILE, self.TILE  # 2x1 tile grid
-        store_path = self._seed_zone_repo(tmp_path, ny, nx, dim, obs_vars=("s2_obs_count",))
+        store_path = self._seed_zone_repo(tmp_path, ny, nx, dim, carried=("s2_obs_count",))
         # Tile (0,0) carries the obs count; tile (1,0) does not.
         self._stage_raw_tile(
             tmp_path,

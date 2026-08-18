@@ -63,12 +63,16 @@ from tessera_embeddings.config.inference import (
     TimeWindow,
 )
 from tessera_embeddings.config.store_layout import (
+    CARRIED_VARS,
     INNER_PX,
+    MONTH_COORD,
     MONTH_COVERED_VAR,
     MONTHS_IN_YEAR,
     OBS_COUNT_VARS,
+    REQUIRED_VARS,
     SINGLE,
     StoreLayout,
+    trailing_extent,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
 from tessera_embeddings.inference.conventions import build_convention_attrs
@@ -692,14 +696,16 @@ class StagedShardSource:
                     f"Staged tile {path} has {var} extent {h} x {w} px but shards are {self.shard_px} px — "
                     "truncated or off-grid tile (ADR-008 D3 requires whole tiles)."
                 )
-            # Also validate the trailing band axis of 4-D vars (embeddings /
-            # embedding_std): a (1, px, px, 1) block would broadcast across all
-            # destination bands and commit repeated values under a shape check
-            # that only looked at [1:3].
-            if self.embedding_dim and block.ndim == 4 and block.shape[3] != self.embedding_dim:
+            # Also validate the trailing axis of 4-D vars: a (1, px, px, 1) block would
+            # broadcast across every destination band/month and commit repeated values
+            # under a shape check that only looked at [1:3]. The expected width is
+            # per-variable (`trailing_extent`) because the two 4-D axes differ — bands
+            # are as wide as the embedding, months are twelve.
+            want_trailing = trailing_extent(var, self.embedding_dim)
+            if want_trailing and block.ndim == 4 and block.shape[3] != want_trailing:
                 raise ValueError(
-                    f"Staged tile {path} has {var} band width {block.shape[3]} but expected "
-                    f"{self.embedding_dim} — a singleton band would broadcast over the output."
+                    f"Staged tile {path} has {var} trailing width {block.shape[3]} but expected "
+                    f"{want_trailing} — a singleton axis would broadcast over the output."
                 )
             blocks[var] = block
         # Detect a heterogeneous stage on EVERY tile (not just a first/last sample):
@@ -726,8 +732,9 @@ class StagedShardSource:
         blocks: dict[str, np.ndarray] = {}
         for var in self.variables:
             shape: tuple[int, ...] = (1, self.shard_px, self.shard_px)
-            if self.embedding_dim and var in ("embeddings", "embedding_std"):
-                shape = (*shape, self.embedding_dim)
+            trailing = trailing_extent(var, self.embedding_dim)
+            if trailing:
+                shape = (*shape, trailing)
             blocks[var] = np.full(shape, fills.get(var, 0), dtype=np.dtype(dtypes.get(var, "float32")))
         return blocks
 
@@ -1406,17 +1413,28 @@ class ZarrWriter:
         files, so the on-disk output is identical regardless of how inference
         tiled the mosaic. Cost is independent of extent (no pixels written).
         """
-        sizes = {"time": 1, "northing": total_y, "easting": total_x, "band": self.embedding_dim}
+        variables = list(variables)
+        sizes = {
+            "time": 1,
+            "northing": total_y,
+            "easting": total_x,
+            "band": self.embedding_dim,
+            "month": MONTHS_IN_YEAR,
+        }
         create_layout_arrays(root, layout, variables, sizes)
-        _write_coord_arrays(
-            root,
-            {
-                "time": np.asarray([time_date], dtype="datetime64[ns]"),
-                "northing": spatial.northing if spatial else np.arange(total_y),
-                "easting": spatial.easting if spatial else np.arange(total_x),
-                "band": np.arange(self.embedding_dim),
-            },
-        )
+        coords: dict[str, np.ndarray] = {
+            "time": np.asarray([time_date], dtype="datetime64[ns]"),
+            "northing": spatial.northing if spatial else np.arange(total_y),
+            "easting": spatial.easting if spatial else np.arange(total_x),
+            "band": np.arange(self.embedding_dim),
+        }
+        if MONTH_COVERED_VAR in variables:
+            # Only when the array that uses the axis is created — a bare `month`
+            # coordinate in a store with no month dimension is a schema surprise for
+            # readers. 1..12, so `cov.sel(month=7)` means July rather than the eighth
+            # index, mirroring what the global store's seeder writes.
+            coords["month"] = np.asarray(MONTH_COORD, dtype="int16")
+        _write_coord_arrays(root, coords)
 
     def assemble(
         self,
@@ -1576,11 +1594,13 @@ class ZarrWriter:
         else:
             time_date = np.datetime64(started.date(), "ns")
 
-        staged_obs = self._staged_vars_present(run_id, live_chunks, OBS_COUNT_VARS)
-        variables = ["embeddings", "scales"]
+        # `embedding_std` is decided by the caller's `compute_std`, not by what the tiles
+        # happen to hold; every other carried var is included when the tiles staged it.
+        staged_extra = self._staged_vars_present(run_id, live_chunks, CARRIED_VARS)
+        variables = [*REQUIRED_VARS]
         if compute_std:
             variables.append("embedding_std")
-        variables += [v for v in OBS_COUNT_VARS if v in staged_obs]
+        variables += [v for v in CARRIED_VARS if v != "embedding_std" and v in staged_extra]
 
         # Divide the fleet-wide S3 concurrency target across worker forks; see
         # TARGET_AGGREGATE_S3_CONCURRENCY. Forks inherit the repo config through
@@ -1691,8 +1711,19 @@ class ZarrWriter:
             missing = [v for v in variables if v not in root]
             if missing:
                 nt = cast(zarr.Array, root["time"]).shape[0]
-                sizes = {"time": nt, "northing": total_y, "easting": total_x, "band": self.embedding_dim}
+                sizes = {
+                    "time": nt,
+                    "northing": total_y,
+                    "easting": total_x,
+                    "band": self.embedding_dim,
+                    "month": MONTHS_IN_YEAR,
+                }
                 create_layout_arrays(root, _layout_matching_store(root, layout, missing), missing, sizes)
+                if MONTH_COVERED_VAR in missing and "month" not in root:
+                    # The axis this array introduces to a store that predates it; without
+                    # the coordinate a reader gets a positional month axis and has to know
+                    # it is 0-based (see `_create_schema`).
+                    _write_coord_arrays(root, {"month": np.asarray(MONTH_COORD, dtype="int16")})
                 _log.info("Created missing variable(s) %s in %s from layout %s", missing, output_path, layout.name)
             time_index_found = time_index_of(root, time_date)
             if time_index_found is not None:
@@ -2017,7 +2048,7 @@ class ZarrWriter:
         # every tile for one of these that's absent from `variables` (i.e. present
         # only in some tiles, so silently dropped) — full-coverage homogeneity, not
         # a first/last sample.
-        dest_optional = tuple(v for v in ("embedding_std", *OBS_COUNT_VARS) if v in node)
+        dest_optional = tuple(v for v in CARRIED_VARS if v in node)
 
         if labels:
             # One probe of a staged tile: required vars, dtypes, variable set, and
@@ -2025,7 +2056,7 @@ class ZarrWriter:
             # tile is re-validated by StagedShardSource.load as it is read).
             probe_path = f"{self.staging_base}/{run_id}/{labels[0]}.zarr"
             staged_group = zarr.open_group(probe_path, mode="r", storage_options=_staged_storage_options(probe_path))
-            missing = [v for v in ("embeddings", "scales") if v not in staged_group]
+            missing = [v for v in REQUIRED_VARS if v not in staged_group]
             if missing:
                 raise IncompleteStageError(
                     f"Staged tile {probe_path} is missing required variable(s) {missing} — refusing to "
@@ -2044,16 +2075,14 @@ class ZarrWriter:
                     f"Staged tiles are {staged_shape[0]} x {staged_shape[1]} px but {zone} shards are "
                     f"{shard_px} px — the global write path requires 1 inference tile == 1 shard (ADR-008 D3)."
                 )
-            variables = tuple(
-                v for v in ("embeddings", "scales", "embedding_std", *OBS_COUNT_VARS) if v in staged_group and v in node
-            )
+            variables = tuple(v for v in (*REQUIRED_VARS, *CARRIED_VARS) if v in staged_group and v in node)
             # Validate each staged variable's dtype against its DESTINATION array, not
             # just embeddings/scales (asserted int8/float32 above): a raw-zarr shard
             # write does a silent C-cast, so a uniformly int64/uint32 observation
             # count — which agrees with the probe, so StagedShardSource's tile-vs-probe
             # check passes — would be narrowed into a seeded uint16 without this guard.
             for v in variables:
-                if v in ("embeddings", "scales"):
+                if v in REQUIRED_VARS:
                     continue
                 staged_dt = cast(zarr.Array, staged_group[v]).dtype
                 dest_dt = cast(zarr.Array, node[v]).dtype
@@ -2070,7 +2099,7 @@ class ZarrWriter:
             # write (every one the zone holds, since any of them could carry a previous
             # attempt's data) and at what dtype (the seeded one, which a fill cannot
             # disagree with).
-            variables = ("embeddings", "scales", *dest_optional)
+            variables = (*REQUIRED_VARS, *dest_optional)
             probe_dtypes = tuple((v, str(cast(zarr.Array, node[v]).dtype)) for v in variables)
 
         _log.info(

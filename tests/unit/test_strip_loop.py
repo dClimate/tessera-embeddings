@@ -22,6 +22,7 @@ import zarr
 import tessera_embeddings.inference.actors as _actors_mod
 import tessera_embeddings.inference.data_loading as _dl_mod
 from tessera_embeddings.config.inference import S2_BAND_ORDER
+from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.actors import (
     _MIN_STRIP_H,
@@ -37,7 +38,7 @@ from tessera_embeddings.inference.actors import (
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
-from tests.unit.mosaic_stores import make_sar_group, store_opener
+from tests.unit.mosaic_stores import S2_SEED, make_s2_group, make_sar_group, store_opener
 
 
 class TestStripSlices:
@@ -224,6 +225,9 @@ class _CapturingWriter:
             "embeddings": embeddings.copy(),
             "scales": scales.copy(),
             "obs_counts": {k: (v.copy() if v is not None else None) for k, v in (obs_counts or {}).items()},
+            # Recorded, not discarded: a fake that accepts an argument and drops it leaves an
+            # actor that never populates the buffer indistinguishable from one that does.
+            "month_covered": month_covered.copy() if month_covered is not None else None,
         }
 
     def write_skip_marker(self, chunk, run_id):
@@ -323,6 +327,47 @@ class TestProcessChunkStriping:
             np.testing.assert_allclose(write_one["scales"], other["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
             for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
                 np.testing.assert_array_equal(write_one["obs_counts"][var], other["obs_counts"][var], err_msg=var)
+            # Month coverage is assembled strip by strip like the obs counts, so a
+            # tiling-dependent bug would show as a mismatch on the strip boundaries.
+            np.testing.assert_array_equal(
+                write_one["month_covered"], other["month_covered"], err_msg="s2_month_covered"
+            )
+
+    def test_month_coverage_is_populated_and_agrees_with_the_obs_count(self, inference_config, test_model):
+        """The actor must pass month flags that describe its own observations.
+
+        A LIVENESS test, deliberately: the buffer is allocated zeroed and threaded through
+        several optional arguments, so an actor that never fills it produces all-``False`` —
+        which is also what a pixel with no observations correctly produces, and what the store
+        held for a whole published zone-year while every other array beside it was right.
+        Nothing downstream can tell those apart, so the check has to be that the flags are
+        both PRESENT and consistent with the count they partition.
+        """
+        with patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=False)):
+            result, write = _run_process_chunk(inference_config, test_model)
+
+        assert result["status"] == "success"
+        covered = write["month_covered"]
+        obs = write["obs_counts"]["s2_obs_count"]
+        assert covered is not None, "the actor passed no month coverage at all"
+        assert covered.shape == (MONTHS_IN_YEAR, _CHUNK.height, _CHUNK.width)
+        assert covered.dtype == np.bool_
+        assert covered.any(), "month coverage is entirely False despite a successful chunk"
+        # Every flagged month needs an observation behind it, and a pixel cannot cover more
+        # months than it has observations. Both directions, since either alone admits a bug:
+        # an all-True buffer satisfies "some month is set" but not this.
+        months_per_px = covered.sum(axis=0)
+        assert np.all(months_per_px <= obs), "a pixel covers more months than it has observations"
+        assert np.all((months_per_px > 0) == (obs > 0)), "a month flag and the obs count disagree on emptiness"
+        # Exactly the months the fixture's own S2 time axis falls in — every pixel of this
+        # synthetic chunk is valid at every timestep, so the flags are the axis's months and
+        # nothing else. Read off the fixture rather than written out, so it stays true if the
+        # fixture's date spacing changes.
+        s2_times = np.asarray(make_s2_group(8, _CHUNK.height, _CHUNK.width, seed=S2_SEED)["time"][:])
+        want_months = sorted(
+            {int(m) for m in s2_times.astype("datetime64[ns]").astype("datetime64[M]").astype(int) % 12 + 1}
+        )
+        assert [m + 1 for m in range(MONTHS_IN_YEAR) if covered[m].any()] == want_months
 
     def test_multi_strip_actually_splits(self):
         # The strip height used in the equality test genuinely splits this chunk.
