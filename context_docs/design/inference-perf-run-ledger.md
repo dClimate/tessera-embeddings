@@ -58,142 +58,23 @@ within-1 >= 99.9931%, max|Δ|=2, scale drift <= 0.78%, cosine >= 0.99991, and
 **footprint_mismatch = 0** on the sampled windows. This is a spot-check, not
 full-ROI proof; the Phase 4 entry below extends it to 25 windows / 2.23M px.
 
-## Comparison semantics (ADR 012)
+## What this was, and what survives it
 
-- `526db07f32be` vs `a85be572e2fb`: batch size differs (7168 vs 3584) → NOT
-  bit-comparable; cosine-class thresholds only. Doubles as the empirical
-  measurement of how far a batch-size change alone moves int8 outputs.
-- P2+3 gate vs `526db07f32be`: same batch size, same GRU (cuDNN nn.GRU in both),
-  Phase 2 bit-identical by construction, PE change bit-identical → expect exact
-  bitwise equality under the strict same-config thresholds (confirmed above).
+This mapped staging run-IDs to the code and config that produced them, so staged outputs stayed
+attributable after their clusters tore down. **Those clusters are long gone and those staging
+prefixes with them** — the runs were July dev work on the Iowa reference ROI, and the fingerprinting
+mechanism they motivated is now in the code (`_staging_run_id`, which fingerprints inputs, config and
+inference-source identity, so a resume can only ever reuse tiles produced by the same work).
 
-Compare with:
+What the ledger established, and is cited elsewhere for:
 
-```
-AWS_PROFILE=yield te-compare-outputs \
-  s3://arbol-tessera-embeddings-dev/staging/<ref_run_id> \
-  s3://arbol-tessera-embeddings-dev/staging/<test_run_id> \
-  [--labels chunk_0_0,chunk_0_2,...]
-```
+**A staged tile is only reusable if something identifies the code that made it.** The ledger was a
+hand-maintained answer to that, and its existence is the argument for the automatic one — a table
+somebody has to update is a table that is wrong the first time somebody forgets.
 
-## Phase 4 (striping) run — 2026-07-17
+**Comparison semantics (ADR-012).** Two runs are comparable only on identical inputs, identical
+geometry and identical code; the ledger's whole structure was that triple, and the equivalence gate
+enforces it now rather than relying on a reader checking a table.
 
-Flow-run `76f3137b`, cluster `tessera-inference-76f3137b`, 22 g6e.xlarge / L40S.
-Full campaign + interleaving removal + striping P0–P3 (valid-pixel-aware
-`_strip_plan`, budget 5.75 GiB, starter strip). Assembled output:
-`.../embeddings/iowa_epsg5070-inference-speedup-phase4.zarr/` (dims
-34964×53383×128).
-
-Fleet: peak host RAM **45–47%** (vs 51% at the 4.75 GiB pre-striping budget —
-lower despite the bigger budget, because more chunks run single-strip);
-GPU util **~80.8%** (30 s poll) / ~87% (1 s DCGM); mid-density chunks
-**21–24K px/s** end-to-end (was 16–22K pre-striping), dense 10–18K; `T≤71`
-full-width chunks confirmed **single strip** (were 2); `write_s ≈ 0`
-(background write); steady-state `overhead_s` **24–34 s**.
-
-Correctness vs the `main` reference (`iowa_epsg5070-reference.zarr`), 25 sampled
-384² windows / 2.23M valid px (cross-config, batch 3584→7168): **footprint
-mismatch = 0**, **obs-layer mismatch = 0**, int8 exact 95.33%, within-1
-**99.9947%**, max|Δ| **2**, scale drift **1.19%**, cosine min **0.999913** —
-inside the ADR-012 cross-config envelope.
-
-## Phase 5 (bounded cross-chunk starter prefetch) run — 2026-07-17
-
-Flow-run `a60550ae`, cluster `tessera-inference-a60550ae`, autoscaled 22→30
-g6e.xlarge / L40S, us-west-2a. 404 chunks in ~73 min (~34 GPU-hrs), 0 skipped,
-0 failed, 0 stalled. **This is the final shipped state of the branch — use these
-numbers for headline/current claims.**
-
-Fleet: **prefetch hit-rate 100%** (630 starter prefetches → 630 hits; 0
-mask-only / miss / cap-skip); per-chunk `overhead_s` **~6 s median on
-prefetch-hit chunks** (n=251, 5.9 s median / 7.3 s mean) vs ~36 s on the
-unavoidable first-per-worker cold starts (n=85, no predecessor to prefetch
-from); GPU util **~89–93%** (CloudWatch: 89.1% whole-run incl. ramp/drain,
-93.3% mid-run steady; 96.4% on 1 s DCGM — reads high); peak host RAM
-**~52%** (16.1 GB / 30.9 GB — ~6 pts above phase 4 because the prefetch stash
-is co-resident, still well under the 60% target); `write_s ≈ 0`. Per-chunk-class
-px/s unchanged from phase 4 (bit-identical forwards); **fleet-overall ≈ 13–15K
-px/s/worker** (1.87B-px ROI ÷ ~34 GPU-hrs — the whole-run average incl. cold
-starts, density mix, and ramp; live-chunk-only basis ~13K).
-
-Correctness: **bit-identical to phase 4** (output-preserving — the prefetch
-changes *when* the prologue loads, not the tensors), spot-checked across 8
-chunks / ~1.2B px (exact 100%, max|Δ|=0, obs-mismatch 0, cosine 1.0). So the
-phase-4 cross-config comparison vs `main` above carries over unchanged. Full.
-
-## P2 — the rate rung, three geographies — 2026-08-04
-
-Every run above is Iowa. This is the first measurement at more than one geography, and its
-purpose was to settle whether the campaign's throughput unit is tokens or pixels — see
-`campaign-cost-model.md` §6, which had already switched to tokens on argument alone.
-
-Three single-ROI runs via `tessera-full-pipeline`, dispatched at 22:0x UTC, all COMPLETED in
-~151 min. Sites chosen to bracket the token range rather than to be dual-orbit (Cambridge had
-already validated radar-free output, which is what let the rung shrink from six runs to three):
-
-| site | region built | native CRS | area |
-|---|---|---|---|
-| boreal North America (NWT/Yukon) | `p2_boreal` | EPSG:32611 | 63,500 km² |
-| Iowa — the continuity anchor | `iowa` (existing) | EPSG:5070 | 144,700 km² |
-| humid tropics (Amazon) | `p2_amazon` | EPSG:32721 | 96,500 km² |
-
-> **2026-08-06 — READ THE UNIT BEFORE REUSING THIS RATE.** The `tok/sec` below is computed from
-> `t_kept`, which is the Sentinel-2 cloud mask's first dimension — **optical timesteps only.** It is
-> therefore *optical* tokens per second. The campaign token census that this rate is divided into
-> counts **S2 + S1**, so the two are not in the same unit, and the cost model's central division is
-> not like-for-like. See the note beside the census table in `campaign-cost-model.md`.
->
-> Compounding it: the sentence above says these sites were chosen to bracket the token range
-> **rather than to be dual-orbit**, so this rate's radar composition was never established. Later
-> per-cell measurement puts radar-free cells at 2.26–2.93 M optical tok/s and both-orbit cells at
-> 1.26–1.62 M. Dual-orbit pixels are 0.51–0.57 of land by era (`campaign-cost-model.md`'s per-pixel
-> census; a per-zone survey put it near 98% and that is withdrawn — it measured presence). **1.90–1.93 M sits above every both-orbit cell measured.**
->
-> No correction is applied here and no direction is claimed — three terms push different ways and
-> none is pinned (see the cost model). What settles it is one both-orbit cell run with the
-> `t_s1_asc` / `t_s1_desc` fields added to `CHUNK_SUMMARY` on 2026-08-06, which yields the radar
-> term per chunk and hence a rate in the census's own unit.
-
-Aggregated over twelve `g6e.xlarge` actors, from the `tok/sec` line each sub-batch emits:
-
-| | mean | range |
-|---|---|---|
-| **tok/sec per actor** | **1.90 – 1.93 M** | maxima all within 1% of 1,956,110 |
-| **effective TFLOPS** | **85** | 84.7 – 86.2 |
-| px/sec per actor | — | **12,420 – 27,285 (2.2×)** |
-
-**Two results.** The reference rate of ≈1.9M tok/sec is confirmed at three geographies to
-within ~1%, so the cost model's most load-bearing input is no longer a one-ROI figure. And the
-unit question is settled empirically: tokens per second is flat to ±1% across the same twelve
-actors over which pixels per second varies 2.2-fold.
-
-Per-chunk duty cycle, from twenty `CHUNK_SUMMARY` records:
-
-| | mean | min | max |
-|---|---:|---:|---:|
-| `infer_s` | 319.6 | 236.9 | 358.1 |
-| `overhead_s` | 58.1 | 48.2 | 65.5 |
-| `prologue_s` | 46.6 | 41.2 | 52.2 |
-| `total_s` | 377.7 | 298.9 | 423.7 |
-
-**Inference is 84.6% of chunk wall-clock**, which is the supply-side input P6's duty-cycle
-criterion is a ratio against.
-
-**Observations per pixel are measurable here, but this run cannot judge the census.** `t_kept`
-is the timesteps each chunk actually kept, and `t_kept × valid_px` reproduces the measured token
-rate to within 9% — so it *is* the observations-per-pixel term, measured per chunk on every run.
-Over 200 chunks: range **55–136**, area-weighted mean **69.9**, against the census's 145.
-
-That is **not** evidence the census is high. This run used the single-ROI path, whose
-`min_valid_coverage` default is **5.0%** against the campaign's **0.1%** — a 50× stricter gate
-that drops more dates and biases `t_kept` LOW in exactly the direction of the gap. Its window
-also ends December 2024, before Sentinel-1C restored radar coverage, and three sites chosen to
-bracket a token range are not land-weighted. See `campaign-cost-model.md` §6 for what settles
-which.
-
-**Two registration bugs surfaced here and both are fixed** (`yield-embeddings`
-`_base.py` / `deploy_flow.py`). The first attempt of all three runs died instantly on
-`ObjectNotFound: None` — `tessera-full-pipeline` had no branch routing, so all four of its
-stage refs pointed at prod deployments absent from the branch account. Separately every Ray
-deployment stored an AMI parameter that does not exist, so each dispatch needed a manual
-override. Registration now verifies both.
+Per-run figures are in git history. Anything quoted from them in a live document carries its own
+provenance line, which is what the corrections register requires.
