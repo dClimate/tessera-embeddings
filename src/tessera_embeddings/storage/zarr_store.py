@@ -67,6 +67,7 @@ from tessera_embeddings.errors import (
     CorruptedStoreError,
     DuplicateDateError,
     InconclusiveStoreProbeError,
+    NonMonotonicDateError,
     StoreHoldsCommittedDataError,
 )
 from tessera_embeddings.storage.manifest import IngestManifest, extract_manifest
@@ -1429,6 +1430,21 @@ class RegionWriteBatch:
                 "Another writer has almost certainly committed this date to this store — "
                 "check for a second run ingesting the same zone/year/orbit before looking "
                 "for a date-derivation bug."
+            )
+        # The axis is read POSITIONALLY downstream (the resampler samples by position, not by
+        # timestamp), so appending an older date than one already stored silently changes which
+        # observations a repaired store yields against a clean one holding the same dates.
+        # This append cannot fix that by inserting in place — that would mean moving every
+        # array's data — so it refuses, and the caller has to decide. A batch that discovers
+        # an older date mid-run is the reachable case and it lands here loudly instead of
+        # committing a store nothing downstream can tell is wrong.
+        if len(existing) and when_ns < existing.max():
+            raise NonMonotonicDateError(
+                f"date {when_ns} is older than the latest date already on the time axis "
+                f"({existing.max()}); refusing to append it out of order. The axis is sampled "
+                "positionally, so an out-of-order slot changes which observations this store "
+                "yields without changing anything a reader can check. Ingest the missing date "
+                "into a fresh store for the window, or re-ingest the window in order."
             )
         t_index = len(existing)
         time_arr = self.group["time"]

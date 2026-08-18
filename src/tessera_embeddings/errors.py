@@ -13,6 +13,23 @@ class ConfigMismatchError(Exception):
     """Raised when a store's structural parameters don't match the current config."""
 
 
+class NonMonotonicDateError(ValueError):
+    """Raised when a date being appended is OLDER than a date already on the time axis.
+
+    Deliberately not a :data:`CONCURRENT_WRITER_ERRORS` member and not a sibling of
+    :class:`DuplicateDateError`: a duplicate means another writer moved the branch, while this
+    means one writer offered its own dates out of order, and only the second is a bug in the
+    caller.
+
+    It matters because the time axis is read POSITIONALLY downstream — the deterministic
+    resampler selects observations by position, not by timestamp — so a store whose axis is
+    out of order yields different embeddings from a chronologically-ingested store holding the
+    same dates. Nothing downstream would notice; the arrays are all valid and all the right
+    shape. Refusing the append is what makes the ordering assumption enforceable rather than
+    merely documented.
+    """
+
+
 class DuplicateDateError(ValueError):
     """Raised when a date being appended is already on a store's time axis.
 

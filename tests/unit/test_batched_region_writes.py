@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tessera_embeddings.errors import DuplicateDateError
+from tessera_embeddings.errors import DuplicateDateError, NonMonotonicDateError
 from tessera_embeddings.storage.empty_store import VarSpec, create_empty_store_from_coords
 from tessera_embeddings.storage.zarr_store import (
     CONCURRENT_WRITER_ERRORS,
@@ -111,3 +111,27 @@ def test_attr_edits_land_in_the_same_commit(store):
     assert attrs["baselines_applied"] == {"2024-06-01": 5, "2024-06-11": 5}
     assert attrs["last_appended"] == "2026-07-24T00:00:00Z"
     assert attrs["crs"] == "EPSG:32601"  # pre-existing attrs preserved
+
+
+def test_an_out_of_order_date_is_refused(store):
+    """The time axis is sampled POSITIONALLY downstream, so its order is load-bearing.
+
+    A repair or a batch that discovers a missed earlier date would previously append it at the
+    end, leaving the axis non-monotonic. Every array stays valid and correctly shaped, so
+    nothing downstream can tell — but the deterministic resampler selects observations by
+    position, so that store yields different embeddings from a chronologically-ingested one
+    holding exactly the same dates.
+
+    This append cannot fix it in place (inserting means moving every array's data), so it
+    refuses and the caller decides. Distinct from `DuplicateDateError`: that means another
+    writer moved the branch, this means one writer offered its dates out of order.
+    """
+    older = np.datetime64("2024-05-15", "ns")  # before D1, which the fixture already stored
+    with (
+        pytest.raises(NonMonotonicDateError, match="older than the latest date"),
+        batched_region_writes(store, message="backfill") as batch,
+    ):
+        batch.append_time_slot(older)
+    # Forward in time still works, so the guard is on ORDER and not on appending at all.
+    with batched_region_writes(store, message="forward") as batch:
+        batch.append_time_slot(np.datetime64("2024-07-01", "ns"))
