@@ -8,9 +8,16 @@ live shards — every one refused for having no RADAR.
 
 **Why only FULLY refused shards need this.** For a shard that WAS written the evidence is already
 published: its ``s2_obs_count`` is real, so a pixel refused for depth is identifiable as
-``0 < obs < optical_min_obs`` with a NaN scale. A fully refused shard writes nothing at all, its obs
-counts read back as fill, and its mosaic is deleted when the cell lands — so that is the only case
-where the reason is unrecoverable, and the only case this registry has to cover.
+``0 < obs < optical_min_obs`` with a NaN scale. A fully refused shard's mosaic is deleted when the
+cell lands, so its reason is the only one that is unrecoverable afterwards.
+
+**Corrected 2026-08-18: a fully refused shard no longer "writes nothing at all".** That was true when
+this registry was built, and it was half the problem rather than the justification for it — the obs
+counts and month coverage of a refused chunk are real, measured before the gate refused it, and
+publishing them as fill made a tile's provenance depend on whether some NEIGHBOURING pixel happened
+to embed. A refused chunk now stages a coverage-only tile beside its marker, and assembly copies
+those variables while filling the embeddings. The marker still carries the reasons, which no array
+can.
 """
 
 from __future__ import annotations
@@ -20,9 +27,13 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import zarr
 
+from tessera_embeddings.config.store_layout import MONTH_COVERED_VAR, MONTHS_IN_YEAR, OBS_COUNT_VARS
 from tessera_embeddings.inference.assembly import (
     REFUSAL_REASONS,
+    AllChunksSkippedError,
+    StagedShardSource,
     ZarrWriter,
     read_skip_records,
     summarise_optical_skips,
@@ -241,3 +252,176 @@ def test_reading_many_markers_returns_every_one(tmp_path: Path, n: int) -> None:
     assert unreadable == 0
     assert len(got) == n
     assert {lbl: got[lbl]["refused"]["thin"] for lbl in labels} == {lbl: i + 1 for i, lbl in enumerate(labels)}
+
+
+class TestCoverageOnlyStaging:
+    """A refused chunk publishes the coverage it measured, not zeros.
+
+    The counts and the month mask are accumulated per strip regardless of validity, so a chunk that
+    embeds nothing has still measured its inputs. Filling those alongside the embeddings made a
+    tile's published provenance depend on whether a neighbouring pixel happened to embed — a mixed
+    tile kept real counts for its refused pixels while a fully refused one reported zero.
+    """
+
+    @staticmethod
+    def _coverage(h: int = 8, w: int = 8):
+        obs = {
+            "s2_obs_count": np.full((h, w), 7, dtype=np.uint16),
+            "s1_asc_obs_count": np.full((h, w), 3, dtype=np.uint16),
+            "s1_desc_obs_count": np.zeros((h, w), dtype=np.uint16),
+        }
+        months = np.zeros((MONTHS_IN_YEAR, h, w), dtype=bool)
+        months[:4] = True
+        return obs, months
+
+    def test_it_stages_what_write_chunk_would_have(self, tmp_path: Path) -> None:
+        """The equivalence that keeps two code paths in step.
+
+        `write_coverage_only` restates the encoding `write_chunk` uses — axis order, chunking, and
+        the bool-becomes-int8 conversion — because assembly reads both with RAW zarr and compares
+        against what is on disk. Asserting the two agree is cheaper than trusting them to.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+        obs, months = self._coverage()
+
+        cov = writer.write_coverage_only(chunk, "run1", obs, months)
+        emb, scales = np.zeros((8, 8, 128), dtype=np.int8), np.zeros((8, 8), dtype=np.float32)
+        full = writer.write_chunk(chunk, emb, run_id="run2", scales=scales, obs_counts=obs, month_covered=months)
+
+        cov_g, full_g = zarr.open_group(cov, mode="r"), zarr.open_group(full, mode="r")
+        for var in (*OBS_COUNT_VARS, MONTH_COVERED_VAR):
+            assert cov_g[var].dtype == full_g[var].dtype, var
+            assert cov_g[var].shape == full_g[var].shape, var
+            np.testing.assert_array_equal(cov_g[var][:], full_g[var][:], err_msg=var)
+        assert "embeddings" not in cov_g, "the point is to NOT stage a tile of fill embeddings"
+
+    def test_the_listing_does_not_mistake_it_for_a_chunk(self, tmp_path: Path) -> None:
+        """It ends in `.zarr`, so the listing would read "<label>.coverage" as a chunk label of its
+        own, find no `.done` beside it, and report every refused chunk as an interrupted write.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+        obs, months = self._coverage()
+        writer.write_coverage_only(chunk, "run1", obs, months)
+        writer.write_skip_marker(chunk, "run1", _record(chunk.label, no_optical=64))
+
+        listing = writer._list_staged("run1")
+        assert listing.complete == []
+        assert listing.interrupted == [], "the coverage tile must not read as a half-landed pair"
+        assert listing.skipped == [chunk.label]
+
+    def test_a_later_successful_write_clears_it(self, tmp_path: Path) -> None:
+        """A stale coverage tile carries real counts, so leaving one beside a successful rewrite
+        would have assembly publish a footprint that attempt has just replaced.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+        obs, months = self._coverage()
+        cov = writer.write_coverage_only(chunk, "run1", obs, months)
+        assert Path(cov).exists()
+
+        emb, scales = np.zeros((8, 8, 128), dtype=np.int8), np.zeros((8, 8), dtype=np.float32)
+        writer.write_chunk(chunk, emb, run_id="run1", scales=scales)
+        assert not Path(cov).exists()
+
+    def test_assembly_reads_the_real_counts_instead_of_fill(self, tmp_path: Path) -> None:
+        """The whole point, end to end: a skipped position whose coverage was staged publishes the
+        measured counts, and everything it genuinely lacks still publishes as fill.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+        obs, months = self._coverage()
+        writer.write_coverage_only(chunk, "run1", obs, months)
+
+        source = StagedShardSource(
+            staging_base=str(tmp_path / "staging"),
+            run_id="run1",
+            shards=(),
+            variables=("embeddings", "s2_obs_count", "s1_asc_obs_count", MONTH_COVERED_VAR),
+            shard_px=8,
+            dtypes=(
+                ("embeddings", "int8"),
+                ("s2_obs_count", "uint16"),
+                ("s1_asc_obs_count", "uint16"),
+                (MONTH_COVERED_VAR, "int8"),
+            ),
+            embedding_dim=128,
+            cleared=((0, 0),),
+            fill_values=(("embeddings", 0), ("s2_obs_count", 0), ("s1_asc_obs_count", 0), (MONTH_COVERED_VAR, 0)),
+        )
+        block = source.load((0, 0))
+
+        assert block["s2_obs_count"].max() == 7, "measured, not filled"
+        assert block["s1_asc_obs_count"].max() == 3
+        assert block[MONTH_COVERED_VAR][..., :4].all(), "the months it did see"
+        assert not block[MONTH_COVERED_VAR][..., 4:].any()
+        assert block["embeddings"].shape == (1, 8, 8, 128)
+        assert not block["embeddings"].any(), "the embeddings are what it failed to produce — fill"
+
+    def test_a_position_with_no_coverage_tile_still_fills(self, tmp_path: Path) -> None:
+        """Absence is ordinary and silent: an ocean position never staged coverage, and neither did a
+        refused chunk from a run predating this. Both must fill exactly as before.
+        """
+        source = StagedShardSource(
+            staging_base=str(tmp_path / "staging"),
+            run_id="run1",
+            shards=(),
+            variables=("s2_obs_count",),
+            shard_px=8,
+            dtypes=(("s2_obs_count", "uint16"),),
+            cleared=((0, 0),),
+            fill_values=(("s2_obs_count", 0),),
+        )
+        block = source.load((0, 0))
+        assert block["s2_obs_count"].shape == (1, 8, 8)
+        assert not block["s2_obs_count"].any()
+
+
+class TestTheGridAnAllSkippedRunWasStagedOn:
+    """An assembly-only resume of a run where everything skipped has no tile to measure.
+
+    Falling back to the CURRENT configured size re-enumerates the chunk grid under different labels,
+    after which verification reports the valid old markers as unexpected and its own new labels as
+    missing — defeating the all-skipped assembly path. The default moved from 2000 to 2048, so any
+    run staged before that is affected.
+    """
+
+    def test_the_size_is_recovered_from_the_markers(self, tmp_path: Path) -> None:
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        for col in (0, 1):
+            chunk = ChunkSpec(row=0, col=col, y_start=0, y_stop=2000, x_start=0, x_stop=2000)
+            record = _record(chunk.label, no_optical=4_000_000, eligible=4_000_000)
+            record["chunk_side_px"] = 2000
+            writer.write_skip_marker(chunk, "run1", record)
+
+        assert writer.detect_staged_chunk_size("run1") == 2000
+
+    def test_markers_predating_the_field_still_report_unknown(self, tmp_path: Path) -> None:
+        """The caller's configured size is the only answer left, and it must still be asked for."""
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+        writer.write_skip_marker(chunk, "run1", _record(chunk.label, no_optical=64))
+
+        with pytest.raises(AllChunksSkippedError):
+            writer.detect_staged_chunk_size("run1")
+
+    def test_markers_that_disagree_report_unknown(self, tmp_path: Path) -> None:
+        """A heterogeneous stage no single size describes. Guessing one of them would re-enumerate
+        half the grid, which is the failure this recovery exists to prevent.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        for col, side in ((0, 2000), (1, 2048)):
+            chunk = ChunkSpec(row=0, col=col, y_start=0, y_stop=side, x_start=0, x_stop=side)
+            record = _record(chunk.label, no_optical=side * side, eligible=side * side)
+            record["chunk_side_px"] = side
+            writer.write_skip_marker(chunk, "run1", record)
+
+        with pytest.raises(AllChunksSkippedError):
+            writer.detect_staged_chunk_size("run1")
+
+    def test_a_run_that_never_existed_still_raises(self, tmp_path: Path) -> None:
+        """A typo must not become a silent re-run."""
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        with pytest.raises(FileNotFoundError):
+            writer.detect_staged_chunk_size("no-such-run")

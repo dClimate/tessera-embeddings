@@ -41,6 +41,10 @@ def wired(monkeypatch):
     monkeypatch.setattr(mod, "zone_year_complete", lambda *a, **k: False)
     monkeypatch.setattr(mod, "zone_year_on_axis", lambda *a, **k: True)
     monkeypatch.setattr(mod, "zone_has_live_tiles", lambda *a, **k: True)
+    # The destination schema preflight, which reads the store like its three neighbours above. A test
+    # about the flow's wiring has no seeded store to read; the check's own behaviour is covered by
+    # test_destination_preflight.py, and that it runs BEFORE the cluster is asserted below.
+    monkeypatch.setattr(mod, "preflight_destination", lambda **k: None)
     monkeypatch.setattr(mod, "resolve_s1_orbit", lambda *a, **k: "both")
     # A real dataclass rather than a namespace: the flow replaces the config to stamp the store's
     # minimum-depth rule onto it, and dataclasses.replace is what that costs.
@@ -404,3 +408,40 @@ def test_the_depth_rule_is_resolved_even_when_no_cluster_is_needed(monkeypatch):
         "the rule must be resolved before the needs_cluster branch, or terminal cells reach the "
         "runner with optical_min_obs=None and its assertion fails them"
     )
+
+
+def test_the_destination_schema_is_checked_before_ray(wired):
+    """A destination this fill cannot write to must cost nothing.
+
+    The runner checks the same thing, but it runs INSIDE the cluster context — so on 2026-08-18 a
+    seeded dtype the staging writer cannot produce was found only after a full GPU inference had
+    been paid for. The check now runs in the pre-Ray gate, and this asserts the ordering rather
+    than the check: the fleet must never be provisioned.
+    """
+    ray_calls: list = []
+    wired.setattr(
+        "tessera_embeddings.providers.aws.ray.ray_cluster", lambda *a, **k: ray_calls.append((a, k)), raising=False
+    )
+
+    def _refuse(**kwargs):
+        raise ValueError("33N year 2025: embeddings has dtype int8, expected int16")
+
+    wired.setattr(mod, "preflight_destination", _refuse)
+
+    with pytest.raises(ValueError, match="expected int16"):
+        mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami")
+    assert ray_calls == [], "the GPU fleet must not be provisioned for a destination we cannot write"
+
+
+def test_a_complete_cell_does_not_pay_for_the_schema_check(wired):
+    """Gated like its neighbours in that block: a retag-only recovery writes nothing, so it needs
+    no destination read and must not be blocked by one.
+    """
+    wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)  # retag-only: no cluster, no gate
+    wired.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", lambda *a, **k: None, raising=False)
+    wired.setattr(mod, "fill_zone_year", lambda **kw: {"tag": "t"})
+    calls: list = []
+    wired.setattr(mod, "preflight_destination", lambda **k: calls.append(k))
+
+    mod.fill_zone_year_flow.fn(zone="33N", year=2025, paths=_PATHS, ami_ssm_name="ami")
+    assert calls == []

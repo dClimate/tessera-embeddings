@@ -430,6 +430,37 @@ class ZonePlan:
     done: dict[str, Any] | None = None
 
 
+def preflight_destination(
+    *,
+    store_path: str,
+    zone: str,
+    year: int,
+    get_credentials: Callable[[], Any] | None = None,
+    s3_region: str | None = None,
+) -> None:
+    """Can the seeded destination hold what a fill will write? One metadata read, no fleet.
+
+    **The point of this function is WHERE it can be called from.** The same check runs inside
+    :func:`plan_zone_inference`, which is already far earlier than assembly — but the single-cell
+    Prefect flow provisions its GPU cluster and only then calls the fill, so a mismatch there is
+    caught after the fleet is up and billing. This is callable before the cluster exists, needs
+    nothing but the store, and raises the same error with the same message.
+
+    Cheap enough to run in both places and left in both deliberately: a caller that forgets it
+    still fails before inference rather than at assembly, and a caller that remembers pays one
+    metadata read to fail before it spends anything at all.
+
+    Raises:
+        ValueError: If the zone is not seeded, or its arrays disagree with the layout the
+            staging writer produces (dtype or logical attrs).
+    """
+    repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
+    if zone not in root:
+        raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
+    check_destination_types(cast(zarr.Group, root[zone]), GLOBAL, where=f"{zone} year {year}")
+
+
 def plan_zone_inference(
     *,
     store_path: str,

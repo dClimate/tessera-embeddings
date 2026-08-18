@@ -230,7 +230,9 @@ class TestWriteChunk:
           at all, leaves a window in which a listing calls a half-replaced tile
           complete), and any ``.skipped`` from an attempt where this chunk had no valid
           pixels, which would otherwise sit beside the new tile and read as an
-          inconsistent artifact.
+          inconsistent artifact — and the COVERAGE-ONLY tile of such an attempt, which
+          carries real counts and so would have assembly publish a footprint this write
+          has just replaced.
         """
         writer = ZarrWriter(str(tmp_path / "staging"))
         chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=4, x_start=0, x_stop=4)
@@ -263,7 +265,7 @@ class TestWriteChunk:
         ):
             writer.write_chunk(chunk, emb, run_id="run1", scales=scales)
 
-        assert seen == ["retract:done", "retract:skipped", "tile", "attribute", "done"]
+        assert seen == ["retract:done", "retract:skipped", "retract:zarr", "tile", "attribute", "done"]
 
     def test_write_chunk_wrong_shape_raises(self, tmp_path):
         staging = str(tmp_path / "staging")

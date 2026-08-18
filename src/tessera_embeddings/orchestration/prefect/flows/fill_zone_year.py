@@ -48,6 +48,7 @@ from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
 from tessera_embeddings.orchestration.runners.zone_fill import (
     assert_calendar_year_window,
     fill_zone_year,
+    preflight_destination,
     zone_has_live_tiles,
     zone_year_complete,
     zone_year_on_axis,
@@ -329,6 +330,20 @@ def fill_zone_year_flow(
         else False
     )
     needs_cluster = on_axis and not already_complete and has_live
+
+    # CAN THE DESTINATION HOLD WHAT WE ARE ABOUT TO WRITE? One metadata read, and it belongs in this
+    # block for the same reason as its neighbours. The runner checks this too, but only after the GPU
+    # fleet is up — so on 2026-08-18 a seeded dtype the staging writer cannot produce cost a whole
+    # inference before anyone heard about it. Gated on `needs_cluster` like the orbit probe below: a
+    # complete cell writes nothing, and an all-ocean cell has nothing to write.
+    if needs_cluster:
+        preflight_destination(
+            store_path=store_path,
+            zone=zone,
+            year=year,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+        )
 
     # resolve_s1_orbit probes the mosaics (with the same credential callback / region
     # the rest of the fill uses), so only do it when we'll actually infer.

@@ -103,6 +103,10 @@ logger = logging.getLogger(__name__)
 
 
 STAGED_READ_CONFIG_KWARGS = {"retries": {"max_attempts": 10, "mode": "adaptive"}}
+#: Suffix of the coverage-only tile a refused chunk stages. Named once because two places
+#: depend on it agreeing: the writer that creates it, and the listing that must NOT read it as
+#: a chunk label.
+_COVERAGE_SUFFIX = ".coverage.zarr"
 """botocore retry config for staged-Zarr GETs during assembly.
 
 Staged reads fan out across every worker process at once, so a momentary GET burst
@@ -672,7 +676,7 @@ class StagedShardSource:
     def load(self, shard: tuple[int, int]) -> dict[str, np.ndarray]:
         """Read one staged tile whole and return ``{var: (1, h, w[, band]) block}``."""
         if shard in self.cleared:
-            return self._fill_block()
+            return self._fill_block(shard)
         sy, sx = shard
         path = f"{self.staging_base}/{self.run_id}/{chunk_label(sy, sx)}.zarr"
         group = _open_staged_tile(path)
@@ -721,12 +725,24 @@ class StagedShardSource:
             )
         return blocks
 
-    def _fill_block(self) -> dict[str, np.ndarray]:
-        """A whole tile of fill, for a position this run skipped.
+    def _fill_block(self, shard: tuple[int, int] | None = None) -> dict[str, np.ndarray]:
+        """A whole tile of fill for a position this run skipped — with any coverage it DID measure.
 
         Built from the DESTINATION's fill values (passed in by the caller, which read
         them off the seeded arrays) so a cleared tile reads back identical to one that
         was never written — not zero for a float array whose fill is NaN.
+
+        **Then the coverage variables are overlaid from the refused chunk's own tile, when it staged
+        one.** A fully refused chunk measures real observation counts and real month coverage before
+        it fails the gate, and filling those alongside the embeddings published zeros for a tile that
+        had been looked at — while a MIXED tile published true counts, because one pixel in it
+        happened to embed. Provenance that depends on a neighbour is worse than provenance that is
+        merely absent, because nothing marks it.
+
+        Absence stays ordinary and silent: an ocean position never staged coverage, and neither did a
+        refused chunk from a run predating this. Both fill, exactly as before. What is NOT tolerated
+        is a tile that exists and disagrees with the destination — that raises, because a raw-zarr
+        write would C-cast it.
         """
         dtypes = dict(self.dtypes)
         fills = dict(self.fill_values)
@@ -737,6 +753,30 @@ class StagedShardSource:
             if trailing:
                 shape = (*shape, trailing)
             blocks[var] = np.full(shape, fills.get(var, 0), dtype=np.dtype(dtypes.get(var, "float32")))
+        if shard is None:
+            return blocks
+        sy, sx = shard
+        path = f"{self.staging_base}/{self.run_id}/{chunk_label(sy, sx)}{_COVERAGE_SUFFIX}"
+        try:
+            group = _open_staged_tile(path)
+        except FileNotFoundError:
+            return blocks
+        for var in self.variables:
+            if var not in group:
+                continue
+            block = np.asarray(cast(zarr.Array, group[var])[:])[np.newaxis]
+            want = dtypes.get(var)
+            if want is not None and str(block.dtype) != want:
+                raise ValueError(
+                    f"Coverage tile {path} has {var} dtype {block.dtype}, expected {want} — a raw-zarr "
+                    "write would silently C-cast (wraparound); mixed-version or corrupt staged run."
+                )
+            if block.shape != blocks[var].shape:
+                raise ValueError(
+                    f"Coverage tile {path} has {var} shape {block.shape}, expected {blocks[var].shape} — "
+                    "truncated or off-grid tile (ADR-008 D3 requires whole tiles)."
+                )
+            blocks[var] = block
         return blocks
 
 
@@ -766,6 +806,27 @@ class ZarrWriter:
     def _staging_path(self, run_id: str, chunk: ChunkSpec) -> str:
         """Get the staging path for a chunk."""
         return f"{self.staging_base}/{run_id}/{chunk.label}.zarr"
+
+    def _coverage_path(self, run_id: str, chunk: ChunkSpec) -> str:
+        """Where a REFUSED chunk stages the coverage it measured but could not embed.
+
+        A third artifact class beside the staged tile and the skip marker, and it exists because
+        the other two cannot carry this. A fully refused chunk has real observation counts and real
+        month coverage — they are accumulated per strip regardless of validity — and throwing them
+        away published zero counts for the tile while a MIXED tile published true ones. Whether a
+        pixel's provenance survived therefore depended on whether some neighbouring pixel happened
+        to embed, which is not a property anyone should have to reason about.
+
+        Named ``.coverage.zarr`` and excluded explicitly from the ``.zarr`` match in
+        :meth:`_list_staged` — without that it parses as a chunk label of its own, lands in
+        ``staged`` with no ``.done`` beside it, and every refused chunk reads as an interrupted
+        write.
+
+        NOT vouched for by its own ``.done``: it is written BEFORE the skip marker, so the marker
+        being present already implies this finished. That is the same ordering trick ``.done`` plays
+        for a staged tile, reusing an artifact that has to exist anyway.
+        """
+        return f"{self.staging_base}/{run_id}/{chunk.label}{_COVERAGE_SUFFIX}"
 
     def _skip_marker_path(self, run_id: str, chunk: ChunkSpec) -> str:
         """Get the skip-marker path for a chunk.
@@ -821,6 +882,71 @@ class ZarrWriter:
                 len(skipped),
             )
         return summary
+
+    def write_coverage_only(
+        self,
+        chunk: ChunkSpec,
+        run_id: str,
+        obs_counts: Mapping[str, np.ndarray | None],
+        month_covered: np.ndarray | None,
+    ) -> str:
+        """Stage the coverage arrays of a chunk that embedded nothing. Call BEFORE the marker.
+
+        Only the provenance variables: the observation counts and the month-coverage mask, with the
+        same dtypes, axis order and chunking :meth:`write_chunk` gives them, because assembly reads
+        both with raw zarr and compares against what is on disk. ``test_coverage_only_staging``
+        asserts that equivalence directly rather than trusting these two code paths to stay in step.
+
+        No embeddings and no scales, which is the point: those are what the chunk failed to produce,
+        and a fill array of 128 bands per refused tile is the cost this avoids. Assembly fills them
+        and copies these — see :meth:`StagedShardSource._fill_block`.
+        """
+        path = self._coverage_path(run_id, chunk)
+        staged_chunks_2d = (min(INNER_PX, chunk.height), min(INNER_PX, chunk.width))
+        data_vars: dict[str, tuple[list[str], np.ndarray]] = {}
+        encoding: dict[str, dict] = {}
+        expected_2d = (chunk.height, chunk.width)
+        for var_name in OBS_COUNT_VARS:
+            arr = obs_counts.get(var_name)
+            if arr is None:
+                continue
+            if arr.shape != expected_2d:
+                raise ValueError(f"Expected {var_name} shape {expected_2d}, got {arr.shape}")
+            data_vars[var_name] = (["northing", "easting"], arr)
+            encoding[var_name] = {"chunks": staged_chunks_2d, "compressors": None}
+        if month_covered is not None:
+            expected_month = (MONTHS_IN_YEAR, chunk.height, chunk.width)
+            if month_covered.shape != expected_month:
+                raise ValueError(f"Expected {MONTH_COVERED_VAR} shape {expected_month}, got {month_covered.shape}")
+            # Month axis LAST, and no dtype in the encoding — both for the reasons write_chunk
+            # states at length: the destination is (northing, easting, month) so nothing transposes
+            # on the way in, and `to_zarr` stores bool as int8 whatever an encoding asks for.
+            data_vars[MONTH_COVERED_VAR] = (
+                ["northing", "easting", "month"],
+                np.ascontiguousarray(month_covered.transpose(1, 2, 0)),
+            )
+            encoding[MONTH_COVERED_VAR] = {
+                "chunks": (*staged_chunks_2d, MONTHS_IN_YEAR),
+                "compressors": None,
+            }
+        if not data_vars:
+            raise ValueError(f"Chunk {chunk.label}: no coverage arrays to stage")
+        ds = xr.Dataset(
+            data_vars,
+            coords={
+                "northing": np.arange(chunk.y_start, chunk.y_stop),
+                "easting": np.arange(chunk.x_start, chunk.x_stop),
+            },
+        )
+        ds.to_zarr(path, mode="w", encoding=encoding, storage_options=_staged_storage_options(path))
+        # `staged_complete`, for the same reason write_chunk sets it and read through the same gate
+        # (`_open_staged_tile`). A crash between the array metadata and the chunk objects leaves a
+        # tile that reads back as FILL rather than as an error — which here would publish zeroed
+        # counts while looking like measured ones, the exact failure this whole change removes.
+        marker = zarr.open_group(path, mode="a", storage_options=_staged_storage_options(path))
+        marker.attrs["staged_complete"] = True
+        logger.info("Staged coverage-only tile for refused chunk %s to %s", chunk.label, path)
+        return path
 
     def write_skip_marker(self, chunk: ChunkSpec, run_id: str, record: dict | None = None) -> str:
         """Write a skip marker for a chunk, carrying WHY it was refused.
@@ -1022,6 +1148,12 @@ class ZarrWriter:
         for stale in (done_path, self._skip_marker_path(run_id, chunk)):
             with contextlib.suppress(FileNotFoundError):
                 done_fs.rm(stale)
+        # And the COVERAGE-ONLY tile of a previous refusal, the third artifact this rule now covers.
+        # That tile carries real counts, so a stale one beside a successful write is worse than
+        # untidy: it measures a footprint this attempt has just replaced. Recursive — it is a
+        # directory, not a marker.
+        with contextlib.suppress(FileNotFoundError):
+            done_fs.rm(self._coverage_path(run_id, chunk), recursive=True)
 
         # The same S3 client config the staged READS use. The write is the larger and
         # more failure-prone of the two — it is the one uploading the tile — and it was
@@ -1075,13 +1207,23 @@ class ZarrWriter:
         """
         labels = self._list_staged_labels(run_id)
         if not labels:
-            if self._list_skip_marker_labels(run_id):
-                # A real run in which every chunk skipped: there is no tile to measure,
-                # but assemble() publishes an all-fill timestep for exactly this case,
-                # so report "unknown" and let the caller use its configured size. Only
-                # reached when markers prove the run exists — a run_id that matches
-                # nothing at all still raises, so a typo can't become a silent re-run.
+            if skipped := self._list_skip_marker_labels(run_id):
+                # A real run in which every chunk skipped. ASK THE MARKERS what grid they were
+                # produced on before giving up: they record it precisely because there is no tile
+                # here to measure, and falling back to the CURRENT configured size re-enumerates the
+                # chunk grid under different labels — after which verification reports the valid old
+                # markers as unexpected and its own new labels as missing, defeating the all-skipped
+                # assembly path this branch exists to serve. The default moved from 2000 to 2048, so
+                # this is not hypothetical for any run staged before that.
+                records, _unreadable = read_skip_records(self.staging_base, run_id, skipped)
+                sides = {int(r["chunk_side_px"]) for r in records.values() if isinstance(r.get("chunk_side_px"), int)}
+                if len(sides) == 1:
+                    return sides.pop()
+                # Either no marker records the grid (every run before this field) or they disagree,
+                # which is a heterogeneous stage no single size can describe. Both are "unknown", and
+                # the caller's configured size is the only answer left.
                 raise AllChunksSkippedError(run_id)
+            # A run_id matching nothing at all still raises, so a typo cannot become a silent re-run.
             raise FileNotFoundError(f"No staged chunks found for run '{run_id}' under {self.staging_base}")
         path = f"{self.staging_base}/{run_id}/{labels[0]}.zarr"
         try:
@@ -1212,7 +1354,10 @@ class ZarrWriter:
         :meth:`_done_marker_path` for why completeness is its own signal.
         """
         names = self._list_run_names(run_id)
-        staged = {n.removesuffix(".zarr") for n in names if n.endswith(".zarr")}
+        # The coverage-only tile of a REFUSED chunk is excluded FIRST, and must be: it ends in
+        # ".zarr", so the match below would take "<label>.coverage" for a chunk label of its own,
+        # find no ".done" beside it, and report every refused chunk as an interrupted write.
+        staged = {n.removesuffix(".zarr") for n in names if n.endswith(".zarr") and not n.endswith(_COVERAGE_SUFFIX)}
         done = {n.removesuffix(".done") for n in names if n.endswith(".done")}
         skipped = sorted(n.removesuffix(".skipped") for n in names if n.endswith(".skipped"))
         # Symmetric difference, not `staged - done`: a .done whose .zarr is absent is
@@ -2410,6 +2555,11 @@ def summarise_optical_skips(
     obs_px_with_any = 0
     mixed = 0
     inconsistent: list[str] = []
+    # Pixels inside a published tile that the dataset never evaluated, because the read plan cropped
+    # the chunk to the columns holding valid pixels. They are filled like the refused ones and are
+    # NOT refusals, so folding them into a reason would misattribute them — but leaving them out
+    # entirely makes the reason totals look short of the footprint they explain.
+    not_evaluated_px = 0
     for label in skipped_list:
         record = records.get(label)
         if record is None:
@@ -2424,13 +2574,21 @@ def summarise_optical_skips(
             # of them and must not read as a shard with no reason recorded.
             inconsistent.append(label)
             continue
-        # THE INVARIANT: a fully refused shard refused every eligible pixel. The dataset's three
-        # reasons partition its pixels by construction, so a mismatch means strips did not cover the
-        # chunk or a count was double-added — either way the pixel totals below are wrong and saying
-        # so is worth more than a plausible number.
+        # THE INVARIANT: a fully refused shard refused every pixel the dataset EVALUATED. The three
+        # reasons partition those pixels by construction, so a mismatch means the strips did not
+        # cover what was loaded or a count was double-added — either way the pixel totals below are
+        # wrong and saying so is worth more than a plausible number.
+        #
+        # Against the EVALUATED footprint, not the tile: the read plan crops a chunk to the columns
+        # holding valid pixels, and comparing cropped counts against the whole tile flagged every
+        # cropped shard as a defect. The cropped-out columns are accounted for separately below —
+        # they are unevaluated, which is a third thing from refused and from embedded.
         eligible = int(record.get("eligible_px") or 0)
         if eligible and total != eligible:
             inconsistent.append(label)
+        # A record predating this field carries no `chunk_px`; `eligible_px` is then the whole tile
+        # by construction, so the difference is zero rather than unknown.
+        not_evaluated_px += max(int(record.get("chunk_px") or eligible) - eligible, 0)
         if sum(1 for n in refused.values() if n) > 1:
             mixed += 1
         dominant = max(refused, key=lambda r: refused[r])
@@ -2449,6 +2607,11 @@ def summarise_optical_skips(
     # once the mosaic is deleted, and it is what made the record large.
     summary["s2_obs_at_refused"] = {"max": obs_max, "px_with_any": obs_px_with_any}
     summary["unrecorded"] = [label for label in skipped_list if label not in records]
+    # Emitted only when non-zero, so the ordinary uncropped year does not carry a field of zeros —
+    # and so its presence is itself the signal that some tiles were cropped. Together with the
+    # per-reason totals this accounts for the whole filled footprint: refused + never evaluated.
+    if not_evaluated_px:
+        summary["not_evaluated_px"] = not_evaluated_px
     if inconsistent:
         summary["inconsistent"] = sorted(inconsistent)
     return summary

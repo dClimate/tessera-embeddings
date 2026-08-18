@@ -36,6 +36,7 @@ from tessera_embeddings.inference.actors import (
     _StripPlan,
     _xchunk_rung,
 )
+from tessera_embeddings.inference.assembly import summarise_optical_skips
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 from tests.unit.mosaic_stores import S2_SEED, make_s2_group, make_sar_group, store_opener
@@ -1012,3 +1013,100 @@ class TestPerCellTimeWindow:
         # which is what stops a cross-cell prefetch hint reading the wrong window.
         assert ZoneContext("m", "s", "r", window) == ZoneContext("m", "s", "r", window)
         assert ZoneContext("m", "s", "r", window) != ZoneContext("m", "s", "r", parse_time_window("December 2023"))
+
+
+class TestTheRecordTheConsumerWillRead:
+    """The producer's record, fed to the consumer that grades it.
+
+    These two were tested to different contracts and never against each other: the producer test
+    asserted the record's SHAPE, the summary's tests asserted its ARITHMETIC over hand-built records,
+    and nothing checked that what the producer emits satisfies what the consumer enforces. That gap
+    is exactly where the cropping defect lived — `eligible_px` declared the whole tile while the
+    reasons counted only the loaded columns, so every cropped shard was graded inconsistent by an
+    invariant no test ever fed a real record to.
+    """
+
+    @staticmethod
+    def _refused_run(inference_config, test_model, monkeypatch, *, crop: slice | None):
+        """Drive a fully refused chunk through the real producer; return its record."""
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+        actor = _make_actor(inference_config, test_model)
+        h, w = _CHUNK.height, _CHUNK.width
+        s2_root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+        for band in S2_BAND_ORDER:
+            arr = s2_root.create_array(band, shape=(4, h, w), dtype=np.uint16, chunks=(4, h, w))
+            arr[:] = 0
+        scl = s2_root.create_array("scl", shape=(4, h, w), dtype=np.uint8, chunks=(4, h, w))
+        scl[:] = 8  # every class invalid -> every pixel refused
+        times = pd.date_range("2024-01-01", periods=4, freq="5D").values.astype("datetime64[ns]").astype("int64")
+        t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
+        t_arr[:] = times
+        sar = make_sar_group(3, h, w)
+
+        def _open_store(path, region=None):
+            return s2_root if "reflectance" in path else sar
+
+        if crop is not None:
+            # Force the read plan to narrow the chunk, which no all-invalid fixture does on its own:
+            # the crop is derived from the columns holding valid pixels, and here there are none.
+            real_plan = _actors_mod._chunk_read_plan
+
+            def _cropped(chunk, mask_bundle):
+                _x_sub, valid_px, plan = real_plan(chunk, mask_bundle)
+                return crop, valid_px, plan
+
+            monkeypatch.setattr(_actors_mod, "_chunk_read_plan", _cropped)
+
+        _CapturingWriter.last_write = None
+        _CapturingWriter.last_skip = None
+        _CapturingWriter.last_skip_record = None
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store),
+            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+        ):
+            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+        assert result["status"] == "skipped"
+        record = _CapturingWriter.last_skip_record
+        assert record is not None
+        return record
+
+    def test_the_consumer_grades_the_producers_record_as_consistent(self, inference_config, test_model, monkeypatch):
+        """The round trip, uncropped: the reasons account for every pixel the dataset evaluated."""
+        record = self._refused_run(inference_config, test_model, monkeypatch, crop=None)
+        label = record["label"]
+        summary = summarise_optical_skips(staged=[], skipped=[label], records={label: record})
+
+        assert summary.get("inconsistent") is None, summary
+        assert sum(summary["refused_px_by_reason"].values()) == _CHUNK.height * _CHUNK.width
+        # Nothing was cropped, so nothing is unaccounted for.
+        assert "not_evaluated_px" not in summary
+
+    def test_a_cropped_chunk_is_consistent_and_its_remainder_is_named(self, inference_config, test_model, monkeypatch):
+        """The defect two reviewers found, from both ends at once.
+
+        With the read plan narrowed to four of ten columns, the reasons cover 4/10 of the tile. The
+        record must say so — and the consumer must grade that as CONSISTENT while still accounting
+        for the columns nobody looked at, because they are published as fill just like the refused
+        ones and a summary that ignores them looks short of the footprint it explains.
+        """
+        crop = slice(3, 7)
+        record = self._refused_run(inference_config, test_model, monkeypatch, crop=crop)
+        label = record["label"]
+
+        assert record["eligible_px"] == _CHUNK.height * 4, "the footprint the reasons actually cover"
+        assert record["chunk_px"] == _CHUNK.height * _CHUNK.width, "the footprint that gets published"
+
+        summary = summarise_optical_skips(staged=[], skipped=[label], records={label: record})
+        assert summary.get("inconsistent") is None, "a legitimate crop is not a defect"
+        assert summary["not_evaluated_px"] == _CHUNK.height * (_CHUNK.width - 4)
+        assert (
+            sum(summary["refused_px_by_reason"].values()) + summary["not_evaluated_px"] == _CHUNK.height * _CHUNK.width
+        ), "refused plus never-evaluated must account for the whole published tile"
+
+    def test_the_record_carries_the_grid_it_was_produced_on(self, inference_config, test_model, monkeypatch):
+        """An assembly-only resume of an all-skipped run has no staged tile to read a chunk size
+        off, and guessing the current default re-enumerates every label.
+        """
+        record = self._refused_run(inference_config, test_model, monkeypatch, crop=None)
+        assert record["chunk_side_px"] == _CHUNK.width

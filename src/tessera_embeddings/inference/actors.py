@@ -1310,10 +1310,29 @@ class InferenceActor:
                 # even on a chunk where nothing passed.
                 s2_obs = obs_buffers["s2_obs_count"]
                 any_obs = s2_obs > 0
+                # THE FOOTPRINT THE REASONS ACTUALLY COVER, which is not the whole chunk when the
+                # read plan cropped it. `_chunk_read_plan` narrows a chunk to the columns holding
+                # valid pixels, and the three refusal counts are computed over what was LOADED — so
+                # recording the whole chunk as eligible undercounted the reasons against it and made
+                # the consumer's consistency invariant fire on a legitimate crop.
+                #
+                # Both numbers are kept, because they answer different questions and neither can be
+                # derived from the other. `eligible_px` is what the dataset evaluated and is what the
+                # reasons must sum to — deriving it FROM the counts would make the invariant vacuous,
+                # since being an independent second measurement is the whole source of its power.
+                # `chunk_px` is the PUBLISHED footprint, so the consumer can also say how much of a
+                # filled tile was never evaluated at all.
+                eff_w = int(chunk.width) if x_sub is None else int(x_sub.stop - x_sub.start)
                 skip_record = {
                     "label": chunk.label,
                     "refused": dict(refused),
-                    "eligible_px": int(chunk.height) * int(chunk.width),
+                    "eligible_px": int(chunk.height) * eff_w,
+                    "chunk_px": int(chunk.height) * int(chunk.width),
+                    # The grid this marker was produced on. An assembly-only resume of an all-skipped
+                    # run has no staged tile to read a chunk size off, and falling back to the
+                    # CURRENT default re-enumerates the labels — after which the valid old markers
+                    # read as unexpected and the new labels as missing.
+                    "chunk_side_px": int(chunk.width),
                     "s2_obs": {
                         "px_with_any": int(any_obs.sum()),
                         "max": int(s2_obs.max()),
@@ -1325,6 +1344,20 @@ class InferenceActor:
                     chunk.label,
                     ", ".join(f"{k}={v}" for k, v in sorted(refused.items()) if v),
                 )
+                # COVERAGE FIRST, MARKER LAST, and the order is the atomicity: the marker's presence
+                # is what vouches for the coverage tile being complete, so a crash between them
+                # leaves a tile nothing points at rather than a marker promising data that is not
+                # there. Best-effort — losing the coverage degrades provenance, while losing the
+                # MARKER turns a benign skip into a failed chunk and wedges the cell on every retry
+                # under the stable run id. Same rule as the record inside the marker.
+                try:
+                    writer.write_coverage_only(chunk, run_id, obs_buffers, month_buffer)
+                except Exception:
+                    logger.exception(
+                        "Chunk %s: coverage-only tile could not be staged; its counts will publish as "
+                        "fill. The refusal reasons in the marker are unaffected.",
+                        chunk.label,
+                    )
                 writer.write_skip_marker(chunk, run_id, skip_record)  # small marker: keep synchronous
                 # Collect the prior deferred write BEFORE snapshotting elapsed —
                 # the wait is actor-occupancy this chunk owns, same as the
