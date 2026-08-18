@@ -132,3 +132,31 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
             BucketPaths(inputs="s3://in", outputs="s3://out", global_store_uri="s3://pub/v1/x.icechunk"),
         ):
             assert not paths.optical_registry().startswith(paths.global_store() + "/")
+
+    def test_per_cell_refusal_detail_follows_the_store_not_our_outputs(self):
+        """The mistake this class exists to prevent, made once and caught here.
+
+        The per-tile refusal records were first placed under ``outputs``, which works in dev — where
+        the store is derived from ``outputs`` too — and quietly splits in production, where the store
+        is published to a bucket that is not ours. Every tool still works; the records simply sit
+        somewhere no consumer of the store will look.
+        """
+        prod = BucketPaths(
+            inputs="s3://in",
+            outputs="s3://ours",
+            global_store_uri="s3://tessera-embeddings/v1.1/dclimate.icechunk",
+        )
+        detail = prod.refusal_detail("32S", 2021)
+
+        assert detail.startswith(prod.optical_registry() + "/"), "inside the registry beside the store"
+        assert "s3://ours" not in detail, "and never in our own bucket when the store is published"
+        assert not detail.startswith(prod.global_store() + "/"), "still never inside the Icechunk prefix"
+
+    def test_per_cell_refusal_detail_is_partitioned_for_a_parquet_dataset(self):
+        """The registry is specified as Parquet indexing what each shard holds. The parts are JSON
+        for now — pyarrow is not in the fill's runtime — so the LAYOUT has to be the one a later
+        compaction wants, or every path changes when the format does.
+        """
+        paths = BucketPaths(inputs="s3://in", outputs="s3://out")
+        detail = paths.refusal_detail("09S", 2024)
+        assert "zone=09S" in detail and "year=2024" in detail
