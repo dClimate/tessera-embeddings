@@ -422,7 +422,45 @@ validation and its published verdicts; the four Slack automations; and the round
 > round.
 >
 > Found by running a round against a live fill, not by a test, which is also how the `cell_validation`
-> and progress-check defects were found. Then swept rather than spot-fixed: an AST pass over every
+> and progress-check defects were found.
+
+> **A four-cell run found five more, and four of them were one mistake (2026-08-18).** Run at scale
+> deliberately: 4 cells, 12 concurrent ingest fleets spanning 3 to 41 tasks, ingest through fill,
+> assembly and validation, ~2.6 hours of five-minute rounds. The alerting held up — **one** false-alarm
+> round in 32, which cleared itself — but five checks were reasoning wrongly, and the shared error is
+> the one this plan keeps rediscovering: **an absence read as evidence.**
+>
+> | check | what it inferred | what was actually true |
+> |---|---|---|
+> | cells still making progress | "4 cells have never written anything" | the log query had FAILED; all four had filled and validated |
+> | cells still making progress | a cell at 237/239 chunks was "past inference" | its startup line, the only thing naming its zone, had aged out of the window |
+> | cells still making progress | 02S was "committing or cleaning up" | 02S had not started inferring; its ingest was still running |
+> | commit rates | "decelerating" | three of four INGESTS had finished; the rate per live ingest had risen |
+> | fleet strength | "121/70 = 173%" | one fleet of ten was unidentified, so all ten were pooled against the smallest legs |
+>
+> **The first is the dangerous one and the one to remember.** At 07:43Z a brief AWS blip failed
+> `aws logs get-query-results` and CloudFormation. Seven checks correctly reported DID NOT RUN. The
+> progress check, handed the empty map that failure produces, accused four healthy cells instead — it
+> pages during an outage and blames the campaign for it. An empty result and a dead query are
+> indistinguishable downstream and mean opposite things, so the failure is now a PARAMETER.
+>
+> The blip is answered twice over: the checks report an unknown, and the Insights result fetch now
+> retries the transport error (3 attempts, narrow — a query the service judged Failed still raises at
+> once) so the round does not go blank in the first place.
+>
+> **The second is the one scale was needed to find.** The zone comes from a line published once at
+> startup; the progress lines carry no zone. Measured at one instant with two windows: at 45m zone 47S
+> read "past inference, no write in the window"; at 90m the same cell read "inferring — 237/239". The
+> deployed round uses 60m, so this hit every cell whose inference outlasts an hour — the largest cells,
+> which need watching most. A stream is now named from a 12-hour lookback, issued only when a stream
+> has fresh progress and no startup line, so short cells never pay for it.
+>
+> **Two names were also wrong, and one was ECS's rather than ours.** `placement` is ECS's word for
+> whether a task found capacity; it is displayed as **fleet strength** (did the workers we asked for
+> start?). `fleet widths` read as a size report though it only ever fires on clusters with NO workers;
+> it is displayed as **empty clusters**. Neither is occupancy — that is `GPUs kept busy`, and mistaking
+> the three for each other is what the rename fixes. Both SLUGS are unchanged, which is exactly the
+> split `CheckSpec` documents. Then swept rather than spot-fixed: an AST pass over every
 > numeric format applied to a local assigned `... else None` found **nine** such uses, eight already
 > inside their own `is not None` guard and this the only gap. The sweep is what turns "I fixed the one I
 > tripped over" into "there is not another one".
