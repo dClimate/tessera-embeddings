@@ -104,186 +104,31 @@ The per-cell spread says the same thing more bluntly. Legibility by cell runs fr
 which is Saharan desert, deep and uniform) to **100%** (38N/2021, 47S/2021, 59S/2022). Which zone a
 window came from predicts its legibility far better than how many observations it had.
 
-## 4. What each candidate cutoff costs
+## 4-9. What the legibility route concluded, and why it was abandoned
 
-| cutoff | windows refused | legible among refused | illegible among kept |
-|---|---:|---:|---:|
-| 12 | 15 | 9 (**60%**) | 121 (18%) |
-| 15 | 54 | 44 (81%) | 118 (19%) |
-| 18 | 113 | 98 (87%) | 115 (21%) |
-| **20** | 155 | 132 (**85%**) | 109 (21%) |
-| **25** | 280 | 240 (**86%**) | 99 (25%) |
-| **30** | 404 | 341 (**84%**) | 81 (**30%**) |
+**Six sections here priced candidate cutoffs by legibility, and §7's own conclusion is that
+legibility was the wrong measure.** They are cut rather than kept because the line was then decided
+against them twice over — the picture is a three-component projection of 128 dimensions, one reviewer
+measured illegible windows carrying coherent structure at a tenth of the rendered amplitude, and the
+rule's argument rests on usefulness, which no measurement here tested. What survives:
 
-**The transferable number is the second column, and it is flat: whatever line is drawn between 15 and
-30, roughly 85% of what it refuses shows recognisable ground.** Only at 12 does that fall to 60%. The
-corpus is deliberately depth-stratified, so the counts describe the corpus rather than the product —
-the product-level volume comes from the census (10.9% of pixels below 30 in its sample, 18.4%
-globally).
+**Legibility does not track depth, and the gradient runs backwards.** Deeper windows are *less*
+often legible, because depth correlates with cloud-prone geography and the contrast stretch is shared
+across a cell. At every cutoff from 15 to 30 about 85% of what it refuses is legible, and the
+illegible share of what a cutoff KEEPS rises monotonically to 30% at 30 — refusing more made the
+surviving product proportionally worse.
 
-**The third column is the finding nobody expected.** Raising the cutoff makes the *kept* product
-proportionally worse: the illegible share of what survives climbs monotonically from 18% at a cutoff
-of 12 to 30% at 30, because the illegible windows are mostly the deep ones. A refusal line does not
-concentrate on poor data. It removes good data and leaves the poor data behind.
+**What does depend on observation count is a measurable bias**, not legibility: the straight-edge
+artefacts visible in some windows are upstream, present in the source imagery rather than introduced
+by assembly, which was checked rather than assumed.
 
-## 5. What this measurement cannot settle
+**The reason this matters beyond this document:** the original 30 line rested on how pictures looked,
+and the blind re-measurement is what dislodged it. The failure mode was that the renderer's
+per-window contrast stretch expanded a low-variance window's noise floor to full contrast, so
+"noisy below 20" was partly the renderer. That is why §10-11 below abandon pictures entirely and
+measure agreement between two independent embeddings of the same ground.
 
-**Thin data and its geography remain entangled, and no sample fixes that.** Thin optical data occurs
-only where it is cloudy or dark for months, so a corpus of thin windows is a corpus of particular
-places. Forty cells and a within-latitude control make the confound visible and partly separable —
-that is what §3's second table does — but the campaign will publish zones this corpus has no example
-of, and the dev store holds no 2017, which is the year where two thirds of shard-years fall below 30.
-
-**Below 12 observations is thinly sampled** — 13 windows — so the shape of the curve at the very
-bottom is the one part of it that more data would still change. It is also the one part where the
-refusal case is strongest: legibility there is 62%, the lowest of any band.
-
-**Legibility is not utility, and this is the limit that matters most.** The picture is a
-three-component projection of a 128-dimensional embedding, so a window a reader cannot interpret may
-still carry signal a downstream model uses; the first three components explain about 67%, 8% and 6% of
-variance, and nothing about the other 122 dimensions appears in the frame. This measurement therefore
-bounds one thing only — whether the *pictures* justify the sentence the plan quotes. **It cannot
-establish that thin embeddings are useless, and the plan's reputational argument rests on a claim
-about usefulness that no measurement here or before it has tested.**
-
-## 6. What follows for the plan
-
-**No cutoff between 15 and 35 is supportable on picture evidence, 30 least of all.** Each one refuses
-about 85% legible ground, and the higher the line the more unreadable windows it leaves behind. If a
-refusal ships, it ships as a product judgement with this document cited against it, not as a
-conclusion the pictures support.
-
-One further observation from the reviewers, which weakens any inference from "illegible" to
-"worthless": one session measured seven of its twenty-five illegible windows as carrying real,
-coherent ground structure — region boundaries, discrete patches, in one case a full drainage network —
-at roughly a tenth of the amplitude the shared contrast stretch renders visible, three to eight grey
-levels out of 255 against twenty or more for a typical legible window. **"Illegible" here means "low
-contrast relative to the rest of its cell", not "carries no information."**
-
-Three options, in the order I would consider them:
-
-1. **Publish everything with the quality field, and refuse nothing.** The reversible branch. The
-   reputational goal — a user not silently handed poor data — is served by the per-pixel
-   `s2_obs_count` already in the store, a documented quality band, and the registry's per-shard
-   summary. Everything else in the plan is worth building unchanged.
-2. **Refuse at a line low enough that nothing legible is known to fall under it.** Below 12.8 is
-   unmeasured, so this means measuring the 5–13 range first, in more than one biome.
-3. **Refuse at 30 anyway**, as a deliberate quality-over-coverage judgement, with this document cited
-   in the ADR as the evidence against it. Defensible as a product decision; not defensible as a
-   claim that the pictures support the line.
-
-**What would change the answer:** a corpus with thin windows from more biomes — high-latitude winter,
-monsoon Asia, coastal west Africa — and, more decisively, any measurement of whether a thin embedding
-degrades a downstream model. The second is the question the rule is really about, and it has never
-been measured.
-
----
-
-## 7. What explains the inversion — and why legibility was the wrong measurement
-
-The inverted gradient in §3 is real in the data but it is **not a fact about information content**.
-Three measurements, each computed over the 671 fully-land windows.
-
-**Legibility is a function of rendered contrast, not of depth.** Grouping by `variation_share` — each
-window's range as a share of the widest window in its cell — legibility runs 18%, 77%, 94%, 92%, 91%
-across five bands. There is a cliff below about 0.15 and a plateau above 0.3. Depth barely enters:
-hold contrast fixed in the middle band and legibility is 94%, 96%, 94% across three depth bands.
-
-**Spatial organisation does NOT fall with depth.** Measuring the share of each window's variance that
-survives 8×8 block averaging — per-pixel noise averages away, ground structure does not — the medians
-by depth band are **0.69, 0.70, 0.74, 0.72, 0.69, 0.72, 0.79** from under 15 observations to over 45.
-Flat. What falls with depth is amplitude: median 23.9 at 15–20 observations against 17.4 at 35–45.
-
-**So the same structure is present and rendered fainter.** The split that shows it: windows with high
-organisation but low amplitude are called legible **44%** of the time, against **91%** for equally
-organised but brighter windows. The faint group's median depth is 29.9 — deep.
-
-> **The conclusion this forces.** The legibility measurement, in both its July form and this one, is
-> measuring **contrast in a rendering choice**. The July per-window stretch amplified thin windows and
-> made them look noisy; the corrected shared stretch compresses deep-but-uniform windows and makes
-> them look empty. Neither reading is about whether the embedding carries information, and on the one
-> amplitude-invariant measure available — spatial organisation — **depth makes no difference across
-> 12 to 45 observations.** No cutoff in that range can be justified from pictures, in either
-> direction, because the pictures do not measure the thing.
-
-## 8. What DOES depend on observation count: a measurable bias
-
-Found while attributing the straight edges of §9, and it is the best-founded depth effect in this
-whole investigation. At an observation-count boundary — same ground, same day, a step in how many
-valid looks each side received — **the embedding steps too**. Measured on three windows, comparing the
-mean 128-dimensional vector of equal strips either side against a control pair of adjacent strips
-wholly on one side:
-
-Swept across all 40 harvested cells (`scripts/seam_drift.py`), **148 seams**, with the seam located
-in the COUNT array rather than in the picture so the selection cannot be made on the outcome:
-
-| observation step | n | across the seam | beside it | ratio |
-|---|---:|---:|---:|---:|
-| 0–1 | 65 | 0.00470 | 0.00298 | 1.6× |
-| 1–2 | 35 | 0.00808 | 0.00337 | 2.4× |
-| 2–4 | 34 | 0.01088 | 0.00246 | **4.4×** |
-| 4–8 | 12 | 0.02481 | 0.00406 | **6.1×** |
-| 8+ | 2 | 0.08461 | 0.00609 | **13.9×** |
-
-**Monotonic over five bins, and 123 of the 148 seams move further across than beside.** An eight-
-observation step displaces the embedding about fourteen times more than neighbouring ground does on
-its own.
-
-The two methods measure against different baselines and that is why their per-observation slopes
-differ — 0.00264 here against 0.00053 for the overlaps. The seam's control is *adjacent ground within
-one scene*, which genuinely varies; the overlap's floor is *the same ground twice*, which does not. The
-overlap figure is therefore the cleaner estimate of the pure depth effect, and the seam figure is the
-one that says how the effect compares with ordinary spatial variation. Both agree on sign and on
-monotonicity, from 229 measurements sharing no code and no data.
-
-Unambiguous in direction: **observation count shifts the embedding
-systematically, as a bias rather than as noise.** That is a far better-founded worry than "thin data
-looks noisy", and it points somewhere uncomfortable for the rule: **a refusal does not remove a
-depth-induced discontinuity, it creates a sharper one** — between refused pixels, which are absent,
-and kept pixels at the cutoff. The measurement worth having is how the embedding drifts with depth
-over the whole range; it is cheap, since every ingredient is already in the store, and nobody has
-taken it.
-
-## 9. The straight-edge artefacts: upstream, not ours
-
-
-
-Raised unprompted by four of six reviewer sessions that had no knowledge of each other, then
-attributed by measurement. Across the 713 notes, **33 mention a straight edge, a seam or an
-axis-aligned artefact**; most are legitimate ground (roads, field boundaries, forestry blocks), but
-roughly a dozen are cases where the reviewer judged the frame's only structure to be an artefact.
-Three carry measurements:
-
-* one seam pinned to a single pixel column in **373 of 512 rows**;
-* one straight to within **0.70 pixels of a fitted line over the full 512-row height**, which nothing
-  on the ground achieves over five kilometres;
-* one where an apparent directional signal **vanished entirely** once a single-pixel vertical seam was
-  masked out, so the seam had produced the whole effect.
-
-One reviewer described a case as "a cluster of axis-aligned rectangular blocks — structure or chunk
-artefact", which is the reading that matters: **axis-aligned means aligned to OUR raster.**
-
-**The attribution, run 2026-08-13 over all 713 windows.** Taking the strongest full-width step in each
-axis profile, **45 windows (6.3%) carry one at eight sigma or more above their own frame's noise**.
-Where they fall settles it:
-
-* **none at our chunk boundary.** A window is 512 pixels starting at a chunk boundary, so ours sits at
-  exactly 256. **Zero of fifty** strong steps land within two pixels of it, and the positions show no
-  periodicity in our chunk grid.
-* **two zones repeat a position across DIFFERENT YEARS** — column 30 four times in 30S over 2022 and
-  2023, row 432 three times in 26S over 2021 and 2022 — so the line is fixed in geography, not in our
-  processing.
-* **the embedding step coincides exactly with a step in the input observation count.** Checked on
-  three windows: embedding column 30 against observation column 30; embedding row 432 against
-  observation row 432, at comparable strength each time.
-
-So these are **Sentinel-2 swath and orbit-overlap boundaries**, which the campaign already knows about
-and ignores at the count level. What is new is that they **propagate into the published embeddings**,
-visibly, in about one window in sixteen. Two consequences: the validator's seam test examines *shard*
-boundaries only and cannot see them, so they will not appear in any verdict; and they are the
-mechanism behind §8.
-
----
+Full working in git history.
 
 ## 10. The measurement that finally isolates depth — zone overlaps, 2026-08-13
 

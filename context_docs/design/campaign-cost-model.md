@@ -701,120 +701,51 @@ historical px/s measurements.
 | **Iowa 14K → campaign — planning basis, SUPERSEDED by §6b** | **13.1K** | **288,900** | **$537,700** |
 | Iowa 13K → campaign | 12.2K | 311,100 | $578,900 |
 
-### 6b. The division re-based on one token unit — 2026-08-07
+### 6b. The division re-based on one token unit — method, superseded numbers
 
-Derived from CloudWatch `CHUNK_SUMMARY` records over a 96-hour window (`/ecs/global-tessera-dev`,
-29,886 successful chunks across 31 streams and 13 zones, 1,633 chunks carrying the radar
-telemetry), through the truncation-bisecting profiler.
+Derived from CloudWatch `CHUNK_SUMMARY` over a 96-hour window (29,886 successful chunks, 31 streams,
+13 zones, 1,633 carrying radar telemetry), through the truncation-bisecting profiler.
 
-The long-form working for this re-basing was a separate document,
-`inference_cost_basis_revision_2026_08.md`, removed 2026-08-17 and recoverable from git
-history. Its method is described above and its two durable findings are carried below and in
-§6c; what it also carried was a headline of **$527,000**, superseded twice since — by the
-sample-weighted $553,000 and then by §6c's land-weighted $573,000. A retired figure that keeps
-its own file and its own headline is one a reader can land on without ever seeing what replaced
-it, which is the whole reason this model has one table rather than three documents.
+**Its numbers are superseded by §6c**, which measured the completed cell §6b asked for. The
+progression is in one table so no reader can land on a retired figure without seeing what replaced it:
 
-**The headline.**
-
-| | rate per actor | campaign depth | px/s | GPU-hours | cost |
+| basis | rate per actor | depth | px/s | GPU-hours | cost |
 |---|---:|---:|---:|---:|---:|
 | prior model | 1.90 M tok/s (optical) | 145 tok/px (censused, combined) | 13,103 | 288,940 | $537,700 |
-| revised central *(partial 37N cell)* | 2.273 M tok/s (combined) | 170 tok/px (measured, combined) | 13,371 | 283,200 | $527,000 |
-| revised low | | | | 242,700 | $452,000 |
-| revised high | | | | 308,200 | $573,000 |
-| 37N completed, radar sample-weighted | 2.127 M tok/s (combined) | 167 tok/px | 12,736 | 297,321 | $553,000 |
-| **current — radar land-weighted (§6c)** | **2.127 M tok/s (combined)** | **173 tok/px (measured, land-weighted)** | **12,294** | **307,854** | **$573,000** |
+| re-based, partial cell | 2.273 M tok/s (combined) | 170 tok/px (measured) | 13,371 | 283,200 | $527,000 |
+| 37N complete, sample-weighted | 2.127 M | 167 | 12,736 | 297,321 | $553,000 |
+| **current — radar land-weighted (§6c)** | **2.127 M tok/s** | **173 tok/px** | **12,294** | **307,854** | **$573,000** |
 
-The convention-free statement, carrying no definitional risk: **74.8 microseconds of busy GPU
-time per valid pixel, land-weighted.** Because the capacity-planning rate moves only −6.2% even
-after the completion, fleet sizing, the 85%-provisioning policy and the work-hours bank are all
-unaffected; only the dollar line and the token census change.
+The convention-free statement, carrying no definitional risk: **74.8 microseconds of busy GPU time
+per valid pixel, land-weighted.** Because the capacity-planning rate moves only −6.2% across the
+whole progression, fleet sizing, the 85%-provisioning policy and the work-hours bank are unaffected
+throughout; only the dollar line and the token census move.
 
-**The rate: 2.273 M combined tok/s per actor**, pooled over 762 both-orbit chunks. Per cell:
-2.499 M (47S/2020), 2.431 M (60N/2020), 2.579 M (37N/2021 at 66–69°), 1.870 M (37N/2021 at
-30–32°). Three of four agree within 6%; the fourth is 30% low and **unexplained** — the strip
-plan, bucket fragmentation and per-chunk overhead are each ruled out by measurement — and it is
-the single measurement to repeat, because the 20–45° span it anchors holds 38% of land.
+**What survives §6b as method, and must not be re-derived:**
 
-> **That repeat was done (§6c).** The fourth cell was a 203-chunk in-flight sample; completed at
-> 4,859 chunks it reads **2.038 M**, so the deficit is ~19% rather than 30% and did not vanish.
-> The pooled rate over all **2,596** both-orbit chunks is **2.127 M**. The per-cell figures above
-> stand as measured; only the fourth row and the pooled value are superseded.
+**The combined unit is right, empirically.** Within each cell the combined rate is the same for
+both-orbit and one-orbit chunks to within 1.01–1.08× while the optical rate over the same chunks
+spreads 1.24–1.35×. A within-run comparison holds geography, day, code and fleet constant, so this is
+the shape of evidence that settled tokens-versus-pixels. **Do not fit separate per-token prices for
+optical and radar** — the two-coefficient regression is not identifiable here: the ratio comes out
+0.26× to 1.42× across cells, changing sign, and the fit's R² of 0.79 looks respectable and is not.
 
-**Why the combined unit is right, empirically.** Within each of the four cells, the combined
-rate is the same for both-orbit and one-orbit chunks to within 1.01–1.08×, while the optical
-rate over the same chunks spreads 1.24–1.35×. A within-run comparison holds geography, day,
-code and fleet constant, so this is the same shape of evidence that settled tokens-versus-
-pixels (tok/s flat to ±1% while px/s varied 2.2×). The radar-free cells corroborate from the
-other end: for them the optical rate *is* the combined rate, and 23N (2.934 M) and 57S
-(2.258 M) bracket the both-orbit combined figures instead of sitting far above them. **Do not
-fit separate per-token prices for optical and radar** — the two-coefficient regression is not
-identifiable here (the ratio comes out 0.26× to 1.42× across cells, changing sign; the fit's
-R² 0.79 looks respectable and is not).
+**Radar depth is NOT a function of latitude and must not be modelled as one.** Across five bands it
+runs 66, 147, 93, 70, 91 — a 2.2× spread with Pearson r = **+0.009** against band midpoint, where
+optical depth over the same bands gives **+0.912**. The variation is regional: the deepest radar
+measured anywhere is 30–32°N and the shallowest the Arctic, which points at the Sentinel-1
+observation plan rather than geometry. Radar's *share* of a sequence does fall with latitude, but
+that is the optical denominator rising. The defensible form is a constant with a stated spread —
+**90 tokens/px, range 66–147** — no curve, no extrapolation.
 
-**The depth: 170 combined tokens per pixel = 103.1 optical + 66.5 radar.**
-
-- *Optical, measured:* land-weighted 103.1 over 22,343 chunks with every one of the 17
-  populated 5° bands carrying data — rising monotonically 74.0 (0–5°) to 175.5 (80–85°) with
-  no reversal. This supersedes the profile's central 106 (interval 75–139 on 2,779 chunks) and
-  retires "about 26% of land is effectively unmeasured".
-- *Radar, composed:* `0.55 dual × 90 + 0.38 single × 0.48 × 90 + 0.068 radar-free × 8 = 66.5`,
-  using this section's own composition census (dual/single/free per pixel-year over nine
-  years), the measured pooled both-orbit radar depth of **90 tokens/px**, the measured
-  one-orbit ratio of **0.48** of dual (0.39–0.58 over four cells), and the radar-free floor of
-  8 tokens/px, which is a code fact — the smallest S1 bucket, handed an all-zeros slice.
-
-**Radar depth is NOT a function of latitude, and must not be modelled as one.** Across five
-measured bands radar depth runs 66, 147, 93, 70, 91 — a 2.2× spread with Pearson r = **+0.009**
-against band midpoint, where optical depth over the same bands gives r = **+0.912**. The
-variation is **regional**: the deepest radar measured anywhere is 30–32°N in zone 37N (Israel,
-Jordan, north-west Saudi Arabia) and the shallowest the Arctic — which points at the Sentinel-1
-observation plan, not geometry. Radar's *share* of a sequence does fall with latitude (48% at
-the equator to 34–37% above 60°), but that is the optical denominator rising, not the radar
-numerator falling. The defensible form is a constant with a stated spread — 90 tokens/px,
-range 66–147 — no curve, no extrapolation.
-
-**Three conventions of "observations per pixel", and only one pairing is self-consistent.**
-The census counts distinct acquisition dates × clear fraction; the chunk-array depth
-(`t_kept + t_s1_asc + t_s1_desc`) counts a date if *any* pixel in the chunk kept it; the model
-processes each pixel's own count rounded up to a multiple of 8. Chunk-array depth is an upper
-bound on the third, so `depth × valid_px` overstates true tokens — and that overstatement
-**cancels exactly when numerator and denominator are both chunk-array**, which is the case for
-measured-depth ÷ measured-rate and for nothing else. That is why the revised depth is 167
-rather than 145: most of the difference is convention, not disagreement. Pairing the census's
-145 with the measured combined rate would be a new mismatch of the same kind, one level down.
-(This is
-also why 60N's optical `t_kept` landing on exactly 145 is demonstrably a coincidence: its
-*combined* depth is 210, its band's census total 208.)
-
-**The interval, $452,000 – $573,000, and what sets its width.** *(Superseded by §6c: the
-interval is now $472,000 – $713,000 and the ORDER of the drivers has reversed. The reasoning
-below stands and is why — read it before §6c's table.)* The bounds are coherent
-constructions, not products of independent extremes — the 30–32°N band supplies both the
-deepest radar and the slowest rate *from the same 163 chunks*, and multiplying "max radar" by
-"worst rate" double-counts one observation. Largest drivers, in order: the unexplained
-37N/30–32° cell (alone the difference between $483,000 and $796,000 when each cell prices the
-campaign by itself); the radar level's thin support (five band-observations; radar 66 gives
-$471,000 and 147 gives $655,000 at the central rate); the 45–60° bands resting on 19 chunks;
-and optical depth, now the *best*-measured term (its p25–p75 moves the line ±9%).
-
-**Cross-checks.** An independent route — measured both-orbit $/chunk by band, using neither
-the census nor the rate — lands 1.13× above the central model on the same bands, which is the
-right sign and size for a both-orbit-only column against a composition-weighted model. The
-pixel census is about 1.6% optimistic (tile-weighted valid-pixel yield 0.984 over 13 cells);
-not applied. A duplicate fill of 60N against one mosaic put the run-to-run noise floor at
-**0.3%** — treat any effect under ~1% as noise.
-
-**Open, and named as open:** the 37N/30–32° rate deficit is unexplained; **no both-orbit rate
-has been measured at campaign fleet width** — the four cells ran at 20–95 actors against a
-planned 250 per cluster, with no actor-count trend among them but no measurement either; and
-the convention cancellation above is exact only if the overstatement factor matches between
-corpus and rate cells (any residual pushes the line *down*). The highest-value next
-measurement is completing 37N/2021 — or any 20–40°N zone — under the radar telemetry; another
-high-latitude cell would add nothing (60–85° rests on 5,975 chunks across seven zones).
-
-**That measurement was taken the same day. See §6c, which supersedes the interval above.**
+**Three conventions of "observations per pixel", and only one pairing is self-consistent.** The
+census counts distinct acquisition dates × clear fraction; the chunk-array depth counts a date if
+*any* pixel in the chunk kept it; the model processes each pixel's own count rounded up to a multiple
+of 8. Chunk-array depth is an upper bound on the third, so `depth × valid_px` overstates true tokens
+— and that overstatement **cancels exactly when numerator and denominator are both chunk-array**,
+which is measured-depth ÷ measured-rate and nothing else. That is why the revised depth is 167 rather
+than 145: most of the difference is convention, not disagreement. Pairing the census's 145 with the
+measured combined rate would be a new mismatch of the same kind, one level down.
 
 ### 6c. 37N/2021 completed — the measurement §6b asked for, taken 2026-08-07
 
@@ -1046,71 +977,30 @@ will want when they plan for it.
 
 ## 8. Scenario summary
 
-Ingest at its cost midpoint; inference at the **measured combined basis of §6b** (re-based
-2026-08-07 — the inference row read $537,700 on the borrowed 13.1K anchor until then), v1.1,
-with the fleet provisioned at 85% of matched so idle burn is zero (§5).
+The campaign runs **all years in one batch**: 61 cells at 60 workers, 10 clusters of 250 actors.
+Ingest at its cost midpoint, inference at §6c's measured combined basis, fleet provisioned at 85% of
+matched so idle burn is zero (§5).
 
-**The first three columns are YEAR-SERIAL** and are kept for the ingest-width comparison only.
-The campaign runs the last column: all years in one batch, which is what changes the fleet, the
-cluster count and the wall clock.
+| | **THE CAMPAIGN** |
+|---|---|
+| Fargate vCPU | 22,692 |
+| GPU fleet | 2,500 — the quota |
+| clusters × actors | 10 × 250 |
+| Ingest | $121,000 |
+| Inference (§6c) | $573,000 |
+| Assembly + S3 + mosaics | $5,900 |
+| Cluster ramp | ~$1,200 — 10 boots, not 90 |
+| **Total** | **~$700,000** |
+| Ingest wall clock (9 yr) | 4.2 d |
+| **Campaign wall clock** | **~5.1 d** |
+| Idle burn | $0 |
 
-| | 40 × 50w<br>shipped | 45 × 50w<br>the knee | 45 × 60w | **THE CAMPAIGN**<br>61 cells × 60w, all years |
-|---|---|---|---|---|
-| Fargate vCPU | 12,640 | 14,220 | 16,740 | **22,692** |
-| GPU fleet | 1,416 | 1,576 | 1,824 | **2,500 — the quota** |
-| — clusters × actors | 8 × 177 | 8 × 197 | 8 × 228 | **10 × 250** |
-| Ingest | $121,000 | $121,000 | $121,000 | **$121,000** |
-| Inference (§6c) | $573,000 | $573,000 | $573,000 | **$573,000** |
-| Assembly + S3 + mosaics | $5,900 | $5,900 | $5,900 | **$5,900** |
-| Cluster ramp | ~$7,000 | ~$8,000 | ~$9,000 | **~$1,200 — 10 boots, not 90** |
-| **Total** | ~$706,000 | ~$707,000 | ~$708,000 | **~$700,000** |
-| Ingest wall clock (9 yr) | 7.2 d | 6.5 d | 5.6 d | **4.2 d** |
-| **Campaign wall clock** | ~8.7 d | ~7.8 d | ~6.8 d | **~5.1 d** |
-| Idle burn | $0 | $0 | $0 | **$0** |
-
-> **The 72-boot ramp line is a cost of the YEAR BARRIER, and it is now optional.** Clusters
-> are dispatched per year, so 8 clusters x 9 years is 72 `ray up` cycles plus 72 model-load
-> cold starts. With `overlap_years` (shipped 2026-07-30, default off — see
-> `campaign-plan.md` §1) a cluster works a multi-year list, so the campaign pays **8
-> boots**, taking this line from about $9,000 to roughly $1,000. That is a small number
-> against the total and is NOT the reason to drop the barrier — the schedule is (§"Which
-> quota actually binds") — but it is the one line item that moves, so it belongs here rather
-> than being discovered later.
->
-> **The ramp is now measured, and it is a real term in any restart calculus (2026-08-07).**
-> At 160 requested actors the fleet stood at **60 after 25 minutes and 151 after 60**
-> (`assembly-dense-37N-2021-w160`). So widening a running fleet by cancel-and-redispatch pays
-> a fresh `ray up` plus per-worker bringup and model load, and the saving from the wider fleet
-> is the naive ratio MINUS that ramp — compute it before killing a run to resize it. This is
-> also the standing argument for the chained-cluster strategy, which amortises one `ray up`
-> across a year's zones.
-
-**Every column costs the same to within 0.5%.** Inference is the same pixels at the same
-rate in all four; ingest worker-hours are width-neutral; and the fleet policy removes idle
-burn everywhere. The entire decision is wall clock, bought with Fargate quota.
-
-**The campaign runs 61 cells at 60 workers, provisioning 2,500 actors as 10 clusters of 250**
-(§10 item 3). That is the widest shape whose ingest width stays inside the range the width model
-was fitted over and whose matched fleet still fits under the 2,500-actor GPU quota. Under the year
-barrier — the constraint `overlap_years` removed — the same reasoning gave **45 cells at 60
-workers** and about 2,100 actors; that shape is the year-serial fallback, and it needs *less*
-Fargate quota than the 71-cell plan an earlier version recommended (16,740 against 22,436) while
-finishing nearly two days sooner.
-
-**80 workers is viable at the measured rate** — 2,267 provisioned against a 2,500 quota —
-and buys another 1.3 days for 5,400 more vCPU. It stays a target rather than a recommendation
-only because the width model is extrapolated there (§4).
-
-At the measured interval's low bound subtract **$75,000** from every column; at its high add
-**$46,000** (§6b — the interval is set by the unexplained 37N/30–32° cell and the radar
-depth's thin support, not by the rate).
-
-**One consequence for the deadline.** All years must be validated by **2026-09-11**. Every
-column is 5.5 to 8.7 days of campaign wall clock, so compute is not what threatens that
-date. The schedule risk lives in the preflight gates (§10), the Fargate quota lead time, and
-the nine year-barriers at which one stalled zone holds up everything behind it.
-
----
+**Three year-serial variants stood beside this** (40×50w shipped, 45×50w at the knee, 45×60w) and are
+cut: they cost within $2,000 of each other and of the campaign, so the comparison only ever showed
+that **ingest width barely moves the bill** — which §4 establishes directly. What the year barrier
+*did* cost was the ramp: 8 clusters × 9 years is 72 `ray up` cycles plus 72 model loads, against 10.
+Dropping the barrier is worth ~$6,000 and about 3.6 days of wall clock, and that is the whole content
+of the comparison.
 
 ## 9. Assumptions and uncertainties, largest first
 
