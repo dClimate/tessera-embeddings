@@ -260,12 +260,21 @@ below.
 > computed over EMBEDDED pixels only and so can never count the ones the gate removed. A
 > self-fulfilling measurement.
 >
-> **Still open, and deliberately not changed here:** the ZONE-level gate. `require_s1` defaults True
-> and refuses a fill that finds no SAR stores at all, which is what stopped 28S/2022 until it was
-> dispatched by hand. A zone with no radar in principle is real geography — the 2026-08-06 audit has
-> 28S at zero VV in all nine years — so that default now contradicts the decision above for a
-> handful of zones. It is a separate call because relaxing it also removes a genuine
-> ingest-bug detector; the audit's per-zone verdicts are what a targeted relaxation would key on.
+> **CORRECTION to the paragraph this replaces, which claimed the zone-level gate "still refuses a
+> fill that finds no radar at all" and called it an open decision. It does not, and it was not.** The
+> campaign driver passes `require_s1=False` to every child at both dispatch sites, and
+> `fill-zones-sequential` defaults to it — with comments giving the reason: "a global campaign is the
+> opposite case — parts of the globe have no dual-pol coverage at all, and refusing them fails those
+> cells on every retry forever." A GLOBAL run has never demanded radar. Refusing on absent radar is
+> an option, off by default for global runs, exactly as planned.
+>
+> What actually refused 28S/2022 was a HAND dispatch of the single-cell flow, whose own default is
+> True by design — an operator naming one zone-year over terrain that should be imaged wants to be
+> told its radar is missing rather than handed optical-only embeddings quietly. That default is right
+> for the library and wrong for the deployment, because the deployment is a global one: the same cell
+> behaved differently by hand than by driver, which is what cost the time. `CAMPAIGN_REQUIRE_S1 =
+> False` is now registered on both global fill deployments so the two agree; the library default is
+> untouched, so a non-global caller still demands radar unless it says otherwise.
 
 > **The first cell published twelve empty planes, and every other array beside them was right
 > (2026-08-18).** 09S/2022 landed in `tessera-months`, validated, and reported 51 observations per
