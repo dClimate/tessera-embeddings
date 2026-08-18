@@ -279,7 +279,7 @@ posted.
 | **a provenance field absent on an older cell** | the fill predates the field. An attrs patch at the end, if it matters at all |
 | **a check reporting UNAVAILABLE** | the check could not be evaluated — which is not the same as the check failing. It fires when something the comparison needs is *absent* rather than wrong: most often a recorded figure the cell's fill never wrote, because that fill predates the field the check reads. The absence is in the RECORD, not in the pixels, and grading it either way asserts something untrue — "pass" hides a comparison that never happened, "fail" reports a store's age as a data fault. This is not hypothetical: an earlier version turned a missing recorded value into `NaN`, compared it, and reported the *record* as wrong on a healthy cell |
 
-#### OPEN — the 5xx arm of `orchestrator load` fires on n=1 (2026-08-17)
+#### CLOSED 2026-08-18 — the 5xx arm of `orchestrator load` fired on n=1 (found 2026-08-17)
 
 Round 1398 of the `tessera-min15` rehearsal graded the campaign **DEGRADED** on this evidence:
 
@@ -300,6 +300,20 @@ same detail line are the evidence that one 5xx means nothing.
 **Deliberately not changed while the rehearsal was in flight**, because `campaign-watch` pulls its
 image at each round launch: fixing it mid-run would have split the observation across two versions of
 the detector and made the message-volume count meaningless.
+
+**Fixed as asked — a share with a floor, not truthiness.** Server errors are now graded as a share of
+requests, and only once the window holds enough requests for a share to mean anything; below that the
+count is reported and not graded. The share is the scale-free quantity, which matters here because
+every Dask worker is an API client, so request volume grows with fleet width and a harmless baseline
+produces a large count at scale.
+
+**The same defect was sitting in two arms beside it, and that is the part worth carrying forward.**
+The *latency* arm graded a mean over the newest five-minute bin with no denominator at all, so one
+slow response in a quiet bin warned that an idle server was overloading. The *throttle* arm graded
+any non-zero count of our own rate-limited requests, so a single throttle the SDK had already retried
+away read as a binding quota. Both now carry a floor. **The lesson generalises past this check: a
+count or a mean without its denominator is not a finding, and fixing one arm does not fix its
+siblings.**
 
 ---
 
