@@ -1189,6 +1189,10 @@ async def run_global_campaign(
                 )
                 # Each cluster's own cells: every (zone, year) pair whose zone it owns.
                 cells_for = {id(cl): [[z, y] for z, y in batch_cells if z in set(cl)] for cl in clusters}
+                # The same partition, keyed by year, kept here rather than re-derived from
+                # `cells_for` because that one is JSON-shaped for the deployment parameters
+                # (lists, not tuples) and has lost the year's type by the time it is read.
+                years_for = {id(cl): sorted({y for z, y in batch_cells if z in set(cl)}) for cl in clusters}
                 log.info(
                     "Year(s) %s: dispatching %d chained fill(s) for %d zone(s), %d cell(s): %s",
                     batch_years,
@@ -1334,9 +1338,13 @@ async def run_global_campaign(
                         round_failures.append(str(exc))
                         continue
                     round_runs.append(str(r.id))
-                    # A chained cluster genuinely spans the batch's years, so unlike the
-                    # per-cell path below its run belongs to all of them.
-                    for y in batch_years:
+                    # Credited to the years this cluster ACTUALLY owns, not to the batch.
+                    # A fresh campaign gives every cluster every year, which is what made
+                    # `for y in batch_years` look right; a RESUMED one partitions over what
+                    # is still missing, so a cluster can hold zones that are each short a
+                    # different single year. Crediting the batch then claimed years the run
+                    # never touched and inflated `dispatched`, which sums these lists.
+                    for y in years_for[id(cl)]:
                         runs_this_round_by_year.setdefault(y, []).append(str(r.id))
                 log.info(
                     "Year(s) %s: %d/%d chained fill(s) landed",

@@ -369,6 +369,40 @@ def check_root_identity(
         )
 
 
+def stamp_root_identity(
+    repo: icechunk.Repository,
+    *,
+    layout: StoreLayout = GLOBAL,
+    model_version: str | None = None,
+    optical_min_obs: int | None = None,
+    commit_msg: str | None = None,
+) -> str | None:
+    """Stamp the write-once root identity on a store that carries none.
+
+    Returns the commit snapshot, or ``None`` when the root is already stamped (that case
+    is :func:`check_root_identity`'s, not this one's — a stamped root that DISAGREES is a
+    refusal, and re-stamping is exactly what write-once forbids).
+
+    Exists because "already stamped" and "seeding created no groups" are different
+    questions and a store can answer no to both: one seeded before the root carried an
+    identity at all. :func:`seed_zone_groups` stamps as a side effect of creating groups,
+    so a store with all 120 already present never reached that line, and the flow reported
+    a clean seed having recorded neither the checkpoint nor the depth rule the operator
+    asked for — after which the fill-side gates, which pass on an ABSENT attr, would let
+    anything write.
+
+    The caller must establish that no year has landed yet. Stamping a rule onto a store
+    that already holds data would publish a claim about how those pixels were filtered
+    when nothing here can know that, which is worse than the missing attr it fixes.
+    """
+    session = repo.writable_session("main")
+    root = zarr.open_group(session.store, mode="a")
+    if "geoemb:model" in root.attrs:
+        return None
+    root.attrs.update(_root_attrs(layout, model_version, optical_min_obs))
+    return session.commit(commit_msg or "stamp root identity on an already-seeded store")
+
+
 def seed_zone_groups(
     repo: icechunk.Repository,
     specs: Iterable[ZoneSpec],

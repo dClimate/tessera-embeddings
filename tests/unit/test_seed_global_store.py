@@ -122,6 +122,66 @@ def test_an_explicit_minimum_depth_rule_reaches_the_seeder(monkeypatch):
     assert captured["optical_min_obs"] == 25
 
 
+def _fully_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int):
+    """Wire the every-zone-exists path with a given root and a given amount of landed data."""
+    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-seed"))
+
+    class _Root:
+        def __init__(self) -> None:
+            self.attrs = root_attrs
+
+        def __getitem__(self, _name):  # the year-axis probe reads one seeded group
+            return self
+
+    monkeypatch.setattr(
+        mod,
+        "open_global_repo",
+        lambda *a, **k: type("R", (), {"readonly_session": lambda s, branch: type("S", (), {"store": object()})()})(),
+    )
+    monkeypatch.setattr(
+        mod,
+        "campaign_status",
+        lambda repo, years: type("St", (), {"zones": list(mod.ZONES), "zone_years_done": cells_landed})(),
+    )
+    monkeypatch.setattr(mod.zarr, "open_group", lambda *a, **k: _Root())
+    monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
+    monkeypatch.setattr(mod, "year_of", lambda t: t)
+    monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)
+
+
+def test_an_unstamped_but_empty_store_gets_its_identity_written(monkeypatch):
+    """Seeding a store that predates the root identity must RECORD what was asked for.
+
+    `seed_zone_groups` stamps as a side effect of creating groups, so a store whose 120
+    groups already exist never reaches that line. The flow reported a clean seed having
+    written neither the checkpoint nor the depth rule — and the fill gates pass on an
+    ABSENT attr, so the store would then accept anything.
+    """
+    _fully_seeded(monkeypatch, {}, cells_landed=0)
+    stamped: dict = {}
+    monkeypatch.setattr(
+        mod,
+        "stamp_root_identity",
+        lambda repo, **kw: stamped.update(kw) or "SNAP1",
+    )
+    out = mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
+    assert stamped["optical_min_obs"] == 15
+    assert out["seeded_now"] == 0, "nothing is created — only the identity is written"
+
+
+def test_an_unstamped_store_holding_data_is_refused_rather_than_stamped(monkeypatch):
+    """The stamp is write-once and every later fill reads it, so it must not be a guess.
+
+    Nothing here can know which encoder or depth rule already-landed cells were filtered
+    under, and claiming one would be a false provenance record — worse than the missing
+    attr it fixes. So this raises instead of stamping.
+    """
+    _fully_seeded(monkeypatch, {}, cells_landed=7)
+    monkeypatch.setattr(mod, "stamp_root_identity", lambda *a, **k: pytest.fail("must not stamp over existing data"))
+    with pytest.raises(ValueError, match="no root identity"):
+        mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
+
+
 def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch):
     """The every-zone-exists path returns before seed_zone_groups, which is the only place
     the write-once root identity is compared.
@@ -148,7 +208,9 @@ def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch
 
     monkeypatch.setattr(mod, "open_global_repo", lambda *a, **k: _Repo())
     # Every zone already present → todo is empty → the early return.
-    monkeypatch.setattr(mod, "campaign_status", lambda repo, years: type("St", (), {"zones": list(mod.ZONES)})())
+    monkeypatch.setattr(
+        mod, "campaign_status", lambda repo, years: type("St", (), {"zones": list(mod.ZONES), "zone_years_done": 0})()
+    )
     monkeypatch.setattr(mod.zarr, "open_group", lambda *a, **k: _Root())
     # The year-axis guard runs first and must pass, so the identity check is what raises.
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))

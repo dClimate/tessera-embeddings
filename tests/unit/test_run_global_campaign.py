@@ -1281,6 +1281,33 @@ def test_overlap_years_keeps_every_year_of_a_zone_in_one_cluster(wired, monkeypa
         assert all(yrs == {2025, 2024, 2023} for yrs in by_zone.values()), by_zone
 
 
+def test_a_resumed_cluster_is_credited_only_with_the_years_it_owns(wired, monkeypatch):
+    """Attribution follows the PARTITION, not the batch.
+
+    A fresh campaign hands every cluster every year, which is what made crediting
+    `batch_years` look right. A RESUMED one partitions over what is still missing, so a
+    cluster can hold zones each short a DIFFERENT single year — here 01N wants only 2024
+    and 02N only 2025, one zone per cluster. Crediting the batch gave each run both years:
+    `dispatched` came out 4 for 2 runs, and each year claimed a run that never touched it.
+    """
+    status = SimpleNamespace(zones=dict.fromkeys(["01N", "02N"], ()), has=lambda z, y: False, years=(2025, 2024))
+    monkeypatch.setattr(mod, "campaign_status", lambda *a, **k: status)
+    monkeypatch.setattr(mod, "campaign_work_list", _shrinking([("01N", 2024), ("02N", 2025)], wired))
+    monkeypatch.setattr(mod, "zone_work_weight", lambda mask, zone, **k: 100.0)
+    summary = asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS,
+            ami_ssm_name="ami",
+            fill_strategy="chained-clusters",
+            max_parallel_clusters=2,
+            overlap_years=True,
+        )
+    )
+    # Two clusters, one cell each, so exactly two runs — not two runs counted twice.
+    assert summary["dispatched"] == 2, summary["runs_by_year"]
+    assert {y: len(runs) for y, runs in summary["runs_by_year"].items()} == {2024: 1, 2025: 1}
+
+
 def test_a_failing_year_does_not_block_its_zones_later_years(wired, monkeypatch):
     """A repeatable failure that belongs to ONE year must not take the zone's others down.
 

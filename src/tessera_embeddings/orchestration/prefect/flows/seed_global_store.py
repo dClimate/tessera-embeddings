@@ -28,6 +28,7 @@ from tessera_embeddings.storage.global_store import (
     create_global_repo,
     open_global_repo,
     seed_zone_groups,
+    stamp_root_identity,
 )
 from tessera_embeddings.storage.zarr_store import is_missing_repo, read_time_values
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES, year_of
@@ -90,6 +91,7 @@ def seed_global_store(
         log.info("Creating global store %s", store_path)
         repo = create_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
         seeded = set()
+        cells_landed = 0
     except icechunk.IcechunkError as exc:
         # Only a genuinely-missing repo means "create it". Auth/throttle/timeout/
         # corruption errors must NOT fall into the create path (it would fail against
@@ -108,10 +110,16 @@ def seed_global_store(
         # retry seeds the store (the flow's advertised idempotency) instead of
         # propagating and wedging every retry on the half-created repo.
         try:
-            seeded = set(campaign_status(repo, years=years).zones)
+            status = campaign_status(repo, years=years)
         except zarr.errors.GroupNotFoundError:
             log.info("Store %s exists but has no root group yet — treating as unseeded", store_path)
             seeded = set()
+            cells_landed = 0
+        else:
+            # Kept whole, not reduced to its zone names: the every-zone-exists path below
+            # needs to know whether any CELL has landed before it may stamp an identity.
+            seeded = set(status.zones)
+            cells_landed = status.zone_years_done
 
     # A retry after a partial seed must use the SAME year axis as the groups already
     # landed — the axis is fixed at seeding (ADR-008 D1), so seeding the remainder
@@ -137,6 +145,30 @@ def seed_global_store(
         # GLOBAL is what the seed below uses (seed_zone_groups' default), so the identity
         # compared here is the identity that a seed would have written.
         check_root_identity(root_attrs, layout=GLOBAL, model_version=model_version, optical_min_obs=optical_min_obs)
+        if "geoemb:model" not in root_attrs:
+            # UNSTAMPED, and no group is created here to stamp it as a side effect. Seeding a
+            # store predating the root identity used to report success having written neither
+            # the checkpoint nor the depth rule asked for — and the fill gates pass on an
+            # ABSENT attr (`if seeded is not None`, `optical_min_obs` compared to None), so the
+            # store would then accept anything while the operator had been told it was seeded.
+            if cells_landed:
+                raise ValueError(
+                    f"Store {store_path} has all {len(ZONES)} zone groups and {cells_landed} landed "
+                    f"cell(s) but no root identity. Refusing to stamp one: this cannot know which "
+                    f"encoder or minimum-depth rule those cells were filled under, and the stamp is "
+                    f"write-once and read by every later fill. Verify the existing data's provenance "
+                    f"and stamp it deliberately, or fill a freshly seeded store."
+                )
+            snapshot = stamp_root_identity(
+                repo, layout=GLOBAL, model_version=model_version, optical_min_obs=optical_min_obs
+            )
+            log.info(
+                "Store %s was seeded without a root identity and holds no data — stamped it (%s); "
+                "minimum optical depth %s",
+                store_path,
+                snapshot,
+                optical_min_obs if optical_min_obs is not None else "no rule",
+            )
         log.info("All %d zone groups already seeded in %s", len(ZONES), store_path)
         return {"store_path": store_path, "seeded_now": 0, "already_seeded": len(seeded), "total": len(ZONES)}
 
