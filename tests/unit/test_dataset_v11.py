@@ -217,7 +217,8 @@ class TestTheMinimumOpticalDepthGate:
 
     def test_the_boundary_keeps_the_line_and_refuses_below_it(self):
         """29 out at a line of 30, 30 in. An off-by-one here silently changes what a petabyte
-        contains, and the plan states the arithmetic once, as at-least."""
+        contains, and the plan states the arithmetic once, as at-least.
+        """
         ds = MosaicChunkInferenceDataset(self._chunk(np.array([[29, 30]])), allow_s2_only=True, optical_min_obs=30)
         assert len(ds) == 1
         assert ds.refused_thin == 1
@@ -230,7 +231,8 @@ class TestTheMinimumOpticalDepthGate:
 
     def test_the_off_state_is_identical_to_no_gate_at_all(self):
         """What protects every non-campaign caller: None must select exactly the pixels the
-        historical code selected, not almost those."""
+        historical code selected, not almost those.
+        """
         chunk = self._chunk(np.array([[1, 14, 15, 400]]))
         without = MosaicChunkInferenceDataset(chunk, allow_s2_only=True)
         explicit = MosaicChunkInferenceDataset(chunk, allow_s2_only=True, optical_min_obs=None)
@@ -238,14 +240,16 @@ class TestTheMinimumOpticalDepthGate:
 
     def test_zero_is_refused_rather_than_treated_as_off(self):
         """Zero refuses nothing while presenting as a configured rule, so a campaign whose value
-        resolved to zero would publish under no rule while believing it had one."""
+        resolved to zero would publish under no rule while believing it had one.
+        """
         with pytest.raises(ValueError, match="refuses nothing"):
             MosaicChunkInferenceDataset(self._chunk(np.array([[10]])), optical_min_obs=0)
 
     def test_the_two_optical_reasons_partition_rather_than_overlap(self):
         """No optical input at all is a fact about the imagery; too little of it is this
         campaign's quality rule. Counting the first in both would overrun the shard's eligible
-        total, and the per-shard record's invariant is that the parts sum to it."""
+        total, and the per-shard record's invariant is that the parts sum to it.
+        """
         chunk = self._chunk(np.array([[0, 0, 5, 40]]))
         chunk.s2_bands[:, 0, 0:2, :] = 0  # no reflectance where the count is zero
         ds = MosaicChunkInferenceDataset(chunk, allow_s2_only=True, optical_min_obs=30)

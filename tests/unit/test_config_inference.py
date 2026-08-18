@@ -136,7 +136,8 @@ def test_the_newest_field_is_the_last_field() -> None:
 def test_the_minimum_depth_rule_defaults_to_no_rule() -> None:
     """None, not zero, and not the module constant. A config that inherited a refusal line from
     whatever the module happened to hold would publish under a rule nobody chose, and zero would
-    read as a configured rule that refuses nothing."""
+    read as a configured rule that refuses nothing.
+    """
     assert _minimal_config().optical_min_obs is None
     assert _minimal_config(optical_min_obs=25).optical_min_obs == 25
 

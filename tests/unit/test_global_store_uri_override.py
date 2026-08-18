@@ -102,7 +102,8 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
 
     def test_an_overridden_store_takes_its_registry_with_it(self):
         """The two prefixes named in the Open Data access request, and the reason they are two:
-        Icechunk owns every key under its own prefix, so the registry cannot live inside it."""
+        Icechunk owns every key under its own prefix, so the registry cannot live inside it.
+        """
         paths = BucketPaths(
             inputs="s3://in",
             outputs="s3://out",
@@ -112,7 +113,8 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
 
     def test_the_registry_is_never_inside_the_store(self):
         """Icechunk's garbage collection enumerates its own prefix and reconciles it against its
-        manifests, so a parquet in there is at best unrecognised and at worst collected."""
+        manifests, so a parquet in there is at best unrecognised and at worst collected.
+        """
         for paths in (
             BucketPaths(inputs="s3://in", outputs="s3://out"),
             BucketPaths(inputs="s3://in", outputs="s3://out", global_store_uri="s3://pub/v1/x.icechunk"),

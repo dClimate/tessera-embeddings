@@ -8,7 +8,6 @@ mosaic fails BEFORE a cluster is provisioned.
 from __future__ import annotations
 
 import dataclasses
-
 import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -365,7 +364,8 @@ class TestTheMinimumDepthRuleComesFromTheStore:
 
     def test_the_flow_takes_no_minimum_depth_parameter(self):
         """The structural half of the guarantee: there is no dispatch parameter to disagree with
-        the store, so the two cannot diverge."""
+        the store, so the two cannot diverge.
+        """
         import inspect
 
         flow = getattr(mod.fill_zone_year, "fn", mod.fill_zone_year)
@@ -375,7 +375,8 @@ class TestTheMinimumDepthRuleComesFromTheStore:
     def test_the_reader_returns_none_for_a_store_that_declares_no_rule(self, monkeypatch):
         """Every store seeded before 2026-08-13 declares none, and those stores already contain
         everything with any optical input — applying a line retrospectively would claim their
-        existing zones were filled under one that never touched them."""
+        existing zones were filled under one that never touched them.
+        """
         monkeypatch.setattr(mod, "open_store_as_zarr_group", lambda *a, **k: SimpleNamespace(attrs={}))
         assert mod._optical_min_obs_from_store("s3://x", get_credentials=None) is None
 

@@ -166,7 +166,7 @@ def test_an_ordinary_failure_still_cleans_up(tmp_path, monkeypatch):
 
 
 def test_an_unanswered_emptiness_probe_never_deletes(tmp_path, monkeypatch):
-    """ "Could not tell" is not "safe to delete".
+    """A probe that could not tell is not a probe that said "safe to delete".
 
     `_write_new`'s probe reads the network, so a transient failure — or a decode error
     while inspecting a repo another writer is creating — is ordinary. Reaching
