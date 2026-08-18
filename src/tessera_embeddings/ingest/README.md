@@ -161,7 +161,7 @@ deadline plus one final attempt. And failing the cell this way is not surrender:
 returns to the campaign's work list, and a later dispatch RESUMES from the dates already
 committed (Icechunk commits a date's time slot atomically with its pixels), so the bound
 costs latency, never work. The default's derivation against measured leg durations is in
-`context_docs/design/catalogue_refusal_classification_2026_08.md`.
+`context_docs/design/ingest_read_failure_causes_2026_08.md` (cause 3).
 
 `source_coverage.py`'s preflight probe deliberately does **not** use any of this. Every
 failure of that probe is already INCONCLUSIVE by design, which is the right answer for both

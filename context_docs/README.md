@@ -50,8 +50,7 @@ context_docs/
     │  INGEST
     ├── ingest_optimization_campaign_2026_07.md   every ingest measurement
     ├── ingest_concurrency_investigation_2026_08.md
-    ├── ingest_read_failure_causes_2026_08.md     the two WarpOperationError causes
-    ├── catalogue_refusal_classification_2026_08.md
+    ├── ingest_read_failure_causes_2026_08.md     three source-read failure causes, and the retry budget they share
     ├── ingest-live-tile-cropping.md              + appendix A, the multi-write-per-commit test
     ├── ingest-graph-and-stac-budget.md
     ├── region-writes.md
