@@ -1281,6 +1281,42 @@ def test_overlap_years_keeps_every_year_of_a_zone_in_one_cluster(wired, monkeypa
         assert all(yrs == {2025, 2024, 2023} for yrs in by_zone.values()), by_zone
 
 
+def test_a_failing_year_does_not_block_its_zones_later_years(wired, monkeypatch):
+    """A repeatable failure that belongs to ONE year must not take the zone's others down.
+
+    The per-cell path used to copy the first failing year's exception into every later
+    year of that zone WITHOUT dispatching it. Years come out oldest-first and every
+    retry rebuilds the list the same way, so a deterministic 2024 failure — a coverage
+    gate is evaluated per zone-year — meant 2025 was never attempted on any round, and
+    was then reported unfilled having never been tried.
+
+    2024 fails here on every attempt; 2025 must still be dispatched and must still land.
+    """
+    _multi_year(monkeypatch, ["01N"], [2024, 2025], wired)
+
+    async def arun(dep, parameters=None, tags=None):
+        wired["arun"].append((dep, parameters))
+        if "fill-zone-year" in dep and (parameters or {}).get("year") == 2024:
+            raise RuntimeError("2024 coverage gate — deterministic")
+        wired["land"](parameters)
+        return _completed_run()
+
+    monkeypatch.setattr(mod, "arun_deployment", arun)
+    asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS,
+            ami_ssm_name="ami",
+            fill_strategy="cluster-per-zone",
+            overlap_years=True,
+            max_dispatch_rounds=1,
+        )
+    )
+    filled = {p["year"] for d, p in wired["arun"] if "fill-zone-year" in d}
+    assert 2024 in filled, "the failing year should still have been attempted"
+    assert 2025 in filled, "2025 was never dispatched — the failing year blocked it"
+    assert ("01N", 2025) in wired["landed"], "2025 was dispatched but did not land"
+
+
 def test_overlap_years_still_reports_unfilled_cells_per_year(wired, monkeypatch):
     """The failure report stays YEAR-keyed, so an operator reads it the same way.
 

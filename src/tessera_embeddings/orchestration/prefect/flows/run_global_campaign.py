@@ -1348,11 +1348,15 @@ async def run_global_campaign(
                 log.info("Year(s) %s: dispatching %d zone fill(s)", batch_years, len(batch_cells))
 
                 # Different zones are different store groups, so they fill concurrently.
-                # A zone's OWN years do not: they write the same group, and this used to
-                # rely on the outer loop being one-year-per-round to keep them apart —
-                # which `overlap_years` removed, putting every year of every zone into one
-                # batch and dispatching them all here at once. So the serialisation is
-                # done explicitly now rather than inherited from the loop shape.
+                # A zone's own years are dispatched one at a time here — but NOT because the
+                # store requires it. `write_year_shards` relaxed that on 2026-07-30 (d1a379c):
+                # every chunk and shard is 1 in the time dimension, so a zone's years write
+                # strictly disjoint objects and always rebased cleanly; the only collision was
+                # two group attrs, and those now commit separately and retry, each writer
+                # inserting only its own year's key. This serialisation therefore reflects
+                # scheduling, not correctness, and it is a candidate for removal — the open
+                # question is the attr retry budget (`commit_year_attrs(tries=8)`) once many
+                # years of one zone contend. Until that is answered, keep it sequential.
                 # return_exceptions=True so a single zone's failure doesn't abandon its
                 # siblings mid-flight (default gather() would leave them running orphaned);
                 # we let the whole year settle, then fail loudly with every failure.
@@ -1361,17 +1365,31 @@ async def run_global_campaign(
                     years_of.setdefault(z, []).append(y)
 
                 async def _zone_years(zone: str, years: list[int]) -> list[Any]:
-                    """One zone's years, in order, stopping at its first failure.
+                    """One zone's years, in order, each attempted whatever the last one did.
 
-                    Later years are reported as the exception that stopped them rather
-                    than being dispatched, so a zone never has two years in flight and
-                    the round still accounts for every cell it was given.
+                    Sequential, so a zone never has two years in flight; one result per year,
+                    so the round still accounts for every cell it was given.
+
+                    IT DOES NOT STOP AT THE FIRST FAILURE, and that is the point. It used to
+                    copy the stopping exception into every later year without dispatching it.
+                    Years are ordered oldest-first and every retry rebuilds the list the same
+                    way, so a failure that repeats and belongs to ONE year — a coverage gate is
+                    evaluated per zone-year, and radar coverage genuinely varies year to year —
+                    kept its zone's other years from ever being attempted on any round, then
+                    reported them unfilled. The no-progress guard below would eventually halt
+                    the campaign over a cell that was never going to succeed while the years
+                    behind it were fillable.
+
+                    What that cost bought was fail-fast, and it buys much less than it did: the
+                    deterministic zone-wide failures (unseeded group, destination dtype, year
+                    off the axis, no live tiles) now surface in `fill_zone_year_flow`'s
+                    preflight, BEFORE a GPU fleet is provisioned. Continuing past one costs a
+                    few metadata reads. The chained path above already reasons this way
+                    ("one cluster failing must not abandon the year, and certainly not the
+                    years after it"); this is the same rule on the per-cell path.
                     """
                     out: list[Any] = []
                     for y in years:
-                        if out and isinstance(out[-1], BaseException):
-                            out.append(out[-1])
-                            continue
                         try:
                             out.append(await _process(zone, y))
                         except Exception as exc:  # mirrors gather(return_exceptions=True)
