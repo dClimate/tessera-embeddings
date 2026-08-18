@@ -90,6 +90,17 @@ def _survivors(uri: str, log: _Log) -> list[str] | None:
 
     ``None`` is not "empty": a listing that failed proves nothing, and reporting it as a
     clean prefix is how an unverified delete comes to look verified.
+
+    THE LIMIT OF THIS CHECK. `fs.find` lists CURRENT keys only. On a versioned bucket it
+    cannot see non-current versions or delete markers, so an `--all-versions` delete that
+    exited zero while leaving history behind would read back as verified-empty — and the
+    caller would report reclaimed storage that is still billed. Measured 2026-08-18: every
+    bucket this runs against (`arbol-tessera-{embeddings,inputs}` and their `-dev` pair)
+    answers `get-bucket-versioning` with no Status, i.e. versioning has never been enabled,
+    and the CDK construct creates buckets with it off because Icechunk carries its own
+    versioning. So the gap is unreachable today. It becomes reachable the moment versioning
+    is turned on anywhere, and nothing here would notice: enable it and this must move to a
+    version-aware listing (`list_object_versions`) first.
     """
     try:
         fs = fsspec.filesystem(fsspec.utils.get_protocol(uri))
@@ -166,7 +177,10 @@ def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = Tru
         log: Optional logger; falls back to the module logger.
         all_versions: Pass ``--all-versions`` to s5cmd so a versioned bucket does
             not accumulate non-current versions (the default; the reason this
-            helper exists).
+            helper exists). Note the asymmetry: s5cmd DELETES every version, but the
+            read-back in :func:`_survivors` only CONFIRMS current ones — see its
+            docstring for why that is safe on today's buckets and what to change first
+            if versioning is ever enabled.
         strict: When True, RAISE if the delete does not succeed — including when it ran
             and left objects behind, which is the case a returned success used to hide.
             Best-effort (default) is right for post-success cleanup (staging, tagged
