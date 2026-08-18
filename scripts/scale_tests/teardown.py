@@ -70,8 +70,14 @@ def main() -> int:
 
     before, after = _rm_prefix(cfg.store_root)
     logger.info("stores: removed %d objects under %s (%d remain)", before - after, cfg.store_root, after)
-    if after != 0:
-        logger.warning("store prefix not empty after teardown: %d objects remain", after)
+    # A count of what was removed is not a statement about what is left, and this command's
+    # whole advertised outcome is return-to-$0. Exiting zero with a warning meant an
+    # automated caller — or an operator reading `$?` — recorded a successful teardown while
+    # a benchmark store kept billing. The warning stays for the human; the status is what
+    # the machine reads.
+    residue = after
+    if residue:
+        logger.error("store prefix NOT empty after teardown: %d object(s) remain under %s", residue, cfg.store_root)
 
     if args.purge_results:
         if cfg.results_dir.exists():
@@ -85,7 +91,7 @@ def main() -> int:
             logger.info("results: removed %d S3 objects under %s", b - a, s3_results)
     else:
         logger.info("results kept at %s (pass --purge-results to remove)", cfg.results_dir)
-    return 0
+    return 1 if residue else 0
 
 
 if __name__ == "__main__":
