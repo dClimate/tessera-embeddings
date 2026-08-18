@@ -930,6 +930,12 @@ class ZarrWriter:
                 ["northing", "easting", "month"],
                 np.ascontiguousarray(month_covered.transpose(1, 2, 0)),
             )
+            # No dtype in the encoding, deliberately. `to_zarr` stores a bool array as int8 with
+            # attrs dtype="bool" — its own boolean representation — and IGNORES an encoding dtype
+            # asking for bool, so the staged tile is int8 either way. The destination is seeded int8
+            # to match, because assembly reads staged tiles with RAW zarr and so compares against
+            # what is on disk rather than what xarray hands back. A bool destination refused every
+            # staged month tile on the dtype guard; asking for bool here only looks like a fix.
             encoding[MONTH_COVERED_VAR] = {
                 "chunks": (*staged_chunks_2d, MONTHS_IN_YEAR),
                 "compressors": None,

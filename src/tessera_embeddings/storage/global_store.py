@@ -99,7 +99,11 @@ def create_layout_arrays(
     for var in variables:
         array_layout = layout.for_var(var)
         shape = tuple(sizes[d] for d in array_layout.dims)
-        node.create_array(var, **array_layout.create_kwargs(shape))
+        array = node.create_array(var, **array_layout.create_kwargs(shape))
+        if array_layout.attrs:
+            # Part of the array's TYPE rather than decoration: `dtype="bool"` on an int8 array is
+            # how xarray represents a boolean, and without it a reader gets 0/1 integers back.
+            array.attrs.update(dict(array_layout.attrs))
 
 
 def _layout_band(layout: StoreLayout) -> int:

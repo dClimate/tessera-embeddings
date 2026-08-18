@@ -76,6 +76,11 @@ MONTH_COORD = tuple(range(1, MONTHS_IN_YEAR + 1))
 #: Presence, not counts: a month is covered when at least one timestep that month passed the same
 #: SCL validity classes ``s2_obs_count`` totals, so the twelve flags partition the observations that
 #: count feeds on. ``False`` also reads for an unwritten pixel, exactly as ``s2_obs_count`` reads 0.
+#:
+#: Stored as ``int8`` carrying the attribute ``dtype="bool"``, which is how xarray represents a
+#: boolean array — so a reader gets booleans back, while the on-disk type is the one the staging
+#: writer can actually produce (``Dataset.to_zarr`` stores bool as int8 regardless of encoding, and
+#: assembly reads staged tiles with raw zarr).
 MONTH_COVERED_VAR = "s2_month_covered"
 
 # codec keys
@@ -120,6 +125,12 @@ class ArrayLayout:
     ``chunks``/``shards`` are element counts over ``dims``. ``codec`` is one of
     ``"zstd"`` (default serializer + zstd), ``"pcodec"`` (PCodec serializer, no
     compressor — floats only), or ``"raw"`` (default serializer, no compressor).
+
+    ``attrs`` are array attributes written at creation, as pairs so the layout stays
+    hashable and two presets cannot share a mutable dict. Needed because a dtype is
+    not always the whole story about a type: xarray represents a boolean array as
+    ``int8`` plus the attribute ``dtype="bool"``, and a reader gets booleans back only
+    if the attribute is there.
     """
 
     dims: tuple[str, ...]
@@ -128,6 +139,7 @@ class ArrayLayout:
     fill_value: float | int
     codec: str
     shards: tuple[int, ...] | None = None
+    attrs: tuple[tuple[str, str], ...] = ()
 
     def create_kwargs(self, shape: tuple[int, ...]) -> dict:
         """Build ``zarr.Group.create_array`` kwargs for an array of ``shape``.
@@ -221,12 +233,28 @@ def _sharded_arrays(*, include_std: bool) -> dict[str, ArrayLayout]:
         "embeddings": ArrayLayout(DIMS_4D, _INNER_4D, "int8", 0, _ZSTD, shards=_SHARD_4D),
         "scales": ArrayLayout(DIMS_3D, _INNER_3D, "float32", float("nan"), _PCODEC, shards=_SHARD_3D),
         **_obs(_INNER_3D, _SHARD_3D, _ZSTD),
-        # Boolean rather than a packed integer, and zstd rather than PCodec. Measured on real
-        # coverage: twelve boolean planes cost 1.14x a packed 12-bit mask once compressed — 0.24
-        # bits a pixel against 0.21 — because month coverage is spatially smooth and a plane
-        # compresses ~400x while packed bits look like noise to the compressor. The 6x it costs
-        # uncompressed never reaches disk, and booleans need no helper library to read.
-        MONTH_COVERED_VAR: ArrayLayout(DIMS_4D_MONTH, _INNER_4D_MONTH, "bool", False, _ZSTD, shards=_SHARD_4D_MONTH),
+        # Twelve labelled planes rather than a packed integer, and zstd rather than PCodec. Measured
+        # on real coverage: the planes cost 1.14x a packed 12-bit mask once compressed — 0.24 bits a
+        # pixel against 0.21 — because month coverage is spatially smooth and a plane compresses
+        # ~400x while packed bits look like noise to the compressor. The 6x it costs uncompressed
+        # never reaches disk, and a plane per month needs no helper library to read.
+        #
+        # int8 + attrs dtype="bool" is xarray's OWN representation of a boolean array, and it is here
+        # because the write path forces it: staged tiles are written with `Dataset.to_zarr`, which
+        # stores bool as int8 whatever the encoding asks for, while assembly reads those tiles with
+        # RAW zarr and so sees int8. A bool destination therefore refused every staged month tile on
+        # the dtype guard. Matching the destination to what the writer can express keeps the guard
+        # intact, and the attribute is what makes an xarray reader see booleans rather than 0/1 — so
+        # `cov.sel(month=7)` is still a boolean mask. Size is unchanged: numpy bool is already 1 byte.
+        MONTH_COVERED_VAR: ArrayLayout(
+            DIMS_4D_MONTH,
+            _INNER_4D_MONTH,
+            "int8",
+            0,
+            _ZSTD,
+            shards=_SHARD_4D_MONTH,
+            attrs=(("dtype", "bool"),),
+        ),
     }
     if include_std:
         arrays["embedding_std"] = ArrayLayout(DIMS_4D, _INNER_4D, "float32", float("nan"), _PCODEC, shards=_SHARD_4D)

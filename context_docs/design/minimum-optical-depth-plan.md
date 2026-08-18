@@ -250,6 +250,27 @@ below.
 > the pre-fix code and fail there, the round-trip one with the production symptom exactly — all-`False`
 > against a mixed pattern.
 >
+> **The array is stored `int8` with the attribute `dtype="bool"`, because the write path cannot
+> express anything else (2026-08-18).** The re-fill then failed on a *fourth* defect, caught by a
+> guard written for something else entirely: the staged tile held `s2_month_covered` as **int8** while
+> the destination was seeded **bool**, and assembly's dtype check refused rather than silently
+> C-casting. `Dataset.to_zarr` stores a bool array as int8 with attrs `dtype="bool"` — xarray's own
+> boolean representation — and **ignores an encoding dtype asking for bool**; assembly reads staged
+> tiles with *raw* zarr, so it compares against what is on disk rather than what xarray hands back.
+> The guard was right and the destination's dtype was wrong.
+>
+> So the destination is seeded to match what the writer can produce, and the attribute is what
+> restores the reader's view: in xarray `s2_month_covered` is a **boolean** array, so
+> `cov.sel(month=7)` is still a mask and `cov.sum("month")` still counts months. Size is unchanged —
+> numpy bool is already one byte — so the 0.24 bits/pixel and 0.025%-of-store figures above stand.
+> `ArrayLayout` gained an `attrs` field for this, applied by the seeder, because a dtype is not always
+> the whole story about a type.
+>
+> **The test that could not have caught it staged with raw zarr.** Raw zarr keeps bool; production
+> stages through xarray. A fixture that writes by a different route than production is not testing the
+> route, so there is now a test that stages through `write_chunk` itself with a bool buffer and asserts
+> both the values and the attribute at the destination. It fails against a bool-seeded destination.
+>
 > **A well-observed window cannot verify this array.** The two windows first banked as external truth
 > came back at **11.99994 and 11.92 months per pixel**, where a correct array, an all-`True` array and
 > almost any wrong array agree to within a rounding error; they could only have caught a gross

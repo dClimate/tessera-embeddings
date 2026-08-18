@@ -2034,7 +2034,7 @@ class TestAssembleGlobal:
             # Test-sized chunk/shard pitch, but the layout's own dims, dtype and fill —
             # so the seeded array is exactly the shape the write path will meet.
             trailing = tuple(sizes[d] for d in layout.dims[3:])
-            node.create_array(
+            array = node.create_array(
                 var,
                 shape=tuple(sizes[d] for d in layout.dims),
                 chunks=(1, self.INNER, self.INNER, *trailing),
@@ -2043,6 +2043,11 @@ class TestAssembleGlobal:
                 fill_value=layout.fill_value,
                 dimension_names=layout.dims,
             )
+            # Including the layout's attrs, as the real seeder does — `dtype="bool"` on an int8
+            # array is part of its type, not decoration, and a fixture that drops it is a fixture
+            # that disagrees with production about what was seeded.
+            if layout.attrs:
+                array.attrs.update(dict(layout.attrs))
         time_int = times.astype("int64")
         time_arr = node.create_array("time", data=time_int, chunks=(len(time_int),), dimension_names=("time",))
         time_arr.attrs.update(TIME_ENCODING)
@@ -2375,6 +2380,43 @@ class TestAssembleGlobal:
 
         with pytest.raises(IncompleteStageError, match="missing required variable"):
             writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runC", n_workers=1)
+
+    def test_month_coverage_survives_the_real_staging_path(self, tmp_path):
+        """A BOOL buffer handed to write_chunk must reach an int8 destination with its values.
+
+        Staged through the production path — ``write_chunk``, which writes an xarray Dataset — rather
+        than a hand-rolled zarr tile, because that is the difference the defect lived in.
+        ``Dataset.to_zarr`` stores a bool array as **int8** with attrs ``dtype="bool"`` (xarray's own
+        boolean representation) and ignores an encoding dtype asking for bool; assembly reads staged
+        tiles with RAW zarr, so it sees the int8. A bool-seeded destination therefore refused every
+        month tile on the dtype guard — the guard was right, the destination's dtype was wrong.
+
+        The round-trip test beside this one could not catch it: it stages with raw zarr, which keeps
+        bool. A fixture that writes by a different route than production is not testing the route.
+        """
+        dim = 8
+        store_path = self._seed_zone_repo(tmp_path, self.TILE, self.TILE, dim, carried=(MONTH_COVERED_VAR,))
+        writer = ZarrWriter(str(tmp_path / "staging"), embedding_dim=dim)
+        rng = np.random.default_rng(19)
+        chunk = ChunkSpec(row=0, col=0, y_start=0, y_stop=self.TILE, x_start=0, x_stop=self.TILE)
+        # (month, y, x) as the actor builds it, and a mixed pattern so all-True and all-False both fail.
+        covered = rng.random((MONTHS_IN_YEAR, self.TILE, self.TILE)) > 0.35
+        writer.write_chunk(
+            chunk,
+            rng.integers(-100, 100, size=(self.TILE, self.TILE, dim)).astype(np.int8),
+            "runM",
+            scales=rng.random((self.TILE, self.TILE)).astype(np.float32),
+            month_covered=covered,
+        )
+        assert writer.assemble_global(store_path, self.ZONE, year=2025, run_id="runM", n_workers=1)
+
+        repo = open_global_repo(store_path)
+        node = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")[self.ZONE]
+        got = np.asarray(node[MONTH_COVERED_VAR][self.YEARS.index(2025)])
+        # Destination axis order is (northing, easting, month); the actor's buffer is (month, y, x).
+        np.testing.assert_array_equal(got.astype(bool), covered.transpose(1, 2, 0))
+        # And the attribute that makes an xarray reader see booleans rather than 0/1 integers.
+        assert dict(node[MONTH_COVERED_VAR].attrs).get("dtype") == "bool"
 
     def _carried_pattern(self, var: str, dim: int, rng) -> np.ndarray:
         """A distinctive per-tile array for *var*, shaped and typed from the GLOBAL layout.
