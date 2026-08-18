@@ -86,12 +86,26 @@ def test_delete_prefix_retries_while_objects_survive(monkeypatch):
 
 
 def test_delete_prefix_treats_an_unlistable_prefix_as_unknown_not_as_survivors(monkeypatch):
-    """A listing that failed proves nothing — it must not manufacture an endless retry."""
+    """A listing that failed proves nothing, and the two halves of that pull apart.
+
+    It must not manufacture an endless retry — the delete is not what failed, so running it
+    again cannot help. And it must not read as success under ``strict``, whose entire purpose
+    is callers that cannot proceed onto un-cleared data; ``_survivors`` documents reporting an
+    unlistable prefix as clean as the way an unverified delete comes to look verified.
+
+    So: one pass either way, best-effort returns, strict raises — and the error says UNKNOWN
+    rather than claiming survivors nobody has seen.
+    """
     passes = []
     monkeypatch.setattr(object_store, "_s5cmd_rm", lambda uri, log, **k: passes.append(uri))
     monkeypatch.setattr(object_store, "_survivors", lambda uri, log: None)
-    object_store.delete_prefix("s3://b/p", strict=True)  # must not raise
+
+    object_store.delete_prefix("s3://b/p")  # best-effort: reports and returns
     assert len(passes) == 1
+
+    with pytest.raises(object_store.DeleteUnverifiedError):
+        object_store.delete_prefix("s3://b/p", strict=True)
+    assert len(passes) == 2, "one delete pass per call — an unlistable prefix is not retried"
 
 
 def test_delete_prefix_strict_raises_when_delete_fails(monkeypatch):

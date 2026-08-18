@@ -13,7 +13,7 @@ config/
 ├── paths.py                BucketPaths   ─── pydantic, deployment-supplied storage URIs
 ├── inference.py            InferenceConfig ── frozen dataclass: model, sampling, Ray-actor
 │                           TimeWindow      ── 12-month rolling window
-│                           INFERENCE_CHUNK_SIZE = 2000
+│                           INFERENCE_CHUNK_SIZE = 2048
 │                           EMBEDDING_DIM = 128
 │                           DEFAULT_NUM_OBS_CHECKPOINTS = tuple(range(8, 257, 8))
 │                           checkpoint_filename(norm_source="mpc"|"aws") → str
@@ -158,13 +158,14 @@ pool driving raw-zarr fork/merge writes (no Dask cluster), sized by
 ```python
 from tessera_embeddings import AssemblyConfig
 
-cfg = AssemblyConfig()                                # chunks_per_worker=10, max_workers=8
+cfg = AssemblyConfig()                                # chunks_per_worker=10, max_workers=16
 n_workers = cfg.compute_n_workers(25)                 # → 3
 ```
 
-The default cap of 8 keeps the pool ~12 GB (one staged-tile slice in
-flight per worker) and aggregate S3 PUT concurrency safely under the
-fleet-wide target. Override `chunks_per_worker` if your workload
+The default cap of 16 keeps the pool around **~24 GB** — one staged-tile slice
+in flight per worker, ~1–1.5 GB at a 2048-px full-band tile — which fits inside
+the flow runner's 64 GiB and measured 20 GB peak in practice. Size a custom
+flow-runner container against 24 GB, not 12: assembly is where the peak is. Override `chunks_per_worker` if your workload
 profile differs; raise `max_workers` only with the RAM and S3 budgets
 in view.
 

@@ -549,10 +549,12 @@ async def run_global_campaign(
         max_parallel_clusters: Bounds simultaneous Ray clusters within a year (a
             cost knob, distinct from the commit gate): the concurrent per-cell
             fill runs under ``"cluster-per-zone"``, or the number of Ray clusters
-            under ``"chained-clusters"``. Defaults to 40 — measurement favours
-            many narrow fleets over few wide ones, so size ``num_actors`` and
-            ``IngestSettings.max_workers`` down to match, or the aggregate fleet
-            will exceed the account's EC2 quota.
+            under ``"chained-clusters"``. **Defaults to 8**, which is what
+            `campaign-cluster-sizing.md` settled on; 40 is the INGEST concurrency
+            cap and the two are easy to confuse. Measurement favours many narrow
+            fleets over few wide ones, so raising this means sizing ``num_actors``
+            and ``IngestSettings.max_workers`` down to match, or the aggregate
+            fleet will exceed the account's EC2 quota.
         fill_strategy: Named for the CLUSTER LIFECYCLE — both strategies run
             up to ``max_parallel_clusters`` zones at once.
             ``"chained-clusters"`` (default) dispatches up to ``max_parallel_clusters``

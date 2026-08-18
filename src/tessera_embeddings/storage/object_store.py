@@ -65,6 +65,17 @@ _DELETE_PASSES = 3
 _DELETE_BACKOFF_S = 5.0
 
 
+class DeleteUnverifiedError(RuntimeError):
+    """The delete ran, and whether it worked could not be established.
+
+    Distinct from :class:`PrefixNotEmptyError`, which asserts a fact: objects ARE still
+    there. This one asserts the absence of a fact, and the two want different responses —
+    survivors mean the work did not take, an unverifiable prefix means we do not know.
+    Only ``strict`` callers see it, because only they have said they cannot proceed on
+    an unverified prefix.
+    """
+
+
 class PrefixNotEmptyError(RuntimeError):
     """A delete ran to completion and objects are still there.
 
@@ -123,8 +134,15 @@ def _s5cmd_rm_verified(uri: str, log: _Log, *, all_versions: bool) -> None:
                 raise
             continue
         left = _survivors(uri, log)
-        if left is None or not left:
-            return
+        if left == []:
+            return  # verified empty — the only outcome that is a success
+        if left is None:
+            # The listing failed, so the prefix is UNKNOWN rather than clean. Retrying the
+            # delete would not help (the delete is not what failed) and would manufacture an
+            # endless loop, so stop here and let the caller's own bar decide: best-effort
+            # returns, strict raises. Reporting it as clean is what `_survivors` documents as
+            # the way an unverified delete comes to look verified.
+            raise DeleteUnverifiedError(uri)
         log.warning(
             "%d object(s) survived pass %d of the delete of %s (e.g. %s)",
             len(left),
@@ -163,6 +181,15 @@ def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = Tru
             _s5cmd_rm_verified(uri, log, all_versions=all_versions)
         # BEFORE the RuntimeError arm, which is its base class: except clauses match in order,
         # so the general one would swallow every survivor into the fsspec fallback.
+        except DeleteUnverifiedError:
+            # The delete ran; the read-back could not confirm it. fsspec would face the same
+            # unreadable prefix, so there is nothing further to try.
+            if strict:
+                raise
+            log.error(
+                "Could not verify the delete of %s — treat the prefix as unknown, not clean", uri
+            )
+            return
         except PrefixNotEmptyError:
             # The delete ran and did not finish the job. Falling back to fsspec would re-run the
             # same failing work serially, so report and let the caller's own bar decide.
