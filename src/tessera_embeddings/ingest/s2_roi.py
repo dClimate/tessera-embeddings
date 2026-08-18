@@ -73,6 +73,7 @@ from tessera_embeddings.ingest.live_windows import (
 )
 from tessera_embeddings.ingest.loader_failures import (
     collect_aborted_hrefs,
+    implicated_items,
     implicated_tile_dates,
     install_capture_everywhere,
     label_objects,
@@ -876,7 +877,11 @@ def ingest_s2_roi_reflectance(
                 # puts it back on the whole-date ladder, which is what this did before
                 # attribution existed.
                 blamed = (implicated_tile_dates(attempt.items, hrefs) or None) if hrefs else None
-                stepped = step_down_copies(date_alternates, attempt.items, only=blamed)
+                # The failing ITEMS, not just their tile-dates: a tile-date can hold several
+                # acquisitions, and the ladder must step the one that failed rather than the
+                # one whose spare happens to rank highest (see step_down_copies).
+                bad_items = implicated_items(attempt.items, hrefs) if hrefs else []
+                stepped = step_down_copies(date_alternates, attempt.items, only=blamed, implicated=bad_items)
                 if stepped is None:
                     _record_unreadable(attempt, exc, tried, blamed, hrefs)
                     total_filtered += 1

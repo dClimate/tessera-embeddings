@@ -351,3 +351,58 @@ class TestTheLadderStepsOneAcquisitionAtATime:
         stepped, keys = step_down_copies(alternates, kept, only=None)
         assert stepped == [old]
         assert keys == {("MGRS-34WFA", "2021-09-08")}
+
+
+def _two_acquisitions_each_with_a_spare() -> tuple[_Item, _Item, _Item, _Item]:
+    """One high-latitude tile-date: two ORBITS, each reprocessed once.
+
+    Successive orbits revisit the same tile the same day above ~60 degrees, so a tile-date
+    holds genuinely different imagery as well as reprocessings of it. The acquisition split
+    keeps one copy per orbit; the spares are the ladder.
+    """
+    a_old = _Item("A_old", "MGRS-34WFA", "0")
+    a_new = _Item("A_new", "MGRS-34WFA", "9")  # ranks first across the whole tile-date
+    b_old = _Item("B_old", "MGRS-34WFA", "0")
+    b_new = _Item("B_new", "MGRS-34WFA", "1")
+    # Distinct acquisition instants, far enough apart to be separate orbits.
+    for it in (a_old, a_new):
+        it.properties["datetime"] = "2021-09-08T10:00:00Z"
+    for it in (b_old, b_new):
+        it.properties["datetime"] = "2021-09-08T11:00:00Z"
+    return a_old, a_new, b_old, b_new
+
+
+def test_the_ladder_steps_the_acquisition_that_failed_not_the_best_ranked_spare():
+    """A tile-date with two acquisitions must downgrade only the one that could not be read.
+
+    Ranking is per tile-date, so without attribution the rung taken is whichever spare sorts
+    first — which can belong to the acquisition that read perfectly well. That downgrades
+    healthy imagery to an older baseline, leaves the unreadable copy still selected, and
+    forces a second rung: two spent, one acquisition needlessly older.
+
+    Here A's spare outranks B's, and B is the one that failed.
+    """
+    a_old, a_new, b_old, b_new = _two_acquisitions_each_with_a_spare()
+    kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
+    assert set(kept) == {a_new, b_new}, "one survivor per acquisition"
+
+    stepped = step_down_copies(dict(alternates), kept, implicated=[b_new])
+    assert stepped is not None
+    items, _keys = stepped
+    assert a_new in items, "the acquisition that read fine must keep its newest copy"
+    assert b_old in items, "the acquisition that failed is the one that steps down"
+    assert b_new not in items
+
+
+def test_without_attribution_the_ladder_still_steps_the_best_ranked_spare():
+    """The pre-existing behaviour, kept: with nothing attributed there is nothing to prefer.
+
+    Pinned so the new preference cannot quietly become the only path — a caller that cannot
+    identify the failing object must still make progress.
+    """
+    a_old, a_new, b_old, b_new = _two_acquisitions_each_with_a_spare()
+    kept, alternates = select_preferred_duplicates([a_old, a_new, b_old, b_new])
+    stepped = step_down_copies(dict(alternates), kept)
+    assert stepped is not None
+    items, _keys = stepped
+    assert a_old in items, "highest-ranked spare belongs to A, so A steps"

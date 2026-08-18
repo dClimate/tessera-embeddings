@@ -293,6 +293,7 @@ def step_down_copies(
     alternates: dict[tuple[str, str], list[Any]],
     items: Sequence[Any],
     only: Iterable[tuple[str, str]] | None = None,
+    implicated: Sequence[Any] = (),
 ) -> tuple[list[Any], set[tuple[str, str]]] | None:
     """Swap tile-dates' copies for their next alternates, or ``None`` if none is left.
 
@@ -309,6 +310,14 @@ def step_down_copies(
     walks every rung of every other tile's ladder before the date can be given up. An EMPTY
     ``only`` returns ``None`` rather than stepping everything: the failure was attributed,
     and to nothing here.
+
+    ``implicated`` is the failed ITEMS, when the caller could identify them. A tile-date can
+    hold several distinct acquisitions, and without this the rung taken is whichever
+    alternate ranks highest across the whole tile-date — which may belong to an acquisition
+    that read perfectly well. Stepping it downgrades healthy imagery to an older baseline and
+    leaves the unreadable copy selected, so the next rung has to step again: two rungs spent,
+    one acquisition needlessly older. With it, the ladder steps the acquisition that actually
+    failed and every other acquisition keeps its newest copy.
 
     Returns the new item list and the keys that were stepped, so a caller can name what
     changed rather than the whole date.
@@ -332,14 +341,35 @@ def step_down_copies(
     # acquisition split was added to fix, because it feeds the loader the same granule twice.
     swap: dict[int, Any] = {}
     for key, copies in remaining.items():
-        alternate = copies[0]
-        alternates[key] = copies[1:]
+        alternate = _first_for_failed_acquisition(copies, implicated)
+        alternates[key] = [c for c in copies if c is not alternate]
         target = _alternate_for(alternate, survivors.get(key, ()), taken=swap)
         if target is not None:
             swap[id(target)] = alternate
     if not swap:
         return None
     return [swap.get(id(item), item) for item in items], set(remaining)
+
+
+def _first_for_failed_acquisition(copies: list[Any], implicated: Sequence[Any]) -> Any:  # noqa: ANN401
+    """The best-ranked alternate belonging to an acquisition that FAILED, else the best overall.
+
+    ``copies`` is already preference-ordered, so the plain answer is ``copies[0]`` — and that
+    is what this returns when nothing was attributed, which is the pre-existing behaviour.
+
+    When the caller identified the failing objects, prefer an alternate sharing an acquisition
+    with one of them. Otherwise a tile-date holding two acquisitions steps whichever has the
+    higher-ranked spare, which can be the one that read fine: that acquisition drops to an
+    older baseline for no reason, the broken one stays selected, and the next rung has to step
+    again. Preferring the failed acquisition keeps every other one on its newest copy.
+    """
+    if not implicated:
+        return copies[0]
+    for candidate in copies:
+        for cluster in _by_acquisition([*implicated, candidate]):
+            if any(it is candidate for it in cluster) and any(any(it is bad for bad in implicated) for it in cluster):
+                return candidate
+    return copies[0]
 
 
 def _alternate_for(alternate: Any, survivors: Iterable[Any], *, taken: dict[int, Any]) -> Any | None:  # noqa: ANN401

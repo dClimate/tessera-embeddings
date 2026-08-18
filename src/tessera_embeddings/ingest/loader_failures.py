@@ -218,21 +218,35 @@ def implicated_tile_dates(
     date — plausible, since a fleet's workers read many dates — and attributing it here
     would step down a tile that read perfectly well.
     """
+    return {(item_tile(it), solar_day_of(it)) for it in implicated_items(items, hrefs)}  # type: ignore[misc]
+
+
+def implicated_items(items: Iterable[Any], hrefs: Iterable[str]) -> list[Any]:
+    """The ITEMS whose objects appear among ``hrefs`` — what the tile-date keys reduce from.
+
+    :func:`implicated_tile_dates` answers "which tile-dates failed", which is the granularity
+    a caller reports at. This answers "which copies failed", which is the granularity a
+    fallback should STEP at: a tile-date can hold several distinct acquisitions, and stepping
+    the one whose alternate happens to rank highest downgrades a healthy acquisition to an
+    older baseline while leaving the unreadable one selected.
+
+    Same two-way matching and the same silent drop of an unmatched href, for the same
+    reasons — see :func:`implicated_tile_dates`.
+    """
     wanted = {href_key(h) for h in hrefs}
     if not wanted:
-        return set()
+        return []
     segments = {seg for h in hrefs for seg in urlsplit(_strip_band_suffix(h)).path.split("/") if seg}
 
-    keys: set[tuple[str, str]] = set()
+    matched: list[Any] = []
     for item in items:
-        tile = item_tile(item)
-        if tile is None:
+        if item_tile(item) is None:
             continue
         if str(getattr(item, "id", "")) in segments:
-            keys.add((tile, solar_day_of(item)))
+            matched.append(item)
             continue
         assets = getattr(item, "assets", None) or {}
         hrefs_of_item = (getattr(a, "href", None) for a in assets.values())
         if any(h and href_key(h) in wanted for h in hrefs_of_item):
-            keys.add((tile, solar_day_of(item)))
-    return keys
+            matched.append(item)
+    return matched
