@@ -1229,10 +1229,9 @@ def fill_zones_sequential_flow(
                 handoff,
                 store_path=store_path,
                 staging_base=prep.staging_base,
-                # The PER-TILE refusal sidecar. Resolved here rather than in the runner because path
-                # conventions belong to BucketPaths (§0.3), and `handoff` carries the cell identity
-                # this needs — the same zone and year the assembly is about to publish.
-                refusal_detail_uri=paths.refusal_detail(handoff.zone, handoff.year),
+                # The published registry's ROOT. Resolved here because bucket conventions belong to
+                # BucketPaths (§0.3); the part's name is composed downstream, where the run id is.
+                registry_root=paths.optical_registry(),
                 input_coverage=prep.input_coverage,
                 log=log,
                 gate=gate,

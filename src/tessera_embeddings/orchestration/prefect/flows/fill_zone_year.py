@@ -447,10 +447,10 @@ def fill_zone_year_flow(
         # run_id can't then match another cell's staged labels+shapes and trick
         # resume detection into skipping inference for the wrong year.
         "staging_base": f"{paths.outputs.rstrip('/')}/staging/{zone}/{year}",
-        # The PER-TILE refusal sidecar. Resolved here because path conventions belong to
-        # BucketPaths, not to the runner (§0.3) — the runner receives a URI exactly as it
-        # receives `staging_base`.
-        "refusal_detail_uri": paths.refusal_detail(zone, year),
+        # The published registry's ROOT. Resolved here because bucket conventions belong to
+        # BucketPaths, not to the runner (§0.3); the part's own name is the registry module's, since
+        # it keys by a run id nothing here knows yet.
+        "registry_root": paths.optical_registry(),
         "config": config,
         "num_actors": num_actors,
         "log": log,

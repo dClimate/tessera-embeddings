@@ -81,6 +81,7 @@ from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
 from tessera_embeddings.storage.object_store import delete_prefix
+from tessera_embeddings.storage.registry import part_uri, registry_rows, write_registry_part
 from tessera_embeddings.storage.shard_writer import (
     CommitGate,
     PhaseTimer,
@@ -865,7 +866,9 @@ class ZarrWriter:
         run_id: str,
         staged: list[str],
         skipped: list[str],
-        detail_uri: str | None = None,
+        registry_root: str | None = None,
+        zone: str = "",
+        year: int = 0,
     ) -> dict:
         """The year's optical-skip summary, with the per-shard reasons read from their markers.
 
@@ -887,20 +890,24 @@ class ZarrWriter:
         """
         records, unreadable = read_skip_records(self.staging_base, run_id, skipped)
         summary = summarise_optical_skips(staged=staged, skipped=skipped, records=records)
-        if detail_uri and records:
+        if registry_root:
+            detail_uri = part_uri(registry_root, zone, year, run_id)
             try:
                 fs = _fs_for(detail_uri)
                 fs.makedirs(detail_uri.rsplit("/", 1)[0], exist_ok=True)
-                body = (
-                    json.dumps(
-                        {"run_id": run_id, "tiles": [records[label] for label in sorted(records)]},
-                        sort_keys=True,
-                        indent=1,
-                    ).encode()
-                    + b"\n"
+                written = write_registry_part(
+                    detail_uri,
+                    registry_rows(
+                        run_id,
+                        datetime.datetime.now(datetime.UTC).isoformat(),
+                        embedded=staged,
+                        refused=skipped,
+                        records=records,
+                    ),
+                    open_output=lambda uri: fs.open(uri, "wb"),
+                    zone=zone,
+                    year=year,
                 )
-                with fs.open(detail_uri, "wb") as f:
-                    f.write(body)
             except Exception:
                 logger.exception(
                     "Run %s: per-tile refusal detail could not be written to %s; the year's pooled "
@@ -909,10 +916,10 @@ class ZarrWriter:
                     detail_uri,
                 )
             else:
-                # A POINTER, so a reader of the attributes knows the detail exists without carrying
-                # it. Recorded only on a successful write, so its presence is a promise.
-                summary["detail_uri"] = detail_uri
-                logger.info("Wrote per-tile refusal detail for %d tile(s) to %s", len(records), detail_uri)
+                # A POINTER, so a reader of the attributes knows the registry part exists without
+                # carrying it. Recorded only on a successful write, so its presence is a promise.
+                summary["registry_part"] = detail_uri
+                logger.info("Wrote registry part with %d tile row(s) to %s", written, detail_uri)
         if unreadable:
             # SURFACED, because "no records" and "every read failed" are the same empty dict. Without
             # this a systematic failure — expired credentials, a wrong prefix — would publish a
@@ -2192,7 +2199,7 @@ class ZarrWriter:
         input_coverage: dict | None = None,
         # Where the PER-TILE refusal detail is persisted, from `BucketPaths.refusal_detail`. None
         # writes no sidecar and changes nothing the store commits — see `_skip_summary`.
-        refusal_detail_uri: str | None = None,
+        registry_root: str | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2230,11 +2237,11 @@ class ZarrWriter:
             year: Campaign calendar year to fill — must be on the group's
                 pre-allocated time axis.
             run_id: Run identifier (locates staged files).
-            refusal_detail_uri: Where to persist the PER-TILE refusal records, from
-                :meth:`BucketPaths.refusal_detail`. The year's summary in the store is pooled and
-                so cannot say WHICH tile came closest to the depth cutoff, which is the question a
-                cleanup campaign asks; this sidecar can. ``None`` writes nothing and changes
-                nothing the store commits.
+            registry_root: Root of the published registry dataset
+                (:meth:`BucketPaths.optical_registry`). One Parquet part per cell lands under it,
+                a row per live tile, because the year's summary in the store is pooled and so cannot
+                say WHICH tile came closest to the depth cutoff — the question a cleanup campaign
+                asks. ``None`` writes nothing and changes nothing the store commits.
             n_workers: Worker process count; also divides
                 ``TARGET_AGGREGATE_S3_CONCURRENCY`` into the per-fork cap.
             gate: Optional commit gate shared across the zone-year fills this
@@ -2441,7 +2448,9 @@ class ZarrWriter:
             # `skipped_labels=None` is a caller that resolved no live set at all, so
             # there is nothing to summarise and no ZERO to assert (see below).
             optical_skips=(
-                self._skip_summary(run_id, labels, skipped, refusal_detail_uri) if skipped_labels is not None else None
+                self._skip_summary(run_id, labels, skipped, registry_root, zone, year)
+                if skipped_labels is not None
+                else None
             ),
             empty=empty,
             telemetry=telemetry,

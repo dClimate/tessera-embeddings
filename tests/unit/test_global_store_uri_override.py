@@ -17,6 +17,7 @@ from __future__ import annotations
 import pytest
 
 from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.storage.registry import part_uri
 
 #: The real target, so the test says what this exists for.
 OPEN_DATA = "s3://tessera-embeddings/v1.1/dclimate.icechunk"
@@ -133,7 +134,7 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         ):
             assert not paths.optical_registry().startswith(paths.global_store() + "/")
 
-    def test_per_cell_refusal_detail_follows_the_store_not_our_outputs(self):
+    def test_registry_parts_follow_the_store_not_our_outputs(self):
         """The mistake this class exists to prevent, made once and caught here.
 
         The per-tile refusal records were first placed under ``outputs``, which works in dev — where
@@ -146,17 +147,17 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
             outputs="s3://ours",
             global_store_uri="s3://tessera-embeddings/v1.1/dclimate.icechunk",
         )
-        detail = prod.refusal_detail("32S", 2021)
+        detail = part_uri(prod.optical_registry(), "32S", 2021, "run-1")
 
         assert detail.startswith(prod.optical_registry() + "/"), "inside the registry beside the store"
         assert "s3://ours" not in detail, "and never in our own bucket when the store is published"
         assert not detail.startswith(prod.global_store() + "/"), "still never inside the Icechunk prefix"
 
-    def test_per_cell_refusal_detail_is_partitioned_for_a_parquet_dataset(self):
+    def test_registry_parts_are_partitioned_for_a_parquet_dataset(self):
         """The registry is specified as Parquet indexing what each shard holds. The parts are JSON
         for now — pyarrow is not in the fill's runtime — so the LAYOUT has to be the one a later
         compaction wants, or every path changes when the format does.
         """
         paths = BucketPaths(inputs="s3://in", outputs="s3://out")
-        detail = paths.refusal_detail("09S", 2024)
+        detail = part_uri(paths.optical_registry(), "09S", 2024, "run-1")
         assert "zone=09S" in detail and "year=2024" in detail

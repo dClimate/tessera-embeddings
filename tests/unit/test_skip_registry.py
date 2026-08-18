@@ -40,6 +40,7 @@ from tessera_embeddings.inference.assembly import (
     summarise_optical_skips,
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
+from tessera_embeddings.storage.registry import REASONS, part_uri, registry_rows, write_registry_part
 
 
 def _chunk(row: int, col: int) -> ChunkSpec:
@@ -480,20 +481,33 @@ class TestThePerTileSidecar:
     version was removed for exactly that. So it is a sidecar, pointed at from the summary.
     """
 
-    def test_it_writes_the_per_tile_records_and_points_at_them(self, tmp_path: Path) -> None:
+    def test_it_writes_a_parquet_part_and_points_at_it(self, tmp_path: Path) -> None:
+        """A row per live tile, embedded and refused alike, readable with `pd.read_parquet` — which
+        is the promise the Open Data access request makes on our behalf.
+        """
+        pq = pytest.importorskip("pyarrow.parquet")
         writer = ZarrWriter(str(tmp_path / "staging"))
-        detail = str(tmp_path / "refusals" / "32S" / "2021.json")
+        root = str(tmp_path / "registry")
+        part = part_uri(root, "32S", 2021, "run1")
         for col in (0, 1):
             chunk = _chunk(0, col)
             writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64, obs_max=14))
 
-        summary = writer._skip_summary("run1", [], ["chunk_0_0", "chunk_0_1"], detail)
+        summary = writer._skip_summary("run1", ["chunk_9_9"], ["chunk_0_0", "chunk_0_1"], root, "32S", 2021)
 
-        assert summary["detail_uri"] == detail, "the pointer is the promise that it landed"
-        body = json.loads(Path(detail).read_text())
-        assert body["run_id"] == "run1"
-        assert [t["label"] for t in body["tiles"]] == ["chunk_0_0", "chunk_0_1"], "sorted, so diffable"
-        assert body["tiles"][0]["s2_obs"]["max"] == 14, "the per-tile depth the summary pools away"
+        assert summary["registry_part"] == part, "the pointer is the promise that it landed"
+        table = pq.read_table(part).to_pylist()
+        by_tile = {r["tile"]: r for r in table}
+        assert set(by_tile) == {"chunk_9_9", "chunk_0_0", "chunk_0_1"}, "every live tile, not just refused"
+        assert by_tile["chunk_9_9"]["embedded"] is True
+        assert by_tile["chunk_9_9"]["refused_px"] is None, "no measurement was taken, so none is claimed"
+        assert by_tile["chunk_0_0"]["embedded"] is False
+        assert by_tile["chunk_0_0"]["refused_thin_px"] == 64
+        # zone/year are the PARTITION keys, not columns — see the module docstring for the type
+        # collision that carrying both causes. The identity is in the file metadata instead.
+        assert "zone" not in by_tile["chunk_0_0"] and "year" not in by_tile["chunk_0_0"]
+        meta = pq.read_schema(part).metadata
+        assert meta[b"zone"] == b"32S" and meta[b"year"] == b"2021"
 
     def test_the_summary_still_pools_what_it_always_did(self, tmp_path: Path) -> None:
         """The sidecar is additional, not a replacement: the attributes keep the compact aggregate
@@ -503,7 +517,7 @@ class TestThePerTileSidecar:
         chunk = _chunk(0, 0)
         writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64, obs_max=14))
 
-        summary = writer._skip_summary("run1", [], [chunk.label], str(tmp_path / "d.json"))
+        summary = writer._skip_summary("run1", [], [chunk.label], str(tmp_path / "reg"), "32S", 2021)
         assert summary["refused_px_by_reason"]["thin"] == 64
         assert summary["shards_by_reason"] == {"thin": [chunk.label]}
 
@@ -512,8 +526,8 @@ class TestThePerTileSidecar:
         chunk = _chunk(0, 0)
         writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64))
 
-        summary = writer._skip_summary("run1", [], [chunk.label], None)
-        assert "detail_uri" not in summary
+        summary = writer._skip_summary("run1", [], [chunk.label], None, "32S", 2021)
+        assert "registry_part" not in summary
 
     def test_a_failed_sidecar_write_never_costs_the_cell(self, tmp_path: Path, monkeypatch) -> None:
         """The summary is what the store commits. Losing the sidecar costs a future planner some
@@ -523,7 +537,8 @@ class TestThePerTileSidecar:
         chunk = _chunk(0, 0)
         writer.write_skip_marker(chunk, "run1", _record(chunk.label, thin=64))
 
-        detail = str(tmp_path / "d.json")
+        root = str(tmp_path / "reg")
+        detail = part_uri(root, "32S", 2021, "run1")
         real_fs_for = _assembly_mod._fs_for
 
         def _boom_on_detail(uri, *a, **k):
@@ -534,10 +549,10 @@ class TestThePerTileSidecar:
             return real_fs_for(uri, *a, **k)
 
         monkeypatch.setattr(_assembly_mod, "_fs_for", _boom_on_detail)
-        summary = writer._skip_summary("run1", [], [chunk.label], detail)
+        summary = writer._skip_summary("run1", [], [chunk.label], root, "32S", 2021)
 
         assert summary["refused_px_by_reason"]["thin"] == 64, "the year's record is unaffected"
-        assert "detail_uri" not in summary, "and it does not promise a sidecar it failed to write"
+        assert "registry_part" not in summary, "and it does not promise a sidecar it failed to write"
 
 
 def test_an_unopenable_staging_filesystem_does_not_fail_the_cell(tmp_path: Path, monkeypatch) -> None:
@@ -557,3 +572,96 @@ def test_an_unopenable_staging_filesystem_does_not_fail_the_cell(tmp_path: Path,
 
     assert records == {}
     assert unreadable == 2, "every marker, so the caller can say so rather than imply nothing existed"
+
+
+class TestTheDatasetIsActuallyReadable:
+    """The two defects a red-team pass found, both of which every individual part survived.
+
+    A registry is 1,008 parts read as one dataset, so a part that is valid alone and unmergeable with
+    its siblings is worse than a broken part: nothing notices until the whole thing is read.
+    """
+
+    @staticmethod
+    def _write(root: str, zone: str, year: int, run: str, rows: list[dict]) -> str:
+        uri = part_uri(root, zone, year, run)
+        Path(uri).parent.mkdir(parents=True, exist_ok=True)
+        # The lambda is not a leak: `write_registry_part` consumes it as
+        # `with open_output(uri) as f`, which is the contract the parameter exists to express.
+        write_registry_part(
+            uri,
+            rows,
+            open_output=lambda u: Path(u).open("wb"),  # noqa: SIM115
+            zone=zone,
+            year=year,
+        )
+        return uri
+
+    def test_a_cell_that_refused_nothing_still_merges_with_one_that_did(self, tmp_path: Path) -> None:
+        """The schema must be DECLARED. Inferred, a cell with no refusals types every refusal column
+        `null`, and concatenating it with a cell that did refuse something raises ArrowInvalid — and
+        most cells refuse nothing, so the compaction would have broken on almost any pair.
+        """
+        pa = pytest.importorskip("pyarrow")
+        pq = pytest.importorskip("pyarrow.parquet")
+        root = str(tmp_path / "reg")
+        clean = self._write(root, "32S", 2021, "r1", registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[]))
+        dirty = self._write(
+            root,
+            "09S",
+            2021,
+            "r2",
+            registry_rows(
+                "r2", "t", embedded=[], refused=["chunk_1_1"], records={"chunk_1_1": _record("chunk_1_1", thin=64)}
+            ),
+        )
+
+        merged = pa.concat_tables([pq.read_table(clean), pq.read_table(dirty)])
+        assert merged.num_rows == 2
+        assert merged.schema.field("refused_thin_px").type == pa.int64(), "typed even where all-null"
+
+    def test_the_whole_dataset_reads_with_hive_partitioning(self, tmp_path: Path) -> None:
+        """Carrying zone/year as columns as well as partition keys made this raise
+        `ArrowTypeError: Field year has incompatible types: int64 vs int32` — the dataset was
+        unreadable as a dataset while every part opened fine on its own.
+        """
+        ds = pytest.importorskip("pyarrow.dataset")
+        root = str(tmp_path / "reg")
+        self._write(root, "32S", 2021, "r1", registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[]))
+        self._write(root, "09S", 2022, "r2", registry_rows("r2", "t", embedded=["chunk_1_1"], refused=[]))
+
+        table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
+        assert table.num_rows == 2
+        assert set(table.column("zone").to_pylist()) == {"32S", "09S"}, "from the path, not a column"
+        assert set(table.column("year").to_pylist()) == {2021, 2022}
+
+    def test_a_refill_adds_a_part_rather_than_replacing_one(self, tmp_path: Path) -> None:
+        """Keyed by run so the registry holds both fills of a cell. A fixed name would silently
+        replace the original, and dedup is the compaction's decision to make, not a write's.
+        """
+        ds = pytest.importorskip("pyarrow.dataset")
+        root = str(tmp_path / "reg")
+        self._write(root, "32S", 2021, "first", registry_rows("first", "t1", embedded=["chunk_0_0"], refused=[]))
+        self._write(root, "32S", 2021, "refill", registry_rows("refill", "t2", embedded=["chunk_0_0"], refused=[]))
+
+        table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
+        assert table.num_rows == 2, "both fills are on the record"
+        assert set(table.column("run_id").to_pylist()) == {"first", "refill"}
+        assert set(table.column("assembled_at").to_pylist()) == {"t1", "t2"}, "and a clock to pick by"
+
+    def test_an_embedded_tile_claims_no_refusal_measurement(self, tmp_path: Path) -> None:
+        """Null, not zero. Zero would assert that something counted this tile's refusals and found
+        none, which is the misreading the whole registry exists to prevent.
+        """
+        rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[])
+        assert rows[0]["embedded"] is True
+        assert rows[0]["refused_px"] is None
+        assert all(rows[0][f"refused_{r}_px"] is None for r in REASONS)
+
+    def test_a_refused_tile_with_no_record_is_null_not_zero(self, tmp_path: Path) -> None:
+        """A marker that could not be read leaves the reason unknown. Reporting zero refusals for a
+        tile that is demonstrably empty would be a self-contradicting row.
+        """
+        rows = registry_rows("r1", "t", embedded=[], refused=["chunk_0_0"], records={})
+        assert rows[0]["embedded"] is False
+        assert rows[0]["refused_px"] is None
+        assert rows[0]["obs_max"] is None

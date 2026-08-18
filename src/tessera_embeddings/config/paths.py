@@ -156,23 +156,3 @@ class BucketPaths(BaseModel):
         helper. Lives under ``inputs`` (it is a campaign input, like ROI masks).
         """
         return posixpath.join(self.inputs, "masks", f"{name}.icechunk")
-
-    def refusal_detail(self, zone: str, year: int) -> str:
-        """Return the URI of one cell's PER-TILE refusal records, inside the published registry.
-
-        **Derived from :meth:`optical_registry`, never from ``outputs``** — that method's docstring
-        names the exact mistake this one made first: production publishes the store to a bucket that
-        is not ours, so a registry built from ``outputs`` sits in our bucket while the store sits in
-        the public one, and every tool still works. The registry is the sibling prefix the access
-        request already asks Cambridge for, so the two move together by construction.
-
-        Partitioned ``zone=``/``year=`` so the layout is already the one a Parquet dataset wants: the
-        registry is specified as Parquet indexing what each shard holds and how close its refusals
-        came to the line, and these per-cell parts are the write-optimised half of that.
-
-        **Deviation worth knowing: the parts are JSON, not Parquet.** Writing Parquet needs
-        ``pyarrow``, which this runtime does not carry, and adding it to the path a GPU fill takes to
-        publish a cell is a poor trade for a file a consumer reads later. Compacting these parts into
-        the Parquet dataset belongs in a separate step that may depend on whatever it likes.
-        """
-        return f"{self.optical_registry()}/zone={zone}/year={year}/refusals.json"
