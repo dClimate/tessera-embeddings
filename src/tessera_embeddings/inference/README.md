@@ -496,11 +496,25 @@ as **raw, uncompressed** zarr (zero codec CPU on GPU-priced nodes). Staged sub-c
 so a staged 2048-px tile *is* the 8×8 inner-chunk grid of the output region it becomes,
 and the band axis is never split (ADR-008 D2).
 
-Alongside embeddings, each staged chunk includes float32 `scales` and three **observation
-count** layers (`s2_obs_count`, `s1_asc_obs_count`, `s1_desc_obs_count`) — uint16 (H, W)
-arrays recording how many valid timesteps contributed to each pixel. These are carried
-through assembly into the final store as 2D spatial variables (dims: `time, northing,
-easting`).
+Alongside embeddings, each staged chunk includes float32 `scales` and the per-pixel
+provenance layers: three **observation count** arrays (`s2_obs_count`, `s1_asc_obs_count`,
+`s1_desc_obs_count`) — uint16 (H, W), how many valid timesteps contributed to each pixel —
+and `s2_month_covered`, twelve booleans per pixel recording *which* calendar months those
+optical observations fell in (dims `time, northing, easting, month`; the month axis is never
+split, like the band axis).
+
+**Which of these assembly copies into the destination is derived from the store layout, not
+written out.** `store_layout.REQUIRED_VARS` is what every staged tile must carry and every
+destination must hold; `store_layout.CARRIED_VARS` is everything else, computed from the
+layout's own array set. Assembly keeps whichever of them are present in *both* the staged tile
+and the destination, so a store predating an array, or a run that stages nothing for one,
+needs no special case. Adding an array to the layout is therefore sufficient to have it
+carried — which was not true while the copy set was a hand-written tuple, and cost one
+published zone-year of empty `s2_month_covered` planes.
+
+A 4-D variable's trailing extent comes from `store_layout.trailing_extent`, per variable:
+`band` is as wide as the embedding, `month` is twelve. There is deliberately no "4-D means
+bands" rule, because there are now two different 4-D trailing axes.
 
 #### Completion markers: how a resume tells finished from interrupted
 

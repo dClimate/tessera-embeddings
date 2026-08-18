@@ -216,6 +216,66 @@ below.
 > quantised embedding shrink by 7%, so the store is essentially 120 bytes of embedding per pixel
 > whatever else is added beside it — and month coverage compresses ~400×.
 
+> **The first cell published twelve empty planes, and every other array beside them was right
+> (2026-08-18).** 09S/2022 landed in `tessera-months`, validated, and reported 51 observations per
+> pixel. Its `s2_month_covered` was `False` everywhere — 4 matching flags out of 786,432, and those 4
+> by coincidence — while on the same 256-px window `s2_obs_count` agreed with the mosaic on **65,536
+> of 65,536 pixels** and the mosaic itself showed **45.3 observations and 11.99994 months per pixel**.
+> Fixed in `ac932c6`.
+>
+> **The cause was enumeration, not the array.** Assembly chose which staged variables to copy into the
+> destination from a hand-written tuple, `("embeddings", "scales", "embedding_std", *OBS_COUNT_VARS)`,
+> repeated at four decision points. Adding an array to the layout satisfied everything else — it was
+> created in every zone, seeded at the right dtype and geometry, computed per strip by the actors, and
+> staged with real values — so no step failed. The array simply had no name on the list, and a
+> variable that is never copied leaves the destination reading exactly like a pixel with no
+> observations. The copy set is now **derived from the layout** (`CARRIED_VARS`), so an array added to
+> the schema is carried by construction.
+>
+> Three further defects sat behind it, all latent because the copy never reached them, and all of
+> which would have failed the fill once the array was on the list. Each is the *same* mistake in a
+> different place — a rule written when `band` was the only trailing axis:
+>
+> | check | assumed | consequence for a month tile |
+> |---|---|---|
+> | staged-tile shape | any 4-D trailing axis is bands | a correct 12-month tile looks like a 12-wide embedding, rejected |
+> | cleared-tile fill block | 4-D only for `embeddings`/`embedding_std` | a skipped tile writes a 3-D block into a 4-D array |
+> | single-ROI schema | `sizes` has no `"month"` key | `KeyError` creating the array, and no month coordinate written |
+>
+> **Why no test caught it.** Every assembly test hand-rolled its destination group, so no test
+> destination held the new array; and the one fake that touched it — the strip-loop capturing writer —
+> accepted `month_covered` and discarded it. Both are now structural: the test destination is seeded
+> **from the layout**, and the round-trip assertion loops over `CARRIED_VARS` rather than a written-out
+> list, so the next array added is covered without anyone remembering. Both new tests were run against
+> the pre-fix code and fail there, the round-trip one with the production symptom exactly — all-`False`
+> against a mixed pattern.
+>
+> **A well-observed window cannot verify this array.** The two windows first banked as external truth
+> came back at **11.99994 and 11.92 months per pixel**, where a correct array, an all-`True` array and
+> almost any wrong array agree to within a rounding error; they could only have caught a gross
+> misalignment. What discriminates is thin ground with genuine month gaps, so the snapshot now scans a
+> lattice and keeps the thinnest windows alongside a dense control:
+>
+> | zone | window | obs/px | months/px | pixels with a month gap |
+> |---|---|---:|---:|---:|
+> | 40S | thin | 18.6 | 9.945 | **96.7%** |
+> | 40S | mid | 32.7 | 10.828 | 54.5% |
+> | 40S | dense (control) | 56.4 | 12.000 | 0.0% |
+> | 28S | thin | 14.3 | 8.376 | — |
+> | 28S | dense (control) | 56.0 | 12.000 | 0.0% |
+>
+> The comparison also reports what an all-`True` and an all-`False` array would have scored on the
+> same ground, because an agreement figure means nothing without it.
+>
+> **Two operational notes.** The mosaic is the only external check and is deleted when a cell lands,
+> so the snapshot must be taken between ingest completing and the fill finishing — and a fill
+> cancelled *before* its cell lands preserves the mosaic (`cleanup` runs only after a cell lands),
+> which is what made a re-fill possible without re-ingesting. 09S/2022 keeps its empty planes: the
+> store is write-once, so a wrong array is not repaired, it is superseded by a fresh store.
+>
+> A single-timestep probe for "is this window populated" wrongly concluded 28S had no populated window
+> at all — a partial-swath date reads empty over good land. Probe several.
+
 The census that produced the campaign figures measured **shard means**, and this rule
 refuses **individual pixels** — a different question, and the class of error the
 corrections register calls *presence counted where coverage was meant*. It was therefore
