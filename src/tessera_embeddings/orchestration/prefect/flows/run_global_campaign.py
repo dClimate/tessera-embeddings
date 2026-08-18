@@ -1132,6 +1132,7 @@ async def run_global_campaign(
             batch_zones = list(dict.fromkeys(z for z, _y in batch_cells))
             round_failures: list[str] = []
             round_runs: list[str] = []
+            runs_this_round_by_year: dict[int, list[str]] = {}
 
             if batch_zones and fill_strategy == "chained-clusters":
                 # Up to max_parallel_clusters child runs fill the year, each owning
@@ -1306,6 +1307,10 @@ async def run_global_campaign(
                         round_failures.append(str(exc))
                         continue
                     round_runs.append(str(r.id))
+                    # A chained cluster genuinely spans the batch's years, so unlike the
+                    # per-cell path below its run belongs to all of them.
+                    for y in batch_years:
+                        runs_this_round_by_year.setdefault(y, []).append(str(r.id))
                 log.info(
                     "Year(s) %s: %d/%d chained fill(s) landed",
                     batch_years,
@@ -1358,12 +1363,19 @@ async def run_global_campaign(
                         round_failures.append(f"{z}-{y}: {cr!r}")
                     else:
                         round_runs.append(str(cr))
+                        # Per-cell runs fill ONE year each, so each is attributed to its own.
+                        # Copying the whole round into every year reported each year as
+                        # holding the others' runs and overcounted `dispatched` by the number
+                        # of years in the batch — invisible with one year per round, which is
+                        # every batch until `overlap_years` puts several in one.
+                        runs_this_round_by_year.setdefault(y, []).append(str(cr))
                 log.info("Year(s) %s: %d/%d fill(s) landed", batch_years, len(round_runs), len(batch_cells))
 
-            # Attributed to every year the batch covered: with one batch per year that is
-            # exactly the old behaviour, and with overlap a run genuinely spans them.
-            for y in batch_years:
-                runs_by_year.setdefault(y, []).extend(round_runs)
+            # Attribution is per strategy, and the two differ: a chained cluster spans the
+            # batch's years while a per-cell run fills exactly one. Both populate
+            # `runs_this_round_by_year` above, so this only merges it.
+            for y, runs in runs_this_round_by_year.items():
+                runs_by_year.setdefault(y, []).extend(runs)
             # Re-read the STORE, every round, including the rounds that reported no
             # failures. What landed is a property of the store, never of a child's
             # return value: a child can report success having silently not attempted

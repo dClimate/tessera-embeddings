@@ -1332,3 +1332,29 @@ def test_the_staging_fingerprint_changes_with_the_stores_depth_rule(wired, monke
     at_none = mod._staging_run_id("33N", 2025, optical_min_obs=None, **common)
     assert len({at_25, at_30, at_none}) == 3, "each rule must own its staging prefix"
     assert at_25 == mod._staging_run_id("33N", 2025, optical_min_obs=25, **common), "and be stable"
+
+
+def test_overlap_years_does_not_overcount_per_cell_runs(wired, monkeypatch):
+    """Under `overlap_years` with per-cell dispatch, a round holds one run PER CELL.
+
+    The attribution loop copied the whole round's run list into every year in the batch, so
+    each year reported the other years' runs and `dispatched` — summed over years — came out
+    multiplied by the number of years in the batch. Invisible while every batch carried one
+    year, which is every batch until this flag puts several into one.
+
+    Two zones over two years is four cells, so `dispatched` must be 4 and not 8.
+    """
+    _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024], wired)
+    result = asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS,
+            ami_ssm_name="ami",
+            fill_strategy="cluster-per-zone",
+            max_parallel_clusters=2,
+            overlap_years=True,
+        )
+    )
+    assert result["dispatched"] == 4, (
+        f"four cells were dispatched; {result['dispatched']} means each year was credited "
+        "with the other years' runs"
+    )
