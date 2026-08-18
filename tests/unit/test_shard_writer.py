@@ -57,11 +57,19 @@ class _OneInnerChunkSource:
         return {"embeddings": emb, "scales": scl}
 
 
+#: How long `_SlowLoadSource` stalls. Sized to DOMINATE the real write it is compared
+#: against, not merely to be measurable: the assertion is `write_s < read_s`, and the write
+#: is unbounded real work whose duration depends on the runner. At 0.05 s this flaked on CI
+#: with read_s=0.054 against write_s=0.068 — a contended runner made the genuine write take
+#: longer than the injected stall, failing a test whose subject is attribution, not speed.
+_STALL_S = 0.3
+
+
 class _SlowLoadSource(_OneInnerChunkSource):
     """A source whose load stalls, standing in for a slow staged-tile GET."""
 
     def load(self, shard):
-        time.sleep(0.05)
+        time.sleep(_STALL_S)
         return super().load(shard)
 
 
@@ -228,7 +236,7 @@ class TestForkTelemetry:
             telemetry=telemetry,
         )
         (worker,) = telemetry["workers"]
-        assert worker["read_s"] >= 0.045
+        assert worker["read_s"] >= _STALL_S * 0.9
         assert worker["write_s"] < worker["read_s"]
         # The stall is blocked time, so it must NOT appear as read CPU either.
         assert worker["read_cpu_s"] < worker["read_s"]
