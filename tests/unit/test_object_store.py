@@ -126,8 +126,16 @@ def test_delete_prefix_strict_raises_when_delete_fails(monkeypatch):
     monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
 
     object_store.delete_prefix("s3://b/p")  # best-effort: swallows
-    with pytest.raises(OSError, match="access denied"):
+
+    # strict + all_versions (the default) is refused BEFORE the fallback runs: fsspec cannot
+    # remove non-current versions, so the promise cannot be kept whatever the fallback does.
+    with pytest.raises(object_store.DeleteUnverifiedError):
         object_store.delete_prefix("s3://b/p", strict=True)
+
+    # With all_versions=False the fallback CAN keep the promise, so it runs — and its own
+    # failure propagates under strict, which is what this test was written to pin.
+    with pytest.raises(OSError, match="access denied"):
+        object_store.delete_prefix("s3://b/p", strict=True, all_versions=False)
 
 
 def test_a_throttled_delete_is_retried_before_the_fallback(monkeypatch):
@@ -178,3 +186,40 @@ def test_a_missing_binary_is_not_retried(monkeypatch):
     object_store.delete_prefix("s3://b/p")
     assert len(calls) == 1, "a missing binary must not be retried"
     assert fell_back == ["s3://b/p"]
+
+
+def test_strict_all_versions_refuses_the_fsspec_fallback(monkeypatch):
+    """Fsspec's rm removes CURRENT objects only; on a versioned bucket the old versions stay.
+
+    So when s5cmd is missing or fails, the fallback cannot honour `all_versions` — and returning
+    success from it tells a strict caller a prefix is reclaimed while terabytes of non-current
+    versions are still billed. `_InputRetention.cleanup` then releases the cell's storage-budget
+    slot and admits another ingest on the strength of it.
+
+    Best-effort callers still get the fallback; only a caller that said it cannot proceed on an
+    unclean prefix is refused.
+    """
+
+    def _s5_missing(*a, **k):
+        raise FileNotFoundError("s5cmd not on PATH")
+
+    monkeypatch.setattr(object_store, "_s5cmd_rm", _s5_missing)
+    monkeypatch.setattr(object_store.time, "sleep", lambda _s: None)
+
+    class _FS:
+        def exists(self, p):
+            return True
+
+        def rm(self, p, recursive):
+            return None
+
+    monkeypatch.setattr(object_store.fsspec, "filesystem", lambda proto: _FS())
+
+    # Best-effort: the fallback runs and the caller is warned, not stopped.
+    object_store.delete_prefix("s3://b/p", all_versions=True)
+
+    with pytest.raises(object_store.DeleteUnverifiedError, match="non-current versions"):
+        object_store.delete_prefix("s3://b/p", all_versions=True, strict=True)
+
+    # all_versions=False is a different promise and the fallback CAN keep it.
+    object_store.delete_prefix("s3://b/p", all_versions=False, strict=True)

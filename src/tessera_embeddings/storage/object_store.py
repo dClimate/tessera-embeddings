@@ -201,6 +201,21 @@ def delete_prefix(uri: str, *, log: _Log | None = None, all_versions: bool = Tru
             )
             return
         except (FileNotFoundError, RuntimeError) as exc:
+            if strict and all_versions:
+                # fsspec's rm removes CURRENT objects; on a versioned bucket it leaves every
+                # non-current version in place (and adds a delete marker). So the fallback
+                # cannot honour `all_versions`, and returning success from it tells a strict
+                # caller a prefix is reclaimed when terabytes of old versions are still billed
+                # — `_InputRetention.cleanup` then releases the cell's storage-budget slot and
+                # admits another ingest. Best-effort callers still get the fallback; a caller
+                # that said it cannot proceed on an unclean prefix gets told.
+                msg = (
+                    f"s5cmd could not delete {uri} ({exc}) and the fsspec fallback cannot remove "
+                    "non-current versions, so an all-versions delete cannot be honoured here. "
+                    "Install s5cmd on this runner, or call with all_versions=False if current "
+                    "objects alone are what the caller needs."
+                )
+                raise DeleteUnverifiedError(msg) from exc
             versions_note = " (non-current versions may remain)" if all_versions else ""
             log.warning("s5cmd rm of %s failed (%s) — falling back to fsspec%s", uri, exc, versions_note)
         else:
