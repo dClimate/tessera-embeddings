@@ -432,6 +432,43 @@ class TestS2OnlyPolicyIsPartOfEmbeddingIdentity:
         assert EmbeddingManifest.from_dict(on.to_dict()).allow_s2_only is True
 
 
+class TestOpticalMinObsIsPartOfEmbeddingIdentity:
+    """The minimum-depth rule decides which pixels become embeddings and which stay fill.
+
+    Exactly the argument that put ``allow_s2_only`` in this manifest, and the reason the
+    two sit beside each other: nothing else here reflects the rule, so a store could hold
+    two time slices admitted under different lines and the append gate would see nothing
+    wrong. The store's advertised root rule is write-once for the same reason — this is the
+    per-append half of it.
+    """
+
+    def test_a_different_line_changes_the_digest(self):
+        a = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, optical_min_obs=25)
+        b = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, optical_min_obs=30)
+        assert a.hash() != b.hash()
+
+    def test_no_rule_matches_a_store_written_before_the_field_existed(self):
+        """Unrecorded and "no rule" are the same state, so such an append must be allowed."""
+        legacy = EmbeddingManifest(model_checkpoint="ckpt", num_obs_checkpoints=(8,))
+        none = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, optical_min_obs=None)
+        assert none.optical_min_obs is None
+        assert none.hash() == legacy.hash()
+        assert "optical_min_obs" not in none.to_dict()
+
+    def test_introducing_a_rule_over_a_store_that_has_none_is_refused(self):
+        """The case the general "skip a key the store lacks" rule cannot see: the store says
+        nothing, the run says 25, and nothing disagrees unless absence is read as a value.
+        """
+        legacy = EmbeddingManifest(model_checkpoint="ckpt", num_obs_checkpoints=(8,)).to_dict()
+        withrule = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, optical_min_obs=25)
+        with pytest.raises(ConfigMismatchError, match="optical_min_obs"):
+            withrule.validate_against(legacy, "existing.zarr")
+
+    def test_the_rule_survives_a_round_trip(self):
+        m = EmbeddingManifest.from_upstream_stores("ckpt", (8,), {}, optical_min_obs=25)
+        assert EmbeddingManifest.from_dict(m.to_dict()).optical_min_obs == 25
+
+
 class TestAdmissionThresholdIsPartOfIngestIdentity:
     """A resumed mosaic must be built to ONE admission policy.
 

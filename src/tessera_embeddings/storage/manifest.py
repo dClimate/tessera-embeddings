@@ -325,7 +325,7 @@ class EmbeddingManifest(StoreManifest):
     replaces v1.0's ``repeat_times``/``sample_size_s2`` as the structural param.
     """
 
-    ABSENT_MEANS_OFF: ClassVar[frozenset[str]] = frozenset({"allow_s2_only"})
+    ABSENT_MEANS_OFF: ClassVar[frozenset[str]] = frozenset({"allow_s2_only", "optical_min_obs"})
 
     model_checkpoint: str
     num_obs_checkpoints: tuple[int, ...]
@@ -342,6 +342,18 @@ class EmbeddingManifest(StoreManifest):
     #: which is right, because that store WAS written with the policy off. Only turning
     #: the policy on changes the digest, which is the append this needs to catch.
     allow_s2_only: bool | None = None
+    #: The minimum optical depth a pixel needed to be embedded, or ``None`` for no rule.
+    #: Here for the same reason as ``allow_s2_only`` directly above, and by the same
+    #: argument: it decides which pixels become embeddings and which stay fill, so two
+    #: appends to one store under different lines leave time slices that are not
+    #: comparable, and no other field in this manifest would notice. A store's advertised
+    #: root rule is write-once for the same reason; this is the per-append half of it.
+    #:
+    #: ``None`` means no rule, and is in :data:`ABSENT_MEANS_OFF` so a store written before
+    #: this field existed still matches a later no-rule run — that store genuinely had no
+    #: rule — while an append that INTRODUCES a line is refused, which is the case the
+    #: general "skip a key the store lacks" rule cannot see.
+    optical_min_obs: int | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> EmbeddingManifest:
@@ -359,6 +371,7 @@ class EmbeddingManifest(StoreManifest):
         num_obs_checkpoints: tuple[int, ...],
         upstream_manifests: dict[str, dict[str, Any] | None],
         allow_s2_only: bool | None = None,
+        optical_min_obs: int | None = None,
     ) -> EmbeddingManifest:
         """Build from upstream ingest store manifests.
 
@@ -371,6 +384,7 @@ class EmbeddingManifest(StoreManifest):
             allow_s2_only: The run's per-pixel S1 policy. Falsy is stored as ``None`` so
                 the digest matches stores written before the field existed — see the
                 field's own note for why those are the same state.
+            optical_min_obs: The run's minimum optical depth, or ``None`` for no rule.
         """
         ref_dict = upstream_manifests.get("reflectance")
         ref_hash = IngestManifest.from_dict(ref_dict).hash() if ref_dict else None
@@ -391,4 +405,5 @@ class EmbeddingManifest(StoreManifest):
             reflectance_manifest_hash=ref_hash,
             sar_manifest_hash=sar_hash,
             allow_s2_only=allow_s2_only or None,
+            optical_min_obs=optical_min_obs,
         )

@@ -78,6 +78,7 @@ def build_embedding_manifest(
             else {}
         ),
         allow_s2_only=config.allow_s2_only,
+        optical_min_obs=config.optical_min_obs,
     )
 
 
