@@ -21,7 +21,7 @@ their CRS and grid differ by zone.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import cast
 
 import icechunk
@@ -272,6 +272,42 @@ def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> N
             )
 
 
+def check_root_identity(
+    root_attrs: Mapping[str, object],
+    *,
+    layout: str,
+    model_version: str | None = None,
+    optical_min_obs: int | None = None,
+) -> None:
+    """Raise unless *root_attrs* already publishes the identity this seed requests.
+
+    Split out of :func:`seed_zone_groups` so the two callers that must not disagree share
+    one implementation. The seed itself runs it before creating groups; the
+    ``seed_global_store`` flow runs it on the path where every zone already exists and no
+    groups are created at all — which previously returned success without checking, so a
+    rerun requesting a different checkpoint or a different minimum-depth rule reported a
+    clean seed and left the old identity in place for the campaign to follow.
+
+    A store with no identity stamped yet passes: the first seed is what stamps it.
+    """
+    if optical_min_obs is not None and optical_min_obs <= 0:
+        raise ValueError(
+            f"optical_min_obs={optical_min_obs} refuses nothing — pass None for a store with no "
+            "minimum-depth rule, or a positive number of observations."
+        )
+    if "geoemb:model" not in root_attrs:
+        return
+    new_root = _root_attrs(layout, model_version, optical_min_obs)
+    identity = ("geoemb:model", "geoemb:dimensions", "geoemb:data_type", "checkpoint_id", "optical_min_obs")
+    mismatched = {k: (root_attrs.get(k), new_root.get(k)) for k in identity if root_attrs.get(k) != new_root.get(k)}
+    if mismatched:
+        raise ValueError(
+            f"Refusing to reseed: the store root's published identity is write-once, but this seed "
+            f"would change {mismatched}. Seed a fresh store for a new encoder or a new minimum-depth "
+            "rule (mixing either under one store would corrupt already-published zones)."
+        )
+
+
 def seed_zone_groups(
     repo: icechunk.Repository,
     specs: Iterable[ZoneSpec],
@@ -311,30 +347,16 @@ def seed_zone_groups(
     # A) be mixed with a new one (encoder B) under a root now advertising B. The
     # first seed stamps it; a matching reseed is a no-op; a changed identity is
     # rejected. (Software build_version may drift and is not part of the identity.)
-    if optical_min_obs is not None and optical_min_obs <= 0:
-        # Zero cannot be a rule: it refuses nothing while presenting as a configured line, and it
-        # would then be stamped as one, permanently, on a store that has no rule at all.
-        raise ValueError(
-            f"optical_min_obs={optical_min_obs} refuses nothing — pass None for a store with no "
-            "minimum-depth rule, or a positive number of observations."
-        )
-    new_root = _root_attrs(layout, model_version, optical_min_obs)
+    # Zero cannot be a rule, and a changed identity is a refusal: both in check_root_identity,
+    # which the seed_global_store flow also calls on the every-zone-exists path.
+    check_root_identity(root.attrs, layout=layout, model_version=model_version, optical_min_obs=optical_min_obs)
     if "geoemb:model" not in root.attrs:
-        root.attrs.update(new_root)
-    else:
         # optical_min_obs is in the identity for the same reason the encoder is: a fill reads it to
         # decide which pixels it may embed, so re-stamping it would let zones filled under one rule
         # sit beside zones filled under another, under a root advertising only the second. The
         # consequence to know is that it makes the rule UNCHANGEABLE for this store — moving the
         # line means a new store, not a migration.
-        identity = ("geoemb:model", "geoemb:dimensions", "geoemb:data_type", "checkpoint_id", "optical_min_obs")
-        mismatched = {k: (root.attrs.get(k), new_root.get(k)) for k in identity if root.attrs.get(k) != new_root.get(k)}
-        if mismatched:
-            raise ValueError(
-                f"Refusing to reseed: the store root's published identity is write-once, but this seed "
-                f"would change {mismatched}. Seed a fresh store for a new encoder or a new minimum-depth "
-                "rule (mixing either under one store would corrupt already-published zones)."
-            )
+        root.attrs.update(_root_attrs(layout, model_version, optical_min_obs))
     # The time axis is fixed and UNIFORM across all zone groups (ADR-008 D1):
     # campaign status/fill code assumes every group shares one axis. A direct
     # incremental seed passing a different `years` than the groups already present

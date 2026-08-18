@@ -2267,7 +2267,7 @@ def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
     expected over and would say nothing about the data.
     """
     embedded = free = light = s2_thin = 0
-    reported = silent = 0
+    reported = silent = fully_free = 0
     thin_below: int | None = None
     for r in results:
         if r.get("status") != "success":
@@ -2281,6 +2281,11 @@ def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
         light += int(r.get("s1_thin_pixels", 0))
         s2_thin += int(r.get("s2_thin_pixels", 0))
         thin_below = thin_below or r.get("s2_thin_below_obs")
+        # In THIS loop, for the reason stated two fields below: `results` is an Iterable and
+        # a generator is exhausted by the time any second pass runs, which would silently
+        # report zero fully-free tiles rather than fail.
+        if r["s1_free_pixels"] and r["s1_free_pixels"] == r.get("valid_pixels"):
+            fully_free += 1
     if silent:
         # A RESUMED tile is a synthetic success carrying no counters, and dropping it from
         # both sides of the ratio still leaves a figure — computed over the tiles this run
@@ -2321,10 +2326,6 @@ def summarise_radar_coverage(results: Iterable[dict]) -> dict | None:
         # storing a per-tile grid, and distinguishes a concentrated absence (whole tiles,
         # e.g. an ice margin) from a diffuse one (a swath edge crossing many tiles). Exact
         # locations are already in the store's per-pixel observation-count arrays.
-        "tiles_fully_s1_free": sum(
-            1
-            for r in results
-            if r.get("status") == "success" and r.get("s1_free_pixels") and r["s1_free_pixels"] == r.get("valid_pixels")
-        ),
+        "tiles_fully_s1_free": fully_free,
         "tiles_reporting": reported,
     }

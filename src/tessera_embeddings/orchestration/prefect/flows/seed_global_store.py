@@ -21,8 +21,14 @@ from prefect import flow, get_run_logger
 
 from tessera_embeddings.config.inference import checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
+from tessera_embeddings.config.store_layout import GLOBAL
 from tessera_embeddings.storage.campaign import campaign_status
-from tessera_embeddings.storage.global_store import create_global_repo, open_global_repo, seed_zone_groups
+from tessera_embeddings.storage.global_store import (
+    check_root_identity,
+    create_global_repo,
+    open_global_repo,
+    seed_zone_groups,
+)
 from tessera_embeddings.storage.zarr_store import is_missing_repo, read_time_values
 from tessera_embeddings.storage.zone_grid import CAMPAIGN_YEARS, ZONES, year_of
 
@@ -122,6 +128,15 @@ def seed_global_store(
 
     todo = [spec for zone_name, spec in ZONES.items() if zone_name not in seeded]
     if not todo:
+        # seed_zone_groups is where the write-once root identity is checked, and it is not
+        # reached when there is nothing to create — so a rerun asking for a different
+        # checkpoint or a different minimum-depth rule used to report a clean seed and leave
+        # the old identity standing, with the campaign then following the OLD rule. Check it
+        # here too, on exactly the path that skips the seed.
+        root_attrs = dict(zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs)
+        # GLOBAL is what the seed below uses (seed_zone_groups' default), so the identity
+        # compared here is the identity that a seed would have written.
+        check_root_identity(root_attrs, layout=GLOBAL, model_version=model_version, optical_min_obs=optical_min_obs)
         log.info("All %d zone groups already seeded in %s", len(ZONES), store_path)
         return {"store_path": store_path, "seeded_now": 0, "already_seeded": len(seeded), "total": len(ZONES)}
 

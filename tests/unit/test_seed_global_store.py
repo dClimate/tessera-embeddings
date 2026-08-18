@@ -7,6 +7,7 @@ the point is only which ``model_version`` (→ ``checkpoint_id``) is stamped.
 from __future__ import annotations
 
 import logging
+from typing import ClassVar
 
 import icechunk
 import pytest
@@ -119,3 +120,48 @@ def test_an_explicit_minimum_depth_rule_reaches_the_seeder(monkeypatch):
     captured = _capture_seed(monkeypatch)
     mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=25)
     assert captured["optical_min_obs"] == 25
+
+
+def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch):
+    """The every-zone-exists path returns before seed_zone_groups, which is the only place
+    the write-once root identity is compared.
+
+    So a rerun asking for a different checkpoint — or a different minimum-depth rule —
+    reported a clean seed, left the old identity standing, and the campaign then followed
+    the OLD rule while the operator believed they had configured a new one. Nothing raised
+    and nothing logged a difference.
+
+    The check now runs on exactly that path. A MATCHING request must still be a no-op, so
+    both directions are pinned here.
+    """
+    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-seed"))
+
+    class _Root:
+        attrs: ClassVar[dict] = {"geoemb:model": "tessera-v1.1", "optical_min_obs": 25}
+
+        def __getitem__(self, _name):  # the year-axis probe reads one seeded group
+            return self
+
+    class _Repo:
+        def readonly_session(self, branch):
+            return type("S", (), {"store": object()})()
+
+    monkeypatch.setattr(mod, "open_global_repo", lambda *a, **k: _Repo())
+    # Every zone already present → todo is empty → the early return.
+    monkeypatch.setattr(mod, "campaign_status", lambda repo, years: type("St", (), {"zones": list(mod.ZONES)})())
+    monkeypatch.setattr(mod.zarr, "open_group", lambda *a, **k: _Root())
+    # The year-axis guard runs first and must pass, so the identity check is what raises.
+    monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
+    monkeypatch.setattr(mod, "year_of", lambda t: t)
+    seen: dict = {}
+
+    def _check(root_attrs, *, layout, model_version, optical_min_obs):
+        seen["optical_min_obs"] = optical_min_obs
+        if optical_min_obs != root_attrs["optical_min_obs"]:
+            raise ValueError("Refusing to reseed: the store root's published identity is write-once")
+
+    monkeypatch.setattr(mod, "check_root_identity", _check)
+
+    with pytest.raises(ValueError, match="write-once"):
+        mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=30)
+    assert seen["optical_min_obs"] == 30, "the REQUESTED rule must reach the check, not the store's"

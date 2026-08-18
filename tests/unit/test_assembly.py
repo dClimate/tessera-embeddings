@@ -2665,3 +2665,28 @@ class TestPlainZarrIsReadWithTheRunsCredentials:
         plain_zarr_storage_options("s3://in/rois/roi.zarr", get_credentials, None)
         plain_zarr_storage_options("s3://in/rois/roi.zarr", get_credentials, None)
         assert len(calls) == 2
+
+
+def test_radar_coverage_counts_fully_free_tiles_from_a_generator():
+    """`summarise_radar_coverage` takes an Iterable, so it may traverse it exactly once.
+
+    `tiles_fully_s1_free` was computed by a second pass over `results`. With a list that
+    works; with the generator the signature invites, the aggregation loop has already
+    exhausted the iterable, so the second pass sees nothing and the year records zero
+    fully-radar-free tiles however many there were. Silent, and wrong in the direction that
+    hides a coverage gap.
+
+    Two calls with identical content, one materialised and one lazy, must agree.
+    """
+    tiles = [
+        {"status": "success", "valid_pixels": 100, "s1_free_pixels": 100, "s1_thin_pixels": 0, "s2_thin_pixels": 0},
+        {"status": "success", "valid_pixels": 100, "s1_free_pixels": 100, "s1_thin_pixels": 0, "s2_thin_pixels": 0},
+        {"status": "success", "valid_pixels": 100, "s1_free_pixels": 10, "s1_thin_pixels": 0, "s2_thin_pixels": 0},
+    ]
+
+    from_list = _assembly_mod.summarise_radar_coverage(tiles)
+    from_generator = _assembly_mod.summarise_radar_coverage(t for t in tiles)
+
+    assert from_list is not None and from_generator is not None
+    assert from_list["tiles_fully_s1_free"] == 2, "two of the three tiles are entirely radar-free"
+    assert from_generator == from_list, "a one-shot iterable must give the same answer as a list"
