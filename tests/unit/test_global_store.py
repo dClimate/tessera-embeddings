@@ -262,6 +262,7 @@ def test_adding_a_rule_to_a_store_seeded_without_one_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="write-once"):
         global_store.seed_zone_groups(repo, [_ZB], years=(2025,), optical_min_obs=30)
 
+
 def test_seeding_a_zone_that_already_exists_is_a_no_op(tmp_path):
     """A matching reseed is allowed by the identity and layout checks, then used to fail.
 
