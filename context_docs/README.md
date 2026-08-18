@@ -27,7 +27,8 @@ context_docs/
 │   ├── 013-optional-s1-s2-only-pixels.md
 │   ├── 014-architecture-rules-scan-the-package.md
 │   ├── 015-regrouping-the-unit-tests.md
-│   └── 016-scripts-layout-and-shared-modules.md
+│   ├── 016-scripts-layout-and-shared-modules.md
+│   └── 017-no-antarctic-coverage.md
 └── design/           Long-form framing docs, grouped by what they answer
     │
     │  THE CAMPAIGN — start here

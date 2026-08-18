@@ -315,6 +315,14 @@ pre-allocated with a 2017–2025 annual time axis and filled one
 operational plan for running the campaign is
 [`context_docs/design/campaign-plan.md`](context_docs/design/campaign-plan.md).
 
+**What "global" means here: land between 59.45°S and 83.65°N**, which is the
+extent of the coverage registry the campaign is built from.
+**Antarctica is excluded by decision**, not omitted by accident — the registry
+offers no Antarctic land cell, and the UTM grid could not place one if it did
+(UTM's usable range stops at 80°S). Reaching further south would need a
+different projection, a different coverage source and a different zone scheme;
+see [ADR-017](context_docs/decisions/017-no-antarctic-coverage.md).
+
 ```
 one Icechunk repo (BucketPaths.global_store())
 ├── 01N/    embeddings (time, northing, easting, band)  int8

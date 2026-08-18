@@ -231,6 +231,13 @@ def build_zone_coverage(zone: str, lons: np.ndarray, lats: np.ndarray) -> ZoneCo
                 # grid can't represent it. It set no coverage bit; count it so
                 # build_all can surface the loss loudly rather than dropping it
                 # silently. (The v1.1 registry is 59.45S to 83.65N, so this is 0.)
+                #
+                # Antarctica is therefore absent from the product BY DECISION, not by
+                # accident of this guard: the registry never offers an Antarctic cell, and
+                # UTM could not place one if it did. See ADR-017 — "global" here means the
+                # registry's extent, 59.45S to 83.65N, and that bound is published rather
+                # than implied. This counter stays because it is what would report a FUTURE
+                # registry quietly reaching past what UTM can represent.
                 n_clipped += 1
                 continue
             tile_live[
