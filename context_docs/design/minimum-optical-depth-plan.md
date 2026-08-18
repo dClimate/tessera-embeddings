@@ -287,6 +287,50 @@ below.
 >
 > The comparison also reports what an all-`True` and an all-`False` array would have scored on the
 > same ground, because an agreement figure means nothing without it.
+
+> **Verified, on ground where a wrong array would have shown (2026-08-18).** 40S/2022 and 28S/2022
+> re-filled into a fresh store from the same mosaics, and every published flag matches the SCL it was
+> derived from: **seven windows, 5,505,024 flags, zero disagreements**, with `s2_obs_count` also
+> matching on all 458,752 pixels and no pixel covering more months than it has observations.
+>
+> | zone | window | obs/px | months/px | px with a gap | agreement | all-`True` would score |
+> |---|---|---:|---:|---:|---:|---:|
+> | 40S | thin | 18.6 | 9.945 | 96.7% | **100.0000%** | 82.9% |
+> | 40S | mid | 32.7 | 10.828 | 54.5% | **100.0000%** | 90.2% |
+> | 40S | dense | 56.4 | 12.000 | 0.0% | 100.0000% | 100.0% |
+> | 28S | thin | 14.3 | 8.376 | 100.0% | **100.0000%** | 69.8% |
+> | 28S | mid | 16.2 | 10.574 | 89.6% | **100.0000%** | 88.1% |
+> | 28S | mid | 18.3 | 10.795 | 100.0% | **100.0000%** | 90.0% |
+> | 28S | dense | 56.0 | 12.000 | 0.0% | 100.0000% | 100.0% |
+>
+> The last column is the point of the table: on the dense windows the test has NO power — a broken
+> array scores full marks there — and the thin windows are where 100% means something. Seasonal
+> structure is reproduced too, not just totals: 28S's thinnest window has months 10 and 11 absent
+> across the whole window and its neighbour has month 10 absent, matching the mosaic exactly.
+>
+> The reader expressions were run verbatim against the published store rather than reasoned about.
+> `s2_month_covered` opens in xarray with dims `(time, northing, easting, month)`, a `month`
+> coordinate of 1..12, and dtype **bool**; `cov.sum("month")`, `cov.sel(month=7)`,
+> `cov.sel(month=slice(5, 9)).all("month")` and `cov.all("month")` all work with no helper.
+>
+> **CORRECTION to the 0.24 bits/pixel figure above: cost is driven by FRAGMENTATION, not by mean
+> coverage, and it spans a factor of 150.** Re-compressing published 256-px inner chunks with the
+> array's own zstd:
+>
+> | 28S window | months/px | bits/px | zstd ratio |
+> |---|---:|---:|---:|
+> | thin | 8.38 | 0.514 | 187× |
+> | mid | 10.57 | **0.771** | 125× |
+> | mid | 10.79 | 0.209 | 459× |
+> | dense | 12.00 | 0.005 | 18,725× |
+>
+> The 10.57-month window costs **more** than the 8.38-month one: a uniform plane — all covered or all
+> empty — is nearly free, and a mottled one is not, so the predictor is patchiness rather than depth.
+> The 0.24 bits/pixel design figure sits inside this range and remains the best population estimate;
+> it was measured over ordinary chunks, whereas a thin-weighted sample like the one above pools to
+> 0.325 and is an upper-tail sample by construction. **The store-share conclusion does not move**:
+> even at the worst window's 0.771 bits/pixel everywhere the array is ~0.08% of the store rather than
+> 0.025%, so it is negligible under either figure.
 >
 > **Two operational notes.** The mosaic is the only external check and is deleted when a cell lands,
 > so the snapshot must be taken between ingest completing and the fill finishing — and a fill
