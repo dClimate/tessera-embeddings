@@ -708,6 +708,12 @@ async def ingest_zone_year(
                     refusal.token,
                 )
             if attempt == ingest_settings.max_leg_attempts:
+                # TERMINAL FOR THE CELL, so say so. `gather` must fail the cell once this leg
+                # gives up, and a sibling that is failed or backing off right now would otherwise
+                # keep launching its remaining attempts — holding a Dask fleet for a cell that
+                # cannot succeed, and delaying the failure report by however long they take.
+                # Same reasoning as the unfixable-failure branch above; only the route here differs.
+                doomed.set()
                 return detail
             if doomed.is_set():
                 # Another leg has failed in a way no re-dispatch can fix, so this cell cannot
@@ -746,6 +752,9 @@ async def ingest_zone_year(
                     ingest_settings.max_leg_attempts,
                     detail,
                 )
+                # Terminal for the cell for the same reason as the attempt-budget branch: this
+                # leg will start nothing further, so no sibling should either.
+                doomed.set()
                 return detail
             wait = _leg_backoff_s(attempt)
             # A re-dispatch RESUMES: already-committed dates are skipped, not rewritten, so the

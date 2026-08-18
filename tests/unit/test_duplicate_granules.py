@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pystac
 import pytest
 
 from tessera_embeddings.ingest.duplicates import (
@@ -26,6 +27,7 @@ from tessera_embeddings.ingest.duplicates import (
     select_preferred_duplicates,
     step_down_copies,
 )
+from tessera_embeddings.ingest.solar_days import normalize_to_solar_day
 
 
 class _Item:
@@ -48,6 +50,61 @@ def _pair() -> tuple[_Item, _Item]:
     old = _Item("S2B_34WFA_20210908_0_L2A", "MGRS-34WFA", "0", **{"s2:processing_baseline": "03.01"})
     new = _Item("S2B_34WFA_20210908_1_L2A", "MGRS-34WFA", "1", **{"s2:processing_baseline": "05.00"})
     return old, new
+
+
+class TestAgainstRealPystacItems:
+    """The claim that `normalize_to_solar_day` destroys the acquisition instant, settled.
+
+    Reviewers have raised this four times: that assigning `pystac.Item.datetime` writes
+    through to `properties["datetime"]`, so `acquisition_instant` reads canonical noon for
+    every copy and distinct same-day passes collapse into one reprocessing group — real
+    imagery silently dropped at high latitudes, where successive orbits overlap.
+
+    It is a good failure to worry about and it is not what pystac does: `datetime` is a
+    plain instance attribute with no descriptor behind it, so the assignment leaves
+    `properties` untouched. Every other test in this file uses a double, which is exactly
+    the objection someone could raise next — so this one drives REAL `pystac.Item`s
+    through the real `normalize_to_solar_day` and asserts on the outcome, not the mechanism.
+    """
+
+    @staticmethod
+    def _real(ident: str, tile: str, sequence: str, acquired: str) -> pystac.Item:
+        return pystac.Item(
+            id=ident,
+            geometry=None,
+            bbox=None,
+            datetime=datetime.fromisoformat(acquired.replace("Z", "+00:00")),
+            properties={"grid:code": tile, "s2:sequence": sequence, "datetime": acquired},
+        )
+
+    def test_normalising_leaves_the_acquisition_instant_in_properties(self) -> None:
+        item = self._real("S2A_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", "2021-09-08T10:20:31.024000Z")
+        normalize_to_solar_day([item], mid_longitude=15.0)
+
+        assert item.datetime.hour == 12, "the solar-day stamp must be applied to .datetime"
+        assert item.properties["datetime"] == "2021-09-08T10:20:31.024000Z", (
+            "pystac.Item.datetime is a plain attribute — assigning it must NOT write through"
+        )
+
+    def test_two_real_same_day_acquisitions_both_survive_the_whole_pipeline(self) -> None:
+        """End to end on real objects: normalise, then select. Neither may be dropped."""
+        first = self._real("S2A_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", "2021-09-08T10:20:31.024000Z")
+        second = self._real("S2B_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", "2021-09-08T11:10:14.512000Z")
+        normalize_to_solar_day([first, second], mid_longitude=15.0)
+
+        kept, alternates = select_preferred_duplicates([first, second])
+        assert kept == [first, second], "two distinct passes were collapsed into one"
+        assert alternates == {}
+
+    def test_real_reprocessings_of_one_acquisition_still_reduce(self) -> None:
+        """The other direction, so the test above cannot pass by never grouping anything."""
+        old = self._real("S2B_33XVG_20210908_0_L2A", "MGRS-33XVG", "0", "2021-09-08T10:20:31.024000Z")
+        new = self._real("S2B_33XVG_20210908_1_L2A", "MGRS-33XVG", "1", "2021-09-08T10:20:31.024000Z")
+        normalize_to_solar_day([old, new], mid_longitude=15.0)
+
+        kept, alternates = select_preferred_duplicates([old, new])
+        assert kept == [new]
+        assert alternates == {("MGRS-33XVG", "2021-09-08"): [old]}
 
 
 class TestIdentifyingACopy:

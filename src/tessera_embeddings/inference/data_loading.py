@@ -409,6 +409,38 @@ def resolve_s1_orbit(
     return "both"
 
 
+def _months_holding_unreadable_dates(unreadable: object) -> set[tuple[int, int]] | None:
+    """Months containing a date the ingest examined and could not read.
+
+    ``None`` means the answer is UNKNOWN — the attribute is present but not in a shape this
+    can read — and the caller must then excuse nothing, the same asymmetry
+    :func:`_months_within_assessed` documents: over-excusing publishes a hole, under-excusing
+    costs a re-ingest. An absent attribute is a genuine empty set, not unknown: stores record
+    it unconditionally, so its absence means no assessment wrote one rather than that one was
+    lost.
+
+    The distinction this exists to draw: a month inside the assessed window is normally
+    absent because the ingest LOOKED and there was nothing reachable — a real finding, common
+    for radar. A month whose every acquisition was skipped as unreadable is absent because the
+    imagery existed and was LOST. Both look identical to a present-month count, and only this
+    tells them apart.
+    """
+    if unreadable is None:
+        return set()
+    if not isinstance(unreadable, (list, tuple)):
+        return None
+    months: set[tuple[int, int]] = set()
+    for entry in unreadable:
+        raw = entry.get("date") if isinstance(entry, dict) else entry
+        try:
+            day = datetime.date.fromisoformat(str(raw))
+        except (ValueError, TypeError):
+            logger.warning("Unparseable assessed_unreadable_dates entry %r — excusing no month", entry)
+            return None
+        months.add((day.year, day.month))
+    return months
+
+
 def _months_within_assessed(months: list[tuple[int, int]], assessed: object) -> set[tuple[int, int]]:
     """Of ``months``, those lying ENTIRELY inside an ``assessed_window`` attribute.
 
@@ -528,7 +560,15 @@ def check_time_window_coverage(
         # cannot tell it from a hole. Anything reading this field to raise an alarm must key
         # on the UNEXPLAINED count, never on the month total, or it fires on healthy cells.
         _assessed = root.attrs.get(ASSESSED_WINDOW_ATTR)
+        _raw_unreadable = root.attrs.get("assessed_unreadable_dates")
+        # A month wholly inside the assessed window is normally EXPLAINED — looked at, nothing
+        # reachable. But a month whose acquisitions were all skipped as unreadable was looked at
+        # and its imagery LOST, and the store records exactly that. Excusing it would let a
+        # write-once year publish a whole-month data-loss hole labelled a legitimate absence.
+        # `None` = the attribute is unreadable itself, so nothing is excused (stricter).
+        _lost_months = _months_holding_unreadable_dates(_raw_unreadable)
         _explained = _months_within_assessed(missing, _assessed) if missing else set()
+        _explained = (_explained - _lost_months) if _lost_months is not None else set()
         # The ingest's own account of what it looked at and did not keep, carried onto the
         # year because it is recorded on the MOSAIC and the mosaic is deleted once a cell
         # lands. Empty dates are the cloud-and-footprint answer — dates the window examined
@@ -537,7 +577,7 @@ def check_time_window_coverage(
         # read, WITHOUT needing a density threshold: a month holding two dates because two is
         # all the sky offered is not the same as one holding two because the rest were lost,
         # and only these counts tell them apart.
-        _unreadable = root.attrs.get("assessed_unreadable_dates")
+        _unreadable = _raw_unreadable
         summary["stores"][label].update(
             assessed_window=list(_assessed) if isinstance(_assessed, (list, tuple)) else None,
             assessed_empty_dates=int(root.attrs.get("assessed_empty_dates") or 0),
@@ -545,6 +585,9 @@ def check_time_window_coverage(
             months_absent=len(missing),
             months_absent_examined=len(_explained),
             months_absent_unexplained=len(missing) - len(_explained),
+            # Of the unexplained, the ones that are unexplained BECAUSE imagery was lost rather
+            # than because the window never covered them. Two different repairs.
+            months_absent_unreadable=len(set(missing) & (_lost_months or set())),
         )
 
         if skip_coverage_check:

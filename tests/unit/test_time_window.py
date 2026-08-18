@@ -295,6 +295,44 @@ class TestCheckTimeWindowCoverage:
         with pytest.raises(InsufficientCoverageError, match="no timestamps within the window"):
             check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending")
 
+    def test_a_month_lost_to_unreadable_imagery_is_not_excused(self, monkeypatch):
+        """A whole-month DATA-LOSS hole must not publish as a legitimate absence.
+
+        The assessed window says "we looked here". It cannot say "and there was nothing to
+        find" for a month whose every acquisition was skipped as unreadable — there the
+        imagery existed and was lost. Both look identical to a present-month count, and the
+        year is write-once, so excusing this one makes the hole permanent and mislabelled.
+        """
+        import tessera_embeddings.inference.data_loading as dl
+
+        def _open_store(path, **kwargs):
+            root = _make_time_group("2024-08-01", "2024-10-31")  # first 3 months only
+            root.attrs["assessed_window"] = ["2024-08-01", "2025-07-31"]  # would excuse them all
+            root.attrs["assessed_unreadable_dates"] = [{"date": "2025-03-14", "objects": 4, "scope": "tile"}]
+            return root
+
+        monkeypatch.setattr(dl, "open_store_as_zarr_group", _open_store)
+        with pytest.raises(InsufficientCoverageError, match="2025-03"):
+            check_time_window_coverage("s3://fake/mosaic", parse_time_window("July 2025"), s1_orbit="ascending")
+
+    def test_an_unparseable_unreadable_record_excuses_nothing(self, monkeypatch):
+        """Same asymmetry the assessed-window parser uses: a damaged record makes it STRICTER.
+
+        If the list cannot be read, which month lost imagery is unknown — so no month may be
+        excused. Over-excusing publishes a hole; under-excusing costs a re-ingest.
+        """
+        import tessera_embeddings.inference.data_loading as dl
+
+        def _open_store(path, **kwargs):
+            root = _make_time_group("2024-08-01", "2024-10-31")
+            root.attrs["assessed_window"] = ["2024-08-01", "2025-07-31"]
+            root.attrs["assessed_unreadable_dates"] = [{"date": "not-a-date"}]
+            return root
+
+        monkeypatch.setattr(dl, "open_store_as_zarr_group", _open_store)
+        with pytest.raises(InsufficientCoverageError):
+            check_time_window_coverage("s3://fake/mosaic", parse_time_window("July 2025"), s1_orbit="ascending")
+
     def test_an_assessed_window_still_excuses_absent_months_when_data_exists(self, monkeypatch):
         """The guard must not undo what the assessed window is FOR.
 

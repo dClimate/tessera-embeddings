@@ -248,6 +248,26 @@ def test_export_zone_roi_ocean_returns_none(tmp_path) -> None:
     assert land_mask.export_zone_roi("01N", land_mask_path=cov, dest_path=str(tmp_path / "roi.zarr")) is None
 
 
+def test_export_zone_roi_removes_a_superseded_mask_when_a_zone_turns_all_ocean(tmp_path) -> None:
+    """A new delivery that removes a zone's land must not leave the old ROI readable.
+
+    The ROI path is derived from the zone name, so ingest callers resolve it directly and
+    never see this function's `None`. Left in place, a superseded delivery's land would go on
+    being ingested while the current coverage bitmap declares there is none — the stale file
+    winning purely by existing.
+    """
+    dest = tmp_path / "zone_01N.zarr"
+    # A real ROI from a delivery that DID have land, written to the path 01N would use.
+    land_mask.export_zone_roi("31N", land_mask_path=make_coverage(tmp_path, "31N", [(0, 0)]), dest_path=str(dest))
+    assert dest.exists(), "fixture failed: nothing to supersede"
+
+    # The next delivery finds no land in the zone at that path.
+    assert (
+        land_mask.export_zone_roi("01N", land_mask_path=make_coverage(tmp_path, "01N", []), dest_path=str(dest)) is None
+    )
+    assert not dest.exists(), "the superseded ROI is still discoverable by a direct ingest caller"
+
+
 def test_export_zone_roi_roundtrip_matches_zone_grid(tmp_path) -> None:
     """The synthesized ROI reconstructs to the EXACT zone grid via the real
     consumer (read_roi_metadata) — the acceptance test the fill relies on.

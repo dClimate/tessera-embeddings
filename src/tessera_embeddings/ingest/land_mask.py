@@ -750,6 +750,33 @@ def _zone_roi_transform(spec: ZoneSpec) -> list[float]:
     return [PIXEL_M, 0.0, spec.easting[0], 0.0, -PIXEL_M, spec.northing[1]]
 
 
+def _remove_superseded_roi(dest_path: str, storage_options: dict | None) -> None:
+    """Remove an ROI a PREVIOUS coverage delivery left for a zone that is now all-ocean.
+
+    The ROI is a plain zarr at a path derived from the zone name, so direct ingest callers
+    find it by name rather than by being handed it. Returning "all-ocean" while one is still
+    sitting there lets a superseded delivery's land go on being ingested while the current
+    coverage bitmap declares there is none — the stale file wins simply by existing.
+
+    Raises rather than warning when a mask is present and cannot be removed: that is exactly
+    the state this exists to prevent, and reporting the zone as cleanly all-ocean with the old
+    mask still readable would be the misleading half of both outcomes.
+    """
+    fs, path = fsspec.core.url_to_fs(dest_path, **(storage_options or {}))
+    if not fs.exists(path):
+        return
+    try:
+        fs.rm(path, recursive=True)
+    except Exception as exc:
+        msg = (
+            f"Zone is all-ocean in this coverage delivery but a previous delivery's ROI at {dest_path} "
+            f"could not be removed ({exc}). Ingest callers resolve that path by name, so leaving it would "
+            "let superseded land be ingested against coverage that declares none."
+        )
+        raise RuntimeError(msg) from exc
+    logger.warning("Removed superseded ROI at %s — this delivery has no land in that zone", dest_path)
+
+
 def _roi_is_current(
     dest_path: str,
     height: int,
@@ -821,6 +848,10 @@ def export_zone_roi(
     tile_live = np.asarray(cast("zarr.Array", cov["tile_live_2048"]), dtype=bool)
     coverage_sha = cast("str | None", cov.attrs.get("registry_sha256"))
     if not tile_live.any():
+        # Clear any ROI an EARLIER delivery left here before reporting the zone all-ocean —
+        # this delivery is the authority on where land is, and a stale mask at a
+        # name-derived path is discoverable by ingest callers that never see this return.
+        _remove_superseded_roi(dest_path, plain_zarr_storage_options(dest_path, get_credentials, s3_region))
         logger.info("Zone %s is all-ocean — no ROI to export", zone)
         return None
 
