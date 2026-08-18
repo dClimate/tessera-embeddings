@@ -144,11 +144,34 @@ def resolve_code_artifact_identity(
             the SSM pointer at different instants and disagree.
     """
     parts = [f"ami={ami_id if ami_id is not None else resolve_ami_id(ami_ssm_name, region)}"]
-    if code_bucket:
-        s3 = boto3.client("s3", region_name=region)
-        etag = s3.head_object(Bucket=code_bucket, Key=f"code/src{code_suffix}.tar.gz")["ETag"].strip('"')
-        parts.append(f"tarball={etag}")
+    tarball = source_tarball_identity(code_bucket, code_suffix, region)
+    if tarball:
+        parts.append(tarball)
     return "|".join(parts)
+
+
+def source_tarball_identity(code_bucket: str | None, code_suffix: str, region: str) -> str:
+    """``tarball=<etag>`` for the source archive workers overlay, or ``""`` when there is none.
+
+    Split out of :func:`resolve_code_artifact_identity` so the staging fingerprint can carry
+    the TARBALL term without the AMI one. Those two have opposite properties for staging
+    reuse: re-baking an AMI does not change what a staged tile contains, so folding it in
+    abandoned every staged tile for nothing — which is why the staging identity was narrowed
+    on 2026-07-30 — while replacing the tarball changes exactly what a worker executes.
+
+    **Empty for a baked-AMI deploy** (``code_bucket=None``), which is production. So a
+    fingerprint that includes this is unchanged there and gains the term only on the
+    dev-overlay path, where it is the whole exposure.
+
+    The residual window in :func:`resolve_code_artifact_identity` applies here unchanged: the
+    ETag is read once while workers later GET the mutable key, so do not overwrite a tarball
+    a campaign is running against.
+    """
+    if not code_bucket:
+        return ""
+    s3 = boto3.client("s3", region_name=region)
+    etag = s3.head_object(Bucket=code_bucket, Key=f"code/src{code_suffix}.tar.gz")["ETag"].strip('"')
+    return f"tarball={etag}"
 
 
 def cluster_name_for_flow_run(flow_run_id: object, cluster_yaml: Path = DEFAULT_CLUSTER_TEMPLATE) -> str | None:

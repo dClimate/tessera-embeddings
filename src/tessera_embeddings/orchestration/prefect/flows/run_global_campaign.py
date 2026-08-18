@@ -463,6 +463,19 @@ def _resolve_code_identity(
     return resolve_code_artifact_identity(ami_ssm_name, code_bucket, code_suffix, region or "us-west-2", ami_id=ami_id)
 
 
+def _resolve_tarball_identity(code_bucket: str | None, code_suffix: str, region: str | None) -> str:
+    """Lazy-import wrapper over the AWS provider's tarball-ETag resolver (see
+    :func:`tessera_embeddings.providers.aws.ray.source_tarball_identity`). Empty string when
+    no tarball overlays the AMI, i.e. production. Kept thin so this flow imports on non-AWS
+    machines, where boto3 is absent.
+    """
+    if not code_bucket:
+        return ""
+    from tessera_embeddings.providers.aws.ray import source_tarball_identity
+
+    return source_tarball_identity(code_bucket, code_suffix, region or "us-west-2")
+
+
 def _resolve_ami_id(ami_ssm_name: str, region: str | None) -> str:
     """Lazy-import wrapper over the AWS provider's AMI-ID resolver (see
     :func:`tessera_embeddings.providers.aws.ray.resolve_ami_id`). Region ``None`` →
@@ -919,6 +932,20 @@ async def run_global_campaign(
         if force_staging_reuse:
             return "infcode-forced-reuse"
         identity = inference_code_identity()
+        # The source hash covers what the flow runner can SEE. On the dev-overlay path the
+        # workers execute a tarball they download instead, and replacing that tarball changes
+        # what runs without changing anything here — so a retry would resume tiles staged by
+        # the old code and add new ones from the new. The tarball's ETag closes that, and it
+        # is EMPTY for a baked-AMI deploy (code_bucket=None), which is production: this term
+        # costs prod nothing and exists only where the exposure does.
+        #
+        # Deliberately the tarball term ALONE, not resolve_code_artifact_identity's whole
+        # string. Folding the AMI back in is what the 2026-07-30 narrowing removed, and for a
+        # good reason — re-baking an image does not change what a staged tile contains, so it
+        # abandoned every staged tile for nothing.
+        tarball = _resolve_tarball_identity(code_bucket, code_suffix, None)
+        if tarball:
+            identity = f"{identity}|{tarball}"
         return f"{identity}+{force_staging_restage}" if force_staging_restage else identity
 
     def _code_identity() -> str:

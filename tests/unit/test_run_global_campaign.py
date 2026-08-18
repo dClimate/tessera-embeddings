@@ -1357,3 +1357,29 @@ def test_overlap_years_does_not_overcount_per_cell_runs(wired, monkeypatch):
     assert result["dispatched"] == 4, (
         f"four cells were dispatched; {result['dispatched']} means each year was credited with the other years' runs"
     )
+
+
+def test_production_staging_identity_is_unchanged_by_the_tarball_term(monkeypatch):
+    """A baked-AMI deploy passes no code_bucket, so the term is empty and prod is untouched.
+
+    The point of adding it at all is that it costs production nothing: `code_bucket=None`
+    means no tarball overlays the image, there is nothing to fingerprint, and the identity
+    stays exactly the source hash the 2026-07-30 narrowing settled on.
+    """
+    called: list = []
+    monkeypatch.setattr(mod, "source_tarball_identity", lambda *a, **k: called.append(a) or "x", raising=False)
+    assert mod._resolve_tarball_identity(None, "", None) == ""
+    assert not called, "no bucket means no S3 call at all, not an empty answer from one"
+
+
+def test_the_dev_overlay_folds_the_tarball_etag_into_the_staging_identity(monkeypatch):
+    """On the dev path the workers run a tarball the flow runner never imports.
+
+    Replacing it changes what executes while the local source hash stays put, so a retry
+    would resume tiles staged by the old code and add new ones from the new — mixing two
+    code versions in one write-once zone-year. The ETag is what makes the fingerprint move.
+    """
+    import tessera_embeddings.providers.aws.ray as ray_mod
+
+    monkeypatch.setattr(ray_mod, "source_tarball_identity", lambda b, s, r: f"tarball=etag-{b}{s}")
+    assert mod._resolve_tarball_identity("bkt", "-branch", None) == "tarball=etag-bkt-branch"
