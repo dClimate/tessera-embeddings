@@ -539,3 +539,215 @@ it is finally computed, and a gate that computes a subset of bands only protects
 - The failing source URL appears only on the `Aborting load` line and the GDAL `ERROR 1` line —
   never inside the exception. Any attribution to a granule has to come from those.
 - CloudWatch Logs Insights `like` is case-sensitive; see the `querying-logs-and-apis` playbook.
+
+---
+
+# Cause 4 — the catalogue repointed items at a cross-region archive, and the NAT tier could not carry it
+
+Traced 2026-08-19 on `global-tessera-prod`, during the first global campaign dispatch (driver
+`friendly-malkoha`, dispatched 21:55Z). Absorbed here rather than given its own document because it
+shares this one's central shape: **a source read failed, and the exception named a codec rather than
+the access.** Causes 1–3 above are about credentials, corrupt objects and catalogue refusals; this one
+is about *which bucket the catalogue sent us to*, and it is the first cause here that is not upstream
+data at all.
+
+## The two exceptions, and why they are one cause
+
+```
+RasterioIOError('CURL error: Empty reply from server')
+RasterioIOError("'/vsis3/sentinel-s2-l2a/tiles/48/P/YV/2022/1/7/0/R20m/SCL.jp2'
+                 not recognized as being in a supported file format.")
+```
+
+They look unrelated and are the same failure at two different depths. Measured over one hour in
+`/ecs/global-tessera-prod`:
+
+| pattern | count |
+|---|---:|
+| `ERROR 1: opj_get_decoded_tile() failed` | 32,141 |
+| `ERROR 1: Failed to decode.` | 18,630 |
+| `ERROR 1: Stream too short` | 13,511 |
+| `Empty reply from server` | 615 |
+| `not recognized as being in a supported file format` | 112 |
+| `response_code=503` | **0** |
+| `SlowDown` | **0** |
+| `response_code=5` (any 5xx) | **0** |
+| `response_code=403` | **0** |
+
+`opj_*` is OpenJPEG. `Stream too short` and `Expected a SOC marker` are what it reports when the
+buffer it is handed is truncated or empty — **the JP2 analogue of the `ZIPDecode` mechanism this
+document opens with.** GDAL logs the access failure to its error handler and proceeds into the codec
+with an unusable buffer, so the decode error propagates and the access error is lost. The prose
+differs by codec; the shape does not.
+
+**The zeros are the finding.** S3 refuses a request it will not serve with `503 SlowDown`. There are
+none, and no 5xx of any kind. The source was not shedding us; the bytes were being lost below HTTP.
+
+## The object is healthy — verify before blaming the provider
+
+Unlike Cause 2, the object is fine. `s3://sentinel-s2-l2a/tiles/48/P/YV/2022/1/7/0/R20m/SCL.jp2`
+is 1,724,592 bytes and opens: `JP2OpenJPEG`, 5490×5490 uint8, EPSG:32648, SCL classes 0–10 present.
+It reads through `/vsis3` with and without a requester-pays header. Four distinct objects across four
+MGRS tiles appear in the failures, so it is not one bad granule either.
+
+**So `not recognized as being in a supported file format` must not be read as "corrupt source".** On
+this path it means *no usable bytes arrived*. Cause 2's discriminator — no HTTP error at all — is
+also true here, which makes the two indistinguishable by message. What separates them is fetching
+the object yourself: Cause 2's object stays broken, Cause 4's opens first try.
+
+## What actually changed: an upstream backfill, dated
+
+`config/providers.py` has named `collection_id="sentinel-2-l2a"` since the module was created and has
+never changed. The catalogue changed under us.
+
+For tile 33TWM, the `red` asset's bucket against the item's `created` date:
+
+| item date | bucket | item created |
+|---|---|---|
+| 2022-01-07 | `sentinel-s2-l2a` (ESA JP2, **eu-central-1**) | **2026-08-18** |
+| 2022-06-06 | `sentinel-cogs` (E84 COG, us-west-2) | 2022-11-06 |
+| 2017-01-20 (35QKC) | `sentinel-s2-l2a` | **2026-08-18** |
+| 2017-01-20 (35QKC) | `sentinel-cogs` | 2022-11-08 |
+
+Every failing item was created **2026-08-18**, the day before the campaign, and points at ESA. Every
+working item predates that and points at Element 84's COGs. The last two rows are the same scene:
+**the backfill also produces duplicates of items that already had a COG copy.**
+
+Scale on that tile for 2017: **16 items now match, 13 pointing at ESA and 3 at COG, 9 of the 16
+created 2026-08-18.** Before the backfill this tile-year had three usable scenes.
+
+**A correction to record, because the first reading of this was wrong.** An initial check of one item
+concluded the whole collection had been repointed at ESA. It has not — sampling one item per year
+shows `sentinel-cogs` for every year 2018–2025 on this tile. The repointing is **per item**,
+concentrated on dates Element 84 never COG-converted. A single-item check cannot see that.
+
+## Not a reflectance defect — a concern raised and withdrawn
+
+Earth Search's collection config deliberately omits `baseline_threshold`/`baseline_offset`, on the
+recorded reasoning that its COGs already carry the BOA offset correction. Reading ESA originals
+through that config would therefore skip a correction the originals need — a silent, per-pixel error.
+
+**Checked, and it does not occur.** Cross-tabulating source against `s2:processing_baseline`:
+every ESA-pointing item is baseline **02.06**, far below the `S2_BASELINE_THRESHOLD = 400` that
+triggers `S2_BASELINE_OFFSET = -1000`; everything at baseline ≥ 04.00 comes from `sentinel-cogs`,
+which is pre-harmonized. No correction is due on the JP2 path, so none being applied is correct.
+Recorded because the structure invites the opposite conclusion, and because it will stop being true
+if the backfill ever reaches post-2022 dates.
+
+## The amplifier: a region-scoped endpoint over a burstable NAT tier
+
+The reads fail because of where they have to go, not what they ask for.
+
+* The VPC's S3 endpoint is `com.amazonaws.**us-west-2**.s3`, a **Gateway** endpoint. Gateway
+  endpoints are region-scoped, so `sentinel-cogs` (us-west-2) bypasses NAT entirely — and
+  `sentinel-s2-l2a` (eu-central-1) **cannot use it**.
+* There are **no NAT Gateways**. Egress is three **`t4g.micro`** instances, one per AZ, whose
+  **baseline network is 0.064 Gbps**.
+
+So every cross-region optical read from up to 5,291 Fargate tasks funnels through three instances
+whose combined baseline is under 200 Mbps. Observed on those instances: one burst to ~408 Mbps and
+then collapse to a ~17 Mbps floor that all three converge on, at 12–15% CPU with credit balance
+declining. **CPU is not the constraint.** Whether the binding limit is bandwidth, packets per second
+or connection tracking is not established — a `t4g.micro` is undersized on all three, and its
+conntrack table is the most likely of them to produce "connection dropped with no body".
+
+**The asymmetry confirms the mechanism.** Radar reads ASF in us-west-2 and goes through the gateway
+endpoint; optical splits between COGs on the endpoint and ESA JP2s through NAT. In the same window:
+**3 radar leg failures against 30 optical.** No property of the data explains that split; the egress
+path does.
+
+## Sizing, if the NAT tier is the fix
+
+Measured from `describe-instance-types` and `pricing:GetProducts`, us-west-2. **Peak and baseline
+differ, and for a NAT carrying a steady bulk load the baseline is the number that matters.** The
+9-day column is three instances, one per AZ, for a full campaign:
+
+| instance | vCPU | peak Gbps | **baseline Gbps** | $/hr | x3, 9 days |
+|---|---:|---:|---:|---:|---:|
+| `t4g.micro` (current) | 2 | 5 | **0.064** | — | — |
+| `c8gn.8xlarge` | 32 | 100 | **100** | 1.896 | $1,229 |
+| `c8gn.12xlarge` | 48 | 150 | **150** | 2.844 | $1,843 |
+| `c8gn.16xlarge` | 64 | 200 | **200** | 3.792 | $2,457 |
+| `c8gn.24xlarge` | 96 | 300 | **300** | 5.688 | $3,686 |
+| `c8gn.48xlarge` | 192 | 600 | **300** | 11.376 | $7,372 |
+
+Two things this table decides.
+
+**Choose the network-optimized family, not the compute one.** `c8g.48xlarge` (192 vCPU) and
+`c8gn.4xlarge` (16 vCPU) both deliver 50 Gbps. A NAT forwards packets — it wants Gbps, not cores.
+
+**`c8gn.48xlarge` is the one size that does not pay for itself.** Its sustained baseline is 300 Gbps,
+*identical to `c8gn.24xlarge` at exactly half the hourly rate*; the only thing the larger size adds is
+burst headroom to 600 that a continuous read cannot hold. Against a plausible fleet appetite of
+roughly 57–288 Gbps (3,600 optical workers at 2–10 MB/s each), **`c8gn.16xlarge` per AZ — 600 Gbps
+aggregate, about 3,000x the current baseline — is already well clear**, and `c8gn.24xlarge` buys
+headroom beyond it.
+
+Going to instances rather than NAT Gateway is a deliberate trade and is defensible here: a NAT
+**Gateway** scales to 100 Gbps with nothing to manage but bills **$0.045/GB processed**, while NAT
+**instances** bill EC2 hours and no per-GB fee. At campaign volume the per-GB fee is the larger
+number, and the crossover is computable: three `c8gn.16xlarge` for nine days costs $2,457, which is
+what a Gateway charges to process **55 TB**. Above that the instances are cheaper; the equivalent
+break-even is 27 TB against `c8gn.8xlarge` and 164 TB against `c8gn.48xlarge`. Instances in exchange need source/destination check disabled, `nf_conntrack_max` raised, and
+per-AZ failover thought through — none of which a Gateway asks for.
+
+**Expect widening the NAT to move the bottleneck rather than remove it.** The zeros in the table
+above are the current state: S3 is not refusing us today. Sustaining hundreds of Gbps against
+eu-central-1 prefixes is a different regime, and the `tiles/` layout concentrates requests, so real
+`503 SlowDown` becomes a plausible next failure. That is the throttle the retry ladder is built for,
+but it means the widening should be judged on whether cells complete, not on the disappearance of
+these particular strings.
+
+**The better option removes the path instead of widening it.** A server-side S3 copy of the
+ESA-sourced granules into an in-region bucket does not traverse the VPC at all, so it needs neither
+NAT gateway nor NAT instance bandwidth; the fleet then reads them through the existing gateway
+endpoint for free. Since `sentinel-s2-l2a` is not requester-pays, the egress is the bucket owner's.
+This converts a repeated, fragile, metered path into a one-time internal copy plus free in-region
+reads, and it is the only option that also fixes the latency.
+
+## What the retry ladder did, and the alert that oversold it
+
+**64,000 read failures produced 30 dead legs and zero dead cells.** The per-leg retry absorbed
+essentially all of it — `failed attempt 1/3 — re-dispatching in 30 s (it resumes from the dates
+already committed)` — and 60 of 60 cells plus 10 of 10 clusters stayed alive throughout.
+
+The monitoring poll nonetheless posted `INTERVENE NOW` with `@here` for five such leg failures. That
+is the shape already closed once in `campaign-monitoring-plan.md`, where a single 5xx put `DEGRADED`
+on a healthy campaign: **an infra hiccup promoted to a finding.** Intervene Now on crashed runs is
+meant for the campaign driver stopping, not for retryable ingest legs, and the plan's own guidance is
+that the ingest alert exists for the repeated pattern rather than the single failure.
+
+## Open, and worth closing before the next dispatch
+
+* **How much of the campaign routes through NAT.** The ESA share by year is not established: a
+  100-item page against a 146-item year cannot census it, and a sample that showed no ESA items for
+  2022 is contradicted by a direct query for 2022-01-07. This number sets both the bandwidth
+  requirement and the mirror's size, so it needs a real census rather than a page.
+* **Whether the depth survey still holds.** The backfill took one tile-year from 3 scenes to 16. More
+  observations per pixel moves cells across the write-once `optical_min_obs = 15` line, in the
+  favourable direction, but the survey that chose 15 was measured against the old holdings.
+* **Duplicate preference is now source-blind.** `ingest/duplicates.py` prefers **newest first**, on
+  the recorded reasoning that newer means a newer processing baseline. The ESA items are newer, so
+  where a date has both copies the preference now selects the **JP2 in eu-central-1 over the COG in
+  us-west-2**, stepping down to the COG only after a demonstrated read failure. The premise has not
+  become false so much as incomplete: newer can now mean a different bucket and format rather than a
+  better reprocessing. Preferring an in-region COG when one exists would restore the old path for
+  duplicated dates — roughly one date in fifteen on the tile sampled, so it is a partial fix and not
+  a substitute for the egress work.
+* **`sentinel-cogs` appears in ~30 GDAL error lines** under the older `sentinel-s2-l2a-cogs/` prefix.
+  Unexplained, and small enough to be noise, but it is the v0 layout and nothing here accounts for it.
+
+## Method notes
+
+* Bucket regions read from `x-amz-bucket-region`: `sentinel-s2-l2a` is **eu-central-1**;
+  `sentinel-cogs` and `e84-earth-search-sentinel-data` are both **us-west-2**.
+* `sentinel-s2-l2a` answered a `head-object` **without** a requester-pays header, so it is not
+  requester-pays on this path and transfer-out is the owner's cost, not ours.
+* A first pass counted 6,493 "503s" using a regex containing a bare `503`, which matches any number
+  containing those digits. The precise term returns **0**, and `response_code=5` returning 0
+  independently confirms it. Quote the exact token; see `verify-a-filter-actually-filters`.
+* Requesting 500 items per page from Earth Search returned **502 Bad Gateway** — the page-size
+  sensitivity already pinned at `max_page_size=100` in `config/providers.py`.
+* Our 10 requested bands plus SCL are **571 MiB per scene** at full read (`head-object` sums).
+* Global extent for volume work, from the land-mask coverage store: **112 zones with land, 360,953
+  live 2048-px tiles, ~15,100 MGRS-tile footprints.**
