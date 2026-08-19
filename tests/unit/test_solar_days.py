@@ -18,6 +18,7 @@ bites, rather than against a hand-picked example.
 from __future__ import annotations
 
 import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -176,6 +177,34 @@ def test_an_antimeridian_bbox_midpoint_is_not_averaged() -> None:
     assert bbox_mid_longitude((179.0, 0.0, -179.0, 5.0)) == 180.0
     assert bbox_mid_longitude((10.0, 0.0, 20.0, 5.0)) == 15.0
     assert solar_day_offset_seconds(bbox_mid_longitude((179.0, 0.0, -179.0, 5.0))) == 12 * 3600
+
+
+def test_a_real_noon_acquisition_still_gets_its_offset() -> None:
+    """Noon UTC is a real acquisition time as well as our canonical stamp.
+
+    Idempotence was briefly obtained by treating a noon stamp as "already normalised", which
+    is a heuristic over a value the catalogue can legitimately produce: an item acquired at
+    exactly 12:00:00.000000 skipped its offset and landed on the wrong solar day — at the
+    dateline, where the offset is a whole day, which is precisely where it matters most.
+
+    The day is now computed from the ACQUISITION instant in `properties["datetime"]`, which
+    normalisation never modifies, so re-normalising recomputes the same day from the same
+    input. Idempotence by construction rather than by self-detection.
+    """
+    raw = "2025-06-01T12:00:00Z"
+    item = SimpleNamespace(
+        datetime=datetime.datetime(2025, 6, 1, 12, 0, tzinfo=datetime.UTC), properties={"datetime": raw}
+    )
+
+    # +180 puts a 12:00Z acquisition on the FOLLOWING solar day.
+    (out,) = normalize_to_solar_day([item], mid_longitude=180.0)
+    assert out.datetime.date() == datetime.date(2025, 6, 2), "the offset must be applied to a real noon item"
+
+    # ...and stays there, however many times the streamed path re-normalises it.
+    for _ in range(3):
+        (out,) = normalize_to_solar_day([out], mid_longitude=180.0)
+        assert out.datetime.date() == datetime.date(2025, 6, 2)
+    assert out.properties["datetime"] == raw, "the acquisition instant must survive untouched"
 
 
 def test_an_already_canonical_stamp_is_left_alone() -> None:

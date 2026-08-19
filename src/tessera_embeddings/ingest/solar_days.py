@@ -182,6 +182,24 @@ def solar_grouping_longitude(roi: object) -> float | None:
     return bbox_mid_longitude(getattr(roi, "bbox_wgs84", None))
 
 
+def _acquisition_instant(item: Any) -> datetime.datetime | None:  # noqa: ANN401 — any STAC-like item
+    """The raw acquisition instant from ``properties["datetime"]``, or ``None``.
+
+    A local copy of :func:`~tessera_embeddings.ingest.duplicates.acquisition_instant`, which
+    cannot be imported here: that module imports :func:`solar_day_of` from this one, so the
+    dependency only runs one way. Both read the same field for the same reason — it is the only
+    record of the acquisition that survives the canonical stamp.
+    """
+    properties = getattr(item, "properties", None)
+    raw = properties.get("datetime") if isinstance(properties, dict) else None
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def normalize_to_solar_day(items: list[Any], *, mid_longitude: float | None) -> list[Any]:
     """Stamp every item with **noon UTC of the solar day it belongs to**. In place.
 
@@ -215,15 +233,26 @@ def normalize_to_solar_day(items: list[Any], *, mid_longitude: float | None) -> 
     offset = datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
     groups: dict[datetime.date, list[Any]] = {}
     for item in items:
-        when = item.datetime
-        # ALREADY NORMALISED items keep their day rather than being shifted again. Noon UTC is
-        # this package's canonical stamp — `solar_day_of` refuses anything else for the same
-        # reason — so its date IS the solar day and adding the offset a second time would move
-        # it. That is what makes this function idempotent, and it holds for every offset: the
-        # alternative was bounding the offset below the twelve hours that cross midnight, which
-        # bought idempotence by returning the wrong offset at the dateline.
-        canonical_already = (when.hour, when.minute, when.second, when.microsecond) == (12, 0, 0, 0)
-        day = when.date() if canonical_already else (when + offset).date()
+        # THE SOLAR DAY IS COMPUTED FROM THE ACQUISITION INSTANT, which survives normalisation
+        # in `properties["datetime"]` — assigning `item.datetime` does not write through to it
+        # (pinned against real pystac in `TestAgainstRealPystacItems`). Deriving the day from an
+        # input this function never modifies is what makes it idempotent, by construction rather
+        # than by detecting its own past work: re-normalising recomputes the same day from the
+        # same instant, whatever the offset.
+        #
+        # This replaced a heuristic that treated a noon-UTC stamp as "already normalised". That
+        # is a real acquisition time as well as our canonical one, so an item genuinely acquired
+        # at 12:00:00.000000 was mistaken for normalised and skipped its offset — landing on the
+        # wrong solar day exactly where the offset matters most, at the dateline.
+        acquired = _acquisition_instant(item)
+        if acquired is not None:
+            day = (acquired + offset).date()
+        else:
+            # No usable property: an object that never came from a catalogue. Fall back to the
+            # canonical-stamp reading, which is still right for anything this package produced.
+            when = item.datetime
+            is_canonical = (when.hour, when.minute, when.second, when.microsecond) == (12, 0, 0, 0)
+            day = when.date() if is_canonical else (when + offset).date()
         groups.setdefault(day, []).append(item)
     for day, group in groups.items():
         canonical = datetime.datetime(day.year, day.month, day.day, 12, 0, 0, tzinfo=datetime.UTC)
