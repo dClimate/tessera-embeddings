@@ -770,40 +770,14 @@ async def run_global_campaign(
     # ingests first. A typo would otherwise buy a Ray head and a round of multi-hour ingests
     # before failing deterministically on a value known up front.
     #
-    # And ahead of the limit upserts below, because one of them RESETS the fleet-wide inference
-    # pause gate to running. Zero is how an operator pauses a campaign that is already in flight,
-    # so an invocation that flipped the gate and then died on `num_actors=0` would have resumed
-    # somebody else's paused fleet on its way out — a side effect on shared state from a call that
-    # accomplished nothing.
+    # And ahead of everything that touches SHARED state. The limit upserts used to sit right
+    # below; they now run after the whole read-only preflight, for the reason this paragraph
+    # gave and which turned out to cover more cases than it named — see there.
     if num_actors < 1:
         raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
     if fill_strategy not in ("cluster-per-zone", "chained-clusters"):
         raise ValueError(f"fill_strategy must be 'cluster-per-zone' or 'chained-clusters', got {fill_strategy!r}")
 
-    # Publish both fleet-wide caps so the numbers the operator set here are the
-    # numbers actually enforced in the children (see _upsert_limit). Cheap,
-    # idempotent, and safe to repeat.
-    if ingest and fill_strategy == "chained-clusters":
-        _upsert_limit(ingest_limit_name, max_parallel_ingest, what="ingest", log=log)
-    if inference_pause_gate and fill_strategy == "chained-clusters":
-        # Upserted to ONE, and one is not a cap: this gate is read as a flag rather than
-        # acquired, so any positive value means "run" and nothing consumes a slot. It is
-        # created here so that pausing is always available — a gate an operator has to create
-        # first is not a lever they can reach at 3 a.m. — and reset to running at every start,
-        # so a campaign can never inherit a pause somebody left behind.
-        _upsert_limit(inference_pause_gate, 1, what="inference pause (1 = running)", log=log)
-    if commit_limit_name:
-        # DERIVED, not a parameter. A cluster's trailing assembly is a single
-        # thread, so N clusters can produce at most N assembly commits at once —
-        # a larger limit would be a number that never binds. And the run-1 curve
-        # says never exceed MAX_SIMULTANEOUS_COMMITTERS however many clusters run.
-        #
-        # A cluster's FEEDER can also commit (a terminal plan inside `plan()`),
-        # so the fleet's true ceiling is 2N and the gate can briefly queue those.
-        # That is the intent: the gate is a bound, not an operating point, and a
-        # queued commit costs seconds against zones that run for hours.
-        commit_limit = min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS)
-        _upsert_limit(commit_limit_name, commit_limit, what="commit", log=log)
     campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS
 
     # Lazy AWS import so the flow file imports on non-AWS machines (arch tests).
@@ -883,6 +857,39 @@ async def run_global_campaign(
             f"Zone(s) {unseeded_work} in the work list are not seeded in {store_path} — run the seed flow "
             "first (a partially-seeded store would ingest each cell only for the fill to reject it)."
         )
+
+    # SHARED CONTROLS ARE WRITTEN LAST, once every read-only check has passed and there is work
+    # to do. One of these RESETS the fleet-wide inference pause gate to running, and zero is how
+    # an operator pauses a campaign already in flight — so a run that flipped the gate and then
+    # rejected would have resumed somebody else's paused fleet on its way out. The parameter
+    # checks were moved above the upserts for that reason; the store read, the model gate, the
+    # year-axis probe, the seeded-zone guards and the work list all sit between them, and any of
+    # those can reject too. A no-work invocation is the same hazard without an error: it would
+    # resume the gate and then dispatch nothing, so `work` gates this as well.
+    #
+    # Cheap, idempotent and safe to repeat — the ordering is the only thing that matters.
+    if work:
+        if ingest and fill_strategy == "chained-clusters":
+            _upsert_limit(ingest_limit_name, max_parallel_ingest, what="ingest", log=log)
+        if inference_pause_gate and fill_strategy == "chained-clusters":
+            # Upserted to ONE, and one is not a cap: this gate is read as a flag rather than
+            # acquired, so any positive value means "run" and nothing consumes a slot. Created
+            # here so that pausing is always available — a gate an operator has to create first
+            # is not a lever they can reach at 3 a.m. — and reset to running at every start that
+            # has work, so a campaign can never inherit a pause somebody left behind.
+            _upsert_limit(inference_pause_gate, 1, what="inference pause (1 = running)", log=log)
+        if commit_limit_name:
+            # DERIVED, not a parameter. A cluster's trailing assembly is a single
+            # thread, so N clusters can produce at most N assembly commits at once —
+            # a larger limit would be a number that never binds. And the run-1 curve
+            # says never exceed MAX_SIMULTANEOUS_COMMITTERS however many clusters run.
+            #
+            # A cluster's FEEDER can also commit (a terminal plan inside `plan()`),
+            # so the fleet's true ceiling is 2N and the gate can briefly queue those.
+            # That is the intent: the gate is a bound, not an operating point, and a
+            # queued commit costs seconds against zones that run for hours.
+            commit_limit = min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS)
+            _upsert_limit(commit_limit_name, commit_limit, what="commit", log=log)
 
     # Orphan-mosaic recovery: a per-cell cleanup that failed after tagging leaves
     # the mosaic behind, and that cell is no longer in `work`, so it is never

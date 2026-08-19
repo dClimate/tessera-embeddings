@@ -220,6 +220,32 @@ class TestCampaignDefaults:
             asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
         assert wired.get("limits", []) == [], "no cap, and above all no pause-gate reset"
 
+    def test_a_rejected_invocation_never_touches_the_shared_gates(self, wired, monkeypatch):
+        """Resuming somebody else's paused fleet on the way out is the failure to avoid.
+
+        Zero on the pause gate is how an operator pauses a campaign ALREADY IN FLIGHT, and the
+        gate is fleet-wide. A run that wrote it and then rejected would have resumed that fleet
+        as a side effect of accomplishing nothing. The parameter checks were already ahead of the
+        writes; the store read, the model gate, the year-axis probe and the seeded-zone guards
+        sit between them and can reject too, which is what this pins.
+        """
+        # A work cell whose zone is not seeded — the last guard before dispatch.
+        monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [("99N", 2025)])
+
+        with pytest.raises(ValueError, match="not seeded"):
+            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+
+        assert wired.get("limits", []) == [], "a rejected run must leave every shared gate alone"
+
+    def test_a_no_work_invocation_never_touches_the_shared_gates(self, wired, monkeypatch):
+        """The same hazard without an error: nothing to dispatch, so nothing to resume for."""
+        monkeypatch.setattr(mod, "campaign_work_list", lambda *a, **k: [])
+
+        asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
+
+        assert wired.get("limits", []) == [], "a run with no work must not reset a live pause"
+        assert wired["arun"] == [], "and must dispatch nothing"
+
     def test_no_ingest_cap_is_published_when_ingest_is_off(self, wired):
         """Prebuilt mosaics mean no ingest to gate. Commits still happen, so that cap is
         still published — and so is the inference pause, because inference is exactly what
