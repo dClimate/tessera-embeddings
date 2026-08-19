@@ -548,6 +548,7 @@ def _coverage_record(
     radar_rule_enforced: bool | None,
     obs_buffers: Mapping[str, np.ndarray],
     eff_w: int,
+    optical_min_obs: int,
 ) -> dict[str, Any]:
     """One shard's refusal reasons and observation depth, in the shape the registry consumes.
 
@@ -585,6 +586,17 @@ def _coverage_record(
             # including the never-imaged ones drags it to zero and then it describes neither
             # population.
             "median_where_any": (round(float(np.median(s2_obs[any_obs])), 1) if any_obs.any() else 0.0),
+            # AND THE DEPTH OF THE PIXELS THAT FELL SHORT, which is the one an infill planner
+            # ranks by. `median_where_any` is over the whole evaluated footprint, so on a
+            # PARTLY refused shard it is dominated by the pixels that passed: 09S/2021 published
+            # tiles with a median of 50 against a line of 15 while still refusing several
+            # thousand pixels each. Ranking by it put a handful of marginal pixels in deep
+            # imagery above a shard that is uniformly thin. Over pixels strictly below the line
+            # and above zero — the thin population by the rule's own definition. None when the
+            # shard has none, which is different from a shard whose thin pixels sit at zero.
+            "median_where_thin": (
+                round(float(np.median(s2_obs[thin])), 1) if (thin := (any_obs & (s2_obs < optical_min_obs))).any() else None
+            ),
         },
         # RADAR PRESENCE, because a tile that is thin AND radar-free is a different cleanup
         # candidate from one that is merely thin — more optical will not fix the first. Either orbit
@@ -1386,6 +1398,7 @@ class InferenceActor:
                     radar_rule_enforced=radar_rule_enforced,
                     obs_buffers=obs_buffers,
                     eff_w=eff_w,
+                    optical_min_obs=self.config.optical_min_obs or OPTICAL_MIN_OBS,
                 )
                 logger.info(
                     "Chunk %s has no valid pixels, skipping (assembly will fill) — refused %s",
@@ -1508,6 +1521,7 @@ class InferenceActor:
                 radar_rule_enforced=radar_rule_enforced,
                 obs_buffers=obs_buffers,
                 eff_w=int(chunk.width) if x_sub is None else int(x_sub.stop - x_sub.start),
+                optical_min_obs=thin_below,
             )
 
             def _timed_write() -> str:

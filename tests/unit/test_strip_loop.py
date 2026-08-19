@@ -466,7 +466,15 @@ class TestProcessChunkStriping:
         # bright patch of deep pixels beside a dark majority, and including never-imaged pixels
         # drags either statistic to zero so it describes neither population.
         assert "s2_obs" in record
-        assert set(record["s2_obs"]) == {"px_with_any", "max", "mean_where_any", "median_where_any"}
+        # `median_where_thin` is the one an infill ranks by: `median_where_any` is over the whole
+        # evaluated footprint, so on a PARTLY refused shard it describes the pixels that passed.
+        assert set(record["s2_obs"]) == {
+            "px_with_any",
+            "max",
+            "mean_where_any",
+            "median_where_any",
+            "median_where_thin",
+        }
         # Radar presence, because a tile that is thin AND radar-free is a different cleanup
         # candidate from one that is merely thin — more optical will not fix the first.
         assert "px_with_any_radar" in record

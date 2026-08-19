@@ -5,6 +5,14 @@ petabyte-scale store to find out, and a later infill campaign asking "which tile
 would more imagery fix them" should not have to re-read the pixels. The registry answers both from a
 Parquet dataset beside the store: one row per 2048-pixel tile per year.
 
+**Rank an infill by ``median_obs_where_thin``, never by ``median_obs_where_any``.** The second is
+over the whole evaluated footprint, so on a partly refused tile it describes the pixels that PASSED.
+09S/2021 published tiles whose median depth was 50 against a line of 15 while still refusing several
+thousand pixels each; ranking by that number puts a handful of marginal pixels in deep imagery above
+land that is uniformly thin. ``median_obs_where_thin`` is over the pixels below the line — the ones a
+revisit would actually fix — and ``refused_no_optical_px`` beside it separates land that was imaged
+and fell short from land that was never imaged at all, which no amount of the same imagery will fix.
+
 **"Covered" is two columns, not one.** ``embedded`` says whether a tile holds embeddings at all;
 ``refused_px`` says how much of its land the depth rule removed. A tile can be embedded and still be
 largely holes, and those partial refusals are the bulk of what a revisit campaign would fill — so a
@@ -121,6 +129,14 @@ def registry_schema() -> pa.Schema:
             pa.field("px_with_any_optical", pa.int64()),
             pa.field("obs_max", pa.int64()),
             pa.field("median_obs_where_any", pa.float64()),
+            # THE ONE TO RANK AN INFILL BY: the depth of the pixels that fell SHORT of the line.
+            # `median_obs_where_any` is over the whole evaluated footprint, so on a partly refused
+            # tile it is dominated by the pixels that passed — 09S/2021 published tiles with a
+            # median of 50 against a line of 15 while still refusing thousands of pixels each, and
+            # ranking by it put a few marginal pixels in deep imagery above uniformly thin land.
+            # Null when the tile has no thin pixels at all, which is not the same as having thin
+            # pixels that sit at zero.
+            pa.field("median_obs_where_thin", pa.float64()),
             # Whether more optical could help at all: a tile that is thin AND radar-free needs both.
             pa.field("px_with_any_radar", pa.int64()),
             # Whether the radar rule was in force. Without it a reader cannot tell
@@ -170,6 +186,7 @@ def _blank_measurements() -> dict[str, Any]:
         "px_with_any_optical": None,
         "obs_max": None,
         "median_obs_where_any": None,
+        "median_obs_where_thin": None,
         "px_with_any_radar": None,
         "radar_rule_enforced": None,
         "optical_min_obs": None,
@@ -264,6 +281,7 @@ def _measurement_fields(record: Mapping[str, Any]) -> dict[str, Any]:
         "px_with_any_optical": _int_or_none(obs.get("px_with_any")),
         "obs_max": _int_or_none(obs.get("max")),
         "median_obs_where_any": _float_or_none(obs.get("median_where_any")),
+        "median_obs_where_thin": _float_or_none(obs.get("median_where_thin")),
         "px_with_any_radar": _int_or_none(record.get("px_with_any_radar")),
         "radar_rule_enforced": (
             bool(record["radar_rule_enforced"]) if isinstance(record.get("radar_rule_enforced"), bool) else None

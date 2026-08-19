@@ -46,6 +46,7 @@ context_docs/
     ├── inference-perf-run-ledger.md              raw per-run measurements
     ├── campaign-monitoring-plan.md               what is watched while it runs, and how
     ├── final-data-validation-plan.md             the closing gate over every published cell
+    ├── optical-registry-2026-08-19.md            the published per-tile index: schema, and what the first live run corrected
     │
     │  INGEST
     ├── ingest_optimization_campaign_2026_07.md   every ingest measurement

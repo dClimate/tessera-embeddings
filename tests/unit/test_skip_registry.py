@@ -807,6 +807,75 @@ class TestTheDepthRuleTheRowsWereJudgedAgainst:
         assert md["zone"] == "32S" and md["year"] == "2021"
 
 
+class TestRankingAnInfillByTheRightDepth:
+    """`median_obs_where_any` is the wrong number to rank a revisit by, and 09S/2021 showed why.
+
+    Observed 2026-08-19: tiles with a median depth of 50 against a line of 15, each still refusing
+    several thousand pixels. The median is over the whole evaluated footprint, so on a partly refused
+    tile it describes the pixels that PASSED — ranking by it puts a few marginal pixels in deep
+    imagery above land that is uniformly thin.
+    """
+
+    @staticmethod
+    def _rec(median_any: float, median_thin: float | None, thin: int) -> dict:
+        return {
+            "refused": {"thin": thin, "no_optical": 0, "no_radar": 0},
+            "eligible_px": 4194304,
+            "chunk_px": 4194304,
+            "s2_obs": {
+                "px_with_any": 4194304,
+                "max": 60,
+                "median_where_any": median_any,
+                "median_where_thin": median_thin,
+            },
+            "px_with_any_radar": 0,
+            "radar_rule_enforced": False,
+        }
+
+    def test_the_two_medians_describe_different_populations(self) -> None:
+        rows = registry_rows(
+            "r1", "t", embedded=["chunk_132_19"], refused=[],
+            embedded_records={"chunk_132_19": self._rec(50.0, 11.0, 5504)}, optical_min_obs=15,
+        )
+        row = rows[0]
+        assert row["median_obs_where_any"] == 50.0, "the footprint, dominated by what passed"
+        assert row["median_obs_where_thin"] == 11.0, "the pixels a revisit would fix"
+
+    def test_ranking_by_the_footprint_median_inverts_the_answer(self) -> None:
+        """The concrete inversion, so the choice of column is pinned rather than described.
+
+        A deep tile with a few marginal pixels and a uniformly thin tile: by footprint median the
+        deep one looks the more urgent, and by thin median the thin one does — which is correct,
+        because its shortfall is larger and covers all of it.
+        """
+        rows = registry_rows(
+            "r1", "t", embedded=["deep_but_nicked", "uniformly_thin"], refused=[],
+            embedded_records={
+                "deep_but_nicked": self._rec(50.0, 13.0, 5_000),
+                "uniformly_thin": self._rec(9.0, 6.0, 3_000_000),
+            },
+            optical_min_obs=15,
+        )
+        by = {r["tile"]: r for r in rows}
+        worst_by_footprint = max(rows, key=lambda r: r["median_obs_where_any"])
+        assert worst_by_footprint["tile"] == "deep_but_nicked", "the misleading ranking"
+        # The honest ranking: the shard whose shortfall is deepest and widest.
+        worst = max(rows, key=lambda r: r["refused_px"])
+        assert worst["tile"] == "uniformly_thin"
+        assert by["uniformly_thin"]["median_obs_where_thin"] < by["deep_but_nicked"]["median_obs_where_thin"]
+
+    def test_a_tile_with_no_thin_pixels_is_null_not_zero(self) -> None:
+        """Null says the tile has no pixels below the line. Zero would say it has some, at depth
+        zero — which is the never-imaged case `refused_no_optical_px` counts instead.
+        """
+        rows = registry_rows(
+            "r1", "t", embedded=["clean"], refused=[],
+            embedded_records={"clean": self._rec(50.0, None, 0)}, optical_min_obs=15,
+        )
+        assert rows[0]["refused_px"] == 0
+        assert rows[0]["median_obs_where_thin"] is None
+
+
 class TestWhichBuildRefusedIt:
     """A revisit campaign has two reasons to re-examine a refusal: more imagery now exists, or the
     code that refused it has since been fixed. Several refusal-path defects were fixed in the days
