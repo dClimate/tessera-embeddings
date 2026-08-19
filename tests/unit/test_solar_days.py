@@ -35,7 +35,11 @@ from tessera_embeddings.ingest.solar_days import (
 #: Longitudes whose whole-hour offset puts UTC midnight on top of a Sentinel-1 pass
 #: (~06:00 descending, ~18:00 local solar). Zone 47's central meridian is +99 and it is
 #: the third-densest UTM zone on Earth, so this is where a boundary split costs most.
-_HOSTILE_LONGITUDES = [99.0, 93.0, -93.0, -99.0, 0.0, 179.0, -179.0]
+#: +/-180.0 are here because they are VALID longitudes that the previous offset formula
+#: truncated to +/-12 h, and +12 h is the one value that breaks
+#: `normalize_to_solar_day`'s idempotence (noon + 12 h is midnight of the next day). Every
+#: property below now runs at the dateline as well as at the 15-degree boundaries.
+_HOSTILE_LONGITUDES = [99.0, 93.0, -93.0, -99.0, 0.0, 179.0, -179.0, 180.0, -180.0]
 
 
 def _dates(start: str, end: str) -> list[str]:
@@ -108,6 +112,46 @@ def test_the_query_pad_is_not_clamped_to_the_window(producer: str) -> None:
 
 
 # --- a queried range always covers its owned days in full -----------------------------
+
+
+@pytest.mark.parametrize("longitude", [*_HOSTILE_LONGITUDES, 179.9, -179.9, 174.0, -174.0])
+def test_the_offset_never_reaches_twelve_hours(longitude: float) -> None:
+    """The bound that makes normalising idempotent, asserted as a property of the offset.
+
+    `normalize_to_solar_day` stamps every item to noon of its solar day and is called
+    defensively at several points in the streamed path, so re-normalising an already-noon
+    stamp must land on the same date. That holds exactly while |offset| <= 11 h: at 12 h,
+    noon steps to midnight of the next day and each pass advances the item another day.
+    """
+    assert abs(solar_day_offset_seconds(longitude)) <= 11 * 3600
+
+
+@pytest.mark.parametrize("longitude", [*_HOSTILE_LONGITUDES, 179.9, -179.9])
+def test_normalising_twice_is_normalising_once(longitude: float) -> None:
+    """Idempotence end to end, not just via the offset — this is what callers rely on."""
+
+    class _Item:
+        def __init__(self) -> None:
+            # An acquisition close enough to UTC midnight that any offset moves its date.
+            self.datetime = datetime.datetime(2025, 6, 1, 23, 30, tzinfo=datetime.UTC)
+
+    (once,) = normalize_to_solar_day([_Item()], mid_longitude=longitude)
+    first = once.datetime
+
+    (twice,) = normalize_to_solar_day([once], mid_longitude=longitude)
+    assert twice.datetime == first, f"re-normalising moved the stamp at longitude {longitude}"
+
+    (thrice,) = normalize_to_solar_day([twice], mid_longitude=longitude)
+    assert thrice.datetime == first, "the streamed path normalises three times over"
+
+
+def test_the_offset_stays_continuous_across_the_dateline() -> None:
+    """No cliff at 180. The alternative fix (canonicalising +180 to -180) reached
+    idempotence by jumping the offset 23 hours between 179.9 and 180.0 and reassigning a
+    dateline acquisition to the previous date; this pins that we did not do that.
+    """
+    assert solar_day_offset_seconds(179.9) == solar_day_offset_seconds(180.0)
+    assert solar_day_offset_seconds(-179.9) == solar_day_offset_seconds(-180.0)
 
 
 @pytest.mark.parametrize("longitude", _HOSTILE_LONGITUDES)

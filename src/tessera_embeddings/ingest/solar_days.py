@@ -79,8 +79,23 @@ def solar_day_offset_seconds(mid_longitude: float) -> int:
     loader's ever disagreed at a 15-degree boundary, an image could be filtered out as
     another chunk's while the loader would have grouped it into this one — dropping it
     from the run entirely rather than merely mislabelling it.
+
+    **Bounded to +/-11 h, which is what keeps :func:`normalize_to_solar_day` idempotent.**
+    A longitude of exactly +180.0 is valid and truncates to +12 h, and noon plus twelve
+    hours is midnight of the NEXT day — so a canonical noon stamp would advance one day
+    every time it was re-normalised, and the streamed S2 path normalises defensively in
+    three places. The clamp is the honest form of the +/-11 h claim the caller's docstring
+    already makes: eleven hours is the true extreme of the zone grid (its nearest centroid
+    to the antimeridian is 177 degrees), so this changes nothing any real zone produces and
+    only refuses to step off the end at the dateline itself.
+
+    Clamped rather than canonicalising +180 to -180, which was the other way to reach
+    idempotence: -12 h is also stable (noon minus twelve is midnight of the SAME day), but
+    it would make the offset jump 23 hours between 179.9 and 180.0 and reassign a dateline
+    acquisition to the previous date. Clamping keeps the function continuous.
     """
-    return int(mid_longitude / 15) * 3600
+    hours = int(mid_longitude / 15)
+    return max(-11, min(11, hours)) * 3600
 
 
 def solar_grouping_longitude(roi: object) -> float | None:

@@ -364,12 +364,23 @@ class _DeploymentCellInputs:
                 except CancelledError:
                     continue
             if not pending:
-                self._raise_window_all_failed(futs, done)
+                # ALL of `futs`, not this iteration's `done`. The loop drains `pending` over
+                # several waits, so `done` holds only whatever settled last — and reporting
+                # that made a whole window's failure read as one cell, hiding both the real
+                # extent and, when the cells failed for one shared reason, the cause. Every
+                # future is settled by the time `pending` is empty, so `.exception()` still
+                # cannot block.
+                self._raise_window_all_failed(futs, set(futs))
         return None
 
     @staticmethod
     def _raise_window_all_failed(futs: dict[Future[None], tuple[str, int]], done: set[Future[None]]) -> None:
-        """Every cell offered to :meth:`wait_first` finished and every one failed."""
+        """Every cell offered to :meth:`wait_first` finished and every one failed.
+
+        ``done`` must be every settled future, not one wait's slice of them: the message
+        names the cells an operator will go and look at, and a short list points at the
+        wrong subsystem when a fleet-wide failure took the whole window down.
+        """
         cells = sorted(futs[f] for f in done)
         cause: BaseException | None = None
         for fut in done:

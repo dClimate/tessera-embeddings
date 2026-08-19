@@ -934,6 +934,37 @@ def test_wait_first_raises_rather_than_booting_gpus_when_every_cell_failed():
         adapter.shutdown()
 
 
+def test_the_all_failed_report_names_cells_that_failed_in_earlier_waits():
+    """A fleet-wide failure must not report as one cell.
+
+    `wait_first` drains its futures over SEVERAL waits — `FIRST_COMPLETED` returns as soon
+    as any one settles — so the final wait's `done` holds only whatever finished last. The
+    error was built from that slice, so a window where every ingest failed for one shared
+    reason (bad credentials, an unreachable API) named the single cell that happened to
+    finish last. An operator then goes looking at that zone instead of at the credential.
+
+    The two cells here settle in DIFFERENT waits, which the sibling test above cannot show
+    because both of its futures are already settled when the first wait runs.
+    """
+    adapter = _adapter()
+    try:
+        late: Future = Future()
+        adapter._futures = {
+            ("01N", 2024): _settled(RuntimeError("bad credentials")),  # settles in wait #1
+            ("02N", 2024): late,  # settles in wait #2
+        }
+        threading.Timer(0.05, lambda: late.set_exception(RuntimeError("bad credentials"))).start()
+
+        with pytest.raises(RuntimeError, match="every ingest in the opening window failed") as caught:
+            adapter.wait_first([("01N", 2024), ("02N", 2024)])
+
+        message = str(caught.value)
+        assert "02N-2024" in message, "the last cell to settle must be named"
+        assert "01N-2024" in message, "the cell that failed in an EARLIER wait must be named too"
+    finally:
+        adapter.shutdown()
+
+
 def test_a_failure_while_priming_still_cancels_the_ingests_it_started(wired, monkeypatch):
     """Priming lives inside the shutdown guard, so no child ingest is ever orphaned.
 
