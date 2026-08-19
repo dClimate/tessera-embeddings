@@ -35,13 +35,19 @@ by construction rather than racing for slots.
 
 **Scheduling (ADR-008 D6 + the runner contract).** Inference is parallel across
 zones; only commits contend, and only *same-zone* fills conflict (shared
-``years_complete``/``runs`` attrs → ``RebaseFailedError``). So the driver runs
-**year by year** (an outer serial loop) and, within a year, dispatches its zones
-**concurrently** up to ``max_parallel_clusters`` — all distinct zones, so no
-same-zone overlap is ever possible. The fleet-wide committer bound is a separate
-knob: ``commit_limit_name`` (a Prefect global concurrency limit) is passed to
-every fill so commits stay under the storm threshold while inference runs free.
-``pending()`` is year-major for exactly this drain pattern.
+``years_complete``/``runs`` attrs → ``RebaseFailedError``). By default
+(``overlap_years``) the driver dispatches **every requested year as one batch** and
+partitions by ZONE, so a zone's every year lands in one cluster and its assemblies
+serialize on that cluster's single trailing thread — which is what keeps same-zone
+fills from colliding without a year barrier. ``overlap_years=False`` restores the
+older shape: **year by year** in an outer serial loop, dispatching each year's zones
+concurrently, where distinct zones make same-zone overlap impossible by construction.
+Either way concurrency is bounded by ``max_parallel_clusters``.
+
+The fleet-wide committer bound is a separate knob: ``commit_limit_name`` (a Prefect
+global concurrency limit) is passed to every fill so commits stay under the storm
+threshold while inference runs free. ``pending()`` is year-major, which is the drain
+pattern the barrier path relies on.
 """
 
 from __future__ import annotations
@@ -501,11 +507,11 @@ async def run_global_campaign(
     store_name: str = "tessera",
     years: tuple[int, ...] | None = None,
     zones: list[str] | None = None,
-    max_parallel_clusters: int = 8,
+    max_parallel_clusters: int = 10,
     fill_strategy: str = "chained-clusters",
     chained_fill_deployment: str | None = None,
     commit_limit_name: str = "tessera-global-commits",
-    num_actors: int = 20,
+    num_actors: int = 250,
     s1_orbit: str = "both",
     s3_region: str | None = None,
     ssm_prefix: str = "/tessera/ray/",
@@ -516,12 +522,12 @@ async def run_global_campaign(
     ingest: bool = True,
     ingest_deployment: str | None = None,
     mask_name: str = "global",
-    max_parallel_ingest: int = 40,
+    max_parallel_ingest: int = 60,
     max_dispatch_rounds: int = 2,
     # Staging-reuse escape hatches. Both default off; see `_staging_code_identity`.
     force_staging_reuse: bool = False,
     force_staging_restage: str = "",
-    overlap_years: bool = False,
+    overlap_years: bool = True,
     ingest_limit_name: str = "tessera-global-ingests",
     inference_pause_gate: str = "tessera-global-inference",
     cleanup_mosaics: bool = True,
@@ -532,7 +538,7 @@ async def run_global_campaign(
     sweep_orphan_mosaics: bool = False,
     validation_deployment: str | None = None,
 ) -> dict[str, Any]:
-    """Fill every pending (zone, year), year-serial with bounded zone parallelism.
+    """Fill every pending (zone, year) — all years in one batch, bounded zone parallelism.
 
     Args:
         paths: Deployment storage contract.
@@ -562,12 +568,25 @@ async def run_global_campaign(
         max_parallel_clusters: Bounds simultaneous Ray clusters within a year (a
             cost knob, distinct from the commit gate): the concurrent per-cell
             fill runs under ``"cluster-per-zone"``, or the number of Ray clusters
-            under ``"chained-clusters"``. **Defaults to 8**, which is what
-            `campaign-cluster-sizing.md` settled on; 40 is the INGEST concurrency
-            cap and the two are easy to confuse. Measurement favours many narrow
-            fleets over few wide ones, so raising this means sizing ``num_actors``
-            and ``IngestSettings.max_workers`` down to match, or the aggregate
-            fleet will exceed the account's EC2 quota.
+            under ``"chained-clusters"``. **Defaults to 10**, the campaign's planned
+            width: 10 x 250 actors reaches the full 2,500-actor quota while keeping each
+            cluster's assembly thread under its ~275-actor ceiling, and balance holds to
+            ~16. Do not confuse it with ``max_parallel_ingest`` (60), which caps
+            simultaneous zone-INGESTS. 60 divides evenly by 10, which matters: the
+            per-cluster share is the cap over the cluster count ROUNDED UP, so an
+            uneven split aims the fleet above its own gate and logs a width it never
+            runs at. Measurement favours many narrow fleets over few
+            wide ones, so raising this means sizing ``num_actors`` and
+            ``IngestSettings.max_workers`` down to match, or the aggregate fleet will
+            exceed the account's EC2 quota.
+
+            These four — this, ``max_parallel_ingest``, ``num_actors`` and
+            ``overlap_years`` — are ONE decision and move together
+            (``context_docs/design/campaign-plan.md`` §3). They default to the campaign's
+            shape rather than to something conservative because this flow has one caller:
+            the global campaign. A width that is wrong does not fail — the run completes and
+            publishes real data at a fraction of the intended rate, with no error and no
+            symptom but a wall clock nobody has a baseline for.
         fill_strategy: Named for the CLUSTER LIFECYCLE — both strategies run
             up to ``max_parallel_clusters`` zones at once.
             ``"chained-clusters"`` (default) dispatches up to ``max_parallel_clusters``
@@ -652,13 +671,17 @@ async def run_global_campaign(
             work is always safe, where reusing it across a real change is not.
         overlap_years: Drop the YEAR BARRIER — dispatch every requested year as one
             batch instead of one batch per year, so a cluster works a multi-year list and
-            year N+1's ingest overlaps year N's inference. Default off; the year-serial
-            path is what has been run. What makes it safe is not this flag but two things
+            year N+1's ingest overlaps year N's inference. **Default ON**: it is the
+            campaign's planned shape, and it is what makes ``max_parallel_ingest`` reachable
+            — with the barrier in place the ceiling is 45 whatever the cap says. Certified
+            on six cells each carrying both radar orbits, including a same-zone year
+            rollover inside one cluster. What makes it safe is not this flag but two things
             underneath it: each cell carries its own inference window to the actors, and
             the zone-group attribute commit is separate and retried, so two years of one
             zone no longer collide. The partition is over ZONES, so a zone's every year
             lands in one cluster and its assemblies serialize on that cluster's single
-            trailing thread. **Untested against a real fleet — see the Phase 4 plan.**
+            trailing thread. Pass ``False`` to restore the barrier — a repair pass over one
+            year still wants it.
         max_dispatch_rounds: How many ROUNDS of re-dispatch the campaign runs — not a
             per-zone budget. Each round dispatches everything still missing, whatever
             zones that is, and re-reads the STORE to decide, so it never re-does landed

@@ -155,18 +155,34 @@ class TestCampaignDefaults:
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
         assert [d for d, _ in wired["arun"]] == ["fill-zones-sequential/fill-zones-sequential"]
 
-    def test_eight_clusters_share_forty_ingest_slots(self):
-        """Five UTM zones ingesting per cluster: 8 x 5 = the 40-zone fleet-wide cap.
+    def test_ten_clusters_share_sixty_ingest_slots(self):
+        """Six UTM zones ingesting per cluster: 10 x 6 = the 60-zone fleet-wide cap.
 
-        The two numbers are a pair, not independent knobs — the per-cluster ingest
-        window is the cap divided by the cluster count, so changing either changes
-        how many zones a cluster keeps in flight.
+        The campaign's planned width (``context_docs/design/campaign-plan.md`` §3), and 10 x 250
+        actors is what reaches the 2,500-actor quota.
+
+        The two numbers are a pair, not independent knobs — the per-cluster ingest window is the cap
+        divided by the cluster count, so changing either changes how many zones a cluster keeps in
+        flight. The plan named 61; 60 is used instead precisely because of the assertion below.
         """
         sig = inspect.signature(mod.run_global_campaign.fn)
         clusters = sig.parameters["max_parallel_clusters"].default
         ingests = sig.parameters["max_parallel_ingest"].default
-        assert (clusters, ingests) == (8, 40)
+        assert (clusters, ingests) == (10, 60)
         assert ingests % clusters == 0, "an uneven split rounds up and overshoots the cap"
+
+    def test_the_actor_count_reaches_the_quota_without_exceeding_the_assembly_ceiling(self):
+        """250 per cluster x 10 = the 2,500-actor quota, and each stays under ~275.
+
+        Both bounds matter and they pull opposite ways: fewer actors leaves quota unused, more
+        pushes a cluster's single assembly thread past the width it was measured to sustain.
+        """
+        sig = inspect.signature(mod.run_global_campaign.fn)
+        actors = sig.parameters["num_actors"].default
+        clusters = sig.parameters["max_parallel_clusters"].default
+        assert actors == 250
+        assert actors * clusters == 2500, "the fleet should reach the actor quota exactly"
+        assert actors < 275, "one cluster's assembly thread is the ceiling"
 
     def test_every_gate_is_published_to_the_server(self, wired):
         """All three gates live in CHILD flow runs, so a gate only binds if it reaches the
@@ -176,7 +192,7 @@ class TestCampaignDefaults:
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami"))
         assert dict(wired["limits"]) == {
-            "tessera-global-ingests": 40,
+            "tessera-global-ingests": 60,
             "tessera-global-commits": 8,
             "tessera-global-inference": 1,
         }
@@ -276,7 +292,7 @@ class TestCampaignDefaults:
         a limit named ``""``.
         """
         asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", commit_limit_name=""))
-        assert dict(wired["limits"]) == {"tessera-global-ingests": 40, "tessera-global-inference": 1}
+        assert dict(wired["limits"]) == {"tessera-global-ingests": 60, "tessera-global-inference": 1}
 
     def test_nothing_bounds_mosaics_in_flight(self, wired, monkeypatch):
         """A whole year's mosaics may coexist: no backpressure from fill onto ingest.
@@ -753,14 +769,20 @@ def test_sequential_strategy_dispatches_one_run_per_year(wired):
     fill-zones-sequential run per year: no driver-side ingest (the child's
     look-ahead owns it), no driver-side mosaic cleanup, cells passed as (zone, year) pairs.
     """
-    result = asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters"))
+    # overlap_years is the DEFAULT now, and this test is about the per-year dispatch shape, so the
+    # barrier is asked for explicitly rather than relied on.
+    result = asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", overlap_years=False
+        )
+    )
     deps = [d for d, _ in wired["arun"]]
     assert deps == ["fill-zones-sequential/fill-zones-sequential"]
     params = wired["arun"][0][1]
     assert _dispatched_zones(params) == ["33N"] and params["cells"] == [["33N", 2025]]
-    # One cluster, so it carries the whole ingest bound as its window.
-    # One cluster, cap 40: width 40 means 39 cells BEYOND the current one.
-    assert params["ingest"] is True and 1 + params["look_ahead"] == 40
+    # One cell dispatched, so the cluster list is one long and it carries the whole ingest bound as
+    # its window: cap 60 means 59 cells BEYOND the current one.
+    assert params["ingest"] is True and 1 + params["look_ahead"] == 60
     assert params["ingest_deployment"] == "ingest-zone-year/ingest-zone-year"
     # Mosaic lifecycle belongs to the child in this mode.
     assert wired["deletes"] == []
@@ -1260,11 +1282,18 @@ def _multi_year(monkeypatch, zones, years, wired):
     return status
 
 
-def test_year_serial_is_still_the_default(wired, monkeypatch):
-    """The flag is opt-in: without it the driver dispatches one batch PER YEAR.
+def test_overlapping_years_is_now_the_default(wired, monkeypatch):
+    """One batch covering every requested year, without anyone asking for it.
 
-    Pinned because the year-serial path is the one that has actually been run, and a
-    default flip would change the campaign's shape silently.
+    This assertion is inverted from what it was, deliberately. It used to pin year-serial as the
+    default, on the reasoning that year-serial was the path that had actually been run and a silent
+    flip would change the campaign's shape. That premise expired: `overlap_years` was certified on
+    six cells each carrying both radar orbits, including a same-zone year rollover inside one
+    cluster, and `context_docs/design/campaign-plan.md` §3 makes it the campaign's shape.
+
+    The guard's PURPOSE is unchanged and is why this still exists rather than being deleted — the
+    default must not move without a test saying so. Overlapping years is what makes the 60-zone
+    ingest cap reachable; with the barrier in place the ceiling is 45 regardless of the cap.
     """
     _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024], wired)
     asyncio.run(
@@ -1272,7 +1301,26 @@ def test_year_serial_is_still_the_default(wired, monkeypatch):
             paths=_PATHS, ami_ssm_name="ami", fill_strategy="chained-clusters", max_parallel_clusters=1
         )
     )
-    # One dispatch per year, each carrying exactly one year's cells.
+    # One dispatch carrying BOTH years, so year N+1's ingest overlaps year N's inference.
+    years_per_dispatch = [{y for _z, y in p["cells"]} for _, p in wired["arun"]]
+    assert years_per_dispatch == [{2025, 2024}], years_per_dispatch
+
+
+def test_the_year_barrier_is_still_reachable_when_asked_for(wired, monkeypatch):
+    """The complement, so the test above cannot be satisfied by the option disappearing.
+
+    A repair pass over one year, or a diagnosis that wants years kept apart, still needs this.
+    """
+    _multi_year(monkeypatch, ["01N", "02N"], [2025, 2024], wired)
+    asyncio.run(
+        mod.run_global_campaign.fn(
+            paths=_PATHS,
+            ami_ssm_name="ami",
+            fill_strategy="chained-clusters",
+            max_parallel_clusters=1,
+            overlap_years=False,
+        )
+    )
     years_per_dispatch = [{y for _z, y in p["cells"]} for _, p in wired["arun"]]
     assert years_per_dispatch == [{2025}, {2024}], years_per_dispatch
 

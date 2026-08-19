@@ -65,7 +65,7 @@ when one fails.
    the campaign             ingest alongside it       ~5.1 days    ~340 TB at once
 ```
 
-**~5.1 days is the campaign's wall clock.** It is 61 cells of ingest feeding 2,500 GPU actors
+**~5.1 days is the campaign's wall clock.** It is ~60 cells of ingest feeding 2,500 GPU actors
 across 10 clusters, with every year dispatched in one batch — the settings of §3, and the only
 configuration this plan describes. The campaign is **GPU-bound**: ingest finishes its 1,008
 zone-years in 4.2 days and the fleet needs 5.1 to consume them, so the schedule is
@@ -271,12 +271,12 @@ is in this table because it is the most consequential value in it.
 | **published store** | **`s3://tessera-embeddings/v1.1/dclimate.icechunk`** | the AWS Open Data bucket, not ours — it carries the storage cost and serves the dataset publicly. Set as `BucketPaths.global_store_uri` on the PROD account's paths, so it is a property of the account rather than a parameter an operator can get wrong. Every producer and consumer of the store reads it from that one method, and no dev or branch deployment carries it, so nothing but production can reach the public bucket |
 | `fill_strategy` | `"chained-clusters"` | one cluster per zone-set, not per zone-year |
 | **`max_parallel_clusters`** | **10** ★ | 10 x 250 actors reaches the full 2,500-actor quota while keeping each cluster's assembly thread under its ~275-actor ceiling (§6). Balance holds to ~16, and each cluster still opens on one of the 10 densest zones |
-| **`max_parallel_ingest`** | **61** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§6) |
+| **`max_parallel_ingest`** | **60** ★ | fleet-wide cap on simultaneous zone-ingests. With every year in one batch the ingest knee is gone, so this is set by quota and by what the GPU fleet can absorb (§6). **60, not the 61 this table asked for until 2026-08-19, and the reason is division:** each cluster's share is this cap over the cluster count ROUNDED UP, so 61 over 10 aims every cluster at 7 and the fleet at 70 against its own gate of 61 — the gate holds the ceiling, so it oversubscribes rather than breaches, but the clusters queue on it and the log reports a width the fleet never runs at. 60 over 10 is exactly 6. Now the flow DEFAULT, so it needs no passing |
 | `max_dispatch_rounds` | 2 | **The outer recovery.** How many times the campaign re-dispatches whatever is still missing — rounds, not a per-zone budget. It is the only thing that recovers a child run that DIED, since a killed or cancelled run takes its own retry counter with it (§8) |
 | `ingest_settings.max_workers` | 60 | S2 fleet width. Shortens each cell, and so the tail of the cluster holding the densest zone (§6) |
 | `ingest_settings.s1_worker_fraction` | 0.22 | → 13 workers per S1 orbit at the recommended 60w, sized to finish inside S2 |
 | `ingest_settings.batch_days` | 30 | S1 batch length |
-| **`num_actors`** | **250** ★ | GPU actors per cluster. 10 clusters x 250 = the 2,500-actor quota, which is 81% of what 61 cells of ingest can feed — under it by policy, so the fleet never idles (§6) |
+| **`num_actors`** | **250** ★ | GPU actors per cluster. 10 clusters x 250 = the 2,500-actor quota, which is ~82% of what 60 cells of ingest can feed — under it by policy, so the fleet never idles (§6) |
 | `s1_orbit` | `"both"` | downgrades per zone when an orbit has no imagery. `"none"` is a *resolved* value, not a request: passing it in is refused, since it would defeat `require_s1` and publish optical-only embeddings that report success |
 | `cleanup_mosaics` | `true` | **required** — the storage figure depends on it |
 | `allow_partial_window` | `false` | a zone-year is a full calendar year or it fails |
@@ -426,7 +426,7 @@ that used to be restated here are one click away and were a second copy of numbe
 
 | | |
 |---|---|
-| Shape | all years in one batch, 61 cells × 60 workers, 10 clusters × 250 actors |
+| Shape | all years in one batch, 60 cells × 60 workers, 10 clusters × 250 actors |
 | Campaign total | **~$700,000** (ingest ~$121,000, inference ~$573,000, the rest ~$6,000) |
 | Wall clock | **~5.1 days** |
 | Basis | 2.36 × 10¹⁵ combined S2+S1 tokens — 1.363 × 10¹³ pixels at a measured, land-weighted **173 tokens/pixel** — at **2.127 M combined tok/sec** per worker |
@@ -450,7 +450,10 @@ answer — cost-model §4.
 ## 7. Before launch
 
 1. **Quotas, both applied in prod (verified 2026-08-06).** Fargate **25,000 vCPU**, which
-   covers the recommended 61 cells at 22,692. G-and-VT **10,000 vCPU**, which is 2,500
+   covers the recommended shape with room to spare. **The quota was sized against 61 cells
+   (22,692 vCPU); the operating point is 60** — see `max_parallel_ingest` in §3 for why the cap
+   divides by the cluster count. The headroom is therefore slightly larger than these figures
+   state, never smaller, so no quota conclusion below changes. G-and-VT **10,000 vCPU**, which is 2,500
    `g6e.xlarge` actors — the full fleet the recommended shape provisions. Neither is slack: 61
    cells provisions all 2,500 actors, so the two are matched exactly, with no slack.
    Read the applied value in the account before relying on either; the request history lags
@@ -693,7 +696,7 @@ Three levers, and it is worth knowing which one does what before needing them at
 prefect global-concurrency-limit update tessera-global-inference --limit 0  # pause inference
 prefect global-concurrency-limit update tessera-global-ingests   --limit 0  # pause ingest
 prefect global-concurrency-limit update tessera-global-inference --limit 1  # resume
-prefect global-concurrency-limit update tessera-global-ingests   --limit 61 # resume
+prefect global-concurrency-limit update tessera-global-ingests   --limit 60 # resume
 ```
 
 **Which one to reach for.** Pausing **inference** is the one that stops embeddings being
