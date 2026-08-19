@@ -284,6 +284,15 @@ def run(
     # already resolving correctly, so it is left alone.
     if not any(p.suffix == ".py" for p in source_path.iterdir() if p.is_file()):
         nested = sorted(p for p in source_path.iterdir() if p.is_dir() and (p / "__init__.py").exists())
+        if not nested and source_path.name == "src":
+            # PEP 420 namespace packages carry no `__init__.py`, so the marker above finds
+            # nothing and the wrapper gets scanned as itself — the silent pass this branch
+            # exists to prevent, reached by another route. Keyed on the directory being named
+            # `src` because that is the only signal available: without `__init__.py` there is
+            # nothing to distinguish a namespace package from an ordinary subpackage, and
+            # treating every module-bearing directory as a root would descend into the
+            # subpackages of a normal package root whose own modules all live one level down.
+            nested = sorted(p for p in source_path.iterdir() if p.is_dir() and next(p.rglob("*.py"), None))
         if nested:
             found = [v for pkg in nested for v in _scan_root(pkg, expanded_rules)]
             found.sort(key=lambda v: (str(v.path), v.lineno))

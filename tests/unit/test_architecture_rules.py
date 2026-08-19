@@ -251,6 +251,24 @@ def test_a_src_wrapper_holding_several_packages_is_scanned_whole(tmp_path: Path)
     assert "no-profiling-imports-outside-profiling" in {v.rule for v in run(src)}
 
 
+def test_a_namespace_package_under_a_wrapper_is_still_found(tmp_path: Path) -> None:
+    """PEP 420 packages have no `__init__.py`, and requiring one reopened the silent pass.
+
+    The first version of the wrapper handling looked for `__init__.py` to decide what was a
+    package. A namespace package has none, so nothing was found, the wrapper was scanned as
+    itself, and every relative-import rule passed again — the same hole, reached by a
+    different route.
+    """
+    src = tmp_path / "src"
+    # No __init__.py anywhere: this is the namespace layout.
+    _write(
+        src / "tessera_embeddings" / "inference" / "actors.py",
+        "from ..profiling.ingest import report\n",
+    )
+
+    assert "no-profiling-imports-outside-profiling" in {v.rule for v in run(src)}
+
+
 def test_a_root_holding_its_own_modules_is_scanned_as_itself(tmp_path: Path) -> None:
     """A plain tree is not a wrapper, and descending into it would change what resolves."""
     root = tmp_path / "tessera_embeddings"

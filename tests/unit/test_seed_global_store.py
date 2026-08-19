@@ -147,6 +147,7 @@ def _fully_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int):
     # These tests are about the ROOT IDENTITY, and their `_Root` is not a zarr group — the
     # layout check needs real arrays. Covered on its own below.
     monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)
     monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)
@@ -177,6 +178,24 @@ def test_a_rerun_over_existing_groups_validates_their_layout(monkeypatch):
     with pytest.raises(ValueError, match="has no 'month' array"):
         mod.seed_global_store.fn(paths=_PATHS)
     assert seen["group"], "the flow must probe a seeded group, not skip the check"
+
+
+def test_a_rerun_over_groups_missing_a_coordinate_is_refused(monkeypatch):
+    """The layout check alone does not cover this, which is why the first fix was incomplete.
+
+    `_check_layout_matches` iterates `layout.arrays` — the six DATA arrays — while a seed also
+    writes six coordinates beside them. A store seeded by an older schema without `month` or
+    `time_bnds` therefore passed the layout check and still reported a clean reseed, then
+    failed at fill or read: `s2_month_covered` with no calendar labels, the time axis with no
+    CF bounds. `seed_zone_groups` has always caught this, but only while creating something,
+    and it creates nothing when all 120 zones exist.
+    """
+    _fully_seeded(monkeypatch, {"geoemb:model": "tessera-v1.1"}, cells_landed=0)
+    monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)  # the OTHER check passes
+    monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: {"month", "time_bnds"})
+
+    with pytest.raises(ValueError, match=r"missing.*month"):
+        mod.seed_global_store.fn(paths=_PATHS)
 
 
 def test_an_unstamped_but_empty_store_gets_its_identity_written(monkeypatch):
@@ -238,6 +257,7 @@ def _partially_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int, seede
     # These tests are about the ROOT IDENTITY, and their `_Root` is not a zarr group — the
     # layout check needs real arrays. Covered on its own below.
     monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)
     monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)
@@ -318,6 +338,7 @@ def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch
     # These tests are about the ROOT IDENTITY, and their `_Root` is not a zarr group — the
     # layout check needs real arrays. Covered on its own below.
     monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "missing_seeded_arrays", lambda *a, **k: set())
     # The year-axis guard runs first and must pass, so the identity check is what raises.
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)

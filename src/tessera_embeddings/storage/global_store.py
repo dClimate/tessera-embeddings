@@ -267,6 +267,23 @@ def _codec_id(arr: zarr.Array) -> str:
     return "zstd" if arr.compressors else "raw"
 
 
+def missing_seeded_arrays(node: zarr.Group, layout: StoreLayout) -> set[str]:
+    """Arrays a seed of *layout* would have written that this group does not have.
+
+    EVERY array the seeder writes, not a subset: the layout's own arrays plus the six
+    coordinates it creates beside them. `month` and `time_bnds` were once absent from that
+    set, so a group holding the layout arrays and four coordinates counted as complete
+    without them — leaving `s2_month_covered` with no calendar labels and the time axis with
+    no CF bounds.
+
+    Split out so the two callers that must agree share one definition: `seed_zone_groups`
+    asks it per spec while creating, and `seed_global_store` asks it on the path where
+    nothing is created at all, which otherwise never applied a completeness check.
+    """
+    expected = set(layout.arrays) | {"time", "northing", "easting", "band", "month", "time_bnds"}
+    return expected - set(node.array_keys())
+
+
 def _check_layout_matches(grp: zarr.Group, gname: str, layout: StoreLayout) -> None:
     """Reject an incremental seed whose layout differs from the seeded groups'.
 
@@ -506,9 +523,9 @@ def seed_zone_groups(
         # leaving `s2_month_covered` with no calendar labels and the time axis with no CF bounds.
         # Derived from what the seeder produces below, so a future array is covered by construction
         # rather than by someone remembering to extend this literal.
-        expected_arrays = set(layout.arrays) | {"time", "northing", "easting", "band", "month", "time_bnds"}
         present = set(node.array_keys())
-        if expected_arrays <= present:
+        missing = missing_seeded_arrays(node, layout)
+        if not missing:
             continue
         if present:
             # PARTIAL, which is a real defect — a crash mid-seed, or a group written by a seeder
@@ -518,7 +535,7 @@ def seed_zone_groups(
             # array it happens to reach first, which says nothing about what is wrong.
             raise ValueError(
                 f"Zone group {spec.group_name} exists but is missing "
-                f"{sorted(expected_arrays - present)} — it was seeded by a different schema or a "
+                f"{sorted(missing)} — it was seeded by a different schema or a "
                 f"crashed run. Refusing to complete it in place: the arrays it already has were "
                 f"sized by a call this one cannot see. Reseed the zone into a fresh store, or remove "
                 f"the group and seed it again."

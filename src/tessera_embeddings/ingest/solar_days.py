@@ -82,22 +82,19 @@ def solar_day_offset_seconds(mid_longitude: float) -> int:
     another chunk's while the loader would have grouped it into this one — dropping it
     from the run entirely rather than merely mislabelling it.
 
-    **Bounded to +/-11 h, which is what keeps :func:`normalize_to_solar_day` idempotent.**
-    A longitude of exactly +180.0 is valid and truncates to +12 h, and noon plus twelve
-    hours is midnight of the NEXT day — so a canonical noon stamp would advance one day
-    every time it was re-normalised, and the streamed S2 path normalises defensively in
-    three places. The clamp is the honest form of the +/-11 h claim the caller's docstring
-    already makes: eleven hours is the true extreme of the zone grid (its nearest centroid
-    to the antimeridian is 177 degrees), so this changes nothing any real zone produces and
-    only refuses to step off the end at the dateline itself.
+    **The full +/-12 h at the dateline, deliberately.** This was briefly clamped to +/-11 h
+    to keep :func:`normalize_to_solar_day` idempotent — noon plus twelve hours is midnight of
+    the NEXT day, so a canonical stamp advanced a day on every re-normalisation, and the
+    streamed S2 path normalises defensively three times over. That bought idempotence with a
+    wrong answer: at exactly +180 the true offset IS +12 h, and clamping misplaces one hour
+    of every day (12:00-12:59 UTC stays on the current date instead of advancing), which
+    `bbox_mid_longitude` then feeds every antimeridian-crossing box into.
 
-    Clamped rather than canonicalising +180 to -180, which was the other way to reach
-    idempotence: -12 h is also stable (noon minus twelve is midnight of the SAME day), but
-    it would make the offset jump 23 hours between 179.9 and 180.0 and reassign a dateline
-    acquisition to the previous date. Clamping keeps the function continuous.
+    Idempotence is handled where it belongs instead — `normalize_to_solar_day` recognises an
+    already-canonical stamp and leaves it alone, which holds for ANY offset rather than only
+    for offsets small enough not to cross midnight.
     """
-    hours = int(mid_longitude / 15)
-    return max(-11, min(11, hours)) * 3600
+    return int(mid_longitude / 15) * 3600
 
 
 def bbox_mid_longitude(bbox: object) -> float | None:
@@ -218,7 +215,16 @@ def normalize_to_solar_day(items: list[Any], *, mid_longitude: float | None) -> 
     offset = datetime.timedelta(seconds=solar_day_offset_seconds(mid_longitude) if mid_longitude is not None else 0)
     groups: dict[datetime.date, list[Any]] = {}
     for item in items:
-        groups.setdefault((item.datetime + offset).date(), []).append(item)
+        when = item.datetime
+        # ALREADY NORMALISED items keep their day rather than being shifted again. Noon UTC is
+        # this package's canonical stamp — `solar_day_of` refuses anything else for the same
+        # reason — so its date IS the solar day and adding the offset a second time would move
+        # it. That is what makes this function idempotent, and it holds for every offset: the
+        # alternative was bounding the offset below the twelve hours that cross midnight, which
+        # bought idempotence by returning the wrong offset at the dateline.
+        canonical_already = (when.hour, when.minute, when.second, when.microsecond) == (12, 0, 0, 0)
+        day = when.date() if canonical_already else (when + offset).date()
+        groups.setdefault(day, []).append(item)
     for day, group in groups.items():
         canonical = datetime.datetime(day.year, day.month, day.day, 12, 0, 0, tzinfo=datetime.UTC)
         for item in group:

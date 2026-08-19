@@ -116,16 +116,18 @@ def test_the_query_pad_is_not_clamped_to_the_window(producer: str) -> None:
 # --- a queried range always covers its owned days in full -----------------------------
 
 
-@pytest.mark.parametrize("longitude", [*_HOSTILE_LONGITUDES, 179.9, -179.9, 174.0, -174.0])
-def test_the_offset_never_reaches_twelve_hours(longitude: float) -> None:
-    """The bound that makes normalising idempotent, asserted as a property of the offset.
+def test_the_dateline_keeps_its_true_twelve_hour_offset() -> None:
+    """+/-180 really is +/-12 h, and the offset must say so.
 
-    `normalize_to_solar_day` stamps every item to noon of its solar day and is called
-    defensively at several points in the streamed path, so re-normalising an already-noon
-    stamp must land on the same date. That holds exactly while |offset| <= 11 h: at 12 h,
-    noon steps to midnight of the next day and each pass advances the item another day.
+    This was briefly clamped to +/-11 h to make normalising idempotent, which bought that
+    property with a wrong answer: at +180 it left 12:00-12:59 UTC on the current date
+    instead of advancing it, one hour of every day, and `bbox_mid_longitude` maps every
+    antimeridian-crossing box to exactly 180. Idempotence is handled in
+    `normalize_to_solar_day` instead, where it holds for any offset.
     """
-    assert abs(solar_day_offset_seconds(longitude)) <= 11 * 3600
+    assert solar_day_offset_seconds(180.0) == 12 * 3600
+    assert solar_day_offset_seconds(-180.0) == -12 * 3600
+    assert solar_day_offset_seconds(179.9) == 11 * 3600
 
 
 @pytest.mark.parametrize("longitude", [*_HOSTILE_LONGITUDES, 179.9, -179.9])
@@ -168,21 +170,30 @@ def test_an_antimeridian_bbox_midpoint_is_not_averaged() -> None:
 
     (179, -179) averages to 0.0 — the middle of the wrong hemisphere, and a solar offset
     about twelve hours out. The box is walked eastward across the dateline instead. The
-    result is exactly 180.0, which is only safe because the offset is clamped; before the
-    clamp this value was the one that broke idempotence.
+    result is exactly 180.0 — the meridian the box actually straddles — and its offset is the
+    true +12 h, which is safe to produce now that idempotence no longer rests on the offset.
     """
     assert bbox_mid_longitude((179.0, 0.0, -179.0, 5.0)) == 180.0
     assert bbox_mid_longitude((10.0, 0.0, 20.0, 5.0)) == 15.0
-    assert abs(solar_day_offset_seconds(bbox_mid_longitude((179.0, 0.0, -179.0, 5.0)))) <= 11 * 3600
+    assert solar_day_offset_seconds(bbox_mid_longitude((179.0, 0.0, -179.0, 5.0))) == 12 * 3600
 
 
-def test_the_offset_stays_continuous_across_the_dateline() -> None:
-    """No cliff at 180. The alternative fix (canonicalising +180 to -180) reached
-    idempotence by jumping the offset 23 hours between 179.9 and 180.0 and reassigning a
-    dateline acquisition to the previous date; this pins that we did not do that.
+def test_an_already_canonical_stamp_is_left_alone() -> None:
+    """The mechanism idempotence rests on, asserted directly rather than through an offset.
+
+    Noon UTC is this package's canonical stamp — `solar_day_of` refuses anything else — so
+    an item carrying it has been normalised already and its date IS its solar day. Adding
+    the offset a second time is what used to move it, and at +/-12 h that crossed midnight.
     """
-    assert solar_day_offset_seconds(179.9) == solar_day_offset_seconds(180.0)
-    assert solar_day_offset_seconds(-179.9) == solar_day_offset_seconds(-180.0)
+
+    class _Item:
+        def __init__(self) -> None:
+            self.datetime = datetime.datetime(2025, 6, 1, 12, 0, tzinfo=datetime.UTC)
+
+    for longitude in (180.0, -180.0, 150.0, 0.0):
+        item = _Item()
+        (out,) = normalize_to_solar_day([item], mid_longitude=longitude)
+        assert out.datetime == datetime.datetime(2025, 6, 1, 12, 0, tzinfo=datetime.UTC), longitude
 
 
 @pytest.mark.parametrize("longitude", _HOSTILE_LONGITUDES)

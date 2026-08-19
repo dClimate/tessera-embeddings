@@ -27,6 +27,7 @@ from tessera_embeddings.storage.global_store import (
     _check_layout_matches,
     check_root_identity,
     create_global_repo,
+    missing_seeded_arrays,
     open_global_repo,
     seed_zone_groups,
     stamp_root_identity,
@@ -155,6 +156,19 @@ def seed_global_store(
         # every group shares one axis and one layout, which is the invariant the helper's own
         # single-group check rests on.
         _check_layout_matches(probe, probe_name, GLOBAL)
+        # And COMPLETENESS, which the layout check does not cover: it iterates `layout.arrays`,
+        # the six data arrays, while a seed also writes six coordinates beside them. An older
+        # store missing `month` or `time_bnds` therefore passed the layout check and still failed
+        # at fill or read — the exact case this block exists to catch. One probe group suffices
+        # for the same reason the axis and layout checks use one: a schema-wide omission is
+        # present in every group.
+        if missing := missing_seeded_arrays(probe, GLOBAL):
+            raise ValueError(
+                f"Zone group {probe_name!r} in {store_path} is missing {sorted(missing)}. The store "
+                f"was seeded by an older schema or a crashed run, so reporting this reseed as "
+                f"successful would hand the campaign a store that fails at fill or read instead. "
+                f"Reseed into a fresh store, or remove the incomplete groups and seed them again."
+            )
 
     def _refuse_stamping_over_landed_cells(root_attrs: dict, how_many_groups: str) -> None:
         """Refuse to stamp a write-once identity onto a store that already holds cells.
