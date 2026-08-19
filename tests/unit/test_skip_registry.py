@@ -665,8 +665,12 @@ class TestAPartlyRefusedTileIsNotFullyCovered:
 
     def test_an_embedded_tile_reports_what_the_gate_removed(self) -> None:
         rows = registry_rows(
-            "r1", "t", embedded=["chunk_0_0"], refused=[],
-            embedded_records={"chunk_0_0": self._partial()}, optical_min_obs=15,
+            "r1",
+            "t",
+            embedded=["chunk_0_0"],
+            refused=[],
+            embedded_records={"chunk_0_0": self._partial()},
+            optical_min_obs=15,
         )
         row = rows[0]
         assert row["embedded"] is True, "it does hold embeddings"
@@ -679,8 +683,12 @@ class TestAPartlyRefusedTileIsNotFullyCovered:
         removed nothing, the second says nobody looked. Both used to publish as null.
         """
         rows = registry_rows(
-            "r1", "t", embedded=["chunk_0_0", "chunk_0_1"], refused=[],
-            embedded_records={"chunk_0_0": self._partial(thin=0)}, optical_min_obs=15,
+            "r1",
+            "t",
+            embedded=["chunk_0_0", "chunk_0_1"],
+            refused=[],
+            embedded_records={"chunk_0_0": self._partial(thin=0)},
+            optical_min_obs=15,
         )
         measured = next(r for r in rows if r["tile"] == "chunk_0_0")
         unmeasured = next(r for r in rows if r["tile"] == "chunk_0_1")
@@ -693,8 +701,13 @@ class TestAPartlyRefusedTileIsNotFullyCovered:
         """
         rec = self._partial()
         rows = registry_rows(
-            "r1", "t", embedded=["chunk_0_0"], refused=["chunk_1_1"],
-            embedded_records={"chunk_0_0": rec}, records={"chunk_1_1": rec}, optical_min_obs=15,
+            "r1",
+            "t",
+            embedded=["chunk_0_0"],
+            refused=["chunk_1_1"],
+            embedded_records={"chunk_0_0": rec},
+            records={"chunk_1_1": rec},
+            optical_min_obs=15,
         )
         a, b = (next(r for r in rows if r["tile"] == t) for t in ("chunk_0_0", "chunk_1_1"))
         shared = [c for c in a if c not in ("tile", "embedded")]
@@ -704,7 +717,10 @@ class TestAPartlyRefusedTileIsNotFullyCovered:
     def test_a_marker_wins_over_a_result_for_the_same_label(self) -> None:
         """A label in both sources refused everything at the end, so its marker is the later word."""
         rows = registry_rows(
-            "r1", "t", embedded=[], refused=["chunk_0_0"],
+            "r1",
+            "t",
+            embedded=[],
+            refused=["chunk_0_0"],
             embedded_records={"chunk_0_0": self._partial(thin=1)},
             records={"chunk_0_0": self._partial(thin=99)},
             optical_min_obs=15,
@@ -787,8 +803,9 @@ class TestTheDepthRuleTheRowsWereJudgedAgainst:
         """
         ds = pytest.importorskip("pyarrow.dataset")
         root = str(tmp_path / "reg")
-        self._write(root, "32S", 2021, "r1", registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], optical_min_obs=15), 15)
-        self._write(root, "09S", 2021, "r2", registry_rows("r2", "t", embedded=["chunk_0_0"], refused=[], optical_min_obs=30), 30)
+        for zone, rule in (("32S", 15), ("09S", 30)):
+            rows = registry_rows("r", "t", embedded=["chunk_0_0"], refused=[], optical_min_obs=rule)
+            self._write(root, zone, 2021, f"r-{zone}", rows, rule)
 
         table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
         assert table.num_rows == 2
@@ -799,9 +816,8 @@ class TestTheDepthRuleTheRowsWereJudgedAgainst:
         """Also in the key-value block, for a reader that opens one file without the partitioning."""
         pq = pytest.importorskip("pyarrow.parquet")
         root = str(tmp_path / "reg")
-        uri = self._write(
-            root, "32S", 2021, "r1", registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], optical_min_obs=15), 15
-        )
+        rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], optical_min_obs=15)
+        uri = self._write(root, "32S", 2021, "r1", rows, 15)
         md = {k.decode(): v.decode() for k, v in (pq.read_schema(uri).metadata or {}).items()}
         assert md["optical_min_obs"] == "15"
         assert md["zone"] == "32S" and md["year"] == "2021"
@@ -834,8 +850,13 @@ class TestOneCellsRefusalsNeverReachAnother:
         # Second cell, same writer, no skips of its own — the reset `assemble_global` performs.
         writer._last_skip_records = {}
         uri = writer.publish_registry_part(
-            str(tmp_path / "registry"), "60S", 2024, "run-B",
-            embedded=[chunk.label], refused=[], optical_min_obs=15,
+            str(tmp_path / "registry"),
+            "60S",
+            2024,
+            "run-B",
+            embedded=[chunk.label],
+            refused=[],
+            optical_min_obs=15,
         )
         assert uri is not None
 
@@ -855,8 +876,13 @@ class TestOneCellsRefusalsNeverReachAnother:
         writer._skip_summary("run-A", [], [chunk.label])
 
         uri = writer.publish_registry_part(  # no reset — the old behaviour
-            str(tmp_path / "registry"), "60S", 2024, "run-B",
-            embedded=[chunk.label], refused=[], optical_min_obs=15,
+            str(tmp_path / "registry"),
+            "60S",
+            2024,
+            "run-B",
+            embedded=[chunk.label],
+            refused=[],
+            optical_min_obs=15,
         )
         pq = pytest.importorskip("pyarrow.parquet")
         cols = pq.read_table(uri).to_pydict()
@@ -889,15 +915,27 @@ class TestPartsWrittenByDifferentBuilds:
         older = pa.schema([f for f in newer if f.name != "median_obs_where_thin"])
         rec = {
             "refused": {"thin": 40, "no_optical": 0, "no_radar": 0},
-            "eligible_px": 100, "chunk_px": 100,
+            "eligible_px": 100,
+            "chunk_px": 100,
             "s2_obs": {"px_with_any": 95, "max": 60, "median_where_any": 50.0, "median_where_thin": 11.0},
-            "px_with_any_radar": 0, "radar_rule_enforced": False,
+            "px_with_any_radar": 0,
+            "radar_rule_enforced": False,
         }
         root = str(tmp_path / "reg")
         for zone, schema in ((older_zone, older), (newer_zone, newer)):
-            self._write(root, zone, schema,
-                        registry_rows("r", "t", embedded=["chunk_0_0"], refused=[],
-                                      embedded_records={"chunk_0_0": rec}, optical_min_obs=15))
+            self._write(
+                root,
+                zone,
+                schema,
+                registry_rows(
+                    "r",
+                    "t",
+                    embedded=["chunk_0_0"],
+                    refused=[],
+                    embedded_records={"chunk_0_0": rec},
+                    optical_min_obs=15,
+                ),
+            )
         return root
 
     def test_an_inferred_read_drops_a_column_the_older_part_lacks(self, tmp_path: Path) -> None:
@@ -921,8 +959,9 @@ class TestPartsWrittenByDifferentBuilds:
 
         root = self._two_builds(tmp_path, older_zone="01N", newer_zone="60S")
         table = ds.dataset(f"{root}/parts", schema=dataset_schema(), partitioning="hive").to_table()
-        by_zone = dict(zip(table.column("zone").to_pylist(),
-                           table.column("median_obs_where_thin").to_pylist(), strict=True))
+        by_zone = dict(
+            zip(table.column("zone").to_pylist(), table.column("median_obs_where_thin").to_pylist(), strict=True)
+        )
         assert by_zone == {"01N": None, "60S": 11.0}
 
     def test_the_hazard_is_order_dependent_which_is_why_it_hides(self, tmp_path: Path) -> None:
@@ -962,8 +1001,12 @@ class TestRankingAnInfillByTheRightDepth:
 
     def test_the_two_medians_describe_different_populations(self) -> None:
         rows = registry_rows(
-            "r1", "t", embedded=["chunk_132_19"], refused=[],
-            embedded_records={"chunk_132_19": self._rec(50.0, 11.0, 5504)}, optical_min_obs=15,
+            "r1",
+            "t",
+            embedded=["chunk_132_19"],
+            refused=[],
+            embedded_records={"chunk_132_19": self._rec(50.0, 11.0, 5504)},
+            optical_min_obs=15,
         )
         row = rows[0]
         assert row["median_obs_where_any"] == 50.0, "the footprint, dominated by what passed"
@@ -977,7 +1020,10 @@ class TestRankingAnInfillByTheRightDepth:
         because its shortfall is larger and covers all of it.
         """
         rows = registry_rows(
-            "r1", "t", embedded=["deep_but_nicked", "uniformly_thin"], refused=[],
+            "r1",
+            "t",
+            embedded=["deep_but_nicked", "uniformly_thin"],
+            refused=[],
             embedded_records={
                 "deep_but_nicked": self._rec(50.0, 13.0, 5_000),
                 "uniformly_thin": self._rec(9.0, 6.0, 3_000_000),
@@ -997,8 +1043,12 @@ class TestRankingAnInfillByTheRightDepth:
         zero — which is the never-imaged case `refused_no_optical_px` counts instead.
         """
         rows = registry_rows(
-            "r1", "t", embedded=["clean"], refused=[],
-            embedded_records={"clean": self._rec(50.0, None, 0)}, optical_min_obs=15,
+            "r1",
+            "t",
+            embedded=["clean"],
+            refused=[],
+            embedded_records={"clean": self._rec(50.0, None, 0)},
+            optical_min_obs=15,
         )
         assert rows[0]["refused_px"] == 0
         assert rows[0]["median_obs_where_thin"] is None
@@ -1012,7 +1062,10 @@ class TestWhichBuildRefusedIt:
 
     def test_every_row_names_the_build(self) -> None:
         rows = registry_rows(
-            "r1", "t", embedded=["chunk_0_0"], refused=["chunk_1_1"],
+            "r1",
+            "t",
+            embedded=["chunk_0_0"],
+            refused=["chunk_1_1"],
             code={"version": "0.1.0", "commit": "8171f0186ec954f63c43b00ae5e9ed6d253b267e"},
         )
         assert {r["code_commit"] for r in rows} == {"8171f0186ec954f63c43b00ae5e9ed6d253b267e"}
@@ -1028,7 +1081,8 @@ class TestWhichBuildRefusedIt:
 
     def test_no_build_information_at_all_is_null(self) -> None:
         """`code_identity` returns None rather than raising when its own metadata is unreadable, and
-        no fill may fail over that."""
+        no fill may fail over that.
+        """
         rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], code=None)
         assert rows[0]["code_version"] is None and rows[0]["code_commit"] is None
 
@@ -1041,9 +1095,7 @@ class TestWhereTheTileIs:
             "chunk_0_0": (-90.0, -0.05, -89.8, 0.13),
             "chunk_5_3": (-89.5, -0.98, -89.3, -0.79),
         }
-        rows = registry_rows(
-            "r1", "t", embedded=["chunk_0_0"], refused=["chunk_5_3"], bboxes=boxes, optical_min_obs=15
-        )
+        rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=["chunk_5_3"], bboxes=boxes, optical_min_obs=15)
         by_tile = {r["tile"]: r for r in rows}
         assert by_tile["chunk_0_0"]["bbox_west"] == -90.0
         assert by_tile["chunk_0_0"]["bbox_north"] == 0.13
@@ -1064,7 +1116,9 @@ class TestWhereTheTileIs:
 
         spec = zone_grid.zone("01N")
         west, south, east, north = zone_grid.tile_range_bbox_wgs84(spec, 0, 1, 0, 1)
-        rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], bboxes={"chunk_0_0": (west, south, east, north)})
+        rows = registry_rows(
+            "r1", "t", embedded=["chunk_0_0"], refused=[], bboxes={"chunk_0_0": (west, south, east, north)}
+        )
         row = rows[0]
         assert row["bbox_west"] == west and row["bbox_east"] == east
         assert row["bbox_south"] < row["bbox_north"], "latitude is always ordered"

@@ -502,13 +502,13 @@ class TestSolarDayPainterOrdering:
             seen["order"] = [it.properties["eo:cloud_cover"] for it in items]
             seen["preserve"] = kwargs.get("preserve_original_order")
             seen["groupby"] = kwargs.get("groupby")
-            raise _StopLoad
+            raise _StopLoadError
 
         import odc.stac
 
         monkeypatch.setattr(odc.stac, "load", fake_load)
 
-        with pytest.raises(_StopLoad):
+        with pytest.raises(_StopLoadError):
             ingest_tile(
                 provider="earth-search",
                 collection="sentinel-2-l2a",
@@ -522,7 +522,7 @@ class TestSolarDayPainterOrdering:
         assert seen["order"] == [90.0, 55.0, 2.0], "cloudiest first, so the clearest paints last"
 
 
-class _StopLoad(Exception):
+class _StopLoadError(Exception):
     """Cuts `ingest_tile` off at the load call — the ordering is what this asserts."""
 
 

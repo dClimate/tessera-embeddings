@@ -161,7 +161,7 @@ def test_a_group_missing_a_later_schema_array_is_refused_not_skipped(tmp_path):
     zarr.open_group(session.store, mode="a")[_ZA.group_name].__delitem__("month")
     session.commit("drop month, as an older seeder would have left it")
 
-    with pytest.raises(ValueError, match="missing.*month"):
+    with pytest.raises(ValueError, match=r"missing.*month"):
         global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
 
 

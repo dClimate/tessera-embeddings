@@ -220,9 +220,7 @@ def test_a_partially_seeded_store_holding_data_is_not_stamped_by_the_incremental
     by every later fill to decide what may write, so later fills would then mix under it.
     """
     _partially_seeded(monkeypatch, {}, cells_landed=4)
-    monkeypatch.setattr(
-        mod, "seed_zone_groups", lambda *a, **k: pytest.fail("must not seed, because seeding stamps")
-    )
+    monkeypatch.setattr(mod, "seed_zone_groups", lambda *a, **k: pytest.fail("must not seed, because seeding stamps"))
     with pytest.raises(ValueError, match="no root identity"):
         mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
 

@@ -149,11 +149,12 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         )
         detail = part_uri(prod.optical_registry(prod.global_store()), "32S", 2021, "run-1")
 
-        assert detail.startswith(prod.optical_registry(prod.global_store()) + "/"), "inside the registry beside the store"
+        registry = prod.optical_registry(prod.global_store())
+        assert detail.startswith(registry + "/"), "inside the registry beside the store"
         assert "s3://ours" not in detail, "and never in our own bucket when the store is published"
         assert not detail.startswith(prod.global_store() + "/"), "still never inside the Icechunk prefix"
 
-    def test_a_named_store_gets_a_registry_beside_THAT_store(self):
+    def test_a_named_store_gets_a_registry_beside_that_same_store(self):
         """The defect this signature exists to prevent, observed in dev on 2026-08-19.
 
         `optical_registry` used to call `global_store()` with no arguments, so it derived from the

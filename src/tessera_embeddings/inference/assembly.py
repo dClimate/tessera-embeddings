@@ -56,6 +56,7 @@ import numpy as np
 import xarray as xr
 import zarr
 
+from tessera_embeddings.config.environment import code_identity
 from tessera_embeddings.config.fault_injection import ArmedFault
 from tessera_embeddings.config.inference import (
     EMBEDDING_DIM,
@@ -77,6 +78,7 @@ from tessera_embeddings.config.store_layout import (
 )
 from tessera_embeddings.inference.chunk_spec import ChunkSpec, chunk_label, filter_chunks_by_roi_mask, parse_chunk_label
 from tessera_embeddings.inference.conventions import build_convention_attrs
+from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.empty_store import _write_coord_arrays
 from tessera_embeddings.storage.global_store import create_layout_arrays, open_global_repo
 from tessera_embeddings.storage.manifest import EmbeddingManifest, extract_manifest
@@ -98,8 +100,6 @@ from tessera_embeddings.storage.zarr_store import (
     read_time_values,
     time_index_of,
 )
-from tessera_embeddings.config.environment import code_identity
-from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.zone_grid import PIXEL_M, year_timestamp
 
 logger = logging.getLogger(__name__)
@@ -837,6 +837,12 @@ class ZarrWriter:
         """
         self.staging_base = staging_base.rstrip("/")
         self.embedding_dim = embedding_dim
+        # This assembly's skip records, read from the markers by `_skip_summary` and consumed by
+        # `publish_registry_part` afterwards. Declared here so the attribute always exists rather
+        # than appearing only once a summary has run — a reader that had to guard for its absence
+        # was also a reader that could not tell "no skips" from "a previous cell's skips", which is
+        # the confusion `assemble_global` now clears at the start of every assembly.
+        self._last_skip_records: dict[str, dict] = {}
 
     def _staging_path(self, run_id: str, chunk: ChunkSpec) -> str:
         """Get the staging path for a chunk."""
@@ -1033,7 +1039,7 @@ class ZarrWriter:
         # results. Merged into one map because a row's measurements mean the same thing either way —
         # see `_coverage_record` — and the marker side wins on a label in both, since a marker is
         # written at the end of a shard that refused everything.
-        records = {**(embedded_records or {}), **getattr(self, "_last_skip_records", {})}
+        records = {**(embedded_records or {}), **self._last_skip_records}
         uri = part_uri(registry_root, zone, year, run_id)
         boxes = _tile_bboxes_wgs84(zone, [*embedded, *refused])
         # The build publishing this part IS the build that produced the cell — same process. Reads
@@ -2352,6 +2358,10 @@ class ZarrWriter:
                 row. The registry's ``obs_max``/``median_obs_where_any`` are distances from this
                 line, so without it they cannot be read; the store's root is the authority and the
                 runner asserts the config matches it before any of this runs.
+            embedded_records: Per-shard coverage for shards that DID embed something, keyed by
+                label, as the actors reported it. Merged with the refused shards' marker records so
+                a partly-refused tile reports what the depth gate removed from it; a label present
+                in both takes the marker, which is written at the end of a wholly refused shard.
             n_workers: Worker process count; also divides
                 ``TARGET_AGGREGATE_S3_CONCURRENCY`` into the per-fork cap.
             gate: Optional commit gate shared across the zone-year fills this
@@ -2411,7 +2421,7 @@ class ZarrWriter:
         # match by name and attach one cell's refusals to another's tiles — silently, and with
         # plausible numbers. Reset here rather than in the summary, because the bug is the summary
         # NOT running.
-        self._last_skip_records: dict[str, dict] = {}
+        self._last_skip_records = {}
 
         labels = sorted(staged_labels) if staged_labels is not None else self._list_staged_labels(run_id)
         # Zero staged tiles is legitimate in exactly one case: every live tile of the

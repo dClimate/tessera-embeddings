@@ -595,7 +595,9 @@ def _coverage_record(
             # and above zero — the thin population by the rule's own definition. None when the
             # shard has none, which is different from a shard whose thin pixels sit at zero.
             "median_where_thin": (
-                round(float(np.median(s2_obs[thin])), 1) if (thin := (any_obs & (s2_obs < optical_min_obs))).any() else None
+                round(float(np.median(s2_obs[thin])), 1)
+                if (thin := (any_obs & (s2_obs < optical_min_obs))).any()
+                else None
             ),
         },
         # RADAR PRESENCE, because a tile that is thin AND radar-free is a different cleanup

@@ -248,9 +248,7 @@ def test_the_registry_root_follows_the_store_this_run_writes(wired):
     captured: dict = {}
     wired.setattr(mod, "fill_zone_year", lambda **kw: captured.update(kw) or {"tag": "t"})
 
-    mod.fill_zone_year_flow.fn(
-        zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami", store_name="tessera-radar"
-    )
+    mod.fill_zone_year_flow.fn(zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami", store_name="tessera-radar")
     assert captured["registry_root"] == "s3://out/global/tessera-radar.registry"
     assert captured["store_path"] == "s3://out/global/tessera-radar.icechunk"
     # The pair must agree by construction — same stem, sibling prefixes.
