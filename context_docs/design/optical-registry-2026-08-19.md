@@ -71,6 +71,47 @@ coverage record never arrived stays null.
 A second verification run was dispatched against 09S/2021 (10 live tiles, western Amazon) and
 03S/2024 (4 live tiles) for exactly that reason — small, fresh cells over persistently cloudy land.
 
+## 3a. The second run: verified, and it found one more thing
+
+09S/2021 (10 tiles, Pitcairn) and 03S/2024 (4 tiles) landed against the fixed code. The dataset now
+reads as one table across both parts — 14 rows, two zones, two years, partition keys typed from the
+path, and **zero consistency violations**: refusal reasons sum to `refused_px`, `eligible_px` never
+exceeds `chunk_px`, `px_with_any_optical` never exceeds `eligible_px`, latitudes ordered.
+
+Four of the fourteen tiles carry refused pixels while being embedded — the case that previously
+recorded nothing — and the worst is 03S/2024 `chunk_59_11`: 42,212 refused of 4,194,304 eligible,
+40,852 of them imaged but thin and 1,360 never imaged at all. Both zones are wholly radar-free
+(`px_with_any_radar = 0`, `radar_rule_enforced = false`), which is correct: neither has OPERA RTC
+coverage, and the campaign embeds radar-free land by policy.
+
+**That run also showed why `median_obs_where_any` had to be replaced as the ranking key.**
+`chunk_59_11`'s footprint median is 37 against a line of 15, because the median describes the pixels
+that PASSED. Its `median_obs_where_thin` is 5.0 — the refused pixels are about ten observations
+short. Ranked by footprint median it would have sat below tiles with no refusals at all; ranked by
+thin median it is correctly first.
+
+**And it confirmed the schema-evolution hazard on live data.** The two parts were written by
+different builds — 09S by `10f31a1`, 03S by `22b2352` — and `median_obs_where_thin` exists in only
+the newer one. The merged read shows the column *because* `zone=03S` sorts before `zone=09S`, so the
+newer part's schema is the one inferred. Had the older zone sorted first the column would have
+vanished from the read with no error. That is why `dataset_schema()` exists and why any whole-dataset
+read must pass it. The `code_commit` column is what made the diagnosis possible, which is its first
+real use.
+
+## 3b. One failure that was not a registry defect
+
+03S/2024's first attempt lost all four tiles to
+`TypeError: _coverage_record() missing 1 required keyword-only argument`. No commit on the branch
+contains that inconsistency — the function and both its call sites move together in every one — and
+the tarball on S3 afterwards was correct. A pin bump pushed **while that cell was mid-ingest** had
+CI replace the Ray code tarball between its ingest and its fill. Re-dispatched against a stable
+tarball, the same cell completed.
+
+Two things worth keeping. The failure direction was right: a required keyword-only argument with no
+default produced four loud tile failures instead of a registry of rows measured against a line
+nobody recorded. And a green test suite cannot see this class at all — the tree was internally
+consistent; the inconsistency was created by deployment.
+
 ## 4. Decisions worth keeping
 
 **Null means "not measured", never zero.** A resumed tile is a synthetic success carrying no
