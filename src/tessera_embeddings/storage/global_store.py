@@ -445,7 +445,8 @@ def seed_zone_groups(
     # Zero cannot be a rule, and a changed identity is a refusal: both in check_root_identity,
     # which the seed_global_store flow also calls on the every-zone-exists path.
     check_root_identity(root.attrs, layout=layout, model_version=model_version, optical_min_obs=optical_min_obs)
-    if "geoemb:model" not in root.attrs:
+    stamped_now = "geoemb:model" not in root.attrs
+    if stamped_now:
         # optical_min_obs is in the identity for the same reason the encoder is: a fill reads it to
         # decide which pixels it may embed, so re-stamping it would let zones filled under one rule
         # sit beside zones filled under another, under a root advertising only the second. The
@@ -499,9 +500,29 @@ def seed_zone_groups(
         # Skipped only when the group is COMPLETE. A partially-seeded group is a real defect
         # (a crash mid-seed) and still raises, because silently completing it here would write
         # arrays under a group whose existing ones were sized by an unknown earlier call.
-        expected_arrays = set(layout.arrays) | {"time", "northing", "easting", "band"}
-        if expected_arrays <= set(node.array_keys()):
+        # EVERY array this seeder writes, not a subset of them. `month` and `time_bnds` were
+        # missing from this set, so a group holding the layout arrays and the four coordinates
+        # counted as complete without them — and the call then reported an idempotent success while
+        # leaving `s2_month_covered` with no calendar labels and the time axis with no CF bounds.
+        # Derived from what the seeder produces below, so a future array is covered by construction
+        # rather than by someone remembering to extend this literal.
+        expected_arrays = set(layout.arrays) | {"time", "northing", "easting", "band", "month", "time_bnds"}
+        present = set(node.array_keys())
+        if expected_arrays <= present:
             continue
+        if present:
+            # PARTIAL, which is a real defect — a crash mid-seed, or a group written by a seeder
+            # older than part of the schema. Refused rather than completed here, because filling in
+            # the gaps would write arrays under a group whose existing ones were sized by an unknown
+            # earlier call. Named explicitly: the alternative is `create_array` raising on whichever
+            # array it happens to reach first, which says nothing about what is wrong.
+            raise ValueError(
+                f"Zone group {spec.group_name} exists but is missing "
+                f"{sorted(expected_arrays - present)} — it was seeded by a different schema or a "
+                f"crashed run. Refusing to complete it in place: the arrays it already has were "
+                f"sized by a call this one cannot see. Reseed the zone into a fresh store, or remove "
+                f"the group and seed it again."
+            )
         created += 1
         north = northing_coords(spec)
         east = easting_coords(spec)
@@ -529,11 +550,18 @@ def seed_zone_groups(
         bnds.attrs.update(TIME_ENCODING)  # same int64-ns encoding as `time`
         node["time"].attrs["bounds"] = "time_bnds"  # CF: this coordinate represents an interval
         node.attrs.update(_zone_attrs(spec, north, east, layout))
-    if not created:
-        # Every requested zone was already complete, so nothing was written — and icechunk
-        # refuses an empty commit unless asked. Committing anyway turned the advertised
-        # idempotent reseed into a failure, which is the opposite of what skipping complete
-        # groups was for. The identity and layout checks above still ran, so this returns
-        # having VERIFIED the store rather than having ignored the request.
+    if not created and not stamped_now:
+        # Every requested zone was already complete AND the root already carried its identity, so
+        # nothing was written — and icechunk refuses an empty commit unless asked. Committing anyway
+        # turned the advertised idempotent reseed into a failure, which is the opposite of what
+        # skipping complete groups was for. The identity and layout checks above still ran, so this
+        # returns having VERIFIED the store rather than having ignored the request.
+        #
+        # `stamped_now` is in the condition because the identity is written to THIS session above.
+        # Returning the branch tip without committing discarded it: the call reported success, the
+        # root stayed unstamped, and the fill gates — which pass on an ABSENT attr — then accepted
+        # anything, with the operator believing the store had been stamped.
         return repo.lookup_branch("main")
+    if not created:
+        return session.commit(commit_msg or "stamp root identity on an already-seeded store")
     return session.commit(commit_msg or f"seed {created} zone group(s)")

@@ -6,6 +6,7 @@ import dataclasses
 
 import numpy as np
 import pytest
+import zarr
 
 from tessera_embeddings.config.inference import EMBEDDING_DIM
 from tessera_embeddings.config.store_layout import GLOBAL
@@ -113,6 +114,55 @@ def test_second_seed_adds_groups_without_clobbering_first(tmp_path):
     global_store.seed_zone_groups(repo, [_ZB], years=(2025,))
     root = zarr_store.open_store_as_zarr_group(store)
     assert set(root.group_keys()) >= {"01N", "01S"}
+
+
+def test_an_unstamped_store_keeps_its_identity_when_nothing_is_created(tmp_path):
+    """The stamp is written to the SESSION, so a call that creates nothing must still commit it.
+
+    A reseed of already-complete zones on a store predating the root identity added `_root_attrs` to
+    the session and then returned the branch tip without committing — so the call reported success,
+    the root stayed unstamped, and the fill gates (which pass on an ABSENT attr) then accepted
+    anything while the operator believed the store had been stamped.
+    """
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+
+    # A store predating the root identity. Simulated by removing the attr, since every seed since
+    # then stamps one — which is exactly why such a store can only arrive from an older build.
+    session = repo.writable_session("main")
+    root = zarr.open_group(session.store, mode="a")
+    del root.attrs["geoemb:model"]
+    session.commit("drop the root identity, as a store predating it would have")
+    assert "geoemb:model" not in zarr_store.open_store_as_zarr_group(store).attrs, "the premise"
+
+    # The same zone again — complete, so nothing is created — but now asking for an identity.
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,), model_version="v1", optical_min_obs=15)
+
+    root = zarr_store.open_store_as_zarr_group(store)
+    assert "geoemb:model" in root.attrs, "the stamp must have been committed, not discarded"
+    assert root.attrs["checkpoint_id"] == "v1", "and it must carry the identity that was asked for"
+    assert root.attrs["optical_min_obs"] == 15
+
+
+def test_a_group_missing_a_later_schema_array_is_refused_not_skipped(tmp_path):
+    """The completeness check must name every array the seeder writes.
+
+    `month` and `time_bnds` were absent from it, so a group holding the layout arrays and the four
+    other coordinates counted as complete without them — and the reseed reported idempotent success
+    while leaving `s2_month_covered` with no calendar labels and the time axis with no CF bounds.
+    """
+    store = str(tmp_path / "g.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
+
+    # Simulate a group seeded by a schema that predates `month`.
+    session = repo.writable_session("main")
+    zarr.open_group(session.store, mode="a")[_ZA.group_name].__delitem__("month")
+    session.commit("drop month, as an older seeder would have left it")
+
+    with pytest.raises(ValueError, match="missing.*month"):
+        global_store.seed_zone_groups(repo, [_ZA], years=(2025,))
 
 
 def test_reseed_with_different_model_rejected(tmp_path):
