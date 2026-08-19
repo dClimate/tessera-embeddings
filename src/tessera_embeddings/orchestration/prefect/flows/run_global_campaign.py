@@ -763,6 +763,23 @@ async def run_global_campaign(
         raise ValueError(
             f"max_dispatch_rounds must be >= 1, got {max_dispatch_rounds} (no cell would ever be dispatched)"
         )
+    # EVERY value this can reject on its own, BEFORE any shared control is touched.
+    #
+    # Checked here rather than left to run_inference: the child validates only after both fill
+    # strategies have entered ray_cluster, and the chained strategy has primed its look-ahead
+    # ingests first. A typo would otherwise buy a Ray head and a round of multi-hour ingests
+    # before failing deterministically on a value known up front.
+    #
+    # And ahead of the limit upserts below, because one of them RESETS the fleet-wide inference
+    # pause gate to running. Zero is how an operator pauses a campaign that is already in flight,
+    # so an invocation that flipped the gate and then died on `num_actors=0` would have resumed
+    # somebody else's paused fleet on its way out — a side effect on shared state from a call that
+    # accomplished nothing.
+    if num_actors < 1:
+        raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
+    if fill_strategy not in ("cluster-per-zone", "chained-clusters"):
+        raise ValueError(f"fill_strategy must be 'cluster-per-zone' or 'chained-clusters', got {fill_strategy!r}")
+
     # Publish both fleet-wide caps so the numbers the operator set here are the
     # numbers actually enforced in the children (see _upsert_limit). Cheap,
     # idempotent, and safe to repeat.
@@ -787,14 +804,6 @@ async def run_global_campaign(
         # queued commit costs seconds against zones that run for hours.
         commit_limit = min(max_parallel_clusters, MAX_SIMULTANEOUS_COMMITTERS)
         _upsert_limit(commit_limit_name, commit_limit, what="commit", log=log)
-    # Checked HERE, not left to run_inference: the child validates only after both fill
-    # strategies have entered ray_cluster, and the chained strategy has primed its
-    # look-ahead ingests first. A typo would otherwise buy a Ray head and a round of
-    # multi-hour ingests before failing deterministically on a value known up front.
-    if num_actors < 1:
-        raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
-    if fill_strategy not in ("cluster-per-zone", "chained-clusters"):
-        raise ValueError(f"fill_strategy must be 'cluster-per-zone' or 'chained-clusters', got {fill_strategy!r}")
     campaign_years = tuple(years) if years is not None else CAMPAIGN_YEARS
 
     # Lazy AWS import so the flow file imports on non-AWS machines (arch tests).

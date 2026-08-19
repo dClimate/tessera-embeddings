@@ -200,6 +200,26 @@ class TestCampaignDefaults:
         writes = [v for k, v in wired["limits"] if k == "tessera-global-inference"]
         assert writes == [1]
 
+    @pytest.mark.parametrize(
+        ("kwargs", "match"),
+        [
+            ({"num_actors": 0}, "num_actors must be >= 1"),
+            ({"fill_strategy": "cluster-per-zne"}, "fill_strategy must be"),
+        ],
+    )
+    def test_a_doomed_invocation_touches_no_shared_limit(self, wired, kwargs, match):
+        """A call that cannot possibly run must not have changed the fleet's shared controls.
+
+        The pause gate is the one that matters: ZERO is how an operator pauses a campaign already
+        in flight, and a start RESETS the gate to running. So an invocation that reset the gate and
+        then died on a typo would have resumed somebody else's paused fleet on its way out — a side
+        effect on shared state from a call that accomplished nothing. The validations therefore run
+        before any upsert, and this asserts the absence rather than the ordering.
+        """
+        with pytest.raises(ValueError, match=match):
+            asyncio.run(mod.run_global_campaign.fn(paths=_PATHS, ami_ssm_name="ami", **kwargs))
+        assert wired.get("limits", []) == [], "no cap, and above all no pause-gate reset"
+
     def test_no_ingest_cap_is_published_when_ingest_is_off(self, wired):
         """Prebuilt mosaics mean no ingest to gate. Commits still happen, so that cap is
         still published — and so is the inference pause, because inference is exactly what
