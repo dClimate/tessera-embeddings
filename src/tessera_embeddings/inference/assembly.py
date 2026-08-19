@@ -2403,6 +2403,15 @@ class ZarrWriter:
         _log = log or logger
         t0 = time.monotonic()
         workers_requested = n_workers
+        # THIS ASSEMBLY'S records only. `_skip_summary` populates this during the shard write, and
+        # `publish_registry_part` reads it afterwards — but `skipped_labels=None` is a supported
+        # default that skips the summary entirely, so a reused writer would carry the PREVIOUS cell's
+        # refusal measurements into these registry rows. Chunk labels are grid-local
+        # (`chunk_<row>_<col>`) and repeat across every zone and year, so the stale entries would
+        # match by name and attach one cell's refusals to another's tiles — silently, and with
+        # plausible numbers. Reset here rather than in the summary, because the bug is the summary
+        # NOT running.
+        self._last_skip_records: dict[str, dict] = {}
 
         labels = sorted(staged_labels) if staged_labels is not None else self._list_staged_labels(run_id)
         # Zero staged tiles is legitimate in exactly one case: every live tile of the

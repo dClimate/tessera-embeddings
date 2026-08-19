@@ -807,6 +807,62 @@ class TestTheDepthRuleTheRowsWereJudgedAgainst:
         assert md["zone"] == "32S" and md["year"] == "2021"
 
 
+class TestOneCellsRefusalsNeverReachAnother:
+    """`_last_skip_records` lives on the writer, so a reused writer can carry a previous cell's
+    refusals into the next cell's registry rows.
+
+    The reason this is not merely theoretical: `skipped_labels=None` is a supported default that
+    skips `_skip_summary` entirely, so nothing replaces the state. And chunk labels are grid-local
+    (`chunk_<row>_<col>`), repeating in every zone and every year — so the stale entries match by
+    NAME and attach one cell's measurements to another's tiles, with plausible numbers and no error.
+    Reported by review; I had checked the risk and wrongly cleared it, because the runner happens to
+    build a fresh writer per cell and I stopped at the only caller.
+    """
+
+    def test_a_second_assembly_does_not_inherit_the_first_cells_records(self, tmp_path: Path) -> None:
+        """Pins the mechanism at the seam where it happens, without a store: seed the cache as a
+        first assembly would, then publish as a second assembly does after resetting it.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+
+        # First cell: a refusal recorded, exactly as `_skip_summary` leaves it.
+        writer.write_skip_marker(chunk, "run-A", _record(chunk.label, thin=64, obs_max=14))
+        writer._skip_summary("run-A", [], [chunk.label])
+        assert writer._last_skip_records, "the first cell's records are cached"
+
+        # Second cell, same writer, no skips of its own — the reset `assemble_global` performs.
+        writer._last_skip_records = {}
+        uri = writer.publish_registry_part(
+            str(tmp_path / "registry"), "60S", 2024, "run-B",
+            embedded=[chunk.label], refused=[], optical_min_obs=15,
+        )
+        assert uri is not None
+
+        pq = pytest.importorskip("pyarrow.parquet")
+        cols = pq.read_table(uri).to_pydict()
+        assert cols["tile"] == [chunk.label]
+        assert cols["refused_thin_px"] == [None], "the other cell's 64 refused pixels must not appear"
+        assert cols["obs_max"] == [None], "nor its depth"
+
+    def test_without_the_reset_the_stale_record_does_attach(self, tmp_path: Path) -> None:
+        """The counterfactual, so the reset is pinned as load-bearing rather than incidental. If this
+        ever starts failing, the staleness has been fixed somewhere better and the reset can go.
+        """
+        writer = ZarrWriter(str(tmp_path / "staging"))
+        chunk = _chunk(0, 0)
+        writer.write_skip_marker(chunk, "run-A", _record(chunk.label, thin=64, obs_max=14))
+        writer._skip_summary("run-A", [], [chunk.label])
+
+        uri = writer.publish_registry_part(  # no reset — the old behaviour
+            str(tmp_path / "registry"), "60S", 2024, "run-B",
+            embedded=[chunk.label], refused=[], optical_min_obs=15,
+        )
+        pq = pytest.importorskip("pyarrow.parquet")
+        cols = pq.read_table(uri).to_pydict()
+        assert cols["refused_thin_px"] == [64], "this is the corruption the reset prevents"
+
+
 class TestPartsWrittenByDifferentBuilds:
     """A nine-year campaign crosses code versions, so parts will disagree about their columns.
 
