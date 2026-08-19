@@ -807,6 +807,78 @@ class TestTheDepthRuleTheRowsWereJudgedAgainst:
         assert md["zone"] == "32S" and md["year"] == "2021"
 
 
+class TestPartsWrittenByDifferentBuilds:
+    """A nine-year campaign crosses code versions, so parts will disagree about their columns.
+
+    The failure is silent and order-dependent, which is what makes it worth a test rather than a
+    note: `ds.dataset` infers its schema from the FIRST file in sorted path order, so an older part
+    under `zone=01N` hides a column that a newer part under `zone=60S` carries — and hides it by
+    omission, which reads as "never recorded" rather than as an error.
+    """
+
+    @staticmethod
+    def _write(root: str, zone: str, schema, rows: list[dict]) -> None:
+        pq = pytest.importorskip("pyarrow.parquet")
+        pa = pytest.importorskip("pyarrow")
+        trimmed = [{k: v for k, v in r.items() if k in schema.names} for r in rows]
+        uri = part_uri(root, zone, 2021, f"run-{zone}")
+        Path(uri).parent.mkdir(parents=True, exist_ok=True)
+        pq.write_table(pa.Table.from_pylist(trimmed, schema=schema), uri, compression="zstd")
+
+    def _two_builds(self, tmp_path: Path, older_zone: str, newer_zone: str) -> str:
+        pa = pytest.importorskip("pyarrow")
+        from tessera_embeddings.storage.registry import registry_schema
+
+        newer = registry_schema()
+        older = pa.schema([f for f in newer if f.name != "median_obs_where_thin"])
+        rec = {
+            "refused": {"thin": 40, "no_optical": 0, "no_radar": 0},
+            "eligible_px": 100, "chunk_px": 100,
+            "s2_obs": {"px_with_any": 95, "max": 60, "median_where_any": 50.0, "median_where_thin": 11.0},
+            "px_with_any_radar": 0, "radar_rule_enforced": False,
+        }
+        root = str(tmp_path / "reg")
+        for zone, schema in ((older_zone, older), (newer_zone, newer)):
+            self._write(root, zone, schema,
+                        registry_rows("r", "t", embedded=["chunk_0_0"], refused=[],
+                                      embedded_records={"chunk_0_0": rec}, optical_min_obs=15))
+        return root
+
+    def test_an_inferred_read_drops_a_column_the_older_part_lacks(self, tmp_path: Path) -> None:
+        """Pinned as a HAZARD, not as desired behaviour. This is why the docstring tells a reader to
+        state the schema, and why the assertion is about silence rather than about an exception.
+        """
+        ds = pytest.importorskip("pyarrow.dataset")
+        root = self._two_builds(tmp_path, older_zone="01N", newer_zone="60S")
+        table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
+        assert table.num_rows == 2, "it reads, which is the problem"
+        assert "median_obs_where_thin" not in table.schema.names, (
+            "the older part sorts first, so the newer column vanishes with no error"
+        )
+
+    def test_stating_the_schema_recovers_it_and_nulls_the_older_part(self, tmp_path: Path) -> None:
+        """The prescribed read: the column is present, and the run that never measured it says null
+        rather than claiming a value.
+        """
+        ds = pytest.importorskip("pyarrow.dataset")
+        from tessera_embeddings.storage.registry import dataset_schema
+
+        root = self._two_builds(tmp_path, older_zone="01N", newer_zone="60S")
+        table = ds.dataset(f"{root}/parts", schema=dataset_schema(), partitioning="hive").to_table()
+        by_zone = dict(zip(table.column("zone").to_pylist(),
+                           table.column("median_obs_where_thin").to_pylist(), strict=True))
+        assert by_zone == {"01N": None, "60S": 11.0}
+
+    def test_the_hazard_is_order_dependent_which_is_why_it_hides(self, tmp_path: Path) -> None:
+        """Reverse which zone is older and the inferred read starts working — so a campaign could
+        pass every check on one zone ordering and drop the column on another.
+        """
+        ds = pytest.importorskip("pyarrow.dataset")
+        root = self._two_builds(tmp_path, older_zone="60S", newer_zone="01N")
+        table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
+        assert "median_obs_where_thin" in table.schema.names, "newer part sorts first, so it survives"
+
+
 class TestRankingAnInfillByTheRightDepth:
     """`median_obs_where_any` is the wrong number to rank a revisit by, and 09S/2021 showed why.
 

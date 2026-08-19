@@ -24,6 +24,23 @@ itself, so a wrong row is a rebuildable inconvenience rather than a data defect,
 it never touches published data. That property is what the Open Data access request promises
 Cambridge, and it is why a later compaction may replace the whole dataset.
 
+**READING THE WHOLE DATASET REQUIRES STATING THE SCHEMA.** A nine-year campaign will cross code
+versions, so an older part will be missing a column a newer one has — and ``ds.dataset(...)`` infers
+its schema from the FIRST file it discovers, in sorted path order. If the older part sorts first
+(``zone=01N`` before ``zone=60S``), the newer column is **silently dropped from the read**: no error,
+and a consumer sees the column as absent rather than as unset. Whether a column added mid-campaign is
+visible at all would then depend on whether zone 01N was filled before or after the change.
+
+So a whole-dataset read must pass the schema explicitly::
+
+    ds.dataset(f"{root}/parts", schema=dataset_schema(), partitioning="hive")
+
+which backfills the missing column as null on the older parts — the honest answer, since those runs
+did not measure it. Consumers without this package should read the compacted master, which is written
+with one schema, or take the schema from a part they know to be current. The compaction is where a
+dataset-level ``_common_metadata`` belongs; parts are written concurrently by cells that cannot agree
+on one.
+
 **One part per cell, keyed by run.** Parts land under ``parts/zone=<Z>/year=<Y>/<run_id>.parquet``.
 Keying by run rather than a fixed name means a refill writes a NEW part instead of overwriting the
 original fill's: the registry then holds both, which is the honest record of a cell filled twice, and
@@ -174,6 +191,25 @@ def registry_schema() -> pa.Schema:
             pa.field("code_commit", pa.string()),
         ]
     )
+
+
+def dataset_schema() -> pa.Schema:
+    """The schema to read the WHOLE dataset with: the part columns plus the hive partition keys.
+
+    Passing :func:`registry_schema` alone loses ``zone`` and ``year`` — an explicit schema replaces
+    what the partitioning would have contributed, so the keys have to be in it. They are typed as the
+    path yields them: ``zone`` a string, ``year`` an ``int32``.
+
+    Use it for any read spanning more than one part::
+
+        ds.dataset(f"{root}/parts", schema=dataset_schema(), partitioning="hive")
+
+    which is what keeps a column added mid-campaign visible on the newer parts and null on the older
+    ones, instead of dropped from the read entirely — see the module docstring.
+    """
+    import pyarrow as pa
+
+    return pa.schema([*registry_schema(), pa.field("zone", pa.string()), pa.field("year", pa.int32())])
 
 
 def _blank_measurements() -> dict[str, Any]:
