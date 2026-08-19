@@ -14,6 +14,7 @@ loaded eagerly.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 from collections.abc import Callable
@@ -25,11 +26,17 @@ import icechunk
 import numpy as np
 import zarr
 
-from tessera_embeddings.config.inference import S2_BAND_ORDER, SCL_VALID_CLASSES
+from tessera_embeddings.config.inference import S1_ORBIT_NONE, S2_BAND_ORDER, SCL_VALID_CLASSES
+from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
-from tessera_embeddings.storage.zarr_store import compute_doy, open_store_as_zarr_group
+from tessera_embeddings.storage.zarr_store import (
+    ASSESSED_WINDOW_ATTR,
+    compute_doy,
+    is_missing_repo,
+    open_store_as_zarr_group,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +81,7 @@ def _band_read_workers(reserve_cpus: int = 0) -> int:
 StoreOpener = Callable[[str], zarr.Group]
 
 
-def make_store_opener() -> StoreOpener:
+def make_store_opener(region: str | None = None) -> StoreOpener:
     """Return a store opener that opens each distinct path once and reuses it.
 
     Intended to live for the duration of one chunk's strip loop: each strip of
@@ -83,13 +90,18 @@ def make_store_opener() -> StoreOpener:
     *data* re-reads: a dense strip's working set far exceeds icechunk's chunk
     cache, so cross-strip reuse does not hit — see
     ``zarr_store._default_repo_config``.)
+
+    ``region`` is the S3 region for the mosaic repos (credentials are injected
+    separately, via the actor's :func:`credentials_provider` context); a
+    non-default-region fill must thread it so the actor's reads open the store in
+    the same region the preflight/assembly paths use.
     """
     cache: dict[str, zarr.Group] = {}
 
     def _open(store_path: str) -> zarr.Group:
         group = cache.get(store_path)
         if group is None:
-            group = open_store_as_zarr_group(store_path)
+            group = open_store_as_zarr_group(store_path, region=region)
             cache[store_path] = group
         return group
 
@@ -121,12 +133,17 @@ class S2MaskBundle:
         abs_indices: Absolute store-level time indices of kept timesteps, (T_kept,).
         obs_count: Per-pixel valid-timestep count from the full (pre-prune) mask,
             shape (chunk_height, W), uint16.
+        month_covered: Which calendar months each pixel was seen in, shape
+            (12, chunk_height, W), bool, month 0 = January. From the same
+            pre-prune mask as ``obs_count``, so the twelve flags partition
+            exactly the observations that count totals.
     """
 
     mask: np.ndarray
     doys: np.ndarray
     abs_indices: np.ndarray
     obs_count: np.ndarray
+    month_covered: np.ndarray
 
 
 @dataclass
@@ -255,12 +272,17 @@ def _load_scl_mask(
 # ---------------------------------------------------------------------------
 
 
-def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.ndarray, np.ndarray]:
+def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Filter the time coordinate of a raw zarr group to a TimeWindow.
 
     Returns:
-        Tuple of (window_indices, doys): absolute store-level integer indices of
-        the matching timesteps, and int32 DOY values for those timesteps.
+        Tuple of (window_indices, doys, months): absolute store-level integer indices of
+        the matching timesteps, int32 DOY values for those timesteps, and their calendar
+        months as 1-12.
+
+    Months are taken from the timestamps themselves rather than derived from the DOYs, which
+        would need the year to place a boundary and would be a day out for every month after
+        February of a leap year.
     """
     times = root["time"][:].astype("datetime64[ns]")
     years = times.astype("datetime64[Y]").astype(int) + 1970
@@ -271,19 +293,28 @@ def _filter_times_from_zarr(root: zarr.Group, window: TimeWindow) -> tuple[np.nd
     if len(indices) == 0:
         msg = f"No observations found within time window {window.months[0]}-{window.months[-1]}"
         raise RuntimeError(msg)
-    return indices, compute_doy(times[indices])
+    return indices, compute_doy(times[indices]), months_arr[indices].astype(np.int16)
 
 
 def _active_orbits(s1_orbit: str) -> tuple[str, ...]:
     """Return the orbit directions active for a given ``s1_orbit`` setting."""
     if s1_orbit == "both":
         return ("ascending", "descending")
+    if s1_orbit == S1_ORBIT_NONE:
+        return ()
     if s1_orbit in {"ascending", "descending"}:
         return (s1_orbit,)
-    raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
+    raise ValueError(f"Invalid s1_orbit: {s1_orbit!r}. Must be 'ascending', 'descending', 'both', or 'none'.")
 
 
-def resolve_s1_orbit(mosaic_base: str, s1_orbit: str) -> str:
+def resolve_s1_orbit(
+    mosaic_base: str,
+    s1_orbit: str,
+    *,
+    allow_none: bool = True,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> str:
     """Downgrade ``s1_orbit="both"`` to a single orbit when only one store exists.
 
     ``"both"`` is a request, not a guarantee — if upstream ingestion only wrote
@@ -293,27 +324,146 @@ def resolve_s1_orbit(mosaic_base: str, s1_orbit: str) -> str:
 
     ``"ascending"`` / ``"descending"`` are returned unchanged without probing;
     a missing store at that point is an error surfaced downstream.
+
+    ``allow_none`` defaults to **True**, because parts of the globe are radar-free in
+    principle and a global product cannot refuse them: over ice Sentinel-1 flies Extra Wide
+    swath with HH/HV, which the dual-pol query correctly discards, so a zone can be
+    permanently radar-free while its catalogue holds a hundred thousand granules. Requiring a
+    SAR store there fails the cell forever, on every retry.
+
+    Pass ``allow_none=False`` where radar is a *demand* rather than a request — a single run
+    over terrain that is known to be imaged, where an absent store means something upstream
+    broke and silently embedding without radar would hide it. Callers reach this through the
+    flows' ``require_s1`` parameter.
+
+    The SAR stores are opened with the SAME credential callback / region that
+    the runner uses for the rest of the fill (``get_credentials`` / ``s3_region``);
+    without them the probe would fall back to the default Icechunk credential
+    chain and fail at orbit resolution in any deployment that needs the callback.
     """
     if s1_orbit != "both":
         _active_orbits(s1_orbit)  # validates
+        if s1_orbit == S1_ORBIT_NONE and not allow_none:
+            # `none` is meant as a RESOLVED value — what "both" becomes over radar-free
+            # terrain — but it is a plain string on a public flow parameter, so a caller
+            # can pass it in. Returning it here skipped the check below entirely, and
+            # `InferenceConfig` then forces `allow_s2_only` for it, so a run that demanded
+            # radar published optical-only embeddings instead of failing. Asking for no
+            # radar while demanding radar is a contradiction, and the only safe reading of
+            # a contradiction is to refuse it.
+            raise InsufficientCoverageError(
+                f"s1_orbit={S1_ORBIT_NONE!r} was requested for {mosaic_base} while radar was demanded "
+                "(require_s1). Those cannot both hold: drop require_s1 to embed this cell optical-only, "
+                "or name the orbit(s) the run must have."
+            )
         return s1_orbit
 
     present = []
     for orbit in ("ascending", "descending"):
         path = f"{mosaic_base}/sar_{orbit}.zarr"
         try:
-            open_store_as_zarr_group(path)
+            open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
             present.append(orbit)
-        except (FileNotFoundError, icechunk.IcechunkError):
+        except zarr.errors.GroupNotFoundError:
+            # PRESENT but rootless (created, then crashed before the schema commit).
+            # GroupNotFoundError subclasses FileNotFoundError, so without this clause a
+            # damaged orbit reads as an absent one — and with s1_orbit="both" and the
+            # sibling healthy, the campaign would quietly resolve to a single orbit and
+            # permanently publish half the radar it was asked for. Fail closed.
+            raise
+        except FileNotFoundError:
+            logger.info("SAR %s store not present at %s — will be excluded", orbit, path)
+        except icechunk.IcechunkError as exc:
+            # ONLY a genuinely-absent repo means "exclude this orbit". A timeout,
+            # auth failure, or corruption must not silently downgrade `both` to a
+            # single orbit and permanently drop the other's data — re-raise so the
+            # caller fails loudly instead.
+            if not is_missing_repo(exc):
+                raise
             logger.info("SAR %s store not present at %s — will be excluded", orbit, path)
 
     if not present:
-        msg = f"s1_orbit='both' but no SAR stores found under {mosaic_base}"
-        raise InsufficientCoverageError(msg)
+        if not allow_none:
+            msg = (
+                f"s1_orbit='both' but no SAR stores found under {mosaic_base}, and radar was "
+                "demanded (require_s1). Either the ingest lost an orbit, or this ROI is "
+                "genuinely radar-free — the ingest's per-orbit item counts say which."
+            )
+            raise InsufficientCoverageError(msg)
+        # A consumer reading a finished mosaic cannot distinguish a radar-free ROI from a lost
+        # orbit, so this warning is the only record that it happened. It must name the mosaic
+        # and say where to confirm, because the confirmation lives in a different run's log:
+        # the INGEST queried both orbits and its per-orbit item count is the authority —
+        # `items_seen=0` means the source offers nothing here, which is terrain, not a gap.
+        logger.warning(
+            "s1_orbit='both' and NO SAR store exists under %s — resolving to %r. "
+            "Legitimate where the ROI has no dual-pol VV+VH coverage; check the ingest's "
+            "per-batch item counts to confirm the source offered nothing usable.",
+            mosaic_base,
+            S1_ORBIT_NONE,
+        )
+        return S1_ORBIT_NONE
     if len(present) == 1:
         logger.warning("s1_orbit='both' requested but only %s store is present — falling back", present[0])
         return present[0]
     return "both"
+
+
+def _months_holding_unreadable_dates(unreadable: object) -> set[tuple[int, int]] | None:
+    """Months containing a date the ingest examined and could not read.
+
+    ``None`` means the answer is UNKNOWN — the attribute is present but not in a shape this
+    can read — and the caller must then excuse nothing, the same asymmetry
+    :func:`_months_within_assessed` documents: over-excusing publishes a hole, under-excusing
+    costs a re-ingest. An absent attribute is a genuine empty set, not unknown: stores record
+    it unconditionally, so its absence means no assessment wrote one rather than that one was
+    lost.
+
+    The distinction this exists to draw: a month inside the assessed window is normally
+    absent because the ingest LOOKED and there was nothing reachable — a real finding, common
+    for radar. A month whose every acquisition was skipped as unreadable is absent because the
+    imagery existed and was LOST. Both look identical to a present-month count, and only this
+    tells them apart.
+    """
+    if unreadable is None:
+        return set()
+    if not isinstance(unreadable, (list, tuple)):
+        return None
+    months: set[tuple[int, int]] = set()
+    for entry in unreadable:
+        raw = entry.get("date") if isinstance(entry, dict) else entry
+        try:
+            day = datetime.date.fromisoformat(str(raw))
+        except (ValueError, TypeError):
+            logger.warning("Unparseable assessed_unreadable_dates entry %r — excusing no month", entry)
+            return None
+        months.add((day.year, day.month))
+    return months
+
+
+def _months_within_assessed(months: list[tuple[int, int]], assessed: object) -> set[tuple[int, int]]:
+    """Of ``months``, those lying ENTIRELY inside an ``assessed_window`` attribute.
+
+    Returns an empty set for any unusable attribute — absent, malformed, unparseable — so a
+    damaged record makes the gate STRICTER rather than more permissive. That asymmetry is the
+    safety argument: over-excusing a month publishes a mosaic with a hole in it, while
+    under-excusing one costs a re-ingest.
+    """
+    if not isinstance(assessed, (list, tuple)) or len(assessed) != 2:
+        return set()
+    try:
+        start = datetime.date.fromisoformat(str(assessed[0]))
+        end = datetime.date.fromisoformat(str(assessed[1]))
+    except ValueError:
+        logger.warning("Unparseable %s attribute %r — treating as absent", ASSESSED_WINDOW_ATTR, assessed)
+        return set()
+    inside = set()
+    for year, month in months:
+        first = datetime.date(year, month, 1)
+        last = datetime.date(year + month // 12, month % 12 + 1, 1) - datetime.timedelta(days=1)
+        if start <= first and last <= end:
+            inside.add((year, month))
+    return inside
 
 
 def check_time_window_coverage(
@@ -321,12 +471,34 @@ def check_time_window_coverage(
     window: TimeWindow,
     s1_orbit: str = "both",
     skip_coverage_check: bool = False,
-) -> None:
-    """Verify that source stores span the requested time window.
+    *,
+    get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+    s3_region: str | None = None,
+) -> dict:
+    """Verify that source stores span the requested time window; report what they hold.
+
+    Opens each store with the caller's credential callback / region (same as the
+    rest of the fill); ``skip_coverage_check=True`` still hard-fails an EMPTY
+    store (no in-window data at all) but skips the month-span check, the escape
+    hatch for a legitimately partial window (e.g. an arctic-only edge zone).
+
+    **Returns what it measured, so a fill can record it, and the RELAXED path is the whole
+    reason that is worth doing.** A cell filled under ``skip_coverage_check`` is published
+    from an input the strict rule would have refused, and afterwards nothing can tell:
+    mosaics are deleted once a cell lands, so the evidence outlives neither the run nor the
+    question. The returned summary is per store label — months present of those required,
+    and the first/last in-window date — plus ``relaxed``, which records which rule was in
+    force. :func:`~tessera_embeddings.storage.shard_writer.run_provenance` is where it
+    lands on the year.
 
     Raises:
         InsufficientCoverageError: If any required store does not span the window.
     """
+    summary: dict = {
+        "window_months": len(window.months),
+        "relaxed": bool(skip_coverage_check),
+        "stores": {},
+    }
     earliest = window.months[0]
     latest = window.months[-1]
 
@@ -334,47 +506,148 @@ def check_time_window_coverage(
     for orbit in _active_orbits(s1_orbit):
         stores.append((f"sar_{orbit}", f"{mosaic_base}/sar_{orbit}.zarr"))
 
+    required_months = set(window.months)
     for label, path in stores:
-        root = open_store_as_zarr_group(path)
+        root = open_store_as_zarr_group(path, get_credentials=get_credentials, region=s3_region)
         times = root["time"][:].astype("datetime64[ns]")
         if len(times) == 0:
             msg = f"{label} store at {path} has no time entries"
             raise InsufficientCoverageError(msg)
 
+        years = times.astype("datetime64[Y]").astype(int) + 1970
+        months = times.astype("datetime64[M]").astype(int) % 12 + 1
+        present_months = set(zip(years.tolist(), months.tolist(), strict=True))
+
+        # Recorded before any raise, and measured against the REQUIRED months rather than
+        # the store's own extent: a store may hold dates outside the window, and what a
+        # published year needs to state is how much of ITS OWN window the input covered.
+        in_window = times[[(y, m) in required_months for y, m in zip(years.tolist(), months.tolist(), strict=True)]]
+        summary["stores"][label] = {
+            "months_present": len(present_months & required_months),
+            "dates_in_window": len(in_window),
+            "first": str(in_window.min())[:10] if len(in_window) else None,
+            "last": str(in_window.max())[:10] if len(in_window) else None,
+        }
+
+        # At least one timestamp INSIDE the window, whichever mode this is. A store with
+        # only out-of-window dates is non-empty but useless: the loaders filter to the
+        # window and raise on an empty index, so without this the preflight passes, a GPU
+        # fleet is provisioned, and the run fails at the first read.
+        #
+        # Applies to the STRICT mode too, which is not redundant with its every-month
+        # rule. An assessed window can explain every absent month away (see below), and
+        # that path can empty the missing list entirely — so a store the ingest examined
+        # and wrote nothing into would otherwise sail through the one gate that exists to
+        # fail before provisioning.
+        if not (present_months & required_months):
+            msg = (
+                f"{label} store at {path} has no timestamps within the window "
+                f"{earliest[0]}-{earliest[1]:02d}..{latest[0]}-{latest[1]:02d}"
+            )
+            raise InsufficientCoverageError(msg)
+
+        # Require EVERY month of the window to be present, not just that the
+        # min/max span it: a mosaic with only January + December (or out-of-window
+        # dates bracketing the year) would otherwise pass despite missing every
+        # intervening month, and the write-once tag would make that partial year
+        # permanent. Month granularity matches the campaign's calendar-year window.
+        missing = sorted(required_months - present_months)
+
+        # Split the absence into EXPLAINED and UNEXPLAINED for the record, before any
+        # decision to raise or to skip, and for BOTH paths. A month the ingest examined and
+        # found empty is a legitimately absent month — common for radar, where a zone's orbit
+        # may reach its land on no date of a month — and a count of present months alone
+        # cannot tell it from a hole. Anything reading this field to raise an alarm must key
+        # on the UNEXPLAINED count, never on the month total, or it fires on healthy cells.
+        _assessed = root.attrs.get(ASSESSED_WINDOW_ATTR)
+        _raw_unreadable = root.attrs.get("assessed_unreadable_dates")
+        # A month wholly inside the assessed window is normally EXPLAINED — looked at, nothing
+        # reachable. But a month whose acquisitions were all skipped as unreadable was looked at
+        # and its imagery LOST, and the store records exactly that. Excusing it would let a
+        # write-once year publish a whole-month data-loss hole labelled a legitimate absence.
+        # `None` = the attribute is unreadable itself, so nothing is excused (stricter).
+        _lost_months = _months_holding_unreadable_dates(_raw_unreadable)
+        _explained = _months_within_assessed(missing, _assessed) if missing else set()
+        _explained = (_explained - _lost_months) if _lost_months is not None else set()
+        # The ingest's own account of what it looked at and did not keep, carried onto the
+        # year because it is recorded on the MOSAIC and the mosaic is deleted once a cell
+        # lands. Empty dates are the cloud-and-footprint answer — dates the window examined
+        # that yielded nothing — and unreadable dates are the ones it deliberately gave up on.
+        # Together they turn "why is this year thin?" from an unanswerable question into a
+        # read, WITHOUT needing a density threshold: a month holding two dates because two is
+        # all the sky offered is not the same as one holding two because the rest were lost,
+        # and only these counts tell them apart.
+        _unreadable = _raw_unreadable
+        summary["stores"][label].update(
+            assessed_window=list(_assessed) if isinstance(_assessed, (list, tuple)) else None,
+            assessed_empty_dates=int(root.attrs.get("assessed_empty_dates") or 0),
+            assessed_unreadable_dates=len(_unreadable) if isinstance(_unreadable, (list, tuple)) else 0,
+            months_absent=len(missing),
+            months_absent_examined=len(_explained),
+            months_absent_unexplained=len(missing) - len(_explained),
+            # Of the unexplained, the ones that are unexplained BECAUSE imagery was lost rather
+            # than because the window never covered them. Two different repairs.
+            months_absent_unreadable=len(set(missing) & (_lost_months or set())),
+        )
+
         if skip_coverage_check:
             continue
 
-        store_min = times.min()
-        store_max = times.max()
-        store_min_ym = (
-            int(store_min.astype("datetime64[Y]").astype(int)) + 1970,
-            int(store_min.astype("datetime64[M]").astype(int)) % 12 + 1,
-        )
-        store_max_ym = (
-            int(store_max.astype("datetime64[Y]").astype(int)) + 1970,
-            int(store_max.astype("datetime64[M]").astype(int)) % 12 + 1,
-        )
+        # A month can be absent because the ingest EXAMINED it and found nothing reachable,
+        # which is a finding, or because the ingest never covered it, which is a gap. Only
+        # the second is an error, and `assessed_window` is what tells them apart: the ingest
+        # records the range it processed in full, so a month wholly inside that range was
+        # looked at. A satellite pass covers a swath rather than a whole UTM zone, and some
+        # zones have an orbit that reaches their land on no date of the year at all.
+        #
+        # Requires the month to be COVERED ENTIRELY. A partially-assessed month could hide
+        # unexamined days, so it stays an error — strict here costs nothing on the campaign's
+        # calendar-year windows, where months are always wholly inside.
+        if missing:
+            # Reuses the split computed above rather than re-deriving it: two copies of this
+            # decision could disagree, and the record and the gate must never differ about
+            # which months were examined.
+            assessed, examined = _assessed, _explained
+            if examined:
+                logger.info(
+                    "%s store at %s: %d month(s) absent but inside the assessed window %s "
+                    "— examined and holding no reachable imagery, not a gap (e.g. %s)",
+                    label,
+                    path,
+                    len(examined),
+                    assessed,
+                    ", ".join(f"{y}-{m:02d}" for y, m in sorted(examined)[:6]),
+                )
+                missing = [m for m in missing if m not in examined]
 
-        if store_min_ym > earliest:
+        if missing:
+            preview = ", ".join(f"{y}-{m:02d}" for y, m in missing[:6])
+            assessed = root.attrs.get(ASSESSED_WINDOW_ATTR)
+            why = (
+                f"assessed window {assessed} does not cover them"
+                if assessed
+                else "the store records no assessed window, so absence cannot be explained"
+            )
             msg = (
-                f"{label} store starts at {store_min_ym[0]}-{store_min_ym[1]:02d}, "
-                f"but window requires data from {earliest[0]}-{earliest[1]:02d}"
+                f"{label} store at {path} is missing {len(missing)} of the window's "
+                f"{len(required_months)} month(s) (e.g. {preview}) — "
+                f"window {earliest[0]}-{earliest[1]:02d}..{latest[0]}-{latest[1]:02d}; {why}"
             )
             raise InsufficientCoverageError(msg)
-        if store_max_ym < latest:
-            msg = (
-                f"{label} store ends at {store_max_ym[0]}-{store_max_ym[1]:02d}, "
-                f"but window requires data through {latest[0]}-{latest[1]:02d}"
-            )
-            raise InsufficientCoverageError(msg)
 
+    # Honest about WHICH rule passed. The relaxed path reaches here too, having verified
+    # only that each store holds something in the window — claiming "every month present"
+    # there would assert exactly the thing that was not checked.
     logger.info(
-        "Time window coverage verified: %d-%02d through %d-%02d",
+        "Time window coverage verified (%s): %d-%02d through %d-%02d — %s",
+        "non-empty only, month rule RELAXED" if skip_coverage_check else "every month present",
         earliest[0],
         earliest[1],
         latest[0],
         latest[1],
+        ", ".join(f"{k} {v['months_present']}/{len(required_months)} mo" for k, v in summary["stores"].items()),
     )
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +706,7 @@ def load_s2_mask_bundle(
     if store_opener is None:
         store_opener = open_store_as_zarr_group
     root = store_opener(f"{mosaic_base}/reflectance.zarr")
-    window_indices, doys_full = _filter_times_from_zarr(root, time_window)
+    window_indices, doys_full, months_full = _filter_times_from_zarr(root, time_window)
     y_slice = slice(chunk.y_start, chunk.y_stop)
     x_slice = slice(chunk.x_start, chunk.x_stop)
 
@@ -441,6 +714,14 @@ def load_s2_mask_bundle(
     t_full = mask_full.shape[0]
     # obs_count from the full (pre-prune) mask so pixels aren't under-counted.
     obs_count = mask_full.sum(axis=0).astype(np.uint16)
+    # Month coverage from that SAME mask, so "how many" and "which months" cannot disagree about
+    # what counted. Pruning only drops timesteps with no valid pixel anywhere in the chunk, which
+    # contribute to neither, but deriving both here removes the question.
+    month_covered = np.zeros((MONTHS_IN_YEAR, *obs_count.shape), dtype=bool)
+    for month in range(1, MONTHS_IN_YEAR + 1):
+        in_month = months_full == month
+        if in_month.any():
+            month_covered[month - 1] = mask_full[in_month].any(axis=0)
     logger.info("Loaded full-chunk SCL for %d S2 timesteps", t_full)
 
     # Prune timesteps with no valid pixel anywhere in the chunk — the v1.1
@@ -456,6 +737,7 @@ def load_s2_mask_bundle(
         doys=doys_full[kept],
         abs_indices=window_indices[kept],
         obs_count=obs_count,
+        month_covered=month_covered,
     )
 
 
@@ -529,7 +811,7 @@ def _load_s2(
         logger.info("Loaded S2 bands shape %s (sliced shared mask)", s2_bands.shape)
         return s2_bands, s2_masks, s2_doys, s2_obs_count
 
-    window_indices, s2_doys_full = _filter_times_from_zarr(root, time_window)
+    window_indices, s2_doys_full, _months = _filter_times_from_zarr(root, time_window)
     y_slice = _resolve_y_slice(chunk, y_sub)
 
     abs_indices = window_indices
@@ -583,7 +865,7 @@ def _load_sar_orbit(
     if store_opener is None:
         store_opener = open_store_as_zarr_group
     root = store_opener(f"{mosaic_base}/sar_{orbit}.zarr")
-    window_indices, doys_full = _filter_times_from_zarr(root, time_window)
+    window_indices, doys_full, _months = _filter_times_from_zarr(root, time_window)
     y_slice = _resolve_y_slice(chunk, y_sub)
     x_slice = slice(chunk.x_start, chunk.x_stop)
     bands, kept = _load_sar_bands_from_zarr(root, window_indices, y_slice, x_slice)
@@ -594,7 +876,10 @@ def load_chunk(
     chunk: ChunkSpec,
     mosaic_base: str,
     time_window: TimeWindow,
-    s1_orbit: Literal["ascending", "descending", "both"] = "both",
+    # Includes "none": `_active_orbits` returns an empty tuple for it, and the S2-only path
+    # (ADR-013) reaches here with exactly that. The narrower annotation was wrong rather than
+    # protective — it described three of the four values this already handles.
+    s1_orbit: Literal["ascending", "descending", "both", "none"] = "both",
     y_sub: slice | None = None,
     store_opener: StoreOpener | None = None,
     mask_bundle: S2MaskBundle | None = None,

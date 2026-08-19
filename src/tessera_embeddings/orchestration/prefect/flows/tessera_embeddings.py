@@ -11,8 +11,8 @@ Architecture::
       ├── Pre-filter chunks against the ROI mask
       ├── Spin up Ray cluster (head on-demand, GPU workers configurable)
       ├── Submit chunk work to Ray GPU actors via run_inference_task
-      ├── Spin up Dask cluster, run assemble_embeddings_task
-      └── Tear down both clusters; on-cancellation hook covers partials
+      ├── Run assemble_embeddings_task on the flow runner (worker processes)
+      └── Tear down the Ray cluster; on-cancellation hook covers partials
 
 The ``BucketPaths`` parameter is the deployment-supplied storage
 contract — there is no ``dev: bool`` toggle. Callers (typically a
@@ -24,44 +24,45 @@ from __future__ import annotations
 
 import datetime
 import logging
-import subprocess
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-import yaml
 from prefect import flow, get_run_logger
 from prefect.runtime import flow_run as flow_run_ctx
 from pydantic import BaseModel
 
-from tessera_embeddings.config.dask import AssemblyConfig
+from tessera_embeddings.config.assembly import AssemblyConfig
 from tessera_embeddings.config.inference import INFERENCE_CHUNK_SIZE, checkpoint_filename
 from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.time_windows import parse_time_window
-from tessera_embeddings.inference.assembly import ZarrWriter
+from tessera_embeddings.inference.assembly import AllChunksSkippedError, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import filter_chunks_by_roi_mask
 from tessera_embeddings.inference.data_loading import check_time_window_coverage, resolve_s1_orbit
 from tessera_embeddings.inference.orchestration_helpers import (
+    assert_output_store_accepts,
     build_inference_config,
-    compute_assembly_worker_counts,
     enumerate_mosaic_chunks,
 )
-from tessera_embeddings.orchestration.prefect.flows._dask_runner import get_task_runner_for_cluster
+from tessera_embeddings.orchestration.prefect.flows._ray_lifecycle import (
+    activate,
+    deactivate,
+    ray_cleanup_on_cancellation,
+)
 from tessera_embeddings.orchestration.prefect.tasks.inference import (
     assemble_embeddings_task,
     run_inference_task,
 )
-from tessera_embeddings.providers.aws.ray import (
-    DEFAULT_CLUSTER_TEMPLATE,
-    cleanup_ray_tempfiles,
-    terminate_ray_instances_by_tag,
-)
+from tessera_embeddings.storage.zarr_store import plain_zarr_storage_options
 
-# Module-level state for the cancellation hook. The flow body sets these
-# on entry and clears them on normal exit; the hook reads them.
-_active_resolved_yaml: str | None = None
-_active_cluster_name: str | None = None
+# Fresh runs with allow_s2_only=True carry this run_id prefix. The run_id
+# namespaces the staging directory, so the prefix records the per-pixel S1
+# mode that produced a run's staged chunks — letting a resume detect (and
+# refuse) a mode flip that would otherwise mix S1-gated and S2-only chunks in
+# one assembled output. Default runs keep the historical bare-uuid run_id, so
+# the single-ROI path is byte-for-byte unchanged when the flag is off.
+S2_ONLY_RUN_PREFIX = "s2only-"
 
 
 class EmbeddingsDevParams(BaseModel):
@@ -85,55 +86,82 @@ class EmbeddingsDevParams(BaseModel):
     sync_source_path: str | None = None
 
 
-def _cluster_name_for_flow_run(flow_run_id: object) -> str:
-    """Derive the deterministic Ray cluster name for a flow run.
+def _resolve_run_id(previous_run_id: str | None, *, allow_s2_only: bool, assembly_only: bool) -> str:
+    """Derive the staging run_id, encoding the S2-only mode via S2_ONLY_RUN_PREFIX.
 
-    The name must be recomputable from nothing but the flow-run id:
-    Prefect executes cancellation/crash hooks in a freshly imported copy
-    of this module after the flow's child process has been killed, so any
-    state the hook needs has to be derivable, not stored. The base name
-    comes from the shipped cluster template so the two stay in sync.
+    ``run_inference()`` reuses staged ``.zarr``/``.skipped`` artifacts by run_id
+    alone. If a resume flipped ``allow_s2_only``, old skip markers (S2-valid /
+    zero-S1 pixels the flag now embeds) would be kept for already-staged chunks
+    while only the not-yet-staged chunks were recomputed under the new gate, and
+    assembly would publish a mix of S1-gated and S2-only tiles. Encoding the mode
+    in the run_id — which namespaces the staging directory — lets a resume detect
+    and refuse a mode flip. Fresh default-mode runs keep the historical bare-uuid
+    run_id, so the single-ROI path is unchanged when the flag is off.
+
+    Assembly-only resumes never run the per-pixel gate, so the requested flag cannot
+    change WHICH pixels they publish — but it still reaches the ``EmbeddingManifest``
+    they write, so exempting them outright let a staged S2-only run be published as
+    flag-off, after which a later flag-off append mixes incompatible slices into one
+    store. :func:`staged_s2_only_mode` is what the caller uses instead: the prefix is the
+    record of what the staged pixels ARE, so the mode is read off it rather than trusted
+    from a parameter nobody had to set.
     """
-    with DEFAULT_CLUSTER_TEMPLATE.open() as f:
-        base = yaml.safe_load(f).get("cluster_name", "tessera-inference")
-    return f"{base}-{str(flow_run_id).replace('-', '')[:8]}"
+    if previous_run_id:
+        resumed_s2_only = previous_run_id.startswith(S2_ONLY_RUN_PREFIX)
+        if not assembly_only and resumed_s2_only != allow_s2_only:
+            raise ValueError(
+                f"Cannot resume run {previous_run_id!r} (allow_s2_only={resumed_s2_only}) with "
+                f"allow_s2_only={allow_s2_only}: its staged chunks were produced under the other "
+                f"per-pixel S1 mode, so continuing would publish a mix of S1-gated and S2-only "
+                f"tiles. Resume with allow_s2_only={resumed_s2_only}, or start a fresh run."
+            )
+        return previous_run_id
+    return (S2_ONLY_RUN_PREFIX if allow_s2_only else "") + uuid.uuid4().hex[:12]
 
 
-def _ray_cleanup_on_cancellation(flow: object, flow_run: object, state: object) -> None:  # noqa: ARG001
-    """Emergency teardown when the flow is cancelled or crashes.
+def _assert_resume_mode_matches(previous_run_id: str | None, *, allow_s2_only: bool, assembly_only: bool) -> None:
+    """The half of the mode-mixing refusal that the REQUEST alone can settle.
 
-    Prefect runs these hooks in a FRESH import of this module after the
-    flow's child process has been killed, so the module globals set by
-    the flow body are normally ``None`` here and ``ray down`` (which
-    needs the dead process's resolved YAML tempfile) is normally
-    impossible. The authoritative path is therefore tag-based: re-derive
-    the cluster name from the flow-run id and terminate every instance
-    carrying its ``ray-cluster-name`` tag. The YAML fast path is kept for
-    the rare same-process case; both paths are idempotent.
+    :func:`_resolve_run_id` has to run LATE, because the flag it must encode is the
+    config's effective one and that is not known until the orbit has been resolved
+    against the mosaic. This is the part that can be decided before any store is opened,
+    and it is deliberately only HALF the check.
+
+    **Only the request-is-True direction.** The effective flag is forced ON — never off —
+    when the orbit resolves to ``"none"`` (:class:`InferenceConfig`), so a request of
+    ``False`` may still become ``True`` and legitimately match an S2-only staged run.
+    Refusing that here rejected exactly the resume it should allow: a radar-free ROI
+    staged under the forced flag, resumed with ``require_s1=False`` and the flag left at
+    its default. The opposite direction has no such escape — nothing forces the flag off,
+    so a request of ``True`` against a bare staged run contradicts whatever the orbit
+    resolves to, and is refused now rather than after a store probe.
+
+    The full comparison still happens, against ``config.allow_s2_only``, once the orbit
+    is known. This check narrows what reaches it; it does not replace it.
     """
-    log = logging.getLogger(__name__)
-    log.warning("Flow cancelled/crashed — tearing down Ray cluster")
+    if allow_s2_only and not assembly_only and previous_run_id and not staged_s2_only_mode(previous_run_id):
+        _resolve_run_id(previous_run_id, allow_s2_only=allow_s2_only, assembly_only=assembly_only)
 
-    if _active_resolved_yaml and Path(_active_resolved_yaml).exists():
-        log.info("Running ray down with %s", _active_resolved_yaml)
-        subprocess.run(["ray", "down", _active_resolved_yaml, "-y"], check=False)
-        cleanup_ray_tempfiles(_active_resolved_yaml)
 
-    run_id = getattr(flow_run, "id", None)
-    cluster_name = _active_cluster_name or (_cluster_name_for_flow_run(run_id) if run_id else None)
-    if cluster_name:
-        log.warning("Terminating instances for cluster '%s'", cluster_name)
-        terminate_ray_instances_by_tag(cluster_name=cluster_name, log=log)
-    else:
-        log.warning(
-            "No flow-run id or cluster name available — cannot derive the cluster tag. Check the AWS console manually."
-        )
+def staged_s2_only_mode(previous_run_id: str | None) -> bool:
+    """Whether a staged run's chunks were produced under the S2-only pixel gate.
+
+    The run_id prefix is the durable record of that, and on an ASSEMBLY-ONLY resume it is
+    the only one: nothing recomputes the pixels, so the flow parameter says nothing about
+    what is in the staging directory. Publishing on the parameter alone wrote a manifest
+    claiming S1-gated pixels over S2-only ones, and a later flag-off append then mixed
+    two policies into one store with nothing objecting.
+    """
+    return bool(previous_run_id and previous_run_id.startswith(S2_ONLY_RUN_PREFIX))
 
 
 @flow(
     name="tessera_embeddings",
-    on_cancellation=[_ray_cleanup_on_cancellation],
-    on_crashed=[_ray_cleanup_on_cancellation],
+    # Both lists hold the SAME function: a crashed run leaks exactly like a
+    # cancelled one. Keep the hook IDEMPOTENT — cancelling a parent and its child
+    # together delivers the transition twice and runs it twice (2026-07-25).
+    on_cancellation=[ray_cleanup_on_cancellation],
+    on_crashed=[ray_cleanup_on_cancellation],
 )
 def tessera_embeddings(
     *,
@@ -147,6 +175,9 @@ def tessera_embeddings(
     code_suffix: str = "",
     num_actors: int = 20,
     s1_orbit: str = "both",
+    require_s1: bool = True,
+    s3_region: str | None = None,
+    allow_s2_only: bool = False,
     dev_params: EmbeddingsDevParams = EmbeddingsDevParams(),  # noqa: B008
 ) -> dict[str, Any]:
     """Generate Tessera embeddings for a mosaicked ROI.
@@ -182,6 +213,24 @@ def tessera_embeddings(
             Empty for production tarballs.
         num_actors: Number of GPU actors to create.
         s1_orbit: ``"ascending"``, ``"descending"``, or ``"both"``.
+        require_s1: Demand radar rather than request it, and **True by default here**
+            because this flow fills ONE cell: an operator naming a single zone-year over
+            terrain that should be imaged wants to be told when its radar is missing, not
+            to receive optical-only embeddings quietly. Set False for a cell that is
+            genuinely radar-free — parts of the globe have no dual-pol coverage at all, and
+            the ingest's per-orbit item count is what distinguishes that from a lost orbit.
+            The global campaign passes False for the same reason.
+        s3_region: Optional S3 region for the mosaic/store opens — threaded, like the
+            IAM credential callback, through orbit resolution, chunk enumeration, the
+            coverage gate, and the assembly task. ``None`` uses the default Icechunk
+            region; set it for a store outside the default region.
+        allow_s2_only: Embed S2-valid pixels that have ZERO S1 observations
+            (sub-zone SAR coverage gaps) via the upstream v1.1 missing-S1
+            convention (all-zeros normalized S1 input) instead of skipping
+            them. Default False (historical behavior). Affected pixels are
+            identifiable afterwards via ``s1_asc_obs_count +
+            s1_desc_obs_count == 0``; quality is unvalidated — see the
+            optional-S1 ADR.
         dev_params: See :class:`EmbeddingsDevParams`.
 
     Returns:
@@ -197,8 +246,18 @@ def tessera_embeddings(
         raise ValueError("Only one of assembly_only, inference_only can be True")
     if dev_params.assembly_only and not dev_params.previous_run_id:
         raise ValueError("assembly_only=True requires previous_run_id")
+    # Decidable from parameters, so decide it before anything is provisioned:
+    # run_inference rejects this too, but only from inside the Ray context, after
+    # a GPU cluster has been paid for. Mirrors fill_zone_year.
+    if not dev_params.assembly_only and num_actors < 1:
+        raise ValueError(f"num_actors must be >= 1, got {num_actors} (no actor would ever run inference)")
 
-    run_id = dev_params.previous_run_id or uuid.uuid4().hex[:12]
+    # Refuse a contradicted resume before anything is opened. The run_id itself is minted
+    # much later, from the config's EFFECTIVE flag (see below), but this half of the check
+    # needs only the request and must not wait behind a store probe.
+    _assert_resume_mode_matches(
+        dev_params.previous_run_id, allow_s2_only=allow_s2_only, assembly_only=dev_params.assembly_only
+    )
     run_started_at = datetime.datetime.now(datetime.UTC)
     t0 = time.monotonic()
 
@@ -215,9 +274,18 @@ def tessera_embeddings(
     checkpoint_path = f"{inputs_bucket.rstrip('/')}/models/{checkpoint_filename()}"
 
     mosaic_base = f"{inputs_bucket.rstrip('/')}/mosaics/{roi_name}"
-    log.info("Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s", roi_name, mosaic_base, run_id)
 
-    resolved_s1_orbit = resolve_s1_orbit(mosaic_base, s1_orbit)
+    # Probe the SAR stores with the same credential callback + region the assemble
+    # step uses, so orbit resolution doesn't fall back to the default Icechunk chain.
+    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+
+    resolved_s1_orbit = resolve_s1_orbit(
+        mosaic_base,
+        s1_orbit,
+        allow_none=not require_s1,
+        get_credentials=iam_icechunk_credentials,
+        s3_region=s3_region,
+    )
     if resolved_s1_orbit != s1_orbit:
         log.info("s1_orbit resolved: %s → %s", s1_orbit, resolved_s1_orbit)
 
@@ -227,6 +295,32 @@ def tessera_embeddings(
         checkpoint_path=checkpoint_path,
         inputs_bucket=inputs_bucket,
         output_bucket=output_bucket,
+        # An assembly-only resume republishes staged pixels without recomputing them, so
+        # what they ARE is recorded in the run_id prefix and nowhere in this call's
+        # parameters. The prefix is therefore the ONLY source, not one of two: OR-ing the
+        # requested flag in let `allow_s2_only=True` over a bare staged run publish an
+        # S2-only manifest for S1-gated tiles, which is the same mislabelling in the other
+        # direction — and the direction that makes a later honest flag-off append fail.
+        allow_s2_only=(staged_s2_only_mode(dev_params.previous_run_id) if dev_params.assembly_only else allow_s2_only),
+    )
+
+    # AFTER the config, and from the config's own flag. `InferenceConfig` FORCES
+    # allow_s2_only when the orbit resolves to none — every pixel there has zero S1
+    # observations, so the default gate would skip all of them — and minting the run_id
+    # from the requested flag missed that: S2-only chunks landed under an unprefixed
+    # staging prefix, where an explicit S2-only resume is then refused and the same bare
+    # id can be reused under the S1-gated mode the prefix exists to separate.
+    run_id = _resolve_run_id(
+        dev_params.previous_run_id,
+        allow_s2_only=config.allow_s2_only,
+        assembly_only=dev_params.assembly_only,
+    )
+    log.info(
+        "Starting tessera_embeddings: roi=%s, mosaic_base=%s, run_id=%s, allow_s2_only=%s",
+        roi_name,
+        mosaic_base,
+        run_id,
+        config.allow_s2_only,
     )
 
     staging_base = f"{output_bucket.rstrip('/')}/staging"
@@ -235,16 +329,38 @@ def tessera_embeddings(
     # between a resumed run and the current config.
     chunk_size = config.chunk_size
     if dev_params.previous_run_id:
-        detected = ZarrWriter(staging_base).detect_staged_chunk_size(dev_params.previous_run_id)
-        if detected != chunk_size:
-            log.warning(
-                "Staged chunks use chunk_size=%d (current config: %d) — using staged value", detected, chunk_size
+        try:
+            detected = ZarrWriter(staging_base).detect_staged_chunk_size(dev_params.previous_run_id)
+        except AllChunksSkippedError:
+            # Nothing staged to measure, but the run is real and assemble() publishes
+            # an all-fill timestep for it — keep the configured size and continue.
+            log.info(
+                "Run %s staged no tiles (all chunks skipped) — using configured chunk_size", dev_params.previous_run_id
             )
-            chunk_size = detected
+        else:
+            if detected != chunk_size:
+                log.warning(
+                    "Staged chunks use chunk_size=%d (current config: %d) — using staged value", detected, chunk_size
+                )
+                chunk_size = detected
 
-    chunks, total_y, total_x = enumerate_mosaic_chunks(mosaic_base, chunk_size or INFERENCE_CHUNK_SIZE, log)
+    chunks, total_y, total_x = enumerate_mosaic_chunks(
+        mosaic_base,
+        chunk_size or INFERENCE_CHUNK_SIZE,
+        log,
+        get_credentials=iam_icechunk_credentials,
+        s3_region=s3_region,
+    )
 
-    live_chunks = filter_chunks_by_roi_mask(chunks, roi_zarr_path)
+    live_chunks = filter_chunks_by_roi_mask(
+        chunks,
+        roi_zarr_path,
+        # The SAME options assembly uses. This filter and assembly's must derive the
+        # identical live set from the identical mask; opening one on the ambient chain
+        # and the other on the run's credentials can fail here before Ray, or — worse —
+        # succeed against a different mask than the one the output is assembled from.
+        storage_options=plain_zarr_storage_options(roi_zarr_path, iam_icechunk_credentials, s3_region),
+    )
     log.info(
         "ROI filter: %d/%d chunks intersect the ROI, sending %d to GPU actors",
         len(live_chunks),
@@ -253,14 +369,45 @@ def tessera_embeddings(
     )
 
     check_time_window_coverage(
-        mosaic_base, time_window, s1_orbit=config.s1_orbit, skip_coverage_check=dev_params.skip_coverage_check
+        mosaic_base,
+        time_window,
+        s1_orbit=config.s1_orbit,
+        skip_coverage_check=dev_params.skip_coverage_check,
+        get_credentials=iam_icechunk_credentials,
+        s3_region=s3_region,
     )
+
+    # Same structural check `assemble` makes before extending an existing store —
+    # model, sampler checkpoints, upstream ingest identity — run HERE, on metadata
+    # only, so an append that can never be accepted is rejected before a GPU fleet
+    # is provisioned rather than after the whole inference is paid for.
+    #
+    # Only on runs that will actually append. `assembly_only` reaches assemble
+    # immediately, which validates for itself; `inference_only` returns after
+    # staging and never touches the output store, so gating it would block a
+    # legitimate dev run — staging a new checkpoint against an ROI whose published
+    # store was written by a different one — over an append it is not making.
+    if not (dev_params.assembly_only or dev_params.inference_only):
+        assert_output_store_accepts(
+            output_bucket=output_bucket,
+            roi_name=roi_name,
+            output_name_suffix=dev_params.output_name_suffix,
+            config=config,
+            mosaic_base=mosaic_base,
+            log=log,
+            get_credentials=iam_icechunk_credentials,
+            s3_region=s3_region,
+        )
 
     # Lazily import the AWS Ray provider so the embeddings flow file
     # can be inspected (for arch tests) on machines without ray
     # installed. The provider is only needed when the flow actually
     # runs.
-    from tessera_embeddings.providers.aws.ray import ray_cluster
+    from tessera_embeddings.providers.aws.ray import (
+        cluster_name_for_flow_run,
+        make_instance_terminator,
+        ray_cluster,
+    )
 
     assemble_kwargs: dict[str, Any] = {
         "chunk_size": chunk_size or INFERENCE_CHUNK_SIZE,
@@ -279,47 +426,65 @@ def tessera_embeddings(
         "time_window": time_window,
         "cleanup_staging": dev_params.cleanup_staging,
         "output_name_suffix": dev_params.output_name_suffix,
+        # Same credential callback + region the orbit probe uses — so the assembly
+        # task's manifest read + writer.assemble open the stores with them, not the
+        # default Icechunk chain (callback-only / non-default-region deployments).
+        "get_credentials": iam_icechunk_credentials,
+        "s3_region": s3_region,
     }
 
     if dev_params.assembly_only:
-        log.info("Assembly-only mode: verifying staged chunks from run %s", dev_params.previous_run_id)
-        ZarrWriter(staging_base).verify_staged_completeness(run_id, live_chunks, log=log)
+        # Staged completeness is verified by `assemble` itself, against the same live
+        # set it derives from the ROI mask — so it holds however assembly is entered.
+        log.info("Assembly-only mode: assembling staged chunks from run %s", dev_params.previous_run_id)
         return _run_assembly(log=log, result_stats=None, **assemble_kwargs)
 
-    global _active_resolved_yaml, _active_cluster_name
-    # Deterministic, flow-run-derived cluster name so the cancellation/crash
-    # hook can re-derive it in a fresh process (see _cluster_name_for_flow_run).
-    # Outside a Prefect run (unit tests) the id is None and ray_cluster falls
-    # back to its own random suffix.
-    with ray_cluster(
-        log,
-        ami_ssm_name=ami_ssm_name,
-        cluster_name=_cluster_name_for_flow_run(flow_run_ctx.id) if flow_run_ctx.id else None,
-        ssm_prefix=ssm_prefix,
-        cloudwatch_log_group=cloudwatch_log_group,
-        code_bucket=code_bucket,
-        code_suffix=code_suffix,
-        sync_source_path=Path(dev_params.sync_source_path) if dev_params.sync_source_path else None,
-    ) as resolved_yaml:
-        _active_resolved_yaml = resolved_yaml
-        if resolved_yaml and Path(resolved_yaml).exists():
-            with Path(resolved_yaml).open() as _f:
-                _active_cluster_name = yaml.safe_load(_f).get("cluster_name")
+    # Deterministic, flow-run-derived cluster name so the cancellation/crash hook can
+    # re-derive it in a fresh process (see _ray_lifecycle). Outside a Prefect run
+    # (unit tests) the id is None and ray_cluster falls back to its own random suffix.
+    try:
+        with ray_cluster(
+            log,
+            ami_ssm_name=ami_ssm_name,
+            cluster_name=cluster_name_for_flow_run(flow_run_ctx.id) if flow_run_ctx.id else None,
+            ssm_prefix=ssm_prefix,
+            cloudwatch_log_group=cloudwatch_log_group,
+            code_bucket=code_bucket,
+            code_suffix=code_suffix,
+            sync_source_path=Path(dev_params.sync_source_path) if dev_params.sync_source_path else None,
+        ) as resolved_yaml:
+            activate(resolved_yaml)
 
-        from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+            from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
 
-        results = run_inference_task(
-            num_actors=num_actors,
-            config=config,
-            chunks=live_chunks,
-            mosaic_base=mosaic_base,
-            staging_base=staging_base,
-            run_id=run_id,
-            t0=t0,
-            get_credentials=iam_icechunk_credentials,
-        )
-    _active_resolved_yaml = None
-    _active_cluster_name = None
+            results = run_inference_task(
+                num_actors=num_actors,
+                config=config,
+                chunks=live_chunks,
+                mosaic_base=mosaic_base,
+                staging_base=staging_base,
+                run_id=run_id,
+                t0=t0,
+                get_credentials=iam_icechunk_credentials,
+                s3_region=s3_region,
+                # Terminate the EC2 instance behind each retired idle actor at once,
+                # rather than holding idle GPU nodes to the end of the run on the Ray
+                # autoscaler's idle timeout, which is unreliable after ray.kill()
+                # (providers/aws/gotchas.md). Actors go idle at the tail, while the
+                # last chunks finish, so this is where a run stops paying for GPUs it
+                # is done with. The callback runs driver-side; its boto3 client never
+                # ships to a worker. Matches fill_zone_year.
+                on_actor_retire=make_instance_terminator(log=log),
+            )
+    finally:
+        # Clear the hook state on the EXCEPTION path too. Cleared only on success, a run
+        # whose inference raised inside the Ray context left `_ray_lifecycle`'s
+        # process-wide cluster name pointing at it — and Prefect reuses worker processes,
+        # so a LATER run's cancellation hook would prefer that stale name over its own
+        # flow-run fallback, tear down a cluster already gone, and leak the live fleet it
+        # was called to reclaim. Matches fill_zone_year and fill_zones_sequential, which
+        # both already do this.
+        deactivate()
 
     succeeded = [r for r in results if r["status"] == "success"]
     skipped = [r for r in results if r["status"] == "skipped"]
@@ -351,7 +516,6 @@ def tessera_embeddings(
             "inference_only": True,
         }
 
-    ZarrWriter(staging_base).verify_staged_completeness(run_id, live_chunks, log=log)
     result_stats = {
         "succeeded": len(succeeded),
         "skipped": len(skipped),
@@ -367,54 +531,17 @@ def _run_assembly(
     result_stats: dict | None,
     **assemble_kwargs: Any,  # noqa: ANN401 — pass-through to the assembly task
 ) -> dict[str, Any]:
-    """Provision the assembly Dask cluster and submit the assembly task."""
-    n_live_chunks = assemble_kwargs["n_live_chunks"]
-    min_workers, max_workers = compute_assembly_worker_counts(n_live_chunks, AssemblyConfig())
+    """Run the assembly task on the flow runner with a local worker-process pool.
 
-    from tessera_embeddings.providers.aws.dask import ecs_cluster
-
-    extra_worker_env = {
-        "AWS_NO_SIGN_REQUEST": "NO",  # use signed requests for the project's S3 bucket
-        "MALLOC_TRIM_THRESHOLD_": "0",  # eagerly return freed memory to the OS
-    }
-    with ecs_cluster(
-        log,
-        min_workers=min_workers,
-        max_workers=max_workers,
-        # 24 GiB for headroom on the assembly commit, which is memory intensive:
-        # merging the write changeset and building the manifest for a full-
-        # spatial-extent timestep peaks well above the ingest workers' needs.
-        # 24576 MiB is a valid Fargate combo at 4 vCPU.
-        worker_mem=24576,
-        extra_worker_env=extra_worker_env,
-    ) as cluster:
-        log.info("Assembly Dask cluster ready: scaling to %d workers", max_workers)
-        task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
-        return _assemble_inner.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-            result_stats=result_stats,
-            n_workers=max_workers,
-            **assemble_kwargs,
-        )
-
-
-@flow(name="tessera_embeddings_assemble_inner")
-def _assemble_inner(
-    *,
-    result_stats: dict | None,
-    n_workers: int,
-    **assemble_kwargs: Any,  # noqa: ANN401 — pass-through to the assembly task
-) -> dict[str, Any]:
-    """Inner flow that submits the assembly task to the configured Dask runner.
-
-    The full chunk grid is intentionally *not* a parameter here — the
-    task re-enumerates it from ``total_y``/``total_x``/``chunk_size`` (in
-    ``assemble_kwargs``). Likewise the per-chunk inference results are
-    pre-aggregated into ``result_stats`` upstream. Both keep this flow's
-    serialized parameters under Prefect's 524,288-byte limit on large ROIs.
+    No cluster to provision: the raw-zarr engine forks worker processes on this
+    host (see ``inference.assembly``), so the task runs directly under the
+    flow's default runner. ``AssemblyConfig`` sizes the pool from the live
+    chunk count within its RAM/S3 budget.
     """
-    future = assemble_embeddings_task.submit(
+    n_workers = AssemblyConfig().compute_n_workers(assemble_kwargs["n_live_chunks"])
+    log.info("Assembling on the flow runner with %d worker process(es)", n_workers)
+    return assemble_embeddings_task(
         result_stats=result_stats,
         n_workers=n_workers,
         **assemble_kwargs,
     )
-    return future.result()

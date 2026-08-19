@@ -1,0 +1,242 @@
+# 011 — Campaign-triggered per-zone ingestion
+
+**Status:** **Accepted (2026-07-15).** Implemented as
+`ingest.land_mask.export_zone_roi` (zone ROI synthesis), the
+`ingest-zone-year` Prefect flow, and campaign wiring in `run_global_campaign`
+(ingest → fill → mosaic cleanup). Builds on ADR-008 (global store), ADR-010
+(coverage bitmaps), and the existing ROI ingest engine.
+
+## Context
+
+The global campaign (ADR-008) drove inference + assembly per `(zone, year)` but
+treated the input mosaics under `{inputs}/mosaics/{zone}` as "a separate upstream
+step" — nothing in-repo produced them. All satellite ingestion was **ROI-based**
+(`ingest_s2_roi_reflectance` / `ingest_s1_roi_sar`), keyed off a rasterized ROI
+zarr whose grid/CRS/bbox is the sole authority. We want the campaign to produce
+its own mosaics without a second ingestion engine.
+
+Two hard constraints shaped the design:
+
+1. **The fill validates mosaics against the seeded zone grid** exactly (shape /
+   CRS / coordinate endpoints ±½ px, `runners/zone_fill.py`). `generate_roi`'s
+   `compute_grid` bbox-fits the input geometry and cannot reproduce the fixed,
+   shard-snapped `zone_grid.ZoneSpec` extent — so a GeoJSON detour is not viable.
+2. **A UTM zone is huge** (~676 km × up to ~934 km per hemisphere). The S2
+   per-solar-day coverage filter is a percentage of the *whole ROI*, so the ROI
+   default (5 %) would drop almost every date over a whole 6° band.
+
+## Decision
+
+**Reuse the ROI ingest engine unchanged; feed it a synthesized zone-shaped ROI.**
+
+- **Zone ROI synthesis** (`export_zone_roi`): write the exact ROI-mask artifact
+  (`ingest.roi.read_roi_metadata`'s contract) directly from `ZoneSpec` — a bool
+  zarr on the fixed zone grid, mask = the zone's `tile_live_2048` coverage bitmap
+  upsampled ×2048, with a WGS84 bbox tight to the live tiles (so the STAC/CMR
+  query never scans ocean-only latitudes). Ocean skipping is tile-granular via
+  the coverage mask; within a live coastal tile, water pixels are ingested by
+  design (the fill embeds whole live tiles, ADR-010), and masked ocean chunks are
+  elided on write (empirically pinned in `test_zarr_store`).
+- **`ingest-zone-year` flow**: ocean-skip → synthesize ROI → per-store completion
+  marker probe → dispatch S1/S2 ingest deployments onto
+  `{inputs}/mosaics/{zone}/{year}` → verify temporal coverage → write the marker.
+  A low `min_valid_coverage` default (0.1 %) fits the zone-scale denominator.
+- **Campaign wiring**: per cell, ingest (own concurrency cap) → fill → delete the
+  transient mosaic. `ingest=False` bypasses for pre-existing mosaics.
+
+**Per `(zone, year)` mosaics** (`mosaics/{zone}/{year}/…`), not one multi-year
+store per zone: isolates windows, avoids out-of-order multi-year time-axis
+appends, and makes deletion + idempotency per-cell.
+
+**Idempotency / crash-repair** rests on a per-store **completion marker** (root
+attr `ingest_marker`, a fingerprint of window + `min_valid_coverage` + requested
+`s1_orbit` + `allow_partial_window` + coverage-delivery sha): a matching marker on every required store
+short-circuits, and the marker is written **only after coverage is verified**, so
+it can never bless an incomplete mosaic. The probe runs over the **maximal**
+candidate set (reflectance + both SAR orbits) keyed on physical existence, not
+just the resolved-orbit set, so a SAR crash the orbit-resolver can't see is still
+seen. A changed input (rebuilt coverage, new threshold, ascending-only → both)
+changes the fingerprint. An unreadable store (transient / auth `IcechunkError`)
+re-raises rather than being mistaken for "absent".
+
+**Amended 2026-07-29 — an interrupted store is RESUMED, not rebuilt.** This ADR
+originally specified that a half-written prior attempt be **cleared and rebuilt**,
+on the reasoning that appending to it would dedupe against stale dates and then
+stamp a fresh fingerprint over mixed inputs. That is now superseded, because at
+campaign scale a crash is expected rather than exceptional and discarding a
+part-built dense mosaic can throw away most of a day's ingest.
+
+Three properties make resuming safe, and the third is what the original reasoning
+was missing:
+
+- **Icechunk commits a date's time slot atomically with its pixels**, so a date
+  present is complete and a date absent was never started. There is no partial
+  date to detect. This is a property of the format, not of our code.
+- **The dates already present are not "stale"** unless an input that decides
+  *which* dates qualify has changed — and every such input is in the fingerprint,
+  including the coverage mask (`IngestManifest.coverage_sha256`, validated on
+  every write). A store whose marker matches the current fingerprint was built
+  under the same admission rules the resume would apply.
+- **An unmarked store carries no fingerprint to compare**, which is exactly the
+  crash case. It is adopted: the flow logs `RESUMING`, ingests only the missing
+  dates, and stamps the marker at the end. A store whose marker is *present and
+  different* is the genuinely unsafe case and raises `ConfigMismatchError` rather
+  than being silently mixed or silently discarded.
+
+The clearing delete remains for the mismatch path and is still `strict`, so a
+failed delete aborts rather than ingesting onto stale data. It threads credentials
+explicitly: a delete that fails on permissions must not be mistakable for a
+corrupted store.
+
+**Mosaics are transient** (`cleanup_mosaics`, default on): they are re-derivable
+inputs at ~5–15 TB per zone-year, so retention across 120 zones × 9 years is
+untenable. Deletion uses `s5cmd rm --all-versions` (shared
+`storage.object_store.delete_prefix`) so a versioned bucket does not accumulate
+non-current versions; staging cleanup was upgraded to the same helper.
+
+**Coverage gate** (`check_time_window_coverage`): a zone-wide mosaic spans all
+latitudes, so a whole-month gap is an ingest-failure signal. The **fill** hard-
+fails on a partial mosaic **before provisioning Ray** (the write-once zone-year
+tag would otherwise make partial embeddings permanent); the **ingest** verifies
+the same before marking done. `allow_partial_window` relaxes both to "non-empty"
+for the rare arctic-only edge zone; an empty store always fails. Because the
+marker short-circuits before coverage validation, `allow_partial_window` is part
+of the fingerprint — a mosaic accepted under the relaxed policy never satisfies a
+later strict run (which would otherwise reuse it and then fail its fill's strict
+preflight forever); the differing fingerprint forces a re-ingest instead.
+
+**Grid gate** (fill, pre-Ray): reflectance **and every active SAR store** are
+validated against the seeded zone grid (shape / CRS / coordinate endpoints).
+SAR is read by positional slice with no coords of its own, so a stale child SAR
+store or a hand-provided `mosaic_base` on a different grid than reflectance would
+otherwise be mixed in and silently misgeoreference the fill.
+
+**Model gate** (fill, pre-Ray): the store root's seeded `geoemb:model` (encoder
+version) must match the running build's, else the fill refuses — a mid-campaign
+model upgrade would otherwise write new-encoder embeddings under a store still
+advertising the old one and tag them permanently. `allow_model_mismatch` is the
+deliberate-override escape hatch. This gate is only sound because the root
+provenance is **write-once**: `seed_zone_groups` stamps the encoder identity on the
+first seed and rejects any incremental reseed that would change it (a partial
+reseed with a different encoder would otherwise re-stamp the root and let the gate
+wave the new encoder through onto already-published zones).
+
+**Zone identity = UTM common name** (`"33N"`, `"07S"`) everywhere — group names,
+mosaic paths, tags, flow params — with EPSG retained only as the CRS
+(`ZoneSpec.epsg` / `proj:code`). This is a **deliberate deviation from the
+geoembeddings `utm_zones` spec**, whose `utm{NN}` group name cannot express the
+hemisphere (33N vs 33S). A hemisphere amendment is a candidate to propose
+upstream. `canonicalize_zone` is the single parser.
+
+**Staging `run_id`** (fill, per cell): the campaign derives each cell's staging
+`run_id` as `{zone}-{year}-{hash}` over the acceptance config (threshold / orbit /
+window / checkpoint), the **immutable code artifact** the fill will run, and the
+per-`(zone, year)` mosaic identity (post-ingest `ingest_marker`). A retry with
+identical inputs resumes the same staging prefix; any change starts a fresh one, so
+tiles staged by old inputs are never resumed under new ones. The code artifact is the
+**resolved AMI ID plus (when a source tarball overlays it) that object's ETag**, not
+the mutable `code_suffix` label — re-baking the AMI under the same SSM name or
+overwriting `code/src{suffix}.tar.gz` would otherwise leave the fingerprint unchanged
+and let a retry publish a permanently-tagged mixed-code year. An **all-ocean cell**
+(no live tiles) produces no mosaic and the fill marks it empty with no staging, so it
+takes a stable `-empty` `run_id` and skips both mosaic fingerprinting (which would
+raise) and cleanup. The campaign's `s3_region` is threaded through ingest's Icechunk
+metadata opens as well as the fill's, so a non-default-region store is read
+consistently (the ROI-engine mosaic write remains us-west-2-only, a pre-existing
+limitation moot while all campaign data lives there).
+
+**Time convention — calendar-year slots are a GUARANTEE (decided 2026-07-22).** Each
+zone group's time axis is fixed and uniform at seeding (D1): one `time` point per
+campaign year at Jan 1 — i.e. each point is the **start of the exact Jan–Dec window
+its slot holds** — plus a CF `time_bnds` variable (`(time, 2)`,
+`time.attrs["bounds"]="time_bnds"`) stating each slot's true interval
+`[Jan 1 of y, Jan 1 of y+1)` — half-open, so consecutive years are contiguous
+rather than leaving a one-day hole at each boundary. The `fill_zone_year` runner **rejects any window that is not
+exactly the slot's calendar year**; `time_convention="calendar_year"` is therefore a
+guarantee, and every label matches the data it holds.
+
+Two designs for supporting non-calendar 12-month windows in this store were
+**considered and rejected**:
+
+- *Keep the Jan-1 point and record a deviating window in `time_bnds`/provenance*
+  (briefly implemented, then reverted): a Feb→Jan window pinned at `2025-01-01`
+  places the coordinate **outside its own bounds** (`2025-01-01 ∉
+  [2025-02-01, 2026-01-31]`), which CF's cell-bounds model does not tolerate
+  (a coordinate is a representative instant *inside* its cell; checkers flag
+  violations) — the label lies even with honest bounds attached. Worse, one slot
+  per year cannot hold two window phases at all (June–May *and* July–June anchored
+  in the same year collide): a **cardinality** defect no labeling fixes.
+- *Mutating the `time` point per fill*: breaks the fixed, uniform cross-zone axis
+  that slot lookup (`time_index_of(year_timestamp(year))`), campaign status, and
+  D1's no-resize contract all key off.
+
+**The sanctioned non-calendar design** rests on the observation that a 12-month
+window is uniquely identified by its start month, and Jan-1 points already *are*
+window starts: a **windowed store variant** would seed slots at other declared
+start months (a June–May slot's point IS `2025-06-01`, inside its bounds; June–May
+and July–June are distinct slots — no collisions, ever). This is a design note
+only, to be built on real demand; until then, non-calendar 12-month windows use
+the **single-ROI `12mo_window_end` path** (`assemble()`: `time` = window-end
+label, an extendable axis where multiple windows already coexist correctly).
+The single-ROI path is deliberately untouched by all of this.
+
+## Alternatives considered
+
+- **A zone-native (non-Dask) ingest engine** — rejected: it would duplicate the
+  STAC/CMR + `odc.stac.load` + write machinery. The ROI engine's per-date/per-
+  batch graphs are already the accepted Dask pattern; the "avoid unnecessary Dask
+  graphs" rule targets *metadata* reads, not the ingest data plane.
+- **A zone GeoJSON fed to `generate_roi`** — rejected: `compute_grid` bbox-fits
+  and cannot pin the shard-snapped zone grid the fill requires.
+- **One multi-year mosaic per zone** — rejected: out-of-order appends break
+  `resolve_region`, and per-cell deletion/idempotency is cleaner.
+
+## Consequences
+
+- The campaign is self-contained: seed → build mask → (per cell) ingest → fill →
+  cleanup. Ingestion and fill have independent concurrency caps.
+- ~~Peak input storage is bounded by in-flight cells, not the whole campaign.~~
+  **Superseded (2026-07-28).** This held while a semaphore made a cell hold a slot
+  from the start of its ingest through to its cleanup, sized to the fill cap plus
+  an ingest look-ahead. Measurement then showed ingest is markedly more efficient
+  run across many narrow fleets than a few wide ones, and that bound is precisely
+  what prevented it: it throttled the cheap half of the campaign to the throughput
+  of the expensive half. It was removed. Peak input storage is now bounded by a
+  **year**, not by in-flight cells — of order a hundred zone-mosaics, hundreds of
+  terabytes, transient. Cleanup is unchanged and still matters: `cleanup_mosaics`
+  deletes each mosaic as its fill lands, `sweep_orphan_mosaics` collects what a
+  crash leaves. The trade accepted is storage cost for ingest throughput.
+- Ingestion has exactly ONE limit: `max_parallel_ingest` (40), the number of UTM
+  zones ingesting simultaneously across the whole campaign. Under
+  `chained-clusters` the clusters are separate Prefect flow runs, so no in-process
+  semaphore can see across them and the cap is a Prefect **global concurrency
+  limit** — the same mechanism as the D6 commit gate. Each zone's ingest holds one
+  slot for its duration; a cluster starts as many zones as fit and queues the rest.
+  The campaign upserts the limit from the parameter at start (failing preflight if
+  it cannot), so the two can never drift. Each cluster also takes an even share of
+  the cap as its own window, dividing it by construction rather than by races.
+- GPUs are never booted speculatively, and **density ordering** is what makes the
+  cheap version of that guarantee sound. A cluster starts its ingest window, waits
+  for its FIRST zone only, then requests a fleet. That is safe because zones are
+  dealt out densest-first — the N densest zones of a year go one to each of the N
+  clusters, and each cluster then works from dense to sparse — so a cluster always
+  opens on a big zone whose inference outlasts the ingest of the rest of its
+  window. Inference is slower than ingest in almost every case, so the stream does
+  not run dry.
+
+  Measured against the real coverage bitmaps in
+  [`design/campaign-cluster-sizing.md`](../design/campaign-cluster-sizing.md):
+  at 8 clusters every one opens on a zone of 8,593+ tiles (~20% of its own
+  workload) and totals land within 0.0% of each other. That doc is the basis for
+  choosing the cluster count.
+
+  Two alternatives were tried and rejected. Waiting for a cluster's *entire* ingest
+  is unoverlapped time paid up front for a risk the ordering already removes.
+  Ordering on the clamped per-cell actor request (`min(num_actors, n_tiles)`) looks
+  equivalent and is not: every zone bigger than the fleet collapses to the same
+  value, leaving the dense end of the list — the part that decides what the fleet
+  opens on — in arbitrary order. The sort key is the unclamped tile count.
+- A deliberate refill re-ingests (hours, STAC/ASF re-pull) — acceptable given the
+  storage saving; the coverage store + zone ROI regenerate in seconds.
+- The zone-fill chain gained its first temporal-coverage gate; a missing-months
+  mosaic now fails loudly instead of silently tagging partial embeddings.

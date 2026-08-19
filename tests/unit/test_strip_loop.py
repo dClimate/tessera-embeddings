@@ -22,6 +22,7 @@ import zarr
 import tessera_embeddings.inference.actors as _actors_mod
 import tessera_embeddings.inference.data_loading as _dl_mod
 from tessera_embeddings.config.inference import S2_BAND_ORDER
+from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.inference.actors import (
     _MIN_STRIP_H,
@@ -35,8 +36,10 @@ from tessera_embeddings.inference.actors import (
     _StripPlan,
     _xchunk_rung,
 )
+from tessera_embeddings.inference.assembly import summarise_optical_skips
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
+from tests.unit.mosaic_stores import S2_SEED, make_s2_group, make_sar_group, store_opener
 
 
 class TestStripSlices:
@@ -209,56 +212,36 @@ class TestStripPlan:
 _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
 
 
-def _make_s2_zarr_group(n_t: int, h: int, w: int, seed: int = 10) -> zarr.Group:
-    rng = np.random.default_rng(seed)
-    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-    for band in S2_BAND_ORDER:
-        vals = rng.integers(100, 5000, size=(n_t, h, w)).astype(np.uint16)
-        arr = root.create_array(band, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
-        arr[:] = vals
-    # Mix valid and invalid SCL classes so pruning has something to do.
-    scl_vals = rng.choice([0, 4, 5, 8], size=(n_t, h, w)).astype(np.uint8)
-    scl_arr = root.create_array("scl", shape=scl_vals.shape, dtype=scl_vals.dtype, chunks=scl_vals.shape)
-    scl_arr[:] = scl_vals
-    times = pd.date_range("2024-01-01", periods=n_t, freq="5D")
-    time_ns = times.values.astype("datetime64[ns]").astype("int64")
-    t_arr = root.create_array("time", shape=time_ns.shape, dtype=np.int64, chunks=time_ns.shape)
-    t_arr[:] = time_ns
-    return root
-
-
-def _make_sar_zarr_group(n_t: int, h: int, w: int, seed: int = 20) -> zarr.Group:
-    rng = np.random.default_rng(seed)
-    times = pd.date_range("2024-01-01", periods=n_t, freq="12D")
-    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-    for name in ("0_VV", "0_VH"):
-        vals = rng.integers(1000, 8000, size=(n_t, h, w)).astype(np.uint16)
-        arr = root.create_array(name, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
-        arr[:] = vals
-    time_ns = times.values.astype("datetime64[ns]").astype("int64")
-    t_arr = root.create_array("time", shape=time_ns.shape, dtype=np.int64, chunks=time_ns.shape)
-    t_arr[:] = time_ns
-    return root
-
-
 class _CapturingWriter:
     """Stand-in for ZarrWriter that records the single whole-chunk write."""
 
     last_write: dict | None = None
     last_skip: str | None = None
+    last_skip_record: dict | None = None
+    discarded: str | None = None
 
     def __init__(self, staging_base, embedding_dim=128):
         self.embedding_dim = embedding_dim
 
-    def write_chunk(self, chunk, embeddings, run_id, scales, embeddings_std=None, obs_counts=None):
+    def write_chunk(self, chunk, embeddings, run_id, scales, embeddings_std=None, obs_counts=None, month_covered=None):
         _CapturingWriter.last_write = {
             "embeddings": embeddings.copy(),
             "scales": scales.copy(),
             "obs_counts": {k: (v.copy() if v is not None else None) for k, v in (obs_counts or {}).items()},
+            # Recorded, not discarded: a fake that accepts an argument and drops it leaves an
+            # actor that never populates the buffer indistinguishable from one that does.
+            "month_covered": month_covered.copy() if month_covered is not None else None,
         }
 
-    def write_skip_marker(self, chunk, run_id):
+    def discard_coverage(self, chunk, run_id):
+        """The real writer removes a partial coverage tile here; the fake records the intent."""
+        _CapturingWriter.discarded = chunk.label
+
+    def write_skip_marker(self, chunk, run_id, record=None):
         _CapturingWriter.last_skip = chunk.label
+        # Recorded, not discarded — a fake that drops the record leaves an actor which never builds
+        # one indistinguishable from one that does, and the record is the whole registry.
+        _CapturingWriter.last_skip_record = record
 
 
 def _make_actor(inference_config, test_model):
@@ -270,27 +253,14 @@ def _make_actor(inference_config, test_model):
     actor.model = test_model
     actor.instance_id = "test-instance"
     actor._get_credentials = None  # no scoped provider; opens use the default chain
+    actor._s3_region = None  # default region
     # Unstarted monitor: process_chunk tags phase context on it (no thread runs).
     actor._resource_monitor = ResourceMonitor()
     return actor
 
 
 def _open_store_side_effect():
-    h, w = _CHUNK.height, _CHUNK.width
-    s2_root = _make_s2_zarr_group(8, h, w, seed=10)
-    sar_asc = _make_sar_zarr_group(5, h, w, seed=20)
-    sar_desc = _make_sar_zarr_group(5, h, w, seed=30)
-
-    def _open_store(path):
-        if "reflectance" in path:
-            return s2_root
-        if "ascending" in path:
-            return sar_asc
-        if "descending" in path:
-            return sar_desc
-        raise ValueError(f"Unexpected store path: {path}")
-
-    return _open_store
+    return store_opener(_CHUNK, n_t_s2=8, n_t_sar=5)
 
 
 def _run_process_chunk(inference_config, test_model):
@@ -367,6 +337,47 @@ class TestProcessChunkStriping:
             np.testing.assert_allclose(write_one["scales"], other["scales"], rtol=1e-6, atol=1e-10, equal_nan=True)
             for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
                 np.testing.assert_array_equal(write_one["obs_counts"][var], other["obs_counts"][var], err_msg=var)
+            # Month coverage is assembled strip by strip like the obs counts, so a
+            # tiling-dependent bug would show as a mismatch on the strip boundaries.
+            np.testing.assert_array_equal(
+                write_one["month_covered"], other["month_covered"], err_msg="s2_month_covered"
+            )
+
+    def test_month_coverage_is_populated_and_agrees_with_the_obs_count(self, inference_config, test_model):
+        """The actor must pass month flags that describe its own observations.
+
+        A LIVENESS test, deliberately: the buffer is allocated zeroed and threaded through
+        several optional arguments, so an actor that never fills it produces all-``False`` —
+        which is also what a pixel with no observations correctly produces, and what the store
+        held for a whole published zone-year while every other array beside it was right.
+        Nothing downstream can tell those apart, so the check has to be that the flags are
+        both PRESENT and consistent with the count they partition.
+        """
+        with patch.object(_actors_mod, "_strip_plan", _force_strip_plan(4, prefetch=False)):
+            result, write = _run_process_chunk(inference_config, test_model)
+
+        assert result["status"] == "success"
+        covered = write["month_covered"]
+        obs = write["obs_counts"]["s2_obs_count"]
+        assert covered is not None, "the actor passed no month coverage at all"
+        assert covered.shape == (MONTHS_IN_YEAR, _CHUNK.height, _CHUNK.width)
+        assert covered.dtype == np.bool_
+        assert covered.any(), "month coverage is entirely False despite a successful chunk"
+        # Every flagged month needs an observation behind it, and a pixel cannot cover more
+        # months than it has observations. Both directions, since either alone admits a bug:
+        # an all-True buffer satisfies "some month is set" but not this.
+        months_per_px = covered.sum(axis=0)
+        assert np.all(months_per_px <= obs), "a pixel covers more months than it has observations"
+        assert np.all((months_per_px > 0) == (obs > 0)), "a month flag and the obs count disagree on emptiness"
+        # Exactly the months the fixture's own S2 time axis falls in — every pixel of this
+        # synthetic chunk is valid at every timestep, so the flags are the axis's months and
+        # nothing else. Read off the fixture rather than written out, so it stays true if the
+        # fixture's date spacing changes.
+        s2_times = np.asarray(make_s2_group(8, _CHUNK.height, _CHUNK.width, seed=S2_SEED)["time"][:])
+        want_months = sorted(
+            {int(m) for m in s2_times.astype("datetime64[ns]").astype("datetime64[M]").astype(int) % 12 + 1}
+        )
+        assert [m + 1 for m in range(MONTHS_IN_YEAR) if covered[m].any()] == want_months
 
     def test_multi_strip_actually_splits(self):
         # The strip height used in the equality test genuinely splits this chunk.
@@ -425,9 +436,9 @@ class TestProcessChunkStriping:
         times = pd.date_range("2024-01-01", periods=4, freq="5D").values.astype("datetime64[ns]").astype("int64")
         t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
         t_arr[:] = times
-        sar = _make_sar_zarr_group(3, h, w)
+        sar = make_sar_group(3, h, w)
 
-        def _open_store(path):
+        def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
             return s2_root if "reflectance" in path else sar
 
         _CapturingWriter.last_write = None
@@ -442,6 +453,31 @@ class TestProcessChunkStriping:
         assert result["valid_pixels"] == 0
         assert _CapturingWriter.last_skip == _CHUNK.label
         assert _CapturingWriter.last_write is None
+        # THE REGISTRY'S PRODUCER SIDE. A fully refused chunk used to write a zero-byte marker, so a
+        # thin-depth refusal could not be told from land that was never imaged. The reason has to be
+        # written HERE: the cell is write-once and its mosaic is deleted when it lands.
+        record = _CapturingWriter.last_skip_record
+        assert record is not None, "a refused chunk must record WHY it was refused"
+        assert record["label"] == _CHUNK.label
+        assert set(record["refused"]) == {"no_optical", "thin", "no_radar"}
+        assert sum(record["refused"].values()) > 0, "something refused every pixel; say what"
+        # The observation summary rides along, because the counts alone cannot say HOW thin.
+        # MEDIAN as well as mean, and both over pixels that saw ANYTHING: a mean is pulled by a
+        # bright patch of deep pixels beside a dark majority, and including never-imaged pixels
+        # drags either statistic to zero so it describes neither population.
+        assert "s2_obs" in record
+        # `median_where_thin` is the one an infill ranks by: `median_where_any` is over the whole
+        # evaluated footprint, so on a PARTLY refused shard it describes the pixels that passed.
+        assert set(record["s2_obs"]) == {
+            "px_with_any",
+            "max",
+            "mean_where_any",
+            "median_where_any",
+            "median_where_thin",
+        }
+        # Radar presence, because a tile that is thin AND radar-free is a different cleanup
+        # candidate from one that is merely thin — more optical will not fix the first.
+        assert "px_with_any_radar" in record
 
 
 # ---------------------------------------------------------------------------
@@ -481,7 +517,9 @@ class TestDeferredStagingWrites:
 
     def test_failed_write_surfaces_on_next_call(self, inference_config, test_model):
         class _FailingWriter(_CapturingWriter):
-            def write_chunk(self, chunk, embeddings, run_id, scales, embeddings_std=None, obs_counts=None):
+            def write_chunk(
+                self, chunk, embeddings, run_id, scales, embeddings_std=None, obs_counts=None, month_covered=None
+            ):
                 raise OSError("S3 500")
 
         r1, r2, flushed = self._run_two_chunks(inference_config, test_model, _FailingWriter)
@@ -556,10 +594,10 @@ class TestEmptyStripBandReadSkip:
         times = pd.date_range("2024-12-01", periods=6, freq="3D").values.astype("datetime64[ns]").astype("int64")
         t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
         t_arr[:] = times
-        sar_asc = _make_sar_zarr_group(4, h, w, seed=201)
-        sar_desc = _make_sar_zarr_group(4, h, w, seed=202)
+        sar_asc = make_sar_group(4, h, w, seed=201)
+        sar_desc = make_sar_group(4, h, w, seed=202)
 
-        def _open_store(path):
+        def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
             if "reflectance" in path:
                 return s2_root
             if "ascending" in path:
@@ -629,10 +667,10 @@ class TestEastingBboxCrop:
         times = pd.date_range("2024-12-01", periods=6, freq="3D").values.astype("datetime64[ns]").astype("int64")
         t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
         t_arr[:] = times
-        sar_asc = _make_sar_zarr_group(4, h, w, seed=301)
-        sar_desc = _make_sar_zarr_group(4, h, w, seed=302)
+        sar_asc = make_sar_group(4, h, w, seed=301)
+        sar_desc = make_sar_group(4, h, w, seed=302)
 
-        def _open_store(path):
+        def _open_store(path, region=None):  # region tolerated (make_store_opener threads it)
             if "reflectance" in path:
                 return s2_root
             if "ascending" in path:
@@ -829,3 +867,343 @@ class TestXChunkPrefetch:
                 actor._take_prefetched("chunk_x")
         finally:
             release.set()
+
+
+class TestAllowS2Only:
+    """End-to-end through the real model: the optional per-pixel S1 requirement."""
+
+    def _stores_with_sar_gap(self, h: int, w: int, half: int):
+        """S2 valid EVERYWHERE (scl=4); SAR zeroed over columns >= half (a coverage gap)."""
+        rng = np.random.default_rng(11)
+        s2_root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+        for band in S2_BAND_ORDER:
+            vals = rng.integers(100, 5000, size=(6, h, w)).astype(np.uint16)
+            arr = s2_root.create_array(band, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
+            arr[:] = vals
+        scl = s2_root.create_array("scl", shape=(6, h, w), dtype=np.uint8, chunks=(6, h, w))
+        scl[:] = 4  # every pixel S2-valid at every timestep
+        times = pd.date_range("2024-01-01", periods=6, freq="5D").values.astype("datetime64[ns]").astype("int64")
+        t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
+        t_arr[:] = times
+
+        sar_asc = make_sar_group(5, h, w, seed=20)
+        sar_desc = make_sar_group(5, h, w, seed=30)
+        for grp in (sar_asc, sar_desc):
+            for name in ("0_VV", "0_VH"):
+                data = grp[name][:]
+                data[:, :, half:] = 0  # no SAR observations right of the gap edge
+                grp[name][:] = data
+
+        def _open_store(path, region=None):
+            if "reflectance" in path:
+                return s2_root
+            if "ascending" in path:
+                return sar_asc
+            if "descending" in path:
+                return sar_desc
+            raise ValueError(f"Unexpected store path: {path}")
+
+        return _open_store
+
+    def _run(self, inference_config, test_model, opener, allow_s2_only: bool):
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+        inference_config.allow_s2_only = allow_s2_only
+        actor = _make_actor(inference_config, test_model)
+        _CapturingWriter.last_write = None
+        _CapturingWriter.last_skip = None
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=opener),
+            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+        ):
+            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+            # The staging write is deferred to the actor's writer thread; drain it
+            # so last_write reflects this chunk before we read it (mirrors
+            # _run_process_chunk — without this the read races the write thread).
+            flushed = actor.flush_writes()
+            assert flushed is None or flushed["ok"], f"deferred write failed: {flushed}"
+        return result, _CapturingWriter.last_write
+
+    def test_sar_gap_pixels_embed_only_with_flag(self, inference_config, test_model):
+        h, w = _CHUNK.height, _CHUNK.width
+        half = w // 2
+        opener = self._stores_with_sar_gap(h, w, half)
+
+        res_off, write_off = self._run(inference_config, test_model, opener, allow_s2_only=False)
+        res_on, write_on = self._run(inference_config, test_model, opener, allow_s2_only=True)
+        assert res_off["status"] == "success" and res_on["status"] == "success"
+
+        # Provenance is identical either way: zero S1 observations in the gap.
+        for write in (write_off, write_on):
+            assert np.all(write["obs_counts"]["s1_asc_obs_count"][:, half:] == 0)
+            assert np.all(write["obs_counts"]["s1_desc_obs_count"][:, half:] == 0)
+            assert np.all(write["obs_counts"]["s2_obs_count"] > 0)
+
+        # Flag OFF (historical gate): gap pixels are never embedded — NaN scale.
+        assert np.all(np.isnan(write_off["scales"][:, half:]))
+        assert np.all(np.isfinite(write_off["scales"][:, :half]))
+
+        # Flag ON: every S2-valid pixel embeds — finite scales and embeddings
+        # everywhere, including the SAR gap (upstream v1.1 zero-input convention).
+        assert np.all(np.isfinite(write_on["scales"]))
+        assert np.all(np.isfinite(write_on["embeddings"]))
+        assert res_on["valid_pixels"] == h * w
+        assert res_off["valid_pixels"] == h * half
+
+        # S1-informed pixels are unaffected by the flag: identical int8 embeddings.
+        np.testing.assert_array_equal(write_on["embeddings"][:, :half], write_off["embeddings"][:, :half])
+
+
+class TestPerCellTimeWindow:
+    """The window is a PER-CELL value carried on the work item, not an actor constant.
+
+    A chained session's cells may span campaign years, and an actor is built once with one
+    config. Reading the window from that config would make every cell of a different year
+    read the wrong months, and the session's only mismatch check is on `s1_orbit`, so
+    nothing would catch it. These tests pin both halves: threading it changed nothing when
+    the value matches, and it genuinely takes effect when it does not.
+    """
+
+    @staticmethod
+    def _run(inference_config, test_model, *, time_window=None):
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+        actor = _make_actor(inference_config, test_model)
+        _CapturingWriter.last_write = None
+        _CapturingWriter.last_skip = None
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store_side_effect()),
+            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+        ):
+            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1", time_window=time_window)
+            flushed = actor.flush_writes()
+            assert flushed is None or flushed["ok"], f"deferred write failed: {flushed}"
+        return result, _CapturingWriter.last_write
+
+    def test_passing_the_config_window_explicitly_is_bit_identical(self, inference_config, test_model):
+        """The safety property: threading the window must not have changed the numbers.
+
+        The window reaches three loader call sites — the serial prologue, the cross-chunk
+        prefetch starter, and the strip loop — which are documented as needing identical
+        kwargs for bit-identity. `_process_chunk` resolves the fallback ONCE into a local and
+        passes that value to all three, so they cannot drift; this asserts the outcome.
+        """
+        res_default, write_default = self._run(inference_config, test_model)
+        res_explicit, write_explicit = self._run(
+            inference_config, test_model, time_window=parse_time_window("December 2024")
+        )
+        assert res_default["status"] == res_explicit["status"] == "success"
+        assert res_default["valid_pixels"] == res_explicit["valid_pixels"] > 0
+        np.testing.assert_array_equal(write_default["embeddings"], write_explicit["embeddings"])
+        np.testing.assert_allclose(write_default["scales"], write_explicit["scales"], rtol=0, atol=0, equal_nan=True)
+        for var in ("s2_obs_count", "s1_asc_obs_count", "s1_desc_obs_count"):
+            np.testing.assert_array_equal(
+                write_default["obs_counts"][var], write_explicit["obs_counts"][var], err_msg=var
+            )
+
+    def test_a_different_window_actually_changes_what_is_read(self, inference_config, test_model):
+        """The liveness property, and the one that would catch the override being ignored.
+
+        A silently-dropped `time_window` argument would leave every test above passing while
+        the multi-year campaign read the wrong months. The synthetic stores carry 2024 dates,
+        so a 2022 window must filter them all out — a visibly different result rather than
+        merely a different number.
+        """
+        res_2024, write_2024 = self._run(inference_config, test_model, time_window=parse_time_window("December 2024"))
+        assert res_2024["valid_pixels"] > 0 and write_2024 is not None
+
+        # The 2022 window filters every date out, and the loader raises rather than
+        # quietly embedding nothing — which is a stronger liveness signal than a zero
+        # count, because it can only come from the passed window reaching the loader.
+        res_2022, _ = self._run(inference_config, test_model, time_window=parse_time_window("December 2022"))
+        assert res_2022["status"] == "failed", res_2022
+        assert "time window (2022" in res_2022.get("error", ""), res_2022
+
+    def test_the_zone_context_carries_the_window_to_the_dispatch(self):
+        """The wiring, unit-tested without a fleet: ZoneContext holds it and defaults to None.
+
+        `None` is what the single-ROI path passes, which is what keeps that path unchanged.
+        """
+        from tessera_embeddings.inference.scheduling import ZoneContext
+
+        assert ZoneContext("m", "s", "r").time_window is None
+        window = parse_time_window("December 2024")
+        assert ZoneContext("m", "s", "r", window).time_window is window
+        # Frozen + value-based equality still works, and two years of one zone differ —
+        # which is what stops a cross-cell prefetch hint reading the wrong window.
+        assert ZoneContext("m", "s", "r", window) == ZoneContext("m", "s", "r", window)
+        assert ZoneContext("m", "s", "r", window) != ZoneContext("m", "s", "r", parse_time_window("December 2023"))
+
+
+class TestTheRecordTheConsumerWillRead:
+    """The producer's record, fed to the consumer that grades it.
+
+    These two were tested to different contracts and never against each other: the producer test
+    asserted the record's SHAPE, the summary's tests asserted its ARITHMETIC over hand-built records,
+    and nothing checked that what the producer emits satisfies what the consumer enforces. That gap
+    is exactly where the cropping defect lived — `eligible_px` declared the whole tile while the
+    reasons counted only the loaded columns, so every cropped shard was graded inconsistent by an
+    invariant no test ever fed a real record to.
+    """
+
+    @staticmethod
+    def _refused_run(inference_config, test_model, monkeypatch, *, crop: slice | None):
+        """Drive a fully refused chunk through the real producer; return its record."""
+        inference_config.s1_orbit = "both"
+        inference_config.time_window = parse_time_window("December 2024")
+        actor = _make_actor(inference_config, test_model)
+        h, w = _CHUNK.height, _CHUNK.width
+        s2_root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
+        for band in S2_BAND_ORDER:
+            arr = s2_root.create_array(band, shape=(4, h, w), dtype=np.uint16, chunks=(4, h, w))
+            arr[:] = 0
+        scl = s2_root.create_array("scl", shape=(4, h, w), dtype=np.uint8, chunks=(4, h, w))
+        scl[:] = 8  # every class invalid -> every pixel refused
+        times = pd.date_range("2024-01-01", periods=4, freq="5D").values.astype("datetime64[ns]").astype("int64")
+        t_arr = s2_root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
+        t_arr[:] = times
+        sar = make_sar_group(3, h, w)
+
+        def _open_store(path, region=None):
+            return s2_root if "reflectance" in path else sar
+
+        if crop is not None:
+            # Force the read plan to narrow the chunk, which no all-invalid fixture does on its own:
+            # the crop is derived from the columns holding valid pixels, and here there are none.
+            real_plan = _actors_mod._chunk_read_plan
+
+            def _cropped(chunk, mask_bundle):
+                _x_sub, valid_px, plan = real_plan(chunk, mask_bundle)
+                return crop, valid_px, plan
+
+            monkeypatch.setattr(_actors_mod, "_chunk_read_plan", _cropped)
+
+        _CapturingWriter.last_write = None
+        _CapturingWriter.last_skip = None
+        _CapturingWriter.last_skip_record = None
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open_store),
+            patch.object(_actors_mod, "ZarrWriter", _CapturingWriter),
+        ):
+            result = actor.process_chunk(_CHUNK, "s3://b/m", "/tmp/staging", "run-1")
+        assert result["status"] == "skipped"
+        record = _CapturingWriter.last_skip_record
+        assert record is not None
+        return record
+
+    def test_the_consumer_grades_the_producers_record_as_consistent(self, inference_config, test_model, monkeypatch):
+        """The round trip, uncropped: the reasons account for every pixel the dataset evaluated."""
+        record = self._refused_run(inference_config, test_model, monkeypatch, crop=None)
+        label = record["label"]
+        summary = summarise_optical_skips(staged=[], skipped=[label], records={label: record})
+
+        assert summary.get("inconsistent") is None, summary
+        assert sum(summary["refused_px_by_reason"].values()) == _CHUNK.height * _CHUNK.width
+        # Nothing was cropped, so nothing is unaccounted for.
+        assert "not_evaluated_px" not in summary
+
+    def test_a_cropped_chunk_is_consistent_and_its_remainder_is_named(self, inference_config, test_model, monkeypatch):
+        """The defect two reviewers found, from both ends at once.
+
+        With the read plan narrowed to four of ten columns, the reasons cover 4/10 of the tile. The
+        record must say so — and the consumer must grade that as CONSISTENT while still accounting
+        for the columns nobody looked at, because they are published as fill just like the refused
+        ones and a summary that ignores them looks short of the footprint it explains.
+        """
+        crop = slice(3, 7)
+        record = self._refused_run(inference_config, test_model, monkeypatch, crop=crop)
+        label = record["label"]
+
+        assert record["eligible_px"] == _CHUNK.height * 4, "the footprint the reasons actually cover"
+        assert record["chunk_px"] == _CHUNK.height * _CHUNK.width, "the footprint that gets published"
+
+        summary = summarise_optical_skips(staged=[], skipped=[label], records={label: record})
+        assert summary.get("inconsistent") is None, "a legitimate crop is not a defect"
+        assert summary["not_evaluated_px"] == _CHUNK.height * (_CHUNK.width - 4)
+        assert (
+            sum(summary["refused_px_by_reason"].values()) + summary["not_evaluated_px"] == _CHUNK.height * _CHUNK.width
+        ), "refused plus never-evaluated must account for the whole published tile"
+
+    def test_the_record_carries_the_grid_it_was_produced_on(self, inference_config, test_model, monkeypatch):
+        """An assembly-only resume of an all-skipped run has no staged tile to read a chunk size
+        off, and guessing the current default re-enumerates every label.
+        """
+        record = self._refused_run(inference_config, test_model, monkeypatch, crop=None)
+        assert record["chunk_side_px"] == _CHUNK.width
+
+
+class TestTheRecordCountsOnlyTheEvaluatedColumns:
+    """Every statistic in the record is restricted to the columns the reasons were counted over.
+
+    The obs buffers are allocated and filled at FULL chunk width on both the cropped and uncropped
+    paths, on purpose — the arrays published into the store keep full-extent fidelity. So a record
+    built by summing them whole describes a wider footprint than its own ``eligible_px`` denominator,
+    and every ratio a consumer derives is then measured against the wrong base. The failure is not
+    only cosmetic: a count can exceed its denominator, which reads as "more imagery would repair
+    this" about imagery that was never in question.
+
+    A reviewer found this on the radar count. It was never only radar — the buffers are full width
+    for the optical counts too, so ``px_with_any`` and all three depth statistics carried the same
+    mismatch. These tests are written so a version that sums the full width scores DIFFERENTLY rather
+    than merely failing an inequality: the observations are placed exclusively OUTSIDE the crop, so
+    the correct answer is zero and the full-width answer is not.
+    """
+
+    CROP = slice(3, 7)
+
+    @classmethod
+    def _record(cls, *, x_sub, s2_cols, radar_cols, depth=40):
+        h, w = _CHUNK.height, _CHUNK.width
+        buffers = {var: np.zeros((h, w), dtype=np.uint16) for var in _actors_mod.OBS_COUNT_VARS}
+        if s2_cols is not None:
+            buffers["s2_obs_count"][:, s2_cols] = depth
+        if radar_cols is not None:
+            buffers["s1_asc_obs_count"][:, radar_cols] = 5
+        return _actors_mod._coverage_record(
+            _CHUNK,
+            refused={"thin_optical": 0},
+            radar_rule_enforced=True,
+            obs_buffers=buffers,
+            x_sub=x_sub,
+            optical_min_obs=15,
+        )
+
+    def test_observations_outside_the_crop_are_not_counted(self):
+        """Everything sits in columns 0:3; the crop is 3:7. The correct answer is zero of each."""
+        outside = slice(0, 3)
+        record = self._record(x_sub=self.CROP, s2_cols=outside, radar_cols=outside)
+
+        would_be = _CHUNK.height * 3  # what a full-width sum reports, and it is not zero
+        assert would_be > 0, "the fixture must be able to fail"
+        assert record["s2_obs"]["px_with_any"] == 0
+        assert record["px_with_any_radar"] == 0
+        assert record["s2_obs"]["max"] == 0
+
+    def test_no_count_can_exceed_its_own_denominator(self):
+        """Full-width observations, cropped reasons: each count lands exactly on ``eligible_px``."""
+        every = slice(None)
+        record = self._record(x_sub=self.CROP, s2_cols=every, radar_cols=every)
+
+        eligible = record["eligible_px"]
+        assert eligible == _CHUNK.height * 4
+        assert record["s2_obs"]["px_with_any"] == eligible
+        assert record["px_with_any_radar"] == eligible
+        # The full-width sum would have been height * 10 — larger than the denominator it divides.
+        assert record["px_with_any_radar"] <= eligible
+        assert record["s2_obs"]["px_with_any"] <= eligible
+
+    def test_the_depth_statistics_describe_the_evaluated_columns_only(self):
+        """Thin pixels outside the crop must not appear in the thin-population median."""
+        record = self._record(x_sub=self.CROP, s2_cols=slice(0, 3), radar_cols=None, depth=4)
+        assert record["s2_obs"]["median_where_thin"] is None, "no thin pixel was evaluated"
+
+        inside = self._record(x_sub=self.CROP, s2_cols=slice(3, 7), radar_cols=None, depth=4)
+        assert inside["s2_obs"]["median_where_thin"] == 4.0
+
+    def test_an_uncropped_chunk_still_sees_its_whole_width(self):
+        """The guard against over-correcting: with no crop the footprint is the whole tile."""
+        record = self._record(x_sub=None, s2_cols=slice(None), radar_cols=slice(None))
+
+        assert record["eligible_px"] == _CHUNK.height * _CHUNK.width
+        assert record["s2_obs"]["px_with_any"] == _CHUNK.height * _CHUNK.width
+        assert record["px_with_any_radar"] == _CHUNK.height * _CHUNK.width

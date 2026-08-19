@@ -1,9 +1,8 @@
-"""Dask cluster configuration for the embedding-assembly phase.
+"""Dask cluster sizing for the ingest phase.
 
-The :class:`AssemblyConfig` config object scales worker count from the
-number of *live* (ROI-intersecting) spatial chunks. It is consumed by
-the AWS Dask provider (and any equivalent) as a substrate-agnostic
-recipe — the substrate decides what a "worker" actually is.
+Ingest keeps Dask for compute (STAC reads, mosaicking); these caps size its
+cluster and the master pipeline's Ray pool. Assembly no longer runs on Dask —
+its process-pool sizing lives in :mod:`tessera_embeddings.config.assembly`.
 
 The reference repo also defines a ``CoarsenConfig`` for an embedding
 coarsening flow; that flow is out of scope for the open-source release
@@ -11,65 +10,6 @@ and is not ported here.
 """
 
 from __future__ import annotations
-
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class _ChunkScaledClusterConfig:
-    """Base config for Dask clusters that scale worker count from chunk count.
-
-    Subclasses set defaults for ``chunks_per_worker`` and ``max_workers``
-    to match their workload profile.
-    """
-
-    chunks_per_worker: int
-    worker_cpu: int = 4096
-    worker_mem: int = 8192
-    # Dask scheduler has trouble past ~200 workers; cap conservatively.
-    max_workers: int = 200
-
-    def __post_init__(self) -> None:
-        """Validate configuration values."""
-        if self.chunks_per_worker <= 0:
-            raise ValueError(f"chunks_per_worker must be > 0, got {self.chunks_per_worker}")
-        if self.max_workers <= 0:
-            raise ValueError(f"max_workers must be > 0, got {self.max_workers}")
-
-    def compute_n_workers(self, n_chunks: int) -> int:
-        """Return the number of workers for ``n_chunks`` spatial chunks.
-
-        Scales linearly at ``ceil(n_chunks / chunks_per_worker)`` up to
-        ``max_workers``, with a floor of 1.
-        """
-        return max(1, min(-(-n_chunks // self.chunks_per_worker), self.max_workers))
-
-
-@dataclass(frozen=True)
-class AssemblyConfig(_ChunkScaledClusterConfig):
-    """Configuration for the Dask assembly phase of inference.
-
-    Controls per-worker resource allocation and dynamic scaling of the
-    cluster that assembles staged chunk Zarrs into the final output.
-
-    Worker count is derived from *live* (ROI-intersecting) chunks, not
-    the full grid: only live chunks have staged data to read and write,
-    so they account for essentially all the work — non-intersecting
-    chunks are constant fill in the Dask graph and never touch S3.
-    Calibrated so ~850 live chunks → 85 workers, scaling up to the
-    ``max_workers`` cap once an ROI exceeds that.
-
-    ``max_workers`` is capped at 100 to match
-    ``assembly.TARGET_AGGREGATE_S3_CONCURRENCY``. Each Dask worker forks its
-    own icechunk Repository that issues at least 1 concurrent S3 PUT, so
-    aggregate PUT concurrency is >= n_workers. Capping workers at the target
-    keeps the fleet-wide PUT rate under S3's ~3500 req/s/prefix ceiling; a
-    higher cap would burst over it and draw ``503 SlowDown`` on append.
-    """
-
-    chunks_per_worker: int = 10
-    max_workers: int = 100
-
 
 # Auto-sizing caps for the master pipeline's ingest cluster + Ray pool.
 INGEST_MIN_WORKERS_CAP = 150

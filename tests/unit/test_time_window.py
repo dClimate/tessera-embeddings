@@ -128,11 +128,17 @@ class TestParseTimeWindowErrors:
 
 
 def _make_time_group(start: str, end: str):
-    """Build an in-memory zarr group with a ``time`` array spanning [start, end]."""
+    """Build an in-memory zarr group with a MONTHLY ``time`` array over [start, end].
+
+    Monthly (first of each month) rather than just the two endpoints, so a store
+    that "spans" the window actually contains every month the per-month coverage
+    check now requires.
+    """
     store = zarr.storage.MemoryStore()
     root = zarr.group(store)
 
-    times = np.array([np.datetime64(start), np.datetime64(end)], dtype="datetime64[ns]").astype("int64")
+    months = np.arange(np.datetime64(start, "M"), np.datetime64(end, "M") + 1)
+    times = months.astype("datetime64[ns]").astype("int64")
 
     t_arr = root.create_array("time", shape=times.shape, dtype=np.int64, chunks=times.shape)
     t_arr[:] = times
@@ -150,7 +156,7 @@ def _mock_open_store(monkeypatch):
 
     store_times: dict[str, tuple[str, str]] = {}
 
-    def _open_store(path):
+    def _open_store(path, **kwargs):  # accept get_credentials/region
         start, end = store_times.get("default", ("2024-01-01", "2025-12-31"))
         return _make_time_group(start, end)
 
@@ -172,17 +178,17 @@ class TestCheckTimeWindowCoverage:
         check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending")
 
     @pytest.mark.parametrize(
-        ("store_start", "store_end", "match"),
+        ("store_start", "store_end"),
         [
-            ("2024-10-01", "2025-12-31", "store starts at"),
-            ("2024-01-01", "2025-06-15", "store ends at"),
+            ("2024-10-01", "2025-12-31"),  # missing the window's Aug/Sep 2024 months
+            ("2024-01-01", "2025-06-15"),  # missing the window's July 2025 month
         ],
         ids=["too-late-start", "too-early-end"],
     )
-    def test_coverage_fails(self, _mock_open_store, store_start, store_end, match):
+    def test_coverage_fails(self, _mock_open_store, store_start, store_end):
         _mock_open_store(store_start, store_end)
         tw = parse_time_window("July 2025")
-        with pytest.raises(InsufficientCoverageError, match=match):
+        with pytest.raises(InsufficientCoverageError, match="missing"):
             check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending")
 
     def test_ascending_orbit_checks_two_stores(self, monkeypatch):
@@ -191,7 +197,7 @@ class TestCheckTimeWindowCoverage:
 
         checked_paths: list[str] = []
 
-        def _open_store(path):
+        def _open_store(path, **kwargs):  # accept get_credentials/region
             checked_paths.append(path)
             return _make_time_group("2024-01-01", "2025-12-31")
 
@@ -209,7 +215,7 @@ class TestCheckTimeWindowCoverage:
 
         checked_paths: list[str] = []
 
-        def _open_store(path):
+        def _open_store(path, **kwargs):  # accept get_credentials/region
             checked_paths.append(path)
             return _make_time_group("2024-01-01", "2025-12-31")
 
@@ -225,7 +231,7 @@ class TestCheckTimeWindowCoverage:
         """A store with zero time entries raises InsufficientCoverageError."""
         import tessera_embeddings.inference.data_loading as dl
 
-        def _open_store(path):
+        def _open_store(path, **kwargs):  # accept get_credentials/region
             store = zarr.storage.MemoryStore()
             root = zarr.group(store)
             root.create_array("time", shape=(0,), dtype=np.int64, chunks=(1,))
@@ -235,6 +241,13 @@ class TestCheckTimeWindowCoverage:
         tw = parse_time_window("July 2025")
         with pytest.raises(InsufficientCoverageError, match="no time entries"):
             check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending")
+
+    def test_skip_coverage_check_requires_in_window_data(self, _mock_open_store):
+        """Partial-window mode still rejects a store with only out-of-window dates."""
+        _mock_open_store("2023-01-01", "2023-12-31")  # entirely before the July 2025 window
+        tw = parse_time_window("July 2025")
+        with pytest.raises(InsufficientCoverageError, match="no timestamps within the window"):
+            check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending", skip_coverage_check=True)
 
     def test_skip_coverage_check_bypasses_range_check(self, _mock_open_store):
         """skip_coverage_check=True bypasses the range check even when out of range."""
@@ -248,7 +261,7 @@ class TestCheckTimeWindowCoverage:
         """skip_coverage_check does not bypass the empty-store guard (it runs first)."""
         import tessera_embeddings.inference.data_loading as dl
 
-        def _open_store(path):
+        def _open_store(path, **kwargs):  # accept get_credentials/region
             store = zarr.storage.MemoryStore()
             root = zarr.group(store)
             root.create_array("time", shape=(0,), dtype=np.int64, chunks=(1,))
@@ -258,3 +271,80 @@ class TestCheckTimeWindowCoverage:
         tw = parse_time_window("July 2025")
         with pytest.raises(InsufficientCoverageError, match="no time entries"):
             check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending", skip_coverage_check=True)
+
+    def test_an_assessed_window_cannot_excuse_a_store_with_no_in_window_dates(self, monkeypatch):
+        """STRICT mode needs the in-window guard too, despite its every-month rule.
+
+        An `assessed_window` says a month was examined and held nothing reachable, which
+        is a finding rather than a gap — but it can explain away EVERY month of the
+        window, emptying the missing list. A store the ingest looked at and wrote nothing
+        into would then pass the one gate that exists to fail before a GPU fleet is
+        provisioned, and the run would die at the first read instead, because the loaders
+        raise on an empty filtered index.
+        """
+        import tessera_embeddings.inference.data_loading as dl
+
+        def _open_store(path, **kwargs):
+            # Dates from a PRIOR year only: non-empty, but nothing the window can use.
+            root = _make_time_group("2023-01-01", "2023-12-31")
+            root.attrs["assessed_window"] = ["2024-08-01", "2025-07-31"]  # the whole window
+            return root
+
+        monkeypatch.setattr(dl, "open_store_as_zarr_group", _open_store)
+        tw = parse_time_window("July 2025")
+        with pytest.raises(InsufficientCoverageError, match="no timestamps within the window"):
+            check_time_window_coverage("s3://fake/mosaic", tw, s1_orbit="ascending")
+
+    def test_a_month_lost_to_unreadable_imagery_is_not_excused(self, monkeypatch):
+        """A whole-month DATA-LOSS hole must not publish as a legitimate absence.
+
+        The assessed window says "we looked here". It cannot say "and there was nothing to
+        find" for a month whose every acquisition was skipped as unreadable — there the
+        imagery existed and was lost. Both look identical to a present-month count, and the
+        year is write-once, so excusing this one makes the hole permanent and mislabelled.
+        """
+        import tessera_embeddings.inference.data_loading as dl
+
+        def _open_store(path, **kwargs):
+            root = _make_time_group("2024-08-01", "2024-10-31")  # first 3 months only
+            root.attrs["assessed_window"] = ["2024-08-01", "2025-07-31"]  # would excuse them all
+            root.attrs["assessed_unreadable_dates"] = [{"date": "2025-03-14", "objects": 4, "scope": "tile"}]
+            return root
+
+        monkeypatch.setattr(dl, "open_store_as_zarr_group", _open_store)
+        with pytest.raises(InsufficientCoverageError, match="2025-03"):
+            check_time_window_coverage("s3://fake/mosaic", parse_time_window("July 2025"), s1_orbit="ascending")
+
+    def test_an_unparseable_unreadable_record_excuses_nothing(self, monkeypatch):
+        """Same asymmetry the assessed-window parser uses: a damaged record makes it STRICTER.
+
+        If the list cannot be read, which month lost imagery is unknown — so no month may be
+        excused. Over-excusing publishes a hole; under-excusing costs a re-ingest.
+        """
+        import tessera_embeddings.inference.data_loading as dl
+
+        def _open_store(path, **kwargs):
+            root = _make_time_group("2024-08-01", "2024-10-31")
+            root.attrs["assessed_window"] = ["2024-08-01", "2025-07-31"]
+            root.attrs["assessed_unreadable_dates"] = [{"date": "not-a-date"}]
+            return root
+
+        monkeypatch.setattr(dl, "open_store_as_zarr_group", _open_store)
+        with pytest.raises(InsufficientCoverageError):
+            check_time_window_coverage("s3://fake/mosaic", parse_time_window("July 2025"), s1_orbit="ascending")
+
+    def test_an_assessed_window_still_excuses_absent_months_when_data_exists(self, monkeypatch):
+        """The guard must not undo what the assessed window is FOR.
+
+        A store holding part of the window, with the rest examined and empty, is the
+        legitimate sparse-zone case and has to keep passing.
+        """
+        import tessera_embeddings.inference.data_loading as dl
+
+        def _open_store(path, **kwargs):
+            root = _make_time_group("2024-08-01", "2024-10-31")  # first 3 months only
+            root.attrs["assessed_window"] = ["2024-08-01", "2025-07-31"]
+            return root
+
+        monkeypatch.setattr(dl, "open_store_as_zarr_group", _open_store)
+        check_time_window_coverage("s3://fake/mosaic", parse_time_window("July 2025"), s1_orbit="ascending")

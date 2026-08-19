@@ -11,14 +11,14 @@ from tessera_embeddings.inference.orchestration_helpers import read_upstream_man
 
 @pytest.fixture()
 def _mock_stores():
-    """Mock open_store and extract_manifest for manifest reading tests."""
+    """Mock the raw-zarr opener and extract_manifest for manifest reading tests."""
     fake_manifest = {"version": "1.0", "dates": ["2024-01-01"]}
     mock_ds = MagicMock()
     mock_ds.attrs = {"_manifest": fake_manifest}
 
     with (
         patch(
-            "tessera_embeddings.inference.orchestration_helpers.open_store",
+            "tessera_embeddings.inference.orchestration_helpers.open_store_as_zarr_group",
             return_value=mock_ds,
         ),
         patch(

@@ -17,6 +17,7 @@ import logging
 import os
 import tempfile
 import time
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,10 +28,22 @@ import numpy as np
 import ray
 import requests
 
-from tessera_embeddings.config.inference import EMBEDDING_DIM, PREFETCH_DEPTH, S2_BAND_ORDER, InferenceConfig
+from tessera_embeddings.config.inference import (
+    EMBEDDING_DIM,
+    OPTICAL_MIN_OBS,
+    PREFETCH_DEPTH,
+    RADAR_THIN_MAX_OBS,
+    S1_ORBIT_NONE,
+    S2_BAND_ORDER,
+    InferenceConfig,
+    S1Orbit,
+)
+from tessera_embeddings.config.store_layout import MONTHS_IN_YEAR
+from tessera_embeddings.config.time_windows import TimeWindow
 from tessera_embeddings.inference.assembly import OBS_COUNT_VARS, ZarrWriter
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
 from tessera_embeddings.inference.data_loading import load_chunk, load_s2_mask_bundle, make_store_opener
+from tessera_embeddings.inference.progress import chunk_uid
 from tessera_embeddings.inference.resource_monitor import ResourceMonitor
 from tessera_embeddings.storage.zarr_store import credentials_provider
 
@@ -75,7 +88,7 @@ logger = logging.getLogger(__name__)
 def _chunk_summary_line(**fields: Any) -> str:  # noqa: ANN401 — heterogeneous JSON payload
     """One machine-readable per-chunk line for the profiling tools.
 
-    ``scripts/inference_perf/observe_cluster.py --report`` parses these in
+    ``te-observe-cluster --report`` parses these in
     preference to prose log lines (whose wording drifts across branches and
     silently breaks regex parsers). Keep the keys stable — or update that
     parser in the same change.
@@ -528,6 +541,87 @@ def _log_vram_breakdown(model: MultimodalBTInferenceModel, torch_mod: types.Modu
 # These are A/B probes: if peak RSS drops, the plateau was retained churn, not
 # live working set; if it barely moves, the working set is genuinely resident
 # and chunking is the only remaining lever.
+def _coverage_record(
+    chunk: ChunkSpec,
+    *,
+    refused: Mapping[str, int],
+    radar_rule_enforced: bool | None,
+    obs_buffers: Mapping[str, np.ndarray],
+    x_sub: slice | None,
+    optical_min_obs: int,
+) -> dict[str, Any]:
+    """One shard's refusal reasons and observation depth, in the shape the registry consumes.
+
+    Built here rather than at each of the two call sites because BOTH need it and they must not
+    disagree: a wholly-refused shard writes it into its skip marker, and a shard that embedded
+    something returns it with its result. Two copies of these expressions is how the two rows in one
+    registry stop being comparable — and comparing them is the point, since a shard 60% refused for
+    thin optical is a better revisit candidate than many that were refused outright.
+
+    Every count is over the footprint the reasons were COUNTED over (``eligible_px``), not over the
+    embedded pixels: an infill planner is asking about the land, and a denominator that shrinks with
+    the answer cannot support the comparison. ``chunk_px`` is the published footprint beside it, so a
+    reader can also see how much of the shard was never evaluated at all.
+
+    ``x_sub`` IS THE COLUMN RANGE THE REASONS WERE COUNTED OVER, and every buffer here is sliced by
+    it — which is why this takes the slice rather than its width. The obs buffers are allocated and
+    filled at FULL chunk width on both the cropped and uncropped paths, deliberately, so the arrays
+    published into the store keep full-extent fidelity. Summing them whole would describe a footprint
+    the refusal counts do not cover: observations in columns outside the evaluated range would inflate
+    every statistic here and can push a count above its own ``eligible_px`` denominator, telling a
+    consumer more imagery could repair a shard when the imagery it is counting was never in question.
+    Carrying both footprints was the alternative and is rejected here: the unevaluated columns were
+    never refused, so no consumer ranks by them, and ``chunk_px`` already says how much was skipped.
+    """
+    cols = x_sub if x_sub is not None else slice(None)
+    eff_w = int(chunk.width) if x_sub is None else int(x_sub.stop - x_sub.start)
+    s2_obs = obs_buffers["s2_obs_count"][:, cols]
+    any_obs = s2_obs > 0
+    return {
+        "refused": dict(refused),
+        "eligible_px": int(chunk.height) * int(eff_w),
+        "chunk_px": int(chunk.height) * int(chunk.width),
+        # The grid this record was produced on. An assembly-only resume of an all-skipped run has no
+        # staged tile to read a chunk size off, and falling back to the CURRENT default
+        # re-enumerates the labels — after which valid old markers read as unexpected.
+        "chunk_side_px": int(chunk.width),
+        # None when no strip ran far enough to say — reported as unknown rather than guessed from the
+        # config, whose value the per-cell orbit downgrade can override.
+        "radar_rule_enforced": radar_rule_enforced,
+        "s2_obs": {
+            "px_with_any": int(any_obs.sum()),
+            "max": int(s2_obs.max()),
+            "mean_where_any": round(float(s2_obs[any_obs].mean()), 2) if any_obs.any() else 0.0,
+            # MEDIAN, beside the mean, because a cleanup planner's question is "would another scene
+            # or two cross the line for most of this tile" and a mean is pulled by a bright patch of
+            # deep pixels next to a dark majority. Over pixels that saw ANYTHING, not over the land:
+            # including the never-imaged ones drags it to zero and then it describes neither
+            # population.
+            "median_where_any": (round(float(np.median(s2_obs[any_obs])), 1) if any_obs.any() else 0.0),
+            # AND THE DEPTH OF THE PIXELS THAT FELL SHORT, which is the one an infill planner
+            # ranks by. `median_where_any` is over the whole evaluated footprint, so on a
+            # PARTLY refused shard it is dominated by the pixels that passed: 09S/2021 published
+            # tiles with a median of 50 against a line of 15 while still refusing several
+            # thousand pixels each. Ranking by it put a handful of marginal pixels in deep
+            # imagery above a shard that is uniformly thin. Over pixels strictly below the line
+            # and above zero — the thin population by the rule's own definition. None when the
+            # shard has none, which is different from a shard whose thin pixels sit at zero.
+            "median_where_thin": (
+                round(float(np.median(s2_obs[thin])), 1)
+                if (thin := (any_obs & (s2_obs < optical_min_obs))).any()
+                else None
+            ),
+        },
+        # RADAR PRESENCE, because a tile that is thin AND radar-free is a different cleanup
+        # candidate from one that is merely thin — more optical will not fix the first. Either orbit
+        # counts: which one it was is per-pixel in the coverage arrays, so the summary only has to
+        # answer presence.
+        "px_with_any_radar": int(
+            ((obs_buffers["s1_asc_obs_count"][:, cols] > 0) | (obs_buffers["s1_desc_obs_count"][:, cols] > 0)).sum()
+        ),
+    }
+
+
 @ray.remote(
     runtime_env={
         "env_vars": {
@@ -569,6 +663,7 @@ class InferenceActor:
         config: InferenceConfig,
         checkpoint_path: str,
         get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+        s3_region: str | None = None,
     ) -> None:
         """Initialize actor: download checkpoint (if S3) and load model onto GPU.
 
@@ -579,6 +674,10 @@ class InferenceActor:
                 (via :func:`credentials_provider`) for the duration of every
                 :meth:`process_chunk` call. Injected by the cloud-aware caller;
                 ``None`` uses icechunk's default credential chain.
+            s3_region: Optional S3 region for the mosaic repos, applied to every
+                store open. ``None`` uses icechunk's default region — a fill in a
+                non-default region must thread it so the actor's reads match the
+                region the preflight/assembly paths use.
         """
         import torch as _torch
 
@@ -588,6 +687,7 @@ class InferenceActor:
 
         self.config = config
         self._get_credentials = get_credentials
+        self._s3_region = s3_region
         self.instance_id = _fetch_ec2_instance_id()
         self.device = _torch.device("cpu") if self.config.num_gpus == 0 else _select_device(_torch, self.instance_id)
 
@@ -606,11 +706,11 @@ class InferenceActor:
         logger.info("InferenceActor ready on instance %s", self.instance_id)
 
     def _open_and_plan(
-        self, chunk: ChunkSpec, mosaic_base: str
+        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow
     ) -> tuple[StoreOpener, S2MaskBundle, slice | None, int, _StripPlan]:
         """Open stores, load the SCL bundle, and derive the chunk read plan."""
-        store_opener = make_store_opener()
-        mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, self.config.time_window, store_opener=store_opener)
+        store_opener = make_store_opener(region=self._s3_region)
+        mask_bundle = load_s2_mask_bundle(mosaic_base, chunk, time_window, store_opener=store_opener)
         x_sub, valid_px, plan = _chunk_read_plan(chunk, mask_bundle)
         return store_opener, mask_bundle, x_sub, valid_px, plan
 
@@ -618,6 +718,8 @@ class InferenceActor:
         self,
         chunk: ChunkSpec,
         mosaic_base: str,
+        time_window: TimeWindow,
+        s1_orbit: S1Orbit,
         *,
         y_sub: slice,
         store_opener: StoreOpener,
@@ -633,11 +735,20 @@ class InferenceActor:
         """
         from tessera_embeddings.inference.dataset import MosaicChunkInferenceDataset
 
+        # Both derived from the ONE threaded orbit, never re-resolved per path: the three
+        # callers must pass identical load/dataset kwargs for bit-identity, and a value each
+        # of them computed for itself is exactly how they would drift apart.
+        #
+        # A radar-free cell has zero S1 observations at every pixel, so the default gate would
+        # skip all of them and the cell would write nothing while reporting success. The gate
+        # is therefore opened BY the orbit rather than asked of the caller — the same rule
+        # InferenceConfig applies, applied here per cell because the orbit is now per cell.
+        allow_s2_only = self.config.allow_s2_only or s1_orbit == S1_ORBIT_NONE
         data = load_chunk(
             chunk,
             mosaic_base,
-            time_window=self.config.time_window,
-            s1_orbit=self.config.s1_orbit,
+            time_window=time_window,
+            s1_orbit=s1_orbit,
             y_sub=y_sub,
             store_opener=store_opener,
             mask_bundle=mask_bundle,
@@ -647,11 +758,15 @@ class InferenceActor:
         dataset = MosaicChunkInferenceDataset(
             data,
             num_obs_checkpoints=self.config.num_obs_checkpoints,
-            s1_orbit=self.config.s1_orbit,
+            s1_orbit=s1_orbit,
+            allow_s2_only=allow_s2_only,
+            optical_min_obs=self.config.optical_min_obs,
         )
         return data, dataset
 
-    def _load_chunk_prologue(self, chunk: ChunkSpec, mosaic_base: str) -> _ChunkPrologue:
+    def _load_chunk_prologue(
+        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
+    ) -> _ChunkPrologue:
         """Load everything _process_chunk needs before its first forward pass.
 
         Runs inline (serially, GPU idle) at the top of every chunk, UNLESS the
@@ -672,14 +787,16 @@ class InferenceActor:
             # LIVE opener inside THIS call's credential scope so the body-strip
             # reads never inherit stale credentials (worst case: one repo
             # re-open, matching the serial path's per-chunk opener).
-            prologue.store_opener = make_store_opener()
+            prologue.store_opener = make_store_opener(region=self._s3_region)
         else:
-            store_opener, mask_bundle, x_sub, _valid_px, plan = self._open_and_plan(chunk, mosaic_base)
+            store_opener, mask_bundle, x_sub, _valid_px, plan = self._open_and_plan(chunk, mosaic_base, time_window)
             prologue = _ChunkPrologue(store_opener, mask_bundle, plan, x_sub, first_strip=None)
         if prologue.first_strip is None:
             prologue.first_strip = self._load_strip_dataset(
                 chunk,
                 mosaic_base,
+                time_window,
+                s1_orbit,
                 y_sub=prologue.plan.strips[0],
                 store_opener=prologue.store_opener,
                 mask_bundle=prologue.mask_bundle,
@@ -701,7 +818,9 @@ class InferenceActor:
             self._xchunk_prefetched: dict[str, Future[_ChunkPrologue]] = {}
         return self._xchunk_prefetch_pool, self._xchunk_prefetched
 
-    def _load_prefetched_starter(self, chunk: ChunkSpec, mosaic_base: str) -> _ChunkPrologue:
+    def _load_prefetched_starter(
+        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
+    ) -> _ChunkPrologue:
         """Load the capped prefetch payload for ``chunk`` (prefetch thread).
 
         Store opens normally land inside the calling process_chunk's scoped
@@ -710,7 +829,7 @@ class InferenceActor:
         consumer falls back to an inline (in-scope) reload, so a
         credential-window miss degrades to the unprefetched behaviour.
         """
-        store_opener, mask_bundle, x_sub, valid_px, plan = self._open_and_plan(chunk, mosaic_base)
+        store_opener, mask_bundle, x_sub, valid_px, plan = self._open_and_plan(chunk, mosaic_base, time_window)
         rung = _xchunk_rung(chunk, int(mask_bundle.mask.shape[0]), x_sub, valid_px, plan)
 
         first_strip = None
@@ -730,6 +849,8 @@ class InferenceActor:
             first_strip = self._load_strip_dataset(
                 chunk,
                 mosaic_base,
+                time_window,
+                s1_orbit,
                 y_sub=plan.strips[0],
                 store_opener=store_opener,
                 mask_bundle=mask_bundle,
@@ -738,7 +859,9 @@ class InferenceActor:
             )
         return _ChunkPrologue(store_opener, mask_bundle, plan, x_sub, first_strip, rung=rung)
 
-    def _start_chunk_prefetch(self, chunk: ChunkSpec, mosaic_base: str) -> None:
+    def _start_chunk_prefetch(
+        self, chunk: ChunkSpec, mosaic_base: str, time_window: TimeWindow, s1_orbit: S1Orbit
+    ) -> None:
         """Kick off the next chunk's capped prefetch on the prefetch thread.
 
         Called from the strip loop at the top of the CURRENT chunk's last
@@ -758,7 +881,7 @@ class InferenceActor:
         if chunk.label in stash:
             return
         logger.info("xchunk prefetch: starting for %s", chunk.label)
-        stash[chunk.label] = pool.submit(self._load_prefetched_starter, chunk, mosaic_base)
+        stash[chunk.label] = pool.submit(self._load_prefetched_starter, chunk, mosaic_base, time_window, s1_orbit)
 
     def _take_prefetched(self, label: str) -> _ChunkPrologue | None:
         """Consume the stash for ``label``; evict stale entries.
@@ -905,6 +1028,8 @@ class InferenceActor:
         run_id: str,
         tracker: ray.actor.ActorHandle | None = None,
         prefetch_hint: ChunkSpec | None = None,
+        time_window: TimeWindow | None = None,
+        s1_orbit: S1Orbit | None = None,
     ) -> dict[str, Any]:
         """Process a single spatial chunk: load data, run inference, write output.
 
@@ -929,6 +1054,19 @@ class InferenceActor:
             prefetch_hint: The chunk the scheduler has reserved as this actor's
                 next assignment; its capped starter payload is prefetched
                 during this chunk's last strip (see ``_XCHUNK_*`` constants).
+            s1_orbit: This CELL's resolved orbit, overriding the actor's own config, for
+                the same reason as ``time_window``: a chained session's cells may resolve
+                different orbits because parts of the globe are radar-free in principle, and
+                an actor built for ``"both"`` would otherwise be unable to serve one. ``None``
+                uses the actor's own config. A ``"none"`` cell also opens the S2-only pixel
+                gate, since every one of its pixels has zero S1 observations.
+            time_window: This CELL's inference window, overriding the actor's own
+                config. Required for a chained session whose cells span campaign
+                years: an actor is built once with one config, so reading the
+                window from it would make every cell of a different year read the
+                wrong months — and the session's only mismatch check is on
+                ``s1_orbit``, so nothing would catch it. ``None`` uses the actor's
+                config, which is what the single-ROI path does.
 
         Returns:
             Result dict with chunk label, status, pixel count, and timing.
@@ -939,7 +1077,9 @@ class InferenceActor:
             else contextlib.nullcontext()
         )
         with cred_scope:
-            return self._process_chunk(chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint)
+            return self._process_chunk(
+                chunk, mosaic_base, staging_base, run_id, tracker, prefetch_hint, time_window, s1_orbit
+            )
 
     def _process_chunk(
         self,
@@ -949,20 +1089,36 @@ class InferenceActor:
         run_id: str,
         tracker: ray.actor.ActorHandle | None = None,
         prefetch_hint: ChunkSpec | None = None,
+        time_window: TimeWindow | None = None,
+        s1_orbit: S1Orbit | None = None,
     ) -> dict[str, Any]:
         """Run the load → inference → write pipeline for one chunk.
 
         Always invoked through :meth:`process_chunk`, which establishes the
         scoped icechunk credential provider this body's S3 opens depend on.
         """
+        # Resolve the cell's window ONCE, here, and pass the resolved value down. The
+        # three loader call sites (serial prologue, cross-chunk prefetch, strip loop)
+        # must receive identical kwargs for bit-identity, so the fallback must not be
+        # re-evaluated at each of them — one resolution, one value, no chance of drift.
+        window = time_window if time_window is not None else self.config.time_window
+        # Same rule, same reason: a chained session's cells may resolve DIFFERENT orbits,
+        # because parts of the globe are radar-free in principle. Resolved once here so the
+        # three loader call sites cannot disagree about which orbit a chunk was read under.
+        orbit = s1_orbit if s1_orbit is not None else self.config.s1_orbit
         from tessera_embeddings.inference.inference import run_inference
 
         t0 = time.monotonic()
         self._resource_monitor.set_context("work", f"{chunk.label}:prologue")
 
+        # Progress is tracked by the run-qualified uid, not the bare label: labels
+        # repeat across zones, and a shared multi-zone session (chained fill) can
+        # have two zones' same-labelled chunks in flight at once (see chunk_uid).
+        uid = chunk_uid(run_id, chunk.label)
+
         # Report loading phase so stall detection has visibility before batch 50
         if tracker:
-            tracker.report.remote(chunk.label, 0, 0, "loading")  # type: ignore[union-attr]
+            tracker.report.remote(uid, 0, 0, "loading")  # type: ignore[union-attr]
 
         try:
             # The prologue — repo handles, full-chunk SCL mask (which sizes the
@@ -970,7 +1126,7 @@ class InferenceActor:
             # loads serially here (GPU idle) unless the bounded cross-chunk
             # prefetch staged part of it during the PREVIOUS chunk's tail; see
             # _load_chunk_prologue and the _XCHUNK_* constants.
-            prologue = self._load_chunk_prologue(chunk, mosaic_base)
+            prologue = self._load_chunk_prologue(chunk, mosaic_base, window, orbit)
             store_opener = prologue.store_opener
             mask_bundle = prologue.mask_bundle
             plan = prologue.plan
@@ -985,6 +1141,19 @@ class InferenceActor:
             # Captured for the CHUNK_SUMMARY line — mask_bundle and prologue are
             # both deleted before the completion site.
             t_kept = int(mask_bundle.mask.shape[0])
+            # Radar sequence lengths, also for the CHUNK_SUMMARY line, and NOT redundant with
+            # ``t_kept``: that counts OPTICAL timesteps only, since it comes from the S2 SCL
+            # mask. So the token identity built on it (``t_kept x valid_px``) cannot see the two
+            # further sequences a radar-bearing chunk's forward pass encodes — and those are no
+            # rounding error. Measured pairs at equal optical depth put a chunk carrying one
+            # orbit at about 1.3x, and both orbits at about 2.0x, the per-chunk inference time of
+            # a radar-free one. Without these fields that gap is visible only by comparing whole
+            # runs; with them it is a within-run regression over every chunk.
+            #
+            # Zero is a real answer here rather than a missing one: for a radar-free cell it is
+            # every chunk, which is exactly what makes the comparison possible.
+            t_s1_asc = 0
+            t_s1_desc = 0
             rung = prologue.rung or "serial"
             prologue_s = time.monotonic() - t0
             logger.info(
@@ -1020,6 +1189,8 @@ class InferenceActor:
                 return self._load_strip_dataset(
                     chunk,
                     mosaic_base,
+                    window,
+                    orbit,
                     y_sub=y_sub,
                     store_opener=store_opener,
                     mask_bundle=bundle,
@@ -1028,7 +1199,7 @@ class InferenceActor:
                 )
 
             on_batch = (
-                (lambda b, t: tracker.report.remote(chunk.label, b, t, "inference"))  # type: ignore[union-attr]
+                (lambda b, t: tracker.report.remote(uid, b, t, "inference"))  # type: ignore[union-attr]
                 if tracker
                 else None
             )
@@ -1038,8 +1209,27 @@ class InferenceActor:
             obs_buffers: dict[str, np.ndarray] = {
                 var: np.zeros((chunk.height, chunk.width), dtype=np.uint16) for var in OBS_COUNT_VARS
             }
+            # Which months each pixel was seen in, accumulated per strip like the obs counts. Gates
+            # nothing — it is published so a reader can apply their own view of sufficiency without
+            # the imagery, which is deleted after the fill. Month axis first so a strip assigns as
+            # `[:, strip, :]`, matching how the mask bundle is sliced.
+            month_buffer = np.zeros((MONTHS_IN_YEAR, chunk.height, chunk.width), dtype=bool)
 
             total_valid = 0
+            # Refusals accumulate across STRIPS: one dataset is built per strip, so its counters
+            # describe a slice rather than the shard. Summed here because the per-shard record's
+            # invariant is that the parts reach the shard's eligible total, and a per-strip count
+            # would fail it by construction.
+            refused = {"thin": 0, "no_optical": 0, "no_radar": 0}
+            # WAS THE RADAR RULE IN FORCE? Recorded because otherwise `no_radar: 0` means two
+            # different things and the record cannot say which: no tile was refused for missing
+            # radar, or that rule was switched off. `allow_s2_only` defaults to FALSE in the
+            # library — refusing radar-free land is the default behaviour — and the global campaign
+            # registers True to embed it, so under campaign settings the count is zero by
+            # construction. A reader who took that for a measurement would conclude the campaign
+            # found radar everywhere. None until a strip has run, since the effective value includes
+            # the per-cell orbit downgrade and only the dataset knows it.
+            radar_rule_enforced: bool | None = None
             infer_s = 0.0  # summed wall-clock of the per-strip inference calls
             # Strip pipeline. When prefetch is on (dense/hideable), strip i+1
             # loads (and buckets) on the background thread while strip i runs
@@ -1075,7 +1265,7 @@ class InferenceActor:
                     # multi-strip load isn't misclassified as an inference stall
                     # by _poll_tracker. (Strip 0's "loading" was reported above.)
                     if tracker and i > 0:
-                        tracker.report.remote(chunk.label, 0, 0, "loading")  # type: ignore[union-attr]
+                        tracker.report.remote(uid, 0, 0, "loading")  # type: ignore[union-attr]
 
                     # Release the previous strip's input arrays BEFORE blocking
                     # on this strip's load and submitting the next prefetch. The
@@ -1122,19 +1312,30 @@ class InferenceActor:
                     # here — no room for the stash — so they take a serial
                     # prologue instead.
                     if i + 1 == len(strips) and prefetch_hint is not None and not plan.pair_budget:
-                        self._start_chunk_prefetch(prefetch_hint, mosaic_base)
+                        self._start_chunk_prefetch(prefetch_hint, mosaic_base, window, orbit)
+
+                    # The chunk's radar sequence lengths. Read here because every strip of a
+                    # chunk sees the same ones — SAR is read full-width regardless of the crop —
+                    # so any strip's value is the chunk's, and the last assignment wins. A
+                    # skipped orbit gets an EMPTY array rather than None (see
+                    # ``load_chunk``'s full-width placeholders), so a length is always defined.
+                    t_s1_asc = len(chunk_data.s1_asc_doys)
+                    t_s1_desc = len(chunk_data.s1_desc_doys)
 
                     if x_sub is None:
                         for var in OBS_COUNT_VARS:
                             arr = getattr(chunk_data, var)
                             if arr is not None:
                                 obs_buffers[var][strip] = arr
+                        if mask_bundle is not None:
+                            month_buffer[:, strip, :] = mask_bundle.month_covered[:, strip, :]
                     else:
                         # Cropped grid: the saved obs layers keep full-extent
                         # fidelity — S2 counts come from the (full-width) mask
                         # bundle, SAR counts from the full-width side channel
                         # (SAR is read full-width regardless; see load_chunk).
                         obs_buffers["s2_obs_count"][strip] = mask_bundle.obs_count[strip, :]
+                        month_buffer[:, strip, :] = mask_bundle.month_covered[:, strip, :]
                         for var, full in (
                             ("s1_asc_obs_count", chunk_data.s1_asc_obs_count_full),
                             ("s1_desc_obs_count", chunk_data.s1_desc_obs_count_full),
@@ -1148,6 +1349,13 @@ class InferenceActor:
                         # handling of fully-invalid chunks and the NaN convention
                         # for "no embedding here" (see #39). The strip still
                         # contributes its (zero) obs counts, already written above.
+                        # Its refusals still count: an empty strip is the case the record most
+                        # needs to explain, and skipping the tally here would make a fully refused
+                        # shard report zero refusals.
+                        refused["thin"] += dataset.refused_thin
+                        refused["no_optical"] += dataset.refused_no_optical
+                        refused["no_radar"] += dataset.refused_no_radar
+                        radar_rule_enforced = not dataset.allow_s2_only
                         logger.info("Chunk %s strip %s: no valid pixels, leaving zero-filled", chunk.label, strip)
                         continue
 
@@ -1161,6 +1369,10 @@ class InferenceActor:
                     embeddings[strip, cols] = result.embeddings
                     scales[strip, cols] = result.scales
                     total_valid += len(dataset)
+                    refused["thin"] += dataset.refused_thin
+                    refused["no_optical"] += dataset.refused_no_optical
+                    refused["no_radar"] += dataset.refused_no_radar
+                    radar_rule_enforced = not dataset.allow_s2_only
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
 
@@ -1179,8 +1391,65 @@ class InferenceActor:
                 # zero-byte skip marker so verify_staged_completeness can
                 # distinguish a legitimate skip from a silently-failed chunk
                 # (Ray worker crash, etc.).
-                logger.info("Chunk %s has no valid pixels, skipping (assembly will fill)", chunk.label)
-                writer.write_skip_marker(chunk, run_id)  # zero-byte marker: keep synchronous
+                # THE REASON, RECORDED. These three counts are summed over the chunk's strips just
+                # above and used to be discarded here, which made a thin-depth refusal
+                # indistinguishable from land that was never imaged — and left 43 of 40S's 58 live
+                # shards attributed to "optical skips" when every one was refused for having no
+                # radar. The cell is write-once and its mosaic is deleted when it lands, so a reason
+                # not written here is not recoverable.
+                #
+                # The observation summary rides along because the counts alone cannot say HOW thin:
+                # obs counts are accumulated per strip regardless of validity, so they are populated
+                # even on a chunk where nothing passed.
+                # THE FOOTPRINT THE REASONS ACTUALLY COVER, which is not the whole chunk when the
+                # read plan cropped it, and the depth behind them. The crop is passed as the slice
+                # itself so the record can restrict its own buffers to it. Shared with the success
+                # path so a refused shard and a partly-refused one are described in the same terms —
+                # see `_coverage_record`.
+                skip_record = {"label": chunk.label} | _coverage_record(
+                    chunk,
+                    refused=refused,
+                    radar_rule_enforced=radar_rule_enforced,
+                    obs_buffers=obs_buffers,
+                    x_sub=x_sub,
+                    optical_min_obs=self.config.optical_min_obs or OPTICAL_MIN_OBS,
+                )
+                logger.info(
+                    "Chunk %s has no valid pixels, skipping (assembly will fill) — refused %s",
+                    chunk.label,
+                    ", ".join(f"{k}={v}" for k, v in sorted(refused.items()) if v),
+                )
+                # COVERAGE FIRST, MARKER LAST, and the order is the atomicity: the marker's presence
+                # is what vouches for the coverage tile being complete, so a crash between them
+                # leaves a tile nothing points at rather than a marker promising data that is not
+                # there. Best-effort — losing the coverage degrades provenance, while losing the
+                # MARKER turns a benign skip into a failed chunk and wedges the cell on every retry
+                # under the stable run id. Same rule as the record inside the marker.
+                try:
+                    writer.write_coverage_only(chunk, run_id, obs_buffers, month_buffer)
+                except Exception:
+                    logger.exception(
+                        "Chunk %s: coverage-only tile could not be staged; its counts will publish as "
+                        "fill. The refusal reasons in the marker are unaffected.",
+                        chunk.label,
+                    )
+                    # AND REMOVE WHAT IT LEFT, which is the half of this that matters. A failure
+                    # AFTER `to_zarr` created the array metadata but BEFORE `staged_complete` was set
+                    # leaves a tile that reads back as fill and that `_open_staged_tile` refuses —
+                    # while the marker written just below makes every resume skip this chunk, so
+                    # nothing ever repairs it. Under the stable, input-fingerprinted run id that
+                    # refusal then repeats on every retry and wedges the cell until someone deletes
+                    # the prefix by hand. Swallowing the write and keeping its debris would have
+                    # turned a degraded provenance entry into a permanently failing cell.
+                    # Guarded at the CALL as well, even though `discard_coverage` is written not to
+                    # raise. Nothing on this path may stop the marker below being written: the marker
+                    # is what tells a legitimate skip from a crashed worker, and an exception here —
+                    # an older writer without the method, anything — would turn a benign skip into a
+                    # failed chunk and wedge the cell on every retry. Exactly the failure this whole
+                    # cleanup exists to prevent, so it must not reintroduce it one line up.
+                    with contextlib.suppress(Exception):
+                        writer.discard_coverage(chunk, run_id)
+                writer.write_skip_marker(chunk, run_id, skip_record)  # small marker: keep synchronous
                 # Collect the prior deferred write BEFORE snapshotting elapsed —
                 # the wait is actor-occupancy this chunk owns, same as the
                 # success path below (else the phase table under-reports it).
@@ -1190,6 +1459,7 @@ class InferenceActor:
                     "%s",
                     _chunk_summary_line(
                         label=chunk.label,
+                        run=run_id,
                         status="skipped",
                         valid_px=0,
                         total_s=round(elapsed, 1),
@@ -1224,6 +1494,50 @@ class InferenceActor:
             # write's outcome is confirmed (see class comment above).
             self._writer_pool_handle()
 
+            # Radar coverage for this chunk, from buffers already in memory — no extra read.
+            # `scales` is NaN-filled and written only where a pixel was embedded, so it IS
+            # the embedded mask; counting over the whole chunk instead would score every
+            # out-of-ROI pixel as radar-free and swamp the answer.
+            #
+            # Summed only over embedded pixels, so the intermediate is as small as the ROI
+            # rather than the chunk. Radar-free needs no sum at all — both counts zero.
+            embedded = ~np.isnan(scales)
+            asc, desc = obs_buffers["s1_asc_obs_count"], obs_buffers["s1_desc_obs_count"]
+            s1_free_px = int((embedded & (asc == 0) & (desc == 0)).sum())
+            obs_at_embedded = asc[embedded].astype(np.uint32) + desc[embedded].astype(np.uint32)
+            s1_thin_px = int(((obs_at_embedded > 0) & (obs_at_embedded < RADAR_THIN_MAX_OBS)).sum())
+            # Optical depth, from the same mask and the same principle. Previously only the
+            # EXTREME was visible: a tile where nothing survived the validity filter is recorded
+            # as a skip, so every depth above zero published as ordinary data even though a year
+            # seen a handful of times and one seen weekly are not the same embedding. No
+            # optical-free count is needed — that case IS the skip, and a skipped chunk never
+            # reaches here.
+            s2_at_embedded = obs_buffers["s2_obs_count"][embedded]
+            # The rule this RUN applied, not the module default. The dataset gates on
+            # `config.optical_min_obs`, which comes from the store root, so counting against
+            # the constant would report a thin share measured by a line the fill never used —
+            # and it would read as a non-zero count on a store whose rule already refuses
+            # every pixel it names.
+            thin_below = self.config.optical_min_obs or OPTICAL_MIN_OBS
+            s2_thin_px = int((s2_at_embedded < thin_below).sum())
+            del embedded, obs_at_embedded, s2_at_embedded
+
+            # THE SAME RECORD A WHOLLY-REFUSED SHARD WRITES, for a shard that embedded something.
+            # `refused` is accumulated over this shard's strips on BOTH paths, so a shard where the
+            # depth gate removed part of the land has always known how much — and used to discard it,
+            # because only the all-refused branch wrote a record. The registry then described such a
+            # shard as embedded with no refusals recorded, which reads as "covered" for ground that
+            # is partly holes. Those holes are exactly what a revisit campaign would fill, so this is
+            # the larger half of the infill work list, not a refinement of it.
+            coverage = _coverage_record(
+                chunk,
+                refused=refused,
+                radar_rule_enforced=radar_rule_enforced,
+                obs_buffers=obs_buffers,
+                x_sub=x_sub,
+                optical_min_obs=thin_below,
+            )
+
             def _timed_write() -> str:
                 # "write" is a separate context slot: the upload overlaps the
                 # NEXT chunk's prologue on the main thread, so both phases must
@@ -1238,6 +1552,7 @@ class InferenceActor:
                         embeddings_std=None,
                         scales=scales,
                         obs_counts=obs_buffers,
+                        month_covered=month_buffer,
                     )
                     # One line per chunk: how long the backgrounded upload took
                     # (the phase table's write_s is ~0 by design — this is the
@@ -1262,6 +1577,15 @@ class InferenceActor:
                 "%s",
                 _chunk_summary_line(
                     label=chunk.label,
+                    # The per-CELL run id (e.g. "49S-2021-f1fa65fc"). Without it this line
+                    # cannot be attributed to a zone at all: `label` is chunk_<row>_<col>,
+                    # grid-local, so every cell restarts at chunk_0_0 and labels collide both
+                    # across zones and across concurrent fills sharing a log group. Attributing
+                    # by time window instead produced two confidently wrong findings on
+                    # 2026-08-05, including a write-failure rework tax whose mechanism had not
+                    # fired at all. Additive, and observe_cluster reads keys via .get(), so no
+                    # consumer breaks.
+                    run=run_id,
                     # "success" = inference finished and outputs are staged for
                     # upload. write_confirmed=False flags that the deferred S3
                     # write is NOT yet durably confirmed (that happens a chunk
@@ -1281,6 +1605,10 @@ class InferenceActor:
                     strip_h=plan.strip_h,
                     strategy=plan.strategy,
                     t_kept=t_kept,
+                    # Optical depth alone does not say how much the forward pass did — see the
+                    # capture site. Additive keys, and every consumer reads by name.
+                    t_s1_asc=t_s1_asc,
+                    t_s1_desc=t_s1_desc,
                     rung=rung,
                     x_crop_w=(x_sub.stop - x_sub.start) if x_sub is not None else None,
                 ),
@@ -1290,6 +1618,18 @@ class InferenceActor:
                 "chunk": chunk.label,
                 "status": "success",
                 "valid_pixels": total_valid,
+                # Per-chunk radar coverage, aggregated per YEAR at assembly. Reported from
+                # here because this is the only place the observation maps and the embedded
+                # mask are both in memory; recomputing it later would mean reading the grid.
+                "s1_free_pixels": s1_free_px,
+                "s1_thin_pixels": s1_thin_px,
+                "s2_thin_pixels": s2_thin_px,
+                # The line the count was measured against, carried so the year record
+                # states the rule this fill applied rather than the module default.
+                "s2_thin_below_obs": thin_below,
+                # Per-shard refusal reasons and optical depth, for the published registry. Keyed
+                # under one name so assembly can merge it by label without knowing its contents.
+                "coverage": coverage,
                 "elapsed_sec": elapsed,
                 "instance_id": self.instance_id,
                 "write_deferred": True,
@@ -1303,7 +1643,13 @@ class InferenceActor:
             # fields can be unbound here); parsers key on status.
             logger.info(
                 "%s",
-                _chunk_summary_line(label=chunk.label, status="failed", total_s=round(elapsed, 1), error=str(e)[:200]),
+                _chunk_summary_line(
+                    label=chunk.label,
+                    run=run_id,
+                    status="failed",
+                    total_s=round(elapsed, 1),
+                    error=str(e)[:200],
+                ),
             )
             return {
                 "chunk": chunk.label,

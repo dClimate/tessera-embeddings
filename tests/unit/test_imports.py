@@ -20,6 +20,7 @@ def test_config_modules_import() -> None:
     from tessera_embeddings.config import (  # noqa: F401
         dask,
         environment,
+        fault_injection,
         inference,
         providers,
         satellites,
@@ -31,11 +32,13 @@ def test_ingest_modules_import() -> None:
     """Every ingest submodule imports."""
     from tessera_embeddings.ingest import (  # noqa: F401
         auth,
+        land_mask,
         opera_query,
         roi,
         roi_processing,
         s1_roi,
         s2_roi,
+        source_coverage,
         stac,
         transforms,
     )

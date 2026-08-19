@@ -5,11 +5,14 @@ and a quality band. They are shared by S2 and S1 ROI ingestion flows.
 """
 
 import logging
-from collections.abc import Set
+from collections.abc import Iterator, Sequence, Set
+from contextlib import contextmanager
+from typing import cast
 
 import dask.array as da
 import numpy as np
 import xarray as xr
+from tenacity import Retrying, before_sleep_log, stop_after_attempt, wait_exponential
 
 from tessera_embeddings.ingest.roi import read_roi_mask
 
@@ -18,6 +21,63 @@ logger = logging.getLogger(__name__)
 # Default minimum percentage of valid ROI pixels required to keep a date.
 DEFAULT_MIN_VALID_COVERAGE = 5.0
 
+#: Attempts for ONE date's source read.
+SOURCE_READ_ATTEMPTS = 3
+
+
+def source_read_retrying(log: logging.Logger | logging.LoggerAdapter[logging.Logger]) -> Retrying:
+    """Retry the source read for one date.
+
+    Writes have always retried; reads did not, and that asymmetry cost whole cells. A
+    transient failure reading a single granule propagates out of the per-date loop and
+    fails the entire zone-year, abandoning every month the run had already committed.
+
+    Scoped to ONE date deliberately. A retry at the task level would re-run the whole
+    multi-day loop, which is why the ingest task refuses ``@task(retries=...)``; this sits
+    inside the loop instead, so a retry re-reads only the date that failed.
+
+    Not narrowed by exception type. Reads fail through several unrelated surfaces —
+    rasterio, GDAL/CPL, botocore, plain socket timeouts — and enumerating them is how a new
+    transient class silently becomes fatal. A read is idempotent, so retrying one that
+    turns out to be permanent costs three attempts and a logged warning.
+    """
+    return Retrying(
+        stop=stop_after_attempt(SOURCE_READ_ATTEMPTS),
+        wait=wait_exponential(multiplier=1, min=2, max=15),
+        before_sleep=before_sleep_log(cast("logging.Logger", log), logging.WARNING),
+        reraise=True,
+    )
+
+
+@contextmanager
+def read_failure_context(
+    log: logging.Logger | logging.LoggerAdapter[logging.Logger], *, roi: str, date: str, items: Sequence[object] = ()
+) -> Iterator[None]:
+    """Name the ROI, the date and the granules on any failure raised inside.
+
+    Per-date telemetry is emitted *after* a date commits, so the last date in a log is the
+    last date that WORKED — a date that failed leaves no record of having been attempted,
+    and the furthest date reached reads as progress rather than as the failure point.
+
+    The ROI label matters as much as the date. The failure is raised on a Dask worker whose
+    message carries no zone, so at fleet width an error cannot be attributed to a cell at
+    all: the same error text appears for every zone running at once.
+
+    rasterio compounds both. It reports ``Read failed. See previous exception for details.``
+    and that previous exception is GDAL's, which is discarded unless the chain is logged —
+    ``log.exception`` is what preserves it, and without it the message names a detail the
+    reader has no way to reach.
+
+    Emitted only on failure, so it costs nothing on the success path and does not scale
+    with worker count the way a per-date INFO line does.
+    """
+    try:
+        yield
+    except Exception:
+        ids = ", ".join(str(getattr(i, "id", "?")) for i in items[:4]) or "none"
+        log.exception("READ FAILED roi=%s date=%s items=%d first=%s", roi, date, len(items), ids)
+        raise
+
 
 def apply_roi_mask(
     data: xr.Dataset,
@@ -25,11 +85,15 @@ def apply_roi_mask(
     spatial_chunks: dict[str, int],
     fill_value: int = 0,
     roi_mask: da.Array | None = None,
-) -> tuple[xr.Dataset, int]:
+) -> xr.Dataset:
     """Apply a binary ROI mask to all variables in a dataset.
 
     Reads the Zarr ROI store, and sets pixels outside the ROI to
     ``fill_value`` for every data variable.
+
+    Lazy by contract: builds the masking graph and returns. Both sensor paths call
+    this once per date over a full zone grid, so nothing here may compute eagerly.
+    Callers needing the ROI pixel total compute it themselves, once.
 
     Args:
         data: Dataset with (time, northing, easting) dimensions and an ``odc.geobox``.
@@ -37,20 +101,18 @@ def apply_roi_mask(
         spatial_chunks: Dict with ``"northing"`` and ``"easting"`` chunk sizes for the
             broadcast dask array (should match the dataset's load chunks).
         fill_value: Value to assign outside the ROI. Default 0.
-        roi_mask: Pre-computed boolean dask array (northing, easting), e.g. already
-            persisted on workers. When provided, avoids re-reading from
-            the Zarr store.
+        roi_mask: Pre-computed boolean dask array (northing, easting), already
+            persisted on workers or left lazy. When provided, avoids re-reading
+            from the Zarr store.
 
     Returns:
-        Tuple of (masked dataset, roi_pixel_count) where roi_pixel_count is
-        the number of True pixels in the mask.
+        The masked dataset.
     """
     mask_2d = roi_mask if roi_mask is not None else read_roi_mask(roi_zarr_path, spatial_chunks)
     mask_da = mask_2d[np.newaxis, :, :]
-    roi_pixel_count = int(mask_2d.sum().compute())
     for var in data.data_vars:
         data[var] = data[var].where(mask_da, other=fill_value)
-    return data, roi_pixel_count
+    return data
 
 
 def filter_low_coverage_dates(

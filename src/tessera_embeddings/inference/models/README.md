@@ -14,21 +14,28 @@ modify unless you are also retraining or have verified checkpoint compatibility.
 
 ## What not to touch
 
-- **`modules.py`**: `TransformerEncoder`, `TemporalPositionalEncoder`, `AttentionPooling`,
-  `TemporalAwarePooling`, `ProjectionHead` — these define the exact architecture the
-  checkpoint was trained with. Changing layer dimensions, activation functions, or the
-  forward pass will break checkpoint loading.
+- **`modules.py`**: `TransformerEncoder`, `TemporalPositionalEncoder`,
+  `TemporalEncoding`, `TemporalAwarePooling`, and the `CustomGRU` / `CustomGRUCell`
+  pair — these define the exact architecture the checkpoint was trained with. Changing
+  layer dimensions, activation functions, or the forward pass will break checkpoint
+  loading.
 
-- **`ssl_model.py`**: `MultimodalBTModel` (full model for checkpoint loading) and
-  `MultimodalBTInferenceModel` (stripped model for inference). The fusion method
-  (`concat` vs `sum`) and `dim_reducer` structure must match the checkpoint.
+- **`ssl_model.py`**: `MultimodalBTInferenceModel` (the inference model) and
+  `build_dim_reducer`. The fusion method (`concat` vs `sum`) and the `dim_reducer`
+  structure must match the checkpoint.
 
 ## What can be adjusted
 
-- **`builder.py`**: Checkpoint paths (`CHECKPOINT_FULL`, `CHECKPOINT_QAT`) can be
-  updated when new checkpoints are trained. The `load_checkpoint()` function handles
-  FSDP prefix stripping — if the checkpoint format changes, this may need updating.
+- **`builder.py`**: `load_checkpoint()` handles FSDP prefix stripping — if the
+  checkpoint format changes, this may need updating. `build_inference_model()` assembles
+  the model from an `InferenceConfig`.
 
-- **`InferenceConfig`** (in `../config.py`): Default architecture parameters must match
-  the checkpoint. If you train a new model with different hyperparameters, update the
-  defaults there.
+- **Checkpoint names** live in `config/inference.py`, not here:
+  `checkpoint_filename(norm_source)` maps a normalization source (`"aws"` / `"mpc"`) to
+  the bundled checkpoint's filename. A new checkpoint ships under a new name — which is
+  deliberate, because that filename is what the global store's model gate and the
+  campaign's staging fingerprint compare against.
+
+- **`InferenceConfig`** (in `config/inference.py`): default architecture parameters must
+  match the checkpoint. If you train a new model with different hyperparameters, update
+  the defaults there.

@@ -13,16 +13,18 @@ config/
 ├── paths.py                BucketPaths   ─── pydantic, deployment-supplied storage URIs
 ├── inference.py            InferenceConfig ── frozen dataclass: model, sampling, Ray-actor
 │                           TimeWindow      ── 12-month rolling window
-│                           INFERENCE_CHUNK_SIZE = 2000
+│                           INFERENCE_CHUNK_SIZE = 2048
 │                           EMBEDDING_DIM = 128
 │                           DEFAULT_NUM_OBS_CHECKPOINTS = tuple(range(8, 257, 8))
 │                           checkpoint_filename(norm_source="mpc"|"aws") → str
 ├── time_windows.py         parse_time_window(s)  ── "Month YYYY" → TimeWindow
-├── dask.py                 AssemblyConfig   ── frozen: chunks_per_worker scaling
-│                           compute_pipeline_cluster_sizing
+├── assembly.py             AssemblyConfig   ── frozen: worker-process pool sizing
+├── dask.py                 compute_pipeline_cluster_sizing ── ingest cluster caps
 ├── providers.py            STAC PROVIDERS registry: Earth Search, CMR-STAC, PC
 ├── satellites.py           Band lists, baseline thresholds, SCL classes
 └── environment.py          configure_gdal_environment() — call before rasterio import
+                            configure_logging() — package logger level + fallback handler;
+                            spawned worker processes call it at entry (they inherit none)
 ```
 
 ## The contract: caller-supplied URIs, never env-derived
@@ -148,20 +150,24 @@ The string form is the only public input — the underlying
 
 ## AssemblyConfig
 
-Frozen dataclass that encodes "how big a cluster do I need to
-assemble N ROI chunks?" — used by the master pipeline's
-auto-sizing logic and by `assemble_embeddings_task`.
+Frozen dataclass that encodes "how many worker *processes* does
+assembling N ROI chunks need?" — assembly runs as a local process
+pool driving raw-zarr fork/merge writes (no Dask cluster), sized by
+`assemble_embeddings_task` and the plain runner.
 
 ```python
 from tessera_embeddings import AssemblyConfig
 
-cfg = AssemblyConfig(chunks_per_worker=40, max_workers=200)
-n_workers = cfg.compute_n_workers(n_live_chunks=850)  # → 22
+cfg = AssemblyConfig()                                # chunks_per_worker=10, max_workers=16
+n_workers = cfg.compute_n_workers(25)                 # → 3
 ```
 
-Calibration: ~850 live chunks → 20 workers → 200 workers ceiling for
-dense ROIs. Override `chunks_per_worker` if your workload profile
-differs.
+The default cap of 16 keeps the pool around **~24 GB** — one staged-tile slice
+in flight per worker, ~1–1.5 GB at a 2048-px full-band tile — which fits inside
+the flow runner's 64 GiB and measured 20 GB peak in practice. Size a custom
+flow-runner container against 24 GB, not 12: assembly is where the peak is. Override `chunks_per_worker` if your workload
+profile differs; raise `max_workers` only with the RAM and S3 budgets
+in view.
 
 ## What's NOT pydantic
 
@@ -184,6 +190,6 @@ exactly which field was bad.
 ## Public API
 
 The pydantic models and helpers documented above are part of the
-public API surface (see [`docs/public-api.md`](public-api.md)). The
-internal helpers (e.g. `_chunkscaledClusterConfig` base class) are
-not — depend only on what's listed.
+public API surface (see [`docs/public-api.md`](public-api.md)).
+Anything underscore-prefixed is not — depend only on what is listed
+there.

@@ -39,7 +39,7 @@ Input stores (Icechunk/Zarr on S3):
   reflectance.zarr / sar_ascending.zarr / sar_descending.zarr
             │
             ▼
-  enumerate_chunks_from_dataset()     ← 2000×2000 px chunks
+  enumerate_chunks_from_dataset()     ← 2048 px tiles (== one output shard)
             │
             ▼
   filter_chunks_by_roi_mask()         ← drop chunks outside the ROI
@@ -63,17 +63,23 @@ Input stores (Icechunk/Zarr on S3):
   Staged chunks (S3 staging per run_id) — live chunks only
             │
             ▼
-  ┌────────────────────────────────────────┐
-  │  Dask Cluster (ECS Fargate, 20 workers)│
-  │  writer.assemble() → to_icechunk()     │
-  │  (non-live chunks filled with 0/NaN    │
-  │   directly in the Dask graph)          │
-  └────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────┐
+  │  Worker processes (on the flow runner)      │
+  │  writer.assemble(): fork/merge raw-zarr     │
+  │  writes into disjoint northing bands,       │
+  │  one data commit (no Dask, no task graph;   │
+  │  unstaged footprints stay at fill 0/NaN)    │
+  └─────────────────────────────────────────────┘
             │
             ▼
-  Output:  {roi_name}.zarr  (Icechunk, append on re-run)
+  Output:  {roi_name}.zarr  (Icechunk; time axis extends on re-run)
            embedding dims: (time, northing, easting, 128)
            obs count dims:  (time, northing, easting)  — s2/s1_asc/s1_desc
+
+  Global-campaign variant: writer.assemble_global() writes the same staged
+  tiles as whole 2048-px shards into a pre-seeded UTM zone group of the
+  global store (1 tile == 1 shard), driven by the zone-fill runner
+  (orchestration/runners/zone_fill.py). See ADR-008.
 ```
 
 ---
@@ -82,11 +88,26 @@ Input stores (Icechunk/Zarr on S3):
 
 ### 1. Chunk Enumeration and ROI Pre-Filter
 
-The input mosaic is divided into a grid of 2000×2000 pixel `ChunkSpec` objects (edge chunks may
-be smaller). 2000 px balances peak RAM during inference (~10 GB vs. ~37 GB at 3000 px) against
-scheduling overhead. This read-tile size is independent of the store's on-disk chunk size: the
-mosaic is written with larger 4000×4000 chunks at ingest (`INGEST_CHUNK_SIZE`), and `load_chunk`
-reads the 2000×2000 sub-tile out of them via `zarr.Array.oindex` with no alignment requirement.
+The input mosaic is divided into a grid of square `ChunkSpec` tiles (edge chunks may be
+smaller). **2048 px on both paths** (`INFERENCE_CHUNK_SIZE`, equal to `SHARD_PX`; the global
+campaign also passes it explicitly): ~2k px balances peak RAM during inference (~10 GB vs.
+~37 GB at 3000 px) against scheduling overhead, and one tile is exactly one output shard
+(ADR-008 D3), so assembly writes whole shards instead of read-modify-writing a partial
+chunk at every tile boundary.
+
+The whole chain divides evenly, so nothing rechunks between stages:
+
+```text
+  4096 px          2048 px            2048 px           256 px
+  ingest chunk  →  inference tile  →  output shard  →   inner chunk
+  (INGEST_       (INFERENCE_        (SHARD_PX)        (INNER_PX,
+   CHUNK_SIZE)    CHUNK_SIZE)                          full 128 band)
+    2×2 tiles      1 tile =                             8×8 per shard
+    per chunk      1 shard
+```
+
+`load_chunk` still reads its sub-tile via `zarr.Array.oindex` and imposes no alignment
+requirement of its own — the alignment is what makes each read cover whole objects.
 
 `filter_chunks_by_roi_mask` then drops any chunk whose footprint does not intersect the ROI
 zarr mask produced by `generate_roi`. Only the surviving **live chunks** are dispatched to
@@ -97,9 +118,9 @@ pre-filtering, only intersecting chunks reach the Ray cluster at all, and the cl
 auto-sized from the live-chunk count.
 
 Non-intersecting chunks have no staged Zarr on S3. Assembly re-runs the same ROI filter
-and fills their footprint with `0` (for `int8` embeddings / `uint16` obs counts) or `NaN`
-(for `float32` scales / std) as constant Dask tasks directly in the mosaic graph — no
-placeholder zarrs are written.
+and simply never writes their footprint, so it reads back as the store's fill value —
+`0` (for `int8` embeddings / `uint16` obs counts) or `NaN` (for `float32` scales / std).
+No placeholder zarrs, no placeholder chunk objects.
 
 ### 2. Ray Cluster Startup
 
@@ -175,8 +196,17 @@ directly from `root["time"]`. `data_loading.py` imports neither `xarray` nor `da
 
 S1 SAR: VV is read first to identify non-empty timesteps, then VH is loaded for survivors.
 Both ascending and descending stores are loaded when `s1_orbit="both"`;
-`resolve_s1_orbit(mosaic_base, s1_orbit)` probes for available stores and falls back
-gracefully when only one orbit was ingested.
+`resolve_s1_orbit(mosaic_base, s1_orbit, *, allow_none=True, get_credentials=None,
+s3_region=None)` probes for available stores and falls back gracefully when only one orbit was
+ingested, or to `"none"` when neither exists. Callers thread the same credential callback /
+region they use for the rest of the fill, so the probe doesn't drop to the default Icechunk
+credential chain in a callback-only deployment.
+
+`allow_none` defaults to True because parts of the globe are radar-free as a matter of
+geography. Pass the flows' `require_s1` to demand radar instead, on a single run over terrain
+known to be imaged. A resolved `"none"` makes `InferenceConfig` force `allow_s2_only`, since
+every pixel there has zero S1 observations and the default gate would otherwise skip all of
+them and complete having written nothing.
 
 Output: `ChunkData` — numpy arrays for S2 bands/masks/DOYs, S1 ascending/descending
 bands/DOYs, and per-pixel observation counts (`s2_obs_count`, `s1_asc_obs_count`,
@@ -186,8 +216,8 @@ bands/DOYs, and per-pixel observation counts (`s2_obs_count`, `s1_asc_obs_count`
 
 The SCL pre-filter above caps peak RAM for *typical* chunks, but it does not bound it: the
 resident S2 band array is `T_valid × H × W × 10 × 2` bytes, which scales with the timestep
-count. On dense ROIs `T_valid` can reach ~120, so a 2000×2000 chunk's `s2_bands` alone is
-~9.6 GB in a single `np.empty` — on the earlier 16 GB g5-class workers that OOMed the loader
+count. On dense ROIs `T_valid` can reach ~120, so a 2048×2048 chunk's `s2_bands` alone is
+~10 GB in a single `np.empty` — on the earlier 16 GB g5-class workers that OOMed the loader
 *before* inference runs, and even on today's 32 GB g6e.xlarge it must share the box with the
 SAR stack, output buffers, and model. `T` is not a free variable (v1.1 uses every valid
 observation), so the only lever is the spatial working set.
@@ -313,9 +343,17 @@ to roughly bbox-proportional cost.
 `MosaicChunkInferenceDataset` identifies pixels eligible for inference and groups them
 into `(s2_bin, s1_bin)` buckets for batched processing:
 
-1. **Valid pixel mask** — at least one non-zero S2 observation AND at least one non-zero
-   S1 observation. S1 floor of 1 prevents the sampler from crashing on all-zero SAR tiles
-   at orbit coverage edges (pixels with zero valid S1 would be OOD for the model anyway).
+1. **Valid pixel mask** — at least one non-zero S2 observation AND (by default) at least
+   one non-zero S1 observation. The S1 term is optional: with
+   `InferenceConfig.allow_s2_only=True` (flow param `allow_s2_only`, default off),
+   S2-valid pixels inside S1 coverage gaps (swath edges/holes) are embedded too, using
+   the upstream v1.1 missing-S1 convention — an all-zeros *normalized-space* S1 slice
+   in the smallest bucket, bit-identical to `ucam-eo/tessera`'s
+   `_sample_s1_merged` zero return (`resample_s1_bucket` already produces it; nothing
+   in the encoder requires ≥1 S1 observation). S1-informed pixels are unaffected by
+   the flag. Detect S2-only pixels downstream via finite `scales` +
+   `s1_asc_obs_count + s1_desc_obs_count == 0`. Quality of S2-only embeddings is
+   unvalidated against S1-informed ones — see ADR-013 before enabling in production.
 
 2. **Bin key assignment** — for each valid pixel, `compute_bin_keys` maps observation
    counts `(s2_obs_count, s1_obs_count)` to the nearest entry in `num_obs_checkpoints`
@@ -334,7 +372,9 @@ When every pixel in a live (ROI-intersecting) chunk fails the validity filter, t
 takes the `"skipped"` path. The actor writes a zero-byte `{chunk.label}.skipped` marker
 and returns. Assembly fills the footprint with constant-zero/NaN fill tasks. The marker
 distinguishes a legitimate skip from a silently-failed chunk; `verify_staged_completeness`
-requires every live chunk to have either a staged zarr or a skip marker.
+requires every live chunk to have either a **completed** staged zarr (see §5) or a skip
+marker. A chunk that staged on one attempt and skipped on a retry must not look like both,
+so `write_skip_marker` deletes the sibling zarr and its completion marker first.
 
 #### 4c. Temporal Sampling (`sampling.py`)
 
@@ -425,7 +465,7 @@ comes only from its own 128 channels), so `run_inference` quantizes each bucket'
 `quantize_rows` the moment they come off the GPU, accumulating directly into skinny int8 +
 scale buffers. It never materializes the full `(H, W, 128)` chunk in float32. This is
 numerically identical to quantizing the whole array at the end, but shrinks the resident
-accumulator ~4× (~2 GB → ~0.5 GB at `chunk_size=2000`) and removes the end-of-chunk
+accumulator ~4× (~2 GB → ~0.5 GB at `chunk_size=2048`) and removes the end-of-chunk
 whole-array quantize and its multi-GB float32 temporaries — lowering the per-chunk host-RAM
 plateau. `quantize_embeddings` remains as the `(H, W, D)` entry point and delegates to
 `quantize_rows`.
@@ -451,120 +491,269 @@ corruption.
 ### 5. Staged Chunk Writes (`assembly.py`)
 
 Each actor writes its chunk to S3 staging at `{staging_base}/{run_id}/{chunk_label}.zarr`
-using Blosc compression (fast for read-writes). Zarr sub-chunks are 500×500 px —
-smaller sub-chunks prevent multi-GB decompresses during assembly.
+as **raw, uncompressed** zarr (zero codec CPU on GPU-priced nodes). Staged sub-chunks are
+`256×256 × full band` (`INNER_PX`, int8) — exactly the final store's inner-chunk geometry,
+so a staged 2048-px tile *is* the 8×8 inner-chunk grid of the output region it becomes,
+and the band axis is never split (ADR-008 D2).
 
-Alongside embeddings, each staged chunk includes three **observation count** layers
-(`s2_obs_count`, `s1_asc_obs_count`, `s1_desc_obs_count`) — uint16 (H, W) arrays recording
-how many valid timesteps contributed to each pixel. These are carried through assembly into the
-final store as 2D spatial variables (dims: `time, northing, easting`).
+Alongside embeddings, each staged chunk includes float32 `scales` and the per-pixel
+provenance layers: three **observation count** arrays (`s2_obs_count`, `s1_asc_obs_count`,
+`s1_desc_obs_count`) — uint16 (H, W), how many valid timesteps contributed to each pixel —
+and `s2_month_covered`, twelve booleans per pixel recording *which* calendar months those
+optical observations fell in (dims `time, northing, easting, month`; the month axis is never
+split, like the band axis).
 
-### 6. Dask Assembly
+**Which of these assembly copies into the destination is derived from the store layout, not
+written out.** `store_layout.REQUIRED_VARS` is what every staged tile must carry and every
+destination must hold; `store_layout.CARRIED_VARS` is everything else, computed from the
+layout's own array set. Assembly keeps whichever of them are present in *both* the staged tile
+and the destination, so a store predating an array, or a run that stages nothing for one,
+needs no special case. Adding an array to the layout is therefore sufficient to have it
+carried — which was not true while the copy set was a hand-written tuple, and cost one
+published zone-year of empty `s2_month_covered` planes.
 
-After all live chunks complete, a Dask cluster (20-500 workers × 4 GB RAM) reads staged
-chunks and assembles them into the final Icechunk store.
+A 4-D variable's trailing extent comes from `store_layout.trailing_extent`, per variable:
+`band` is as wide as the embedding, `month` is twelve. There is deliberately no "4-D means
+bands" rule, because there are now two different 4-D trailing axes.
 
-#### Three-layer chunk anatomy
+#### Completion markers: how a resume tells finished from interrupted
 
-The assembly design deliberately uses three different chunk granularities for three
-independent concerns. Understanding this is key to understanding why the code is shaped
-as it is:
-
-```text
-Layer                   Size              Controls
-──────────────────────────────────────────────────────────────────────
-Dask logical block      2000×2000 px      Scheduler task count (RAM)
-Staged zarr sub-chunk     500×500 px      Per-task read + decode RAM
-Final store sub-chunk     500×500×4       Downstream partial-read cost
-
-                         ┌──────────────────────────┐
-  One Dask task ──────►  │  ChunkSpec  2000×2000 px  │
-  (one entry in the      │  ┌────┬────┬────┬────┐   │
-   scheduler's task      │  │500 │500 │500 │500 │   │
-   graph)                │  ├────┼────┼────┼────┤   │
-                         │  │    │    │    │    │   │
-                         │  ├────┼────┼────┼────┤   │
-                         │  │    │    │    │    │   │
-                         │  ├────┼────┼────┼────┤   │
-                         │  │    │    │    │    │   │
-                         │  └────┴────┴────┴────┘   │
-                         │  16 on-disk sub-chunks    │
-                         └──────────────────────────┘
-                           to_icechunk handles the
-                           fan-out via align_chunks=True
-```
-
-At sub-chunk granularity (millions of tasks), the scheduler's per-task `TaskState` overhead
-(~1.5 KB each — see [`ingest/README.md`](../ingest/README.md#background-how-dask-task-graphs-consume-scheduler-ram))
-exhausted the scheduler's 8 GB RAM during graph expansion before any worker started. At
-ChunkSpec granularity (a few thousand tasks at cornbelt scale), graph planning takes
-seconds.
-
-The mechanism that makes this possible is `align_chunks=True` in the `to_icechunk` call.
-Without it, on-disk sub-chunk size and Dask block size would be forced to match:
+A staged `.zarr` is **many objects** (group and array metadata plus one per data chunk)
+written with no atomic multi-object commit. So a crash mid-upload leaves a `.zarr` with
+valid metadata but missing data chunks — and Zarr reads those back as **fill values, not an
+error**. Presence of the directory therefore proves nothing, which is why completeness is
+recorded as its own signal, *after* the store is fully written:
 
 ```text
-Without align_chunks=True (forced coupling):
-  To write 500×500 on-disk chunks, Dask blocks must also be 500×500.
-  A 2000×2000 ChunkSpec becomes 16 Dask blocks → 16 TaskStates.
+  write_chunk:  rm <label>.done                   retract the old marker FIRST
+                    ↓
+                ds.to_zarr(…, mode="w")           many objects, no atomic commit
+                    ↓
+                staged_complete = True            in-store attribute
+                    ↓
+                <label>.done  (zero bytes)        sibling object, written LAST
 
-  At cornbelt scale: 5,000 ChunkSpecs × 16 sub-chunks × 2 layers
-                   = 160,000 TaskStates — manageable, but grows fast.
-  Add more variables, time steps, or larger ROIs and this explodes.
-
-With align_chunks=True:
-  Dask block = 2000×2000 ChunkSpec → 1 TaskState per variable per ChunkSpec.
-  Worker reads the full 2000×2000 array and writes it in one call.
-  zarr/icechunk splits the write into 500×500 on-disk sub-chunks internally.
-
-  Scheduler graph:  1 TaskState per ChunkSpec  (graph stays small)
-  On-disk layout:  16 sub-chunks per ChunkSpec (reads stay fast)
-  These two numbers are now independent — each can be tuned separately.
+  INVARIANT:  .done  ⟹  attribute  ⟹  to_zarr returned
 ```
+
+The marker is retracted before the rewrite, not after: `to_zarr` replaces a tile in place,
+so a marker left over from an earlier write would keep vouching for the tile throughout,
+and a listing taken in that window would call a half-replaced tile complete.
+
+**The gate is the listing.** The sibling `.done` is what a prefix LIST can see, so one
+listing of a run classifies every tile without opening any of them — that is what keeps
+verification and resume cheap at zone scale (~361k live tiles across 112 zones).
+`_list_staged` derives the three-way split from that one listing, and it is the only place
+the split is made, so verification and resume can never disagree:
+
+| state | listing shows | meaning | what happens |
+|---|---|---|---|
+| **complete** | `.zarr` + `.done` | the write finished | validate shape/dtype, then skip |
+| **interrupted** | one of the pair only | a crash caught it part-way | re-infer (`mode="w"` overwrites; no cleanup needed) |
+| **skipped** | `.skipped` | no valid pixels at all | skip, and report as a skip, not a success |
+
+Interrupted tiles are excluded from the resume set rather than raising — under the stable,
+input-fingerprinted `run_id` a raise would re-fire on the same artifact every retry and
+wedge the cell until someone deleted it by hand. `verify_staged_completeness` does raise if
+one survives to assembly, and names it as *interrupted* rather than *missing*: the resume
+scan re-infers interrupted tiles, so one reaching assembly means either inference never ran
+(an assembly-only run) or it crashed the same way twice, and the remedy differs from a
+chunk that was never attempted.
+
+Both paths get this from the same code. `run_inference` runs the resume scan for the
+single-ROI and global zone-fill paths alike. `assemble` verifies its own live set rather
+than trusting its caller, since it derives that set from the ROI mask and is called
+directly on an assembly-only re-run; `assemble_global` is handed a pre-verified label set
+by the zone-fill runner, which owns the expected tile list.
+
+**The in-store attribute is the backstop, and it covers one case the listing cannot.** A
+listing is taken once, in the driver; tiles are read minutes to hours later, in worker
+processes. A tile *rewritten* in that window is reported by the listing as the listing last
+saw it — and because the `run_id` is derived from the inputs, two attempts at one zone-year
+share a staging prefix, so that window is reachable. Only the attribute, absent until a
+write finishes, describes the tile as it is now. Every reader goes through one shared
+opener (`_open_staged_tile`) rather than repeating the check, so this is a single place in
+the code, not a second gate to maintain.
+
+(All of this guards the *staging* layer; the final store is Icechunk, whose transactional
+commit already rolls back cleanly on a crash *during* assembly.)
+
+### 6. Raw-Zarr Assembly (fork/merge, no Dask)
+
+After all live chunks complete, `writer.assemble` writes the staged tiles straight into
+the final Icechunk store with plain zarr assignments — a pool of worker processes on the
+flow runner, each holding a pickled **fork** of one icechunk session, merged and committed
+once by the coordinator. No task graph is ever built over the store, so assembly cost
+scales with the *live* pixels, not the grid, and the scheduler-RAM ceiling that shaped the
+old Dask engine is gone.
+
+The output geometry comes from a `StoreLayout` preset (`config/store_layout.py`) — the
+same source of truth the global store's seeder uses — not from the staged files:
+
+```text
+Preset            embeddings                       scales / obs / std
+──────────────────────────────────────────────────────────────────────────
+SINGLE + GLOBAL   (1, 256, 256, 128) int8+zstd     (1, 256, 256) PCodec/zstd
+(one geometry)    in (1, 2048, 2048, 128) shards   in (1, 2048, 2048) shards
+```
+
+Both presets describe the same geometry and are built from one definition; the names
+survive because a caller picks one explicitly and the choice is recorded in the store's
+creating commit.
+
+#### Write-conflict discipline: northing bands
+
+Two forks writing the same output object would conflict at merge, so workers partition the
+mosaic into **northing bands aligned to the output's write granularity** (shard height when
+sharded, chunk height otherwise) — bands are disjoint and span the full easting extent, so
+no two forks ever touch the same object. Because the tile size equals the shard pitch, band
+boundaries fall on tile edges and each tile is read by exactly one fork. Band boundaries are
+**work-weighted** (live tiles per
+granularity unit), not equal-height: an ROI mask clusters live tiles spatially, and
+equal-height bands would leave most workers idle while one dragged the assembly:
+
+```text
+                    easting ─────────────────►
+            ┌tile 0───────┬tile 1───────┬tile 2──┐
+  worker 0  │             │             │        │  band [0, 1000)     ── fork 0
+            │ ┈┈┈┈┈┈┈┈┈┈┈ band boundary ┈┈┈┈┈┈┈┈ │  (multiple of 500)
+  worker 1  │             │             │        │  band [1000, 2048+…)── fork 1
+            └─────────────┴─────────────┴────────┘
+             a tile straddling a boundary is read
+             twice, once per band, as a y-slice —
+             each worker streams ONE tile-slice at
+             a time (≤ ~0.5 GB int8)
+
+  coordinator:  session.fork() ──► workers write bands ──► merge(*forks)
+                └── one data commit via commit_with_rebase ──┘
+
+  atomic publish:  branch _assemble-wip ──► phases 1–3 commit here ──► fast-forward main
+                   └── main only advances once the timestep's data is fully written ──┘
+```
+
+Within a band, tile x-boundaries still cut output chunks mid-chunk; those partial chunks
+are read-modify-written *sequentially inside one fork* — icechunk sessions are
+read-your-writes, so the merged result is exact.
 
 #### Assembly steps
 
 1. Re-run `filter_chunks_by_roi_mask` to recover the set of live chunk labels (the list
-   isn't marshaled through Prefect; the ROI zarr path is the source of truth).
-2. Build a lazy Dask mosaic as two unmaterialized `Blockwise` layers, at **ChunkSpec
-   granularity** — one dask block per ChunkSpec (full spatial extent × full band axis):
-    - a `da.full` template of the right shape filled with the fill value (0 for int8
-      embeddings, NaN for floats);
-    - a `map_blocks(_assemble_var_block, live_lookup=…)` on top that, per block, consults
-      a `(row, col) -> staged_path` dict and either reads the entire staged chunk or
-      returns the fill template unchanged.
-3. Output zarr sub-chunking (500×500×4) is set via `to_icechunk(..., encoding=...)` and
-   read from the staged files' on-disk chunk shape. `align_chunks=True` lets
-   `to_icechunk` fan a single dask block out into 512 small on-disk zarr chunks — dask
-   graph stays small, final store layout stays suitable for downstream partial reads.
-4. Write via `xr.Dataset.to_icechunk()` — float32 embeddings use PCodec compression; int8
-   quantized embeddings use default compression. Appends to existing store if present.
-5. Delete _all versions_ of the staged chunk zarrs (unless `dev` flag is passed).
+   isn't marshaled through Prefect; the ROI zarr path is the source of truth), minus
+   skip-marked chunks.
+2. **Phase 1 (schema / time-axis placement)** — all phases run on a private `_assemble-wip`
+   branch, never on `main` directly (see *atomic publish* below). Fresh store: create the
+   layout's array schemas + coord arrays (no chunk data; cost independent of extent).
+   Existing store: validate the `_manifest`, then either resize every time-dimmed array by
+   one step (an append IS a resize + write at the new index) or, when the time value already
+   exists, target its index for an in-place overwrite — **idempotent resume**: a crashed
+   assembly re-run lands on the same index instead of appending a duplicate timestep. On an
+   overwrite, any time-dimmed array this run does NOT write (e.g. `embedding_std` when std
+   is now off, or the other S1 orbit's obs count) is reset to fill at that index, so no
+   stale slice describes the overwritten data.
+3. **Phase 2 (data)** — fork the session; each worker process writes its band's staged-tile
+   y-slices into every output array; the coordinator merges the forks, sets root attrs (run
+   metadata, GeoZarr conventions, `_manifest`, merged `time_windows`), and commits once via
+   `commit_with_rebase`.
+4. **Atomic publish** — fast-forward `main` to the fully-written work-branch tip (guarded by
+   `from_snapshot_id`, so a concurrent writer to the same store fails loudly), then drop the
+   work branch. `main` never observes the half-written state: committing Phase 1 to `main`
+   directly would advertise a resized array + new time coordinate (or, for a fresh store, an
+   empty schema) before any worker writes, so a crash in Phase 2/3 would leave `main` serving
+   an all-fill timestep.
+5. Delete the staged chunk zarrs (unless `cleanup_staging=False`).
 
-**Manifest splitting.** The whole `writer.assemble` call is wrapped in
-`manifest_split({"northing": 32, "easting": 32})` (see `tasks/inference.py`). By default
-icechunk keeps one manifest object per array, so every commit rewrites the entire chunk
-index — O(store size) regardless of how few chunks changed. Splitting tiles the manifest
-into 32-chunk-per-axis shards; with 500×500 px on-disk sub-chunks that's ~16k px/shard,
-matching `zarr_store.DEFAULT_MANIFEST_SPLIT_SIZES`' target. No `time` split is applied:
-assembly only ever writes a single timestep, so one time shard equals the whole array and
-splitting time would be a no-op. The split config is persisted via `repo.save_config()` so
-it survives the session being shipped to Dask workers.
+The **global-campaign variant**, `writer.assemble_global`, skips the banding entirely:
+one staged 2048-px tile is exactly one output shard (D3), so whole tiles round-robin
+across workers via `storage.shard_writer.write_year_shards` — every shard object is
+emitted once, lean (all-fill inner chunks elided: fully-masked tiles cost nothing and
+no-valid-observation inner chunks vanish; note water pixels ARE SCL-valid, so coastal
+tiles embed their ocean pixels — the mask selects tiles, not pixels), with
+`years_complete` and per-year run provenance advanced in the same single commit. The
+zone-fill runner (`orchestration/runners/zone_fill.py`) drives it: coverage mask →
+inference → `assemble_global` → `campaign.tag_zone_year`.
+
+#### Assembly telemetry: the `ASSEMBLY_SUMMARY` record
+
+Both `assemble` and `assemble_global` emit **one machine-readable log line per assembly**
+— `ASSEMBLY_SUMMARY: {json}`, the assembly-phase counterpart of the actors'
+`CHUNK_SUMMARY` — so a slow assembly can be attributed to staged reads, to compression,
+or to the object store without re-running it. Each fork worker times its loop into two
+phases (`read` = staged-tile fetches, `write` = the raw-zarr region assignments) on two
+clocks: wall time says how long a phase held the worker, process CPU time says how much
+of that was computation, and the difference is time blocked on the store. That CPU/wall
+split is the honest boundary between compression and upload: the two are **fused inside
+the zarr→icechunk write call** (the codec encodes and the store uploads within one
+assignment the worker cannot see into), so there is no separate compress or upload timer
+— `write_cpu_s` bounds the encode cost, `write_s − write_cpu_s` is store wait, and the
+record says so in-band via `fused_compress_put`. The record also carries the per-worker
+stats (band order / partition order), requested-vs-effective worker counts, the per-fork
+S3 request cap in force, and object/byte counts, so throughput rates derive from the
+record alone. Field-by-field meaning lives on `assembly._assembly_summary_line`; keep the
+keys stable or update the parsers in the same change.
+
+The **campaign land mask** is not a pixel ROI but a per-zone *coverage bitmap*
+(`tile_live_2048`) built from the partner's delivery registry by
+`ingest/land_mask.py` and the `build-land-mask-coverage` flow (ADR-010). v1.1 tiles are
+all-1s with a ~1-cell sea buffer, so the registry listing *is* the mask: a 2048-px tile
+is live iff a land cell's footprint intersects it. The runner reads one small bitmap
+(one GET) and selects live tiles by direct index — 1 tile == 1 shard == 1 coverage tile
+(D3) — rather than the per-chunk windowed reads `filter_chunks_by_roi_mask` does for the
+single-ROI flows.
+
+#### Write units vs read units, per layout
+
+The write path and the read path deliberately touch different granularities —
+what a writer emits in one go is much larger than what a reader must fetch:
+
+```text
+                  SINGLE (single-ROI)             GLOBAL (zone group)
+─────────────────────────────────────────────────────────────────────────────
+S3 object       = one 500×500×4 chunk (~a few   = one 2048² shard (≤ ~0.5 GB:
+                  hundred KB)                     8×8 inner chunks + index)
+
+writer emits    band worker streams tile        shard worker emits whole
+                y-slices; partial edge chunks    shard objects, exactly once
+                read-modify-write in-fork        (never read-modify-write)
+
+reader fetches  whole chunk objects under       shard index (one small GET),
+                the window (~KBs per point,      then ranged-GETs of only the
+                ×32 band chunks for full         overlapped inner chunks
+                depth)                           (~8.4 MB per point, full band)
+
+commit rewrites manifest tiles the write        that year's manifests only
+                touched (32-chunk 2D split)      (time@1 split)
+```
+
+The commit row is the manifest-splitting story: an Icechunk manifest maps
+chunks → objects, one per array by default, so unsplit commits are O(store).
+See the README's "Manifest splitting" diagram for the visual.
+
+**S3 concurrency.** The coordinator opens the repo with `max_concurrent_requests =
+TARGET_AGGREGATE_S3_CONCURRENCY // n_workers`; forks inherit it through pickling (no
+`save_config` round-trip needed), so fleet-wide PUT concurrency stays under S3's
+per-prefix ceiling regardless of worker count.
+
+**Manifest splitting.** `assemble` opens the repo under `manifest_split({"time": 1})`. By
+default icechunk keeps one manifest object per array, so every commit rewrites the entire
+chunk index — O(store size) regardless of how few chunks changed. One manifest shard per
+timestep means a one-timestep write rewrites no prior timestep's manifests. Time-only,
+because the rule is to split the axis a single commit is **narrow** along: an assemble
+writes one timestep across the full spatial extent, so a spatial split would only shard the
+axis being rewritten in full. The global store bakes the same `time@1` split into its repo
+config at seeding (`global_store_config`).
 
 The split applies to both new and pre-existing stores. A store created before this change
-has a single unsplit manifest; the first append under the `manifest_split` block re-shards
+has a single unsplit manifest; the first write under the `manifest_split` block re-shards
 the touched array in that commit (a one-time migration — old chunk data is untouched and
-reads back unchanged), and every commit after it rewrites only the shards it touches. So
-existing stores pick up the same bounded-commit speedup on their next assembly run, with no
-manual migration step.
+reads back unchanged), and every commit after it rewrites only the shards it touches.
 
-**Why PCodec for the final store:** Embeddings are 128-dim float32 vectors — dense, continuous,
-and without the spatial redundancy that makes byte-shuffle + zstd effective for reflectance
-data. PCodec is a floating-point-aware codec that models the distribution of float values
-directly, achieving significantly better compression ratios on this kind of data than
-general-purpose codecs. The tradeoff is that PCodec decompresses the entire on-disk chunk
-to read any slice of it (no partial decode), which is why staged chunks use 500×500
-sub-chunks to cap decode buffer size.
+**Codecs in the final store:** quantized int8 embeddings use the zarr default
+(bytes + zstd). The float32 `scales` (and `embedding_std`, when computed) use **PCodec**,
+a floating-point-aware serializer that models the distribution of float values directly
+and beats general-purpose codecs on this kind of data. The tradeoff is that PCodec
+decompresses the entire on-disk chunk to read any slice of it (no partial decode), which
+is why the inner chunks stay small (256 px). PCodec composes with the sharding codec
+(verified: round-trip + fill on partial shards).
 
 **Reading the output store.** On a CONUS-scale store, open with `chunks=None` for
 interactive or selective reads:
@@ -854,7 +1043,7 @@ New code (not ported):
 | `data_loading.py` | Icechunk/Zarr loader with 3-phase selective S2 timestep loading |
 | `dataset.py` | Valid-pixel filtering and lazy per-batch indexing |
 | `quantization.py` | Int8 quantization with per-pixel scale factors and dequantization |
-| `assembly.py` | Staged Zarr writes + Dask-based parallel assembly into Icechunk |
+| `assembly.py` | Staged Zarr writes + raw-zarr fork/merge assembly into Icechunk (single-ROI + global modes) |
 | `actors.py` | Ray actor wrapping the full per-chunk pipeline |
 | `scheduling.py` | Work-stealing scheduler (`_process_chunks_work_stealing`) and `ActorPool` — manages dispatch, actor replacement, idle retirement, and tracker polling |
 | `progress.py` | Lightweight Ray actor (`num_cpus=0`) polled by the flow runner every 60s for batch-level progress and 5-minute stall detection |
@@ -863,16 +1052,40 @@ New code (not ported):
 
 ## Accessing the Dask Dashboard
 
-The Dask assembly cluster runs in a private subnet (ECS Fargate). Use SSM port forwarding to reach the Bokeh dashboard:
+Assembly no longer uses Dask — only the *ingest* Dask cluster remains, in a private subnet
+(ECS Fargate). Use SSM port forwarding to reach its Bokeh dashboard:
 
 ```bash
 # Look up TASK_ID and RUNTIME_ID for the Dask scheduler task in the ECS console
 aws ssm start-session \
   --target ecs:yield-cluster_${TASK_ID}_${RUNTIME_ID} \
-  --document-name AWS-StartPortForwardingSessionToRemoteHost \
-  --parameters '{"host":["localhost"],"portNumber":["8787"],"localPortNumber":["8787"]}'
+  --document-name AWS-StartPortForwardingSession \
+  --region <aws-region> \
+  --parameters '{"portNumber":["8787"],"localPortNumber":["8787"]}'
 ```
 
 Then open http://localhost:8787 in your browser.
 
-Requires the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (`brew install session-manager-plugin`).
+## Accessing the Ray Dashboard
+
+Inference runs a Ray cluster whose head node is an EC2 instance in a private subnet.
+`_log_ray_dashboard_ssm_command` (in `providers/aws/ray.py`) logs a ready-to-paste command
+once the head is up, with the instance ID and region already filled in:
+
+```bash
+# INSTANCE_ID is the head node — tagged ray-node-type=head
+aws ssm start-session \
+  --target ${INSTANCE_ID} \
+  --document-name AWS-StartPortForwardingSession \
+  --region <aws-region> \
+  --parameters '{"portNumber":["8265"],"localPortNumber":["8265"]}'
+```
+
+Then open http://localhost:8265 in your browser.
+
+Both tunnels use `AWS-StartPortForwardingSession`, which forwards a port on the target
+itself. The `AWS-StartPortForwardingSessionToRemoteHost` variant is for hosts reachable
+*from* the target (RDS, an internal ALB); current SSM agents refuse loopback destinations
+for it and fail with `Forwarding to IP address localhost is forbidden`.
+
+Both require the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) (`brew install session-manager-plugin`).

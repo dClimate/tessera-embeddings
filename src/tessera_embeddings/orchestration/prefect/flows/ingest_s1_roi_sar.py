@@ -16,9 +16,14 @@ from collections.abc import Callable
 from typing import Any
 
 from prefect import flow, get_run_logger
+from prefect.runtime import flow_run as flow_run_ctx
 
 from tessera_embeddings.ingest.auth import get_s3_credentials, set_s3_credentials
 from tessera_embeddings.ingest.s1_roi import S1Orbit
+from tessera_embeddings.orchestration.prefect.flows._dask_lifecycle import (
+    dask_cleanup_on_cancellation,
+    dask_resource_tags,
+)
 from tessera_embeddings.orchestration.prefect.flows._dask_runner import get_task_runner_for_cluster
 from tessera_embeddings.orchestration.prefect.tasks.ingest import process_roi_sar
 
@@ -36,6 +41,10 @@ def _ingest_s1_roi_impl(
     apply_credentials_fn: Callable[[dict[str, str]], None] | None,
     use_s3_direct: bool,
     storage_options: dict | None,
+    overlap_window_writes: bool,
+    pipeline_batches: bool,
+    narrow_windows_per_date: bool,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Inner flow: submits the S1 ingestion task to the configured Dask runner."""
     future = process_roi_sar.submit(
@@ -49,6 +58,10 @@ def _ingest_s1_roi_impl(
         apply_credentials_fn=apply_credentials_fn,
         use_s3_direct=use_s3_direct,
         storage_options=storage_options,
+        overlap_window_writes=overlap_window_writes,
+        pipeline_batches=pipeline_batches,
+        narrow_windows_per_date=narrow_windows_per_date,
+        s3_region=s3_region,
     )
     return future.result()
 
@@ -70,7 +83,14 @@ def _default_edl_env() -> dict[str, str]:
     }
 
 
-@flow(name="ingest_s1_roi_sar")
+@flow(
+    name="ingest_s1_roi_sar",
+    # Both lists hold the SAME function: a crashed run leaks exactly like a
+    # cancelled one. Keep the hook IDEMPOTENT — cancelling a parent and its child
+    # together delivers the transition twice and runs it twice (2026-07-25).
+    on_cancellation=[dask_cleanup_on_cancellation],
+    on_crashed=[dask_cleanup_on_cancellation],
+)
 def ingest_s1_roi_sar(
     *,
     roi_zarr_path: str,
@@ -84,6 +104,11 @@ def ingest_s1_roi_sar(
     use_s3_direct: bool = True,
     use_local: bool = False,
     storage_options: dict | None = None,
+    perf_report_uri: str | None = None,
+    overlap_window_writes: bool = True,
+    pipeline_batches: bool = True,
+    narrow_windows_per_date: bool = True,
+    s3_region: str | None = None,
 ) -> dict[str, Any]:
     """Ingest OPERA RTC-S1 SAR for an ROI using Dask workers.
 
@@ -108,6 +133,30 @@ def ingest_s1_roi_sar(
         use_local: Use the local Dask provider for testing.
         storage_options: fsspec storage options forwarded to the
             domain function.
+        perf_report_uri: Optional fsspec URI; when set, a Dask
+            performance-report HTML for this run is captured and
+            uploaded there (probe-rung profiling; default off).
+            Ignored on the ``use_local`` path, which warns.
+        overlap_window_writes: Submit a date's windows as ONE dask compute rather
+            than one blocking compute per window, so they share the fleet instead of
+            each waiting its turn. Produces an identical store either way. **Defaults
+            ON.** Also selects the window merge exchange rate, which prices a boundary
+            by how it is written, so the two cannot drift apart.
+        narrow_windows_per_date: Write only the live windows a date's own imagery reaches,
+            as the S2 path does. **Defaults ON**: six times fewer windows per date in both
+            zones measured, worth 7-20% of per-date wall clock. Dates reaching NO live window
+            are skipped unconditionally, independent of this flag.
+        pipeline_batches: Prepare the NEXT batch's catalogue query while the current
+            batch writes, so only the first batch pays its query on the critical path.
+            **Defaults ON.** Look-ahead is one batch and not configurable: a batch's
+            write is one long consume, so depth 1 covers it, and deeper retention is
+            what once deadlocked the S2 driver. Set False for a strictly serial
+            query-then-write loop.
+
+        s3_region: S3 region for the mosaic Icechunk store. ``None`` uses the
+            storage layer's default (us-west-2); set it when the input bucket
+            lives elsewhere, or the mosaic writes sign against the wrong region
+            and fail after the preflight checks have already passed.
 
     Returns:
         ``SarIngestResult`` serialised as a dict.
@@ -133,6 +182,10 @@ def ingest_s1_roi_sar(
     if use_local:
         from tessera_embeddings.providers.local.dask import local_cluster
 
+        if perf_report_uri:
+            # Say so rather than no-op: an operator who set this and finds nothing
+            # at the URI would otherwise suspect the upload or their credentials.
+            log.warning("perf_report_uri is ignored on the local-cluster path (use_local=True)")
         with local_cluster() as cluster:
             log.info("Local Dask cluster ready: scheduler=%s", cluster.scheduler_address)
             task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
@@ -147,9 +200,13 @@ def ingest_s1_roi_sar(
                 apply_credentials_fn=apply_credentials_fn,
                 use_s3_direct=use_s3_direct,
                 storage_options=storage_options,
+                overlap_window_writes=overlap_window_writes,
+                pipeline_batches=pipeline_batches,
+                narrow_windows_per_date=narrow_windows_per_date,
+                s3_region=s3_region,
             )
 
-    from tessera_embeddings.providers.aws.dask import ecs_cluster
+    from tessera_embeddings.providers.aws.dask import ecs_cluster, maybe_performance_report
 
     edl_env = _default_edl_env()
 
@@ -158,18 +215,29 @@ def ingest_s1_roi_sar(
         min_workers=min_workers,
         max_workers=max_workers,
         extra_worker_env=edl_env,
+        # A capped task stream silently truncates the report to the run's last few
+        # dates; raise it only when a report is actually being captured.
+        diagnostic_task_stream=bool(perf_report_uri),
+        # Tag every cluster resource with this run's id so the cancellation/crash
+        # hook can sweep the tasks from a fresh process (see _dask_lifecycle).
+        resource_tags=dask_resource_tags(flow_run_ctx.id),
     ) as cluster:
         task_runner = get_task_runner_for_cluster(cluster.scheduler_address)
         log.info("Task runner connected to scheduler at %s", cluster.scheduler_address)
-        return _ingest_s1_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
-            roi_zarr_path=roi_zarr_path,
-            start_date=start_date,
-            end_date=end_date,
-            store_path=store_path,
-            orbit=orbit,
-            batch_days=batch_days,
-            edl_credentials_fn=edl_credentials_fn,
-            apply_credentials_fn=apply_credentials_fn,
-            use_s3_direct=use_s3_direct,
-            storage_options=storage_options,
-        )
+        with maybe_performance_report(cluster.scheduler_address, perf_report_uri, log):
+            return _ingest_s1_roi_impl.with_options(task_runner=task_runner)(  # type: ignore[arg-type]
+                roi_zarr_path=roi_zarr_path,
+                start_date=start_date,
+                end_date=end_date,
+                store_path=store_path,
+                orbit=orbit,
+                batch_days=batch_days,
+                edl_credentials_fn=edl_credentials_fn,
+                apply_credentials_fn=apply_credentials_fn,
+                use_s3_direct=use_s3_direct,
+                storage_options=storage_options,
+                overlap_window_writes=overlap_window_writes,
+                pipeline_batches=pipeline_batches,
+                narrow_windows_per_date=narrow_windows_per_date,
+                s3_region=s3_region,
+            )

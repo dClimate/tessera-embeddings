@@ -54,5 +54,3 @@ implemented yet; tracked as a future optimization.
 ## Related
 
 - `storage/zarr_store.py` — `_default_repo_config`
-- [Inference spatial striping](../memory/inference-spatial-striping.md)
-- [Striping perf regression](../memory/striping-perf-regression.md)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 import pytest
 
 from tessera_embeddings.config.inference import (
@@ -115,3 +117,36 @@ def test_inference_config_empty_num_obs_checkpoints_raises() -> None:
 def test_inference_config_compute_std_forced_false() -> None:
     cfg = _minimal_config(compute_std=True)  # type: ignore[call-arg]
     assert cfg.compute_std is False
+
+
+def test_the_newest_field_is_the_last_field() -> None:
+    """InferenceConfig is public API (docs/public-api.md) and a positional
+    dataclass. A new field inserted mid-list would silently rebind later
+    positional args in downstream construction (e.g. a positional num_gpus would
+    land in compute_std). New fields must be appended, and this pins the last one.
+
+    Moving this assertion is the expected cost of adding a field, and it is worth paying: the
+    tripwire fires on an insertion and on an append alike, so whoever moves it has to look at
+    where their field landed. It named allow_s2_only until 2026-08-13, when optical_min_obs was
+    appended after it.
+    """
+    assert fields(InferenceConfig)[-1].name == "optical_min_obs"
+
+
+def test_the_minimum_depth_rule_defaults_to_no_rule() -> None:
+    """None, not zero, and not the module constant. A config that inherited a refusal line from
+    whatever the module happened to hold would publish under a rule nobody chose, and zero would
+    read as a configured rule that refuses nothing.
+    """
+    assert _minimal_config().optical_min_obs is None
+    assert _minimal_config(optical_min_obs=25).optical_min_obs == 25
+
+
+def test_a_rule_that_refuses_nothing_is_refused_by_the_config() -> None:
+    with pytest.raises(ValueError, match="refuses nothing"):
+        _minimal_config(optical_min_obs=0)
+
+
+def test_allow_s2_only_defaults_off() -> None:
+    assert _minimal_config().allow_s2_only is False
+    assert _minimal_config(allow_s2_only=True).allow_s2_only is True

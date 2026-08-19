@@ -1,8 +1,9 @@
 """Unit tests for the AWS Ray provider's pure helpers.
 
-These tests stay offline by mocking SSM and EC2 with ``moto``. They
-exercise ``_resolve_ray_config`` (the most complex pure helper) and
-``cleanup_ray_tempfiles``.
+These tests stay offline by mocking SSM, EC2, and S3 with ``moto``. They
+exercise ``_resolve_ray_config`` (the most complex pure helper, now multi-AZ),
+``cleanup_ray_tempfiles``, and ``resolve_code_artifact_identity`` (the
+staging-fingerprint code identity).
 
 The full ``ray_cluster`` context manager is NOT tested end-to-end here
 because it shells out to ``ray up`` / ``ray down``; that path is an
@@ -13,6 +14,7 @@ below with the launch/teardown helpers stubbed out.
 from __future__ import annotations
 
 import logging
+import subprocess
 from pathlib import Path
 
 import boto3
@@ -26,6 +28,8 @@ from tessera_embeddings.providers.aws.ray import (
     PROJECT_TAG_VALUE,
     _resolve_ray_config,
     cleanup_ray_tempfiles,
+    resolve_ami_id,
+    resolve_code_artifact_identity,
 )
 
 _LOG = logging.getLogger("test")
@@ -115,6 +119,40 @@ def test_resolve_ray_config_writes_a_complete_yaml(tmp_path: Path) -> None:
         assert any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["head_start_ray_commands"])
         assert any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["worker_start_ray_commands"])
         assert not any("amazon-cloudwatch-agent" in str(cmd) for cmd in config["setup_commands"])
+
+        # No code_bucket was given (the documented AMI-baked default), so the tarball
+        # fetch is DROPPED rather than left holding an unsubstituted placeholder. Left
+        # in, `aws s3 cp s3://{CODE_BUCKET}/...` is a copy from a bucket name that
+        # cannot exist, and `ray up` runs setup on every node before Ray starts — so
+        # the default path would fail to provision a cluster at all.
+        assert not any("{CODE_BUCKET}" in str(cmd) for cmd in config["setup_commands"])
+        assert not any("s3 cp" in str(cmd) for cmd in config["setup_commands"])
+        # The rest of setup survives; only the fetch went.
+        assert any("PYTHONPATH" in str(cmd) for cmd in config["setup_commands"])
+    finally:
+        cleanup_ray_tempfiles(resolved)
+
+
+@mock_aws
+def test_resolve_ray_config_substitutes_the_code_bucket_when_given(tmp_path: Path) -> None:
+    """The tarball fetch survives, fully substituted, when a bucket IS supplied."""
+    ami_param, _, _ = _seed_ssm_and_vpc()
+
+    resolved = _resolve_ray_config(
+        DEFAULT_CLUSTER_TEMPLATE,
+        region=REGION,
+        ami_ssm_name=ami_param,
+        ssm_prefix=SSM_PREFIX,
+        cluster_name="test-cluster",
+        code_bucket="my-code-bucket",
+        code_suffix="-mybranch",
+    )
+    try:
+        config = yaml.safe_load(Path(resolved).read_text())
+        fetch = [cmd for cmd in config["setup_commands"] if "s3 cp" in str(cmd)]
+        assert len(fetch) == 1
+        assert "s3://my-code-bucket/code/src-mybranch.tar.gz" in fetch[0]
+        assert "{CODE_BUCKET}" not in fetch[0] and "{CODE_SUFFIX}" not in fetch[0]
     finally:
         cleanup_ray_tempfiles(resolved)
 
@@ -186,6 +224,88 @@ def test_resolve_ray_config_raises_on_missing_ssm() -> None:
             ami_ssm_name="/test/tessera/ray/ami-id",
             ssm_prefix=SSM_PREFIX,
         )
+
+
+# ---------------------------------------------------------------------------
+# resolve_code_artifact_identity (staging-fingerprint code identity)
+# ---------------------------------------------------------------------------
+
+
+@mock_aws
+def test_resolve_code_artifact_identity_ami_only() -> None:
+    """Pure-AMI deploy (no tarball): the identity is the resolved AMI ID."""
+    ssm = boto3.client("ssm", region_name=REGION)
+    ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-0123456789abcdef0", Type="String")
+    assert resolve_code_artifact_identity("/tessera/ray/ami-id", region=REGION) == "ami=ami-0123456789abcdef0"
+
+
+@mock_aws
+def test_resolve_code_artifact_identity_tracks_tarball_overwrite() -> None:
+    """With a code tarball, the identity folds in its ETag — so re-baking the AMI
+    (new AMI value) OR overwriting the tarball (new ETag) both flip the fingerprint,
+    while identical content resolves to the same identity (safe resume).
+    """
+    ssm = boto3.client("ssm", region_name=REGION)
+    s3 = boto3.client("s3", region_name=REGION)
+    ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-aaa", Type="String")
+    s3.create_bucket(Bucket="code-bkt", CreateBucketConfiguration={"LocationConstraint": REGION})
+    s3.put_object(Bucket="code-bkt", Key="code/src.tar.gz", Body=b"v1")
+
+    id_v1 = resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION)
+    # Lock the documented format exactly (ami=<id>|tarball=<etag>), not just a prefix,
+    # so a regression from ETag to some other object attribute would be caught.
+    etag_v1 = s3.head_object(Bucket="code-bkt", Key="code/src.tar.gz")["ETag"].strip('"')
+    assert id_v1 == f"ami=ami-aaa|tarball={etag_v1}"
+    assert resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION) == id_v1
+
+    # Overwrite the tarball with different content → different ETag → different identity.
+    s3.put_object(Bucket="code-bkt", Key="code/src.tar.gz", Body=b"v2-different")
+    id_v2 = resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION)
+    etag_v2 = s3.head_object(Bucket="code-bkt", Key="code/src.tar.gz")["ETag"].strip('"')
+    assert id_v2 == f"ami=ami-aaa|tarball={etag_v2}" and id_v2 != id_v1
+
+    # Re-bake the AMI (new value behind the same SSM name) → different identity.
+    ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-bbb", Type="String", Overwrite=True)
+    assert resolve_code_artifact_identity("/tessera/ray/ami-id", code_bucket="code-bkt", region=REGION) != id_v2
+
+
+@mock_aws
+def test_resolve_ami_id_reads_the_ssm_pointer() -> None:
+    ssm = boto3.client("ssm", region_name=REGION)
+    ssm.put_parameter(Name="/tessera/ray/ami-id", Value="ami-pinned-01", Type="String")
+    assert resolve_ami_id("/tessera/ray/ami-id", region=REGION) == "ami-pinned-01"
+
+
+@mock_aws
+def test_resolve_code_artifact_identity_uses_pinned_ami_id() -> None:
+    """A pinned ami_id fingerprints that exact image WITHOUT reading the SSM
+    pointer (no ami param is seeded here), so the campaign's fingerprint matches
+    the image it also pins provisioning to.
+    """
+    identity = resolve_code_artifact_identity("/unread/ami-id", region=REGION, ami_id="ami-pinned-99")
+    assert identity == "ami=ami-pinned-99"
+
+
+@mock_aws
+def test_resolve_ray_config_pins_ami_id_over_ssm(tmp_path: Path) -> None:
+    """When ami_id is given, the cluster boots THAT image, not whatever the SSM
+    pointer currently holds — a mid-campaign re-bake can't change the booted image.
+    """
+    ami_param, _, _ = _seed_ssm_and_vpc()  # SSM ami-id = ami-0123456789abcdef0
+    resolved = _resolve_ray_config(
+        DEFAULT_CLUSTER_TEMPLATE,
+        region=REGION,
+        ami_ssm_name=ami_param,
+        ami_id="ami-pinned-different",  # differs from the SSM value on purpose
+        ssm_prefix=SSM_PREFIX,
+        cluster_name="test-cluster",
+    )
+    try:
+        config = yaml.safe_load(Path(resolved).read_text())
+        for node in config["available_node_types"].values():
+            assert node["node_config"]["ImageId"] == "ami-pinned-different"  # pinned id wins
+    finally:
+        cleanup_ray_tempfiles(resolved)
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +381,69 @@ def test_ray_cluster_finalizer_skips_ray_down_when_resolve_fails(
     assert cleaned == [None]  # cleanup called with None (no resolved YAML) — a safe no-op
 
 
+class TestRayDashboardSsmCommand:
+    """The copy-pasteable port-forward command logged once the head node is up."""
+
+    def _launch_head(self, cluster_name: str) -> str:
+        """Run a tagged head instance in moto and return its instance ID."""
+        ec2 = boto3.client("ec2", region_name=REGION)
+        resp = ec2.run_instances(
+            ImageId="ami-0123456789abcdef0",
+            MinCount=1,
+            MaxCount=1,
+            TagSpecifications=[
+                {
+                    "ResourceType": "instance",
+                    "Tags": [
+                        {"Key": "ray-cluster-name", "Value": cluster_name},
+                        {"Key": "ray-node-type", "Value": "head"},
+                    ],
+                }
+            ],
+        )
+        return str(resp["Instances"][0]["InstanceId"])
+
+    @mock_aws
+    def test_forwards_a_port_on_the_instance_not_a_remote_host(self, caplog) -> None:
+        """The ``...ToRemoteHost`` document cannot reach the head's own port.
+
+        That variant addresses hosts reachable *from* the instance, and current
+        ``amazon-ssm-agent`` versions refuse loopback destinations for it
+        ("Forwarding to IP address localhost is forbidden"). The dashboard runs
+        on the head itself, so the plain document is the right one — and it takes
+        no ``host`` parameter.
+        """
+        instance_id = self._launch_head("tessera-ray-abc123")
+        with caplog.at_level(logging.INFO):
+            ray_mod._log_ray_dashboard_ssm_command("tessera-ray-abc123", _LOG, region=REGION)
+        msg = caplog.records[-1].getMessage()
+        assert "--document-name AWS-StartPortForwardingSession \\" in msg  # trailing \ excludes ...ToRemoteHost
+        assert "ToRemoteHost" not in msg
+        assert '"host"' not in msg
+        assert f"--target {instance_id}" in msg
+        assert '{"portNumber":["8265"],"localPortNumber":["8265"]}' in msg
+
+    @mock_aws
+    def test_region_is_printed_so_a_differing_default_does_not_bite(self, caplog) -> None:
+        """SSM resolves the target within one region.
+
+        An operator whose default region differs from the cluster's gets a
+        target-not-connected failure rather than a tunnel, so the region the head
+        was found in is baked into the command.
+        """
+        self._launch_head("tessera-ray-abc123")
+        with caplog.at_level(logging.INFO):
+            ray_mod._log_ray_dashboard_ssm_command("tessera-ray-abc123", _LOG, region=REGION)
+        assert f"  --region {REGION} \\\n" in caplog.records[-1].getMessage()
+
+    @mock_aws
+    def test_missing_head_warns_without_raising(self, caplog) -> None:
+        """Best-effort: no head found is a warning, never a failed cluster start."""
+        with caplog.at_level(logging.WARNING):
+            ray_mod._log_ray_dashboard_ssm_command("no-such-cluster", _LOG, region=REGION)
+        assert "Could not find Ray head node" in caplog.records[-1].getMessage()
+
+
 def test_cleanup_ray_tempfiles_handles_missing_path() -> None:
     """``cleanup_ray_tempfiles(None)`` and a missing path are both no-ops."""
     cleanup_ray_tempfiles(None)
@@ -278,3 +461,50 @@ def test_cleanup_ray_tempfiles_removes_yaml_and_ssh_key(tmp_path: Path) -> None:
 
     assert not yaml_path.exists()
     assert not ssh_key.exists()
+
+
+@mock_aws
+def test_resolve_ray_config_idle_timeout_override(tmp_path: Path) -> None:
+    """idle_timeout_minutes overrides the template value; None keeps it.
+
+    The template's 2-minute default suits per-cell fills; a multi-zone
+    sequential fill holds one cluster across zones and must survive the
+    inter-zone seam, so it passes a larger value through ray_cluster.
+    """
+    ami_param, _, _ = _seed_ssm_and_vpc()
+    template_default = yaml.safe_load(DEFAULT_CLUSTER_TEMPLATE.read_text())["idle_timeout_minutes"]
+
+    kept = _resolve_ray_config(DEFAULT_CLUSTER_TEMPLATE, region=REGION, ami_ssm_name=ami_param, ssm_prefix=SSM_PREFIX)
+    overridden = _resolve_ray_config(
+        DEFAULT_CLUSTER_TEMPLATE,
+        region=REGION,
+        ami_ssm_name=ami_param,
+        ssm_prefix=SSM_PREFIX,
+        idle_timeout_minutes=10,
+    )
+    try:
+        assert yaml.safe_load(Path(kept).read_text())["idle_timeout_minutes"] == template_default
+        assert yaml.safe_load(Path(overridden).read_text())["idle_timeout_minutes"] == 10
+    finally:
+        cleanup_ray_tempfiles(kept)
+        cleanup_ray_tempfiles(overridden)
+
+
+def test_ray_down_is_bounded_so_the_tag_fallback_can_still_run(monkeypatch):
+    """An unreachable head must not wedge teardown and strand a billing GPU fleet.
+
+    ``ray down`` SSHes into the head. Unbounded, a head that never answers means this
+    call never returns — so the caller never reaches ``terminate_ray_instances_by_tag``,
+    which is the fallback that exists for exactly this failure. The timeout is reported
+    as a failed ``ray down`` rather than raised, which is what routes the caller there.
+    """
+    seen: dict = {}
+
+    def _hangs(cmd, **kwargs):
+        seen.update(cmd=cmd, timeout=kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    monkeypatch.setattr(ray_mod.subprocess, "run", _hangs)
+
+    assert ray_mod._stop_ray_cluster("/tmp/resolved.yaml", _LOG) is False
+    assert seen["timeout"] == ray_mod.RAY_DOWN_TIMEOUT_S

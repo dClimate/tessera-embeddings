@@ -1,11 +1,11 @@
-# tessera_embeddings
+# TESSERA Inference
 
 [![Lint](https://github.com/dClimate/tessera-embeddings/actions/workflows/lint.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/lint.yml)
 [![Unit tests](https://github.com/dClimate/tessera-embeddings/actions/workflows/unit.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/unit.yml)
 [![Architecture](https://github.com/dClimate/tessera-embeddings/actions/workflows/architecture.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/architecture.yml)
 [![Nightly](https://github.com/dClimate/tessera-embeddings/actions/workflows/nightly.yml/badge.svg)](https://github.com/dClimate/tessera-embeddings/actions/workflows/nightly.yml)
 
-Generate per-pixel satellite embeddings at scale. Ports the HPC-based
+Generate per-pixel (10m^2) TESSERA satellite embeddings at any scale. Ports the HPC-based
 [Tessera](https://github.com/ucam-eo/tessera) embedding pipeline to a
 cloud-native, distributed architecture that runs on any major cloud —
 or on a laptop (slowly).
@@ -140,6 +140,28 @@ Two supported paths:
    [`docs/orchestrator-swap.md`](docs/orchestrator-swap.md) and
    [`docs/providers/adding-your-own.md`](docs/providers/adding-your-own.md).
 
+Ingest cost scales with the area you actually keep, not your ROI's
+bounding extent: mosaic loads and writes are restricted to the
+chunk-aligned windows that intersect the ROI mask (measured
+campaign-wide: ~4.3× less compute; a sparse island zone drops from
+3,706 chunks per band-date to 4). This is unconditional and has no
+flag — it serves a single sparse ROI and a global campaign zone alike.
+See [the ingest README](src/tessera_embeddings/ingest/README.md#cropping-to-live-windows-unconditional).
+
+### Profiling a run
+
+Both compute stages ship a profiling harness — `te-watch-scheduler` and friends
+for the Dask ingest scheduler, `te-observe-cluster` for the Ray GPU fleet. They
+install as console scripts with the AWS extra:
+
+```
+pip install "tessera_embeddings[aws]"   # or: uv sync --extra aws
+```
+
+They are **AWS-specific** (CloudWatch, ECS, EC2, SSM) but are written to be a
+template for other clouds, and PRs generalizing them are welcome. See
+[`src/tessera_embeddings/profiling/README.md`](src/tessera_embeddings/profiling/README.md).
+
 ## Architecture
 
 Three strict layers:
@@ -200,7 +222,7 @@ means workers can't fit a chunk in memory.
 ```
 ROI: 20 km × 20 km, S2 reflectance, 10 m resolution, 12 dates:
 
-chunks=200×200 (10× too small)        chunks=2000×2000 (the right size)
+chunks=200×200 (10× too small)        chunks=2048×2048 (the right size)
 ─────────────────────────────         ───────────────────────────────
 □□□□□□□□□□  □□□□□□□□□□  □□□□□           ┌────────┐
 □□□□□□□□□□  □□□□□□□□□□  □□□□□           │        │
@@ -214,13 +236,43 @@ overhead:       95% of wall-clock       overhead:      <5%
 ```
 
 Storage and read granularity are tuned separately. Ingest writes
-`INGEST_CHUNK_SIZE = 4000` storage chunks to keep the satellite-ingest
-Dask graph small (¼ the spatial tasks), while inference reads
-`INFERENCE_CHUNK_SIZE = 2000` sub-tiles out of them — small enough to keep
-peak GPU-node RAM in check. Zarr's `oindex` reads the 2000 sub-tile out
-of a 4000 chunk without any alignment requirement. Go smaller on the
-read size and the Dask scheduler hangs on graph construction; larger and
-you OOM on a g6e.xlarge. If you change either, profile.
+`INGEST_CHUNK_SIZE = 4096` storage chunks to keep the satellite-ingest
+Dask graph small (¼ the spatial tasks), while inference reads a smaller
+sub-tile out of them — small enough to keep peak GPU-node RAM in check.
+Zarr's `oindex` reads a sub-tile out of a 4096 chunk with no alignment
+requirement, so the two sizes are independent.
+
+The read tile divides the OUTPUT chunking, and both paths use the same
+one: `INFERENCE_CHUNK_SIZE = 2048`, so one inference tile is exactly one
+2048-px shard (ADR-008 D3). The global campaign also passes it explicitly,
+since that path requires the identity rather than merely matching it. Go
+smaller on the ingest chunk and the satellite-ingest Dask scheduler drowns
+in tasks; go larger on the read tile and you OOM on a g6e.xlarge. If you
+change either, profile.
+
+The powers of two are not cosmetic — they align every stage of the
+pipeline on one grid, so no stage rechunks its input:
+
+```
+ingest chunk    4096 px  = 2×2 inference tiles
+inference tile  2048 px  = 1 output shard
+shard           2048 px  = 8×8 inner chunks
+inner chunk      256 px  = the unit downstream readers decode
+
+one ingest store chunk (4096²) — what one satellite read/write touches
+┌─ inference tile (2048²) ─┬─ inference tile (2048²) ─┐
+│ ░░░░░░░░░░░░░░░░░░░░░░░░ │                          │
+│ ░ 8×8 grid of 256²     ░ │   each tile is read out  │
+│ ░ inner chunks — the   ░ │   of the ingest chunk by │
+│ ░ same grid the output ░ │   one GPU actor, staged  │
+│ ░ shard will store     ░ │   as one file, and lands │
+│ ░░░░░░░░░░░░░░░░░░░░░░░░ │   as ONE shard object    │
+├──────────────────────────┼──────────────────────────┤
+│                          │                          │
+│    inference tile        │    inference tile        │
+│                          │                          │
+└──────────────────────────┴──────────────────────────┘
+```
 
 ### Using these architecture checks in your own repo
 
@@ -250,6 +302,199 @@ is implementation detail and may change between minor releases. The
 full public-API surface is listed in
 [`docs/public-api.md`](docs/public-api.md). External code should
 depend only on items listed there.
+
+## The global embeddings store
+
+Beyond single-ROI stores, the library ships the storage layout and write
+path for a **global 10 m campaign**: one Icechunk repo holding 120 Zarr
+groups — one per UTM zone, named by its **common name** (`01N`–`60N`,
+`01S`–`60S`; the EPSG:326xx/327xx code is retained only as the CRS) — each
+pre-allocated with a 2017–2025 annual time axis and filled one
+(zone, year) at a time. The architecture is settled in
+[ADR-008](context_docs/decisions/008-global-store-architecture.md), and the
+operational plan for running the campaign is
+[`context_docs/design/campaign-plan.md`](context_docs/design/campaign-plan.md).
+
+**What "global" means here: land between 59.45°S and 83.65°N**, which is the
+extent of the coverage registry the campaign is built from.
+**Antarctica is excluded by decision**, not omitted by accident — the registry
+offers no Antarctic land cell, and the UTM grid could not place one if it did
+(UTM's usable range stops at 80°S). Reaching further south would need a
+different projection, a different coverage source and a different zone scheme;
+see [ADR-017](context_docs/decisions/017-no-antarctic-coverage.md).
+
+```
+one Icechunk repo (BucketPaths.global_store())
+├── 01N/    embeddings (time, northing, easting, band)  int8
+│           (1, 256, 256, 128) inner chunks in (1, 2048, 2048, 128) shards
+│           scales / obs counts sharded on the same 2048² spatial grid
+├── 02N/    … one group per UTM zone, seeded metadata-only up front …
+⋮
+└── 60S/    attrs: crs, zone_scheme, years_complete, runs, conventions
+```
+
+Zone groups, mosaic paths, and tags all use the UTM **common name**
+(`canonicalize_zone` parses `"33n"`/`" 7s "` → `"33N"`/`"07S"`) — a
+deliberate deviation from the geoembeddings `utm_zones` spec, whose
+`utm{NN}` group name can't express the hemisphere.
+
+Four write paths, all committing atomically (`storage/zarr_store.py` has
+the first three; `inference/assembly.py` + `storage/shard_writer.py` the
+fourth):
+
+1. **create** — `write_dataset` on a fresh store; it adopts a repo an
+   interrupted attempt left behind rather than failing forever on a dirty
+   prefix;
+2. **append** — extend the time axis of an existing store;
+3. **region overwrite** — rewrite a temporal/spatial slice in place;
+4. **shard-assemble** — staged inference tiles written as whole, lean
+   2048-px shards into a pre-allocated zone group, one fork/merge commit
+   per (zone, year), gated to a handful of concurrent committers.
+
+### Anatomy of a shard: what a write emits, what a read fetches
+
+A shard is one S3 object wrapping an 8×8 grid of independently
+compressed **inner chunks**, plus a tiny index mapping each inner chunk
+to its byte range inside the object:
+
+```
+zone group "32601" ▸ embeddings ▸ year 2025 ▸ one shard
+┌─ shard object (2048² px × 128 bands ≈ 0.5 GB max on S3) ────────────┐
+│   8×8 inner chunks, 256² px × 128 bands (~8.4 MB int8+zstd each)    │
+│   ┌────┬────┬────┬────┬────┬────┬────┬────┐                         │
+│   │▓▓▓▓│▓▓▓▓│▓▓▓▓│    │    │▓▓▓▓│▓▓▓▓│▓▓▓▓│   ▓ = data: encoded    │
+│   ├────┼────┼────┼────┼────┼────┼────┼────┤       bytes + an index  │
+│   │▓▓▓▓│▓▓▓▓│    │    │    │    │▓▓▓▓│▓▓▓▓│       entry             │
+│   ├────┼────┼────┼────┼────┼────┼────┼────┤   blank = all-fill (no  │
+│   │▓▓▓▓│    │    │    │    │    │    │▓▓▓▓│     valid observations):│
+│   └────┴────┴────┴────┴────┴────┴────┴────┘       zero bytes stored │
+│   + shard index: inner chunk → (offset, length)    — a "lean" shard │
+└──────────────────────────────────────────────────────────────────────┘
+
+WRITE  1 staged inference tile (2048²) == 1 shard: the assembly worker
+       emits the whole object exactly once — no read-modify-write, and
+       an all-ocean tile costs nothing (never staged, never written).
+READ   a point/window read GETs the shard index, then ranged-GETs only
+       the inner chunks it overlaps — ~8 MB per point, not 0.5 GB.
+       (Single-ROI stores use this same geometry — one preset, two names.)
+```
+
+### Manifest splitting: why a commit costs one year, not the store
+
+An Icechunk **manifest** is the index mapping every chunk to its object.
+By default there is one per array — so every commit rewrites the whole
+index, O(store), regardless of how little changed. The global store
+splits manifests at `time@1`:
+
+```
+    unsplit (default)                     split time@1 (global store)
+    one manifest per array                one manifest per (array, year)
+
+    MANIFEST: all 9 years                 M2017 M2018 ⋯ M2024 M2025
+    ┌────────────────────────┐            ┌────┐┌────┐  ┌────┐┌────┐
+    │ every (year, y, x)     │            │ ρρ ││ ρρ │  │ ρρ ││ ρρ │
+    │ chunk → object ref     │            └────┘└────┘  └────┘└─▲──┘
+    └───────────▲────────────┘                                  │
+                │                         WRITE  filling 2025 rewrites
+    WRITE  ANY commit rewrites                   only M2025 — commit
+           the whole thing:                      cost stays O(one year)
+           O(entire store)                       for all nine years
+                                          READ   opening a group loads
+                                                 only the manifests of
+                                                 the arrays/years read
+```
+
+Single-ROI stores use the same idea spatially: a 32-chunk-per-axis 2D
+split so a region overwrite rewrites only the manifest tiles it touches
+(see `zarr_store.manifest_split`).
+
+The per-zone pixel grids are derived from the EPSG registry
+(`storage/zone_grid.py`), snapped to the 20,480 m shard pitch.
+**Zone-boundary policy:** zones are pure nominal 6° longitude bands —
+disjoint, every pixel-center in exactly one zone. The Norway/Svalbard
+MGRS width exceptions (32V, 31X–37X) are deliberately **not** honored:
+they exist for navigation, not data grids. Consumers must not assume
+MGRS behavior near those zones; the dataset advertises this via the
+`zone_scheme: "utm_6deg_nominal"` group attribute.
+
+Campaign operations — per-cell tags, snapshot expiry + GC, and a
+zone×year progress reader — live in `storage/campaign.py`; the
+end-to-end (zone, year) fill callable is
+`orchestration/runners/zone_fill.py`.
+
+`run_global_campaign` drives the whole thing year-serial with bounded
+zone parallelism, and **triggers its own ingestion** (ADR-011): per
+pending cell it dispatches `ingest-zone-year` (synthesize a zone-shaped
+ROI from the coverage bitmap → run the S1/S2 ROI ingest flows onto
+`mosaics/{zone}/{year}`) → `fill-zone-year` (a pre-Ray coverage gate,
+then inference → shard-assemble → tag) → delete the transient mosaic
+(`s5cmd --all-versions`). A `zones=["33N", "15S"]` filter restricts the
+run; the default (all 120) skips already-finished cells, and `ingest=False`
+bypasses ingestion when mosaics already exist upstream. A `branch` slug routes
+every dispatched deployment — the fill, the ingest, and the S1/S2 grandchildren
+`ingest-zone-year` dispatches — to its `-<branch>` variant, so a downstream that
+registers dev-branch deployments can exercise the whole chain (including
+ingestion) off prod; `branch=None` (default) is the unsuffixed production path.
+
+### Reading a zone group (xarray)
+
+Open a zone group through an Icechunk readonly session and ask xarray to
+decode CF-linked variables as coordinates:
+
+```python
+import xarray as xr
+from tessera_embeddings.storage.global_store import open_global_repo
+
+repo = open_global_repo("s3://<bucket>/global/tessera.icechunk")
+session = repo.readonly_session(branch="main")
+ds = xr.open_zarr(session.store, group="33N", consolidated=False, decode_coords="all")
+```
+
+```
+<xarray.Dataset>
+Coordinates:
+  * time         (time) datetime64[ns] 2017-01-01 2018-01-01 ... 2025-01-01
+  * northing     (northing) float64 ...
+  * easting      (easting) float64 ...
+  * band         (band) int64 0 1 ... 127
+    time_bnds    (time, bnds) datetime64[ns] ...     ← [Jan 1, Dec 31] per slot
+Data variables:
+    embeddings   (time, northing, easting, band) int8 ...
+    scales       (time, northing, easting) float32 ...
+    s2_obs_count (time, northing, easting) uint16 ...
+```
+
+**Time semantics (guaranteed).** Each `time` point is **January 1 of its
+calendar year — the start of the exact Jan–Dec window that slot holds**
+(`time_convention="calendar_year"`; the fill runner rejects any other
+window, so the label always matches the data). The companion `time_bnds`
+variable (shape `(time, 2)`, linked via `time.attrs["bounds"]` per CF)
+states each slot's covered interval explicitly: `[YYYY-01-01, YYYY-12-31]`.
+
+`decode_coords="all"` is what promotes `time_bnds` from *Data variables*
+to *Coordinates* — xarray sets variables referenced by `bounds` (and
+`grid_mapping`) attributes as coordinates. Without it the dataset is
+identical; `time_bnds` just lists under data variables. Non-calendar
+12-month windows are **not** written to this store — the single-ROI
+output stores (`time_convention="12mo_window_end"`, one time entry per
+window-end label) are the home for rolling windows.
+
+**Per-pixel input provenance.** The obs-count layers record how many
+observations fed each pixel's embedding: `s2_obs_count`,
+`s1_asc_obs_count`, `s1_desc_obs_count` (always written; `0` = none).
+By default every embedded pixel has ≥1 S1 observation; when a fill ran
+with `allow_s2_only=True` (opt-in — embeds S2-valid pixels inside S1
+coverage gaps using the upstream v1.1 missing-S1 convention), the
+**S2-only pixels are exactly those with a finite `scales` value and
+`s1_asc_obs_count + s1_desc_obs_count == 0`**. S2-only embedding quality
+is unvalidated against S1-informed embeddings — see
+[ADR-013](context_docs/decisions/013-optional-s1-s2-only-pixels.md).
+
+Reference docs:
+[`xarray.open_zarr` / `decode_coords`](https://docs.xarray.dev/en/stable/generated/xarray.open_zarr.html) ·
+[xarray weather & climate (CF) guide](https://docs.xarray.dev/en/stable/user-guide/weather-climate.html) ·
+[CF conventions §7.1 Cell Boundaries](https://cfconventions.org/cf-conventions/cf-conventions.html#cell-boundaries) ·
+[cf-xarray bounds handling](https://cf-xarray.readthedocs.io/en/latest/bounds.html)
 
 ## The test that proves decoupling
 

@@ -19,9 +19,13 @@ PREFECT_ALLOWED_PREFIX = SRC_ROOT / "orchestration" / "prefect"
 def test_flow_modules_import() -> None:
     """Every Prefect flow module imports cleanly."""
     from tessera_embeddings.orchestration.prefect.flows import (  # noqa: F401
+        build_land_mask,
+        fill_zone_year,
         generate_roi,
         ingest_s1_roi_sar,
         ingest_s2_roi_reflectance,
+        run_global_campaign,
+        seed_global_store,
         tessera_embeddings,
         tessera_full_pipeline,
     )
@@ -32,6 +36,7 @@ def test_task_modules_import() -> None:
     from tessera_embeddings.orchestration.prefect.tasks import (  # noqa: F401
         inference,
         ingest,
+        land_mask,
     )
 
 

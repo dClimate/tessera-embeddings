@@ -130,7 +130,7 @@ Now the runner adds two steps:
 ```
 6. Local Ray cluster (GPU if available, else CPU)
 7. Inference: 1 chunk of ROI           (~15-30 min CPU, ~1-2 min GPU)
-8. Local Dask cluster, assemble        (~2 min)
+8. Assemble (local worker processes)   (~2 min)
 ```
 
 The `device` field in `config.yaml` controls this:

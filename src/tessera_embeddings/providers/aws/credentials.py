@@ -17,9 +17,12 @@ Usage in the S1 ingest flow::
 
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, final
 
 import icechunk
 from botocore import session as botocore_session
@@ -33,6 +36,51 @@ if TYPE_CHECKING:
 # refresh window — botocore auto-refreshes the underlying token on the next
 # get_frozen_credentials() call, so we never serve a stale one.
 _ICECHUNK_CRED_TTL = timedelta(minutes=15)
+
+#: The same interval for an ASSUMED-ROLE credential, and shorter for a measured reason.
+#:
+#: A role assumed from a role is *chained*, which AWS caps at one hour whatever the target role's
+#: MaxSessionDuration says. Botocore refreshes such a credential advisory at 900s before expiry and
+#: MANDATORY at 600s. At a 15-minute cadence the callbacks in a one-hour session land at 0, 15, 30,
+#: 45 and 60 minutes — so the 45-minute call trips only the ADVISORY refresh, which serves the old
+#: still-valid credential if STS hiccups, and the next call is at 60: exactly expiry. The mandatory
+#: window (from minute 50) is stepped over entirely, and any clock skew or in-flight request then
+#: meets `ExpiredToken` mid-write.
+#:
+#: Five minutes puts calls at 45, 50 and 55, so at least one lands inside the mandatory window and
+#: forces a blocking refresh. The cost is twelve in-memory reads an hour rather than four, at a few
+#: microseconds each — the STS call itself is botocore's decision, not this interval's.
+_ASSUMED_ROLE_CRED_TTL = timedelta(minutes=5)
+
+#: Never promise icechunk a credential for longer than the real token has left, minus this. The
+#: interval above is only half the protection: it relies on two independently chosen constants
+#: staying in a sensible relationship, and the relationship is what broke above. Capping by the
+#: ACTUAL expiry cannot be defeated that way — whatever the interval, the promise is bounded by the
+#: truth. Two minutes is comfortably more than a refresh round trip and far less than the mandatory
+#: window it sits inside.
+_EXPIRY_SAFETY_MARGIN = timedelta(minutes=2)
+
+
+def _expires_after(creds: Credentials, ttl: timedelta) -> datetime:
+    """When icechunk should come back: ``now + ttl``, but never past the token's own life.
+
+    Refreshable credentials expose ``_expiry_time``; a static one has none, in which case the
+    interval alone is all there is to go on. Reading a private attribute is deliberate and narrow —
+    botocore exposes no public expiry, and the alternative is promising validity we cannot support.
+    """
+    horizon = datetime.now(UTC) + ttl
+    expiry = getattr(creds, "_expiry_time", None)
+    if expiry is None:
+        return horizon
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=UTC)
+    # NORMALISED TO datetime.timezone.utc, not merely to "some UTC tzinfo". Botocore parses the STS
+    # expiry with dateutil, so a refreshable credential's `_expiry_time` carries `tzutc()` — a
+    # different object that compares equal and formats identically. icechunk rejects it outright with
+    # "expected datetime.timezone.utc", so returning the minimum unconverted fails the first store
+    # write whenever the real expiry is the nearer of the two. Only the assumed-role path has an
+    # expiry to read, which is why nothing noticed until that path existed.
+    return min(horizon, expiry - _EXPIRY_SAFETY_MARGIN).astimezone(UTC)
 
 
 @lru_cache(maxsize=1)
@@ -75,6 +123,164 @@ def _resolve_iam_credentials() -> Credentials:
     return creds
 
 
+@lru_cache(maxsize=4)
+def _assumed_role_credentials(role_arn: str, external_id: str | None = None) -> Credentials:
+    """A self-refreshing credential for ``role_arn``, built once per process.
+
+    Mirrors :func:`_resolve_iam_credentials` deliberately: build the credential object ONCE and let
+    botocore refresh it underneath, rather than calling ``AssumeRole`` on every access. The reason is
+    not the cost of the call — an STS round trip is tens of milliseconds against cells that run for
+    hours — but what a fresh resolve does to a transient failure. A cached refreshable credential
+    serves its still-valid in-memory token through an STS blip and only reaches out inside its own
+    refresh window; a fresh resolve turns that same blip into a failed write.
+
+    The refresh callback re-assumes, so the credential renews indefinitely even though each session
+    is capped at one hour by AWS's role-chaining rule.
+
+    ``lru_cache`` does not cache exceptions, so a failed cold assume retries on the next call.
+    """
+    from botocore.credentials import DeferredRefreshableCredentials
+
+    # The BASE identity does the assuming — the task role, resolved with env stripped for the same
+    # reason as everywhere else here: `set_s3_credentials` may have overwritten AWS_* with
+    # OPERA-scoped tokens, and those cannot assume anything of ours.
+    bc_session = botocore_session.get_session()
+    bc_session.get_component("credential_provider").remove("env")
+    sts = bc_session.create_client("sts")
+
+    def _assume() -> dict[str, str]:
+        kwargs: dict[str, object] = {
+            "RoleArn": role_arn,
+            # Identifies US in the target account's CloudTrail. A fixed name rather than a random
+            # one so their audit log groups our sessions instead of showing one principal per hour.
+            "RoleSessionName": "tessera-published-store-writer",
+        }
+        if external_id:
+            kwargs["ExternalId"] = external_id
+        creds = sts.assume_role(**kwargs)["Credentials"]
+        return {
+            "access_key": creds["AccessKeyId"],
+            "secret_key": creds["SecretAccessKey"],
+            "token": creds["SessionToken"],
+            "expiry_time": creds["Expiration"].isoformat(),
+        }
+
+    # DEFERRED so constructing this costs no network call: the first assume happens on first use,
+    # which keeps a process that never touches the published store from needing the permission at all.
+    return DeferredRefreshableCredentials(refresh_using=_assume, method="sts-assume-role")
+
+
+@final
+@dataclass(frozen=True)
+class AssumedRoleIcechunkCredentials:
+    """An icechunk credential callback that writes as ``role_arn``.
+
+    For the published store, whose bucket belongs to the delivery partner: the write permission lives
+    in THEIR account on a role we assume, so this is the only credential that can write it — and it
+    cannot read our own buckets, which is why the choice has to be made per destination rather than
+    per process (see :func:`icechunk_credentials_for`).
+
+    **A class rather than a closure because icechunk PICKLES the callback.** It hands it to its Rust
+    S3 client and ships it to every process that deserialises a ``Storage``, so a nested function
+    fails at construction with "Can't get local object" — before any credential is fetched, and
+    identically whether or not the grant works. A frozen dataclass holding just the role identifiers
+    pickles by value; the refreshable credential behind it is rebuilt on arrival, keyed by those same
+    identifiers, so each process ends up with its own and refreshes independently. The existing
+    task-role callback survives only because it is a module-level function.
+
+    Calling it is cheap and repeatable: it reads an already-resolved credential while botocore
+    refreshes underneath. The expiry it reports is capped by the token's real life
+    (:func:`_expires_after`), so icechunk comes back before the credential dies rather than
+    discovering the fact as a failed write.
+    """
+
+    role_arn: str
+    external_id: str | None = None
+
+    def __call__(self) -> icechunk.S3StaticCredentials:
+        """A freshly-read credential for the assumed role, with its capped expiry."""
+        creds = _assumed_role_credentials(self.role_arn, self.external_id)
+        frozen = creds.get_frozen_credentials()
+        return icechunk.S3StaticCredentials(
+            access_key_id=frozen.access_key,
+            secret_access_key=frozen.secret_key,
+            session_token=frozen.token,
+            expires_after=_expires_after(creds, _ASSUMED_ROLE_CRED_TTL),
+        )
+
+
+def assumed_role_icechunk_credentials(
+    role_arn: str, external_id: str | None = None
+) -> Callable[[], icechunk.S3StaticCredentials]:
+    """Build the published store's credential callback. See :class:`AssumedRoleIcechunkCredentials`."""
+    return AssumedRoleIcechunkCredentials(role_arn, external_id)
+
+
+#: Env vars the runner's task definition carries when this deployment publishes to a bucket that is
+#: not ours: the role to assume, and an optional external id if the owner requires one. Configuration
+#: rather than an argument because the destination decides, and every process that touches the store
+#: — the flow runner, each assembly worker — has to reach the same conclusion without being told.
+_WRITER_ROLE_ENV = "PUBLISHED_STORE_WRITER_ROLE_ARN"
+_WRITER_EXTERNAL_ID_ENV = "PUBLISHED_STORE_WRITER_EXTERNAL_ID"
+
+
+def published_store_writer_role() -> tuple[str, str | None] | None:
+    """The role to assume for the published store, or ``None`` when there is nothing to assume."""
+    arn = (os.environ.get(_WRITER_ROLE_ENV) or "").strip()
+    if not arn:
+        return None
+    return arn, (os.environ.get(_WRITER_EXTERNAL_ID_ENV) or "").strip() or None
+
+
+def icechunk_credentials_for(
+    uri: str, default: Callable[[], icechunk.S3StaticCredentials] | None = None
+) -> Callable[[], icechunk.S3StaticCredentials]:
+    """The credential callback for ``uri`` — assumed role for the published store, task role elsewhere.
+
+    **Chosen from the destination, never from the caller.** One fill legitimately spans two accounts:
+    it reads mosaics and staged tiles from our buckets and writes embeddings to the partner's. The
+    assumed role is scoped to two prefixes in their bucket and cannot read ours, so handing it to
+    everything breaks every other access — and handing the task role to everything cannot write the
+    published store. Deriving the answer from where the bytes are going is what makes both work
+    without any call site having to know which case it is in.
+
+    The same registry-shaped mistake, one layer down: a sibling artifact that took its location from a
+    default rather than from the resolved target published beside the wrong store while every unit of
+    the derivation was correct. Here the resolved target is the argument.
+
+    Returns the ordinary task-role provider whenever no writer role is configured, which is every
+    deployment whose store lives in our own buckets — so dev behaviour is unchanged by construction.
+    """
+    configured = published_store_writer_role()
+    if configured and _is_published_store(uri):
+        return assumed_role_icechunk_credentials(*configured)
+    # The caller's own provider is PRESERVED rather than replaced. It is the right credential for our
+    # own buckets, and in tests it is a double — substituting the real task-role provider here would
+    # quietly undo both.
+    return default or iam_icechunk_credentials
+
+
+def _is_published_store(uri: str) -> bool:
+    """Whether ``uri`` addresses the externally-owned published store or its registry sibling.
+
+    Keyed on the BUCKET, not on a prefix list. The store and its registry are siblings under one
+    externally-owned bucket, and a prefix list would have to be kept in step with
+    ``BucketPaths.optical_registry`` — which derives one location from the other precisely so the two
+    cannot drift. Anything we are asked to write in that bucket needs the assumed role; there is
+    nothing else of ours there.
+    """
+    if not uri.startswith("s3://"):
+        return False
+    bucket = uri[len("s3://") :].split("/", 1)[0]
+    return bucket == PARTNER_DELIVERY_BUCKET
+
+
+#: The externally-owned bucket the campaign publishes into. Named here rather than imported from the
+#: infrastructure definition because that lives in a separate uv project the library cannot import;
+#: the two are kept in hand-lockstep, and the test below pins the pairing.
+PARTNER_DELIVERY_BUCKET = "tessera-embeddings"
+
+
 def iam_s3_storage_options() -> dict[str, str]:
     """Resolve IAM credentials as plain strings for ``da.from_zarr`` / fsspec.
 
@@ -84,8 +290,17 @@ def iam_s3_storage_options() -> dict[str, str]:
     ``set_s3_credentials`` has overridden ``AWS_*`` env vars with
     OPERA-scoped STS tokens.
 
-    Returns frozen credential strings that Dask can serialize into the
-    task graph without re-invoking the credential chain.
+    Returns frozen credential strings, which Dask can serialize into a task graph.
+
+    **Pass this function to the ingest, not its result.** What it returns is a snapshot,
+    and the role credential behind it expires (instance-metadata ~1h, ECS task role ~6h)
+    — a leg can run longer, so options resolved once at leg entry stop working partway
+    through, on a bucket the role can always read. Every consumer accepts a callable for
+    exactly this reason (see
+    :func:`tessera_embeddings.ingest.roi.resolve_storage_options`) and re-invokes it at
+    each read. That is cheap: :func:`_resolve_iam_credentials` caches a live refreshable
+    credential, so each call is a frozen-copy of an already-resolved one and botocore
+    refreshes underneath.
 
     Raises:
         RuntimeError: If no AWS credentials are found outside env vars.

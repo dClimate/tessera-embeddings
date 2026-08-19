@@ -2,13 +2,13 @@
 
 from unittest.mock import patch
 
+import icechunk
 import numpy as np
-import pandas as pd
 import pytest
 import zarr
 
 import tessera_embeddings.inference.data_loading as _dl_mod
-from tessera_embeddings.config.inference import S2_BAND_ORDER, SCL_VALID_CLASSES
+from tessera_embeddings.config.inference import S1_ORBIT_NONE, S2_BAND_ORDER, SCL_VALID_CLASSES
 from tessera_embeddings.config.time_windows import parse_time_window
 from tessera_embeddings.errors import InsufficientCoverageError
 from tessera_embeddings.inference.chunk_spec import ChunkSpec
@@ -23,6 +23,7 @@ from tessera_embeddings.inference.data_loading import (
     resolve_s1_orbit,
 )
 from tessera_embeddings.storage.zarr_store import compute_doy
+from tests.unit.mosaic_stores import make_s2_group, make_sar_group, store_opener
 
 
 class TestLoadS2Bands:
@@ -124,42 +125,12 @@ class TestComputeDoy:
 
 
 # ---------------------------------------------------------------------------
-# Helpers for building synthetic zarr stores (used by load_chunk tests)
+# Synthetic mosaic stores come from tests.unit.mosaic_stores — the same three-store
+# layout the strip-loop tests read, so a schema change lands in one place.
 # ---------------------------------------------------------------------------
 
 _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=8, x_start=0, x_stop=10)
 _TIME_WINDOW = parse_time_window("December 2024")
-
-
-def _make_s2_zarr_group(n_t: int, h: int, w: int, seed: int = 42) -> zarr.Group:
-    rng = np.random.default_rng(seed)
-    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-    for band in S2_BAND_ORDER:
-        vals = rng.integers(100, 5000, size=(n_t, h, w)).astype(np.uint16)
-        arr = root.create_array(band, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
-        arr[:] = vals
-    scl_vals = rng.choice([0, 4, 5, 8], size=(n_t, h, w)).astype(np.uint8)
-    scl_arr = root.create_array("scl", shape=scl_vals.shape, dtype=scl_vals.dtype, chunks=scl_vals.shape)
-    scl_arr[:] = scl_vals
-    times = pd.date_range("2024-01-01", periods=n_t, freq="5D")
-    time_ns = times.values.astype("datetime64[ns]").astype("int64")
-    t_arr = root.create_array("time", shape=time_ns.shape, dtype=np.int64, chunks=time_ns.shape)
-    t_arr[:] = time_ns
-    return root
-
-
-def _make_sar_zarr_group(n_t: int, h: int, w: int, seed: int = 99) -> zarr.Group:
-    rng = np.random.default_rng(seed)
-    times = pd.date_range("2024-01-01", periods=n_t, freq="12D")
-    root = zarr.open_group(zarr.storage.MemoryStore(), mode="w")
-    for name in ("0_VV", "0_VH"):
-        vals = rng.integers(1000, 8000, size=(n_t, h, w)).astype(np.uint16)
-        arr = root.create_array(name, shape=vals.shape, dtype=vals.dtype, chunks=vals.shape)
-        arr[:] = vals
-    time_ns = times.values.astype("datetime64[ns]").astype("int64")
-    t_arr = root.create_array("time", shape=time_ns.shape, dtype=np.int64, chunks=time_ns.shape)
-    t_arr[:] = time_ns
-    return root
 
 
 class TestLoadSarOrbit:
@@ -167,7 +138,7 @@ class TestLoadSarOrbit:
 
     def test_shapes_and_dtypes(self):
         n_t, h, w = 6, _CHUNK.height, _CHUNK.width
-        root = _make_sar_zarr_group(n_t, h, w)
+        root = make_sar_group(n_t, h, w)
         with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
             bands, doys = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
 
@@ -177,14 +148,14 @@ class TestLoadSarOrbit:
         assert doys.dtype == np.int32
 
     def test_store_path_uses_orbit_name(self):
-        root = _make_sar_zarr_group(3, _CHUNK.height, _CHUNK.width)
+        root = make_sar_group(3, _CHUNK.height, _CHUNK.width)
         with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root) as mock_open:
             _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "descending", _TIME_WINDOW)
         mock_open.assert_called_once_with("s3://bucket/mosaic/sar_descending.zarr")
 
     def test_band_values_match_source(self):
         n_t, h, w = 4, _CHUNK.height, _CHUNK.width
-        root = _make_sar_zarr_group(n_t, h, w)
+        root = make_sar_group(n_t, h, w)
         with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
             bands, _ = _load_sar_orbit("s3://bucket/mosaic", _CHUNK, "ascending", _TIME_WINDOW)
 
@@ -197,7 +168,7 @@ class TestLoadS2:
 
     def test_shapes_and_dtypes(self):
         n_t, h, w = 10, _CHUNK.height, _CHUNK.width
-        root = _make_s2_zarr_group(n_t, h, w)
+        root = make_s2_group(n_t, h, w)
         with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
             bands, masks, doys, obs_count = _load_s2("s3://b/m", _CHUNK, _TIME_WINDOW)
 
@@ -214,7 +185,7 @@ class TestLoadS2:
 
     def test_obs_count_from_full_mask(self):
         n_t, h, w = 15, _CHUNK.height, _CHUNK.width
-        root = _make_s2_zarr_group(n_t, h, w)
+        root = make_s2_group(n_t, h, w)
         with patch.object(_dl_mod, "open_store_as_zarr_group", return_value=root):
             _, _, _, obs_count = _load_s2("s3://b/m", _CHUNK, _TIME_WINDOW)
         # Observation counts can go up to the full timestep count.
@@ -225,21 +196,7 @@ class TestLoadChunkOrchestration:
     """Tests for load_chunk delegating to helpers and respecting s1_orbit."""
 
     def _make_open_store_side_effect(self, n_t_s2=10, n_t_sar=5):
-        h, w = _CHUNK.height, _CHUNK.width
-        s2_root = _make_s2_zarr_group(n_t_s2, h, w, seed=10)
-        sar_asc = _make_sar_zarr_group(n_t_sar, h, w, seed=20)
-        sar_desc = _make_sar_zarr_group(n_t_sar, h, w, seed=30)
-
-        def _open_store(path):
-            if "reflectance" in path:
-                return s2_root
-            if "ascending" in path:
-                return sar_asc
-            if "descending" in path:
-                return sar_desc
-            raise ValueError(f"Unexpected store path: {path}")
-
-        return _open_store
+        return store_opener(_CHUNK, n_t_s2=n_t_s2, n_t_sar=n_t_sar)
 
     def _run(self, s1_orbit="ascending", n_t_s2=10, n_t_sar=5):
         se = self._make_open_store_side_effect(n_t_s2, n_t_sar)
@@ -314,21 +271,7 @@ class TestStripReassembly:
     _TALL_CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
 
     def _side_effect(self, n_t_s2=10, n_t_sar=5):
-        h, w = self._TALL_CHUNK.height, self._TALL_CHUNK.width
-        s2_root = _make_s2_zarr_group(n_t_s2, h, w, seed=10)
-        sar_asc = _make_sar_zarr_group(n_t_sar, h, w, seed=20)
-        sar_desc = _make_sar_zarr_group(n_t_sar, h, w, seed=30)
-
-        def _open_store(path):
-            if "reflectance" in path:
-                return s2_root
-            if "ascending" in path:
-                return sar_asc
-            if "descending" in path:
-                return sar_desc
-            raise ValueError(f"Unexpected store path: {path}")
-
-        return _open_store
+        return store_opener(self._TALL_CHUNK, n_t_s2=n_t_s2, n_t_sar=n_t_sar)
 
     def _load(self, y_sub=None, s1_orbit="both"):
         with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()):
@@ -393,21 +336,7 @@ class TestSharedMaskBundle:
     _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
 
     def _side_effect(self, n_t_s2=10, n_t_sar=5):
-        h, w = self._CHUNK.height, self._CHUNK.width
-        s2_root = _make_s2_zarr_group(n_t_s2, h, w, seed=10)
-        sar_asc = _make_sar_zarr_group(n_t_sar, h, w, seed=20)
-        sar_desc = _make_sar_zarr_group(n_t_sar, h, w, seed=30)
-
-        def _open_store(path):
-            if "reflectance" in path:
-                return s2_root
-            if "ascending" in path:
-                return sar_asc
-            if "descending" in path:
-                return sar_desc
-            raise ValueError(f"Unexpected store path: {path}")
-
-        return _open_store
+        return store_opener(self._CHUNK, n_t_s2=n_t_s2, n_t_sar=n_t_sar)
 
     def test_bundle_tkept_matches_inline_prune(self):
         with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()):
@@ -443,7 +372,7 @@ class TestResolveS1Orbit:
 
     @staticmethod
     def _probe(present_orbits):
-        def _open_store(path):
+        def _open_store(path, **kwargs):  # accepts get_credentials/region like the real opener
             for orbit in ("ascending", "descending"):
                 if f"sar_{orbit}" in path:
                     if orbit in present_orbits:
@@ -473,12 +402,35 @@ class TestResolveS1Orbit:
         with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._probe({"descending"})):
             assert resolve_s1_orbit("s3://b/m", "both") == "descending"
 
-    def test_both_with_neither_present_raises(self):
+    def test_both_with_neither_present_resolves_to_none(self):
+        """The default is permissive: parts of the globe are radar-free in principle."""
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._probe(set())):
+            assert resolve_s1_orbit("s3://b/m", "both") == S1_ORBIT_NONE
+
+    def test_both_with_neither_present_raises_when_radar_is_demanded(self):
+        """``require_s1`` reaches here as ``allow_none=False``: an absent store is then an error."""
         with (
             patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._probe(set())),
             pytest.raises(InsufficientCoverageError, match="no SAR stores found"),
         ):
-            resolve_s1_orbit("s3://b/m", "both")
+            resolve_s1_orbit("s3://b/m", "both", allow_none=False)
+
+    def test_probe_threads_credentials_and_region(self):
+        """The SAR probe must use the caller's credential callback / region, not
+        the default Icechunk chain — else orbit resolution fails in deployments
+        that need the callback.
+        """
+
+        def _creds():
+            return object()
+
+        probe = self._probe({"ascending", "descending"})
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=probe) as m:
+            resolve_s1_orbit("s3://b/m", "both", get_credentials=_creds, s3_region="us-west-2")
+        assert m.call_count == 2
+        for call in m.call_args_list:
+            assert call.kwargs["get_credentials"] is _creds
+            assert call.kwargs["region"] == "us-west-2"
 
 
 class TestSharedStoreOpener:
@@ -492,21 +444,14 @@ class TestSharedStoreOpener:
     _CHUNK = ChunkSpec(row=0, col=0, y_start=0, y_stop=12, x_start=0, x_stop=10)
 
     def _side_effect(self):
-        h, w = self._CHUNK.height, self._CHUNK.width
-        s2_root = _make_s2_zarr_group(10, h, w, seed=10)
-        sar_asc = _make_sar_zarr_group(5, h, w, seed=20)
-        sar_desc = _make_sar_zarr_group(5, h, w, seed=30)
+        return store_opener(self._CHUNK)
 
-        def _open_store(path):
-            if "reflectance" in path:
-                return s2_root
-            if "ascending" in path:
-                return sar_asc
-            if "descending" in path:
-                return sar_desc
-            raise ValueError(f"Unexpected store path: {path}")
-
-        return _open_store
+    def test_opener_forwards_region(self):
+        """A non-default region is threaded to every store open (actor read path)."""
+        with patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=self._side_effect()) as mock_open:
+            opener = make_store_opener(region="eu-west-1")
+            opener("s3://b/m/reflectance.zarr")
+        assert mock_open.call_args.kwargs["region"] == "eu-west-1"
 
     def test_opener_caches_each_path(self):
         """make_store_opener opens each distinct path once and returns the same group."""
@@ -543,6 +488,32 @@ class TestSharedStoreOpener:
             "s3://b/m/sar_ascending.zarr",
             "s3://b/m/sar_descending.zarr",
         ]
+
+
+class TestResolveS1OrbitErrors:
+    """resolve_s1_orbit must not swallow transient/auth errors as 'orbit absent'."""
+
+    def test_missing_repo_excludes_orbit(self):
+        def _open(path, **kwargs):
+            raise icechunk.IcechunkError("the repository doesn't exist")
+
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open),
+            pytest.raises(InsufficientCoverageError, match="no SAR stores found"),
+        ):
+            resolve_s1_orbit("s3://b/m", "both", allow_none=False)
+
+    def test_transient_error_reraises_not_downgrades(self):
+        def _open(path, **kwargs):
+            if "ascending" in path:
+                return object()  # ascending opens fine
+            raise icechunk.IcechunkError("connection timed out")  # descending errors transiently
+
+        with (
+            patch.object(_dl_mod, "open_store_as_zarr_group", side_effect=_open),
+            pytest.raises(icechunk.IcechunkError, match="timed out"),
+        ):
+            resolve_s1_orbit("s3://b/m", "both")  # must NOT silently downgrade to ascending
 
 
 class TestBandReadWorkerReservation:

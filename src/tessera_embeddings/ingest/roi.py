@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -86,16 +87,21 @@ class GridSpec:
 # ---------------------------------------------------------------------------
 
 
-def read_roi_metadata(roi_path: str) -> ROIMetadata:
+def read_roi_metadata(roi_path: str, *, storage_options: StorageOptions = None) -> ROIMetadata:
     """Read spatial metadata from a Zarr ROI store.
 
     Args:
         roi_path: Path to the Zarr ROI store (local or s3://).
+        storage_options: fsspec options for the open, or a callable resolving them.
+            The per-date mask reads take these already; this open happens BEFORE any
+            of them, so without it a callback-only or non-default-region deployment
+            fails at the very first ROI read — on the leg whose mask reads were wired
+            to succeed.
 
     Returns:
         ROIMetadata with WGS84 bbox, native CRS string, and grid dimensions.
     """
-    z = zarr.open(roi_path, mode="r")
+    z = zarr.open(roi_path, mode="r", storage_options=resolve_storage_options(storage_options))
     assert isinstance(z, zarr.Array), f"Expected Zarr Array, got {type(z).__name__}"
     native_crs = str(z.attrs["crs"])
     transform = Affine(*cast(list, z.attrs["transform"]))
@@ -116,23 +122,50 @@ def read_roi_metadata(roi_path: str) -> ROIMetadata:
     )
 
 
+StorageOptions = dict | Callable[[], "dict | None"] | None
+"""fsspec options, or a callable resolving them — see :func:`resolve_storage_options`."""
+
+
+def resolve_storage_options(storage_options: StorageOptions) -> dict | None:
+    """Resolve ``storage_options``, calling it if it is a provider.
+
+    **Accepting a callable is what keeps these credentials fresh, and it belongs here
+    rather than at each call site.** A dict is a snapshot: resolved once, it is still
+    the value being used however much later the read happens, and an IAM credential
+    outlives neither a long leg nor its own TTL. A provider is re-invoked at each read,
+    which is where the credential is actually consumed.
+
+    Resolving inside the reader rather than at the call sites means a new call site
+    cannot silently reintroduce the frozen behaviour by forgetting to re-resolve.
+    """
+    return storage_options() if callable(storage_options) else storage_options
+
+
 def read_roi_mask(
     roi_path: str,
     chunks: dict[str, int],
-    storage_options: dict | None = None,
+    storage_options: StorageOptions = None,
 ) -> da.Array:
     """Read ROI mask from a Zarr store as a chunked dask array.
 
     Args:
         roi_path: Path to the Zarr ROI store (local or s3:// or any fsspec URI).
         chunks: Dict with ``"northing"`` and ``"easting"`` chunk sizes.
-        storage_options: fsspec storage options (e.g. explicit AWS credentials).
-            When ``None``, fsspec infers credentials from the environment.
+        storage_options: fsspec storage options, or a callable returning them.
+            Prefer the callable for S3: it is re-invoked per read, so the credential
+            cannot be older than this call. When ``None``, fsspec infers credentials
+            from the environment — which on the radar path holds the SOURCE's
+            short-lived token rather than our own role, so ``None`` is only safe
+            locally.
 
     Returns:
         Chunked dask boolean array aligned to the target grid (True = inside ROI).
     """
-    return da.from_zarr(roi_path, chunks=(chunks["northing"], chunks["easting"]), storage_options=storage_options)
+    return da.from_zarr(
+        roi_path,
+        chunks=(chunks["northing"], chunks["easting"]),
+        storage_options=resolve_storage_options(storage_options),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Literal, final
 
+from tessera_embeddings.config.code_identity import source_identity
 from tessera_embeddings.config.time_windows import TimeWindow
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Model checkpoints
@@ -30,6 +34,56 @@ def checkpoint_filename(norm_source: str = "aws") -> str:
         valid = ", ".join(repr(k) for k in _CHECKPOINT_NAMES)
         raise ValueError(f"Unknown norm_source: {norm_source!r}. Must be one of {valid}.")
     return _CHECKPOINT_NAMES[norm_source]
+
+
+# ---------------------------------------------------------------------------
+# Staged-output code identity
+# ---------------------------------------------------------------------------
+
+#: SEED for the source whose behaviour determines what a staged tile CONTAINS.
+#:
+#: The fingerprint covers this plus everything it imports, transitively (see
+#: :mod:`tessera_embeddings.config.code_identity`) — a hand-maintained list cannot keep
+#: up with the imports, and it fails in the silent direction when it falls behind.
+#:
+#: A change anywhere in that closure means already-staged tiles were produced by
+#: different logic and must not be mixed with new ones. Code outside it — orchestration,
+#: provider and tooling code, and the ingest and storage modules inference never reaches
+#: — does not invalidate staging, which is the point of narrowing away from the old
+#: whole-build identity.
+#:
+#: The whole ``inference`` package seeds it rather than a hand-picked module list, and
+#: the closure then pulls in what those modules import (about a third of the package).
+#: Both OVER-include: ``assembly.py`` reads staged tiles rather than producing them, and
+#: ``storage.zarr_store`` arrives for ``compute_doy`` but brings its own dependencies
+#: with it. Deliberate, because the two errors are not symmetric — over-including costs
+#: a spurious re-inference, and ``force_staging_reuse`` exists to wave one through, while
+#: under-including silently assembles tiles from two code versions into one write-once
+#: zone-year and has no escape hatch at all. Err toward the expensive failure, never the
+#: silent one.
+_STAGED_OUTPUT_SOURCES: tuple[str, ...] = ("inference", "config/inference.py")
+
+
+def inference_code_identity() -> str:
+    """Fingerprint of the code that determines staged tile CONTENT, not of the whole build.
+
+    Replaces the AMI-ID-plus-tarball-ETag identity that used to feed the campaign's staging
+    ``run_id``. That identity was correct but far too wide: re-baking the worker AMI, or a
+    hotfix anywhere in the repo, changed it and so abandoned every staged tile and re-ran
+    inference for no semantic reason. At campaign scale that is the difference between a
+    hotfix costing minutes and costing a re-run.
+
+    Hashes :data:`_STAGED_OUTPUT_SOURCES` **and everything it imports**, transitively —
+    see :func:`~tessera_embeddings.config.code_identity.source_identity` for the closure
+    and for what a source hash cannot see.
+
+    The residual dependency-drift case is bounded twice here: the AMI is resolved once
+    and PINNED into every fill of a campaign, so one run cannot straddle two images, and
+    a model change ships under a new checkpoint filename, which is in the fingerprint
+    separately. A deliberate library upgrade mid-campaign wants the force-new escape
+    hatch rather than a silent reuse.
+    """
+    return source_identity(_STAGED_OUTPUT_SOURCES, "infcode")
 
 
 def _normalize_obs_checkpoints(checkpoints: tuple[int, ...]) -> tuple[int, ...]:
@@ -128,6 +182,77 @@ S2_BAND_ORDER = ["red", "blue", "green", "nir", "nir08", "rededge1", "rededge2",
 # SCL classes considered valid for masking (complement of S2_SCL_INVALID_CLASSES)
 SCL_VALID_CLASSES = frozenset({4, 5, 6, 7, 10, 11})
 
+#: A pixel with fewer than this many radar observations in the year is "radar-thin".
+#:
+#: Reported per year alongside the radar-free count so a downstream user can tell a pixel
+#: the radar barely saw from one it saw normally — a distinction the embedding itself does
+#: not expose, since both produce an embedding. The exact per-pixel counts are in the store;
+#: this only sets where the summary draws its line, and it is deliberately generous:
+#: twelve is roughly one observation a month, below which a year's radar signal is thin
+#: however it is sampled.
+RADAR_THIN_MAX_OBS = 12
+
+#: Minimum valid Sentinel-2 observations for a pixel to be EMBEDDED AT ALL, in the calendar
+#: year being filled. A pixel below it is written as fill, exactly as an out-of-ROI pixel is.
+#:
+#: **Not the counterpart of :data:`RADAR_THIN_MAX_OBS`, and the asymmetry is deliberate.** The
+#: radar line labels; this one refuses. They are also not comparable as numbers: radar sees
+#: through cloud, so its count is set by orbit geometry and one observation a month is a
+#: thin-but-usable year, while optical loses most of its passes to cloud and what survives
+#: masking is a small fraction of the overpasses.
+#:
+#: **This is a refusal, not a label, and the difference is that it is not reversible.** Under
+#: its old name (``OPTICAL_THIN_MAX_OBS``, 40 until 2026-08-12, then 15) nothing was refused for
+#: being under it and the per-pixel counts in ``s2_obs_count`` told the whole story either way —
+#: so raising or lowering it changed what summaries said and never what was published. That is no
+#: longer true: a refused pixel has no embedding, so recovering one is a re-run of its whole
+#: shard. **A reader of commits or documents from before 2026-08-13 will find the opposite claim
+#: under the old name.**
+#:
+#: Two things bound how freely this value moves:
+#:
+#: * it is stamped into the global store's root attrs and is part of their write-once identity,
+#:   so **a store cannot be re-stamped with a different value** — changing the line means a new
+#:   store, not a migration;
+#: * the seeder takes it explicitly and does not default to this constant, so nothing can stamp
+#:   a store by inheriting whatever happens to be here.
+#:
+#: **What the thin counters mean now that this is the only line.** ``s2_thin_px`` per chunk and
+#: ``s2_thin_below_obs`` in run provenance count EMBEDDED pixels below this value. While nothing
+#: refuses, that is a preview of what a refusal would remove. Once the gate is enforced it is an
+#: invariant: **the count must be zero, and a non-zero one means the gate leaked.** Each cell's
+#: provenance records the line its own numbers were produced under, so cells filled before and
+#: after a change are comparable rather than silently restated.
+#:
+#: **15 is a DECISION (Robert and colleague, 2026-08-17), not a placeholder** — it replaces the 25
+#: that stood here from 2026-08-13 purely so the machinery could be built. Coverage was chosen over
+#: reproducibility: the line keeps **94% of pixels rather than 79%**, and the cost, accepted
+#: knowingly, is that two independent embeddings of the same ground agree less well. The trade is
+#: recorded in full, including what 15 admits that 20 would not, in
+#: ``context_docs/design/minimum-optical-depth-plan.md``.
+#:
+#: **A store already seeded at another value keeps it.** The root attr decides, and it is write-once,
+#: so this constant changes what a NEW store is seeded with and what the thin counters report —
+#: never what an existing store enforces.
+#: The four orbit selections, as one name rather than a Literal repeated at every boundary.
+#: ``"none"`` is a real member: the S2-only path (ADR-013) carries it end to end, and a signature
+#: that omits it forces a cast at each hop instead of saying what the value is.
+S1Orbit = Literal["ascending", "descending", "both", "none"]
+
+OPTICAL_MIN_OBS = 15
+
+#: Resolved value meaning "this ROI has no usable radar at all, and that is a finding".
+#:
+#: Distinct from an empty request: nobody ASKS for ``"none"``, it is what ``"both"`` resolves
+#: to once probing shows neither orbit wrote a store. Some land has no dual-pol VV+VH radar in
+#: principle — over ice Sentinel-1 runs Extra Wide swath with HH/HV, which the OPERA query
+#: correctly discards — so a zone can be permanently radar-free while the catalogue holds a
+#: hundred thousand granules for it. Requiring a SAR store there fails the cell forever.
+#:
+#: Defined HERE, in the layer the config lives in, because ``InferenceConfig`` has to validate
+#: it and the loader that resolves it already depends on this module.
+S1_ORBIT_NONE = "none"
+
 # Embedding output dimension — v1.1 produces 192-D reps; we save the first 128.
 EMBEDDING_DIM = 128
 
@@ -147,14 +272,16 @@ DEFAULT_NUM_OBS_CHECKPOINTS: tuple[int, ...] = tuple(range(8, 257, 8))
 # module scope (the Fargate flow runner has no torch).
 PREFETCH_DEPTH = 2
 
-# Spatial read-tile size for inference. The read/ChunkSpec grid stays 2000x2000;
-# the *resident input working set* is bounded separately via density-sized
-# northing strips (see actors._strip_height_for_density), so a 2000x2000 chunk's
-# peak host RAM is capped by a per-strip byte budget rather than fixed by
-# T x H x W. Sparse chunks load in one full-height strip; only dense chunks
-# split. Independent of the storage chunk size written at ingest
-# (config.ingest.INGEST_CHUNK_SIZE).
-INFERENCE_CHUNK_SIZE = 2000
+# Spatial read-tile size for inference, on both paths: one tile is exactly one
+# 2048-px output shard (ADR-008 D3), so assembly writes whole shards instead of
+# read-modify-writing a partial output chunk at each tile edge. A literal rather
+# than an import of ``store_layout.SHARD_PX`` — that module imports EMBEDDING_DIM
+# from this one — and ``test_store_layout`` pins the two together.
+#
+# A tile's peak host RAM is not T x H x W: the resident input working set is
+# bounded by density-sized northing strips (actors._strip_height_for_density),
+# so sparse tiles load in one full-height strip and only dense ones split.
+INFERENCE_CHUNK_SIZE = 2048
 
 
 @final
@@ -177,7 +304,8 @@ class InferenceConfig:
             batch_size: Per-GPU sub-batch size within a bucket.
             norm_source: Which v1.1 checkpoint/stats — "aws" (default) or "mpc".
             num_workers: GPU workers.
-            s1_orbit: Which S1 orbit(s) — "ascending", "descending", or "both".
+            s1_orbit: Which S1 orbit(s) — "ascending", "descending", "both", or
+                "none" for radar-free land (which requires allow_s2_only).
             compute_std: No-op under v1.1 (deterministic sampling); always False.
 
         I/O:
@@ -216,7 +344,16 @@ class InferenceConfig:
     batch_size: int = 7168
     num_workers: int = 4
     norm_source: Literal["mpc", "aws"] = "aws"
-    s1_orbit: Literal["ascending", "descending", "both"] = "both"
+    s1_orbit: S1Orbit = "both"
+    """Which S1 orbit direction(s) to read.
+
+    ``"none"`` is a RESOLVED value, not a request: it is what ``"both"`` becomes once probing
+    finds that neither orbit wrote a store. Parts of the globe are radar-free in principle —
+    over ice Sentinel-1 flies Extra Wide swath with HH/HV, which the dual-pol query correctly
+    discards — so this is a permanent property of the terrain rather than an ingest failure,
+    and a global product cannot refuse it. It requires ``allow_s2_only``: with no radar at all
+    every pixel has zero S1 observations, so the default gate would skip every one of them.
+    """
     # Deterministic sampling under v1.1 — no repeat variance; forced False in __post_init__.
     compute_std: bool = False
 
@@ -249,13 +386,66 @@ class InferenceConfig:
     # provisions 48/50) can't gate every remaining batch forever.
     actor_batch_placement_timeout_sec: float = 300.0
 
+    # Appended last on purpose: InferenceConfig is public API (docs/public-api.md)
+    # and this is a positional dataclass, so a new field in the middle would
+    # silently rebind later positional args in downstream construction. Keep new
+    # fields at the tail.
+    #
+    # Embed S2-valid pixels that have ZERO S1 observations (sub-zone SAR coverage
+    # gaps — swath edges/holes; worst at high latitudes). Such a pixel gets the
+    # upstream v1.1 missing-S1 convention: an all-zeros (normalized-space) S1 slice
+    # at the smallest bucket — exactly ucam-eo/tessera's `_sample_s1_merged` zero
+    # return — so this restores upstream parity rather than inventing an input.
+    # Default False: pixels without S1 are skipped (this pipeline's historical
+    # gate). Per-pixel provenance is free either way: an embedded pixel with
+    # s1_asc_obs_count + s1_desc_obs_count == 0 is an S2-only embedding. NOTE:
+    # S2-only embedding QUALITY is unvalidated for this S1-trained checkpoint —
+    # see the optional-S1 ADR before enabling in production.
+    allow_s2_only: bool = False
+
+    # Minimum valid optical observations for a pixel to be embedded at all, or None for "embed
+    # everything with any optical input" — the historical behaviour, and what every non-campaign
+    # caller wants. See OPTICAL_MIN_OBS for what a refusal costs. None rather than 0 because the
+    # two are different statements and only one of them is recoverable from a config dump: a
+    # campaign whose value silently resolved to 0 would publish under no rule while believing it
+    # had one, which is the shape of two failures already in this repo's register.
+    optical_min_obs: int | None = None
+
     def __post_init__(self) -> None:
         """Validate and normalise config fields."""
+        if self.optical_min_obs is not None and self.optical_min_obs <= 0:
+            raise ValueError(
+                f"optical_min_obs={self.optical_min_obs} refuses nothing — pass None for no "
+                "minimum optical depth, or a positive number of observations."
+            )
         if self.norm_source not in _NORM_STATS:
             valid = ", ".join(repr(k) for k in _NORM_STATS)
             raise ValueError(f"Invalid norm_source: {self.norm_source!r}. Must be one of {valid}.")
-        if self.s1_orbit not in {"ascending", "descending", "both"}:
-            raise ValueError(f"Invalid s1_orbit: {self.s1_orbit!r}. Must be 'ascending', 'descending', or 'both'.")
+        if self.s1_orbit not in {"ascending", "descending", "both", S1_ORBIT_NONE}:
+            raise ValueError(
+                f"Invalid s1_orbit: {self.s1_orbit!r}. Must be 'ascending', 'descending', 'both', or {S1_ORBIT_NONE!r}."
+            )
+        if self.s1_orbit == S1_ORBIT_NONE and not self.allow_s2_only:
+            # FORCED, not refused, and not left alone. Refusing would defeat the decision that
+            # radar-free land is acceptable — a global product cannot reject terrain that has no
+            # dual-pol radar in principle. Leaving the flag alone would be worse than either:
+            # with no radar every pixel has zero S1 observations, the default gate skips every
+            # one, and the fill would COMPLETE having written nothing while tagging the year
+            # done. An empty result that reads as success is the one outcome no later run
+            # revisits.
+            #
+            # Safe to derive rather than demand from the caller because it is a function of
+            # s1_orbit alone, so a resume computes the same value from the same inputs and the
+            # staged-chunk consistency check in the embeddings flow still holds.
+            self.allow_s2_only = True
+            logger.warning(
+                "s1_orbit=%r: forcing allow_s2_only=True. This ROI has no radar at all, so "
+                "EVERY pixel gets the missing-S1 input (all-zeros normalised S1) and every "
+                "embedding here is S2-only — whose quality is unvalidated for this S1-trained "
+                "checkpoint (see the optional-S1 ADR). Without this the fill would write "
+                "nothing and still report success.",
+                self.s1_orbit,
+            )
         self.num_obs_checkpoints = _normalize_obs_checkpoints(self.num_obs_checkpoints)
 
         # v1.1 sampling is deterministic — no repeat variance to measure.

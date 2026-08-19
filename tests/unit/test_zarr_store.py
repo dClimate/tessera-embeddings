@@ -41,12 +41,13 @@ from tessera_embeddings.storage.zarr_store import (
     _DEFAULT_STORAGE_MAX_TRIES,
     S3Config,
     _default_repo_config,
-    _open_repo,
     _open_writable_session,
     _write_new,
     compute_doy,
     get_existing_dates,
+    open_repo,
     open_store,
+    open_store_as_zarr_group,
     resolve_region,
     rollback_commits,
     set_s3_config,
@@ -206,25 +207,25 @@ class TestRollbackCommits:
         store_path = str(local_zarr_path / "rb_id" / "reflectance.zarr")
         self._build_history(store_path, sample_reflectance_data, ["2024-01-01", "2024-01-06", "2024-01-11"])
 
-        repo = _open_repo(store_path)
+        repo = open_repo(store_path)
         history = list(repo.ancestry(branch="main"))
         expected_target = history[1].id  # one commit back
 
         new_head = rollback_commits(store_path, 1)
 
         assert new_head == expected_target
-        assert _open_repo(store_path).lookup_branch("main") == expected_target
+        assert open_repo(store_path).lookup_branch("main") == expected_target
 
     def test_dry_run_does_not_move_branch(self, local_zarr_path, sample_reflectance_data):
         """dry_run resolves the target id but leaves HEAD untouched."""
         store_path = str(local_zarr_path / "rb_dry" / "reflectance.zarr")
         self._build_history(store_path, sample_reflectance_data, ["2024-01-01", "2024-01-06", "2024-01-11"])
 
-        head_before = _open_repo(store_path).lookup_branch("main")
+        head_before = open_repo(store_path).lookup_branch("main")
 
         target = rollback_commits(store_path, 1, dry_run=True)
 
-        assert _open_repo(store_path).lookup_branch("main") == head_before
+        assert open_repo(store_path).lookup_branch("main") == head_before
         assert target != head_before
         assert open_store(store_path).sizes["time"] == 3
 
@@ -233,11 +234,11 @@ class TestRollbackCommits:
         store_path = str(local_zarr_path / "rb_rev" / "reflectance.zarr")
         self._build_history(store_path, sample_reflectance_data, ["2024-01-01", "2024-01-06", "2024-01-11"])
 
-        original_head = _open_repo(store_path).lookup_branch("main")
+        original_head = open_repo(store_path).lookup_branch("main")
         rollback_commits(store_path, 2)
         assert open_store(store_path).sizes["time"] == 1
 
-        _open_repo(store_path).reset_branch("main", original_head)
+        open_repo(store_path).reset_branch("main", original_head)
         assert open_store(store_path).sizes["time"] == 3
 
     def test_n_below_one_raises(self, local_zarr_path, sample_reflectance_data):
@@ -1064,3 +1065,36 @@ class TestDefaultRepoConfig:
         assert config.storage is not None
         assert config.storage.timeouts.read_timeout_ms == _DEFAULT_READ_TIMEOUT_MS
         assert config.storage.retries.max_tries == _DEFAULT_STORAGE_MAX_TRIES
+
+
+class TestEmptyChunkElision:
+    """The zone mosaics stay cheap only if all-fill (ocean/nodata) chunks are
+    not materialized as objects. This pins that write_dataset's icechunk write
+    elides them (ADR-011's cost assumption), rather than taking it on faith.
+    """
+
+    def test_all_fill_chunks_are_not_materialized(self, local_zarr_path):
+        store_path = str(local_zarr_path / "elision" / "reflectance.zarr")
+        data = xr.Dataset(
+            {"red": (("time", "northing", "easting"), np.zeros((1, 8, 8), dtype="uint16"))},
+            coords={
+                "time": np.array(["2025-06-01"], dtype="datetime64[ns]"),
+                "northing": np.arange(8, dtype="float64"),
+                "easting": np.arange(8, dtype="float64"),
+            },
+        )
+        data["red"].values[0, 0:4, 0:4] = 1  # only the top-left 4x4 chunk carries data
+
+        write_dataset(
+            store_path,
+            data,
+            tile_id="t",
+            baselines={},
+            chunks={"time": 1, "northing": 4, "easting": 4},
+            crs="EPSG:32601",
+        )
+
+        red = open_store_as_zarr_group(store_path)["red"]
+        assert red.shape == (1, 8, 8)
+        # 2x2 spatial chunks; the three all-zero (fill) chunks are elided.
+        assert red.nchunks_initialized == 1
