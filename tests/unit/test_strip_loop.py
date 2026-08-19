@@ -1130,3 +1130,80 @@ class TestTheRecordTheConsumerWillRead:
         """
         record = self._refused_run(inference_config, test_model, monkeypatch, crop=None)
         assert record["chunk_side_px"] == _CHUNK.width
+
+
+class TestTheRecordCountsOnlyTheEvaluatedColumns:
+    """Every statistic in the record is restricted to the columns the reasons were counted over.
+
+    The obs buffers are allocated and filled at FULL chunk width on both the cropped and uncropped
+    paths, on purpose — the arrays published into the store keep full-extent fidelity. So a record
+    built by summing them whole describes a wider footprint than its own ``eligible_px`` denominator,
+    and every ratio a consumer derives is then measured against the wrong base. The failure is not
+    only cosmetic: a count can exceed its denominator, which reads as "more imagery would repair
+    this" about imagery that was never in question.
+
+    A reviewer found this on the radar count. It was never only radar — the buffers are full width
+    for the optical counts too, so ``px_with_any`` and all three depth statistics carried the same
+    mismatch. These tests are written so a version that sums the full width scores DIFFERENTLY rather
+    than merely failing an inequality: the observations are placed exclusively OUTSIDE the crop, so
+    the correct answer is zero and the full-width answer is not.
+    """
+
+    CROP = slice(3, 7)
+
+    @classmethod
+    def _record(cls, *, x_sub, s2_cols, radar_cols, depth=40):
+        h, w = _CHUNK.height, _CHUNK.width
+        buffers = {var: np.zeros((h, w), dtype=np.uint16) for var in _actors_mod.OBS_COUNT_VARS}
+        if s2_cols is not None:
+            buffers["s2_obs_count"][:, s2_cols] = depth
+        if radar_cols is not None:
+            buffers["s1_asc_obs_count"][:, radar_cols] = 5
+        return _actors_mod._coverage_record(
+            _CHUNK,
+            refused={"thin_optical": 0},
+            radar_rule_enforced=True,
+            obs_buffers=buffers,
+            x_sub=x_sub,
+            optical_min_obs=15,
+        )
+
+    def test_observations_outside_the_crop_are_not_counted(self):
+        """Everything sits in columns 0:3; the crop is 3:7. The correct answer is zero of each."""
+        outside = slice(0, 3)
+        record = self._record(x_sub=self.CROP, s2_cols=outside, radar_cols=outside)
+
+        would_be = _CHUNK.height * 3  # what a full-width sum reports, and it is not zero
+        assert would_be > 0, "the fixture must be able to fail"
+        assert record["s2_obs"]["px_with_any"] == 0
+        assert record["px_with_any_radar"] == 0
+        assert record["s2_obs"]["max"] == 0
+
+    def test_no_count_can_exceed_its_own_denominator(self):
+        """Full-width observations, cropped reasons: each count lands exactly on ``eligible_px``."""
+        every = slice(None)
+        record = self._record(x_sub=self.CROP, s2_cols=every, radar_cols=every)
+
+        eligible = record["eligible_px"]
+        assert eligible == _CHUNK.height * 4
+        assert record["s2_obs"]["px_with_any"] == eligible
+        assert record["px_with_any_radar"] == eligible
+        # The full-width sum would have been height * 10 — larger than the denominator it divides.
+        assert record["px_with_any_radar"] <= eligible
+        assert record["s2_obs"]["px_with_any"] <= eligible
+
+    def test_the_depth_statistics_describe_the_evaluated_columns_only(self):
+        """Thin pixels outside the crop must not appear in the thin-population median."""
+        record = self._record(x_sub=self.CROP, s2_cols=slice(0, 3), radar_cols=None, depth=4)
+        assert record["s2_obs"]["median_where_thin"] is None, "no thin pixel was evaluated"
+
+        inside = self._record(x_sub=self.CROP, s2_cols=slice(3, 7), radar_cols=None, depth=4)
+        assert inside["s2_obs"]["median_where_thin"] == 4.0
+
+    def test_an_uncropped_chunk_still_sees_its_whole_width(self):
+        """The guard against over-correcting: with no crop the footprint is the whole tile."""
+        record = self._record(x_sub=None, s2_cols=slice(None), radar_cols=slice(None))
+
+        assert record["eligible_px"] == _CHUNK.height * _CHUNK.width
+        assert record["s2_obs"]["px_with_any"] == _CHUNK.height * _CHUNK.width
+        assert record["px_with_any_radar"] == _CHUNK.height * _CHUNK.width

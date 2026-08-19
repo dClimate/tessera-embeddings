@@ -547,7 +547,7 @@ def _coverage_record(
     refused: Mapping[str, int],
     radar_rule_enforced: bool | None,
     obs_buffers: Mapping[str, np.ndarray],
-    eff_w: int,
+    x_sub: slice | None,
     optical_min_obs: int,
 ) -> dict[str, Any]:
     """One shard's refusal reasons and observation depth, in the shape the registry consumes.
@@ -562,8 +562,20 @@ def _coverage_record(
     embedded pixels: an infill planner is asking about the land, and a denominator that shrinks with
     the answer cannot support the comparison. ``chunk_px`` is the published footprint beside it, so a
     reader can also see how much of the shard was never evaluated at all.
+
+    ``x_sub`` IS THE COLUMN RANGE THE REASONS WERE COUNTED OVER, and every buffer here is sliced by
+    it — which is why this takes the slice rather than its width. The obs buffers are allocated and
+    filled at FULL chunk width on both the cropped and uncropped paths, deliberately, so the arrays
+    published into the store keep full-extent fidelity. Summing them whole would describe a footprint
+    the refusal counts do not cover: observations in columns outside the evaluated range would inflate
+    every statistic here and can push a count above its own ``eligible_px`` denominator, telling a
+    consumer more imagery could repair a shard when the imagery it is counting was never in question.
+    Carrying both footprints was the alternative and is rejected here: the unevaluated columns were
+    never refused, so no consumer ranks by them, and ``chunk_px`` already says how much was skipped.
     """
-    s2_obs = obs_buffers["s2_obs_count"]
+    cols = x_sub if x_sub is not None else slice(None)
+    eff_w = int(chunk.width) if x_sub is None else int(x_sub.stop - x_sub.start)
+    s2_obs = obs_buffers["s2_obs_count"][:, cols]
     any_obs = s2_obs > 0
     return {
         "refused": dict(refused),
@@ -605,7 +617,7 @@ def _coverage_record(
         # counts: which one it was is per-pixel in the coverage arrays, so the summary only has to
         # answer presence.
         "px_with_any_radar": int(
-            ((obs_buffers["s1_asc_obs_count"] > 0) | (obs_buffers["s1_desc_obs_count"] > 0)).sum()
+            ((obs_buffers["s1_asc_obs_count"][:, cols] > 0) | (obs_buffers["s1_desc_obs_count"][:, cols] > 0)).sum()
         ),
     }
 
@@ -1389,17 +1401,17 @@ class InferenceActor:
                 # The observation summary rides along because the counts alone cannot say HOW thin:
                 # obs counts are accumulated per strip regardless of validity, so they are populated
                 # even on a chunk where nothing passed.
-                eff_w = int(chunk.width) if x_sub is None else int(x_sub.stop - x_sub.start)
                 # THE FOOTPRINT THE REASONS ACTUALLY COVER, which is not the whole chunk when the
-                # read plan cropped it, and the depth behind them. Shared with the success path so a
-                # refused shard and a partly-refused one are described in the same terms — see
-                # `_coverage_record`.
+                # read plan cropped it, and the depth behind them. The crop is passed as the slice
+                # itself so the record can restrict its own buffers to it. Shared with the success
+                # path so a refused shard and a partly-refused one are described in the same terms —
+                # see `_coverage_record`.
                 skip_record = {"label": chunk.label} | _coverage_record(
                     chunk,
                     refused=refused,
                     radar_rule_enforced=radar_rule_enforced,
                     obs_buffers=obs_buffers,
-                    eff_w=eff_w,
+                    x_sub=x_sub,
                     optical_min_obs=self.config.optical_min_obs or OPTICAL_MIN_OBS,
                 )
                 logger.info(
@@ -1522,7 +1534,7 @@ class InferenceActor:
                 refused=refused,
                 radar_rule_enforced=radar_rule_enforced,
                 obs_buffers=obs_buffers,
-                eff_w=int(chunk.width) if x_sub is None else int(x_sub.stop - x_sub.start),
+                x_sub=x_sub,
                 optical_min_obs=thin_below,
             )
 
