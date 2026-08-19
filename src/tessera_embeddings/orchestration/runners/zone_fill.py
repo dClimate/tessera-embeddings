@@ -1030,6 +1030,16 @@ def assemble_zone_year(
     # YEAR's provenance entry: radar coverage is a property of what was acquired, so one
     # year of a zone can be radar-free where another is not.
     radar_coverage = summarise_radar_coverage(results)
+    # Per-shard coverage for the shards that DID embed something, keyed by label. A shard the depth
+    # gate partly refused knows how much it lost — the actor accumulates the reasons on the success
+    # path too — and without this the registry describes it as embedded with no refusals recorded,
+    # which reads as fully covered ground. Resumed successes are synthetic and carry no record, so
+    # they are simply absent and publish as null rather than as zero.
+    embedded_records = {
+        str(r["chunk"]): r["coverage"]
+        for r in results
+        if r.get("status") == "success" and isinstance(r.get("coverage"), dict) and r.get("chunk")
+    }
     if radar_coverage:
         log.info(
             "Radar coverage %s-%d: %.1f%% of embedded pixels have NO radar, %.1f%% have "
@@ -1047,6 +1057,7 @@ def assemble_zone_year(
         year=year,
         registry_root=registry_root,
         optical_min_obs=optical_min_obs,
+        embedded_records=embedded_records,
         run_id=run_id,
         n_workers=n_workers,
         gate=gate,

@@ -631,14 +631,85 @@ class TestTheDatasetIsActuallyReadable:
         assert set(table.column("run_id").to_pylist()) == {"first", "refill"}
         assert set(table.column("assembled_at").to_pylist()) == {"t1", "t2"}, "and a clock to pick by"
 
-    def test_an_embedded_tile_claims_no_refusal_measurement(self, tmp_path: Path) -> None:
-        """Null, not zero. Zero would assert that something counted this tile's refusals and found
-        none, which is the misreading the whole registry exists to prevent.
+    def test_an_unmeasured_tile_claims_no_refusal_measurement(self, tmp_path: Path) -> None:
+        """Null, not zero, when no coverage record reached the row — a resumed success carries none.
+
+        Zero would assert that something counted this tile's refusals and found none, which is the
+        misreading the whole registry exists to prevent.
         """
         rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[])
         assert rows[0]["embedded"] is True
         assert rows[0]["refused_px"] is None
         assert all(rows[0][f"refused_{r}_px"] is None for r in REASONS)
+
+
+class TestAPartlyRefusedTileIsNotFullyCovered:
+    """The largest hole this registry had: a tile the depth gate partly refused was recorded as
+    embedded with no refusals, which reads as covered ground when part of it is holes.
+
+    The actor accumulates refusal reasons on the SUCCESS path too, so the number always existed; only
+    the wholly-refused branch wrote it down. Those partial refusals are the bulk of what a revisit
+    campaign would fill, so this is most of the infill work list rather than a refinement of it.
+    """
+
+    @staticmethod
+    def _partial(thin: int = 40) -> dict:
+        return {
+            "refused": {"thin": thin, "no_optical": 0, "no_radar": 0},
+            "eligible_px": 100,
+            "chunk_px": 100,
+            "s2_obs": {"px_with_any": 95, "max": 14, "median_where_any": 11.0},
+            "px_with_any_radar": 100,
+            "radar_rule_enforced": False,
+        }
+
+    def test_an_embedded_tile_reports_what_the_gate_removed(self) -> None:
+        rows = registry_rows(
+            "r1", "t", embedded=["chunk_0_0"], refused=[],
+            embedded_records={"chunk_0_0": self._partial()}, optical_min_obs=15,
+        )
+        row = rows[0]
+        assert row["embedded"] is True, "it does hold embeddings"
+        assert row["refused_px"] == 40, "and 40 of its 100 eligible pixels are not there"
+        assert row["refused_thin_px"] == 40
+        assert row["eligible_px"] == 100
+
+    def test_zero_refusals_is_written_as_zero_not_null(self) -> None:
+        """A measured zero and an unmeasured tile must be distinguishable: the first says the gate
+        removed nothing, the second says nobody looked. Both used to publish as null.
+        """
+        rows = registry_rows(
+            "r1", "t", embedded=["chunk_0_0", "chunk_0_1"], refused=[],
+            embedded_records={"chunk_0_0": self._partial(thin=0)}, optical_min_obs=15,
+        )
+        measured = next(r for r in rows if r["tile"] == "chunk_0_0")
+        unmeasured = next(r for r in rows if r["tile"] == "chunk_0_1")
+        assert measured["refused_px"] == 0
+        assert unmeasured["refused_px"] is None
+
+    def test_both_kinds_of_row_are_measured_in_the_same_terms(self) -> None:
+        """Comparability is the point — an infill planner ranks a 60%-refused embedded tile against
+        a wholly refused one — so the two record sources must fill the same columns identically.
+        """
+        rec = self._partial()
+        rows = registry_rows(
+            "r1", "t", embedded=["chunk_0_0"], refused=["chunk_1_1"],
+            embedded_records={"chunk_0_0": rec}, records={"chunk_1_1": rec}, optical_min_obs=15,
+        )
+        a, b = (next(r for r in rows if r["tile"] == t) for t in ("chunk_0_0", "chunk_1_1"))
+        shared = [c for c in a if c not in ("tile", "embedded")]
+        assert {c: a[c] for c in shared} == {c: b[c] for c in shared}
+        assert a["embedded"] is True and b["embedded"] is False
+
+    def test_a_marker_wins_over_a_result_for_the_same_label(self) -> None:
+        """A label in both sources refused everything at the end, so its marker is the later word."""
+        rows = registry_rows(
+            "r1", "t", embedded=[], refused=["chunk_0_0"],
+            embedded_records={"chunk_0_0": self._partial(thin=1)},
+            records={"chunk_0_0": self._partial(thin=99)},
+            optical_min_obs=15,
+        )
+        assert rows[0]["refused_thin_px"] == 99
 
     def test_a_refused_tile_with_no_record_is_null_not_zero(self, tmp_path: Path) -> None:
         """A marker that could not be read leaves the reason unknown. Reporting zero refusals for a

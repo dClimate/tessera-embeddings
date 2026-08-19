@@ -862,6 +862,97 @@ def test_a_store_with_no_depth_rule_publishes_null_not_zero(tmp_path, monkeypatc
     assert cols["optical_min_obs"] == [None] * len(cols["tile"])
 
 
+def test_a_partly_refused_tile_publishes_what_the_gate_removed(tmp_path, monkeypatch):
+    """The actor's success-path coverage record must reach the published row.
+
+    Worth an end-to-end test because the failure is silent and reads as good news: without the
+    forwarding, a tile the depth gate partly refused publishes as embedded with every measurement
+    null, which a consumer reads as fully covered ground. The number was always computed — the actor
+    accumulates refusal reasons on the success path too — so nothing looks wrong anywhere.
+    """
+    store = _seed_global_with_rule(tmp_path, 15)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0), (1, 1)])
+    registry_root = str(tmp_path / "registry")
+
+    def partly_refusing_stub(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
+        rng = np.random.default_rng(5)
+        writer = ZarrWriter(staging_base, embedding_dim=_BAND)
+        results = []
+        for i, chunk in enumerate(chunks):
+            emb = rng.integers(-100, 100, size=(chunk.height, chunk.width, _BAND)).astype(np.int8)
+            writer.write_chunk(chunk, emb, run_id, scales=rng.random((chunk.height, chunk.width)).astype(np.float32))
+            results.append(
+                {
+                    "chunk": chunk.label,
+                    "status": "success",
+                    "valid_pixels": 1,
+                    "elapsed_sec": 0.0,
+                    "s1_free_pixels": 0,
+                    "s1_thin_pixels": 0,
+                    "s2_thin_pixels": 0,
+                    "s2_thin_below_obs": 15,
+                    "coverage": {
+                        "refused": {"thin": 7 * (i + 1), "no_optical": 0, "no_radar": 0},
+                        "eligible_px": 100,
+                        "chunk_px": 100,
+                        "s2_obs": {"px_with_any": 95, "max": 14, "median_where_any": 11.0},
+                        "px_with_any_radar": 100,
+                        "radar_rule_enforced": False,
+                    },
+                }
+            )
+        return results
+
+    monkeypatch.setattr(zone_fill, "run_inference", partly_refusing_stub)
+    summary = _fill(
+        tmp_path,
+        store,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        registry_root=registry_root,
+        config=InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15),
+        run_id="partialRun",
+    )
+    assert summary["empty"] is False
+
+    cols = _published_part(registry_root)
+    rows = {t: i for i, t in enumerate(cols["tile"])}
+    assert set(cols["embedded"]) == {True}, "both tiles hold embeddings"
+    # ...and both report the pixels the depth gate took out of them, per tile, not pooled.
+    refused = {t: cols["refused_px"][i] for t, i in rows.items()}
+    assert sorted(refused.values()) == [7, 14], "each tile's own count, not a shared one"
+    assert all(cols["obs_max"][i] == 14 for i in rows.values())
+    assert all(cols["median_obs_where_any"][i] == 11.0 for i in rows.values())
+    assert all(cols["optical_min_obs"][i] == 15 for i in rows.values()), "and the line they missed"
+
+
+def test_a_resumed_success_publishes_null_rather_than_zero(tmp_path, monkeypatch):
+    """A resumed tile is a synthetic success carrying no coverage record. It must publish as
+    unmeasured, not as a tile the gate refused nothing from — the second is a claim nobody made.
+    """
+    store = _seed_global_with_rule(tmp_path, 15)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0)])
+    registry_root = str(tmp_path / "registry")
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
+
+    _fill(
+        tmp_path,
+        store,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        registry_root=registry_root,
+        config=InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15),
+        run_id="resumedRun",
+    )
+    cols = _published_part(registry_root)
+    assert cols["embedded"] == [True]
+    assert cols["refused_px"] == [None], "no record reached it, so nothing is claimed"
+    assert cols["optical_min_obs"] == [15], "the cell's policy is known regardless"
+
+
 def test_infer_phase_threads_retirement_gate(tmp_path, monkeypatch):
     """The sequential runner's retire_idle_actors=False must reach run_inference —
     it is what keeps a zone tail from draining the shared cluster.

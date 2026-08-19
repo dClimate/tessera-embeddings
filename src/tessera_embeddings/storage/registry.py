@@ -5,6 +5,12 @@ petabyte-scale store to find out, and a later infill campaign asking "which tile
 would more imagery fix them" should not have to re-read the pixels. The registry answers both from a
 Parquet dataset beside the store: one row per 2048-pixel tile per year.
 
+**"Covered" is two columns, not one.** ``embedded`` says whether a tile holds embeddings at all;
+``refused_px`` says how much of its land the depth rule removed. A tile can be embedded and still be
+largely holes, and those partial refusals are the bulk of what a revisit campaign would fill — so a
+reader treating ``embedded`` alone as coverage will overstate it. Both kinds of row are measured in
+the same terms and are directly comparable.
+
 **A convenience layer, never a second source of truth.** Every column is derivable from the store
 itself, so a wrong row is a rebuildable inconvenience rather than a data defect, and a correction to
 it never touches published data. That property is what the Open Data access request promises
@@ -29,10 +35,11 @@ Three things this module does deliberately, each because the obvious version is 
   (``ArrowTypeError: Field year has incompatible types``). The path is the authority; the same
   identity is repeated in the file's key-value metadata, which collides with nothing, so a part
   opened on its own still says what it describes.
-* **Null means "not measured", never zero.** An embedded tile's refusal columns are null because
-  nothing counted refusals for it, and a refused tile with no recorded reason is null for the same
-  reason. Writing zero would assert a measurement nobody took, which is the mistake this registry
-  exists to stop a reader making.
+* **Null means "not measured", never zero.** A tile whose coverage record did not survive — a
+  resumed success carries none, an unreadable marker leaves none — is null across every
+  measurement. Writing zero would assert a measurement nobody took, which is the mistake this
+  registry exists to stop a reader making. Zero refusals is a real, different answer, and it is
+  written as zero.
 
 **Where the bounding box comes from.** Each row carries its tile's WGS84 box, which is what makes
 "is my area of interest covered" a query rather than a grid calculation the consumer has to get
@@ -96,6 +103,10 @@ def registry_schema() -> pa.Schema:
             pa.field("tile", pa.string(), nullable=False),
             pa.field("run_id", pa.string(), nullable=False),
             pa.field("assembled_at", pa.string(), nullable=False),
+            # Whether this tile holds embeddings AT ALL — not whether it is whole. A tile the depth
+            # gate partly refused is `True` here and carries a non-zero `refused_px`, so the
+            # question "is my area covered" is answered by BOTH columns: `embedded` says whether
+            # anything is there, `refused_px` says how much is missing from it.
             pa.field("embedded", pa.bool_(), nullable=False),
             # The footprint the reasons were counted over, and the tile's whole footprint. They
             # differ when the read plan cropped the chunk, and the difference is land nobody
@@ -168,6 +179,7 @@ def registry_rows(
     embedded: Iterable[str],
     refused: Iterable[str],
     records: Mapping[str, dict] | None = None,
+    embedded_records: Mapping[str, dict] | None = None,
     optical_min_obs: int | None = None,
     bboxes: Mapping[str, tuple[float, float, float, float]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -187,47 +199,51 @@ def registry_rows(
     derived here because the box comes from the zone's grid geometry, which this module has no
     business knowing; a label with no entry gets nulls rather than a guess.
     """
-    records = records or {}
+    records = {**(embedded_records or {}), **(records or {})}
     rule = _int_or_none(optical_min_obs)
     boxes = bboxes or {}
     rows: list[dict[str, Any]] = []
-    for label in sorted(embedded):
-        rows.append(
-            {"tile": label, "run_id": run_id, "assembled_at": assembled_at, "embedded": True}
-            | _blank_measurements()
-            | {"optical_min_obs": rule}
-            | _bbox_fields(boxes.get(label))
-        )
-    for label in sorted(refused):
-        record = records.get(label) or {}
+    for label, was_embedded in [*((lbl, True) for lbl in sorted(embedded)), *((lbl, False) for lbl in sorted(refused))]:
         row: dict[str, Any] = {
             "tile": label,
             "run_id": run_id,
             "assembled_at": assembled_at,
-            "embedded": False,
+            "embedded": was_embedded,
         }
         row |= _blank_measurements()
         row["optical_min_obs"] = rule
         row |= _bbox_fields(boxes.get(label))
-        if record:
-            reasons = record.get("refused") or {}
-            obs = record.get("s2_obs") or {}
-            counted = {reason: int(reasons.get(reason) or 0) for reason in REASONS}
-            row |= {
-                "eligible_px": _int_or_none(record.get("eligible_px")),
-                "chunk_px": _int_or_none(record.get("chunk_px")),
-                "refused_px": sum(counted.values()),
-                **{f"refused_{reason}_px": n for reason, n in counted.items()},
-                "px_with_any_optical": _int_or_none(obs.get("px_with_any")),
-                "obs_max": _int_or_none(obs.get("max")),
-                "median_obs_where_any": _float_or_none(obs.get("median_where_any")),
-                "px_with_any_radar": _int_or_none(record.get("px_with_any_radar")),
-                "radar_rule_enforced": (
-                    bool(record["radar_rule_enforced"]) if isinstance(record.get("radar_rule_enforced"), bool) else None
-                ),
-            }
+        row |= _measurement_fields(records.get(label) or {})
         rows.append(row)
     return rows
+
+
+def _measurement_fields(record: Mapping[str, Any]) -> dict[str, Any]:
+    """One shard's measurements from its coverage record; nothing at all without one.
+
+    Applied to embedded and refused rows alike, because the numbers mean the same thing for both:
+    a shard the depth gate partly refused reports what it lost, which is the majority of an infill
+    work list, and reporting it only for shards that lost EVERYTHING described the partly-holed ones
+    as covered.
+    """
+    if not record:
+        return {}
+    reasons = record.get("refused") or {}
+    obs = record.get("s2_obs") or {}
+    counted = {reason: int(reasons.get(reason) or 0) for reason in REASONS}
+    return {
+        "eligible_px": _int_or_none(record.get("eligible_px")),
+        "chunk_px": _int_or_none(record.get("chunk_px")),
+        "refused_px": sum(counted.values()),
+        **{f"refused_{reason}_px": n for reason, n in counted.items()},
+        "px_with_any_optical": _int_or_none(obs.get("px_with_any")),
+        "obs_max": _int_or_none(obs.get("max")),
+        "median_obs_where_any": _float_or_none(obs.get("median_where_any")),
+        "px_with_any_radar": _int_or_none(record.get("px_with_any_radar")),
+        "radar_rule_enforced": (
+            bool(record["radar_rule_enforced"]) if isinstance(record.get("radar_rule_enforced"), bool) else None
+        ),
+    }
 
 
 def _bbox_fields(box: tuple[float, float, float, float] | None) -> dict[str, float | None]:

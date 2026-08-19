@@ -17,6 +17,7 @@ import logging
 import os
 import tempfile
 import time
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -540,6 +541,61 @@ def _log_vram_breakdown(model: MultimodalBTInferenceModel, torch_mod: types.Modu
 # These are A/B probes: if peak RSS drops, the plateau was retained churn, not
 # live working set; if it barely moves, the working set is genuinely resident
 # and chunking is the only remaining lever.
+def _coverage_record(
+    chunk: ChunkSpec,
+    *,
+    refused: Mapping[str, int],
+    radar_rule_enforced: bool | None,
+    obs_buffers: Mapping[str, np.ndarray],
+    eff_w: int,
+) -> dict[str, Any]:
+    """One shard's refusal reasons and observation depth, in the shape the registry consumes.
+
+    Built here rather than at each of the two call sites because BOTH need it and they must not
+    disagree: a wholly-refused shard writes it into its skip marker, and a shard that embedded
+    something returns it with its result. Two copies of these expressions is how the two rows in one
+    registry stop being comparable — and comparing them is the point, since a shard 60% refused for
+    thin optical is a better revisit candidate than many that were refused outright.
+
+    Every count is over the footprint the reasons were COUNTED over (``eligible_px``), not over the
+    embedded pixels: an infill planner is asking about the land, and a denominator that shrinks with
+    the answer cannot support the comparison. ``chunk_px`` is the published footprint beside it, so a
+    reader can also see how much of the shard was never evaluated at all.
+    """
+    s2_obs = obs_buffers["s2_obs_count"]
+    any_obs = s2_obs > 0
+    return {
+        "refused": dict(refused),
+        "eligible_px": int(chunk.height) * int(eff_w),
+        "chunk_px": int(chunk.height) * int(chunk.width),
+        # The grid this record was produced on. An assembly-only resume of an all-skipped run has no
+        # staged tile to read a chunk size off, and falling back to the CURRENT default
+        # re-enumerates the labels — after which valid old markers read as unexpected.
+        "chunk_side_px": int(chunk.width),
+        # None when no strip ran far enough to say — reported as unknown rather than guessed from the
+        # config, whose value the per-cell orbit downgrade can override.
+        "radar_rule_enforced": radar_rule_enforced,
+        "s2_obs": {
+            "px_with_any": int(any_obs.sum()),
+            "max": int(s2_obs.max()),
+            "mean_where_any": round(float(s2_obs[any_obs].mean()), 2) if any_obs.any() else 0.0,
+            # MEDIAN, beside the mean, because a cleanup planner's question is "would another scene
+            # or two cross the line for most of this tile" and a mean is pulled by a bright patch of
+            # deep pixels next to a dark majority. Over pixels that saw ANYTHING, not over the land:
+            # including the never-imaged ones drags it to zero and then it describes neither
+            # population.
+            "median_where_any": (round(float(np.median(s2_obs[any_obs])), 1) if any_obs.any() else 0.0),
+        },
+        # RADAR PRESENCE, because a tile that is thin AND radar-free is a different cleanup
+        # candidate from one that is merely thin — more optical will not fix the first. Either orbit
+        # counts: which one it was is per-pixel in the coverage arrays, so the summary only has to
+        # answer presence.
+        "px_with_any_radar": int(
+            ((obs_buffers["s1_asc_obs_count"] > 0) | (obs_buffers["s1_desc_obs_count"] > 0)).sum()
+        ),
+    }
+
+
 @ray.remote(
     runtime_env={
         "env_vars": {
@@ -1319,53 +1375,18 @@ class InferenceActor:
                 # The observation summary rides along because the counts alone cannot say HOW thin:
                 # obs counts are accumulated per strip regardless of validity, so they are populated
                 # even on a chunk where nothing passed.
-                s2_obs = obs_buffers["s2_obs_count"]
-                any_obs = s2_obs > 0
-                # THE FOOTPRINT THE REASONS ACTUALLY COVER, which is not the whole chunk when the
-                # read plan cropped it. `_chunk_read_plan` narrows a chunk to the columns holding
-                # valid pixels, and the three refusal counts are computed over what was LOADED — so
-                # recording the whole chunk as eligible undercounted the reasons against it and made
-                # the consumer's consistency invariant fire on a legitimate crop.
-                #
-                # Both numbers are kept, because they answer different questions and neither can be
-                # derived from the other. `eligible_px` is what the dataset evaluated and is what the
-                # reasons must sum to — deriving it FROM the counts would make the invariant vacuous,
-                # since being an independent second measurement is the whole source of its power.
-                # `chunk_px` is the PUBLISHED footprint, so the consumer can also say how much of a
-                # filled tile was never evaluated at all.
                 eff_w = int(chunk.width) if x_sub is None else int(x_sub.stop - x_sub.start)
-                skip_record = {
-                    "label": chunk.label,
-                    "refused": dict(refused),
-                    "eligible_px": int(chunk.height) * eff_w,
-                    "chunk_px": int(chunk.height) * int(chunk.width),
-                    # The grid this marker was produced on. An assembly-only resume of an all-skipped
-                    # run has no staged tile to read a chunk size off, and falling back to the
-                    # CURRENT default re-enumerates the labels — after which the valid old markers
-                    # read as unexpected and the new labels as missing.
-                    "chunk_side_px": int(chunk.width),
-                    # None when no strip ran far enough to say — reported as unknown rather than
-                    # guessed from the config, whose value the per-cell orbit downgrade can override.
-                    "radar_rule_enforced": radar_rule_enforced,
-                    "s2_obs": {
-                        "px_with_any": int(any_obs.sum()),
-                        "max": int(s2_obs.max()),
-                        "mean_where_any": round(float(s2_obs[any_obs].mean()), 2) if any_obs.any() else 0.0,
-                        # MEDIAN, beside the mean, because a cleanup planner's question is "would
-                        # another scene or two cross the line for most of this tile" and a mean is
-                        # pulled by a bright patch of deep pixels next to a dark majority. Over
-                        # pixels that saw ANYTHING, not over the land: including the never-imaged
-                        # ones drags it to zero and then it describes neither population.
-                        "median_where_any": (round(float(np.median(s2_obs[any_obs])), 1) if any_obs.any() else 0.0),
-                    },
-                    # RADAR PRESENCE, because a tile that is thin AND radar-free is a different
-                    # cleanup candidate from one that is merely thin — more optical will not fix
-                    # the first. Either orbit counts: which one it was is per-pixel in the coverage
-                    # tile this chunk also stages, so the summary only has to answer presence.
-                    "px_with_any_radar": int(
-                        ((obs_buffers["s1_asc_obs_count"] > 0) | (obs_buffers["s1_desc_obs_count"] > 0)).sum()
-                    ),
-                }
+                # THE FOOTPRINT THE REASONS ACTUALLY COVER, which is not the whole chunk when the
+                # read plan cropped it, and the depth behind them. Shared with the success path so a
+                # refused shard and a partly-refused one are described in the same terms — see
+                # `_coverage_record`.
+                skip_record = {"label": chunk.label} | _coverage_record(
+                    chunk,
+                    refused=refused,
+                    radar_rule_enforced=radar_rule_enforced,
+                    obs_buffers=obs_buffers,
+                    eff_w=eff_w,
+                )
                 logger.info(
                     "Chunk %s has no valid pixels, skipping (assembly will fill) — refused %s",
                     chunk.label,
@@ -1474,6 +1495,21 @@ class InferenceActor:
             s2_thin_px = int((s2_at_embedded < thin_below).sum())
             del embedded, obs_at_embedded, s2_at_embedded
 
+            # THE SAME RECORD A WHOLLY-REFUSED SHARD WRITES, for a shard that embedded something.
+            # `refused` is accumulated over this shard's strips on BOTH paths, so a shard where the
+            # depth gate removed part of the land has always known how much — and used to discard it,
+            # because only the all-refused branch wrote a record. The registry then described such a
+            # shard as embedded with no refusals recorded, which reads as "covered" for ground that
+            # is partly holes. Those holes are exactly what a revisit campaign would fill, so this is
+            # the larger half of the infill work list, not a refinement of it.
+            coverage = _coverage_record(
+                chunk,
+                refused=refused,
+                radar_rule_enforced=radar_rule_enforced,
+                obs_buffers=obs_buffers,
+                eff_w=int(chunk.width) if x_sub is None else int(x_sub.stop - x_sub.start),
+            )
+
             def _timed_write() -> str:
                 # "write" is a separate context slot: the upload overlaps the
                 # NEXT chunk's prologue on the main thread, so both phases must
@@ -1563,6 +1599,9 @@ class InferenceActor:
                 # The line the count was measured against, carried so the year record
                 # states the rule this fill applied rather than the module default.
                 "s2_thin_below_obs": thin_below,
+                # Per-shard refusal reasons and optical depth, for the published registry. Keyed
+                # under one name so assembly can merge it by label without knowing its contents.
+                "coverage": coverage,
                 "elapsed_sec": elapsed,
                 "instance_id": self.instance_id,
                 "write_deferred": True,

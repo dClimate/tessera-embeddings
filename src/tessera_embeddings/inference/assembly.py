@@ -1011,6 +1011,7 @@ class ZarrWriter:
         embedded: list[str],
         refused: list[str],
         optical_min_obs: int | None = None,
+        embedded_records: Mapping[str, dict] | None = None,
     ) -> str | None:
         """Publish this cell's registry part. Call ONLY after the cell has committed.
 
@@ -1027,7 +1028,11 @@ class ZarrWriter:
         index is missing. A lost part is also recoverable, because every column is derivable from the
         store the cell just wrote.
         """
-        records = getattr(self, "_last_skip_records", {})
+        # Refused shards' records come from their markers; embedded shards' come from the actors'
+        # results. Merged into one map because a row's measurements mean the same thing either way —
+        # see `_coverage_record` — and the marker side wins on a label in both, since a marker is
+        # written at the end of a shard that refused everything.
+        records = {**(embedded_records or {}), **getattr(self, "_last_skip_records", {})}
         uri = part_uri(registry_root, zone, year, run_id)
         boxes = _tile_bboxes_wgs84(zone, [*embedded, *refused])
         try:
@@ -2290,6 +2295,7 @@ class ZarrWriter:
         # writes no sidecar and changes nothing the store commits — see `_skip_summary`.
         registry_root: str | None = None,
         optical_min_obs: int | None = None,
+        embedded_records: Mapping[str, dict] | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2566,6 +2572,7 @@ class ZarrWriter:
                 embedded=registry_embedded,
                 refused=registry_refused,
                 optical_min_obs=optical_min_obs,
+                embedded_records=embedded_records,
             )
         workers = telemetry.get("workers", [])
         _log.info(
