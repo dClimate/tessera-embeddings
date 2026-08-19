@@ -54,8 +54,6 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, cast, final
@@ -65,7 +63,7 @@ from pystac_client import Client
 from pystac_client.stac_api_io import StacApiIO
 
 from tessera_embeddings.config import PROVIDERS
-from tessera_embeddings.ingest._http import make_logging_retry
+from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.land_mask import live_tile_block_bboxes_wgs84
 from tessera_embeddings.ingest.solar_days import whole_window_range
 from tessera_embeddings.ingest.stac import split_antimeridian_bbox
@@ -258,58 +256,52 @@ def preflight_optical_source(
     # upper one. An injected probe can block indefinitely. Every campaign cell pays that delay, to
     # learn something this preflight is willing to answer INCONCLUSIVE for anyway.
     #
-    # A timed-out future does not stop the thread — nothing here can interrupt a blocking socket read
-    # — but it returns control to this loop on time, which is what the budget promises. The abandoned
-    # thread finishes on the probe's own timeouts and writes nothing, so leaving it is safe.
-    #
-    # NOT used as a context manager, and that is the whole point: `__exit__` calls
-    # `shutdown(wait=True)`, which blocks on exactly the thread the timeout just walked away from —
-    # so the budget would be honoured inside the loop and then handed straight back on the way out.
-    # A test that asserted only the verdict passed while the call still took thirty seconds.
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"preflight-{zone}")
-    try:
-        for bbox, _weight in blocks:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+    # Abandoning a probe does not stop it — nothing here can interrupt a blocking socket read — but it
+    # returns control to this loop on time, which is what the budget promises. The probe runs on a
+    # DAEMON thread precisely so abandoning it is final: a ThreadPoolExecutor's workers are non-daemon
+    # and joined at interpreter exit, so `shutdown(wait=False)` returns while the stalled probe still
+    # holds the process open for the rest of its own retry budget — honouring the deadline inside the
+    # loop and handing it straight back on the way out. An injected probe with no timeouts of its own
+    # would block that exit indefinitely. See `spawn_abandonable`.
+    for bbox, _weight in blocks:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return OpticalPreflight(
+                zone,
+                SourceFinding.INCONCLUSIVE,
+                f"probe budget ({budget_s:.0f}s) exhausted after {probes} probe(s) with no verdict",
+                probes,
+            )
+        try:
+            probes += 1
+            pending = spawn_abandonable(lambda b: probe(b, rng.query_start, rng.query_end), bbox)
+            if pending(remaining):
                 return OpticalPreflight(
                     zone,
-                    SourceFinding.INCONCLUSIVE,
-                    f"probe budget ({budget_s:.0f}s) exhausted after {probes} probe(s) with no verdict",
+                    SourceFinding.PRESENT,
+                    f"catalogue has items intersecting a live-land block for {window_label} "
+                    f"(provisional — the fill's own coverage gates remain the authority)",
                     probes,
                 )
-            try:
-                probes += 1
-                if pool.submit(probe, bbox, rng.query_start, rng.query_end).result(timeout=remaining):
-                    return OpticalPreflight(
-                        zone,
-                        SourceFinding.PRESENT,
-                        f"catalogue has items intersecting a live-land block for {window_label} "
-                        f"(provisional — the fill's own coverage gates remain the authority)",
-                        probes,
-                    )
-            except FutureTimeoutError:
-                # The catalogue is slow rather than empty, and the budget is spent. Returning here
-                # rather than continuing, because the next probe has no time to run in and a
-                # slow catalogue does not become fast for the block after this one.
-                log.warning(
-                    "Optical preflight for %s: a block probe outran the remaining budget (%.0fs) — "
-                    "reporting INCONCLUSIVE rather than delaying the cell further",
-                    zone,
-                    remaining,
-                )
-                return OpticalPreflight(
-                    zone,
-                    SourceFinding.INCONCLUSIVE,
-                    f"probe budget ({budget_s:.0f}s) exhausted mid-probe after {probes} probe(s)",
-                    probes,
-                )
-            except Exception:
-                failed_blocks += 1
-                log.warning("Optical preflight for %s: block probe failed", zone, exc_info=True)
-    finally:
-        # wait=False so a probe that outran its budget does not get to spend it again here.
-        pool.shutdown(wait=False)
-
+        except TimeoutError:
+            # The catalogue is slow rather than empty, and the budget is spent. Returning here
+            # rather than continuing, because the next probe has no time to run in and a
+            # slow catalogue does not become fast for the block after this one.
+            log.warning(
+                "Optical preflight for %s: a block probe outran the remaining budget (%.0fs) — "
+                "reporting INCONCLUSIVE rather than delaying the cell further",
+                zone,
+                remaining,
+            )
+            return OpticalPreflight(
+                zone,
+                SourceFinding.INCONCLUSIVE,
+                f"probe budget ({budget_s:.0f}s) exhausted mid-probe after {probes} probe(s)",
+                probes,
+            )
+        except Exception:
+            failed_blocks += 1
+            log.warning("Optical preflight for %s: block probe failed", zone, exc_info=True)
     if failed_blocks:
         # Some blocks went unanswered and none hit: absence over live land is possible
         # but was not POSITIVELY established, and that distinction is the whole gate.

@@ -9,7 +9,6 @@ Supports multiple providers (Earth Search, Planetary Computer) and collections
 """
 
 import logging
-import threading
 import time
 from collections.abc import Callable, Iterator
 from itertools import count
@@ -31,7 +30,7 @@ from tessera_embeddings.config import (
 )
 from tessera_embeddings.config.environment import configure_gdal_environment
 from tessera_embeddings.config.ingest import INGEST_CHUNKS
-from tessera_embeddings.ingest._http import make_logging_retry
+from tessera_embeddings.ingest._http import make_logging_retry, spawn_abandonable
 from tessera_embeddings.ingest.catalogue_refusal import (
     CatalogueRequest,
     bbox_area_label,
@@ -1111,44 +1110,15 @@ def ingest_tile(
     return data, baselines
 
 
-def _prefetch[A, T](fn: Callable[[A], T], arg: A) -> Callable[[], T]:
-    """Start ``fn(arg)`` on a DAEMON thread; return a callable that waits for it.
+def _prefetch[A, T](fn: Callable[[A], T], arg: A) -> Callable[..., T]:
+    """Start ``fn(arg)`` on a daemon thread; return a callable that waits for it.
 
-    A ThreadPoolExecutor cannot express what this needs. ``cancel_futures=True``
-    only drops futures that have not STARTED, and the executor's worker threads are
-    non-daemon and joined by an ``atexit`` hook — so an abandoned prefetch keeps the
-    interpreter (and, on the Prefect path, the per-run ECS task) alive for the whole
-    remaining timeout-and-retry budget of an HTTP walk whose result nobody wants.
-    A daemon thread simply does not hold the process open, so abandoning the query
-    costs nothing beyond the socket the OS reclaims on exit.
-
-    There is no cancel: an in-flight ``requests`` call is not interruptible from
-    outside. Abandonment is the mechanism — the caller stops waiting, and the thread
-    dies with the process.
-
-    Exceptions are captured and re-raised in the CALLER's thread on ``result()``, so
-    a failing prefetch surfaces exactly where the executor's ``future.result()``
-    raised it before.
+    The month-streaming loop always waits for its prefetch, so this passes no timeout — what it needs
+    from :func:`spawn_abandonable` is the daemon thread, so an abandoned prefetch cannot hold the
+    interpreter (or, on the Prefect path, the ECS task) open for the remaining timeout-and-retry
+    budget of an HTTP walk whose result nobody wants.
     """
-    out: list[T] = []
-    err: list[BaseException] = []
-
-    def target() -> None:
-        try:
-            out.append(fn(arg))
-        except BaseException as exc:
-            err.append(exc)
-
-    thread = threading.Thread(target=target, name="stac-prefetch", daemon=True)
-    thread.start()
-
-    def result() -> T:
-        thread.join()
-        if err:
-            raise err[0]
-        return out[0]
-
-    return result
+    return spawn_abandonable(fn, arg)
 
 
 def stream_stac_months(
