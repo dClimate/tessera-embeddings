@@ -470,7 +470,30 @@ answer — cost-model §4.
    superseded manifests become permanent). We extend our own identity policy to match; until both
    halves exist, seeding fails with `403`. The request is written and ready to send:
    `yield-embeddings/context_docs/monitoring/open-data-access-request.md`. The registry's name and
-   contents are settled (§2), so the request is ready as written. **Treat the lead time as the
+   contents are settled (§2), so the request is ready as written.
+
+   **What was actually granted differs from what was asked for, and our side is not wired for it
+   (established 2026-08-19).** The request asked the bucket owner to name our runner role directly in
+   their bucket policy. Instead they created a role in THEIR account,
+   `TesseraDClimateWriterRole`, for us to assume — stricter, and better, but a different mechanism.
+   Two things are missing on our side, and either one alone blocks every write:
+
+   - `global-tessera-prod-runner-task` has **no `sts:AssumeRole` permission at all**, so it cannot
+     assume that role. Its only grant on the published bucket is `PartnerDeliveryRead` —
+     `s3:GetObject` and `s3:ListBucket`, no write, no delete.
+   - The application picks credentials per *call site*, not per destination. The assumed role is
+     scoped to the two published prefixes, so handing it to everything would break every read and
+     write against our OWN buckets — mosaics, staging, land mask, ROI masks. The credentials have to
+     be chosen from the destination URI, which is the same structural rule that stopped the registry
+     landing beside the wrong store (§ optical-registry-2026-08-19).
+
+   Measured, not inferred: `DeleteObject` on `v1.1/dclimate.icechunk/` returns `AccessDenied`
+   reproducibly while `ListObjectsV2` on the same prefix succeeds in the same breath — so it is a
+   permissions boundary, not a transient fault. The consequence is that **the blocking marker in 4c
+   cannot be removed yet either**; that deletion needs this grant working first.
+
+   Still needed from the bucket owner: the role's full ARN (its account is not ours — the role does
+   not exist in 190444052100 or 658132200637), and whether an `ExternalId` is required for the trust. **Treat the lead time as the
    schedule risk it is** — the code was a day and the access is somebody else's queue.
 4c. **The published prefixes must be EMPTY before the seed, not merely granted.** As delivered on
    2026-08-18 both `v1.1/dclimate.icechunk/` and `v1.1/dclimate.registry/` hold a single zero-byte
