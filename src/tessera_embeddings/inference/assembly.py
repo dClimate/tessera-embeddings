@@ -1019,6 +1019,8 @@ class ZarrWriter:
         refused: list[str],
         optical_min_obs: int | None = None,
         embedded_records: Mapping[str, dict] | None = None,
+        get_credentials: Callable[[], icechunk.S3StaticCredentials] | None = None,
+        s3_region: str | None = None,
     ) -> str | None:
         """Publish this cell's registry part. Call ONLY after the cell has committed.
 
@@ -1047,7 +1049,14 @@ class ZarrWriter:
         # information simply leaves the columns null.
         build = code_identity() or {}
         try:
-            fs = _fs_for(uri)
+            # CREDENTIALLED, like every other write. The registry is a sibling of the store in the
+            # same bucket, so when that store is the partner-owned one it needs the same assumed
+            # role — and `_fs_for` with no options falls back to fsspec's ambient chain, which is
+            # the task role and cannot write there. That failure is caught below and the cell is
+            # still tagged, so the symptom is not a failed run: it is a campaign that looks healthy
+            # and publishes no registry at all, which is the artifact the access request promises.
+            # Resolved per call, so a fill outliving its credential picks up a fresh one.
+            fs = _fs_for(uri, plain_zarr_storage_options(uri, get_credentials, s3_region))
             fs.makedirs(uri.rsplit("/", 1)[0], exist_ok=True)
             written = write_registry_part(
                 uri,
@@ -1076,7 +1085,10 @@ class ZarrWriter:
             logger.exception(
                 "Run %s: registry part for %s year %d could not be published to %s. The cell itself "
                 "is committed and unaffected, and every column is derivable from it, so this is a "
-                "rebuildable index rather than lost data.",
+                "rebuildable index rather than lost data. READ THIS AS A CONFIGURATION FAULT IF IT "
+                "REPEATS: a permission or credential failure here is identical on every cell, so the "
+                "campaign completes green having published NO registry — the one artifact a consumer "
+                "is told to read instead of the store.",
                 run_id,
                 zone,
                 year,
@@ -2616,6 +2628,10 @@ class ZarrWriter:
                 refused=registry_refused,
                 optical_min_obs=optical_min_obs,
                 embedded_records=embedded_records,
+                # The store's own callback: the registry is its sibling in the same bucket, so
+                # whatever credential opened the store is the one that can write beside it.
+                get_credentials=get_credentials,
+                s3_region=s3_region,
             )
         workers = telemetry.get("workers", [])
         _log.info(

@@ -810,11 +810,15 @@ async def run_global_campaign(
     # The driver reads the global store directly (status, tags, on-axis probe)
     # BEFORE any child flow is dispatched, so a deployment whose store authenticates
     # only through the callback needs it here too — not just in the children.
-    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials, icechunk_credentials_for
 
     store_path = paths.global_store(store_name)
     land_mask_path = paths.land_mask_store(mask_name)
-    repo = open_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
+    # THE STORE may be the partner-owned published bucket, which the task role cannot open. Only
+    # the four store reads take this; the land-mask reads, the mosaic fingerprint and the live-tile
+    # partition stay on the task role, which is the only credential that can read OUR buckets.
+    store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
+    repo = open_global_repo(store_path, get_credentials=store_credentials, region=s3_region)
     # ONCE, before any dispatch. Each fill re-checks this, but by then the campaign has
     # already paid for that cell's ingest — and it dispatches cells concurrently, so a
     # store seeded for a different encoder buys a multi-terabyte mosaic per in-flight
@@ -824,7 +828,7 @@ async def run_global_campaign(
         store_path,
         build_checkpoint=checkpoint_filename(),
         allow_model_mismatch=allow_model_mismatch,
-        get_credentials=iam_icechunk_credentials,
+        get_credentials=store_credentials,
         s3_region=s3_region,
     )
     status = campaign_status(repo, years=campaign_years)
@@ -840,7 +844,7 @@ async def run_global_campaign(
             y
             for y in campaign_years
             if not zone_year_on_axis(
-                store_path, seeded_zones[0], y, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+                store_path, seeded_zones[0], y, get_credentials=store_credentials, s3_region=s3_region
             )
         ]
         if off_axis:
@@ -916,7 +920,7 @@ async def run_global_campaign(
         """
         if not optical_rule_cache:
             optical_rule_cache.append(
-                _optical_min_obs_from_store(store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region)
+                _optical_min_obs_from_store(store_path, get_credentials=store_credentials, s3_region=s3_region)
             )
         return optical_rule_cache[0]
 

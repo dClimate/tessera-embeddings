@@ -289,7 +289,7 @@ def fill_zone_year_flow(
 
     # Lazily import the AWS providers so the flow file imports on machines
     # without ray/boto installed (arch tests, local inspection).
-    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials, icechunk_credentials_for
     from tessera_embeddings.providers.aws.ray import (
         cluster_name_for_flow_run,
         make_instance_terminator,
@@ -298,6 +298,11 @@ def fill_zone_year_flow(
 
     zone = canonicalize_zone(zone)
     store_path = paths.global_store(store_name)
+    # THE STORE may live in the partner-owned published bucket, which the task role cannot open.
+    # Only the reads of the STORE take this; the land-mask and mosaic reads below stay on the task
+    # role, which is the only credential that can read OUR buckets. `icechunk_credentials_for`
+    # returns the caller's own callback unchanged for our buckets, so nothing changes in dev.
+    store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
     land_mask_path = paths.land_mask_store(mask_name)
     # Campaign mosaics live per (zone, year); `mosaic_base` overrides for a
     # hand-provided mosaic (e.g. a shared multi-year store).
@@ -317,10 +322,10 @@ def fill_zone_year_flow(
     #    straight back down.
     #  - all-ocean cell (no live tiles): may have no mosaic to probe; fill empty.
     already_complete = zone_year_complete(
-        store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        store_path, zone, year, get_credentials=store_credentials, s3_region=s3_region
     )
     on_axis = already_complete or zone_year_on_axis(
-        store_path, zone, year, get_credentials=iam_icechunk_credentials, s3_region=s3_region
+        store_path, zone, year, get_credentials=store_credentials, s3_region=s3_region
     )
     # Only touch the mask once completion + axis are cleared: an unavailable mask
     # must not block retag-only recovery, and an off-axis year needs no mask.
@@ -341,7 +346,7 @@ def fill_zone_year_flow(
             store_path=store_path,
             zone=zone,
             year=year,
-            get_credentials=iam_icechunk_credentials,
+            get_credentials=store_credentials,
             s3_region=s3_region,
         )
 
@@ -396,9 +401,7 @@ def fill_zone_year_flow(
     # read, and the branch it used to sit in is the one that does NOT need it cheap.
     config = dataclasses.replace(
         config,
-        optical_min_obs=_optical_min_obs_from_store(
-            store_path, get_credentials=iam_icechunk_credentials, s3_region=s3_region
-        ),
+        optical_min_obs=_optical_min_obs_from_store(store_path, get_credentials=store_credentials, s3_region=s3_region),
     )
     log.info(
         "Minimum optical depth for this fill: %s (from the store's root)",
@@ -414,7 +417,7 @@ def fill_zone_year_flow(
             store_path,
             build_checkpoint=checkpoint_filename(),
             allow_model_mismatch=allow_model_mismatch,
-            get_credentials=iam_icechunk_credentials,
+            get_credentials=store_credentials,
             s3_region=s3_region,
         )
         # Fail loudly on a partial/absent mosaic BEFORE provisioning Ray: a

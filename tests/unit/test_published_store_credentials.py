@@ -301,3 +301,61 @@ class TestIcechunkCanActuallyUseTheCallback:
 
         expires = cred._expires_after(_DateutilRefreshable(), timedelta(minutes=60))
         assert expires < datetime.now(UTC) + timedelta(minutes=10), "the token's own life still wins"
+
+
+class TestTheWiringReachesTheStore:
+    """The selector existing is not the same as anything using it.
+
+    `icechunk_credentials_for` was built, tested and then called from nowhere in runtime code,
+    so with a writer role configured the seed failed with AccessDenied before the store could be
+    created, the fill failed on its first store write, and the registry publication failed into
+    a handler that suppresses it — leaving a campaign that completes green having published no
+    registry at all. These pin that the production call sites reach the selector.
+    """
+
+    @staticmethod
+    def _configured(monkeypatch):
+        monkeypatch.setenv("PUBLISHED_STORE_WRITER_ROLE_ARN", "arn:aws:iam::111122223333:role/writer")
+        monkeypatch.setattr(cred, "assumed_role_icechunk_credentials", lambda *a, **k: lambda: "ASSUMED", raising=True)
+
+    def test_the_runner_picks_the_store_credential_from_the_store_path(self, monkeypatch) -> None:
+        """The runner resolves per call site rather than taking a second parameter, so this is
+        what proves a store open gets the assumed role while our buckets keep the task role.
+        """
+        from tessera_embeddings.orchestration.runners import zone_fill
+
+        self._configured(monkeypatch)
+        ours = lambda: "TASK_ROLE"  # noqa: E731 — a stand-in callback, identity is what is asserted
+
+        assert zone_fill._store_credentials(_THEIRS, ours)() == "ASSUMED"
+        assert zone_fill._store_credentials(_OURS, ours) is ours, "our own buckets keep the task role"
+        assert zone_fill._store_credentials("/tmp/local.icechunk", ours) is ours, "and so do local paths"
+
+    def test_an_unconfigured_deployment_is_untouched(self, monkeypatch) -> None:
+        """Every deployment whose store is in our own buckets must behave exactly as before."""
+        from tessera_embeddings.orchestration.runners import zone_fill
+
+        monkeypatch.delenv("PUBLISHED_STORE_WRITER_ROLE_ARN", raising=False)
+        ours = lambda: "TASK_ROLE"  # noqa: E731
+
+        for uri in (_OURS, _THEIRS, _THEIR_REGISTRY):
+            assert zone_fill._store_credentials(uri, ours) is ours, uri
+
+    def test_the_registry_write_is_given_the_stores_credential(self) -> None:
+        """The registry is a sibling of the store in the SAME bucket, so it needs the same role.
+
+        Asserted on the signature rather than by writing: `publish_registry_part` builds its
+        filesystem from `plain_zarr_storage_options(uri, get_credentials, s3_region)`, and before
+        this it called `_fs_for(uri)` bare — falling back to fsspec's ambient chain, which is the
+        task role and cannot write there.
+        """
+        import inspect
+
+        from tessera_embeddings.inference.assembly import ZarrWriter
+
+        params = inspect.signature(ZarrWriter.publish_registry_part).parameters
+        assert "get_credentials" in params and "s3_region" in params
+
+        src = inspect.getsource(ZarrWriter.publish_registry_part)
+        assert "plain_zarr_storage_options(uri, get_credentials, s3_region)" in src
+        assert "_fs_for(uri)" not in src, "a bare _fs_for falls back to the ambient chain"

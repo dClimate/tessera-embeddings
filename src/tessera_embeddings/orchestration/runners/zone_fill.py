@@ -243,7 +243,9 @@ def zone_year_complete(
     re-checks and, for such a cell, only re-creates the tag — no inference).
     Returns False for an unseeded zone.
     """
-    repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    repo = open_global_repo(
+        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
+    )
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
     if zone not in root:
         return False
@@ -265,7 +267,9 @@ def zone_year_on_axis(
     rejects such a year up front, but only after the flow would otherwise have
     stood up Ray. Returns False for an unseeded zone or an off-axis year.
     """
-    repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    repo = open_global_repo(
+        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
+    )
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
     if zone not in root:
         return False
@@ -296,6 +300,34 @@ class ZoneFillHandoff:
     # Terminal result produced by the inference phase (already-complete cell,
     # or all-ocean empty fill). When set, assembly is a pass-through no-op.
     done: dict[str, Any] | None = None
+
+
+def _store_credentials(
+    store_path: str, get_credentials: Callable[[], icechunk.S3StaticCredentials] | None
+) -> Callable[[], icechunk.S3StaticCredentials] | None:
+    """The credential for the STORE specifically, which may not be the one for our buckets.
+
+    One fill legitimately spans two accounts. It reads mosaics, staged tiles and the land mask
+    from our buckets with the task role, and — when the global store is the partner-owned
+    published one — writes embeddings to a bucket that role cannot touch at all. So the callback
+    threaded through this module is correct for everything EXCEPT the store, and handing the
+    store's assumed role to everything would break the land-mask read that happens first, on the
+    path every cell takes.
+
+    Resolved HERE, at each `open_global_repo(store_path, ...)`, rather than threaded as a second
+    parameter through a dozen signatures: keying on the argument means the destination decides,
+    and a site that opens the store cannot be missed or mislabelled by hand. Returns the caller's
+    own callback unchanged for our own buckets and for local paths, so dev behaviour and every
+    test double are untouched by construction.
+
+    The import is lazy and s3-only for the same reason the ingest task's is: this module must
+    import on a machine with no boto3.
+    """
+    if not store_path.startswith("s3://"):
+        return get_credentials
+    from tessera_embeddings.providers.aws.credentials import icechunk_credentials_for
+
+    return icechunk_credentials_for(store_path, get_credentials)
 
 
 def _check_assembly_workers(n: int | None) -> None:
@@ -463,7 +495,9 @@ def preflight_destination(
         ValueError: If the zone is not seeded, if a REQUIRED array is missing from it, or if its
             arrays disagree with the layout the staging writer produces (dtype or logical attrs).
     """
-    repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    repo = open_global_repo(
+        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
+    )
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
     if zone not in root:
         raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
@@ -509,7 +543,9 @@ def plan_zone_inference(
     run_id = run_id or uuid.uuid4().hex[:12]
 
     # The seeded zone group is the grid authority.
-    repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    repo = open_global_repo(
+        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
+    )
     root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
     if zone not in root:
         raise ValueError(f"Zone group {zone!r} is not seeded in {store_path} — run seed_zone_groups first (D1).")
@@ -978,7 +1014,9 @@ def assemble_zone_year(
                 optical_min_obs=optical_min_obs,
                 s3_concurrency=s3_concurrency,
                 empty=True,
-                get_credentials=get_credentials,
+                # The STORE's credential: assemble_global uses it only to open the global store and
+                # to write the registry part beside it — both live in the store's own bucket.
+                get_credentials=_store_credentials(store_path, get_credentials),
                 s3_region=s3_region,
                 log=log,
                 fault=fault,
@@ -988,13 +1026,17 @@ def assemble_zone_year(
             # No live tiles at all: nothing was ever written here, so there is nothing
             # to clear and the attrs alone are the whole job.
             snapshot = mark_zone_year_empty(
-                open_global_repo(store_path, get_credentials=get_credentials, region=s3_region),
+                open_global_repo(
+                    store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
+                ),
                 zone,
                 year,
                 run_id=run_id,
                 gate=gate,
             )
-        repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
+        repo = open_global_repo(
+            store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
+        )
         tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
         result = {
             **summary,
@@ -1065,13 +1107,17 @@ def assemble_zone_year(
         skipped_labels=skipped_labels,
         s3_concurrency=s3_concurrency,
         radar_coverage=radar_coverage,
-        get_credentials=get_credentials,
+        # The STORE's credential: assemble_global uses it only to open the global store and
+        # to write the registry part beside it — both live in the store's own bucket.
+        get_credentials=_store_credentials(store_path, get_credentials),
         s3_region=s3_region,
         log=log,
         fault=fault,
         input_coverage=input_coverage,
     )
-    repo = open_global_repo(store_path, get_credentials=get_credentials, region=s3_region)
+    repo = open_global_repo(
+        store_path, get_credentials=_store_credentials(store_path, get_credentials), region=s3_region
+    )
     tag = tag_zone_year(repo, zone, year, snapshot_id=snapshot)
     _cleanup()
 

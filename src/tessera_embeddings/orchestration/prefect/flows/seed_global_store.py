@@ -75,9 +75,15 @@ def seed_global_store(
     # mandatory FIRST step opens/creates the repo, so a callback-only or non-default-
     # region deployment needs the credential callback + region here too — not just in
     # the campaign and fill flows.
-    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials
+    from tessera_embeddings.providers.aws.credentials import iam_icechunk_credentials, icechunk_credentials_for
 
     store_path = paths.global_store(name)
+    # CHOSEN FROM THE DESTINATION, not hard-wired. When the store lives in the partner-owned
+    # published bucket and a writer role is configured, the task role cannot create or open it
+    # and the seed fails with AccessDenied before anything exists. `icechunk_credentials_for`
+    # returns the task-role provider unchanged for our own buckets, so every other deployment
+    # is unaffected by construction — the substitution only happens where it is required.
+    store_credentials = icechunk_credentials_for(store_path, iam_icechunk_credentials)
     # Default the recorded checkpoint identity to the build's checkpoint filename so
     # the fill's checkpoint gate is effective by default (it only compares when the
     # store carries a checkpoint_id). geoemb:model alone can't tell aws from mpc.
@@ -87,14 +93,13 @@ def seed_global_store(
     # repo raises on open; create_global_repo persists the config via save_config.
     seeded: set[str]
     try:
-        repo = open_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
+        repo = open_global_repo(store_path, get_credentials=store_credentials, region=s3_region)
     except FileNotFoundError:
         log.info("Creating global store %s", store_path)
-        repo = create_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
+        repo = create_global_repo(store_path, get_credentials=store_credentials, region=s3_region)
         seeded = set()
         # A store this call just created holds nothing. Initialised because the unstamped-store
         # refusal below reads it on EVERY path, not only the every-zone-exists one.
-        cells_landed = 0
         cells_landed = 0
     except icechunk.IcechunkError as exc:
         # Only a genuinely-missing repo means "create it". Auth/throttle/timeout/
@@ -104,7 +109,7 @@ def seed_global_store(
         if not is_missing_repo(exc):
             raise
         log.info("Creating global store %s", store_path)
-        repo = create_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
+        repo = create_global_repo(store_path, get_credentials=store_credentials, region=s3_region)
         seeded = set()
         # A store this call just created holds nothing. Initialised because the unstamped-store
         # refusal below reads it on EVERY path, not only the every-zone-exists one.
