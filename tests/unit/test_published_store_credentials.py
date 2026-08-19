@@ -15,7 +15,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import icechunk
 import pytest
+from dateutil.tz import tzutc
 
 from tessera_embeddings.providers.aws import credentials as cred
 
@@ -238,3 +240,64 @@ class TestTheAssumedRoleProviderItself:
         for _ in range(5):
             get()
         assert len(calls) == 1, f"assumed {len(calls)} times for 5 reads"
+
+
+class TestIcechunkCanActuallyUseTheCallback:
+    """The two properties icechunk enforces at CONSTRUCTION, before any credential is fetched.
+
+    Both were violated by the first version of this provider, and neither was reachable by a test that
+    checked what the callback returns: they are about the callback OBJECT and about the tzinfo TYPE of
+    the instant it reports. Because the grant itself was blocked, nothing exercised either one — a
+    passing suite and a working grant would still have failed on the first store write.
+    """
+
+    def test_the_callback_survives_the_pickling_icechunk_does_to_it(self) -> None:
+        """A closure fails here with "Can't get local object" — before any credential is fetched.
+
+        icechunk pickles the callback to reach its Rust S3 client and to ship it to every process that
+        deserialises a Storage, so the provider has to be picklable by value.
+        """
+        import pickle
+
+        provider = cred.assumed_role_icechunk_credentials(_ROLE)
+        revived = pickle.loads(pickle.dumps(provider))
+
+        assert revived == provider, "a frozen dataclass round-trips by value"
+        assert revived.role_arn == _ROLE
+
+    def test_icechunk_accepts_the_provider_when_building_storage(self) -> None:
+        """The end-to-end acceptance criterion, and no network: construction alone rejects a closure."""
+        storage = icechunk.s3_storage(
+            bucket="tessera-embeddings",
+            prefix="v1.1/dclimate.icechunk/",
+            region="us-west-2",
+            get_credentials=cred.assumed_role_icechunk_credentials(_ROLE),
+        )
+        assert storage is not None
+
+    def test_the_expiry_is_datetime_timezone_utc_even_when_botocore_says_tzutc(self) -> None:
+        """Not merely "a UTC offset" — icechunk requires that exact tzinfo object.
+
+        botocore parses the STS expiry with dateutil, so a refreshable credential's ``_expiry_time``
+        carries ``tzutc()``: equal to and indistinguishable from ``timezone.utc`` in comparisons and
+        formatting, and rejected by icechunk. It only bites when the real expiry is the nearer of the
+        two bounds, which is exactly the case the cap exists to produce.
+        """
+
+        class _DateutilRefreshable:
+            _expiry_time = datetime.now(tzutc()) + timedelta(minutes=45)
+
+        expires = cred._expires_after(_DateutilRefreshable(), timedelta(minutes=60))
+
+        assert expires.tzinfo is UTC, f"icechunk requires datetime.timezone.utc, got {expires.tzinfo!r}"
+        # The real proof: the value is one icechunk will take.
+        icechunk.S3StaticCredentials(access_key_id="a", secret_access_key="b", session_token="c", expires_after=expires)
+
+    def test_the_cap_still_bites_after_normalisation(self) -> None:
+        """Normalising the tzinfo must not quietly stop the expiry from bounding the promise."""
+
+        class _DateutilRefreshable:
+            _expiry_time = datetime.now(tzutc()) + timedelta(minutes=10)
+
+        expires = cred._expires_after(_DateutilRefreshable(), timedelta(minutes=60))
+        assert expires < datetime.now(UTC) + timedelta(minutes=10), "the token's own life still wins"

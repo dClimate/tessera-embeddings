@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, final
 
 import icechunk
 from botocore import session as botocore_session
@@ -73,7 +74,13 @@ def _expires_after(creds: Credentials, ttl: timedelta) -> datetime:
         return horizon
     if expiry.tzinfo is None:
         expiry = expiry.replace(tzinfo=UTC)
-    return min(horizon, expiry - _EXPIRY_SAFETY_MARGIN)
+    # NORMALISED TO datetime.timezone.utc, not merely to "some UTC tzinfo". Botocore parses the STS
+    # expiry with dateutil, so a refreshable credential's `_expiry_time` carries `tzutc()` — a
+    # different object that compares equal and formats identically. icechunk rejects it outright with
+    # "expected datetime.timezone.utc", so returning the minimum unconverted fails the first store
+    # write whenever the real expiry is the nearer of the two. Only the assumed-role path has an
+    # expiry to read, which is why nothing noticed until that path existed.
+    return min(horizon, expiry - _EXPIRY_SAFETY_MARGIN).astimezone(UTC)
 
 
 @lru_cache(maxsize=1)
@@ -163,9 +170,9 @@ def _assumed_role_credentials(role_arn: str, external_id: str | None = None) -> 
     return DeferredRefreshableCredentials(refresh_using=_assume, method="sts-assume-role")
 
 
-def assumed_role_icechunk_credentials(
-    role_arn: str, external_id: str | None = None
-) -> Callable[[], icechunk.S3StaticCredentials]:
+@final
+@dataclass(frozen=True)
+class AssumedRoleIcechunkCredentials:
     """An icechunk credential callback that writes as ``role_arn``.
 
     For the published store, whose bucket belongs to the delivery partner: the write permission lives
@@ -173,14 +180,25 @@ def assumed_role_icechunk_credentials(
     cannot read our own buckets, which is why the choice has to be made per destination rather than
     per process (see :func:`icechunk_credentials_for`).
 
-    The returned callback is cheap to call repeatedly: it reads an already-resolved credential and
-    botocore refreshes underneath. What it reports as the expiry is capped by the token's real life
-    (:func:`_expires_after`), so icechunk always comes back before the credential dies rather than
+    **A class rather than a closure because icechunk PICKLES the callback.** It hands it to its Rust
+    S3 client and ships it to every process that deserialises a ``Storage``, so a nested function
+    fails at construction with "Can't get local object" — before any credential is fetched, and
+    identically whether or not the grant works. A frozen dataclass holding just the role identifiers
+    pickles by value; the refreshable credential behind it is rebuilt on arrival, keyed by those same
+    identifiers, so each process ends up with its own and refreshes independently. The existing
+    task-role callback survives only because it is a module-level function.
+
+    Calling it is cheap and repeatable: it reads an already-resolved credential while botocore
+    refreshes underneath. The expiry it reports is capped by the token's real life
+    (:func:`_expires_after`), so icechunk comes back before the credential dies rather than
     discovering the fact as a failed write.
     """
 
-    def _get() -> icechunk.S3StaticCredentials:
-        creds = _assumed_role_credentials(role_arn, external_id)
+    role_arn: str
+    external_id: str | None = None
+
+    def __call__(self) -> icechunk.S3StaticCredentials:
+        creds = _assumed_role_credentials(self.role_arn, self.external_id)
         frozen = creds.get_frozen_credentials()
         return icechunk.S3StaticCredentials(
             access_key_id=frozen.access_key,
@@ -189,7 +207,12 @@ def assumed_role_icechunk_credentials(
             expires_after=_expires_after(creds, _ASSUMED_ROLE_CRED_TTL),
         )
 
-    return _get
+
+def assumed_role_icechunk_credentials(
+    role_arn: str, external_id: str | None = None
+) -> Callable[[], icechunk.S3StaticCredentials]:
+    """Build the published store's credential callback. See :class:`AssumedRoleIcechunkCredentials`."""
+    return AssumedRoleIcechunkCredentials(role_arn, external_id)
 
 
 #: Env vars the runner's task definition carries when this deployment publishes to a bucket that is
