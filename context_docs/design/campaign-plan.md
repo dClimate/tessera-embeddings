@@ -135,9 +135,18 @@ figures and verdicts stay in our own buckets, because they are working state.
 client reads to learn what the store contains without opening it. It is a sibling rather than a folder
 inside the store because Icechunk owns every key under its own prefix — its garbage collection
 enumerates that prefix and reconciles it against its own manifests, so a foreign file in there is at
-best unrecognised and at worst collected. **What the registry contains is not yet decided.** The
-prefix is named in the access request because it has to be in the bucket policy, and renaming it later
-means asking Cambridge twice.
+best unrecognised and at worst collected. The prefix is named in the access request because it has to
+be in the bucket policy, and renaming it later means asking Cambridge twice.
+
+**What the registry contains is settled and built** (2026-08-19): a Parquet dataset of one row per
+2048-pixel tile per year, under `parts/zone=<Z>/year=<Y>/<run_id>.parquet`, written as each cell
+lands. Each row carries its WGS84 bounding box, whether the tile holds embeddings, how much of its
+land the depth rule removed and for which reason, how deep the pixels that fell short actually got,
+the depth rule they were judged against, whether radar reached the tile at all, and the build that
+produced the judgement. Verified against two live cells. The schema, the decisions behind it, and the
+five defects the first live runs exposed are in `optical-registry-2026-08-19.md`; the reader-facing
+notes — WGS84, the antimeridian convention, and stating the schema on a whole-dataset read — are in
+the access request itself.
 
 ```
 s3://tessera-embeddings/v1.1/dclimate.icechunk     ← one repository, branch `main`
@@ -460,8 +469,8 @@ answer — cost-model §4.
    `v1.1/dclimate.registry/*` (delete included, or Icechunk garbage collection cannot run and
    superseded manifests become permanent). We extend our own identity policy to match; until both
    halves exist, seeding fails with `403`. The request is written and ready to send:
-   `yield-embeddings/context_docs/monitoring/open-data-access-request.md`. Settle the registry's
-   name before it goes, since the prefix is in the policy (§2). **Treat the lead time as the
+   `yield-embeddings/context_docs/monitoring/open-data-access-request.md`. The registry's name and
+   contents are settled (§2), so the request is ready as written. **Treat the lead time as the
    schedule risk it is** — the code was a day and the access is somebody else's queue.
 5. **Model checkpoint staged** at `{inputs}/models/` and matching the seed.
 6. **Deployments registered** for `ingest-zone-year`, the chained fill, and the campaign.
