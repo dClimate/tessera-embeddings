@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import io
 import logging
+import os
 import pickle
 import threading
 from pathlib import Path
@@ -36,9 +37,11 @@ from tessera_embeddings.profiling.ingest import DEFAULT_INGEST_LOG_GROUP
 from tessera_embeddings.profiling.ingest.watch_scheduler import parse_health_line
 from tessera_embeddings.providers.aws import dask as dask_mod
 from tessera_embeddings.providers.aws.dask import (
+    _PROVISIONING_RETRY_ENV,
     _RETRYABLE_CLUSTER_START_ERRORS,
     SchedulerResourceLogger,
     _is_retryable_cluster_start_error,
+    apply_provisioning_retry_defaults,
     maybe_performance_report,
 )
 
@@ -80,6 +83,93 @@ class TestRetryablePredicate:
         """
         exc = ValueError("Scheduler failed to start")
         assert _is_retryable_cluster_start_error(exc) is False
+
+
+class TestProvisioningThrottles:
+    """Control-plane throttles hit while the constructor provisions.
+
+    Written from the errors AWS actually returns rather than from the code tuple:
+    the parametrized test above compares the tuple with itself and passes for any
+    tuple, so it cannot tell whether a real message is covered.
+    """
+
+    # Verbatim shapes, one per service in the provisioning path. They use
+    # different codes for the same condition, which is why the predicate matches
+    # codes rather than one service's prose.
+    EC2_ENI_POLL = (
+        "Cluster failed to start: An error occurred (RequestLimitExceeded) when calling the "
+        "DescribeNetworkInterfaces operation (reached max retries: 4): Request limit exceeded. "
+        "Account 123456789012 has been throttled on ec2:DescribeNetworkInterfaces because it "
+        "exceeded its request rate limit."
+    )
+    ECS_ACCOUNT_SETTINGS = (
+        "Cluster failed to start: An error occurred (ThrottlingException) when calling the "
+        "ListAccountSettings operation (reached max retries: 4): Rate exceeded"
+    )
+
+    @pytest.mark.parametrize("message", [EC2_ENI_POLL, ECS_ACCOUNT_SETTINGS])
+    def test_throttled_provisioning_retries(self, message: str) -> None:
+        """A rate limit clears on its own, so it must not end the cell.
+
+        No quota request can raise these buckets, so retrying with backoff is the
+        only available response.
+        """
+        assert _is_retryable_cluster_start_error(RuntimeError(message)) is True
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Cluster failed to start: An error occurred (AccessDenied) when calling the RunTask operation",
+            "Cluster failed to start: An error occurred (InvalidSubnetID.NotFound) when calling RunTask",
+            "Cluster failed to start: CannotPullContainerError: manifest unknown",
+            "Cluster failed to start: An error occurred (InvalidParameterException) when calling RunTask",
+        ],
+    )
+    def test_misconfiguration_still_fails_fast(self, message: str) -> None:
+        """The complement, which is what keeps the widened match honest: adding the
+        throttle codes must not turn a permanent error into four backed-off retries.
+        """
+        assert _is_retryable_cluster_start_error(RuntimeError(message)) is False
+
+
+class TestProvisioningRetryDefaults:
+    """The botocore budget underneath the predicate.
+
+    The predicate handles a throttle that has already become an exception; this
+    raises the budget so fewer of them get that far. Both matter: without the
+    budget every burst surfaces, and without the predicate a surfaced one ends
+    the cell.
+    """
+
+    def test_defaults_are_applied(self, monkeypatch) -> None:
+        for name in _PROVISIONING_RETRY_ENV:
+            monkeypatch.delenv(name, raising=False)
+        apply_provisioning_retry_defaults()
+        assert os.environ["AWS_RETRY_MODE"] == "adaptive", "adaptive PACES into the bucket; more retries alone do not"
+        assert int(os.environ["AWS_MAX_ATTEMPTS"]) >= 10
+
+    def test_an_operators_choice_wins(self, monkeypatch) -> None:
+        """``setdefault``, so a task definition that has set a policy keeps it —
+        otherwise this would silently override deployment-level configuration.
+        """
+        monkeypatch.setenv("AWS_RETRY_MODE", "standard")
+        monkeypatch.setenv("AWS_MAX_ATTEMPTS", "3")
+        apply_provisioning_retry_defaults()
+        assert os.environ["AWS_RETRY_MODE"] == "standard"
+        assert os.environ["AWS_MAX_ATTEMPTS"] == "3"
+
+    def test_botocore_actually_resolves_the_mode_from_the_environment(self, monkeypatch) -> None:
+        """The env var is the whole mechanism, since the provisioning clients are built
+        inside dask-cloudprovider and take no config. A misspelled name would satisfy the
+        assertions above and configure nothing, so this resolves it on a real client.
+        """
+        boto3 = pytest.importorskip("boto3")
+        for name in _PROVISIONING_RETRY_ENV:
+            monkeypatch.delenv(name, raising=False)
+        apply_provisioning_retry_defaults()
+        client = boto3.client("ec2", region_name="us-west-2", aws_access_key_id="a", aws_secret_access_key="b")
+        assert client.meta.config.retries["mode"] == "adaptive"
+        assert client.meta.config.retries["total_max_attempts"] >= 10
 
 
 class TestRetryPolicyWiring:
