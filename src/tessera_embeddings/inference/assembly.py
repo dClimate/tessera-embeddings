@@ -1917,6 +1917,20 @@ class ZarrWriter:
         )
         staged_labels = self.verify_staged_completeness(run_id, roi_live_chunks, log=_log)
         live_chunks = [c for c in roi_live_chunks if c.label in staged_labels]
+        # SKIP-MARKED CHUNKS ARE DROPPED HERE AND THEIR COVERAGE ARTIFACTS GO UNREAD. That is a
+        # DELIBERATE asymmetry with the global path, recorded because it reads as an oversight
+        # otherwise: global assembly consumes each skipped chunk's `.coverage.zarr`, so its published
+        # observation counts and month coverage are real over refused footprints. This path publishes
+        # fill there instead — a mixed output carries zeros where the global one carries measurements,
+        # and an all-skipped fresh output can omit the coverage arrays entirely.
+        #
+        # It stays that way because the two paths have different consumers: those arrays exist to feed
+        # the registry a targeted repair campaign ranks from, and only the global path writes that
+        # registry. Closing the gap is tracked with the repair-campaign follow-ups (issue #103) rather
+        # than done here, because doing it properly means reading the artifacts the way
+        # `StagedShardSource._fill_block` does, and this path has no coverage test that would catch
+        # getting it wrong. Anyone reading the single-ROI output for coverage analysis wants that issue
+        # first.
         if not live_chunks:
             # Every ROI-intersecting chunk was skipped (no valid pixels). Publish
             # an all-fill timestep anyway rather than aborting: a create/append
