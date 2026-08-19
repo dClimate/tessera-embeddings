@@ -27,6 +27,11 @@ them. They are not hardcoded in source.
 | ``CLOUDWATCH_LOG_GROUP`` | CloudWatch log group (default ``/ecs/tessera/dask``) |
 | ``EC2_SCHEDULER_CAPACITY_PROVIDER`` | Required only when ``ec2_scheduler=True`` |
 | ``EC2_SCHEDULER_SUBNET`` | Optional subnet override when ``ec2_scheduler=True`` |
+| ``AWS_RETRY_MODE`` / ``AWS_MAX_ATTEMPTS`` | Botocore retry policy for provisioning (defaulted, not required) |
+
+The last row differs from the rest: :func:`apply_provisioning_retry_defaults`
+supplies it, so a deployment need not, and a value already in the environment
+wins over the default.
 
 This contract is documented for the open-source release in
 ``providers/aws/gotchas.md``.
@@ -518,11 +523,48 @@ def maybe_performance_report(
 # distributed's spec._start() calls _close() before re-raising, so a failed
 # scheduler task is torn down before the exception surfaces — a fresh
 # constructor on retry starts clean, with no orphaned task/ENI to leak.
+#   * Throttle codes — control-plane rate limits hit while the constructor
+#     provisions. Creating a cluster calls ECS (``ListAccountSettings``,
+#     ``RunTask``) and then polls EC2 (``DescribeNetworkInterfaces``) for the
+#     scheduler's address, so a fan-out that starts many clusters at once
+#     exhausts per-account request buckets that no quota request can raise.
+#     dask-cloudprovider retries only some of these internally, and botocore's
+#     own attempt budget is spent before the code surfaces here, wrapped by
+#     _start() as ``RuntimeError("Cluster failed to start: ...")``. Matching the
+#     CODE rather than the prose covers every service in the provisioning path,
+#     which use different codes for the same condition.
+_RETRYABLE_THROTTLE_CODES = (
+    "RequestLimitExceeded",
+    "Throttling",
+    "Throttled",
+    "TooManyRequests",
+)
+
 _RETRYABLE_CLUSTER_START_ERRORS = (
     "not enough values to unpack",
     "RESOURCE:ENI",
     "Scheduler failed to start",
+    *_RETRYABLE_THROTTLE_CODES,
 )
+
+
+#: Botocore retry defaults for the provisioning process. ``adaptive`` adds
+#: client-side rate limiting, which is what a burst of simultaneous cluster
+#: starts needs: every client in the process backs off against the same
+#: observed throttling instead of each discovering the limit alone.
+_PROVISIONING_RETRY_ENV = {"AWS_RETRY_MODE": "adaptive", "AWS_MAX_ATTEMPTS": "10"}
+
+
+def apply_provisioning_retry_defaults(env: dict[str, str] | None = None) -> None:
+    """Raise this process's botocore retry budget for control-plane calls.
+
+    Set via the environment because the provisioning clients are constructed
+    inside dask-cloudprovider, which accepts no botocore config: an env default
+    is the only way to reach them. ``setdefault``, so a task definition or an
+    operator that has already chosen a policy keeps it.
+    """
+    for name, value in (env or _PROVISIONING_RETRY_ENV).items():
+        os.environ.setdefault(name, value)
 
 
 def _is_retryable_cluster_start_error(exc: BaseException) -> bool:
@@ -884,6 +926,9 @@ def ecs_cluster(
     # itself down at its 300s default idle timeout. Raise it so the scheduler
     # stays alive through the client-side prep phase.
     cluster_kwargs["scheduler_timeout"] = "600s"
+
+    # Before the constructor, so the clients dask-cloudprovider builds inherit it.
+    apply_provisioning_retry_defaults()
 
     if ec2_scheduler:
         log.info("Creating ECSCluster (EC2 scheduler) with config: %s", safe_kwargs)
