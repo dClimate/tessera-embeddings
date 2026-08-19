@@ -472,6 +472,23 @@ answer — cost-model §4.
    `yield-embeddings/context_docs/monitoring/open-data-access-request.md`. The registry's name and
    contents are settled (§2), so the request is ready as written. **Treat the lead time as the
    schedule risk it is** — the code was a day and the access is somebody else's queue.
+4c. **The published prefixes must be EMPTY before the seed, not merely granted.** As delivered on
+   2026-08-18 both `v1.1/dclimate.icechunk/` and `v1.1/dclimate.registry/` hold a single zero-byte
+   directory marker — the object a console "create folder" leaves behind. `Repository.create` refuses
+   any prefix that is not clean, and **one zero-byte marker is enough**: measured against a
+   disposable prefix in our own bucket on 2026-08-19, an empty prefix created fine and the same
+   prefix holding only `.../marker-test.icechunk/` failed with *"repositories can only be created in
+   clean prefixes"*. So the seed cannot run against `dclimate.icechunk` until that marker is deleted,
+   and the deletion needs the write grant — the marker is the grant's first real use, not an
+   afterthought.
+
+   Only the **icechunk** marker blocks anything. The registry is a plain Parquet dataset with no
+   such rule, so its marker is harmless and can stay.
+
+   This is the same failure that cost 14 mosaic prefixes on 2026-08-18, which is why it is worth a
+   numbered item rather than a footnote: it is deterministic, it repeats on every retry, and the
+   error names the prefix rather than the cause.
+
 5. **Model checkpoint staged** at `{inputs}/models/` and matching the seed.
 6. **Deployments registered** for `ingest-zone-year`, the chained fill, and the campaign.
 6b. **No leftover input locations** — `audit_mosaic_prefixes.py` (in yield-embeddings), which
