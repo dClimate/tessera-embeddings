@@ -23,10 +23,12 @@ import pytest
 
 from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
+    bbox_mid_longitude,
     fixed_day_ranges,
     month_ranges,
     normalize_to_solar_day,
     owned_items,
+    resolve_grouping_longitude,
     solar_day_of,
     solar_day_offset_seconds,
     whole_window_range,
@@ -143,6 +145,35 @@ def test_normalising_twice_is_normalising_once(longitude: float) -> None:
 
     (thrice,) = normalize_to_solar_day([twice], mid_longitude=longitude)
     assert thrice.datetime == first, "the streamed path normalises three times over"
+
+
+def test_grouping_longitude_is_refused_rather_than_defaulted_to_utc() -> None:
+    """No longitude means no solar day — and silence was the bug.
+
+    `normalize_to_solar_day(mid_longitude=None)` groups by UTC date, which was a sound
+    default while a caller could legitimately load by UTC. `_load_from_stac` now rejects
+    every grouping but `solar_day`, so no such caller remains, and what the default actually
+    produced was every item stamped to noon of its UTC date: right in the middle of a day,
+    a full day wrong near midnight in the far east or far west, and reported nowhere.
+    """
+    with pytest.raises(ValueError, match="solar-day grouping needs a longitude"):
+        resolve_grouping_longitude(None, None)
+
+    assert resolve_grouping_longitude(42.0, None) == 42.0, "an explicit longitude wins"
+    assert resolve_grouping_longitude(None, (10.0, 0.0, 20.0, 5.0)) == 15.0, "else derive from the bbox"
+
+
+def test_an_antimeridian_bbox_midpoint_is_not_averaged() -> None:
+    """A box crossing 180 is written west > east, and averaging it lands half a world away.
+
+    (179, -179) averages to 0.0 — the middle of the wrong hemisphere, and a solar offset
+    about twelve hours out. The box is walked eastward across the dateline instead. The
+    result is exactly 180.0, which is only safe because the offset is clamped; before the
+    clamp this value was the one that broke idempotence.
+    """
+    assert bbox_mid_longitude((179.0, 0.0, -179.0, 5.0)) == 180.0
+    assert bbox_mid_longitude((10.0, 0.0, 20.0, 5.0)) == 15.0
+    assert abs(solar_day_offset_seconds(bbox_mid_longitude((179.0, 0.0, -179.0, 5.0)))) <= 11 * 3600
 
 
 def test_the_offset_stays_continuous_across_the_dateline() -> None:

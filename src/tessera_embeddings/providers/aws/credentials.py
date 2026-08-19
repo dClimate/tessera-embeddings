@@ -198,6 +198,7 @@ class AssumedRoleIcechunkCredentials:
     external_id: str | None = None
 
     def __call__(self) -> icechunk.S3StaticCredentials:
+        """A freshly-read credential for the assumed role, with its capped expiry."""
         creds = _assumed_role_credentials(self.role_arn, self.external_id)
         frozen = creds.get_frozen_credentials()
         return icechunk.S3StaticCredentials(

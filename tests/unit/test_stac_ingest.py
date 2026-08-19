@@ -298,6 +298,9 @@ class TestIngestTile:
             start_date="2024-01-01",
             end_date="2024-01-10",
             existing_dates=existing_dates,
+            # 33UUP is UTM zone 33 (central meridian 15E). Required now: solar-day grouping
+            # refuses a call carrying no geometry rather than stamping UTC dates silently.
+            mid_longitude=15.0,
         )
 
         assert result_data is None
@@ -331,6 +334,9 @@ class TestIngestTile:
             start_date="2024-01-01",
             end_date="2024-01-10",
             existing_dates=None,
+            # 33UUP is UTM zone 33 (central meridian 15E). Required now: solar-day grouping
+            # refuses a call carrying no geometry rather than stamping UTC dates silently.
+            mid_longitude=15.0,
         )
 
         assert result_data is not None
@@ -366,6 +372,9 @@ class TestIngestTile:
             end_date="2024-01-10",
             existing_dates=None,
             extra_bands=["scl"],
+            # 33UUP is UTM zone 33 (central meridian 15E). Required now: solar-day grouping
+            # refuses a call carrying no geometry rather than stamping UTC dates silently.
+            mid_longitude=15.0,
         )
 
         assert result_data is not None
@@ -403,6 +412,9 @@ class TestIngestTile:
             end_date="2024-01-10",
             existing_dates=None,
             post_load_fn=double_blue,
+            # 33UUP is UTM zone 33 (central meridian 15E). Required now: solar-day grouping
+            # refuses a call carrying no geometry rather than stamping UTC dates silently.
+            mid_longitude=15.0,
         )
 
         assert result_data is not None
@@ -440,6 +452,9 @@ class TestIngestTile:
             end_date="2024-01-15",
             existing_dates=None,
             item_filter_fn=keep_first,
+            # 33UUP is UTM zone 33 (central meridian 15E). Required now: solar-day grouping
+            # refuses a call carrying no geometry rather than stamping UTC dates silently.
+            mid_longitude=15.0,
         )
 
         assert result_data is not None
@@ -464,6 +479,9 @@ class TestIngestTile:
             end_date="2024-01-10",
             existing_dates=None,
             item_filter_fn=lambda items: [],  # Remove all items
+            # 33UUP is UTM zone 33 (central meridian 15E). Required now: solar-day grouping
+            # refuses a call carrying no geometry rather than stamping UTC dates silently.
+            mid_longitude=15.0,
         )
 
         assert result_data is None
@@ -515,6 +533,9 @@ class TestSolarDayPainterOrdering:
                 tile_id="33UUP",
                 start_date="2024-01-01",
                 end_date="2024-01-02",
+                # 33UUP is UTM zone 33 (central meridian 15E). Required now: solar-day grouping
+                # refuses a call carrying no geometry rather than stamping UTC dates silently.
+                mid_longitude=15.0,
             )
 
         assert seen["preserve"] is True, "the premise: order decides, so order must be correct"
@@ -728,6 +749,32 @@ class TestItemPruning:
         for key in ("id", "collection", "type", "stac_version", "stac_extensions", "bbox", "geometry", "properties"):
             assert pruned[key] == src[key], key
 
+    def test_a_partial_asset_match_retains_the_whole_item(self):
+        """The alias case: matching SOME requested names is not enough to prune safely.
+
+        Ask for `blue` and `scl` against an item carrying `B02` and `scl` — one name matches,
+        so the old `if not kept` guard let the prune run, keeping `scl` and deleting `B02`.
+        The loader then asks for `blue`, whose only source has just been removed, and the
+        load fails having passed every check before it. Nothing here can see the alias table
+        that maps a band name to an asset key, so an absent name and an aliased one look
+        identical — and the costs are not symmetric: retaining spends memory, wrongly
+        pruning loses the band.
+        """
+        item = self._item()
+        item["assets"]["B02"] = item["assets"].pop("blue")  # native key, not the requested name
+
+        pruned = _prune_item_dict(item, frozenset({"blue", "scl"}))
+
+        assert pruned is item, "a partial match must leave the item untouched"
+        assert "B02" in pruned["assets"], "the asset backing the requested band must survive"
+
+    def test_a_complete_match_still_prunes(self):
+        """The guard must not have disabled pruning in the ordinary case, which is the point
+        of the function — 35 assets down to the handful the loader reads.
+        """
+        pruned = _prune_item_dict(self._item(), frozenset({"blue", "scl"}))
+        assert set(pruned["assets"]) == {"blue", "scl"}
+
     def test_does_not_mutate_the_input(self):
         src = self._item()
         _prune_item_dict(src, frozenset({"blue"}))
@@ -784,6 +831,9 @@ def test_requested_extra_bands_survive_item_pruning(monkeypatch):
         start_date="2024-01-01",
         end_date="2024-01-10",
         extra_bands=["aot"],
+        # 33UUP is UTM zone 33 (central meridian 15E). Required now: solar-day grouping
+        # refuses a call carrying no geometry rather than stamping UTC dates silently.
+        mid_longitude=15.0,
     )
     assert seen["extra_bands"] == ["aot"]
 

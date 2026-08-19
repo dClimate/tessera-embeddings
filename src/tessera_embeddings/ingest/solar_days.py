@@ -49,10 +49,12 @@ from typing import Any, final
 
 __all__ = [
     "SolarDayRange",
+    "bbox_mid_longitude",
     "fixed_day_ranges",
     "month_ranges",
     "normalize_to_solar_day",
     "owned_items",
+    "resolve_grouping_longitude",
     "solar_day_of",
     "solar_day_offset_seconds",
     "solar_grouping_longitude",
@@ -98,6 +100,67 @@ def solar_day_offset_seconds(mid_longitude: float) -> int:
     return max(-11, min(11, hours)) * 3600
 
 
+def bbox_mid_longitude(bbox: object) -> float | None:
+    """The mid-longitude of a WGS84 ``(west, south, east, north)`` box, or ``None``.
+
+    Handles the antimeridian case, which a plain average gets badly wrong: the GeoJSON /
+    STAC convention for a box crossing 180 is ``west > east`` (e.g. 179 to -179), and
+    averaging those gives 0 — the middle of the wrong hemisphere, half a planet from the
+    box, and a solar-day offset ~12 hours out. Such a box is walked EASTWARD across the
+    dateline instead, then wrapped back into range.
+    """
+    if bbox is None or not isinstance(bbox, (list, tuple)) or len(bbox) < 3:
+        return None
+    west, east = float(bbox[0]), float(bbox[2])
+    if west <= east:
+        return (west + east) / 2.0
+    span = (180.0 - west) + (east + 180.0)
+    mid = west + span / 2.0
+    return mid - 360.0 if mid > 180.0 else mid
+
+
+def resolve_grouping_longitude(mid_longitude: float | None, bbox: object, geobox: object = None) -> float:
+    """The longitude to stamp solar days with. RAISES rather than degrading to UTC.
+
+    Refusing is the point. ``normalize_to_solar_day`` treats ``mid_longitude=None`` as
+    "group by UTC date", which was a sound default while a caller could legitimately load
+    by UTC — but ``_load_from_stac`` now rejects every grouping mode except ``solar_day``,
+    so there is no such caller left. What the default produced instead was every item
+    stamped to noon of its UTC date, silently: correct in the middle of a UTC day, and
+    wrong by a whole day for an acquisition near midnight in the far east or far west,
+    where the two calendars differ. That reaches the store as a mislabelled or split
+    mosaic, with nothing anywhere reporting a problem.
+
+    So the longitude is taken from the caller, else derived from the query's own ``bbox``,
+    and if neither exists the call is refused. A path that cannot say where on Earth it is
+    reading cannot say which day it read.
+    """
+    if mid_longitude is not None:
+        return float(mid_longitude)
+    # Geobox before bbox, for the reason `solar_grouping_longitude` gives: the loader shifts
+    # by its geobox extent's centroid, so taking the same source makes the two agree by
+    # construction, and a bbox midpoint can differ from an extent centroid by enough to
+    # cross a 15-degree boundary.
+    if geobox is not None:
+        try:
+            ((lon, _),) = geobox.extent.centroid.to_crs("epsg:4326").points  # type: ignore[attr-defined]
+            return float(lon)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    derived = bbox_mid_longitude(bbox)
+    if derived is not None:
+        return derived
+    msg = (
+        "solar-day grouping needs a longitude: pass mid_longitude (the ROI geobox centroid's "
+        "longitude in WGS84, via solar_grouping_longitude), or a geobox, or a WGS84 bbox to "
+        "derive it from. "
+        "Neither was given, and defaulting to UTC dates would stamp every item to noon of its "
+        "UTC day — right in the middle of a day and a full day wrong near midnight in the far "
+        "east or west, with nothing to show it happened."
+    )
+    raise ValueError(msg)
+
+
 def solar_grouping_longitude(roi: object) -> float | None:
     """The longitude to group solar days by, matching the loader's own choice.
 
@@ -119,10 +182,7 @@ def solar_grouping_longitude(roi: object) -> float | None:
             return float(lon)
         except (AttributeError, TypeError, ValueError):
             pass
-    bbox = getattr(roi, "bbox_wgs84", None)
-    if bbox is not None and len(bbox) >= 3:
-        return float((bbox[0] + bbox[2]) / 2.0)
-    return None
+    return bbox_mid_longitude(getattr(roi, "bbox_wgs84", None))
 
 
 def normalize_to_solar_day(items: list[Any], *, mid_longitude: float | None) -> list[Any]:

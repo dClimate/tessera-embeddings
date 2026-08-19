@@ -41,6 +41,7 @@ from tessera_embeddings.ingest.solar_days import (
     month_ranges,
     normalize_to_solar_day,
     owned_items,
+    resolve_grouping_longitude,
 )
 
 # =============================================================================
@@ -543,14 +544,24 @@ def _prune_item_dict(item: dict[str, Any], keep_assets: frozenset[str]) -> dict[
     ``proj:epsg``. Dropping whole unread assets cannot lose metadata the loader needs,
     and it is where nearly all of the saving is anyway.
 
-    Leaves the item untouched if no asset name is recognised, so a collection whose assets
-    are named differently degrades to today's behaviour rather than losing its bands.
+    Leaves the item untouched unless EVERY requested name is present as an asset key. The
+    old test was ``if not kept`` — zero matches — which protected a collection named
+    entirely differently but not one named PARTLY differently. An item mixing native keys
+    with aliases (asked for ``blue`` and ``scl``, carrying ``B02`` and ``scl``) matched on
+    one name, so the prune kept ``scl`` and dropped ``B02`` — and the loader then asked for
+    ``blue``, whose only source had just been deleted. That fails the load having passed
+    every check before it.
+
+    Nothing here can see the alias table that maps a band name to an asset key, so a name
+    that is absent as a key is indistinguishable from one that is served under another key.
+    Retaining the whole item is the conservative reading, and the cost is asymmetric: a
+    retained item spends memory, a wrongly pruned one loses the band.
     """
     assets = item.get("assets")
     if not assets:
         return item
     kept = {name: a for name, a in assets.items() if name in keep_assets}
-    if not kept:
+    if len(kept) < len(keep_assets):
         return item
     pruned = dict(item)
     pruned["assets"] = kept
@@ -767,7 +778,10 @@ def has_new_stac_dates(
     # raw UTC date against them under-reports new data in exactly the high-offset zones
     # where a day straddles midnight. Same reason as the ingest path — see
     # ingest.solar_days — and cheap here because nothing is loaded.
-    items = normalize_to_solar_day(items, mid_longitude=mid_longitude)
+    # A longitude is REQUIRED for solar-day grouping — `resolve_grouping_longitude` refuses
+    # rather than falling back to UTC dates, deriving from this call's own `bbox` when the
+    # caller gave none. See that function for why the old None-means-UTC default was unsafe.
+    items = normalize_to_solar_day(items, mid_longitude=resolve_grouping_longitude(mid_longitude, bbox))
     new_items = _filter_existing_dates(items, existing_dates)
     has_new = len(new_items) > 0
     logger.debug(f"{query_label}: {len(new_items)} new dates (of {len(items)} total)")
@@ -851,7 +865,10 @@ def query_stac_items(
     # map keyed on the UTC date while the loader grouped by solar day, so on a day
     # straddling UTC midnight the group was not actually sorted clearest-last and half
     # its baseline entries never matched.
-    items = normalize_to_solar_day(items, mid_longitude=mid_longitude)
+    # Same rule as the date probe above, and it matters more here: this is THE single
+    # solar-offset application for the path, so a UTC-day stamp taken by default would be
+    # read as the solar day by the sort, the baseline map, the dedup and every consumer.
+    items = normalize_to_solar_day(items, mid_longitude=resolve_grouping_longitude(mid_longitude, bbox))
 
     # Sort by (solar date, cloud_cover DESCENDING) so same-day tiles are adjacent and the
     # CLEAREST tile comes LAST.
@@ -1068,6 +1085,11 @@ def ingest_tile(
         - dataset: Corrected xarray Dataset, or None if all dates already exist
         - baselines: Dict mapping date strings to baseline integers (always returned)
     """
+    # Resolved ONCE here, where both a geobox and a bbox are in scope, and handed down as a
+    # concrete longitude — the inner entry points can only see a bbox. Refuses if this call
+    # carries no geometry at all: with `_load_from_stac` accepting solar_day alone, there is
+    # no reading of "no longitude" that is correct, and the old default silently stamped UTC.
+    mid_longitude = resolve_grouping_longitude(mid_longitude, bbox, geobox=geobox)
     items, baselines = query_stac_items(
         provider=provider,
         collection=collection,
@@ -1223,6 +1245,12 @@ def stream_stac_months(
         # is the last point that can guarantee the items are solar-day stamped before
         # ownership reads their dates. normalize_to_solar_day is idempotent, so paying it
         # twice on the default path costs a dict build and nothing else.
+        # NOT resolved-or-refused, unlike the two call sites above, and the difference is
+        # deliberate. This generator has a documented UTC mode for callers that do not group
+        # by solar day (`test_the_same_acquisition_stays_in_january_without_a_longitude` pins
+        # it), and it hands items back rather than loading them — so it is not the place that
+        # can know whether a solar day was wanted. The caller that DOES load resolves at its
+        # own entry point.
         items = normalize_to_solar_day(items, mid_longitude=mid_longitude)
         # Ownership by SOLAR day, applied BEFORE the loader sees an item — see
         # ingest.solar_days for why the queried range and the owned range differ.
