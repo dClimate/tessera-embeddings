@@ -35,13 +35,19 @@ by construction rather than racing for slots.
 
 **Scheduling (ADR-008 D6 + the runner contract).** Inference is parallel across
 zones; only commits contend, and only *same-zone* fills conflict (shared
-``years_complete``/``runs`` attrs → ``RebaseFailedError``). So the driver runs
-**year by year** (an outer serial loop) and, within a year, dispatches its zones
-**concurrently** up to ``max_parallel_clusters`` — all distinct zones, so no
-same-zone overlap is ever possible. The fleet-wide committer bound is a separate
-knob: ``commit_limit_name`` (a Prefect global concurrency limit) is passed to
-every fill so commits stay under the storm threshold while inference runs free.
-``pending()`` is year-major for exactly this drain pattern.
+``years_complete``/``runs`` attrs → ``RebaseFailedError``). By default
+(``overlap_years``) the driver dispatches **every requested year as one batch** and
+partitions by ZONE, so a zone's every year lands in one cluster and its assemblies
+serialize on that cluster's single trailing thread — which is what keeps same-zone
+fills from colliding without a year barrier. ``overlap_years=False`` restores the
+older shape: **year by year** in an outer serial loop, dispatching each year's zones
+concurrently, where distinct zones make same-zone overlap impossible by construction.
+Either way concurrency is bounded by ``max_parallel_clusters``.
+
+The fleet-wide committer bound is a separate knob: ``commit_limit_name`` (a Prefect
+global concurrency limit) is passed to every fill so commits stay under the storm
+threshold while inference runs free. ``pending()`` is year-major, which is the drain
+pattern the barrier path relies on.
 """
 
 from __future__ import annotations
@@ -532,7 +538,7 @@ async def run_global_campaign(
     sweep_orphan_mosaics: bool = False,
     validation_deployment: str | None = None,
 ) -> dict[str, Any]:
-    """Fill every pending (zone, year), year-serial with bounded zone parallelism.
+    """Fill every pending (zone, year) — all years in one batch, bounded zone parallelism.
 
     Args:
         paths: Deployment storage contract.
@@ -665,13 +671,17 @@ async def run_global_campaign(
             work is always safe, where reusing it across a real change is not.
         overlap_years: Drop the YEAR BARRIER — dispatch every requested year as one
             batch instead of one batch per year, so a cluster works a multi-year list and
-            year N+1's ingest overlaps year N's inference. Default off; the year-serial
-            path is what has been run. What makes it safe is not this flag but two things
+            year N+1's ingest overlaps year N's inference. **Default ON**: it is the
+            campaign's planned shape, and it is what makes ``max_parallel_ingest`` reachable
+            — with the barrier in place the ceiling is 45 whatever the cap says. Certified
+            on six cells each carrying both radar orbits, including a same-zone year
+            rollover inside one cluster. What makes it safe is not this flag but two things
             underneath it: each cell carries its own inference window to the actors, and
             the zone-group attribute commit is separate and retried, so two years of one
             zone no longer collide. The partition is over ZONES, so a zone's every year
             lands in one cluster and its assemblies serialize on that cluster's single
-            trailing thread. **Untested against a real fleet — see the Phase 4 plan.**
+            trailing thread. Pass ``False`` to restore the barrier — a repair pass over one
+            year still wants it.
         max_dispatch_rounds: How many ROUNDS of re-dispatch the campaign runs — not a
             per-zone budget. Each round dispatches everything still missing, whatever
             zones that is, and re-reads the STORE to decide, so it never re-does landed
