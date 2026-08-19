@@ -148,6 +148,14 @@ def registry_schema() -> pa.Schema:
             pa.field("bbox_south", pa.float64()),
             pa.field("bbox_east", pa.float64()),
             pa.field("bbox_north", pa.float64()),
+            # WHICH BUILD REFUSED IT. A revisit campaign has two reasons to re-examine a refusal:
+            # more imagery now exists, or the code that refused it has since been fixed. The store's
+            # year provenance carries this, but a consumer of the registry has been told it need not
+            # open the store — and several refusal-path defects were fixed in the days around the
+            # first campaign, so "produced before commit X" is a real query. Cell-level, so it is
+            # stamped on every row; null on a wheel install with no VCS metadata.
+            pa.field("code_version", pa.string()),
+            pa.field("code_commit", pa.string()),
         ]
     )
 
@@ -169,6 +177,8 @@ def _blank_measurements() -> dict[str, Any]:
         "bbox_south": None,
         "bbox_east": None,
         "bbox_north": None,
+        "code_version": None,
+        "code_commit": None,
     }
 
 
@@ -182,6 +192,7 @@ def registry_rows(
     embedded_records: Mapping[str, dict] | None = None,
     optical_min_obs: int | None = None,
     bboxes: Mapping[str, tuple[float, float, float, float]] | None = None,
+    code: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """One row per live tile: what it holds, and for a refused tile why, and how close it came.
 
@@ -198,10 +209,18 @@ def registry_rows(
     ``bboxes`` maps a tile label to its WGS84 ``(west, south, east, north)``. Passed in rather than
     derived here because the box comes from the zone's grid geometry, which this module has no
     business knowing; a label with no entry gets nulls rather than a guess.
+
+    ``code`` is the build that produced the cell, as
+    :func:`~tessera_embeddings.config.environment.code_identity` reports it — cell-level, so it is
+    stamped on every row.
     """
     records = {**(embedded_records or {}), **(records or {})}
     rule = _int_or_none(optical_min_obs)
     boxes = bboxes or {}
+    build = {
+        "code_version": _str_or_none((code or {}).get("version")),
+        "code_commit": _str_or_none((code or {}).get("commit")),
+    }
     rows: list[dict[str, Any]] = []
     for label, was_embedded in [*((lbl, True) for lbl in sorted(embedded)), *((lbl, False) for lbl in sorted(refused))]:
         row: dict[str, Any] = {
@@ -213,9 +232,15 @@ def registry_rows(
         row |= _blank_measurements()
         row["optical_min_obs"] = rule
         row |= _bbox_fields(boxes.get(label))
+        row |= build
         row |= _measurement_fields(records.get(label) or {})
         rows.append(row)
     return rows
+
+
+def _str_or_none(value: object) -> str | None:
+    """A non-empty string, or None. An empty string would read as a known-blank build."""
+    return str(value) if isinstance(value, str) and value else None
 
 
 def _measurement_fields(record: Mapping[str, Any]) -> dict[str, Any]:

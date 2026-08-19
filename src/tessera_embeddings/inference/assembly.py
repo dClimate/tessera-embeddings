@@ -98,6 +98,7 @@ from tessera_embeddings.storage.zarr_store import (
     read_time_values,
     time_index_of,
 )
+from tessera_embeddings.config.environment import code_identity
 from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.zone_grid import PIXEL_M, year_timestamp
 
@@ -1035,6 +1036,10 @@ class ZarrWriter:
         records = {**(embedded_records or {}), **getattr(self, "_last_skip_records", {})}
         uri = part_uri(registry_root, zone, year, run_id)
         boxes = _tile_bboxes_wgs84(zone, [*embedded, *refused])
+        # The build publishing this part IS the build that produced the cell — same process. Reads
+        # install metadata and returns None rather than raising, so a wheel install with no VCS
+        # information simply leaves the columns null.
+        build = code_identity() or {}
         try:
             fs = _fs_for(uri)
             fs.makedirs(uri.rsplit("/", 1)[0], exist_ok=True)
@@ -1048,13 +1053,18 @@ class ZarrWriter:
                     records=records,
                     optical_min_obs=optical_min_obs,
                     bboxes=boxes,
+                    code=build,
                 ),
                 open_output=lambda target: fs.open(target, "wb"),
                 zone=zone,
                 year=year,
                 # Also in the key-value block, so a part read on its own — without the dataset's
                 # partitioning — still states the rule its rows were judged against.
-                extra_metadata={"optical_min_obs": "" if optical_min_obs is None else str(optical_min_obs)},
+                extra_metadata={
+                    "optical_min_obs": "" if optical_min_obs is None else str(optical_min_obs),
+                    "code_commit": str(build.get("commit") or ""),
+                    "code_version": str(build.get("version") or ""),
+                },
             )
         except Exception:
             logger.exception(

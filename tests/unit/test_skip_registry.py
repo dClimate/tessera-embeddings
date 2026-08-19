@@ -807,6 +807,35 @@ class TestTheDepthRuleTheRowsWereJudgedAgainst:
         assert md["zone"] == "32S" and md["year"] == "2021"
 
 
+class TestWhichBuildRefusedIt:
+    """A revisit campaign has two reasons to re-examine a refusal: more imagery now exists, or the
+    code that refused it has since been fixed. Several refusal-path defects were fixed in the days
+    around the first campaign, so "produced before commit X" is a query someone will actually run.
+    """
+
+    def test_every_row_names_the_build(self) -> None:
+        rows = registry_rows(
+            "r1", "t", embedded=["chunk_0_0"], refused=["chunk_1_1"],
+            code={"version": "0.1.0", "commit": "8171f0186ec954f63c43b00ae5e9ed6d253b267e"},
+        )
+        assert {r["code_commit"] for r in rows} == {"8171f0186ec954f63c43b00ae5e9ed6d253b267e"}
+        assert {r["code_version"] for r in rows} == {"0.1.0"}
+
+    def test_a_wheel_install_with_no_commit_is_null_not_blank(self) -> None:
+        """`code_identity` reports a version and no commit for a non-VCS install. An empty string
+        would read as a known-blank build; null says the build did not record one.
+        """
+        rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], code={"version": "0.1.0", "editable": True})
+        assert rows[0]["code_version"] == "0.1.0"
+        assert rows[0]["code_commit"] is None
+
+    def test_no_build_information_at_all_is_null(self) -> None:
+        """`code_identity` returns None rather than raising when its own metadata is unreadable, and
+        no fill may fail over that."""
+        rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], code=None)
+        assert rows[0]["code_version"] is None and rows[0]["code_commit"] is None
+
+
 class TestWhereTheTileIs:
     """The bounding box the access request promises, and the two ways a consumer misreads it."""
 
