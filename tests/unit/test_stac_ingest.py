@@ -470,6 +470,62 @@ class TestIngestTile:
         assert result_baselines == {}
 
 
+class TestSolarDayPainterOrdering:
+    """Which of two overlapping same-day scenes wins a pixel, and it is decided by ORDER.
+
+    `ingest_tile` loads with `preserve_original_order=True` and `groupby="solar_day"`, and odc.stac's
+    painter keeps the LAST item written. So the list handed to the loader must end with the clearest
+    scene. It used to be sorted clearest-FIRST, with a comment saying that was for SCL mosaicking, so
+    the cloudiest scene won every overlap — silently, because the output has the right shape and the
+    right dates. The campaign's own S2 path reverses the order and says why; this generic API
+    disagreed with it.
+    """
+
+    def test_the_clearest_scene_of_a_solar_day_is_loaded_last(self, mock_stac_item, monkeypatch):
+        seen: dict = {}
+
+        def mock_query(*args, **kwargs):
+            # Deliberately delivered clearest-first, which is what query_stac_items produces.
+            return [
+                mock_stac_item("2024-01-01T10:00:00", cloud_cover=2.0),
+                mock_stac_item("2024-01-01T10:05:00", cloud_cover=55.0),
+                mock_stac_item("2024-01-01T10:10:00", cloud_cover=90.0),
+            ]
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
+        monkeypatch.setattr(
+            "tessera_embeddings.ingest.stac.normalize_to_solar_day",
+            lambda items, mid_longitude=None: items,
+        )
+
+        def fake_load(items, **kwargs):
+            seen["order"] = [it.properties["eo:cloud_cover"] for it in items]
+            seen["preserve"] = kwargs.get("preserve_original_order")
+            seen["groupby"] = kwargs.get("groupby")
+            raise _StopLoad
+
+        import odc.stac
+
+        monkeypatch.setattr(odc.stac, "load", fake_load)
+
+        with pytest.raises(_StopLoad):
+            ingest_tile(
+                provider="earth-search",
+                collection="sentinel-2-l2a",
+                tile_id="33UUP",
+                start_date="2024-01-01",
+                end_date="2024-01-02",
+            )
+
+        assert seen["preserve"] is True, "the premise: order decides, so order must be correct"
+        assert seen["groupby"] == "solar_day"
+        assert seen["order"] == [90.0, 55.0, 2.0], "cloudiest first, so the clearest paints last"
+
+
+class _StopLoad(Exception):
+    """Cuts `ingest_tile` off at the load call — the ordering is what this asserts."""
+
+
 class TestBuildStacQueryBboxFallback:
     """Tests for _build_stac_query bbox fallback behavior."""
 

@@ -854,13 +854,25 @@ def query_stac_items(
     # its baseline entries never matched.
     items = normalize_to_solar_day(items, mid_longitude=mid_longitude)
 
-    # Sort by (date, cloud_cover) so same-day tiles are adjacent and the
-    # clearest tile comes first for SCL-based mosaicking.
+    # Sort by (solar date, cloud_cover DESCENDING) so same-day tiles are adjacent and the
+    # CLEAREST tile comes LAST.
+    #
+    # Last, not first, because `load_kwargs` below sets `preserve_original_order=True` with
+    # `groupby="solar_day"`, and odc.stac's painter keeps the last item written for a pixel. Sorting
+    # clearest-first therefore let the CLOUDIEST scene win wherever two scenes of one solar day
+    # overlap — the opposite of the intent, and silent, because the output has the right shape and
+    # the right dates. The campaign's own S2 path (`s2_roi._ingest_s2_dates`) already reverses the
+    # order for exactly this reason and says so; the two orderings disagreed, and this generic API
+    # was the one that was wrong.
+    #
+    # Keyed on the SOLAR day, matching `normalize_to_solar_day` just above and the loader's own
+    # grouping. Keying on the UTC date instead splits a group the loader treats as one, in the
+    # far-eastern and far-western zones where the solar offset crosses midnight.
     if collection_config.has_scl:
         items.sort(
             key=lambda item: (
-                str(item.datetime)[:10],
-                float(item.properties.get("eo:cloud_cover", 100)),
+                item.datetime.strftime("%Y-%m-%d"),
+                -float(item.properties.get("eo:cloud_cover", 100)),
             )
         )
 
