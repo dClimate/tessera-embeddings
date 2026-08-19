@@ -144,6 +144,40 @@ def test_exhausted_budget_passes_through(coverage):
     assert probe.calls == []  # no probe was started against a spent budget
 
 
+def test_a_stalled_probe_cannot_outrun_the_budget(coverage):
+    """The budget must BOUND a probe, not merely precede one.
+
+    Checking the deadline between probes bounds nothing: the default probe carries connect and read
+    timeouts plus a three-attempt retry adapter, so a stalled catalogue makes a single call run for
+    minutes and the advertised budget becomes a lower bound on the delay rather than an upper one.
+    Every campaign cell would pay that, to learn something this preflight will answer INCONCLUSIVE
+    for anyway.
+
+    The probe here blocks far longer than the budget. What is asserted is that the CALL returns
+    quickly — a timed-out future cannot stop the thread, and this pins the part that is actually
+    promised.
+    """
+    import threading
+    import time as _time
+
+    started = threading.Event()
+
+    def stalling_probe(_bbox, _start, _end):
+        started.set()
+        _time.sleep(30.0)  # far past the budget below
+        return True  # and it WOULD have hit, so a pass-through cannot be luck
+
+    t0 = _time.monotonic()
+    result = _preflight(coverage, stalling_probe, budget_s=0.3)
+    elapsed = _time.monotonic() - t0
+
+    assert started.is_set(), "the probe really was entered"
+    assert result.finding is SourceFinding.INCONCLUSIVE
+    assert "budget" in result.reason
+    assert elapsed < 5.0, f"returned in {elapsed:.1f}s — the budget must bound the call"
+    assert result.probes == 1
+
+
 def test_unreadable_coverage_repo_is_inconclusive(tmp_path):
     probe = ScriptedProbe([False])
     result = preflight_optical_source(
