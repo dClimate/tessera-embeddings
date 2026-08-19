@@ -182,6 +182,78 @@ def test_an_unstamped_store_holding_data_is_refused_rather_than_stamped(monkeypa
         mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
 
 
+def _partially_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int, seeded_zones: int = 3):
+    """Wire the INCREMENTAL path: some zone groups present, the rest still to create."""
+    monkeypatch.setattr(mod, "get_run_logger", lambda: logging.getLogger("test-seed"))
+
+    class _Root:
+        def __init__(self) -> None:
+            self.attrs = root_attrs
+
+        def __getitem__(self, _name):
+            return self
+
+    monkeypatch.setattr(
+        mod,
+        "open_global_repo",
+        lambda *a, **k: type("R", (), {"readonly_session": lambda s, branch: type("S", (), {"store": object()})()})(),
+    )
+    present = list(mod.ZONES)[:seeded_zones]
+    monkeypatch.setattr(
+        mod,
+        "campaign_status",
+        lambda repo, years: type("St", (), {"zones": present, "zone_years_done": cells_landed})(),
+    )
+    monkeypatch.setattr(mod.zarr, "open_group", lambda *a, **k: _Root())
+    monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
+    monkeypatch.setattr(mod, "year_of", lambda t: t)
+    monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)
+
+
+def test_a_partially_seeded_store_holding_data_is_not_stamped_by_the_incremental_seed(monkeypatch):
+    """The same refusal, on the path that never had it.
+
+    `seed_zone_groups` stamps the root identity whenever it is absent, as a side effect of adding
+    the missing groups. Only the every-zone-exists path checked for landed cells first, so a store
+    with SOME zones seeded, no root identity and cells already filled had those cells silently
+    attributed to an encoder and a depth rule nobody verified — and the stamp is write-once and read
+    by every later fill to decide what may write, so later fills would then mix under it.
+    """
+    _partially_seeded(monkeypatch, {}, cells_landed=4)
+    monkeypatch.setattr(
+        mod, "seed_zone_groups", lambda *a, **k: pytest.fail("must not seed, because seeding stamps")
+    )
+    with pytest.raises(ValueError, match="no root identity"):
+        mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
+
+
+def test_a_partially_seeded_store_with_no_data_still_seeds_the_remainder(monkeypatch):
+    """The refusal is about attributing EXISTING cells, so an empty partial store proceeds.
+
+    Without this the guard would break the ordinary resume-a-partial-seed path, which is the
+    reason the incremental branch exists.
+    """
+    _partially_seeded(monkeypatch, {}, cells_landed=0)
+    seen: dict = {}
+    monkeypatch.setattr(mod, "seed_zone_groups", lambda repo, todo, **kw: seen.update(kw, n=len(todo)) or "SNAP2")
+    out = mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
+    assert seen["n"] == len(mod.ZONES) - 3, "the remainder is seeded"
+    assert seen["optical_min_obs"] == 15
+    assert out["seeded_now"] == len(mod.ZONES) - 3
+
+
+def test_a_partially_seeded_store_that_is_already_stamped_seeds_the_remainder(monkeypatch):
+    """A store WITH an identity is the normal partial-seed case, landed cells or not: the identity
+    is already established, so adding groups attributes nothing new.
+    """
+    _partially_seeded(monkeypatch, {"geoemb:model": "tessera-v1.1", "optical_min_obs": 15}, cells_landed=9)
+    seen: dict = {}
+    monkeypatch.setattr(mod, "seed_zone_groups", lambda repo, todo, **kw: seen.update(n=len(todo)) or "SNAP3")
+    out = mod.seed_global_store.fn(paths=_PATHS, optical_min_obs=15)
+    assert seen["n"] == len(mod.ZONES) - 3
+    assert out["seeded_now"] == len(mod.ZONES) - 3
+
+
 def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch):
     """The every-zone-exists path returns before seed_zone_groups, which is the only place
     the write-once root identity is compared.

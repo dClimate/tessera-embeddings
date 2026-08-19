@@ -91,6 +91,9 @@ def seed_global_store(
         log.info("Creating global store %s", store_path)
         repo = create_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
         seeded = set()
+        # A store this call just created holds nothing. Initialised because the unstamped-store
+        # refusal below reads it on EVERY path, not only the every-zone-exists one.
+        cells_landed = 0
         cells_landed = 0
     except icechunk.IcechunkError as exc:
         # Only a genuinely-missing repo means "create it". Auth/throttle/timeout/
@@ -102,6 +105,9 @@ def seed_global_store(
         log.info("Creating global store %s", store_path)
         repo = create_global_repo(store_path, get_credentials=iam_icechunk_credentials, region=s3_region)
         seeded = set()
+        # A store this call just created holds nothing. Initialised because the unstamped-store
+        # refusal below reads it on EVERY path, not only the every-zone-exists one.
+        cells_landed = 0
     else:
         # The repo exists — but may still be UNSEEDED: a prior run can create the
         # repo (and persist its config) then crash BEFORE the first seed_zone_groups
@@ -134,6 +140,27 @@ def seed_global_store(
                 f"({len(seeded)} zone(s) already seeded) — reseeding with a different axis would corrupt the store."
             )
 
+    def _refuse_stamping_over_landed_cells(root_attrs: dict, how_many_groups: str) -> None:
+        """Refuse to stamp a write-once identity onto a store that already holds cells.
+
+        Called on BOTH seeding paths, because both stamp. The every-zone-exists path stamps through
+        `stamp_root_identity`; the incremental path stamps as a side effect of `seed_zone_groups`,
+        which writes the root identity whenever it is absent while adding the missing groups. Only
+        the first path checked, so a store with SOME zones seeded, no root identity and landed cells
+        would have its existing cells silently attributed to an encoder and a depth rule nobody
+        verified — and the stamp is write-once and read by every later fill to decide what may
+        write, so later fills would then mix under that false identity.
+        """
+        if "geoemb:model" in root_attrs or not cells_landed:
+            return
+        raise ValueError(
+            f"Store {store_path} has {how_many_groups} and {cells_landed} landed cell(s) but no root "
+            f"identity. Refusing to stamp one: this cannot know which encoder or minimum-depth rule "
+            f"those cells were filled under, and the stamp is write-once and read by every later "
+            f"fill. Verify the existing data's provenance and stamp it deliberately, or fill a "
+            f"freshly seeded store."
+        )
+
     todo = [spec for zone_name, spec in ZONES.items() if zone_name not in seeded]
     if not todo:
         # seed_zone_groups is where the write-once root identity is checked, and it is not
@@ -151,14 +178,7 @@ def seed_global_store(
             # the checkpoint nor the depth rule asked for — and the fill gates pass on an
             # ABSENT attr (`if seeded is not None`, `optical_min_obs` compared to None), so the
             # store would then accept anything while the operator had been told it was seeded.
-            if cells_landed:
-                raise ValueError(
-                    f"Store {store_path} has all {len(ZONES)} zone groups and {cells_landed} landed "
-                    f"cell(s) but no root identity. Refusing to stamp one: this cannot know which "
-                    f"encoder or minimum-depth rule those cells were filled under, and the stamp is "
-                    f"write-once and read by every later fill. Verify the existing data's provenance "
-                    f"and stamp it deliberately, or fill a freshly seeded store."
-                )
+            _refuse_stamping_over_landed_cells(root_attrs, f"all {len(ZONES)} zone groups")
             snapshot = stamp_root_identity(
                 repo, layout=GLOBAL, model_version=model_version, optical_min_obs=optical_min_obs
             )
@@ -172,6 +192,14 @@ def seed_global_store(
         log.info("All %d zone groups already seeded in %s", len(ZONES), store_path)
         return {"store_path": store_path, "seeded_now": 0, "already_seeded": len(seeded), "total": len(ZONES)}
 
+    # BEFORE the incremental seed, because that seed stamps the root identity as a side effect of
+    # adding groups. A partially seeded store predating the identity, holding cells, would otherwise
+    # have them attributed to an identity this call invented.
+    if seeded:
+        _refuse_stamping_over_landed_cells(
+            dict(zarr.open_group(repo.readonly_session(branch="main").store, mode="r").attrs),
+            f"{len(seeded)} of {len(ZONES)} zone groups",
+        )
     snapshot = seed_zone_groups(
         repo,
         todo,
