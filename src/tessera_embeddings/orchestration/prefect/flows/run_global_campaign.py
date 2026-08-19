@@ -501,11 +501,11 @@ async def run_global_campaign(
     store_name: str = "tessera",
     years: tuple[int, ...] | None = None,
     zones: list[str] | None = None,
-    max_parallel_clusters: int = 8,
+    max_parallel_clusters: int = 10,
     fill_strategy: str = "chained-clusters",
     chained_fill_deployment: str | None = None,
     commit_limit_name: str = "tessera-global-commits",
-    num_actors: int = 20,
+    num_actors: int = 250,
     s1_orbit: str = "both",
     s3_region: str | None = None,
     ssm_prefix: str = "/tessera/ray/",
@@ -516,12 +516,12 @@ async def run_global_campaign(
     ingest: bool = True,
     ingest_deployment: str | None = None,
     mask_name: str = "global",
-    max_parallel_ingest: int = 40,
+    max_parallel_ingest: int = 60,
     max_dispatch_rounds: int = 2,
     # Staging-reuse escape hatches. Both default off; see `_staging_code_identity`.
     force_staging_reuse: bool = False,
     force_staging_restage: str = "",
-    overlap_years: bool = False,
+    overlap_years: bool = True,
     ingest_limit_name: str = "tessera-global-ingests",
     inference_pause_gate: str = "tessera-global-inference",
     cleanup_mosaics: bool = True,
@@ -562,12 +562,25 @@ async def run_global_campaign(
         max_parallel_clusters: Bounds simultaneous Ray clusters within a year (a
             cost knob, distinct from the commit gate): the concurrent per-cell
             fill runs under ``"cluster-per-zone"``, or the number of Ray clusters
-            under ``"chained-clusters"``. **Defaults to 8**, which is what
-            `campaign-cluster-sizing.md` settled on; 40 is the INGEST concurrency
-            cap and the two are easy to confuse. Measurement favours many narrow
-            fleets over few wide ones, so raising this means sizing ``num_actors``
-            and ``IngestSettings.max_workers`` down to match, or the aggregate
-            fleet will exceed the account's EC2 quota.
+            under ``"chained-clusters"``. **Defaults to 10**, the campaign's planned
+            width: 10 x 250 actors reaches the full 2,500-actor quota while keeping each
+            cluster's assembly thread under its ~275-actor ceiling, and balance holds to
+            ~16. Do not confuse it with ``max_parallel_ingest`` (60), which caps
+            simultaneous zone-INGESTS. 60 divides evenly by 10, which matters: the
+            per-cluster share is the cap over the cluster count ROUNDED UP, so an
+            uneven split aims the fleet above its own gate and logs a width it never
+            runs at. Measurement favours many narrow fleets over few
+            wide ones, so raising this means sizing ``num_actors`` and
+            ``IngestSettings.max_workers`` down to match, or the aggregate fleet will
+            exceed the account's EC2 quota.
+
+            These four — this, ``max_parallel_ingest``, ``num_actors`` and
+            ``overlap_years`` — are ONE decision and move together
+            (``context_docs/design/campaign-plan.md`` §3). They default to the campaign's
+            shape rather than to something conservative because this flow has one caller:
+            the global campaign. A width that is wrong does not fail — the run completes and
+            publishes real data at a fraction of the intended rate, with no error and no
+            symptom but a wall clock nobody has a baseline for.
         fill_strategy: Named for the CLUSTER LIFECYCLE — both strategies run
             up to ``max_parallel_clusters`` zones at once.
             ``"chained-clusters"`` (default) dispatches up to ``max_parallel_clusters``
