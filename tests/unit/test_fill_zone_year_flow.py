@@ -235,6 +235,28 @@ def test_staging_base_scoped_to_zone_year(wired):
     assert captured["staging_base"] == "s3://out/staging/33N/2025"
 
 
+def test_the_registry_root_follows_the_store_this_run_writes(wired):
+    """The flow must derive the registry from the store it is FILLING, not the default repo.
+
+    Observed in dev on 2026-08-19: a campaign against `store_name="tessera-radar"` published its
+    parts beside `tessera.icechunk`, because `optical_registry()` re-derived from the default
+    basename. The part was valid and the log said it was published, so nothing looked wrong — it
+    simply described a zone-year the store it sat beside does not contain.
+    """
+    wired.setattr(mod, "zone_year_complete", lambda *a, **k: True)  # retag-only: no cluster
+    wired.setattr("tessera_embeddings.providers.aws.ray.ray_cluster", lambda *a, **k: None, raising=False)
+    captured: dict = {}
+    wired.setattr(mod, "fill_zone_year", lambda **kw: captured.update(kw) or {"tag": "t"})
+
+    mod.fill_zone_year_flow.fn(
+        zone="33n", year=2025, paths=_PATHS, ami_ssm_name="ami", store_name="tessera-radar"
+    )
+    assert captured["registry_root"] == "s3://out/global/tessera-radar.registry"
+    assert captured["store_path"] == "s3://out/global/tessera-radar.icechunk"
+    # The pair must agree by construction — same stem, sibling prefixes.
+    assert captured["registry_root"].removesuffix(".registry") == captured["store_path"].removesuffix(".icechunk")
+
+
 class TestPerCellValidation:
     """The landed cell is handed to its validation deployment on BOTH return paths.
 

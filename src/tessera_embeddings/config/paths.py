@@ -118,18 +118,26 @@ class BucketPaths(BaseModel):
             return self.global_store_uri
         return posixpath.join(self.outputs, "global", f"{name}.icechunk")
 
-    def optical_registry(self) -> str:
-        """Return the URI of the per-shard registry that sits BESIDE the published store.
+    def optical_registry(self, store_uri: str) -> str:
+        """Return the URI of the per-shard registry that sits BESIDE ``store_uri``.
 
         A Parquet dataset indexing what the store contains per shard and year — what was embedded,
         what was refused and how close the refusals were to the line — so a consumer can answer
         "is my area covered, and how well" with one read instead of opening a petabyte.
 
-        **Derived from the store's own location, never from ``outputs``.** Production publishes to a
-        bucket that is not ours through :attr:`global_store_uri`, so a registry built from
-        ``outputs`` would sit in our bucket while the store sat in the public one — and every tool
-        would still work, which is exactly how a mask written where nothing reads it looks like
-        success. Deriving it from :meth:`global_store` makes the two move together by construction.
+        **Takes the store URI, and the argument is required.** This used to call
+        :meth:`global_store` with no arguments, which meant it derived from the DEFAULT repo
+        basename whatever store the run was actually writing. A campaign against
+        ``store_name="tessera-radar"`` therefore published its registry beside
+        ``tessera.icechunk``: every tool still worked, the part was valid, and it described a
+        zone-year that store does not contain. Worse than an overwrite, because two stores' parts
+        then merge into one dataset under the same partition keys and nothing in the dataset can
+        tell them apart. Observed on 2026-08-19 against ``tessera-radar``.
+
+        Passing the resolved store URI is what makes disagreement impossible: there is one input
+        and it IS the store. The same reasoning rules out deriving from ``outputs`` — production
+        publishes to a bucket that is not ours through :attr:`global_store_uri`, so a registry
+        built from ``outputs`` would sit in our bucket while the store sat in the public one.
 
         A SIBLING of the store rather than a path inside it, because Icechunk owns every key under
         its own prefix: its garbage collection enumerates that prefix and reconciles it against its
@@ -141,7 +149,7 @@ class BucketPaths(BaseModel):
         # which is the one place a Parquet file must never live: garbage collection enumerates that
         # prefix, reconciles it against its own manifests, and can collect what it does not
         # recognise. A configured URI is human-entered, so the trailing slash is a matter of time.
-        store = self.global_store().rstrip("/")
+        store = store_uri.rstrip("/")
         base, sep, name = store.rpartition("/")
         stem = name[: -len(".icechunk")] if name.endswith(".icechunk") else name
         # A store URI with no separator at all — a bare relative path like

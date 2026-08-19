@@ -1229,9 +1229,19 @@ def fill_zones_sequential_flow(
                 handoff,
                 store_path=store_path,
                 staging_base=prep.staging_base,
-                # The published registry's ROOT. Resolved here because bucket conventions belong to
-                # BucketPaths (§0.3); the part's name is composed downstream, where the run id is.
-                registry_root=paths.optical_registry(),
+                # The published registry's ROOT, derived from the STORE THIS RUN WRITES. Deriving
+                # it from the default repo name instead put this flow's parts beside
+                # `tessera.icechunk` while it filled `tessera-radar` (2026-08-19). Bucket
+                # conventions belong to BucketPaths (§0.3); the part's name is composed downstream,
+                # where the run id is.
+                registry_root=paths.optical_registry(store_path),
+                # The depth rule every registry row is judged against, from the store root — the
+                # same cached read `_config_for` gates inference on, so the row states the line the
+                # fill actually applied. This call site is a SECOND entry into
+                # `assemble_zone_year` (`fill_zone_year` is the other), and omitting it published
+                # rows whose `obs_max` and `median_obs_where_any` had no line to be measured from,
+                # with `None` reading as "this fill applied no depth rule".
+                optical_min_obs=_store_optical_min_obs(),
                 input_coverage=prep.input_coverage,
                 log=log,
                 gate=gate,

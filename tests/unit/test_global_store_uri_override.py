@@ -99,7 +99,7 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
     def test_a_derived_store_gets_a_derived_registry_beside_it(self):
         paths = BucketPaths(inputs="s3://in", outputs="s3://out")
         assert paths.global_store() == "s3://out/global/tessera.icechunk"
-        assert paths.optical_registry() == "s3://out/global/tessera.registry"
+        assert paths.optical_registry(paths.global_store()) == "s3://out/global/tessera.registry"
 
     def test_an_overridden_store_takes_its_registry_with_it(self):
         """The two prefixes named in the Open Data access request, and the reason they are two:
@@ -110,7 +110,7 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
             outputs="s3://out",
             global_store_uri="s3://tessera-embeddings/v1.1/dclimate.icechunk",
         )
-        assert paths.optical_registry() == "s3://tessera-embeddings/v1.1/dclimate.registry"
+        assert paths.optical_registry(paths.global_store()) == "s3://tessera-embeddings/v1.1/dclimate.registry"
 
     def test_a_relative_store_uri_keeps_its_registry_beside_it(self):
         """A bare relative path is what local runs and tests use, and it has no separator.
@@ -121,8 +121,8 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         if you are not.
         """
         paths = BucketPaths(inputs="s3://in", outputs="s3://out", global_store_uri="tessera.icechunk")
-        assert paths.optical_registry() == "tessera.registry"
-        assert not paths.optical_registry().startswith("/")
+        assert paths.optical_registry(paths.global_store()) == "tessera.registry"
+        assert not paths.optical_registry(paths.global_store()).startswith("/")
 
     def test_the_registry_is_never_inside_the_store(self):
         """Icechunk's garbage collection enumerates its own prefix and reconciles it against its
@@ -132,7 +132,7 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
             BucketPaths(inputs="s3://in", outputs="s3://out"),
             BucketPaths(inputs="s3://in", outputs="s3://out", global_store_uri="s3://pub/v1/x.icechunk"),
         ):
-            assert not paths.optical_registry().startswith(paths.global_store() + "/")
+            assert not paths.optical_registry(paths.global_store()).startswith(paths.global_store() + "/")
 
     def test_registry_parts_follow_the_store_not_our_outputs(self):
         """The mistake this class exists to prevent, made once and caught here.
@@ -147,11 +147,52 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
             outputs="s3://ours",
             global_store_uri="s3://tessera-embeddings/v1.1/dclimate.icechunk",
         )
-        detail = part_uri(prod.optical_registry(), "32S", 2021, "run-1")
+        detail = part_uri(prod.optical_registry(prod.global_store()), "32S", 2021, "run-1")
 
-        assert detail.startswith(prod.optical_registry() + "/"), "inside the registry beside the store"
+        assert detail.startswith(prod.optical_registry(prod.global_store()) + "/"), "inside the registry beside the store"
         assert "s3://ours" not in detail, "and never in our own bucket when the store is published"
         assert not detail.startswith(prod.global_store() + "/"), "still never inside the Icechunk prefix"
+
+    def test_a_named_store_gets_a_registry_beside_THAT_store(self):
+        """The defect this signature exists to prevent, observed in dev on 2026-08-19.
+
+        `optical_registry` used to call `global_store()` with no arguments, so it derived from the
+        DEFAULT repo basename whatever store the run was writing. A campaign against
+        `store_name="tessera-radar"` published its registry beside `tessera.icechunk`: the part was
+        valid, every tool worked, and it described a zone-year that store does not contain.
+
+        Worse than an overwrite. Two stores' parts then merge into one dataset under the same
+        `zone=`/`year=` keys, and nothing IN the dataset can tell them apart — so the wrongness is
+        unfalsifiable from the artifact a consumer was told to trust instead of the store.
+        """
+        paths = BucketPaths(inputs="s3://in", outputs="s3://out")
+        radar = paths.global_store("tessera-radar")
+
+        assert paths.optical_registry(radar) == "s3://out/global/tessera-radar.registry"
+        assert paths.optical_registry(radar) != paths.optical_registry(paths.global_store())
+
+        # And the part lands beside the store it describes, not beside the default one.
+        detail = part_uri(paths.optical_registry(radar), "16S", 2022, "16S-2022-792816d6")
+        assert detail.startswith("s3://out/global/tessera-radar.registry/")
+        assert "tessera.registry" not in detail
+
+    def test_the_registry_root_cannot_be_asked_for_without_naming_a_store(self):
+        """Structural, not documentary: there is no default to fall back to silently.
+
+        A defaulted argument would have reintroduced exactly the original bug the moment a caller
+        forgot it, and the failure was invisible — a plausible part in the wrong place.
+        """
+        paths = BucketPaths(inputs="s3://in", outputs="s3://out")
+        with pytest.raises(TypeError):
+            paths.optical_registry()  # type: ignore[call-arg]
+
+    def test_a_configured_store_uri_with_a_trailing_slash_stays_outside_the_prefix(self):
+        """A human-entered override ends in "/" sooner or later, and `rpartition` then leaves the
+        basename empty — naming `.../dclimate.icechunk/.registry`, INSIDE the Icechunk prefix that
+        garbage collection enumerates.
+        """
+        paths = BucketPaths(inputs="s3://in", outputs="s3://out")
+        assert paths.optical_registry("s3://pub/v1/dclimate.icechunk/") == "s3://pub/v1/dclimate.registry"
 
     def test_registry_parts_are_partitioned_for_a_parquet_dataset(self):
         """The registry is specified as Parquet indexing what each shard holds. The parts are JSON
@@ -159,5 +200,5 @@ class TestTheRegistrySitsBesideWhicheverStoreIsInUse:
         compaction wants, or every path changes when the format does.
         """
         paths = BucketPaths(inputs="s3://in", outputs="s3://out")
-        detail = part_uri(paths.optical_registry(), "09S", 2024, "run-1")
+        detail = part_uri(paths.optical_registry(paths.global_store()), "09S", 2024, "run-1")
         assert "zone=09S" in detail and "year=2024" in detail
