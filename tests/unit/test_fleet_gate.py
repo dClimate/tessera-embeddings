@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -253,6 +254,51 @@ def test_an_inactive_gate_is_not_a_pause() -> None:
 def test_an_absent_gate_is_not_a_pause() -> None:
     """A campaign whose gate was never created must run, not sit still."""
     assert mod.pause_signal("g", read_limit=lambda name: None)() is False
+
+
+class TestTheGateIsReadByName:
+    """The lookup must not be able to miss a gate that exists.
+
+    It used to list limits with `limit=200` and scan for the name. The server caps that
+    page and truncates silently, so on a workspace holding more limits than the page the
+    gate could fall off it and read as ABSENT — which `pause_signal` treats as "not
+    paused". An operator lowering the gate to zero would then watch clusters keep taking
+    cells, with nothing reporting that the pause had not been seen.
+    """
+
+    @staticmethod
+    def _client(monkeypatch, *, by_name, listed=None):
+        """Stub the Prefect client, failing loudly if the list form is used at all."""
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return None
+
+            async def read_global_concurrency_limit_by_name(self, name):
+                return by_name(name)
+
+            async def read_global_concurrency_limits(self, limit=10, offset=0):
+                raise AssertionError("the gate must be read by name, not by listing")
+
+        monkeypatch.setattr("prefect.client.orchestration.get_client", lambda: _Client())
+
+    def test_a_gate_is_found_regardless_of_how_many_others_exist(self, monkeypatch) -> None:
+        self._client(monkeypatch, by_name=lambda n: SimpleNamespace(name=n, limit=0, active=True))
+        assert mod._read_limit_via_prefect("campaign-pause") == (0, True)
+
+    def test_an_absent_gate_still_reads_as_absent(self, monkeypatch) -> None:
+        """`None`, not an exception — `pause_signal` turns it into "not paused"."""
+        from prefect.exceptions import ObjectNotFound
+
+        def _missing(_name):
+            # ObjectNotFound requires the HTTP error it wraps — construct it as the client would.
+            raise ObjectNotFound(http_exc=Exception("404"))
+
+        self._client(monkeypatch, by_name=_missing)
+        assert mod._read_limit_via_prefect("never-created") is None
 
 
 def test_a_failed_read_is_not_a_pause() -> None:

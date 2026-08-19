@@ -273,15 +273,27 @@ def pause_signal(
 
 
 def _read_limit_via_prefect(name: str) -> tuple[int, bool] | None:
-    """``(limit, active)`` for one global concurrency limit, or ``None`` if it does not exist."""
+    """``(limit, active)`` for one global concurrency limit, or ``None`` if it does not exist.
+
+    Reads BY NAME rather than listing. The list form takes a `limit` whose default the
+    server caps at 200 and truncates silently, so on a workspace holding more limits than
+    that this gate could fall off the page and read as absent — and absent is "not paused".
+    An operator lowering the gate to zero would then watch clusters keep taking cells, with
+    nothing anywhere reporting that the pause had not been seen. Asking for the one name
+    removes the boundary rather than moving it.
+    """
     from prefect.client.orchestration import get_client
+    from prefect.exceptions import ObjectNotFound
     from prefect.utilities.asyncutils import run_coro_as_sync
 
     async def _read() -> tuple[int, bool] | None:
         async with get_client() as client:
-            for gl in await client.read_global_concurrency_limits(limit=200):
-                if gl.name == name:
-                    return int(gl.limit), bool(gl.active)
-        return None
+            try:
+                gl = await client.read_global_concurrency_limit_by_name(name)
+            except ObjectNotFound:
+                # A gate that was never created is not a pause — same answer the list form
+                # gave when no row matched, and `pause_signal` documents why.
+                return None
+            return int(gl.limit), bool(gl.active)
 
     return run_coro_as_sync(_read())

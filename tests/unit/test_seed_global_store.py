@@ -144,9 +144,39 @@ def _fully_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int):
         lambda repo, years: type("St", (), {"zones": list(mod.ZONES), "zone_years_done": cells_landed})(),
     )
     monkeypatch.setattr(mod.zarr, "open_group", lambda *a, **k: _Root())
+    # These tests are about the ROOT IDENTITY, and their `_Root` is not a zarr group — the
+    # layout check needs real arrays. Covered on its own below.
+    monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)
     monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)
+
+
+def test_a_rerun_over_existing_groups_validates_their_layout(monkeypatch):
+    """The no-work return used to check root identity and nothing else.
+
+    `seed_zone_groups` validates the existing groups' layout, but only while it is creating
+    something — and it creates nothing when all 120 already exist. So a rerun against a
+    store carrying an older schema (a missing `month` or `time_bnds` array) reported
+    "seeded successfully" having applied a check the helper itself would have failed, and
+    the defect surfaced later at fill or read time against a store an operator was told
+    was fine.
+
+    The check's own behaviour is covered against real stores in `test_global_store.py`;
+    what this pins is that the flow reaches it on the path that creates nothing.
+    """
+    _fully_seeded(monkeypatch, {"geoemb:model": "tessera-v1.1"}, cells_landed=0)
+    seen: dict = {}
+
+    def _refuse(grp, gname, layout):
+        seen["group"] = gname
+        raise ValueError(f"Refusing to seed: existing group {gname!r} has no 'month' array")
+
+    monkeypatch.setattr(mod, "_check_layout_matches", _refuse)
+
+    with pytest.raises(ValueError, match="has no 'month' array"):
+        mod.seed_global_store.fn(paths=_PATHS)
+    assert seen["group"], "the flow must probe a seeded group, not skip the check"
 
 
 def test_an_unstamped_but_empty_store_gets_its_identity_written(monkeypatch):
@@ -205,6 +235,9 @@ def _partially_seeded(monkeypatch, root_attrs: dict, *, cells_landed: int, seede
         lambda repo, years: type("St", (), {"zones": present, "zone_years_done": cells_landed})(),
     )
     monkeypatch.setattr(mod.zarr, "open_group", lambda *a, **k: _Root())
+    # These tests are about the ROOT IDENTITY, and their `_Root` is not a zarr group — the
+    # layout check needs real arrays. Covered on its own below.
+    monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)
     monkeypatch.setattr(mod, "check_root_identity", lambda *a, **k: None)
@@ -282,6 +315,9 @@ def test_a_fully_seeded_store_still_validates_the_requested_identity(monkeypatch
         mod, "campaign_status", lambda repo, years: type("St", (), {"zones": list(mod.ZONES), "zone_years_done": 0})()
     )
     monkeypatch.setattr(mod.zarr, "open_group", lambda *a, **k: _Root())
+    # These tests are about the ROOT IDENTITY, and their `_Root` is not a zarr group — the
+    # layout check needs real arrays. Covered on its own below.
+    monkeypatch.setattr(mod, "_check_layout_matches", lambda *a, **k: None)
     # The year-axis guard runs first and must pass, so the identity check is what raises.
     monkeypatch.setattr(mod, "read_time_values", lambda grp: list(mod.CAMPAIGN_YEARS))
     monkeypatch.setattr(mod, "year_of", lambda t: t)

@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from tessera_embeddings.architecture_tests import (
     DEFAULT_RULES,
     Rule,
@@ -206,14 +204,18 @@ def test_importing_the_subpackage_by_name_is_flagged(tmp_path: Path) -> None:
     assert "ok.py" not in {v.path.name for v in run(pkg) if v.rule == "no-profiling-imports-outside-profiling"}
 
 
-def test_scanning_a_src_wrapper_is_refused(tmp_path: Path) -> None:
-    """A non-package root must fail loudly, not silently approve everything.
+def test_scanning_a_src_wrapper_descends_into_the_package(tmp_path: Path) -> None:
+    """A `src/` wrapper is scanned by descending into it, not by refusing it.
 
-    The scanned root's NAME is what relative imports resolve against, so pointing the
-    checker at a `src/` wrapper turns `from ..profiling import x` inside
-    `src/pkg/inference/` into `src.pkg.profiling` — matching no absolute forbidden
-    prefix, so every relative-import rule passes on the imports it exists to forbid.
-    A checker that approves by accident is worse than no checker.
+    The scanned root's NAME is what relative imports resolve against, so scanning `src/`
+    itself turns `from ..profiling import x` inside `src/pkg/inference/` into
+    `src.pkg.profiling` — matching no absolute forbidden prefix, so every relative-import
+    rule passes on the imports it exists to forbid. A checker that approves by accident is
+    worse than no checker.
+
+    This used to be handled by REFUSING a single-package wrapper, which made
+    `--source src/` — the command the adapter template documents — unusable. Each package
+    beneath the wrapper is now its own scan root, so the imports resolve and the rule fires.
     """
     src = tmp_path / "src"
     _write(src / "tessera_embeddings" / "__init__.py", "")
@@ -222,13 +224,37 @@ def test_scanning_a_src_wrapper_is_refused(tmp_path: Path) -> None:
         "from ..profiling.ingest import report\n",
     )
 
-    with pytest.raises(ValueError, match="one level above the package root"):
-        run(src)
+    flagged = {v.rule for v in run(src)}
+    assert "no-profiling-imports-outside-profiling" in flagged, (
+        "scanning the wrapper must find the violation, not pass it or refuse to look"
+    )
 
-    # The message names the package it found, since one directory down is the fix.
-    with pytest.raises(ValueError, match="tessera_embeddings"):
-        run(src)
+    # And the same answer as pointing at the package directly, which is the whole point.
+    assert flagged == {v.rule for v in run(src / "tessera_embeddings")}
 
-    # And pointed at the package itself, the rule fires as it should.
-    flagged = {v.rule for v in run(src / "tessera_embeddings")}
-    assert "no-profiling-imports-outside-profiling" in flagged
+
+def test_a_src_wrapper_holding_several_packages_is_scanned_whole(tmp_path: Path) -> None:
+    """The silent half of the old behaviour: more than one package fell straight through.
+
+    The refusal only triggered on a SINGLE nested package. With two, the old code scanned
+    with the root named `src` and every relative-import rule passed on the imports it
+    forbids — no error, no finding, exit 0.
+    """
+    src = tmp_path / "src"
+    for pkg in ("tessera_embeddings", "second_pkg"):
+        _write(src / pkg / "__init__.py", "")
+    _write(
+        src / "tessera_embeddings" / "inference" / "actors.py",
+        "from ..profiling.ingest import report\n",
+    )
+
+    assert "no-profiling-imports-outside-profiling" in {v.rule for v in run(src)}
+
+
+def test_a_root_holding_its_own_modules_is_scanned_as_itself(tmp_path: Path) -> None:
+    """A plain tree is not a wrapper, and descending into it would change what resolves."""
+    root = tmp_path / "tessera_embeddings"
+    _write(root / "__init__.py", "")
+    _write(root / "inference" / "actors.py", "from ..profiling.ingest import report\n")
+
+    assert "no-profiling-imports-outside-profiling" in {v.rule for v in run(root)}

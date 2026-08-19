@@ -271,14 +271,29 @@ def run(
     # Detected narrowly, by the shape that mistake has: nothing importable at the root
     # and a single package directly beneath it. A root with its own modules is somebody
     # scanning a plain tree, which is supported and resolves correctly.
+    # DESCEND, rather than refuse. A `src/` wrapper is the conventional layout, and
+    # `--source src/` is the command the adapter template documents, so rejecting it made
+    # the checker unusable exactly where it is meant to be adopted. Scanning it as-is is
+    # worse still: with several packages beneath it the old code fell straight through and
+    # scanned with the root named `src`, so `from ..profiling` inside `src/pkg/inference/`
+    # resolved to `src.pkg.profiling`, matched no forbidden absolute prefix, and every
+    # relative-import rule passed on precisely the imports it forbids. Each package is its
+    # own scan root instead, which is what makes those imports resolve.
+    #
+    # A root carrying modules of its own is somebody scanning a plain tree: supported, and
+    # already resolving correctly, so it is left alone.
     if not any(p.suffix == ".py" for p in source_path.iterdir() if p.is_file()):
         nested = sorted(p for p in source_path.iterdir() if p.is_dir() and (p / "__init__.py").exists())
-        if len(nested) == 1:
-            raise ValueError(
-                f"{source_path} holds no modules of its own and wraps a single package, so it is one "
-                f"level above the package root. Its name is what relative imports resolve against, so "
-                f"scanning it would silently pass every relative-import rule. Scan {nested[0]} instead."
-            )
+        if nested:
+            found = [v for pkg in nested for v in _scan_root(pkg, expanded_rules)]
+            found.sort(key=lambda v: (str(v.path), v.lineno))
+            return found
+
+    return _scan_root(source_path, expanded_rules)
+
+
+def _scan_root(source_path: Path, expanded_rules: tuple[Rule, ...]) -> list[Violation]:
+    """Every violation under one PACKAGE root, whose name relative imports resolve against."""
     violations: list[Violation] = []
     for path in sorted(source_path.rglob("*.py")):
         rel = _path_to_subtree(source_path, path)

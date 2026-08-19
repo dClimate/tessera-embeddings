@@ -24,6 +24,7 @@ from tessera_embeddings.config.paths import BucketPaths
 from tessera_embeddings.config.store_layout import GLOBAL
 from tessera_embeddings.storage.campaign import campaign_status
 from tessera_embeddings.storage.global_store import (
+    _check_layout_matches,
     check_root_identity,
     create_global_repo,
     open_global_repo,
@@ -132,13 +133,23 @@ def seed_global_store(
     # with a different `years` would silently leave the store with mixed axes.
     if seeded:
         root = zarr.open_group(repo.readonly_session(branch="main").store, mode="r")
-        probe = cast("zarr.Group", root[sorted(seeded)[0]])
+        probe_name = sorted(seeded)[0]
+        probe = cast("zarr.Group", root[probe_name])
         existing_years = tuple(year_of(t) for t in read_time_values(probe))
         if existing_years != tuple(years):
             raise ValueError(
                 f"years {tuple(years)} differ from the store's existing axis {existing_years} "
                 f"({len(seeded)} zone(s) already seeded) — reseeding with a different axis would corrupt the store."
             )
+        # And the LAYOUT, alongside the axis it belongs with. `seed_zone_groups` runs this
+        # check too, but only while it is creating something — so a rerun against a store
+        # whose 120 groups all exist returned "seeded successfully" without ever applying it,
+        # and a store carrying an older schema (a missing `month` or `time_bnds` array) passed
+        # a seed that the helper itself would have refused. The failure then surfaces at fill
+        # or read time, against a store an operator was told was fine. One group suffices:
+        # every group shares one axis and one layout, which is the invariant the helper's own
+        # single-group check rests on.
+        _check_layout_matches(probe, probe_name, GLOBAL)
 
     def _refuse_stamping_over_landed_cells(root_attrs: dict, how_many_groups: str) -> None:
         """Refuse to stamp a write-once identity onto a store that already holds cells.
