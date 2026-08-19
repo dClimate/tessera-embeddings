@@ -760,6 +760,108 @@ def test_phase_split_matches_composed_fill(tmp_path, monkeypatch):
     assert zone_fill.zone_year_complete(store, _ZONE, 2025)
 
 
+def _seed_global_with_rule(tmp_path, rule: int) -> str:
+    """A store whose write-once root declares a depth rule, so the fill's gate accepts one."""
+    store = str(tmp_path / "global.icechunk")
+    repo = global_store.create_global_repo(store)
+    global_store.seed_zone_groups(repo, [_SPEC], years=_YEARS, layout=SMALL, optical_min_obs=rule)
+    return store
+
+
+def _published_part(registry_root: str) -> dict:
+    """The one part under ``registry_root``, read back as a column -> values dict."""
+    ds = pytest.importorskip("pyarrow.dataset")
+    table = ds.dataset(f"{registry_root}/parts", partitioning="hive").to_table()
+    return table.to_pydict()
+
+
+def test_the_registry_records_the_depth_rule_the_cell_was_filled_under(tmp_path, monkeypatch):
+    """The runner's config must reach the published row, through three forwarding hops.
+
+    Worth a test rather than a reading, because the failure is INVISIBLE: every hop defaults to
+    ``None``, and ``None`` in the column means "this fill applied no depth rule" — a legitimate,
+    plausible value. A dropped argument therefore publishes a registry that looks fine and silently
+    unreadable, since `obs_max` and `median_obs_where_any` are distances from a line the rows would
+    no longer name.
+    """
+    store = _seed_global_with_rule(tmp_path, 15)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0), (1, 1)])
+    registry_root = str(tmp_path / "registry")
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
+
+    summary = _fill(
+        tmp_path,
+        store,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        registry_root=registry_root,
+        config=InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15),
+        run_id="ruleRun",
+    )
+    assert summary["empty"] is False
+
+    cols = _published_part(registry_root)
+    assert cols["tile"], "a part was published"
+    assert set(cols["optical_min_obs"]) == {15}, "every row states the store's rule"
+    assert set(cols["embedded"]) == {True}
+
+
+def test_an_all_refused_cell_still_records_the_depth_rule(tmp_path, monkeypatch):
+    """The all-skipped branch is a SEPARATE forwarding site, and it is the cell with the most to say.
+
+    It also cannot recover the value any other way: no staged tile is opened, so the rule has to
+    arrive as an argument or not at all.
+    """
+    store = _seed_global_with_rule(tmp_path, 15)
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0), (1, 1)])
+    registry_root = str(tmp_path / "registry")
+
+    def all_skip_inference(num_actors, config, chunks, mosaic_base, staging_base, run_id, t0, log, **kwargs):
+        writer = ZarrWriter(staging_base, embedding_dim=_BAND)
+        results = []
+        for chunk in chunks:
+            writer.write_skip_marker(chunk, run_id, {"label": chunk.label, "refused": {"thin": 4}})
+            results.append({"chunk": chunk.label, "status": "skipped", "valid_pixels": 0, "elapsed_sec": 0.0})
+        return results
+
+    monkeypatch.setattr(zone_fill, "run_inference", all_skip_inference)
+    summary = _fill(
+        tmp_path,
+        store,
+        land_mask_path=mask,
+        mosaic_base=mosaic_base,
+        registry_root=registry_root,
+        config=InferenceConfig(time_window=_window(2025), chunk_size=_TILE, num_gpus=0, optical_min_obs=15),
+        run_id="ruleRunEmpty",
+    )
+    assert summary["empty"] is True
+
+    cols = _published_part(registry_root)
+    assert set(cols["embedded"]) == {False}, "every tile refused"
+    assert set(cols["optical_min_obs"]) == {15}
+    assert set(cols["refused_thin_px"]) == {4}, "and the reason survived alongside the rule"
+
+
+def test_a_store_with_no_depth_rule_publishes_null_not_zero(tmp_path, monkeypatch):
+    """`None` is the honest value for a store that refuses nothing by policy. Zero would name a line
+    that `optical_min_obs` validation rejects outright, and would read as "everything is thin".
+    """
+    store = _seed_global(tmp_path)  # seeded without a rule
+    mosaic_base = _make_mosaic(tmp_path)
+    mask = _make_mask(tmp_path, [(0, 0)])
+    registry_root = str(tmp_path / "registry")
+    staged: dict[str, np.ndarray] = {}
+    monkeypatch.setattr(zone_fill, "run_inference", _staging_inference_stub(staged))
+
+    _fill(tmp_path, store, land_mask_path=mask, mosaic_base=mosaic_base, registry_root=registry_root)
+
+    cols = _published_part(registry_root)
+    assert cols["optical_min_obs"] == [None] * len(cols["tile"])
+
+
 def test_infer_phase_threads_retirement_gate(tmp_path, monkeypatch):
     """The sequential runner's retire_idle_actors=False must reach run_inference —
     it is what keeps a zone tail from draining the shared cluster.

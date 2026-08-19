@@ -982,6 +982,7 @@ class ZarrWriter:
         *,
         embedded: list[str],
         refused: list[str],
+        optical_min_obs: int | None = None,
     ) -> str | None:
         """Publish this cell's registry part. Call ONLY after the cell has committed.
 
@@ -1011,10 +1012,14 @@ class ZarrWriter:
                     embedded=embedded,
                     refused=refused,
                     records=records,
+                    optical_min_obs=optical_min_obs,
                 ),
                 open_output=lambda target: fs.open(target, "wb"),
                 zone=zone,
                 year=year,
+                # Also in the key-value block, so a part read on its own — without the dataset's
+                # partitioning — still states the rule its rows were judged against.
+                extra_metadata={"optical_min_obs": "" if optical_min_obs is None else str(optical_min_obs)},
             )
         except Exception:
             logger.exception(
@@ -2254,6 +2259,7 @@ class ZarrWriter:
         # Where the PER-TILE refusal detail is persisted, from `BucketPaths.refusal_detail`. None
         # writes no sidecar and changes nothing the store commits — see `_skip_summary`.
         registry_root: str | None = None,
+        optical_min_obs: int | None = None,
     ) -> str:
         """Assemble a run's staged tiles into one (zone, year) of the global store.
 
@@ -2296,6 +2302,10 @@ class ZarrWriter:
                 a row per live tile, because the year's summary in the store is pooled and so cannot
                 say WHICH tile came closest to the depth cutoff — the question a cleanup campaign
                 asks. ``None`` writes nothing and changes nothing the store commits.
+            optical_min_obs: The depth rule this cell was filled under, stamped on every registry
+                row. The registry's ``obs_max``/``median_obs_where_any`` are distances from this
+                line, so without it they cannot be read; the store's root is the authority and the
+                runner asserts the config matches it before any of this runs.
             n_workers: Worker process count; also divides
                 ``TARGET_AGGREGATE_S3_CONCURRENCY`` into the per-fork cap.
             gate: Optional commit gate shared across the zone-year fills this
@@ -2525,6 +2535,7 @@ class ZarrWriter:
                 run_id,
                 embedded=registry_embedded,
                 refused=registry_refused,
+                optical_min_obs=optical_min_obs,
             )
         workers = telemetry.get("workers", [])
         _log.info(

@@ -650,6 +650,92 @@ class TestTheDatasetIsActuallyReadable:
         assert rows[0]["obs_max"] is None
 
 
+class TestTheDepthRuleTheRowsWereJudgedAgainst:
+    """`obs_max` and `median_obs_where_any` are distances from a threshold, so a row without the
+    threshold is unreadable: 14 is one scene short of a line at 15 and nowhere near one at 30.
+
+    Cell-level policy, not a per-tile measurement, which is why it is stamped on EVERY row rather
+    than pulled from a record — an all-refused cell and a fully-embedded one must both state it.
+    """
+
+    @staticmethod
+    def _write(root: str, zone: str, year: int, run: str, rows: list[dict], rule: int | None) -> str:
+        uri = part_uri(root, zone, year, run)
+        Path(uri).parent.mkdir(parents=True, exist_ok=True)
+        write_registry_part(
+            uri,
+            rows,
+            open_output=lambda u: Path(u).open("wb"),  # noqa: SIM115
+            zone=zone,
+            year=year,
+            extra_metadata={"optical_min_obs": "" if rule is None else str(rule)},
+        )
+        return uri
+
+    def test_every_row_carries_it_including_embedded_ones(self) -> None:
+        """The trap this pins: the value is applied at TWO sites — the embedded loop and the refused
+        loop — so setting it in one leaves half the rows unreadable, and the half that is fine is the
+        half most cells are made of.
+        """
+        rows = registry_rows(
+            "r1",
+            "t",
+            embedded=["chunk_0_0", "chunk_0_1"],
+            refused=["chunk_1_0", "chunk_1_1"],
+            records={"chunk_1_0": _record("chunk_1_0", thin=64)},
+            optical_min_obs=15,
+        )
+        assert len(rows) == 4
+        assert [r["optical_min_obs"] for r in rows] == [15, 15, 15, 15], "embedded AND refused, recorded AND not"
+
+    def test_no_rule_stays_null_rather_than_becoming_zero(self) -> None:
+        """A store that declares no depth rule is not a store with a rule of zero: the first refuses
+        nothing by policy, the second is the value `optical_min_obs` validation rejects outright.
+        """
+        rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=["chunk_1_1"], optical_min_obs=None)
+        assert all(r["optical_min_obs"] is None for r in rows)
+
+    def test_a_row_states_the_line_its_own_refusal_was_measured_against(self) -> None:
+        """The pairing that makes a refusal interpretable: how deep it got, and what it needed."""
+        rows = registry_rows(
+            "r1",
+            "t",
+            embedded=[],
+            refused=["chunk_1_1"],
+            records={"chunk_1_1": _record("chunk_1_1", thin=64)},
+            optical_min_obs=15,
+        )
+        row = rows[0]
+        assert row["optical_min_obs"] == 15
+        assert row["obs_max"] is not None, "a distance needs both ends"
+
+    def test_two_cells_filled_under_different_lines_stay_distinguishable(self, tmp_path: Path) -> None:
+        """The reason this belongs in the rows and not only in a docstring: a store is write-once on
+        its rule, but the registry outlives any one store and a compaction may span two. Reading the
+        merged dataset must not average across two different definitions of "thin" silently.
+        """
+        ds = pytest.importorskip("pyarrow.dataset")
+        root = str(tmp_path / "reg")
+        self._write(root, "32S", 2021, "r1", registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], optical_min_obs=15), 15)
+        self._write(root, "09S", 2021, "r2", registry_rows("r2", "t", embedded=["chunk_0_0"], refused=[], optical_min_obs=30), 30)
+
+        table = ds.dataset(f"{root}/parts", partitioning="hive").to_table()
+        assert table.num_rows == 2
+        by_zone = dict(zip(table.column("zone").to_pylist(), table.column("optical_min_obs").to_pylist(), strict=True))
+        assert by_zone == {"32S": 15, "09S": 30}
+
+    def test_a_part_read_alone_still_states_the_rule(self, tmp_path: Path) -> None:
+        """Also in the key-value block, for a reader that opens one file without the partitioning."""
+        pq = pytest.importorskip("pyarrow.parquet")
+        root = str(tmp_path / "reg")
+        uri = self._write(
+            root, "32S", 2021, "r1", registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], optical_min_obs=15), 15
+        )
+        md = {k.decode(): v.decode() for k, v in (pq.read_schema(uri).metadata or {}).items()}
+        assert md["optical_min_obs"] == "15"
+        assert md["zone"] == "32S" and md["year"] == "2021"
+
+
 class TestAPartialCoverageTileCannotWedgeACell:
     """The defect a reviewer found in the coverage tile, twice, from both ends.
 

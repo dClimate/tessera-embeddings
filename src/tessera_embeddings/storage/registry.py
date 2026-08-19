@@ -110,6 +110,14 @@ def registry_schema() -> pa.Schema:
             # `refused_no_radar_px = 0` ("nothing refused for radar") from the rule being switched
             # off, which is what a global campaign does by policy.
             pa.field("radar_rule_enforced", pa.bool_()),
+            # THE OPTICAL LINE THIS CELL WAS FILLED UNDER, for the same reason the radar rule is
+            # here: `obs_max` and `median_obs_where_any` are distances from a threshold, and without
+            # the threshold they are unreadable — 14 is one scene short of the line at 15 and nowhere
+            # near it at 30. The store's root carries the value, but a consumer reading the registry
+            # has been told it need not open the store, so a row that cannot be interpreted on its
+            # own defeats the point. Cell-level policy, so it is set on EVERY row including embedded
+            # ones; null means the fill applied no depth rule at all, which is not the same as 0.
+            pa.field("optical_min_obs", pa.int64()),
         ]
     )
 
@@ -126,6 +134,7 @@ def _blank_measurements() -> dict[str, Any]:
         "median_obs_where_any": None,
         "px_with_any_radar": None,
         "radar_rule_enforced": None,
+        "optical_min_obs": None,
     }
 
 
@@ -136,6 +145,7 @@ def registry_rows(
     embedded: Iterable[str],
     refused: Iterable[str],
     records: Mapping[str, dict] | None = None,
+    optical_min_obs: int | None = None,
 ) -> list[dict[str, Any]]:
     """One row per live tile: what it holds, and for a refused tile why, and how close it came.
 
@@ -143,12 +153,20 @@ def registry_rows(
     provenance summary is built from, so the registry cannot disagree with the store about which tiles
     were written. A refused tile with no record still gets a row, measurements null: "no reason was
     recorded" and "nothing was refused" are different facts, and a zero asserts the second.
+
+    ``optical_min_obs`` is the cell's depth rule, stamped on every row — including embedded ones,
+    which carry no measurements but were still filled under it. It is cell-level policy rather than a
+    per-tile measurement, so it is passed in rather than read from a record: an all-refused cell and a
+    fully-embedded one must both be able to state it.
     """
     records = records or {}
+    rule = _int_or_none(optical_min_obs)
     rows: list[dict[str, Any]] = []
     for label in sorted(embedded):
         rows.append(
-            {"tile": label, "run_id": run_id, "assembled_at": assembled_at, "embedded": True} | _blank_measurements()
+            {"tile": label, "run_id": run_id, "assembled_at": assembled_at, "embedded": True}
+            | _blank_measurements()
+            | {"optical_min_obs": rule}
         )
     for label in sorted(refused):
         record = records.get(label) or {}
@@ -159,6 +177,7 @@ def registry_rows(
             "embedded": False,
         }
         row |= _blank_measurements()
+        row["optical_min_obs"] = rule
         if record:
             reasons = record.get("refused") or {}
             obs = record.get("s2_obs") or {}
@@ -196,6 +215,7 @@ def write_registry_part(
     open_output: Callable[[str], AbstractContextManager[Any]],
     zone: str = "",
     year: int = 0,
+    extra_metadata: Mapping[str, str] | None = None,
 ) -> int:
     """Write ``rows`` as one Parquet part at ``uri``; returns the rows written.
 
@@ -204,6 +224,8 @@ def write_registry_part(
 
     ``zone``/``year`` go into the file's key-value metadata rather than a column, so a part opened on
     its own still says what it describes while the dataset's partition keys stay the single authority.
+    ``extra_metadata`` adds to that key-value block — for provenance that describes the whole part
+    rather than any one tile, and that a reader may want without decoding a row.
 
     Buffered and written in one shot rather than streamed: a part is at most a few hundred rows, and a
     partial Parquet file is unreadable, so one write is both cheap and the only version that fails
@@ -215,7 +237,9 @@ def write_registry_part(
     if not rows:
         return 0
     table = pa.Table.from_pylist(rows, schema=registry_schema())
-    table = table.replace_schema_metadata({"zone": zone, "year": str(year), "run_id": str(rows[0]["run_id"])})
+    table = table.replace_schema_metadata(
+        {"zone": zone, "year": str(year), "run_id": str(rows[0]["run_id"]), **dict(extra_metadata or {})}
+    )
     buf = io.BytesIO()
     pq.write_table(table, buf, compression="zstd")
     with open_output(uri) as f:

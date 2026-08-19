@@ -403,6 +403,7 @@ def fill_zone_year(
         store_path=store_path,
         staging_base=staging_base,
         registry_root=registry_root,
+        optical_min_obs=config.optical_min_obs,
         log=log,
         gate=gate,
         n_assembly_workers=n_assembly_workers,
@@ -896,6 +897,11 @@ def assemble_zone_year(
     # Root of the published registry dataset; from `BucketPaths.optical_registry`. None writes
     # no part. Mirrors `staging_base`: a location the CALLER resolves.
     registry_root: str | None = None,
+    # The depth rule this cell was filled under, stamped on every registry row. Passed rather than
+    # re-read: `preflight_destination` already asserted the config matches the store's write-once
+    # root value, so the caller's number IS the store's, and an all-refused cell — which opens no
+    # staged tile — must still be able to state it.
+    optical_min_obs: int | None = None,
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     gate: CommitGate | None = None,
     n_assembly_workers: int | None = None,
@@ -969,6 +975,7 @@ def assemble_zone_year(
                 # pooled summary from the year's provenance, and staging cleanup then destroyed the
                 # only surviving account of which tiles were thin, unimaged, or radar-free.
                 registry_root=registry_root,
+                optical_min_obs=optical_min_obs,
                 s3_concurrency=s3_concurrency,
                 empty=True,
                 get_credentials=get_credentials,
@@ -1039,6 +1046,7 @@ def assemble_zone_year(
         zone,
         year=year,
         registry_root=registry_root,
+        optical_min_obs=optical_min_obs,
         run_id=run_id,
         n_workers=n_workers,
         gate=gate,
