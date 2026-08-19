@@ -736,6 +736,70 @@ class TestTheDepthRuleTheRowsWereJudgedAgainst:
         assert md["zone"] == "32S" and md["year"] == "2021"
 
 
+class TestWhereTheTileIs:
+    """The bounding box the access request promises, and the two ways a consumer misreads it."""
+
+    def test_every_row_gets_the_box_for_its_own_tile(self) -> None:
+        boxes = {
+            "chunk_0_0": (-90.0, -0.05, -89.8, 0.13),
+            "chunk_5_3": (-89.5, -0.98, -89.3, -0.79),
+        }
+        rows = registry_rows(
+            "r1", "t", embedded=["chunk_0_0"], refused=["chunk_5_3"], bboxes=boxes, optical_min_obs=15
+        )
+        by_tile = {r["tile"]: r for r in rows}
+        assert by_tile["chunk_0_0"]["bbox_west"] == -90.0
+        assert by_tile["chunk_0_0"]["bbox_north"] == 0.13
+        assert by_tile["chunk_5_3"]["bbox_south"] == -0.98, "the refused row too, not only embedded"
+
+    def test_a_tile_with_no_box_is_null_rather_than_a_guess(self) -> None:
+        """Nulls point nowhere; a guessed box points a consumer at the wrong ground."""
+        rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], bboxes={})
+        assert rows[0]["bbox_west"] is None and rows[0]["bbox_east"] is None
+
+    def test_an_antimeridian_row_keeps_the_west_greater_than_east_convention(self, tmp_path: Path) -> None:
+        """Zones 01 and 60 straddle +/-180. The registry must carry the crossing as GeoJSON does —
+        west > east — rather than "helpfully" ordering the pair, which would widen the box to most
+        of the globe and report coverage the tile does not have.
+        """
+        pytest.importorskip("pyproj")
+        from tessera_embeddings.storage import zone_grid
+
+        spec = zone_grid.zone("01N")
+        west, south, east, north = zone_grid.tile_range_bbox_wgs84(spec, 0, 1, 0, 1)
+        rows = registry_rows("r1", "t", embedded=["chunk_0_0"], refused=[], bboxes={"chunk_0_0": (west, south, east, north)})
+        row = rows[0]
+        assert row["bbox_west"] == west and row["bbox_east"] == east
+        assert row["bbox_south"] < row["bbox_north"], "latitude is always ordered"
+        if west > east:
+            assert west - east > 0, "a crossing row is preserved, not normalised"
+
+    def test_the_box_matches_the_shard_the_label_names(self) -> None:
+        """The label's row/col index the SHARD grid — the same reading assembly uses to place a
+        tile — so a box must step by one tile pitch per row, not by a pixel or by a chunk of some
+        other size. A pitch error yields boxes that look plausible and describe the wrong ground.
+        """
+        pytest.importorskip("pyproj")
+        from tessera_embeddings.config.store_layout import SHARD_PX
+        from tessera_embeddings.storage.zone_grid import PIXEL_M, tile_range_bbox_wgs84, zone
+
+        spec = zone("16S")
+        top = tile_range_bbox_wgs84(spec, 0, 1, 0, 1)
+        next_row = tile_range_bbox_wgs84(spec, 1, 2, 0, 1)
+        deg_per_m = 1.0 / 111_320.0
+
+        # One tile south, and by one tile PITCH: ~20.48 km of latitude per row.
+        assert next_row[3] < top[3] and next_row[1] < top[1], "row 1 is south of row 0"
+        assert abs((top[3] - top[1]) - SHARD_PX * PIXEL_M * deg_per_m) < 0.01
+
+        # Adjacent boxes OVERLAP rather than abut, and that is the containment guarantee showing
+        # through: each is the WGS84 envelope of its own projected quad, so along the northing line
+        # the two tiles share, one box takes that curve's maximum latitude and the other its
+        # minimum. What must never happen is a GAP — land in neither box.
+        assert next_row[3] >= top[1], "no gap between vertically adjacent tiles"
+        assert (next_row[3] - top[1]) < 10.0 * deg_per_m, "and the overlap stays inside one pixel"
+
+
 class TestAPartialCoverageTileCannotWedgeACell:
     """The defect a reviewer found in the coverage tile, twice, from both ends.
 

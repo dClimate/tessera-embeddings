@@ -98,6 +98,7 @@ from tessera_embeddings.storage.zarr_store import (
     read_time_values,
     time_index_of,
 )
+from tessera_embeddings.storage import zone_grid
 from tessera_embeddings.storage.zone_grid import PIXEL_M, year_timestamp
 
 logger = logging.getLogger(__name__)
@@ -786,6 +787,33 @@ class StagedShardSource:
         return blocks
 
 
+def _tile_bboxes_wgs84(zone: str, labels: Iterable[str]) -> dict[str, tuple[float, float, float, float]]:
+    """WGS84 ``(west, south, east, north)`` per tile label, for the registry's bbox columns.
+
+    A label's ``(row, col)`` indexes the SHARD grid — the same interpretation
+    ``StagedShardSource.load`` uses to place a tile — so the box is that shard's footprint and no
+    new assumption about the chunk size is introduced here.
+
+    Best-effort per label: a malformed label, or a row/col outside the zone, yields no entry rather
+    than a wrong box or an exception. This runs after the cell has committed, so nothing here may
+    raise; and a missing box publishes as null, which reads as "not recorded" instead of pointing a
+    consumer at the wrong ground.
+    """
+    try:
+        spec = zone_grid.zone(zone)
+    except Exception:
+        logger.warning("Zone %s has no grid spec; registry rows will carry no bounding box", zone)
+        return {}
+    boxes: dict[str, tuple[float, float, float, float]] = {}
+    for label in labels:
+        try:
+            row, col = parse_chunk_label(label)
+            boxes[label] = zone_grid.tile_range_bbox_wgs84(spec, row, row + 1, col, col + 1)
+        except Exception:
+            logger.warning("Could not derive a bounding box for tile %s of zone %s", label, zone)
+    return boxes
+
+
 class ZarrWriter:
     """Write embeddings to Zarr stores.
 
@@ -1001,6 +1029,7 @@ class ZarrWriter:
         """
         records = getattr(self, "_last_skip_records", {})
         uri = part_uri(registry_root, zone, year, run_id)
+        boxes = _tile_bboxes_wgs84(zone, [*embedded, *refused])
         try:
             fs = _fs_for(uri)
             fs.makedirs(uri.rsplit("/", 1)[0], exist_ok=True)
@@ -1013,6 +1042,7 @@ class ZarrWriter:
                     refused=refused,
                     records=records,
                     optical_min_obs=optical_min_obs,
+                    bboxes=boxes,
                 ),
                 open_output=lambda target: fs.open(target, "wb"),
                 zone=zone,

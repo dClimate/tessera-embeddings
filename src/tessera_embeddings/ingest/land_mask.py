@@ -634,59 +634,16 @@ def _join(base: str, name: str) -> str:
 # =============================================================================
 
 
-@cache
-def _to_wgs84(epsg: int) -> Transformer:
-    """Zone-CRS → WGS84 transformer, cached per zone (inverse of :func:`_transformer`)."""
-    return Transformer.from_crs(epsg, 4326, always_xy=True)
-
-
 def _tile_range_bbox_wgs84(spec: ZoneSpec, r0: int, r1: int, c0: int, c1: int) -> tuple[float, float, float, float]:
     """WGS84 ``(minx, miny, maxx, maxy)`` covering tile rows ``[r0, r1)`` x cols ``[c0, c1)``.
 
-    The projected rectangle's perimeter is densified before projecting to WGS84
-    so meridian curvature can't clip the extremes (which may fall mid-edge, not
-    at a corner) — the WGS84 envelope of the perimeter therefore CONTAINS the
-    whole projected rectangle, which is what lets callers treat a catalogue miss
-    against the box as a miss against everything inside it.
+    Delegates to :func:`~tessera_embeddings.storage.zone_grid.tile_range_bbox_wgs84`, which is
+    where the densified-perimeter containment guarantee and the antimeridian convention now live —
+    the published registry needs the same box per tile, and two implementations of a grid
+    convention is how one of them quietly stops describing the grid in use. Kept as a
+    module-private alias so this file's callers and their tests read unchanged.
     """
-    tile_m = SHARD_PX * PIXEL_M
-    e_lo = spec.easting[0] + c0 * tile_m
-    e_hi = spec.easting[0] + c1 * tile_m
-    n_hi = spec.northing[1] - r0 * tile_m  # top (max northing)
-    n_lo = spec.northing[1] - r1 * tile_m  # bottom (min northing)
-
-    # 64 samples per edge, chosen by measurement rather than by feel. The docstring's
-    # containment guarantee is what callers rely on — `preflight_optical_source` treats a
-    # catalogue miss against this box as a miss against everything inside it — and a sampled
-    # perimeter only contains the true envelope if no extremum hides between two samples.
-    # Measured worst-case under-coverage across zone edges and latitudes:
-    #
-    #     16 -> 325 m     32 -> 63 m     64 -> 9.8 m     128 -> 0.61 m
-    #
-    # 64 is the first that lands inside one pixel (10 m), i.e. below the resolution anything
-    # downstream can act on. The cost is ~30 us per box against ~8 us, and the campaign
-    # computes at most a few hundred boxes per cell: about eight seconds across all 1,008
-    # cells, which is not a number worth trading a correctness guarantee for.
-    n = 64  # samples per edge
-    es = np.linspace(e_lo, e_hi, n)
-    ns = np.linspace(n_lo, n_hi, n)
-    perim_e = np.concatenate([es, np.full(n, e_hi), es[::-1], np.full(n, e_lo)])
-    perim_n = np.concatenate([np.full(n, n_hi), ns[::-1], np.full(n, n_lo), ns])
-    lon, lat = _to_wgs84(int(spec.epsg)).transform(perim_e, perim_n)
-    lon = np.asarray(lon, dtype="float64")
-    lat = np.asarray(lat, dtype="float64")
-    lat_min, lat_max = float(lat.min()), float(lat.max())
-
-    # Antimeridian: zones 01* / 60* snap slightly past ±180, so inverse projection
-    # wraps some perimeter points to the far side. Plain min/max would then span
-    # nearly the whole globe. A span > 180° signals the wrap; represent the crossing
-    # per the GeoJSON/STAC convention (west > east) — west is the eastern (>0)
-    # cluster's min, east the western (<0) cluster's max — keeping the box narrow.
-    if float(lon.max() - lon.min()) > 180.0:
-        west = float(lon[lon > 0.0].min())
-        east = float(lon[lon < 0.0].max())
-        return west, lat_min, east, lat_max
-    return float(lon.min()), lat_min, float(lon.max()), lat_max
+    return zone_grid.tile_range_bbox_wgs84(spec, r0, r1, c0, c1)
 
 
 def _live_tile_bbox_wgs84(spec: ZoneSpec, tile_live: np.ndarray) -> tuple[float, float, float, float]:

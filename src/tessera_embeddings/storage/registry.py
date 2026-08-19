@@ -34,12 +34,18 @@ Three things this module does deliberately, each because the obvious version is 
   reason. Writing zero would assert a measurement nobody took, which is the mistake this registry
   exists to stop a reader making.
 
-**Why there is no bounding box column yet.** The access request promises one, and a tile's projected
-bounds look like arithmetic over the zone extent and the pixel size — but that arithmetic needs the
-northing sign convention, and getting it wrong yields bounds that are plausible everywhere and
-correct nowhere. The store's own coordinate arrays are the authority (the 2026-08 tile-offset
-investigation ended in exactly that rule: align by coordinate VALUE, never by index), so the column
-lands when it is read from them rather than derived here.
+**Where the bounding box comes from.** Each row carries its tile's WGS84 box, which is what makes
+"is my area of interest covered" a query rather than a grid calculation the consumer has to get
+right. It is NOT derived here: the arithmetic needs the northing sign convention, and getting that
+wrong yields bounds that are plausible everywhere and correct nowhere. The caller supplies boxes from
+:func:`~tessera_embeddings.storage.zone_grid.tile_range_bbox_wgs84`, which is the single
+implementation of that convention and whose densified perimeter is measured to contain the true
+envelope to within one pixel — the ingest's catalogue preflight relies on the same guarantee.
+
+**Two things a consumer must know about the box.** It is in WGS84 degrees, so there is no CRS column
+to check. And rows for zones 01 and 60 straddle the antimeridian, where the GeoJSON and STAC
+convention makes ``west > east``: filtering ``west <= lon <= east`` silently drops them, and the
+correct test for such a row is ``lon >= west or lon <= east``.
 """
 
 from __future__ import annotations
@@ -118,6 +124,19 @@ def registry_schema() -> pa.Schema:
             # own defeats the point. Cell-level policy, so it is set on EVERY row including embedded
             # ones; null means the fill applied no depth rule at all, which is not the same as 0.
             pa.field("optical_min_obs", pa.int64()),
+            # WHERE THE TILE IS, in WGS84 degrees, so "is my area of interest covered" is a
+            # comparison against the registry rather than a grid calculation the consumer has to
+            # get right. Four columns rather than a struct: every Parquet reader filters a float
+            # column without unpacking anything, and this dataset's whole point is being easy to
+            # query. Always WGS84, so no CRS column — a projected box would need one per zone.
+            #
+            # ANTIMERIDIAN: zones 01 and 60 straddle +/-180, and those rows follow the GeoJSON and
+            # STAC convention of west > east. A consumer filtering `west <= lon <= east` silently
+            # drops them; the correct test for a crossing row is `lon >= west or lon <= east`.
+            pa.field("bbox_west", pa.float64()),
+            pa.field("bbox_south", pa.float64()),
+            pa.field("bbox_east", pa.float64()),
+            pa.field("bbox_north", pa.float64()),
         ]
     )
 
@@ -135,6 +154,10 @@ def _blank_measurements() -> dict[str, Any]:
         "px_with_any_radar": None,
         "radar_rule_enforced": None,
         "optical_min_obs": None,
+        "bbox_west": None,
+        "bbox_south": None,
+        "bbox_east": None,
+        "bbox_north": None,
     }
 
 
@@ -146,6 +169,7 @@ def registry_rows(
     refused: Iterable[str],
     records: Mapping[str, dict] | None = None,
     optical_min_obs: int | None = None,
+    bboxes: Mapping[str, tuple[float, float, float, float]] | None = None,
 ) -> list[dict[str, Any]]:
     """One row per live tile: what it holds, and for a refused tile why, and how close it came.
 
@@ -158,15 +182,21 @@ def registry_rows(
     which carry no measurements but were still filled under it. It is cell-level policy rather than a
     per-tile measurement, so it is passed in rather than read from a record: an all-refused cell and a
     fully-embedded one must both be able to state it.
+
+    ``bboxes`` maps a tile label to its WGS84 ``(west, south, east, north)``. Passed in rather than
+    derived here because the box comes from the zone's grid geometry, which this module has no
+    business knowing; a label with no entry gets nulls rather than a guess.
     """
     records = records or {}
     rule = _int_or_none(optical_min_obs)
+    boxes = bboxes or {}
     rows: list[dict[str, Any]] = []
     for label in sorted(embedded):
         rows.append(
             {"tile": label, "run_id": run_id, "assembled_at": assembled_at, "embedded": True}
             | _blank_measurements()
             | {"optical_min_obs": rule}
+            | _bbox_fields(boxes.get(label))
         )
     for label in sorted(refused):
         record = records.get(label) or {}
@@ -178,6 +208,7 @@ def registry_rows(
         }
         row |= _blank_measurements()
         row["optical_min_obs"] = rule
+        row |= _bbox_fields(boxes.get(label))
         if record:
             reasons = record.get("refused") or {}
             obs = record.get("s2_obs") or {}
@@ -197,6 +228,19 @@ def registry_rows(
             }
         rows.append(row)
     return rows
+
+
+def _bbox_fields(box: tuple[float, float, float, float] | None) -> dict[str, float | None]:
+    """The four bbox columns for one tile, all null when no box was supplied."""
+    if box is None:
+        return {"bbox_west": None, "bbox_south": None, "bbox_east": None, "bbox_north": None}
+    west, south, east, north = box
+    return {
+        "bbox_west": float(west),
+        "bbox_south": float(south),
+        "bbox_east": float(east),
+        "bbox_north": float(north),
+    }
 
 
 def _int_or_none(value: object) -> int | None:

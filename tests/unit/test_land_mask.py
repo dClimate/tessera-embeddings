@@ -311,7 +311,7 @@ def test_export_zone_roi_bbox_contains_live_tiles(tmp_path) -> None:
     # The centre of live tile (10, 5) projected to WGS84 must lie inside the bbox.
     e = spec.easting[0] + (5 * SHARD_PX + SHARD_PX / 2) * land_mask.PIXEL_M
     n = spec.northing[1] - (10 * SHARD_PX + SHARD_PX / 2) * land_mask.PIXEL_M
-    lon, lat = land_mask._to_wgs84(int(spec.epsg)).transform(e, n)
+    lon, lat = zone_grid.to_wgs84(int(spec.epsg)).transform(e, n)
     assert minx <= lon <= maxx
     assert miny <= lat <= maxy
 
