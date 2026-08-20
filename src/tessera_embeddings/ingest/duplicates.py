@@ -37,6 +37,7 @@ from __future__ import annotations
 import datetime
 import itertools
 import logging
+import math
 import re
 import urllib.parse
 from collections.abc import Iterable, Sequence
@@ -154,9 +155,35 @@ def item_is_in_preferred_location(
     locality being claimed. An item exposing none of them is remote — absence of evidence is not
     locality.
     """
+    # EVERY requested key must resolve, not merely the ones present. Asserting over only the
+    # keys an item happens to carry let a single local band read as fully in-region: that copy
+    # displaces a COMPLETE remote one on a baseline tie, then fails at load with no source href
+    # to attribute, sending the recovery ladder stepping down every duplicated tile-date of that
+    # day. Locality is a claim about the whole read, so an incomplete item cannot make it.
+    if not read_set_is_complete(item, keys):
+        return False
+    assets = item.assets
+    return all(asset_bucket(_asset_href(assets[key]) or "") in buckets for key in keys)
+
+
+def read_set_is_complete(
+    item: Any,  # noqa: ANN401 — any STAC-like item
+    keys: tuple[str, ...] = READ_ASSET_KEYS,
+) -> bool:
+    """Whether every asset this ingest would READ resolves to an href.
+
+    Separate from :func:`item_is_in_preferred_location` because it answers a different
+    question — *can* this copy be read at all, rather than *from where*. Locality now implies
+    completeness, so the two are correlated, but ranking needs the weaker claim on its own:
+    with locality tied, an incomplete copy would otherwise be separated from a complete one
+    only by the id tiebreak, and could win a tile-date it cannot deliver.
+
+    Items carrying no assets at all — radar copies, and any non-S2 product whose bands are not
+    named by :data:`READ_ASSET_KEYS` — are uniformly incomplete, so this term ties across the
+    whole set and changes no ordering there.
+    """
     assets = getattr(item, "assets", None) or {}
-    hrefs = [href for key in keys if (asset := assets.get(key)) is not None and (href := _asset_href(asset))]
-    return bool(hrefs) and all(asset_bucket(href) in buckets for href in hrefs)
+    return all((asset := assets.get(key)) is not None and _asset_href(asset) is not None for key in keys)
 
 
 def item_processing_baseline(item: Any) -> float | None:  # noqa: ANN401 — any STAC-like item
@@ -170,10 +197,19 @@ def item_processing_baseline(item: Any) -> float | None:  # noqa: ANN401 — any
     if raw is None:
         return None
     try:
-        return float(raw)
+        value = float(raw)
     except (TypeError, ValueError):
         logger.debug("Unparseable s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
         return None
+    # `float()` accepts "NaN" and "Infinity", so a malformed catalogue value would otherwise
+    # count as a KNOWN baseline. NaN makes every comparison false and leaves the order dependent
+    # on catalogue response order; +inf outranks every real baseline and can later make the
+    # integer conversion raise. Neither is a baseline, so both are unknown — which falls back to
+    # sequence ordering, the same as an absent value.
+    if not math.isfinite(value):
+        logger.debug("Non-finite s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
+        return None
+    return value
 
 
 def _sequence_key(item: Any) -> tuple[int, int, str]:  # noqa: ANN401 — any STAC-like item
@@ -189,7 +225,7 @@ def _sequence_key(item: Any) -> tuple[int, int, str]:  # noqa: ANN401 — any ST
     return (-has_sequence, -(sequence or 0), str(getattr(item, "id", "")))
 
 
-def _baseline_locality_key(item: Any) -> tuple[float, int, int, int, str]:  # noqa: ANN401
+def _baseline_locality_key(item: Any) -> tuple[float, int, int, int, int, str]:  # noqa: ANN401
     """Descending processing baseline, then locality among EQUAL baselines, then sequence.
 
     Only used when every copy's baseline is readable, which is what makes the locality term
@@ -203,9 +239,38 @@ def _baseline_locality_key(item: Any) -> tuple[float, int, int, int, str]:  # no
     """
     baseline = item_processing_baseline(item)
     remote = 0 if item_is_in_preferred_location(item) else 1
+    incomplete = 0 if read_set_is_complete(item) else 1
     sequence = item_sequence(item)
     has_sequence = 0 if sequence is None else 1
-    return (-(baseline or 0.0), remote, -has_sequence, -(sequence or 0), str(getattr(item, "id", "")))
+    return (
+        -(baseline or 0.0),
+        remote,
+        incomplete,
+        -has_sequence,
+        -(sequence or 0),
+        str(getattr(item, "id", "")),
+    )
+
+
+def _across_acquisitions_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  # noqa: ANN401
+    """Context-free rank, for ordering one acquisition's ladder against another's.
+
+    Deliberately NOT group-relative: it compares a spare from one acquisition with a spare from
+    a different one, where "best in my group" means nothing. An unknown baseline sorts last here
+    rather than suspending the comparison, because suspending it is what leaked one acquisition's
+    malformed metadata into another's ordering.
+    """
+    baseline = item_processing_baseline(item)
+    sequence = item_sequence(item)
+    return (
+        0 if baseline is not None else 1,
+        -(baseline or 0.0),
+        0 if item_is_in_preferred_location(item) else 1,
+        0 if read_set_is_complete(item) else 1,
+        0 if sequence is not None else 1,
+        -(sequence or 0),
+        str(getattr(item, "id", "")),
+    )
 
 
 def _rank_copies(copies: list[Any]) -> list[Any]:
@@ -331,14 +396,17 @@ def select_preferred_duplicates(
             survivors.add(id(ranked[0]))
             rejected.extend(ranked[1:])
         if rejected:
-            # Ranked across the WHOLE tile-date, not merely concatenated per acquisition.
-            # `_first_for_failed_acquisition` documents that `copies[0]` is the best answer when
-            # nothing was attributed, so this list has to be globally preference-ordered; a
-            # concatenation put an earlier acquisition's low-sequence spare ahead of a later
-            # one's newest. Safe to sort globally because the keys are absolute — an earlier
-            # version ranked against the group's own best baseline, which is what made a
-            # cross-acquisition comparison meaningless.
-            alternates[key] = _rank_copies(rejected)
+            # Ranked WITHIN each acquisition, then the acquisitions ordered by their own best
+            # spare. Ranking the whole tile-date in one call leaked one acquisition's unknown
+            # baseline into another's order: `_rank_copies` reverts the entire set to sequence
+            # ordering when any baseline is unreadable, so a single malformed item in acquisition
+            # A could push A's 03.00/seq-1 spare ahead of B's 04.00/seq-0 one. Ranking per
+            # acquisition keeps each ladder baseline-first, and ordering the groups by their best
+            # member keeps `copies[0]` the best overall answer, which is what
+            # `_first_for_failed_acquisition` documents it needs when nothing was attributed.
+            ladders = [_rank_copies(g) for g in _by_acquisition(rejected)]
+            ladders.sort(key=lambda ladder: _across_acquisitions_key(ladder[0]))
+            alternates[key] = [copy for ladder in ladders for copy in ladder]
 
     kept = [it for it in items if id(it) in survivors]
     return kept, alternates
