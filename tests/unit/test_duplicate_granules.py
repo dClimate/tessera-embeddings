@@ -27,6 +27,7 @@ from tessera_embeddings.ingest.asset_locations import (
     read_set_is_complete,
 )
 from tessera_embeddings.ingest.duplicates import (
+    _first_for_failed_acquisition,
     _preference_key,
     alternates_for,
     copies_label,
@@ -1588,3 +1589,55 @@ class TestAnUndatedCopyCannotDisplaceADatedPass:
         ]
         kept, _ = select_preferred_duplicates(items)
         assert sorted(i.id for i in kept) == ["pass-a", "pass-b"]
+
+
+class TestAttributedRecoveryOnlyUsesCopiesItCanPlace:
+    """A spare with no readable instant has an arbitrary — and UNSTABLE — acquisition.
+
+    `_first_for_failed_acquisition` clusters a candidate against the implicated copies, while
+    `_alternate_for` clusters it against the survivors and lands on the earliest. So an undated
+    spare could be chosen for the acquisition that failed and then swapped onto a healthy one:
+    the spare is consumed, the failure stays selected, and the date is not recovered. Raised on
+    PR #107.
+    """
+
+    _A = "2021-09-08T10:00:00Z"
+    _B = "2021-09-08T14:00:00Z"
+
+    def _at(self, ident: str, acquired: str | None, sequence: str = "0") -> _Item:
+        extra: dict[str, object] = {"s2:processing_baseline": "05.00"}
+        if acquired is not None:
+            extra["datetime"] = acquired
+        return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **extra), _bands_at(_IN_REGION))
+
+    def test_an_undated_spare_is_not_offered_for_an_attributed_failure(self) -> None:
+        undated = self._at("undated", None, "9")
+        failed = self._at("failed-b", self._B, "1")
+        assert _first_for_failed_acquisition([undated], [failed]) is None
+
+    def test_a_dated_spare_of_the_failed_acquisition_is_offered(self) -> None:
+        """The complement, or excluding everything would pass the test above."""
+        spare = self._at("spare-b", self._B, "0")
+        failed = self._at("failed-b", self._B, "1")
+        chosen = _first_for_failed_acquisition([spare], [failed])
+        assert chosen is not None and chosen.id == "spare-b"
+
+    def test_an_undated_spare_is_still_used_when_nothing_is_attributed(self) -> None:
+        """With no acquisition to match there is nothing to place it against, and the
+        pre-existing behaviour — take the best-ranked spare — remains right.
+        """
+        undated = self._at("undated", None, "9")
+        chosen = _first_for_failed_acquisition([undated], [])
+        assert chosen is not None and chosen.id == "undated"
+
+    def test_the_healthy_acquisition_is_not_swapped_end_to_end(self) -> None:
+        """The consequence the reviewer named, through the real entry point."""
+        pass_a = self._at("pass-a", self._A, "1")
+        pass_b = self._at("pass-b", self._B, "1")
+        undated = self._at("undated-spare", None, "9")
+        kept, alternates = select_preferred_duplicates([pass_a, pass_b, undated])
+        assert sorted(i.id for i in kept) == ["pass-a", "pass-b"]
+        stepped = step_down_copies(alternates, kept, implicated=[pass_b])
+        if stepped is not None:
+            swapped = [i.id for i in stepped[0]]
+            assert "pass-a" in swapped, "the healthy acquisition was replaced by an unplaceable spare"

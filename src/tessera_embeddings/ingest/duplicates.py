@@ -603,8 +603,9 @@ def _first_for_failed_acquisition(copies: list[Any], implicated: Sequence[Any]) 
     ``copies`` is already preference-ordered, so the plain answer is ``copies[0]`` — and that
     is what this returns when nothing was attributed, which is the pre-existing behaviour.
 
-    **When attribution DID name the failing objects and none of the copies belongs to their
-    acquisition, the answer is ``None``.** Falling back to the best overall alternate there swapped
+    **When attribution DID name the failing objects, only candidates with a readable acquisition
+    instant are considered, and the answer is ``None`` if none of them belongs to the failing
+    acquisition.** Falling back to the best overall alternate there swapped
     a healthy acquisition down to an older copy while leaving the known-bad one selected, then
     rebuilt and re-read the whole date only to fail the same way — once per unrelated spare before
     recording the loss. Nothing to step means nothing to step.
@@ -618,6 +619,15 @@ def _first_for_failed_acquisition(copies: list[Any], implicated: Sequence[Any]) 
     if not implicated:
         return copies[0]
     for candidate in copies:
+        # A candidate with no readable instant is attached to a cluster ARBITRARILY, and the two
+        # calls that need its acquisition see different item sets: this one clusters it against the
+        # implicated copies, while `_alternate_for` clusters it against the survivors and lands on
+        # the earliest. So it could be chosen as the spare for the acquisition that FAILED and then
+        # swapped onto a healthy one — consuming the spare, leaving the failure selected, and
+        # recovering nothing. Attributed recovery therefore only considers candidates whose
+        # acquisition is a fact rather than a guess.
+        if acquisition_instant(candidate) is None:
+            continue
         for cluster in _by_acquisition([*implicated, candidate]):
             if any(it is candidate for it in cluster) and any(any(it is bad for bad in implicated) for it in cluster):
                 return candidate
