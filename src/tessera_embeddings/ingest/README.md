@@ -1172,6 +1172,49 @@ ahead of the writes, so the set they filter against is a snapshot frozen before 
 began; the write loop tracks what it has actually written and is the authority, on the
 cropped and full-extent branches alike.
 
+### Choosing between duplicate copies of a tile-date
+
+A catalogue indexes the same tile-date more than once whenever a granule is reprocessed, and
+sometimes from more than one region. `duplicates.py` reduces each tile-date to one copy per
+*acquisition* before the loader sees it, because `odc.stac.load` fuses a solar-day group: two
+copies of one acquisition would be blended into one pixel stack at two different processing
+baselines, and the baseline recorded on the store would match neither.
+
+Copies of one acquisition are ordered on four signals, in this order:
+
+1. **Processing baseline, descending.** The signal that carries data vintage. Ordered by
+   value rather than by "is it the best", so every rung of the fallback ladder stays in
+   descending baseline order — collapsing the non-best baselines into one tier let a read
+   failure skip a 04.00 copy and hand out a 03.00 one.
+2. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
+   bucket is cheaper to read, so it wins a baseline tie. Restricting locality to ties is what
+   stops it buying cheaper egress with an older pixel.
+3. **Read-set completeness.** A copy missing any asset the ingest would read cannot deliver
+   the tile-date, so it loses to one that can. Without this term an unreadable copy could win
+   an otherwise total tie on the alphabetical id tiebreak.
+4. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of
+   catalogue response order, so a rerun cannot silently produce a different mosaic.
+
+Two properties of that ordering are easy to get wrong and are held by tests:
+
+- **Locality is judged over the read set, not over every asset.** A real Element 84 item
+  carries its COG bands *and* the original JP2s — 35 assets across two buckets on the pair
+  this was measured against. Requiring all of them silently disabled the preference
+  altogether. It is also judged over the *whole* read set: one local band among many remote
+  ones is not locality, and an item exposing none of them is remote, because absence of
+  evidence is not evidence of locality.
+- **An unreadable baseline suspends locality entirely** for the copies of that acquisition,
+  restoring sequence-first ordering. A missing baseline is an absence of evidence rather than
+  a tie, and treating it as a tie let an in-region copy with no baseline displace a remote
+  copy at 05.00 — which both selects an older reprocessing and skips the post-04.00 offset
+  correction downstream. The suspension is scoped to the acquisition it belongs to: applying
+  it across a whole tile-date let one malformed item revert an unrelated acquisition's ladder
+  to sequence order.
+
+Buckets are compared by parsing the href's host and path rather than by substring, so a
+lookalike host cannot be mistaken for a preferred one. `"NaN"` and `"Infinity"` parse as
+floats but are not baselines, so both read as unknown.
+
 ### When a source object will not read
 
 Some published objects are corrupt: a tile of the COG will not inflate, and no retry of any
