@@ -156,7 +156,7 @@ def _would_refuse_its_date(
 def _preference_key(
     item: Any,  # noqa: ANN401
     read_keys: tuple[str, ...] = READ_ASSET_KEYS,
-) -> tuple[int, int, int, float, int, int, int, int, str]:
+) -> tuple[int, int, int, int, float, int, int, int, str]:
     """How much we would rather read this copy than another. Lower sorts first.
 
     **Context-free:** no term is relative to the set being sorted, so the same key orders copies
@@ -174,19 +174,22 @@ def _preference_key(
        refuses its date at or above the correction threshold — and neither the generic path nor the
        read-failure ladder retries a refusal. Below the threshold the term is inert, because there
        the producer changes no pixel.
-    3. **Whether the baseline is readable — for producers whose correction depends on it.** A copy
+    3. **Whether this copy demonstrably belongs to the acquisition it is ranked in.** A copy with
+       no readable instant was attached to a cluster arbitrarily — nothing says which pass it came
+       from — so it must not displace one that does say, whatever its baseline. Above the baseline
+       terms deliberately: a known member at an older baseline still represents that pass, while a
+       possibly-unrelated copy at a newer one may duplicate another pass and drop this one's
+       coverage entirely.
+    4. **Whether the baseline is readable — for producers whose correction depends on it.** A copy
        declaring nothing is one whose correction cannot be decided, so it refuses its date. An
        already-harmonised copy is the exception: its pixels need no correction whatever the
        baseline says, so penalising it here would hand a tile-date to an OLDER raw reprocessing,
        which is the opposite of the usable-first rule this key starts with.
-    4. **The baseline, descending, by value** — not by "is it the best", so every rung of the
+    5. **The baseline, descending, by value** — not by "is it the best", so every rung of the
        fallback ladder stays in descending baseline order.
-    5. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
+    6. **Locality, only where the baseline is readable.** Below the baseline so it cannot buy
        cheaper egress with an older pixel, and inert for unreadable baselines so it cannot decide
        a comparison the baseline could not enter.
-    6. **A readable acquisition instant.** A copy without one is attached to a cluster
-       arbitrarily, since nothing says which pass it belongs to, so it must not displace a copy
-       that does say. Below the baseline terms because it concerns provenance, not pixels.
     7. **Sequence, descending, then id.** The id makes the order total, so the choice is
        independent of catalogue response order and a rerun cannot produce a different mosaic.
     """
@@ -198,10 +201,10 @@ def _preference_key(
     return (
         0 if read_set_is_complete(item, read_keys) else 1,
         1 if _would_refuse_its_date(item, baseline, read_keys, harmonisation) else 0,
+        0 if acquisition_instant(item) is not None else 1,
         0 if baseline is not None or not baseline_matters else 1,
         -(baseline or 0.0),
         (0 if item_is_in_preferred_location(item, keys=read_keys) else 1) if baseline is not None else 0,
-        0 if acquisition_instant(item) is not None else 1,
         0 if sequence is not None else 1,
         -(sequence or 0),
         str(getattr(item, "id", "")),
@@ -435,8 +438,8 @@ def log_duplicate_selection(
         where = f"; winners by source: {local} in-region, {len(winners) - local} remote"
 
     how = (
-        "complete read set, then a decidable producer and readable baseline, then newest baseline, "
-        "then in-region, then a readable acquisition instant, then newest sequence"
+        "complete read set, then a decidable producer, then a known acquisition, then readable "
+        "and newest baseline, then in-region, then newest sequence"
     )
     log.info(
         "Duplicate catalogue items pruned roi=%s: %d tile-date(s) had more than one copy, "

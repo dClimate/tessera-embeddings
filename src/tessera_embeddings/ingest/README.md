@@ -1297,18 +1297,22 @@ The key reads five fields, in this order:
    cannot deliver the tile-date at any baseline, and the generic paths have no recovery for it: a
    missing band is not one of the read failures the fallback ladder recognises, so an incomplete
    winner fails the acquisition outright.
-2. **Whether the baseline is readable at all**, with unknown sorting last. An absent baseline is
+2. **Whether the copy demonstrably belongs to the acquisition it is ranked in.** A copy with no
+   readable instant was attached to a cluster arbitrarily, so it must not displace one that says
+   which pass it came from — a known member at an older baseline still represents that pass, while
+   a possibly-unrelated newer one may duplicate another and drop this one's coverage.
+3. **Whether the baseline is readable at all**, with unknown sorting last. An absent baseline is
    an absence of evidence, and such a copy refuses its whole date downstream, so an older
    reprocessing that can be corrected beats a newer one that cannot be processed at all.
-3. **Processing baseline, descending.** The signal that carries data vintage. Ordered by value
+4. **Processing baseline, descending.** The signal that carries data vintage. Ordered by value
    rather than by "is it the best", so every rung of the fallback ladder stays in descending
    baseline order — collapsing the non-best baselines into one tier let a read failure skip a
    04.00 copy and hand out a 03.00 one.
-4. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
+5. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
    bucket is cheaper to read, so it wins a baseline tie. Restricting locality to ties is what
    stops it buying cheaper egress with an older pixel, and it is inert where the baseline is
    unreadable, so it cannot decide a comparison the baseline could not enter.
-5. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of catalogue
+6. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of catalogue
    response order, so a rerun cannot silently produce a different mosaic — and it makes the key a
    total order, so no comparison ever falls back to input order.
 

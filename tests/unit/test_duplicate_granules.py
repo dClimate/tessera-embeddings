@@ -740,8 +740,8 @@ class TestTheDuplicateLogIsAnAuditTrail:
         local = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
         remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
         msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
-        assert "complete read set, then a decidable producer and readable baseline" in msg
-        assert "then newest baseline, then in-region, then a readable acquisition instant, then newest sequence" in msg
+        assert "complete read set, then a decidable producer, then a known acquisition" in msg
+        assert "then readable and newest baseline, then in-region, then newest sequence" in msg
         assert "newest kept" not in msg, "the stale claim must not come back"
 
     def test_it_names_where_the_survivors_came_from(self, caplog) -> None:
@@ -798,8 +798,8 @@ class TestTheDuplicateLogIsAnAuditTrail:
         winner = _copy("a", sequence="1", baseline="00.01", host_root=_IN_REGION)
         unreadable = _with_assets(_Item("b", "MGRS-33TWM", "0"), _bands_at(_REMOTE))
         msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [unreadable]})
-        assert "complete read set, then a decidable producer and readable baseline" in msg
-        assert "then newest baseline, then in-region, then a readable acquisition instant, then newest sequence" in msg
+        assert "complete read set, then a decidable producer, then a known acquisition" in msg
+        assert "then readable and newest baseline, then in-region, then newest sequence" in msg
         assert "sequence alone" not in msg, "a mode that cannot happen must not be reported"
 
     def test_no_duplicates_logs_nothing(self, caplog) -> None:
@@ -1536,3 +1536,55 @@ class TestTheLadderStepsNothingWhenTheFailedAcquisitionHasNoSpare:
         stepped = step_down_copies(alternates, kept, implicated=[])
         assert stepped is not None
         assert "spare" in [i.id for i in stepped[0]]
+
+
+class TestAnUndatedCopyCannotDisplaceADatedPass:
+    """`_by_acquisition` attaches an undated copy to a cluster ARBITRARILY, so it must not win it.
+
+    The acquisition-instant term used to sit below baseline and locality, so an undated 05.10 copy
+    beat that cluster's dated 05.00 pass — representing a real pass with an item that may belong to
+    a different one, and potentially duplicating another pass while dropping this one's coverage.
+    Raised on PR #107.
+    """
+
+    _A = "2021-09-08T10:00:00Z"
+    _B = "2021-09-08T14:00:00Z"
+
+    def _at(self, ident: str, acquired: str | None, baseline: str, sequence: str = "0") -> _Item:
+        extra: dict[str, object] = {"s2:processing_baseline": baseline}
+        if acquired is not None:
+            extra["datetime"] = acquired
+        return _with_assets(_Item(ident, "MGRS-33TWM", sequence, **extra), _bands_at(_IN_REGION))
+
+    def test_a_dated_pass_beats_an_undated_copy_at_a_higher_baseline(self) -> None:
+        dated = self._at("dated-05.00", self._A, "05.00")
+        undated = self._at("undated-05.10", None, "05.10")
+        kept, _ = select_preferred_duplicates([dated, undated])
+        assert [i.id for i in kept] == ["dated-05.00"], "an arbitrary attachment displaced a real pass"
+
+    def test_a_dated_pass_beats_an_undated_copy_in_region(self) -> None:
+        """Locality sits below this too, so cheaper egress cannot buy an unknown pass either."""
+        dated = _with_assets(
+            _Item("dated-remote", "MGRS-33TWM", "0", **{"s2:processing_baseline": "05.00", "datetime": self._A}),
+            _bands_at(_REMOTE),
+        )
+        undated = self._at("undated-local", None, "05.00")
+        kept, _ = select_preferred_duplicates([dated, undated])
+        assert [i.id for i in kept] == ["dated-remote"]
+
+    def test_two_dated_copies_are_still_ranked_on_baseline(self) -> None:
+        """The complement: the new term must only separate dated from undated."""
+        newer = self._at("dated-05.10", self._A, "05.10")
+        older = self._at("dated-05.00", self._A, "05.00")
+        kept, _ = select_preferred_duplicates([newer, older])
+        assert [i.id for i in kept] == ["dated-05.10"]
+
+    def test_both_passes_still_survive_with_an_undated_copy_present(self) -> None:
+        """And the coverage guarantee still holds: one survivor per readable pass."""
+        items = [
+            self._at("pass-a", self._A, "05.00"),
+            self._at("pass-b", self._B, "05.00"),
+            self._at("undated", None, "05.10", sequence="9"),
+        ]
+        kept, _ = select_preferred_duplicates(items)
+        assert sorted(i.id for i in kept) == ["pass-a", "pass-b"]
