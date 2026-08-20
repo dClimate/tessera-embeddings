@@ -371,11 +371,11 @@ surface reflectance values. Whether that offset has to be subtracted is a proper
 served the pixels**, not of the collection: Element 84 harmonises its own COGs and subtracts it
 for you, while ESA's originals carry it.
 
-The Earth Search collection config therefore used to leave `baseline_threshold` unset, on the
-reasoning that its items are always harmonised. That stopped being true when the same collection
-began indexing items whose assets point at ESA's archive. Reading the collection alone exempts
-or corrects both kinds together, and one of those is always wrong, silently: a skipped
-correction leaves plausible pixels 1000 too high, a doubled one shifts every value by 1000.
+Leaving `baseline_threshold` unset for Earth Search assumes every item is a harmonised COG, and
+that fails once the collection also indexes items whose assets point at ESA's archive. Reading the
+collection alone exempts or corrects both kinds together, and one of those is always wrong and
+always silent: a skipped correction leaves plausible pixels 1000 too high, a doubled one shifts
+every value by 1000.
 
 So the threshold **is** set for Earth Search, and the exemption is decided per item from where
 its reflectance assets live (`asset_locations.item_harmonisation`). Three properties of that
@@ -389,9 +389,9 @@ decision are worth stating:
   which uses the full read set including `scl`.
 - **Decided per DATE, not per item.** `odc.stac.load` fuses a solar day into one time slice and
   the correction is applied per date from one baseline, so the question asked of a date is
-  whether *anything* in it is actually owed a correction. Mixed-producer days are real — a
-  census of four tile-years found 7 in 522 — and after duplicate selection their survivors pair
-  a harmonised COG with a raw item at an old baseline, which is owed nothing.
+  whether *anything* in it is actually owed a correction. Mixed-producer days are real, and their
+  survivors typically pair a harmonised COG with a raw item at an old baseline, which is owed
+  nothing.
 - **Thresholded per item on its own declared baseline, with the caller's per-date map as the
   fallback for items that declare none.** An absent or malformed `s2:processing_baseline` parses
   as 0, which is under the threshold, so reading only the item exempted a date the caller had
@@ -413,11 +413,10 @@ check there instead classified every modern PC item as undeterminable and refuse
 baseline 04.00 or above.
 
 The correction VALUE comes from the same evidence as the decision — `correction_baselines_by_date`
-returns the baseline to correct each solar day at, and `0` where nothing is owed. It used to be
-built by masking a caller-supplied per-date map with an item-derived exemption, so the decision and
-the value sat on different evidence: a date the items showed was owed the offset kept its pixels
-1000 too high whenever the map omitted it (the corrector reads a missing entry as `0`) or carried a
-stale lower value. `extract_baselines` remains separate and untouched — it records what each item
+returns the baseline to correct each solar day at, and `0` where nothing is owed. Deriving the two
+from separate evidence — an item-derived exemption masking a caller-supplied map — leaves a date the
+items show is owed the offset with its pixels 1000 too high whenever the map omits it (a missing
+entry reads as `0`) or carries a stale lower value. `extract_baselines` remains separate and untouched — it records what each item
 declared and is what reaches the store's `baselines_applied`.
 
 Duplicate selection has **three owners, one per entry point**, and none of them is the shared
@@ -1287,12 +1286,12 @@ baselines, and the baseline recorded on the store would match neither.
 
 Preference is expressed as **one sort key** (`_preference_key`), and the property that makes it
 work is that it is **context-free**: no term means "best in my group", so the same tuple orders two
-copies of one acquisition and two copies from different ones. An earlier version ranked against the
-group's own best baseline, which made a cross-acquisition comparison meaningless and needed a
-second key alongside it — after which every fix had to be applied twice, and that is how the
-read-set term reached one key and not the other. If you add a signal, add it here and nowhere else.
+copies of one acquisition and two copies from different ones. A term relative to the group's own
+best baseline makes a cross-acquisition comparison meaningless and forces a second key alongside
+this one, where a signal added to either is easily missed from the other. If you add a signal, add
+it here and nowhere else.
 
-The key reads five fields, in this order:
+The key reads these signals, in this order:
 
 1. **Read-set completeness**, judged over the assets *this* load will request — the configured
    bands plus the caller's `extra_bands`, not a fixed list and not the broader pruning set, which
@@ -1300,31 +1299,35 @@ The key reads five fields, in this order:
    cannot deliver the tile-date at any baseline, and the generic paths have no recovery for it: a
    missing band is not one of the read failures the fallback ladder recognises, so an incomplete
    winner fails the acquisition outright.
-2. **Whether the copy demonstrably belongs to the acquisition it is ranked in.** A copy with no
+2. **Whether the producer is decidable**, where it would change a pixel. A copy whose reflectance
+   bands span a harmonised and a raw producer, or whose producer cannot be identified at all,
+   refuses its date at or above the correction threshold — and a refusal is not something the
+   fallback ladder can step down on. Below the threshold the term is inert, because the producer
+   changes no pixel there.
+3. **Whether the copy demonstrably belongs to the acquisition it is ranked in.** A copy with no
    readable instant was attached to a cluster arbitrarily, so it must not displace one that says
    which pass it came from — a known member at an older baseline still represents that pass, while
    a possibly-unrelated newer one may duplicate another and drop this one's coverage.
-3. **Whether the baseline is readable at all**, with unknown sorting last. An absent baseline is
+4. **Whether the baseline is readable at all**, with unknown sorting last. An absent baseline is
    an absence of evidence, and such a copy refuses its whole date downstream, so an older
    reprocessing that can be corrected beats a newer one that cannot be processed at all.
-4. **Processing baseline, descending.** The signal that carries data vintage. Ordered by value
+5. **Processing baseline, descending.** The signal that carries data vintage. Ordered by value
    rather than by "is it the best", so every rung of the fallback ladder stays in descending
-   baseline order — collapsing the non-best baselines into one tier let a read failure skip a
+   baseline order. Collapsing the non-best baselines into one tier lets a read failure skip a
    04.00 copy and hand out a 03.00 one.
-5. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
+6. **Locality, among equal baselines only.** A copy whose read assets all sit in a preferred
    bucket is cheaper to read, so it wins a baseline tie. Restricting locality to ties is what
    stops it buying cheaper egress with an older pixel, and it is inert where the baseline is
    unreadable, so it cannot decide a comparison the baseline could not enter.
-6. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of catalogue
+7. **`s2:sequence`, descending, then item id.** The id keeps the choice independent of catalogue
    response order, so a rerun cannot silently produce a different mosaic — and it makes the key a
    total order, so no comparison ever falls back to input order.
 
 Two properties of that ordering are easy to get wrong and are held by tests:
 
 - **Locality is judged over the read set, not over every asset.** A real Element 84 item
-  carries its COG bands *and* the original JP2s — 35 assets across two buckets on the pair
-  this was measured against. Requiring all of them silently disabled the preference
-  altogether. It is also judged over the *whole* read set: one local band among many remote
+  carries its COG bands *and* the original JP2s, across two buckets. Requiring all of them
+  disables the preference altogether. It is also judged over the *whole* read set: one local band among many remote
   ones is not locality, and an item exposing none of them is remote, because absence of
   evidence is not evidence of locality.
 - **An unreadable baseline sorts LAST, and makes locality inert for that copy.** A missing

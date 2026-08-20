@@ -292,8 +292,8 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
     not whether its producers agree. That distinction matters because mixed-producer days are
     real: a full census of four tile-years found 7 such days in 522, and after duplicate
     selection the survivors pair a harmonised COG with a raw item at an OLD baseline. Nothing
-    there is owed a correction, so exempting the date is right — and refusing it, as an earlier
-    version of this did, would have lost real dates for an ambiguity that was not present.
+    there is owed a correction, so exempting the date is right; refusing it would lose real dates
+    for an ambiguity that is not present.
 
     So a date is exempt unless some item is BOTH raw and at or above the threshold. Only when
     such an item shares a date with a harmonised one is the answer genuinely ambiguous: the
@@ -466,13 +466,10 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
 def correction_baselines_by_date(items: list[Any], threshold: int = S2_BASELINE_THRESHOLD) -> dict[str, int]:
     """The baseline to CORRECT each solar day at, ``0`` where no correction is owed.
 
-    Derived from the same items :func:`dates_exempt_from_correction` decides on, and that is the
-    whole point. The exemption used to be applied by masking a caller-supplied per-date map, so
-    the decision came from the items while the value came from the map — and where they disagreed
-    the correction quietly did nothing. A date the items showed was owed the offset kept its
-    pixels 1000 too high if the map omitted it (the corrector reads a missing entry as 0) or
-    carried a stale lower value (which fails the threshold test). One function, one source of
-    evidence, no reconciliation step to forget.
+    Derived from the same items :func:`dates_exempt_from_correction` decides on, so the decision
+    and the value cannot disagree. Masking a caller-supplied map instead puts them on separate
+    evidence, and a date the items show is owed the offset then keeps its pixels 1000 too high
+    whenever the map omits it (a missing entry reads as 0) or carries a stale lower value.
 
     A non-exempt date takes the HIGHEST baseline declared by its unharmonised items. They cannot
     meaningfully disagree: :func:`dates_exempt_from_correction` refuses a date whose raw items

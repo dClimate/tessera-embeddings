@@ -60,10 +60,9 @@ def processing_baseline(item: Any) -> int | None:  # noqa: ANN401 — any STAC-l
     if not value.is_finite() or value < 0 or value > MAX_BASELINE:
         logger.debug("Not a baseline: s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
         return None
-    # A positive value below one hundredth cannot be a version, and scaling it UNDERFLOWS rather
-    # than overflowing: `Decimal("1e-1000000000") * 100` becomes `0E-1000026`, which is integral, so
-    # the check below accepted it and the parser reported a confident baseline of 0. Zero itself is
-    # a real declared value and stays readable.
+    # Below one hundredth is not a version, and scaling such a value UNDERFLOWS rather than
+    # overflowing — `Decimal("1e-1000000000") * 100` is `0E-1000026`, which passes the integral
+    # check below and would read as a confident baseline of 0. A declared zero stays readable.
     if 0 < value < decimal.Decimal("0.01"):
         logger.debug("Below one hundredth: s2:processing_baseline %r on %s", raw, getattr(item, "id", "?"))
         return None

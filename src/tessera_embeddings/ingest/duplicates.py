@@ -415,16 +415,13 @@ def log_duplicate_selection(
     did not use — a winner serving every requested band locally reads as remote for lacking an
     asset nobody asked for.
     """
-    # Counted from what selection DID, not from what survived the ladder filter. Copies that would
-    # refuse their date are excluded from `alternates`, so deriving the audit from it suppressed the
-    # line entirely on a date whose every spare was unusable, and elsewhere undercounted while
-    # implying every rejected copy remained available as a fallback.
+    # Counted from what selection DID, not from the ladder: copies that would refuse their date are
+    # excluded from `alternates`, so it does not answer "what was pruned".
     supplied, survivors = list(items), list(kept)
     if supplied:
         pruned = len(supplied) - len(survivors)
         # By MULTIPLICITY, not by set difference: a tile-date that loses a copy keeps its key in
-        # both sets, so subtracting cardinalities reported zero contested dates beside a non-zero
-        # rejected count — the line contradicting itself.
+        # both sets, so a difference of cardinalities cannot see it.
         seen = collections.Counter(k for it in supplied if (k := _contested_key(it)) is not None)
         contested = sum(1 for n in seen.values() if n > 1)
     else:
