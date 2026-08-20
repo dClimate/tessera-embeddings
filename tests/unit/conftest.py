@@ -164,6 +164,11 @@ def mock_stac_item():
             "s2:processing_baseline": baseline,
             "eo:cloud_cover": cloud_cover,
             "grid:code": f"MGRS-{tile_id}",
+            # The ACQUISITION instant, which is where a real item keeps it and the only surviving
+            # record of it once normalize_to_solar_day has stamped `.datetime` with noon. Duplicate
+            # selection reads this to tell distinct same-day passes from reprocessings of one, so a
+            # fixture without it makes every scene of a day look like one acquisition.
+            "datetime": date,
         }
         # REAL asset hrefs, because whether the BOA offset is corrected is decided from where
         # the assets live. A bare Mock auto-creates `assets`, so an href read off it is a Mock

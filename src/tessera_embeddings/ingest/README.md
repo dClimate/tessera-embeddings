@@ -412,6 +412,19 @@ correct per the declared baseline, which the threshold alone already does. Runni
 check there instead classified every modern PC item as undeterminable and refused every date at
 baseline 04.00 or above.
 
+The correction VALUE comes from the same evidence as the decision — `correction_baselines_by_date`
+returns the baseline to correct each solar day at, and `0` where nothing is owed. It used to be
+built by masking a caller-supplied per-date map with an item-derived exemption, so the decision and
+the value sat on different evidence: a date the items showed was owed the offset kept its pixels
+1000 too high whenever the map omitted it (the corrector reads a missing entry as `0`) or carried a
+stale lower value. `extract_baselines` remains separate and untouched — it records what each item
+declared and is what reaches the store's `baselines_applied`.
+
+Duplicate selection runs **before** the load on this path, not only in `s2_roi`. `odc.stac.load`
+fuses a solar day, so an unpruned harmonised COG beside a raw reprocessing of the same acquisition
+reached the producer check as a genuine conflict and refused a date that selecting one copy
+resolves. It is idempotent, so the campaign path that already prunes is unaffected.
+
 Genuinely ambiguous dates **refuse** (`HeterogeneousProducerError`) rather than picking a side,
 because no date-wide answer is right for them and both mistakes are silent: an item whose own
 bands straddle the two producers, raw items on opposite sides of the threshold, a raw item owed
@@ -1289,11 +1302,13 @@ The key reads five fields, in this order:
    catalogue response order, so a rerun cannot silently produce a different mosaic — and it makes
    the key a total order, so no comparison ever falls back to input order.
 
-Choosing an acquisition's **winner** is the one place that does not use this key directly: if any
-copy there declares no readable baseline, the whole group falls back to sequence order. Within one
-acquisition an unreadable baseline may still belong to the newest reprocessing, so demoting it
-could select an older one; across acquisitions there is no such reason and the key's own
-unknown-last ordering applies. The audit log names which of the two ran.
+There is no second ranking and no fallback mode. Choosing a winner and building the ladder use the
+same key. An earlier version suspended the baseline and locality terms for any acquisition holding
+an unreadable baseline and ordered it on sequence alone, reasoning that such a copy might still be
+the newest reprocessing. That stopped being true once an unreadable baseline came to **refuse** its
+date: the read-failure ladder cannot recover from a refusal, so preferring that copy discards the
+date while a usable one sits behind it. An older reprocessing that can be corrected correctly beats
+a newer one that cannot be processed at all.
 
 Two primitives carry most of the correctness here, and both are shaped so the mistakes they used
 to invite are no longer expressible:

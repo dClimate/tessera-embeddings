@@ -521,10 +521,19 @@ class TestSolarDayPainterOrdering:
             ]
 
         monkeypatch.setattr("tessera_embeddings.ingest.stac._query_stac_items", mock_query)
-        monkeypatch.setattr(
-            "tessera_embeddings.ingest.stac.normalize_to_solar_day",
-            lambda items, mid_longitude=None: items,
-        )
+
+        def stamp_noon(items, mid_longitude=None):
+            """What the real function does to `.datetime`, without the longitude offset.
+
+            A bare pass-through is no longer a faithful stub: every date derived downstream goes
+            through `solar_day_of`, which refuses an item that has not been stamped. The offset is
+            what this test is isolating away from, not the stamping.
+            """
+            for item in items:
+                item.datetime = item.datetime.replace(hour=12, minute=0, second=0, microsecond=0)
+            return items
+
+        monkeypatch.setattr("tessera_embeddings.ingest.stac.normalize_to_solar_day", stamp_noon)
 
         def fake_load(items, **kwargs):
             seen["order"] = [it.properties["eo:cloud_cover"] for it in items]

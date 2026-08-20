@@ -163,12 +163,18 @@ class TestChoosingBetweenCopies:
             assert [it.id for it in kept] == [new.id]
 
     def test_a_third_copy_orders_the_whole_ladder(self) -> None:
-        """Fallback must step down in preference order, not arbitrarily."""
+        """Fallback must step down in preference order, not arbitrarily.
+
+        `_pair()` declares baselines 03.01 and 05.00; the third copy declares none, so it now
+        ranks BELOW both. A copy whose baseline cannot be read refuses its whole date downstream,
+        and the read-failure ladder cannot recover from a refusal — so an older reprocessing that
+        can be corrected correctly beats a newer one that cannot be processed at all.
+        """
         old, new = _pair()
-        newest = _Item("S2B_34WFA_20210908_2_L2A", "MGRS-34WFA", "2")
-        kept, alternates = select_preferred_duplicates([old, new, newest])
-        assert [it.id for it in kept] == [newest.id]
-        assert [it.id for it in alternates[("MGRS-34WFA", "2021-09-08")]] == [new.id, old.id]
+        no_baseline = _Item("S2B_34WFA_20210908_2_L2A", "MGRS-34WFA", "2")
+        kept, alternates = select_preferred_duplicates([old, new, no_baseline])
+        assert [it.id for it in kept] == [new.id]
+        assert [it.id for it in alternates[("MGRS-34WFA", "2021-09-08")]] == [old.id, no_baseline.id]
 
     def test_different_tiles_are_never_merged(self) -> None:
         """Two tiles imaged the same day are not duplicates — merging them drops imagery."""
@@ -677,15 +683,23 @@ class TestUnknownBaselineSuspendsLocality:
         kept, _ = select_preferred_duplicates([local_unknown, remote_best])
         assert [i.id for i in kept] == [remote_best.id], "sequence must decide when a baseline is unknown"
 
-    def test_an_unknown_baseline_still_wins_on_sequence(self) -> None:
-        """The complement: suspending locality must not become demoting the unknown. A newest
-        copy that omits the property is still the newest.
+    def test_a_usable_baseline_beats_a_higher_sequence_without_one(self) -> None:
+        """REVERSED deliberately, and the reason is worth reading.
+
+        This used to assert that a newest copy omitting the property still wins, on the grounds
+        that suspending locality must not become demoting the unknown. That was right while an
+        unreadable baseline merely meant "no evidence". It now means the date is REFUSED, because
+        whether those pixels carry the +1000 offset cannot be determined — and the duplicate
+        recovery ladder only steps down on a read failure, never on a refusal. So preferring the
+        unreadable copy does not risk an older pixel, it discards the date while a usable copy
+        sits directly behind it.
         """
         local_old = _copy("S2A_33TWM_20220107_0_L2A", sequence="0", baseline="05.00", host_root=_IN_REGION)
         remote_unknown = _Item("S2A_33TWM_20220107_1_L2A", "MGRS-33TWM", "1")
         _with_assets(remote_unknown, _bands_at(_REMOTE))
-        kept, _ = select_preferred_duplicates([local_old, remote_unknown])
-        assert [i.id for i in kept] == [remote_unknown.id]
+        kept, alternates = select_preferred_duplicates([local_old, remote_unknown])
+        assert [i.id for i in kept] == [local_old.id]
+        assert [i.id for i in alternates[("MGRS-33TWM", "2021-09-08")]] == [remote_unknown.id]
 
 
 class TestFallbackLadderKeepsBaselineOrder:
@@ -724,7 +738,7 @@ class TestTheDuplicateLogIsAnAuditTrail:
         local = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
         remote = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
         msg = self._emit(caplog, [local], {("MGRS-33TWM", "2021-09-08"): [remote]})
-        assert "newest baseline, then in-region, then newest sequence" in msg
+        assert "newest baseline, then in-region, then complete read set, then newest sequence" in msg
         assert "newest kept" not in msg, "the stale claim must not come back"
 
     def test_it_names_where_the_survivors_came_from(self, caplog) -> None:
@@ -772,24 +786,17 @@ class TestTheDuplicateLogIsAnAuditTrail:
         msg = self._emit(caplog, [winner, stray], {("MGRS-33TWM", "2021-09-08"): [stray]})
         assert "1 in-region, 0 remote" in msg
 
-    def test_it_names_the_sequence_only_fallback_when_that_is_what_ran(self, caplog) -> None:
-        """`_rank_copies` abandons BOTH baseline and locality when a copy declares no readable
-        baseline, and chooses on sequence alone. On exactly the uncertain-metadata dates this
-        line exists to explain, it was describing the wrong mechanism.
+    def test_it_states_one_ranking_because_there_is_only_one(self, caplog) -> None:
+        """This clause used to be conditional, naming a sequence-only fallback for acquisitions
+        where a copy declared no readable baseline. There is no fallback any more — such a copy
+        simply ranks last — so the line states the ranking unconditionally, and it is the truth
+        on an uncertain-metadata date as much as on any other.
         """
         winner = _copy("a", sequence="1", baseline="00.01", host_root=_IN_REGION)
         unreadable = _with_assets(_Item("b", "MGRS-33TWM", "0"), _bands_at(_REMOTE))
         msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [unreadable]})
-        assert "ranked on sequence alone" in msg
-        assert "1 tile-date(s) where a copy declared no readable baseline" in msg
-
-    def test_it_does_not_claim_a_fallback_that_did_not_happen(self, caplog) -> None:
-        """The complement, or the clause above would just always be present."""
-        winner = _copy("a", sequence="0", baseline="00.01", host_root=_IN_REGION)
-        rejected = _copy("b", sequence="1", baseline="00.01", host_root=_REMOTE)
-        msg = self._emit(caplog, [winner], {("MGRS-33TWM", "2021-09-08"): [rejected]})
-        assert "sequence alone" not in msg
-        assert "newest baseline, then in-region, then newest sequence" in msg
+        assert "newest baseline, then in-region, then complete read set, then newest sequence" in msg
+        assert "sequence alone" not in msg, "a mode that cannot happen must not be reported"
 
     def test_no_duplicates_logs_nothing(self, caplog) -> None:
         assert self._emit(caplog, [], {}) == ""

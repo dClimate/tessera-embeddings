@@ -37,11 +37,13 @@ from tessera_embeddings.ingest.asset_locations import (
     item_is_in_preferred_location,
     read_asset_sources,
 )
+from tessera_embeddings.ingest.duplicates import select_preferred_duplicates
 from tessera_embeddings.ingest.stac import (
     HeterogeneousProducerError,
     _apply_baseline_corrections_by_date,
     _declared_baseline,
     _extract_baseline,
+    correction_baselines_by_date,
     dates_exempt_from_correction,
     extract_baselines,
 )
@@ -781,3 +783,106 @@ class TestAssetSourcesCannotLoseAKey:
         sources = read_asset_sources(_Item(None, "05.00"))
         assert sources.empty is True
         assert sources.complete is False
+
+
+class TestTheCorrectionValueComesFromTheSameEvidenceAsTheDecision:
+    """The exemption decided from the items while the value came from the caller's map, so where
+    they disagreed the correction quietly did nothing. Raised on PR #107.
+    """
+
+    def test_a_date_the_items_show_is_owed_gets_a_usable_correction_baseline(self) -> None:
+        assert correction_baselines_by_date([_Item(_RAW_ESA, "05.00")]) == {"2022-01-07": 500}
+
+    def test_an_exempt_date_is_reported_as_zero(self) -> None:
+        assert correction_baselines_by_date([_Item(_HARMONISED, "05.10")]) == {"2022-01-07": 0}
+
+    def test_a_pre_threshold_raw_date_is_reported_as_zero(self) -> None:
+        """It is exempt — nothing in it is owed the offset — and this map answers "correct at
+        what", not "what was declared". Provenance is `extract_baselines`' job and still reports
+        the real 300.
+        """
+        assert correction_baselines_by_date([_Item(_RAW_ESA, "03.00")]) == {"2022-01-07": 0}
+        assert extract_baselines([_Item(_RAW_ESA, "03.00")]) == {"2022-01-07": 300}
+
+    def test_the_highest_declared_baseline_of_a_date_is_used(self) -> None:
+        """They cannot meaningfully disagree — a straddling date refuses — so the max is only
+        ever picking between equals above the threshold.
+        """
+        items = [_Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "05.10")]
+        assert correction_baselines_by_date(items) == {"2022-01-07": 510}
+
+    def test_a_harmonised_item_does_not_contribute_a_correction_value(self) -> None:
+        """The mixed-producer day: the raw item is pre-threshold so nothing is owed, and the
+        harmonised item's 05.10 must not become the date's correction baseline.
+        """
+        items = [_Item(_HARMONISED, "05.10"), _Item(_RAW_ESA, "02.06")]
+        assert correction_baselines_by_date(items) == {"2022-01-07": 0}
+
+    def test_the_end_to_end_path_corrects_a_date_the_caller_map_omits(self, monkeypatch) -> None:
+        """THE FAILURE. The corrector reads a missing entry as 0, so an owed date was skipped."""
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.full((1, 2, 2), 3000, dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+        monkeypatch.setattr(stac_module, "_load_from_stac", lambda *a, **k: data)
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            stac_module,
+            "_apply_baseline_corrections_by_date",
+            lambda d, corrections, **kw: calls.append({"corrections": corrections}) or d,
+        )
+        stac_module.load_stac_items(
+            [_Item(_RAW_ESA, "05.00")], "earth-search", "sentinel-2-l2a", baselines={"1999-01-01": 300}
+        )
+        assert calls == [{"corrections": {"2022-01-07": 500}}], "an owed date was skipped"
+
+    def test_provenance_is_not_touched(self) -> None:
+        """`extract_baselines` still reports what each item declared, including for exempt dates,
+        because it is what reaches the store's `baselines_applied`.
+        """
+        assert extract_baselines([_Item(_HARMONISED, "05.10")]) == {"2022-01-07": 510}
+
+
+class TestTheGenericPathPrunesDuplicatesBeforeDeciding:
+    """Only `s2_roi` called `select_preferred_duplicates`, so the generic entry point handed the
+    producer check an unpruned set — and a harmonised COG beside a raw reprocessing of the SAME
+    acquisition refused a date that selecting one copy resolves. Raised on PR #107.
+    """
+
+    @staticmethod
+    def _item(item_id: str, host: str, baseline: str, sequence: str) -> _Item:
+        item = _Item(host, baseline)
+        item.id = item_id
+        item.properties["s2:sequence"] = sequence
+        item.properties["grid:code"] = "MGRS-33TWM"
+        item.properties["datetime"] = "2022-01-07T10:20:31.024000Z"
+        return item
+
+    def _run(self, monkeypatch, items) -> list[str]:
+        loaded: list[str] = []
+        data = xr.Dataset(
+            {"blue": (("time", "y", "x"), np.ones((1, 2, 2), dtype=np.uint16))},
+            coords={"time": [np.datetime64("2022-01-07T12:00:00")], "y": [0, 1], "x": [0, 1]},
+        )
+
+        def fake_load(loaded_items, *a, **k):
+            loaded.extend(i.id for i in loaded_items)
+            return data
+
+        monkeypatch.setattr(stac_module, "_load_from_stac", fake_load)
+        monkeypatch.setattr(stac_module, "_apply_baseline_corrections_by_date", lambda d, *a, **k: d)
+        stac_module.load_stac_items(items, "earth-search", "sentinel-2-l2a", baselines={"2022-01-07": 500})
+        return loaded
+
+    def test_two_producers_of_one_acquisition_are_pruned_not_refused(self, monkeypatch) -> None:
+        harmonised = self._item("harmonised", _HARMONISED, "05.10", "1")
+        raw = self._item("raw", _RAW_ESA, "05.00", "0")
+        # Unpruned, these two reach the producer check as a genuine conflict and raise.
+        assert self._run(monkeypatch, [harmonised, raw]) == ["harmonised"]
+
+    def test_an_already_pruned_set_is_unchanged(self) -> None:
+        """`s2_roi` prunes first, so this must be idempotent there."""
+        items = [self._item("only", _HARMONISED, "05.10", "0")]
+        kept, alternates = select_preferred_duplicates(items)
+        assert [i.id for i in kept] == ["only"]
+        assert alternates == {}

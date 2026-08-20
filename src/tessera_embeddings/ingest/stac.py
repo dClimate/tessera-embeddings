@@ -41,6 +41,7 @@ from tessera_embeddings.ingest.catalogue_refusal import (
     bbox_area_label,
     raise_catalogue_query_error,
 )
+from tessera_embeddings.ingest.duplicates import select_preferred_duplicates
 from tessera_embeddings.ingest.item_baselines import processing_baseline as _declared_baseline
 from tessera_embeddings.ingest.solar_days import (
     SolarDayRange,
@@ -447,6 +448,38 @@ def dates_exempt_from_correction(items: list[Any], threshold: int = S2_BASELINE_
                 sorted({_extract_baseline(it) for it in owed}),
             )
     return exempt
+
+
+def correction_baselines_by_date(items: list[Any], threshold: int = S2_BASELINE_THRESHOLD) -> dict[str, int]:
+    """The baseline to CORRECT each solar day at, ``0`` where no correction is owed.
+
+    Derived from the same items :func:`dates_exempt_from_correction` decides on, and that is the
+    whole point. The exemption used to be applied by masking a caller-supplied per-date map, so
+    the decision came from the items while the value came from the map — and where they disagreed
+    the correction quietly did nothing. A date the items showed was owed the offset kept its
+    pixels 1000 too high if the map omitted it (the corrector reads a missing entry as 0) or
+    carried a stale lower value (which fails the threshold test). One function, one source of
+    evidence, no reconciliation step to forget.
+
+    A non-exempt date takes the HIGHEST baseline declared by its unharmonised items. They cannot
+    meaningfully disagree: :func:`dates_exempt_from_correction` refuses a date whose raw items
+    straddle the threshold, so by the time a date is corrected they all sit above it.
+
+    Provenance is untouched by this. :func:`extract_baselines` records what each item declared and
+    is what reaches the store's ``baselines_applied``; this is only the correction input, so a
+    store cannot end up reporting baseline 0 for imagery processed at 05.10.
+    """
+    exempt = dates_exempt_from_correction(items, threshold)
+    owed: dict[str, int] = {}
+    for item in items:
+        date_str = solar_day_of(item)
+        owed.setdefault(date_str, 0)
+        if date_str in exempt or item_harmonisation(item) is Harmonisation.HARMONISED:
+            continue
+        declared = _declared_baseline(item)
+        if declared is not None:
+            owed[date_str] = max(owed[date_str], declared)
+    return owed
 
 
 def _filter_existing_dates(
@@ -1162,6 +1195,15 @@ def load_stac_items(
     """
     collection_config = _get_collection_config(provider, collection)
 
+    if collection_config.harmonisation_varies_by_item:
+        # Reduce to one copy per acquisition BEFORE loading. `s2_roi` already does this, so this
+        # is a no-op there — but the generic entry point did not, and `odc.stac.load` fuses a
+        # solar day, so an unpruned harmonised COG beside a raw ESA reprocessing of the same
+        # acquisition reached the producer check as a genuine conflict and refused a date that
+        # selecting one copy resolves cleanly. Refusing what we can decide is the one outcome the
+        # refusals are not for.
+        items, _ = select_preferred_duplicates(items)
+
     data = _load_from_stac(
         items,
         collection_config,
@@ -1178,19 +1220,24 @@ def load_stac_items(
     if collection_config.requires_baseline_correction and baselines:
         loaded_dates = {str(t.values)[:10] for t in data.time}
         filtered_baselines = {d: b for d, b in baselines.items() if d in loaded_dates}
-        # Mask a LOCAL copy for the corrector. `baselines` itself is provenance and reaches the
-        # store's `baselines_applied`, so zeroing it there would make the store misreport its
-        # vintage. Zero means "no correction owed", which is what an already-harmonised
-        # producer means.
-        # Only where items can actually disagree. The per-item read looks for assets keyed by the
-        # names in `bands`, which is true of Earth Search and NOT of Planetary Computer — PC keys
-        # its assets natively (`B02`, `SCL`) and relies on the loader resolving the common names,
-        # so this read finds nothing there. Running it anyway classified every modern PC item as
-        # UNKNOWN and refused every date at baseline >= 04.00, breaking a working provider. PC
-        # serves ESA's values unharmonised throughout, so its answer is the collection's: correct
-        # per the declared baseline, which is what the threshold alone already does.
-        exempt = dates_exempt_from_correction(items) if collection_config.harmonisation_varies_by_item else set()
-        correction_baselines = {d: (0 if d in exempt else b) for d, b in filtered_baselines.items()}
+        # The correction input is built from the ITEMS where producers can disagree, and from the
+        # caller's map where they cannot. Never a mixture: masking the map with an item-derived
+        # decision left the decision and the value on different evidence, so a date the items
+        # showed was owed the offset kept its pixels 1000 high whenever the map omitted it or
+        # carried a stale lower value. `baselines` stays untouched either way — it is provenance
+        # and reaches the store's `baselines_applied`.
+        #
+        # The per-item read looks for assets keyed by the names in `bands`, which is how Earth
+        # Search keys its assets and NOT how Planetary Computer does — PC keys them natively
+        # (`B02`, `SCL`) and relies on the loader resolving the common names, so that read finds
+        # nothing there. Running it anyway classified every modern PC item as UNKNOWN and refused
+        # every date at baseline >= 04.00, breaking a working provider. PC serves ESA's values
+        # unharmonised throughout, so its answer is the collection's: correct per the declared
+        # baseline, which the threshold alone already does.
+        if collection_config.harmonisation_varies_by_item:
+            correction_baselines = {d: b for d, b in correction_baselines_by_date(items).items() if d in loaded_dates}
+        else:
+            correction_baselines = dict(filtered_baselines)
         # Skip the corrector outright when nothing reaches the threshold. It is a no-op on those
         # dates, but not a free one: it clips, casts, adds and `xr.where`s every reflectance band
         # in the graph before deciding to change nothing. Setting the threshold for Earth Search

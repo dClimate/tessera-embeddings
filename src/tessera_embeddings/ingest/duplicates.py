@@ -89,28 +89,6 @@ def item_sequence(item: Any) -> int | None:  # noqa: ANN401 — any STAC-like it
     return int(match.group(1)) if match else None
 
 
-def _sequence_key(item: Any) -> tuple[int, int, int, str]:  # noqa: ANN401 — any STAC-like item
-    """Readable read set, then newest sequence, then a deterministic tiebreak. No locality.
-
-    Used where the baseline comparison is suspended, so it deliberately omits both the baseline
-    and the locality terms — but NOT completeness, which is orthogonal to either. A copy missing
-    an asset the ingest would read cannot deliver the tile-date whatever its sequence says, and
-    letting a higher-sequence incomplete copy win guaranteed the eager ``No such band/alias``
-    failure. That failure names no object, so the recovery steps every duplicated tile-date of
-    the day rather than this one, and can downgrade healthy imagery before ever reaching the
-    complete alternate sitting right behind it.
-
-    An item whose sequence cannot be read never displaces one whose can — an unreadable
-    sequence must not win a comparison it cannot participate in. The id tiebreak makes the
-    choice independent of catalogue response order, so a rerun cannot silently produce a
-    different mosaic.
-    """
-    sequence = item_sequence(item)
-    has_sequence = 0 if sequence is None else 1
-    incomplete = 0 if read_set_is_complete(item) else 1
-    return (incomplete, -has_sequence, -(sequence or 0), str(getattr(item, "id", "")))
-
-
 def _preference_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  # noqa: ANN401
     """How much we would rather read this copy than another. Lower sorts first.
 
@@ -154,20 +132,23 @@ def _preference_key(item: Any) -> tuple[int, float, int, int, int, int, str]:  #
 
 
 def _rank_copies(copies: list[Any]) -> list[Any]:
-    """Order copies of one tile-date, PREFERRED first.
+    """Order copies of one acquisition, PREFERRED first. One key, no special cases.
 
-    **An unknown baseline suspends the locality preference entirely** and restores
-    sequence-first ordering for the whole set. An absent baseline is not a tie: it is an absence
-    of evidence, and treating it as one let an in-region copy with no baseline displace a remote
-    copy at 05.00. That is wrong twice over — it can select an older reprocessing, and
-    ``_extract_baseline`` maps the missing value to 0 downstream, so the post-04.00 offset
-    correction is skipped and the reflectance is wrong with nothing raising.
+    An unreadable baseline used to suspend the whole comparison here and fall back to sequence
+    order, on the reasoning that such a copy might still be the newest reprocessing and demoting
+    it could select an older one. That reasoning no longer holds: a selected unharmonised copy
+    with no readable baseline now REFUSES its date in
+    :func:`~tessera_embeddings.ingest.stac.dates_exempt_from_correction`, because whether its
+    pixels carry the offset cannot be determined — and the read-failure ladder cannot recover from
+    a refusal, only from a read error. So preferring it does not risk an older pixel, it throws
+    the date away while a usable copy sits behind it. An older reprocessing that can be corrected
+    correctly beats a newer one that cannot be processed at all.
 
-    Locality therefore applies only where baselines are readable and can be compared, which is
-    the overwhelming majority of real items and every case this preference was built for.
+    :func:`_preference_key` already ranks a readable baseline first and already declines to let
+    locality decide a comparison the baseline could not enter, so the fallback it replaced was
+    both redundant and worse — and being a second key, it was where the read-set term went missing
+    once already.
     """
-    if any(item_processing_baseline(item) is None for item in copies):
-        return sorted(copies, key=_sequence_key)
     return sorted(copies, key=_preference_key)
 
 
@@ -319,27 +300,6 @@ def _contested_key(item: Any) -> tuple[str, str] | None:  # noqa: ANN401 — any
         return None
 
 
-def _keys_ranked_by_sequence_only(
-    alternates: dict[tuple[str, str], list[Any]],
-    winners: Iterable[Any],
-) -> set[tuple[str, str]]:
-    """The contested tile-dates whose ranking fell back to sequence order.
-
-    :func:`_rank_copies` suspends the baseline and locality terms for an acquisition in which any
-    copy's baseline is unreadable, so the audit line cannot claim a baseline-first preference for
-    those dates. Recomputed here rather than threaded out of the selector, because it is needed
-    only to word one log line and a return-value change would reach every caller.
-    """
-    unreadable: set[tuple[str, str]] = set()
-    for key, copies in alternates.items():
-        if any(item_processing_baseline(it) is None for it in copies):
-            unreadable.add(key)
-    for winner in winners:
-        if item_processing_baseline(winner) is None and (winner_key := _contested_key(winner)) is not None:
-            unreadable.add(winner_key)
-    return unreadable & set(alternates)
-
-
 def log_duplicate_selection(
     log: logging.Logger | logging.LoggerAdapter[logging.Logger],
     roi: str,
@@ -374,17 +334,12 @@ def log_duplicate_selection(
         local = sum(1 for it in winners if item_is_in_preferred_location(it))
         where = f"; winners by source: {local} in-region, {len(winners) - local} remote"
 
-    # Name the ranking that actually ran. `_rank_copies` abandons BOTH the baseline and the
-    # locality terms for an acquisition where any copy declares no readable baseline, and
-    # chooses on sequence alone — so on exactly the uncertain-metadata dates this line exists to
-    # explain, stating the baseline-then-locality preference described the wrong mechanism.
-    unreadable = _keys_ranked_by_sequence_only(alternates, winners)
-    how = "newest baseline, then in-region, then newest sequence"
-    if unreadable:
-        how += (
-            f" — except {len(unreadable)} tile-date(s) where a copy declared no readable "
-            f"baseline, ranked on sequence alone"
-        )
+    # One ranking, always, so the line can state it unconditionally. It used to describe a
+    # baseline-first preference while `_rank_copies` had silently fallen back to sequence order
+    # for any acquisition with an unreadable baseline — the wrong mechanism named on exactly the
+    # uncertain-metadata dates this line exists to explain. That fallback is gone rather than
+    # reported: see `_rank_copies`.
+    how = "newest baseline, then in-region, then complete read set, then newest sequence"
     log.info(
         "Duplicate catalogue items pruned roi=%s: %d tile-date(s) had more than one copy, "
         "%d rejected. Preference: %s (rejected copies stay available as a fallback)%s",
