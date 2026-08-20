@@ -55,9 +55,9 @@ import numpy as np
 import xarray as xr
 
 from tessera_embeddings.config.ingest import INGEST_CHUNK_SIZE, INGEST_CHUNKS, auto_batch_dates
+from tessera_embeddings.config.providers import PROVIDERS
 from tessera_embeddings.config.satellites import S2_SCL_INVALID_CLASSES
 from tessera_embeddings.ingest._pipeline import pipelined
-from tessera_embeddings.ingest.asset_locations import READ_ASSET_KEYS
 from tessera_embeddings.ingest.duplicates import (
     copies_label,
     is_unreadable_source,
@@ -97,6 +97,7 @@ from tessera_embeddings.ingest.solar_days import (
     whole_window_range,
 )
 from tessera_embeddings.ingest.stac import (
+    _requested_assets,
     extract_baselines,
     group_items_by_date,
     load_stac_items,
@@ -126,8 +127,11 @@ logger = logging.getLogger(__name__)
 _LOADED_EXTRA_BANDS = ["scl"]
 
 #: The assets this driver's loads request, which is what duplicate selection judges a copy's
-#: readability over. Built from the same extra-band list the loads pass, so the two cannot drift.
-_READ_ASSET_KEYS: tuple[str, ...] = (*READ_ASSET_KEYS, *(b for b in _LOADED_EXTRA_BANDS if b not in READ_ASSET_KEYS))
+#: readability over. Derived through the same helper the generic path uses, from the same
+#: extra-band list passed to the loads, so no second definition of "what this reads" can drift.
+_READ_ASSET_KEYS: tuple[str, ...] = _requested_assets(
+    PROVIDERS["earth-search"].collections["sentinel-2-l2a"], _LOADED_EXTRA_BANDS
+)
 
 
 @final

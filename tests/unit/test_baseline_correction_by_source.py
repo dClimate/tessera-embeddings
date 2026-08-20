@@ -1053,3 +1053,64 @@ class TestTheSplitWorkflowProvenanceFollowsTheSelectedCopy:
         baselines = {"2022-01-07": 510}
         stac_module.load_stac_items([self._pair()[0]], "earth-search", "sentinel-2-l2a", baselines=baselines)
         assert baselines == {"2022-01-07": 510}
+
+
+class TestTheThemesThatGeneratedTheReviewStayClosed:
+    """Guards against the SHAPES of defect this branch was reviewed for, not just the instances.
+
+    Grouping the review findings, most fell into a few repeating shapes: a set judged over a
+    subset of itself, one fact with two implementations that drift, and a guard whose position is
+    load-bearing but incidental. These assert the invariants that keep each shape closed, so an
+    unreported instance fails here rather than in a later review.
+    """
+
+    def test_there_is_one_definition_of_what_a_load_reads(self) -> None:
+        """The driver and the generic path must not define their read set twice."""
+        from tessera_embeddings.ingest.s2_roi import _LOADED_EXTRA_BANDS, _READ_ASSET_KEYS
+
+        config = PROVIDERS["earth-search"].collections["sentinel-2-l2a"]
+        assert stac_module._requested_assets(config, _LOADED_EXTRA_BANDS) == _READ_ASSET_KEYS
+
+    def test_the_reflectance_set_matches_the_collection_it_judges(self) -> None:
+        """`item_harmonisation` defaults to a module constant while the decision is made for a
+        specific collection. They agree today; if a collection's bands change, this fails rather
+        than silently judging the producer over the wrong bands.
+        """
+        for provider, collection in (("earth-search", "sentinel-2-l2a"), ("planetary-computer", "sentinel-2-l2a")):
+            config = PROVIDERS[provider].collections[collection]
+            if config.harmonisation_varies_by_item:
+                assert set(REFLECTANCE_ASSET_KEYS) == set(config.bands), f"{provider}/{collection}"
+
+    def test_scl_is_read_but_never_judged_for_harmonisation(self) -> None:
+        """The two key sets differ by exactly `scl`, and that difference is the point."""
+        assert set(READ_ASSET_KEYS) - set(REFLECTANCE_ASSET_KEYS) == {"scl"}
+
+    def test_every_refusal_is_gated_on_the_date_being_owed_a_correction(self) -> None:
+        """A pre-threshold date must never refuse, whatever else is wrong with it: which producer
+        served it, or whether they disagree, cannot change a pixel that gets no offset.
+        """
+        pre_threshold = [
+            [_Item(_HARMONISED, "03.00"), _Item(_RAW_ESA, "03.00")],  # mixed producers
+            [_Item(None, "03.00")],  # producer undeterminable
+            [_Item(_RAW_ESA, "03.00"), _Item(_RAW_ESA, "02.06")],  # differing raw baselines
+        ]
+        for items in pre_threshold:
+            assert dates_exempt_from_correction(items) == {"2022-01-07"}, [i.assets for i in items]
+
+    def test_the_same_situations_refuse_once_the_date_is_owed_a_correction(self) -> None:
+        """The complement, or the test above would pass with the refusals deleted."""
+        for items in (
+            [_Item(_HARMONISED, "05.00"), _Item(_RAW_ESA, "05.00")],
+            [_Item(None, "05.00")],
+            [_Item(_RAW_ESA, "05.00"), _Item(_RAW_ESA, "02.06")],
+        ):
+            with pytest.raises(HeterogeneousProducerError):
+                dates_exempt_from_correction(items)
+
+    def test_provenance_is_never_the_correction_input(self) -> None:
+        """Two maps, two purposes: what each item declared, and what to correct at. Collapsing
+        them is what made a store report baseline 0 for imagery processed at 05.10.
+        """
+        harmonised = [_Item(_HARMONISED, "05.10")]
+        assert extract_baselines(harmonised) == {"2022-01-07": 510}
+        assert correction_baselines_by_date(harmonised) == {"2022-01-07": 0}
